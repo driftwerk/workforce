@@ -1147,9 +1147,16 @@ fn codex_front(r: &mut SessionRecord, l: &mut Live) {
     }
 }
 
-/// Codex asks the person something only its terminal answers: shown with
-/// its words and options, after what Desk can answer.
-fn codex_question(r: &mut SessionRecord, l: &mut Live, request: Value, q: claude::Question) {
+/// Codex asks the person something its terminal answers: shown with its
+/// words and options, after what Desk can answer. With `asks` (its
+/// questions whole), its boss answers it in the person's place.
+fn codex_question(
+    r: &mut SessionRecord,
+    l: &mut Live,
+    request: Value,
+    q: claude::Question,
+    asks: Option<Value>,
+) {
     // The generic wait its status said becomes this question.
     let was = l
         .pending
@@ -1160,11 +1167,16 @@ fn codex_question(r: &mut SessionRecord, l: &mut Live, request: Value, q: claude
         since: was.as_ref().map_or_else(Utc::now, |p| p.since),
         tool: q.tool,
         detail: q.detail,
-        answerable: false,
+        answerable: asks.is_some(),
         choices: Vec::new(),
         why: q.why,
         options: q.options,
-        request: None,
+        request: asks.map(|questions| crate::model::Request {
+            tool: claude::DIALOG_TOOL.into(),
+            input: serde_json::json!({ "questions": questions, "codex": true }),
+            cwd: Some(r.cwd.clone()),
+            read_only: true,
+        }),
         call: None,
         agent: None,
         cli_session: None,
@@ -1173,6 +1185,63 @@ fn codex_question(r: &mut SessionRecord, l: &mut Live, request: Value, q: claude
     if l.codex_asks.is_empty() {
         codex_front(r, l);
     }
+}
+
+/// Codex's answers to its `questions` (`item/tool/requestUserInput`) from
+/// what its boss said, a JSON object of each question's id to its answer:
+/// an option's label (as Codex names it), or the boss's words where the
+/// question takes other answers. Every question is answered, or none is.
+fn codex_answers(questions: &Value, said: &str) -> Result<Value, String> {
+    let said = said
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    let given: serde_json::Map<String, Value> = serde_json::from_str(said)
+        .map_err(|_| "its answer isn't each question's id to its answer".to_string())?;
+    let mut out = serde_json::Map::new();
+    for q in questions.as_array().into_iter().flatten() {
+        let id = q.get("id").and_then(Value::as_str).unwrap_or_default();
+        let header = q
+            .get("header")
+            .and_then(Value::as_str)
+            .unwrap_or(id)
+            .to_string();
+        if q.get("isSecret").and_then(Value::as_bool) == Some(true) {
+            return Err(format!("“{header}” is a secret, the person's to type"));
+        }
+        let answer = match given.get(id) {
+            Some(Value::String(a)) => a.trim().to_string(),
+            Some(Value::Array(a)) => a
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
+            _ => String::new(),
+        };
+        if answer.is_empty() {
+            return Err(format!("it didn't answer “{header}”"));
+        }
+        let labels: Vec<&str> = q
+            .get("options")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|o| o.get("label").and_then(Value::as_str))
+            .collect();
+        let other = q.get("isOther").and_then(Value::as_bool) == Some(true);
+        let answer = match labels.iter().find(|l| l.eq_ignore_ascii_case(&answer)) {
+            Some(label) => (*label).to_string(),
+            None if labels.is_empty() || other => answer,
+            None => return Err(format!("“{answer}” isn't one of “{header}”'s options")),
+        };
+        out.insert(id.to_string(), serde_json::json!({ "answers": [answer] }));
+    }
+    if out.is_empty() {
+        return Err("it asks nothing Desk can answer".into());
+    }
+    Ok(Value::Object(out))
 }
 
 /// Codex's request `request` was answered, in Desk or its terminal: only
@@ -3593,6 +3662,14 @@ impl Desk {
         if codex {
             return self.decide_codex(id, approval, decision, by);
         }
+        let codex_question = self.0.state.lock().live.get(&id).is_some_and(|l| {
+            l.codex_question
+                .as_ref()
+                .is_some_and(|(_, q)| q.id == approval)
+        });
+        if codex_question {
+            return self.answer_codex_question(id, approval, decision, by);
+        }
         let asked = self
             .0
             .state
@@ -3702,11 +3779,12 @@ impl Desk {
         Ok(view)
     }
 
-    /// Answers one of Codex's requests. Only the person does: what Codex
-    /// asks is to leave its sandbox, which no agent's tool may grant (the
-    /// overseer's read-only rule reads Codex's words, not what runs).
-    /// Activity says it once Codex is told, or that the terminal answered
-    /// first.
+    /// Answers one of Codex's requests: the person, a boss that runs the
+    /// session, or an unbound boss, which decides on what runs (the
+    /// command, where, what it asks of its sandbox, the diffs), never on
+    /// Codex's account of it. No other agent's tool lets Codex out of its
+    /// sandbox. Activity says it once Codex is told, or that the terminal
+    /// answered first.
     fn decide_codex(
         &self,
         id: Uuid,
@@ -3751,6 +3829,35 @@ impl Desk {
                 return self.view_after(seen, id);
             }
             let asked = &live.codex_asks[at];
+            // A boss allows only what Desk saw whole: a request whose
+            // command or changes it didn't see, or saw only in part, is the
+            // person's to allow.
+            let seen_whole = asked.pending.request.as_ref().is_some_and(|r| {
+                r.input.get("clipped").and_then(Value::as_bool) != Some(true)
+                        // A whole folder for the rest of the session: the person's.
+                        && r.input.get("grantRoot").is_none_or(Value::is_null)
+            });
+            if by.party.kind == crew::PartyKind::Manager
+                && matches!(decision, Decision::Allow | Decision::AllowForSession)
+                && !seen_whole
+            {
+                return Err(DeskError::Invalid(
+                    "Desk didn't see all of what it runs, so it's the person's to allow".into(),
+                ));
+            }
+            // A boss's no, where Codex offers only to cancel what it asks:
+            // its turn stops there, and the boss tells it why on its line.
+            let offered = &asked.pending.choices;
+            let decision = match decision {
+                Decision::Deny
+                    if by.party.kind == crew::PartyKind::Manager
+                        && !offered.contains(&Decision::Deny)
+                        && offered.contains(&Decision::Cancel) =>
+                {
+                    Decision::Cancel
+                }
+                d => d,
+            };
             if !asked.pending.choices.contains(&decision) {
                 return Err(DeskError::Invalid(
                     "Codex doesn't offer that answer to this request".into(),
@@ -3762,6 +3869,7 @@ impl Desk {
                     .send(codex::Reply {
                         request: request.clone(),
                         decision,
+                        answers: None,
                     })
                     .is_ok()
             });
@@ -3779,6 +3887,85 @@ impl Desk {
                     by,
                 },
             );
+            st.decided.insert(approval);
+            seen
+        };
+        self.view_after(seen, id)
+    }
+
+    /// Answers Codex's question `approval`, held for its boss: the boss's
+    /// deny says its answers (a JSON object, each question's id to its
+    /// answer), sent to Codex in the person's place; anything else lets its
+    /// terminal ask the person.
+    fn answer_codex_question(
+        &self,
+        id: Uuid,
+        approval: Uuid,
+        decision: Decision,
+        by: Option<By>,
+    ) -> Result<SessionView, DeskError> {
+        // Only a boss that may answer Codex at all says its answers: an
+        // unbound one, or the one that runs the session.
+        let charged = |b: &By| {
+            b.party.kind == crew::PartyKind::Manager
+                && (self.full_of(&b.party.id).unbound
+                    || self
+                        .charge_of(id)
+                        .is_some_and(|c| c.live() && c.boss == b.party.id))
+        };
+        let said = by
+            .as_ref()
+            .filter(|b| decision == Decision::Deny && charged(b))
+            .and_then(|b| b.reason.clone());
+        let seen = {
+            let mut guard = self.0.state.lock();
+            let st = &mut *guard;
+            let seen = st.records.get(&id).map(|r| Self::view_of(st, r));
+            let live = st
+                .live
+                .get_mut(&id)
+                .ok_or_else(|| DeskError::Conflict("session is not running".into()))?;
+            let (request, q) = live
+                .codex_question
+                .as_mut()
+                .filter(|(_, q)| q.id == approval)
+                .ok_or_else(|| DeskError::Conflict("already answered".into()))?;
+            if !q.answerable {
+                return Err(DeskError::Conflict(
+                    "the terminal is asking for this one".into(),
+                ));
+            }
+            let Some(said) = said else {
+                q.answerable = false;
+                if let Some(p) = live.pending.as_mut().filter(|p| p.id == approval) {
+                    p.answerable = false;
+                }
+                drop(guard);
+                return self.view_after(seen, id);
+            };
+            let questions = q
+                .request
+                .as_ref()
+                .and_then(|r| r.input.get("questions"))
+                .cloned()
+                .unwrap_or_default();
+            let answers = codex_answers(&questions, &said).map_err(DeskError::Invalid)?;
+            let request = request.clone();
+            let sent = live._codex.as_ref().is_some_and(|link| {
+                link.replies
+                    .send(codex::Reply {
+                        request,
+                        decision,
+                        answers: Some(answers),
+                    })
+                    .is_ok()
+            });
+            if !sent {
+                return Err(DeskError::Conflict(
+                    "the terminal is asking for this one".into(),
+                ));
+            }
+            live.codex_question = None;
             st.decided.insert(approval);
             seen
         };
@@ -6163,9 +6350,33 @@ impl Desk {
                     .live
                     .get_mut(&id)
                     .and_then(|l| l.codex_sent.remove(&request.to_string()));
+                let mut why_not = None;
                 if let (Some(sent), Ok(view)) = (sent, self.view(id)) {
                     let note = match event {
                         CodexEvent::Answered(_) => {
+                            // A boss's no reaches Codex without words: why,
+                            // and what to do instead, go on its line once
+                            // Codex has the no, never when the terminal
+                            // answered first.
+                            let manager = sent.by.party.kind == crew::PartyKind::Manager;
+                            if manager && matches!(sent.decision, Decision::Deny | Decision::Cancel)
+                            {
+                                if let Some(why) = sent.by.reason.as_deref() {
+                                    let why = why.trim_end_matches(" (unbound: no limits)");
+                                    let what = match sent.pending.detail.trim() {
+                                        "" => sent.pending.tool.clone(),
+                                        d => format!(
+                                            "{} `{}`",
+                                            sent.pending.tool,
+                                            crew::clip(d, 160)
+                                        ),
+                                    };
+                                    why_not = Some((
+                                        sent.by.clone(),
+                                        format!("I said no to {what}: {why}"),
+                                    ));
+                                }
+                            }
                             decided_note(&view, &sent.pending, sent.decision, sent.by)
                         }
                         _ => {
@@ -6183,6 +6394,21 @@ impl Desk {
                     };
                     if let Some(note) = note {
                         self.note(note);
+                    }
+                }
+                if let Some((by, text)) = why_not {
+                    let told = self
+                        .line_send(
+                            crate::LineSender::Overseer(by),
+                            crate::line::Send::Tell {
+                                to: crate::line::Target::Session(id),
+                                text,
+                                when: crate::line::When::Queue,
+                            },
+                        )
+                        .await;
+                    if let Err(e) = told {
+                        tracing::warn!(%id, error = ?e, "telling Codex why its boss said no failed");
                     }
                 }
                 continue;
@@ -6286,6 +6512,10 @@ impl Desk {
                 .and_then(|(_, t)| t.said.clone())
                 .filter(|_| reader.is_some());
             let mut read = None;
+            // A question its boss answers in the person's place, unless they
+            // are in control of it.
+            let for_boss = matches!(&event, CodexEvent::Question { asks: Some(_), .. })
+                && self.holds_dialog_for_boss(id);
             self.change(id, |r, mut l| {
                 r.cli_session_id.get_or_insert_with(|| thread.clone());
                 match event {
@@ -6380,9 +6610,14 @@ impl Desk {
                             codex_asks(r, l, ask);
                         }
                     }
-                    CodexEvent::Question { request, question } => {
+                    CodexEvent::Question {
+                        request,
+                        question,
+                        asks,
+                    } => {
                         if let Some(l) = l {
-                            codex_question(r, l, request, question);
+                            let asks = asks.filter(|_| for_boss);
+                            codex_question(r, l, request, question, asks);
                         }
                     }
                     CodexEvent::Resolved(request) => {

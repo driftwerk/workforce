@@ -396,15 +396,32 @@ impl CrewHub {
             .as_ref()
             .and_then(|r| r.input.get("questions").cloned())
             .unwrap_or_else(|| serde_json::json!([{"question": p.detail, "options": p.options}]));
+        // Codex takes each question's answer by its id.
+        let codex = p
+            .request
+            .as_ref()
+            .is_some_and(|r| r.input.get("codex") == Some(&serde_json::Value::Bool(true)));
+        let shape = match codex {
+            true => "This dialog is Codex's: after ANSWER: put, on that one line, a JSON object of each \
+                     question's id to its answer: an option's label exactly, or your own words where the \
+                     question takes other answers (isOther).\n\n",
+            false => "",
+        };
         let prompt = format!(
-            "{MARK} A session you oversee asks this in a dialog. Answer it now.\n\n{}\n\n{}{prefs}",
+            "{MARK} A session you oversee asks this in a dialog. Answer it now.\n\n{shape}{}\n\n{}{prefs}",
             super::watcher::reported(&session.to_string(), "the session"),
             super::watcher::reported(&questions.to_string(), "its questions"),
         );
-        // Answered before Desk gives up holding it, with a margin.
-        let deadline = p.since
-            + chrono::Duration::from_std(workforce_desk::DIALOG_HOLD).unwrap_or_default()
-            - chrono::Duration::seconds(5);
+        // Answered before Desk gives up holding it, with a margin. Codex
+        // holds its question until it is answered: the boss's two tries.
+        let deadline = match codex {
+            true => chrono::Utc::now() + chrono::Duration::from_std(WITHIN * 2).unwrap_or_default(),
+            false => {
+                p.since
+                    + chrono::Duration::from_std(workforce_desk::DIALOG_HOLD).unwrap_or_default()
+                    - chrono::Duration::seconds(5)
+            }
+        };
         let mut failed = String::new();
         let mut replied = None;
         for _ in 0..2 {
