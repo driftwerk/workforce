@@ -97,10 +97,14 @@ async fn hand(
             .await;
         // A stop or a change of its grant meanwhile: let go of it at once.
         if charged.is_ok() && s.desk.grant_boss_for(&g, id).is_err() {
-            let _ = s
+            if let Err(e) = s
                 .desk
                 .release(id, &By::desk("Its grant changed as it was handed over."))
-                .await;
+                .await
+            {
+                // The hub's settle lets go of it on its next tick.
+                tracing::warn!(session = %id, error = %e, "a hand its grant no longer lets wasn't let go of");
+            }
             return DeskError::Conflict(
                 "Its grant changed as it was handed over, so it isn't; try again.".into(),
             )
