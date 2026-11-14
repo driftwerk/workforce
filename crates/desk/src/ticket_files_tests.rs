@@ -205,7 +205,7 @@ async fn a_ticket(store: &DeskStore) -> Uuid {
     client
         .execute(
             "INSERT INTO boards (id, name, prefix, created_at, updated_at) VALUES ($1, 'B', $2, now(), now())",
-            &[&board, &format!("B{}", &board.simple().to_string()[..4].to_ascii_uppercase().replace(|c: char| c.is_ascii_digit(), "X"))],
+            &[&board, &format!("B{}", &board.simple().to_string()[..5].to_ascii_uppercase())],
         )
         .await
         .unwrap();
