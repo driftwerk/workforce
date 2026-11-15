@@ -119,6 +119,37 @@ pub fn curated_surface(
     surface
 }
 
+/// Loads into `service`'s registry, as the caller, each configured built-in
+/// adapter whose tools `patterns` (`[remote_mcp] tools_allow`) offer and
+/// that isn't there yet, as a turn of theirs or this hub's own board sync
+/// loads it. A key a person keeps for themselves (`users/{uid}/skills/…`)
+/// is never seen at boot, so without this a restart leaves remote MCP
+/// without that adapter's tools until some turn happens to load it.
+/// When every offered adapter is registered nothing is read; otherwise the
+/// caller's vault paths are listed (in memory) to see which they hold.
+fn load_offered_adapters(service: &AgentService, identity_id: &str, patterns: &[String]) {
+    let everything = patterns.iter().any(|p| p == EXPOSE_ALL);
+    let offered = |skill: &str| {
+        // Opt-in only, as at boot.
+        skill != "obscura"
+            && crate::skill_loader::static_skill_tool_names(skill)
+                .iter()
+                .any(|tool| everything || matches_any(tool, patterns))
+    };
+    let unloaded = crate::skill_loader::builtin_skill_catalog()
+        .iter()
+        .any(|meta| {
+            offered(meta.name)
+                && !crate::skill_loader::skill_tools_registered(meta.name, &service.tools)
+        });
+    if !unloaded {
+        return;
+    }
+    workforce_agent::runner::CURRENT_USER_ID.sync_scope(identity_id.to_string(), || {
+        crate::skill_loader::ensure_adapters_loaded(service, offered)
+    });
+}
+
 /// What the plain route's 403 says when the default agent does not admit
 /// the caller. A client of this hub (a Desk's board sync) knows it by these
 /// words and goes on to the agents it may reach, so they are kept as they
@@ -277,6 +308,7 @@ async fn serve(
     // or a hub's sync of its linked hub. Only a program is offered the
     // file-byte readers, or has a file's chunk left whole.
     let program = caller.as_member || marked_as_board_sync(query);
+    load_offered_adapters(&service, &identity_id, &gateway.remote_mcp.tools_allow);
     let mut surface = remote.surface_for(&service);
     if caller.as_member {
         surface = Arc::new(device_surface(&surface));
@@ -1645,6 +1677,132 @@ mod tests {
                 assert!(offered.contains(&n.to_string()), "{plain}: {offered:?}");
             }
         }
+    }
+
+    /// A key a person keeps for themselves is never seen at boot: on a
+    /// fresh registry (as after a restart) their remote MCP still lists and
+    /// runs the adapter's tools, loaded as them; someone with no key of
+    /// their own loads nothing.
+    #[tokio::test]
+    async fn a_persons_own_key_reaches_their_remote_mcp_after_a_restart() {
+        use wiremock::matchers::{method, path_regex};
+        let jira = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("GET"))
+            .and(path_regex("/myself$"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"accountId": "a-1", "displayName": "Member"}),
+                ),
+            )
+            .mount(&jira)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let fx = fixture(true);
+        let service = crate::serve::testing::plain_service(tmp.path()).await;
+        let who = Identity::new("Member", IdentityRole::Member);
+        fx.identities.create(&who).unwrap();
+        let other = Identity::new("Other", IdentityRole::Member);
+        fx.identities.create(&other).unwrap();
+        let vault = service.vault.clone().expect("agent vault");
+        let site = jira.uri();
+        for (key, value) in [
+            ("jira/site", site.as_str()),
+            ("jira/email", "member@acme.example"),
+            ("jira/api_token", "member-token"),
+            ("linear/api_key", "lin_api_member"),
+        ] {
+            vault
+                .set(&format!("users/{}/skills/{key}", who.id), value)
+                .unwrap();
+        }
+        assert!(
+            !crate::skill_loader::skill_tools_registered("jira", &service.tools),
+            "nothing loads a person's own key at boot"
+        );
+        fx.state.registry.insert("default", Arc::clone(&service));
+        let app = router(RemoteMcpState::new(Arc::clone(&fx.state)));
+        let post = |token: String, body: &'static str| {
+            let app = app.clone();
+            async move {
+                let resp = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/mcp")
+                            .header("authorization", format!("Bearer {token}"))
+                            .header("content-type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+            }
+        };
+        let list = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        let names = |v: serde_json::Value| -> Vec<String> {
+            v["result"]["tools"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|t| t["name"].as_str().map(str::to_string))
+                .collect()
+        };
+
+        // Someone without a key of their own: nothing to load.
+        let theirs = names(post(issue(&fx, &other, TokenShape::default()), list).await);
+        assert!(!theirs.iter().any(|n| n.starts_with("jira_")), "{theirs:?}");
+        assert!(!crate::skill_loader::skill_tools_registered(
+            "jira",
+            &service.tools
+        ));
+
+        let token = issue(&fx, &who, TokenShape::default());
+        let offered = names(post(token.clone(), list).await);
+        for tool in [
+            "jira_myself",
+            "jira_get_issue",
+            "jira_search",
+            "linear_viewer",
+        ] {
+            assert!(offered.contains(&tool.to_string()), "{tool}: {offered:?}");
+        }
+        // Called, it runs as them, with their own key.
+        let call = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"jira_myself","arguments":{}}}"#;
+        let ran = post(token, call).await;
+        assert!(
+            ran["error"].is_null() && ran["result"]["isError"] != true,
+            "{ran}"
+        );
+        let sent = jira.received_requests().await.unwrap();
+        assert_eq!(sent.len(), 1);
+        let theirs_auth = format!(
+            "Basic {}",
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                "member@acme.example:member-token"
+            )
+        );
+        assert_eq!(
+            sent[0]
+                .headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok()),
+            Some(theirs_auth.as_str())
+        );
+
+        // Loaded as them, the adapter lends no one else their key: a call
+        // by someone without one of their own never reaches Jira.
+        let not_theirs = post(issue(&fx, &other, TokenShape::default()), call).await;
+        assert!(
+            not_theirs["error"].is_object() || not_theirs["result"]["isError"] == true,
+            "{not_theirs}"
+        );
+        assert_eq!(jira.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
