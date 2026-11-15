@@ -1255,6 +1255,117 @@ mod tests {
         }
     }
 
+    /// Jira keys kept at the person's own tier and added after the turn
+    /// began, as Desk's connection card writes them: enabling Jira in that
+    /// turn makes jira.search callable there and on the session's next
+    /// turn, and the call reaches Jira with the person's key.
+    #[tokio::test]
+    async fn a_persons_own_jira_keys_added_mid_session_are_callable_that_turn_and_the_next() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let jira = MockServer::start().await;
+        let expected_auth = format!(
+            "Basic {}",
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                "alice@example.com:alice-token"
+            )
+        );
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/search/jql"))
+            .and(header("authorization", expected_auth.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issues": [{ "id": "1", "key": "ACM-7", "fields": { "summary": "Fix the login" } }]
+            })))
+            .expect(2)
+            .mount(&jira)
+            .await;
+
+        let service = service().await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = crate::system_tool::SystemToolContext {
+            tools: Arc::clone(&service.tools),
+            ..crate::system_tool::tests::test_context(
+                dir.path(),
+                workforce_common::settings::WorkforceConfig::default(),
+            )
+        };
+        let vault = Arc::clone(&ctx.vault);
+        for tool in crate::system_tool::system_tools(ctx) {
+            if tool.name() == "system.enable_skill" {
+                service.tools.register(tool);
+            }
+        }
+        let following = || TurnTools {
+            registry: Arc::new(ToolRegistry::follow(&service.tools, |_| true)),
+            exclusive: false,
+        };
+        let tools = bind_in_turn(
+            &service,
+            "alice",
+            McpExposure::Turn(following()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The person adds their own keys while the session is open.
+        vault
+            .set("users/alice/skills/jira/email", "alice@example.com")
+            .unwrap();
+        vault
+            .set("users/alice/skills/jira/api_token", "alice-token")
+            .unwrap();
+        vault
+            .set("users/alice/skills/jira/site", &jira.uri())
+            .unwrap();
+
+        let (is_error, text) = text_of(
+            &session()
+                .scope(call(
+                    tools.endpoint(),
+                    "system_enable_skill",
+                    serde_json::json!({ "skill": "jira" }),
+                ))
+                .await,
+        );
+        assert!(!is_error, "{text}");
+        assert!(text.contains("\"name\":\"jira_search\""), "{text}");
+
+        let search = serde_json::json!({ "name": "jira_search", "arguments": { "jql": "assignee = currentUser()" } });
+        let (is_error, text) = text_of(
+            &session()
+                .scope(call(tools.endpoint(), "tool_call", search.clone()))
+                .await,
+        );
+        assert!(!is_error, "jira.search runs in the same turn: {text}");
+        assert!(text.contains("ACM-7"), "{text}");
+
+        // The session's next turn binds afresh and still has it.
+        let next = bind_in_turn(
+            &service,
+            "alice",
+            McpExposure::Turn(following()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(listed(next.endpoint())
+            .await
+            .contains(&"jira_search".to_string()));
+        let (is_error, text) = text_of(
+            &session()
+                .scope(call(next.endpoint(), "tool_call", search))
+                .await,
+        );
+        assert!(!is_error, "jira.search runs on the next turn: {text}");
+        assert!(text.contains("ACM-7"), "{text}");
+        jira.verify().await;
+    }
+
     #[tokio::test]
     async fn mcp_call_runs_under_its_own_tool_call() {
         #[derive(Default)]
