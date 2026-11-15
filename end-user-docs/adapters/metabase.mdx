@@ -97,8 +97,8 @@ The skill supports both single-instance and multi-instance configurations. Here'
 site_url = "${METABASE_URL}"
 api_key  = "${METABASE_API_KEY}"
 
-# Hard row cap for card_query / dataset_query_native (default 2000, max 50000)
-# max_query_rows = 2000
+# Row cap for query tools (no-limit default 2000; explicit limits up to 50000)
+# max_query_rows = 50000
 
 # ── Multi-instance mode ──
 # Uncomment to configure multiple Metabase instances. Tools accept an optional
@@ -109,7 +109,7 @@ api_key  = "${METABASE_API_KEY}"
 # [instances.prod]
 # site_url       = "https://mb.prod.example.com"
 # api_key        = "${METABASE_API_KEY_PROD}"
-# # max_query_rows = dic2000
+# # max_query_rows = 2000
 #
 # [instances.staging]
 # site_url       = "https://mb.staging.example.com"
