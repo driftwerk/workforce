@@ -7,10 +7,15 @@
 //!   API) is reachable through them.
 //! - As the caller: the adapter is built, and its keys and instances read,
 //!   as the person whose turn it is (`CURRENT_USER_ID`), at the tiers the
-//!   boss's `[skills]` pins. A call with no person in scope reads nothing;
-//!   another person's key is never used.
+//!   boss's `[skills]` pins, as any connector call of the person's reads
+//!   them: their own key, else one the hub keeps for everyone (the bare
+//!   tier, where a key the person saved before per-person keys stays).
+//!   Another person's own key is never read, and a turn with no person in
+//!   scope (or the system's) reads nothing.
 //! - Not connected (no key for this person, GitHub off for the boss, or a
 //!   key GitHub refuses), it says so in one plain sentence for the person.
+//! - What anyone can write on GitHub (titles, branch, check, job and step
+//!   names) reaches the boss fenced as data, apart from the facts it checks.
 
 use std::sync::Arc;
 
@@ -76,8 +81,17 @@ pub(super) fn schema(name: &str) -> Value {
 /// `repo` as GitHub's owner and name.
 fn owner_repo(input: &Value) -> Result<(String, String), String> {
     let repo = input["repo"].as_str().map(str::trim).unwrap_or_default();
+    // GitHub's own characters alone: nothing that steers the request
+    // elsewhere (`?`, `#`, `..`).
+    let part = |p: &str| {
+        !p.is_empty()
+            && p != "."
+            && p != ".."
+            && p.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
     match repo.split_once('/') {
-        Some((owner, name)) if !owner.is_empty() && !name.is_empty() && !name.contains('/') => {
+        Some((owner, name)) if part(owner) && part(name) => {
             Ok((owner.to_string(), name.to_string()))
         }
         _ => Err("Say the repository as owner/name (driftwerk/workforce).".into()),
@@ -145,7 +159,7 @@ pub(crate) async fn read(
     let person = workforce_agent::runner::CURRENT_USER_ID
         .try_with(Clone::clone)
         .ok()
-        .filter(|p| !p.is_empty());
+        .filter(|p| !p.is_empty() && p != workforce_agent::runner::SYSTEM_USER_ID);
     let (Some(person), Some(vault)) = (person, vault) else {
         return Err(NOT_CONNECTED.into());
     };
@@ -175,10 +189,15 @@ pub(crate) async fn read(
     let got = out.pop().unwrap_or(Value::Null);
     Ok(match name {
         PR => pull(&got),
-        BRANCH => json!({ "pulls": got["pulls"] }),
+        BRANCH => json!({ "pulls": fenced(&got["pulls"]) }),
         CI if got.get("jobs").is_some() => run(&got),
-        _ => json!({ "runs": got["runs"] }),
+        _ => json!({ "runs": fenced(&got["runs"]) }),
     })
+}
+
+/// What anyone can write on GitHub, fenced as data for the boss.
+fn fenced(v: &Value) -> Value {
+    json!(super::watcher::reported(&v.to_string(), "GitHub"))
 }
 
 /// What a failed read tells the boss: not connected for a key GitHub
@@ -186,47 +205,80 @@ pub(crate) async fn read(
 fn refused(error: &str) -> String {
     let lower = error.to_lowercase();
     let unauthorised = [
-        "401",
+        "authentication failed",
         "bad credentials",
         "missing vault credential",
         "not configured",
     ]
     .iter()
     .any(|w| lower.contains(w));
-    match unauthorised {
-        true => NOT_CONNECTED.into(),
-        false => format!(
-            "GitHub couldn't be read: {}",
-            workforce_desk::crew::one_line(error, 300)
-        ),
+    if unauthorised {
+        return NOT_CONNECTED.into();
     }
+    // GitHub answers 404 for what the key may not see, too.
+    if lower.contains("404") || lower.contains("not found") {
+        return "GitHub says there's no such pull request, run or repository that the person's \
+            GitHub can see. Check the repo and number; if it's private, the person's key may not \
+            reach it. Don't say it merged or passed."
+            .into();
+    }
+    format!(
+        "GitHub couldn't be read: {}",
+        workforce_desk::crew::one_line(error, 300)
+    )
 }
 
 /// A pull request as the boss checks it: its state and checks, not its
-/// text or files.
+/// text or files; its title and names fenced.
 fn pull(p: &Value) -> Value {
-    json!({
+    let c = &p["checks"];
+    let checks = match c["total"].as_u64() {
+        _ if c.is_null() => json!({ "note": "Its checks couldn't be read: don't say CI passed." }),
+        Some(0) => json!({
+            "overall": "none yet",
+            "note": "No checks have reported on its head yet (CI may not have started): don't say CI passed.",
+        }),
+        _ => json!({
+            "overall": c["overall"],
+            "total": c["total"],
+            "success": c["success"],
+            "failure": c["failure"],
+            "pending": c["pending"],
+            "skipped": c["skipped"],
+            "neutral": c["neutral"],
+        }),
+    };
+    let mut out = json!({
         "number": p["number"],
-        "title": p["title"],
         "state": p["state"],
         "merged": p["merged"],
         "merged_at": p["merged_at"],
-        "merged_by": p["merged_by"],
         "merge_commit_sha": p["merge_commit_sha"],
         "draft": p["draft"],
         "mergeable": p["mergeable"],
         "mergeable_state": p["mergeable_state"],
-        "head": p["head"],
         "head_sha": p["head_sha"],
-        "base": p["base"],
-        "reviews": p["reviews"],
-        "checks": p["checks"],
+        "checks": checks,
         "html_url": p["html_url"],
-    })
+        "named": fenced(&json!({
+            "title": p["title"],
+            "head": p["head"],
+            "base": p["base"],
+            "merged_by": p["merged_by"],
+            "reviews": p["reviews"],
+            "failed_checks": c["failed"],
+            "cancelled_checks": c["cancelled"],
+        })),
+    });
+    if p["mergeable"].is_null() && p["state"] == "open" {
+        out["note"] =
+            json!("mergeable is null: GitHub is still working it out; check again shortly.");
+    }
+    out
 }
 
 /// A run as the boss checks it: its status and the jobs that failed, each
-/// with its failed steps.
+/// with its failed steps, their names fenced.
 fn run(r: &Value) -> Value {
     let failed = |c: &Value| matches!(c.as_str(), Some("failure") | Some("timed_out"));
     let jobs: Vec<Value> = r["jobs"]
@@ -245,7 +297,21 @@ fn run(r: &Value) -> Value {
             json!({ "name": j["name"], "conclusion": j["conclusion"], "failed_steps": steps, "html_url": j["html_url"] })
         })
         .collect();
-    json!({ "run": r["run"], "jobs": r["total_count"], "failed_jobs": jobs })
+    let run = &r["run"];
+    json!({
+        "run": {
+            "id": run["id"],
+            "status": run["status"],
+            "conclusion": run["conclusion"],
+            "head_sha": run["head_sha"],
+            "run_attempt": run["run_attempt"],
+            "html_url": run["html_url"],
+            "updated_at": run["updated_at"],
+        },
+        "jobs": r["total_count"],
+        "failed": jobs.len(),
+        "named": fenced(&json!({ "workflow": run["name"], "branch": run["head_branch"], "failed_jobs": jobs })),
+    })
 }
 
 #[cfg(test)]
@@ -380,12 +446,19 @@ mod tests {
             .unwrap();
         assert_eq!(pr["merged"], true);
         assert_eq!(pr["merged_at"], "2026-11-15T09:00:00Z");
-        assert_eq!(pr["merged_by"], "kings");
         assert_eq!(pr["merge_commit_sha"], "b7f4061");
         assert_eq!(pr["checks"]["overall"], "failure");
-        assert_eq!(pr["checks"]["failed"], json!(["Test (1/6)"]));
+        assert_eq!(pr["checks"]["failure"], 1);
         assert_eq!(pr["checks"]["pending"], 0, "a skipped check isn't pending");
         assert!(pr.get("body").is_none(), "{pr}");
+        // Its names reach the boss fenced, as data.
+        let named = pr["named"].as_str().unwrap();
+        assert!(named.contains("EXTERNAL_UNTRUSTED_CONTENT"), "{named}");
+        assert!(
+            named.contains("Test (1/6)") && named.contains("kings"),
+            "{named}"
+        );
+        assert!(pr.get("title").is_none() && pr["checks"].get("failed").is_none());
     }
 
     #[tokio::test]
@@ -409,9 +482,15 @@ mod tests {
         let h = hub(&server);
         let input = json!({"repo": "driftwerk/workforce", "branch": "hub/boss-github-reads"});
         let ann = h.read(Some("ann"), BRANCH, input.clone()).await.unwrap();
-        assert_eq!(ann["pulls"][0]["title"], "ann's");
+        let fenced = |v: &Value| {
+            let s = v["pulls"].as_str().unwrap().to_string();
+            assert!(s.contains("EXTERNAL_UNTRUSTED_CONTENT"), "{s}");
+            s
+        };
+        assert!(fenced(&ann).contains("ann's"));
         let bob = h.read(Some("bob"), BRANCH, input.clone()).await.unwrap();
-        assert_eq!(bob["pulls"][0]["title"], "bob's");
+        let bob = fenced(&bob);
+        assert!(bob.contains("bob's") && !bob.contains("ann's"));
         // Cara keeps no key: not connected, and nobody else's is used.
         assert_eq!(
             h.read(Some("cara"), BRANCH, input.clone())
@@ -460,10 +539,14 @@ mod tests {
             .unwrap();
         assert_eq!(ci["run"]["conclusion"], "failure");
         assert_eq!(ci["run"]["status"], "completed");
-        assert_eq!(
-            ci["failed_jobs"],
-            json!([{"name": "Test (3/6)", "conclusion": "failure", "failed_steps": ["Run tests"], "html_url": null}])
+        assert_eq!(ci["failed"], 1);
+        let named = ci["named"].as_str().unwrap();
+        assert!(named.contains("EXTERNAL_UNTRUSTED_CONTENT"), "{named}");
+        assert!(
+            named.contains("Test (3/6)") && named.contains("Run tests"),
+            "{named}"
         );
+        assert!(!named.contains("Clippy"), "only the failed jobs: {named}");
     }
 
     #[tokio::test]
@@ -486,7 +569,121 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(e, NOT_CONNECTED);
-        assert!(!e.contains("ann-token"));
+    }
+
+    /// The system's turn is no person's: nothing is read as anyone.
+    #[tokio::test]
+    async fn the_systems_turn_reads_nothing() {
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let h = hub(&server);
+        h.global.set("skills/github/token", "team-token").unwrap();
+        let e = h
+            .read(
+                Some(workforce_agent::runner::SYSTEM_USER_ID),
+                PR,
+                json!({"repo": "driftwerk/workforce", "number": 1}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(e, NOT_CONNECTED);
+    }
+
+    /// GitHub off for the boss in its `[skills]`: no key is read, even the
+    /// person's own.
+    #[tokio::test]
+    async fn github_off_for_the_boss_reads_nothing() {
+        struct Off;
+        impl workforce_common::credential_pin::PinSource for Off {
+            fn pin(&self, path: &str) -> workforce_common::credential_pin::TierPin {
+                match path.starts_with("skills/github") {
+                    true => workforce_common::credential_pin::TierPin::Nothing,
+                    false => workforce_common::credential_pin::TierPin::All,
+                }
+            }
+        }
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let h = hub(&server);
+        h.registry.credential_pins().fill(Arc::new(Off));
+        let e = h
+            .read(
+                Some("ann"),
+                PR,
+                json!({"repo": "driftwerk/workforce", "number": 1}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(e, NOT_CONNECTED);
+    }
+
+    /// A key the hub keeps for everyone (the bare tier) backs a person with
+    /// none of their own, as it does every connector call of theirs; their
+    /// own goes first.
+    #[tokio::test]
+    async fn the_hubs_shared_key_backs_a_person_without_their_own() {
+        let server = MockServer::start().await;
+        for (token, title) in [("team-token", "shared"), ("ann-token", "own")] {
+            Mock::given(method("GET"))
+                .and(path("/repos/driftwerk/workforce/pulls"))
+                .and(header("authorization", format!("Bearer {token}").as_str()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([{"title": title}])))
+                .mount(&server)
+                .await;
+        }
+        let h = hub(&server);
+        h.global.set("skills/github/token", "team-token").unwrap();
+        let input = json!({"repo": "driftwerk/workforce", "branch": "main"});
+        let cara = h.read(Some("cara"), BRANCH, input.clone()).await.unwrap();
+        assert!(cara["pulls"].as_str().unwrap().contains("shared"));
+        let ann = h.read(Some("ann"), BRANCH, input).await.unwrap();
+        let ann = ann["pulls"].as_str().unwrap();
+        assert!(ann.contains("own") && !ann.contains("shared"), "{ann}");
+    }
+
+    /// No checks yet on its head is never "passed".
+    #[tokio::test]
+    async fn a_pull_request_with_no_checks_yet_is_not_green() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/driftwerk/workforce/pulls/9"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "number": 9, "state": "open", "merged": false, "mergeable": null,
+                "head": {"ref": "x", "sha": "abc"}, "base": {"ref": "main"}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/driftwerk/workforce/commits/abc/check-runs"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"check_runs": []})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+        let h = hub(&server);
+        let pr = h
+            .read(
+                Some("ann"),
+                PR,
+                json!({"repo": "driftwerk/workforce", "number": 9}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pr["checks"]["overall"], "none yet");
+        assert!(pr["note"]
+            .as_str()
+            .unwrap()
+            .contains("still working it out"));
     }
 
     #[tokio::test]
@@ -501,6 +698,9 @@ mod tests {
         for (name, input) in [
             (PR, json!({"repo": "workforce", "number": 1})),
             (PR, json!({"repo": "driftwerk/workforce"})),
+            (PR, json!({"repo": "driftwerk/workforce?x=1", "number": 1})),
+            (PR, json!({"repo": "../workforce", "number": 1})),
+            (PR, json!({"repo": "driftwerk/a/b", "number": 1})),
             (BRANCH, json!({"repo": "driftwerk/workforce"})),
             (CI, json!({"repo": "driftwerk/workforce"})),
         ] {
