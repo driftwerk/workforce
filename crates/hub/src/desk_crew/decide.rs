@@ -1053,19 +1053,21 @@ impl CrewHub {
     }
 }
 
-/// One call to `service`'s own model for a decision, on whichever hub holds
+/// One call to `service`'s model for a decision, on whichever hub holds
 /// `service` (the person's own, or a remote boss's): its text. It runs on
-/// `service`'s own model alone, never another's.
+/// `service`'s heavy background model (`[llm] heavy_model`), never
+/// another agent's.
 pub(crate) async fn decision_call(
     service: &crate::serve::AgentService,
     system: &str,
     prompt: &str,
 ) -> Result<String, String> {
+    let model = crate::turn_loop::heavy_model(service);
     let (response, served) = with_served_log(service.llm.create_message(
         Some(system),
         &[LlmMessage::user(prompt.to_string())],
         &[],
-        None,
+        model.as_deref(),
         Some(400),
         true,
     ))

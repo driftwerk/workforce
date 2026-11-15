@@ -234,6 +234,7 @@ impl Deriver for HubDeriver {
                     max_tokens: workforce_desk::memory::derive::ANSWER_TOKENS,
                     task: "desk_memory_derive",
                     description: "desk:memory-notes",
+                    heavy: false,
                 },
             )
             .await?;

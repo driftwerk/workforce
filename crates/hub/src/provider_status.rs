@@ -254,6 +254,7 @@ mod tests {
 
     fn resolved() -> ResolvedConfig {
         ResolvedConfig::resolve(None, None, &WorkforceConfig::default(), "anthropic", None)
+            .without_background_fill()
     }
 
     #[test]

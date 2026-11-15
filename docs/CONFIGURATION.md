@@ -214,7 +214,7 @@ backend = "weaviate"  # sqlite | weaviate | in_memory
 | `embedding_api_url` | String | `"https://api.openai.com/v1/embeddings"` | Embedding endpoint |
 | `embedding_api_key` | Option\<String\> | None | API key (prefer env var) |
 | `passive` | bool | `false` | Enable post-turn memory extraction |
-| `passive_model` | Option\<String\> | None | Model for extraction (falls back to compaction_model) |
+| `passive_model` | Option\<String\> | None | Model for extraction (unset: the agent's `[llm] light_model`) |
 | `passive_min_turn_tokens` | u32 | `200` | Minimum turn tokens to trigger extraction |
 | `passive_prompt` | Option\<String\> | None | Custom extraction system prompt |
 | `consolidation` | bool | `false` | Enable periodic memory consolidation |
@@ -481,7 +481,7 @@ compaction_model = "claude-haiku-4-5-20251001"  # Model for compaction LLM calls
 | `prune_tool_output_max_chars` | usize | `2000` |
 | `max_compaction_passes` | u32 | `3` |
 | `min_messages_to_compact` | usize | `5` |
-| `compaction_model` | Option\<String\> | `"claude-haiku-4-5-20251001"` |
+| `compaction_model` | Option\<String\> | None: the agent's `[llm] heavy_model` |
 
 Compaction runs when estimated token count exceeds `max_context_tokens * compaction_threshold`. Between the normal threshold and `urgent_compaction_threshold`, compaction is deferred to background. Above the urgent threshold, it blocks synchronously.
 
@@ -949,6 +949,8 @@ All fields are optional. Only include the fields you want to override — unset 
 | `[compaction]` | `prune_tool_output_max_chars` | usize | Max tool output chars |
 | `[compaction]` | `max_compaction_passes` | u32 | Safety valve |
 | `[compaction]` | `min_messages_to_compact` | usize | Min messages |
+| `[llm]` | `light_model` | String | Light background work: session accounts, gists, memory notes, passive memory, lessons, consolidation, self-learning. A tier, `provider:tier`, a model id, or `"chat"` for the agent's own model. Unset: the provider's `cheap` tier |
+| `[llm]` | `heavy_model` | String | Heavier background work: compaction and rollover summaries, the overseer's own turns and decisions, update briefs, claim grounding. Same forms. Unset: the provider's `standard` tier, or the agent's own model where that is on the cheap tier |
 | `[compaction]` | `compaction_model` | String | Model for compaction |
 | `[memory]` | `passive` | bool | Enable post-turn extraction |
 | `[memory]` | `passive_model` | String | Model for extraction |

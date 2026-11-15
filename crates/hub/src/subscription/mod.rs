@@ -228,8 +228,11 @@ mod tests {
         codex: CODEX,
     };
 
+    /// An Anthropic agent's config, checked under the `[llm]` each test
+    /// names: background work's Anthropic defaults left out.
     fn resolved() -> ResolvedConfig {
         ResolvedConfig::resolve(None, None, &WorkforceConfig::default(), "anthropic", None)
+            .without_background_fill()
     }
 
     #[test]
