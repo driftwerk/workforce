@@ -574,7 +574,7 @@ impl ConfigSchemaResponse {
                     key: "compaction_model".to_string(),
                     label: "Compaction Model".to_string(),
                     description:
-                        "Model for compaction LLM calls (optional, defaults to agent model)."
+                        "Model for compaction LLM calls (optional, defaults to the agent's heavy background model)."
                             .to_string(),
                     field_type: ConfigFieldType::String,
                     default_value: None,

@@ -92,7 +92,15 @@ pub(crate) async fn run(
         &memories,
         include_profile,
     ))];
-    let call = with_served_log(llm.create_message(Some(&system), &task, &[], None, None, false));
+    let model = cc_model(&service.resolved.snapshot());
+    let call = with_served_log(llm.create_message(
+        Some(&system),
+        &task,
+        &[],
+        model.as_deref(),
+        None,
+        false,
+    ));
     let (response, served) = match cancel {
         Some(cancel) => tokio::select! {
             _ = cancel.cancelled() => return CcOutcome::Cancelled,
@@ -348,6 +356,22 @@ fn consolidation_task(memories: &[Memory], include_profile: bool) -> String {
         },
         serde_json::to_string_pretty(&Value::Array(listing)).unwrap_or_default()
     )
+}
+
+/// The Claude Code model consolidation runs on: the agent's light
+/// background model (`[llm] light_model`) as Claude Code names it. `None`
+/// (the CLI's own default) where that is the agent's own model or names
+/// another provider.
+fn cc_model(resolved: &crate::resolved_config::ResolvedConfig) -> Option<String> {
+    use workforce_agent::llm::tiers::ModelTier;
+    let spec = resolved.background.light_spec.as_str();
+    if spec.eq_ignore_ascii_case(crate::resolved_config::SAME_AS_CHAT) {
+        return None;
+    }
+    let cc = ProviderKind::ClaudeCode.canonical_name();
+    let (routing, model) = resolved.tiers.resolve_routed_model(spec, cc);
+    let elsewhere = routing.is_some_and(|r| r != cc);
+    (!elsewhere && ModelTier::from_name(&model).is_none()).then_some(model)
 }
 
 #[cfg(test)]

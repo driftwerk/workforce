@@ -958,17 +958,15 @@ fn doing_at_end(outcome: Outcome) -> Doing {
     }
 }
 
-/// The model a gist is written on for an agent on `tier_key`: its
-/// provider's cheap tier (a Claude plan's is Haiku), never the agent's main
-/// or compaction model; none where the provider maps no cheap one.
-fn floor_model(
-    tiers: &workforce_agent::llm::tiers::TierRegistry,
-    tier_key: &str,
-) -> Option<String> {
-    let (routing, model) = tiers.resolve_routed_model("cheap", tier_key);
-    (model != "cheap").then(|| {
-        workforce_agent::llm::tiers::TierRegistry::format_routed(routing.as_deref(), model)
-    })
+/// The model `call` is written on by `service`: its light background model
+/// (`[llm] light_model`, the provider's cheap tier unless set; a Claude
+/// plan's is Haiku), or its heavy one for a heavy call, else its own.
+fn floor_model(service: &crate::serve::AgentService, call: Call) -> String {
+    match call.heavy {
+        true => crate::turn_loop::heavy_model(service)
+            .unwrap_or_else(|| service.current_default_model.read().clone()),
+        false => crate::turn_loop::cheap_model(service),
+    }
 }
 
 /// The hub's own model: an agent's turn's gist on that agent's cheap
@@ -1134,6 +1132,9 @@ pub(crate) struct Call {
     pub max_tokens: u32,
     pub task: &'static str,
     pub description: &'static str,
+    /// Run on the agent's heavy background model (`[llm] heavy_model`),
+    /// not its light one.
+    pub heavy: bool,
 }
 
 impl Call {
@@ -1142,6 +1143,7 @@ impl Call {
         max_tokens: 400,
         task: "floor_gist",
         description: "floor:gist",
+        heavy: false,
     };
 
     /// A session's running account, with its turn-end gist; booked apart
@@ -1150,6 +1152,7 @@ impl Call {
         max_tokens: workforce_desk::account::ANSWER_TOKENS,
         task: workforce_desk::account::TASK,
         description: "desk:account",
+        heavy: false,
     };
 
     /// A session's account refreshed and its new exchanges read for notes
@@ -1160,6 +1163,7 @@ impl Call {
             + workforce_desk::memory::derive::ANSWER_TOKENS,
         task: workforce_desk::account::SHARED_TASK,
         description: "desk:account-and-notes",
+        heavy: false,
     };
 
     /// A running turn's `now` in a session's account.
@@ -1167,6 +1171,7 @@ impl Call {
         max_tokens: 200,
         task: workforce_desk::account::TASK,
         description: "desk:account-now",
+        heavy: false,
     };
 
     /// A question about a session, answered from its exchanges.
@@ -1174,6 +1179,7 @@ impl Call {
         max_tokens: workforce_desk::account::QUESTION_TOKENS,
         task: workforce_desk::account::QUESTION_TASK,
         description: "desk:account-question",
+        heavy: false,
     };
 
     /// The session paragraphs of a boss's update.
@@ -1181,6 +1187,7 @@ impl Call {
         max_tokens: 700,
         task: "desk_update",
         description: "desk:update",
+        heavy: true,
     };
 }
 
@@ -1228,8 +1235,7 @@ async fn answer_with(
     let principal = principal_for(&primary, owner);
     let mut failed = None;
     for (kind, service) in candidates {
-        let model = floor_model(&service.tier_registry(), &service.tier_key.read())
-            .unwrap_or_else(|| crate::turn_loop::cheap_model(&service));
+        let model = floor_model(&service, call);
         let llm = match kind {
             None => Arc::clone(&service.llm),
             Some(_) => own_provider(&service),
@@ -2127,14 +2133,6 @@ mod tests {
             "the recent thread, not the first ask or the old purpose"
         );
         assert!(written.purpose_at > Some(crew::now() - chrono::Duration::minutes(1)));
-    }
-
-    #[test]
-    fn a_gist_is_written_on_the_providers_cheap_tier() {
-        let tiers = workforce_agent::llm::tiers::TierRegistry::from_defaults().unwrap();
-        assert_eq!(floor_model(&tiers, "claude-code").as_deref(), Some("haiku"));
-        assert_eq!(floor_model(&tiers, "codex").as_deref(), Some("gpt-6-luna"));
-        assert_eq!(floor_model(&tiers, "no-such-provider"), None);
     }
 
     #[tokio::test(start_paused = true)]

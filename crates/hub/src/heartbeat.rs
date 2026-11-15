@@ -219,11 +219,13 @@ impl HeartbeatRunner {
                     relayed: false,
                 },
             );
+        // The agent's own check-in: its heavy background model's work.
+        let model = crate::turn_loop::heavy_model(&self.service);
         workforce_agent::runner::with_desk(
             desk,
             self.service.run_background_unit(
                 &principal,
-                Route::Model(None),
+                Route::Model(model.as_deref()),
                 workforce_agent::runner::with_tool_whitelist(
                     tools.map(ToolWhitelist::for_own_session),
                     Box::pin(self.service.process_turn(
@@ -236,7 +238,7 @@ impl HeartbeatRunner {
                         None,
                         None,
                         None,
-                        None,
+                        model.as_deref(),
                         None,
                         None,
                         principal.run_as.as_deref(),

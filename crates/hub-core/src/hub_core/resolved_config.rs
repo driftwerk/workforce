@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use workforce_agent::llm::failover::LlmTimeouts;
-use workforce_agent::llm::tiers::TierRegistry;
+use workforce_agent::llm::tiers::{ModelTier, TierRegistry};
 use workforce_agent::model_router::RoutingConfig;
 use workforce_common::session::CompactionConfig;
 use workforce_common::settings::{
@@ -51,6 +51,11 @@ pub struct ResolvedConfig {
     /// `[llm] fast`, resolved workspace → agent section like `effort` and
     /// read every turn.
     pub fast: bool,
+    /// `[llm] light_model` and `heavy_model`: the models the agent's
+    /// background work runs on, defaults applied and tier-resolved. Already
+    /// filled into the feature fields they stand for (compaction, memory,
+    /// self-learning, claim grounding) wherever those set none.
+    pub background: BackgroundModels,
     /// `[aws_s3]` — surfaced here only so [`Self::structural_diff`] can
     /// report when an edit needs a restart. The hub doesn't read this
     /// per-turn (tools take their config at registration time); a
@@ -235,6 +240,18 @@ impl ResolvedConfig {
             .cloned();
 
         let llm = crate::serve::merged_effective_llm(agent_config, workspace_config, &global.llm);
+        let background = BackgroundModels::resolve(
+            BackgroundModels::written(workspace_llm, agent_llm),
+            &llm.default_model,
+            &tiers,
+            tier_key,
+        );
+        background.fill(
+            &mut compaction,
+            &mut memory,
+            &mut self_learning,
+            &mut claim_grounding,
+        );
         let llm_timeouts = llm
             .retry
             .as_ref()
@@ -252,6 +269,7 @@ impl ResolvedConfig {
             voice_thinking_budget_tokens,
             effort,
             fast,
+            background,
             aws_s3: global.aws_s3.clone(),
             worker_read_sources_enabled,
             self_learning,
@@ -349,7 +367,6 @@ fn route_chatgpt_advisor(
 /// another provider, is left for review to judge.
 fn chatgpt_spec(spec: &str, codex: &workforce_common::settings::CodingCodexConfig) -> String {
     use workforce_agent::llm::provider::ProviderKind;
-    use workforce_agent::llm::tiers::ModelTier;
     let spec = spec.trim();
     let name = ProviderKind::ChatGpt.canonical_name();
     let routed = crate::hub_core::subscriptions::routed_kind(spec);
@@ -363,6 +380,124 @@ fn chatgpt_spec(spec: &str, codex: &workforce_common::settings::CodingCodexConfi
         return format!("{name}:{spec}");
     }
     format!("{name}:{}", codex.resolve_model(spec))
+}
+
+/// What `[llm] light_model` or `heavy_model` says to mean the agent's own
+/// (chat) model.
+pub const SAME_AS_CHAT: &str = "chat";
+
+/// The light group's model when `[llm] light_model` names none.
+pub const LIGHT_DEFAULT: &str = "cheap";
+
+/// The heavy group's model when `[llm] heavy_model` names none.
+pub const HEAVY_DEFAULT: &str = "standard";
+
+/// The models an agent's background work runs on, by weight. `None` is the
+/// agent's own (chat) model.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackgroundModels {
+    /// Accounts, gists, memory notes, passive memory, lessons,
+    /// consolidation, self-learning, readings.
+    pub light: Option<String>,
+    /// Compaction and rollover, the overseer's own turns and decisions,
+    /// update briefs, claim grounding.
+    pub heavy: Option<String>,
+    /// `light` as written (defaults applied), for a caller that routes it
+    /// on another provider than the agent's (Claude Code consolidation).
+    pub light_spec: String,
+}
+
+/// `[llm] light_model` and `heavy_model` as written, workspace over the
+/// agent's section.
+pub struct Written<'a> {
+    pub light: Option<&'a str>,
+    pub heavy: Option<&'a str>,
+}
+
+impl BackgroundModels {
+    pub fn written<'a>(
+        workspace: Option<&'a workforce_common::settings::AgentLlmConfig>,
+        agent: Option<&'a workforce_common::settings::AgentLlmConfig>,
+    ) -> Written<'a> {
+        let pick = |f: fn(&workforce_common::settings::AgentLlmConfig) -> Option<&String>| {
+            workspace
+                .and_then(f)
+                .or_else(|| agent.and_then(f))
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+        };
+        Written {
+            light: pick(|l| l.light_model.as_ref()),
+            heavy: pick(|l| l.heavy_model.as_ref()),
+        }
+    }
+
+    /// The groups' models for an agent on `default_model` and `tier_key`.
+    /// Unset, light is the provider's cheap tier and heavy its standard
+    /// one, never above the agent's own model: an agent that chats on its
+    /// cheap tier does its heavy work there too. A tier the provider has no
+    /// model for is the agent's own model, never the tier's bare name.
+    pub fn resolve(
+        written: Written<'_>,
+        default_model: &str,
+        tiers: &TierRegistry,
+        tier_key: &str,
+    ) -> Self {
+        let light_spec = written.light.unwrap_or(LIGHT_DEFAULT).to_string();
+        let heavy = match written.heavy {
+            Some(spec) => routed_background(spec, tiers, tier_key),
+            None => match chat_tier(default_model, tiers, tier_key) {
+                ModelTier::Cheap => None,
+                _ => routed_background(HEAVY_DEFAULT, tiers, tier_key),
+            },
+        };
+        Self {
+            light: routed_background(&light_spec, tiers, tier_key),
+            heavy,
+            light_spec,
+        }
+    }
+
+    /// Fills each feature's model the agent's config leaves unset with its
+    /// group's.
+    pub fn fill(
+        &self,
+        compaction: &mut CompactionConfig,
+        memory: &mut workforce_common::settings::MemoryConfig,
+        self_learning: &mut workforce_common::settings::SelfLearningConfig,
+        claim_grounding: &mut ClaimGroundingConfig,
+    ) {
+        let fill = |field: &mut Option<String>, group: &Option<String>| {
+            if field.is_none() {
+                field.clone_from(group);
+            }
+        };
+        fill(&mut compaction.compaction_model, &self.heavy);
+        fill(&mut claim_grounding.model, &self.heavy);
+        fill(&mut memory.passive_model, &self.light);
+        fill(&mut memory.consolidation_model, &self.light);
+        fill(&mut memory.lesson_extract_model, &self.light);
+        fill(&mut self_learning.model, &self.light);
+    }
+}
+
+/// `spec` routed for `tier_key`: `None` for [`SAME_AS_CHAT`] or a tier the
+/// provider maps no model to.
+fn routed_background(spec: &str, tiers: &TierRegistry, tier_key: &str) -> Option<String> {
+    if spec.eq_ignore_ascii_case(SAME_AS_CHAT) {
+        return None;
+    }
+    let (routing_key, model) = tiers.resolve_routed_model(spec, tier_key);
+    if ModelTier::from_name(&model).is_some() {
+        return None;
+    }
+    Some(TierRegistry::format_routed(routing_key.as_deref(), model))
+}
+
+/// The tier the agent's own model is on.
+fn chat_tier(default_model: &str, tiers: &TierRegistry, tier_key: &str) -> ModelTier {
+    ModelTier::from_name(default_model)
+        .unwrap_or_else(|| tiers.classify(&tiers.resolve_model(default_model, tier_key)))
 }
 
 pub fn resolve_routed_field(field: &mut Option<String>, tiers: &TierRegistry, tier_key: &str) {
@@ -418,6 +553,7 @@ mod tests {
             voice_thinking_budget_tokens: None,
             effort: None,
             fast: false,
+            background: BackgroundModels::default(),
             aws_s3: AwsS3Config::default(),
             worker_read_sources_enabled: false,
             self_learning: workforce_common::settings::SelfLearningConfig::default(),
@@ -486,6 +622,120 @@ mod tests {
                 .map(String::as_str),
             Some("anthropic:powerful")
         );
+    }
+
+    fn on_claude_code(llm: workforce_common::settings::AgentLlmConfig) -> ResolvedConfig {
+        let ws = AgentWorkspaceConfig {
+            llm: Some(workforce_common::settings::AgentLlmConfig {
+                provider: Some("claude-code".into()),
+                ..llm
+            }),
+            ..Default::default()
+        };
+        ResolvedConfig::resolve(
+            None,
+            Some(&ws),
+            &WorkforceConfig::default(),
+            "claude-code",
+            None,
+        )
+    }
+
+    fn chatting_on(model: &str) -> workforce_common::settings::AgentLlmConfig {
+        workforce_common::settings::AgentLlmConfig {
+            default_model: Some(model.into()),
+            ..Default::default()
+        }
+    }
+
+    /// An agent chatting on its plan's strongest model does its background
+    /// work on the cheap and standard tiers, never on its own model.
+    #[test]
+    fn background_work_runs_on_the_cheap_and_standard_tiers_unless_set() {
+        let cfg = on_claude_code(chatting_on("fable"));
+        assert_eq!(cfg.background.light.as_deref(), Some("haiku"));
+        assert_eq!(cfg.background.heavy.as_deref(), Some("sonnet"));
+        assert_eq!(cfg.compaction.compaction_model.as_deref(), Some("sonnet"));
+        assert_eq!(cfg.claim_grounding.model.as_deref(), Some("sonnet"));
+        assert_eq!(cfg.memory.passive_model.as_deref(), Some("haiku"));
+        assert_eq!(cfg.memory.consolidation_model.as_deref(), Some("haiku"));
+        assert_eq!(cfg.memory.lesson_extract_model.as_deref(), Some("haiku"));
+        assert_eq!(cfg.self_learning.model.as_deref(), Some("haiku"));
+    }
+
+    #[test]
+    fn a_features_own_model_beats_its_group() {
+        let ws = AgentWorkspaceConfig {
+            llm: Some(workforce_common::settings::AgentLlmConfig {
+                provider: Some("claude-code".into()),
+                ..chatting_on("fable")
+            }),
+            compaction: Some(workforce_common::settings::AgentCompactionConfig {
+                compaction_model: Some("cheap".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cfg = ResolvedConfig::resolve(
+            None,
+            Some(&ws),
+            &WorkforceConfig::default(),
+            "claude-code",
+            None,
+        );
+        assert_eq!(cfg.compaction.compaction_model.as_deref(), Some("haiku"));
+        assert_eq!(cfg.claim_grounding.model.as_deref(), Some("sonnet"));
+    }
+
+    #[test]
+    fn a_group_set_to_chat_runs_on_the_agents_own_model() {
+        let cfg = on_claude_code(workforce_common::settings::AgentLlmConfig {
+            light_model: Some("chat".into()),
+            heavy_model: Some("Chat".into()),
+            ..chatting_on("fable")
+        });
+        assert_eq!(cfg.background.light, None);
+        assert_eq!(cfg.background.heavy, None);
+        assert_eq!(cfg.compaction.compaction_model, None);
+        assert_eq!(cfg.memory.passive_model, None);
+    }
+
+    #[test]
+    fn a_group_takes_any_model_spec() {
+        let cfg = on_claude_code(workforce_common::settings::AgentLlmConfig {
+            light_model: Some("standard".into()),
+            heavy_model: Some("opus".into()),
+            ..chatting_on("fable")
+        });
+        assert_eq!(cfg.background.light.as_deref(), Some("sonnet"));
+        assert_eq!(cfg.background.heavy.as_deref(), Some("opus"));
+    }
+
+    /// The heavy default never costs more than the agent's own model.
+    #[test]
+    fn an_agent_chatting_on_its_cheap_tier_does_its_heavy_work_there_too() {
+        let cfg = on_claude_code(chatting_on("haiku"));
+        assert_eq!(cfg.background.heavy, None);
+        assert_eq!(cfg.compaction.compaction_model, None);
+        assert_eq!(cfg.background.light.as_deref(), Some("haiku"));
+        let cfg = on_claude_code(chatting_on("cheap"));
+        assert_eq!(cfg.background.heavy, None);
+    }
+
+    /// A provider with no model for a tier runs that group on the agent's
+    /// own model, never on the tier's bare name; another provider's cheap
+    /// tier is its own.
+    #[test]
+    fn a_tier_the_provider_lacks_is_the_agents_own_model() {
+        let tiers = TierRegistry::new(None);
+        let unset = || Written {
+            light: None,
+            heavy: None,
+        };
+        let on = |key: &str| BackgroundModels::resolve(unset(), "opus", &tiers, key);
+        assert_eq!(on("no-such-provider").light, None);
+        assert_eq!(on("no-such-provider").heavy, None);
+        assert_eq!(on("codex").light.as_deref(), Some("gpt-6-luna"));
     }
 
     /// `[llm] voice_model` is read from the agent's workspace `config.toml`
@@ -875,9 +1125,10 @@ mod tests {
 
         let mut global = WorkforceConfig::default();
 
-        // Absent ⇒ stays None so grounding falls back to the agent's model.
+        // Absent ⇒ the agent's heavy background model, never its own.
         let base = ResolvedConfig::resolve(None, None, &global, "anthropic", None);
-        assert!(base.claim_grounding.model.is_none());
+        assert!(base.background.heavy.is_some());
+        assert_eq!(base.claim_grounding.model, base.background.heavy);
 
         // A tier name resolves to a concrete model for the agent's tier_key.
         global.claim_grounding.model = Some("cheap".into());
@@ -924,9 +1175,12 @@ mod tests {
 
         let mut global = WorkforceConfig::default();
 
-        // Absent ⇒ stays None so curation falls back to the agent's model.
+        // Absent ⇒ the agent's light background model, the cheap tier.
         let base = ResolvedConfig::resolve(None, None, &global, "anthropic", None);
-        assert!(base.self_learning.model.is_none());
+        assert_eq!(
+            base.self_learning.model.as_deref(),
+            Some("claude-haiku-5-5")
+        );
 
         // A tier name resolves to a concrete model for the agent's tier_key.
         global.self_learning.model = Some("cheap".into());

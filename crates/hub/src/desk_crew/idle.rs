@@ -203,6 +203,12 @@ fn finished(crew: &CrewHub) -> Vec<Uuid> {
 }
 
 /// What became of a finished turn handed to its boss.
+/// Whether a call failed for its plan's usage limit (no login with room
+/// left), which a second call on the same plan would only meet again.
+fn at_limit(error: &str) -> bool {
+    error.contains(workforce_agent::llm::failover::SUBSCRIPTION_UNAVAILABLE_MARKER)
+}
+
 enum Judged {
     Done,
     /// The person took the session meanwhile: looked at again later.
@@ -370,6 +376,12 @@ impl CrewHub {
                         )
                     }
                 },
+                // Its plan is at its limit: a full turn would only meet the
+                // same limit, so the session is looked at again later.
+                Ok(Err(e)) if at_limit(&e) => {
+                    tracing::info!(session = %view.id, %boss, "the boss's plan is at its limit; a session's finished turn is judged later");
+                    return Judged::Later;
+                }
                 Ok(Err(e)) => {
                     failed = format!(
                         "its model failed: {}",

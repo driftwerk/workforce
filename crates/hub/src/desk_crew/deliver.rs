@@ -109,6 +109,13 @@ impl CrewHub {
             attended: in_dm || channel.starts_with(&format!("{DESK_CHANNEL}:checkin:")),
             relayed: true,
         };
+        // The person's own words (an answer, a suggestion they said yes
+        // to) are theirs, on the agent's own model; everything else is the
+        // boss's own work, on its heavy background model.
+        let model = match &author {
+            Some(a) if a.kind == workforce_desk::conversations::SpeakerKind::You => None,
+            _ => crate::turn_loop::heavy_model(service),
+        };
         let progress = workforce_agent::runner::with_desk(
             Some(scope),
             service.process_message_with_progress(
@@ -126,7 +133,7 @@ impl CrewHub {
                 None,
                 None,
                 None,
-                None,
+                model.as_deref(),
                 None,
                 None,
                 None,

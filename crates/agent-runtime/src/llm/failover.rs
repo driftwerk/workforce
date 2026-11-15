@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use eyre::Result;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, RwLock};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::provider::{LlmProvider, ProviderKind};
 use super::streaming::{
@@ -1165,10 +1165,31 @@ impl FailoverProvider {
     }
 
     /// The last-resort hub default's entry, when it is worth trying after
-    /// `chain`: not already in it.
+    /// `chain`: not already in it, and on no stronger tier than the model
+    /// the call asked for. A call made on a cheaper model (an agent's
+    /// background work) never lands on a dearer one: its plan may be the
+    /// very one at its limit, and its work was sized for the cheaper model.
     fn hub_default_entry(&self, chain: &[ChainSpec]) -> Option<ChainSpec> {
-        self.hub_default_to_try(chain)
-            .map(|hub_default| self.routed_entry(hub_default))
+        let entry = self
+            .hub_default_to_try(chain)
+            .map(|hub_default| self.routed_entry(hub_default))?;
+        let Some(asked) = chain.first() else {
+            return Some(entry);
+        };
+        let rank = |spec: &ChainSpec| match self.tier_registry.classify(&spec.model) {
+            super::tiers::ModelTier::Cheap => 0,
+            super::tiers::ModelTier::Standard => 1,
+            super::tiers::ModelTier::Powerful => 2,
+        };
+        if rank(&entry) > rank(asked) {
+            debug!(
+                asked = asked.raw.as_str(),
+                hub_default = entry.raw.as_str(),
+                "no last resort on the hub default: it is a stronger tier than the call asked for"
+            );
+            return None;
+        }
+        Some(entry)
     }
 
     /// The provider serving the last-resort `entry`, when it is routable.
@@ -3791,6 +3812,38 @@ mod tests {
 
         assert_eq!(result.text(), Some("hub-default-rescue".to_string()));
         assert_eq!(provider.last_used_model().as_deref(), Some("hub-fallback"));
+    }
+
+    /// A call on a cheap model (background work) that fails never lands on
+    /// a dearer hub default: at 10:48 a Haiku call that timed out was sent
+    /// again on Fable, on the plan already at its limit.
+    #[tokio::test]
+    async fn hub_default_never_takes_a_cheaper_call_up_a_tier() {
+        let inner = Arc::new(MockOnlyOkOnModel {
+            good_model: "claude-opus-4-6".to_string(),
+            error: "Anthropic API error (500): server error".to_string(),
+        });
+        let config = FailoverConfig {
+            retry: RetryConfig {
+                max_retries: 0,
+                initial_backoff_ms: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let provider =
+            FailoverProvider::new(inner, config).with_hub_default_model("claude-opus-4-6");
+        let err = provider
+            .create_message(None, &[], &[], Some("claude-haiku-4-5"), None, true)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("server error"), "{err}");
+        // A call on the same tier or above is still rescued.
+        let rescued = provider
+            .create_message(None, &[], &[], Some("claude-opus-4-7"), None, true)
+            .await
+            .unwrap();
+        assert_eq!(rescued.text(), Some("hub-default-rescue".to_string()));
     }
 
     #[tokio::test]

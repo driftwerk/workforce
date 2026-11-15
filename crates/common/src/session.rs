@@ -161,9 +161,10 @@ pub struct CompactionConfig {
     /// carry-over summary (default 4).
     #[serde(default = "default_rollover_keep_recent")]
     pub rollover_keep_recent: usize,
-    /// Model to use for compaction LLM calls (summarisation, memory flush).
-    /// If None, uses the agent's default model. Set to a fast model like
-    /// "claude-haiku-4-5-20251001" for faster compaction.
+    /// Model to use for compaction LLM calls (summarisation, memory flush,
+    /// a rollover's summary). If None, the agent's heavy background model
+    /// (`[llm] heavy_model`, the provider's standard tier unless set) is
+    /// filled in when the agent's config is resolved.
     #[serde(default = "default_compaction_model")]
     pub compaction_model: Option<String>,
     /// Custom system prompt for memory flush (what to persist before compaction).
@@ -282,7 +283,7 @@ fn default_rollover_keep_recent() -> usize {
     4
 }
 fn default_compaction_model() -> Option<String> {
-    None // Use the active model for compaction — no hardcoded provider dependency
+    None // Filled from `[llm] heavy_model` when the agent's config is resolved
 }
 fn default_stale_rollover_hours() -> u64 {
     24
