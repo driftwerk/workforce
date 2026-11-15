@@ -974,3 +974,148 @@ async fn only_its_own_boss_clears_a_prompt_its_terminal_shows() {
     })
     .await;
 }
+
+/// A boss the hub last said its requests are held for clears nothing once
+/// another boss holds a live charge on the session: the session is that
+/// other boss's now, and the dialog stays the person's.
+#[tokio::test]
+async fn a_boss_clears_nothing_in_a_session_another_boss_has_taken_on() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, _logged) = logged_desk(pool, dir.path(), fake_cli(dir.path())).await;
+        let s = asking_session(&d, dir.path()).await;
+        prompted(&d, s.id, "ship the migration").await;
+        let unbound = crate::charge::FullGrant {
+            anywhere: true,
+            unbound: true,
+            ..Default::default()
+        };
+        d.set_full(std::collections::HashMap::from([
+            ("crew".to_string(), unbound.clone()),
+            ("rival".to_string(), unbound),
+        ]));
+        // The last sweep said crew; rival has taken it on since.
+        d.set_dialog_answerers(std::collections::HashMap::from([(
+            s.id,
+            super::DialogAnswerer {
+                boss: "crew".into(),
+                gap: chrono::Duration::zero(),
+            },
+        )]));
+        d.take_on(
+            s.id,
+            &crate::crew::Party::manager("rival", "Rival"),
+            crate::charge::How::Handed,
+            &Default::default(),
+            &crate::crew::By::you(),
+        )
+        .await
+        .unwrap();
+        assert!(d.charge_of(s.id).is_some_and(|c| c.live() && c.boss == "rival"));
+        let notice = json!({"hook_event_name": "Notification", "notification_type": "permission_prompt",
+            "message": "Claude needs your permission to use Bash"});
+        post(&d, s.id, notice).await;
+        let p = d.view(s.id).unwrap().pending.expect("its dialog waits");
+        assert!(!p.answerable);
+        let crew = crate::crew::By::manager("crew", "crew", "clearing it");
+
+        let e = d
+            .clear_dialog(s.id, p.id, crew.clone())
+            .expect_err("the session is another boss's now");
+        assert!(matches!(e, super::DeskError::Conflict(_)), "{e}");
+        d.interrupt(s.id, Some(crew))
+            .expect_err("nor its Esc");
+        let v = d.view(s.id).unwrap();
+        assert_eq!(v.pending.map(|w| w.id), Some(p.id), "nothing was pressed");
+        assert_eq!(v.state, SessionState::Blocked);
+    })
+    .await;
+}
+
+/// Waits for `s`'s terminal to show `text`.
+async fn shows(d: &Desk, s: Uuid, text: &str) {
+    for _ in 0..300 {
+        if d.terminal_text(s, 4000).unwrap().contains(text) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("its terminal never showed {text:?}");
+}
+
+/// Nothing is typed into a session while a dialog shows in its terminal
+/// (the Enter after the prompt would answer it): neither one only its
+/// terminal answers nor one held in Desk. With none up, typing goes on.
+#[tokio::test]
+async fn a_prompt_is_never_typed_into_a_dialog() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, _logged) = logged_desk(pool, dir.path(), fake_cli(dir.path())).await;
+        let refused = |e: super::DeskError| {
+            assert!(
+                matches!(&e, super::DeskError::Conflict(m) if m == super::WAITING_ON_DIALOG),
+                "{e}"
+            );
+        };
+
+        // No dialog up: typed in.
+        let s = asking_session(&d, dir.path()).await;
+        prompted(&d, s.id, "ship the migration").await;
+        d.type_prompt(s.id, "first, the schema", None).unwrap();
+        shows(&d, s.id, "first, the schema").await;
+
+        // Its terminal asks: refused, whoever types, and nothing is typed.
+        let notice = json!({"hook_event_name": "Notification", "notification_type": "permission_prompt",
+            "message": "Claude needs your permission to use Bash"});
+        post(&d, s.id, notice).await;
+        let p = d.view(s.id).unwrap().pending.expect("its dialog waits");
+        assert!(!p.answerable);
+        refused(d.type_prompt(s.id, "then the data", None).unwrap_err());
+        refused(
+            d.type_prompt(s.id, "then the data", Some(&crate::crew::By::you()))
+                .unwrap_err(),
+        );
+        refused(
+            d.prompt(
+                s.id,
+                "then the data",
+                Some(crate::crew::By::manager("crew", "crew", "next step")),
+            )
+            .unwrap_err(),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!d.terminal_text(s.id, 4000).unwrap().contains("then the data"));
+        let v = d.view(s.id).unwrap();
+        assert_eq!(v.pending.map(|w| w.id), Some(p.id), "the dialog still waits");
+
+        // Cleared, typing goes on.
+        d.interrupt(s.id, Some(crate::crew::By::you())).unwrap();
+        assert!(d.view(s.id).unwrap().pending.is_none());
+        d.type_prompt(s.id, "then the data", None).unwrap();
+        shows(&d, s.id, "then the data").await;
+
+        // A request held in Desk: refused too, until it is answered.
+        let h = super::tests::new_session(&d, dir.path()).await;
+        prompted(&d, h.id, "fix it").await;
+        post(
+            &d,
+            h.id,
+            start("toolu_1", "Bash", json!({"command": "cargo test"})),
+        )
+        .await;
+        let waiting = held(&d, h.id, asks_for("Bash", json!({"command": "cargo test"})));
+        keeps(&d, h.id, 1).await;
+        let p = d.view(h.id).unwrap().pending.expect("its request is held");
+        assert!(p.answerable);
+        refused(d.type_prompt(h.id, "and the docs", None).unwrap_err());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!d.terminal_text(h.id, 4000).unwrap().contains("and the docs"));
+        d.decide(h.id, p.id, crate::model::Decision::Allow, None)
+            .unwrap();
+        waiting.await.unwrap();
+        assert!(d.view(h.id).unwrap().pending.is_none());
+        d.type_prompt(h.id, "and the docs", None).unwrap();
+        shows(&d, h.id, "and the docs").await;
+    })
+    .await;
+}
