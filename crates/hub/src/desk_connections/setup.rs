@@ -1521,7 +1521,8 @@ impl Setups {
             })
     }
 
-    /// What the agent does next, as `connections.setup` tells it.
+    /// What the agent does next, as `connections.setup` tells it: first,
+    /// where the person finds the setup's card.
     pub fn next(&self, view: &SetupView) -> String {
         let c = catalog::find(view.service).expect("in the catalog");
         let secrets: Vec<&str> = c
@@ -1536,11 +1537,12 @@ impl Setups {
             .filter(|f| !f.secret)
             .map(|f| f.name)
             .collect();
+        let said = say_card(view);
         match view.way {
-            Way::Cli => return "GitHub's CLI is signed in on this computer: the setup's card asks the person to use that sign-in. Call connections.wait now, and nothing else: Desk checks it and turns it on itself. Don't open a browser or message the person.".into(),
-            Way::Device => return "The setup's card shows the person a code to approve on GitHub. Call connections.wait now, and nothing else: Desk finishes by itself once they approve. Don't open a browser, read the code out or message the person.".into(),
+            Way::Cli => return format!("GitHub's CLI is signed in on this computer: the setup's card asks the person to use that sign-in. {said} Then call connections.wait, and nothing else: Desk checks it and turns it on itself. Don't open a browser or say anything more to the person."),
+            Way::Device => return format!("The setup's card shows the person a code to approve on GitHub. {said} Then call connections.wait, and nothing else: Desk finishes by itself once they approve. Don't open a browser, read the code out or say anything more to the person."),
             Way::Browser => {}
-            Way::Token => return "The person is pasting a token of their own on the setup's card. Call connections.wait now, and nothing else.".into(),
+            Way::Token => return format!("The person is pasting a token of their own on the setup's card. {said} Then call connections.wait, and nothing else."),
         }
         let page = match view.service {
             "github" => github_token_page(&view.name, view.write),
@@ -1553,7 +1555,8 @@ impl Setups {
             _ => "",
         };
         format!(
-            "1. Keep {} with connections.keep (ask the person if you can't tell).\n\
+            "{said}\n\
+             1. Keep {} with connections.keep (ask the person if you can't tell).\n\
              2. Open {} with browser.navigate, then call connections.wait. If the person must sign in, the card asks them and Desk sees when they have: never call browser.sign_in, never type or read a password.\n\
              3. Once signed in, make the key (name it like \"Desk · {}\").{github} The page hides keys from you: read {} with browser.capture_key {{connector: \"{}\"}}, with no selector: Desk finds it. The key never comes back to you.\n\
              4. Call connections.wait: Desk checks it with the service and turns it on itself.",
@@ -2904,7 +2907,7 @@ impl Tool for SetupTool {
                     .await
                     .map(|view| {
                         let next = setups.next(&view);
-                        json!({ "setup": view.id, "next": next })
+                        json!({ "setup": view.id, "card": card_link(&view.id), "next": next })
                     }),
             },
             "connections.wait" => match need() {
@@ -2983,6 +2986,22 @@ impl Tool for SetupTool {
             Err(e) => ToolResult::failure(e, ms()),
         })
     }
+}
+
+/// Desk's link to setup `id`'s card: a click brings it into view, in the
+/// chat that asked for it or at the top of whatever Desk shows.
+pub fn card_link(id: &str) -> String {
+    format!("desk://setup/{id}")
+}
+
+/// The one line the agent says before it waits, so the person knows the
+/// card is there, wherever they are looking.
+fn say_card(view: &SetupView) -> String {
+    format!(
+        "First tell the person, in this one line and no other words: \"I've put a {} card here: [open it]({})\".",
+        view.service_name,
+        card_link(&view.id)
+    )
 }
 
 /// Registers `connections.*` for `service`.
