@@ -7,7 +7,6 @@
 //! routed through `wrap_external_content` to neutralise prompt injection in
 //! attacker-influenceable fields (contact names, line descriptions, references).
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -22,41 +21,51 @@ use workforce_agent::tools::{Tool, ToolResult};
 
 use super::client::XeroClient;
 use super::config::{clamp_page, clamp_page_size};
-use crate::adapters::utils::{coerce_to_u64, instance_choices};
+use crate::adapters::utils::{coerce_to_u64, instance_choices, unknown_instance, LiveInstances};
 
-type Clients = Arc<HashMap<String, Arc<XeroClient>>>;
+pub(super) type Instances = Arc<LiveInstances<XeroClient>>;
 type Handler =
     Box<dyn Fn(Arc<XeroClient>, Value) -> BoxFuture<'static, Result<Value>> + Send + Sync>;
 
 #[derive(Clone)]
 struct Ctx {
-    clients: Clients,
-    default_entity: String,
+    instances: Instances,
 }
 
 impl Ctx {
+    /// The caller's entity for this call: chosen among the entities they
+    /// have now, and an error names only those.
     fn client(&self, input: &Value) -> Result<Arc<XeroClient>> {
+        let (clients, default_entity) = self.instances.for_caller();
         let name = workforce_agent::llm::environment::resolve_instance(
             "xero",
             input["entity"].as_str(),
-            &self.default_entity,
-            &*self.clients,
+            &default_entity,
+            &*clients,
         )
         .map_err(|d| eyre!("{}", d.message))?;
-        self.clients.get(&name).cloned().ok_or_else(|| {
-            let mut available: Vec<&str> = self.clients.keys().map(String::as_str).collect();
-            available.sort_unstable();
-            eyre!("Unknown Xero entity: '{name}'. Available: {available:?}")
-        })
+        clients
+            .get(&name)
+            .cloned()
+            .ok_or_else(|| unknown_instance("Xero entity", &name, &clients))
     }
 
+    /// The schema is built once and shown to everyone, so a set read per
+    /// caller names no entity in it.
     fn entity_prop(&self) -> Value {
-        let description = if self.clients.len() <= 1 {
+        if self.instances.is_live() {
+            return json!({
+                "type": "string",
+                "description": "Xero entity name (for multi-entity setups). Uses your default if omitted."
+            });
+        }
+        let (clients, default_entity) = self.instances.for_caller();
+        let description = if clients.len() <= 1 {
             "Xero entity name (for multi-entity setups)".to_string()
         } else {
             format!(
                 "Xero entity. {}",
-                instance_choices(&*self.clients, &self.default_entity, "entity")
+                instance_choices(&*clients, &default_entity, "entity")
             )
         };
         json!({ "type": "string", "description": description })
@@ -573,10 +582,9 @@ fn specs() -> Vec<ToolSpec> {
     ]
 }
 
-pub(super) fn build_tools(clients: Clients, default_entity: String) -> Vec<Arc<dyn Tool>> {
+pub(super) fn build_tools(instances: Instances) -> Vec<Arc<dyn Tool>> {
     let ctx = Ctx {
-        clients: clients.clone(),
-        default_entity: default_entity.clone(),
+        instances: Arc::clone(&instances),
     };
     let mut tools: Vec<Arc<dyn Tool>> = specs()
         .into_iter()
@@ -587,7 +595,7 @@ pub(super) fn build_tools(clients: Clients, default_entity: String) -> Vec<Arc<d
             }) as Arc<dyn Tool>
         })
         .collect();
-    tools.push(super::export::export_tool(clients, default_entity));
+    tools.push(super::export::export_tool(instances));
     tools
 }
 
@@ -640,6 +648,7 @@ pub(super) fn skill_tools_and_policies() -> (
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::HashMap;
     use wiremock::matchers::{body_json, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -649,8 +658,7 @@ mod tests {
         let mut clients = HashMap::new();
         clients.insert("default".to_string(), Arc::new(client));
         Ctx {
-            clients: Arc::new(clients),
-            default_entity: "default".to_string(),
+            instances: Arc::new(LiveInstances::fixed_map(clients, "default")),
         }
     }
 
@@ -665,7 +673,7 @@ mod tests {
     }
 
     fn tool(name: &str, ctx: &Ctx) -> Arc<dyn Tool> {
-        build_tools(ctx.clients.clone(), ctx.default_entity.clone())
+        build_tools(Arc::clone(&ctx.instances))
             .into_iter()
             .find(|t| t.name() == name)
             .unwrap_or_else(|| panic!("tool {name} not found"))

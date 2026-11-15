@@ -87,6 +87,217 @@ pub fn build_instances<W, C>(
     })
 }
 
+/// Where one adapter's instances live in the vault: each named instance is
+/// `{prefix}{name}/{marker}`, and a single-instance setup keeps its key at
+/// `flat` (it is then the instance `default`).
+#[derive(Clone, Debug)]
+pub struct InstancePaths {
+    pub prefix: String,
+    pub marker: String,
+    pub flat: String,
+}
+
+impl InstancePaths {
+    pub fn new(prefix: &str, marker: &str, flat: &str) -> Self {
+        Self {
+            prefix: prefix.to_string(),
+            marker: marker.to_string(),
+            flat: flat.to_string(),
+        }
+    }
+
+    /// The instances `store` holds for whoever is in scope now: the named
+    /// ones it lists (the shared tiers and the caller's own, never another
+    /// person's), or else `default` when only the flat key resolves.
+    pub fn names(&self, store: &dyn workforce_common::settings::SecretStore) -> Vec<String> {
+        let suffix = format!("/{}", self.marker);
+        let mut names: Vec<String> = store
+            .list(Some(&self.prefix))
+            .into_iter()
+            .filter(|path| store.get(path).is_some())
+            .filter_map(|path| {
+                path.strip_prefix(&self.prefix)?
+                    .strip_suffix(&suffix)
+                    .filter(|name| {
+                        let ok = is_instance_name(name);
+                        if !ok {
+                            warn!(prefix = %self.prefix, "instance skipped: its name isn't a plain word");
+                        }
+                        ok
+                    })
+                    .map(str::to_string)
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        if names.is_empty() && store.get(&self.flat).is_some() {
+            names.push("default".to_string());
+        }
+        names
+    }
+}
+
+/// Whether `name` can name an instance: a plain word (letters, digits, `-`,
+/// `_`, `.`), so a vault path can't put arbitrary text where an instance's
+/// name is shown.
+pub fn is_instance_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// At most this many clients a live set keeps built; past it the cache
+/// starts again (each client only holds a connection pool and a token).
+const MAX_BUILT: usize = 512;
+
+type MakeClient<C> = dyn Fn(&str) -> eyre::Result<C> + Send + Sync;
+
+/// An adapter's instances, read as the caller on every call.
+///
+/// One loaded adapter serves everyone who uses its agent, so nothing about
+/// which instances exist may come from whoever loaded it: a store-backed set
+/// lists the caller's own (and the shared) instances each time it is asked,
+/// and builds a client for one the first time anyone uses it. A client is
+/// built from its name and the shared tiers only, and resolves its keys per
+/// call, so one cached by name serves every caller alike. A fixed set (no
+/// store: static config) is what it was built with.
+pub struct LiveInstances<C> {
+    fixed: Option<Instances<C>>,
+    live: Option<Live<C>>,
+}
+
+struct Live<C> {
+    store: Arc<dyn workforce_common::settings::SecretStore>,
+    paths: InstancePaths,
+    /// The configured default selector (a shared setting).
+    selector: Option<String>,
+    make: Box<MakeClient<C>>,
+    built: std::sync::Mutex<HashMap<String, Arc<C>>>,
+}
+
+impl<C> LiveInstances<C> {
+    /// A fixed set: static configuration every caller shares.
+    pub fn fixed(instances: Instances<C>) -> Self {
+        Self {
+            fixed: Some(instances),
+            live: None,
+        }
+    }
+
+    /// A fixed set from a map of clients and its default.
+    pub fn fixed_map(clients: HashMap<String, Arc<C>>, default: &str) -> Self {
+        Self::fixed(Instances {
+            clients: Arc::new(clients),
+            default: default.to_string(),
+        })
+    }
+
+    /// A set read from `store` as the caller, each client made by `make`.
+    pub fn live(
+        store: Arc<dyn workforce_common::settings::SecretStore>,
+        paths: InstancePaths,
+        selector: Option<String>,
+        make: impl Fn(&str) -> eyre::Result<C> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            fixed: None,
+            live: Some(Live {
+                store,
+                paths,
+                selector: selector
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+                make: Box::new(make),
+                built: std::sync::Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    /// Whether the set is read per caller (so a tool's schema must not name
+    /// any instance: it is built once and shown to everyone).
+    pub fn is_live(&self) -> bool {
+        self.live.is_some()
+    }
+
+    /// The instances the caller in scope can use, by name, and the one a
+    /// call naming none goes to.
+    pub fn for_caller(&self) -> (Arc<HashMap<String, Arc<C>>>, String) {
+        let Some(live) = self.live.as_ref() else {
+            let fixed = self.fixed.as_ref().expect("a fixed or live set");
+            return (Arc::clone(&fixed.clients), fixed.default.clone());
+        };
+        let names = live.paths.names(live.store.as_ref());
+        let cache = || {
+            live.built
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        let mut clients = HashMap::with_capacity(names.len());
+        for name in names {
+            if let Some(client) = cache().get(&name) {
+                clients.insert(name, Arc::clone(client));
+                continue;
+            }
+            // Built outside the lock: a slow or failing build blocks no one.
+            let client = match (live.make)(&name) {
+                Ok(client) => Arc::new(client),
+                Err(e) => {
+                    warn!(instance = %name, error = %e, "instance client not built");
+                    continue;
+                }
+            };
+            let client = {
+                let mut built = cache();
+                if built.len() >= MAX_BUILT {
+                    built.clear();
+                }
+                match built.get(&name) {
+                    // Another call built it first: use that one.
+                    Some(first) => Arc::clone(first),
+                    None => {
+                        built.insert(name.clone(), Arc::clone(&client));
+                        client
+                    }
+                }
+            };
+            clients.insert(name, client);
+        }
+        let default = preferred_instance(&clients, live.selector.as_deref())
+            .map(str::to_string)
+            .or_else(|| live.selector.clone())
+            .unwrap_or_else(|| "default".to_string());
+        (Arc::new(clients), default)
+    }
+
+    /// The caller's instance names, sorted.
+    pub fn names(&self) -> Vec<String> {
+        let (clients, _) = self.for_caller();
+        let mut names: Vec<String> = clients.keys().cloned().collect();
+        names.sort();
+        names
+    }
+}
+
+impl<C: Send + Sync> workforce_agent::llm::environment::InstanceSource for LiveInstances<C> {
+    fn variants(&self) -> Option<workforce_agent::llm::environment::SkillVariants> {
+        let (clients, default) = self.for_caller();
+        workforce_agent::llm::environment::SkillVariants::of(clients.keys().cloned(), &default)
+    }
+}
+
+/// The error for an instance the caller has none of, naming only theirs.
+pub fn unknown_instance<V>(what: &str, name: &str, clients: &HashMap<String, V>) -> eyre::Report {
+    let mut available: Vec<&str> = clients.keys().map(String::as_str).collect();
+    available.sort_unstable();
+    if available.is_empty() {
+        eyre::eyre!("No {what} is configured for you (asked for '{name}').")
+    } else {
+        eyre::eyre!("Unknown {what}: '{name}'. Available: {available:?}")
+    }
+}
+
 /// The `Available: …. Default: ….` tail of an instance parameter's
 /// description; the default reads `none — pass <param>` when no instance
 /// carries that name.

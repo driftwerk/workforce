@@ -126,19 +126,22 @@ pub fn host_for(
         .map(|url| url.trim_end_matches('/').to_string())
 }
 
-/// The address a loader builds a client with, for the credential at
-/// `credential_path`: [`shared_get`] as before, except on a pinned store,
-/// where it is read as [`companion_for`] reads it.
-pub fn address_for(
-    store: &dyn SecretStore,
-    credential_path: &str,
-    address_path: &str,
-) -> Option<String> {
+/// The address a loader builds a client with, which every caller of that
+/// client falls back to when their own credential has none beside it:
+/// [`shared_get`], except on a pinned store (a hub running Desk), where it is
+/// read only from the hub's shared `Global` tier, which only an administrator
+/// writes. It is never read beside the loader's own credential: that is
+/// whoever happened to load the adapter, and their site must not become the
+/// site another person's key is sent to.
+pub fn address_for(store: &dyn SecretStore, address_path: &str) -> Option<String> {
     if !store.is_pinned() {
         return shared_get(store, address_path);
     }
-    let cred = resolve_at(store, credential_path)?;
-    companion_for(store, &cred, address_path, address_path)
+    store
+        .inspect(address_path)
+        .into_iter()
+        .find(|(tier, _)| *tier == VaultSource::Global)
+        .map(|(_, value)| value)
 }
 
 /// [`resolve_credential`] for a field that has a single form.
@@ -437,7 +440,7 @@ mod tests {
         ));
         let cred = resolve_credential(&store, WS, FLAT).unwrap();
         assert_eq!(companion_for(&store, &cred, WS_SITE, FLAT_SITE), None);
-        assert_eq!(address_for(&store, WS, WS_SITE), None);
+        assert_eq!(address_for(&store, WS_SITE), None);
         // The person's key, a site only the agent wrote: none, where before
         // it would have been read.
         let store = Pinned(LayeredInMem::new(
