@@ -812,15 +812,31 @@ impl CrewHub {
                         .map(|m| m.id.clone())
                 })
         });
-        let extras = Extras {
+        let mut extras = Extras {
             update: Some(p.update.clone()),
             away: p.away.clone(),
             suggestions: self.quiet_suggestions(boss, &p),
             ..Default::default()
         };
         match found {
-            Some(m) => self.keep_extras_of(&m, boss, &extras).await,
+            Some(m) => {
+                // The line on the directives it went with stays with it.
+                extras.directives_open = self
+                    .desk
+                    .store()
+                    .extras(std::slice::from_ref(&m))
+                    .await
+                    .ok()
+                    .and_then(|mut e| e.remove(&m))
+                    .and_then(|e| e.directives_open);
+                self.keep_extras_of(&m, boss, &extras).await
+            }
             None => {
+                // Going out now: at a quiet moment, at most once a day, one
+                // line on the directives still open.
+                if let Some((_, o)) = self.overseer_named(boss) {
+                    extras.directives_open = self.directives_line(boss, &o, &p).await;
+                }
                 let kind = match p.away {
                     Some(_) => DeliveryKind::Away,
                     None => DeliveryKind::Update,
@@ -833,6 +849,17 @@ impl CrewHub {
                     .deliver_with_extras(service, owner, delivery, &extras)
                     .await?;
                 self.on_floor(service, owner, &delivered.session_id, &p);
+                if let Some(n) = &extras.directives_open {
+                    // Said: the next is a day off.
+                    if let Err(e) = self
+                        .desk
+                        .store()
+                        .directive_nudged(workforce_desk::rooms::YOU, &n.boss_scope)
+                        .await
+                    {
+                        tracing::warn!(error = %format!("{e:#}"), "a directives line wasn't kept as said");
+                    }
+                }
                 let message = delivered.message_id;
                 // Sent: kept so, before anything else, so a restart from
                 // here on finds it whatever the DM did since.
@@ -1011,6 +1038,8 @@ pub(super) async fn updates_loop(crew: Arc<CrewHub>, cancel: CancellationToken) 
             _ = every.tick() => {
                 // Held needs-you a restart left: theirs by now.
                 crew.post_due_cards().await;
+                // A boss newly at Act fully asks the person's directives.
+                crew.look_at_directives().await;
                 crew.look_at_updates().await;
             }
             // The person paused typing, came back, or wrote: look now.

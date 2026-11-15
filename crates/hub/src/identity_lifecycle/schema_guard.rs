@@ -224,6 +224,18 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
     ),
     (
         "desk",
+        "boss_directive_asks",
+        "owner",
+        NotPersonal("`you`, the one person of the Desk whose own hub this is"),
+    ),
+    (
+        "desk",
+        "boss_directive_asks",
+        "boss_scope",
+        NotPersonal("which boss the directives are asked for: `main` or a sidebar group's id"),
+    ),
+    (
+        "desk",
         "boss_held_cards",
         "post_by",
         NotPersonal("the time a held needs-you goes out by, not a party"),

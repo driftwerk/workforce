@@ -128,6 +128,10 @@ pub struct GatewayState {
     /// boss of its person's groups, and the link tokens' limits. Live: the
     /// config overlay watcher replaces it when the overlay changes.
     pub desk_boss: crate::boss_links::LiveConfig,
+    /// `[desk] allow_personal_key_export`: whether a person's paired Desk
+    /// may copy their own keys from here (`desk_key_copies`). Live: the
+    /// config overlay watcher sets it when the overlay changes.
+    pub desk_key_export: KeyExportSwitch,
     /// Every engine's uplink to this hub, as a boss hub (RB5).
     pub uplinks: Arc<crate::boss_links::uplink::Uplinks>,
     /// Permission cascade evaluator — owns the rule store + LRU cache
@@ -1233,22 +1237,57 @@ pub(crate) fn hardened(routes: Router) -> Router {
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
 }
 
-/// Desk's routes beside the gateway's: its hub link and its conversations.
+/// Desk's routes beside the gateway's: its hub link, its conversations, and
+/// a person's own keys copied by their Desk.
 /// They read conversations from the Postgres-backed hub, so a hub without
 /// it serves neither.
 fn desk_routes(state: Arc<GatewayState>) -> Router {
     #[cfg(feature = "postgres")]
     {
-        crate::desk_conversations::router(Arc::clone(&state)).merge(
-            Router::new()
-                .route("/ws/desk", get(crate::desk_surface::link::handler))
-                .with_state(state),
-        )
+        crate::desk_conversations::router(Arc::clone(&state))
+            // A person's own keys here, copied by their paired Desk into its
+            // vault (Settings → Connections): the device token alone.
+            .merge(crate::desk_key_copies::router(Arc::clone(&state)))
+            .merge(
+                Router::new()
+                    .route("/ws/desk", get(crate::desk_surface::link::handler))
+                    .with_state(state),
+            )
     }
     #[cfg(not(feature = "postgres"))]
     {
         let _ = state;
         Router::new()
+    }
+}
+
+/// `[desk] allow_personal_key_export`, shared by the gateway and the config
+/// overlay watcher, so an admin turning it off takes effect without a
+/// restart. On by default, as the setting is.
+#[derive(Clone, Debug)]
+pub struct KeyExportSwitch(Arc<std::sync::atomic::AtomicBool>);
+
+impl KeyExportSwitch {
+    pub fn new(on: bool) -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicBool::new(on)))
+    }
+
+    /// Whether Desk may copy a person's keys now.
+    pub fn on(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Sets it, for every holder of this handle at once.
+    pub fn set(&self, on: bool) {
+        if self.0.swap(on, std::sync::atomic::Ordering::Relaxed) != on {
+            tracing::info!(on, "[desk] allow_personal_key_export changed");
+        }
+    }
+}
+
+impl Default for KeyExportSwitch {
+    fn default() -> Self {
+        Self::new(true)
     }
 }
 

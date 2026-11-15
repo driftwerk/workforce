@@ -784,6 +784,14 @@ pub struct DeskConfig {
     /// Sees): this engine's limits for sending it.
     #[serde(default)]
     pub knows: DeskKnowsSyncConfig,
+    /// Whether a person's paired Desk may copy their own personal keys
+    /// (the `users/<id>/` tier of this hub's vault, never a shared, agent
+    /// or org key) into Desk's vault on their computer, as Settings →
+    /// Connections offers (`/api/me/desk-key-copies`). Off, both routes
+    /// refuse and Desk shows no offer. Live: a change to the config overlay
+    /// takes effect without a restart. Default: on.
+    #[serde(default = "default_true")]
+    pub allow_personal_key_export: bool,
 }
 
 /// `[desk.knows]`: how Desk sends each agent what its rule covers.
@@ -1129,6 +1137,7 @@ impl Default for DeskConfig {
             memory: DeskMemoryConfig::default(),
             bosses: DeskBossesConfig::default(),
             knows: DeskKnowsSyncConfig::default(),
+            allow_personal_key_export: true,
         }
     }
 }

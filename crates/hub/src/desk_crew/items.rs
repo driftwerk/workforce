@@ -1276,7 +1276,7 @@ impl CrewHub {
                 true,
             )
             .await
-            .map(|p| format!("The person's preferences:\n{}", p.listed.trim_end()));
+            .map(|p| p.listed.trim_end().to_string());
         [orders, prefs]
             .into_iter()
             .flatten()

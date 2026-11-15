@@ -35,6 +35,7 @@ pub(crate) mod context;
 pub(crate) mod decide;
 mod decisions;
 mod deliver;
+mod directives;
 mod extras;
 mod github;
 mod handover;

@@ -2982,3 +2982,94 @@ mod setups {
         assert!(keys(&h.allan).is_empty());
     }
 }
+
+#[test]
+fn a_copied_connections_hub_is_named_on_one_short_line() {
+    assert_eq!(hub_name(Some("  Patchwork ")).as_deref(), Some("Patchwork"));
+    assert_eq!(
+        hub_name(Some("Patch\nwork\u{7}")).as_deref(),
+        Some("Patchwork")
+    );
+    assert_eq!(
+        hub_name(Some(&"x".repeat(200))).map(|n| n.len()),
+        Some(MAX_NAME)
+    );
+    assert_eq!(hub_name(Some("   ")), None);
+    assert_eq!(hub_name(None), None);
+}
+
+/// Keys Desk copied from a paired hub are kept as any connection is, and
+/// this hub's audit says where from, never a value; a connection made by
+/// hand writes no such row.
+#[tokio::test]
+async fn a_copied_connection_is_audited_here_with_where_it_came_from() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt as _;
+    use workforce_identity::store::IdentityStore as _;
+    use workforce_identity::types::{Identity, IdentityRole};
+
+    let h = hub().await;
+    let fx = crate::remote_mcp::testing::fixture(false);
+    let mut sarah = Identity::new("Sarah", IdentityRole::SystemAdmin);
+    sarah.id = uuid::Uuid::parse_str(SARAH).unwrap();
+    fx.identities.create(&sarah).unwrap();
+    let jwt =
+        crate::jwt::JwtConfig::new("a-test-secret-of-at-least-32-bytes!!".into(), 3600).unwrap();
+    let token = crate::jwt::generate_token_with_identity(
+        &jwt,
+        "Sarah",
+        IdentityRole::SystemAdmin,
+        Some(SARAH.to_string()),
+    )
+    .unwrap();
+    let audit = Arc::new(workforce_common::persistence::SqliteStore::in_memory().unwrap());
+    let state = Arc::new(GatewayState {
+        jwt_config: Some(jwt),
+        telemetry_store: Some(Arc::clone(&audit) as _),
+        ..Arc::try_unwrap(fx.state)
+            .ok()
+            .expect("the fixture's only handle")
+    });
+    let app = router(state, Arc::clone(&h.c));
+    let post = |body: Value| {
+        Request::builder()
+            .method("POST")
+            .uri("/api/desk/connections/linear")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let res = app
+        .clone()
+        .oneshot(post(
+            json!({"level": "all", "fields": {"api_key": GOOD}, "copied_from": "Patchwork\n"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let res = app
+        .clone()
+        .oneshot(post(
+            json!({"name": "Mine", "level": "all", "fields": {"api_key": GOOD2}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let rows: Vec<_> = audit
+        .recent_audit(100)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.action == "desk_connections.copy")
+        .collect();
+    assert_eq!(rows.len(), 1, "only the copy: {rows:?}");
+    let detail = rows[0].detail.clone().unwrap_or_default();
+    assert!(detail.contains("Desk copied your Linear key"), "{detail}");
+    assert!(detail.contains("from Patchwork"), "{detail}");
+    assert!(
+        !detail.contains(GOOD) && !detail.contains(&GOOD[..8]),
+        "{detail}"
+    );
+    assert_eq!(rows[0].actor, format!("user:{SARAH}"));
+}
