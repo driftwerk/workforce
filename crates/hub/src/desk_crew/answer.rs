@@ -749,7 +749,9 @@ impl CrewHub {
     /// to Desk, which holds such a question's start for its boss.
     /// The sessions an Act fully boss answers itself (and how long the
     /// person's input keeps each theirs), and every session looked at.
-    pub(super) fn dialog_answerers(&self) -> (HashMap<Uuid, chrono::Duration>, HashSet<Uuid>) {
+    pub(super) fn dialog_answerers(
+        &self,
+    ) -> (HashMap<Uuid, workforce_desk::DialogAnswerer>, HashSet<Uuid>) {
         let views = self.desk.list();
         let seen = views.iter().map(|v| v.id).collect();
         let answered = views
@@ -762,7 +764,8 @@ impl CrewHub {
                     return None;
                 }
                 let (_, o) = self.overseer_named(&boss)?;
-                Some((v.id, self.answer_gap(&o)))
+                let gap = self.answer_gap(&o);
+                Some((v.id, workforce_desk::DialogAnswerer { boss, gap }))
             })
             .collect();
         (answered, seen)

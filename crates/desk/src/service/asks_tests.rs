@@ -898,3 +898,79 @@ async fn a_prompt_only_the_terminal_shows_carries_the_call_it_is_about() {
     })
     .await;
 }
+
+/// A prompt only its terminal's dialog shows is cleared (Esc) only by the
+/// boss its requests are held for, or by the person: another boss, even
+/// one at Act fully, presses nothing there.
+#[tokio::test]
+async fn only_its_own_boss_clears_a_prompt_its_terminal_shows() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, _logged) = logged_desk(pool, dir.path(), fake_cli(dir.path())).await;
+        let s = asking_session(&d, dir.path()).await;
+        prompted(&d, s.id, "ship the migration").await;
+        // Both bosses at Act fully: which one the session is held for decides.
+        let unbound = crate::charge::FullGrant {
+            anywhere: true,
+            unbound: true,
+            ..Default::default()
+        };
+        d.set_full(std::collections::HashMap::from([
+            ("crew".to_string(), unbound.clone()),
+            ("rival".to_string(), unbound),
+        ]));
+        d.set_dialog_answerers(std::collections::HashMap::from([(
+            s.id,
+            super::DialogAnswerer {
+                boss: "crew".into(),
+                gap: chrono::Duration::zero(),
+            },
+        )]));
+        let notice = json!({"hook_event_name": "Notification", "notification_type": "permission_prompt",
+            "message": "Claude needs your permission to use Bash"});
+        post(&d, s.id, notice.clone()).await;
+        let p = d.view(s.id).unwrap().pending.expect("its dialog waits");
+        assert!(!p.answerable);
+        let boss = |id: &str| crate::crew::By::manager(id, id, "clearing it");
+
+        // Another boss: refused, and the dialog still waits.
+        d.clear_dialog(s.id, p.id, boss("rival"))
+            .expect_err("another boss clears nothing");
+        d.interrupt(s.id, Some(boss("rival")))
+            .expect_err("told it isn't theirs");
+        let v = d.view(s.id).unwrap();
+        assert_eq!(v.pending.map(|w| w.id), Some(p.id), "nothing was pressed");
+        assert_eq!(v.state, SessionState::Blocked);
+
+        // Nor an agent's, as its own: a boss's alone.
+        let agent = crate::crew::By {
+            party: crate::crew::Party::agent("crew", "crew"),
+            reason: None,
+            suggestion_id: None,
+            hop: 0,
+            preference: None,
+        };
+        d.interrupt(s.id, Some(agent.clone()))
+            .expect_err("an agent clears nothing");
+        d.interrupt(s.id, Some(crate::crew::By::desk("for the test")))
+            .expect_err("nor Desk");
+        assert_eq!(d.view(s.id).unwrap().pending.map(|w| w.id), Some(p.id));
+        d.clear_dialog(s.id, p.id, agent)
+            .expect_err("only a boss clears a prompt");
+
+        // Its own boss clears it.
+        d.clear_dialog(s.id, p.id, boss("crew")).unwrap();
+        assert!(d.view(s.id).unwrap().pending.is_none());
+
+        // Its own boss's Esc too, and the person's.
+        post(&d, s.id, notice.clone()).await;
+        assert!(d.view(s.id).unwrap().pending.is_some());
+        d.interrupt(s.id, Some(boss("crew"))).unwrap();
+        assert!(d.view(s.id).unwrap().pending.is_none());
+        post(&d, s.id, notice).await;
+        assert!(d.view(s.id).unwrap().pending.is_some());
+        d.interrupt(s.id, Some(crate::crew::By::you())).unwrap();
+        assert!(d.view(s.id).unwrap().pending.is_none());
+    })
+    .await;
+}
