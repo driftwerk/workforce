@@ -36,6 +36,7 @@ pub(crate) mod decide;
 mod decisions;
 mod deliver;
 mod extras;
+mod github;
 mod handover;
 mod idle;
 mod items;

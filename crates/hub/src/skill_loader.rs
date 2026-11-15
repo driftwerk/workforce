@@ -2560,6 +2560,31 @@ fn load_github_from_vault(
     })
 }
 
+/// The GitHub adapter for `registry`'s agent, its keys pinned as that
+/// agent's `[skills]` says, built now as the caller in scope and registered
+/// nowhere: Desk's boss checks pull requests and CI with a few of its reads
+/// ([`crate::desk_crew::github`]), and nothing else of it is reachable.
+/// Its instances and keys are read per call as the caller, as a loaded
+/// adapter's are.
+pub(crate) fn github_skill_for(
+    vault: Arc<Vault>,
+    global_vault: Option<Arc<Vault>>,
+    config: &WorkforceConfig,
+    registry: &ToolRegistry,
+) -> eyre::Result<workforce_skills::adapters::github::GithubSkill> {
+    struct Loading;
+    impl Drop for Loading {
+        fn drop(&mut self) {
+            LOADING_PINS.with(|p| p.borrow_mut().take());
+        }
+    }
+    LOADING_PINS.with(|p| *p.borrow_mut() = Some(registry.credential_pins()));
+    let _loading = Loading;
+    let store = layered_user_store(vault, global_vault);
+    let (skill_config, _) = github_vault_config(store.as_ref(), config)?;
+    workforce_skills::adapters::github::GithubSkill::with_store(skill_config, store)
+}
+
 fn load_google_from_vault(
     vault: Arc<Vault>,
     global_vault: Option<Arc<Vault>>,
