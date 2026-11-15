@@ -523,6 +523,7 @@ async fn serve_remote(
             ..state.remote_mcp.clone()
         },
         desk_boss: Default::default(),
+        desk_key_export: Default::default(),
         uplinks: Default::default(),
         ..state
     });
