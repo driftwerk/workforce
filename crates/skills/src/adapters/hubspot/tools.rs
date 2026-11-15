@@ -28,15 +28,18 @@ fn resolve_client(
     input: &Value,
 ) -> eyre::Result<Arc<HubspotClient>> {
     let (clients, default_portal) = instances.for_caller_or(default_portal);
-    let (clients, default_portal) = (&*clients, default_portal.as_str());
-    if let Some(name) = input["portal"].as_str() {
-        return clients.get(name).cloned().ok_or_else(|| {
-            crate::adapters::utils::unknown_instance("HubSpot portal", name, clients)
-        });
-    }
-    clients.get(default_portal).cloned().ok_or_else(|| {
-        crate::adapters::utils::unknown_instance("HubSpot portal", default_portal, clients)
-    })
+    // Through the environment's binding, as every other connector goes.
+    let name = workforce_agent::llm::environment::resolve_instance(
+        "hubspot",
+        input["portal"].as_str(),
+        &default_portal,
+        &*clients,
+    )
+    .map_err(|d| eyre::eyre!("{}", d.message))?;
+    clients
+        .get(&name)
+        .cloned()
+        .ok_or_else(|| crate::adapters::utils::unknown_instance("HubSpot portal", &name, &clients))
 }
 
 fn portal_description(instances: &LiveInstances<HubspotClient>, default_portal: &str) -> String {
@@ -1287,6 +1290,32 @@ pub(super) fn append_associations_query(query: &mut Vec<(&str, String)>, input: 
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn an_environment_binding_rules_out_the_other_portals() {
+        use workforce_agent::runner::{ACTIVE_ENVIRONMENT, ACTIVE_SKILL_INSTANCES};
+        let clients: HashMap<String, Arc<HubspotClient>> = ["acme", "globex"]
+            .into_iter()
+            .map(|n| {
+                (
+                    n.to_string(),
+                    Arc::new(HubspotClient::new("pat", 100).unwrap()),
+                )
+            })
+            .collect();
+        let set = LiveInstances::from(clients);
+        let pins: workforce_agent::llm::environment::SkillPins =
+            [("hubspot".to_string(), vec!["acme".to_string()])].into();
+        ACTIVE_ENVIRONMENT.sync_scope("prod".to_string(), || {
+            ACTIVE_SKILL_INSTANCES.sync_scope(pins, || {
+                assert!(resolve_client(&set, "acme", &json!({ "portal": "acme" })).is_ok());
+                let err = resolve_client(&set, "acme", &json!({ "portal": "globex" }))
+                    .err()
+                    .expect("globex is outside the binding");
+                assert!(err.to_string().contains("globex"), "{err}");
+            })
+        });
+    }
 
     #[test]
     fn portal_description_single() {

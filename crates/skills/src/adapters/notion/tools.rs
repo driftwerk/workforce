@@ -28,14 +28,16 @@ fn resolve_client(
     input: &Value,
 ) -> eyre::Result<Arc<NotionClient>> {
     let (clients, default_workspace) = instances.for_caller_or(default_workspace);
-    let (clients, default_workspace) = (&*clients, default_workspace.as_str());
-    if let Some(name) = input["workspace"].as_str() {
-        return clients.get(name).cloned().ok_or_else(|| {
-            crate::adapters::utils::unknown_instance("Notion workspace", name, clients)
-        });
-    }
-    clients.get(default_workspace).cloned().ok_or_else(|| {
-        crate::adapters::utils::unknown_instance("Notion workspace", default_workspace, clients)
+    // Through the environment's binding, as every other connector goes.
+    let name = workforce_agent::llm::environment::resolve_instance(
+        "notion",
+        input["workspace"].as_str(),
+        &default_workspace,
+        &*clients,
+    )
+    .map_err(|d| eyre::eyre!("{}", d.message))?;
+    clients.get(&name).cloned().ok_or_else(|| {
+        crate::adapters::utils::unknown_instance("Notion workspace", &name, &clients)
     })
 }
 
@@ -946,6 +948,32 @@ impl Tool for CommentCreateTool {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn an_environment_binding_rules_out_the_other_workspaces() {
+        use workforce_agent::runner::{ACTIVE_ENVIRONMENT, ACTIVE_SKILL_INSTANCES};
+        let clients: HashMap<String, Arc<NotionClient>> = ["acme", "globex"]
+            .into_iter()
+            .map(|n| {
+                (
+                    n.to_string(),
+                    Arc::new(NotionClient::new("ntn", 100).unwrap()),
+                )
+            })
+            .collect();
+        let set = LiveInstances::from(clients);
+        let pins: workforce_agent::llm::environment::SkillPins =
+            [("notion".to_string(), vec!["acme".to_string()])].into();
+        ACTIVE_ENVIRONMENT.sync_scope("prod".to_string(), || {
+            ACTIVE_SKILL_INSTANCES.sync_scope(pins, || {
+                assert!(resolve_client(&set, "acme", &json!({ "workspace": "acme" })).is_ok());
+                let err = resolve_client(&set, "acme", &json!({ "workspace": "globex" }))
+                    .err()
+                    .expect("globex is outside the binding");
+                assert!(err.to_string().contains("globex"), "{err}");
+            })
+        });
+    }
 
     #[test]
     fn workspace_description_single() {

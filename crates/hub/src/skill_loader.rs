@@ -4046,8 +4046,7 @@ fn load_hubspot_from_vault(
                  - vault.set('skills/hubspot/portals/<name>/access_token', '...') for multi-portal"
             )
         })?;
-        let max_results = store
-            .get("skills/hubspot/max_results")
+        let max_results = shared_get(store.as_ref(), "skills/hubspot/max_results")
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(workforce_skills::adapters::hubspot::config::DEFAULT_MAX_RESULTS);
         workforce_skills::adapters::hubspot::HubspotSkillConfig {
@@ -4165,8 +4164,7 @@ fn load_notion_from_vault(
                  - vault.set('skills/notion/workspaces/<name>/token', '...') for multi-workspace"
             )
         })?;
-        let max_results = store
-            .get("skills/notion/max_results")
+        let max_results = shared_get(store.as_ref(), "skills/notion/max_results")
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(workforce_skills::adapters::notion::config::DEFAULT_MAX_RESULTS);
         workforce_skills::adapters::notion::NotionSkillConfig {

@@ -368,6 +368,7 @@ impl Tool for LinearIssueListTool {
 
         if let Some(team_id) = input["team_id"]
             .as_str()
+            .or(client.default_team_id())
             .or(self.default_team_id.as_deref())
         {
             filters.push(format!(r#"team: {{ id: {{ eq: "{}" }} }}"#, team_id));
@@ -1016,7 +1017,11 @@ impl Tool for LinearIssueCreateTool {
             }
         };
 
-        let team_id = match resolve_team_id(&input, &self.default_team_id) {
+        let default_team = client
+            .default_team_id()
+            .map(str::to_string)
+            .or_else(|| self.default_team_id.clone());
+        let team_id = match resolve_team_id(&input, &default_team) {
             Ok(t) => t,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
@@ -1775,7 +1780,11 @@ impl Tool for LinearStatesListTool {
             }
         };
 
-        let team_id = match resolve_team_id(&input, &self.default_team_id) {
+        let default_team = client
+            .default_team_id()
+            .map(str::to_string)
+            .or_else(|| self.default_team_id.clone());
+        let team_id = match resolve_team_id(&input, &default_team) {
             Ok(t) => t,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };

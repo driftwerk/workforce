@@ -89,7 +89,16 @@ impl LinearSkill {
     ) -> eyre::Result<Self> {
         let live = (Arc::clone(&store), Self::instance_paths());
         Self::build(config, Some(live), move |name, ws| {
+            // A workspace's default team is a shared setting, read here for
+            // any name (not only the loader's).
+            let team = ws.default_team_id.clone().or_else(|| {
+                crate::adapters::auth::shared_get(
+                    store.as_ref(),
+                    &format!("skills/linear/workspaces/{name}/default_team_id"),
+                )
+            });
             client::LinearClient::with_store(Arc::clone(&store), name, &ws.base_url)
+                .map(|c| c.with_default_team(team))
         })
     }
 
@@ -104,6 +113,14 @@ impl LinearSkill {
             + Sync
             + 'static,
     ) -> eyre::Result<Self> {
+        // Each workspace's client carries its own (shared) default team, so
+        // a call reads the default team of the workspace it resolves to.
+        let make = move |name: &str, ws: &config::LinearWorkspaceConfig| {
+            make(name, ws).map(|c| match ws.default_team_id.clone() {
+                Some(team) => c.with_default_team(Some(team)),
+                None => c,
+            })
+        };
         let resolved = config.resolve();
         let Instances { clients, default } = build_instances(
             "linear",
@@ -811,6 +828,39 @@ impl LinearSkill {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bob's own key on a workspace whose default team is a shared setting:
+    /// his calls get that team, though the loader never had the workspace.
+    #[tokio::test]
+    async fn a_workspaces_shared_default_team_reaches_each_persons_calls() {
+        use crate::adapters::test_support::People;
+        let store = People::new(&[("skills/linear/workspaces/acme/default_team_id", "team-acme")]);
+        store.own("bob", "skills/linear/workspaces/acme/api_key", "lin_bob");
+        store.own("ann", "skills/linear/workspaces/other/api_key", "lin_ann");
+        let config = LinearSkillConfig {
+            api_key: None,
+            base_url: config::default_base_url(),
+            default_team_id: None,
+            workspaces: [(
+                "other".to_string(),
+                config::LinearWorkspaceConfig {
+                    api_key: "lin_ann".into(),
+                    base_url: config::default_base_url(),
+                    default_team_id: None,
+                },
+            )]
+            .into(),
+            default_workspace: None,
+            prefix_map: Default::default(),
+        };
+        let skill = LinearSkill::with_store(config, store).unwrap();
+        let team = workforce_agent::runner::CURRENT_USER_ID.sync_scope("bob".to_string(), || {
+            skill.clients.for_caller().0["acme"]
+                .default_team_id()
+                .map(str::to_string)
+        });
+        assert_eq!(team.as_deref(), Some("team-acme"));
+    }
 
     fn named(names: &[&str], default_workspace: Option<&str>) -> LinearSkillConfig {
         LinearSkillConfig {

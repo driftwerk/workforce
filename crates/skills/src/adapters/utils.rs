@@ -137,6 +137,41 @@ impl InstancePaths {
         }
         names
     }
+
+    /// Whose instance `name` is for the caller: their id when any of its
+    /// values (its own `{prefix}{name}/…` ones, or for `default` the flat
+    /// key) is one of their own, `None` when it's all shared. A client
+    /// built on someone's own keys may hold what it learns from them, so it
+    /// is never shared with anyone else.
+    pub fn owner(
+        &self,
+        store: &dyn workforce_common::settings::SecretStore,
+        name: &str,
+    ) -> Option<String> {
+        let me = workforce_agent::runner::CURRENT_USER_ID
+            .try_with(|u| u.clone())
+            .ok()
+            .filter(|u| !u.is_empty())?;
+        let dir = format!("{}{name}/", self.prefix);
+        let mut paths = store.list(Some(&dir));
+        if store.get(&format!("{dir}{}", self.marker)).is_none() {
+            // The flat keys: the flat key and its siblings.
+            if let Some((parent, _)) = self.flat.rsplit_once('/') {
+                let parent = format!("{parent}/");
+                paths.extend(
+                    store
+                        .list(Some(&parent))
+                        .into_iter()
+                        .filter(|p| !p.starts_with(&self.prefix)),
+                );
+            }
+            paths.push(self.flat.clone());
+        }
+        paths
+            .iter()
+            .any(|path| store.get_user_override(path).is_some())
+            .then_some(me)
+    }
 }
 
 /// The instance parameter's description when the set is read per caller:
@@ -156,10 +191,11 @@ pub fn is_instance_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-/// At most this many clients a live set keeps built. Past it a new name's
-/// client is built for the call and not kept, so one person with many
-/// names never evicts anyone else's.
+/// At most this many clients a live set keeps built for shared instances,
+/// and for each person's own. Past it a new client is built for the call
+/// and not kept, so no one's names crowd out anyone else's.
 const MAX_BUILT: usize = 512;
+const MAX_BUILT_PER_PERSON: usize = 32;
 
 type OnBuilt<C> = dyn Fn(&Arc<C>) + Send + Sync;
 
@@ -185,7 +221,9 @@ struct Live<C> {
     /// The configured default selector (a shared setting).
     selector: Option<String>,
     make: Box<MakeClient<C>>,
-    built: std::sync::Mutex<HashMap<String, Arc<C>>>,
+    /// Built clients by (name, owner): `None` for an instance on shared
+    /// keys, the person's id for one on keys of their own.
+    built: std::sync::Mutex<HashMap<(String, Option<String>), Arc<C>>>,
     on_built: Option<Box<OnBuilt<C>>>,
 }
 
@@ -257,7 +295,9 @@ impl<C> LiveInstances<C> {
         };
         let mut clients = HashMap::with_capacity(names.len());
         for name in names {
-            if let Some(client) = cache().get(&name) {
+            let owner = live.paths.owner(live.store.as_ref(), &name);
+            let key = (name.clone(), owner.clone());
+            if let Some(client) = cache().get(&key) {
                 clients.insert(name, Arc::clone(client));
                 continue;
             }
@@ -271,15 +311,26 @@ impl<C> LiveInstances<C> {
             };
             let client = {
                 let mut built = cache();
-                match built.get(&name) {
+                match built.get(&key) {
                     // Another call built it first: use that one.
                     Some(first) => Arc::clone(first),
                     None => {
-                        if let Some(hook) = live.on_built.as_ref() {
-                            hook(&client);
+                        // Only a shared instance's client is handed to the
+                        // hook (which may publish what it learns).
+                        if owner.is_none() {
+                            if let Some(hook) = live.on_built.as_ref() {
+                                hook(&client);
+                            }
                         }
-                        if built.len() < MAX_BUILT {
-                            built.insert(name.clone(), Arc::clone(&client));
+                        let (cap, kept) = match owner.as_ref() {
+                            None => (MAX_BUILT, built.keys().filter(|(_, o)| o.is_none()).count()),
+                            Some(_) => (
+                                MAX_BUILT_PER_PERSON,
+                                built.keys().filter(|(_, o)| *o == owner).count(),
+                            ),
+                        };
+                        if kept < cap {
+                            built.insert(key, Arc::clone(&client));
                         }
                         client
                     }
@@ -826,6 +877,59 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One instance name, `default`, for two people on keys of their own
+    /// and for a shared key: each person's client is theirs alone, the
+    /// shared one is shared, and only the shared one reaches the hook.
+    #[tokio::test]
+    async fn a_client_on_someones_own_keys_is_never_anyone_elses() {
+        use crate::adapters::test_support::People;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use workforce_agent::runner::CURRENT_USER_ID;
+
+        let store = People::new(&[]);
+        store
+            .own("ann", "skills/x/api_key", "k-ann")
+            .own("bob", "skills/x/api_key", "k-bob");
+        let hooked = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&hooked);
+        let set = LiveInstances::live(
+            Arc::clone(&store) as Arc<dyn workforce_common::settings::SecretStore>,
+            InstancePaths::new("skills/x/workspaces/", "api_key", "skills/x/api_key"),
+            None,
+            |name: &str| Ok(name.to_string()),
+        )
+        .on_built(move |_: &Arc<String>| {
+            seen.fetch_add(1, Ordering::SeqCst);
+        });
+        let as_person = |who: &'static str| {
+            let set = &set;
+            CURRENT_USER_ID.sync_scope(who.to_string(), || set.for_caller().0["default"].clone())
+        };
+        let (ann, bob) = (as_person("ann"), as_person("bob"));
+        assert!(!Arc::ptr_eq(&ann, &bob), "Bob was handed Ann's client");
+        assert!(
+            Arc::ptr_eq(&ann, &as_person("ann")),
+            "Ann's client is kept for her"
+        );
+        assert_eq!(
+            hooked.load(Ordering::SeqCst),
+            0,
+            "a person's own client reached the hook"
+        );
+
+        // A shared flat key: one client for everyone without one of their own.
+        workforce_common::settings::SecretStore::set(
+            store.as_ref(),
+            "skills/x/api_key",
+            "k-shared",
+        )
+        .unwrap();
+        let (cy, dee) = (as_person("cy"), as_person("dee"));
+        assert!(Arc::ptr_eq(&cy, &dee));
+        assert!(!Arc::ptr_eq(&cy, &as_person("ann")));
+        assert_eq!(hooked.load(Ordering::SeqCst), 1);
+    }
     use serde_json::json;
 
     // ---- sniff_mime / extension_for_mime ----
