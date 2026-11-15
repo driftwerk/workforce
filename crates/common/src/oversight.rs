@@ -13,7 +13,7 @@
 //! max_checkins_per_hour = 6
 //! max_checkins_per_day = 100
 //! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = true, interrupt = false, message_agents = false, message_terminal_sessions = false, answer_sessions = true, hand_off = false, set_mode = false }
-//! work = { prefer_sessions = true, parallel = 4, take_on = "handed", engine = "claude", max_turns_per_hour = 60 }
+//! work = { prefer_sessions = true, parallel = 4, take_on = "handed", engine = "claude", max_turns_per_hour = 60, close_finished = true }
 //! full = { repos = ["acme/acme-web", "~/dev/globex-api"], workflows = ["deploy.yml", "promote.yml"], budget_usd_per_day = 25 }
 //! updates = { cheap_calls_per_day = 500, account_questions_per_day = 60, close_from_accounts = false, enabled = true, every_minutes = 3, max_wait_minutes = 10, away_after_minutes = 15 }
 //! ```
@@ -63,7 +63,12 @@
 //! `[oversight.work]` is how it runs sessions for the person: the sessions
 //! in its charge (handed to it, or every one with `take_on = "all"`) wake
 //! it at each turn's end, up to `max_turns_per_hour` such turns, and at
-//! most `parallel` of them start or work at once.
+//! most `parallel` of them start or work at once. With `close_finished`
+//! (on unless said), the sessions it started, and at Act fully those
+//! handed to it, are closed once their work is done (their PR merged,
+//! their ticket finished, the session said so, or a day idle with nothing
+//! open), never with uncommitted or unpushed work, nor while the person
+//! is in one: below where it acts, it suggests it.
 //!
 //! A session asks the overseer on Desk's line: with `on_message` it gets a
 //! turn of its own for that, else every question goes straight to the
@@ -317,6 +322,9 @@ pub struct Work {
     pub engine: String,
     /// Its turns for its sessions' turn ends, in any hour.
     pub max_turns_per_hour: u32,
+    /// It closes the sessions it runs once their work is done
+    /// (`desk_crew::closing`).
+    pub close_finished: bool,
 }
 
 /// The cheap model's day for the boss's reading (`[oversight.updates]`).
@@ -440,6 +448,7 @@ impl Default for Oversight {
                 take_on: TakeOn::Handed,
                 engine: "claude".into(),
                 max_turns_per_hour: 60,
+                close_finished: true,
             },
             full: Full::default(),
             updates: Updates {
@@ -917,6 +926,12 @@ impl Oversight {
                         "The most turns an hour it may spend on its sessions must be a whole number from 1 to {MAX_WORK_TURNS_PER_HOUR}."
                     ),
                 )?,
+                close_finished: switch(
+                    work,
+                    "close_finished",
+                    d.work.close_finished,
+                    "closing the sessions it started once they are finished",
+                )?,
             },
             full,
             updates: Updates {
@@ -1339,12 +1354,16 @@ mod tests {
         assert!(d.prefer_sessions);
         assert_eq!((d.parallel, d.take_on), (4, TakeOn::Handed));
         assert_eq!((d.engine.as_str(), d.max_turns_per_hour), ("claude", 60));
+        assert!(
+            d.close_finished,
+            "it closes its finished sessions unless told not to"
+        );
         let inline = parse(
-            "[oversight]\nwork = { prefer_sessions = false, parallel = 12, take_on = \"all\", engine = \"codex\", max_turns_per_hour = 1 }\n",
+            "[oversight]\nwork = { prefer_sessions = false, parallel = 12, take_on = \"all\", engine = \"codex\", max_turns_per_hour = 1, close_finished = false }\n",
         )
         .unwrap();
         let table = parse(
-            "[oversight]\n[oversight.work]\nprefer_sessions = false\nparallel = 12\ntake_on = \"all\"\nengine = \"codex\"\nmax_turns_per_hour = 1\n",
+            "[oversight]\n[oversight.work]\nprefer_sessions = false\nparallel = 12\ntake_on = \"all\"\nengine = \"codex\"\nmax_turns_per_hour = 1\nclose_finished = false\n",
         )
         .unwrap();
         assert_eq!(inline, table);
@@ -1356,6 +1375,7 @@ mod tests {
                 take_on: TakeOn::All,
                 engine: "codex".into(),
                 max_turns_per_hour: 1,
+                close_finished: false,
             }
         );
     }
@@ -1403,10 +1423,21 @@ mod tests {
                 "[oversight]\nwork = 4\n",
                 "The settings for how it runs sessions for you need to be a group of settings.",
             ),
+            (
+                "[oversight]\nwork = { close_finished = \"yes\" }\n",
+                "Whether closing the sessions it started once they are finished is on or off must be true or false.",
+            ),
         ] {
             let e = parse(source).unwrap_err();
             assert_eq!(e, says, "{source}");
-            for key in ["parallel", "take_on", "prefer_sessions", "max_turns", "work"] {
+            for key in [
+                "parallel",
+                "take_on",
+                "prefer_sessions",
+                "max_turns",
+                "close_finished",
+                "work",
+            ] {
                 assert!(!e.contains(key), "{source} → {e} names {key}");
             }
         }

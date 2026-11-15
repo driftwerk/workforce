@@ -113,6 +113,20 @@ impl DeskStore {
         Ok(out)
     }
 
+    /// Whether a boss's close of `session` was undone: the person wants it
+    /// open, and it is never closed as finished again.
+    pub async fn close_undone(&self, session: Uuid) -> Result<bool> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .query_opt(
+                "SELECT 1 FROM boss_decisions WHERE session = $1 AND undone_at IS NOT NULL \
+                 AND action->>'kind' = 'reopen' LIMIT 1",
+                &[&session],
+            )
+            .await?
+            .is_some())
+    }
+
     /// How many needs `boss` handled since `since`, over every decision in
     /// that time (never a page of them).
     pub async fn decisions_handled(&self, boss: &str, since: DateTime<Utc>) -> Result<Handled> {

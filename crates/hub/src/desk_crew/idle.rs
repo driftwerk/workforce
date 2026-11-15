@@ -434,6 +434,9 @@ impl CrewHub {
                     .await;
             }
             Some(Next::Done(why)) => {
+                // Said finished: closed once it has rested, when nothing
+                // is left in it ([`super::closing`]).
+                self.said_done(view, &why);
                 self.record_nothing(boss, view.id, true, &why).await;
             }
             Some(Next::Continue { text, why }) => {

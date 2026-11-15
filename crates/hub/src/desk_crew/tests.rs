@@ -1829,6 +1829,8 @@ mod terminal_asks;
 
 mod idle;
 
+mod closing;
+
 mod decisions;
 mod directives;
 mod items;

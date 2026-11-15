@@ -95,6 +95,7 @@ impl CrewHub {
             Action::Approve { session, .. }
             | Action::Deny { session, .. }
             | Action::Stop { session }
+            | Action::Close { session }
             | Action::Interrupt { session }
             | Action::Resume { session, .. }
             | Action::Restart { session, .. }

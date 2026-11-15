@@ -280,7 +280,8 @@ impl CrewHub {
             .quiet_made
             .lock()
             .get(boss)
-            .is_some_and(|m| !m.is_empty());
+            .is_some_and(|m| !m.is_empty())
+            || self.has_closing_notes(boss);
         if !decisions.is_empty() || !kept.is_empty() || quiet {
             change = Change::Result;
         }
@@ -319,6 +320,8 @@ impl CrewHub {
             .iter()
             .rev()
             .filter(|d| d.kind == DecisionKind::Acted)
+            // Said in the closed line, in its own words.
+            .filter(|d| !update::is_close(d))
             .take(update::COMPOSED_DECISIONS)
             .cloned()
             .collect();
@@ -433,6 +436,27 @@ impl CrewHub {
             })
             .collect();
         let (brief, more_items) = update::brief(&b.decisions, &decisions, &b.for_you, &names);
+        // The finished sessions it closed, would close, or left open: one
+        // line each.
+        let notes = self.closing_notes(boss, now);
+        let of = |kind: update::ClosedKind| -> Vec<update::ClosedSession> {
+            notes
+                .iter()
+                .filter(|(k, _)| *k == kind)
+                .map(|(_, s)| s.clone())
+                .collect()
+        };
+        let closed: Vec<update::ClosedLine> = update::closed_line(&b.decisions)
+            .into_iter()
+            .chain(update::noted_line(
+                update::ClosedKind::Suggested,
+                of(update::ClosedKind::Suggested),
+            ))
+            .chain(update::noted_line(
+                update::ClosedKind::KeptOpen,
+                of(update::ClosedKind::KeptOpen),
+            ))
+            .collect();
         let mut u = MentionedUpdate {
             sessions,
             decisions,
@@ -451,11 +475,17 @@ impl CrewHub {
             headline: String::new(),
             brief,
             more_items,
+            closed,
         };
         let headline = headline.unwrap_or_else(|| update::plain_headline(&u, b.for_you.len()));
         // Never a line without its session: one about one session says it.
         u.headline = update::situated(&u, &headline, b.for_you.len());
-        let decided: Vec<String> = b.decisions.iter().map(BossDecision::said).collect();
+        let decided: Vec<String> = b
+            .decisions
+            .iter()
+            .filter(|d| !update::is_close(d))
+            .map(BossDecision::said)
+            .collect();
         let text = update::render(&u, &decided);
         (u, text)
     }
@@ -984,6 +1014,7 @@ impl CrewHub {
         if let Some(made) = self.quiet_made.lock().get_mut(service.agent_id.as_str()) {
             made.retain(|(at, _)| *at > cutoff);
         }
+        self.closing_told(service.agent_id.as_str(), cutoff);
         let read = service
             .sessions
             .desk_read(owner, DESK_CHANNEL)
