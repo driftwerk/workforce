@@ -59,6 +59,13 @@ pub(crate) struct Charges {
     /// The sessions whose dialog questions an Act fully boss answers, and
     /// how long the person's input keeps them theirs, as the hub last said.
     dialogs: HashMap<Uuid, chrono::Duration>,
+    /// How many times the hub has said `dialogs` since Desk started (0:
+    /// not yet, and which sessions an Act fully boss answers isn't known).
+    dialogs_said: u64,
+    /// When the hub last said `dialogs`.
+    dialogs_at: Option<std::time::Instant>,
+    /// The sessions the hub looked at when it last said `dialogs`.
+    dialogs_seen: HashSet<Uuid>,
     /// Whether the rows were read. Until they are, Desk doesn't know which
     /// sessions a boss runs or who drives them: every boss's message to a
     /// session waits, and nothing is taken on.
@@ -405,30 +412,44 @@ impl Desk {
 
     /// Lets session `id`'s question `pending`, held at its start for its
     /// boss, go to its dialog: the person answers it there.
-    pub fn release_dialog(&self, id: Uuid, pending: Uuid) {
+    pub fn release_dialog(&self, id: Uuid, pending: Uuid) -> bool {
         let answer = {
             let mut st = self.0.state.lock();
             let Some(l) = st.live.get_mut(&id) else {
-                return;
+                return false;
             };
-            let Some(p) = l
+            match l
                 .pending
                 .as_mut()
                 .filter(|p| p.id == pending && p.answerable)
-            else {
-                return;
-            };
-            p.answerable = false;
-            // Codex's question, kept for when what it asks in front ends.
-            if let Some((_, q)) = l.codex_question.as_mut().filter(|(_, q)| q.id == pending) {
-                q.answerable = false;
+            {
+                Some(p) => {
+                    p.answerable = false;
+                    // Codex's question, kept for when what it asks in front ends.
+                    if let Some((_, q)) = l.codex_question.as_mut().filter(|(_, q)| q.id == pending)
+                    {
+                        q.answerable = false;
+                    }
+                    l.answer.take()
+                }
+                // One waiting behind the one shown goes the same way.
+                None => l
+                    .behind
+                    .iter_mut()
+                    .find(|b| b.pending.id == pending && b.pending.answerable)
+                    .and_then(|b| {
+                        b.pending.answerable = false;
+                        b.answer.take()
+                    }),
             }
-            l.answer.take()
         };
-        if let Some(a) = answer {
-            let _ = a.send(crate::claude::ask_in_terminal());
-        }
+        let Some(a) = answer else {
+            return false;
+        };
+        tracing::info!(session = %id, %pending, "a request held for its boss goes to its terminal");
+        let _ = a.send(crate::claude::ask_in_terminal());
         self.change(id, |_, _| {});
+        true
     }
 
     /// When the person last gave session `id` input ([`Self::last_input`]).
@@ -518,7 +539,134 @@ impl Desk {
     /// and how long the person's input there keeps them theirs: said by the
     /// hub as it sweeps.
     pub fn set_dialog_answerers(&self, dialogs: HashMap<Uuid, chrono::Duration>) {
-        self.0.state.lock().charges.dialogs = dialogs;
+        self.set_dialog_answerers_of(dialogs, HashSet::new());
+    }
+
+    /// [`Self::set_dialog_answerers`], with the sessions the hub looked at
+    /// to say it (`seen`): one of them it left out isn't held, at once.
+    pub fn set_dialog_answerers_of(
+        &self,
+        dialogs: HashMap<Uuid, chrono::Duration>,
+        seen: HashSet<Uuid>,
+    ) {
+        {
+            let mut st = self.0.state.lock();
+            st.charges.dialogs = dialogs;
+            st.charges.dialogs_seen = seen;
+            st.charges.dialogs_said += 1;
+            st.charges.dialogs_at = Some(std::time::Instant::now());
+        }
+        self.release_held_for_person();
+    }
+
+    /// How many times the hub has said which sessions an Act fully boss
+    /// answers since Desk started (it says so each sweep).
+    pub(super) fn answerers_said(&self) -> u64 {
+        self.0.state.lock().charges.dialogs_said
+    }
+
+    /// Whether `id`'s permission requests are held for its Act fully boss
+    /// whatever its approvals say: its boss answers them, and the person
+    /// isn't in control of it. As for its dialog's questions.
+    pub(super) fn holds_requests_for_boss(&self, id: Uuid) -> bool {
+        // The hub says which each sweep (two seconds): a word long stale
+        // (its crew stopped) holds nothing new.
+        let fresh = self
+            .0
+            .state
+            .lock()
+            .charges
+            .dialogs_at
+            .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(15));
+        fresh && self.holds_dialog_for_boss(id)
+    }
+
+    /// The permission requests held for an Act fully boss in sessions whose
+    /// terminal asks them (approvals = terminal) that are no longer its: the
+    /// person took control, or Act fully isn't in force for it now. Each
+    /// goes to Claude Code's own dialog, as the person set it to.
+    fn release_held_for_person(&self) {
+        let terminal: Vec<Uuid> = {
+            let st = self.0.state.lock();
+            st.live
+                .keys()
+                .copied()
+                .filter(|id| {
+                    st.records
+                        .get(id)
+                        .is_some_and(|r| r.approvals != crate::model::Approvals::Desk)
+                })
+                .collect()
+        };
+        for id in terminal {
+            if self.holds_requests_for_boss(id) {
+                continue;
+            }
+            let answers = {
+                let mut st = self.0.state.lock();
+                let Some(l) = st.live.get_mut(&id) else {
+                    continue;
+                };
+                let mut answers = Vec::new();
+                // A dialog's question held at its start is `answer`'s to let go.
+                let question = l.holder().is_some_and(|h| h.question);
+                if !question {
+                    if let Some(a) = l.answer.take() {
+                        if let Some(p) = l.pending.as_mut() {
+                            p.answerable = false;
+                        }
+                        answers.push(a);
+                    }
+                }
+                for b in l.behind.iter_mut().filter(|b| !b.raised.question) {
+                    if let Some(a) = b.answer.take() {
+                        b.pending.answerable = false;
+                        answers.push(a);
+                    }
+                }
+                answers
+            };
+            if answers.is_empty() {
+                continue;
+            }
+            tracing::info!(session = %id, requests = answers.len(), "requests held for the boss go to the terminal: the person took control, or Act fully ended");
+            for a in answers {
+                let _ = a.send(crate::claude::ask_in_terminal());
+            }
+            self.change(id, |_, _| {});
+        }
+    }
+
+    /// Lets session `id`'s request `pending`, held for its boss, go to the
+    /// terminal when that is where its approvals are asked (the boss left
+    /// it to the person, or Act fully ended meanwhile); one asked in Desk
+    /// stays on its card.
+    pub fn let_go(&self, id: Uuid, pending: Uuid) -> bool {
+        let terminal = self
+            .0
+            .state
+            .lock()
+            .records
+            .get(&id)
+            .is_some_and(|r| r.approvals != crate::model::Approvals::Desk);
+        terminal && self.release_dialog(id, pending)
+    }
+
+    /// Whether the hub hasn't said which sessions its bosses answer for
+    /// [`HELD_STALE`]: its decide loop stopped or wedged.
+    pub(super) fn answerers_stale(&self) -> bool {
+        self.0
+            .state
+            .lock()
+            .charges
+            .dialogs_at
+            .is_none_or(|at| at.elapsed() >= super::HELD_STALE)
+    }
+
+    /// Whether the hub's last word on which sessions a boss answers looked
+    /// at `id`: then it says for certain whether `id` is held.
+    pub(super) fn answerers_saw(&self, id: Uuid) -> bool {
+        self.0.state.lock().charges.dialogs_seen.contains(&id)
     }
 
     /// Whether `id`'s next dialog question is held for its boss to answer:
@@ -1041,6 +1189,15 @@ impl Desk {
         // A session Desk's breaker paused goes on only at the person's
         // word, whoever runs it.
         self.breaker_refuses_prompt(id, Some(boss))?;
+        // Where its terminal asks its approvals, Desk holds a request for
+        // its boss only while the person isn't in control: once they are,
+        // no boss's answer is taken, however late its decision lands.
+        let terminal = self.record(id).is_ok_and(|r| {
+            r.approvals != crate::model::Approvals::Desk && r.engine == crate::model::Engine::Claude
+        });
+        if terminal && !self.holds_requests_for_boss(id) {
+            return Err(DeskError::Conflict(super::ASKED_IN_TERMINAL.into()));
+        }
         if !self.charge_of(id).is_some_and(|c| c.live()) {
             return Ok(());
         }
@@ -1050,7 +1207,7 @@ impl Desk {
             self.mode_lets(id, Some(boss))?;
         }
         if self.pending_of(id, approval).is_none() {
-            return Err(DeskError::Conflict("already answered".into()));
+            return Err(DeskError::Conflict(super::ALREADY_ANSWERED.into()));
         }
         if unbound && decision == Decision::Allow {
             return Ok(());

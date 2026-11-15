@@ -503,6 +503,44 @@ fn charge_plain(e: workforce_desk::DeskError) -> String {
     }
 }
 
+/// How long a boss's resume or restart is waited for: its turn goes on
+/// past it, never held for the whole of a tool call's time.
+const STARTS_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What a boss is told of a resume or restart Desk didn't finish within
+/// [`STARTS_WITHIN`]: it may still be starting.
+fn still_starting(session: uuid::Uuid) -> String {
+    tracing::warn!(%session, "a boss's resume or restart didn't finish within a minute");
+    format!(
+        "Desk didn't finish starting it within {} seconds; it may still be starting. Look at it \
+         with crew.history in a moment before you start it again.",
+        STARTS_WITHIN.as_secs()
+    )
+}
+
+/// What a boss is told when Desk takes no answer to a request because it
+/// was answered already, or because Claude Code's own dialog asks it now:
+/// what is true and what to do, never a wait to pass on to the person.
+/// `Err` gives the error back for the usual words.
+fn answer_refused(e: workforce_desk::DeskError) -> Result<String, workforce_desk::DeskError> {
+    match &e {
+        workforce_desk::DeskError::Conflict(why) if why == workforce_desk::ALREADY_ANSWERED => Ok(
+            "Already answered (by your own decision, or by the person): nothing waits on it \
+             now, so there is nothing to tell the person."
+                .into(),
+        ),
+        workforce_desk::DeskError::Conflict(why) if why == workforce_desk::ASKED_IN_TERMINAL => Ok(
+            "Claude Code's own dialog in the session's terminal asks this one now, where no \
+             answer from Desk reaches it. At Act fully, while the person isn't in control of the \
+             session, Desk clears that dialog itself within seconds and has the session ask again \
+             in Desk, where your decision is taken at once: nothing for you to do or to pass on. \
+             Otherwise it is the person's, in their terminal."
+                .into(),
+        ),
+        _ => Err(e),
+    }
+}
+
 /// A board change refused, in the words the person reads, as they are.
 fn board_plain(e: workforce_desk::DeskError) -> String {
     match e {
@@ -1356,7 +1394,7 @@ impl CrewHub {
                         workforce_desk::model::Decision::Allow,
                         Some(by),
                     )
-                    .map_err(plain)?;
+                    .map_err(|e| answer_refused(e).unwrap_or_else(plain))?;
                 Ok(format!("allowed {}", v.label()))
             }
             Action::Deny { session, approval } => {
@@ -1375,7 +1413,7 @@ impl CrewHub {
                 };
                 let v = d
                     .decide(*session, *approval, decision, Some(by))
-                    .map_err(plain)?;
+                    .map_err(|e| answer_refused(e).unwrap_or_else(plain))?;
                 Ok(format!("denied {}", v.label()))
             }
             Action::Stop { session } => {
@@ -1390,17 +1428,25 @@ impl CrewHub {
                 let v = d.interrupt(*session, Some(by)).map_err(plain)?;
                 Ok(format!("interrupted {}", v.label()))
             }
+            // Run on their own, so one that outlasts the wait still ends
+            // whole: only the boss stops waiting.
             Action::Resume { session, prompt } => {
-                let v = d
-                    .resume(*session, prompt.clone(), Some(by))
+                let (desk, id, prompt) = (d.clone(), *session, prompt.clone());
+                let started = tokio::spawn(async move { desk.resume(id, prompt, Some(by)).await });
+                let v = tokio::time::timeout(STARTS_WITHIN, started)
                     .await
+                    .map_err(|_| still_starting(id))?
+                    .map_err(|e| format!("resuming it failed: {e}"))?
                     .map_err(plain)?;
                 Ok(format!("resumed {}", v.label()))
             }
             Action::Restart { session, prompt } => {
-                let v = d
-                    .restart(*session, prompt.clone(), by)
+                let (desk, id, prompt) = (d.clone(), *session, prompt.clone());
+                let started = tokio::spawn(async move { desk.restart(id, prompt, by).await });
+                let v = tokio::time::timeout(STARTS_WITHIN, started)
                     .await
+                    .map_err(|_| still_starting(id))?
+                    .map_err(|e| format!("restarting it failed: {e}"))?
                     .map_err(plain)?;
                 Ok(format!("restarted {}", v.label()))
             }

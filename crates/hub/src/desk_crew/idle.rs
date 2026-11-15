@@ -17,8 +17,9 @@
 //! - The sessions a boss runs too (as it takes on every session): their
 //!   turn's end is judged here, in place of a work turn (`work`). One the
 //!   person took back from it is theirs.
-//! - At most [`CONTINUES`] steps in a row on the boss's word alone: then the
-//!   person is told once, and it waits for them.
+//! - No count of steps holds a session back: Act fully, with every box
+//!   ticked, keeps only the budget, the audit (each step a decision with its
+//!   Undo) and Stop. Lower levels never come here.
 //! - A call that fails or runs past [`WITHIN`] is tried once more; then the
 //!   turn's end goes to the boss's full turn, as before the fast call.
 
@@ -46,9 +47,6 @@ const AT_ONCE: usize = 3;
 
 /// How long ago a turn may have ended and still be judged.
 const RECENT_MINUTES: i64 = 30;
-
-/// How many steps in a row a session takes on its boss's word alone.
-pub(crate) const CONTINUES: u32 = 5;
 
 /// How much of what the boss says the DM shows, and how long its message
 /// to the session may be.
@@ -132,15 +130,6 @@ pub(super) fn next(text: &str) -> Option<Next> {
 /// A finished turn: which session, and how many prompts it had.
 type Key = (Uuid, u64);
 
-/// The steps a session took on its boss's word since the person last gave
-/// it input (then, and how many), and whether the person was told it waits.
-#[derive(Debug, Default, Clone)]
-struct Run {
-    since: Option<DateTime<Utc>>,
-    steps: u32,
-    told: bool,
-}
-
 /// What the loop keeps between looks.
 #[derive(Default)]
 struct Seen {
@@ -149,7 +138,6 @@ struct Seen {
     judged: HashSet<Key>,
     /// Since when each boss has been at Act fully, as seen here.
     unbound_since: HashMap<String, DateTime<Utc>>,
-    runs: HashMap<Uuid, Run>,
     /// Each session's last turn's end as Desk said it: what its full turn
     /// is handed.
     ends: HashMap<Uuid, Event>,
@@ -317,34 +305,6 @@ impl CrewHub {
             if !fresh || s.judged.contains(&key) {
                 return;
             }
-            // The person's input since starts its steps again.
-            let input = self.desk.last_input_of(view.id);
-            let run = s.runs.entry(view.id).or_default();
-            if run.since != input {
-                *run = Run {
-                    since: input,
-                    ..Run::default()
-                };
-            }
-            if run.steps >= CONTINUES {
-                if run.told {
-                    return;
-                }
-                run.told = true;
-                s.judged.insert(key);
-                let crew = Arc::clone(self);
-                tokio::spawn(async move {
-                    crew.tell_dm(
-                        &boss,
-                        &format!(
-                            "{} has taken {CONTINUES} steps in a row without you, so I've stopped it there: it's yours to look at.",
-                            view.label()
-                        ),
-                    )
-                    .await;
-                });
-                return;
-            }
             s.judged.insert(key);
         }
         let crew = Arc::clone(self);
@@ -451,10 +411,6 @@ impl CrewHub {
             }
             Some(Next::Work(what)) => {
                 tracing::info!(session = %view.id, %boss, what, "a session's next step needs the boss's full turn");
-                // A step on the boss's word too.
-                if let Some(run) = seen.lock().runs.get_mut(&view.id) {
-                    run.steps += 1;
-                }
                 self.hand_to_work(view, seen);
             }
             Some(Next::Ask(ask)) => {
@@ -478,9 +434,6 @@ impl CrewHub {
                 match self.perform(&action, By::manager(boss, &name, &why)).await {
                     Ok(done) => {
                         tracing::info!(session = %view.id, %boss, %done, "the boss told a finished session its next step");
-                        if let Some(run) = seen.lock().runs.get_mut(&view.id) {
-                            run.steps += 1;
-                        }
                     }
                     Err(refused) => {
                         tracing::warn!(session = %view.id, %boss, %refused, "a boss's next step for a session was refused");

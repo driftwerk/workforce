@@ -978,3 +978,66 @@ async fn another_agents_desk_tools_never_drive_a_session_in_bypass() {
     })
     .await;
 }
+
+/// The person put a session in auto mode in its own terminal (Desk keeps
+/// no mode for it): its unbound boss's restart, and its resume after a
+/// stop, start it in auto again, never Claude Code's default, and soon.
+/// The person's own resume starts it in its own mode.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bosss_resume_keeps_the_mode_the_session_last_ran_in() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (overseer, crew, d, llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        super::boss_allows(&llm).await;
+        let boss = Party::manager("desk", &super::super::name_of(&overseer));
+        let s = new_session(&d, &base, "Cufflink Migration").await;
+        let url = hook_url(&base, s.id).await;
+        d.take_on(s.id, &boss, How::Handed, &Default::default(), &By::you())
+            .await
+            .unwrap();
+        eventually("Desk to know it acts anywhere", async || {
+            d.acts_fully_in(s.id, "desk").then_some(())
+        })
+        .await;
+        // Claude Code says the mode it runs in on each hook.
+        hook(
+            &url,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "go on", "permission_mode": "auto"}),
+        )
+        .await;
+        eventually("its mode seen", async || {
+            (d.mode_seen(s.id) == Some(workforce_desk::mode::Mode::Auto)).then_some(())
+        })
+        .await;
+        let by = || By::manager("desk", &super::super::name_of(&overseer), "It was stuck.");
+        let before = starts_of(&base, s.id);
+        let done = tokio::time::timeout(
+            Duration::from_secs(60),
+            crew.perform(&Action::Restart { session: s.id, prompt: None }, by()),
+        )
+        .await
+        .expect("a restart never hangs");
+        assert!(done.is_ok(), "{done:?}");
+        let args = next_start(&base, s.id, &before).await;
+        assert!(args.contains("--permission-mode\nauto\n"), "{args}");
+
+        // Stopped, then resumed by its boss: auto again (the mode it was
+        // last seen in is kept across its stop).
+        stopped(&d, s.id).await;
+        let before = starts_of(&base, s.id);
+        crew.perform(&Action::Resume { session: s.id, prompt: None }, by())
+            .await
+            .unwrap();
+        let args = next_start(&base, s.id, &before).await;
+        assert!(args.contains("--permission-mode\nauto\n"), "{args}");
+
+        // The person's own resume: its own mode.
+        stopped(&d, s.id).await;
+        let before = starts_of(&base, s.id);
+        d.resume(s.id, None, Some(By::you())).await.unwrap();
+        let args = next_start(&base, s.id, &before).await;
+        assert!(!args.contains("--permission-mode"), "{args}");
+    })
+    .await;
+}

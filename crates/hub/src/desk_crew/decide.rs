@@ -144,6 +144,8 @@ pub(crate) enum Outcome {
     Handed,
     /// It waits on the person: why, as said in the boss's DM.
     Waits(String),
+    /// Its decision call failed: it is decided again soon, why said once.
+    Retry(String),
     /// The boss decided it but Desk refused it for now (its breaker, its
     /// hold, its own settings): why, and the decision, done again each
     /// sweep until Desk takes it or the person answers.
@@ -153,6 +155,8 @@ pub(crate) enum Outcome {
 /// A request that waits on the person, to say in its boss's DM, and the
 /// boss's decision Desk refused, to do again.
 struct Said {
+    /// The session that asks it.
+    session: Uuid,
     approval: Uuid,
     boss: String,
     why: String,
@@ -160,7 +164,53 @@ struct Said {
     again: Option<(Action, By)>,
     /// Whether Desk can answer it (not asked in its own terminal).
     answerable: bool,
+    /// Its decision call failed: it is decided again soon.
+    retry: bool,
 }
+
+/// When each session's prompts that only its terminal answered were
+/// cleared, by session.
+type Cleared = HashMap<Uuid, Vec<chrono::DateTime<chrono::Utc>>>;
+
+/// How many times a session's terminal-only prompts are cleared in ten of
+/// the crew's minutes before the person is told it needs them: enough for
+/// a queue of them, its main thread's and its sub-agents' at once.
+const CLEARS: usize = 8;
+
+impl CrewHub {
+    /// How long a request whose decision call failed waits before it is
+    /// decided again: twenty seconds.
+    fn retry_after(&self) -> Duration {
+        self.timing.minute / 3
+    }
+
+    /// How long a prompt only a session's terminal answers is left before
+    /// its boss clears it, ten seconds: what was asked a moment ago may
+    /// still reach Desk.
+    fn clear_after(&self) -> chrono::TimeDelta {
+        chrono::TimeDelta::from_std(self.timing.minute / 6).unwrap_or_default()
+    }
+}
+
+/// How many times a request's decision call fails (one every
+/// [`CrewHub::retry_after`]) before it is the person's.
+const RETRIES: u32 = 15;
+
+/// Clears what Desk holds for bosses when the decide loop ends.
+struct HoldsEnd(Arc<CrewHub>);
+
+impl Drop for HoldsEnd {
+    fn drop(&mut self) {
+        self.0.desk.set_dialog_answerers(HashMap::new());
+    }
+}
+
+/// What a session is told once its boss cleared its prompt from its
+/// terminal: it asks again, where its boss answers.
+pub(crate) const ASK_AGAIN: &str = "Desk here, for the person: a permission prompt or question of yours \
+    showed in your terminal's own dialog, where I can't answer it, so I pressed Esc to clear it. Run the \
+    call it was for again now, and have any sub-agent whose call was turned down run its call again: \
+    this time it reaches me, and I answer it at once. Nothing was refused on purpose.";
 
 /// What was said in the DMs of requests that wait: by request, its boss
 /// and why. Each reason is said once a boss while it holds anything.
@@ -178,6 +228,16 @@ pub(super) async fn decide_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     let mut again: HashMap<Uuid, (Action, By)> = HashMap::new();
     // How many decision calls each boss makes at once.
     let mut slots: HashMap<String, Arc<tokio::sync::Semaphore>> = HashMap::new();
+    // When each session's terminal-only prompts were last cleared, by
+    // session: how often it is done.
+    let mut cleared: Cleared = HashMap::new();
+    // Requests whose decision call failed, when they are decided again,
+    // and how often each failed.
+    let mut again_at: HashMap<Uuid, tokio::time::Instant> = HashMap::new();
+    let mut failed: HashMap<Uuid, u32> = HashMap::new();
+    // However the loop ends (stopped, its events closed, a panic), Desk
+    // holds nothing more for a boss it no longer decides for.
+    let _holds_end = HoldsEnd(Arc::clone(&crew));
     loop {
         let mut swept = false;
         let sessions: Vec<Uuid> = tokio::select! {
@@ -188,9 +248,30 @@ pub(super) async fn decide_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                     asked.remove(&s.approval);
                     continue;
                 }
+                // Its decision call failed: decided again soon, the person
+                // told once; failing for minutes on end, it is theirs.
+                if s.retry {
+                    let n = failed.entry(s.approval).or_default();
+                    *n += 1;
+                    if *n > RETRIES {
+                        crew.desk.let_go(s.session, s.approval);
+                        s.retry = false;
+                        s.text = format!(
+                            "{} (it failed {RETRIES} times over, so it's yours to answer now)",
+                            s.text
+                        );
+                    } else {
+                        again_at.insert(s.approval, tokio::time::Instant::now() + crew.retry_after());
+                    }
+                }
                 let refused = match s.again.take() {
                     Some(a) => {
-                        again.insert(s.approval, a);
+                        // Held where its terminal asks it, it goes there, for
+                        // the person, and nothing more can answer it here;
+                        // otherwise Desk tries the decision again.
+                        if !crew.desk.let_go(s.session, s.approval) {
+                            again.insert(s.approval, a);
+                        }
                         true
                     }
                     None => false,
@@ -216,7 +297,8 @@ pub(super) async fn decide_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 swept = true;
                 match crew.desk.any_boss_unbound() {
                     true => {
-                        crew.desk.set_dialog_answerers(crew.dialog_answerers());
+                        let (answered, seen) = crew.dialog_answerers();
+                        crew.desk.set_dialog_answerers_of(answered, seen);
                         waiting(&crew)
                     }
                     false => {
@@ -265,8 +347,20 @@ pub(super) async fn decide_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 again.remove(&a);
             }
         }
+        // A request whose decision call failed is decided again once its
+        // wait is up.
+        if swept {
+            let now = tokio::time::Instant::now();
+            again_at.retain(|a, at| {
+                let due = *at <= now;
+                if due {
+                    asked.remove(a);
+                }
+                !due
+            });
+        }
         for id in sessions {
-            crew.look_at(id, &mut asked, &tx, &cancel, &mut slots);
+            crew.look_at(id, &mut asked, &tx, &cancel, &mut slots, &mut cleared);
         }
         // Only what still waits is remembered: a dialog's question behind
         // another ask too, so it isn't said again when it shows again.
@@ -281,6 +375,8 @@ pub(super) async fn decide_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
             told.retain(|a, _| open.contains(a));
             asked.retain(|a| open.contains(a));
             again.retain(|a, _| open.contains(a));
+            again_at.retain(|a, _| open.contains(a));
+            failed.retain(|a, _| open.contains(a));
         }
     }
 }
@@ -303,6 +399,58 @@ fn shown(p: &PendingApproval) -> String {
         d => format!("{}({d})", p.tool),
     };
     workforce_desk::crew::one_line(&whole, SHOWN)
+}
+
+/// How much of each text in a request a boss's tools show, and of all its
+/// texts together: past it, what was left out is said.
+pub(super) const WHOLE_MAX: usize = 8 * 1024;
+const WHOLE_TOTAL: usize = 32 * 1024;
+
+/// `v`'s texts, at every depth, cut at [`WHOLE_MAX`] each and
+/// [`WHOLE_TOTAL`] in all, what was left out said. Whether any was cut.
+fn cut_texts(v: &mut serde_json::Value, left: &mut usize) -> bool {
+    match v {
+        serde_json::Value::String(t) => {
+            let n = t.chars().count();
+            let keep = n.min(WHOLE_MAX).min(*left);
+            *left -= keep;
+            if keep < n {
+                *t = format!(
+                    "{}… [cut: {} more characters]",
+                    t.chars().take(keep).collect::<String>(),
+                    n - keep
+                );
+                return true;
+            }
+            false
+        }
+        serde_json::Value::Array(a) => a.iter_mut().fold(false, |cut, v| cut_texts(v, left) || cut),
+        serde_json::Value::Object(o) => o
+            .values_mut()
+            .fold(false, |cut, v| cut_texts(v, left) || cut),
+        _ => false,
+    }
+}
+
+/// `p` as this hub's own boss's tools show it: as Desk shows it, and with
+/// what it asks whole (its command, its file and change), as its decision
+/// call is given it: its texts cut ([`cut_texts`]), and without the
+/// session's own account of it (no evidence of what it does). Desk's own
+/// `detail` is its first line only. Never for a boss on another hub.
+pub(super) fn pending_for_boss(p: &PendingApproval) -> serde_json::Value {
+    let mut shown = serde_json::json!(p);
+    if let Some(r) = &p.request {
+        let mut input = r.input.clone();
+        if let Some(o) = input.as_object_mut() {
+            o.remove("description");
+        }
+        let mut left = WHOLE_TOTAL;
+        let cut = cut_texts(&mut input, &mut left);
+        shown["asks_whole"] = serde_json::json!({
+            "tool": r.tool, "input": input, "cwd": r.cwd, "cut": cut,
+        });
+    }
+    shown
 }
 
 /// A request's text, quoted where a model reads it as the session's words,
@@ -349,6 +497,7 @@ impl CrewHub {
         tx: &mpsc::UnboundedSender<Said>,
         cancel: &CancellationToken,
         slots: &mut HashMap<String, Arc<tokio::sync::Semaphore>>,
+        cleared: &mut Cleared,
     ) -> Outcome {
         let Ok(view) = self.desk.view(id) else {
             return Outcome::NotOurs;
@@ -361,6 +510,7 @@ impl CrewHub {
         };
         let waits = |why: String| {
             let _ = tx.send(Said {
+                session: view.id,
                 approval: p.id,
                 boss: boss.clone(),
                 why: why.clone(),
@@ -371,6 +521,7 @@ impl CrewHub {
                 ),
                 again: None,
                 answerable: p.answerable,
+                retry: false,
             });
             Outcome::Waits(why)
         };
@@ -400,16 +551,31 @@ impl CrewHub {
             return waits("Codex's requests in a session run from another hub are yours".into());
         }
         if !p.answerable {
-            // A question its dialog asks while the person is in control of
-            // the session is theirs: nothing is said of it until they are
-            // quiet (`answer`). One the boss had at its start and let go to
-            // the person was said then.
-            if self.dialog_is_persons(&view, &boss) || asked.contains(&p.id) {
+            // What its terminal asks while the person is in control of the
+            // session is theirs: nothing is said or done of it until they
+            // are quiet. One the boss had and let go to the person was said
+            // then.
+            if self.person_has_questions(&view, &boss) || asked.contains(&p.id) {
                 return Outcome::Soon;
             }
-            return waits(
-                "it asks in its own terminal, where Desk can't answer it; answer it there".into(),
-            );
+            // A boss on another hub can't press keys here.
+            if workforce_desk::grant::is_served(&boss) {
+                return waits(
+                    "it asks in its own terminal, where no answer from Desk reaches it".into(),
+                );
+            }
+            // Only Claude Code's own permission prompts are cleared: a
+            // question, Codex's request, an MCP server's dialog wait for the
+            // person, said once.
+            let prompt = view.engine == workforce_desk::engine::Engine::Claude
+                && !self.desk.asks_in_dialog(view.id)
+                && (p.tool != "Input" || p.detail.contains("permission"));
+            if !prompt {
+                return waits(
+                    "it asks in its own terminal's dialog, which only you can answer".into(),
+                );
+            }
+            return self.clear_terminal(&view, &p, &boss, cleared, waits);
         }
         // Codex's request Desk didn't see whole (no command, its changes
         // unseen or cut) is the person's: the boss can't judge what runs.
@@ -455,33 +621,43 @@ impl CrewHub {
                     crew.decide_request(&view, &p, &boss).await
                 } => d,
             };
-            let (why, again) = match decided {
-                Outcome::Waits(why) => (why, None),
-                Outcome::Refused(why, again) => (why, Some(*again)),
+            let (why, again, retry) = match decided {
+                Outcome::Waits(why) => (why, None, false),
+                Outcome::Retry(why) => (why, None, true),
+                Outcome::Refused(why, again) => (why, Some(*again), false),
                 Outcome::Handed => {
                     let _ = tx.send(Said {
+                        session: view.id,
                         approval: p.id,
                         boss,
                         why: String::new(),
                         text: String::new(),
                         again: None,
                         answerable: p.answerable,
+                        retry: false,
                     });
                     return;
                 }
                 _ => return,
             };
-            let _ = tx.send(Said {
-                approval: p.id,
-                boss,
-                text: format!(
+            let text = match retry {
+                // Still the boss's: the person only hears why it is slow.
+                true => format!("{} asks for {}: {why}", view.label(), quoted(&shown(&p))),
+                false => format!(
                     "{} is waiting on you to allow {}: {why}",
                     view.label(),
                     quoted(&shown(&p))
                 ),
+            };
+            let _ = tx.send(Said {
+                session: view.id,
+                approval: p.id,
+                boss,
+                text,
                 why,
                 again,
                 answerable: p.answerable,
+                retry,
             });
         });
         Outcome::Deciding
@@ -496,7 +672,7 @@ impl CrewHub {
         // A boss on another hub: the person hears it there, as an ask, once
         // a reason. Not while what it decided is still to be done again,
         // nor what asks in its own terminal (no ask can answer that).
-        if !refused && s.answerable {
+        if !refused && s.answerable && !s.retry {
             self.served_waits(&s.boss, s.approval);
         }
         let said = told.values().any(|(b, w)| *b == s.boss && *w == s.why);
@@ -504,6 +680,70 @@ impl CrewHub {
         if !said {
             self.tell_dm(&s.boss, &s.text).await;
         }
+    }
+
+    /// `view` waits on `p`, which only its terminal's own dialog answers
+    /// (its approvals are asked there and weren't held, its hook was lost to
+    /// a restart, or it was let go), while the person isn't in control:
+    /// its boss clears it with Esc and has the session ask again, where the
+    /// boss decides it. Done a few times; then the person is told, once.
+    fn clear_terminal(
+        self: &Arc<Self>,
+        view: &SessionView,
+        p: &PendingApproval,
+        boss: &str,
+        cleared: &mut Cleared,
+        waits: impl FnOnce(String) -> Outcome,
+    ) -> Outcome {
+        let now = chrono::Utc::now();
+        let after = self.clear_after();
+        // What was asked a moment ago may still reach Desk.
+        if now - p.since < after {
+            return Outcome::Soon;
+        }
+        let within = after * 60;
+        let times = cleared.entry(view.id).or_default();
+        times.retain(|t| now - *t < within);
+        // Cleared a moment ago: its session is asking again.
+        if times.last().is_some_and(|t| now - *t < after) {
+            return Outcome::Soon;
+        }
+        if times.len() >= CLEARS {
+            return waits(format!(
+                "only its terminal's own dialog answers it, and clearing it {CLEARS} times didn't \
+                 bring it back to Desk; it needs you in its terminal"
+            ));
+        }
+        times.push(now);
+        let crew = Arc::clone(self);
+        let (view, p, boss) = (view.clone(), p.clone(), boss.to_string());
+        tokio::spawn(async move {
+            let name = crew
+                .overseer_named(&boss)
+                .map(|(s, _)| super::name_of(&s))
+                .unwrap_or_else(|| boss.clone());
+            let by = By::manager(
+                &boss,
+                &name,
+                "Its prompt showed in its terminal's own dialog, where Desk can't answer it: \
+                 cleared, so it asks again in Desk",
+            );
+            tracing::info!(session = %view.id, %boss, request = %p.id, tool = %p.tool, "the boss clears a prompt only the terminal answers, so it is asked again in Desk");
+            let cleared = crew.desk.clear_dialog(view.id, p.id, by.clone());
+            if let Err(e) = cleared {
+                tracing::warn!(session = %view.id, %boss, error = %e, "clearing a terminal's prompt was refused");
+                return;
+            }
+            let ask = Action::Nudge {
+                to: super::actions::Target::Session(view.id),
+                message: ASK_AGAIN.into(),
+                reply_to: None,
+            };
+            if let Err(e) = crew.perform(&ask, by).await {
+                tracing::warn!(session = %view.id, %boss, error = %e, "telling a session to ask again was refused");
+            }
+        });
+        Outcome::Deciding
     }
 
     /// The boss's decision on `view`'s request `p`, done.
@@ -523,6 +763,9 @@ impl CrewHub {
             .decision_prompt(boss, view, p, &decider.oversight)
             .await;
         let mut failed = String::new();
+        // A failure asking again changes nothing (its hub's budget, pace,
+        // or a request too long to send): the person's, as before.
+        let mut lasting = false;
         let mut decided = None;
         for _ in 0..2 {
             match tokio::time::timeout(WITHIN, self.decide_by(&decider, &prompt)).await {
@@ -543,6 +786,7 @@ impl CrewHub {
                 // changes nothing.
                 Ok(Err(e)) if !e.again() => {
                     failed = e.why;
+                    lasting = true;
                     break;
                 }
                 Ok(Err(e)) => {
@@ -575,11 +819,27 @@ impl CrewHub {
             if !still() {
                 return Outcome::NotOurs;
             }
-            tracing::warn!(session = %view.id, %boss, failed, "the boss couldn't decide a request");
-            self.record_left(boss, view, p, &format!("couldn't decide: {failed}"))
-                .await;
-            return Outcome::Waits(format!(
-                "I couldn't decide it, as {failed}. It's yours to answer"
+            // A boss on another hub whose link is down may stay away, and
+            // a lasting failure doesn't pass: what it can't decide is the
+            // person's, as before. A model that failed or was slow is asked
+            // again soon.
+            if lasting || workforce_desk::grant::is_served(boss) {
+                tracing::warn!(session = %view.id, %boss, failed, "the boss couldn't decide a request");
+                // Held for the boss where the terminal asks it: it goes to
+                // the terminal, where the person answers.
+                self.desk.let_go(view.id, p.id);
+                self.record_left(boss, view, p, &format!("couldn't decide: {failed}"))
+                    .await;
+                return Outcome::Waits(format!(
+                    "I couldn't decide it, as {failed}. It's yours to answer"
+                ));
+            }
+            tracing::warn!(session = %view.id, %boss, failed, "the boss couldn't decide a request: deciding it again soon");
+            // Said once however often it fails, and however: why each time
+            // is in the log.
+            return Outcome::Retry(format!(
+                "my decision call failed, so I'm deciding it again every {} seconds until it's done",
+                self.retry_after().as_secs().max(1)
             ));
         };
         let (action, why) = match &verdict {
@@ -604,6 +864,9 @@ impl CrewHub {
                 if !still() {
                     return Outcome::NotOurs;
                 }
+                // Held for the boss where the terminal asks it: it goes to
+                // the terminal, where the person answers.
+                self.desk.let_go(view.id, p.id);
                 self.record_left(boss, view, p, question).await;
                 return Outcome::Waits(format!("I'm leaving it to you: {question}"));
             }
@@ -623,6 +886,7 @@ impl CrewHub {
             {
                 return Outcome::Handed;
             }
+            self.desk.let_go(view.id, p.id);
             return Outcome::Waits(
                 "Act fully isn't in force for it now, so I didn't do what I decided; it's yours to answer"
                     .into(),
@@ -856,5 +1120,56 @@ mod tests {
         );
         assert_eq!(verdict("I can't see the command"), None);
         assert_eq!(verdict("ALLOW:"), None);
+    }
+
+    /// A boss reads what a request asks whole, not Desk's first line of it,
+    /// with a very long text cut and said so.
+    #[test]
+    fn a_boss_sees_a_request_whole_and_what_was_cut() {
+        use workforce_desk::model::{PendingApproval, Request};
+        let command = format!(
+            "cd services/leads && git fetch origin && git rebase origin/main && {}",
+            "echo step && ".repeat(20)
+        );
+        let huge = "x".repeat(super::WHOLE_MAX + 10);
+        let p = PendingApproval {
+            id: uuid::Uuid::new_v4(),
+            tool: "Bash".into(),
+            detail: "cd services/leads && git fetch…".into(),
+            since: chrono::Utc::now(),
+            answerable: true,
+            choices: Vec::new(),
+            why: None,
+            options: None,
+            request: Some(Request {
+                tool: "Bash".into(),
+                input: serde_json::json!({"command": command, "description": "harmless", "edits": [{"new_string": huge}]}),
+                cwd: Some("/repo".into()),
+                read_only: false,
+            }),
+            call: None,
+            agent: Some("a1".into()),
+            cli_session: None,
+        };
+        let shown = super::pending_for_boss(&p);
+        assert_eq!(shown["detail"], "cd services/leads && git fetch…");
+        assert_eq!(shown["asks_whole"]["input"]["command"], command.as_str());
+        assert_eq!(shown["asks_whole"]["cwd"], "/repo");
+        assert_eq!(shown["asks_whole"]["cut"], true);
+        assert!(
+            shown["asks_whole"]["input"].get("description").is_none(),
+            "its own account isn't evidence"
+        );
+        let cut = shown["asks_whole"]["input"]["edits"][0]["new_string"]
+            .as_str()
+            .unwrap();
+        assert!(
+            cut.ends_with("… [cut: 10 more characters]"),
+            "{}",
+            &cut[cut.len() - 40..]
+        );
+        // Nothing Desk didn't see whole is made up.
+        let bare = super::pending_for_boss(&PendingApproval { request: None, ..p });
+        assert!(bare.get("asks_whole").is_none());
     }
 }
