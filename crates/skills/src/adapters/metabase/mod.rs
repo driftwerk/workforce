@@ -161,15 +161,18 @@ impl MetabaseSkill {
         Arc::clone(&self.clients) as Arc<dyn workforce_agent::llm::environment::InstanceSource>
     }
 
-    /// All agent-callable tools. This is the point a client becomes a live
-    /// tool client the hub publishes schema to; the sync pass's throwaway
-    /// clients only ever call [`MetabaseSkill::clients`].
+    /// All agent-callable tools. A fixed set's clients become live tool
+    /// clients the hub publishes schema to here; a store-backed set's do as
+    /// they're built (`on_built`), and only those on shared keys, so no
+    /// one's own learned tables are published.
     pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
-        self.clients
-            .for_caller()
-            .0
-            .values()
-            .for_each(client::track_live);
+        if !self.clients.is_live() {
+            self.clients
+                .for_caller()
+                .0
+                .values()
+                .for_each(client::track_live);
+        }
         let c = &self.clients;
         let d = &self.default_instance;
         vec![

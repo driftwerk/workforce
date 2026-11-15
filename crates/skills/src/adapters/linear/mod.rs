@@ -92,10 +92,12 @@ impl LinearSkill {
             // A workspace's default team is a shared setting, read here for
             // any name (not only the loader's).
             let team = ws.default_team_id.clone().or_else(|| {
-                crate::adapters::auth::shared_get(
-                    store.as_ref(),
-                    &format!("skills/linear/workspaces/{name}/default_team_id"),
-                )
+                let path = match name {
+                    // The flat key's instance: the flat default team.
+                    "default" => "skills/linear/default_team_id".to_string(),
+                    _ => format!("skills/linear/workspaces/{name}/default_team_id"),
+                };
+                crate::adapters::auth::shared_get(store.as_ref(), &path)
             });
             client::LinearClient::with_store(Arc::clone(&store), name, &ws.base_url)
                 .map(|c| c.with_default_team(team))
