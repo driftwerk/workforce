@@ -10,7 +10,7 @@ pub const DEFAULT_MAX_RESULTS: u64 = 100;
 /// The Notion API version header value.
 pub const NOTION_VERSION: &str = "2022-06-28";
 
-fn default_max_results() -> u64 {
+pub(crate) fn default_max_results() -> u64 {
     DEFAULT_MAX_RESULTS
 }
 

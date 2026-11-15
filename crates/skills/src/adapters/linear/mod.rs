@@ -15,7 +15,9 @@ use std::sync::Arc;
 
 use workforce_agent::tools::Tool;
 
-use crate::adapters::utils::{build_instances, Instances};
+use crate::adapters::utils::{
+    build_instances, live_from_config, InstancePaths, Instances, LiveInstances,
+};
 use crate::definition::{
     CredentialRequirement, SkillDefinition, SkillPolicy, SkillRequirements, SkillTool,
 };
@@ -59,7 +61,7 @@ pub const WRITE_TOOLS: &[&str] = &[
 
 /// The Linear skill — provides tools for interacting with the Linear GraphQL API.
 pub struct LinearSkill {
-    clients: Arc<HashMap<String, Arc<client::LinearClient>>>,
+    clients: Arc<LiveInstances<client::LinearClient>>,
     default_workspace: String,
     default_team_id: Option<String>,
     /// Team key prefix → workspace name (e.g. "STA" → "contoso").
@@ -70,7 +72,7 @@ impl LinearSkill {
     /// Create from config with static credentials captured at build time.
     /// Use [`LinearSkill::with_store`] for per-user credential resolution.
     pub fn new(config: LinearSkillConfig) -> eyre::Result<Self> {
-        Self::build(config, |_, ws| {
+        Self::build(config, None, |_, ws| {
             client::LinearClient::new(&ws.api_key, &ws.base_url)
         })
     }
@@ -85,14 +87,22 @@ impl LinearSkill {
         config: LinearSkillConfig,
         store: Arc<dyn workforce_common::settings::SecretStore>,
     ) -> eyre::Result<Self> {
-        Self::build(config, |name, ws| {
+        let live = (Arc::clone(&store), Self::instance_paths());
+        Self::build(config, Some(live), move |name, ws| {
             client::LinearClient::with_store(Arc::clone(&store), name, &ws.base_url)
         })
     }
 
     fn build(
         config: LinearSkillConfig,
-        make: impl Fn(&str, &config::LinearWorkspaceConfig) -> eyre::Result<client::LinearClient>,
+        live: Option<(
+            Arc<dyn workforce_common::settings::SecretStore>,
+            InstancePaths,
+        )>,
+        make: impl Fn(&str, &config::LinearWorkspaceConfig) -> eyre::Result<client::LinearClient>
+            + Send
+            + Sync
+            + 'static,
     ) -> eyre::Result<Self> {
         let resolved = config.resolve();
         let Instances { clients, default } = build_instances(
@@ -100,12 +110,40 @@ impl LinearSkill {
             &resolved,
             config.default_workspace.as_deref(),
             "No Linear workspaces configured. Set api_key or workspaces.",
-            make,
+            &make,
         )?;
         let default_team_id = resolved
             .iter()
             .find(|(name, _)| *name == default)
             .and_then(|(_, ws)| ws.default_team_id.clone());
+        // Store-backed: the instances are the caller's, read per call, and
+        // the default_team_id a call naming none falls back to is a shared one,
+        // never one of the loader's own workspaces.
+        let (default_team_id, clients) = match live {
+            None => (
+                default_team_id,
+                LiveInstances::fixed(Instances {
+                    clients,
+                    default: default.clone(),
+                }),
+            ),
+            Some((store, paths)) => (
+                config.default_team_id.clone(),
+                live_from_config(
+                    store,
+                    paths,
+                    config.default_workspace.clone(),
+                    resolved.clone(),
+                    config::LinearWorkspaceConfig {
+                        api_key: String::new(),
+                        base_url: config::default_base_url(),
+                        default_team_id: None,
+                    },
+                    make,
+                ),
+            ),
+        };
+        let clients = Arc::new(clients);
         Ok(Self {
             clients,
             default_workspace: default,
@@ -114,13 +152,18 @@ impl LinearSkill {
         })
     }
 
-    /// The instances this skill exposes, for the environments of the agent
-    /// that loaded it.
-    pub fn variants(&self) -> Option<workforce_agent::llm::environment::SkillVariants> {
-        workforce_agent::llm::environment::SkillVariants::of(
-            self.clients.keys().cloned(),
-            &self.default_workspace,
+    /// Where this adapter's instances live in the vault.
+    pub fn instance_paths() -> InstancePaths {
+        InstancePaths::new(
+            "skills/linear/workspaces/",
+            "api_key",
+            "skills/linear/api_key",
         )
+    }
+
+    /// The instances this skill exposes, read as whoever asks.
+    pub fn instance_source(&self) -> Arc<dyn workforce_agent::llm::environment::InstanceSource> {
+        Arc::clone(&self.clients) as Arc<dyn workforce_agent::llm::environment::InstanceSource>
     }
 
     /// Return all agent-callable tools.

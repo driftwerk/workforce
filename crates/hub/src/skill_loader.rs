@@ -2289,15 +2289,6 @@ pub fn static_skill_tool_names(skill_name: &str) -> Vec<&'static str> {
     }
 }
 
-/// Record the instances a multi-instance skill exposes on the registry it loads
-/// into, which belongs to one agent, or forget them when it exposes one.
-fn record_instances(registry: &ToolRegistry, skill: &str, variants: Option<SkillVariants>) {
-    match variants {
-        Some(variants) => registry.set_instance_source(skill, Arc::new(variants)),
-        None => registry.clear_instance_source(skill),
-    }
-}
-
 /// Load a specific skill's tools using vault credentials.
 pub fn load_skill_from_vault(
     skill_name: &str,
@@ -2543,8 +2534,16 @@ fn load_github_from_vault(
 ) -> eyre::Result<SkillLoadResult> {
     let store = layered_user_store(vault, global_vault);
     let (skill_config, context_hint) = github_vault_config(store.as_ref(), config)?;
+    let context_hint = shared_hint(
+        store.as_ref(),
+        &workforce_skills::adapters::github::GithubSkill::instance_paths(),
+        "skills/github/default_workspace",
+        "GitHub workspaces",
+        "Pass `owner` to pick which workspace's credentials a call uses.",
+        context_hint,
+    );
     let skill = workforce_skills::adapters::github::GithubSkill::with_store(skill_config, store)?;
-    record_instances(registry, "github", skill.variants());
+    registry.set_instance_source("github", skill.instance_source());
     let tools = skill.tools();
     let mut names = Vec::with_capacity(tools.len());
     for tool in tools {
@@ -2651,12 +2650,21 @@ fn load_google_from_vault(
     registry.register(setup_tool);
 
     // Context hint for agent system prompt.
-    let context_hint = if !workspace_names.is_empty() {
-        let mut parts: Vec<String> = workspace_names
+    // Every turn sees this hint: it names only the shared accounts (with
+    // their addresses), never the loader's own.
+    let shared_accounts = shared_instance_names(
+        store.as_ref(),
+        &workforce_skills::adapters::utils::InstancePaths::new(
+            "skills/google/workspaces/",
+            "refresh_token",
+            "",
+        ),
+    );
+    let context_hint = if !shared_accounts.is_empty() {
+        let mut parts: Vec<String> = shared_accounts
             .iter()
             .map(|ws| {
-                let email = store
-                    .get(&format!("skills/google/workspaces/{ws}/email"))
+                let email = shared_get(store.as_ref(), &format!("skills/google/workspaces/{ws}/email"))
                     .unwrap_or_else(|| "(unknown)".to_string());
                 let is_default = default_ws.as_deref() == Some(ws.as_str());
                 if is_default {
@@ -2668,9 +2676,14 @@ fn load_google_from_vault(
             .collect();
         parts.sort();
         Some(format!(
-            "Accounts: {}\nUse the `account` parameter on any Google tool to select which account.",
+            "Shared accounts: {}\nEach person's own Google accounts are used when they call.\nUse the `account` parameter on any Google tool to select which account.",
             parts.join(", ")
         ))
+    } else if !workspace_names.is_empty() {
+        Some(
+            "Google accounts: each person's own, used when they call. Use the `account` parameter on any Google tool to select which account; if a call says the account isn't connected, call google.setup(action='login', no_browser=true)."
+                .to_string(),
+        )
     } else {
         Some(
             "No Google account connected for this user yet. To connect one:\n\
@@ -2842,8 +2855,16 @@ fn load_linear_from_vault(
 ) -> eyre::Result<SkillLoadResult> {
     let store = layered_user_store(vault, global_vault);
     let (skill_config, context_hint) = linear_vault_config(store.as_ref())?;
+    let context_hint = shared_hint(
+        store.as_ref(),
+        &workforce_skills::adapters::linear::LinearSkill::instance_paths(),
+        "skills/linear/default_workspace",
+        "Linear workspaces",
+        "Use the `workspace` parameter on Linear tools to select which workspace; ticket prefixes auto-resolve.",
+        context_hint,
+    );
     let skill = workforce_skills::adapters::linear::LinearSkill::with_store(skill_config, store)?;
-    record_instances(registry, "linear", skill.variants());
+    registry.set_instance_source("linear", skill.instance_source());
     let tools = skill.tools();
     let mut names = Vec::with_capacity(tools.len());
     for tool in tools {
@@ -3018,8 +3039,16 @@ fn load_jira_from_vault(
 ) -> eyre::Result<SkillLoadResult> {
     let store = layered_user_store(vault, global_vault);
     let (skill_config, context_hint) = jira_vault_config(store.as_ref())?;
+    let context_hint = shared_hint(
+        store.as_ref(),
+        &workforce_skills::adapters::jira::JiraSkill::instance_paths(),
+        "skills/jira/default_workspace",
+        "Jira workspaces",
+        "Use the `workspace` parameter on Jira tools to select which tenant; issue keys auto-route by project prefix.",
+        context_hint,
+    );
     let skill = workforce_skills::adapters::jira::JiraSkill::with_store(skill_config, store)?;
-    record_instances(registry, "jira", skill.variants());
+    registry.set_instance_source("jira", skill.instance_source());
     let tools = skill.tools();
     let mut names = Vec::with_capacity(tools.len());
     for tool in tools {
@@ -3153,8 +3182,16 @@ fn load_datadog_from_vault(
 ) -> eyre::Result<SkillLoadResult> {
     let store = layered_user_store(vault, global_vault);
     let (skill_config, context_hint) = datadog_vault_config(store.as_ref())?;
+    let context_hint = shared_hint(
+        store.as_ref(),
+        &workforce_skills::adapters::datadog::DatadogSkill::instance_paths(),
+        "skills/datadog/default_account",
+        "Datadog accounts",
+        "Use the `account` parameter on Datadog tools to select one.",
+        context_hint,
+    );
     let skill = workforce_skills::adapters::datadog::DatadogSkill::with_store(skill_config, store)?;
-    record_instances(registry, "datadog", skill.variants());
+    registry.set_instance_source("datadog", skill.instance_source());
     let tools = skill.tools();
     let mut names = Vec::with_capacity(tools.len());
     for tool in tools {
@@ -3357,12 +3394,20 @@ fn load_metabase_from_vault(
 ) -> eyre::Result<SkillLoadResult> {
     let store = layered_user_store(vault, global_vault);
     let (skill_config, context_hint) = metabase_vault_config(store.as_ref())?;
+    let context_hint = shared_hint(
+        store.as_ref(),
+        &workforce_skills::adapters::metabase::MetabaseSkill::instance_paths(),
+        "skills/metabase/default_instance",
+        "Metabase instances",
+        "Use the `instance` parameter on Metabase tools to select one.",
+        context_hint,
+    );
     let skill = workforce_skills::adapters::metabase::MetabaseSkill::with_store(
         skill_config,
         store,
         workforce_common::metabase_schema::store(),
     )?;
-    record_instances(registry, "metabase", skill.variants());
+    registry.set_instance_source("metabase", skill.instance_source());
     let tools = skill.tools();
     let mut names = Vec::with_capacity(tools.len());
     for tool in tools {
@@ -3428,6 +3473,34 @@ fn load_xero_from_vault(
         tool_names: names,
         context_hint,
     })
+}
+
+/// A loaded adapter's hint as every turn may see it: the loader's own when
+/// there are no named instances (single-key mode names none), else one
+/// naming only the shared instances, since the loader's lists their own
+/// workspaces too.
+fn shared_hint(
+    store: &dyn workforce_common::settings::SecretStore,
+    paths: &workforce_skills::adapters::utils::InstancePaths,
+    selector_path: &str,
+    label: &str,
+    choose: &str,
+    loaders: Option<String>,
+) -> Option<String> {
+    if store.list(Some(&paths.prefix)).is_empty() {
+        return loaders;
+    }
+    let selector = shared_get(store, selector_path);
+    Some(shared_instances_hint(
+        store,
+        paths,
+        selector.as_deref(),
+        label,
+        choose,
+        &format!(
+            "{label}: each person's own, read when they call; a call naming none uses their default."
+        ),
+    ))
 }
 
 /// The names of `paths`' instances kept at the shared tiers only (the
@@ -3576,15 +3649,24 @@ fn load_freeagent_from_vault(
     names.push(setup_tool.name().to_string());
     registry.register(setup_tool);
 
-    let connected = token_store::list_workspaces(store.as_ref());
+    // Every turn sees this hint: it names only the shared companies, never
+    // the loader's own.
+    let connected = shared_instance_names(
+        store.as_ref(),
+        &workforce_skills::adapters::utils::InstancePaths::new(
+            "skills/freeagent/workspaces/",
+            "refresh_token",
+            "",
+        ),
+    );
     let context_hint = if connected.is_empty() {
         Some(
-            "No FreeAgent company connected yet. Run freeagent.setup(action='login') to connect one."
+            "FreeAgent companies are each person's own. If a call says none is connected, run freeagent.setup(action='login') to connect one."
                 .to_string(),
         )
     } else {
         Some(format!(
-            "Connected FreeAgent companies: {}. Use the `workspace` parameter on freeagent.* tools to select one.",
+            "Shared FreeAgent companies: {}. Each person's own are used when they call. Use the `workspace` parameter on freeagent.* tools to select one.",
             connected.join(", ")
         ))
     };
@@ -3718,9 +3800,17 @@ fn load_postmark_from_vault(
 ) -> eyre::Result<SkillLoadResult> {
     let store = layered_user_store(vault, global_vault);
     let (skill_config, context_hint) = postmark_vault_config(store.as_ref())?;
+    let context_hint = shared_hint(
+        store.as_ref(),
+        &workforce_skills::adapters::postmark::PostmarkSkill::instance_paths(),
+        "skills/postmark/default_workspace",
+        "Postmark workspaces",
+        "Use the `workspace` parameter on Postmark tools to select one.",
+        context_hint,
+    );
     let skill =
         workforce_skills::adapters::postmark::PostmarkSkill::with_store(skill_config, store)?;
-    record_instances(registry, "postmark", skill.variants());
+    registry.set_instance_source("postmark", skill.instance_source());
     let tools = skill.tools();
     let mut names = Vec::with_capacity(tools.len());
     for tool in tools {
@@ -3853,9 +3943,17 @@ fn load_sendgrid_from_vault(
 ) -> eyre::Result<SkillLoadResult> {
     let store = layered_user_store(vault, global_vault);
     let (skill_config, context_hint) = sendgrid_vault_config(store.as_ref())?;
+    let context_hint = shared_hint(
+        store.as_ref(),
+        &workforce_skills::adapters::sendgrid::SendGridSkill::instance_paths(),
+        "skills/sendgrid/default_workspace",
+        "SendGrid workspaces",
+        "Use the `workspace` parameter on SendGrid tools to select one.",
+        Some(context_hint),
+    );
     let skill =
         workforce_skills::adapters::sendgrid::SendGridSkill::with_store(skill_config, store)?;
-    record_instances(registry, "sendgrid", skill.variants());
+    registry.set_instance_source("sendgrid", skill.instance_source());
     let tool_names: Vec<String> = skill
         .tools()
         .into_iter()
@@ -3872,7 +3970,7 @@ fn load_sendgrid_from_vault(
     );
     Ok(SkillLoadResult {
         tool_names,
-        context_hint: Some(context_hint),
+        context_hint,
     })
 }
 
@@ -3967,7 +4065,17 @@ fn load_hubspot_from_vault(
         }
     };
 
+    let context_hint = shared_hint(
+        store.as_ref(),
+        &workforce_skills::adapters::hubspot::HubspotSkill::instance_paths(),
+        "skills/hubspot/default_portal",
+        "HubSpot portals",
+        "Use the `portal` parameter on HubSpot tools to select one.",
+        context_hint,
+    );
+
     let skill = workforce_skills::adapters::hubspot::HubspotSkill::with_store(skill_config, store)?;
+    registry.set_instance_source("hubspot", skill.instance_source());
     let tools = skill.tools();
     let mut names = Vec::with_capacity(tools.len());
     for tool in tools {
@@ -4076,7 +4184,17 @@ fn load_notion_from_vault(
         }
     };
 
+    let context_hint = shared_hint(
+        store.as_ref(),
+        &workforce_skills::adapters::notion::NotionSkill::instance_paths(),
+        "skills/notion/default_workspace",
+        "Notion workspaces",
+        "Use the `workspace` parameter on Notion tools to select one.",
+        context_hint,
+    );
+
     let skill = workforce_skills::adapters::notion::NotionSkill::with_store(skill_config, store)?;
+    registry.set_instance_source("notion", skill.instance_source());
     let tools = skill.tools();
     let mut names = Vec::with_capacity(tools.len());
     for tool in tools {
@@ -4297,8 +4415,13 @@ fn load_email_from_vault(
     let default_account = selector(store.as_ref(), "email", "skills/email/default_account");
 
     let context_hint = {
-        let mut parts: Vec<String> = accounts
-            .keys()
+        // Every turn sees this hint: it names only the shared accounts,
+        // never the loader's own.
+        let paths =
+            workforce_skills::adapters::utils::InstancePaths::new(prefix, "password", "");
+        let shared = shared_instance_names(store.as_ref(), &paths);
+        let mut parts: Vec<String> = shared
+            .iter()
             .map(|name| {
                 let username = shared_get(store.as_ref(), &format!("{prefix}{name}/username"))
                     .unwrap_or_else(|| "per-user account".to_string());
@@ -4310,10 +4433,14 @@ fn load_email_from_vault(
             })
             .collect();
         parts.sort();
-        Some(format!(
-            "Accounts: {}\nUse the `account` parameter on email tools to select which account.",
-            parts.join(", ")
-        ))
+        let own = "Each person's own accounts are read when they call; a call naming none uses their default.";
+        Some(match parts.is_empty() {
+            true => format!("Email accounts: {own}"),
+            false => format!(
+                "Shared accounts: {}\n{own}\nUse the `account` parameter on email tools to select which account.",
+                parts.join(", ")
+            ),
+        })
     };
 
     let acct_count = accounts.len();

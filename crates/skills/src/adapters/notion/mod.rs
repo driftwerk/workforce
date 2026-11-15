@@ -8,12 +8,13 @@ pub mod client;
 pub mod config;
 pub mod tools;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use workforce_agent::tools::Tool;
 
-use crate::adapters::utils::{build_instances, Instances};
+use crate::adapters::utils::{
+    build_instances, live_from_config, InstancePaths, Instances, LiveInstances,
+};
 use crate::definition::{
     CredentialRequirement, SkillDefinition, SkillPolicy, SkillRequirements, SkillTool,
 };
@@ -49,14 +50,14 @@ pub const WRITE_TOOLS: &[&str] = &[
 ];
 
 pub struct NotionSkill {
-    clients: Arc<HashMap<String, Arc<client::NotionClient>>>,
+    clients: Arc<LiveInstances<client::NotionClient>>,
     default_workspace: String,
 }
 
 impl NotionSkill {
     /// Build from config with static credentials. Errors if no workspaces are configured.
     pub fn new(config: NotionSkillConfig) -> eyre::Result<Self> {
-        Self::build(config, |_, ws| {
+        Self::build(config, None, |_, ws| {
             client::NotionClient::new(&ws.token, ws.max_results)
         })
     }
@@ -67,26 +68,64 @@ impl NotionSkill {
         config: NotionSkillConfig,
         store: Arc<dyn workforce_common::settings::SecretStore>,
     ) -> eyre::Result<Self> {
-        Self::build(config, |name, ws| {
+        let live = (Arc::clone(&store), Self::instance_paths());
+        Self::build(config, Some(live), move |name, ws| {
             client::NotionClient::with_store(Arc::clone(&store), name, ws.max_results)
         })
     }
 
     fn build(
         config: NotionSkillConfig,
-        make: impl Fn(&str, &NotionWorkspaceConfig) -> eyre::Result<client::NotionClient>,
+        live: Option<(
+            Arc<dyn workforce_common::settings::SecretStore>,
+            InstancePaths,
+        )>,
+        make: impl Fn(&str, &NotionWorkspaceConfig) -> eyre::Result<client::NotionClient>
+            + Send
+            + Sync
+            + 'static,
     ) -> eyre::Result<Self> {
+        let resolved = config.resolve();
         let Instances { clients, default } = build_instances(
             "notion",
-            &config.resolve(),
+            &resolved,
             config.default_workspace.as_deref(),
             "No Notion workspaces configured. Set `token` or `[workspaces.<name>]`.",
-            make,
+            &make,
         )?;
+        // Store-backed: the instances are the caller's, read per call; the
+        // loader's are only asked whether there is anything to load.
+        let clients = Arc::new(match live {
+            None => LiveInstances::fixed(Instances {
+                clients,
+                default: default.clone(),
+            }),
+            Some((store, paths)) => live_from_config(
+                store,
+                paths,
+                config.default_workspace.clone(),
+                resolved,
+                NotionWorkspaceConfig {
+                    token: String::new(),
+                    max_results: config::default_max_results(),
+                },
+                make,
+            ),
+        });
         Ok(Self {
             clients,
             default_workspace: default,
         })
+    }
+
+    /// Where this adapter's instances live in the vault.
+    pub fn instance_paths() -> InstancePaths {
+        InstancePaths::new("skills/notion/workspaces/", "token", "skills/notion/token")
+    }
+
+    /// The instances this skill exposes, read as whoever asks.
+    pub fn instance_source(&self) -> Arc<dyn workforce_agent::llm::environment::InstanceSource> {
+        Arc::clone(&self.clients) as Arc<dyn workforce_agent::llm::environment::InstanceSource>
     }
 
     pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
@@ -391,6 +430,7 @@ impl NotionSkill {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn read_and_write_tool_lists_cover_all_tools() {

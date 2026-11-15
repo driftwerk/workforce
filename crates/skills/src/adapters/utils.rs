@@ -131,6 +131,12 @@ impl InstancePaths {
     }
 }
 
+/// The instance parameter's description when the set is read per caller:
+/// it names none, since a tool's schema is built once and shown to everyone.
+pub const LIVE_INSTANCE_DESCRIPTION: &str =
+    "Which of your connections to use (by name). Uses your default if omitted; \
+     a name you don't have is answered with the ones you do.";
+
 type MakeClient<C> = dyn Fn(&str) -> eyre::Result<C> + Send + Sync;
 
 /// An adapter's instances, read as the caller on every call.
@@ -154,6 +160,7 @@ struct Live<C> {
     selector: Option<String>,
     make: Box<MakeClient<C>>,
     built: std::sync::Mutex<HashMap<String, Arc<C>>>,
+    on_built: Option<Box<dyn Fn(&Arc<C>) + Send + Sync>>,
 }
 
 impl<C> LiveInstances<C> {
@@ -190,8 +197,17 @@ impl<C> LiveInstances<C> {
                     .filter(|s| !s.is_empty()),
                 make: Box::new(make),
                 built: std::sync::Mutex::new(HashMap::new()),
+                on_built: None,
             }),
         }
+    }
+
+    /// Run `hook` on each client a live set builds, once, as it is built.
+    pub fn on_built(mut self, hook: impl Fn(&Arc<C>) + Send + Sync + 'static) -> Self {
+        if let Some(live) = self.live.as_mut() {
+            live.on_built = Some(Box::new(hook));
+        }
+        self
     }
 
     /// Whether the set is read per caller (so a tool's schema must not name
@@ -217,6 +233,9 @@ impl<C> LiveInstances<C> {
                     None => match (live.make)(&name) {
                         Ok(client) => {
                             let client = Arc::new(client);
+                            if let Some(hook) = live.on_built.as_ref() {
+                                hook(&client);
+                            }
                             built.insert(name.clone(), Arc::clone(&client));
                             client
                         }
@@ -236,12 +255,51 @@ impl<C> LiveInstances<C> {
         (Arc::new(clients), default)
     }
 
+    /// [`Self::for_caller`], except that a fixed set answers with
+    /// `fixed_default` (the default its tool was built with).
+    pub fn for_caller_or(&self, fixed_default: &str) -> (Arc<HashMap<String, Arc<C>>>, String) {
+        match self.live {
+            Some(_) => self.for_caller(),
+            None => (self.for_caller().0, fixed_default.to_string()),
+        }
+    }
+
     /// The caller's instance names, sorted.
     pub fn names(&self) -> Vec<String> {
         let (clients, _) = self.for_caller();
         let mut names: Vec<String> = clients.keys().cloned().collect();
         names.sort();
         names
+    }
+}
+
+/// A live set for an adapter whose loader read a config: each instance's
+/// client is made from that config's entry for its name (its settings were
+/// read from the shared tiers), or from `neutral` for an instance the loader
+/// never saw (another person's). Keys never come from the config: a
+/// store-backed client resolves them per call, as the caller.
+pub fn live_from_config<W, C>(
+    store: Arc<dyn workforce_common::settings::SecretStore>,
+    paths: InstancePaths,
+    selector: Option<String>,
+    resolved: Vec<(String, W)>,
+    neutral: W,
+    make: impl Fn(&str, &W) -> eyre::Result<C> + Send + Sync + 'static,
+) -> LiveInstances<C>
+where
+    W: Send + Sync + 'static,
+{
+    let templates: HashMap<String, W> = resolved.into_iter().collect();
+    LiveInstances::live(store, paths, selector, move |name| {
+        make(name, templates.get(name).unwrap_or(&neutral))
+    })
+}
+
+/// A fixed set from a plain map (its default is `default`; tools that keep
+/// their own default use [`LiveInstances::for_caller_or`]).
+impl<C> From<HashMap<String, Arc<C>>> for LiveInstances<C> {
+    fn from(clients: HashMap<String, Arc<C>>) -> Self {
+        Self::fixed_map(clients, "default")
     }
 }
 

@@ -15,7 +15,6 @@
 //! prompt-injection attempts in Postmark-fetched data can't escape the
 //! security boundary.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -28,6 +27,7 @@ use workforce_agent::tools::{Tool, ToolResult};
 use crate::adapters::utils::{
     artifact_attachments_schema, coerce_to_u64, html_with_inline_images, instance_choices,
     resolve_artifact_attachments, truncate_string_fields, wrap_field, wrap_fields_in_place,
+    LiveInstances, LIVE_INSTANCE_DESCRIPTION,
 };
 
 use super::client::PostmarkClient;
@@ -62,10 +62,12 @@ const MESSAGE_BODY_MAX_BYTES: usize = 25_000;
 /// 1. Explicit `workspace` parameter (errors if unknown).
 /// 2. Fall back to `default_workspace`.
 fn resolve_client(
-    clients: &HashMap<String, Arc<PostmarkClient>>,
+    instances: &LiveInstances<PostmarkClient>,
     default_workspace: &str,
     input: &Value,
 ) -> Result<Arc<PostmarkClient>> {
+    let (clients, default_workspace) = instances.for_caller_or(default_workspace);
+    let (clients, default_workspace) = (&*clients, default_workspace.as_str());
     let name = workforce_agent::llm::environment::resolve_instance(
         "postmark",
         input.get("workspace").and_then(|v| v.as_str()),
@@ -84,9 +86,16 @@ fn resolve_client(
 /// Build a dynamic description for the `workspace` parameter, listing the
 /// available workspaces so the LLM knows what's valid.
 fn workspace_description(
-    clients: &HashMap<String, Arc<PostmarkClient>>,
+    instances: &LiveInstances<PostmarkClient>,
     default_workspace: &str,
 ) -> String {
+    // A set read per caller names no instance: a schema is built once
+    // and shown to everyone.
+    if instances.is_live() {
+        return LIVE_INSTANCE_DESCRIPTION.into();
+    }
+    let (clients, default_workspace) = instances.for_caller_or(default_workspace);
+    let (clients, default_workspace) = (&*clients, default_workspace.as_str());
     if clients.len() <= 1 {
         return "Postmark workspace name. Uses the default if omitted.".to_string();
     }
@@ -169,13 +178,13 @@ macro_rules! resolve_or_fail {
 macro_rules! pm_tool_struct {
     ($name:ident) => {
         pub struct $name {
-            clients: Arc<HashMap<String, Arc<PostmarkClient>>>,
+            clients: Arc<LiveInstances<PostmarkClient>>,
             default_workspace: String,
         }
 
         impl $name {
             pub fn new(
-                clients: Arc<HashMap<String, Arc<PostmarkClient>>>,
+                clients: Arc<LiveInstances<PostmarkClient>>,
                 default_workspace: String,
             ) -> Self {
                 Self {
@@ -2066,6 +2075,7 @@ impl Tool for PostmarkApiTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn merge_artifact_attachments_noop_preserves_existing() {
@@ -2118,7 +2128,7 @@ mod tests {
             .contains(&format!("cid:{cid}")));
     }
 
-    fn make_clients() -> Arc<HashMap<String, Arc<PostmarkClient>>> {
+    fn make_clients() -> Arc<LiveInstances<PostmarkClient>> {
         let mut m = HashMap::new();
         m.insert(
             "default".to_string(),
@@ -2128,7 +2138,7 @@ mod tests {
             "work".to_string(),
             Arc::new(PostmarkClient::new("pm_server_work", Some("pm_acct"), None).unwrap()),
         );
-        Arc::new(m)
+        Arc::new(LiveInstances::from(m))
     }
 
     #[test]
@@ -2172,7 +2182,7 @@ mod tests {
             "default".to_string(),
             Arc::new(PostmarkClient::new("pm_s", None, None).unwrap()),
         );
-        let clients = Arc::new(m);
+        let clients = LiveInstances::from(m);
         let desc = workspace_description(&clients, "default");
         assert!(desc.contains("Uses the default if omitted"));
     }

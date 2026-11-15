@@ -9,7 +9,6 @@
 //! `wrap_external_content` so prompt-injection attempts in Datadog data
 //! can't escape the security boundary.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -31,7 +30,9 @@ use workforce_agent::security::external_content::wrap_external_content;
 use workforce_agent::tools::image_gen::GENERATED_IMAGES_KEY;
 use workforce_agent::tools::{Tool, ToolResult};
 
-use crate::adapters::utils::{coerce_to_i64, coerce_to_u64, instance_choices};
+use crate::adapters::utils::{
+    coerce_to_i64, coerce_to_u64, instance_choices, LiveInstances, LIVE_INSTANCE_DESCRIPTION,
+};
 
 use super::client::DatadogClient;
 
@@ -53,10 +54,12 @@ fn wrap_field(value: &Value, source: &str) -> Value {
 /// 1. Explicit `account` parameter (errors if unknown).
 /// 2. Fall back to `default_account`.
 fn resolve_client(
-    clients: &HashMap<String, Arc<DatadogClient>>,
+    instances: &LiveInstances<DatadogClient>,
     default_account: &str,
     input: &Value,
 ) -> Result<Arc<DatadogClient>> {
+    let (clients, default_account) = instances.for_caller_or(default_account);
+    let (clients, default_account) = (&*clients, default_account.as_str());
     let account = workforce_agent::llm::environment::resolve_instance(
         "datadog",
         input.get("account").and_then(|v| v.as_str()),
@@ -74,10 +77,14 @@ fn resolve_client(
 
 /// Build a dynamic description for the `account` parameter, listing the
 /// available accounts so the LLM knows what's valid.
-fn account_description(
-    clients: &HashMap<String, Arc<DatadogClient>>,
-    default_account: &str,
-) -> String {
+fn account_description(instances: &LiveInstances<DatadogClient>, default_account: &str) -> String {
+    // A set read per caller names no instance: a schema is built once
+    // and shown to everyone.
+    if instances.is_live() {
+        return LIVE_INSTANCE_DESCRIPTION.into();
+    }
+    let (clients, default_account) = instances.for_caller_or(default_account);
+    let (clients, default_account) = (&*clients, default_account.as_str());
     if clients.len() <= 1 {
         return "Datadog account name. Uses the default if omitted.".to_string();
     }
@@ -194,13 +201,13 @@ macro_rules! resolve_or_fail {
 macro_rules! dd_tool_struct {
     ($name:ident) => {
         pub struct $name {
-            clients: Arc<HashMap<String, Arc<DatadogClient>>>,
+            clients: Arc<LiveInstances<DatadogClient>>,
             default_account: String,
         }
 
         impl $name {
             pub fn new(
-                clients: Arc<HashMap<String, Arc<DatadogClient>>>,
+                clients: Arc<LiveInstances<DatadogClient>>,
                 default_account: String,
             ) -> Self {
                 Self {
@@ -2329,8 +2336,9 @@ impl Tool for DatadogApiTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
-    type ClientMap = Arc<HashMap<String, Arc<DatadogClient>>>;
+    type ClientMap = Arc<LiveInstances<DatadogClient>>;
 
     fn make_client() -> Arc<DatadogClient> {
         Arc::new(DatadogClient::new("api", "app", "us1", None).unwrap())
@@ -2454,7 +2462,7 @@ mod tests {
             .into_iter()
             .map(|(name, _)| (name.to_string(), make_client()))
             .collect();
-        Arc::new(clients)
+        Arc::new(LiveInstances::from(clients))
     }
 
     #[test]
@@ -2499,7 +2507,7 @@ mod tests {
     fn account_description_collapses_when_single() {
         let mut map: HashMap<String, Arc<DatadogClient>> = HashMap::new();
         map.insert("only".to_string(), make_client());
-        let desc = account_description(&map, "only");
+        let desc = account_description(&LiveInstances::from((map).clone()), "only");
         assert!(desc.contains("default if omitted"));
     }
 

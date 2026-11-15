@@ -14,7 +14,9 @@ use std::sync::Arc;
 
 use workforce_agent::tools::Tool;
 
-use crate::adapters::utils::{build_instances, Instances};
+use crate::adapters::utils::{
+    build_instances, live_from_config, InstancePaths, Instances, LiveInstances,
+};
 use crate::definition::{
     CredentialRequirement, SkillDefinition, SkillPolicy, SkillRequirements, SkillTool,
 };
@@ -57,7 +59,7 @@ pub const WRITE_TOOLS: &[&str] = &[
 
 /// The Metabase skill — holds a client per configured instance.
 pub struct MetabaseSkill {
-    clients: Arc<HashMap<String, Arc<client::MetabaseClient>>>,
+    clients: Arc<LiveInstances<client::MetabaseClient>>,
     default_instance: String,
 }
 
@@ -65,7 +67,7 @@ impl MetabaseSkill {
     /// Build from config with static credentials. Use
     /// [`MetabaseSkill::with_store`] for per-user resolution.
     pub fn new(config: MetabaseSkillConfig) -> eyre::Result<Self> {
-        Self::build(config, |name, inst| {
+        Self::build(config, None, |name, inst| {
             let site_url = inst.site_url.as_deref().ok_or_else(|| {
                 eyre::eyre!("Metabase instance '{name}' has no site_url configured")
             })?;
@@ -81,7 +83,8 @@ impl MetabaseSkill {
         store: Arc<dyn workforce_common::settings::SecretStore>,
         schema_store: Option<Arc<dyn workforce_common::metabase_schema::MetabaseSchemaStore>>,
     ) -> eyre::Result<Self> {
-        Self::build(config, |name, inst| {
+        let live = (Arc::clone(&store), Self::instance_paths());
+        Self::build(config, Some(live), move |name, inst| {
             Ok(client::MetabaseClient::with_store(
                 Arc::clone(&store),
                 name,
@@ -93,41 +96,80 @@ impl MetabaseSkill {
     }
 
     /// The instance clients, for the sync pass.
+    /// The instances the caller in scope can query, by name.
     pub fn clients(&self) -> Arc<HashMap<String, Arc<client::MetabaseClient>>> {
-        Arc::clone(&self.clients)
+        self.clients.for_caller().0
     }
 
     fn build(
         config: MetabaseSkillConfig,
-        make: impl Fn(&str, &MetabaseInstanceConfig) -> eyre::Result<client::MetabaseClient>,
+        live: Option<(
+            Arc<dyn workforce_common::settings::SecretStore>,
+            InstancePaths,
+        )>,
+        make: impl Fn(&str, &MetabaseInstanceConfig) -> eyre::Result<client::MetabaseClient>
+            + Send
+            + Sync
+            + 'static,
     ) -> eyre::Result<Self> {
+        let resolved = config.resolve();
         let Instances { clients, default } = build_instances(
             "metabase",
-            &config.resolve(),
+            &resolved,
             config.default_instance.as_deref(),
             "No Metabase instances configured. Set `api_key`+`site_url` or `[instances.<name>]`.",
-            make,
+            &make,
         )?;
+        // Store-backed: the instances are the caller's, read per call; the
+        // loader's are only asked whether there is anything to load.
+        let clients = Arc::new(match live {
+            None => LiveInstances::fixed(Instances {
+                clients,
+                default: default.clone(),
+            }),
+            Some((store, paths)) => live_from_config(
+                store,
+                paths,
+                config.default_instance.clone(),
+                resolved,
+                MetabaseInstanceConfig {
+                    api_key: String::new(),
+                    site_url: None,
+                    max_query_rows: config::default_max_rows(),
+                },
+                make,
+            )
+            .on_built(client::track_live),
+        });
         Ok(Self {
             clients,
             default_instance: default,
         })
     }
 
-    /// The instances this skill exposes, for the environments of the agent
-    /// that loaded it.
-    pub fn variants(&self) -> Option<workforce_agent::llm::environment::SkillVariants> {
-        workforce_agent::llm::environment::SkillVariants::of(
-            self.clients.keys().cloned(),
-            &self.default_instance,
+    /// Where this adapter's instances live in the vault.
+    pub fn instance_paths() -> InstancePaths {
+        InstancePaths::new(
+            "skills/metabase/instances/",
+            "api_key",
+            "skills/metabase/api_key",
         )
+    }
+
+    /// The instances this skill exposes, read as whoever asks.
+    pub fn instance_source(&self) -> Arc<dyn workforce_agent::llm::environment::InstanceSource> {
+        Arc::clone(&self.clients) as Arc<dyn workforce_agent::llm::environment::InstanceSource>
     }
 
     /// All agent-callable tools. This is the point a client becomes a live
     /// tool client the hub publishes schema to; the sync pass's throwaway
     /// clients only ever call [`MetabaseSkill::clients`].
     pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
-        self.clients.values().for_each(client::track_live);
+        self.clients
+            .for_caller()
+            .0
+            .values()
+            .for_each(client::track_live);
         let c = &self.clients;
         let d = &self.default_instance;
         vec![

@@ -4,7 +4,6 @@
 //! selection. Rich text and title values from Notion are wrapped via
 //! `wrap_external_content` to defend against prompt injection.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -17,15 +16,19 @@ use workforce_agent::tools::{Tool, ToolResult};
 
 use super::client::NotionClient;
 use super::config::clamp_limit;
-use crate::adapters::utils::{coerce_to_u64, instance_choices};
+use crate::adapters::utils::{
+    coerce_to_u64, instance_choices, LiveInstances, LIVE_INSTANCE_DESCRIPTION,
+};
 
 // ── shared helpers ──────────────────────────────────────────────────
 
 fn resolve_client(
-    clients: &HashMap<String, Arc<NotionClient>>,
+    instances: &LiveInstances<NotionClient>,
     default_workspace: &str,
     input: &Value,
 ) -> eyre::Result<Arc<NotionClient>> {
+    let (clients, default_workspace) = instances.for_caller_or(default_workspace);
+    let (clients, default_workspace) = (&*clients, default_workspace.as_str());
     if let Some(name) = input["workspace"].as_str() {
         return clients.get(name).cloned().ok_or_else(|| {
             eyre::eyre!(
@@ -43,9 +46,16 @@ fn resolve_client(
 }
 
 fn workspace_description(
-    clients: &HashMap<String, Arc<NotionClient>>,
+    instances: &LiveInstances<NotionClient>,
     default_workspace: &str,
 ) -> String {
+    // A set read per caller names no instance: a schema is built once
+    // and shown to everyone.
+    if instances.is_live() {
+        return LIVE_INSTANCE_DESCRIPTION.into();
+    }
+    let (clients, default_workspace) = instances.for_caller_or(default_workspace);
+    let (clients, default_workspace) = (&*clients, default_workspace.as_str());
     if clients.len() <= 1 {
         return "Notion workspace name (for multi-workspace setups)".to_string();
     }
@@ -55,10 +65,7 @@ fn workspace_description(
     )
 }
 
-fn workspace_schema_prop(
-    clients: &HashMap<String, Arc<NotionClient>>,
-    default_workspace: &str,
-) -> Value {
+fn workspace_schema_prop(clients: &LiveInstances<NotionClient>, default_workspace: &str) -> Value {
     json!({
         "type": "string",
         "description": workspace_description(clients, default_workspace)
@@ -121,7 +128,7 @@ fn coerce_id(val: &Value) -> eyre::Result<String> {
 
 #[derive(Clone)]
 struct Ctx {
-    clients: Arc<HashMap<String, Arc<NotionClient>>>,
+    clients: Arc<LiveInstances<NotionClient>>,
     default_workspace: String,
 }
 
@@ -141,7 +148,7 @@ macro_rules! notion_tool {
         }
         impl $struct {
             pub fn new(
-                clients: Arc<HashMap<String, Arc<NotionClient>>>,
+                clients: Arc<LiveInstances<NotionClient>>,
                 default_workspace: String,
             ) -> Self {
                 Self {
@@ -944,6 +951,7 @@ impl Tool for CommentCreateTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn workspace_description_single() {
@@ -952,7 +960,7 @@ mod tests {
             "default".to_string(),
             Arc::new(NotionClient::new("ntn_test", 100).unwrap()),
         );
-        let desc = workspace_description(&clients, "default");
+        let desc = workspace_description(&LiveInstances::from((clients).clone()), "default");
         assert!(desc.contains("multi-workspace"));
     }
 
@@ -967,11 +975,14 @@ mod tests {
             "dev".to_string(),
             Arc::new(NotionClient::new("ntn_dev", 100).unwrap()),
         );
-        let desc = workspace_description(&clients, "prod");
+        let desc = workspace_description(&LiveInstances::from((clients).clone()), "prod");
         assert!(desc.contains("prod"));
         assert!(desc.contains("dev"));
         assert!(desc.contains("Default: prod"));
-        assert!(workspace_description(&clients, "gone").contains("Default: none — pass workspace"));
+        assert!(
+            workspace_description(&LiveInstances::from((clients).clone()), "gone")
+                .contains("Default: none — pass workspace")
+        );
     }
 
     #[test]
@@ -981,9 +992,13 @@ mod tests {
             "prod".to_string(),
             Arc::new(NotionClient::new("ntn_prod", 100).unwrap()),
         );
-        let err = resolve_client(&clients, "prod", &json!({"workspace": "nope"}))
-            .err()
-            .unwrap();
+        let err = resolve_client(
+            &LiveInstances::from((clients).clone()),
+            "prod",
+            &json!({"workspace": "nope"}),
+        )
+        .err()
+        .unwrap();
         assert!(err.to_string().contains("Unknown Notion workspace"));
     }
 

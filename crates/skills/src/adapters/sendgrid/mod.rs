@@ -12,14 +12,15 @@ pub mod client;
 pub mod config;
 pub mod tools;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use eyre::Result;
 use workforce_agent::tools::Tool;
 use workforce_common::settings::SecretStore;
 
-use crate::adapters::utils::{build_instances, Instances};
+use crate::adapters::utils::{
+    build_instances, live_from_config, InstancePaths, Instances, LiveInstances,
+};
 use crate::definition::{CredentialRequirement, SkillDefinition, SkillRequirements};
 
 pub use client::{SendGridClient, Sender};
@@ -49,11 +50,9 @@ pub const WRITE_TOOLS: &[&str] = &[
     "sendgrid.api",
 ];
 
-type Clients = Arc<HashMap<String, Arc<SendGridClient>>>;
-
 /// The SendGrid skill — one client per configured workspace.
 pub struct SendGridSkill {
-    clients: Clients,
+    clients: Arc<LiveInstances<SendGridClient>>,
     default_workspace: String,
 }
 
@@ -61,7 +60,7 @@ impl SendGridSkill {
     /// Static credentials (local-mcp / config.toml). Use
     /// [`SendGridSkill::with_store`] for per-user resolution.
     pub fn new(config: SendGridSkillConfig) -> Result<Self> {
-        Self::build(config, |_, ws| {
+        Self::build(config, None, |_, ws| {
             let sender = ws.from_email.clone().map(|email| Sender {
                 email,
                 name: ws.from_name.clone(),
@@ -73,35 +72,67 @@ impl SendGridSkill {
     /// Credentials resolved from `store` on every request; pass a
     /// `LayeredUserVault` so per-user overlays apply.
     pub fn with_store(config: SendGridSkillConfig, store: Arc<dyn SecretStore>) -> Result<Self> {
-        Self::build(config, |name, ws| {
+        let live = (Arc::clone(&store), Self::instance_paths());
+        Self::build(config, Some(live), move |name, ws| {
             SendGridClient::with_store(Arc::clone(&store), name, ws.base_url.as_deref())
         })
     }
 
     fn build(
         config: SendGridSkillConfig,
-        make: impl Fn(&str, &SendGridWorkspaceConfig) -> Result<SendGridClient>,
+        live: Option<(
+            Arc<dyn workforce_common::settings::SecretStore>,
+            InstancePaths,
+        )>,
+        make: impl Fn(&str, &SendGridWorkspaceConfig) -> Result<SendGridClient> + Send + Sync + 'static,
     ) -> Result<Self> {
+        let resolved = config.resolve();
         let Instances { clients, default } = build_instances(
             "sendgrid",
-            &config.resolve(),
+            &resolved,
             config.default_workspace.as_deref(),
             "No SendGrid workspaces configured. Set api_key or workspaces.*.",
-            make,
+            &make,
         )?;
+        // Store-backed: the instances are the caller's, read per call; the
+        // loader's are only asked whether there is anything to load.
+        let clients = Arc::new(match live {
+            None => LiveInstances::fixed(Instances {
+                clients,
+                default: default.clone(),
+            }),
+            Some((store, paths)) => live_from_config(
+                store,
+                paths,
+                config.default_workspace.clone(),
+                resolved,
+                SendGridWorkspaceConfig {
+                    api_key: String::new(),
+                    from_email: None,
+                    from_name: None,
+                    base_url: None,
+                },
+                make,
+            ),
+        });
         Ok(Self {
             clients,
             default_workspace: default,
         })
     }
 
-    /// The instances this skill exposes, for the environments of the agent
-    /// that loaded it.
-    pub fn variants(&self) -> Option<workforce_agent::llm::environment::SkillVariants> {
-        workforce_agent::llm::environment::SkillVariants::of(
-            self.clients.keys().cloned(),
-            &self.default_workspace,
+    /// Where this adapter's instances live in the vault.
+    pub fn instance_paths() -> InstancePaths {
+        InstancePaths::new(
+            "skills/sendgrid/workspaces/",
+            "api_key",
+            "skills/sendgrid/api_key",
         )
+    }
+
+    /// The instances this skill exposes, read as whoever asks.
+    pub fn instance_source(&self) -> Arc<dyn workforce_agent::llm::environment::InstanceSource> {
+        Arc::clone(&self.clients) as Arc<dyn workforce_agent::llm::environment::InstanceSource>
     }
 
     pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
@@ -144,6 +175,7 @@ impl SendGridSkill {
 mod tests {
     use super::*;
     use crate::adapters::test_support::{assert_read_write_partition, InMem};
+    use std::collections::HashMap;
 
     fn flat() -> SendGridSkillConfig {
         SendGridSkillConfig {
@@ -179,7 +211,7 @@ mod tests {
         let skill = SendGridSkill::with_store(config, InMem::from(&[])).unwrap();
         assert_eq!(skill.default_workspace, "acme");
         assert_eq!(
-            skill.clients["acme"].base_url(),
+            skill.clients.for_caller().0["acme"].base_url(),
             "https://api.eu.sendgrid.com"
         );
     }

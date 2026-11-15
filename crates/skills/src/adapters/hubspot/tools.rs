@@ -4,7 +4,6 @@
 //! selection (explicit -> default). CRM property values are wrapped via
 //! `wrap_external_content` to defend against prompt injection.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -17,15 +16,19 @@ use workforce_agent::tools::{Tool, ToolResult};
 
 use super::client::HubspotClient;
 use super::config::clamp_limit;
-use crate::adapters::utils::{coerce_to_u64, instance_choices};
+use crate::adapters::utils::{
+    coerce_to_u64, instance_choices, LiveInstances, LIVE_INSTANCE_DESCRIPTION,
+};
 
 // ── shared helpers ──────────────────────────────────────────────────
 
 fn resolve_client(
-    clients: &HashMap<String, Arc<HubspotClient>>,
+    instances: &LiveInstances<HubspotClient>,
     default_portal: &str,
     input: &Value,
 ) -> eyre::Result<Arc<HubspotClient>> {
+    let (clients, default_portal) = instances.for_caller_or(default_portal);
+    let (clients, default_portal) = (&*clients, default_portal.as_str());
     if let Some(name) = input["portal"].as_str() {
         return clients.get(name).cloned().ok_or_else(|| {
             eyre::eyre!(
@@ -42,10 +45,14 @@ fn resolve_client(
     })
 }
 
-fn portal_description(
-    clients: &HashMap<String, Arc<HubspotClient>>,
-    default_portal: &str,
-) -> String {
+fn portal_description(instances: &LiveInstances<HubspotClient>, default_portal: &str) -> String {
+    // A set read per caller names no instance: a schema is built once
+    // and shown to everyone.
+    if instances.is_live() {
+        return LIVE_INSTANCE_DESCRIPTION.into();
+    }
+    let (clients, default_portal) = instances.for_caller_or(default_portal);
+    let (clients, default_portal) = (&*clients, default_portal.as_str());
     if clients.len() <= 1 {
         return "HubSpot portal name (for multi-portal setups)".to_string();
     }
@@ -55,10 +62,7 @@ fn portal_description(
     )
 }
 
-fn portal_schema_prop(
-    clients: &HashMap<String, Arc<HubspotClient>>,
-    default_portal: &str,
-) -> Value {
+fn portal_schema_prop(clients: &LiveInstances<HubspotClient>, default_portal: &str) -> Value {
     json!({
         "type": "string",
         "description": portal_description(clients, default_portal)
@@ -118,7 +122,7 @@ pub(super) fn extract_paging(resp: &Value) -> Value {
 
 #[derive(Clone)]
 pub(super) struct Ctx {
-    pub(super) clients: Arc<HashMap<String, Arc<HubspotClient>>>,
+    pub(super) clients: Arc<LiveInstances<HubspotClient>>,
     pub(super) default_portal: String,
 }
 
@@ -139,9 +143,8 @@ macro_rules! hubspot_tool {
         impl $struct {
             pub fn new(
                 clients: ::std::sync::Arc<
-                    ::std::collections::HashMap<
-                        String,
-                        ::std::sync::Arc<$crate::adapters::hubspot::client::HubspotClient>,
+                    $crate::adapters::utils::LiveInstances<
+                        $crate::adapters::hubspot::client::HubspotClient,
                     >,
                 >,
                 default_portal: String,
@@ -1289,6 +1292,7 @@ pub(super) fn append_associations_query(query: &mut Vec<(&str, String)>, input: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn portal_description_single() {
@@ -1297,7 +1301,7 @@ mod tests {
             "default".to_string(),
             Arc::new(HubspotClient::new("pat-test", 100).unwrap()),
         );
-        let desc = portal_description(&clients, "default");
+        let desc = portal_description(&LiveInstances::from((clients).clone()), "default");
         assert!(desc.contains("multi-portal"));
     }
 
@@ -1312,11 +1316,14 @@ mod tests {
             "sandbox".to_string(),
             Arc::new(HubspotClient::new("pat-sandbox", 100).unwrap()),
         );
-        let desc = portal_description(&clients, "prod");
+        let desc = portal_description(&LiveInstances::from((clients).clone()), "prod");
         assert!(desc.contains("prod"));
         assert!(desc.contains("sandbox"));
         assert!(desc.contains("Default: prod"));
-        assert!(portal_description(&clients, "gone").contains("Default: none — pass portal"));
+        assert!(
+            portal_description(&LiveInstances::from((clients).clone()), "gone")
+                .contains("Default: none — pass portal")
+        );
     }
 
     #[test]
@@ -1326,9 +1333,13 @@ mod tests {
             "prod".to_string(),
             Arc::new(HubspotClient::new("pat-prod", 100).unwrap()),
         );
-        let err = resolve_client(&clients, "prod", &json!({"portal": "nope"}))
-            .err()
-            .unwrap();
+        let err = resolve_client(
+            &LiveInstances::from((clients).clone()),
+            "prod",
+            &json!({"portal": "nope"}),
+        )
+        .err()
+        .unwrap();
         assert!(err.to_string().contains("Unknown HubSpot portal"));
     }
 
