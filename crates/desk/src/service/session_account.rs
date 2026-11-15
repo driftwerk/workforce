@@ -128,6 +128,24 @@ struct Said {
     reads: Vec<Read>,
     /// Closed exchanges are left unread for another round.
     more: bool,
+    /// What the transcript (or screen) said last, as [`tail_print`] has
+    /// it: kept for a turn's end or a read, none for a running turn's `now`.
+    tail: Option<String>,
+}
+
+/// The fingerprint of what `tail` says: the transcript's latest words when
+/// it has some, else the screen's, in a stable hash (it outlives a new
+/// build). None when it says nothing.
+fn tail_print(tail: &Tail) -> Option<String> {
+    use sha2::{Digest as _, Sha256};
+    let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let said = tail
+        .said
+        .as_deref()
+        .map(flat)
+        .filter(|s| !s.is_empty())
+        .or_else(|| tail.screen.as_deref().map(flat).filter(|s| !s.is_empty()))?;
+    Some(hex::encode(&Sha256::digest(said.as_bytes())[..16]))
 }
 
 fn fingerprint(tail: &Tail) -> u64 {
@@ -538,6 +556,10 @@ impl Desk {
             fresh.asked_by = a.clone();
         }
         fresh.cursor = kept.cursor.with(said.reads.iter().cloned());
+        if let Some(t) = &said.tail {
+            fresh.cursor.tail = Some(t.clone());
+            fresh.cursor.read_at = Some(at);
+        }
         // A plain write never says the model's words are gone.
         fresh.by_model = said.by_model || kept.by_model;
         fresh.stale_after = None;
@@ -562,6 +584,10 @@ impl Desk {
                     }
                 }
                 again.cursor = newer.cursor.with(said.reads.iter().cloned());
+                if let Some(t) = &said.tail {
+                    again.cursor.tail = Some(t.clone());
+                    again.cursor.read_at = Some(at);
+                }
                 again.by_model = said.by_model || newer.by_model;
                 match self.0.store.session_account_put(&again).await? {
                     Put::Kept(v) => Account {
@@ -813,11 +839,45 @@ impl Desk {
             })
             .collect();
         let more = unread[upto..].iter().any(|(x, _)| x.ended.is_some());
+        // What the transcript (or screen) says last is read every time, so
+        // the next refresh can tell the same words again from new ones.
+        let latest = self.account_tail(id).await;
+        let print = tail_print(&latest);
+        let screen_only = latest.said.as_deref().is_none_or(|s| s.trim().is_empty());
+        // Nothing new in the session since its account was last read: no
+        // exchange to read, nothing given to it since, not working. A
+        // restart, a switch of account or a reader's refresh of an idle
+        // session finds just this.
+        let given = {
+            let base = kept.cursor.read_at.unwrap_or(kept.written_at);
+            self.last_input_of(id).is_some_and(|t| t > base)
+        };
+        let nothing_new = delta.is_empty() && kept.version > 0 && !working && !given;
+        // The same words as last read (an account read before the
+        // fingerprint was kept: its exchanges were harvested, so the
+        // transcript holds nothing they didn't).
+        let same = match &kept.cursor.tail {
+            Some(t) => print.as_ref() == Some(t),
+            None => kept.cursor.newest.is_some(),
+        };
+        if nothing_new && same {
+            // Nothing to say: no model is asked and nothing is said. An
+            // account kept before the fingerprint has it kept now (and
+            // nothing else), so the next refresh can tell new words.
+            let legacy = kept.cursor.tail.is_none() && print.is_some();
+            return Ok((!reads.is_empty() || legacy).then(|| Said {
+                written: Written::default(),
+                by_model: kept.by_model,
+                reads,
+                more,
+                tail: print.filter(|_| legacy),
+            }));
+        }
         // The harvest is off or behind, or the turn still runs: what the
         // transcript and screen say fills in.
         let closed = delta.iter().any(|x| x.ended.is_some());
         let tail = match !closed || working {
-            true => self.account_tail(id).await,
+            true => latest,
             false => Tail::default(),
         };
         if delta.is_empty() && tail.is_empty() {
@@ -827,14 +887,25 @@ impl Desk {
                 by_model: kept.by_model,
                 reads,
                 more,
+                tail: print,
             }));
         }
+        // A reader's re-read (never a turn's end, which may be a turn
+        // Desk or a boss asked for) of a session with no transcript, with
+        // nothing new in it: only the screen moved, and what is written is
+        // the account again, never news. A transcript's new words are a
+        // new reply, whoever asked for it.
+        let restated = nothing_new && screen_only && !share;
         if account::short(delta) {
             return Ok(Some(Said {
-                written: account::plainly(kept, ctx, delta, &tail, ended),
+                written: Written {
+                    restated,
+                    ..account::plainly(kept, ctx, delta, &tail, ended)
+                },
                 by_model: false,
                 reads,
                 more,
+                tail: print,
             }));
         }
         let nonce = Uuid::new_v4().simple().to_string()[..16].to_string();
@@ -863,16 +934,21 @@ impl Desk {
         };
         Ok(Some(match written {
             Some(w) => Said {
-                written: w,
+                written: Written { restated, ..w },
                 by_model: true,
                 reads,
                 more,
+                tail: print,
             },
             None => Said {
-                written: account::plainly(kept, ctx, delta, &tail, ended),
+                written: Written {
+                    restated,
+                    ..account::plainly(kept, ctx, delta, &tail, ended)
+                },
                 by_model: false,
                 reads,
                 more,
+                tail: print,
             },
         }))
     }
@@ -1011,6 +1087,7 @@ impl Desk {
             by_model: false,
             reads: vec![],
             more: false,
+            tail: None,
         };
         if short {
             return Ok(Some(plain()));
@@ -1036,6 +1113,7 @@ impl Desk {
                 by_model: true,
                 reads: vec![],
                 more: false,
+                tail: None,
             },
             None => plain(),
         }))

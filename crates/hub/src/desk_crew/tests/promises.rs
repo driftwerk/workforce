@@ -112,6 +112,7 @@ async fn an_order_links_its_sessions_and_is_done_when_the_account_shows_it() {
             text: "Merged main into the branch".into(),
             refs: vec![pr.clone()],
             at: chrono::Utc::now(),
+            restated: false,
         });
         let workforce_desk::account_store::Put::Kept(v) = d.store().session_account_put(&a).await.unwrap()
         else {
@@ -132,6 +133,7 @@ async fn an_order_links_its_sessions_and_is_done_when_the_account_shows_it() {
             text: "Merged #622 after CI went green".into(),
             refs: vec![pr],
             at: chrono::Utc::now(),
+            restated: false,
         });
         d.store().session_account_put(&a).await.unwrap();
         crew.look_at_items().await;

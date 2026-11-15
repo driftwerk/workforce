@@ -378,6 +378,7 @@ mod tests {
                     text: format!("step {i} {}", "with many words ".repeat(25)),
                     refs: vec![],
                     at: Utc::now(),
+                    restated: false,
                 })
                 .collect();
         }

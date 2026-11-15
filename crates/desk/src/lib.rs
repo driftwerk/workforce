@@ -154,3 +154,6 @@ pub use service::{HandedOff, HandoffPreview, Hop, LineageView};
 pub use speech::{Audio, Speak, SpeakError, Speech, SpeechProvider, VoiceKey};
 pub use store::DeskStore;
 pub use token_pipe::private_run_dir;
+/// The project a folder belongs to, by git (an update names a session's
+/// repository by it).
+pub use worktree::git_project;
