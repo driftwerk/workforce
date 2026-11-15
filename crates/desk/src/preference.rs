@@ -136,6 +136,12 @@ pub struct Preference {
     pub last_applied_at: Option<DateTime<Utc>>,
     pub overruled_count: i32,
     pub state: PrefState,
+    /// The Act fully directive it answers ([`crate::directive`]: a key,
+    /// or `own` for one in the person's own words), when one.
+    pub directive: Option<String>,
+    /// The answer to it (the answer's key), when it answers one of the
+    /// starter set.
+    pub directive_answer: Option<String>,
 }
 
 impl Preference {
@@ -163,6 +169,8 @@ impl Preference {
             last_applied_at: None,
             overruled_count: 0,
             state: PrefState::Active,
+            directive: None,
+            directive_answer: None,
         }
     }
 
@@ -238,14 +246,19 @@ pub fn ranked(mut prefs: Vec<Preference>) -> Vec<Preference> {
 /// a close match and not the preference's own, and naming each of `over`,
 /// the others that also applied and that it was chosen over.
 pub fn cite(applied: &Preference, close: bool, over: &[Preference], tz: chrono_tz::Tz) -> String {
+    // An Act fully directive is cited as one.
+    let what = match applied.directive.is_some() {
+        true => "directive",
+        false => "preference",
+    };
     let mut s = match close {
         false => format!(
-            "per your preference from {} ({})",
+            "per your {what} from {} ({})",
             applied.date(tz),
             applied.rule()
         ),
         true => format!(
-            "per your preference from {} ({}), as a close match: I read this case as covered; shout if wrong",
+            "per your {what} from {} ({}), as a close match: I read this case as covered; shout if wrong",
             applied.date(tz),
             applied.rule()
         ),

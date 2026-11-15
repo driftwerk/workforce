@@ -611,6 +611,17 @@ pub struct Extras {
     /// headline, and what it says beyond its `update`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub away: Option<crate::away::MentionedAway>,
+    /// Act fully's directives card: the boss whose directives it asks,
+    /// read live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directives: Option<crate::directive::MentionedDirectives>,
+    /// The one line an update adds on the directives still open.
+    #[serde(
+        default,
+        rename = "directivesOpen",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub directives_open: Option<crate::directive::MentionedNudge>,
 }
 
 impl Extras {
@@ -623,6 +634,8 @@ impl Extras {
             && self.item.is_none()
             && self.update.is_none()
             && self.away.is_none()
+            && self.directives.is_none()
+            && self.directives_open.is_none()
     }
 }
 

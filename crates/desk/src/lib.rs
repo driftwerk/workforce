@@ -37,6 +37,8 @@ pub mod decision;
 pub mod decision_store;
 mod devin;
 mod devin_config;
+pub mod directive;
+pub mod directive_store;
 pub mod engine;
 pub mod engine_accounts;
 mod first_run;
