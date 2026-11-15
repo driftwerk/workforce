@@ -4626,3 +4626,54 @@ async fn an_account_removed_while_it_signs_in_again_leaves_no_sign_in_behind() {
     })
     .await;
 }
+
+/// 14:12 on 11/15: a call of the hub's own found Work turned away by its
+/// organisation. The Floor says so once, naming who it is and what Desk
+/// uses meanwhile; an hourly re-check refused again says nothing new, and a
+/// call that serves on it again clears it.
+#[tokio::test]
+async fn an_account_the_provider_turned_away_is_told_once_by_name() {
+    use crate::engine_accounts::AccountNeed;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(
+            pool,
+            key_options(dir.path(), Arc::new(MemoryKeys::default())),
+        )
+        .await;
+        let (work, personal, _, _) = two_on_work(&d, dir.path()).await;
+        let reason = "its organisation has turned off Claude Code access";
+        let recheck = chrono::Utc::now() + chrono::Duration::hours(1);
+        d.hub_refused(work, reason, recheck, true);
+        let refused = |d: &Desk| {
+            d.account_needs()
+                .into_iter()
+                .filter(|n| matches!(n, AccountNeed::Refused { .. }))
+                .collect::<Vec<_>>()
+        };
+        let needs = refused(&d);
+        assert!(
+            matches!(
+                &needs[..],
+                [AccountNeed::Refused { account, reason: r, using: Some(using), .. }]
+                    if account.id == Some(work) && r == reason && using.id == Some(personal)
+            ),
+            "{needs:?}"
+        );
+        let first = needs[0].id().to_string();
+        let view = d.accounts();
+        let shown = view.iter().find(|a| a.id == work).unwrap();
+        assert_eq!(
+            shown.refused.as_ref().map(|r| r.reason.as_str()),
+            Some(reason)
+        );
+        // The hourly re-check refused again: the same need, never a new one.
+        d.hub_refused(work, reason, recheck + chrono::Duration::hours(1), false);
+        assert_eq!(refused(&d)[0].id(), first);
+        // It serves again: nothing is said of it any more.
+        d.hub_served(work, chrono::Utc::now());
+        assert!(refused(&d).is_empty());
+        assert!(d.accounts().iter().all(|a| a.refused.is_none()));
+    })
+    .await;
+}

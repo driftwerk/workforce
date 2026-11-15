@@ -564,8 +564,51 @@ struct ClaudeStatus {
     logged_in: bool,
     auth_method: Option<String>,
     org_id: Option<String>,
+    org_name: Option<String>,
     email: Option<String>,
     subscription_type: Option<String>,
+}
+
+/// Whose a Claude Code sign-in's account is, as Settings shows it: its
+/// email, organisation's name and plan. Never its token.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeProfile {
+    pub email: Option<String>,
+    pub org_name: Option<String>,
+    pub plan: Option<String>,
+}
+
+impl ClaudeProfile {
+    /// "kim@example.com, Acme": who the person knows the account as.
+    pub fn who(&self) -> Option<String> {
+        let parts: Vec<&str> = [self.email.as_deref(), self.org_name.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect();
+        (!parts.is_empty()).then(|| parts.join(", "))
+    }
+}
+
+/// The account Claude Code's `auth status --json` names and its profile:
+/// only a claude.ai sign-in names them (a long-lived token is
+/// inference-only, and says nothing of its account).
+pub fn claude_profile(status: &str) -> Option<(crate::identity::Identity, ClaudeProfile)> {
+    let s = serde_json::from_str::<ClaudeStatus>(status).ok()?;
+    if !s.logged_in {
+        return None;
+    }
+    let clean = |v: Option<String>| v.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let email = clean(s.email)?;
+    let identity = crate::identity::Identity::of(s.org_id.as_deref()?, &email)?;
+    Some((
+        identity,
+        ClaudeProfile {
+            email: Some(email),
+            org_name: clean(s.org_name),
+            plan: clean(s.subscription_type),
+        },
+    ))
 }
 
 /// The sign-ins that are a plan's: the claude.ai login and a plan's token.
@@ -996,6 +1039,28 @@ mod tests {
             })
         );
         let token = claude_sign_in(r#"{"loggedIn":true,"authMethod":"oauth_token"}"#);
+        // What a claude.ai sign-in says of its account, from a recorded
+        // `auth status --json` (2.1.325; values made up).
+        let status = include_str!("../fixtures/claude/auth_status.json");
+        let (identity, profile) = claude_profile(status).unwrap();
+        assert_eq!(
+            identity,
+            crate::identity::Identity::of("org-1", "kim@example.com").unwrap()
+        );
+        assert_eq!(
+            profile,
+            ClaudeProfile {
+                email: Some("kim@example.com".into()),
+                org_name: Some("Acme".into()),
+                plan: Some("max".into()),
+            }
+        );
+        assert_eq!(profile.who().as_deref(), Some("kim@example.com, Acme"));
+        assert_eq!(
+            claude_profile(r#"{"loggedIn":true,"authMethod":"oauth_token"}"#),
+            None,
+            "a long-lived token names no account"
+        );
         assert!(token.on_plan());
         assert_eq!(token.plan_account(), Some(LocalAccount::default()));
         let key = claude_sign_in(r#"{"loggedIn":true,"authMethod":"api_key"}"#);
