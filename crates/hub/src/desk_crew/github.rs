@@ -216,7 +216,7 @@ fn refused(error: &str) -> String {
         return NOT_CONNECTED.into();
     }
     // GitHub answers 404 for what the key may not see, too.
-    if lower.contains("404") || lower.contains("not found") {
+    if lower.contains("not found") {
         return "GitHub says there's no such pull request, run or repository that the person's \
             GitHub can see. Check the repo and number; if it's private, the person's key may not \
             reach it. Don't say it merged or passed."
@@ -298,7 +298,7 @@ fn run(r: &Value) -> Value {
         })
         .collect();
     let run = &r["run"];
-    json!({
+    let mut out = json!({
         "run": {
             "id": run["id"],
             "status": run["status"],
@@ -311,7 +311,11 @@ fn run(r: &Value) -> Value {
         "jobs": r["total_count"],
         "failed": jobs.len(),
         "named": fenced(&json!({ "workflow": run["name"], "branch": run["head_branch"], "failed_jobs": jobs })),
-    })
+    });
+    if run.is_null() {
+        out["note"] = json!("The run itself couldn't be read: don't say it passed.");
+    }
+    out
 }
 
 #[cfg(test)]
