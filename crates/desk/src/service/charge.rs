@@ -691,6 +691,16 @@ impl Desk {
     /// now ([`Self::holds_requests_for_boss`]): no other boss presses keys
     /// in its terminal.
     pub(super) fn holds_requests_for(&self, id: Uuid, boss: &str) -> bool {
+        // Checked now too, not only as the last sweep said: a session
+        // another boss has taken on since, or a boss no longer at Act
+        // fully, is no longer this one's.
+        let charged_to_another = self
+            .charge_of(id)
+            .filter(Charge::live)
+            .is_some_and(|c| c.boss != boss);
+        if charged_to_another || !self.boss_unbound(boss) {
+            return false;
+        }
         let ours = self
             .0
             .state
@@ -1500,7 +1510,8 @@ impl Desk {
         self.charge_withdraw(id).await;
         // A boss served from a grant let go of it: the turn it set going
         // ends here, so nothing of its work goes on under the person's own
-        // rules. The person starts it again if they want it.
+        // rules. The person starts it again if they want it. A dialog its
+        // terminal shows stays the person's to answer or clear.
         if served
             && matches!(
                 view.state,

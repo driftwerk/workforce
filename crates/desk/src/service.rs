@@ -4309,10 +4309,17 @@ impl Desk {
             // Blocked on what only its terminal's dialog answers: Esc there
             // turns it down, and the turn ends.
             // A boss clears only Claude Code's (the one it asks again).
-            let in_dialog = boss_clears
-                && (!by_boss || record.is_some_and(|r| r.engine == Engine::Claude))
-                && record.map(|r| r.state) == Some(SessionState::Blocked)
+            let dialog = record.map(|r| r.state) == Some(SessionState::Blocked)
                 && live.pending.as_ref().is_some_and(|p| !p.answerable);
+            let in_dialog = dialog
+                && boss_clears
+                && (!by_boss || record.is_some_and(|r| r.engine == Engine::Claude));
+            // Said, not done in silence: whoever pressed it is told.
+            if dialog && !in_dialog && !working {
+                return Err(DeskError::Conflict(
+                    "its terminal's dialog is the person's to clear, or its own boss's".into(),
+                ));
+            }
             keys.filter(|_| working || in_dialog)
                 .map(|keys| (Arc::clone(&live.pty), keys))
         };

@@ -909,6 +909,16 @@ async fn only_its_own_boss_clears_a_prompt_its_terminal_shows() {
         let (d, _logged) = logged_desk(pool, dir.path(), fake_cli(dir.path())).await;
         let s = asking_session(&d, dir.path()).await;
         prompted(&d, s.id, "ship the migration").await;
+        // Both bosses at Act fully: which one the session is held for decides.
+        let unbound = crate::charge::FullGrant {
+            anywhere: true,
+            unbound: true,
+            ..Default::default()
+        };
+        d.set_full(std::collections::HashMap::from([
+            ("crew".to_string(), unbound.clone()),
+            ("rival".to_string(), unbound),
+        ]));
         d.set_dialog_answerers(std::collections::HashMap::from([(
             s.id,
             super::DialogAnswerer {
@@ -926,7 +936,8 @@ async fn only_its_own_boss_clears_a_prompt_its_terminal_shows() {
         // Another boss: refused, and the dialog still waits.
         d.clear_dialog(s.id, p.id, boss("rival"))
             .expect_err("another boss clears nothing");
-        d.interrupt(s.id, Some(boss("rival"))).unwrap();
+        d.interrupt(s.id, Some(boss("rival")))
+            .expect_err("told it isn't theirs");
         let v = d.view(s.id).unwrap();
         assert_eq!(v.pending.map(|w| w.id), Some(p.id), "nothing was pressed");
         assert_eq!(v.state, SessionState::Blocked);
@@ -939,7 +950,10 @@ async fn only_its_own_boss_clears_a_prompt_its_terminal_shows() {
             hop: 0,
             preference: None,
         };
-        d.interrupt(s.id, Some(agent.clone())).unwrap();
+        d.interrupt(s.id, Some(agent.clone()))
+            .expect_err("an agent clears nothing");
+        d.interrupt(s.id, Some(crate::crew::By::desk("for the test")))
+            .expect_err("nor Desk");
         assert_eq!(d.view(s.id).unwrap().pending.map(|w| w.id), Some(p.id));
         d.clear_dialog(s.id, p.id, agent)
             .expect_err("only a boss clears a prompt");
