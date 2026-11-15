@@ -385,6 +385,7 @@ async fn a_refresh_that_loses_its_write_merges_onto_the_newer_account() {
                     text: "Wrote the failing test".into(),
                     refs: vec![],
                     at: crate::crew::now(),
+                    restated: false,
                 });
                 a.purpose = "Rival purpose.".into();
                 rival.session_account_put(&a).await.unwrap();
@@ -1233,6 +1234,91 @@ async fn a_shared_read_covers_as_far_as_the_account_reads_and_the_rest_is_due_at
         settle(&d).await;
         assert_eq!(deriver.calls(), 0);
         assert!(fake.asked.lock().is_empty());
+    })
+    .await;
+}
+
+/// An idle session restarted (a switch of account, the hub's restart) or
+/// refreshed for a reader, with no exchange it hadn't read and its
+/// transcript saying what it said, says nothing new: no model is asked,
+/// no done line is added, its account stands. A real turn after is read
+/// as ever, and its lines are news.
+#[tokio::test]
+async fn an_idle_sessions_restart_or_reread_says_nothing_new() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        // Rephrased each time it is asked: what a re-read of the same tail
+        // gave before.
+        let shipped = |text: &str| {
+            format!(
+                r#"{{"purpose": "Ship PLT-3010.", "done": [{{"text": "{text}", "refs": []}}],
+                  "now": "Idle.", "waiting_on": "the person's answer", "next": "Wait."}}"#
+            )
+        };
+        let fake = Fake::answering(&[
+            &shipped("PLT-3010 shipped"),
+            &shipped("Shipped PLT-3010"),
+            &shipped("Opened PR #624 for the edit form"),
+        ]);
+        DeskStore::migrate(&pool).await.unwrap();
+        let store = DeskStore::from_pool(pool.clone());
+        let transcript = dir.path().join("t.jsonl");
+        let reply = |text: &str| {
+            format!(
+                r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{text}"}}]}}}}"#
+            )
+        };
+        std::fs::write(&transcript, reply("PLT-3010 shipped; waiting on your answer.") + "\n")
+            .unwrap();
+        let mut r = record_fixture("plt-3010");
+        r.state = crate::model::SessionState::Idle;
+        r.transcript = Some(transcript.to_string_lossy().into_owned());
+        store.put(&r).await.unwrap();
+        let id = r.id;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let d = Desk::start(
+            DeskStore::from_pool(pool.clone()),
+            crate::testing::options(dir.path()),
+            super::Floor {
+                accountant: Some(Arc::clone(&fake) as Arc<dyn Accountant>),
+                redactor: Some(Arc::new(crate::memory::record::tests::Plain)),
+                ..Default::default()
+            },
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+        d.set_bosses(vec![Boss {
+            agent: "boss".into(),
+            name: "Desk".into(),
+            scope: Scope::Ungrouped,
+            level: "act".into(),
+        }]);
+        harvested(&store, id, &[exchange("x1", 60 * 24 * 3, &"Shipped it. ".repeat(40), 2)]).await;
+        let first = d.account_refresh(id, Moment::TurnEnd).await.unwrap().unwrap();
+        assert_eq!(fake.calls(), 1);
+        assert_eq!(first.done.len(), 1);
+        assert!(first.cursor.tail.is_some(), "what it said last is kept");
+
+        // Restarted on another account (its exit ends a turn), then read:
+        // nothing new, no call, the account as it was.
+        for moment in [Moment::TurnEnd, Moment::Read, Moment::TurnEnd] {
+            d.account_refresh(id, moment).await.unwrap();
+        }
+        assert_eq!(fake.calls(), 1, "nothing new asks no model");
+        let after = kept(&d, id).await;
+        assert_eq!(after.version, first.version);
+        assert_eq!(after.done, first.done, "no line said again");
+
+        // Control: a real turn is read, and its line is news.
+        harvested(&store, id, &[exchange("x2", 1, &"Opened the PR. ".repeat(40), 2)]).await;
+        std::fs::write(&transcript, reply("PR #624 is up.") + "\n").unwrap();
+        let real = d.account_refresh(id, Moment::TurnEnd).await.unwrap().unwrap();
+        assert_eq!(fake.calls(), 2);
+        let line = real.done.last().unwrap();
+        assert!(!line.restated, "{line:?}");
+        assert_ne!(real.cursor.tail, first.cursor.tail);
+        cancel.cancel();
     })
     .await;
 }

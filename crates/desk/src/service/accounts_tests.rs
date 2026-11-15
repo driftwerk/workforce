@@ -561,7 +561,8 @@ async fn codex_signs_in_by_its_device_page_and_its_sign_in_is_read_again_at_once
         assert_eq!(
             d.engine_sign_in(second.id).unwrap().state,
             EngineSignInState::Failed {
-                why: super::engine_sign_ins::DEVICE_FAILED.into()
+                why: super::engine_sign_ins::DEVICE_FAILED.into(),
+                instead: None,
             }
         );
         assert!(d.cancel_engine_sign_in(second.id).is_ok());
@@ -684,10 +685,18 @@ fn devin_browser() -> (&'static [u8], &'static [u8]) {
 async fn devin_failed(d: &Desk, id: Uuid) -> String {
     use super::engine_sign_ins::EngineSignInState;
     until(|| match d.engine_sign_in(id).unwrap().state {
-        EngineSignInState::Failed { why } => Some(why),
+        EngineSignInState::Failed { why, .. } => Some(why),
         _ => None,
     })
     .await
+}
+
+/// The way on Desk is offered beside Devin's failed sign-in `id`.
+fn devin_instead(d: &Desk, id: Uuid) -> Option<String> {
+    match d.engine_sign_in(id).unwrap().state {
+        super::engine_sign_ins::EngineSignInState::Failed { instead, .. } => instead,
+        other => panic!("not failed: {other:?}"),
+    }
 }
 
 /// What Desk says of Devin's sign-in on this computer now.
@@ -733,6 +742,65 @@ fn leaked(text: &str, secret: &str) -> Vec<String> {
         .filter(|piece| text.contains(piece))
         .map(str::to_string)
         .collect()
+}
+
+/// An engine's own sign-in is the hub holder's alone: anyone else the hub
+/// lets in (another administrator, the hub's own token alone) starts none,
+/// reads none's code, types into none and stops none; and no token is
+/// taken from the address, which logs keep.
+#[tokio::test]
+async fn only_the_hub_holder_signs_an_engine_in() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut o = account_options(dir.path(), Arc::new(MemoryKeys::default()));
+        o.programs.insert(Engine::Devin, devin(dir.path()));
+        let d = desk(pool, o).await;
+        let holder = crate::api::sessions_router(d.clone(), crate::testing::allow_all());
+        let other = crate::api::sessions_router(d.clone(), crate::testing::not_holder());
+        let start = serde_json::json!({"engine": "devin", "manual": true});
+        let at = format!("/api/desk/engines/sign-ins/{}", Uuid::new_v4());
+        // Refused before anything is looked up or started.
+        for (method, uri, body) in [
+            (
+                "POST",
+                "/api/desk/engines/sign-ins".to_string(),
+                Some(start.clone()),
+            ),
+            ("GET", at.clone(), None),
+            (
+                "POST",
+                format!("{at}/token"),
+                Some(serde_json::json!({"token": "abc"})),
+            ),
+            ("DELETE", at.clone(), None),
+        ] {
+            let (code, said) = api(&other, method, &uri, body).await;
+            assert_eq!(code, 403, "{method} {uri}: {said}");
+            assert!(said.get("id").is_none(), "{said}");
+        }
+        // A token in the address is refused, even the holder's.
+        for (method, uri, body) in [
+            (
+                "POST",
+                "/api/desk/engines/sign-ins?token=hub-token".to_string(),
+                Some(start),
+            ),
+            ("GET", format!("{at}?token=hub-token"), None),
+            (
+                "POST",
+                format!("{at}/token?token=hub-token"),
+                Some(serde_json::json!({"token": "abc"})),
+            ),
+            ("DELETE", format!("{at}?token=hub-token"), None),
+        ] {
+            let (code, said) = api(&holder, method, &uri, body).await;
+            assert_eq!(code, 400, "{method} {uri}: {said}");
+        }
+        // The holder is let through: a sign-in that isn't there is not found.
+        let (code, _) = api(&holder, "GET", &at, None).await;
+        assert_eq!(code, 404);
+    })
+    .await;
 }
 
 // One thread, so everything the desk spawns logs to the subscriber set here.
@@ -906,7 +974,7 @@ async fn devin_signs_in_by_a_pasted_code_kept_and_said_nowhere() {
         d.engine_sign_in_token(again.id, "devin-pasted-wrong")
             .unwrap();
         let failed = until(|| match d.engine_sign_in(again.id).unwrap().state {
-            EngineSignInState::Failed { why } => Some(why),
+            EngineSignInState::Failed { why, .. } => Some(why),
             _ => None,
         })
         .await;
@@ -1030,6 +1098,11 @@ async fn devin_signs_in_in_the_browser_it_opens_from_its_own_picker() {
         std::fs::write(dir.path().join("devin-no-code"), "").unwrap();
         let lost = d.start_engine_sign_in(Engine::Devin, false).unwrap();
         assert_eq!(devin_failed(&d, lost.id).await, sign_ins::DEVIN_NO_ANSWER);
+        // A code to paste is offered beside it, as a field, not in words.
+        assert_eq!(
+            devin_instead(&d, lost.id).as_deref(),
+            Some(sign_ins::DEVIN_PASTE_INSTEAD)
+        );
         std::fs::remove_file(dir.path().join("devin-no-code")).unwrap();
 
         // Enter taken, then nothing, or something else: never in the
@@ -1039,12 +1112,17 @@ async fn devin_signs_in_in_the_browser_it_opens_from_its_own_picker() {
             let _ = std::fs::remove_file(dir.path().join("got-key"));
             let stalled = d.start_engine_sign_in(Engine::Devin, false).unwrap();
             let why = until(|| match state(stalled.id) {
-                EngineSignInState::Failed { why } => Some(why),
+                EngineSignInState::Failed { why, .. } => Some(why),
                 EngineSignInState::Browser { .. } => panic!("{after}: in the browser"),
                 _ => None,
             })
             .await;
             assert_eq!(why, sign_ins::DEVIN_ASKED_UNKNOWN, "{after}");
+            assert_eq!(
+                devin_instead(&d, stalled.id).as_deref(),
+                Some(sign_ins::DEVIN_PASTE_INSTEAD),
+                "{after}"
+            );
             assert_eq!(key(), "\\r", "{after}: Enter was pressed");
             std::fs::remove_file(dir.path().join(after)).unwrap();
         }
@@ -1080,6 +1158,8 @@ async fn devin_signs_in_in_the_browser_it_opens_from_its_own_picker() {
             devin_failed(&d, manual.id).await,
             sign_ins::DEVIN_PAGE_UNKNOWN
         );
+        // Nothing is offered beside a failure that offers nothing.
+        assert_eq!(devin_instead(&d, manual.id), None);
         assert!(
             d.start_engine_sign_in(Engine::Gemini, false).is_err(),
             "Gemini signs in another way"

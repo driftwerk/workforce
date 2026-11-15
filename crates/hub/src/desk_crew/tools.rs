@@ -669,10 +669,7 @@ impl CrewTool {
         let (Some(g), machines) = (self.group(), self.machines(crew)) else {
             return local;
         };
-        let ceiling = super::served::Ceiling {
-            level: b.oversight.level,
-            act: b.oversight.act,
-        };
+        let ceiling = crew.ceiling_now(b.service.agent_id.as_str(), &b.oversight);
         let ceiling = &ceiling;
         let asks = machines.iter().map(|m| {
             let crew = Arc::clone(crew);
@@ -729,10 +726,7 @@ impl CrewTool {
                 "You only watch the crew: tell the person what you would do instead.".into(),
             ));
         }
-        let ceiling = super::served::Ceiling {
-            level: b.oversight.level,
-            act: b.oversight.act,
-        };
+        let ceiling = crew.ceiling_now(b.service.agent_id.as_str(), &b.oversight);
         let mut sent = input.clone();
         sent["session_id"] = json!(id.to_string());
         let cited = input["preference"]

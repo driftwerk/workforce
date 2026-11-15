@@ -331,6 +331,9 @@ pub enum Refusal {
     Conflict(String),
     /// It can't be read as a grant (400).
     Invalid(String),
+    /// It asks to last longer than this engine gives, `most` hours (400,
+    /// with its own `code`, so the home can ask again for no more).
+    TooLong { most: u32, why: String },
 }
 
 /// What a write does.
@@ -469,13 +472,14 @@ pub fn canonical(f: &str) -> bool {
 pub fn hours_of(asked: Option<u32>, ceiling: u32) -> Result<u32, Refusal> {
     let ceiling = ceiling.clamp(1, MAX_HOURS);
     let h = asked.unwrap_or(ceiling);
-    if (1..=ceiling).contains(&h) {
-        Ok(h)
-    } else {
-        Err(invalid(format!(
-            "this engine lets a grant last 1 to {ceiling} hours, not {h}: its [desk.bosses] \
-             grant_hours says so (at most {MAX_HOURS}, 14 days)"
-        )))
+    let why = format!(
+        "this engine lets a grant last 1 to {ceiling} hours, not {h}: its [desk.bosses] \
+         grant_hours says so (at most {MAX_HOURS}, 14 days)"
+    );
+    match h {
+        0 => Err(invalid(why)),
+        h if h > ceiling => Err(Refusal::TooLong { most: ceiling, why }),
+        h => Ok(h),
     }
 }
 
@@ -630,11 +634,27 @@ pub fn unknown_version(version: u32) -> String {
     )
 }
 
-/// `g` stopped at `now` from `from`; one already stopped keeps its first
-/// stop.
+impl Stopped {
+    /// The stop that holds once `new` comes on top of `old`: the first
+    /// stop, except that one from the machine always takes over one from
+    /// Desk, so Desk's own resume of its stop can never lift the machine's.
+    pub fn over(old: Option<Self>, new: Self) -> Self {
+        match old {
+            Some(o) if !(o.from == StoppedFrom::Desk && new.from == StoppedFrom::Machine) => o,
+            _ => new,
+        }
+    }
+
+    /// `slot` with `new` stopped on top of it ([`Stopped::over`]).
+    pub fn onto(slot: &mut Option<Self>, new: Self) {
+        *slot = Some(Self::over(*slot, new));
+    }
+}
+
+/// `g` stopped at `now` from `from` ([`Stopped::over`]).
 pub fn stopped(g: &Grant, now: DateTime<Utc>, from: StoppedFrom) -> Grant {
     let mut g = g.clone();
-    g.stopped.get_or_insert(Stopped { at: now, from });
+    Stopped::onto(&mut g.stopped, Stopped { at: now, from });
     g
 }
 
@@ -815,11 +835,19 @@ mod tests {
         p.hours = Some(336);
         let g = accept(None, None, &p, "g-acme", &[], at(0), MAX_HOURS).unwrap();
         assert_eq!(g.grant.expires_at, at(336));
-        for bad in [0, 337, u32::MAX] {
-            p.hours = Some(bad);
+        p.hours = Some(0);
+        assert!(matches!(take(None, &p, at(0)), Err(Refusal::Invalid(_))));
+        for long in [337, u32::MAX] {
+            p.hours = Some(long);
             assert!(
-                matches!(take(None, &p, at(0)), Err(Refusal::Invalid(_))),
-                "{bad}"
+                matches!(
+                    accept(None, None, &p, "g-acme", &[], at(0), MAX_HOURS),
+                    Err(Refusal::TooLong {
+                        most: MAX_HOURS,
+                        ..
+                    })
+                ),
+                "{long}"
             );
         }
         assert_eq!(hours_of(None, 24), Ok(24));
@@ -871,6 +899,27 @@ mod tests {
         // Stopping twice keeps the first stop.
         let again = stopped(&s, at(9), StoppedFrom::Desk);
         assert_eq!(again.stopped, s.stopped);
+    }
+
+    #[test]
+    fn a_stop_from_the_machine_always_takes_over_one_from_desk_and_never_the_other_way() {
+        let g = take(None, &put(1, &[1]), at(0)).unwrap().grant;
+        let desk = stopped(&g, at(1), StoppedFrom::Desk);
+        let machine = stopped(&desk, at(2), StoppedFrom::Machine);
+        assert_eq!(
+            machine.stopped,
+            Some(Stopped {
+                at: at(2),
+                from: StoppedFrom::Machine
+            })
+        );
+        let desk_again = stopped(&machine, at(3), StoppedFrom::Desk);
+        assert_eq!(desk_again.stopped, machine.stopped);
+        let machine_again = stopped(&machine, at(4), StoppedFrom::Machine);
+        assert_eq!(
+            machine_again.stopped, machine.stopped,
+            "the first one holds"
+        );
     }
 
     #[test]
@@ -929,7 +978,10 @@ mod tests {
         p.folders = vec!["/home/sam/src/acme-api".into()];
         // The engine's grant_hours is the most it gives.
         p.hours = Some(100);
-        assert!(accept(None, None, &p, "g-acme", &[], at(0), 72).is_err());
+        assert!(matches!(
+            accept(None, None, &p, "g-acme", &[], at(0), 72),
+            Err(Refusal::TooLong { most: 72, .. })
+        ));
         assert!(accept(None, None, &p, "g-acme", &[], at(0), 336).is_ok());
     }
 

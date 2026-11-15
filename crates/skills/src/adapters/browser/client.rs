@@ -126,6 +126,37 @@ pub async fn show(agent: &str) -> bool {
     false
 }
 
+/// Where an agent's tab is: its address, and whether the page asks for a
+/// password (a sign-in, or a site's check that it's still the person).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabAt {
+    pub url: String,
+    pub password: bool,
+}
+
+/// The address `agent`'s tab for `user` is on now, as Chrome has it: what
+/// a connection setup waiting on the person to sign in watches. Nothing on
+/// the page is read. `None` when it has no tab open.
+pub async fn location(agent: &str, user: &str) -> Option<TabAt> {
+    let mut open: Vec<Arc<ExtensionCell>> = Vec::new();
+    for client in clients() {
+        let cells = client.cells.lock().await;
+        open.extend(
+            cells
+                .values()
+                .filter(|c| c.agent == agent && c.user == user && *c.open.lock().unwrap())
+                .cloned(),
+        );
+    }
+    open.sort_by_key(|c| c.last_used.lock().unwrap().elapsed());
+    for cell in open {
+        if let Some(at) = cell.location().await {
+            return Some(at);
+        }
+    }
+    None
+}
+
 /// Which tabs [`close`] closes.
 #[derive(Debug, Clone, Copy)]
 pub enum Which<'a> {
@@ -600,7 +631,11 @@ impl BrowserClient {
         self.cell().await.press_key(key, selector).await
     }
 
-    pub(super) async fn capture_key(&self, selector: &str, connector: &str) -> Result<Value> {
+    pub(super) async fn capture_key(
+        &self,
+        selector: Option<&str>,
+        connector: &str,
+    ) -> Result<Value> {
         self.cell().await.capture_key(selector, connector).await
     }
 

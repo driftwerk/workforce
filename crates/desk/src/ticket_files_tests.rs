@@ -198,14 +198,22 @@ async fn a_remote_file_is_read_chunk_by_chunk_and_a_lie_stops_it() {
     ));
 }
 
+/// A ticket on a board of its own. Each board's prefix is the next number
+/// (a prefix is `^[A-Z][A-Z0-9]{1,5}$` and unique), never a chance one: two
+/// boards in a test can't be given the same.
 async fn a_ticket(store: &DeskStore) -> Uuid {
+    static BOARDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let prefix = format!(
+        "B{:05X}",
+        BOARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     let client = store.pool().get().await.unwrap();
     let board = Uuid::new_v4();
     let ticket = Uuid::new_v4();
     client
         .execute(
             "INSERT INTO boards (id, name, prefix, created_at, updated_at) VALUES ($1, 'B', $2, now(), now())",
-            &[&board, &format!("B{}", &board.simple().to_string()[..5].to_ascii_uppercase())],
+            &[&board, &prefix],
         )
         .await
         .unwrap();

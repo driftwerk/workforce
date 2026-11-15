@@ -63,6 +63,7 @@ mod line_api;
 pub mod line_store;
 pub mod lineage_store;
 pub mod local;
+pub mod machine_spent_store;
 pub mod memory;
 pub mod memory_derive_store;
 pub mod memory_index_store;
@@ -139,8 +140,8 @@ pub use service::{
 };
 pub use service::{AccountAnswer, AccountMoment, AccountRead};
 pub use service::{
-    AssignTo, BoardPatch, ChargedTo, Move, NewBoard, NewSessionFor, NewTicket, TicketPatch,
-    TicketQuery, TicketView,
+    AssignTo, BoardPatch, ChargedTo, MachineSessionFor, Move, NewBoard, NewSessionFor, NewTicket,
+    StartText, TicketPatch, TicketQuery, TicketView,
 };
 pub use service::{
     Changed, NewPlan, OnDrop, PlanDetail, PlanEdit, PlanSummary, PlanTicketView, StartRefused,
@@ -154,3 +155,6 @@ pub use service::{ALREADY_ANSWERED, ASKED_IN_TERMINAL};
 pub use speech::{Audio, Speak, SpeakError, Speech, SpeechProvider, VoiceKey};
 pub use store::DeskStore;
 pub use token_pipe::private_run_dir;
+/// The project a folder belongs to, by git (an update names a session's
+/// repository by it).
+pub use worktree::git_project;

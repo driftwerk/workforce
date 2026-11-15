@@ -41,8 +41,10 @@ use super::{Desk, DeskError};
 use crate::engine::Engine;
 use crate::pty::{Pty, Spawn};
 
-/// How long a sign-in may take: Codex's code lasts 15 minutes.
-const SIGN_IN_FOR: Duration = Duration::from_secs(16 * 60);
+/// How long a sign-in may take, in minutes: Codex's code lasts 15.
+const SIGN_IN_MINUTES: u64 = 16;
+/// How long a sign-in may take ([`SIGN_IN_MINUTES`]).
+const SIGN_IN_FOR: Duration = Duration::from_secs(SIGN_IN_MINUTES * 60);
 /// How long Devin's login may take to show something Desk knows (its
 /// picker, or its page): well inside the 30 s Desk waits for a first step.
 const DEVIN_SHOWS_IN: Duration = Duration::from_secs(20);
@@ -90,8 +92,13 @@ pub enum EngineSignInState {
         url: String,
     },
     Done,
+    /// `instead`, when there is one, is the way on Desk offers beside
+    /// `why` ([`DEVIN_PASTE_INSTEAD`]: a new sign-in, `manual`), as
+    /// [`Self::Browser`]'s: Desk reads it, never `why`'s words.
     Failed {
         why: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        instead: Option<String>,
     },
 }
 
@@ -153,7 +160,10 @@ impl Ended {
 
     fn failed(why: &str, reason: &'static str) -> Self {
         Self {
-            state: EngineSignInState::Failed { why: why.into() },
+            state: EngineSignInState::Failed {
+                why: why.into(),
+                instead: None,
+            },
             reason,
         }
     }
@@ -226,9 +236,33 @@ pub const DEVIN_NO_ANSWER: &str =
 /// Devin's servers turned the sign-in away.
 pub const DEVIN_EXCHANGE_FAILED: &str =
     "Devin's servers didn't finish the sign-in. Start it again in a minute.";
-/// The whole sign-in ran past [`SIGN_IN_FOR`].
-pub const DEVIN_TIMED_OUT: &str =
-    "Devin's sign-in timed out. Start it again, and finish signing in within 15 minutes.";
+/// The whole sign-in ran past [`SIGN_IN_FOR`], said in its minutes.
+pub fn devin_timed_out() -> String {
+    format!(
+        "Devin's sign-in timed out. Start it again, and finish signing in within {SIGN_IN_MINUTES} minutes."
+    )
+}
+
+/// The failures whose words offer a code to paste instead: Desk is told so
+/// beside them ([`EngineSignInState::Failed`]'s `instead`), on a sign-in
+/// that wasn't already one with a code to paste.
+const OFFER_PASTE: &[&str] = &[DEVIN_ASKED_UNKNOWN, DEVIN_NO_CALLBACK, DEVIN_NO_ANSWER];
+
+/// `state` with the way on Desk offers beside it, if any: a code to paste
+/// instead, after a failure that offers one on a sign-in in the browser.
+fn with_way_on(state: EngineSignInState, manual: bool) -> EngineSignInState {
+    match state {
+        EngineSignInState::Failed { why, instead: None }
+            if !manual && OFFER_PASTE.contains(&why.as_str()) =>
+        {
+            EngineSignInState::Failed {
+                why,
+                instead: Some(DEVIN_PASTE_INSTEAD.into()),
+            }
+        }
+        other => other,
+    }
+}
 /// Devin said it signed in, but `devin auth status` doesn't say so.
 pub const DEVIN_NOT_CONFIRMED: &str =
     "Devin said it signed in, but it doesn't say so now. Start the sign-in again.";
@@ -990,7 +1024,7 @@ impl Desk {
             if started.elapsed() > SIGN_IN_FOR {
                 end_cli(Arc::clone(&pty)).await;
                 break match engine {
-                    Engine::Devin => Ended::failed(DEVIN_TIMED_OUT, "timed out"),
+                    Engine::Devin => Ended::failed(&devin_timed_out(), "timed out"),
                     _ => Ended::failed(DEVICE_FAILED, "timed out"),
                 };
             }
@@ -1003,7 +1037,7 @@ impl Desk {
                 return; // cancelled as it ended
             };
             let from = run.view.state.step();
-            run.view.state = state;
+            run.view.state = with_way_on(state, run.manual);
             // Its screen goes with it: nothing of it is kept.
             run.pty = None;
             from
@@ -1472,6 +1506,54 @@ mod tests {
         assert!(!device_code("15-minutes"));
     }
 
+    /// A failure that offers a code to paste says so beside it, on a sign-in
+    /// in the browser; one already with a code, or a failure that offers
+    /// nothing, has nothing beside it. The time-out says the minutes the
+    /// sign-in is given.
+    #[test]
+    fn a_failure_offers_a_code_to_paste_as_a_field_only_where_its_words_do() {
+        let failed = |why: &str| EngineSignInState::Failed {
+            why: why.into(),
+            instead: None,
+        };
+        for why in [DEVIN_ASKED_UNKNOWN, DEVIN_NO_CALLBACK, DEVIN_NO_ANSWER] {
+            assert_eq!(
+                with_way_on(failed(why), false),
+                EngineSignInState::Failed {
+                    why: why.into(),
+                    instead: Some(DEVIN_PASTE_INSTEAD.into()),
+                },
+                "{why}"
+            );
+            assert_eq!(with_way_on(failed(why), true), failed(why), "{why}");
+            assert!(
+                why.to_lowercase().contains("paste a code instead"),
+                "its words offer it too: {why}"
+            );
+        }
+        for why in [
+            DEVIN_FAILED,
+            DEVIN_EXCHANGE_FAILED,
+            DEVICE_FAILED,
+            &devin_timed_out(),
+        ] {
+            assert_eq!(with_way_on(failed(why), false), failed(why), "{why}");
+        }
+        assert_eq!(
+            with_way_on(EngineSignInState::Done, false),
+            EngineSignInState::Done
+        );
+        let wire = serde_json::to_value(with_way_on(failed(DEVIN_NO_ANSWER), false)).unwrap();
+        assert_eq!(wire["state"], "failed");
+        assert_eq!(wire["instead"], DEVIN_PASTE_INSTEAD);
+        assert_eq!(SIGN_IN_FOR.as_secs(), SIGN_IN_MINUTES * 60);
+        assert!(
+            devin_timed_out().contains(&format!("within {SIGN_IN_MINUTES} minutes")),
+            "{}",
+            devin_timed_out()
+        );
+    }
+
     #[test]
     fn a_sign_in_reaches_desk_in_its_wire_shape() {
         let view = EngineSignInView {
@@ -1487,10 +1569,15 @@ mod tests {
         assert_eq!(v["state"], "device");
         assert_eq!(v["code"], "ABCD-12345");
         let failed = EngineSignInView {
-            state: EngineSignInState::Failed { why: "x".into() },
+            state: EngineSignInState::Failed {
+                why: "x".into(),
+                instead: None,
+            },
             ..view.clone()
         };
-        assert_eq!(serde_json::to_value(&failed).unwrap()["why"], "x");
+        let said = serde_json::to_value(&failed).unwrap();
+        assert_eq!(said["why"], "x");
+        assert!(said.get("instead").is_none(), "{said}");
         // Devin's, as agreed with Desk.
         let id = Uuid::nil();
         for (state, want) in [

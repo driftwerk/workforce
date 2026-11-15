@@ -317,7 +317,11 @@ pub async fn overlay_create_agent(
             overlay::ensure_agent_entry_scope(&before, ov)
         },
     )
-    .await
+    .await?;
+    // A new agent of this id is a new making: nothing said for an earlier
+    // one holds for it.
+    crate::agent_generation::forget(data_dir, &id);
+    Ok(())
 }
 
 /// Remove an agent: drop any overlay entry and tombstone the id in
@@ -379,7 +383,9 @@ pub async fn overlay_remove_agent(
             overlay::ensure_agent_entry_scope(&before, ov)
         },
     )
-    .await
+    .await?;
+    crate::agent_generation::forget(data_dir, id);
+    Ok(())
 }
 
 /// Update fields on an existing agent. The current **raw** entry is taken

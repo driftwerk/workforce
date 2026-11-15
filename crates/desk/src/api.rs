@@ -78,6 +78,9 @@ struct TokenQuery {
 
 /// The `code` of a 409 that only a move may get past (`DeskError::CrossesBoss`).
 pub const CROSSES_BOSS: &str = "crosses_boss";
+/// The `code` of a 400 for a grant asking to last longer than the engine
+/// gives (`DeskError::TooLong`), with the most it gives as `mostHours`.
+pub const GRANT_TOO_LONG: &str = "grant_too_long";
 
 impl IntoResponse for DeskError {
     fn into_response(self) -> Response {
@@ -92,6 +95,18 @@ impl IntoResponse for DeskError {
                     .into_response()
             }
             DeskError::Invalid(_) => StatusCode::BAD_REQUEST,
+            DeskError::TooLong { most, .. } => {
+                let most = *most;
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": self.to_string(),
+                        "code": GRANT_TOO_LONG,
+                        "mostHours": most,
+                    })),
+                )
+                    .into_response();
+            }
             DeskError::Internal(e) => {
                 tracing::error!(error = format!("{e:#}"), "desk request failed");
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -111,6 +126,41 @@ async fn guard(auth: &dyn Authorize, headers: &HeaderMap, q: &TokenQuery) -> Res
 macro_rules! guarded {
     ($s:expr, $h:expr, $q:expr) => {
         if let Err(r) = guard(&*$s.auth, &$h, &$q).await {
+            return r;
+        }
+    };
+}
+
+/// Only the person who holds the hub ([`Authorize::authorize_holder`]): their
+/// own sign-in or the Desk paired with it, never the hub's own token alone,
+/// another person's, an agent's or a session's; from the `Authorization`
+/// header alone, never a token in the address, which logs keep.
+async fn holder_guard(
+    auth: &dyn Authorize,
+    headers: &HeaderMap,
+    q: &TokenQuery,
+    why: &str,
+) -> Result<(), Response> {
+    if q.token.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "This takes the token in the Authorization header only." })),
+        )
+            .into_response());
+    }
+    auth.authorize_holder(headers, None)
+        .await
+        .map(drop)
+        .map_err(|status| (status, Json(json!({ "error": why }))).into_response())
+}
+
+/// An engine's own sign-in is the hub holder's alone: it signs that
+/// engine's CLI in for every session after, and shows its one-time code.
+const ONLY_YOU_SIGN_IN: &str = "Only the person whose Desk this is signs its engines in.";
+
+macro_rules! holder_only {
+    ($s:expr, $h:expr, $q:expr, $why:expr) => {
+        if let Err(r) = holder_guard(&*$s.auth, &$h, &$q, $why).await {
             return r;
         }
     };
@@ -361,7 +411,8 @@ struct EngineBody {
 }
 
 /// Signs an engine's own CLI in on a terminal of the hub's own (Codex's
-/// device sign-in, Devin's login): the page to open, and the code to type
+/// device sign-in, Devin's login), for the hub's holder alone (every
+/// sign-in route is `holder_only!`): the page to open, and the code to type
 /// there or whether to paste back the code it gives, once it shows them;
 /// or, for Devin's login on this computer, that it waits in the browser it
 /// opened itself (`browser`).
@@ -371,7 +422,7 @@ async fn start_engine_sign_in(
     Query(q): Q,
     Json(b): Json<EngineBody>,
 ) -> Response {
-    guarded!(s, h, q);
+    holder_only!(s, h, q, ONLY_YOU_SIGN_IN);
     match s.desk.start_engine_sign_in(b.engine, b.manual) {
         Ok(view) => (StatusCode::ACCEPTED, Json(view)).into_response(),
         Err(e) => e.into_response(),
@@ -379,7 +430,7 @@ async fn start_engine_sign_in(
 }
 
 async fn engine_sign_in(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
-    guarded!(s, h, q);
+    holder_only!(s, h, q, ONLY_YOU_SIGN_IN);
     s.desk.engine_sign_in(id).map(Json).into_response()
 }
 
@@ -400,7 +451,7 @@ async fn engine_sign_in_token(
     Path(id): Path<Uuid>,
     Json(b): Json<TokenBody>,
 ) -> Response {
-    guarded!(s, h, q);
+    holder_only!(s, h, q, ONLY_YOU_SIGN_IN);
     s.desk
         .engine_sign_in_token(id, &b.token)
         .map(|()| StatusCode::NO_CONTENT)
@@ -413,7 +464,7 @@ async fn cancel_engine_sign_in(
     Query(q): Q,
     Path(id): Path<Uuid>,
 ) -> Response {
-    guarded!(s, h, q);
+    holder_only!(s, h, q, ONLY_YOU_SIGN_IN);
     s.desk
         .cancel_engine_sign_in(id)
         .map(|()| StatusCode::NO_CONTENT)
@@ -1066,12 +1117,14 @@ async fn stream_pty(socket: WebSocket, pty: Arc<crate::pty::Pty>, kind: &'static
 /// a new branch), `folder-remotes` (a listing says its repository and where
 /// it comes from), `keep-tickets` (a board with tickets of its own links
 /// keeping them), `session-model` (a new session runs the model it is
-/// given, and says it).
+/// given, and says it), `ticket-start-on` (a ticket's new session takes a
+/// model, and a ticket is given to a session started on a machine).
 pub const FEATURES: &[&str] = &[
     "fresh-worktree",
     "folder-remotes",
     "keep-tickets",
     "session-model",
+    "ticket-start-on",
 ];
 
 async fn features(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
@@ -2465,6 +2518,24 @@ mod tests {
             }
         }
         seen
+    }
+
+    #[tokio::test]
+    async fn a_grant_too_long_for_the_engine_says_so_by_its_code_with_the_most_it_gives() {
+        use super::{DeskError, IntoResponse, StatusCode, GRANT_TOO_LONG};
+        let res = DeskError::TooLong {
+            most: 12,
+            why: "this engine lets a grant last 1 to 12 hours, not 24".into(),
+        }
+        .into_response();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["code"], GRANT_TOO_LONG);
+        assert_eq!(body["mostHours"], 12);
+        assert!(body["error"].as_str().unwrap().contains("1 to 12 hours"));
     }
 
     #[tokio::test]

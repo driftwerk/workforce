@@ -107,6 +107,7 @@ fn refused(r: Refusal) -> DeskError {
         )),
         Refusal::Conflict(why) => DeskError::Conflict(why),
         Refusal::Invalid(why) => DeskError::Invalid(why),
+        Refusal::TooLong { most, why } => DeskError::TooLong { most, why },
     }
 }
 
@@ -214,7 +215,7 @@ impl Desk {
         };
         let mut g = g.clone();
         if let Some(s) = run.stopping.get(group) {
-            g.stopped.get_or_insert(*s);
+            Stopped::onto(&mut g.stopped, *s);
         }
         grant::live(&g, Utc::now(), run.paused.is_some()).map_err(|why| why.say(&g.name))?;
         Ok(g)
@@ -309,7 +310,7 @@ impl Desk {
     fn grant_view_of(run: &GrantsRun, g: &Grant, now: DateTime<Utc>) -> GrantView {
         let mut g = g.clone();
         if let Some(s) = run.stopping.get(&g.group) {
-            g.stopped.get_or_insert(*s);
+            Stopped::onto(&mut g.stopped, *s);
         }
         let why = grant::live(&g, now, run.paused.is_some())
             .err()
@@ -541,10 +542,11 @@ impl Desk {
         // A stop in force, written or not, stays with what is left.
         let stopped = {
             let run = self.0.grants.lock();
-            run.grants
-                .get(group)
-                .and_then(|g| g.stopped)
-                .or_else(|| run.stopping.get(group).copied())
+            let written = run.grants.get(group).and_then(|g| g.stopped);
+            match run.stopping.get(group) {
+                Some(s) => Some(Stopped::over(written, *s)),
+                None => written,
+            }
         };
         self.commit_grants(Vec::new(), Some((group, stopped)), call)
             .await?;
@@ -584,7 +586,8 @@ impl Desk {
                 None => run.grants.keys().cloned().collect(),
             };
             for g in groups {
-                run.stopping.entry(g).or_insert(stop);
+                let held = Stopped::over(run.stopping.get(&g).copied(), stop);
+                run.stopping.insert(g, held);
             }
         }
         let _one = self.0.grant_write.lock().await;
@@ -648,18 +651,13 @@ impl Desk {
             let mut run = self.0.grants.lock();
             for (g, s) in &stops {
                 match run.grants.get_mut(g) {
-                    Some(x) => {
-                        x.stopped.get_or_insert(*s);
-                    }
+                    Some(x) => Stopped::onto(&mut x.stopped, *s),
                     None => {
-                        run.floors
-                            .entry(g.clone())
-                            .or_insert(Floor {
-                                revision: 0,
-                                stopped: None,
-                            })
-                            .stopped
-                            .get_or_insert(*s);
+                        let floor = run.floors.entry(g.clone()).or_insert(Floor {
+                            revision: 0,
+                            stopped: None,
+                        });
+                        Stopped::onto(&mut floor.stopped, *s);
                     }
                 }
                 run.stopping.remove(g);

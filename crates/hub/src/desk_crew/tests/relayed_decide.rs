@@ -34,6 +34,14 @@ fn relayed(tool: &str, input: Value, boss: &str, level: &str) -> Value {
            "level": level, "act": {}})
 }
 
+/// A take's count of the one budget: from an hour ago, nothing spent
+/// elsewhere.
+fn counted(mut take: Value) -> Value {
+    take["countFrom"] = json!((chrono::Utc::now() - chrono::Duration::hours(1)).timestamp_millis());
+    take["spentElsewhereUsd"] = json!(0.0);
+    take
+}
+
 async fn post(app: &axum::Router, token: &str, body: Value) -> Value {
     let res = app
         .clone()
@@ -156,7 +164,7 @@ async fn a_machine_unbinds_the_homes_boss_only_while_its_home_holds_it_and_takes
                 post(
                     &app,
                     &token,
-                    relayed(TAKE, json!({"inForce": in_force, "sentAt": chrono::Utc::now().timestamp_millis()}), "local:sarah", level),
+                    relayed(TAKE, counted(json!({"inForce": in_force, "sentAt": chrono::Utc::now().timestamp_millis()})), "local:sarah", level),
                 )
                 .await
             }
@@ -195,7 +203,7 @@ async fn a_machine_unbinds_the_homes_boss_only_while_its_home_holds_it_and_takes
         let out = post(
             &app,
             &token,
-            relayed(TAKE, json!({"inForce": true, "sentAt": chrono::Utc::now().timestamp_millis()}), "local:bob", "full"),
+            relayed(TAKE, counted(json!({"inForce": true, "sentAt": chrono::Utc::now().timestamp_millis()})), "local:bob", "full"),
         )
         .await;
         assert_eq!(out["status"], "refused", "{out}");
@@ -210,7 +218,7 @@ async fn a_machine_unbinds_the_homes_boss_only_while_its_home_holds_it_and_takes
             let out = post(
                 &app,
                 &token,
-                relayed(TAKE, json!({"inForce": true, "sentAt": sent}), "local:sarah", "full"),
+                relayed(TAKE, counted(json!({"inForce": true, "sentAt": sent})), "local:sarah", "full"),
             )
             .await;
             assert_eq!(out["body"]["full"], false, "{out}");
@@ -305,6 +313,22 @@ async fn a_machine_unbinds_the_homes_boss_only_while_its_home_holds_it_and_takes
         take(false, "full").await;
         assert!(crew.served_full(SARAH).is_none());
         assert!(!d.boss_unbound(SARAH));
+        // A take its home sent before that one, come late, says nothing
+        // of now: it doesn't bind it again.
+        let late = post(
+            &app,
+            &token,
+            relayed(
+                TAKE,
+                counted(json!({"inForce": true,
+                               "sentAt": chrono::Utc::now().timestamp_millis() - 1_000})),
+                "local:sarah",
+                "full",
+            ),
+        )
+        .await;
+        assert_eq!(late["body"]["decisions"], json!([]), "{late}");
+        assert!(crew.served_full(SARAH).is_none(), "{late}");
         waits_on_person(&d, started).await;
         assert!(d.view(started).unwrap().pending.is_some_and(|p| p.id == a3));
         d.decide(started, a3, workforce_desk::model::Decision::Deny, None)
@@ -317,6 +341,61 @@ async fn a_machine_unbinds_the_homes_boss_only_while_its_home_holds_it_and_takes
         assert!(crew.served_full(SARAH).is_some());
         tokio::time::sleep(FRESH + Duration::from_millis(200)).await;
         assert!(crew.served_full(SARAH).is_none());
+
+        // One budget across the Mac and every machine: devbox counts its
+        // own spend since where the home counts from, says it, and acts
+        // fully only while that and what the home says was spent elsewhere
+        // are under the grant's budget ($50).
+        let from = chrono::Utc::now() - chrono::Duration::hours(1);
+        let take_at = |elsewhere: Value, from: Option<chrono::DateTime<chrono::Utc>>| {
+            let (app, token) = (app.clone(), token.clone());
+            let mut input = json!({"inForce": true, "sentAt": chrono::Utc::now().timestamp_millis(),
+                                   "spentElsewhereUsd": elsewhere});
+            if let Some(f) = from {
+                input["countFrom"] = json!(f.timestamp_millis());
+            }
+            async move { post(&app, &token, relayed(TAKE, input, "local:sarah", "full")).await }
+        };
+        let out = take_at(json!(0.0), Some(from)).await;
+        assert_eq!(out["body"]["full"], true, "{out}");
+        assert_eq!(out["body"]["spentUsd"], 0.0, "{out}");
+        assert_eq!(out["body"]["countFrom"], json!(from.timestamp_millis()));
+        super::act_fully_budget::spent(&d, started, workforce_desk::ledger::Billing::Key, 30.0).await;
+        // A plan's use is never real money.
+        super::act_fully_budget::spent(&d, started, workforce_desk::ledger::Billing::Plan, 500.0).await;
+        let out = take_at(json!(15.0), Some(from)).await;
+        assert_eq!(out["body"]["full"], true, "{out}");
+        assert_eq!(out["body"]["spentUsd"], 30.0, "{out}");
+        assert_eq!(crew.relayed_spent(SARAH), Some(45.0));
+        assert!(crew.served_full(SARAH).is_some());
+        // Spent elsewhere too: $55 of $50, so devbox no longer acts fully.
+        let out = take_at(json!(25.0), Some(from)).await;
+        assert_eq!(out["body"]["full"], false, "{out}");
+        assert_eq!(out["body"]["spentUsd"], 30.0, "it still says what it spent");
+        assert!(crew.served_full(SARAH).is_none());
+        // Counted from after that spend (the person cleared it): in force.
+        let cleared = chrono::Utc::now();
+        let out = take_at(json!(0.0), Some(cleared)).await;
+        assert_eq!(out["body"]["full"], true, "{out}");
+        assert_eq!(out["body"]["spentUsd"], 0.0, "{out}");
+        // A home that says nothing of the count (older), or of what was
+        // spent elsewhere, or a count from the future, never puts it at Act
+        // fully.
+        for (elsewhere, from) in [
+            (json!(0.0), None),
+            (Value::Null, Some(from)),
+            (json!(-1.0), Some(from)),
+            (json!(0.0), Some(chrono::Utc::now() + chrono::Duration::hours(1))),
+        ] {
+            let out = take_at(elsewhere, from).await;
+            assert_eq!(out["body"]["full"], false, "{out}");
+            assert!(crew.served_full(SARAH).is_none());
+        }
+        // The watcher's own read never gives a relayed boss a figure of its
+        // own: only a fresh take does.
+        crew.read_spent_today(&crew.overseers()).await;
+        assert!(crew.served_full(SARAH).is_none());
+        assert_eq!(crew.relayed_spent(SARAH), None);
 
         // Stop on devbox while her decision is out: her ALLOW, come after,
         // isn't done, and the request stays the person's.
@@ -384,17 +463,25 @@ async fn the_home_takes_its_bosss_decisions_from_its_machines_and_answers_each_w
                 loop {
                     for c in crew.relay_take(Duration::from_millis(200)).await {
                         seen.lock().push(c.clone());
-                        let body = match c.tool.as_str() {
-                            TAKE if !handed.swap(true, std::sync::atomic::Ordering::SeqCst) => {
+                        let counts = json!({"countFrom": c.input["countFrom"], "spentUsd": 0.0});
+                        let in_force = c.input["inForce"] == true;
+                        let mut body = match c.tool.as_str() {
+                            TAKE if in_force
+                                && !handed.swap(true, std::sync::atomic::Ordering::SeqCst) =>
+                            {
                                 json!({"full": true, "decisions": [
                                     {"decideId": decide_id, "prompt": format!(
                                         "{} decide `git tag v9`", super::super::decide::MARK)},
                                     {"decideId": bad_id, "prompt": "write me a poem"},
                                 ]})
                             }
-                            TAKE => json!({"full": true, "decisions": []}),
+                            TAKE => json!({"full": in_force, "decisions": []}),
                             _ => json!({"taken": true}),
                         };
+                        if c.tool == TAKE {
+                            body["countFrom"] = counts["countFrom"].clone();
+                            body["spentUsd"] = counts["spentUsd"].clone();
+                        }
                         crew.relay_answer(
                             c.id,
                             RelayAnswer {
@@ -444,17 +531,23 @@ async fn the_home_takes_its_bosss_decisions_from_its_machines_and_answers_each_w
             0,
             "no call for what isn't a decision"
         );
-        // Every take said Act fully is in force, at full.
+        // The first take asks devbox what it spent and says nothing is in
+        // force; once devbox has said, every take says Act fully is in
+        // force, at full, with the count.
         let takes: Vec<RelayCall> = seen
             .lock()
             .iter()
             .filter(|c| c.tool == TAKE)
             .cloned()
             .collect();
-        assert!(!takes.is_empty());
-        assert!(takes
+        assert!(takes.len() >= 2);
+        assert_eq!(takes[0].input["inForce"], false, "{:?}", takes[0].input);
+        assert!(takes[0].input["countFrom"].is_i64());
+        assert!(takes[1..]
             .iter()
             .all(|c| c.input["inForce"] == true && c.machine == "devbox"));
+        assert!(takes.iter().all(|c| c.input["spentElsewhereUsd"] == 0.0));
+        let seen_before = seen.lock().len();
 
         // Act fully no longer in force here (Desk holds Sarah, over her
         // budget): the next take says so, and no take says in force after it.
@@ -477,7 +570,7 @@ async fn the_home_takes_its_bosss_decisions_from_its_machines_and_answers_each_w
             assert!(d.agent_held(&agent).is_some());
         }
         let ended = eventually("a take saying it isn't in force", async || {
-            seen.lock()
+            seen.lock()[seen_before..]
                 .iter()
                 .find(|c| c.tool == TAKE && c.input["inForce"] == false)
                 .cloned()

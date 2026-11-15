@@ -311,7 +311,15 @@ async fn read_issue(
         // remote's own text.
         Err(e) => {
             tracing::warn!(ticket = %id, error = %e, "a ticket's issue wasn't read");
-            unread(&hub, s.system, FileRead::Remote(e))
+            match e {
+                // The hub stopped offering the issue tools: said as the
+                // board says it, not as a file it can't send.
+                e @ RemoteError::Missing(_) => refusal(
+                    StatusCode::CONFLICT,
+                    &paused_words(&hub, s.system, &crate::desk_board_sync::paused_by(&e)),
+                ),
+                e => unread(&hub, s.system, FileRead::Remote(e)),
+            }
         }
     }
 }

@@ -358,6 +358,7 @@ mod tests {
                 purpose: "moving billing".into(),
                 text: "It finished.".into(),
                 refs: Vec::new(),
+                repo: None,
             }],
             waiting: vec![WaitingItem {
                 item_id: "w".into(),

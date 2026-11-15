@@ -40,6 +40,7 @@ mod handover;
 mod idle;
 mod items;
 mod line;
+pub(crate) mod machine_grants;
 mod observe;
 mod own_settings;
 mod plan;
@@ -52,6 +53,7 @@ pub(crate) mod remote_asks;
 pub(crate) mod remote_decide;
 mod scope;
 pub(crate) mod served;
+pub(crate) mod shared_budget;
 mod spend;
 mod tools;
 mod updates;
@@ -152,6 +154,9 @@ pub struct CrewHub {
     /// keys paid for, never the person's plans. Act fully holds only under
     /// its budget, and not before this is read.
     spent_today: Mutex<HashMap<String, f64>>,
+    /// What each machine last said each boss's sessions there spent today
+    /// ([`shared_budget`]): one Act fully budget across them all.
+    machine_spent: Mutex<shared_budget::Machines>,
     /// The overseers the tools were last set up for, by agent: each one's
     /// scope and level.
     tooled: Mutex<HashMap<String, (Scope, String)>>,
@@ -599,6 +604,7 @@ impl CrewHub {
             sent: Mutex::default(),
             read: Mutex::default(),
             spent_today: Mutex::default(),
+            machine_spent: Mutex::default(),
             tooled: Mutex::default(),
             poke: tokio::sync::Notify::new(),
             to_work: Mutex::default(),
@@ -832,8 +838,39 @@ impl CrewHub {
         agent: &str,
         o: &'o Oversight,
     ) -> Result<&'o workforce_common::oversight::Full, String> {
-        let spent = self.spent_today.lock().get(agent).copied();
-        fully_for(agent, o, spent)
+        fully_for(agent, o, self.spent_counted(agent, o))
+    }
+
+    /// What Act fully's budget counts as spent today for `agent`, or none
+    /// while that isn't known:
+    /// - a boss relayed from the home (`home/<agent>`, on a machine): its
+    ///   sessions' spend here and everywhere else, as its home's fresh take
+    ///   said ([`relayed_decide`]); none without one;
+    /// - a boss on another hub served here: its sessions' spend here;
+    /// - this hub's own: its scope's spend here and every machine's count
+    ///   ([`shared_budget`]).
+    pub(crate) fn spent_counted(&self, agent: &str, o: &Oversight) -> Option<f64> {
+        if relayed_decide::relayed_party(agent) {
+            return self.relayed_spent(agent);
+        }
+        let here = self.spent_today.lock().get(agent).copied();
+        if workforce_desk::grant::is_served(agent) {
+            return here;
+        }
+        match self.count_from(o) {
+            Some(from) => Some(here? + self.machines_spent(agent, from)?),
+            None => here,
+        }
+    }
+
+    /// The ceiling the overseer `agent` is relayed to a machine with: its
+    /// level in force now (Act while its Act fully budget is spent or
+    /// unread), and its switches.
+    pub(crate) fn ceiling_now(&self, agent: &str, o: &Oversight) -> served::Ceiling {
+        served::Ceiling {
+            level: self.level_now(agent, o).0,
+            act: o.act,
+        }
     }
 
     /// The level the overseer `agent` runs at now, and, when it chose Act
@@ -917,6 +954,7 @@ impl CrewHub {
         let midnight = self
             .desk
             .period_start(workforce_desk::ledger::Period::Day, now);
+        self.load_machines_spent().await;
         let mut spent = HashMap::new();
         let mut shown = HashMap::new();
         for (s, o) in overseers {
@@ -951,6 +989,11 @@ impl CrewHub {
                 }
             };
             if let Some(budget) = full.budget_usd_per_day() {
+                // The Floor shows what the budget counts: here and on every
+                // machine ([`shared_budget`]).
+                let usd = usd
+                    .zip(self.machines_spent(s.agent_id.as_str(), from))
+                    .map(|(h, m)| h + m);
                 shown.insert(
                     s.agent_id.as_str().to_string(),
                     workforce_desk::floor::FullBudget {
@@ -1155,10 +1198,7 @@ impl Crew for CrewHub {
                 "{boss} isn't a boss here."
             )));
         };
-        let ceiling = served::Ceiling {
-            level: o.level,
-            act: o.act,
-        };
+        let ceiling = self.ceiling_now(boss, &o);
         let a = self
             .relay_as(machine, group.unwrap_or(""), call, input, boss, &ceiling)
             .await?;

@@ -666,6 +666,72 @@ async fn a_deleted_grant_keeps_its_revision_and_its_stop() {
 }
 
 #[tokio::test]
+async fn a_grant_asking_for_longer_than_the_engine_gives_is_told_the_most_it_gives() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = engine(pool, dir.path(), true).await;
+        let mut long = body(1, "Acme", &[]);
+        long["hours"] = json!(100);
+        let e = d.put_grant(native(), "g-acme", long).await.unwrap_err();
+        assert!(matches!(e, DeskError::TooLong { most: 72, .. }), "{e}");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_stop_on_the_machine_takes_over_one_from_desk_and_desk_s_never_takes_over_it() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = engine(pool.clone(), dir.path(), true).await;
+        let s = Uuid::new_v4();
+        put(&d, "g-acme", body(1, "Acme", &[s])).await;
+        for (group, from) in [
+            ("g-acme", StoppedFrom::Desk),
+            ("g-acme", StoppedFrom::Machine),
+            ("g-acme", StoppedFrom::Desk),
+            ("g-globex", StoppedFrom::Desk),
+            ("g-globex", StoppedFrom::Machine),
+            ("g-globex", StoppedFrom::Desk),
+        ] {
+            d.stop_bosses(native(), Some(group), from).await.unwrap();
+        }
+        let machine = |d: &Desk| {
+            let view = d.grants_view(&native());
+            (
+                view.grants
+                    .iter()
+                    .find(|g| g.grant.group == "g-acme")
+                    .and_then(|g| g.grant.stopped)
+                    .map(|s| s.from),
+                view.left
+                    .get("g-globex")
+                    .and_then(|f| f.stopped)
+                    .map(|s| s.from),
+            )
+        };
+        assert_eq!(
+            machine(&d),
+            (Some(StoppedFrom::Machine), Some(StoppedFrom::Machine))
+        );
+        // And so it is kept, so Desk's rule for lifting its own stop never
+        // reaches it.
+        let d = engine(pool, dir.path(), true).await;
+        assert_eq!(
+            machine(&d),
+            (Some(StoppedFrom::Machine), Some(StoppedFrom::Machine))
+        );
+        put(&d, "g-globex", body(1, "Globex", &[])).await;
+        for g in ["g-acme", "g-globex"] {
+            assert!(d
+                .grant_live(g)
+                .unwrap_err()
+                .contains("stopped on this machine"));
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn a_stop_racing_a_delete_or_ahead_of_any_grant_is_kept() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
