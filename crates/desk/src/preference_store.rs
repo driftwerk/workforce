@@ -10,7 +10,8 @@ use crate::preference::{PrefScope, PrefSource, PrefState, Preference};
 use crate::store::DeskStore;
 
 const COLUMNS: &str = "id, owner, boss_scope, when_text, then_text, scope, source, from_item, \
-     created_at, changed_at, applied_count, last_applied_at, overruled_count, state";
+     created_at, changed_at, applied_count, last_applied_at, overruled_count, state, \
+     directive, directive_answer";
 
 /// After this many overrules a preference is set aside until the person
 /// says otherwise.
@@ -33,6 +34,8 @@ fn preference(r: &Row) -> Result<Preference> {
         last_applied_at: r.try_get(11)?,
         overruled_count: r.try_get(12)?,
         state: PrefState::parse(r.try_get(13)?)?,
+        directive: r.try_get(14)?,
+        directive_answer: r.try_get(15)?,
     })
 }
 
@@ -52,7 +55,7 @@ impl DeskStore {
             .execute(
                 &format!(
                     "INSERT INTO boss_preferences ({COLUMNS}) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)"
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)"
                 ),
                 &[
                     &p.id,
@@ -69,6 +72,8 @@ impl DeskStore {
                     &p.last_applied_at,
                     &p.overruled_count,
                     &p.state.as_str(),
+                    &p.directive,
+                    &p.directive_answer,
                 ],
             )
             .await?;

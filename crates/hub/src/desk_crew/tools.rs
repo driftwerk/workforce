@@ -27,7 +27,7 @@ use super::CrewHub;
 
 /// Every `crew.*` tool: the ones it has at every level first (its reads,
 /// and what it asks of the person, which is never gated).
-pub const READ: [&str; 17] = [
+pub const READ: [&str; 18] = [
     "crew.overview",
     "crew.activity",
     "crew.account",
@@ -42,6 +42,7 @@ pub const READ: [&str; 17] = [
     super::items::ORDER,
     super::preferences::PREFER,
     super::preferences::PREFERENCES,
+    super::directives::NAME,
     super::github::PR,
     super::github::BRANCH,
     super::github::CI,
@@ -390,6 +391,7 @@ impl CrewTool {
             super::preferences::PREFER | super::preferences::PREFERENCES => {
                 crew.preferences_tool(self.name, b, input).await
             }
+            super::directives::NAME => crew.directives_tool(b, input).await,
             // The person's GitHub, as them: no scope of Desk's to keep to.
             super::github::PR | super::github::BRANCH | super::github::CI => {
                 super::github::read(
@@ -804,6 +806,7 @@ pub(crate) fn describe(name: &str) -> &'static str {
             super::items::ORDER => super::items::ORDER_DESCRIPTION,
             super::preferences::PREFER => super::preferences::PREFER_DESCRIPTION,
             super::preferences::PREFERENCES => super::preferences::PREFERENCES_DESCRIPTION,
+            super::directives::NAME => super::directives::DESCRIPTION,
             super::board::NAME => super::board::DESCRIPTION,
             super::plan::NAME => super::plan::DESCRIPTION,
             super::plan::UPDATE => super::plan::UPDATE_DESCRIPTION,
@@ -862,6 +865,7 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
         super::preferences::PREFER | super::preferences::PREFERENCES => {
             super::preferences::schema(name)
         }
+        super::directives::NAME => super::directives::schema(),
         super::board::NAME => super::board::schema(),
         super::plan::NAME => super::plan::schema(),
         super::plan::UPDATE => super::plan::update_schema(),

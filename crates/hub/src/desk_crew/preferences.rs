@@ -137,9 +137,27 @@ impl CrewHub {
         };
         // Only the one applied must be there and active: one it set aside
         // that has since gone is left out of the line, never a refusal.
+        // A main boss's directive a group's boss falls back on counts only
+        // while the group hasn't answered it its own way.
+        let inherited: Vec<Uuid> = match scope == preference::MAIN {
+            true => Vec::new(),
+            false => store
+                .directive_view(YOU, &scope)
+                .await
+                .map(|(v, _)| {
+                    v.questions
+                        .iter()
+                        .filter(|q| q.inherited)
+                        .filter_map(|q| q.preference_id)
+                        .chain(v.own.iter().filter(|o| o.inherited).map(|o| o.id))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        let ours = |p: &Preference| p.boss_scope == scope || inherited.contains(&p.id);
         let applied = found
             .into_iter()
-            .find(|p| p.id == id && p.owner == YOU && p.boss_scope == scope)
+            .find(|p| p.id == id && p.owner == YOU && ours(p))
             .ok_or_else(|| {
                 refuse(format!(
                     "There is no preference {id} of the person's for you (crew.preferences lists them)."
@@ -160,7 +178,7 @@ impl CrewHub {
                 Vec::new()
             })
             .into_iter()
-            .filter(|p| p.owner == YOU && p.boss_scope == scope && p.state == PrefState::Active)
+            .filter(|p| p.owner == YOU && ours(p) && p.state == PrefState::Active)
             .collect();
         let tz = self.desk.timezone();
         Ok(Some(Applied {
@@ -281,6 +299,11 @@ impl CrewHub {
             })
             .ok_or_else(|| format!("There is no preference {id} of the person's for you."))?;
         let changed = match action {
+            "change" if found.directive.is_some() => {
+                return Err(
+                    "That one is a directive: answer it again with crew.directives instead.".into(),
+                );
+            }
             "change" => {
                 let change = PrefChange {
                     when_text: text(input, "when"),
@@ -347,8 +370,23 @@ impl CrewHub {
                 return None;
             }
         };
+        // The directives are said apart, as the orders they are.
+        let directives = match self.desk.store().directive_view(YOU, boss_scope).await {
+            Ok((v, named)) => workforce_desk::directive::context(&v, &named, unbound),
+            Err(e) => {
+                tracing::info!(error = %e, "the person's directives couldn't be read for a boss's turn");
+                None
+            }
+        };
+        let prefs: Vec<Preference> = prefs
+            .into_iter()
+            .filter(|p| p.directive.is_none())
+            .collect();
         if prefs.is_empty() {
-            return None;
+            return directives.map(|d| PrefsContext {
+                listed: d.trim_end().to_string(),
+                how: DIRECTIVES_HOW.to_string(),
+            });
         }
         let prefs = match about {
             None => prefs,
@@ -367,7 +405,10 @@ impl CrewHub {
             }
         };
         if prefs.is_empty() {
-            return None;
+            return directives.map(|d| PrefsContext {
+                listed: d.trim_end().to_string(),
+                how: DIRECTIVES_HOW.to_string(),
+            });
         }
         let listed = preference::listed(
             &preference::ranked(prefs),
@@ -378,8 +419,12 @@ impl CrewHub {
             true => "close when it is near but not quite its own case: apply a close match and say so, never ask",
             false => "close when it is near but not quite its own case: apply a close match when what you do can be undone, otherwise ask the person whether it covers this case (crew.ask_person, options Yes / No / Not this time)",
         };
+        let listed = match directives {
+            Some(d) => format!("{}\n\nThe person's preferences:\n{listed}", d.trim_end()),
+            None => format!("The person's preferences:\n{listed}"),
+        };
         Some(PrefsContext {
-            listed: format!("The person's preferences:\n{listed}"),
+            listed,
             how: format!(
                 "Check the person's preferences (in Desk's notes above) before you decide or ask; the \
                  first that fits wins: the most specific scope, then the newest. Apply one by passing \
@@ -391,6 +436,9 @@ impl CrewHub {
         })
     }
 }
+
+/// How a turn given directives and no other preferences applies them.
+const DIRECTIVES_HOW: &str = "Check the person's directives (in Desk's notes above) before you decide or ask: one that fits is the rule. Apply it by passing its id as preference on the crew action, with match: exact.";
 
 /// The key of the item that asks whether to change a preference the
 /// person overruled.

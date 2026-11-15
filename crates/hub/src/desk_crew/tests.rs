@@ -1830,6 +1830,7 @@ mod terminal_asks;
 mod idle;
 
 mod decisions;
+mod directives;
 mod items;
 mod learning;
 mod preferences;
