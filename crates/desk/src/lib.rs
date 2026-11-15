@@ -129,7 +129,8 @@ pub use realtime::{KeySource, Provider, Realtime};
 pub use service::KnowsGather;
 pub use service::{
     agent_subject, plan_subject, pool_subject, session_subject, AgentSpend, AgentVerdict, Boss,
-    BreakerOf, BreakerView, BudgetPatch, BudgetView, BudgetsView, ChargeView, NewBudget, Rules,
+    BreakerOf, BreakerView, BudgetPatch, BudgetView, BudgetsView, ChargeView, DialogAnswerer,
+    NewBudget, Rules,
 };
 pub use service::{check_hub_id, check_hub_url, hub_id_for_url, LinkBoard};
 pub use service::{
