@@ -14,7 +14,8 @@ use std::sync::Arc;
 
 use workforce_agent::tools::Tool;
 
-use crate::adapters::utils::{build_instances, Instances};
+use crate::adapters::auth::{address_for, field_paths, shared_get};
+use crate::adapters::utils::{build_instances, InstancePaths, LiveInstances};
 
 use crate::definition::{
     CredentialRequirement, SkillDefinition, SkillPolicy, SkillRequirements, SkillTool,
@@ -59,97 +60,117 @@ pub const WRITE_TOOLS: &[&str] = &[
 
 /// The Jira skill — provides tools for interacting with Jira Cloud REST v3.
 pub struct JiraSkill {
-    clients: Arc<HashMap<String, Arc<client::JiraClient>>>,
-    default_workspace: String,
+    instances: Arc<LiveInstances<client::JiraClient>>,
     prefix_map: Arc<HashMap<String, String>>,
 }
 
 impl JiraSkill {
     /// Build a `JiraSkill` from its config with static credentials.
     pub fn new(config: JiraSkillConfig) -> eyre::Result<Self> {
-        Self::build(config, |name, ws| {
-            let site = ws
-                .site
-                .as_deref()
-                .ok_or_else(|| eyre::eyre!("Jira workspace '{name}' has no site configured"))?;
-            client::JiraClient::new(&ws.email, &ws.api_token, site, ws.default_project.clone())
-        })
-    }
-
-    /// Build a `JiraSkill` with a `SecretStore` for per-user credential resolution.
-    ///
-    /// Credentials are read from the store on each API request.
-    pub fn with_store(
-        config: JiraSkillConfig,
-        store: Arc<dyn workforce_common::settings::SecretStore>,
-    ) -> eyre::Result<Self> {
-        Self::build(config, |name, ws| {
-            client::JiraClient::with_store(
-                Arc::clone(&store),
-                name,
-                ws.site.as_deref(),
-                ws.default_project.clone(),
-            )
-        })
-    }
-
-    fn build(
-        config: JiraSkillConfig,
-        make: impl Fn(&str, &JiraWorkspaceConfig) -> eyre::Result<client::JiraClient>,
-    ) -> eyre::Result<Self> {
-        let Instances { clients, default } = build_instances(
+        let instances = build_instances(
             "jira",
             &config.resolve(),
             config.default_workspace.as_deref(),
             "No Jira workspaces configured. Set email/api_token/site or workspaces.*.",
-            make,
+            |name, ws: &JiraWorkspaceConfig| {
+                let site = ws
+                    .site
+                    .as_deref()
+                    .ok_or_else(|| eyre::eyre!("Jira workspace '{name}' has no site configured"))?;
+                client::JiraClient::new(&ws.email, &ws.api_token, site, ws.default_project.clone())
+            },
         )?;
         Ok(Self {
-            clients,
-            default_workspace: default,
+            instances: Arc::new(LiveInstances::fixed(instances)),
             prefix_map: Arc::new(config.prefix_map),
         })
     }
 
-    /// The instances this skill exposes, for the environments of the agent
-    /// that loaded it.
-    pub fn variants(&self) -> Option<workforce_agent::llm::environment::SkillVariants> {
-        workforce_agent::llm::environment::SkillVariants::of(
-            self.clients.keys().cloned(),
-            &self.default_workspace,
+    /// Build a `JiraSkill` whose workspaces, keys and sites are read from
+    /// `store` per call, as the caller. Of `config` only the shared default
+    /// selector and project-key prefixes are kept: one loaded skill serves
+    /// everyone, so nothing of whoever loaded it may shape what another sees.
+    pub fn with_store(
+        config: JiraSkillConfig,
+        store: Arc<dyn workforce_common::settings::SecretStore>,
+    ) -> eyre::Result<Self> {
+        let clients = Arc::clone(&store);
+        let instances = LiveInstances::live(
+            store,
+            Self::instance_paths(),
+            config.default_workspace.clone(),
+            move |name| {
+                // Shared settings only: the client resolves the caller's own
+                // key, email and site per call.
+                let ws_flat = |f: &str| field_paths("jira", "workspaces", name, f);
+                let (site_ws, site_flat) = ws_flat("site");
+                let site = address_for(clients.as_ref(), &site_ws)
+                    .or_else(|| address_for(clients.as_ref(), &site_flat));
+                let (proj_ws, proj_flat) = ws_flat("default_project");
+                let default_project = shared_get(clients.as_ref(), &proj_ws)
+                    .or_else(|| shared_get(clients.as_ref(), &proj_flat));
+                client::JiraClient::with_store(
+                    Arc::clone(&clients),
+                    name,
+                    site.as_deref(),
+                    default_project,
+                )
+            },
+        );
+        Ok(Self {
+            instances: Arc::new(instances),
+            prefix_map: Arc::new(config.prefix_map),
+        })
+    }
+
+    /// Where Jira's workspaces live in the vault.
+    pub fn instance_paths() -> InstancePaths {
+        InstancePaths::new(
+            "skills/jira/workspaces/",
+            "api_token",
+            "skills/jira/api_token",
         )
+    }
+
+    /// The workspaces this skill exposes, read as whoever asks.
+    pub fn instance_source(&self) -> Arc<dyn workforce_agent::llm::environment::InstanceSource> {
+        Arc::clone(&self.instances) as Arc<dyn workforce_agent::llm::environment::InstanceSource>
+    }
+
+    /// The workspace a call naming none goes to, for the caller in scope.
+    pub fn default_workspace(&self) -> String {
+        self.instances.for_caller().1
     }
 
     /// Return all agent-callable tools.
     pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
-        let c = || Arc::clone(&self.clients);
-        let w = || self.default_workspace.clone();
+        let i = || Arc::clone(&self.instances);
         let p = || Arc::clone(&self.prefix_map);
         vec![
-            Arc::new(tools::JiraSearchTool::new(c(), w(), p())),
-            Arc::new(tools::JiraGetIssueTool::new(c(), w(), p())),
-            Arc::new(tools::JiraCreateIssueTool::new(c(), w(), p())),
-            Arc::new(tools::JiraUpdateIssueTool::new(c(), w(), p())),
-            Arc::new(tools::JiraDeleteIssueTool::new(c(), w(), p())),
-            Arc::new(tools::JiraAssignIssueTool::new(c(), w(), p())),
-            Arc::new(tools::JiraAddCommentTool::new(c(), w(), p())),
-            Arc::new(tools::JiraListCommentsTool::new(c(), w(), p())),
-            Arc::new(tools::JiraListTransitionsTool::new(c(), w(), p())),
-            Arc::new(tools::JiraTransitionIssueTool::new(c(), w(), p())),
-            Arc::new(tools::JiraAddAttachmentTool::new(c(), w(), p())),
-            Arc::new(tools::JiraGetAttachmentTool::new(c(), w(), p())),
-            Arc::new(tools::JiraAttachmentReadTool::new(c(), w(), p())),
-            Arc::new(tools::JiraListProjectsTool::new(c(), w(), p())),
-            Arc::new(tools::JiraGetProjectTool::new(c(), w(), p())),
-            Arc::new(tools::JiraSearchUsersTool::new(c(), w(), p())),
-            Arc::new(tools::JiraMyselfTool::new(c(), w(), p())),
-            Arc::new(tools::JiraListFieldsTool::new(c(), w(), p())),
-            Arc::new(tools::JiraDevStatusTool::new(c(), w(), p())),
-            Arc::new(tools::JiraListRemoteLinksTool::new(c(), w(), p())),
-            Arc::new(tools::JiraListBoardsTool::new(c(), w(), p())),
-            Arc::new(tools::JiraListSprintsTool::new(c(), w(), p())),
-            Arc::new(tools::JiraAddWorklogTool::new(c(), w(), p())),
-            Arc::new(tools::JiraApiTool::new(c(), w(), p())),
+            Arc::new(tools::JiraSearchTool::with_instances(i(), p())),
+            Arc::new(tools::JiraGetIssueTool::with_instances(i(), p())),
+            Arc::new(tools::JiraCreateIssueTool::with_instances(i(), p())),
+            Arc::new(tools::JiraUpdateIssueTool::with_instances(i(), p())),
+            Arc::new(tools::JiraDeleteIssueTool::with_instances(i(), p())),
+            Arc::new(tools::JiraAssignIssueTool::with_instances(i(), p())),
+            Arc::new(tools::JiraAddCommentTool::with_instances(i(), p())),
+            Arc::new(tools::JiraListCommentsTool::with_instances(i(), p())),
+            Arc::new(tools::JiraListTransitionsTool::with_instances(i(), p())),
+            Arc::new(tools::JiraTransitionIssueTool::with_instances(i(), p())),
+            Arc::new(tools::JiraAddAttachmentTool::with_instances(i(), p())),
+            Arc::new(tools::JiraGetAttachmentTool::with_instances(i(), p())),
+            Arc::new(tools::JiraAttachmentReadTool::with_instances(i(), p())),
+            Arc::new(tools::JiraListProjectsTool::with_instances(i(), p())),
+            Arc::new(tools::JiraGetProjectTool::with_instances(i(), p())),
+            Arc::new(tools::JiraSearchUsersTool::with_instances(i(), p())),
+            Arc::new(tools::JiraMyselfTool::with_instances(i(), p())),
+            Arc::new(tools::JiraListFieldsTool::with_instances(i(), p())),
+            Arc::new(tools::JiraDevStatusTool::with_instances(i(), p())),
+            Arc::new(tools::JiraListRemoteLinksTool::with_instances(i(), p())),
+            Arc::new(tools::JiraListBoardsTool::with_instances(i(), p())),
+            Arc::new(tools::JiraListSprintsTool::with_instances(i(), p())),
+            Arc::new(tools::JiraAddWorklogTool::with_instances(i(), p())),
+            Arc::new(tools::JiraApiTool::with_instances(i(), p())),
         ]
     }
 
@@ -636,9 +657,9 @@ mod tests {
     #[test]
     fn a_sole_named_workspace_becomes_the_default_without_a_selector() {
         let skill = JiraSkill::new(named(&["harbor"], None)).unwrap();
-        assert_eq!(skill.default_workspace, "harbor");
+        assert_eq!(skill.default_workspace(), "harbor");
         let skill = JiraSkill::new(named(&["harbor"], Some("gone"))).unwrap();
-        assert_eq!(skill.default_workspace, "harbor");
+        assert_eq!(skill.default_workspace(), "harbor");
     }
 
     #[test]
@@ -650,17 +671,17 @@ mod tests {
             ..named(&["mateusz"], None)
         };
         let skill = JiraSkill::new(cfg).unwrap();
-        assert_eq!(skill.default_workspace, "default");
+        assert_eq!(skill.default_workspace(), "default");
     }
 
     #[test]
     fn a_configured_selector_wins_and_a_stale_one_over_several_is_kept_for_the_call_error() {
         let skill = JiraSkill::new(named(&["acme", "client"], Some("client"))).unwrap();
-        assert_eq!(skill.default_workspace, "client");
+        assert_eq!(skill.default_workspace(), "client");
         let skill = JiraSkill::new(named(&["acme", "client"], Some("gone"))).unwrap();
-        assert_eq!(skill.default_workspace, "gone");
+        assert_eq!(skill.default_workspace(), "gone");
         let skill = JiraSkill::new(named(&["acme", "client"], None)).unwrap();
-        assert_eq!(skill.default_workspace, "default");
+        assert_eq!(skill.default_workspace(), "default");
     }
 
     #[test]

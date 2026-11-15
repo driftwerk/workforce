@@ -22,12 +22,13 @@ pub mod client;
 pub mod config;
 pub mod tools;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use workforce_agent::tools::Tool;
 
-use crate::adapters::utils::{build_instances, Instances};
+use crate::adapters::utils::{
+    build_instances, live_from_config, InstancePaths, Instances, LiveInstances,
+};
 use crate::definition::{
     CredentialRequirement, SkillDefinition, SkillPolicy, SkillRequirements, SkillTool,
 };
@@ -74,7 +75,7 @@ pub const WRITE_TOOLS: &[&str] = &[
 /// The Postmark skill — provides tools for the Postmark REST API across
 /// multiple server/account token pairs.
 pub struct PostmarkSkill {
-    clients: Arc<HashMap<String, Arc<client::PostmarkClient>>>,
+    clients: Arc<LiveInstances<client::PostmarkClient>>,
     default_workspace: String,
 }
 
@@ -82,7 +83,7 @@ impl PostmarkSkill {
     /// Build a `PostmarkSkill` with static credentials. Use
     /// [`PostmarkSkill::with_store`] for per-user resolution.
     pub fn new(config: PostmarkSkillConfig) -> eyre::Result<Self> {
-        Self::build(config, |_, ws| {
+        Self::build(config, None, |_, ws| {
             client::PostmarkClient::new(
                 &ws.server_token,
                 ws.account_token.as_deref(),
@@ -98,35 +99,69 @@ impl PostmarkSkill {
         config: PostmarkSkillConfig,
         store: Arc<dyn workforce_common::settings::SecretStore>,
     ) -> eyre::Result<Self> {
-        Self::build(config, |name, ws| {
+        let live = (Arc::clone(&store), Self::instance_paths());
+        Self::build(config, Some(live), move |name, ws| {
             client::PostmarkClient::with_store(Arc::clone(&store), name, ws.base_url.as_deref())
         })
     }
 
     fn build(
         config: PostmarkSkillConfig,
-        make: impl Fn(&str, &PostmarkWorkspaceConfig) -> eyre::Result<client::PostmarkClient>,
+        live: Option<(
+            Arc<dyn workforce_common::settings::SecretStore>,
+            InstancePaths,
+        )>,
+        make: impl Fn(&str, &PostmarkWorkspaceConfig) -> eyre::Result<client::PostmarkClient>
+            + Send
+            + Sync
+            + 'static,
     ) -> eyre::Result<Self> {
+        let resolved = config.resolve();
         let Instances { clients, default } = build_instances(
             "postmark",
-            &config.resolve(),
+            &resolved,
             config.default_workspace.as_deref(),
             "No Postmark workspaces configured. Set server_token or workspaces.*.",
-            make,
+            &make,
         )?;
+        // Store-backed: the instances are the caller's, read per call; the
+        // loader's are only asked whether there is anything to load.
+        let clients = Arc::new(match live {
+            None => LiveInstances::fixed(Instances {
+                clients,
+                default: default.clone(),
+            }),
+            Some((store, paths)) => live_from_config(
+                store,
+                paths,
+                config.default_workspace.clone(),
+                resolved,
+                PostmarkWorkspaceConfig {
+                    server_token: String::new(),
+                    account_token: None,
+                    base_url: None,
+                },
+                make,
+            ),
+        });
         Ok(Self {
             clients,
             default_workspace: default,
         })
     }
 
-    /// The instances this skill exposes, for the environments of the agent
-    /// that loaded it.
-    pub fn variants(&self) -> Option<workforce_agent::llm::environment::SkillVariants> {
-        workforce_agent::llm::environment::SkillVariants::of(
-            self.clients.keys().cloned(),
-            &self.default_workspace,
+    /// Where this adapter's instances live in the vault.
+    pub fn instance_paths() -> InstancePaths {
+        InstancePaths::new(
+            "skills/postmark/workspaces/",
+            "server_token",
+            "skills/postmark/server_token",
         )
+    }
+
+    /// The instances this skill exposes, read as whoever asks.
+    pub fn instance_source(&self) -> Arc<dyn workforce_agent::llm::environment::InstanceSource> {
+        Arc::clone(&self.clients) as Arc<dyn workforce_agent::llm::environment::InstanceSource>
     }
 
     /// Return all agent-callable tools.
@@ -691,6 +726,7 @@ impl PostmarkSkill {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn skill_builds_with_flat_config() {

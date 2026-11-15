@@ -1825,6 +1825,8 @@ mod decides_at_once;
 
 mod answers_questions;
 
+mod terminal_asks;
+
 mod idle;
 
 mod decisions;

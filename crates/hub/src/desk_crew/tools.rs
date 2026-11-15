@@ -402,7 +402,7 @@ impl CrewTool {
             "name": v.label(), "hub_name": v.name, "group": v.group.map(|g| g.name),
             "goal": v.goal, "cwd": v.cwd,
             "last_prompt": v.last_prompt, "last_reply": v.last_reply,
-            "pending": v.pending, "terminal": terminal,
+            "pending": v.pending.as_ref().map(super::decide::pending_for_boss), "terminal": terminal,
         });
         Ok(json!({
             "state": v.state,

@@ -13,12 +13,13 @@ pub mod notes;
 pub mod objects;
 pub mod tools;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use workforce_agent::tools::Tool;
 
-use crate::adapters::utils::{build_instances, Instances};
+use crate::adapters::utils::{
+    build_instances, live_from_config, InstancePaths, Instances, LiveInstances,
+};
 use crate::definition::{
     CredentialRequirement, SkillDefinition, SkillPolicy, SkillRequirements, SkillTool,
 };
@@ -27,14 +28,14 @@ pub use config::{HubspotPortalConfig, HubspotSkillConfig};
 
 /// The HubSpot skill — holds a client per configured portal.
 pub struct HubspotSkill {
-    clients: Arc<HashMap<String, Arc<client::HubspotClient>>>,
+    clients: Arc<LiveInstances<client::HubspotClient>>,
     default_portal: String,
 }
 
 impl HubspotSkill {
     /// Build from config with static credentials. Errors if no portals are configured.
     pub fn new(config: HubspotSkillConfig) -> eyre::Result<Self> {
-        Self::build(config, |_, portal| {
+        Self::build(config, None, |_, portal| {
             client::HubspotClient::new(&portal.access_token, portal.max_results)
         })
     }
@@ -45,26 +46,68 @@ impl HubspotSkill {
         config: HubspotSkillConfig,
         store: Arc<dyn workforce_common::settings::SecretStore>,
     ) -> eyre::Result<Self> {
-        Self::build(config, |name, portal| {
+        let live = (Arc::clone(&store), Self::instance_paths());
+        Self::build(config, Some(live), move |name, portal| {
             client::HubspotClient::with_store(Arc::clone(&store), name, portal.max_results)
         })
     }
 
     fn build(
         config: HubspotSkillConfig,
-        make: impl Fn(&str, &HubspotPortalConfig) -> eyre::Result<client::HubspotClient>,
+        live: Option<(
+            Arc<dyn workforce_common::settings::SecretStore>,
+            InstancePaths,
+        )>,
+        make: impl Fn(&str, &HubspotPortalConfig) -> eyre::Result<client::HubspotClient>
+            + Send
+            + Sync
+            + 'static,
     ) -> eyre::Result<Self> {
+        let resolved = config.resolve();
         let Instances { clients, default } = build_instances(
             "hubspot",
-            &config.resolve(),
+            &resolved,
             config.default_portal.as_deref(),
             "No HubSpot portals configured. Set `access_token` or `[portals.<name>]`.",
-            make,
+            &make,
         )?;
+        // Store-backed: the instances are the caller's, read per call; the
+        // loader's are only asked whether there is anything to load.
+        let clients = Arc::new(match live {
+            None => LiveInstances::fixed(Instances {
+                clients,
+                default: default.clone(),
+            }),
+            Some((store, paths)) => live_from_config(
+                store,
+                paths,
+                config.default_portal.clone(),
+                resolved,
+                HubspotPortalConfig {
+                    access_token: String::new(),
+                    max_results: config::default_max_results(),
+                },
+                make,
+            ),
+        });
         Ok(Self {
             clients,
             default_portal: default,
         })
+    }
+
+    /// Where this adapter's instances live in the vault.
+    pub fn instance_paths() -> InstancePaths {
+        InstancePaths::new(
+            "skills/hubspot/portals/",
+            "access_token",
+            "skills/hubspot/access_token",
+        )
+    }
+
+    /// The instances this skill exposes, read as whoever asks.
+    pub fn instance_source(&self) -> Arc<dyn workforce_agent::llm::environment::InstanceSource> {
+        Arc::clone(&self.clients) as Arc<dyn workforce_agent::llm::environment::InstanceSource>
     }
 
     /// All agent-callable tools.
@@ -225,6 +268,7 @@ impl HubspotSkill {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn definition_lists_all_tools() {

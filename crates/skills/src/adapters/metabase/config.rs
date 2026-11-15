@@ -15,7 +15,7 @@ pub const DEFAULT_MAX_QUERY_ROWS: u64 = 2000;
 /// DB load and artifact size, not context.
 pub const STAGED_MAX_QUERY_ROWS: u64 = 50_000;
 
-fn default_max_rows() -> u64 {
+pub(crate) fn default_max_rows() -> u64 {
     STAGED_MAX_QUERY_ROWS
 }
 

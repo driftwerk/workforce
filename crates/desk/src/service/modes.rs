@@ -300,7 +300,22 @@ impl Desk {
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
         self.0.state.lock().acted.insert(id);
-        self.resume_checked(id, None, None).await
+        self.resume_checked(id, None, None, None).await
+    }
+
+    /// The mode a boss's resume or restart of `id` starts it in, where Desk
+    /// keeps none for it: the one it last ran in (one the person chose in
+    /// its terminal, say), not Claude Code's default. One that doesn't ask
+    /// only for an unbound boss that runs it, as [`Self::set_mode`] would;
+    /// the person's own start is in its own mode.
+    pub(crate) fn carried_mode(&self, id: Uuid, by: Option<&By>) -> Option<Mode> {
+        let boss = by.filter(|b| b.party.kind == PartyKind::Manager)?;
+        let mode = self.0.state.lock().modes_seen.get(&id).copied()?;
+        let carried = mode.asks() || self.unbound_runs(id, &boss.party.id);
+        if carried {
+            tracing::info!(%id, boss = %boss.party.id, mode = mode.as_str(), "a boss's start of a session carries the mode it last ran in");
+        }
+        carried.then_some(mode)
     }
 
     /// The person resumes `id` themselves: a mode that doesn't ask, which a

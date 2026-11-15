@@ -206,6 +206,13 @@ pub struct HolderOptions {
     pub token: String,
 }
 
+/// Why Desk can't answer a request: Claude Code's own dialog in its
+/// terminal asks it now.
+pub const ASKED_IN_TERMINAL: &str = "the terminal is asking for this one";
+
+/// Why Desk takes no answer to a request: it was answered already.
+pub const ALREADY_ANSWERED: &str = "already answered";
+
 #[derive(Debug, thiserror::Error)]
 pub enum DeskError {
     #[error("no such session")]
@@ -424,6 +431,26 @@ impl Live {
         }
     }
 
+    /// The call a prompt only its terminal's dialog shows is most likely
+    /// about (Claude Code's notice names no call): `thread`'s only running
+    /// call, else the only call running anywhere. None when it can't be told.
+    fn dialog_call(&self, thread: &Option<String>) -> Option<&Flight> {
+        match self.flights.get(thread).map(Vec::as_slice) {
+            Some([one]) => Some(one),
+            // A notice that names no thread (the main one's, or Claude
+            // Code's for a sub-agent): the one call running anywhere. One
+            // that names its thread is never given another thread's call.
+            _ if thread.is_none() => {
+                let mut all = self.flights.values().flatten();
+                match (all.next(), all.next()) {
+                    (Some(one), None) => Some(one),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// `thread` went on to the call `call`: what it asked of a call that
     /// has since ended is over. Not an ask whose call still runs (one run
     /// beside it may start meanwhile), nor one whose call isn't known, nor
@@ -478,18 +505,47 @@ impl Live {
         }
     }
 
+    /// Whether the sub-agent `agent` still runs: in the background, or
+    /// with a call of its own running.
+    fn agent_runs(&self, agent: &str) -> bool {
+        self.background.runs(agent) || self.flights.contains_key(&Some(agent.to_string()))
+    }
+
+    /// The main thread's turn ended, or another began: the ask it showed is
+    /// over, unless a sub-agent still running asked it. That one waits on,
+    /// shown, with Desk's way to answer it: dropping it would leave its hook
+    /// answered with nothing, and its request to Claude Code's own dialog,
+    /// in front of everything asked after it.
+    fn main_ask_over(&mut self) {
+        let runs = self
+            .holder()
+            .and_then(|h| h.agent.as_deref())
+            .is_some_and(|a| self.agent_runs(a));
+        if !runs {
+            self.pending = None;
+            self.held = None;
+            self.answer = None;
+        }
+    }
+
     /// The main thread's turn is over: nothing it ran runs, and nothing
     /// asked in it waits; but what a sub-agent still running asked waits
     /// on, Desk's way to answer it too, and shows once nothing else does.
     /// Whether an ask shows.
     fn turn_over(&mut self) -> bool {
         self.flights.remove(&None);
-        let (background, flights) = (&self.background, &self.flights);
-        self.behind.retain(|b| {
-            b.raised.agent.as_deref().is_some_and(|agent| {
-                background.runs(agent) || flights.contains_key(&Some(agent.to_string()))
+        let runs: Vec<bool> = self
+            .behind
+            .iter()
+            .map(|b| {
+                b.raised
+                    .agent
+                    .as_deref()
+                    .is_some_and(|a| self.agent_runs(a))
             })
-        });
+            .collect();
+        let mut runs = runs.into_iter();
+        self.behind.retain(|_| runs.next().unwrap_or(false));
         if self.pending.is_none() && !self.behind.is_empty() {
             self.ask_ended();
         }
@@ -639,6 +695,9 @@ struct State {
     /// The mode that doesn't ask each session was last started in, as a
     /// boss kept it ([`SessionView::mode`]).
     modes_started: HashMap<Uuid, crate::mode::Mode>,
+    /// The mode a boss's resume or restart carries a session's next start
+    /// in, where Desk keeps none for it: the one it last ran in.
+    modes_carried: HashMap<Uuid, crate::mode::Mode>,
     records: HashMap<Uuid, SessionRecord>,
     rooms: HashMap<Uuid, Room>,
     live: HashMap<Uuid, Live>,
@@ -763,6 +822,13 @@ struct State {
 }
 
 /// The most readings of the CLI's own sign-in held until it is first read.
+/// How often a request held for a boss looks whether the hub still says
+/// what its bosses answer.
+const HELD_LOOKS: Duration = Duration::from_secs(5);
+/// How long the hub's silence on what its bosses answer (a sweep every two
+/// seconds) lets requests held for them go to their terminals.
+const HELD_STALE: Duration = Duration::from_secs(30);
+
 const OWN_WAITING_MAX: usize = 64;
 
 /// How long a held session's transcript is read for a `/login` before what
@@ -3430,7 +3496,8 @@ impl Desk {
         if by.is_some() || prompt.is_some() {
             self.breaker_refuses_prompt(id, by.as_ref())?;
         }
-        self.resume_checked(id, prompt, by).await
+        let carrier = by.clone();
+        self.resume_checked(id, prompt, by, carrier.as_ref()).await
     }
 
     /// [`Self::resume`], the breaker already asked.
@@ -3439,6 +3506,7 @@ impl Desk {
         id: Uuid,
         prompt: Option<String>,
         by: Option<By>,
+        carrier: Option<&By>,
     ) -> Result<SessionView, DeskError> {
         // A Devin session's run before ends whole first ([`Self::on_exit`]),
         // and it is read after: what that end said is never saved over.
@@ -3510,7 +3578,14 @@ impl Desk {
                 r.last_prompt = Some(p);
             }
         });
+        // A boss's start carries the mode it last ran in, judged now, for
+        // this launch alone.
+        match self.carried_mode(id, carrier) {
+            Some(m) => self.0.state.lock().modes_carried.insert(id, m),
+            None => self.0.state.lock().modes_carried.remove(&id),
+        };
         let launched = self.launch(&r, afresh.is_none(), prompt.as_deref()).await;
+        self.0.state.lock().modes_carried.remove(&id);
         if let (Ok(()), Some(why)) = (&launched, &afresh) {
             if let Ok(view) = self.view(id) {
                 self.note(Event::new(
@@ -3611,7 +3686,9 @@ impl Desk {
             }
         }
         self.0.state.lock().acted.insert(id);
-        let view = self.resume_checked(id, prompt.clone(), None).await?;
+        let view = self
+            .resume_checked(id, prompt.clone(), None, Some(&by))
+            .await?;
         let text = match &prompt {
             Some(p) => format!(
                 "restarted {} with “{}”",
@@ -3849,7 +3926,7 @@ impl Desk {
                 .get_mut(&id)
                 .ok_or_else(|| DeskError::Conflict("session is not running".into()))?;
             if live.pending.as_ref().map(|p| p.id) != Some(approval) {
-                return Err(DeskError::Conflict("already answered".into()));
+                return Err(DeskError::Conflict(ALREADY_ANSWERED.into()));
             }
             if matches!(decision, Decision::AllowForSession | Decision::Cancel) {
                 return Err(DeskError::Invalid(
@@ -3862,7 +3939,7 @@ impl Desk {
                 .answer
                 .take()
                 .filter(|a| !a.is_closed())
-                .ok_or_else(|| DeskError::Conflict("the terminal is asking for this one".into()))?;
+                .ok_or_else(|| DeskError::Conflict(ASKED_IN_TERMINAL.into()))?;
             // A dialog's question held at its start: its boss's deny is its
             // answer.
             let question = live.holder().is_some_and(|h| h.question);
@@ -4001,7 +4078,7 @@ impl Desk {
                 .codex_asks
                 .iter()
                 .position(|a| a.pending.id == approval)
-                .ok_or_else(|| DeskError::Conflict("already answered".into()))?;
+                .ok_or_else(|| DeskError::Conflict(ALREADY_ANSWERED.into()))?;
             if decision == Decision::Terminal {
                 // Its terminal asks it too: Desk just stops offering it.
                 let asked = live.codex_asks.remove(at);
@@ -4059,9 +4136,7 @@ impl Desk {
                     .is_ok()
             });
             if !sent {
-                return Err(DeskError::Conflict(
-                    "the terminal is asking for this one".into(),
-                ));
+                return Err(DeskError::Conflict(ASKED_IN_TERMINAL.into()));
             }
             let asked = live.codex_asks.remove(at);
             live.codex_sent.insert(
@@ -4114,11 +4189,9 @@ impl Desk {
                 .codex_question
                 .as_mut()
                 .filter(|(_, q)| q.id == approval)
-                .ok_or_else(|| DeskError::Conflict("already answered".into()))?;
+                .ok_or_else(|| DeskError::Conflict(ALREADY_ANSWERED.into()))?;
             if !q.answerable {
-                return Err(DeskError::Conflict(
-                    "the terminal is asking for this one".into(),
-                ));
+                return Err(DeskError::Conflict(ASKED_IN_TERMINAL.into()));
             }
             let Some(said) = said else {
                 q.answerable = false;
@@ -4146,9 +4219,7 @@ impl Desk {
                     .is_ok()
             });
             if !sent {
-                return Err(DeskError::Conflict(
-                    "the terminal is asking for this one".into(),
-                ));
+                return Err(DeskError::Conflict(ASKED_IN_TERMINAL.into()));
             }
             live.codex_question = None;
             st.decided.insert(approval);
@@ -4213,6 +4284,12 @@ impl Desk {
     /// one's shell) goes on. Not working, it does nothing.
     pub fn interrupt(&self, id: Uuid, by: Option<By>) -> Result<SessionView, DeskError> {
         self.boss_holds(id, by.as_ref())?;
+        // A boss presses Esc on a dialog only where its Act fully answers
+        // the session and the person isn't in control of it.
+        let by_boss = by
+            .as_ref()
+            .is_some_and(|b| b.party.kind == crew::PartyKind::Manager);
+        let boss_clears = !by_boss || self.holds_requests_for_boss(id);
         let pty = {
             let st = self.0.state.lock();
             let live = st
@@ -4222,19 +4299,37 @@ impl Desk {
             let record = st.records.get(&id);
             let keys = record.and_then(|r| engine::interrupt_keys(r.engine));
             let working = record.map(|r| r.state) == Some(SessionState::Working);
-            keys.filter(|_| working)
+            // Blocked on what only its terminal's dialog answers: Esc there
+            // turns it down, and the turn ends.
+            // A boss clears only Claude Code's (the one it asks again).
+            let in_dialog = boss_clears
+                && (!by_boss || record.is_some_and(|r| r.engine == Engine::Claude))
+                && record.map(|r| r.state) == Some(SessionState::Blocked)
+                && live.pending.as_ref().is_some_and(|p| !p.answerable);
+            keys.filter(|_| working || in_dialog)
                 .map(|keys| (Arc::clone(&live.pty), keys))
         };
         let Some((pty, keys)) = pty else {
             return self.view(id);
         };
         pty.write(keys)?;
-        // Claude Code runs no hook for an interrupted turn.
+        // Claude Code runs no hook for an interrupted turn, nor for a
+        // dialog Esc turned down: that wait is over, and what queues
+        // behind it shows next (its own notice, for one its terminal asks).
         self.change(id, |r, l| {
-            if let Some(l) = l.filter(|_| r.state == SessionState::Working) {
+            let Some(l) = l else { return };
+            if r.state == SessionState::Working {
                 r.state = SessionState::Done;
                 l.current_tool = None;
                 l.interrupted = true;
+            } else if r.state == SessionState::Blocked
+                && l.pending.as_ref().is_some_and(|p| !p.answerable)
+            {
+                l.ask_ended();
+                r.state = match l.pending {
+                    Some(_) => SessionState::Blocked,
+                    None => SessionState::Done,
+                };
             }
         });
         let view = self.view(id)?;
@@ -4245,6 +4340,61 @@ impl Desk {
                 format!("interrupted {}", view.label()),
             ));
         }
+        Ok(view)
+    }
+
+    /// Its Act fully boss clears the prompt `pending` only `id`'s terminal's
+    /// dialog shows (Esc), so the session asks again where the boss answers:
+    /// only while that is still what it waits on, unanswerable, and the
+    /// person isn't in control of it; never a running turn.
+    pub fn clear_dialog(&self, id: Uuid, pending: Uuid, by: By) -> Result<SessionView, DeskError> {
+        if by.party.kind != crew::PartyKind::Manager || !self.holds_requests_for_boss(id) {
+            return Err(DeskError::Conflict(
+                "the person is in control of it, or its boss doesn't answer it".into(),
+            ));
+        }
+        let pty = {
+            let st = self.0.state.lock();
+            let live = st
+                .live
+                .get(&id)
+                .ok_or_else(|| DeskError::Conflict("session is not running".into()))?;
+            let record = st.records.get(&id);
+            // Claude Code's own prompts alone: Codex's, a question, an MCP
+            // server's dialog are the person's, as before.
+            let still = record.is_some_and(|r| r.engine == Engine::Claude)
+                && record.map(|r| r.state) == Some(SessionState::Blocked)
+                && live
+                    .pending
+                    .as_ref()
+                    .is_some_and(|p| p.id == pending && !p.answerable);
+            if !still {
+                return Err(DeskError::Conflict(ALREADY_ANSWERED.into()));
+            }
+            let keys = record
+                .and_then(|r| engine::interrupt_keys(r.engine))
+                .ok_or_else(|| DeskError::Invalid("its engine takes no Esc from Desk".into()))?;
+            (Arc::clone(&live.pty), keys)
+        };
+        pty.0.write(pty.1)?;
+        self.change(id, |r, l| {
+            if let Some(l) = l.filter(|l| l.pending.as_ref().is_some_and(|p| p.id == pending)) {
+                l.ask_ended();
+                r.state = match l.pending {
+                    Some(_) => SessionState::Blocked,
+                    None => SessionState::Done,
+                };
+            }
+        });
+        let view = self.view(id)?;
+        self.note(by.event(
+            Kind::Interrupted,
+            Some(Party::session(&view)),
+            format!(
+                "cleared {}'s prompt from its terminal, so it asks again in Desk",
+                view.label()
+            ),
+        ));
         Ok(view)
     }
 
@@ -4853,7 +5003,8 @@ impl Desk {
         let mut fixed_ground = None;
         // The mode Desk keeps for it, as an overseer set it; one that
         // doesn't ask is shown on its card while it runs in it.
-        let mode = self.mode_to_start(r.id).await;
+        let carried = self.0.state.lock().modes_carried.remove(&r.id);
+        let mode = self.mode_to_start(r.id).await.or(carried);
         {
             let mut st = self.0.state.lock();
             match mode.filter(|m| !m.asks()) {
@@ -5786,16 +5937,40 @@ impl Desk {
             Hook::NeedsInput(message) => self.change(id, |r, l| {
                 if let Some(l) = l.filter(|l| l.pending.is_none()) {
                     r.state = SessionState::Blocked;
+                    // What it asks, whole, where Desk can tell which call it
+                    // is: Claude Code's notice says only "Claude needs your
+                    // permission", and its boss judges the command.
+                    let asked = l.dialog_call(&inside).map(|f| {
+                        let (label, said) = claude::tool_summary(&f.tool, Some(&f.input));
+                        let shown = match said.is_empty() {
+                            true => label,
+                            false => format!("{label}: {said}"),
+                        };
+                        (
+                            format!("{message} ({shown})"),
+                            crate::model::Request {
+                                tool: f.tool.clone(),
+                                input: f.input.clone(),
+                                cwd: Some(r.cwd.clone()),
+                                read_only: false,
+                            },
+                        )
+                    });
+                    // How it ends stays as for any dialog: no call is named.
+                    let (detail, request) = match asked {
+                        Some((d, req)) => (d, Some(req)),
+                        None => (message, None),
+                    };
                     let pending = PendingApproval {
                         id: Uuid::new_v4(),
                         tool: "Input".into(),
-                        detail: message,
+                        detail,
                         since: Utc::now(),
                         answerable: false,
                         choices: Vec::new(),
                         why: None,
                         options: None,
-                        request: None,
+                        request,
                         call: None,
                         agent: inside.clone(),
                         cli_session: r.cli_session_id.clone(),
@@ -5822,9 +5997,12 @@ impl Desk {
             Hook::InputAnswered => self.change(id, |r, l| {
                 if let Some(l) = l {
                     if l.pending.as_ref().is_some_and(|p| p.tool == "Input") {
-                        l.pending = None;
-                        l.held = None;
-                        r.state = SessionState::Working;
+                        // What waits behind it shows next.
+                        l.ask_ended();
+                        r.state = match l.pending {
+                            Some(_) => SessionState::Blocked,
+                            None => SessionState::Working,
+                        };
                     }
                 }
             }),
@@ -5834,7 +6012,7 @@ impl Desk {
                 self.change(id, |r, l| {
                     r.state = SessionState::Working;
                     if let Some(l) = l {
-                        l.pending = None;
+                        l.main_ask_over();
                         l.open_question = None;
                         // A running sub-agent's ask waits on.
                         if l.turn_over() {
@@ -5982,8 +6160,7 @@ impl Desk {
             r.last_prompt = Some(p);
             r.restore_offer = false;
             if let Some(l) = l {
-                l.pending = None;
-                l.held = None;
+                l.main_ask_over();
                 l.open_question = None;
                 // A running sub-agent's ask waits on.
                 if l.turn_over() {
@@ -6121,10 +6298,8 @@ impl Desk {
             r.asked = asked;
             if let Some(l) = l {
                 l.current_tool = None;
-                l.pending = None;
-                l.held = None;
+                l.main_ask_over();
                 l.open_question = None;
-                l.answer = None;
                 // A running sub-agent's ask waits on: the turn is over, the
                 // session's wait on the person isn't.
                 if l.turn_over() {
@@ -6575,9 +6750,42 @@ impl Desk {
         request: Option<crate::model::Request>,
         inside: Option<String>,
     ) -> Value {
-        let desk_answers = self
-            .record(id)
-            .is_ok_and(|r| r.approvals == Approvals::Desk);
+        let (in_desk, holdable) = self.record(id).map_or((false, false), |r| {
+            (
+                r.approvals == Approvals::Desk,
+                engine::caps(r.engine, r.view).approvals == engine::Answerer::Desk,
+            )
+        });
+        // Its terminal asks it, unless an Act fully boss answers it while the
+        // person isn't in control: then Desk holds it for the boss, as in
+        // Desk, and lets it go to the terminal only when the boss leaves it
+        // to the person or the person takes control. The hub says which
+        // sessions a boss answers each sweep (two seconds), and which it
+        // looked at: one its last word looked at is settled at once; one it
+        // hasn't looked at yet (just started, or Desk just started) waits
+        // for its next two words, while any boss is unbound, and no longer.
+        // A dialog's own check (a plan's approval, a question's) is its
+        // dialog's: answered where its question is, never held here.
+        let dialog = request
+            .as_ref()
+            .is_some_and(|r| claude::question_of(&r.tool, Some(&r.input)).is_some());
+        let for_boss = !in_desk && holdable && !dialog && {
+            let before = self.answerers_said();
+            for _ in 0..25 {
+                if self.holds_requests_for_boss(id)
+                    || self.answerers_saw(id)
+                    || !self.any_boss_unbound()
+                    // Two words since: the first may have been read before
+                    // the session was there.
+                    || self.answerers_said() > before + 1
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            self.holds_requests_for_boss(id)
+        };
+        let desk_answers = in_desk || for_boss;
         // Which call it asks about, as Claude Code's permission request
         // doesn't say: the one of its thread's running calls it matches.
         let (call, cli_session) = {
@@ -6636,6 +6844,7 @@ impl Desk {
             }
         });
         if !desk_answers {
+            tracing::info!(session = %id, agent = ?pending.agent, call = ?pending.call, "a request goes to its terminal: its approvals are asked there");
             return claude::ask_in_terminal();
         }
         // Answer a little before Claude Code's own hook timeout, so a slow
@@ -6653,9 +6862,40 @@ impl Desk {
             self.0.opts.approval_timeout
         }
         .saturating_sub(Duration::from_secs(5));
-        match tokio::time::timeout(wait, rx).await {
+        // Held for a boss, it goes to its terminal should the hub stop
+        // saying what it answers (its loop wedged): it looks every few
+        // seconds.
+        let got = if for_boss && !in_desk {
+            let mut rx = rx;
+            let end = tokio::time::Instant::now() + wait;
+            loop {
+                let next = (tokio::time::Instant::now() + HELD_LOOKS).min(end);
+                match tokio::time::timeout_at(next, &mut rx).await {
+                    Ok(r) => break Ok(r),
+                    Err(e) if next >= end => break Err(e),
+                    Err(_) => {
+                        if self.answerers_stale() && self.release_dialog(id, pending.id) {
+                            tracing::warn!(session = %id, request = %pending.id, "the hub stopped saying what its bosses answer: a held request goes to its terminal");
+                        }
+                    }
+                }
+            }
+        } else {
+            tokio::time::timeout(wait, rx).await
+        };
+        match got {
             Ok(Ok(answer)) => answer,
-            _ => {
+            gone => {
+                match gone {
+                    // Its way to be answered was dropped while it was held:
+                    // nothing should, so it is said loudly.
+                    Ok(Err(_)) => {
+                        tracing::warn!(session = %id, request = %pending.id, "a held request lost its answer: its terminal asks it")
+                    }
+                    _ => {
+                        tracing::info!(session = %id, request = %pending.id, "a held request wasn't answered in time: its terminal asks it")
+                    }
+                }
                 self.change(id, |_, l| {
                     if let Some(l) = l {
                         if let Some(p) = l.pending.as_mut().filter(|p| p.id == pending.id) {

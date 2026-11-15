@@ -153,6 +153,7 @@ pub use service::{CommentPost, FileBytes, PostVia, READ_FRESH};
 pub use service::{EffectView, HandoverView, MoveAsk, MoveCommit, MoveDone, MovePreview, SentNote};
 pub use service::{GrantView, GrantWritten, GrantsView, Native, Paused};
 pub use service::{HandedOff, HandoffPreview, Hop, LineageView};
+pub use service::{ALREADY_ANSWERED, ASKED_IN_TERMINAL};
 pub use speech::{Audio, Speak, SpeakError, Speech, SpeechProvider, VoiceKey};
 pub use store::DeskStore;
 pub use token_pipe::private_run_dir;

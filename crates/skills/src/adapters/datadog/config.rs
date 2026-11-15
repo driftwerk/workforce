@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-fn default_site() -> String {
+pub(crate) fn default_site() -> String {
     "us1".to_string()
 }
 
