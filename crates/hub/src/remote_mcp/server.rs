@@ -55,7 +55,17 @@ pub struct RemoteMcpState {
     bridge: Arc<[Arc<dyn Tool>]>,
     pending_calls: Arc<PendingCalls>,
     routed: mpsc::Sender<RoutedApproval>,
+    /// When each `(agent, person)` last had its offered adapters loaded
+    /// ([`load_offered_adapters`]): looked at again only after
+    /// [`ADAPTERS_RECHECK`].
+    adapters_checked:
+        parking_lot::Mutex<std::collections::HashMap<(String, String), std::time::Instant>>,
 }
+
+/// How long a person's offered adapters, once looked at, are left before
+/// they are looked at again: so a key they add is picked up within it, and
+/// one that can't load is tried (and logged) once in it, not every request.
+const ADAPTERS_RECHECK: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl RemoteMcpState {
     pub fn new(gateway: Arc<GatewayState>) -> Arc<Self> {
@@ -81,7 +91,23 @@ impl RemoteMcpState {
             bridge,
             pending_calls,
             routed,
+            adapters_checked: Default::default(),
         })
+    }
+
+    /// Whether `person`'s offered adapters on `agent` are due a look, and
+    /// if so marks them looked at now, so concurrent requests load once.
+    fn adapters_due(&self, agent: &str, person: &str) -> bool {
+        let now = std::time::Instant::now();
+        let mut checked = self.adapters_checked.lock();
+        checked.retain(|_, at| now.duration_since(*at) < ADAPTERS_RECHECK);
+        match checked.entry((agent.to_string(), person.to_string())) {
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(now);
+                true
+            }
+        }
     }
 
     /// The tools one agent exposes remotely: its registry plus the `agent.*`
@@ -126,7 +152,11 @@ pub fn curated_surface(
 /// is never seen at boot, so without this a restart leaves remote MCP
 /// without that adapter's tools until some turn happens to load it.
 /// When every offered adapter is registered nothing is read; otherwise the
-/// caller's vault paths are listed (in memory) to see which they hold.
+/// caller's vault paths are listed (in memory) to see which they hold. The
+/// caller ([`RemoteMcpState::adapters_due`]) does this at most once a
+/// minute per person and agent. The first person to load an adapter sets
+/// the instances it lists, as a turn's load does; each call still resolves
+/// its caller's own key, address and identity.
 fn load_offered_adapters(service: &AgentService, identity_id: &str, patterns: &[String]) {
     let everything = patterns.iter().any(|p| p == EXPOSE_ALL);
     let offered = |skill: &str| {
@@ -308,7 +338,9 @@ async fn serve(
     // or a hub's sync of its linked hub. Only a program is offered the
     // file-byte readers, or has a file's chunk left whole.
     let program = caller.as_member || marked_as_board_sync(query);
-    load_offered_adapters(&service, &identity_id, &gateway.remote_mcp.tools_allow);
+    if remote.adapters_due(&service.agent_id.to_string(), &identity_id) {
+        load_offered_adapters(&service, &identity_id, &gateway.remote_mcp.tools_allow);
+    }
     let mut surface = remote.surface_for(&service);
     if caller.as_member {
         surface = Arc::new(device_surface(&surface));
@@ -1677,6 +1709,26 @@ mod tests {
                 assert!(offered.contains(&n.to_string()), "{plain}: {offered:?}");
             }
         }
+    }
+
+    /// A person's offered adapters are looked at once a minute, per agent,
+    /// whatever the requests in between.
+    #[tokio::test]
+    async fn a_persons_adapters_are_looked_at_once_in_a_while() {
+        let remote = RemoteMcpState::new(Arc::clone(&fixture(true).state));
+        assert!(remote.adapters_due("lattice", "sam"));
+        assert!(!remote.adapters_due("lattice", "sam"));
+        assert!(remote.adapters_due("lattice", "kim"));
+        assert!(remote.adapters_due("koi", "sam"));
+        remote
+            .adapters_checked
+            .lock()
+            .values_mut()
+            .for_each(|at| *at -= ADAPTERS_RECHECK);
+        assert!(
+            remote.adapters_due("lattice", "sam"),
+            "due again a minute on"
+        );
     }
 
     /// A key a person keeps for themselves is never seen at boot: on a

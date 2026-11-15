@@ -655,6 +655,8 @@ async fn an_issue_read_from_a_hub_without_its_tools_says_so_as_the_board_does() 
         seed(&remote.jira, "ACME-1", "Fix the login", &["web"]);
         local.sync.pass_board(b.id, true).await.unwrap();
         let t = desk.ticket_by_key("ACME-1").await.unwrap();
+        // Only the issue tool goes: with any jira.* tool left the adapter
+        // reads as loaded, so remote MCP doesn't load it back.
         for service in remote.state.registry.all_services() {
             service.tools.unregister("jira.get_issue");
         }
