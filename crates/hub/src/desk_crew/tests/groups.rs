@@ -300,6 +300,15 @@ fn pointed_at(name: &str, other: &Client, dir: &Path) -> Vec<(Value, bool)> {
                 false,
             ),
         ],
+        // The person's directives for this boss: its own scope's, whatever
+        // it's pointed at, nothing of another's named.
+        super::super::directives::NAME => vec![
+            (json!({}), false),
+            (
+                json!({ "action": "answer", "key": "merge", "answer": "no" }),
+                false,
+            ),
+        ],
         "crew.promise" => vec![(
             json!({ "session_id": s, "text": "Tell you when it merges", "done_when": "merged" }),
             true,
