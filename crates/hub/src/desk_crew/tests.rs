@@ -5644,7 +5644,7 @@ fn at_act_and_above_the_dm_hint_starts_the_work_in_a_session() {
             "start it now with crew.start_session",
             "never offer or suggest one",
             "never do the work here",
-            "say what you started and in which folder",
+            "say which session has it and in which folder",
             "Pick the folder yourself",
             "ask only when you can't tell",
             "you answer here with your tools",
