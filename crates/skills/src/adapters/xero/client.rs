@@ -3,8 +3,10 @@
 //! Auth is the OAuth 2.0 client-credentials grant used by Xero "Custom
 //! Connections": POST `client_id`/`client_secret` to the identity token
 //! endpoint for a 30-minute bearer token, then call the Accounting API with
-//! that token plus the `Xero-tenant-id` header. Tokens and the tenant id are
-//! cached; the token is refreshed lazily on expiry and once on a 401.
+//! that token plus the `Xero-tenant-id` header. Tokens and a discovered tenant
+//! id are cached per credential set; the token is refreshed lazily on expiry
+//! and once on a 401. A store-backed client reads a pinned `tenant_id` per
+//! call, as the caller, beside the `client_id` it resolved.
 //!
 //! Construct via [`XeroClient::new`] for static credentials, or
 //! [`XeroClient::with_store`] to resolve them per request from a layered
@@ -40,11 +42,13 @@ const EXPORT_MAX_RATE_LIMIT_RETRIES: u32 = 5;
 const EXPORT_BACKOFF_BASE: Duration = Duration::from_millis(500);
 const EXPORT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
-/// Where a client reads its `client_id`/`client_secret`.
+/// Where a client reads its `client_id`/`client_secret` (and a pinned
+/// tenant).
 enum Creds {
     Static {
         client_id: String,
         client_secret: String,
+        tenant_id: Option<String>,
     },
     Store {
         store: Arc<dyn SecretStore>,
@@ -76,10 +80,19 @@ struct CachedToken {
     expires_at: Instant,
 }
 
-/// Cached bearer token plus the tenant discovered for one credential set.
+/// Cached bearer token plus the tenant discovered for one credential set. A
+/// pinned tenant is never kept here: it is read per call, as the caller, so
+/// one person's pin never reaches another sharing the same credentials.
 #[derive(Default)]
 struct TokenCacheEntry {
     token: Option<CachedToken>,
+    discovered_tenant: Option<String>,
+}
+
+/// The credentials a call is made with, and the tenant pinned beside them.
+struct CallCreds {
+    client_id: String,
+    client_secret: String,
     tenant_id: Option<String>,
 }
 
@@ -91,7 +104,6 @@ type CredFingerprint = [u8; 32];
 pub struct XeroClient {
     http: reqwest::Client,
     creds: Creds,
-    configured_tenant: Option<String>,
     endpoints: Endpoints,
     /// SECURITY INVARIANT: a cached token (and the tenant discovered with it) is
     /// only ever served to a caller whose currently-resolved credentials
@@ -119,26 +131,22 @@ impl XeroClient {
             Creds::Static {
                 client_id: client_id.to_string(),
                 client_secret: client_secret.to_string(),
+                tenant_id,
             },
-            tenant_id,
             Endpoints::production(),
         )
     }
 
     /// Build a client that resolves its credentials per request from `store`,
     /// reading `skills/xero/instances/{entity}/{client_id,client_secret}` with
-    /// a fallback to the legacy flat `skills/xero/{client_id,client_secret}`.
-    pub fn with_store(
-        store: Arc<dyn SecretStore>,
-        entity: &str,
-        tenant_id: Option<String>,
-    ) -> Result<Self> {
+    /// a fallback to the legacy flat `skills/xero/{client_id,client_secret}`,
+    /// and a pinned `tenant_id` beside the `client_id` it resolves.
+    pub fn with_store(store: Arc<dyn SecretStore>, entity: &str) -> Result<Self> {
         Self::build(
             Creds::Store {
                 store,
                 entity: entity.to_string(),
             },
-            tenant_id,
             Endpoints::production(),
         )
     }
@@ -156,8 +164,8 @@ impl XeroClient {
             Creds::Static {
                 client_id: client_id.to_string(),
                 client_secret: client_secret.to_string(),
+                tenant_id,
             },
-            tenant_id,
             Endpoints {
                 token_url: format!("{base}/connect/token"),
                 connections_url: format!("{base}/connections"),
@@ -174,7 +182,6 @@ impl XeroClient {
     pub(crate) fn with_store_and_endpoints_for_test(
         store: Arc<dyn SecretStore>,
         entity: &str,
-        tenant_id: Option<String>,
         base: &str,
     ) -> Self {
         Self::build(
@@ -182,7 +189,6 @@ impl XeroClient {
                 store,
                 entity: entity.to_string(),
             },
-            tenant_id,
             Endpoints {
                 token_url: format!("{base}/connect/token"),
                 connections_url: format!("{base}/connections"),
@@ -192,40 +198,51 @@ impl XeroClient {
         .expect("test client builds")
     }
 
-    fn build(
-        creds: Creds,
-        configured_tenant: Option<String>,
-        endpoints: Endpoints,
-    ) -> Result<Self> {
+    fn build(creds: Creds, endpoints: Endpoints) -> Result<Self> {
         Ok(Self {
             http: reqwest::Client::builder().build()?,
             creds,
-            configured_tenant,
             endpoints,
             cache: Mutex::new(HashMap::new()),
         })
     }
 
-    fn resolve_creds(&self) -> Result<(String, String)> {
+    /// The caller's credentials, read now. In store mode the secret and the
+    /// pinned tenant travel with the `client_id`: they come from the
+    /// caller's own tiers only when the `client_id` did, else the shared ones
+    /// (on a Desk hub, the tier the `client_id` came from or `Global`).
+    fn resolve_creds(&self) -> Result<CallCreds> {
         match &self.creds {
             Creds::Static {
                 client_id,
                 client_secret,
-            } => Ok((client_id.clone(), client_secret.clone())),
+                tenant_id,
+            } => Ok(CallCreds {
+                client_id: client_id.clone(),
+                client_secret: client_secret.clone(),
+                tenant_id: tenant_id.clone(),
+            }),
             Creds::Store { store, entity } => {
-                let field = |f: &str| {
-                    crate::adapters::auth::resolve_workspace_or_flat(
-                        store.as_ref(),
-                        &format!("skills/xero/instances/{entity}/{f}"),
-                        &format!("skills/xero/{f}"),
-                    )
-                };
-                let client_id = field("client_id")
+                use crate::adapters::auth::{companion_for, field_paths, resolve_credential};
+                let paths = |f: &str| field_paths("xero", "instances", entity, f);
+                let (id_ws, id_flat) = paths("client_id");
+                let client_id = resolve_credential(store.as_ref(), &id_ws, &id_flat)
                     .ok_or_else(|| eyre!("Xero client_id not configured for entity '{entity}'"))?;
-                let client_secret = field("client_secret").ok_or_else(|| {
+                let companion = |f: &str| {
+                    let (ws, flat) = paths(f);
+                    companion_for(store.as_ref(), &client_id, &ws, &flat)
+                };
+                let client_secret = companion("client_secret").ok_or_else(|| {
                     eyre!("Xero client_secret not configured for entity '{entity}'")
                 })?;
-                Ok((client_id, client_secret))
+                let tenant_id = companion("tenant_id")
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty());
+                Ok(CallCreds {
+                    client_id: client_id.value,
+                    client_secret,
+                    tenant_id,
+                })
             }
         }
     }
@@ -241,7 +258,11 @@ impl XeroClient {
     /// different credential set. Per-fingerprint serialisation fetches the token
     /// at most once per expiry window without blocking unrelated credentials.
     async fn auth(&self) -> Result<(String, String)> {
-        let (client_id, client_secret) = self.resolve_creds()?;
+        let CallCreds {
+            client_id,
+            client_secret,
+            tenant_id,
+        } = self.resolve_creds()?;
         let entry = self.cache_entry(&client_id, &client_secret);
 
         // Single-flight per credential set; the inner lock is the only one held
@@ -260,15 +281,15 @@ impl XeroClient {
             }
         };
 
-        let tenant = match &cached.tenant_id {
-            Some(t) => t.clone(),
-            None => {
-                let tenant = match &self.configured_tenant {
-                    Some(t) => t.clone(),
-                    None => self.discover_tenant(&bearer).await?,
-                };
-                cached.tenant_id = Some(tenant.clone());
-                tenant
+        // A pinned tenant is the caller's, read just now; only a discovered
+        // one (a function of the credentials alone) is cached.
+        let tenant = match (tenant_id, &cached.discovered_tenant) {
+            (Some(pinned), _) => pinned,
+            (None, Some(found)) => found.clone(),
+            (None, None) => {
+                let found = self.discover_tenant(&bearer).await?;
+                cached.discovered_tenant = Some(found.clone());
+                found
             }
         };
 
@@ -296,7 +317,11 @@ impl XeroClient {
     /// expiry). The tenant is left intact — only the bearer is suspect. Resolves
     /// creds again so the same fingerprint (and thus the same entry) is cleared.
     async fn invalidate_token(&self) -> Result<()> {
-        let (client_id, client_secret) = self.resolve_creds()?;
+        let CallCreds {
+            client_id,
+            client_secret,
+            ..
+        } = self.resolve_creds()?;
         let fingerprint = credential_fingerprint(&client_id, &client_secret);
         let entry = self
             .cache
@@ -914,7 +939,6 @@ mod tests {
         XeroClient::with_store_and_endpoints_for_test(
             store as Arc<dyn SecretStore>,
             "harbor",
-            None,
             &server.uri(),
         )
     }
