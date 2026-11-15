@@ -68,10 +68,7 @@ fn resolve_client(
     )
     .map_err(|d| eyre::eyre!("{}", d.message))?;
     clients.get(&account).cloned().ok_or_else(|| {
-        eyre::eyre!(
-            "Unknown Datadog account: '{account}'. Available: {:?}",
-            clients.keys().collect::<Vec<_>>()
-        )
+        crate::adapters::utils::unknown_instance("Datadog account", account.as_ref(), clients)
     })
 }
 

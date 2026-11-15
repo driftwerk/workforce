@@ -91,12 +91,7 @@ impl Ctx {
         )
         .map_err(|d| eyre!("{}", d.message))?;
         clients.get(&name).cloned().ok_or_else(|| {
-            let mut names: Vec<&str> = clients.keys().map(String::as_str).collect();
-            names.sort_unstable();
-            eyre!(
-                "Unknown SendGrid workspace: '{name}'. Available: {}",
-                names.join(", ")
-            )
+            crate::adapters::utils::unknown_instance("SendGrid workspace", &name, &clients)
         })
     }
 
@@ -2054,7 +2049,7 @@ mod tests {
         assert!(!res.success);
         let err = res.error.unwrap();
         assert!(err.contains("Unknown SendGrid workspace: 'ghost'"), "{err}");
-        assert!(err.contains("bare, default"), "{err}");
+        assert!(err.contains(r#"["bare", "default"]"#), "{err}");
     }
 
     #[tokio::test]

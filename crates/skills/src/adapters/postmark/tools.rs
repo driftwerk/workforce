@@ -76,10 +76,7 @@ fn resolve_client(
     )
     .map_err(|d| eyre::eyre!("{}", d.message))?;
     clients.get(&name).cloned().ok_or_else(|| {
-        eyre::eyre!(
-            "Unknown Postmark workspace: '{name}'. Available: {:?}",
-            clients.keys().collect::<Vec<_>>()
-        )
+        crate::adapters::utils::unknown_instance("Postmark workspace", name.as_ref(), clients)
     })
 }
 

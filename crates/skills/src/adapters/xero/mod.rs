@@ -366,6 +366,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_named_entity_never_takes_the_flat_keys_tenant() {
+        // Legacy flat keys with a pinned tenant, beside a named entity of
+        // the agent's with none: the entity discovers its own.
+        let server = mock_xero("T-DISCOVERED").await;
+        let store = People::new(&[
+            ("skills/xero/tenant_id", "T-FLAT"),
+            ("skills/xero/instances/harbor/client_id", "id-harbor"),
+            (
+                "skills/xero/instances/harbor/client_secret",
+                "secret-harbor",
+            ),
+        ]);
+        let skill = XeroSkill::with_store_for_test(None, store, &server.uri());
+        let ran = as_person("ann", organisation(&skill).execute(json!({})))
+            .await
+            .unwrap();
+        assert!(ran.success, "{:?}", ran.error);
+        assert_eq!(tenants_sent(&server).await, ["T-DISCOVERED"]);
+    }
+
+    #[tokio::test]
+    async fn a_persons_own_connection_takes_nothing_shared_with_it() {
+        // Bob's own id and secret; the agent's shared tenant pin is not his.
+        let server = mock_xero("T-DISCOVERED").await;
+        let store = People::new(&[
+            ("skills/xero/client_secret", "secret-shared"),
+            ("skills/xero/tenant_id", "T-SHARED"),
+        ]);
+        store
+            .own("bob", "skills/xero/client_id", "id-bob")
+            .own("bob", "skills/xero/client_secret", "secret-bob")
+            .own("cy", "skills/xero/client_id", "id-cy");
+        let skill = XeroSkill::with_store_for_test(None, store, &server.uri());
+        let tool = organisation(&skill);
+        let ran = as_person("bob", tool.execute(json!({}))).await.unwrap();
+        assert!(ran.success, "{:?}", ran.error);
+        assert_eq!(tenants_sent(&server).await, ["T-DISCOVERED"]);
+        // Cy has only an id of her own: the shared secret doesn't complete it.
+        let ran = as_person("cy", tool.execute(json!({}))).await.unwrap();
+        assert!(!ran.success);
+        assert!(
+            ran.error
+                .unwrap_or_default()
+                .contains("client_secret not configured"),
+            "the shared secret joined Cy's id"
+        );
+        assert_eq!(tenants_sent(&server).await.len(), 1);
+    }
+
+    #[tokio::test]
     async fn a_person_sees_and_reaches_only_their_own_entities() {
         let server = mock_xero("T-DISCOVERED").await;
         let store = People::new(&[]);

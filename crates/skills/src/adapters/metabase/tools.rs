@@ -45,10 +45,7 @@ fn resolve_client(
     )
     .map_err(|d| eyre::eyre!("{}", d.message))?;
     clients.get(&name).cloned().ok_or_else(|| {
-        eyre::eyre!(
-            "Unknown Metabase instance: '{name}'. Available: {:?}",
-            clients.keys().collect::<Vec<_>>()
-        )
+        crate::adapters::utils::unknown_instance("Metabase instance", name.as_ref(), clients)
     })
 }
 
@@ -2410,7 +2407,10 @@ mod tests {
         )
         .err()
         .expect("expected error");
-        assert!(err.to_string().contains("Unknown Metabase instance"));
+        assert!(
+            err.to_string().contains("Metabase instance not configured"),
+            "{err}"
+        );
     }
 
     #[test]

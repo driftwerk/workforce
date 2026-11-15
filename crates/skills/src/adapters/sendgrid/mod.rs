@@ -174,7 +174,7 @@ impl SendGridSkill {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::test_support::{assert_read_write_partition, InMem};
+    use crate::adapters::test_support::assert_read_write_partition;
     use std::collections::HashMap;
 
     fn flat() -> SendGridSkillConfig {
@@ -208,7 +208,12 @@ mod tests {
             default_workspace: None,
             ..SendGridSkillConfig::default()
         };
-        let skill = SendGridSkill::with_store(config, InMem::from(&[])).unwrap();
+        // The store holds the key; the config's entry gives its shared settings.
+        let store = crate::adapters::test_support::People::new(&[(
+            "skills/sendgrid/workspaces/acme/api_key",
+            "SG.acme",
+        )]);
+        let skill = SendGridSkill::with_store(config, store).unwrap();
         assert_eq!(skill.default_workspace, "acme");
         assert_eq!(
             skill.clients.for_caller().0["acme"].base_url(),

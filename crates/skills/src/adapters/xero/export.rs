@@ -824,11 +824,18 @@ fn resolve_client(
     input: &Value,
     default_entity: &str,
 ) -> Result<Arc<XeroClient>> {
-    let name = input["entity"].as_str().unwrap_or(default_entity);
+    // Through the environment's binding, as every other Xero tool goes.
+    let name = workforce_agent::llm::environment::resolve_instance(
+        "xero",
+        input["entity"].as_str(),
+        default_entity,
+        &**clients,
+    )
+    .map_err(|d| eyre!("{}", d.message))?;
     clients
-        .get(name)
+        .get(&name)
         .cloned()
-        .ok_or_else(|| crate::adapters::utils::unknown_instance("Xero entity", name, clients))
+        .ok_or_else(|| crate::adapters::utils::unknown_instance("Xero entity", &name, clients))
 }
 
 pub(super) fn export_description() -> &'static str {

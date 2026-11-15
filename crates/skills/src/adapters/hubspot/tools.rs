@@ -31,17 +31,11 @@ fn resolve_client(
     let (clients, default_portal) = (&*clients, default_portal.as_str());
     if let Some(name) = input["portal"].as_str() {
         return clients.get(name).cloned().ok_or_else(|| {
-            eyre::eyre!(
-                "Unknown HubSpot portal: '{name}'. Available: {:?}",
-                clients.keys().collect::<Vec<_>>()
-            )
+            crate::adapters::utils::unknown_instance("HubSpot portal", name, clients)
         });
     }
     clients.get(default_portal).cloned().ok_or_else(|| {
-        eyre::eyre!(
-            "Unknown HubSpot portal: '{default_portal}'. Available: {:?}",
-            clients.keys().collect::<Vec<_>>()
-        )
+        crate::adapters::utils::unknown_instance("HubSpot portal", default_portal, clients)
     })
 }
 

@@ -31,17 +31,11 @@ fn resolve_client(
     let (clients, default_workspace) = (&*clients, default_workspace.as_str());
     if let Some(name) = input["workspace"].as_str() {
         return clients.get(name).cloned().ok_or_else(|| {
-            eyre::eyre!(
-                "Unknown Notion workspace: '{name}'. Available: {:?}",
-                clients.keys().collect::<Vec<_>>()
-            )
+            crate::adapters::utils::unknown_instance("Notion workspace", name, clients)
         });
     }
     clients.get(default_workspace).cloned().ok_or_else(|| {
-        eyre::eyre!(
-            "Unknown Notion workspace: '{default_workspace}'. Available: {:?}",
-            clients.keys().collect::<Vec<_>>()
-        )
+        crate::adapters::utils::unknown_instance("Notion workspace", default_workspace, clients)
     })
 }
 

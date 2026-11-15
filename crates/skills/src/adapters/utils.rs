@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use base64::Engine;
 use serde_json::{json, Value};
-use tracing::warn;
+use tracing::{debug, warn};
 use workforce_agent::security::external_content::wrap_external_content;
 
 fn selector(configured: Option<&str>) -> Option<&str> {
@@ -118,7 +118,15 @@ impl InstancePaths {
             .filter_map(|path| {
                 path.strip_prefix(&self.prefix)?
                     .strip_suffix(&suffix)
-                    .filter(|name| !name.is_empty() && !name.contains('/'))
+                    // A nested path isn't an instance at all.
+                    .filter(|name| !name.contains('/'))
+                    .filter(|name| {
+                        let ok = is_instance_name(name);
+                        if !ok {
+                            debug!(prefix = %self.prefix, "instance skipped: its name isn't a plain word");
+                        }
+                        ok
+                    })
                     .map(str::to_string)
             })
             .collect();
@@ -136,6 +144,24 @@ impl InstancePaths {
 pub const LIVE_INSTANCE_DESCRIPTION: &str =
     "Which of your connections to use (by name). Uses your default if omitted; \
      a name you don't have is answered with the ones you do.";
+
+/// Whether `name` can name an instance: a plain word (letters, digits, `-`,
+/// `_`, `.`), so a vault path can't put arbitrary text where an instance's
+/// name is shown.
+pub fn is_instance_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// At most this many clients a live set keeps built. Past it a new name's
+/// client is built for the call and not kept, so one person with many
+/// names never evicts anyone else's.
+const MAX_BUILT: usize = 512;
+
+type OnBuilt<C> = dyn Fn(&Arc<C>) + Send + Sync;
 
 type MakeClient<C> = dyn Fn(&str) -> eyre::Result<C> + Send + Sync;
 
@@ -160,7 +186,7 @@ struct Live<C> {
     selector: Option<String>,
     make: Box<MakeClient<C>>,
     built: std::sync::Mutex<HashMap<String, Arc<C>>>,
-    on_built: Option<Box<dyn Fn(&Arc<C>) + Send + Sync>>,
+    on_built: Option<Box<OnBuilt<C>>>,
 }
 
 impl<C> LiveInstances<C> {
@@ -224,29 +250,42 @@ impl<C> LiveInstances<C> {
             return (Arc::clone(&fixed.clients), fixed.default.clone());
         };
         let names = live.paths.names(live.store.as_ref());
+        let cache = || {
+            live.built
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
         let mut clients = HashMap::with_capacity(names.len());
-        {
-            let mut built = live.built.lock().expect("instance cache poisoned");
-            for name in names {
-                let client = match built.get(&name) {
-                    Some(client) => Arc::clone(client),
-                    None => match (live.make)(&name) {
-                        Ok(client) => {
-                            let client = Arc::new(client);
-                            if let Some(hook) = live.on_built.as_ref() {
-                                hook(&client);
-                            }
-                            built.insert(name.clone(), Arc::clone(&client));
-                            client
-                        }
-                        Err(e) => {
-                            warn!(instance = %name, error = %e, "instance client not built");
-                            continue;
-                        }
-                    },
-                };
-                clients.insert(name, client);
+        for name in names {
+            if let Some(client) = cache().get(&name) {
+                clients.insert(name, Arc::clone(client));
+                continue;
             }
+            // Built outside the lock: a slow or failing build blocks no one.
+            let client = match (live.make)(&name) {
+                Ok(client) => Arc::new(client),
+                Err(e) => {
+                    warn!(instance = %name, error = %e, "instance client not built");
+                    continue;
+                }
+            };
+            let client = {
+                let mut built = cache();
+                match built.get(&name) {
+                    // Another call built it first: use that one.
+                    Some(first) => Arc::clone(first),
+                    None => {
+                        if let Some(hook) = live.on_built.as_ref() {
+                            hook(&client);
+                        }
+                        if built.len() < MAX_BUILT {
+                            built.insert(name.clone(), Arc::clone(&client));
+                        }
+                        client
+                    }
+                }
+            };
+            clients.insert(name, client);
         }
         let default = preferred_instance(&clients, live.selector.as_deref())
             .map(str::to_string)
@@ -315,7 +354,7 @@ pub fn unknown_instance<V>(what: &str, name: &str, clients: &HashMap<String, V>)
     let mut available: Vec<&str> = clients.keys().map(String::as_str).collect();
     available.sort_unstable();
     if available.is_empty() {
-        eyre::eyre!("No {what} is configured for you (asked for '{name}').")
+        eyre::eyre!("{what} not configured for you (asked for '{name}'); none of yours is set up.")
     } else {
         eyre::eyre!("Unknown {what}: '{name}'. Available: {available:?}")
     }

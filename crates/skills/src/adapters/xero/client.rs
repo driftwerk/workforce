@@ -223,19 +223,23 @@ impl XeroClient {
                 tenant_id: tenant_id.clone(),
             }),
             Creds::Store { store, entity } => {
-                use crate::adapters::auth::{companion_for, field_paths, resolve_credential};
+                use crate::adapters::auth::{field_paths, resolve_credential};
                 let paths = |f: &str| field_paths("xero", "instances", entity, f);
                 let (id_ws, id_flat) = paths("client_id");
                 let client_id = resolve_credential(store.as_ref(), &id_ws, &id_flat)
                     .ok_or_else(|| eyre!("Xero client_id not configured for entity '{entity}'"))?;
-                let companion = |f: &str| {
+                // The secret and a pinned tenant are one connection with the
+                // id: read at the form (an entity's own, or the flat keys) and
+                // the tier the id came from.
+                let named = holds(store.as_ref(), &id_ws, &client_id);
+                let beside = |f: &str| {
                     let (ws, flat) = paths(f);
-                    companion_for(store.as_ref(), &client_id, &ws, &flat)
+                    kept_with(store.as_ref(), &client_id, if named { &ws } else { &flat })
                 };
-                let client_secret = companion("client_secret").ok_or_else(|| {
+                let client_secret = beside("client_secret").ok_or_else(|| {
                     eyre!("Xero client_secret not configured for entity '{entity}'")
                 })?;
-                let tenant_id = companion("tenant_id")
+                let tenant_id = beside("tenant_id")
                     .map(|t| t.trim().to_string())
                     .filter(|t| !t.is_empty());
                 Ok(CallCreds {
@@ -589,6 +593,45 @@ fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
 fn backoff_for(attempt: u32) -> Duration {
     let shift = attempt.saturating_sub(1).min(6);
     (EXPORT_BACKOFF_BASE * (1u32 << shift)).min(EXPORT_BACKOFF_MAX)
+}
+
+/// Whether `cred` was read at `path` (rather than at its other form).
+fn holds(store: &dyn SecretStore, path: &str, cred: &crate::adapters::auth::Resolved) -> bool {
+    match cred.tier {
+        Some(tier) => store
+            .inspect(path)
+            .iter()
+            .any(|(t, v)| *t == tier && *v == cred.value),
+        None => store.get(path).as_deref() == Some(cred.value.as_str()),
+    }
+}
+
+/// A field that is part of the same connection as `cred`, at `path`: from
+/// the tier `cred` came from; for a shared `cred` also from another shared
+/// tier; for a person's own `cred` never from anywhere else, so neither a
+/// shared secret nor a shared or someone's pinned tenant joins it.
+fn kept_with(
+    store: &dyn SecretStore,
+    cred: &crate::adapters::auth::Resolved,
+    path: &str,
+) -> Option<String> {
+    let Some(tier) = cred.tier else {
+        // A store without tiers has no one's own keys; a person's own key
+        // with no tier known pairs with nothing.
+        return match cred.per_user {
+            true => None,
+            false => store.get(path),
+        };
+    };
+    store
+        .inspect(path)
+        .into_iter()
+        .find(|(t, _)| *t == tier)
+        .map(|(_, v)| v)
+        .or_else(|| match cred.per_user {
+            true => None,
+            false => crate::adapters::auth::shared_get(store, path),
+        })
 }
 
 /// Fingerprint a credential set for use as the token-cache key.
