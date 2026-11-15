@@ -5626,6 +5626,60 @@ fn the_act_hint_says_to_act_and_names_the_switches_that_are_off() {
     assert!(!CrewHub::level_hint(Level::Suggest, &off).contains("Hand out work"));
 }
 
+/// At Act, Act fully and unbound, work the person asks for in the DM
+/// starts its session there and then, in a folder the boss picks itself:
+/// never offered, never done in chat. A question is still answered. With
+/// "Hand out work" or "Always work in real sessions" off, it isn't told to.
+#[test]
+fn at_act_and_above_the_dm_hint_starts_the_work_in_a_session() {
+    use workforce_common::oversight::{Act, Level, Oversight, Work};
+    let o = Oversight::default();
+    for (level, unbound) in [
+        (Level::Act, false),
+        (Level::Full, false),
+        (Level::Full, true),
+    ] {
+        let hint = CrewHub::dm_hint(level, &o, unbound);
+        for says in [
+            "start it now with crew.start_session",
+            "never offer or suggest one",
+            "never do the work here",
+            "say which session has it and in which folder",
+            "Pick the folder yourself",
+            "ask only when you can't tell",
+            "you answer here with your tools",
+        ] {
+            assert!(
+                hint.contains(says),
+                "{level:?}, unbound {unbound}: {says:?} in {hint}"
+            );
+        }
+        assert!(!hint.to_lowercase().contains("would you like"), "{hint}");
+    }
+    for o in [
+        Oversight {
+            act: Act {
+                hand_out_work: false,
+                ..o.act
+            },
+            ..o.clone()
+        },
+        Oversight {
+            work: Work {
+                prefer_sessions: false,
+                ..o.work.clone()
+            },
+            ..o.clone()
+        },
+    ] {
+        let hint = CrewHub::dm_hint(Level::Act, &o, false);
+        assert!(!hint.contains("start it now"), "{hint}");
+    }
+    for level in [Level::Watch, Level::Suggest] {
+        assert!(!CrewHub::dm_hint(level, &o, false).contains("start it now"));
+    }
+}
+
 /// The person's own turns in the overseer's DM carry its level and the
 /// switches that are off, in a line, so it acts within them from the first
 /// request; an agent that doesn't oversee carries nothing.
@@ -5648,7 +5702,10 @@ async fn a_dm_turn_is_told_its_level_and_the_switches_that_are_off() {
         .await;
         assert!(hint.starts_with("You oversee the crew at Act: do the work yourself"), "{hint}");
         assert!(hint.contains("“Hand out work”"), "{hint}");
-        assert!(hint.len() < 600, "kept short: {hint}");
+        // Its own words kept short beside the checks every DM turn carries.
+        let own = hint.len() - super::watcher::CHECK_FIRST.len() - super::github::CHECK_GITHUB.len();
+        assert!(own < 600, "kept short: {hint}");
+        assert!(!hint.contains("start it now"), "starts are the person's here: {hint}");
         assert_eq!(super::dm_oversight_hint(&helper), None);
     })
     .await;
