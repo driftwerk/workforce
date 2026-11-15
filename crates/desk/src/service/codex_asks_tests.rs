@@ -444,7 +444,13 @@ async fn a_codex_question_shows_its_words_until_the_terminal_answers_it() {
                 ..Default::default()
             },
         )]));
-        d.set_dialog_answerers(std::collections::HashMap::from([(s.id, chrono::Duration::zero())]));
+        d.set_dialog_answerers(std::collections::HashMap::from([(
+            s.id,
+            super::DialogAnswerer {
+                boss: "crew".into(),
+                gap: chrono::Duration::zero(),
+            },
+        )]));
         say(&mut ws, json!({"id": 6, "method": "item/tool/requestUserInput", "params": {
             "threadId": "t1", "turnId": "u2", "itemId": "q-3", "isBlocking": true,
             "questions": [
