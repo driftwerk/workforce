@@ -249,9 +249,20 @@ impl CompactionTool {
             }
             config.urgent_compaction_threshold = v;
         }
-        if let Some(v) = input.compaction_model {
-            config.compaction_model = if v.is_empty() { None } else { Some(v) };
-        }
+        // Only a model the call names is pinned. Otherwise the override keeps
+        // the one it already named, or none, so compaction goes on following
+        // the agent's config (its heavy background model when unset) rather
+        // than freezing whatever that resolves to today.
+        let named = input.compaction_model.is_some();
+        config.compaction_model = match input.compaction_model {
+            Some(v) => (!v.is_empty()).then_some(v),
+            None => self
+                .service
+                .active_compaction
+                .read()
+                .as_ref()
+                .and_then(|c| c.compaction_model.clone()),
+        };
 
         // Persisted first, and only if the agent would load the result: a
         // compaction model it could not boot with never goes live.
@@ -266,7 +277,9 @@ impl CompactionTool {
             comp.max_compaction_passes = Some(config.max_compaction_passes);
             comp.min_messages_to_compact = Some(config.min_messages_to_compact);
             comp.urgent_compaction_threshold = Some(config.urgent_compaction_threshold);
-            comp.compaction_model = config.compaction_model.clone();
+            if named {
+                comp.compaction_model = config.compaction_model.clone();
+            }
         }) {
             return Ok(ToolResult::failure(
                 format!("Compaction config not changed: {e}. No changes were made."),
@@ -274,6 +287,7 @@ impl CompactionTool {
             ));
         }
         *self.service.active_compaction.write() = Some(config.clone());
+        let config = self.service.current_compaction_config();
 
         Ok(ToolResult::success(
             serde_json::json!({

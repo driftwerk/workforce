@@ -25,7 +25,7 @@ use super::layers::{within, Layered, SET};
 use super::{Row, Source, Status, Viewer};
 use crate::credentials::{Caller, LastResort};
 use crate::decide::KeySource;
-use crate::resolved_config::ResolvedConfig;
+use crate::resolved_config::{ResolvedConfig, SAME_AS_CHAT};
 use crate::serve::AgentService;
 
 type Section = fn(&Ctx<'_>) -> Vec<Row>;
@@ -136,6 +136,7 @@ fn tables(service: &AgentService, resolved: &ResolvedConfig) -> Vec<Layered> {
         voice_thinking_budget_tokens,
         effort,
         fast,
+        background,
         aws_s3,
         worker_read_sources_enabled,
         self_learning,
@@ -294,6 +295,15 @@ fn tables(service: &AgentService, resolved: &ResolvedConfig) -> Vec<Layered> {
             .effective_field("voice_thinking_budget_tokens", voice_thinking_budget_tokens)
             .effective_field("effort", effort)
             .effective_field("fast", fast)
+            // The model each group runs on, "chat" for the agent's own.
+            .effective_field(
+                "light_model",
+                &background.light.as_deref().unwrap_or(SAME_AS_CHAT),
+            )
+            .effective_field(
+                "heavy_model",
+                &background.heavy.as_deref().unwrap_or(SAME_AS_CHAT),
+            )
             .effective_field("model_preferences", model_preferences)
             .runtime(&json!({
                 "default_model": *service.active_model.read(),

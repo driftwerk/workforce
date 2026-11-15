@@ -189,6 +189,16 @@ pub fn routed_kind(spec: &str) -> Option<ProviderKind> {
         .map(|(kind, _)| kind)
 }
 
+/// Whether a bare model id is one of Claude's, so the Claude Code CLI can
+/// run it (`haiku`, `sonnet`, `claude-opus-4-7`, `fable`, ...). A model of
+/// another provider, filled in from that agent's own tiers, is not.
+pub fn is_claude_model(model: &str) -> bool {
+    let lower = model.trim().to_ascii_lowercase();
+    ["claude", "fable", "opus", "sonnet", "haiku"]
+        .iter()
+        .any(|c| lower.contains(c))
+}
+
 /// The provider kinds that run on a subscription login, in the order an
 /// editor offers them.
 pub const SUBSCRIPTION_PROVIDERS: [ProviderKind; 3] = [

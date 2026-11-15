@@ -92,7 +92,15 @@ pub(crate) async fn run(
         &memories,
         include_profile,
     ))];
-    let call = with_served_log(llm.create_message(Some(&system), &task, &[], None, None, false));
+    let model = cc_model(&service.resolved.snapshot());
+    let call = with_served_log(llm.create_message(
+        Some(&system),
+        &task,
+        &[],
+        model.as_deref(),
+        None,
+        false,
+    ));
     let (response, served) = match cancel {
         Some(cancel) => tokio::select! {
             _ = cancel.cancelled() => return CcOutcome::Cancelled,
@@ -350,10 +358,57 @@ fn consolidation_task(memories: &[Memory], include_profile: bool) -> String {
     )
 }
 
+/// The Claude Code model consolidation runs on: the agent's light
+/// background model (`[llm] light_model`) as Claude Code names it. `None`
+/// (the CLI's own default) where that is the agent's own model, names
+/// another provider, or is a model id that is not Claude's.
+fn cc_model(resolved: &crate::resolved_config::ResolvedConfig) -> Option<String> {
+    use workforce_agent::llm::tiers::ModelTier;
+    let spec = resolved.background.light_spec.as_str();
+    if spec.eq_ignore_ascii_case(crate::resolved_config::SAME_AS_CHAT) {
+        return None;
+    }
+    let cc = ProviderKind::ClaudeCode.canonical_name();
+    let (routing, model) = resolved.tiers.resolve_routed_model(spec, cc);
+    let elsewhere = routing.is_some_and(|r| r != cc);
+    (!elsewhere
+        && ModelTier::from_name(&model).is_none()
+        && crate::hub_core::subscriptions::is_claude_model(&model))
+    .then_some(model)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::memory_consolidation::CONSOLIDATION_SYSTEM_IDENTITY;
+
+    #[test]
+    fn consolidation_runs_on_claude_codes_name_for_the_light_model() {
+        use workforce_common::settings::{AgentLlmConfig, AgentWorkspaceConfig, WorkforceConfig};
+        let on = |light: Option<&str>| {
+            let ws = AgentWorkspaceConfig {
+                llm: Some(AgentLlmConfig {
+                    provider: Some("codex".into()),
+                    default_model: Some("gpt-6-sol".into()),
+                    light_model: light.map(str::to_string),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            cc_model(&crate::resolved_config::ResolvedConfig::resolve(
+                None,
+                Some(&ws),
+                &WorkforceConfig::default(),
+                "codex",
+                None,
+            ))
+        };
+        assert_eq!(on(None).as_deref(), Some("haiku"));
+        assert_eq!(on(Some("standard")).as_deref(), Some("sonnet"));
+        assert_eq!(on(Some("chat")), None);
+        assert_eq!(on(Some("gpt-6-luna")), None, "not Claude's");
+        assert_eq!(on(Some("chatgpt:cheap")), None, "another provider");
+    }
 
     fn memory(id: &str, content: &str) -> Memory {
         let mut m = Memory::new(

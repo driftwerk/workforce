@@ -364,6 +364,8 @@ pub(crate) async fn run(
         }
         Place::Desk(c) => (c.clone(), None, None),
     };
+    // The boss's own wake: its heavy background model's work.
+    let model = crate::turn_loop::heavy_model(&service);
     let turn = workforce_agent::runner::CURRENT_AUTOMATED_ORIGIN.scope(
         ORIGIN.to_string(),
         service.process_turn(
@@ -376,7 +378,7 @@ pub(crate) async fn run(
             thread.as_deref(),
             None,
             None,
-            None,
+            model.as_deref(),
             None,
             None,
             None,
