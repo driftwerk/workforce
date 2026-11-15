@@ -238,6 +238,11 @@ pub(super) const PLAN_DRAFT: &str = "A plan you make is a draft for the person t
 pub(crate) const STANDING_RULE: &str = "The person's instructions are the rule, both ways: their open orders (in your open items, in their words), their preferences, and each session's own instructions. Where they forbid a kind of step (\"don't allow anything that would impact production\"), refuse it and say what to do instead. Where they want work shipped (\"getting stuff out to production is vital as long as nothing breaks\"), do it and have the session check nothing broke. Where they say keep work going or take over, act on a session's sensible next step that serves it (have the session run it) and report \"✓ did X — why\". Touching production or staging is no reason by itself to ask. Ask the person only when their instructions don't cover the step and you truly can't judge (a destructive or irreversible step outside their orders is such a step), or when only they can physically do it (their credentials, a payment). That is rare: you handle about 99 in 100 yourself. When you must ask, answer buttons are fine, alone: no recommendation essay beside them.";
 
 /// What every DM turn of a boss is told before it speaks of a session.
+/// What a boss that starts sessions does with work the person asks it
+/// for in its DM: starts the session itself, at once, in the folder the
+/// work obviously belongs in, and answers a question itself.
+pub(super) const START_THE_WORK: &str = "Work the person asks for (a code change, a fix, an investigation in a repo, a ticket) goes to a real session: start it now with crew.start_session (crew.assign_ticket for a board ticket), never offer or suggest one and never do the work here, then say what you started and in which folder. Pick the folder yourself: a session or PR linked to the ticket, else the folder of the person's latest session (crew.overview), else the only one; ask only when you can't tell. A question (\"what tickets do I have?\") you answer here with your tools.";
+
 pub(super) const CHECK_FIRST: &str = "Before you say anything about a session, read its account with crew.account; never guess. Answer as Done / Now / Next / Waiting on, from the account, and say how fresh it is if it's over a few minutes old.";
 
 impl CrewHub {
@@ -684,16 +689,22 @@ impl CrewHub {
     pub(super) fn dm_hint(level: Level, o: &Oversight, unbound: bool) -> String {
         let says = match level {
             _ if unbound => {
-                return format!("You oversee the crew, unbound: do everything yourself with the crew.* tools. {STANDING_RULE} {PLAN_DRAFT} {CHECK_FIRST} {CHECK_GITHUB}");
+                return format!("You oversee the crew, unbound: do everything yourself with the crew.* tools. {START_THE_WORK} {STANDING_RULE} {PLAN_DRAFT} {CHECK_FIRST} {CHECK_GITHUB}");
             }
             Level::Watch => "at Watch: don't act; say what you would do.",
             Level::Suggest => "at Suggest: your crew.* actions become suggestions the person accepts.",
             Level::Act => "at Act: do the work yourself with the crew.* tools, don't offer it.",
             Level::Full => "at Act fully: do the work yourself with the crew.* tools, and ship in the repos the person named.",
         };
+        // At Act and above, work the person asks for starts its session
+        // here and now, wherever starting one is the boss's to do.
+        let says = match level.acts() && o.act.hand_out_work && o.work.prefer_sessions {
+            true => format!("{says} {START_THE_WORK}"),
+            false => says.to_string(),
+        };
         let says = match level {
             Level::Full => format!("{says} {STANDING_RULE}"),
-            _ => says.to_string(),
+            _ => says,
         };
         let off = o.act.off();
         let off = match level.acts() && !off.is_empty() {
