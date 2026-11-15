@@ -129,7 +129,10 @@ impl GithubClient {
         owner: &str,
         repo: &str,
     ) -> std::result::Result<InstallationToken, AppError> {
-        let key = format!("{owner}/{repo}");
+        // Keyed by the App's identity too: a token minted with one App's
+        // key is never handed to a call made with another's (or with the
+        // same app id and a key that isn't its own).
+        let key = token_key(app, owner, repo);
         let now = Utc::now();
         if let Some(token) = self.installation_tokens.cached(&key, now) {
             return Ok(token);
@@ -145,7 +148,9 @@ impl GithubClient {
             .send()
             .await?;
         if lookup.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(AppError::NotInstalled { repo: key });
+            return Err(AppError::NotInstalled {
+                repo: format!("{owner}/{repo}"),
+            });
         }
         let id = installation_id_of(&Self::handle_response(lookup).await?)?;
         let minted = self
@@ -188,7 +193,8 @@ impl GithubClient {
                 .send()
                 .await?;
             if response.status() == reqwest::StatusCode::UNAUTHORIZED && !reminted {
-                self.installation_tokens.forget(&format!("{owner}/{repo}"));
+                self.installation_tokens
+                    .forget(&token_key(&app, owner, repo));
                 reminted = true;
                 continue;
             }
@@ -360,6 +366,23 @@ impl GithubClient {
     }
 }
 
+/// A non-secret stand-in for an App's identity: its id and a digest of its
+/// key.
+fn app_fingerprint(app: &AppCredentials) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::new()
+        .chain_update(app.app_id.as_bytes())
+        .chain_update([0u8])
+        .chain_update(app.private_key_pem.as_bytes())
+        .finalize();
+    digest.iter().take(16).map(|b| format!("{b:02x}")).collect()
+}
+
+/// The installation-token cache key for `owner/repo` under `app`.
+fn token_key(app: &AppCredentials, owner: &str, repo: &str) -> String {
+    format!("{}/{owner}/{repo}", app_fingerprint(app))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,6 +552,23 @@ mod tests {
         use wiremock::matchers::{body_json, header_regex, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
+        #[test]
+        fn an_installation_token_is_kept_for_the_app_that_minted_it() {
+            let mine = app();
+            let other_key = AppCredentials {
+                private_key_pem: format!("{}x", mine.private_key_pem),
+                ..mine.clone()
+            };
+            assert_eq!(
+                token_key(&mine, "org", "repo"),
+                token_key(&app(), "org", "repo")
+            );
+            assert_ne!(
+                token_key(&mine, "org", "repo"),
+                token_key(&other_key, "org", "repo")
+            );
+        }
+
         fn app() -> AppCredentials {
             AppCredentials {
                 app_id: "4242".into(),
@@ -627,7 +667,7 @@ mod tests {
                 .unwrap()
                 .with_app(app());
             client.installation_tokens.remember(
-                "org/repo",
+                &token_key(&app(), "org", "repo"),
                 InstallationToken {
                     token: "ghs_revoked".into(),
                     expires_at: Utc::now() + chrono::Duration::hours(1),

@@ -316,7 +316,10 @@ mod tests {
             .unwrap()
             .with_base_url(&server.uri());
         let clients = HashMap::from([("default".to_string(), Arc::new(client))]);
-        ApiTool::new(Arc::new(clients), "default".to_string())
+        ApiTool::new(
+            Arc::new(crate::adapters::utils::LiveInstances::from(clients)),
+            "default".to_string(),
+        )
     }
 
     #[tokio::test]

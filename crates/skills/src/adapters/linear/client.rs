@@ -24,9 +24,22 @@ pub struct LinearClient {
     static_auth: Option<HeaderValue>,
     store: Option<Arc<dyn SecretStore>>,
     workspace: String,
+    /// This workspace's shared default team, if it has one.
+    default_team_id: Option<String>,
 }
 
 impl LinearClient {
+    /// The client with `team` as its workspace's default team.
+    pub fn with_default_team(mut self, team: Option<String>) -> Self {
+        self.default_team_id = team;
+        self
+    }
+
+    /// This workspace's default team, if it has one.
+    pub fn default_team_id(&self) -> Option<&str> {
+        self.default_team_id.as_deref()
+    }
+
     /// Create a Linear client with a static API key. Linear uses
     /// `Authorization: {api_key}` (no `Bearer` prefix).
     pub fn new(api_key: &str, base_url: &str) -> Result<Self> {
@@ -38,6 +51,7 @@ impl LinearClient {
             static_auth: Some(auth),
             store: None,
             workspace: String::new(),
+            default_team_id: None,
         })
     }
 
@@ -54,6 +68,7 @@ impl LinearClient {
             static_auth: None,
             store: Some(store),
             workspace: workspace.to_string(),
+            default_team_id: None,
         })
     }
 
