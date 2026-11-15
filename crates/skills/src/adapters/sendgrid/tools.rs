@@ -7,7 +7,6 @@
 //! bounce reasons, template names) pass through `wrap_external_content`;
 //! everything else stays structured JSON.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -23,11 +22,12 @@ use workforce_agent::tools::{Tool, ToolResult};
 use super::client::SendGridClient;
 use crate::adapters::utils::{
     artifact_attachments_schema, coerce_to_u64, html_with_inline_images, instance_choices,
-    resolve_artifact_attachments, truncate_string_fields, wrap_fields_in_place,
+    resolve_artifact_attachments, truncate_string_fields, wrap_fields_in_place, LiveInstances,
+    LIVE_INSTANCE_DESCRIPTION,
 };
 use crate::definition::{SkillPolicy, SkillTool};
 
-type Clients = Arc<HashMap<String, Arc<SendGridClient>>>;
+type Clients = Arc<LiveInstances<SendGridClient>>;
 type Handler =
     Box<dyn Fn(Arc<SendGridClient>, Value) -> BoxFuture<'static, Result<Value>> + Send + Sync>;
 type Summary = fn(&Ctx, &Value) -> Option<String>;
@@ -80,37 +80,35 @@ struct Ctx {
 }
 
 impl Ctx {
+    /// The caller's workspace for this call, among the ones they have now.
     fn client(&self, input: &Value) -> Result<Arc<SendGridClient>> {
+        let (clients, default_workspace) = self.clients.for_caller_or(&self.default_workspace);
         let name = workforce_agent::llm::environment::resolve_instance(
             "sendgrid",
             input["workspace"].as_str(),
-            &self.default_workspace,
-            &*self.clients,
+            &default_workspace,
+            &*clients,
         )
         .map_err(|d| eyre!("{}", d.message))?;
-        self.clients.get(&name).cloned().ok_or_else(|| {
-            eyre!(
-                "Unknown SendGrid workspace: '{name}'. Available: {}",
-                self.names().join(", ")
-            )
+        clients.get(&name).cloned().ok_or_else(|| {
+            crate::adapters::utils::unknown_instance("SendGrid workspace", &name, &clients)
         })
     }
 
-    fn names(&self) -> Vec<&str> {
-        let mut names: Vec<&str> = self.clients.keys().map(String::as_str).collect();
-        names.sort_unstable();
-        names
-    }
-
     fn workspace_prop(&self) -> Value {
-        if self.clients.len() <= 1 {
+        // A set read per caller names none: the schema is shown to everyone.
+        if self.clients.is_live() {
+            return prop("string", LIVE_INSTANCE_DESCRIPTION);
+        }
+        let (clients, _) = self.clients.for_caller();
+        if clients.len() <= 1 {
             return generic_workspace_prop();
         }
         prop(
             "string",
             &format!(
                 "SendGrid workspace name. {}",
-                instance_choices(&*self.clients, &self.default_workspace, "workspace")
+                instance_choices(&*clients, &self.default_workspace, "workspace")
             ),
         )
     }
@@ -1332,6 +1330,7 @@ mod tests {
     use super::*;
     use crate::adapters::sendgrid::{Sender, READ_TOOLS, WRITE_TOOLS};
     use crate::adapters::test_support::InMem;
+    use std::collections::HashMap;
     use wiremock::matchers::{body_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1355,7 +1354,7 @@ mod tests {
             Arc::new(SendGridClient::new("SG.bare", None, Some(&server.uri())).unwrap()),
         );
         Ctx {
-            clients: Arc::new(clients),
+            clients: Arc::new(LiveInstances::from(clients)),
             default_workspace: "default".to_string(),
         }
     }
@@ -2050,7 +2049,7 @@ mod tests {
         assert!(!res.success);
         let err = res.error.unwrap();
         assert!(err.contains("Unknown SendGrid workspace: 'ghost'"), "{err}");
-        assert!(err.contains("bare, default"), "{err}");
+        assert!(err.contains(r#"["bare", "default"]"#), "{err}");
     }
 
     #[tokio::test]
@@ -2074,7 +2073,10 @@ mod tests {
         ]);
         let client = SendGridClient::with_store(store, "default", Some(&server.uri())).unwrap();
         let ctx = Ctx {
-            clients: Arc::new(HashMap::from([("default".to_string(), Arc::new(client))])),
+            clients: Arc::new(LiveInstances::from(HashMap::from([(
+                "default".to_string(),
+                Arc::new(client),
+            )]))),
             default_workspace: "default".to_string(),
         };
         let res = tool("sendgrid.email_send", &ctx)

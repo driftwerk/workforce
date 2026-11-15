@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 /// Hard upper bound on `max_results`. Protects agent context from huge result sets.
 pub const DEFAULT_MAX_RESULTS: u64 = 100;
 
-fn default_max_results() -> u64 {
+pub(crate) fn default_max_results() -> u64 {
     DEFAULT_MAX_RESULTS
 }
 

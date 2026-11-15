@@ -13,12 +13,13 @@ pub mod client;
 pub mod config;
 pub mod tools;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use workforce_agent::tools::Tool;
 
-use crate::adapters::utils::{build_instances, Instances};
+use crate::adapters::utils::{
+    build_instances, live_from_config, InstancePaths, Instances, LiveInstances,
+};
 use crate::definition::{
     CredentialRequirement, SkillDefinition, SkillPolicy, SkillRequirements, SkillTool,
 };
@@ -70,7 +71,7 @@ pub const WRITE_TOOLS: &[&str] = &[
 /// The Datadog skill — provides tools for the Datadog REST API across
 /// multiple accounts/regions.
 pub struct DatadogSkill {
-    clients: Arc<HashMap<String, Arc<client::DatadogClient>>>,
+    clients: Arc<LiveInstances<client::DatadogClient>>,
     default_account: String,
 }
 
@@ -78,7 +79,7 @@ impl DatadogSkill {
     /// Build a `DatadogSkill` with static credentials. Use
     /// [`DatadogSkill::with_store`] for per-user credential resolution.
     pub fn new(config: DatadogSkillConfig) -> eyre::Result<Self> {
-        Self::build(config, |_, acct| {
+        Self::build(config, None, |_, acct| {
             client::DatadogClient::new(
                 &acct.api_key,
                 &acct.app_key,
@@ -95,7 +96,8 @@ impl DatadogSkill {
         config: DatadogSkillConfig,
         store: Arc<dyn workforce_common::settings::SecretStore>,
     ) -> eyre::Result<Self> {
-        Self::build(config, |name, acct| {
+        let live = (Arc::clone(&store), Self::instance_paths());
+        Self::build(config, Some(live), move |name, acct| {
             client::DatadogClient::with_store(
                 Arc::clone(&store),
                 name,
@@ -107,28 +109,62 @@ impl DatadogSkill {
 
     fn build(
         config: DatadogSkillConfig,
-        make: impl Fn(&str, &DatadogAccountConfig) -> eyre::Result<client::DatadogClient>,
+        live: Option<(
+            Arc<dyn workforce_common::settings::SecretStore>,
+            InstancePaths,
+        )>,
+        make: impl Fn(&str, &DatadogAccountConfig) -> eyre::Result<client::DatadogClient>
+            + Send
+            + Sync
+            + 'static,
     ) -> eyre::Result<Self> {
+        let resolved = config.resolve();
         let Instances { clients, default } = build_instances(
             "datadog",
-            &config.resolve(),
+            &resolved,
             config.default_account.as_deref(),
             "No Datadog accounts configured. Set api_key/app_key or accounts.*.",
-            make,
+            &make,
         )?;
+        // Store-backed: the instances are the caller's, read per call; the
+        // loader's are only asked whether there is anything to load.
+        let clients = Arc::new(match live {
+            None => LiveInstances::fixed(Instances {
+                clients,
+                default: default.clone(),
+            }),
+            Some((store, paths)) => live_from_config(
+                store,
+                paths,
+                config.default_account.clone(),
+                resolved,
+                DatadogAccountConfig {
+                    api_key: String::new(),
+                    app_key: String::new(),
+                    site: config::default_site(),
+                    base_url: None,
+                },
+                make,
+            ),
+        });
         Ok(Self {
             clients,
             default_account: default,
         })
     }
 
-    /// The instances this skill exposes, for the environments of the agent
-    /// that loaded it.
-    pub fn variants(&self) -> Option<workforce_agent::llm::environment::SkillVariants> {
-        workforce_agent::llm::environment::SkillVariants::of(
-            self.clients.keys().cloned(),
-            &self.default_account,
+    /// Where this adapter's instances live in the vault.
+    pub fn instance_paths() -> InstancePaths {
+        InstancePaths::new(
+            "skills/datadog/accounts/",
+            "api_key",
+            "skills/datadog/api_key",
         )
+    }
+
+    /// The instances this skill exposes, read as whoever asks.
+    pub fn instance_source(&self) -> Arc<dyn workforce_agent::llm::environment::InstanceSource> {
+        Arc::clone(&self.clients) as Arc<dyn workforce_agent::llm::environment::InstanceSource>
     }
 
     /// Return all agent-callable tools.
@@ -705,6 +741,7 @@ impl DatadogSkill {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn skill_builds_with_flat_config() {

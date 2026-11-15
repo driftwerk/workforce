@@ -23,7 +23,9 @@ use workforce_agent::tools::image_view::{
 };
 use workforce_agent::tools::{Tool, ToolResult};
 
-use crate::adapters::utils::{coerce_to_i64, coerce_to_u64, instance_choices};
+use crate::adapters::utils::{
+    coerce_to_i64, coerce_to_u64, instance_choices, unknown_instance, LiveInstances,
+};
 
 use super::client::{JiraClient, AGILE, REST};
 use super::markdown::markdown_to_adf;
@@ -285,10 +287,11 @@ fn resolve_client(
     )
     .map_err(|d| eyre::eyre!("{}", d.message))?;
     clients.get(&name).cloned().ok_or_else(|| {
-        let available = clients.keys().collect::<Vec<_>>();
         if explicit == Some(name.as_str()) {
-            eyre::eyre!("Unknown Jira workspace: '{name}'. Available: {available:?}")
+            unknown_instance("Jira workspace", &name, clients)
         } else {
+            let mut available: Vec<&str> = clients.keys().map(String::as_str).collect();
+            available.sort_unstable();
             eyre::eyre!("Default Jira workspace '{name}' not configured. Available: {available:?}")
         }
     })
@@ -322,10 +325,17 @@ fn routed_workspace(
 
 /// Build a dynamic description for the `workspace` parameter, listing the
 /// available workspaces so the LLM knows what's valid.
-fn workspace_description(
-    clients: &HashMap<String, Arc<JiraClient>>,
-    default_workspace: &str,
-) -> String {
+///
+/// A set read per caller names none: a schema is built once and shown to
+/// everyone, and one person's workspaces are theirs to know.
+fn workspace_description(instances: &LiveInstances<JiraClient>) -> String {
+    if instances.is_live() {
+        return "Jira workspace name. Uses your default if omitted; issue/project keys also \
+                auto-route via configured project prefixes."
+            .to_string();
+    }
+    let (clients, default_workspace) = instances.for_caller();
+    let (clients, default_workspace) = (&*clients, default_workspace.as_str());
     if clients.len() <= 1 {
         return "Jira workspace name. Uses the default if omitted.".to_string();
     }
@@ -418,12 +428,9 @@ fn required_str<'a>(input: &'a Value, key: &str) -> std::result::Result<&'a str,
 
 macro_rules! resolve_or_fail {
     ($self:ident, $input:ident, $start:ident) => {{
-        match resolve_client(
-            &$self.clients,
-            &$self.default_workspace,
-            &$self.prefix_map,
-            &$input,
-        ) {
+        // The caller's workspaces, read now: never the loader's.
+        let (clients, default_workspace) = $self.instances.for_caller();
+        match resolve_client(&clients, &default_workspace, &$self.prefix_map, &$input) {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -438,22 +445,37 @@ macro_rules! resolve_or_fail {
 macro_rules! jira_tool_struct {
     ($name:ident) => {
         pub struct $name {
-            clients: Arc<HashMap<String, Arc<JiraClient>>>,
-            default_workspace: String,
+            instances: Arc<LiveInstances<JiraClient>>,
             prefix_map: Arc<HashMap<String, String>>,
         }
 
         impl $name {
+            /// A fixed set of workspaces (static config, tests).
             pub fn new(
                 clients: Arc<HashMap<String, Arc<JiraClient>>>,
                 default_workspace: String,
                 prefix_map: Arc<HashMap<String, String>>,
             ) -> Self {
+                let clients = Arc::try_unwrap(clients).unwrap_or_else(|c| (*c).clone());
+                Self::with_instances(
+                    Arc::new(LiveInstances::fixed_map(clients, &default_workspace)),
+                    prefix_map,
+                )
+            }
+
+            /// Workspaces read as the caller on each call.
+            pub fn with_instances(
+                instances: Arc<LiveInstances<JiraClient>>,
+                prefix_map: Arc<HashMap<String, String>>,
+            ) -> Self {
                 Self {
-                    clients,
-                    default_workspace,
+                    instances,
                     prefix_map,
                 }
+            }
+
+            fn workspace_desc(&self) -> String {
+                workspace_description(&self.instances)
             }
         }
     };
@@ -477,7 +499,7 @@ impl Tool for JiraSearchTool {
         json!({
             "type": "object",
             "properties": {
-                "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) },
+                "workspace": { "type": "string", "description": self.workspace_desc() },
                 "jql": { "type": "string", "description": "JQL query, e.g. 'project = ENG AND status = \"In Progress\"'" },
                 "fields": { "type": "array", "items": { "type": "string" }, "description": "Field IDs to return (default: summary,status,assignee,priority,updated)" },
                 "next_page_token": { "type": "string", "description": "Pagination cursor from a previous response" },
@@ -632,7 +654,7 @@ impl Tool for JiraGetIssueTool {
         json!({
             "type": "object",
             "properties": {
-                "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) },
+                "workspace": { "type": "string", "description": self.workspace_desc() },
                 "issue_key": { "type": "string", "description": "Issue key, e.g. 'ENG-123'" },
                 "custom_fields": { "type": "object", "description": "This site's custom field ids by role, from jira.list_fields: points, sprint, start_date, development. Each comes back under its role's name." },
                 "description_adf": { "type": "boolean", "description": "Also answer the description as Jira stores it (Atlassian Document Format), as JSON text under `description_adf`." },
@@ -779,7 +801,7 @@ impl Tool for JiraCreateIssueTool {
         json!({
             "type": "object",
             "properties": {
-                "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) },
+                "workspace": { "type": "string", "description": self.workspace_desc() },
                 "project_key": { "type": "string", "description": "Project key, e.g. 'ENG'. Falls back to default_project." },
                 "summary": { "type": "string", "description": "Issue title" },
                 "issue_type": { "type": "string", "description": "Issue type name (e.g. 'Bug', 'Task', 'Story')" },
@@ -876,7 +898,7 @@ impl Tool for JiraUpdateIssueTool {
         json!({
             "type": "object",
             "properties": {
-                "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) },
+                "workspace": { "type": "string", "description": self.workspace_desc() },
                 "issue_key": { "type": "string" },
                 "summary": { "type": "string" },
                 "description": { "type": "string", "description": "Markdown string (rendered to ADF) or raw ADF object." },
@@ -960,7 +982,7 @@ impl Tool for JiraDeleteIssueTool {
         json!({
             "type": "object",
             "properties": {
-                "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) },
+                "workspace": { "type": "string", "description": self.workspace_desc() },
                 "issue_key": { "type": "string" }
             },
             "required": ["issue_key"]
@@ -1006,7 +1028,7 @@ impl Tool for JiraAssignIssueTool {
         json!({
             "type": "object",
             "properties": {
-                "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) },
+                "workspace": { "type": "string", "description": self.workspace_desc() },
                 "issue_key": { "type": "string" },
                 "account_id": { "type": ["string", "null"], "description": "Atlassian accountId, or null to unassign" }
             },
@@ -1104,7 +1126,7 @@ impl Tool for JiraListFieldsTool {
         json!({
             "type": "object",
             "properties": {
-                "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) }
+                "workspace": { "type": "string", "description": self.workspace_desc() }
             }
         })
     }
@@ -1161,7 +1183,7 @@ impl Tool for JiraMyselfTool {
         json!({
             "type": "object",
             "properties": {
-                "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) }
+                "workspace": { "type": "string", "description": self.workspace_desc() }
             }
         })
     }
@@ -1210,7 +1232,7 @@ impl Tool for JiraAddCommentTool {
         json!({
             "type": "object",
             "properties": {
-                "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) },
+                "workspace": { "type": "string", "description": self.workspace_desc() },
                 "issue_key": { "type": "string" },
                 "body": { "type": "string", "description": "Markdown string (rendered to ADF) or raw ADF object." }
             },
@@ -1265,7 +1287,7 @@ impl Tool for JiraListCommentsTool {
         json!({
             "type": "object",
             "properties": {
-                "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) },
+                "workspace": { "type": "string", "description": self.workspace_desc() },
                 "issue_key": { "type": "string" },
                 "max_results": { "type": "integer", "description": "Page size (default 50, max 100)" },
                 "start_at": { "type": "integer", "description": "Index of the first comment (default 0), to read the next page" }
@@ -1346,7 +1368,7 @@ impl Tool for JiraListTransitionsTool {
         json!({
             "type": "object",
             "properties": {
-                "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) },
+                "workspace": { "type": "string", "description": self.workspace_desc() },
                 "issue_key": { "type": "string" }
             },
             "required": ["issue_key"]
@@ -1408,7 +1430,7 @@ impl Tool for JiraTransitionIssueTool {
         json!({
             "type": "object",
             "properties": {
-                "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) },
+                "workspace": { "type": "string", "description": self.workspace_desc() },
                 "issue_key": { "type": "string" },
                 "transition": { "type": "string", "description": "Transition id (preferred) or display name" }
             },
@@ -1498,7 +1520,7 @@ impl Tool for JiraAddAttachmentTool {
         json!({
             "type": "object",
             "properties": {
-                "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) },
+                "workspace": { "type": "string", "description": self.workspace_desc() },
                 "issue_key": { "type": "string" },
                 "path": { "type": "string", "description": "Absolute path to the local file to upload" }
             },
@@ -1571,7 +1593,7 @@ impl Tool for JiraGetAttachmentTool {
         json!({
             "type": "object",
             "properties": {
-                "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) },
+                "workspace": { "type": "string", "description": self.workspace_desc() },
                 "issue_key": { "type": "string", "description": "Issue the attachment belongs to, e.g. 'ENG-123'. Used only to route to the right workspace." },
                 "attachment_id": { "type": "string", "description": "Attachment id from a jira.get_issue `attachments` entry." }
             },
@@ -1714,7 +1736,7 @@ impl Tool for JiraAttachmentReadTool {
         json!({
             "type": "object",
             "properties": {
-                "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) },
+                "workspace": { "type": "string", "description": self.workspace_desc() },
                 "issue_key": { "type": "string", "description": "The issue the attachment is on, e.g. 'ENG-123'. Only an attachment that issue lists is read." },
                 "attachment_id": { "type": "string", "description": "Attachment id from a jira.get_issue `attachments` entry." },
                 "thumbnail": { "type": "boolean", "description": "Read Jira's small picture of it instead." },
@@ -1835,7 +1857,7 @@ impl Tool for JiraListProjectsTool {
         json!({
             "type": "object",
             "properties": {
-                "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) },
+                "workspace": { "type": "string", "description": self.workspace_desc() },
                 "query": { "type": "string", "description": "Optional substring filter on project key/name" },
                 "max_results": { "type": "integer", "description": "Page size (default 50, max 100; Jira Cloud pages at 50)" },
                 "start_at": { "type": "integer", "description": "Index of the first project (default 0), to read the next page" }
@@ -1907,7 +1929,7 @@ impl Tool for JiraGetProjectTool {
         json!({
             "type": "object",
             "properties": {
-                "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) },
+                "workspace": { "type": "string", "description": self.workspace_desc() },
                 "project_key": { "type": "string", "description": "Project key or numeric id" }
             },
             "required": ["project_key"]
@@ -1970,7 +1992,7 @@ impl Tool for JiraSearchUsersTool {
         json!({
             "type": "object",
             "properties": {
-                "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) },
+                "workspace": { "type": "string", "description": self.workspace_desc() },
                 "query": { "type": "string", "description": "Search string (name or email substring)" },
                 "max_results": { "type": "integer", "description": "Default 20, max 50" }
             },
@@ -2045,7 +2067,7 @@ impl Tool for JiraListBoardsTool {
         json!({
             "type": "object",
             "properties": {
-                "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) },
+                "workspace": { "type": "string", "description": self.workspace_desc() },
                 "project_key": { "type": "string", "description": "Optional project key filter" },
                 "type": { "type": "string", "enum": ["scrum", "kanban", "simple"] },
                 "max_results": { "type": "integer", "description": "Default 50" }
@@ -2120,7 +2142,7 @@ impl Tool for JiraListSprintsTool {
         json!({
             "type": "object",
             "properties": {
-                "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) },
+                "workspace": { "type": "string", "description": self.workspace_desc() },
                 "board_id": { "type": "integer" },
                 "state": { "type": "string", "enum": ["active", "closed", "future"] }
             },
@@ -2197,7 +2219,7 @@ impl Tool for JiraAddWorklogTool {
         json!({
             "type": "object",
             "properties": {
-                "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) },
+                "workspace": { "type": "string", "description": self.workspace_desc() },
                 "issue_key": { "type": "string" },
                 "time_spent": { "type": "string", "description": "Jira duration string, e.g. '3h 30m'" },
                 "comment": { "type": "string", "description": "Optional comment — markdown string (rendered to ADF) or raw ADF object." },
@@ -2259,7 +2281,7 @@ impl Tool for JiraApiTool {
         json!({
             "type": "object",
             "properties": {
-                "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) },
+                "workspace": { "type": "string", "description": self.workspace_desc() },
                 "method": { "type": "string", "enum": ["GET", "POST", "PUT", "DELETE"] },
                 "path": { "type": "string", "description": "Path including the /rest/api/3 or /rest/agile/1.0 prefix" },
                 "body": { "type": "object", "description": "JSON body for POST/PUT" },
@@ -2546,7 +2568,7 @@ impl Tool for JiraDevStatusTool {
         json!({
             "type": "object",
             "properties": {
-                "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) },
+                "workspace": { "type": "string", "description": self.workspace_desc() },
                 "issue_key": { "type": "string", "description": "Issue key, e.g. 'ENG-123'" },
                 "issue_id": { "type": "string", "description": "The issue's numeric id, when known: saves looking it up by its key" }
             },
@@ -2705,7 +2727,7 @@ impl Tool for JiraListRemoteLinksTool {
         json!({
             "type": "object",
             "properties": {
-                "workspace": { "type": "string", "description": workspace_description(&self.clients, &self.default_workspace) },
+                "workspace": { "type": "string", "description": self.workspace_desc() },
                 "issue_key": { "type": "string", "description": "Issue key, e.g. 'ENG-123'" }
             },
             "required": ["issue_key"]
@@ -3148,7 +3170,10 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("acme") && err.contains("client"), "{err}");
-        assert!(workspace_description(&clients, "gone").contains("Default: none — pass workspace"));
+        assert!(
+            workspace_description(&LiveInstances::fixed_map((*clients).clone(), "gone"))
+                .contains("Default: none — pass workspace")
+        );
     }
 
     #[test]
@@ -3563,7 +3588,7 @@ mod tests {
     #[test]
     fn workspace_description_lists_available_workspaces() {
         let (clients, _) = fixture_clients();
-        let desc = workspace_description(&clients, "acme");
+        let desc = workspace_description(&LiveInstances::fixed_map((*clients).clone(), "acme"));
         assert!(desc.contains("acme"));
         assert!(desc.contains("client"));
         assert!(desc.contains("Default: acme"));

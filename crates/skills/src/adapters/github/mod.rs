@@ -11,12 +11,13 @@ pub mod config;
 pub mod event_handler;
 pub mod tools;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use workforce_agent::tools::Tool;
 
-use crate::adapters::utils::{build_instances, Instances};
+use crate::adapters::utils::{
+    build_instances, live_from_config, InstancePaths, Instances, LiveInstances,
+};
 use crate::definition::{
     CredentialRequirement, SkillDefinition, SkillEventSource, SkillPolicy, SkillRequirements,
     SkillTool,
@@ -69,7 +70,7 @@ pub const WRITE_TOOLS: &[&str] = &[
 
 /// The GitHub skill — provides tools for interacting with the GitHub REST API.
 pub struct GithubSkill {
-    clients: Arc<HashMap<String, Arc<client::GithubClient>>>,
+    clients: Arc<LiveInstances<client::GithubClient>>,
     default_workspace: String,
     default_owner: Option<String>,
 }
@@ -78,7 +79,7 @@ impl GithubSkill {
     /// Create from config with static credentials. Use
     /// [`GithubSkill::with_store`] for per-user resolution.
     pub fn new(config: GithubSkillConfig) -> eyre::Result<Self> {
-        Self::build(config, |_, ws| {
+        Self::build(config, None, |_, ws| {
             client::GithubClient::new(&ws.token, &ws.base_url)
         })
     }
@@ -89,14 +90,22 @@ impl GithubSkill {
         config: GithubSkillConfig,
         store: Arc<dyn workforce_common::settings::SecretStore>,
     ) -> eyre::Result<Self> {
-        Self::build(config, |name, ws| {
+        let live = (Arc::clone(&store), Self::instance_paths());
+        Self::build(config, Some(live), move |name, ws| {
             client::GithubClient::with_store(Arc::clone(&store), name, &ws.base_url)
         })
     }
 
     fn build(
         config: GithubSkillConfig,
-        make: impl Fn(&str, &config::GithubWorkspaceConfig) -> eyre::Result<client::GithubClient>,
+        live: Option<(
+            Arc<dyn workforce_common::settings::SecretStore>,
+            InstancePaths,
+        )>,
+        make: impl Fn(&str, &config::GithubWorkspaceConfig) -> eyre::Result<client::GithubClient>
+            + Send
+            + Sync
+            + 'static,
     ) -> eyre::Result<Self> {
         let resolved = config.resolve();
         let Instances { clients, default } = build_instances(
@@ -104,12 +113,40 @@ impl GithubSkill {
             &resolved,
             config.default_workspace.as_deref(),
             "No GitHub workspaces configured. Set token or workspaces.",
-            make,
+            &make,
         )?;
         let default_owner = resolved
             .iter()
             .find(|(name, _)| *name == default)
             .and_then(|(_, ws)| ws.default_owner.clone());
+        // Store-backed: the instances are the caller's, read per call, and
+        // the default_owner a call naming none falls back to is a shared one,
+        // never one of the loader's own workspaces.
+        let (default_owner, clients) = match live {
+            None => (
+                default_owner,
+                LiveInstances::fixed(Instances {
+                    clients,
+                    default: default.clone(),
+                }),
+            ),
+            Some((store, paths)) => (
+                config.default_owner.clone(),
+                live_from_config(
+                    store,
+                    paths,
+                    config.default_workspace.clone(),
+                    resolved.clone(),
+                    config::GithubWorkspaceConfig {
+                        token: String::new(),
+                        base_url: config::default_base_url(),
+                        default_owner: None,
+                    },
+                    make,
+                ),
+            ),
+        };
+        let clients = Arc::new(clients);
         Ok(Self {
             clients,
             default_workspace: default,
@@ -117,13 +154,14 @@ impl GithubSkill {
         })
     }
 
-    /// The instances this skill exposes, for the environments of the agent
-    /// that loaded it.
-    pub fn variants(&self) -> Option<workforce_agent::llm::environment::SkillVariants> {
-        workforce_agent::llm::environment::SkillVariants::of(
-            self.clients.keys().cloned(),
-            &self.default_workspace,
-        )
+    /// Where this adapter's instances live in the vault.
+    pub fn instance_paths() -> InstancePaths {
+        InstancePaths::new("skills/github/workspaces/", "token", "skills/github/token")
+    }
+
+    /// The instances this skill exposes, read as whoever asks.
+    pub fn instance_source(&self) -> Arc<dyn workforce_agent::llm::environment::InstanceSource> {
+        Arc::clone(&self.clients) as Arc<dyn workforce_agent::llm::environment::InstanceSource>
     }
 
     /// Return all agent-callable tools.

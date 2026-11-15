@@ -13,7 +13,9 @@ use workforce_agent::tools::{Tool, ToolResult};
 
 use super::client::LinearClient;
 
-use crate::adapters::utils::{coerce_to_i64, coerce_to_u64, instance_choices};
+use crate::adapters::utils::{
+    coerce_to_i64, coerce_to_u64, instance_choices, LiveInstances, LIVE_INSTANCE_DESCRIPTION,
+};
 
 /// The largest page a `rich` listing reads: its labels, files, relations
 /// and sub-issues raise each issue's share of Linear's per-query
@@ -161,11 +163,13 @@ fn resolve_team_id<'a>(
 ///
 /// Priority: explicit `workspace` param → ticket prefix auto-detection → default workspace.
 fn resolve_client(
-    clients: &HashMap<String, Arc<LinearClient>>,
+    instances: &LiveInstances<LinearClient>,
     default_workspace: &str,
     prefix_map: &HashMap<String, String>,
     input: &Value,
 ) -> eyre::Result<Arc<LinearClient>> {
+    let (clients, default_workspace) = instances.for_caller_or(default_workspace);
+    let (clients, default_workspace) = (&*clients, default_workspace.as_str());
     let requested = input["workspace"]
         .as_str()
         .map(str::to_string)
@@ -178,10 +182,7 @@ fn resolve_client(
     )
     .map_err(|d| eyre::eyre!("{}", d.message))?;
     clients.get(&name).cloned().ok_or_else(|| {
-        eyre::eyre!(
-            "Unknown Linear workspace: '{name}'. Available: {:?}",
-            clients.keys().collect::<Vec<_>>()
-        )
+        crate::adapters::utils::unknown_instance("Linear workspace", name.as_ref(), clients)
     })
 }
 
@@ -217,9 +218,16 @@ fn routed_workspace(
 
 /// Build a dynamic description for the `workspace` parameter that includes available names.
 fn workspace_description(
-    clients: &HashMap<String, Arc<LinearClient>>,
+    instances: &LiveInstances<LinearClient>,
     default_workspace: &str,
 ) -> String {
+    // A set read per caller names no instance: a schema is built once
+    // and shown to everyone.
+    if instances.is_live() {
+        return LIVE_INSTANCE_DESCRIPTION.into();
+    }
+    let (clients, default_workspace) = instances.for_caller_or(default_workspace);
+    let (clients, default_workspace) = (&*clients, default_workspace.as_str());
     if clients.len() <= 1 {
         return "Workspace name (for multi-workspace setups)".to_string();
     }
@@ -232,7 +240,7 @@ fn workspace_description(
 // ── linear.issue_list ────────────────────────────────────────────────
 
 pub struct LinearIssueListTool {
-    clients: Arc<HashMap<String, Arc<LinearClient>>>,
+    clients: Arc<LiveInstances<LinearClient>>,
     default_workspace: String,
     default_team_id: Option<String>,
     prefix_map: Arc<HashMap<String, String>>,
@@ -240,7 +248,7 @@ pub struct LinearIssueListTool {
 
 impl LinearIssueListTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<LinearClient>>>,
+        clients: Arc<LiveInstances<LinearClient>>,
         default_workspace: String,
         default_team_id: Option<String>,
         prefix_map: Arc<HashMap<String, String>>,
@@ -360,6 +368,7 @@ impl Tool for LinearIssueListTool {
 
         if let Some(team_id) = input["team_id"]
             .as_str()
+            .or(client.default_team_id())
             .or(self.default_team_id.as_deref())
         {
             filters.push(format!(r#"team: {{ id: {{ eq: "{}" }} }}"#, team_id));
@@ -546,14 +555,14 @@ fn list_query(params: &str, limit: u64, page: &str, filter_clause: &str, rich: b
 // ── linear.issue_get ────────────────────────────────────────────────
 
 pub struct LinearIssueGetTool {
-    clients: Arc<HashMap<String, Arc<LinearClient>>>,
+    clients: Arc<LiveInstances<LinearClient>>,
     default_workspace: String,
     prefix_map: Arc<HashMap<String, String>>,
 }
 
 impl LinearIssueGetTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<LinearClient>>>,
+        clients: Arc<LiveInstances<LinearClient>>,
         default_workspace: String,
         prefix_map: Arc<HashMap<String, String>>,
     ) -> Self {
@@ -745,14 +754,14 @@ impl Tool for LinearIssueGetTool {
 // ── linear.issue_search ────────────────────────────────────────────────
 
 pub struct LinearIssueSearchTool {
-    clients: Arc<HashMap<String, Arc<LinearClient>>>,
+    clients: Arc<LiveInstances<LinearClient>>,
     default_workspace: String,
     prefix_map: Arc<HashMap<String, String>>,
 }
 
 impl LinearIssueSearchTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<LinearClient>>>,
+        clients: Arc<LiveInstances<LinearClient>>,
         default_workspace: String,
         prefix_map: Arc<HashMap<String, String>>,
     ) -> Self {
@@ -901,7 +910,7 @@ impl Tool for LinearIssueSearchTool {
 // ── linear.issue_create ────────────────────────────────────────────────
 
 pub struct LinearIssueCreateTool {
-    clients: Arc<HashMap<String, Arc<LinearClient>>>,
+    clients: Arc<LiveInstances<LinearClient>>,
     default_workspace: String,
     default_team_id: Option<String>,
     prefix_map: Arc<HashMap<String, String>>,
@@ -909,7 +918,7 @@ pub struct LinearIssueCreateTool {
 
 impl LinearIssueCreateTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<LinearClient>>>,
+        clients: Arc<LiveInstances<LinearClient>>,
         default_workspace: String,
         default_team_id: Option<String>,
         prefix_map: Arc<HashMap<String, String>>,
@@ -1008,7 +1017,11 @@ impl Tool for LinearIssueCreateTool {
             }
         };
 
-        let team_id = match resolve_team_id(&input, &self.default_team_id) {
+        let default_team = client
+            .default_team_id()
+            .map(str::to_string)
+            .or_else(|| self.default_team_id.clone());
+        let team_id = match resolve_team_id(&input, &default_team) {
             Ok(t) => t,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
@@ -1105,14 +1118,14 @@ impl Tool for LinearIssueCreateTool {
 // ── linear.issue_update ────────────────────────────────────────────────
 
 pub struct LinearIssueUpdateTool {
-    clients: Arc<HashMap<String, Arc<LinearClient>>>,
+    clients: Arc<LiveInstances<LinearClient>>,
     default_workspace: String,
     prefix_map: Arc<HashMap<String, String>>,
 }
 
 impl LinearIssueUpdateTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<LinearClient>>>,
+        clients: Arc<LiveInstances<LinearClient>>,
         default_workspace: String,
         prefix_map: Arc<HashMap<String, String>>,
     ) -> Self {
@@ -1348,14 +1361,14 @@ impl Tool for LinearIssueUpdateTool {
 // ── linear.comment_list ────────────────────────────────────────────────
 
 pub struct LinearCommentListTool {
-    clients: Arc<HashMap<String, Arc<LinearClient>>>,
+    clients: Arc<LiveInstances<LinearClient>>,
     default_workspace: String,
     prefix_map: Arc<HashMap<String, String>>,
 }
 
 impl LinearCommentListTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<LinearClient>>>,
+        clients: Arc<LiveInstances<LinearClient>>,
         default_workspace: String,
         prefix_map: Arc<HashMap<String, String>>,
     ) -> Self {
@@ -1517,14 +1530,14 @@ impl Tool for LinearCommentListTool {
 // ── linear.comment_add ────────────────────────────────────────────────
 
 pub struct LinearCommentAddTool {
-    clients: Arc<HashMap<String, Arc<LinearClient>>>,
+    clients: Arc<LiveInstances<LinearClient>>,
     default_workspace: String,
     prefix_map: Arc<HashMap<String, String>>,
 }
 
 impl LinearCommentAddTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<LinearClient>>>,
+        clients: Arc<LiveInstances<LinearClient>>,
         default_workspace: String,
         prefix_map: Arc<HashMap<String, String>>,
     ) -> Self {
@@ -1700,7 +1713,7 @@ impl Tool for LinearCommentAddTool {
 // ── linear.states_list ────────────────────────────────────────────────
 
 pub struct LinearStatesListTool {
-    clients: Arc<HashMap<String, Arc<LinearClient>>>,
+    clients: Arc<LiveInstances<LinearClient>>,
     default_workspace: String,
     default_team_id: Option<String>,
     prefix_map: Arc<HashMap<String, String>>,
@@ -1708,7 +1721,7 @@ pub struct LinearStatesListTool {
 
 impl LinearStatesListTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<LinearClient>>>,
+        clients: Arc<LiveInstances<LinearClient>>,
         default_workspace: String,
         default_team_id: Option<String>,
         prefix_map: Arc<HashMap<String, String>>,
@@ -1767,7 +1780,11 @@ impl Tool for LinearStatesListTool {
             }
         };
 
-        let team_id = match resolve_team_id(&input, &self.default_team_id) {
+        let default_team = client
+            .default_team_id()
+            .map(str::to_string)
+            .or_else(|| self.default_team_id.clone());
+        let team_id = match resolve_team_id(&input, &default_team) {
             Ok(t) => t,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
@@ -1839,14 +1856,14 @@ impl Tool for LinearStatesListTool {
 // ── linear.teams_list ────────────────────────────────────────────────
 
 pub struct LinearTeamsListTool {
-    clients: Arc<HashMap<String, Arc<LinearClient>>>,
+    clients: Arc<LiveInstances<LinearClient>>,
     default_workspace: String,
     prefix_map: Arc<HashMap<String, String>>,
 }
 
 impl LinearTeamsListTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<LinearClient>>>,
+        clients: Arc<LiveInstances<LinearClient>>,
         default_workspace: String,
         prefix_map: Arc<HashMap<String, String>>,
     ) -> Self {
@@ -1942,14 +1959,14 @@ impl Tool for LinearTeamsListTool {
 // ── linear.project_list ────────────────────────────────────────────────
 
 pub struct LinearProjectListTool {
-    clients: Arc<HashMap<String, Arc<LinearClient>>>,
+    clients: Arc<LiveInstances<LinearClient>>,
     default_workspace: String,
     prefix_map: Arc<HashMap<String, String>>,
 }
 
 impl LinearProjectListTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<LinearClient>>>,
+        clients: Arc<LiveInstances<LinearClient>>,
         default_workspace: String,
         prefix_map: Arc<HashMap<String, String>>,
     ) -> Self {
@@ -2079,14 +2096,14 @@ impl Tool for LinearProjectListTool {
 // ── linear.project_get ────────────────────────────────────────────────
 
 pub struct LinearProjectGetTool {
-    clients: Arc<HashMap<String, Arc<LinearClient>>>,
+    clients: Arc<LiveInstances<LinearClient>>,
     default_workspace: String,
     prefix_map: Arc<HashMap<String, String>>,
 }
 
 impl LinearProjectGetTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<LinearClient>>>,
+        clients: Arc<LiveInstances<LinearClient>>,
         default_workspace: String,
         prefix_map: Arc<HashMap<String, String>>,
     ) -> Self {
@@ -2223,14 +2240,14 @@ impl Tool for LinearProjectGetTool {
 // ── linear.labels_list ────────────────────────────────────────────────
 
 pub struct LinearLabelsListTool {
-    clients: Arc<HashMap<String, Arc<LinearClient>>>,
+    clients: Arc<LiveInstances<LinearClient>>,
     default_workspace: String,
     prefix_map: Arc<HashMap<String, String>>,
 }
 
 impl LinearLabelsListTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<LinearClient>>>,
+        clients: Arc<LiveInstances<LinearClient>>,
         default_workspace: String,
         prefix_map: Arc<HashMap<String, String>>,
     ) -> Self {
@@ -2335,14 +2352,14 @@ impl Tool for LinearLabelsListTool {
 
 /// Who the workspace's key belongs to: the person's own Linear user.
 pub struct LinearViewerTool {
-    clients: Arc<HashMap<String, Arc<LinearClient>>>,
+    clients: Arc<LiveInstances<LinearClient>>,
     default_workspace: String,
     prefix_map: Arc<HashMap<String, String>>,
 }
 
 impl LinearViewerTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<LinearClient>>>,
+        clients: Arc<LiveInstances<LinearClient>>,
         default_workspace: String,
         prefix_map: Arc<HashMap<String, String>>,
     ) -> Self {
@@ -2429,14 +2446,14 @@ impl Tool for LinearViewerTool {
 /// description), for Desk's board sync: read with the workspace's key, from
 /// `https://uploads.linear.app/` only.
 pub struct LinearUploadReadTool {
-    clients: Arc<HashMap<String, Arc<LinearClient>>>,
+    clients: Arc<LiveInstances<LinearClient>>,
     default_workspace: String,
     prefix_map: Arc<HashMap<String, String>>,
 }
 
 impl LinearUploadReadTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<LinearClient>>>,
+        clients: Arc<LiveInstances<LinearClient>>,
         default_workspace: String,
         prefix_map: Arc<HashMap<String, String>>,
     ) -> Self {
@@ -2630,14 +2647,14 @@ impl Tool for LinearUploadReadTool {
 // ── linear.members_list ────────────────────────────────────────────────
 
 pub struct LinearMembersListTool {
-    clients: Arc<HashMap<String, Arc<LinearClient>>>,
+    clients: Arc<LiveInstances<LinearClient>>,
     default_workspace: String,
     prefix_map: Arc<HashMap<String, String>>,
 }
 
 impl LinearMembersListTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<LinearClient>>>,
+        clients: Arc<LiveInstances<LinearClient>>,
         default_workspace: String,
         prefix_map: Arc<HashMap<String, String>>,
     ) -> Self {
@@ -2769,14 +2786,14 @@ impl Tool for LinearMembersListTool {
 // ── linear.issue_bulk_update ────────────────────────────────────────────────
 
 pub struct LinearIssueBulkUpdateTool {
-    clients: Arc<HashMap<String, Arc<LinearClient>>>,
+    clients: Arc<LiveInstances<LinearClient>>,
     default_workspace: String,
     prefix_map: Arc<HashMap<String, String>>,
 }
 
 impl LinearIssueBulkUpdateTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<LinearClient>>>,
+        clients: Arc<LiveInstances<LinearClient>>,
         default_workspace: String,
         prefix_map: Arc<HashMap<String, String>>,
     ) -> Self {
@@ -2997,14 +3014,14 @@ impl Tool for LinearIssueBulkUpdateTool {
 // ── linear.issue_link ────────────────────────────────────────────────
 
 pub struct LinearIssueLinkTool {
-    clients: Arc<HashMap<String, Arc<LinearClient>>>,
+    clients: Arc<LiveInstances<LinearClient>>,
     default_workspace: String,
     prefix_map: Arc<HashMap<String, String>>,
 }
 
 impl LinearIssueLinkTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<LinearClient>>>,
+        clients: Arc<LiveInstances<LinearClient>>,
         default_workspace: String,
         prefix_map: Arc<HashMap<String, String>>,
     ) -> Self {
@@ -3245,14 +3262,14 @@ impl Tool for LinearIssueLinkTool {
 // ── linear.document_get ────────────────────────────────────────────────
 
 pub struct LinearDocumentGetTool {
-    clients: Arc<HashMap<String, Arc<LinearClient>>>,
+    clients: Arc<LiveInstances<LinearClient>>,
     default_workspace: String,
     prefix_map: Arc<HashMap<String, String>>,
 }
 
 impl LinearDocumentGetTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<LinearClient>>>,
+        clients: Arc<LiveInstances<LinearClient>>,
         default_workspace: String,
         prefix_map: Arc<HashMap<String, String>>,
     ) -> Self {
@@ -3411,14 +3428,14 @@ impl Tool for LinearDocumentGetTool {
 // ── linear.document_list ────────────────────────────────────────────────
 
 pub struct LinearDocumentListTool {
-    clients: Arc<HashMap<String, Arc<LinearClient>>>,
+    clients: Arc<LiveInstances<LinearClient>>,
     default_workspace: String,
     prefix_map: Arc<HashMap<String, String>>,
 }
 
 impl LinearDocumentListTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<LinearClient>>>,
+        clients: Arc<LiveInstances<LinearClient>>,
         default_workspace: String,
         prefix_map: Arc<HashMap<String, String>>,
     ) -> Self {
@@ -3548,14 +3565,14 @@ impl Tool for LinearDocumentListTool {
 // ── linear.document_create ────────────────────────────────────────────────
 
 pub struct LinearDocumentCreateTool {
-    clients: Arc<HashMap<String, Arc<LinearClient>>>,
+    clients: Arc<LiveInstances<LinearClient>>,
     default_workspace: String,
     prefix_map: Arc<HashMap<String, String>>,
 }
 
 impl LinearDocumentCreateTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<LinearClient>>>,
+        clients: Arc<LiveInstances<LinearClient>>,
         default_workspace: String,
         prefix_map: Arc<HashMap<String, String>>,
     ) -> Self {
@@ -3715,14 +3732,14 @@ impl Tool for LinearDocumentCreateTool {
 // ── linear.document_update ────────────────────────────────────────────────
 
 pub struct LinearDocumentUpdateTool {
-    clients: Arc<HashMap<String, Arc<LinearClient>>>,
+    clients: Arc<LiveInstances<LinearClient>>,
     default_workspace: String,
     prefix_map: Arc<HashMap<String, String>>,
 }
 
 impl LinearDocumentUpdateTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<LinearClient>>>,
+        clients: Arc<LiveInstances<LinearClient>>,
         default_workspace: String,
         prefix_map: Arc<HashMap<String, String>>,
     ) -> Self {
@@ -3889,14 +3906,14 @@ impl Tool for LinearDocumentUpdateTool {
 // ── linear.document_delete ────────────────────────────────────────────────
 
 pub struct LinearDocumentDeleteTool {
-    clients: Arc<HashMap<String, Arc<LinearClient>>>,
+    clients: Arc<LiveInstances<LinearClient>>,
     default_workspace: String,
     prefix_map: Arc<HashMap<String, String>>,
 }
 
 impl LinearDocumentDeleteTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<LinearClient>>>,
+        clients: Arc<LiveInstances<LinearClient>>,
         default_workspace: String,
         prefix_map: Arc<HashMap<String, String>>,
     ) -> Self {
@@ -4011,14 +4028,14 @@ impl Tool for LinearDocumentDeleteTool {
 // ── linear.document_search ────────────────────────────────────────────────
 
 pub struct LinearDocumentSearchTool {
-    clients: Arc<HashMap<String, Arc<LinearClient>>>,
+    clients: Arc<LiveInstances<LinearClient>>,
     default_workspace: String,
     prefix_map: Arc<HashMap<String, String>>,
 }
 
 impl LinearDocumentSearchTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<LinearClient>>>,
+        clients: Arc<LiveInstances<LinearClient>>,
         default_workspace: String,
         prefix_map: Arc<HashMap<String, String>>,
     ) -> Self {
@@ -4164,14 +4181,14 @@ impl Tool for LinearDocumentSearchTool {
 // ── linear.issue_history ─────────────────────────────────────────────────
 
 pub struct LinearIssueHistoryTool {
-    clients: Arc<HashMap<String, Arc<LinearClient>>>,
+    clients: Arc<LiveInstances<LinearClient>>,
     default_workspace: String,
     prefix_map: Arc<HashMap<String, String>>,
 }
 
 impl LinearIssueHistoryTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<LinearClient>>>,
+        clients: Arc<LiveInstances<LinearClient>>,
         default_workspace: String,
         prefix_map: Arc<HashMap<String, String>>,
     ) -> Self {
@@ -4430,14 +4447,14 @@ impl Tool for LinearIssueHistoryTool {
 // ── linear.issue_children ────────────────────────────────────────────────
 
 pub struct LinearIssueChildrenTool {
-    clients: Arc<HashMap<String, Arc<LinearClient>>>,
+    clients: Arc<LiveInstances<LinearClient>>,
     default_workspace: String,
     prefix_map: Arc<HashMap<String, String>>,
 }
 
 impl LinearIssueChildrenTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<LinearClient>>>,
+        clients: Arc<LiveInstances<LinearClient>>,
         default_workspace: String,
         prefix_map: Arc<HashMap<String, String>>,
     ) -> Self {
@@ -4855,7 +4872,11 @@ mod tests {
             Arc::new(LinearClient::new("key", &server.uri()).unwrap()),
         )]
         .into();
-        let tool = LinearUploadReadTool::new(Arc::new(clients), "main".into(), Arc::default());
+        let tool = LinearUploadReadTool::new(
+            Arc::new(LiveInstances::from(clients)),
+            "main".into(),
+            Arc::default(),
+        );
         let walked = tool
             .execute(serde_json::json!({ "identifier": "ENG-1", "url": "https://uploads.linear.app/a/b/someone-elses.png" }))
             .await
@@ -4877,7 +4898,11 @@ mod tests {
     #[tokio::test]
     async fn upload_read_refuses_any_address_but_linear_s_uploads() {
         let (clients, prefix) = fixture();
-        let tool = LinearUploadReadTool::new(Arc::new(clients), "main".into(), Arc::new(prefix));
+        let tool = LinearUploadReadTool::new(
+            Arc::new(LiveInstances::from(clients)),
+            "main".into(),
+            Arc::new(prefix),
+        );
         for url in [
             "https://evil.example/uploads.linear.app/x.png",
             "http://uploads.linear.app/x.png",
@@ -4910,12 +4935,17 @@ mod tests {
             ACTIVE_SKILL_INSTANCES.sync_scope(pins, || {
                 let main = clients.get("main").unwrap();
                 // No identifier → the pin (main), overriding the "staging" default.
-                let c =
-                    resolve_client(&clients, "staging", &prefix, &serde_json::json!({})).unwrap();
+                let c = resolve_client(
+                    &LiveInstances::from((clients).clone()),
+                    "staging",
+                    &prefix,
+                    &serde_json::json!({}),
+                )
+                .unwrap();
                 assert!(Arc::ptr_eq(&c, main));
                 // An identifier routing to the SAME workspace as the pin resolves.
                 let c = resolve_client(
-                    &clients,
+                    &LiveInstances::from((clients).clone()),
                     "staging",
                     &prefix,
                     &serde_json::json!({ "identifier": "MAIN-1" }),
@@ -4924,7 +4954,7 @@ mod tests {
                 assert!(Arc::ptr_eq(&c, main));
                 // An identifier auto-routing to a DIFFERENT workspace is refused.
                 assert!(resolve_client(
-                    &clients,
+                    &LiveInstances::from((clients).clone()),
                     "staging",
                     &prefix,
                     &serde_json::json!({ "identifier": "OPS-7" })
@@ -4932,7 +4962,7 @@ mod tests {
                 .is_err());
                 // An explicit mismatching workspace is refused.
                 assert!(resolve_client(
-                    &clients,
+                    &LiveInstances::from((clients).clone()),
                     "staging",
                     &prefix,
                     &serde_json::json!({ "workspace": "staging" })
@@ -4960,18 +4990,23 @@ mod tests {
             ACTIVE_SKILL_INSTANCES.sync_scope(pins, || {
                 let fabrikam = clients.get("fabrikam-crm").unwrap();
                 let c = resolve_client(
-                    &clients,
+                    &LiveInstances::from((clients).clone()),
                     "main",
                     &prefix,
                     &serde_json::json!({ "identifier": "FAB-123" }),
                 )
                 .unwrap();
                 assert!(Arc::ptr_eq(&c, fabrikam));
-                let c =
-                    resolve_client(&clients, "staging", &prefix, &serde_json::json!({})).unwrap();
+                let c = resolve_client(
+                    &LiveInstances::from((clients).clone()),
+                    "staging",
+                    &prefix,
+                    &serde_json::json!({}),
+                )
+                .unwrap();
                 assert!(Arc::ptr_eq(&c, clients.get("main").unwrap()));
                 assert!(resolve_client(
-                    &clients,
+                    &LiveInstances::from((clients).clone()),
                     "main",
                     &prefix,
                     &serde_json::json!({ "identifier": "OPS-7" })
