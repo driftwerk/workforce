@@ -3137,6 +3137,9 @@ impl workforce_hub::mcp_servers::callback::ManagerLookup for McpManagerMap {
 struct OverlayWatcherCtx {
     /// `[desk_boss]` as the gateway reads it, replaced on each overlay change.
     desk_boss: workforce_hub::boss_links::LiveConfig,
+    /// `[desk] allow_personal_key_export` as the gateway reads it, set on
+    /// each overlay change.
+    desk_key_export: workforce_hub::gateway::KeyExportSwitch,
     registry: Arc<workforce_hub::agent_registry::AgentRegistry>,
     config_path: PathBuf,
     data_dir: PathBuf,
@@ -3228,6 +3231,8 @@ fn spawn_overlay_agent_watcher(ctx: OverlayWatcherCtx) {
                 }
             };
             ctx.desk_boss.set(new_config.desk_boss.clone());
+            ctx.desk_key_export
+                .set(new_config.desk.allow_personal_key_export);
             let default_id = ctx.registry.default_id().to_string();
             let desired: std::collections::HashMap<
                 String,
@@ -4584,6 +4589,10 @@ rules:
             // so an admin turning it on or off takes effect without a restart.
             let desk_boss_live =
                 workforce_hub::boss_links::LiveConfig::new(wf_config.desk_boss.clone());
+            // `[desk] allow_personal_key_export`, live the same way.
+            let desk_key_export_live = workforce_hub::gateway::KeyExportSwitch::new(
+                wf_config.desk.allow_personal_key_export,
+            );
             // Late-bound cells: the identity store + capability gate are built
             // below (after this watcher spawns); the boot path fills these and
             // `spawn_and_wire_agent` reads them so live-spawned agents are
@@ -4623,6 +4632,7 @@ rules:
                     slack: Arc::clone(&slack_slot),
                     kick: Arc::clone(&overlay_kick),
                     desk_boss: desk_boss_live.clone(),
+                    desk_key_export: desk_key_export_live.clone(),
                 });
             }
 
@@ -5193,6 +5203,7 @@ rules:
                     .map(|s| s.as_remote_mcp_token_store()),
                 remote_mcp: wf_config.remote_mcp.clone(),
                 desk_boss: desk_boss_live.clone(),
+                desk_key_export: desk_key_export_live.clone(),
                 uplinks: Default::default(),
                 permission_evaluator: permission_evaluator.clone(),
                 // The live `@destructive → Ask` baseline is in effect only when
