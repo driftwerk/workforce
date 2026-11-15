@@ -34,7 +34,7 @@ use workforce_common::oversight::{Level, Oversight};
 use workforce_desk::account::RefKind;
 use workforce_desk::board::TicketState;
 use workforce_desk::charge::How;
-use workforce_desk::crew::{By, MentionedSuggestion, SuggestionState};
+use workforce_desk::crew::{By, MentionedSuggestion};
 use workforce_desk::model::{Origin, SessionState, SessionView};
 use workforce_desk::update::{ClosedKind, ClosedSession};
 
@@ -161,7 +161,8 @@ pub(crate) fn at_rest(v: &SessionView, now: DateTime<Utc>, settle: chrono::Durat
 
 /// Why a session's work is done, from what is known of it: any ticket
 /// still open, or pull request still open, is work left; then a merged
-/// pull request, its tickets all done, its boss's word, or a day idle.
+/// pull request, its tickets all done, or (when every pull request was
+/// read) its boss's word or a day idle.
 pub(crate) fn finished(
     tickets: &[TicketState],
     pulls: &[(u64, Option<Pull>)],
@@ -186,6 +187,11 @@ pub(crate) fn finished(
     }
     if tickets.contains(&TicketState::Done) {
         return Some(Finished::Ticket);
+    }
+    // A pull request GitHub couldn't say may be open still: neither its
+    // boss's word nor a quiet day closes it.
+    if pulls.iter().any(|(_, p)| p.is_none()) {
+        return None;
     }
     if let Some(why) = said {
         return Some(Finished::Said(why.to_string()));
@@ -331,7 +337,8 @@ async fn origin_of(cwd: &str) -> Option<String> {
     if !dir.is_dir() {
         return None;
     }
-    git(dir, &["remote", "get-url", "origin"])
+    // As configured: a repository's own `insteadOf` doesn't move it.
+    git(dir, &["config", "--get", "remote.origin.url"])
         .await
         .ok()
         .and_then(|u| github_repo(&u))
@@ -426,14 +433,14 @@ impl CrewHub {
             }
             let boss = service.agent_id.as_str().to_string();
             let level = self.level_now(&boss, &o).0;
-            let mine: Vec<(&SessionView, Do)> = views
+            let mine: Vec<(&SessionView, Do, How)> = views
                 .iter()
                 .filter_map(|v| {
                     let c = self.desk.charge_of(v.id)?;
                     (c.live() && c.boss == boss && at_rest(v, now, settle))
                         .then(|| what_to_do(level, c.how))
                         .flatten()
-                        .map(|d| (v, d))
+                        .map(|d| (v, d, c.how))
                 })
                 .collect();
             if mine.is_empty() {
@@ -447,11 +454,11 @@ impl CrewHub {
                     continue;
                 }
             };
-            for (v, what) in mine {
+            for (v, what, how) in mine {
                 if asked.contains(&v.id) {
                     continue;
                 }
-                self.look_at_done(&service, &o, v, what).await;
+                self.look_at_done(&service, &o, v, what, how).await;
             }
         }
     }
@@ -464,6 +471,7 @@ impl CrewHub {
         o: &Oversight,
         v: &SessionView,
         what: Do,
+        how: How,
     ) {
         let now = Utc::now();
         let boss = service.agent_id.as_str();
@@ -471,6 +479,20 @@ impl CrewHub {
         let hands_off = chrono::Duration::hours(HANDS_OFF_HOURS);
         if self.person_in_for(v.id, now - hands_off, self.answer_gap(o)) {
             return;
+        }
+        // Stopped, or Desk started again since: what the person typed in it
+        // is no longer known, so it rests the whole while first.
+        if !v.live && now - v.updated_at < hands_off {
+            return;
+        }
+        // The person reopened it after a close: theirs to close.
+        match self.desk.store().close_undone(v.id).await {
+            Ok(false) => {}
+            Ok(true) => return,
+            Err(e) => {
+                tracing::info!(session = %v.id, error = %format!("{e:#}"), "whether a close of a session was undone couldn't be read; it isn't closed");
+                return;
+            }
         }
         let tickets: Vec<TicketState> = match self.desk.store().session_tickets(v.id).await {
             Ok(t) => t.into_iter().map(|t| t.state).collect(),
@@ -487,7 +509,9 @@ impl CrewHub {
                 .map(|(_, w)| w.clone())
         };
         let a_day = chrono::Duration::hours(IDLE_HOURS);
-        let idle = now - v.updated_at >= a_day
+        // Only one it started itself is closed for being quiet.
+        let idle = how == How::Started
+            && now - v.updated_at >= a_day
             && self
                 .desk
                 .person_input_at(v.id)
@@ -514,7 +538,7 @@ impl CrewHub {
             self.note_once(
                 boss,
                 v.id,
-                &format!("open:{kept}"),
+                "open",
                 ClosedKind::KeptOpen,
                 ClosedSession {
                     why: Some(kept),
@@ -526,7 +550,7 @@ impl CrewHub {
         // Looked at again just now: still where it was.
         let still = self.desk.view(v.id).is_ok_and(|now_v| {
             now_v.prompts == v.prompts && now_v.state == v.state && now_v.terminal_id.is_none()
-        });
+        }) && !self.person_in_for(v.id, Utc::now() - hands_off, self.answer_gap(o));
         if !still {
             return;
         }
@@ -540,6 +564,14 @@ impl CrewHub {
                 }
                 Err(refused) => {
                     tracing::info!(session = %v.id, %boss, %refused, "a finished session couldn't be closed");
+                    // Still stopping, it closes once it has: not left open.
+                    if self
+                        .desk
+                        .view(v.id)
+                        .map_or(true, |now_v| now_v.state != v.state)
+                    {
+                        return;
+                    }
                     self.note_once(
                         boss,
                         v.id,
@@ -607,7 +639,8 @@ impl CrewHub {
             .push((Utc::now(), kind, s));
     }
 
-    /// Whether a suggestion to close `session` is still open.
+    /// Whether closing `session` was suggested already: open still, or
+    /// answered (a dismissed one is the person's word to leave it).
     async fn close_suggested(&self, session: Uuid) -> bool {
         let id = session.to_string();
         self.desk
@@ -617,8 +650,7 @@ impl CrewHub {
             .unwrap_or_default()
             .iter()
             .any(|s| {
-                s.state == SuggestionState::Open
-                    && s.action["tool"] == TOOL
+                s.action["tool"] == TOOL
                     && s.action["input"]["session_id"] == Value::String(id.clone())
             })
     }
@@ -772,6 +804,11 @@ mod tests {
             Some(Finished::Ticket)
         );
         assert_eq!(finished(&[], &[(6, None)], None, false), None);
+        assert_eq!(finished(&[], &[(6, None)], Some("done"), true), None);
+        assert_eq!(
+            finished(&[], &[(6, None), (7, pull(false, true))], None, true),
+            Some(Finished::Merged(7))
+        );
     }
 
     #[test]

@@ -7,6 +7,7 @@
 //! - One the person handed it is only suggested at Act.
 //! - One with uncommitted work, or one the person typed into just now,
 //!   stays open; the first is said once.
+//! - One whose close was undone is never closed again.
 //! - With the setting off, nothing is closed.
 
 use super::act_fully::repo;
@@ -238,6 +239,9 @@ async fn a_boss_closes_the_finished_sessions_it_started_and_never_what_holds_wor
             (state(&d, web.id) != SessionState::Closed).then_some(())
         })
         .await;
+        // Reopened, it is the person's: never closed as finished again.
+        assert!(d.store().close_undone(web.id).await.unwrap());
+        assert!(!d.store().close_undone(notes.id).await.unwrap());
 
         // Off: what finishes stays.
         write_config(
