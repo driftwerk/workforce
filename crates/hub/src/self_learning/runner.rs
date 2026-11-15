@@ -780,7 +780,15 @@ fn claude_code_spec(model: Option<&str>) -> String {
     let claude_code = ProviderKind::ClaudeCode.canonical_name();
     match model.map(|m| (m, crate::subscription::routed_kind(m))) {
         Some((spec, Some(ProviderKind::ClaudeCode))) => spec.to_string(),
-        Some((bare, None)) if !bare.contains(':') => format!("{claude_code}:{bare}"),
+        // A bare model of the agent's own provider (its light background
+        // model, filled in) is no model the CLI runs.
+        Some((bare, None))
+            if !bare.contains(':')
+                && (crate::hub_core::subscriptions::is_claude_model(bare)
+                    || workforce_agent::llm::tiers::ModelTier::from_name(bare).is_some()) =>
+        {
+            format!("{claude_code}:{bare}")
+        }
         _ => format!("{claude_code}:standard"),
     }
 }

@@ -142,6 +142,19 @@ pub struct ResolvedConfig {
 }
 
 impl ResolvedConfig {
+    /// This config with no model filled into its background features, as if
+    /// each were left empty and nothing filled them: for checks of what the
+    /// agent's files name, apart from the defaults.
+    pub fn without_background_fill(mut self) -> Self {
+        self.compaction.compaction_model = None;
+        self.memory.passive_model = None;
+        self.memory.consolidation_model = None;
+        self.memory.lesson_extract_model = None;
+        self.self_learning.model = None;
+        self.claim_grounding.model = None;
+        self
+    }
+
     /// Merge global → agent-section → workspace config for the runtime knobs,
     /// then resolve background-task model tiers (`passive_model`,
     /// `consolidation_model`, `lesson_extract_model`, `compaction_model`,
@@ -476,7 +489,12 @@ impl BackgroundModels {
         fill(&mut claim_grounding.model, &self.heavy);
         fill(&mut memory.passive_model, &self.light);
         fill(&mut memory.consolidation_model, &self.light);
-        fill(&mut memory.lesson_extract_model, &self.light);
+        // Lessons follow passive memory's model, set or filled.
+        let passive = memory.passive_model.clone().filter(|m| !m.is_empty());
+        fill(
+            &mut memory.lesson_extract_model,
+            &passive.or_else(|| self.light.clone()),
+        );
         fill(&mut self_learning.model, &self.light);
     }
 }
@@ -685,6 +703,31 @@ mod tests {
         );
         assert_eq!(cfg.compaction.compaction_model.as_deref(), Some("haiku"));
         assert_eq!(cfg.claim_grounding.model.as_deref(), Some("sonnet"));
+    }
+
+    #[test]
+    fn lessons_follow_the_passive_memory_model() {
+        let ws = AgentWorkspaceConfig {
+            llm: Some(workforce_common::settings::AgentLlmConfig {
+                provider: Some("claude-code".into()),
+                ..chatting_on("fable")
+            }),
+            memory: Some(workforce_common::settings::AgentMemoryConfig {
+                passive_model: Some("standard".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cfg = ResolvedConfig::resolve(
+            None,
+            Some(&ws),
+            &WorkforceConfig::default(),
+            "claude-code",
+            None,
+        );
+        assert_eq!(cfg.memory.passive_model.as_deref(), Some("sonnet"));
+        assert_eq!(cfg.memory.lesson_extract_model.as_deref(), Some("sonnet"));
+        assert_eq!(cfg.memory.consolidation_model.as_deref(), Some("haiku"));
     }
 
     #[test]

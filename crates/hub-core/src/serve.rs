@@ -2114,10 +2114,18 @@ impl AgentService {
 
     /// Get the current compaction config, preferring runtime override if set.
     pub fn current_compaction_config(&self) -> workforce_common::session::CompactionConfig {
-        self.active_compaction
-            .read()
-            .clone()
-            .unwrap_or_else(|| self.effective_compaction().clone())
+        let effective = self.effective_compaction();
+        match self.active_compaction.read().clone() {
+            // An override that names no model runs on the one the agent's
+            // config resolves (its own key, else its heavy background model).
+            Some(mut over) => {
+                if over.compaction_model.is_none() {
+                    over.compaction_model = effective.compaction_model.clone();
+                }
+                over
+            }
+            None => effective.clone(),
+        }
     }
 
     /// [`Self::current_compaction_config`] for a turn on `model`: its context

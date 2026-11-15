@@ -202,13 +202,16 @@ fn finished(crew: &CrewHub) -> Vec<Uuid> {
         .collect()
 }
 
-/// What became of a finished turn handed to its boss.
 /// Whether a call failed for its plan's usage limit (no login with room
-/// left), which a second call on the same plan would only meet again.
+/// left), or for every slot staying busy, which a second call on the same
+/// plan would only meet again. A login to sign in again, or a model the plan
+/// lacks, is not this: those are said like any other failure.
 fn at_limit(error: &str) -> bool {
     error.contains(workforce_agent::llm::failover::SUBSCRIPTION_UNAVAILABLE_MARKER)
+        && (error.contains("at its usage limit") || error.contains("stayed busy for"))
 }
 
+/// What became of a finished turn handed to its boss.
 enum Judged {
     Done,
     /// The person took the session meanwhile: looked at again later.
@@ -502,7 +505,27 @@ impl CrewHub {
 
 #[cfg(test)]
 mod tests {
-    use super::{next, Next};
+    use super::{at_limit, next, Next};
+
+    #[test]
+    fn only_a_plan_at_its_limit_or_busy_is_looked_at_later() {
+        assert!(at_limit(
+            "subscription unavailable: Kings's Claude is at its usage limit until 2026-11-20T19:00:00Z"
+        ));
+        assert!(at_limit(
+            "subscription unavailable: no Claude login for kings: shared at its usage limit until 2026-11-20 19:00:00 UTC"
+        ));
+        assert!(at_limit(
+            "subscription unavailable: every Claude slot on this hub stayed busy for 30s"
+        ));
+        assert!(!at_limit(
+            "subscription unavailable: Kings's Claude must be signed in again: token revoked"
+        ));
+        assert!(!at_limit(
+            "subscription unavailable: no Claude login for kings"
+        ));
+        assert!(!at_limit("the model timed out"));
+    }
 
     #[test]
     fn its_word_is_a_next_step_with_its_why_done_or_a_question_for_the_person() {
