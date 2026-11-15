@@ -213,6 +213,11 @@ pub const ASKED_IN_TERMINAL: &str = "the terminal is asking for this one";
 /// Why Desk takes no answer to a request: it was answered already.
 pub const ALREADY_ANSWERED: &str = "already answered";
 
+/// Why nothing is typed into a session: a dialog shows in its terminal,
+/// and the Enter after a prompt would answer it.
+pub const WAITING_ON_DIALOG: &str =
+    "That session is waiting on a permission prompt; answer or clear it first.";
+
 #[derive(Debug, thiserror::Error)]
 pub enum DeskError {
     #[error("no such session")]
@@ -4270,13 +4275,30 @@ impl Desk {
             return Err(DeskError::Invalid("the prompt is empty".into()));
         }
         self.breaker_refuses_prompt(id, by)?;
-        let pty = self.attach(id)?;
+        let pty = self.attach_outside_dialog(id)?;
         self.breaker_typed(id, &text, by);
         let mut input = b"\x1b[200~".to_vec();
         input.extend_from_slice(text.as_bytes());
         input.extend_from_slice(b"\x1b[201~\r");
         pty.write(&input)?;
         self.view(id)
+    }
+
+    /// Its terminal, only while no dialog shows there: a prompt it asks in
+    /// its terminal, one held in Desk (for its boss or the person) or
+    /// Codex's. The Enter after a prompt would answer the dialog's
+    /// highlighted choice instead, so nothing is typed into one.
+    fn attach_outside_dialog(&self, id: Uuid) -> Result<Arc<Pty>, DeskError> {
+        let st = self.0.state.lock();
+        let live = st
+            .live
+            .get(&id)
+            .ok_or_else(|| DeskError::Conflict("session is not running".into()))?;
+        let blocked = st.records.get(&id).map(|r| r.state) == Some(SessionState::Blocked);
+        if blocked || live.pending.is_some() {
+            return Err(DeskError::Conflict(WAITING_ON_DIALOG.into()));
+        }
+        Ok(Arc::clone(&live.pty))
     }
 
     /// Ends the turn a running session is working on, as Esc in its terminal
