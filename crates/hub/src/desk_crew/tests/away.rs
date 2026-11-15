@@ -47,6 +47,7 @@ async fn did(d: &Desk, s: uuid::Uuid, done: &str) {
             .into_iter()
             .collect(),
         at: chrono::Utc::now(),
+        restated: false,
     });
     a.next = "Deploy it".into();
     d.store().session_account_put(&a).await.unwrap();

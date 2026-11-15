@@ -35,7 +35,7 @@ impl Told {
     /// What `a` says now, as told.
     pub fn of(a: &Account) -> Self {
         Self {
-            done_at: a.done.iter().map(|d| d.at).max(),
+            done_at: a.done.iter().filter(|d| !d.restated).map(|d| d.at).max(),
             next: a.next.trim().to_string(),
             waiting_on: a
                 .waiting_on
@@ -73,12 +73,31 @@ pub fn is_result(d: &Done) -> bool {
             .any(|w| RESULT_WORDS.contains(&w.to_lowercase().as_str()))
 }
 
+/// `s` as compared for news: its words, in lower case, without the
+/// punctuation around them, so a rewording of case or stops is no change.
+fn said_as(s: &str) -> String {
+    s.split_whitespace()
+        .map(|w| {
+            w.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase()
+        })
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Whether what a session waits on is the same as `told` said it.
+fn same_waiting(told: &Told, now: &Told) -> bool {
+    told.waiting_on.as_deref().map(said_as) == now.waiting_on.as_deref().map(said_as)
+}
+
 /// What changed in `a` since `told` (none: never told, so only what was
 /// done since `since` is news). What it is doing this minute alone is not
-/// news: it moves on every refresh.
+/// news: it moves on every refresh. Nor is a done line a refresh said
+/// again ([`Done::restated`]): a restart, a switch of account or a re-read
+/// of an idle session is no event.
 pub fn changed(told: Option<&Told>, a: &Account, since: DateTime<Utc>) -> Change {
-    let after = told.and_then(|t| t.done_at).unwrap_or(since).max(since);
-    let new: Vec<&Done> = a.done.iter().filter(|d| d.at > after).collect();
+    let new = done_since(told, a, since);
     if new.iter().any(|d| is_result(d)) {
         return Change::Result;
     }
@@ -87,7 +106,9 @@ pub fn changed(told: Option<&Told>, a: &Account, since: DateTime<Utc>) -> Change
     }
     let now = Told::of(a);
     match told {
-        Some(t) if t.next != now.next || t.waiting_on != now.waiting_on => Change::Small,
+        Some(t) if said_as(&t.next) != said_as(&now.next) || !same_waiting(t, &now) => {
+            Change::Small
+        }
         Some(_) => Change::None,
         // A session first seen with nothing done is told of once it does
         // something.
@@ -95,12 +116,28 @@ pub fn changed(told: Option<&Told>, a: &Account, since: DateTime<Utc>) -> Change
     }
 }
 
-/// The done lines of `a` since `told` (or `since`), oldest first.
+/// The done lines of `a` since `told` (or `since`), oldest first: what it
+/// did, never what a refresh said again.
 pub fn done_since<'a>(told: Option<&Told>, a: &'a Account, since: DateTime<Utc>) -> Vec<&'a Done> {
     let after = told.and_then(|t| t.done_at).unwrap_or(since).max(since);
-    let mut new: Vec<&Done> = a.done.iter().filter(|d| d.at > after).collect();
+    let mut new: Vec<&Done> = a
+        .done
+        .iter()
+        .filter(|d| d.at > after && !d.restated)
+        .collect();
     new.sort_by_key(|d| d.at);
     new
+}
+
+/// `a` as an update tells of it, since `told`: what it waits on only when
+/// that is new (never told, or no longer what the person was told), so a
+/// session still waiting on the same answer isn't said to wait again.
+pub fn as_told(told: Option<&Told>, a: &Account) -> Account {
+    let mut shown = a.clone();
+    if told.is_some_and(|t| same_waiting(t, &Told::of(a))) {
+        shown.waiting_on = None;
+    }
+    shown
 }
 
 /// The least time between two updates, after `unread` of them in a row
@@ -215,6 +252,115 @@ pub struct UpdateSession {
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub refs: Vec<Ref>,
+    /// The repository it works in, by name: said with it, so a PR's
+    /// number is never said without where it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+}
+
+impl UpdateSession {
+    /// What the update names it by: its name, and its repository when the
+    /// name doesn't say it ("Lead management (PatchworkOnRails)").
+    pub fn context(&self) -> String {
+        subject(&self.name, self.repo.as_deref())
+    }
+}
+
+/// A session named for an update: `name`, with `repo` when the name
+/// doesn't already say it.
+pub fn subject(name: &str, repo: Option<&str>) -> String {
+    let name = name.trim();
+    match repo.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(r) if !name.to_lowercase().contains(&r.to_lowercase()) => match name.is_empty() {
+            true => r.to_string(),
+            false => format!("{name} ({r})"),
+        },
+        _ => name.to_string(),
+    }
+}
+
+/// The repository a session's work is in, by name: the repository of a
+/// PR among `refs` (by its link), else the folder of its git project
+/// (`project`), its last part.
+pub fn repo_of(refs: &[&Ref], project: &str) -> Option<String> {
+    let from_link = refs.iter().find_map(|r| {
+        let url = r.url.as_deref()?;
+        let parts: Vec<&str> = url.split("://").nth(1)?.split('/').collect();
+        // The part before `pull` (GitHub) or before `-/merge_requests`
+        // (GitLab, under however many groups), past host and owner.
+        let at = parts
+            .iter()
+            .position(|p| matches!(*p, "pull" | "pulls" | "-"))?;
+        (at >= 3).then(|| parts[at - 1].to_string())
+    });
+    from_link
+        .or_else(|| {
+            std::path::Path::new(project.trim_end_matches('/'))
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+        .filter(|r| !r.trim().is_empty())
+}
+
+/// `headline` said of the update's subject: an update about one session
+/// (or one group of its brief) says which, before it, unless it names it
+/// already; one about several that names none is said in counts
+/// ([`plain_headline`]), each line below naming its own. A headline with
+/// no subject never stands alone.
+pub fn situated(u: &MentionedUpdate, headline: &str, for_you: usize) -> String {
+    let mut subjects: Vec<String> = u.sessions.iter().map(UpdateSession::context).collect();
+    for g in &u.brief {
+        if g.label != CREW_LABEL && !g.items.is_empty() && !subjects.contains(&g.label) {
+            subjects.push(g.label.clone());
+        }
+    }
+    let words: Vec<String> = headline
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    let low = words.join(" ");
+    // Named whole, or by a word of its name the person calls it by
+    // ("web" of acme-web): never by a word too short to say which.
+    let named = |s: &str| {
+        let bare = s.split(" (").next().unwrap_or(s).trim().to_lowercase();
+        let whole: Vec<&str> = bare
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect();
+        // A name of words ("Lead management") only whole; one made of a
+        // folder's parts ("acme-web") by any of them.
+        let parts = !bare.contains(char::is_whitespace);
+        (!whole.is_empty() && format!(" {low} ").contains(&format!(" {} ", whole.join(" "))))
+            || parts
+                && whole.iter().filter(|w| w.len() >= 3).any(|w| {
+                    words
+                        .iter()
+                        .any(|h| h == w || h.strip_suffix('s') == Some(*w))
+                })
+    };
+    if subjects.is_empty() || subjects.iter().any(|s| named(s)) {
+        return headline.to_string();
+    }
+    match subjects.as_slice() {
+        [one] => format!("{one}: {}", lower_first(headline.trim())),
+        // Two: both named before it; more: in counts, each line below
+        // naming its own.
+        [a, b] => format!("{a} and {b}: {}", lower_first(headline.trim())),
+        _ => plain_headline(u, for_you),
+    }
+}
+
+/// `h` to read on after a colon: its first letter in lower case, unless
+/// it starts an acronym or a ticket ("PLT-3010", "CI").
+fn lower_first(h: &str) -> String {
+    let mut chars = h.chars();
+    match (chars.next(), chars.next()) {
+        (Some(a), Some(b)) if a.is_uppercase() && !b.is_uppercase() && !b.is_numeric() => {
+            a.to_lowercase().collect::<String>() + &h[a.len_utf8()..]
+        }
+        _ => h.to_string(),
+    }
 }
 
 /// What still waits on the person, as an update lists it.
@@ -695,7 +841,7 @@ pub fn render(u: &MentionedUpdate, decided: &[String]) -> String {
             "" => String::new(),
             p => format!(" ({})", p.trim_end_matches('.')),
         };
-        out.push(format!("**{}**{purpose} — {}", s.name, s.text.trim()));
+        out.push(format!("**{}**{purpose} — {}", s.context(), s.text.trim()));
     }
     out.extend(decided.iter().cloned());
     out.extend(u.kept.iter().cloned());
@@ -722,15 +868,24 @@ pub fn render(u: &MentionedUpdate, decided: &[String]) -> String {
 pub fn render_brief(u: &MentionedUpdate) -> String {
     let mut out: Vec<String> = vec![u.headline.trim().to_string()];
     let mut lines: Vec<String> = Vec::new();
-    for i in u.brief.iter().flat_map(|g| &g.items) {
-        let mark = match i.kind {
-            BriefKind::Done => "✓",
-            BriefKind::ForYou => "● For you:",
-        };
-        lines.push(match i.why.as_deref().filter(|w| !w.trim().is_empty()) {
-            Some(why) => format!("{mark} {} — {why}", i.action),
-            None => format!("{mark} {}", i.action),
-        });
+    for g in &u.brief {
+        // Each line under the session it is about, named (and its
+        // repository): never a line with no context.
+        match g.label.as_str() {
+            CREW_LABEL | "" => {}
+            _ if g.items.is_empty() => {}
+            l => lines.push(format!("**{l}**")),
+        }
+        for i in &g.items {
+            let mark = match i.kind {
+                BriefKind::Done => "✓",
+                BriefKind::ForYou => "● For you:",
+            };
+            lines.push(match i.why.as_deref().filter(|w| !w.trim().is_empty()) {
+                Some(why) => format!("{mark} {} — {why}", i.action),
+                None => format!("{mark} {}", i.action),
+            });
+        }
     }
     // Where the brief leaves room, what the sessions did, one sentence
     // each; the rest counted with what it left out.
@@ -738,7 +893,7 @@ pub fn render_brief(u: &MentionedUpdate) -> String {
     for s in u.sessions.iter().take(room) {
         lines.push(format!(
             "**{}** — {}",
-            s.name,
+            s.context(),
             crate::crew::words(s.text.trim(), SESSION_WORDS)
         ));
     }
@@ -777,7 +932,7 @@ pub fn footer(spent: i64, cap: u32) -> Option<String> {
 /// line and why in one sentence, never quoting the message it sent (shown
 /// apart). Asks and what it kept are added verbatim.
 pub const COMPOSER_SYSTEM: &str = "You write parts of an overseer's short update to the person it works for, in its voice (\"I\", plain words, no lists, no headings). Critical facts only: never retell a plan, never quote a message.\n\
-headline: the whole update in at most 12 words (\"Unblocked web's release; one thing needs you.\").\n\
+headline: the whole update in at most 12 words, naming the session it is about when it is about one (\"Lead management: edit-form fix is up as PR #624.\").\n\
 For each session given, write one sentence of at most 25 words: where it is and what's next, from what it did since the person was last told. Don't mention decisions, questions or anything waiting on the person in these: those are added separately.\n\
 For each decision given, write its action: what you did, in at most 12 words (\"Lifted my hold on tonight's release.\", \"Let web wait for CI.\"); and its why: the reason in at most 8 words (\"CI is green again\"). Never quote or repeat the message you sent: the person reads it separately.\n\
 Leave out anything not given; never invent PR numbers, names or times. Answer with JSON only: {\"headline\": \"<line>\", \"sessions\": [{\"id\": \"<session id>\", \"text\": \"<sentence>\"}], \"decisions\": [{\"id\": \"<decision id>\", \"action\": \"<short line>\", \"why\": \"<few words>\"}]}.";
@@ -1005,6 +1160,7 @@ mod tests {
                     .into_iter()
                     .collect(),
                 at: now - Duration::minutes(*mins),
+                restated: false,
             })
             .collect();
         a
@@ -1026,6 +1182,7 @@ mod tests {
             text: "Added a test".into(),
             refs: vec![],
             at: Utc::now(),
+            restated: false,
         });
         assert_eq!(changed(Some(&told), &a, since), Change::Small);
         a.done.push(Done {
@@ -1036,6 +1193,7 @@ mod tests {
                 url: None,
             }],
             at: Utc::now(),
+            restated: false,
         });
         assert_eq!(changed(Some(&told), &a, since), Change::Result);
         assert_eq!(done_since(Some(&told), &a, since).len(), 2);
@@ -1095,6 +1253,7 @@ mod tests {
                 purpose: a.purpose.clone(),
                 text,
                 refs: refs_of(&new),
+                repo: None,
             }],
             waiting: vec![WaitingItem {
                 item_id: "i".into(),
@@ -1336,6 +1495,7 @@ mod tests {
             text,
             "4 done, 1 for you, 2 left alone.\n\n\
              ● For you: Rotate the staging deploy key: it is in your own vault account… — the staging deploy waits on it\n\
+             **acme-web**\n\
              ✓ Sent web a message — you confirmed it yourself at 15:33\n\
              ✓ Sent web a message — you confirmed it yourself at 15:33\n\
              +2 more\n\
@@ -1520,5 +1680,163 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(e.update.unwrap().decisions[0].action, "");
+    }
+
+    /// A done line a refresh said again is no news, whatever it says
+    /// ("shipped"); nor is what it waits on put in other words. A real
+    /// line still is, and so is a real change of what it waits on.
+    #[test]
+    fn a_restated_line_or_a_reworded_wait_is_no_news() {
+        let since = Utc::now() - Duration::days(4);
+        let mut a = account(&[("PLT-3010 shipped", None, 3 * 24 * 60)], "");
+        a.waiting_on = Some("the person's answer".into());
+        let told = Told::of(&a);
+        a.done.push(Done {
+            text: "Shipped PLT-3010.".into(),
+            refs: vec![],
+            at: Utc::now(),
+            restated: true,
+        });
+        a.waiting_on = Some("The person's answer.".into());
+        assert_eq!(changed(Some(&told), &a, since), Change::None);
+        assert!(done_since(Some(&told), &a, since).is_empty());
+        // Never told, the restated line is no news either.
+        let fresh_since = Utc::now() - Duration::minutes(5);
+        assert_eq!(changed(None, &a, fresh_since), Change::None);
+        // Told of, a wait that hasn't moved isn't said again.
+        assert_eq!(as_told(Some(&told), &a).waiting_on, None);
+        assert!(!plain_session(&[], &as_told(Some(&told), &a)).contains("Waiting"));
+        assert!(
+            as_told(None, &a).waiting_on.is_some(),
+            "never told: it is new"
+        );
+        // Controls: a real wait and a real PR are news.
+        let mut b = a.clone();
+        b.waiting_on = Some("CI".into());
+        assert_eq!(changed(Some(&told), &b, since), Change::Small);
+        assert_eq!(as_told(Some(&told), &b).waiting_on.as_deref(), Some("CI"));
+        b.done.push(Done {
+            text: "Opened PR #624".into(),
+            refs: vec![Ref {
+                kind: RefKind::Pr,
+                id: "#624".into(),
+                url: None,
+            }],
+            at: Utc::now(),
+            restated: false,
+        });
+        assert_eq!(changed(Some(&told), &b, since), Change::Result);
+        assert_eq!(done_since(Some(&told), &b, since).len(), 1);
+    }
+
+    /// Each line of an update names its session, and a PR's its
+    /// repository: a headline about one session says which; one that
+    /// names it stands; one about several that names none is said in
+    /// counts. The brief's lines carry their group's name.
+    #[test]
+    fn every_line_names_its_session_and_a_prs_repository() {
+        let pr = Ref {
+            kind: RefKind::Pr,
+            id: "#624".into(),
+            url: Some("https://github.com/acme/PatchworkOnRails/pull/624".into()),
+        };
+        assert_eq!(
+            repo_of(&[&pr], "/dev/elsewhere").as_deref(),
+            Some("PatchworkOnRails")
+        );
+        assert_eq!(repo_of(&[], "/dev/acme-web").as_deref(), Some("acme-web"));
+        let gitlab = Ref {
+            kind: RefKind::Pr,
+            id: "!9".into(),
+            url: Some("https://gitlab.com/acme/tools/deployer/-/merge_requests/9".into()),
+        };
+        assert_eq!(repo_of(&[&gitlab], "").as_deref(), Some("deployer"));
+        // A word inside another is no name: "web" is not in "webhook".
+        let web = MentionedUpdate {
+            sessions: vec![UpdateSession {
+                session_id: String::new(),
+                name: "web".into(),
+                purpose: String::new(),
+                text: String::new(),
+                refs: vec![],
+                repo: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            situated(&web, "Fixed the webhook.", 0),
+            "web: fixed the webhook."
+        );
+        assert_eq!(repo_of(&[], ""), None);
+        assert_eq!(subject("acme-web", Some("acme-web")), "acme-web");
+        let one = UpdateSession {
+            session_id: Uuid::new_v4().to_string(),
+            name: "Lead management".into(),
+            purpose: String::new(),
+            text: "Edit-form fix is up as PR #624; tracing the lead bug now.".into(),
+            refs: vec![pr],
+            repo: Some("PatchworkOnRails".into()),
+        };
+        let mut u = MentionedUpdate {
+            sessions: vec![one.clone()],
+            ..Default::default()
+        };
+        let bare = "Edit-form fix is up as PR #624; tracing the lead bug now.";
+        assert_eq!(
+            situated(&u, bare, 0),
+            "Lead management (PatchworkOnRails): edit-form fix is up as PR #624; tracing the lead bug now."
+        );
+        // A ticket or acronym keeps its case; a headline naming it stands.
+        assert!(situated(&u, "PLT-3010 is merged.", 0).ends_with(": PLT-3010 is merged."));
+        let named = "Lead management's fix is up as PR #624.";
+        assert_eq!(situated(&u, named, 0), named);
+        // Two sessions, none named: both said; more: in counts.
+        u.sessions.push(UpdateSession {
+            session_id: Uuid::new_v4().to_string(),
+            name: "acme-web".into(),
+            ..one.clone()
+        });
+        assert!(situated(&u, bare, 0).starts_with(
+            "Lead management (PatchworkOnRails) and acme-web (PatchworkOnRails): edit-form"
+        ));
+        let mut three = u.clone();
+        three.sessions.push(UpdateSession {
+            session_id: Uuid::new_v4().to_string(),
+            name: "billing".into(),
+            ..one.clone()
+        });
+        assert_eq!(situated(&three, bare, 0), "3 sessions moved on.");
+        // Rendered, each session line and each brief line says its own.
+        u.headline = situated(&u, bare, 0);
+        u.brief = vec![BriefGroup {
+            session_id: Some(one.session_id.clone()),
+            label: "Lead management (PatchworkOnRails)".into(),
+            items: vec![BriefItem {
+                id: "d1".into(),
+                kind: BriefKind::Done,
+                action: "Told it to fix the edit form".into(),
+                why: Some("the lead bug blocks sales".into()),
+                detail: None,
+                undo: None,
+                settled_by: None,
+                at: Utc::now(),
+            }],
+            left_alone: 0,
+        }];
+        let text = render_brief(&u);
+        assert!(
+            text.contains("**Lead management (PatchworkOnRails)**\n✓ Told it to fix the edit form"),
+            "{text}"
+        );
+        assert!(
+            text.contains("**Lead management (PatchworkOnRails)** — Edit-form"),
+            "{text}"
+        );
+        for line in text.lines().filter(|l| l.contains("#624")) {
+            assert!(
+                line.contains("PatchworkOnRails"),
+                "a PR without its repository: {line}"
+            );
+        }
     }
 }

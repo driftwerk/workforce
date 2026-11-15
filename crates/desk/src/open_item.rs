@@ -353,56 +353,59 @@ pub fn kept_by<'a>(
     use crate::account::RefKind;
     let want = normalised(done_when);
     let has = |d: &crate::account::Done, k: RefKind| d.refs.iter().any(|r| r.kind == k);
-    done.iter().filter(|d| d.at >= since).find(|d| {
-        let words: Vec<&str> = d
-            .text
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|w| !w.is_empty())
-            .collect();
-        let words: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
-        let says = |phrases: &[&str]| phrases.iter().any(|p| said(&words, p));
-        match want.as_str() {
-            "merged" | "merge" | "the pr merged" | "pr merged" => {
-                // A merge of it, not of main into it or of a conflict.
-                has(d, RefKind::Pr)
-                    && (0..words.len()).any(|i| {
-                        matches!(words[i].as_str(), "merged" | "merge")
-                            && !negated(&words, i)
-                            && !matches!(
-                                words.get(i + 1).map(String::as_str),
-                                Some(
-                                    "main"
-                                        | "master"
-                                        | "origin"
-                                        | "upstream"
-                                        | "conflict"
-                                        | "conflicts"
+    // A line a refresh said again keeps no promise: it did nothing then.
+    done.iter()
+        .filter(|d| d.at >= since && !d.restated)
+        .find(|d| {
+            let words: Vec<&str> = d
+                .text
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|w| !w.is_empty())
+                .collect();
+            let words: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
+            let says = |phrases: &[&str]| phrases.iter().any(|p| said(&words, p));
+            match want.as_str() {
+                "merged" | "merge" | "the pr merged" | "pr merged" => {
+                    // A merge of it, not of main into it or of a conflict.
+                    has(d, RefKind::Pr)
+                        && (0..words.len()).any(|i| {
+                            matches!(words[i].as_str(), "merged" | "merge")
+                                && !negated(&words, i)
+                                && !matches!(
+                                    words.get(i + 1).map(String::as_str),
+                                    Some(
+                                        "main"
+                                            | "master"
+                                            | "origin"
+                                            | "upstream"
+                                            | "conflict"
+                                            | "conflicts"
+                                    )
                                 )
-                            )
-                    })
+                        })
+                }
+                "in production" | "live" | "in prod" => {
+                    (has(d, RefKind::Deploy) && !negated_anywhere(&words) && !says(&["staging"]))
+                        || says(&[
+                            "in production",
+                            "to production",
+                            "to prod",
+                            "in prod",
+                            "went live",
+                            "is live",
+                        ])
+                }
+                "deployed" | "deploy" | "released" | "shipped" => {
+                    (has(d, RefKind::Deploy) && !negated_anywhere(&words))
+                        || says(&["deployed", "released", "shipped"])
+                }
+                "pr open" | "pr opened" | "the pr open" | "a pr open" => {
+                    has(d, RefKind::Pr) && says(&["opened", "open", "raised", "created"])
+                }
+                "" => false,
+                w => said(&words, w),
             }
-            "in production" | "live" | "in prod" => {
-                (has(d, RefKind::Deploy) && !negated_anywhere(&words) && !says(&["staging"]))
-                    || says(&[
-                        "in production",
-                        "to production",
-                        "to prod",
-                        "in prod",
-                        "went live",
-                        "is live",
-                    ])
-            }
-            "deployed" | "deploy" | "released" | "shipped" => {
-                (has(d, RefKind::Deploy) && !negated_anywhere(&words))
-                    || says(&["deployed", "released", "shipped"])
-            }
-            "pr open" | "pr opened" | "the pr open" | "a pr open" => {
-                has(d, RefKind::Pr) && says(&["opened", "open", "raised", "created"])
-            }
-            "" => false,
-            w => said(&words, w),
-        }
-    })
+        })
 }
 
 /// Whether `words` say `phrase` (normalised words) as done: whole words,
@@ -820,6 +823,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             at: now - Duration::minutes(mins),
+            restated: false,
         };
         let list = vec![
             done("Opened PR #622 for the lead picker", Some(RefKind::Pr), 30),

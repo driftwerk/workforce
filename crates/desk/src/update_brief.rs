@@ -330,19 +330,19 @@ pub fn parse_reply(reply: &str, at: DateTime<Utc>) -> MentionedUpdate {
         more_items: more,
         ..Default::default()
     };
-    u.headline = match headline {
+    let for_you = u
+        .brief
+        .iter()
+        .flat_map(|g| &g.items)
+        .filter(|i| i.kind == BriefKind::ForYou)
+        .count();
+    let headline = match headline {
         Some(h) => h,
         None if u.brief.is_empty() => words(&one_line(reply, usize::MAX), HEADLINE_WORDS),
-        None => {
-            let for_you = u
-                .brief
-                .iter()
-                .flat_map(|g| &g.items)
-                .filter(|i| i.kind == BriefKind::ForYou)
-                .count();
-            plain_headline(&u, for_you)
-        }
+        None => plain_headline(&u, for_you),
     };
+    // Said of the session it is about, never alone.
+    u.headline = crate::update::situated(&u, &headline, for_you);
     u
 }
 
@@ -582,6 +582,7 @@ mod tests {
                 purpose: "Ship the release".into(),
                 text: "A long paragraph about where the release is and what comes next.".into(),
                 refs: vec![],
+                repo: None,
             }],
             kept: vec!["I kept your order: the release waits for CI.".into()],
             footer: Some("Notes today: 90 of 100 cheap calls.".into()),
@@ -792,7 +793,7 @@ mod tests {
             Options: drop or keep\n\
             [x](https://x.example) merged";
         let u = parse_reply(reply, Utc::now());
-        assert_eq!(u.headline, "[WIP] Release is unblocked");
+        assert_eq!(u.headline, "acme-web: [WIP] Release is unblocked");
         let all: Vec<(String, String)> = u
             .brief
             .iter()
@@ -823,7 +824,7 @@ mod tests {
             "---\nAll moving.\n__[acme-web]__\n_✓ Merged the fix_\n**For you** — Rotate the key",
             Utc::now(),
         );
-        assert_eq!(u.headline, "All moving.");
+        assert_eq!(u.headline, "acme-web: all moving.");
         let all: Vec<(String, BriefKind, String)> = u
             .brief
             .iter()
