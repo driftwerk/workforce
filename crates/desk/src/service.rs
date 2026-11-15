@@ -59,7 +59,7 @@ pub use ticket_comments::{CommentPost, PostVia};
 pub use ticket_files::{FileBytes, READ_FRESH};
 mod breaker;
 mod charge;
-pub use charge::ChargeView;
+pub use charge::{ChargeView, DialogAnswerer};
 mod codex_terminals;
 mod copies;
 mod devin_sessions;
@@ -4284,12 +4284,19 @@ impl Desk {
     /// one's shell) goes on. Not working, it does nothing.
     pub fn interrupt(&self, id: Uuid, by: Option<By>) -> Result<SessionView, DeskError> {
         self.boss_holds(id, by.as_ref())?;
-        // A boss presses Esc on a dialog only where its Act fully answers
-        // the session and the person isn't in control of it.
+        // Esc on a dialog is the person's, or the boss's whose Act fully
+        // answers the session while the person isn't in control of it: no
+        // other boss, and no agent, Desk or breaker, clears one.
         let by_boss = by
             .as_ref()
             .is_some_and(|b| b.party.kind == crew::PartyKind::Manager);
-        let boss_clears = !by_boss || self.holds_requests_for_boss(id);
+        let boss_clears = match by.as_ref().map(|b| b.party.kind) {
+            None | Some(crew::PartyKind::You) => true,
+            Some(crew::PartyKind::Manager) => by
+                .as_ref()
+                .is_some_and(|b| self.holds_requests_for(id, &b.party.id)),
+            Some(_) => false,
+        };
         let pty = {
             let st = self.0.state.lock();
             let live = st
@@ -4348,7 +4355,9 @@ impl Desk {
     /// only while that is still what it waits on, unanswerable, and the
     /// person isn't in control of it; never a running turn.
     pub fn clear_dialog(&self, id: Uuid, pending: Uuid, by: By) -> Result<SessionView, DeskError> {
-        if by.party.kind != crew::PartyKind::Manager || !self.holds_requests_for_boss(id) {
+        // Its own boss alone: another boss, whatever its level, presses
+        // nothing in a session it doesn't answer.
+        if by.party.kind != crew::PartyKind::Manager || !self.holds_requests_for(id, &by.party.id) {
             return Err(DeskError::Conflict(
                 "the person is in control of it, or its boss doesn't answer it".into(),
             ));

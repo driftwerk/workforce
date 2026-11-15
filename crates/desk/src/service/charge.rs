@@ -26,6 +26,15 @@ use crate::line::{Delivery, LineKind, LineMessage};
 use crate::model::{DeskEvent, SessionState, SessionView};
 use crate::scope::Scope;
 
+/// Who answers a session's dialog questions and held requests at Act
+/// fully, as the hub says each sweep: its boss (agent id), and how long
+/// the person's input there keeps the session theirs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialogAnswerer {
+    pub boss: String,
+    pub gap: chrono::Duration,
+}
+
 /// What the desk keeps of charges in memory: every row, and when the
 /// person last gave each session input Desk doesn't see in its terminal.
 #[derive(Default)]
@@ -56,9 +65,10 @@ pub(crate) struct Charges {
     unanswering: HashMap<String, String>,
     /// The requests a boss was given and left open: the person's now.
     left: std::collections::HashSet<Uuid>,
-    /// The sessions whose dialog questions an Act fully boss answers, and
-    /// how long the person's input keeps them theirs, as the hub last said.
-    dialogs: HashMap<Uuid, chrono::Duration>,
+    /// The sessions whose dialog questions an Act fully boss answers, which
+    /// boss that is, and how long the person's input keeps them theirs, as
+    /// the hub last said.
+    dialogs: HashMap<Uuid, DialogAnswerer>,
     /// How many times the hub has said `dialogs` since Desk started (0:
     /// not yet, and which sessions an Act fully boss answers isn't known).
     dialogs_said: u64,
@@ -538,7 +548,7 @@ impl Desk {
     /// The sessions whose dialog questions an Act fully boss answers itself,
     /// and how long the person's input there keeps them theirs: said by the
     /// hub as it sweeps.
-    pub fn set_dialog_answerers(&self, dialogs: HashMap<Uuid, chrono::Duration>) {
+    pub fn set_dialog_answerers(&self, dialogs: HashMap<Uuid, DialogAnswerer>) {
         self.set_dialog_answerers_of(dialogs, HashSet::new());
     }
 
@@ -546,7 +556,7 @@ impl Desk {
     /// to say it (`seen`): one of them it left out isn't held, at once.
     pub fn set_dialog_answerers_of(
         &self,
-        dialogs: HashMap<Uuid, chrono::Duration>,
+        dialogs: HashMap<Uuid, DialogAnswerer>,
         seen: HashSet<Uuid>,
     ) {
         {
@@ -673,8 +683,23 @@ impl Desk {
     /// an Act fully boss answers its questions, and the person isn't in
     /// control of it.
     pub(super) fn holds_dialog_for_boss(&self, id: Uuid) -> bool {
-        let gap = self.0.state.lock().charges.dialogs.get(&id).copied();
+        let gap = self.0.state.lock().charges.dialogs.get(&id).map(|a| a.gap);
         gap.is_some_and(|gap| !self.person_in_control(id, gap))
+    }
+
+    /// Whether `boss` is the Act fully boss `id`'s requests are held for
+    /// now ([`Self::holds_requests_for_boss`]): no other boss presses keys
+    /// in its terminal.
+    pub(super) fn holds_requests_for(&self, id: Uuid, boss: &str) -> bool {
+        let ours = self
+            .0
+            .state
+            .lock()
+            .charges
+            .dialogs
+            .get(&id)
+            .is_some_and(|a| a.boss == boss);
+        ours && self.holds_requests_for_boss(id)
     }
 
     /// Whether what `id` waits on is a question its dialog asks the person
