@@ -25,6 +25,7 @@ use workforce_desk::crew::{
 use workforce_desk::model::{DeskEvent, Origin};
 use workforce_desk::CheckIn;
 
+use super::github::CHECK_GITHUB;
 use super::tools::{CrewTool, ACT, READ};
 use super::{name_of, CrewHub, CHECK_IN, MAX_HOPS};
 use crate::scheduler::{JobPayload, Schedule};
@@ -640,7 +641,7 @@ impl CrewHub {
              will need your judgement. Nothing should sit idle. Check the person's preferences first and apply \
              the one that fits (a close match too: apply it and say so). With none, decide yourself; give the \
              person a question only when you truly can't, with crew.ask_person and generalizes, so their \
-             answer settles that kind of case from then on. Give a reason each time; the person reads them in Activity. Your own limits stay theirs: asked to change them, say plainly you can't and post crew.ask_oversight_change. {STANDING_RULE} {PLAN_DRAFT}",
+             answer settles that kind of case from then on. Give a reason each time; the person reads them in Activity. Your own limits stay theirs: asked to change them, say plainly you can't and post crew.ask_oversight_change. {STANDING_RULE} {PLAN_DRAFT} {CHECK_GITHUB}",
             o.work.parallel, o.work.parallel
         )
     }
@@ -660,8 +661,11 @@ impl CrewHub {
     /// becomes a suggestion is said with the switch that would let it act.
     pub(super) fn level_hint(level: Level, o: &Oversight) -> String {
         let hint = match level {
-            Level::Full => format!("{} {STANDING_RULE} {PLAN_DRAFT}", Self::level_words(level)),
-            _ => Self::level_words(level).to_string(),
+            Level::Full => format!(
+                "{} {STANDING_RULE} {PLAN_DRAFT} {CHECK_GITHUB}",
+                Self::level_words(level)
+            ),
+            _ => format!("{} {CHECK_GITHUB}", Self::level_words(level)),
         };
         let off = o.act.off();
         if !level.acts() || off.is_empty() {
@@ -680,7 +684,7 @@ impl CrewHub {
     pub(super) fn dm_hint(level: Level, o: &Oversight, unbound: bool) -> String {
         let says = match level {
             _ if unbound => {
-                return format!("You oversee the crew, unbound: do everything yourself with the crew.* tools. {STANDING_RULE} {PLAN_DRAFT} {CHECK_FIRST}");
+                return format!("You oversee the crew, unbound: do everything yourself with the crew.* tools. {STANDING_RULE} {PLAN_DRAFT} {CHECK_FIRST} {CHECK_GITHUB}");
             }
             Level::Watch => "at Watch: don't act; say what you would do.",
             Level::Suggest => "at Suggest: your crew.* actions become suggestions the person accepts.",
@@ -702,7 +706,7 @@ impl CrewHub {
             ),
             false => String::new(),
         };
-        format!("You oversee the crew {says}{off} {CHECK_FIRST}")
+        format!("You oversee the crew {says}{off} {CHECK_FIRST} {CHECK_GITHUB}")
     }
 
     fn level_words(level: Level) -> &'static str {

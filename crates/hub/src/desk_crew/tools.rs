@@ -27,7 +27,7 @@ use super::CrewHub;
 
 /// Every `crew.*` tool: the ones it has at every level first (its reads,
 /// and what it asks of the person, which is never gated).
-pub const READ: [&str; 14] = [
+pub const READ: [&str; 17] = [
     "crew.overview",
     "crew.activity",
     "crew.account",
@@ -42,6 +42,9 @@ pub const READ: [&str; 14] = [
     super::items::ORDER,
     super::preferences::PREFER,
     super::preferences::PREFERENCES,
+    super::github::PR,
+    super::github::BRANCH,
+    super::github::CI,
 ];
 pub const ACT: [&str; 22] = [
     "crew.nudge",
@@ -386,6 +389,18 @@ impl CrewTool {
             | super::items::ORDER => crew.items_tool(self.name, b, input).await,
             super::preferences::PREFER | super::preferences::PREFERENCES => {
                 crew.preferences_tool(self.name, b, input).await
+            }
+            // The person's GitHub, as them: no scope of Desk's to keep to.
+            super::github::PR | super::github::BRANCH | super::github::CI => {
+                super::github::read(
+                    b.service.vault.clone(),
+                    b.service.global_vault.clone(),
+                    &b.service.config,
+                    &b.service.tools,
+                    self.name,
+                    input,
+                )
+                .await
             }
             _ => Err("not a reading tool".into()),
         }
@@ -778,6 +793,9 @@ pub(crate) fn describe(name: &str) -> &'static str {
     match name {
             "crew.overview" => "Everyone on the crew now: the person's agents and their Claude Code and Codex sessions, each with its state (needs you, working, quiet, done today, idle, failed, stopped), what it's doing, what it asks (with approval ids), since when, and whether you run it for the person (and whether they are driving it now). slots says how many of the sessions you run are starting or working, of the most you may run at once. For what sessions spent (tokens, cost), use crew.spend.",
             super::spend::NAME => super::spend::DESCRIPTION,
+            super::github::PR | super::github::BRANCH | super::github::CI => {
+                super::github::describe(name)
+            }
             super::decisions::NAME => super::decisions::DESCRIPTION,
             super::items::ASK => super::items::ASK_DESCRIPTION,
             super::items::CLOSE => super::items::CLOSE_DESCRIPTION,
@@ -832,6 +850,9 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
     match name {
         "crew.overview" => json!({ "type": "object", "properties": {} }),
         super::spend::NAME => super::spend::schema(),
+        super::github::PR | super::github::BRANCH | super::github::CI => {
+            super::github::schema(name)
+        }
         super::decisions::NAME => super::decisions::schema(),
         super::items::ASK
         | super::items::CLOSE
