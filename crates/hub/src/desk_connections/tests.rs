@@ -2640,6 +2640,13 @@ mod setups {
         let next = s.next(&started);
         assert!(!next.contains("ABCD-1234"), "{next}");
         assert!(next.contains("connections.wait"), "{next}");
+        // The person is told where the card is, before the agent waits.
+        let line = format!(
+            "I've put a GitHub card here: [open it](desk://setup/{})",
+            started.id
+        );
+        assert!(next.contains(&line), "{next}");
+        assert!(next.find(&line) < next.find("connections.wait"), "{next}");
         assert!(!format!("{:?}", started.steps).contains("ABCD-1234"));
         let said = s
             .wait(&allan, &started.id, Duration::from_secs(5))
@@ -2748,6 +2755,11 @@ mod setups {
             assert!(next.contains(want), "{want}: {next}");
         }
         assert!(next.contains("never call browser.sign_in"), "{next}");
+        assert!(
+            next.starts_with("First tell the person")
+                && next.contains(&format!("desk://setup/{}", started.id)),
+            "{next}"
+        );
     }
 
     /// Signing in is seen from the tab: on the service's sign-in, the card
