@@ -825,6 +825,10 @@ impl Tool for GithubListPullsTool {
                     "description": "Filter by state: open, closed, all (default: open)",
                     "enum": ["open", "closed", "all"]
                 },
+                "head": {
+                    "type": "string",
+                    "description": "Only pull requests from this branch: `branch` (in `owner`'s repository) or `user:branch` (from a fork)"
+                },
                 "per_page": {
                     "type": "integer",
                     "description": "Results per page (integer, default: 30, max: 100)",
@@ -870,6 +874,18 @@ impl Tool for GithubListPullsTool {
             .min(100)
             .to_string();
         query.push(("per_page", &per_page_str));
+        // GitHub filters by `user:branch`; a bare branch is in `owner`'s.
+        let head = input["head"]
+            .as_str()
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .map(|h| match h.contains(':') {
+                true => h.to_string(),
+                false => format!("{owner}:{h}"),
+            });
+        if let Some(head) = head.as_deref() {
+            query.push(("head", head));
+        }
 
         let path = format!("/repos/{}/{}/pulls", owner, repo);
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -891,6 +907,7 @@ impl Tool for GithubListPullsTool {
                             "head": p["head"]["ref"],
                             "base": p["base"]["ref"],
                             "draft": p["draft"],
+                            "merged_at": p["merged_at"],
                             "created_at": p["created_at"],
                             "updated_at": p["updated_at"],
                             "html_url": p["html_url"],
@@ -1054,29 +1071,40 @@ impl Tool for GithubGetPullTool {
             })
             .collect();
 
-        // Fetch CI check status
+        // Fetch CI check status: every check on its head, judged as
+        // github.ci_status judges them (a skipped or neutral one isn't
+        // pending), with the failed ones by name.
         let head_sha = pr["head"]["sha"].as_str().unwrap_or_default();
         let checks_summary = if !head_sha.is_empty() {
             let checks_path = format!("/repos/{}/{}/commits/{}/check-runs", owner, repo, head_sha);
-            match client.get(&checks_path).await {
+            match client
+                .get_with_query(&checks_path, &[("per_page", "100")])
+                .await
+            {
                 Ok(data) => {
                     let runs = data["check_runs"].as_array().cloned().unwrap_or_default();
-                    let total = runs.len();
-                    let success = runs
+                    let gate = evaluate_check_runs(&runs);
+                    let failure = gate.failed_checks.len();
+                    let pending = runs
                         .iter()
-                        .filter(|r| r["conclusion"].as_str() == Some("success"))
+                        .filter(|r| r["status"].as_str() != Some("completed"))
                         .count();
-                    let failure = runs
+                    let cancelled: Vec<&str> = runs
                         .iter()
-                        .filter(|r| {
-                            matches!(
-                                r["conclusion"].as_str(),
-                                Some("failure") | Some("timed_out")
-                            )
-                        })
-                        .count();
-                    let pending = total - success - failure;
-                    serde_json::json!({ "total": total, "success": success, "failure": failure, "pending": pending })
+                        .filter(|r| r["conclusion"].as_str() == Some("cancelled"))
+                        .filter_map(|r| r["name"].as_str())
+                        .collect();
+                    serde_json::json!({
+                        "overall": gate.overall,
+                        "total": gate.total_count,
+                        "success": gate.success_count,
+                        "failure": failure,
+                        "pending": pending,
+                        "skipped": gate.skipped_count,
+                        "neutral": gate.neutral_count,
+                        "failed": gate.failed_checks,
+                        "cancelled": cancelled,
+                    })
                 }
                 Err(_) => serde_json::json!(null),
             }
@@ -1095,7 +1123,13 @@ impl Tool for GithubGetPullTool {
                 "head": pr["head"]["ref"],
                 "base": pr["base"]["ref"],
                 "draft": pr["draft"],
+                "merged": pr["merged"],
+                "merged_at": pr["merged_at"],
+                "merged_by": pr["merged_by"]["login"],
+                "merge_commit_sha": pr["merge_commit_sha"],
                 "mergeable": pr["mergeable"],
+                "mergeable_state": pr["mergeable_state"],
+                "head_sha": pr["head"]["sha"],
                 "additions": pr["additions"],
                 "deletions": pr["deletions"],
                 "changed_files": pr["changed_files"],
@@ -3704,7 +3738,7 @@ impl Tool for GithubWorkflowRunLogsTool {
     }
 
     fn description(&self) -> &str {
-        "Get details and jobs for a specific workflow run"
+        "Get a workflow run's status and conclusion, and its jobs with their steps"
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -3753,11 +3787,32 @@ impl Tool for GithubWorkflowRunLogsTool {
             }
         };
 
+        // The run itself: whether it is done, and how it ended.
+        let run = client
+            .get(&format!("/repos/{owner}/{repo}/actions/runs/{run_id}"))
+            .await
+            .map(|r| {
+                serde_json::json!({
+                    "id": r["id"],
+                    "name": r["name"],
+                    "event": r["event"],
+                    "head_branch": r["head_branch"],
+                    "head_sha": r["head_sha"],
+                    "status": r["status"],
+                    "conclusion": r["conclusion"],
+                    "run_attempt": r["run_attempt"],
+                    "html_url": r["html_url"],
+                    "created_at": r["created_at"],
+                    "updated_at": r["updated_at"],
+                })
+            })
+            .unwrap_or(serde_json::Value::Null);
+
         // Get jobs for the run (more useful than raw zip logs)
         let path = format!("/repos/{owner}/{repo}/actions/runs/{run_id}/jobs");
         let duration_ms = start.elapsed().as_millis() as u64;
 
-        match client.get(&path).await {
+        match client.get_with_query(&path, &[("per_page", "100")]).await {
             Ok(result) => {
                 let jobs: Vec<serde_json::Value> = result["jobs"]
                     .as_array()
@@ -3791,9 +3846,21 @@ impl Tool for GithubWorkflowRunLogsTool {
                     })
                     .collect();
 
+                let failed_jobs: Vec<&serde_json::Value> = jobs
+                    .iter()
+                    .filter(|j| {
+                        matches!(
+                            j["conclusion"].as_str(),
+                            Some("failure") | Some("timed_out")
+                        )
+                    })
+                    .map(|j| &j["name"])
+                    .collect();
                 Ok(ToolResult::success(
                     serde_json::json!({
+                        "run": run,
                         "total_count": result["total_count"],
+                        "failed_jobs": failed_jobs,
                         "jobs": jobs,
                     }),
                     duration_ms,
