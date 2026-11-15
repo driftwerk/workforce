@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::account::{Account, Done, Ref, RefKind};
-use crate::decision::{BossDecision, DecisionLine};
+use crate::decision::{BossDecision, DecisionLine, UndoPlan};
 use crate::open_item::OpenItem;
 
 /// What a session's account said when the person was last told of it.
@@ -551,6 +551,149 @@ pub struct MentionedUpdate {
     /// The lines past [`BRIEF_ITEMS`] the brief leaves out.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub more_items: u32,
+    /// The finished sessions it closed, would close, or left open for what
+    /// they still hold: one line each, never a line per session.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub closed: Vec<ClosedLine>,
+}
+
+/// What became of the finished sessions an update speaks of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ClosedKind {
+    /// It closed them: each with its Undo.
+    Closed,
+    /// It would close them: its suggestions, carried with the update.
+    Suggested,
+    /// Done, but left open: work in them isn't committed or pushed.
+    KeptOpen,
+}
+
+/// One line of an update about finished sessions (`extras.update.closed[]`):
+/// "Closed 3 finished sessions: web, api, docs."
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClosedLine {
+    pub kind: ClosedKind,
+    /// The line as said.
+    pub text: String,
+    pub sessions: Vec<ClosedSession>,
+}
+
+/// A session a [`ClosedLine`] names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClosedSession {
+    pub session_id: String,
+    pub name: String,
+    /// Why, in a few words ("its PR #12 merged", "3 uncommitted files").
+    #[serde(default)]
+    pub why: Option<String>,
+    /// The decision that closed it, whose Undo reopens it.
+    #[serde(default)]
+    pub decision_id: Option<String>,
+    /// Its undo button, as [`DecisionLine::undo`]; none when it can't be
+    /// reopened.
+    #[serde(default)]
+    pub undo: Option<String>,
+    /// The suggestion to accept, when it would close it.
+    #[serde(default)]
+    pub suggestion_id: Option<String>,
+}
+
+/// Whether `d` closed a finished session: said in the update's closed
+/// line, never as a line of its own.
+pub fn is_close(d: &BossDecision) -> bool {
+    matches!(d.plan(), Some(UndoPlan::Reopen { .. }))
+}
+
+/// "3 finished sessions", "1 finished session".
+fn finished(n: usize) -> String {
+    match n {
+        1 => "1 finished session".into(),
+        n => format!("{n} finished sessions"),
+    }
+}
+
+/// The sessions named, each with its why when `with_why`.
+fn named(sessions: &[ClosedSession], with_why: bool) -> String {
+    sessions
+        .iter()
+        .map(|s| match (&s.why, with_why) {
+            (Some(w), true) if !w.trim().is_empty() => format!("{} ({})", s.name, w.trim()),
+            _ => s.name.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The line on what `rows` closed, oldest first: none when they closed
+/// nothing.
+pub fn closed_line(rows: &[BossDecision]) -> Option<ClosedLine> {
+    let mut closes: Vec<&BossDecision> = rows.iter().filter(|d| is_close(d)).collect();
+    closes.sort_by_key(|d| d.at);
+    let sessions: Vec<ClosedSession> = closes
+        .into_iter()
+        .filter_map(|d| {
+            let Some(UndoPlan::Reopen { session, name }) = d.plan() else {
+                return None;
+            };
+            let line = d.line();
+            Some(ClosedSession {
+                session_id: session.to_string(),
+                name: match name.trim() {
+                    "" => "a session".into(),
+                    n => n.to_string(),
+                },
+                why: crate::decision::clause(&d.brief_why())
+                    .map(|w| crate::crew::words(&w, crate::decision::WHY_WORDS)),
+                decision_id: Some(line.id),
+                undo: line.undo,
+                suggestion_id: None,
+            })
+        })
+        .collect();
+    (!sessions.is_empty()).then(|| ClosedLine {
+        kind: ClosedKind::Closed,
+        text: format!(
+            "Closed {}: {}.",
+            finished(sessions.len()),
+            named(&sessions, false)
+        ),
+        sessions,
+    })
+}
+
+/// The line on the finished sessions it would close, or left open: none
+/// for none.
+pub fn noted_line(kind: ClosedKind, sessions: Vec<ClosedSession>) -> Option<ClosedLine> {
+    if sessions.is_empty() {
+        return None;
+    }
+    let text = match kind {
+        ClosedKind::Closed => {
+            format!(
+                "Closed {}: {}.",
+                finished(sessions.len()),
+                named(&sessions, false)
+            )
+        }
+        ClosedKind::Suggested => format!(
+            "I'd close {}: {}.",
+            finished(sessions.len()),
+            named(&sessions, false)
+        ),
+        ClosedKind::KeptOpen => format!(
+            "Left {} open: {}.",
+            finished(sessions.len()),
+            named(&sessions, true)
+        ),
+    };
+    Some(ClosedLine {
+        kind,
+        text,
+        sessions,
+    })
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -673,6 +816,10 @@ pub fn brief(
     let mut done: Vec<(&BossDecision, &DecisionLine)> = Vec::new();
     let mut alone: Vec<Option<Uuid>> = Vec::new();
     for d in rows {
+        // Said in the closed line, all together.
+        if is_close(d) {
+            continue;
+        }
         match d.kind {
             DecisionKind::LeftAlone => alone.push(d.session),
             DecisionKind::Acted => {
@@ -735,9 +882,18 @@ pub fn plain_headline(u: &MentionedUpdate, for_you: usize) -> String {
         + (u.more_items as usize).saturating_sub(for_you - shown.min(for_you));
     let waiting = u.needs_you.len();
     let alone: u32 = u.brief.iter().map(|g| g.left_alone).sum();
+    let closed: usize = u
+        .closed
+        .iter()
+        .filter(|l| l.kind == ClosedKind::Closed)
+        .map(|l| l.sessions.len())
+        .sum();
     let mut parts: Vec<String> = Vec::new();
     if done > 0 {
         parts.push(format!("{done} done"));
+    }
+    if closed > 0 {
+        parts.push(format!("{closed} closed"));
     }
     if for_you > 0 {
         parts.push(format!("{for_you} for you"));
@@ -774,6 +930,7 @@ impl MentionedUpdate {
             && self.decisions.is_empty()
             && self.kept.is_empty()
             && self.waiting.is_empty()
+            && self.closed.is_empty()
     }
 }
 
@@ -844,6 +1001,7 @@ pub fn render(u: &MentionedUpdate, decided: &[String]) -> String {
         out.push(format!("**{}**{purpose} — {}", s.context(), s.text.trim()));
     }
     out.extend(decided.iter().cloned());
+    out.extend(u.closed.iter().map(|l| l.text.clone()));
     out.extend(u.kept.iter().cloned());
     if !u.waiting.is_empty() {
         let lines: Vec<String> = u
@@ -901,6 +1059,7 @@ pub fn render_brief(u: &MentionedUpdate) -> String {
     if more > 0 {
         lines.push(format!("+{more} more"));
     }
+    lines.extend(u.closed.iter().map(|l| l.text.clone()));
     let alone: u32 = u.brief.iter().map(|g| g.left_alone).sum();
     if alone > 0 {
         lines.push(format!(
@@ -1120,6 +1279,8 @@ pub fn decision_lines(
     use crate::decision::{brief_line, why_line, BRIEF_CHARS};
     decisions
         .iter()
+        // Said in the closed line, all together.
+        .filter(|d| !is_close(d))
         .map(|d| {
             let mut line = d.line();
             if let Some((action, why)) = composed.get(&d.id) {
@@ -1838,5 +1999,109 @@ mod tests {
                 "a PR without its repository: {line}"
             );
         }
+    }
+
+    /// A close of `name`, as the closer records it.
+    fn close(name: &str, resumable: bool, mins_ago: i64) -> BossDecision {
+        use crate::decision::{How, Need, Undo};
+        let session = Uuid::new_v4();
+        let mut d = BossDecision::new(
+            "desk",
+            Need::Choice,
+            &format!("closed {name}"),
+            "Its PR #12 merged.",
+            How::Own,
+        )
+        .briefly(&format!("closed {name}"), None);
+        d.session = Some(session);
+        d.at = Utc::now() - Duration::minutes(mins_ago);
+        d.undo = if resumable { Undo::Reverse } else { Undo::None };
+        d.action = UndoPlan::Reopen {
+            session,
+            name: name.into(),
+        }
+        .value();
+        d
+    }
+
+    #[test]
+    fn the_sessions_it_closed_are_one_line_never_lines_of_their_own() {
+        use crate::decision::{How, Need};
+        let told = BossDecision::new("desk", Need::Choice, "told web to rebase", "", How::Own)
+            .briefly("Told web to rebase.", None);
+        let rows = vec![close("api", true, 1), told.clone(), close("web", false, 5)];
+        let line = closed_line(&rows).unwrap();
+        assert_eq!(line.kind, ClosedKind::Closed);
+        assert_eq!(line.text, "Closed 2 finished sessions: web, api.");
+        assert_eq!(line.sessions[0].why.as_deref(), Some("its PR #12 merged"));
+        // Undo reopens one with a conversation to resume; the other has none.
+        assert_eq!(line.sessions[0].undo, None);
+        assert_eq!(line.sessions[1].undo.as_deref(), Some("undo"));
+        assert_eq!(line.sessions[1].decision_id, Some(rows[0].id.to_string()));
+        assert!(closed_line(std::slice::from_ref(&told)).is_none());
+        // Nor a brief item, a decision line or a said line.
+        let lines = decision_lines(&rows, &HashMap::new());
+        assert_eq!(lines.len(), 1);
+        let (groups, more) = brief(&rows, &lines, &[], &HashMap::new());
+        assert_eq!(more, 0);
+        assert_eq!(groups.iter().map(|g| g.items.len()).sum::<usize>(), 1);
+        let u = MentionedUpdate {
+            brief: groups,
+            closed: vec![line],
+            ..Default::default()
+        };
+        assert_eq!(plain_headline(&u, 0), "1 done, 2 closed.");
+        let text = render_brief(&MentionedUpdate {
+            headline: "1 done, 2 closed.".into(),
+            ..u
+        });
+        assert!(
+            text.contains("Closed 2 finished sessions: web, api."),
+            "{text}"
+        );
+        assert_eq!(text.matches("api").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn what_it_would_close_and_what_it_left_open_are_a_line_each() {
+        let s = |name: &str, why: Option<&str>| ClosedSession {
+            session_id: Uuid::new_v4().to_string(),
+            name: name.into(),
+            why: why.map(str::to_string),
+            decision_id: None,
+            undo: None,
+            suggestion_id: None,
+        };
+        assert_eq!(
+            noted_line(ClosedKind::Suggested, vec![s("web", Some("its PR merged"))])
+                .unwrap()
+                .text,
+            "I'd close 1 finished session: web."
+        );
+        assert_eq!(
+            noted_line(
+                ClosedKind::KeptOpen,
+                vec![
+                    s("api", Some("2 uncommitted files")),
+                    s("docs", Some("1 commit not pushed"))
+                ]
+            )
+            .unwrap()
+            .text,
+            "Left 2 finished sessions open: api (2 uncommitted files), docs (1 commit not pushed)."
+        );
+        assert!(noted_line(ClosedKind::KeptOpen, Vec::new()).is_none());
+        let u = MentionedUpdate {
+            closed: noted_line(ClosedKind::Suggested, vec![s("web", None)])
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        assert!(!u.is_empty());
+        assert!(render(&u, &[]).contains("I'd close 1 finished session: web."));
+        // Carried to Desk camelCased.
+        let wire = serde_json::to_value(&u).unwrap();
+        assert_eq!(wire["closed"][0]["kind"], "suggested");
+        assert!(wire["closed"][0]["sessions"][0]["sessionId"].is_string());
     }
 }

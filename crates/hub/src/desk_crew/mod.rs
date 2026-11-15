@@ -31,6 +31,7 @@ mod actions;
 mod answer;
 mod away;
 mod board;
+mod closing;
 pub(crate) mod context;
 pub(crate) mod decide;
 mod decisions;
@@ -200,6 +201,14 @@ pub struct CrewHub {
     /// next update to show.
     quiet_made:
         Mutex<HashMap<String, Vec<(DateTime<Utc>, workforce_desk::crew::MentionedSuggestion)>>>,
+    /// What the closer of finished sessions keeps between looks
+    /// ([`closing`]).
+    closing: Mutex<closing::Closing>,
+    /// How long a finished session rests before it is closed
+    /// ([`closing::SETTLE`]; a test's own).
+    close_settle: Mutex<chrono::Duration>,
+    /// Held while the finished sessions are looked at.
+    closing_now: tokio::sync::Mutex<()>,
     /// The person typing in each boss's DM, by its agent: what it would
     /// post waits for a pause.
     dm_typing: Mutex<HashMap<String, workforce_desk::away::Typing>>,
@@ -621,6 +630,9 @@ impl CrewHub {
             update_writer: Mutex::default(),
             updating: Mutex::default(),
             quiet_made: Mutex::default(),
+            closing: Mutex::default(),
+            close_settle: Mutex::new(closing::SETTLE),
+            closing_now: tokio::sync::Mutex::new(()),
             dm_typing: Mutex::default(),
             presence: Mutex::default(),
             on_screen: Mutex::default(),
@@ -661,6 +673,7 @@ impl CrewHub {
         tokio::spawn(relayed_decide::pump_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(answer::answer_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(idle::idle_loop(Arc::clone(&crew), cancel.clone()));
+        tokio::spawn(closing::closing_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(plan::plan_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(items::items_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(updates::updates_loop(Arc::clone(&crew), cancel.clone()));

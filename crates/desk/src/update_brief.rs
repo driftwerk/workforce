@@ -98,7 +98,11 @@ pub fn hides(u: &MentionedUpdate, shown: &MentionedUpdate) -> bool {
 
 /// Whether `u` (already [`shown`]) says anything at all.
 pub fn says_anything(u: &MentionedUpdate) -> bool {
-    !u.brief.is_empty() || !u.needs_you.is_empty() || !u.sessions.is_empty() || !u.kept.is_empty()
+    !u.brief.is_empty()
+        || !u.needs_you.is_empty()
+        || !u.sessions.is_empty()
+        || !u.kept.is_empty()
+        || !u.closed.is_empty()
 }
 
 /// `s` as Slack mrkdwn shows it plainly: `&`, `<` and `>` escaped so no

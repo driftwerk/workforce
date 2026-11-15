@@ -434,6 +434,15 @@ pub enum UndoPlan {
     },
     /// Stop a session it started.
     StopStarted { session: Uuid },
+    /// Reopen a session it closed as finished, by resuming it. Its name is
+    /// kept with it: a closed session may no longer be listed to name it.
+    /// Kept for what it was even when it can't be undone (no conversation
+    /// to resume): an update says it among the sessions it closed.
+    Reopen {
+        session: Uuid,
+        #[serde(default)]
+        name: String,
+    },
 }
 
 impl UndoPlan {
@@ -446,7 +455,8 @@ impl UndoPlan {
             | Self::Release { session }
             | Self::TakeOn { session }
             | Self::Resume { session, .. }
-            | Self::StopStarted { session } => Some(*session),
+            | Self::StopStarted { session }
+            | Self::Reopen { session, .. } => Some(*session),
             Self::MoveTicket { .. } => None,
         }
     }
