@@ -646,3 +646,255 @@ async fn another_threads_call_never_ends_a_sub_agents_ask_whose_call_isnt_known(
     })
     .await;
 }
+
+/// A sub-agent's call, `agent` running `command` as `call`.
+fn sub_bash(agent: &str, call: &str, command: &str) -> Value {
+    json!({"hook_event_name": "PreToolUse", "agent_id": agent, "tool_name": "Bash",
+        "tool_use_id": call, "tool_input": {"command": command}})
+}
+
+fn sub_ended(agent: &str, call: &str) -> Value {
+    json!({"hook_event_name": "PostToolUse", "agent_id": agent, "tool_name": "Bash",
+        "tool_use_id": call})
+}
+
+fn sub_asks(agent: &str, command: &str) -> Value {
+    json!({"hook_event_name": "PermissionRequest", "agent_id": agent, "tool_name": "Bash",
+        "tool_input": {"command": command}})
+}
+
+/// Holds `body`'s hook open, as Claude Code waits on it: its answer.
+fn held(d: &Desk, s: Uuid, body: Value) -> tokio::task::JoinHandle<Value> {
+    let d = d.clone();
+    tokio::spawn(async move { post(&d, s, body).await })
+}
+
+/// Waits for `n` asks Desk keeps for `s`, shown or behind.
+async fn keeps(d: &Desk, s: Uuid, n: usize) {
+    for _ in 0..200 {
+        if d.ask_keys().get(&s).map_or(0, |k| k.len()) == n {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("Desk keeps {:?}, not {n}", d.ask_keys().get(&s));
+}
+
+/// What Cufflink Migration met: background sub-agents and the main thread
+/// asking at once, with other calls of theirs running and ending meanwhile.
+/// Every one is held in Desk, comes to the front answerable, and its answer
+/// reaches its own hook: none is left to the terminal.
+#[tokio::test]
+async fn asks_raised_at_once_by_the_main_thread_and_sub_agents_each_come_up_answerable() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = super::tests::desk(pool, dir.path()).await;
+        let s = super::tests::new_session(&d, dir.path()).await;
+        prompted(&d, s.id, "fix them all").await;
+        for a in ["a1", "a2", "a3"] {
+            post(
+                &d,
+                s.id,
+                json!({"hook_event_name": "SubagentStart", "agent_id": a}),
+            )
+            .await;
+        }
+        // The main turn ends; its sub-agents work on in the background.
+        post(
+            &d,
+            s.id,
+            json!({"hook_event_name": "Stop", "last_assistant_message": "three agents launched"}),
+        )
+        .await;
+        // A message on its line starts the next turn.
+        prompted(&d, s.id, "carry on").await;
+
+        let mut waiting = Vec::new();
+        post(
+            &d,
+            s.id,
+            sub_bash("a2", "toolu_a2", "git show main:ci.yml > ci.yml"),
+        )
+        .await;
+        waiting.push(held(
+            &d,
+            s.id,
+            sub_asks("a2", "git show main:ci.yml > ci.yml"),
+        ));
+        keeps(&d, s.id, 1).await;
+        // a1 runs a call that needs no asking, beside it.
+        post(&d, s.id, sub_bash("a1", "toolu_a1_0", "sed -n 1,5p a.rs")).await;
+        post(&d, s.id, sub_ended("a1", "toolu_a1_0")).await;
+        post(
+            &d,
+            s.id,
+            start("toolu_m", "Bash", json!({"command": "gh run view 1"})),
+        )
+        .await;
+        waiting.push(held(
+            &d,
+            s.id,
+            asks_for("Bash", json!({"command": "gh run view 1"})),
+        ));
+        keeps(&d, s.id, 2).await;
+        post(
+            &d,
+            s.id,
+            sub_bash("a3", "toolu_a3", "python3 - <<EOF\nprint(1)\nEOF"),
+        )
+        .await;
+        waiting.push(held(
+            &d,
+            s.id,
+            sub_asks("a3", "python3 - <<EOF\nprint(1)\nEOF"),
+        ));
+        keeps(&d, s.id, 3).await;
+        post(
+            &d,
+            s.id,
+            sub_bash("a1", "toolu_a1_1", "cargo test -p leads"),
+        )
+        .await;
+        waiting.push(held(&d, s.id, sub_asks("a1", "cargo test -p leads")));
+        keeps(&d, s.id, 4).await;
+
+        // Each shows in turn, answerable, and is allowed from Desk.
+        for n in 0..4 {
+            let p = d
+                .view(s.id)
+                .unwrap()
+                .pending
+                .unwrap_or_else(|| panic!("ask {n} shows"));
+            assert!(p.answerable, "ask {n} ({}) is Desk's to answer", p.tool);
+            d.decide(s.id, p.id, crate::model::Decision::Allow, None)
+                .unwrap_or_else(|e| panic!("ask {n} ({}) is answered: {e}", p.tool));
+            // Its call runs and ends, as Claude Code goes on.
+            let (agent, call) = match p.agent.as_deref() {
+                Some(a) => (Some(a.to_string()), p.call.clone()),
+                None => (None, p.call.clone()),
+            };
+            if let Some(call) = call {
+                match agent {
+                    Some(a) => post(&d, s.id, sub_ended(&a, &call)).await,
+                    None => post(&d, s.id, ended(&call, "Bash")).await,
+                };
+            }
+        }
+        for w in waiting {
+            let said = tokio::time::timeout(std::time::Duration::from_secs(5), w)
+                .await
+                .expect("every hook is answered")
+                .unwrap();
+            assert_eq!(
+                said,
+                crate::claude::allow(),
+                "allowed, never handed to the terminal"
+            );
+        }
+        assert_eq!(d.view(s.id).unwrap().pending, None);
+    })
+    .await;
+}
+
+/// What stopped Cufflink Migration: a message on its line (or the person's
+/// prompt) starting a turn, or the turn ending, while a background
+/// sub-agent's request is held. Dropped, its hook was answered with nothing,
+/// so Claude Code showed its own dialog, and queued every request after it
+/// there. The request still waits, held, and is answered from Desk.
+#[tokio::test]
+async fn a_main_turn_starting_or_ending_never_drops_a_sub_agents_held_request() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = super::tests::desk(pool, dir.path()).await;
+        let s = super::tests::new_session(&d, dir.path()).await;
+        prompted(&d, s.id, "fix them all").await;
+        for a in ["a1", "a2"] {
+            post(
+                &d,
+                s.id,
+                json!({"hook_event_name": "SubagentStart", "agent_id": a}),
+            )
+            .await;
+        }
+        post(
+            &d,
+            s.id,
+            json!({"hook_event_name": "Stop", "last_assistant_message": "launched"}),
+        )
+        .await;
+        post(&d, s.id, sub_bash("a1", "toolu_a1", "cargo test")).await;
+        let first = held(&d, s.id, sub_asks("a1", "cargo test"));
+        keeps(&d, s.id, 1).await;
+        post(&d, s.id, sub_bash("a2", "toolu_a2", "cargo build")).await;
+        let second = held(&d, s.id, sub_asks("a2", "cargo build"));
+        keeps(&d, s.id, 2).await;
+        // The next turn starts, and ends, while they wait.
+        prompted(&d, s.id, "carry on").await;
+        post(
+            &d,
+            s.id,
+            json!({"hook_event_name": "Stop", "last_assistant_message": "waiting on them"}),
+        )
+        .await;
+        for n in 0..2 {
+            let p = d
+                .view(s.id)
+                .unwrap()
+                .pending
+                .unwrap_or_else(|| panic!("ask {n} still shows"));
+            assert!(p.answerable, "ask {n} is still Desk's");
+            d.decide(s.id, p.id, crate::model::Decision::Allow, None)
+                .unwrap_or_else(|e| panic!("ask {n} is answered: {e}"));
+            let call = p.call.clone().unwrap();
+            post(&d, s.id, sub_ended(p.agent.as_deref().unwrap(), &call)).await;
+        }
+        for w in [first, second] {
+            let said = tokio::time::timeout(std::time::Duration::from_secs(5), w)
+                .await
+                .expect("every hook is answered")
+                .unwrap();
+            assert_eq!(said, crate::claude::allow());
+        }
+    })
+    .await;
+}
+
+/// A prompt only its terminal's dialog shows names no call ("Claude needs
+/// your permission"): what it asks is the one call running, said whole,
+/// so its boss judges the command, not a notice. With several running,
+/// nothing is made up.
+#[tokio::test]
+async fn a_prompt_only_the_terminal_shows_carries_the_call_it_is_about() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, _logged) = logged_desk(pool, dir.path(), fake_cli(dir.path())).await;
+        let s = asking_session(&d, dir.path()).await;
+        prompted(&d, s.id, "ship the migration").await;
+        let command = "cd services/leads && git push origin cufflink-7";
+        post(&d, s.id, sub_bash("a1", "toolu_9", command)).await;
+        let notice = json!({"hook_event_name": "Notification", "notification_type": "permission_prompt",
+            "message": "Claude needs your permission to use Bash"});
+        post(&d, s.id, notice.clone()).await;
+        let p = d.view(s.id).unwrap().pending.expect("its dialog waits");
+        assert!(!p.answerable);
+        assert_eq!(p.tool, "Input", "still a dialog's wait, ended as one");
+        assert!(p.detail.starts_with("Claude needs your permission to use Bash"), "{}", p.detail);
+        assert!(p.detail.contains("git push origin cufflink-7"), "{}", p.detail);
+        let r = p.request.expect("what it asks, whole");
+        assert_eq!(r.tool, "Bash");
+        assert_eq!(r.input["command"], command);
+
+        // Esc there (the boss clearing it): its wait is over in Desk too.
+        d.interrupt(s.id, None).unwrap();
+        let v = d.view(s.id).unwrap();
+        assert!(v.pending.is_none(), "{:?}", v.pending);
+
+        // Two calls running: which it is about can't be told.
+        post(&d, s.id, sub_bash("a2", "toolu_10", "git status")).await;
+        post(&d, s.id, notice).await;
+        let p = d.view(s.id).unwrap().pending.expect("its dialog waits");
+        assert_eq!(p.detail, "Claude needs your permission to use Bash");
+        assert!(p.request.is_none());
+    })
+    .await;
+}
