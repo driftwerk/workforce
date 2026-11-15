@@ -369,10 +369,65 @@ pub fn looks_like_auth_failure(text: &str) -> bool {
         || lower.contains("invalid api key")
         || lower.contains("invalid token")
         || lower.contains("oauth token has expired")
+        || lower.contains("oauth token revoked")
         || lower.contains("authentication_error")
         || lower.contains("expiredtoken")
         || lower.contains("unrecognizedclient")
         || lower.contains("accessdeniedexception")
+}
+
+/// How a CLI opens a notice that the provider refused the account itself,
+/// lower-cased: the organisation turned Claude Code off (an unpaid bill, an
+/// admin's switch), the account is on hold, suspended or disabled. Unlike a
+/// limit it does not lift at a reset, and unlike a revoked token it can lift
+/// without a new sign-in, once the account is put right.
+const ACCOUNT_REFUSAL_OPENINGS: &[&str] = &[
+    "your organization has disabled claude subscription access",
+    "your organisation has disabled claude subscription access",
+    "your account is on hold",
+    "your account has been disabled",
+    "your account has been suspended",
+    "your organization has been disabled",
+    "your organization has been suspended",
+    "your organisation has been disabled",
+    "your organisation has been suspended",
+    "your organization is not authorized",
+    "your organization isn't authorized",
+    "your organization does not have access to claude code",
+    "your account is not authorized for claude code",
+    "your account isn't authorized for claude code",
+    "your organization's billing",
+    "your account has a billing issue",
+];
+
+/// Whether `text` carries the provider's refusal of the account itself
+/// where a CLI puts one, at the start of a line, so narration that quotes
+/// one is not one.
+pub fn is_account_refused(text: &str) -> bool {
+    normalise_notice(text).lines().map(notice_of).any(|line| {
+        ACCOUNT_REFUSAL_OPENINGS
+            .iter()
+            .any(|opening| line.starts_with(opening))
+    })
+}
+
+/// What an account refusal says, in plain words for the person: why the
+/// login was turned away.
+pub fn account_refusal_reason(text: &str) -> &'static str {
+    let lower = normalise_notice(text);
+    if lower.contains("disabled claude subscription access") {
+        "its organisation has turned off Claude Code access"
+    } else if lower.contains("on hold") {
+        "the account is on hold"
+    } else if lower.contains("suspended") {
+        "the account is suspended"
+    } else if lower.contains("billing") {
+        "the account has a billing problem"
+    } else if lower.contains("authorized") || lower.contains("does not have access") {
+        "the account isn't allowed to use Claude Code"
+    } else {
+        "the account is disabled"
+    }
 }
 
 /// Codex's own words when the login's usage window is spent
@@ -408,6 +463,9 @@ pub enum Notice {
     Throttled,
     /// The login was refused.
     Auth,
+    /// The provider refused the account itself: its organisation turned
+    /// Claude Code off, or it is on hold. It may lift without a new sign-in.
+    Refused,
     Other,
 }
 
@@ -428,6 +486,8 @@ pub fn classify(kind: SubscriptionKind, error: &str, stderr: &str) -> Notice {
         Notice::Capped
     } else if throttled {
         Notice::Throttled
+    } else if is_account_refused(error) {
+        Notice::Refused
     } else if looks_like_auth_failure(error) {
         Notice::Auth
     } else {
@@ -732,6 +792,21 @@ mod tests {
             (Claude, "API Error: 401 authentication_error", Notice::Auth),
             (Claude, "segfault", Notice::Other),
             (
+                Claude,
+                "Your organization has disabled Claude subscription access for Claude Code \u{b7} Use an Anthropic API key instead, or ask your admin to enable access",
+                Notice::Refused,
+            ),
+            (
+                Claude,
+                "Your account is on hold and can't use Claude Code. View details or appeal: https://claude.ai/restricted",
+                Notice::Refused,
+            ),
+            (
+                Claude,
+                "Failed to authenticate: OAuth token revoked. Please log in again or contact your administrator.",
+                Notice::Auth,
+            ),
+            (
                 ChatGpt,
                 "You've hit your usage limit. Try again later.",
                 Notice::Capped,
@@ -746,6 +821,23 @@ mod tests {
         ] {
             assert_eq!(classify(kind, notice, ""), read, "{kind:?}: {notice}");
         }
+    }
+
+    #[test]
+    fn an_account_refusal_is_read_where_the_cli_puts_it_never_in_narration() {
+        let refused = include_str!("fixtures/claude_org_disabled.txt");
+        assert!(is_account_refused(refused));
+        assert!(is_account_refused(&format!("> API Error: {refused}")));
+        assert_eq!(
+            account_refusal_reason(refused),
+            "its organisation has turned off Claude Code access"
+        );
+        assert!(!is_account_refused(
+            "The CLI said your organization has disabled Claude subscription access, so I stopped."
+        ));
+        // Not a limit: it never lifts at a reset.
+        assert!(!is_usage_capped(refused));
+        assert!(!is_rate_limited(refused));
     }
 
     #[test]

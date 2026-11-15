@@ -3463,6 +3463,34 @@ pub(crate) mod tests {
             vec![assistant("msg-answer", text), result(text)]
         }
 
+        /// What Claude Code says when the account's organisation turned
+        /// Claude Code off (11/15, 2.1.325).
+        pub(crate) const ORG_DISABLED: &str = "Your organization has disabled Claude subscription access for Claude Code \u{b7} Use an Anthropic API key instead, or ask your admin to enable access";
+
+        /// A round refused because the account's organisation turned Claude
+        /// Code off: the CLI's own API-error message, then an error result.
+        pub(crate) fn org_disabled() -> Vec<Value> {
+            vec![
+                json!({
+                    "type": "assistant",
+                    "is_api_error_message": true,
+                    "message": {
+                        "id": "msg-refused",
+                        "model": "<synthetic>",
+                        "role": "assistant",
+                        "content": [{ "type": "text", "text": ORG_DISABLED }],
+                    },
+                }),
+                json!({
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": true,
+                    "num_turns": 1,
+                    "result": ORG_DISABLED,
+                }),
+            ]
+        }
+
         /// A round refused at its five-hour limit, as 2.1.284 reports one: the
         /// CLI's own API-error message, the rejected window, an error result.
         pub(crate) fn rejected() -> Vec<Value> {

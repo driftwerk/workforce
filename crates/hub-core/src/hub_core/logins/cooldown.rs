@@ -6,7 +6,7 @@
 //! correctness never depends on the store, because the provider still reports
 //! both.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use chrono::{DateTime, TimeDelta, Utc};
@@ -35,13 +35,38 @@ pub struct LimitSignal {
     pub window: Option<String>,
 }
 
+/// How long a login whose account the provider refused is skipped before a
+/// call tries it again: the refusal (an organisation's switch, a bill) can
+/// be put right without a new sign-in, and a refused call costs a second.
+pub const REFUSED_RECHECK: TimeDelta = TimeDelta::hours(1);
+
+/// A slot refused for good: the value it held then and, for an account the
+/// provider turned away, why and when it is tried again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Dead {
+    value: String,
+    refusal: Option<Refusal>,
+}
+
+/// Why the provider turned a login's account away, and when a call tries
+/// it again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    /// In plain words: "its organisation has turned off Claude Code access".
+    pub reason: String,
+    pub recheck_at: DateTime<Utc>,
+}
+
 #[derive(Default)]
 pub struct CooldownStore {
     /// Each cooling login: until when, and when the refusal that cooled it
     /// was last heard.
     cooling: RwLock<HashMap<LoginKey, (DateTime<Utc>, DateTime<Utc>)>>,
-    /// The value each slot held when it was refused for good.
-    dead: RwLock<HashMap<String, String>>,
+    /// What each slot held when it was refused for good.
+    dead: RwLock<HashMap<String, Dead>>,
+    /// Each slot and value whose account refusal was news, until the value
+    /// serves again: a re-check refused again is not news.
+    told: RwLock<HashSet<(String, String)>>,
 }
 
 impl CooldownStore {
@@ -131,21 +156,92 @@ impl CooldownStore {
     /// provider refused that login for good.
     pub fn note_dead(&self, slot: &VaultSlot, value: &str) {
         tracing::warn!(slot = %slot.key, "subscription login refused; skipped until it is signed in again");
-        self.dead.write().insert(slot.location(), value.to_string());
+        self.dead.write().insert(
+            slot.location(),
+            Dead {
+                value: value.to_string(),
+                refusal: None,
+            },
+        );
+    }
+
+    /// Skip `slot` while it holds the value fingerprinted `value`, until
+    /// `recheck_at`: the provider refused the login's account (`reason`),
+    /// which can be put right without a new sign-in. Whether it is news —
+    /// not already heard of this value since it last served — so the
+    /// person is told once, not at every re-check.
+    pub fn note_refused(
+        &self,
+        slot: &VaultSlot,
+        value: &str,
+        reason: &str,
+        recheck_at: DateTime<Utc>,
+    ) -> bool {
+        tracing::warn!(
+            slot = %slot.key,
+            reason,
+            %recheck_at,
+            "subscription login's account refused; skipped until it is signed in again or re-checked"
+        );
+        let location = slot.location();
+        let news = self
+            .told
+            .write()
+            .insert((location.clone(), value.to_string()));
+        self.dead.write().insert(
+            location,
+            Dead {
+                value: value.to_string(),
+                refusal: Some(Refusal {
+                    reason: reason.to_string(),
+                    recheck_at,
+                }),
+            },
+        );
+        news
+    }
+
+    /// `slot` served on the value fingerprinted `value`: should its account
+    /// be refused again, that is news again.
+    pub fn note_served(&self, slot: &VaultSlot, value: &str) {
+        let told = (slot.location(), value.to_string());
+        if self.told.read().contains(&told) {
+            self.told.write().remove(&told);
+        }
     }
 
     /// Whether `slot` still holds the value it was refused with. A new value
-    /// clears the mark.
+    /// clears the mark, and so does a refused account's re-check coming
+    /// due: the next call is the re-check.
     pub fn is_dead(&self, slot: &VaultSlot, value: &str) -> bool {
+        self.dead_at(slot, value, Utc::now()).is_some()
+    }
+
+    /// Why `slot` is skipped at `now` while it holds `value`: `Some(None)`
+    /// refused for good, `Some(Some(refusal))` its account refused until
+    /// the re-check, `None` not skipped.
+    pub fn dead_at(
+        &self,
+        slot: &VaultSlot,
+        value: &str,
+        now: DateTime<Utc>,
+    ) -> Option<Option<Refusal>> {
         let location = slot.location();
         let marked = self.dead.read().get(&location).cloned();
         match marked {
-            Some(dead) if dead == value => true,
+            Some(dead) if dead.value == value => match dead.refusal {
+                Some(refusal) if refusal.recheck_at <= now => {
+                    tracing::info!(slot = %slot.key, "re-checking a login whose account was refused");
+                    self.dead.write().remove(&location);
+                    None
+                }
+                refusal => Some(refusal),
+            },
             Some(_) => {
                 self.dead.write().remove(&location);
-                false
+                None
             }
-            None => false,
+            None => None,
         }
     }
 }
@@ -168,6 +264,42 @@ mod tests {
             resets_at,
             window: None,
         }
+    }
+
+    fn slot() -> VaultSlot {
+        super::super::test_support::claude_login("sk-ant-oat01-fixture").slot
+    }
+
+    #[test]
+    fn a_refused_account_is_skipped_until_its_recheck_or_a_new_sign_in_and_told_once() {
+        let store = CooldownStore::default();
+        let slot = slot();
+        let now = Utc::now();
+        let recheck = now + REFUSED_RECHECK;
+        let reason = "its organisation has turned off Claude Code access";
+        assert!(store.note_refused(&slot, "v1", reason, recheck), "news");
+        assert_eq!(
+            store.dead_at(&slot, "v1", now),
+            Some(Some(Refusal {
+                reason: reason.into(),
+                recheck_at: recheck
+            }))
+        );
+        // Due: the next call is the re-check, and its refusal is not news.
+        assert_eq!(store.dead_at(&slot, "v1", recheck), None);
+        assert!(!store.note_refused(&slot, "v1", reason, recheck + REFUSED_RECHECK));
+        // A new sign-in clears it.
+        assert_eq!(store.dead_at(&slot, "v2", now), None);
+        assert_eq!(store.dead_at(&slot, "v1", now), None);
+        // Once the login served, a later refusal is news again.
+        store.note_served(&slot, "v1");
+        assert!(store.note_refused(&slot, "v1", reason, recheck));
+        // A login refused for good has no re-check.
+        store.note_dead(&slot, "v3");
+        assert_eq!(
+            store.dead_at(&slot, "v3", now + TimeDelta::days(30)),
+            Some(None)
+        );
     }
 
     #[test]
