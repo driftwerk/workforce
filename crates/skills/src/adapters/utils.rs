@@ -118,7 +118,13 @@ impl InstancePaths {
             .filter_map(|path| {
                 path.strip_prefix(&self.prefix)?
                     .strip_suffix(&suffix)
-                    .filter(|name| is_instance_name(name))
+                    .filter(|name| {
+                        let ok = is_instance_name(name);
+                        if !ok {
+                            warn!(prefix = %self.prefix, "instance skipped: its name isn't a plain word");
+                        }
+                        ok
+                    })
                     .map(str::to_string)
             })
             .collect();

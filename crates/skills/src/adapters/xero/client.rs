@@ -616,8 +616,12 @@ fn kept_with(
     path: &str,
 ) -> Option<String> {
     let Some(tier) = cred.tier else {
-        // A store without tiers has no one's own keys.
-        return store.get(path);
+        // A store without tiers has no one's own keys; a person's own key
+        // with no tier known pairs with nothing.
+        return match cred.per_user {
+            true => None,
+            false => store.get(path),
+        };
     };
     store
         .inspect(path)
