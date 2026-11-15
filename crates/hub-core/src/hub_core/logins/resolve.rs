@@ -220,10 +220,12 @@ impl Login {
     pub fn turn_away(&self, line: &str, caller: &str) -> SubscriptionError {
         let reason = super::limits::account_refusal_reason(line);
         let recheck_at = Utc::now() + super::cooldown::REFUSED_RECHECK;
+        let who = self.who();
         let news = CooldownStore::global().note_refused(
             &self.slot,
             &self.credential.fingerprint(),
             reason,
+            who.clone(),
             recheck_at,
         );
         if let Credential::Pooled(id) = &self.credential {
@@ -233,7 +235,7 @@ impl Login {
         }
         SubscriptionError::AccountRefused {
             login: self.describe(caller),
-            who: self.who(),
+            who,
             reason: reason.to_string(),
             detail: line.trim().to_string(),
         }
@@ -334,6 +336,8 @@ pub enum Miss {
     /// skipped until it is signed in again or re-checked.
     Refused {
         reason: String,
+        /// Whose account it is, when known: "kim@example.com, Acme".
+        who: Option<String>,
     },
     Malformed(String),
 }
@@ -357,7 +361,11 @@ impl fmt::Display for Miss {
             Self::NotServed(serves) => write!(f, "shared login serves {serves:?} only"),
             Self::Cooling { until } => write!(f, "at its usage limit until {until}"),
             Self::Invalid => f.write_str("must be signed in again"),
-            Self::Refused { reason } => write!(f, "was refused: {reason}"),
+            Self::Refused {
+                reason,
+                who: Some(who),
+            } => write!(f, "({who}) was refused: {reason}"),
+            Self::Refused { reason, who: None } => write!(f, "was refused: {reason}"),
             Self::Malformed(reason) => write!(f, "unusable ({reason})"),
         }
     }
@@ -462,7 +470,7 @@ fn pooled(
     }
     let mut soonest: Option<DateTime<Utc>> = None;
     let mut refused = false;
-    let mut turned_away: Option<String> = None;
+    let mut turned_away: Option<super::cooldown::Refusal> = None;
     for account in pool.claude_accounts() {
         let credential = Credential::Pooled(account.id.clone());
         let key = super::install_pool::login_key(&account.id);
@@ -472,10 +480,11 @@ fn pooled(
         };
         if let Some(cleared) = account.cleared_at {
             cooldowns.clear_since(&key, cleared);
+            cooldowns.clear_dead_since(&slot, cleared);
         }
         match cooldowns.dead_at(&slot, &credential.fingerprint(), now) {
             Some(Some(refusal)) => {
-                turned_away.get_or_insert(refusal.reason);
+                turned_away.get_or_insert(refusal);
                 continue;
             }
             Some(None) => {
@@ -512,7 +521,10 @@ fn pooled(
     }
     match (soonest, turned_away, refused) {
         (Some(until), _, _) => Some(Err(Miss::Cooling { until })),
-        (None, Some(reason), _) => Some(Err(Miss::Refused { reason })),
+        (None, Some(refusal), _) => Some(Err(Miss::Refused {
+            reason: refusal.reason,
+            who: refusal.who,
+        })),
         (None, None, true) => Some(Err(Miss::Invalid)),
         (None, None, false) => None,
     }
@@ -564,6 +576,7 @@ pub fn login_state(
         Some(Some(refusal)) => {
             return Err(Miss::Refused {
                 reason: refusal.reason,
+                who: refusal.who,
             })
         }
         Some(None) => return Err(Miss::Invalid),
@@ -1527,6 +1540,54 @@ mod tests {
             matches!(&call(&pool).unwrap().credential, Credential::Pooled(id) if id == "starmoire")
         );
         assert_eq!(cooldowns.until(&key, Utc::now()), None);
+        super::super::install_pool::set(&f.global, None);
+    }
+
+    /// A pool account its provider turned away is skipped, said with whose
+    /// it is, and tried again as soon as it is signed in again: its slot
+    /// holds the same value either way, so the sign-in is what clears it.
+    #[test]
+    fn a_turned_away_pool_account_names_whose_it_is_and_ends_at_its_next_sign_in() {
+        let f = Fixture::new();
+        let cooldowns = CooldownStore::default();
+        let call = |pool: &Arc<Pool>| {
+            pooled_for(
+                &f,
+                pool,
+                &alice(),
+                &AgentOwner::Unowned,
+                &install_policy(),
+                &cooldowns,
+            )
+        };
+        let pool = Pool::of(vec![("starmoire", "sk-ant-oat01-starmoire", None)]);
+        let slot = VaultSlot {
+            vault: Arc::clone(&f.global),
+            key: super::super::install_pool::slot_key("starmoire"),
+        };
+        let value = Credential::Pooled("starmoire".into()).fingerprint();
+        cooldowns.note_refused(
+            &slot,
+            &value,
+            "its organisation has turned off Claude Code access",
+            Some("kim@example.com, Acme".into()),
+            Utc::now() + super::super::cooldown::REFUSED_RECHECK,
+        );
+        let err = call(&pool).unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "system_shared (kim@example.com, Acme) was refused: its organisation has turned off Claude Code access"
+            ),
+            "{err}"
+        );
+        // Signed in again since: tried at once, not at the re-check.
+        pool.cleared.lock().insert(
+            "starmoire".into(),
+            Utc::now() + chrono::Duration::seconds(1),
+        );
+        assert!(
+            matches!(&call(&pool).unwrap().credential, Credential::Pooled(id) if id == "starmoire")
+        );
         super::super::install_pool::set(&f.global, None);
     }
 

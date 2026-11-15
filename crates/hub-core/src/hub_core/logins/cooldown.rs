@@ -46,6 +46,8 @@ pub const REFUSED_RECHECK: TimeDelta = TimeDelta::hours(1);
 struct Dead {
     value: String,
     refusal: Option<Refusal>,
+    /// When it was refused: a sign-in after this clears the mark.
+    noted: DateTime<Utc>,
 }
 
 /// Why the provider turned a login's account away, and when a call tries
@@ -54,6 +56,8 @@ struct Dead {
 pub struct Refusal {
     /// In plain words: "its organisation has turned off Claude Code access".
     pub reason: String,
+    /// Whose account it is, when known: "kim@example.com, Acme".
+    pub who: Option<String>,
     pub recheck_at: DateTime<Utc>,
 }
 
@@ -161,6 +165,7 @@ impl CooldownStore {
             Dead {
                 value: value.to_string(),
                 refusal: None,
+                noted: Utc::now(),
             },
         );
     }
@@ -175,6 +180,7 @@ impl CooldownStore {
         slot: &VaultSlot,
         value: &str,
         reason: &str,
+        who: Option<String>,
         recheck_at: DateTime<Utc>,
     ) -> bool {
         tracing::warn!(
@@ -194,11 +200,31 @@ impl CooldownStore {
                 value: value.to_string(),
                 refusal: Some(Refusal {
                     reason: reason.to_string(),
+                    who,
                     recheck_at,
                 }),
+                noted: Utc::now(),
             },
         );
         news
+    }
+
+    /// `slot`, whose value never changes (a Desk account's), was signed in
+    /// again or served at `since`: a refusal heard by then is over, so it
+    /// is no longer skipped, and a new one is news again.
+    pub fn clear_dead_since(&self, slot: &VaultSlot, since: DateTime<Utc>) {
+        let location = slot.location();
+        let stale = self
+            .dead
+            .read()
+            .get(&location)
+            .is_some_and(|dead| dead.noted <= since);
+        if stale {
+            if let Some(dead) = self.dead.write().remove(&location) {
+                self.told.write().remove(&(location, dead.value));
+            }
+            tracing::info!(slot = %slot.key, "refused login signed in again; tried again");
+        }
     }
 
     /// `slot` served on the value fingerprinted `value`: should its account
@@ -277,23 +303,43 @@ mod tests {
         let now = Utc::now();
         let recheck = now + REFUSED_RECHECK;
         let reason = "its organisation has turned off Claude Code access";
-        assert!(store.note_refused(&slot, "v1", reason, recheck), "news");
+        assert!(
+            store.note_refused(
+                &slot,
+                "v1",
+                reason,
+                Some("kim@example.com, Acme".into()),
+                recheck
+            ),
+            "news"
+        );
         assert_eq!(
             store.dead_at(&slot, "v1", now),
             Some(Some(Refusal {
                 reason: reason.into(),
+                who: Some("kim@example.com, Acme".into()),
                 recheck_at: recheck
             }))
         );
         // Due: the next call is the re-check, and its refusal is not news.
         assert_eq!(store.dead_at(&slot, "v1", recheck), None);
-        assert!(!store.note_refused(&slot, "v1", reason, recheck + REFUSED_RECHECK));
+        assert!(!store.note_refused(&slot, "v1", reason, None, recheck + REFUSED_RECHECK));
         // A new sign-in clears it.
         assert_eq!(store.dead_at(&slot, "v2", now), None);
         assert_eq!(store.dead_at(&slot, "v1", now), None);
         // Once the login served, a later refusal is news again.
         store.note_served(&slot, "v1");
-        assert!(store.note_refused(&slot, "v1", reason, recheck));
+        assert!(store.note_refused(&slot, "v1", reason, None, recheck));
+        // A Desk account's value never changes: signing it in again after
+        // the refusal clears it at once, and a new refusal is news.
+        store.clear_dead_since(&slot, now - TimeDelta::minutes(1));
+        assert!(
+            store.dead_at(&slot, "v1", now).is_some(),
+            "a sign-in before stands"
+        );
+        store.clear_dead_since(&slot, Utc::now());
+        assert_eq!(store.dead_at(&slot, "v1", now), None);
+        assert!(store.note_refused(&slot, "v1", reason, None, recheck));
         // A login refused for good has no re-check.
         store.note_dead(&slot, "v3");
         assert_eq!(

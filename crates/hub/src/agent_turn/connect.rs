@@ -130,7 +130,7 @@ fn lead(no_login: &NoLogin, unserved: &[Unserved]) -> String {
         .filter(|(tier, miss)| !tier.is_shared() && miss.needs_sign_in())
         .filter_map(|(tier, miss)| match miss {
             Miss::Invalid => Some(format!("{} was refused", tier.as_str())),
-            Miss::Refused { reason } => Some(format!("{} was refused: {reason}", tier.as_str())),
+            Miss::Refused { .. } => Some(format!("{} {miss}", tier.as_str())),
             Miss::Malformed(reason) => Some(format!("{} is unusable ({reason})", tier.as_str())),
             _ => None,
         })

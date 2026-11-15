@@ -486,7 +486,9 @@ pub fn classify(kind: SubscriptionKind, error: &str, stderr: &str) -> Notice {
         Notice::Capped
     } else if throttled {
         Notice::Throttled
-    } else if is_account_refused(error) {
+    } else if matches!(kind, SubscriptionKind::Claude) && is_account_refused(error) {
+        // Claude Code's words for an account its provider turned away;
+        // Codex's are its own and read as auth or nothing yet.
         Notice::Refused
     } else if looks_like_auth_failure(error) {
         Notice::Auth
@@ -800,6 +802,11 @@ mod tests {
                 Claude,
                 "Your account is on hold and can't use Claude Code. View details or appeal: https://claude.ai/restricted",
                 Notice::Refused,
+            ),
+            (
+                ChatGpt,
+                "Your organization has disabled Claude subscription access for Claude Code",
+                Notice::Other,
             ),
             (
                 Claude,
