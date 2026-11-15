@@ -118,7 +118,7 @@ impl InstancePaths {
             .filter_map(|path| {
                 path.strip_prefix(&self.prefix)?
                     .strip_suffix(&suffix)
-                    .filter(|name| !name.is_empty() && !name.contains('/'))
+                    .filter(|name| is_instance_name(name))
                     .map(str::to_string)
             })
             .collect();
@@ -130,6 +130,21 @@ impl InstancePaths {
         names
     }
 }
+
+/// Whether `name` can name an instance: a plain word (letters, digits, `-`,
+/// `_`, `.`), so a vault path can't put arbitrary text where an instance's
+/// name is shown.
+pub fn is_instance_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// At most this many clients a live set keeps built; past it the cache
+/// starts again (each client only holds a connection pool and a token).
+const MAX_BUILT: usize = 512;
 
 type MakeClient<C> = dyn Fn(&str) -> eyre::Result<C> + Send + Sync;
 
@@ -208,26 +223,40 @@ impl<C> LiveInstances<C> {
             return (Arc::clone(&fixed.clients), fixed.default.clone());
         };
         let names = live.paths.names(live.store.as_ref());
+        let cache = || {
+            live.built
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
         let mut clients = HashMap::with_capacity(names.len());
-        {
-            let mut built = live.built.lock().expect("instance cache poisoned");
-            for name in names {
-                let client = match built.get(&name) {
-                    Some(client) => Arc::clone(client),
-                    None => match (live.make)(&name) {
-                        Ok(client) => {
-                            let client = Arc::new(client);
-                            built.insert(name.clone(), Arc::clone(&client));
-                            client
-                        }
-                        Err(e) => {
-                            warn!(instance = %name, error = %e, "instance client not built");
-                            continue;
-                        }
-                    },
-                };
-                clients.insert(name, client);
+        for name in names {
+            if let Some(client) = cache().get(&name) {
+                clients.insert(name, Arc::clone(client));
+                continue;
             }
+            // Built outside the lock: a slow or failing build blocks no one.
+            let client = match (live.make)(&name) {
+                Ok(client) => Arc::new(client),
+                Err(e) => {
+                    warn!(instance = %name, error = %e, "instance client not built");
+                    continue;
+                }
+            };
+            let client = {
+                let mut built = cache();
+                if built.len() >= MAX_BUILT {
+                    built.clear();
+                }
+                match built.get(&name) {
+                    // Another call built it first: use that one.
+                    Some(first) => Arc::clone(first),
+                    None => {
+                        built.insert(name.clone(), Arc::clone(&client));
+                        client
+                    }
+                }
+            };
+            clients.insert(name, client);
         }
         let default = preferred_instance(&clients, live.selector.as_deref())
             .map(str::to_string)

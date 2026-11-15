@@ -3445,7 +3445,7 @@ fn shared_instance_names(
         .filter_map(|(path, _)| {
             path.strip_prefix(&paths.prefix)?
                 .strip_suffix(&suffix)
-                .filter(|name| !name.is_empty() && !name.contains('/'))
+                .filter(|name| workforce_skills::adapters::utils::is_instance_name(name))
                 .map(str::to_string)
         })
         .collect();
@@ -4769,7 +4769,6 @@ mod tests {
         );
     }
 
-    /// `load_linear_from_vault` resolves credentials through
     /// One agent, two people with Xero keys of their own: Ann's turn loads
     /// the adapter, Bob uses it. Nothing Bob is shown names Ann's entities,
     /// he reaches only his own, and the hint every turn sees names neither.
@@ -4853,6 +4852,7 @@ mod tests {
         assert!(err.to_string().contains("skills/xero"), "{err}");
     }
 
+    /// `load_linear_from_vault` resolves credentials through
     /// `LayeredUserVault`, so a `users/<uid>/...` key in the agent vault
     /// loads when `CURRENT_USER_ID` is scoped to that uid.
     #[tokio::test]
