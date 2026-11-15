@@ -1,0 +1,16 @@
+{
+  "loggedIn": true,
+  "authMethod": "claude.ai",
+  "apiProvider": "firstParty",
+  "analyticsDisabled": false,
+  "projectsDirectory": "/Users/kim/.claude/projects",
+  "configDirectory": "/Users/kim/.claude",
+  "loginExpiresAt": "2026-12-15T09:00:00.000Z",
+  "consoleProfileSignInOffered": false,
+  "email": "kim@example.com",
+  "orgId": "org-1",
+  "orgName": "Acme",
+  "subscriptionType": "max",
+  "storedClaudeAiLogin": true,
+  "planTier": "max_20x"
+}

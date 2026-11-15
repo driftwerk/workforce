@@ -55,6 +55,16 @@ impl InstallPool for DeskPool {
         }
     }
 
+    fn refused(&self, id: &str, reason: &str, recheck_at: DateTime<Utc>, news: bool) {
+        if let Ok(id) = Uuid::parse_str(id) {
+            self.desk.hub_refused(id, reason, recheck_at, news);
+        }
+    }
+
+    fn who(&self, id: &str) -> Option<String> {
+        self.desk.account_who(Uuid::parse_str(id).ok()?)
+    }
+
     fn plan_key(&self, id: &str) -> Option<String> {
         self.desk.account_plan_key(Uuid::parse_str(id).ok()?)
     }

@@ -15,8 +15,8 @@ use workforce_common::subscription::Served;
 
 use super::cli::{CliAttempt, CliTurn};
 use super::{
-    answered, rig_or_miss, route_provider, Oversight, TurnChain, TurnRoute, TurnUnavailable,
-    AGENT_TURN_TIMEOUT,
+    answered, names_a_login, rig_or_miss, route_provider, Oversight, TurnChain, TurnRoute,
+    TurnUnavailable, AGENT_TURN_TIMEOUT, MAX_LOGINS_PER_ROUTE,
 };
 use crate::advisor_loop::{run_advisor_tool_loop, AdvisorLoopOutcome, AdvisorLoopRequest};
 use crate::serve::AgentService;
@@ -137,58 +137,75 @@ impl TurnChain {
                             continue;
                         }
                     };
-                    let started = Instant::now();
-                    let timeout = request.budget.map_or(AGENT_TURN_TIMEOUT, |budget| {
-                        (budget.research_deadline + budget.write_up_reserve)
-                            .saturating_duration_since(started)
-                    });
-                    let principal = CURRENT_USER_ID
-                        .try_with(String::clone)
-                        .unwrap_or_else(|_| format!("agent:{}", service.agent_id.as_str()));
-                    let turn = CliTurn {
-                        cli: *cli,
-                        model: model.clone(),
-                        system_prompt: request.system_prompt.clone(),
-                        task: vec![ContentBlock::Text {
-                            text: request.user_message.clone(),
-                        }],
-                        tools: TurnTools {
-                            registry: Arc::new(ToolRegistry::from_tools(
-                                request.tools.iter().map(Arc::clone),
-                            )),
-                            exclusive: true,
-                        },
-                        max_turns: request.max_rounds.max(1),
-                        principal,
-                        oversight,
-                        self_serve: workforce_agent::tools::approval::SelfServe::Answerable,
-                        journal: None,
-                        progress: None,
-                        cancel: request.cancel.clone().unwrap_or_default(),
-                        timeout,
-                    };
-                    match rig.run(service, turn, None, None).await {
-                        Ok(CliAttempt::Served(served)) => {
-                            on_usage(&served.usage, &served.model, Some(&served.served));
-                            return AdvisorLoopOutcome::Success {
-                                text: served.text,
-                                model: served.model,
-                                duration_ms: started.elapsed().as_millis() as u64,
-                                truncated: false,
-                                capped: served.capped,
-                                rounds_used: served.rounds,
-                            };
+                    // Its login at its limit or turned away is skipped from
+                    // then, so the route runs again on the payer's next login
+                    // of the same plan, as a turn's own route does.
+                    let mut tries = 0;
+                    loop {
+                        tries += 1;
+                        let started = Instant::now();
+                        let timeout = request.budget.map_or(AGENT_TURN_TIMEOUT, |budget| {
+                            (budget.research_deadline + budget.write_up_reserve)
+                                .saturating_duration_since(started)
+                        });
+                        let principal = CURRENT_USER_ID
+                            .try_with(String::clone)
+                            .unwrap_or_else(|_| format!("agent:{}", service.agent_id.as_str()));
+                        let turn = CliTurn {
+                            cli: *cli,
+                            model: model.clone(),
+                            system_prompt: request.system_prompt.clone(),
+                            task: vec![ContentBlock::Text {
+                                text: request.user_message.clone(),
+                            }],
+                            tools: TurnTools {
+                                registry: Arc::new(ToolRegistry::from_tools(
+                                    request.tools.iter().map(Arc::clone),
+                                )),
+                                exclusive: true,
+                            },
+                            max_turns: request.max_rounds.max(1),
+                            principal,
+                            oversight,
+                            self_serve: workforce_agent::tools::approval::SelfServe::Answerable,
+                            journal: None,
+                            progress: None,
+                            cancel: request.cancel.clone().unwrap_or_default(),
+                            timeout,
+                        };
+                        match rig.run(service, turn, None, None).await {
+                            Ok(CliAttempt::Served(served)) => {
+                                on_usage(&served.usage, &served.model, Some(&served.served));
+                                return AdvisorLoopOutcome::Success {
+                                    text: served.text,
+                                    model: served.model,
+                                    duration_ms: started.elapsed().as_millis() as u64,
+                                    truncated: false,
+                                    capped: served.capped,
+                                    rounds_used: served.rounds,
+                                };
+                            }
+                            Ok(CliAttempt::Unserved(miss))
+                                if tries < MAX_LOGINS_PER_ROUTE
+                                    && names_a_login(&miss.reason)
+                                    && service.logins.resolve(cli.login()).is_ok() =>
+                            {
+                                tracing::warn!(agent = %service.agent_id, route = %miss.route, reason = %miss.reason, "advisor route's login can't serve; trying the next login");
+                            }
+                            Ok(CliAttempt::Unserved(miss)) => {
+                                misses.push(miss);
+                                break;
+                            }
+                            Err(_)
+                                if request
+                                    .cancel
+                                    .as_ref()
+                                    .is_some_and(|cancel| cancel.is_cancelled()) =>
+                            {
+                                return AdvisorLoopOutcome::Cancelled
+                            }
+                            Err(e) => return AdvisorLoopOutcome::ProviderError(format!("{e:#}")),
                         }
-                        Ok(CliAttempt::Unserved(miss)) => misses.push(miss),
-                        Err(_)
-                            if request
-                                .cancel
-                                .as_ref()
-                                .is_some_and(|cancel| cancel.is_cancelled()) =>
-                        {
-                            return AdvisorLoopOutcome::Cancelled
-                        }
-                        Err(e) => return AdvisorLoopOutcome::ProviderError(format!("{e:#}")),
                     }
                 }
             }

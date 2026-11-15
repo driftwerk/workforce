@@ -381,6 +381,8 @@ fast = "claude-haiku-4-5-20251001"
 smart = "claude-sonnet-4-20250514"
 ```
 
+An agent on a subscription engine (`claude-code`, `chatgpt`, `codex`) stays on that engine when its logins can't serve, unless its `failover` names another provider. A login at its usage limit, signed out, or whose account the provider turned away (an organisation that turned Claude Code off, an account on hold) is never retried: the call moves to the payer's next login of the same plan. A turned-away login is tried again after an hour, or as soon as it is signed in again. `failover = ["chatgpt"]` (Desk's "Use another provider") lets it go to the person's ChatGPT plan instead, and lets `[floor] fallback_providers` write its Floor lines there too.
+
 | Field | Type | Default | Env Override |
 |-------|------|---------|--------------|
 | `provider` | String | `"openrouter"` | `WORKFORCE_LLM_PROVIDER` |

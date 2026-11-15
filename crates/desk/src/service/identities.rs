@@ -149,6 +149,7 @@ struct TakenBack {
 pub(super) const OWN_NONE: &str = "accounts.ownNone";
 pub(super) const RELOGGED: &str = "accounts.relogged";
 pub(super) const PRINTS: &str = "accounts.prints";
+pub(super) const PROFILES: &str = "accounts.profiles";
 
 impl Desk {
     /// This computer's CLI sign-in was read: who it is signed in as. `None`
@@ -172,6 +173,33 @@ impl Desk {
         if changed {
             self.announce_accounts();
         }
+    }
+
+    /// This computer's Claude Code said who `identity` is (`profile`): kept
+    /// by its key, so an account linked to it shows its email, organisation
+    /// and plan, the one saved before this filled in at this check.
+    pub(super) fn profile_read(&self, identity: &Identity, profile: crate::engine::ClaudeProfile) {
+        let all = {
+            let mut st = self.0.state.lock();
+            if st.profiles.get(&identity.key) == Some(&profile) {
+                return;
+            }
+            st.profiles.insert(identity.key.clone(), profile);
+            st.profiles.clone()
+        };
+        self.keep_state(PROFILES, serde_json::json!(all));
+        self.announce_accounts();
+    }
+
+    /// Who account `id` is, as the person knows it: "kim@example.com,
+    /// Acme", when its identity is known.
+    pub fn account_who(&self, id: Uuid) -> Option<String> {
+        let st = self.0.state.lock();
+        let identity = &st.links.get(&id)?.identity;
+        st.profiles
+            .get(&identity.key)
+            .and_then(crate::engine::ClaudeProfile::who)
+            .or_else(|| identity.email.clone())
     }
 
     /// The identity key this computer's CLI sign-in has now (`""`: unknown).

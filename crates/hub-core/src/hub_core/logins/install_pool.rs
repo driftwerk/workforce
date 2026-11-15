@@ -66,6 +66,18 @@ pub trait InstallPool: Send + Sync {
     /// from before then is over.
     fn served(&self, _id: &str, _at: DateTime<Utc>) {}
 
+    /// A call here on account `id` was refused by the provider for the
+    /// account itself (`reason`, in plain words): it is skipped until it is
+    /// signed in again or `recheck_at`. `news` when this is the first time
+    /// since it last served, so the person is told once.
+    fn refused(&self, _id: &str, _reason: &str, _recheck_at: DateTime<Utc>, _news: bool) {}
+
+    /// Whose account `id` is, as the person knows it: "kim@example.com,
+    /// Acme", when Desk knows.
+    fn who(&self, _id: &str) -> Option<String> {
+        None
+    }
+
     /// The key account `id`'s plan readings are kept under, as the Floor
     /// names its card: a call's reading on it is the account's.
     fn plan_key(&self, _id: &str) -> Option<String> {

@@ -189,6 +189,16 @@ pub fn routed_kind(spec: &str) -> Option<ProviderKind> {
         .map(|(kind, _)| kind)
 }
 
+/// Whether an agent on `primary` whose `[llm] failover` is `failover` may
+/// go to another provider when its own can't serve: an entry routes to a
+/// provider of another kind. Its owner's choice ("When its accounts can't
+/// serve: Use another provider"); by default it has none, and waits.
+pub fn fails_over_to_another_provider(primary: ProviderKind, failover: &[String]) -> bool {
+    failover
+        .iter()
+        .any(|spec| routed_kind(spec).is_some_and(|kind| kind != primary))
+}
+
 /// Whether a bare model id is one of Claude's, so the Claude Code CLI can
 /// run it (`haiku`, `sonnet`, `claude-opus-4-7`, `fable`, ...). A model of
 /// another provider, filled in from that agent's own tiers, is not.

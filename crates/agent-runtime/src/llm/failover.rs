@@ -545,6 +545,14 @@ async fn retract(
 /// payer's login can't serve the call. `classify_error` keys on it.
 pub const SUBSCRIPTION_UNAVAILABLE_MARKER: &str = "subscription unavailable";
 
+/// How Claude Code words the provider refusing the subscription account
+/// itself, lower-cased: an organisation that turned Claude Code off, an
+/// account on hold. Retrying the same login is refused the same way.
+pub const ACCOUNT_REFUSALS: &[&str] = &[
+    "has disabled claude subscription access",
+    "your account is on hold and can't use claude code",
+];
+
 /// Marker carried by errors for a request the provider can never serve.
 /// `classify_error` keys on it.
 pub const UNSUPPORTED_REQUEST_MARKER: &str = "request unsupported by provider";
@@ -581,6 +589,14 @@ pub fn classify_error(error: &str) -> ErrorKind {
     // Subscription refusals quote the backend error they came from, whose
     // status ("… error (429): usage limit reached") must not win.
     if lower.contains(SUBSCRIPTION_UNAVAILABLE_MARKER) {
+        return ErrorKind::SubscriptionUnavailable;
+    }
+    // The provider refusing the subscription account itself, quoted bare
+    // by a path that read no login from it: never retried on the same login.
+    if ACCOUNT_REFUSALS
+        .iter()
+        .any(|refusal| lower.contains(refusal))
+    {
         return ErrorKind::SubscriptionUnavailable;
     }
     if lower.contains(UNSUPPORTED_REQUEST_MARKER) {
@@ -3151,6 +3167,22 @@ mod tests {
             "{SUBSCRIPTION_UNAVAILABLE_MARKER}: Alice's ChatGPT plan is at its limit: \
              ChatGPT API error (429): usage limit reached"
         )
+    }
+
+    /// 14:12 on 11/15: an organisation that turned Claude Code off was read
+    /// as `Unknown` and retried four times on the same login.
+    #[test]
+    fn an_organisation_that_turned_claude_code_off_is_never_retried() {
+        let bare = "claude-code round failed: Your organization has disabled Claude subscription \
+                    access for Claude Code \u{b7} Use an Anthropic API key instead, or ask your \
+                    admin to enable access";
+        let kind = classify_error(bare);
+        assert_eq!(kind, ErrorKind::SubscriptionUnavailable);
+        assert!(!kind.is_retryable() && !kind.is_model_fault());
+        assert_eq!(
+            failure_action(&kind, &RetryConfig::default(), 0, None),
+            FailureAction::Failover
+        );
     }
 
     #[test]
