@@ -1307,23 +1307,27 @@ impl HubModel {
         }
         .or_else(|| registry.host())
         .ok_or_else(|| eyre::eyre!("no agent to write with"))?;
-        let others = match self.fallback {
+        // Another provider writes the line only where the install allows it
+        // (`[floor] fallback_providers`) and the agent's owner chose it for
+        // the agent: its `[llm] failover` names another provider.
+        let fallback = self.fallback && may_use_another_provider(&service).await;
+        let others = match fallback {
             true => registry.all_services(),
             false => vec![],
         };
         let admits = |agent: &str, person: &str| registry.admits(agent, person);
-        answer_with(
-            service,
-            others,
-            admits,
-            self.fallback,
-            owner,
-            system,
-            user,
-            call,
-        )
-        .await
+        answer_with(service, others, admits, fallback, owner, system, user, call).await
     }
+}
+
+/// Whether `service`'s owner let it go to another provider when its own
+/// can't serve: its live `[llm] failover` names one.
+async fn may_use_another_provider(service: &crate::serve::AgentService) -> bool {
+    let Some(chain) = service.failover_provider.as_ref() else {
+        return false;
+    };
+    let primary = *service.provider_kind.read();
+    crate::subscription::fails_over_to_another_provider(primary, &chain.get_chain().await)
 }
 
 #[async_trait]

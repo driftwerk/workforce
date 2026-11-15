@@ -15,8 +15,10 @@ use crate::subscription::{CredentialTier, SharedServes};
 pub struct FloorConfig {
     /// When an agent's own plan has no usable login, write a person's line
     /// on another signed-in subscription provider's cheap tier, on that
-    /// person's own login only. Off by default: on a hub many people share
-    /// the line waits for the agent's own plan; Desk's local hub turns it on.
+    /// person's own login only, and only for an agent whose `[llm]
+    /// failover` names another provider (its owner's "Use another
+    /// provider"). Off by default: on a hub many people share the line waits
+    /// for the agent's own plan; Desk's local hub turns it on.
     #[serde(default)]
     pub fallback_providers: bool,
 }

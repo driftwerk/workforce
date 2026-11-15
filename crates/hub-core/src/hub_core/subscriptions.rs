@@ -189,6 +189,16 @@ pub fn routed_kind(spec: &str) -> Option<ProviderKind> {
         .map(|(kind, _)| kind)
 }
 
+/// Whether an agent on `primary` whose `[llm] failover` is `failover` may
+/// go to another provider when its own can't serve: an entry routes to a
+/// provider of another kind. Its owner's choice ("When its accounts can't
+/// serve: Use another provider"); by default it has none, and waits.
+pub fn fails_over_to_another_provider(primary: ProviderKind, failover: &[String]) -> bool {
+    failover
+        .iter()
+        .any(|spec| routed_kind(spec).is_some_and(|kind| kind != primary))
+}
+
 /// The provider kinds that run on a subscription login, in the order an
 /// editor offers them.
 pub const SUBSCRIPTION_PROVIDERS: [ProviderKind; 3] = [
