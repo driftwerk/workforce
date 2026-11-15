@@ -153,6 +153,7 @@ async fn account(d: &Desk, s: uuid::Uuid, done: &[&str], now: &str, next: &str) 
                 .into_iter()
                 .collect(),
             at: chrono::Utc::now(),
+            restated: false,
         });
     }
     a.now = now.into();
@@ -383,7 +384,7 @@ async fn decisions_and_needs_you_are_laid_out() {
             // The text is the brief: its headline and short lines, never
             // the message it sent.
             assert!(!posted.content.contains(message), "{}", posted.content);
-            assert_eq!(u.headline, "1 done, 1 waiting on you.");
+            assert_eq!(u.headline, "acme-web: 1 done, 1 waiting on you.");
             assert!(
                 posted.content.starts_with(&u.headline),
                 "{}",
@@ -666,4 +667,84 @@ async fn an_over_long_update_is_asked_again_once_then_clipped() {
         })
         .await;
     }
+}
+
+/// An idle session's account refreshed by a restart, a switch of account
+/// or a reader (its done lines said again in other words, what it waits on
+/// reworded) is no event: no update, no "shipped" line, no "waiting" said
+/// again. What it really does next still goes out, naming the session, and
+/// says nothing of what was already told.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refreshed_or_restarted_idle_session_is_no_update() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        begun(&crew).await;
+        let s = new_session(&d, dir.path(), "lead-management").await;
+        let waiting = |a: &mut Account, w: &str| a.waiting_on = Some(w.into());
+        // Shipped, and waiting on the person: told once.
+        account(&d, s.id, &["PLT-3010 shipped"], "Idle", "").await;
+        let mut a = d.session_account(s.id).await.unwrap().unwrap();
+        waiting(&mut a, "the person's answer on the lead form");
+        d.store().session_account_put(&a).await.unwrap();
+        let first = eventually("the first update", async || {
+            updates(&overseer).into_iter().next()
+        })
+        .await;
+        assert!(first.content.contains("shipped"), "{}", first.content);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(updates(&overseer).len(), 1);
+
+        // Desk restarts every idle session (an account switch, a hub
+        // restart): each refresh says its work again, reworded.
+        for again in ["Shipped PLT-3010.", "PLT-3010 is shipped"] {
+            let mut a = d.session_account(s.id).await.unwrap().unwrap();
+            a.done.push(Done {
+                text: again.into(),
+                refs: vec![],
+                at: chrono::Utc::now(),
+                restated: true,
+            });
+            waiting(&mut a, "The person's answer on the lead form.");
+            a.now = "Waiting for the person".into();
+            d.store().session_account_put(&a).await.unwrap();
+            crew.look_at_updates().await;
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+        }
+        assert_eq!(
+            updates(&overseer).len(),
+            1,
+            "a refresh is no news: {:?}",
+            updates(&overseer)
+                .iter()
+                .map(|m| &m.content)
+                .collect::<Vec<_>>()
+        );
+        let state = d
+            .store()
+            .update_state("desk", chrono::Utc::now())
+            .await
+            .unwrap();
+        assert!(
+            state.pending.is_none() && state.gather_since.is_none(),
+            "nothing gathers"
+        );
+
+        // A real step (a PR it opened) is news: said of the session, and
+        // never the shipped line or the waiting again.
+        account(&d, s.id, &["Opened PR #624 for the edit form"], "Idle", "").await;
+        let second = eventually("the real update", async || {
+            updates(&overseer).into_iter().nth(1)
+        })
+        .await;
+        let text = second.content.to_lowercase();
+        assert!(text.contains("pr #624"), "{text}");
+        assert!(
+            text.contains("lead-management"),
+            "it names its session: {text}"
+        );
+        assert!(!text.contains("shipped"), "{text}");
+        assert!(!text.contains("waiting"), "{text}");
+    })
+    .await;
 }

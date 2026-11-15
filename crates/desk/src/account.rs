@@ -99,6 +99,12 @@ pub struct Done {
     #[serde(default)]
     pub refs: Vec<Ref>,
     pub at: DateTime<Utc>,
+    /// Said again by a refresh that found nothing new in the session (no
+    /// exchange it hadn't read, nothing given to it since): a restart, a
+    /// switch of account or a re-read put it in other words. Kept in the
+    /// account, never news: an update leaves it out.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restated: bool,
 }
 
 /// A choice the session itself made, and why.
@@ -127,6 +133,16 @@ pub struct Cursor {
     pub newest: Option<DateTime<Utc>>,
     #[serde(default)]
     pub keys: Vec<Read>,
+    /// What the session's transcript (or, with none, its screen) said last
+    /// when a turn's end or a read last refreshed the account, as a
+    /// fingerprint: the same words again, with no exchange to read, are
+    /// nothing new.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail: Option<String>,
+    /// When a turn's end or a read last refreshed the account (never a
+    /// running turn's `now`): what is given to the session after it is new.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<DateTime<Utc>>,
 }
 
 impl Cursor {
@@ -154,7 +170,11 @@ impl Cursor {
             keys.retain(|r| r.at >= n - OVERLAP);
         }
         keys.sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.key.cmp(&b.key)));
-        Cursor { newest, keys }
+        Cursor {
+            newest,
+            keys,
+            ..self.clone()
+        }
     }
 }
 
@@ -248,7 +268,16 @@ impl Account {
                     true => String::new(),
                     false => format!(" ({})", refs.join(", ")),
                 };
-                out.push_str(&format!("- {} {}{refs}\n", d.at.format("%H:%M"), d.text));
+                // Said again by a refresh: not something it did then.
+                let again = match d.restated {
+                    true => " (said again, not new)",
+                    false => "",
+                };
+                out.push_str(&format!(
+                    "- {} {}{refs}{again}\n",
+                    d.at.format("%H:%M"),
+                    d.text
+                ));
             }
         }
         if !self.now.is_empty() {
@@ -711,6 +740,11 @@ pub struct Written {
     pub waiting_on: Option<String>,
     pub next: Option<String>,
     pub decisions: Vec<(String, String)>,
+    /// Written by a refresh that found nothing new in the session: what
+    /// it says is the account again in other words, never news. Its done
+    /// lines are kept as restated, and what it waits on and does next
+    /// stand as they were.
+    pub restated: bool,
 }
 
 fn text_of(v: &Value, key: &str) -> Option<String> {
@@ -776,6 +810,7 @@ pub fn parse(text: &str) -> Option<Written> {
             .filter_map(|d| Some((text_of(d, "what")?, text_of(d, "why").unwrap_or_default())))
             .take(DECISIONS_MAX)
             .collect(),
+        restated: false,
     };
     (w.now.is_some() || w.purpose.is_some() || !w.done.is_empty()).then_some(w)
 }
@@ -811,11 +846,17 @@ pub fn merge(kept: &Account, w: &Written, at: DateTime<Utc>) -> Account {
                         d.refs.push(r.clone());
                     }
                 }
+                // Done for real now, what was only said again before.
+                if d.restated && !w.restated {
+                    d.restated = false;
+                    d.at = at;
+                }
             }
             None => a.done.push(Done {
                 text: text.clone(),
                 refs: refs.clone(),
                 at,
+                restated: w.restated,
             }),
         }
     }
@@ -824,10 +865,12 @@ pub fn merge(kept: &Account, w: &Written, at: DateTime<Utc>) -> Account {
     if let Some(n) = &w.now {
         a.now = n.clone();
     }
-    if let Some(wait) = &w.waiting_on {
+    // Said again, what it waits on and does next are what they were: a
+    // rewording is no change of either.
+    if let Some(wait) = w.waiting_on.as_ref().filter(|_| !w.restated) {
         a.waiting_on = (!is_nothing(wait)).then(|| wait.clone());
     }
-    if let Some(n) = &w.next {
+    if let Some(n) = w.next.as_ref().filter(|_| !w.restated) {
         a.next = n.clone();
     }
     for (what, why) in &w.decisions {
@@ -1269,5 +1312,73 @@ mod tests {
             p[end..].contains("Which key did it use?"),
             "the question is outside the record"
         );
+    }
+
+    /// A refresh that found nothing new keeps what it says as restated:
+    /// the lines it puts in other words are marked, and what the session
+    /// waits on and does next stand as they were.
+    #[test]
+    fn a_restated_write_marks_its_lines_and_keeps_waiting_and_next() {
+        let kept = Account {
+            done: vec![Done {
+                text: "PLT-3010 shipped".into(),
+                refs: vec![],
+                at: at(0),
+                restated: false,
+            }],
+            waiting_on: Some("the person's answer".into()),
+            next: "Nothing until they answer.".into(),
+            ..Account::new(Uuid::nil(), "me", at(0))
+        };
+        let again = Written {
+            done: vec![("Shipped PLT-3010".into(), vec![])],
+            now: Some("Idle.".into()),
+            waiting_on: Some("An answer from the person".into()),
+            next: Some("Wait for them.".into()),
+            restated: true,
+            ..Written::default()
+        };
+        let a = merge(&kept, &again, at(9));
+        assert_eq!(a.done.len(), 2);
+        assert!(
+            !a.done[0].restated && a.done[0].at == at(0),
+            "the first stands"
+        );
+        assert!(a.done[1].restated, "{:?}", a.done[1]);
+        assert_eq!(a.waiting_on, kept.waiting_on);
+        assert_eq!(a.next, kept.next);
+        assert_eq!(a.now, "Idle.");
+        assert!(a.render().contains("(said again, not new)"));
+        // A real refresh's lines are news, and move what it waits on.
+        let real = Written {
+            done: vec![("Opened PR #624".into(), vec![])],
+            waiting_on: Some("CI".into()),
+            ..Written::default()
+        };
+        let b = merge(&a, &real, at(10));
+        assert!(!b.done[2].restated);
+        assert_eq!(b.waiting_on.as_deref(), Some("CI"));
+        // Done for real later in the same words, a restated line is news.
+        let same = Written {
+            done: vec![("Shipped PLT-3010".into(), vec![])],
+            ..Written::default()
+        };
+        let c2 = merge(&b, &same, at(11));
+        assert!(!c2.done[1].restated && c2.done[1].at == at(11));
+        // Kept and read back, the mark and the cursor's fingerprint stay.
+        let json = serde_json::to_value(&b.done).unwrap();
+        let back: Vec<Done> = serde_json::from_value(json).unwrap();
+        assert_eq!(back, b.done);
+        let c = Cursor {
+            tail: Some("abc".into()),
+            read_at: Some(at(3)),
+            ..Cursor::default()
+        };
+        let moved = c.with([Read {
+            key: "k".into(),
+            at: at(4),
+        }]);
+        assert_eq!(moved.tail.as_deref(), Some("abc"));
+        assert_eq!(moved.read_at, Some(at(3)));
     }
 }

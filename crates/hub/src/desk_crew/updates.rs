@@ -96,8 +96,28 @@ impl UpdateWriter for HubWriter {
 pub(super) struct Changed {
     pub id: Uuid,
     pub name: String,
+    /// The repository it works in, by name.
+    repo: Option<String>,
+    /// Its account as the update tells of it ([`update::as_told`]).
     account: Account,
     new: Vec<Done>,
+}
+
+impl Changed {
+    /// What the update names it by: its name and repository.
+    fn context(&self) -> String {
+        update::subject(&self.name, self.repo.as_deref())
+    }
+}
+
+/// The repository session `v` works in, by name: a PR's among `new`, else
+/// its git project's folder.
+fn repo_of(v: &workforce_desk::model::SessionView, new: &[Done]) -> Option<String> {
+    let refs: Vec<&workforce_desk::account::Ref> = new.iter().flat_map(|d| &d.refs).collect();
+    // A folder in no repository names none.
+    let project = workforce_desk::git_project(&v.cwd);
+    let in_git = std::path::Path::new(&project).join(".git").exists();
+    update::repo_of(&refs, if in_git { &project } else { "" })
 }
 
 /// What one boss's next update would say now.
@@ -186,8 +206,10 @@ impl CrewHub {
             sessions.push(Changed {
                 id: v.id,
                 name: v.label().to_string(),
+                repo: repo_of(v, &new),
+                // What it waits on is said only when that is new.
+                account: update::as_told(was, a),
                 new,
-                account: a.clone(),
             });
         }
         let mut last = state.last_update_at.unwrap_or(state.since);
@@ -237,15 +259,22 @@ impl CrewHub {
                 .collect(),
             false => Vec::new(),
         };
+        // What waits on the person is said when it is new: opened or changed
+        // since the last update, or due to be said again. One they were
+        // told of and that hasn't moved is its own card, not news again.
+        let new_since =
+            |i: &OpenItem| i.changed_at > last || restated.iter().any(|(r, _)| *r == i.id);
         let for_you: Vec<OpenItem> = open
             .iter()
             .filter(|i| i.kind == OpenKind::Todo && i.state == OpenState::Open && i.said())
+            .filter(|i| new_since(i))
             .cloned()
             .collect();
         let waiting: Vec<OpenItem> = open
             .into_iter()
             .filter(|i| matches!(i.kind, OpenKind::Ask | OpenKind::Confirm))
             .filter(|i| i.said() && i.state == OpenState::Open)
+            .filter(|i| new_since(i))
             .collect();
         let quiet = self
             .quiet_made
@@ -300,7 +329,7 @@ impl CrewHub {
                 let input: Vec<(Uuid, String, &Account, Vec<&Done>)> = b
                     .sessions
                     .iter()
-                    .map(|s| (s.id, s.name.clone(), &s.account, s.new.iter().collect()))
+                    .map(|s| (s.id, s.context(), &s.account, s.new.iter().collect()))
                     .collect();
                 let mut user = update::composer_input(&input);
                 user.push_str(&update::composer_decisions(&acted));
@@ -349,6 +378,7 @@ impl CrewHub {
                 UpdateSession {
                     session_id: s.id.to_string(),
                     name: s.name.clone(),
+                    repo: s.repo.clone(),
                     purpose: s.account.purpose.trim().to_string(),
                     text: written
                         .sessions
@@ -379,11 +409,28 @@ impl CrewHub {
             Ok((spent, cap)) => update::footer(spent, cap),
             Err(_) => None,
         };
+        // Each group of the brief is named by its session and repository,
+        // so a line read alone still says what it is about.
+        let about: std::collections::HashSet<Uuid> = b
+            .decisions
+            .iter()
+            .filter_map(|d| d.session)
+            .chain(b.for_you.iter().filter_map(|i| i.session))
+            .collect();
         let names: HashMap<Uuid, String> = self
             .desk
             .list()
             .into_iter()
-            .map(|v| (v.id, v.label().to_string()))
+            .filter(|v| about.contains(&v.id))
+            .map(|v| {
+                // Named as its paragraph names it, so one session is one
+                // subject however its repository was found.
+                let named = match b.sessions.iter().find(|s| s.id == v.id) {
+                    Some(s) => s.context(),
+                    None => update::subject(v.label(), repo_of(&v, &[]).as_deref()),
+                };
+                (v.id, named)
+            })
             .collect();
         let (brief, more_items) = update::brief(&b.decisions, &decisions, &b.for_you, &names);
         let mut u = MentionedUpdate {
@@ -405,7 +452,9 @@ impl CrewHub {
             brief,
             more_items,
         };
-        u.headline = headline.unwrap_or_else(|| update::plain_headline(&u, b.for_you.len()));
+        let headline = headline.unwrap_or_else(|| update::plain_headline(&u, b.for_you.len()));
+        // Never a line without its session: one about one session says it.
+        u.headline = update::situated(&u, &headline, b.for_you.len());
         let decided: Vec<String> = b.decisions.iter().map(BossDecision::said).collect();
         let text = update::render(&u, &decided);
         (u, text)
