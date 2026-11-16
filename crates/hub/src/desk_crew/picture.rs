@@ -393,4 +393,3 @@ impl CrewHub {
         (!out.is_empty()).then_some(out)
     }
 }
-
