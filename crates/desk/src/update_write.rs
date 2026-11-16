@@ -744,11 +744,14 @@ pub fn said_from(plain: Said, wrote: &Written, work: &Work) -> Said {
         .map(str::trim)
         .filter(|g| !g.is_empty())
         .map(|g| {
-            let lower = g.to_lowercase();
             let g = ["not checked:", "not checked"]
                 .iter()
-                .find(|p| lower.starts_with(*p))
-                .map_or(g, |p| &g[p.len()..])
+                .find_map(|p| {
+                    g.get(..p.len())
+                        .filter(|h| h.eq_ignore_ascii_case(p))
+                        .and_then(|_| g.get(p.len()..))
+                })
+                .unwrap_or(g)
                 .trim();
             let (g, lifted) = in_words(&cut(g, GAP_WORDS), work);
             for id in lifted {

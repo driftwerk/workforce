@@ -802,3 +802,199 @@ async fn an_update_names_the_work_in_words_with_ids_in_brackets_and_its_session(
     })
     .await;
 }
+
+/// Balanced: what finished waits for the roundup, a problem comes at
+/// once, and the roundup ("Roundup now") says the finished work under
+/// Finished, with what came at once folded in.
+#[tokio::test(flavor = "multi_thread")]
+async fn finished_work_waits_for_the_roundup_and_a_problem_comes_at_once() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let balanced = format!("{ACT}updates = {{ roundup = \"1h\", quiet_hours = \"\" }}\n");
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", &balanced, &[]).await;
+        crew.set_update_writer(Arc::new(Writer(None)));
+        begun(&crew).await;
+        let web = new_session(&d, dir.path(), "acme-web").await;
+        let api = new_session(&d, dir.path(), "acme-api").await;
+        account(&d, web.id, &["Merged PR #622 for the lead picker"], "", "").await;
+        // Past the gather and the ceiling: nothing goes right away.
+        tokio::time::sleep(Duration::from_millis(1600)).await;
+        assert!(updates(&overseer).is_empty(), "finished work waits");
+
+        account(
+            &d,
+            api.id,
+            &["The deploy failed on staging"],
+            "",
+            "Look at the logs",
+        )
+        .await;
+        let posted = eventually("the problem", async || {
+            updates(&overseer).into_iter().next()
+        })
+        .await;
+        let extras = eventually("its extras", async || {
+            d.store()
+                .extras(std::slice::from_ref(&posted.id))
+                .await
+                .unwrap()
+                .remove(&posted.id)
+                .and_then(|e| e.update)
+        })
+        .await;
+        assert!(extras.roundup.is_none(), "a message right away");
+        assert_eq!(extras.said.len(), 1, "{:?}", extras.said);
+        assert_eq!(
+            extras.said[0].kind,
+            workforce_desk::update_write::EventKind::Problem
+        );
+        assert_eq!(
+            extras.said[0].session.as_ref().unwrap().session_id,
+            api.id.to_string()
+        );
+
+        assert!(crew.roundup_now("desk"));
+        let roundup = eventually("the roundup", async || {
+            updates(&overseer).into_iter().nth(1)
+        })
+        .await;
+        let r = eventually("its extras", async || {
+            d.store()
+                .extras(std::slice::from_ref(&roundup.id))
+                .await
+                .unwrap()
+                .remove(&roundup.id)
+                .and_then(|e| e.update)
+                .and_then(|u| u.roundup)
+        })
+        .await;
+        use workforce_desk::update_cadence::SectionKey;
+        let finished = r
+            .sections
+            .iter()
+            .find(|s| s.key == SectionKey::Finished)
+            .expect("Finished");
+        assert_eq!(
+            finished.lines[0].session.as_ref().unwrap().session_id,
+            web.id.to_string()
+        );
+        assert!(
+            r.sections.iter().any(|s| s.key == SectionKey::WorthKnowing),
+            "what came at once is folded in: {r:?}"
+        );
+        assert!(
+            roundup.content.contains("**Finished**"),
+            "{}",
+            roundup.content
+        );
+    })
+    .await;
+}
+
+/// A roundup with nothing to say is skipped: no message, and the next
+/// starts from then. Asked for ("Roundup now"), it says there is nothing
+/// new, in one line.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_roundup_is_skipped() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let balanced = format!("{ACT}updates = {{ roundup = \"1h\", quiet_hours = \"\" }}\n");
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", &balanced, &[]).await;
+        begun(&crew).await;
+        let (service, o) = crew.overseer_named("desk").unwrap();
+        let now = chrono::Utc::now();
+        let state = d.store().update_state("desk", now).await.unwrap();
+        let skipped = crew
+            .roundup(&service, PERSON, &o, &state, state.since, now, false)
+            .await
+            .unwrap();
+        assert!(skipped.is_none(), "nothing to say: no roundup");
+        let state = d.store().update_state("desk", now).await.unwrap();
+        assert!(
+            // Kept to the microsecond.
+            state
+                .roundup_at
+                .is_some_and(|at| at >= now - chrono::Duration::milliseconds(1)),
+            "the next starts from then"
+        );
+        assert!(updates(&overseer).is_empty());
+
+        assert!(crew.roundup_now("desk"));
+        let said = eventually("the answer", async || updates(&overseer).into_iter().next()).await;
+        assert!(
+            said.content.starts_with("Nothing new since "),
+            "{}",
+            said.content
+        );
+        assert!(!crew.roundup_now("nobody"));
+    })
+    .await;
+}
+
+/// The boss changes its own cadence on the person's word alone: in the
+/// DM turn their message began. Outside any turn, in a check-in, or in a
+/// turn another overseer relayed, it is refused and nothing is written.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_cadence_is_changed_only_on_the_persons_own_word() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, _d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        let tool =
+            super::super::tools::CrewTool::for_level(&crew, "desk", &Default::default(), false)
+                .into_iter()
+                .find(|t| workforce_agent::tools::Tool::name(t) == super::super::cadence_tool::NAME)
+                .expect("the cadence tool");
+        let run = |sid: Option<String>| {
+            let tool = &tool;
+            async move {
+                let input = serde_json::json!({ "roundup": "2h" });
+                let call = workforce_agent::tools::Tool::execute(tool, input);
+                match sid {
+                    Some(sid) => workforce_agent::runner::CURRENT_SESSION_ID
+                        .scope(sid, call)
+                        .await
+                        .unwrap(),
+                    None => call.await.unwrap(),
+                }
+            }
+        };
+        let path = overseer
+            .workspace
+            .join(workforce_common::config_files::WORKSPACE_CONFIG);
+        let written = || std::fs::read_to_string(&path).unwrap();
+        let before = written();
+        let dm = overseer
+            .sessions
+            .find(DESK_CHANNEL, PERSON)
+            .unwrap()
+            .unwrap();
+
+        // No turn, and the DM with no message of the person's.
+        assert!(!run(None).await.success);
+        assert!(!run(Some(dm.id.clone())).await.success);
+        // A check-in's own channel, though the person spoke in the DM.
+        crew.person_turns
+            .lock()
+            .insert(dm.id.clone(), "roundup every two hours".into());
+        let checkin = overseer
+            .sessions
+            .get_or_create(&format!("{DESK_CHANNEL}:checkin:x"), PERSON, "desk")
+            .unwrap();
+        overseer.sessions.save(&checkin).unwrap();
+        crew.person_turns
+            .lock()
+            .insert(checkin.id.clone(), "roundup every two hours".into());
+        assert!(!run(Some(checkin.id.clone())).await.success, "a check-in");
+        // Relayed by another overseer.
+        crew.relayed_turns.lock().insert(dm.id.clone());
+        assert!(!run(Some(dm.id.clone())).await.success, "relayed");
+        assert_eq!(written(), before, "nothing written");
+        crew.relayed_turns.lock().remove(&dm.id);
+
+        // The person's own message, in their DM's turn.
+        let r = run(Some(dm.id.clone())).await;
+        assert!(r.success, "{:?}", r.error);
+        assert!(written().contains("roundup = \"2h\""), "{}", written());
+    })
+    .await;
+}

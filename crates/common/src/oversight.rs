@@ -34,6 +34,24 @@
 //! been unread that long; its updates then gather into one catch-up for
 //! their return.
 //!
+//! Its cadence ([`Cadence`]) is in the same table: where each of five
+//! kinds of event goes (`needs_you`, `problems`, `finished`, `progress`,
+//! `routine`: `"right_away"`, `"roundup"` or `"ask"`, needs-you never
+//! only on asking), how often the roundup comes (`roundup`: `"30m"`,
+//! `"1h"`, `"2h"`, `"meals"` for 09:00, 12:30 and 17:30, or `"never"`),
+//! the quiet hours (`quiet_hours = "22:00-07:00"`, `""` for none) and
+//! whether what needs the person still comes in them (`quiet_needs_you`),
+//! which of the boss's decisions are told (`decisions`: `"important"` in
+//! the roundup, `"important_right_away"`, `"all"` in the roundup, or
+//! `"ask"`), and where else what comes right away goes (`also_to`: any of
+//! `"desk"`, `"slack"`, `"iphone"`). Unsaid, it is the Balanced preset
+//! ([`Cadence::preset`]); the boss may change these itself on the person's
+//! word, as they are how it talks to them, not its limits.
+//!
+//! ```toml
+//! updates = { needs_you = "right_away", problems = "right_away", finished = "roundup", progress = "roundup", routine = "ask", roundup = "1h", quiet_hours = "22:00-07:00", quiet_needs_you = true, decisions = "important", also_to = ["desk"] }
+//! ```
+//!
 //! `full` is **Act fully**, and Act fully is unbound (below). `[oversight.full]`
 //! `repos` (`owner/name`, which is GitHub's, a remote's URL, or a local
 //! checkout's path) and `workflows` (file names, matched exactly) are kept
@@ -347,6 +365,223 @@ pub struct Updates {
     pub max_wait_minutes: u32,
     /// How long the boss's posts go unread before the person is away.
     pub away_after_minutes: u32,
+    /// When and how it tells the person what happened.
+    pub cadence: Cadence,
+}
+
+/// Where one kind of event goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Route {
+    /// A message of its own, at once.
+    RightAway,
+    /// In the next roundup.
+    Roundup,
+    /// Only when the person asks.
+    Ask,
+}
+
+impl Route {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RightAway => "right_away",
+            Self::Roundup => "roundup",
+            Self::Ask => "ask",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "right_away" => Some(Self::RightAway),
+            "roundup" => Some(Self::Roundup),
+            "ask" => Some(Self::Ask),
+            _ => None,
+        }
+    }
+}
+
+/// How often the roundup comes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoundupEvery {
+    /// Every 30, 60 or 120 minutes, on the clock (:00, :30).
+    Minutes(u32),
+    /// Morning, lunch and end of day: 09:00, 12:30, 17:30.
+    Meals,
+    /// Never: only what comes right away.
+    Never,
+}
+
+impl RoundupEvery {
+    /// The times "morning, lunch and end of day" are.
+    pub const MEALS: [(u32, u32); 3] = [(9, 0), (12, 30), (17, 30)];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Minutes(30) => "30m",
+            Self::Minutes(120) => "2h",
+            Self::Minutes(_) => "1h",
+            Self::Meals => "meals",
+            Self::Never => "never",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "30m" => Some(Self::Minutes(30)),
+            "1h" => Some(Self::Minutes(60)),
+            "2h" => Some(Self::Minutes(120)),
+            "meals" => Some(Self::Meals),
+            "never" => Some(Self::Never),
+            _ => None,
+        }
+    }
+}
+
+/// Which of the boss's decisions the person is told of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Decided {
+    /// The important ones (it merged, released, deleted, spent, overrode a
+    /// session, or set something to happen later), in each roundup.
+    Important,
+    /// The important ones, right away.
+    ImportantRightAway,
+    /// Every one, in each roundup.
+    All,
+    /// Only when asked.
+    Ask,
+}
+
+impl Decided {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Important => "important",
+            Self::ImportantRightAway => "important_right_away",
+            Self::All => "all",
+            Self::Ask => "ask",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "important" => Some(Self::Important),
+            "important_right_away" => Some(Self::ImportantRightAway),
+            "all" => Some(Self::All),
+            "ask" => Some(Self::Ask),
+            _ => None,
+        }
+    }
+}
+
+/// Where else what comes right away goes, beside the boss's DM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct AlsoTo {
+    /// A Desk notification.
+    pub desk: bool,
+    /// A Slack DM.
+    pub slack: bool,
+    /// The person's iPhone.
+    pub iphone: bool,
+}
+
+/// When and how the boss tells the person what happened
+/// (`[oversight.updates]`'s cadence keys).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Cadence {
+    /// A question only the person can answer, a pause only they can lift:
+    /// never only on asking.
+    pub needs_you: Route,
+    /// Stuck, failed, out of plan, running low.
+    pub problems: Route,
+    /// Merged, released, closed.
+    pub finished: Route,
+    /// A step done, a restart, moving on.
+    pub progress: Route,
+    /// Nudges, checks, left alone.
+    pub routine: Route,
+    pub roundup: RoundupEvery,
+    /// From and until, local time; none: no quiet hours.
+    pub quiet_hours: Option<((u32, u32), (u32, u32))>,
+    /// What needs the person still comes at once in the quiet hours.
+    pub quiet_needs_you: bool,
+    pub decisions: Decided,
+    pub also_to: AlsoTo,
+}
+
+/// The presets, by name, as the card offers them.
+pub const PRESETS: [&str; 3] = ["as_it_happens", "balanced", "roundups_only"];
+
+impl Default for Cadence {
+    fn default() -> Self {
+        Self::preset("balanced").unwrap_or(Self {
+            needs_you: Route::RightAway,
+            problems: Route::RightAway,
+            finished: Route::Roundup,
+            progress: Route::Roundup,
+            routine: Route::Ask,
+            roundup: RoundupEvery::Minutes(60),
+            quiet_hours: Some(((22, 0), (7, 0))),
+            quiet_needs_you: true,
+            decisions: Decided::Important,
+            also_to: AlsoTo {
+                desk: true,
+                slack: false,
+                iphone: false,
+            },
+        })
+    }
+}
+
+impl Cadence {
+    /// The preset `name` ([`PRESETS`]): As it happens (all but routine at
+    /// once, no roundups), Balanced (needs-you and problems at once,
+    /// finished and progress in the hourly roundup) or Roundups only
+    /// (all in the roundup; needs-you still at once). Each sets the five
+    /// rows and the roundup; the rest is the default's.
+    pub fn preset(name: &str) -> Option<Self> {
+        use Route::{Ask, RightAway as Now, Roundup as Later};
+        let (rows, roundup) = match name {
+            "as_it_happens" => ([Now, Now, Now, Now, Ask], RoundupEvery::Never),
+            "balanced" => ([Now, Now, Later, Later, Ask], RoundupEvery::Minutes(60)),
+            "roundups_only" => ([Now, Later, Later, Later, Ask], RoundupEvery::Minutes(60)),
+            _ => return None,
+        };
+        Some(Self {
+            needs_you: rows[0],
+            problems: rows[1],
+            finished: rows[2],
+            progress: rows[3],
+            routine: rows[4],
+            roundup,
+            quiet_hours: Some(((22, 0), (7, 0))),
+            quiet_needs_you: true,
+            decisions: Decided::Important,
+            also_to: AlsoTo {
+                desk: true,
+                slack: false,
+                iphone: false,
+            },
+        })
+    }
+
+    /// The five rows, in the order the settings show them.
+    pub fn rows(&self) -> [Route; 5] {
+        [
+            self.needs_you,
+            self.problems,
+            self.finished,
+            self.progress,
+            self.routine,
+        ]
+    }
+
+    /// The preset its five rows are, if one: any other is Custom.
+    pub fn preset_name(&self) -> Option<&'static str> {
+        PRESETS
+            .into_iter()
+            .find(|p| Self::preset(p).is_some_and(|c| c.rows() == self.rows()))
+    }
 }
 
 /// The longest an update may gather or wait.
@@ -459,6 +694,7 @@ impl Default for Oversight {
                 every_minutes: 3,
                 max_wait_minutes: 10,
                 away_after_minutes: 15,
+                cadence: Cadence::default(),
             },
         }
     }
@@ -524,6 +760,128 @@ fn time(
         }
         Some(_) => Err(problem()),
     }
+}
+
+/// The cadence keys of `[oversight.updates]` as written, or what is wrong
+/// with them, in plain words.
+fn cadence_of(t: Option<&Table>) -> Result<Cadence, String> {
+    let d = Cadence::default();
+    let route = |key: &str, default: Route, what: &str, ask: bool| -> Result<Route, String> {
+        let wrong = || match ask {
+            true => format!(
+                "When you hear of {what} must be right away, in the roundup, or only if you ask."
+            ),
+            false => format!("When you hear of {what} must be right away or in the roundup."),
+        };
+        match t.and_then(|t| t.get(key)) {
+            None => Ok(default),
+            Some(Value::String(s)) => match Route::parse(s) {
+                Some(Route::Ask) if !ask => Err(wrong()),
+                Some(r) => Ok(r),
+                None => Err(wrong()),
+            },
+            Some(_) => Err(wrong()),
+        }
+    };
+    let roundup = match t.and_then(|t| t.get("roundup")) {
+        None => d.roundup,
+        Some(Value::String(s)) => RoundupEvery::parse(s).ok_or(
+            "How often the roundup comes must be every 30 minutes, every hour, every 2 hours, morning, lunch and end of day, or never.",
+        )?,
+        Some(_) => {
+            return Err("How often the roundup comes must be every 30 minutes, every hour, every 2 hours, morning, lunch and end of day, or never.".into())
+        }
+    };
+    let quiet_wrong = "The quiet hours must look like 22:00-07:00, or be empty for none.";
+    let quiet_hours = match t.and_then(|t| t.get("quiet_hours")) {
+        None => d.quiet_hours,
+        Some(Value::String(s)) if s.trim().is_empty() => None,
+        Some(Value::String(s)) => {
+            let (from, until) = s.trim().split_once('-').ok_or(quiet_wrong)?;
+            let at = |x: &str| -> Option<(u32, u32)> {
+                let (h, m) = x.trim().split_once(':')?;
+                let (h, m): (u32, u32) = (h.parse().ok()?, m.parse().ok()?);
+                (h <= 23 && m <= 59 && x.trim().split_once(':')?.1.len() == 2).then_some((h, m))
+            };
+            match (at(from), at(until)) {
+                (Some(f), Some(u)) if f != u => Some((f, u)),
+                _ => return Err(quiet_wrong.into()),
+            }
+        }
+        Some(_) => return Err(quiet_wrong.into()),
+    };
+    let decisions_wrong = "Which of its decisions you hear of must be the important ones in the roundup, the important ones right away, every one in the roundup, or only when you ask.";
+    let decisions = match t.and_then(|t| t.get("decisions")) {
+        None => d.decisions,
+        Some(Value::String(s)) => Decided::parse(s).ok_or(decisions_wrong)?,
+        Some(_) => return Err(decisions_wrong.into()),
+    };
+    let also_wrong =
+        "Where else what comes right away goes must be a list of desk, slack and iphone.";
+    let also_to = match t.and_then(|t| t.get("also_to")) {
+        None => d.also_to,
+        Some(Value::Array(items)) => {
+            let mut a = AlsoTo {
+                desk: false,
+                slack: false,
+                iphone: false,
+            };
+            for i in items {
+                match i.as_str().map(str::trim) {
+                    Some("desk") => a.desk = true,
+                    Some("slack") => a.slack = true,
+                    Some("iphone") => a.iphone = true,
+                    _ => return Err(also_wrong.into()),
+                }
+            }
+            a
+        }
+        Some(_) => return Err(also_wrong.into()),
+    };
+    let c = Cadence {
+        needs_you: route("needs_you", d.needs_you, "what needs you", false)?,
+        problems: route("problems", d.problems, "problems", true)?,
+        finished: route("finished", d.finished, "finished work", true)?,
+        progress: route("progress", d.progress, "progress", true)?,
+        routine: route("routine", d.routine, "routine things", true)?,
+        roundup,
+        quiet_hours,
+        quiet_needs_you: switch(
+            t,
+            "quiet_needs_you",
+            d.quiet_needs_you,
+            "telling you at once in the quiet hours when something needs you",
+        )?,
+        decisions,
+        also_to,
+    };
+    // A row kept for the roundup, with no roundups, would never be told.
+    if c.roundup == RoundupEvery::Never {
+        let names = [
+            "what needs you",
+            "problems",
+            "finished work",
+            "progress",
+            "routine things",
+        ];
+        let waiting: Vec<&str> = names
+            .into_iter()
+            .zip(c.rows())
+            .filter(|(_, r)| *r == Route::Roundup)
+            .map(|(n, _)| n)
+            .collect();
+        if !waiting.is_empty() {
+            return Err(format!(
+                "With no roundups, {} would never be told: send {} right away or only if you ask, or choose how often the roundup comes.",
+                waiting.join(" and "),
+                match waiting.len() {
+                    1 => "it",
+                    _ => "them",
+                }
+            ));
+        }
+    }
+    Ok(c)
 }
 
 /// `[oversight.full]` as written, or what is wrong with it.
@@ -968,6 +1326,7 @@ impl Oversight {
                 every_minutes,
                 max_wait_minutes,
                 away_after_minutes,
+                cadence: cadence_of(updates)?,
             },
         })
     }
@@ -1299,6 +1658,58 @@ mod tests {
         assert!(parse("[oversight]\nupdates = { away_after_minutes = 0 }\n")
             .unwrap_err()
             .contains("away"));
+    }
+
+    /// The cadence is Balanced unsaid; each key reads as written, and what
+    /// is wrong is said in plain words.
+    #[test]
+    fn the_cadence_is_balanced_unless_said_and_reads_as_written() {
+        let d = parse("[oversight]\nenabled = true\n")
+            .unwrap()
+            .updates
+            .cadence;
+        assert_eq!(d, Cadence::preset("balanced").unwrap());
+        assert_eq!(d.preset_name(), Some("balanced"));
+        assert_eq!(d.quiet_hours, Some(((22, 0), (7, 0))));
+        assert!(d.quiet_needs_you && d.also_to.desk && !d.also_to.slack);
+        let set = parse(
+            "[oversight]\nupdates = { finished = \"right_away\", progress = \"right_away\", roundup = \"never\", quiet_hours = \"\", decisions = \"all\", also_to = [\"desk\", \"slack\"] }\n",
+        )
+        .unwrap()
+        .updates
+        .cadence;
+        assert_eq!(set.preset_name(), Some("as_it_happens"));
+        assert_eq!(set.roundup, RoundupEvery::Never);
+        assert_eq!(set.quiet_hours, None);
+        assert_eq!(set.decisions, Decided::All);
+        assert!(set.also_to.slack && !set.also_to.iphone);
+        let custom = parse("[oversight]\nupdates = { routine = \"roundup\" }\n")
+            .unwrap()
+            .updates
+            .cadence;
+        assert_eq!(custom.preset_name(), None, "Custom");
+        for (toml, said) in [
+            (
+                "needs_you = \"ask\"",
+                "what needs you must be right away or in the roundup",
+            ),
+            ("problems = \"later\"", "problems must be right away"),
+            ("roundup = \"5m\"", "How often the roundup comes"),
+            (
+                "quiet_hours = \"22-7\"",
+                "quiet hours must look like 22:00-07:00",
+            ),
+            ("quiet_hours = \"07:00-07:00\"", "quiet hours"),
+            ("decisions = \"some\"", "Which of its decisions"),
+            ("also_to = [\"email\"]", "desk, slack and iphone"),
+            (
+                "roundup = \"never\"",
+                "With no roundups, finished work and progress would never be told",
+            ),
+        ] {
+            let e = parse(&format!("[oversight]\nupdates = {{ {toml} }}\n")).unwrap_err();
+            assert!(e.contains(said), "{toml}: {e}");
+        }
     }
 
     /// Messaging agents and sessions started in another terminal are each

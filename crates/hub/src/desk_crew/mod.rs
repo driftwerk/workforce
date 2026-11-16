@@ -31,6 +31,7 @@ mod actions;
 mod answer;
 mod away;
 mod board;
+mod cadence_tool;
 mod closing;
 pub(crate) mod context;
 pub(crate) mod decide;
@@ -195,6 +196,8 @@ pub struct CrewHub {
     relayed_turns: Mutex<std::collections::HashSet<String>>,
     /// Who writes the updates' paragraphs; none: plainly.
     update_writer: Mutex<Option<Arc<dyn updates::UpdateWriter>>>,
+    /// The bosses the person asked for a roundup now ("Roundup now").
+    roundup_asked: Mutex<std::collections::HashSet<String>>,
     /// The bosses whose update is being looked at now.
     updating: Mutex<std::collections::HashSet<String>>,
     /// The suggestions each boss's quiet check-ins made, and when, for its
@@ -628,6 +631,7 @@ impl CrewHub {
             person_turns: Mutex::default(),
             relayed_turns: Mutex::default(),
             update_writer: Mutex::default(),
+            roundup_asked: Mutex::default(),
             updating: Mutex::default(),
             quiet_made: Mutex::default(),
             closing: Mutex::default(),
@@ -1448,6 +1452,25 @@ impl Crew for CrewHub {
 
     fn dm_typing(&self, agent: &str) -> bool {
         self.typing_in(agent)
+    }
+
+    fn next_roundup(&self, agent: &str) -> Option<Option<DateTime<Utc>>> {
+        let (_, o) = self.overseer_named(agent)?;
+        let last = Utc::now();
+        Some(workforce_desk::update_cadence::next_roundup(
+            &o.updates.cadence,
+            last,
+            &self.desk.timezone(),
+        ))
+    }
+
+    fn roundup_now(&self, agent: &str) -> bool {
+        if self.overseer_named(agent).is_none() {
+            return false;
+        }
+        self.roundup_asked.lock().insert(agent.to_string());
+        self.update_poke.notify_one();
+        true
     }
 
     fn presence(&self, attending: bool, dm_on_screen: Option<&str>) {

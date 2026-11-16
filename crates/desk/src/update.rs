@@ -197,6 +197,12 @@ pub struct UpdateState {
     /// Since when the person is away (overseer H8): updates gather into
     /// one catch-up for their return.
     pub away_since: Option<DateTime<Utc>>,
+    /// Up to when what happened was routed by the cadence (said right
+    /// away, or left for the roundup) without an update going.
+    pub routed_at: Option<DateTime<Utc>>,
+    /// When the last roundup went, or was skipped as empty: the next one
+    /// says what happened since.
+    pub roundup_at: Option<DateTime<Utc>>,
 }
 
 /// An update written and about to go out: kept first, so a restart posts
@@ -585,6 +591,10 @@ pub struct MentionedUpdate {
     /// `brief`, which say the same for what reads only those.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub said: Vec<crate::update_write::Said>,
+    /// A roundup (shape C) rather than a message right away (shape A):
+    /// what happened since the last, by section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roundup: Option<crate::update_cadence::Roundup>,
 }
 
 /// What became of the finished sessions an update speaks of.
@@ -998,6 +1008,7 @@ impl MentionedUpdate {
             && self.waiting.is_empty()
             && self.closed.is_empty()
             && self.said.is_empty()
+            && self.roundup.is_none()
     }
 }
 

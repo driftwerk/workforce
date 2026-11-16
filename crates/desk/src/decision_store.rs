@@ -12,7 +12,7 @@ use crate::store::DeskStore;
 
 const COLUMNS: &str =
     "id, boss, owner, at, session, need, need_ref, what, why, how, preference, action, undo, \
-     undone_at, event, brief, brief_why, message, kind";
+     undone_at, event, brief, brief_why, message, kind, important";
 
 fn decision(r: &Row) -> Result<BossDecision> {
     Ok(BossDecision {
@@ -35,6 +35,10 @@ fn decision(r: &Row) -> Result<BossDecision> {
         brief_why: r.try_get(16)?,
         message: r.try_get(17)?,
         kind: DecisionKind::parse(r.try_get(18)?)?,
+        important: r
+            .try_get::<_, Option<String>>(19)?
+            .as_deref()
+            .and_then(crate::update_cadence::Important::parse),
     })
 }
 
@@ -47,7 +51,7 @@ impl DeskStore {
                 &format!(
                     "INSERT INTO boss_decisions ({COLUMNS}) \
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-                     $16, $17, $18, $19)"
+                     $16, $17, $18, $19, $20)"
                 ),
                 &[
                     &d.id,
@@ -69,6 +73,7 @@ impl DeskStore {
                     &d.brief_why,
                     &d.message,
                     &d.kind.as_str(),
+                    &d.important.map(|i| i.as_str()),
                 ],
             )
             .await?;
