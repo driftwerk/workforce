@@ -1683,16 +1683,19 @@ impl Desk {
         // side, a ticket's notice or an undo, goes through `line_send`
         // and isn't their words.)
         self.person_drove(id);
-        self.picture_person_said(id, &text);
-        self.line_send(
-            Sender::Person,
-            Send::Tell {
-                to: Target::Session(id),
-                text,
-                when,
-            },
-        )
-        .await
+        let m = self
+            .line_send(
+                Sender::Person,
+                Send::Tell {
+                    to: Target::Session(id),
+                    text,
+                    when,
+                },
+            )
+            .await?;
+        // Taken (a refused one isn't their word to it).
+        self.picture_person_said(id, &m.text);
+        Ok(m)
     }
 
     /// Takes back the one message `id` a boss sent a session, while it is

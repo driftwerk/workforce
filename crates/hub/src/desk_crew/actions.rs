@@ -1319,6 +1319,31 @@ impl CrewHub {
                         ),
                         _ => {}
                     }
+                } else if who.party.kind == crew::PartyKind::You {
+                    // The person approved a suggestion: their word to the
+                    // session, for every boss of it.
+                    let theirs = match action {
+                        Action::Nudge {
+                            to: Target::Session(s),
+                            message,
+                            ..
+                        } => Some((*s, message.clone())),
+                        Action::AssignTicket {
+                            ticket,
+                            to: Handout::Session(s),
+                            ..
+                        } => Some((*s, format!("Ticket {ticket} is yours to work on."))),
+                        _ => None,
+                    };
+                    if let Some((s, text)) = theirs {
+                        self.desk.picture_note(
+                            workforce_desk::picture::Note::new(
+                                workforce_desk::picture::What::PersonSaid,
+                                text,
+                            )
+                            .session(s),
+                        );
+                    }
                 }
                 said
             }
