@@ -624,7 +624,7 @@ mod tests {
         };
         let skill = JiraSkill::new(cfg).unwrap();
         let tools = skill.tools();
-        assert_eq!(tools.len(), 24);
+        assert_eq!(tools.len(), 25);
         // Sanity check: all tool names start with "jira."
         for t in &tools {
             assert!(t.name().starts_with("jira."));
@@ -694,10 +694,10 @@ mod tests {
     }
 
     #[test]
-    fn definition_lists_all_24_tools() {
+    fn definition_lists_all_25_tools() {
         let def = JiraSkill::definition();
-        assert_eq!(def.tools.len(), 24);
-        assert_eq!(def.default_policies.len(), 24);
+        assert_eq!(def.tools.len(), 25);
+        assert_eq!(def.default_policies.len(), 25);
         assert_eq!(def.requirements.credentials.len(), 3);
         assert!(def.validate().is_ok());
     }
