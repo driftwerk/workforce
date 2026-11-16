@@ -21,7 +21,23 @@ const ORG_DATADOG: &str = "org-datadog-shared-secret-0004";
 const ANN_SLACK: &str = "xoxb-ann-slack-secret-0005";
 /// A token GitHub's device flow gave Ann's sign-in on this hub's OAuth app.
 const ANN_GITHUB_SIGNED_IN: &str = "gho_ann_signed_in_secret_0006";
+const ALLAN_ANN_LINEAR: &str = "lin_api_allan_ann_secret_0007";
+const ALLAN_ANN_METABASE: &str = "mb_allan_ann_secret_0008";
+const ALLAN_ANN_JIRA: &str = "allan-ann-jira-secret-0009";
+const ALLAN_BOB_EMAIL: &str = "allan-bob-mail-secret-0010";
+const ALLAN_SHARED: &str = "allan-shared-metabase-0011";
+const ALLAN_ANN_SIGNED_IN: &str = "gho_allan_ann_signed_0012";
+const CLOSED_ANN_LINEAR: &str = "lin_api_closed_ann_0013";
+const ALLAN_ANN_GOOGLE: &str = "allan-ann-google-refresh-0014";
 const SECRETS: &[&str] = &[
+    ALLAN_ANN_LINEAR,
+    ALLAN_ANN_METABASE,
+    ALLAN_ANN_JIRA,
+    ALLAN_BOB_EMAIL,
+    ALLAN_SHARED,
+    ALLAN_ANN_SIGNED_IN,
+    CLOSED_ANN_LINEAR,
+    ALLAN_ANN_GOOGLE,
     ANN_JIRA,
     ANN_GITHUB,
     BOB_LINEAR,
@@ -36,6 +52,7 @@ struct Hub {
     audit: Arc<workforce_common::persistence::SqliteStore>,
     jwt: crate::jwt::JwtConfig,
     ann: Identity,
+    bob: Identity,
     ann_desk: String,
     bob_desk: String,
     ann_mcp: String,
@@ -46,6 +63,11 @@ struct Hub {
 /// of hers, her Slack bot token, Bob's Linear key and a shared Datadog key;
 /// each with a desktop device paired.
 async fn hub(allow: bool) -> Hub {
+    hub_on(allow, None).await
+}
+
+/// [`hub`], its vault `global` when given.
+async fn hub_on(allow: bool, global: Option<Arc<Vault>>) -> Hub {
     let dir = tempfile::tempdir().unwrap();
     let (fx, devices) = fixture_with_devices(false);
     let mut ann = Identity::new("Ann", IdentityRole::Member);
@@ -55,7 +77,8 @@ async fn hub(allow: bool) -> Hub {
     let (_, ann_desk) = pair_device(&fx, &devices, &mut ann, "Ann's Mac");
     let (_, bob_desk) = pair_device(&fx, &devices, &mut bob, "Bob's Mac");
     let ann_mcp = issue(&fx, &ann, TokenShape::default());
-    let vault = Arc::new(Vault::open(&dir.path().join("vault"), "test-key").unwrap());
+    let vault = global
+        .unwrap_or_else(|| Arc::new(Vault::open(&dir.path().join("vault"), "test-key").unwrap()));
     let a = ann.id;
     let b = bob.id;
     let me = |p: &str, v: &str, who: &Uuid| {
@@ -101,6 +124,7 @@ async fn hub(allow: bool) -> Hub {
         audit,
         jwt,
         ann,
+        bob,
         ann_desk,
         bob_desk,
         ann_mcp,
@@ -168,6 +192,41 @@ impl Hub {
             Some(json!({ "connections": connections })),
         )
         .await
+    }
+
+    /// [`Hub::take`], each pick through the agent given (or none).
+    async fn take_from(
+        &self,
+        bearer: &str,
+        picks: &[(&str, &str, Option<&str>)],
+    ) -> (StatusCode, Value, String) {
+        let connections: Vec<Value> = picks
+            .iter()
+            .map(|(c, k, a)| match a {
+                Some(a) => json!({ "connector": c, "key": k, "agent": a }),
+                None => json!({ "connector": c, "key": k }),
+            })
+            .collect();
+        let (s, _, v, t) = self
+            .ask(
+                "POST",
+                TAKE_PATH,
+                Some(bearer),
+                Some(json!({ "connections": connections })),
+            )
+            .await;
+        (s, v, t)
+    }
+
+    /// The `desk.key_copy` audit rows' targets.
+    fn copy_targets(&self) -> Vec<String> {
+        self.audit
+            .recent_audit(100)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.action == "desk.key_copy")
+            .map(|e| e.resource)
+            .collect()
     }
 
     fn sign_in(&self, who: &Identity) -> String {
@@ -356,7 +415,8 @@ async fn a_github_sign_ins_token_is_never_copied_but_a_personal_access_token_is(
 
     // Kept flat too, a space before it or not.
     let dir = tempfile::tempdir().unwrap();
-    let vault = Vault::open(&dir.path().join("vault"), "test-key").unwrap();
+    let vault = Arc::new(Vault::open(&dir.path().join("vault"), "test-key").unwrap());
+    let mine = [Source::personal(Arc::clone(&vault))];
     let ann = Uuid::new_v4();
     let github = copyable("github").unwrap();
     for (token, copied) in [
@@ -369,12 +429,12 @@ async fn a_github_sign_ins_token_is_never_copied_but_a_personal_access_token_is(
             .set(&format!("users/{ann}/skills/github/token"), token)
             .unwrap();
         assert_eq!(
-            connections_of(&vault, &ann).len(),
+            connections_of(&mine, &ann).len(),
             usize::from(copied),
             "{token}"
         );
         assert_eq!(
-            take_one(&vault, github, &ann, DEFAULT_INSTANCE).is_some(),
+            take_one(&mine[0], github, &ann, DEFAULT_INSTANCE).is_some(),
             copied,
             "{token}"
         );
@@ -485,7 +545,8 @@ async fn takes_are_rate_limited_per_person() {
 #[test]
 fn an_instance_named_default_is_preferred_over_the_flat_keys() {
     let dir = tempfile::tempdir().unwrap();
-    let vault = Vault::open(&dir.path().join("vault"), "test-key").unwrap();
+    let vault = Arc::new(Vault::open(&dir.path().join("vault"), "test-key").unwrap());
+    let mine = [Source::personal(Arc::clone(&vault))];
     let ann = Uuid::new_v4();
     vault
         .set(&format!("users/{ann}/skills/linear/api_key"), "flat")
@@ -496,10 +557,10 @@ fn an_instance_named_default_is_preferred_over_the_flat_keys() {
             "named",
         )
         .unwrap();
-    let listed = connections_of(&vault, &ann);
+    let listed = connections_of(&mine, &ann);
     assert_eq!(listed.len(), 1, "{listed:?}");
     let c = copyable("linear").unwrap();
-    let taken = take_one(&vault, c, &ann, DEFAULT_INSTANCE).unwrap();
+    let taken = take_one(&mine[0], c, &ann, DEFAULT_INSTANCE).unwrap();
     assert_eq!(taken.fields["api_key"], "named");
 }
 
@@ -513,6 +574,9 @@ fn the_summary_says_handed_over_naming_the_device_and_the_connection() {
         site: None,
         account: None,
         updated_at: None,
+        tier: "global_per_user",
+        agent: None,
+        agent_name: None,
     };
     assert_eq!(
         summary("Sam's Mac", &l),
@@ -521,5 +585,395 @@ fn the_summary_says_handed_over_naming_the_device_and_the_connection() {
     assert_eq!(
         summary(" ", &l),
         "Your Jira key (Acme) was handed over to Desk on a computer"
+    );
+}
+
+// ── Through an agent: the agent-per-user tier ─────────────────────────────
+
+/// An agent named `name` with a vault of its own, on `dir`.
+async fn agent_with_vault(dir: &std::path::Path, name: &str) -> Arc<crate::serve::AgentService> {
+    let mut config = workforce_common::settings::WorkforceConfig::default();
+    config.hub.data_dir = dir.to_string_lossy().into_owned();
+    config.memory.db_path = dir.join("memory.db").to_string_lossy().into_owned();
+    config.llm.api_key = Some("test-key".into());
+    config.vault.enabled = true;
+    use crate::serve::compose::Compose as _;
+    let service = crate::serve::AgentService::from_config(config, None)
+        .await
+        .unwrap();
+    *service.name_override.write() = Some(name.into());
+    assert!(service.vault.is_some(), "an agent with a vault of its own");
+    service
+}
+
+/// Closes agent `id` to everyone but a stranger.
+fn close(state: &GatewayState, id: &str) {
+    use workforce_common::settings::{AccessMode, AgentAccessConfig};
+    state.access_gate.upsert(
+        id.into(),
+        AgentAccessConfig {
+            mode: AccessMode::Allowlist,
+            allow: vec![Uuid::new_v4().to_string()],
+            ..Default::default()
+        },
+    );
+}
+
+/// [`hub`], with agent Allan holding Ann's two Linear workspaces, her
+/// Metabase, a second copy of her personal Jira, a GitHub sign-in and a
+/// Google sign-in of hers, Bob's Email and a key shared by all who use
+/// Allan; and agent `closed`, which Ann can't use, holding her Linear key.
+async fn hub_with_agents() -> (Hub, tempfile::TempDir) {
+    let hub = hub(true).await;
+    let dir = tempfile::tempdir().unwrap();
+    let allan = agent_with_vault(&dir.path().join("allan"), "Allan").await;
+    let closed = agent_with_vault(&dir.path().join("closed"), "Closed").await;
+    let (a, b) = (hub.ann.id, hub.bob.id);
+    let put = |v: &Vault, p: String, val: &str| v.set(&p, val).unwrap();
+    let av = allan.vault.as_ref().unwrap();
+    for (key, secret) in [
+        ("driftwerk", ALLAN_ANN_LINEAR),
+        ("mantiscrm", ALLAN_ANN_LINEAR),
+    ] {
+        put(
+            av,
+            format!("users/{a}/skills/linear/workspaces/{key}/api_key"),
+            secret,
+        );
+        put(
+            av,
+            format!("users/{a}/skills/linear/workspaces/{key}/label"),
+            key,
+        );
+    }
+    put(
+        av,
+        format!("users/{a}/skills/metabase/api_key"),
+        ALLAN_ANN_METABASE,
+    );
+    put(
+        av,
+        format!("users/{a}/skills/metabase/site_url"),
+        "https://mb.driftwerk.example",
+    );
+    // The same Jira as her personal one: the personal one is offered.
+    put(
+        av,
+        format!("users/{a}/skills/jira/site"),
+        "https://ACME.atlassian.net/",
+    );
+    put(
+        av,
+        format!("users/{a}/skills/jira/email"),
+        "ann@acme.example",
+    );
+    put(
+        av,
+        format!("users/{a}/skills/jira/api_token"),
+        ALLAN_ANN_JIRA,
+    );
+    put(
+        av,
+        format!("users/{a}/skills/github/workspaces/signed/token"),
+        ALLAN_ANN_SIGNED_IN,
+    );
+    put(
+        av,
+        format!("users/{a}/skills/google/workspaces/default/refresh_token"),
+        ALLAN_ANN_GOOGLE,
+    );
+    put(
+        av,
+        format!("users/{b}/skills/email/accounts/default/password"),
+        ALLAN_BOB_EMAIL,
+    );
+    put(
+        av,
+        format!("users/{b}/skills/email/accounts/default/username"),
+        "bob@acme.example",
+    );
+    // Allan's agent-specific tier: everyone's who uses Allan.
+    put(
+        av,
+        "skills/metabase/instances/team/api_key".into(),
+        ALLAN_SHARED,
+    );
+    put(
+        av,
+        "skills/metabase/instances/team/site_url".into(),
+        "https://team.example",
+    );
+    put(
+        closed.vault.as_ref().unwrap(),
+        format!("users/{a}/skills/linear/api_key"),
+        CLOSED_ANN_LINEAR,
+    );
+    hub.state.registry.insert("allan", allan);
+    hub.state.registry.insert("closed", closed);
+    close(&hub.state, "closed");
+    (hub, dir)
+}
+
+/// Each connection listed: (connector, key, agent).
+fn listed_from(v: &Value) -> Vec<(String, String, Option<String>)> {
+    v["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            (
+                c["connector"].as_str().unwrap().to_string(),
+                c["key"].as_str().unwrap().to_string(),
+                c["agent"].as_str().map(str::to_string),
+            )
+        })
+        .collect()
+}
+
+fn row(c: &str, k: &str, a: Option<&str>) -> (String, String, Option<String>) {
+    (c.into(), k.into(), a.map(str::to_string))
+}
+
+const WITH_AGENTS: &str = "/api/me/desk-key-copies?with=agents";
+
+#[tokio::test]
+async fn ann_lists_her_keys_through_the_agents_she_uses_and_never_a_shared_or_anothers() {
+    let (hub, _dir) = hub_with_agents().await;
+    let (status, _, v, text) = hub.ask("GET", WITH_AGENTS, Some(&hub.ann_desk), None).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    no_secret_in(&text);
+    assert_eq!(
+        listed_from(&v),
+        [
+            row("github", "acme", None),
+            row("jira", "default", None),
+            row("linear", "driftwerk", Some("allan")),
+            row("linear", "mantiscrm", Some("allan")),
+            row("metabase", "default", Some("allan")),
+        ],
+        "not Allan's copy of her Jira, nor her sign-ins, Bob's Email, Allan's shared \
+         Metabase, or her Linear through an agent she can't use"
+    );
+    let linear = &v["connections"][2];
+    assert_eq!(linear["tier"], "agent_per_user");
+    assert_eq!(linear["agentName"], "Allan");
+    assert_eq!(linear["name"], "driftwerk");
+    assert_eq!(v["connections"][1]["tier"], "global_per_user");
+    assert_eq!(v["connections"][1]["agent"], Value::Null);
+    assert_eq!(
+        v["signInOnly"],
+        json!([{ "connector": "google", "service": "Google" }])
+    );
+    assert!(!text.contains("team.example"), "{text}");
+
+    // A Desk from before asks for none through agents: only her personal tier.
+    let (_, v, _) = hub.list(&hub.ann_desk).await;
+    assert!(listed_from(&v).iter().all(|(_, _, a)| a.is_none()), "{v}");
+}
+
+#[tokio::test]
+async fn a_key_through_an_agent_is_taken_from_that_tier_only_and_audited_naming_it() {
+    let (hub, _dir) = hub_with_agents().await;
+    let (status, v, text) = hub
+        .take_from(
+            &hub.ann_desk,
+            &[
+                ("linear", "driftwerk", Some("allan")),
+                ("jira", "default", Some("allan")),
+                ("jira", "default", None),
+                // Not in her personal tier: never served from Allan's.
+                ("linear", "mantiscrm", None),
+            ],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let copies = v["copies"].as_array().unwrap();
+    assert_eq!(copies.len(), 3, "{v}");
+    assert_eq!(copies[0]["fields"]["api_key"], ALLAN_ANN_LINEAR);
+    assert_eq!(copies[0]["agent"], "allan");
+    assert_eq!(copies[1]["fields"]["api_token"], ALLAN_ANN_JIRA);
+    assert_eq!(copies[2]["fields"]["api_token"], ANN_JIRA);
+    assert_eq!(
+        v["missing"],
+        json!([{ "connector": "linear", "key": "mantiscrm" }])
+    );
+
+    let rows = hub.copies_audited();
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    let linear = rows.iter().find(|r| r["connector"] == "linear").unwrap();
+    assert_eq!(linear["tier"], "agent_per_user");
+    assert_eq!(linear["agent"], "allan");
+    assert_eq!(
+        linear["summary"],
+        "Your Linear key (driftwerk), through Allan, was handed over to Desk on Ann's Mac"
+    );
+    assert!(rows
+        .iter()
+        .any(|r| r["tier"] == "global_per_user" && r["agent"].is_null()));
+    let targets = hub.copy_targets();
+    assert!(
+        targets.contains(&"desk_key_copy:linear/driftwerk@agent:allan".to_string()),
+        "{targets:?}"
+    );
+    assert!(
+        targets.contains(&"desk_key_copy:jira/default".to_string()),
+        "{targets:?}"
+    );
+    for r in &rows {
+        no_secret_in(&r.to_string());
+    }
+}
+
+#[tokio::test]
+async fn an_agent_she_cant_use_or_that_isnt_here_hands_over_nothing() {
+    let (hub, _dir) = hub_with_agents().await;
+    let mut said = Vec::new();
+    for agent in ["closed", "nobody"] {
+        let (status, v, text) = hub
+            .take_from(
+                &hub.ann_desk,
+                &[
+                    ("jira", "default", None),
+                    ("linear", "default", Some(agent)),
+                ],
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{agent}: {text}");
+        assert!(v.get("copies").is_none(), "{text}");
+        no_secret_in(&text);
+        said.push(v["error"].clone());
+    }
+    assert_eq!(
+        said[0], said[1],
+        "the same words, so no agent is told apart"
+    );
+    assert!(hub.copies_audited().is_empty());
+}
+
+#[tokio::test]
+async fn bob_gets_his_own_through_allan_and_never_anns() {
+    let (hub, _dir) = hub_with_agents().await;
+    let (_, _, v, text) = hub.ask("GET", WITH_AGENTS, Some(&hub.bob_desk), None).await;
+    assert_eq!(
+        listed_from(&v),
+        [
+            row("email", "default", Some("allan")),
+            row("linear", "default", None)
+        ],
+        "{text}"
+    );
+    assert_eq!(v["signInOnly"], json!([]));
+    no_secret_in(&text);
+    let (status, v, text) = hub
+        .take_from(
+            &hub.bob_desk,
+            &[
+                ("linear", "driftwerk", Some("allan")),
+                ("metabase", "default", Some("allan")),
+                ("metabase", "team", Some("allan")),
+            ],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(v["copies"], json!([]), "{text}");
+    assert_eq!(v["missing"].as_array().unwrap().len(), 3);
+    no_secret_in(&text);
+}
+
+#[tokio::test]
+async fn a_github_sign_in_through_an_agent_is_never_copied() {
+    let (hub, _dir) = hub_with_agents().await;
+    let (status, v, text) = hub
+        .take_from(&hub.ann_desk, &[("github", "signed", Some("allan"))])
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert!(v.get("copies").is_none());
+    no_secret_in(&text);
+    assert!(hub.copies_audited().is_empty());
+}
+
+#[tokio::test]
+async fn an_agent_on_this_hubs_own_vault_isnt_listed_as_another_tier() {
+    let dir = tempfile::tempdir().unwrap();
+    let mirror = agent_with_vault(&dir.path().join("mirror"), "Mirror").await;
+    let hub = hub_on(true, mirror.vault.clone()).await;
+    hub.state.registry.insert("mirror", mirror);
+    let (status, _, v, text) = hub.ask("GET", WITH_AGENTS, Some(&hub.ann_desk), None).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(
+        listed_from(&v),
+        [row("github", "acme", None), row("jira", "default", None)]
+    );
+}
+
+#[test]
+fn one_connection_in_two_tiers_is_listed_once_from_the_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let open = |n: &str| Arc::new(Vault::open(&dir.path().join(n), "test-key").unwrap());
+    let (mine, allan, bea) = (open("mine"), open("allan"), open("bea"));
+    let ann = Uuid::new_v4();
+    let through = |v: &Arc<Vault>, id: &str| Source {
+        vault: Arc::clone(v),
+        agent: Some(AgentOf {
+            id: id.into(),
+            name: id.into(),
+        }),
+    };
+    for v in [&mine, &allan, &bea] {
+        v.set(
+            &format!("users/{ann}/skills/linear/workspaces/acme/api_key"),
+            "k",
+        )
+        .unwrap();
+        v.set(
+            &format!("users/{ann}/skills/linear/workspaces/acme/label"),
+            "Acme",
+        )
+        .unwrap();
+    }
+    // Two of one tier stay two; another name is another connection.
+    for (key, label) in [("acme2", "acme"), ("other", "Other")] {
+        allan
+            .set(
+                &format!("users/{ann}/skills/linear/workspaces/{key}/api_key"),
+                "k",
+            )
+            .unwrap();
+        allan
+            .set(
+                &format!("users/{ann}/skills/linear/workspaces/{key}/label"),
+                label,
+            )
+            .unwrap();
+    }
+    let sources = [
+        Source::personal(Arc::clone(&mine)),
+        through(&allan, "allan"),
+        through(&bea, "bea"),
+    ];
+    let got: Vec<(String, Option<String>)> = connections_of(&sources, &ann)
+        .into_iter()
+        .map(|l| (l.key, l.agent))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("acme".to_string(), None),
+            ("other".to_string(), Some("allan".to_string())),
+        ],
+        "Acme from the personal tier only; Allan's own second Acme is shadowed by it too"
+    );
+    // Without the personal one, the first agent's.
+    let got: Vec<_> = connections_of(&sources[1..], &ann)
+        .into_iter()
+        .map(|l| (l.key, l.agent))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("acme".to_string(), Some("allan".to_string())),
+            ("acme2".to_string(), Some("allan".to_string())),
+            ("other".to_string(), Some("allan".to_string())),
+        ]
     );
 }
