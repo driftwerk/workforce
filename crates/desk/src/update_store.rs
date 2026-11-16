@@ -19,7 +19,7 @@ impl DeskStore {
         let client = self.pool().get().await?;
         client
             .execute(
-                "INSERT INTO boss_update_state (boss, since) VALUES ($1, $2) \
+                "INSERT INTO boss_update_state (boss, since, roundup_at) VALUES ($1, $2, $2) \
                  ON CONFLICT (boss) DO NOTHING",
                 &[&boss, &now],
             )
@@ -232,6 +232,19 @@ impl DeskStore {
             )
             .await?;
         Ok(n == 1)
+    }
+
+    /// The open items `boss`'s held cards put to the person: a roundup
+    /// leaves them to their cards, which come with its buttons.
+    pub async fn cards_held_items(&self, boss: &str) -> Result<Vec<Uuid>> {
+        let client = self.pool().get().await?;
+        let rows = client
+            .query(
+                "SELECT item_id FROM boss_held_cards WHERE boss = $1 AND item_id IS NOT NULL",
+                &[&boss],
+            )
+            .await?;
+        Ok(rows.iter().filter_map(|r| r.get(0)).collect())
     }
 
     /// Held card `id` went out, or never will: forgotten.

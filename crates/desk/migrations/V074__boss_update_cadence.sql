@@ -6,3 +6,6 @@
 ALTER TABLE boss_decisions ADD COLUMN important TEXT;
 ALTER TABLE boss_update_state ADD COLUMN routed_at TIMESTAMPTZ;
 ALTER TABLE boss_update_state ADD COLUMN roundup_at TIMESTAMPTZ;
+-- A boss already running starts its roundups from its last update, never
+-- from when it began.
+UPDATE boss_update_state SET roundup_at = COALESCE(last_update_at, since);

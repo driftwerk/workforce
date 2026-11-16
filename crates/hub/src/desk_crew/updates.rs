@@ -35,7 +35,7 @@ use uuid::Uuid;
 use workforce_common::channels::desk::{DeliveryKind, DeskPlace, DeskTarget};
 use workforce_common::channels::DESK_CHANNEL;
 use workforce_common::oversight::Oversight;
-use workforce_common::oversight::{Cadence, Route};
+use workforce_common::oversight::{Cadence, RoundupEvery, Route};
 use workforce_desk::account::{Account, Done};
 use workforce_desk::crew::Extras;
 use workforce_desk::decision::{BossDecision, DecisionKind, DecisionLine, Need};
@@ -148,12 +148,14 @@ impl Batch {
     /// once, the decisions that do, and what needs the person when it
     /// does. What goes in the roundup, or only when asked, is left out;
     /// what each session's account said is kept whole, so it is all told.
-    fn right_away(self, c: &Cadence, quiet: bool) -> Batch {
+    ///
+    /// What waits keeps what was last told of it (`was`), so the roundup
+    /// still finds it changed: a new next step or wait is said then.
+    fn right_away(self, c: &Cadence, quiet: bool, was: &HashMap<Uuid, Told>) -> Batch {
         let now = |k: EventKind| cadence::route(k, c, quiet) == Route::RightAway;
-        let sessions: Vec<Changed> = self
-            .sessions
-            .into_iter()
-            .filter(|s| {
+        let mut told = self.told;
+        let (sessions, waits): (Vec<Changed>, Vec<Changed>) =
+            self.sessions.into_iter().partition(|s| {
                 let new: Vec<&Done> = s.new.iter().collect();
                 // What comes next, or what it waits on, changed: progress.
                 let kind = match new.is_empty() {
@@ -161,8 +163,13 @@ impl Batch {
                     false => write::kind_of(&new, &[]),
                 };
                 now(kind)
-            })
-            .collect();
+            });
+        for s in &waits {
+            match was.get(&s.id) {
+                Some(t) => told.insert(s.id, t.clone()),
+                None => told.remove(&s.id),
+            };
+        }
         let decisions: Vec<BossDecision> = self
             .decisions
             .into_iter()
@@ -206,7 +213,7 @@ impl Batch {
             waiting,
             for_you,
             restated,
-            told: self.told,
+            told,
             noted: self.noted && needs,
         }
     }
@@ -813,17 +820,27 @@ impl CrewHub {
         // now), while they are here and nothing is being written to them:
         // what happened since the last, as one message.
         if !away && !held {
-            let last = state.roundup_at.unwrap_or(state.since);
+            // Since the last roundup; with none, since what was last said:
+            // never all since the boss began. With roundups never, the one
+            // that comes as the quiet hours end says only what they held.
+            let said = state.last_update_at.unwrap_or(state.since);
+            let last = match c.roundup {
+                RoundupEvery::Never => said.max(state.roundup_at.unwrap_or(said)),
+                _ => state.roundup_at.unwrap_or(said),
+            };
             let asked = self.roundup_asked.lock().remove(boss);
             if asked || cadence::roundup_due(&c, last, now, &tz) {
-                if let Some(p) = self.roundup(service, &owner, o, &state, last, now).await? {
+                if let Some(p) = self
+                    .roundup(service, &owner, o, &state, last, now, asked)
+                    .await?
+                {
                     return self.resume(service, &owner, o, &state, p).await;
                 }
             }
         }
         let all = self.batch(service, o, &state, now, None).await;
         let something = all.change != Change::None;
-        let b = all.right_away(&c, cadence::quiet_now(&c, now, &tz));
+        let b = all.right_away(&c, cadence::quiet_now(&c, now, &tz), &state.told);
         if b.change == Change::None && something && state.gather_since.is_none() {
             // All of it waits for the roundup, or for the person's asking:
             // routed, and nothing goes now.
@@ -882,7 +899,7 @@ impl CrewHub {
     /// decided without them that is important (or every one, as they
     /// chose), what finished, what is worth knowing, what is still going;
     /// the rest counted as routine. What came right away is folded in.
-    async fn roundup(
+    pub(super) async fn roundup(
         &self,
         service: &Arc<AgentService>,
         owner: &str,
@@ -890,14 +907,28 @@ impl CrewHub {
         state: &UpdateState,
         since: DateTime<Utc>,
         now: DateTime<Utc>,
+        asked: bool,
     ) -> eyre::Result<Option<Pending>> {
         let boss = service.agent_id.as_str();
         let c = o.updates.cadence;
+        // What a held card puts to the person comes with that card.
+        let carded = self
+            .desk
+            .store()
+            .cards_held_items(boss)
+            .await
+            .unwrap_or_default();
         let b = self.batch(service, o, state, now, Some(since)).await;
         let (mut u, _, composed) = self.written(boss, owner, o, &b, now).await;
         let mut lines: Vec<(SectionKey, Said)> = Vec::new();
         // What the person can answer or lift, each with its session.
         for n in &u.needs_you {
+            if n.item_id
+                .parse::<Uuid>()
+                .is_ok_and(|id| carded.contains(&id))
+            {
+                continue;
+            }
             let session = n
                 .session_id
                 .as_deref()
@@ -991,16 +1022,23 @@ impl CrewHub {
             ));
         }
         let r = Roundup::of(since, lines, routine);
-        if r.is_empty() && u.closed.is_empty() {
+        let nothing = r.is_empty() && u.closed.is_empty();
+        if nothing && !asked {
             self.desk.store().update_rounded(boss, now).await?;
             return Ok(None);
         }
         // Its headline is what matters most, in a line: the composer's, or
-        // in counts.
-        if !composed {
+        // in counts; asked for with nothing to say, it says so.
+        if nothing {
+            let at = since.with_timezone(&self.desk.timezone()).format("%H:%M");
+            u.headline = format!("Nothing new since {at}.");
+        } else if !composed {
             u.headline = r.plain_headline();
         }
-        let mut text = cadence::render(&u.headline, &r);
+        let mut text = match nothing {
+            true => u.headline.clone(),
+            false => cadence::render(&u.headline, &r),
+        };
         for l in &u.closed {
             text.push_str(&format!("\n\n{}", l.text));
         }

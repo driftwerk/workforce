@@ -838,7 +838,7 @@ fn cadence_of(t: Option<&Table>) -> Result<Cadence, String> {
         }
         Some(_) => return Err(also_wrong.into()),
     };
-    Ok(Cadence {
+    let c = Cadence {
         needs_you: route("needs_you", d.needs_you, "what needs you", false)?,
         problems: route("problems", d.problems, "problems", true)?,
         finished: route("finished", d.finished, "finished work", true)?,
@@ -854,7 +854,34 @@ fn cadence_of(t: Option<&Table>) -> Result<Cadence, String> {
         )?,
         decisions,
         also_to,
-    })
+    };
+    // A row kept for the roundup, with no roundups, would never be told.
+    if c.roundup == RoundupEvery::Never {
+        let names = [
+            "what needs you",
+            "problems",
+            "finished work",
+            "progress",
+            "routine things",
+        ];
+        let waiting: Vec<&str> = names
+            .into_iter()
+            .zip(c.rows())
+            .filter(|(_, r)| *r == Route::Roundup)
+            .map(|(n, _)| n)
+            .collect();
+        if !waiting.is_empty() {
+            return Err(format!(
+                "With no roundups, {} would never be told: send {} right away or only if you ask, or choose how often the roundup comes.",
+                waiting.join(" and "),
+                match waiting.len() {
+                    1 => "it",
+                    _ => "them",
+                }
+            ));
+        }
+    }
+    Ok(c)
 }
 
 /// `[oversight.full]` as written, or what is wrong with it.
@@ -1675,6 +1702,10 @@ mod tests {
             ("quiet_hours = \"07:00-07:00\"", "quiet hours"),
             ("decisions = \"some\"", "Which of its decisions"),
             ("also_to = [\"email\"]", "desk, slack and iphone"),
+            (
+                "roundup = \"never\"",
+                "With no roundups, finished work and progress would never be told",
+            ),
         ] {
             let e = parse(&format!("[oversight]\nupdates = {{ {toml} }}\n")).unwrap_err();
             assert!(e.contains(said), "{toml}: {e}");

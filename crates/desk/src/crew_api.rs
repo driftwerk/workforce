@@ -393,7 +393,7 @@ async fn roundup_now(
         return r;
     }
     match s.crew.roundup_now(&agent) {
-        true => StatusCode::ACCEPTED.into_response(),
+        true => StatusCode::NO_CONTENT.into_response(),
         false => error(StatusCode::NOT_FOUND, "There is no boss by that name here."),
     }
 }

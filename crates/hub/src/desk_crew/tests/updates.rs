@@ -892,7 +892,8 @@ async fn finished_work_waits_for_the_roundup_and_a_problem_comes_at_once() {
 }
 
 /// A roundup with nothing to say is skipped: no message, and the next
-/// starts from then.
+/// starts from then. Asked for ("Roundup now"), it says there is nothing
+/// new, in one line.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_empty_roundup_is_skipped() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
@@ -900,19 +901,100 @@ async fn an_empty_roundup_is_skipped() {
         let balanced = format!("{ACT}updates = {{ roundup = \"1h\", quiet_hours = \"\" }}\n");
         let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", &balanced, &[]).await;
         begun(&crew).await;
-        let before = chrono::Utc::now();
+        let (service, o) = crew.overseer_named("desk").unwrap();
+        let now = chrono::Utc::now();
+        let state = d.store().update_state("desk", now).await.unwrap();
+        let skipped = crew
+            .roundup(&service, PERSON, &o, &state, state.since, now, false)
+            .await
+            .unwrap();
+        assert!(skipped.is_none(), "nothing to say: no roundup");
+        let state = d.store().update_state("desk", now).await.unwrap();
+        assert!(
+            // Kept to the microsecond.
+            state
+                .roundup_at
+                .is_some_and(|at| at >= now - chrono::Duration::milliseconds(1)),
+            "the next starts from then"
+        );
+        assert!(updates(&overseer).is_empty());
+
         assert!(crew.roundup_now("desk"));
-        let state = eventually("the roundup looked at", async || {
-            d.store()
-                .update_state("desk", chrono::Utc::now())
-                .await
-                .ok()
-                .filter(|s| s.roundup_at.is_some_and(|at| at >= before))
-        })
-        .await;
-        assert!(state.pending.is_none());
-        assert!(updates(&overseer).is_empty(), "nothing to say: no roundup");
+        let said = eventually("the answer", async || updates(&overseer).into_iter().next()).await;
+        assert!(
+            said.content.starts_with("Nothing new since "),
+            "{}",
+            said.content
+        );
         assert!(!crew.roundup_now("nobody"));
+    })
+    .await;
+}
+
+/// The boss changes its own cadence on the person's word alone: in the
+/// DM turn their message began. Outside any turn, in a check-in, or in a
+/// turn another overseer relayed, it is refused and nothing is written.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_cadence_is_changed_only_on_the_persons_own_word() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, _d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        let tool =
+            super::super::tools::CrewTool::for_level(&crew, "desk", &Default::default(), false)
+                .into_iter()
+                .find(|t| workforce_agent::tools::Tool::name(t) == super::super::cadence_tool::NAME)
+                .expect("the cadence tool");
+        let run = |sid: Option<String>| {
+            let tool = &tool;
+            async move {
+                let input = serde_json::json!({ "roundup": "2h" });
+                let call = workforce_agent::tools::Tool::execute(tool, input);
+                match sid {
+                    Some(sid) => workforce_agent::runner::CURRENT_SESSION_ID
+                        .scope(sid, call)
+                        .await
+                        .unwrap(),
+                    None => call.await.unwrap(),
+                }
+            }
+        };
+        let path = overseer
+            .workspace
+            .join(workforce_common::config_files::WORKSPACE_CONFIG);
+        let written = || std::fs::read_to_string(&path).unwrap();
+        let before = written();
+        let dm = overseer
+            .sessions
+            .find(DESK_CHANNEL, PERSON)
+            .unwrap()
+            .unwrap();
+
+        // No turn, and the DM with no message of the person's.
+        assert!(!run(None).await.success);
+        assert!(!run(Some(dm.id.clone())).await.success);
+        // A check-in's own channel, though the person spoke in the DM.
+        crew.person_turns
+            .lock()
+            .insert(dm.id.clone(), "roundup every two hours".into());
+        let checkin = overseer
+            .sessions
+            .get_or_create(&format!("{DESK_CHANNEL}:checkin:x"), PERSON, "desk")
+            .unwrap();
+        overseer.sessions.save(&checkin).unwrap();
+        crew.person_turns
+            .lock()
+            .insert(checkin.id.clone(), "roundup every two hours".into());
+        assert!(!run(Some(checkin.id.clone())).await.success, "a check-in");
+        // Relayed by another overseer.
+        crew.relayed_turns.lock().insert(dm.id.clone());
+        assert!(!run(Some(dm.id.clone())).await.success, "relayed");
+        assert_eq!(written(), before, "nothing written");
+        crew.relayed_turns.lock().remove(&dm.id);
+
+        // The person's own message, in their DM's turn.
+        let r = run(Some(dm.id.clone())).await;
+        assert!(r.success, "{:?}", r.error);
+        assert!(written().contains("roundup = \"2h\""), "{}", written());
     })
     .await;
 }

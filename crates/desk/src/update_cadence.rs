@@ -103,11 +103,34 @@ const DELETE: &[&str] = &[
 const SPEND: &[&str] = &[
     "spend", "spent", "pay", "paid", "buy", "bought", "purchase", "budget",
 ];
-/// Words that say a message holds the step back rather than takes it.
+/// Words that say a message holds the step back rather than takes it,
+/// when they come just before the step ("don't merge", "wait for CI
+/// before merging", "hold off deploying").
 const HOLD: &[&str] = &[
-    "wait", "hold", "don't", "dont", "do not", "not yet", "never", "before", "until", "pause",
-    "stop", "without",
+    "wait", "hold", "don't", "dont", "not", "never", "before", "until", "pause", "stop", "without",
+    "off",
 ];
+/// How many words before a step a hold word holds it back.
+const HOLD_REACH: usize = 3;
+
+/// Whether every step `w` says is held back: a hold word in the few words
+/// just before it. "Merge it before the freeze" takes the step; "wait for
+/// green CI before merging" and "don't merge" hold it.
+fn held_back(w: &[String]) -> bool {
+    let steps = [MERGE, RELEASE, DELETE, SPEND];
+    let mut any = false;
+    for (i, x) in w.iter().enumerate() {
+        if !steps.iter().any(|l| l.contains(&x.as_str())) {
+            continue;
+        }
+        any = true;
+        let from = i.saturating_sub(HOLD_REACH);
+        if !w[from..i].iter().any(|h| HOLD.contains(&h.as_str())) {
+            return false;
+        }
+    }
+    any
+}
 /// Words that say a step is set to happen later.
 const LATER: &[&str] = &[
     "if",
@@ -161,7 +184,7 @@ pub fn important(kind: ActionKind, text: &str) -> Option<Important> {
         ActionKind::Approve => verb(),
         ActionKind::Message => {
             let v = verb()?;
-            if says(&w, HOLD) {
+            if held_back(&w) {
                 return None;
             }
             Some(match says(&w, LATER) {
@@ -206,6 +229,12 @@ pub fn decision_route(important: bool, c: &Cadence, quiet: bool) -> Route {
         (Decided::ImportantRightAway, true) => Route::RightAway,
         (_, false) => c.routine,
     };
+    // With no roundups, what would wait for one comes right away (in
+    // the quiet hours, as they end).
+    let r = match (r, c.roundup) {
+        (Route::Roundup, RoundupEvery::Never) => Route::RightAway,
+        (r, _) => r,
+    };
     match (r, quiet) {
         (Route::RightAway, true) => Route::Roundup,
         (r, _) => r,
@@ -246,42 +275,47 @@ pub fn quiet_now<Tz: TimeZone>(c: &Cadence, now: DateTime<Utc>, tz: &Tz) -> bool
 /// The first roundup time of `c` after `after`, in `tz`: on the clock
 /// (every 30 minutes at :00 and :30, every hour at :00, every two hours at
 /// even hours) or at morning, lunch and end of day, never in the quiet
-/// hours; none when roundups never come.
+/// hours. With roundups never, the end of the quiet hours is the one time
+/// a roundup comes: what was held through them is said then, never lost.
+/// None only with no roundups and no quiet hours. Each time is a local
+/// clock time, so a change of clock neither moves nor skips one; a time
+/// the clock jumps over is left out.
 pub fn next_roundup<Tz: TimeZone>(
     c: &Cadence,
     after: DateTime<Utc>,
     tz: &Tz,
 ) -> Option<DateTime<Utc>> {
-    let step = match c.roundup {
-        RoundupEvery::Never => return None,
-        RoundupEvery::Minutes(m) => m.clamp(30, 120),
-        // The meal times are on the half hour.
-        RoundupEvery::Meals => 30,
-    };
-    let local = after.with_timezone(tz);
-    let minutes = local.hour() * 60 + local.minute();
-    // The next slot of `step` minutes on the clock, strictly after.
-    let first = (minutes / step + 1) * step;
-    let midnight = local
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .and_then(|m| tz.from_local_datetime(&m).earliest())?
-        .with_timezone(&Utc);
-    // Two days of slots is always enough to find one out of quiet hours.
-    for k in 0..(2 * 24 * 60 / step + 2) {
-        let at = midnight + Duration::minutes(i64::from(first + k * step));
-        if at <= after {
-            continue;
+    let local = after.with_timezone(tz).date_naive();
+    // The local clock times of a day that a roundup comes at.
+    let times: Vec<u32> = match c.roundup {
+        RoundupEvery::Never => match c.quiet_hours {
+            Some((_, (uh, um))) => vec![uh * 60 + um],
+            None => return None,
+        },
+        RoundupEvery::Minutes(m) => {
+            let step = m.clamp(30, 120);
+            (0..24 * 60 / step).map(|k| k * step).collect()
         }
-        let t = at.with_timezone(tz).time();
-        let on = match c.roundup {
-            RoundupEvery::Meals => RoundupEvery::MEALS
-                .iter()
-                .any(|(h, m)| t.hour() == *h && t.minute() == *m),
-            _ => true,
-        };
-        if on && !in_quiet(c.quiet_hours, t) {
-            return Some(at);
+        RoundupEvery::Meals => RoundupEvery::MEALS
+            .iter()
+            .map(|(h, m)| h * 60 + m)
+            .collect(),
+    };
+    let never = c.roundup == RoundupEvery::Never;
+    // Three days of times is always enough to find one out of quiet hours.
+    for day in 0..3 {
+        let date = local + Duration::days(day);
+        for m in &times {
+            let Some(t) = NaiveTime::from_hms_opt(m / 60, m % 60, 0) else {
+                continue;
+            };
+            let Some(at) = tz.from_local_datetime(&date.and_time(t)).earliest() else {
+                continue;
+            };
+            let at = at.with_timezone(&Utc);
+            if at > after && (never || !in_quiet(c.quiet_hours, t)) {
+                return Some(at);
+            }
         }
     }
     None
@@ -537,6 +571,10 @@ mod tests {
         now.decisions = Decided::ImportantRightAway;
         assert_eq!(decision_route(true, &now, false), Route::RightAway);
         assert_eq!(decision_route(true, &now, true), Route::Roundup);
+        // As it happens: an important decision comes at once too, there
+        // being no roundup to wait for.
+        let plain = Cadence::preset("as_it_happens").unwrap();
+        assert_eq!(decision_route(true, &plain, false), Route::RightAway);
 
         // What needs the person waits only when they said so.
         let utc = chrono_tz::UTC;
@@ -601,6 +639,21 @@ mod tests {
             None
         );
         assert_eq!(important(Message, "Don't deploy tonight."), None);
+        assert_eq!(important(Message, "Hold off deploying it."), None);
+        assert_eq!(important(Message, "Do not merge yet."), None);
+        // A hold word elsewhere in the message holds nothing back.
+        assert_eq!(
+            important(Message, "Merge it before the freeze."),
+            Some(Important::Merged)
+        );
+        assert_eq!(
+            important(Message, "Release without the flag."),
+            Some(Important::Released)
+        );
+        assert_eq!(
+            important(Message, "Stop the watcher and delete the old build files."),
+            Some(Important::Deleted)
+        );
         assert_eq!(important(Message, "Run the tests again."), None);
         assert_eq!(important(Other, "restarted web"), None);
 
@@ -662,9 +715,51 @@ mod tests {
             next_roundup(&meals, at("2026-11-16T17:30:00Z"), &tz),
             Some(at("2026-11-17T09:00:00Z"))
         );
+        // No roundups: what the quiet hours held is said as they end, so
+        // nothing held is lost; with no quiet hours either, never.
         let mut never = c;
         never.roundup = RoundupEvery::Never;
+        assert_eq!(
+            next_roundup(&never, at("2026-11-16T09:10:00Z"), &tz),
+            Some(at("2026-11-17T07:00:00Z"))
+        );
+        never.quiet_hours = None;
         assert_eq!(next_roundup(&never, at("2026-11-16T09:10:00Z"), &tz), None);
+    }
+
+    /// A change of clock neither skips nor moves a roundup: each is a
+    /// local clock time, and one the clock jumps over is left out.
+    #[test]
+    fn roundups_keep_to_the_local_clock_over_a_change_of_clock() {
+        let london = chrono_tz::Europe::London;
+        let mut c = balanced();
+        c.quiet_hours = None;
+        // 29 Mar 2026: 01:00 GMT becomes 02:00 BST. At 10:10 BST the next
+        // hourly roundup is 11:00 BST (10:00Z).
+        assert_eq!(
+            next_roundup(&c, at("2026-03-29T09:10:00Z"), &london),
+            Some(at("2026-03-29T10:00:00Z"))
+        );
+        // Every two hours: even local hours, 12:00 BST.
+        let mut two = c;
+        two.roundup = RoundupEvery::Minutes(120);
+        assert_eq!(
+            next_roundup(&two, at("2026-03-29T09:10:00Z"), &london),
+            Some(at("2026-03-29T11:00:00Z"))
+        );
+        // 00:30 GMT: the 01:00 slot doesn't exist that day; the next is
+        // 02:00 BST (01:00Z) — 01:00Z is 02:00 BST.
+        assert_eq!(
+            next_roundup(&c, at("2026-03-29T00:30:00Z"), &london),
+            Some(at("2026-03-29T01:00:00Z"))
+        );
+        // A zone whose midnight is skipped still has that day's roundups.
+        let santiago = chrono_tz::America::Santiago;
+        assert!(next_roundup(&c, at("2026-09-06T03:30:00Z"), &santiago).is_some());
+        // What needs the person, held for the roundup, is held to a time.
+        let mut held = c;
+        held.needs_you = Route::Roundup;
+        assert!(held_until(&held, at("2026-03-29T00:30:00Z"), &london).is_some());
     }
 
     fn line(kind: EventKind, headline: &str) -> Said {

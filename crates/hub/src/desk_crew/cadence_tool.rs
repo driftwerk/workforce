@@ -195,6 +195,26 @@ pub fn describe(c: &Cadence) -> String {
 }
 
 impl CrewHub {
+    /// Whether `sid`, the turn a tool runs in, is the boss `b`'s DM
+    /// answering the person's own message: their words are kept for it and
+    /// no other overseer relayed it.
+    pub(super) fn persons_turn(&self, b: &Bound, sid: &str) -> bool {
+        let in_dm = b
+            .service
+            .sessions
+            .get(sid)
+            .ok()
+            .flatten()
+            .is_some_and(|s| s.channel == DESK_CHANNEL);
+        in_dm
+            && !self.relayed_turns.lock().contains(sid)
+            && self
+                .person_turns
+                .lock()
+                .get(sid)
+                .is_some_and(|m| !m.trim().is_empty())
+    }
+
     /// `crew.updates_cadence` for the boss `b`: its cadence as it is, or
     /// changed as `input` says, in a turn answering the person's own
     /// message alone.
@@ -206,23 +226,14 @@ impl CrewHub {
                 describe(&b.oversight.updates.cadence)
             )));
         }
-        let owner = self
-            .person(Some(&b.service))
-            .ok_or("There is no person to change it for.")?;
-        // Their word, in their own message this turn answers: never a
-        // check-in, a session's text or another overseer's.
-        let theirs = b
-            .service
-            .sessions
-            .find(DESK_CHANNEL, &owner)
-            .ok()
-            .flatten()
-            .is_some_and(|dm| {
-                self.person_turns
-                    .lock()
-                    .get(&dm.id)
-                    .is_some_and(|m| !m.trim().is_empty())
-            });
+        // Their word, in their own message this very turn answers: the
+        // call runs in the DM's turn, one the person's message began, not
+        // relayed by another overseer. Never a check-in, a turn on another
+        // channel, or a session's text.
+        let turn = workforce_agent::runner::CURRENT_SESSION_ID
+            .try_with(Clone::clone)
+            .ok();
+        let theirs = turn.as_deref().is_some_and(|sid| self.persons_turn(b, sid));
         if !theirs {
             return Err("Only the person changes how you tell them things, in their own message to you: suggest it to them instead.".into());
         }
@@ -232,6 +243,9 @@ impl CrewHub {
                     .into(),
             );
         }
+        let owner = self
+            .person(Some(&b.service))
+            .ok_or("There is no person to change it for.")?;
         let path = b
             .service
             .workspace
