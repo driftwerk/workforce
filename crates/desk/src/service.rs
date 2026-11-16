@@ -2126,8 +2126,18 @@ impl Desk {
                 self.devin_launched(id, started_at);
             }
             tokio::spawn(self.clone().on_exit(id, record.engine, exit));
-            if !record.state.is_running() {
-                self.change(id, |r, _| r.state = SessionState::Idle);
+            // Its process is the holder's, so it is Desk's: a record that
+            // says another terminal's (as a stopping hub could leave it) is
+            // put right.
+            let foreign = record.origin != Origin::Desk || record.external_pid.is_some();
+            if foreign || !record.state.is_running() {
+                self.change(id, |r, _| {
+                    r.origin = Origin::Desk;
+                    r.external_pid = None;
+                    if !r.state.is_running() {
+                        r.state = SessionState::Idle;
+                    }
+                });
             } else {
                 self.publish(id);
             }
@@ -7423,14 +7433,32 @@ impl Desk {
             .into_iter()
             .filter(|e| !hub.holds(Path::new(&e.cwd)))
             .collect();
-        let table = if hub.knows_its_own() && found.iter().any(|e| e.pid.is_some()) {
-            procs::table().await.unwrap_or_default()
-        } else {
-            Vec::new()
+        // The PTY holder's own children are Desk's sessions, whether this
+        // hub holds them now or lost its link to the holder: never another
+        // terminal's.
+        let holder = self.0.opts.holder.as_ref().and_then(|h| {
+            std::fs::read_to_string(crate::holder::pid_file(&h.socket))
+                .ok()?
+                .trim()
+                .parse::<u32>()
+                .ok()
+        });
+        let table =
+            if (hub.knows_its_own() || holder.is_some()) && found.iter().any(|e| e.pid.is_some()) {
+                procs::table().await.unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+        let holders = |pid: i32| {
+            holder.is_some_and(|holder| {
+                u32::try_from(pid)
+                    .is_ok_and(|pid| table.iter().any(|p| p.pid == pid && p.ppid == holder))
+            })
         };
-        let found = found
-            .into_iter()
-            .filter(|e| !e.pid.is_some_and(|pid| hub.started(&table, pid)));
+        let found = found.into_iter().filter(|e| {
+            !e.pid
+                .is_some_and(|pid| hub.started(&table, pid) || holders(pid))
+        });
         // Ones the person removed stay removed, until they track them again.
         let found: Vec<External> = found
             .filter(|e| !self.is_hidden(Engine::Claude, &e.session_id))
@@ -7441,6 +7469,13 @@ impl Desk {
         let home = self.0.env.get("HOME").map(PathBuf::from);
         let (ours, by_cli): (HashSet<String>, HashMap<String, Uuid>) = {
             let st = self.0.state.lock();
+            // Stopping: [`Self::shutdown`] lets go of every session (under
+            // this lock, once cancelled), and the holder's would each look
+            // like another terminal's. What the listing says is the next
+            // hub's to read.
+            if self.0.cancel.is_cancelled() {
+                return;
+            }
             (
                 // Running here, or in one of Desk's terminals (whose hooks
                 // report it): never another terminal's.
@@ -7573,6 +7608,9 @@ impl Desk {
         }
         let gone: Vec<Uuid> = {
             let st = self.0.state.lock();
+            if self.0.cancel.is_cancelled() {
+                return;
+            }
             st.records
                 .values()
                 .filter(|r| r.origin == Origin::External && r.state.is_running())
@@ -8328,7 +8366,9 @@ mod tests {
             )
             .await
             .unwrap();
-            assert!(second.view(s.id).unwrap().live, "taken back");
+            let back = second.view(s.id).unwrap();
+            assert!(back.live, "taken back");
+            assert_eq!(back.origin, Origin::Desk, "the holder's process is Desk's");
             // `claude agents` lists it, running in the holder.
             let listed = adopt::parse(
                 json!([{ "pid": pid, "cwd": s.cwd, "kind": "interactive",
@@ -8346,6 +8386,108 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(200)).await;
             let saved = DeskStore::from_pool(pool).get(s.id).await.unwrap().unwrap();
             assert_ne!(saved.state, SessionState::Closed);
+            assert_eq!((saved.origin, saved.external_pid), (Origin::Desk, None));
+            holder_cancel.cancel();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_session_the_holder_runs_is_never_another_terminals_when_the_hub_loses_it() {
+        with_test_pool(build_pool, |pool| async move {
+            let (_hdir, socket, holder_cancel) = crate::holder::tests::holder().await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut opts = options(dir.path());
+            opts.holder = Some(HolderOptions {
+                socket: socket.clone(),
+                token: crate::holder::tests::TOKEN.into(),
+            });
+            DeskStore::migrate(&pool).await.unwrap();
+            let d = Desk::start(
+                DeskStore::from_pool(pool),
+                opts,
+                Default::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let s = new_session(&d, dir.path()).await;
+            let pid = d.attach(s.id).unwrap().pid().unwrap() as i32;
+            d.change(s.id, |r, _| {
+                r.cli_session_id = Some("cli-held".into());
+                r.state = SessionState::Idle;
+            });
+            // Its link to the holder gone (as a lost connection leaves it):
+            // the process runs on in the holder.
+            let lost = d.0.state.lock().live.remove(&s.id);
+            assert!(lost.is_some());
+            drop(lost);
+            let listed = adopt::parse(
+                json!([{ "pid": pid, "cwd": s.cwd, "kind": "interactive",
+                    "sessionId": "cli-held", "status": "busy" }])
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+            d.reconcile_external(listed).await;
+            let v = d.view(s.id).unwrap();
+            assert_eq!(v.origin, Origin::Desk, "the holder's child is Desk's");
+            assert_ne!(v.state, SessionState::Closed);
+            holder_cancel.cancel();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_stopping_hub_never_takes_the_holders_sessions_for_another_terminals() {
+        with_test_pool(build_pool, |pool| async move {
+            let (_hdir, socket, holder_cancel) = crate::holder::tests::holder().await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut opts = options(dir.path());
+            opts.holder = Some(HolderOptions {
+                socket: socket.clone(),
+                token: crate::holder::tests::TOKEN.into(),
+            });
+            DeskStore::migrate(&pool).await.unwrap();
+            let cancel = CancellationToken::new();
+            let d = Desk::start(
+                DeskStore::from_pool(pool.clone()),
+                opts,
+                Default::default(),
+                cancel.clone(),
+            )
+            .await
+            .unwrap();
+            let s = new_session(&d, dir.path()).await;
+            let pid = d.attach(s.id).unwrap().pid().unwrap() as i32;
+            d.change(s.id, |r, _| {
+                r.cli_session_id = Some("cli-held".into());
+                r.state = SessionState::Idle;
+            });
+            cancel.cancel();
+            // Let go of every session, as a stopping hub does.
+            for _ in 0..100 {
+                if !d.view(s.id).unwrap().live {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(!d.view(s.id).unwrap().live);
+            // A listing read as it stops: its process runs on in the holder.
+            let listed = adopt::parse(
+                json!([{ "pid": pid, "cwd": s.cwd, "kind": "interactive",
+                    "sessionId": "cli-held", "status": "busy" }])
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+            d.reconcile_external(listed).await;
+            d.reconcile_external(Vec::new()).await;
+            let v = d.view(s.id).unwrap();
+            assert_eq!((v.origin, v.state), (Origin::Desk, SessionState::Idle));
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let saved = DeskStore::from_pool(pool).get(s.id).await.unwrap().unwrap();
+            assert_eq!((saved.origin, saved.external_pid), (Origin::Desk, None));
             holder_cancel.cancel();
         })
         .await;
