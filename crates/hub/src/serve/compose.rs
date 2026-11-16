@@ -2322,7 +2322,11 @@ impl LlmStack {
             let tier_reg =
                 workforce_agent::llm::tiers::TierRegistry::new(config_equivalences.as_ref());
             let base: Arc<dyn workforce_agent::llm::provider::LlmProvider> = Arc::from(base_llm);
-            crate::artifact_index::offer_agent_tagger(provider_kind_val, Arc::clone(&base));
+            crate::artifact_index::offer_agent_tagger(
+                provider_kind_val,
+                Arc::clone(&base),
+                resolved_at_build.background.light.clone(),
+            );
             let provider = Arc::new(
                 FailoverProvider::new(base, failover_config)
                     .with_tier_registry(tier_reg)

@@ -521,6 +521,9 @@ pub async fn lessons_cleanup(
         .clone()
         .ok_or_else(ApiError::service_unavailable)?;
     let llm = Arc::clone(&svc.llm);
+    // Background work: the light model (`[llm] light_model`), never the
+    // agent's chat model.
+    let model = crate::turn_loop::light_model(&svc);
 
     let job_id = uuid::Uuid::new_v4().to_string();
     let dry_run = body.dry_run.unwrap_or(true);
@@ -542,7 +545,7 @@ pub async fn lessons_cleanup(
         let opts = crate::lessons_cleanup::CleanupOptions {
             agent_ids,
             dry_run,
-            model: None,
+            model,
             merge_similarity,
             print: true,
         };
@@ -589,6 +592,8 @@ pub async fn lessons_backfill(
         .clone()
         .ok_or_else(ApiError::service_unavailable)?;
     let llm = Arc::clone(&svc.llm);
+    // Lessons are extracted on the lessons' model (the light one unless set).
+    let model = crate::turn_loop::lesson_extract_model(&svc);
     let data_dir = std::path::PathBuf::from(&svc.config.hub.data_dir);
 
     let job_id = uuid::Uuid::new_v4().to_string();
@@ -612,7 +617,7 @@ pub async fn lessons_backfill(
             agent_ids,
             since,
             dry_run,
-            model: None,
+            model,
             print_lessons: false,
         };
         let run = crate::lessons_backfill::run(&data_dir, llm, store, opts);

@@ -110,11 +110,12 @@ impl Subscriptions {
     }
 
     /// The artifact tagger on the hub's own logins, when the install's
-    /// `[llm]` provider is a subscription one.
+    /// `[llm]` provider is a subscription one: on that provider's light
+    /// background model (its cheap tier: Haiku on a Claude plan), not the
+    /// install's chat model.
     fn tagger(&self, config: &WorkforceConfig, vault: &Arc<Vault>) -> Option<Arc<dyn LlmProvider>> {
         let kind = routed_kind(&config.llm.provider).filter(|kind| kind.is_subscription())?;
-        let (_, model) = TierRegistry::new(None)
-            .resolve_routed_model(&config.llm.default_model, kind.canonical_name());
+        let model = tagger_model(&config.llm.default_model, kind);
         PlanLogins::new(
             self.clone(),
             CredentialScope::system(Arc::clone(vault), &config.subscription),
@@ -177,6 +178,28 @@ pub(crate) fn route_line(
         default_route.is_subscription(),
         |payer| uuid::Uuid::parse_str(payer).ok().and_then(&*lookup),
     )
+}
+
+/// The model a subscription tagger on `kind` runs on, for an install on
+/// `default_model`: the light background model, else that model itself.
+fn tagger_model(default_model: &str, kind: workforce_agent::llm::provider::ProviderKind) -> String {
+    let tiers = TierRegistry::new(None);
+    let written = crate::hub_core::resolved_config::Written {
+        light: None,
+        heavy: None,
+    };
+    crate::hub_core::resolved_config::BackgroundModels::resolve(
+        written,
+        default_model,
+        &tiers,
+        kind.canonical_name(),
+    )
+    .light
+    .unwrap_or_else(|| {
+        tiers
+            .resolve_routed_model(default_model, kind.canonical_name())
+            .1
+    })
 }
 
 #[cfg(test)]
