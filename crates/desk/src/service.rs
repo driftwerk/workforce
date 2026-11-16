@@ -1907,6 +1907,10 @@ impl Desk {
             let ids = desk
                 .restore_offer()
                 .into_iter()
+                // At `Ask` only Desk's own: one from another terminal ended
+                // there, not with the hub, and the listing may not have said
+                // whether its process still runs.
+                .filter(|s| desk.0.opts.restore == RestorePolicy::Auto || s.origin == Origin::Desk)
                 .map(|s| s.id)
                 .collect::<Vec<_>>();
             desk.restore(&ids, None).await;
@@ -8620,6 +8624,33 @@ mod tests {
                 "a new process"
             );
             assert!(d.restore_offer().is_empty(), "nothing left to bring back");
+            holder_cancel.cancel();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn another_terminals_session_lost_in_a_restart_is_offered_not_resumed() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let store = DeskStore::from_pool(pool.clone());
+            DeskStore::migrate(&pool).await.unwrap();
+            let elsewhere = SessionRecord {
+                origin: Origin::External,
+                state: SessionState::Idle,
+                cli_session_id: Some("cli-iterm".into()),
+                external_pid: None,
+                terminal_id: None,
+                ..crate::store::tests::record_fixture("iterm")
+            };
+            store.put(&elsewhere).await.unwrap();
+            let (d, _, holder_cancel, _hdir) = restarted_with_ended(pool, dir.path(), 1).await;
+            let v = d.view(elsewhere.id).unwrap();
+            assert!(!v.live, "never started by Desk on its own");
+            assert!(
+                d.restore_offer().iter().any(|o| o.id == elsewhere.id),
+                "offered"
+            );
             holder_cancel.cancel();
         })
         .await;
