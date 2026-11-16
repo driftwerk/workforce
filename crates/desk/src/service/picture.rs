@@ -42,27 +42,31 @@ impl Desk {
     }
 
     /// Reads back what Postgres kept of the picture, once: what was said
-    /// here before is numbered after it and written.
-    pub async fn picture_load(&self) {
+    /// here before is numbered after it and written. False when it
+    /// couldn't be read: nothing is written until it is (call again).
+    /// One writer per database: the numbers are this process's.
+    pub async fn picture_load(&self) -> bool {
         if self.0.picture.lock().loaded() {
-            return;
+            return true;
         }
         match self.0.store.picture_load(Utc::now()).await {
             Ok((rows, top)) => {
                 let pending = {
                     let mut p = self.0.picture.lock();
                     if p.loaded() {
-                        return;
+                        return true;
                     }
                     p.load(rows, top)
                 };
                 self.picture_write(pending);
+                true
             }
             Err(e) => {
                 tracing::warn!(
                     error = format!("{e:#}"),
                     "couldn't read the bosses' picture back"
                 );
+                false
             }
         }
     }

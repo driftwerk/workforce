@@ -5751,11 +5751,16 @@ impl Desk {
             Hook::Prompt(p) => {
                 // The person's own words: a session its breaker holds goes
                 // on, and its line's loop guard starts again.
+                // Typed at its terminal, not by Desk for them: what Desk
+                // typed is in the picture from when it was written.
+                let at_terminal = !self.desk_typed(id, &p);
                 let person = self.person_prompted(id, &p);
                 if person {
                     // In the bosses' picture first: none of them sends it
                     // anything decided before it.
-                    self.picture_person_said(id, &p);
+                    if at_terminal {
+                        self.picture_person_said(id, &p);
+                    }
                     self.person_spoke(id);
                     self.person_drove(id);
                 }
@@ -6992,6 +6997,10 @@ impl Desk {
             }
             // A line message Desk typed in is not the person speaking; whose
             // a prompt is, is read once.
+            let at_terminal = match &event {
+                CodexEvent::Prompt(p) => !self.desk_typed(id, p),
+                _ => false,
+            };
             let prompted = match &event {
                 CodexEvent::Prompt(p) => Some(self.person_prompted(id, p)),
                 _ => None,
@@ -7004,7 +7013,9 @@ impl Desk {
                     }
                     None => {
                         if prompted == Some(true) {
-                            self.picture_person_said(id, p);
+                            if at_terminal {
+                                self.picture_person_said(id, p);
+                            }
                             self.person_spoke(id);
                             self.person_drove(id);
                         }
