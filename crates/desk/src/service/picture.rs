@@ -105,6 +105,33 @@ impl Desk {
         self.0.picture.lock().last_instruction(boss, session)
     }
 
+    /// Whether `m`, a boss's message waiting to go into its session, was
+    /// overtaken by the person's own words there since it was written: it
+    /// is withdrawn, never delivered, and the boss decides again on what
+    /// they said (its picture has it).
+    pub(super) async fn line_overtaken(&self, m: &crate::line::LineMessage) -> bool {
+        let Some(s) = m.to_session() else {
+            return false;
+        };
+        if m.from.kind != crate::crew::PartyKind::Manager
+            || m.kind != crate::line::LineKind::Tell
+            || !self.0.picture.lock().person_since(s, m.at)
+        {
+            return false;
+        }
+        match self.line_withdraw(m.id).await {
+            Ok(Some(_)) => {
+                tracing::info!(session = %s, message = %m.id, "a boss's message the person's own words overtook was withdrawn");
+                true
+            }
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(session = %s, error = %e, "couldn't withdraw an overtaken message");
+                false
+            }
+        }
+    }
+
     /// The person's own words into session `id` (a prompt, a message from
     /// Desk, an answer to its question).
     pub(super) fn picture_person_said(&self, id: Uuid, text: &str) {

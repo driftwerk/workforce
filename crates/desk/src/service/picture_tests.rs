@@ -137,3 +137,43 @@ async fn the_picture_outlives_a_restart_and_numbering_goes_on() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn a_boss_message_the_persons_own_words_overtook_is_withdrawn_never_delivered() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        d.picture_load().await;
+        let a = new_session(&d, dir.path()).await;
+        let view = d.view(a.id).unwrap();
+        let queued = |text: &str| {
+            let mut m = crate::line::LineMessage::new(
+                crate::crew::Party::manager("boss", "Boss"),
+                crate::crew::Party::session(&view),
+                crate::line::LineKind::Tell,
+                text.into(),
+                1,
+            );
+            m.delivery = crate::line::Delivery::Queued;
+            m
+        };
+        // The boss's message waits for the session's turn to end...
+        let before = queued("Open the PR for the picker.");
+        d.store().put_line(&before).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        // ...and the person, in the session, says otherwise.
+        d.picture_person_said(a.id, "Don't open a PR: I'm reworking the picker.");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        // What the boss decides after their words stands.
+        let after = queued("Understood: no PR. Review the rework when they hand it back.");
+        d.store().put_line(&after).await.unwrap();
+        d.line_pump(a.id).await;
+        let delivery = |id| {
+            let d = d.clone();
+            async move { d.store().line_message(id).await.unwrap().unwrap().delivery }
+        };
+        assert_eq!(delivery(before.id).await, crate::line::Delivery::Withdrawn);
+        assert_ne!(delivery(after.id).await, crate::line::Delivery::Withdrawn);
+    })
+    .await;
+}

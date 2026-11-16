@@ -308,6 +308,15 @@ impl Picture {
         out
     }
 
+    /// Whether the person said something into `session` after `at`.
+    pub fn person_since(&self, session: Uuid, at: DateTime<Utc>) -> bool {
+        self.rows
+            .iter()
+            .rev()
+            .take_while(|r| r.at > at)
+            .any(|r| r.what == What::PersonSaid && r.session == Some(session))
+    }
+
     /// The last instruction `boss` sent `session`, if any is still kept.
     pub fn last_instruction(&self, boss: &str, session: Uuid) -> Option<Happened> {
         self.rows

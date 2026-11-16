@@ -205,11 +205,19 @@ impl CrewHub {
         boss: &str,
         s: Uuid,
     ) -> Result<Option<String>, String> {
+        let tz = self.desk.timezone();
+        let name = self.session_name(s);
+        // The person drives it: nothing of the boss's goes to it, and
+        // nothing waits to go in over what they do there. Handed back, the
+        // boss is woken, and its picture has what they said in it.
+        if self.desk.person_in_control(s, self.desk.hold_for(boss)) {
+            return Ok(Some(format!(
+                "not sent: the person is driving {name} now, so nothing of yours goes to it. When they hand it back (or stop giving it input for a while) you're woken, with what they said in it, and decide then."
+            )));
+        }
         let Some(d) = self.deciding_now() else {
             return Ok(None);
         };
-        let tz = self.desk.timezone();
-        let name = self.session_name(s);
         let moved = self.desk.picture_since(boss, s, d.basis, Some(&d.turn));
         if !moved.is_empty() {
             // Told now: what it sends next stands on this.

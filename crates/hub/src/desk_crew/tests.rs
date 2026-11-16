@@ -3664,7 +3664,7 @@ async fn a_status_question_waits_for_the_turn_and_for_the_person_at_the_wheel() 
             .await
             .unwrap()
             .output;
-        assert!(waits["done"].as_str().unwrap_or_default().contains("the person is driving it"), "{waits}");
+        assert!(waits["done"].as_str().unwrap_or_default().contains("the person is driving"), "{waits}");
     })
     .await;
 }
