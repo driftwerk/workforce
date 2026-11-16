@@ -8536,6 +8536,7 @@ mod tests {
         pool: workforce_postgres::PostgresPool,
         dir: &Path,
         ends: usize,
+        lost_meanwhile: Option<&SessionRecord>,
     ) -> (
         Desk,
         Vec<(SessionView, u32)>,
@@ -8603,6 +8604,10 @@ mod tests {
             "the ended ones ended while the hub was away"
         );
         holder.close();
+        // Running when the last hub stopped, its process gone since.
+        if let Some(r) = lost_meanwhile {
+            DeskStore::from_pool(pool.clone()).put(r).await.unwrap();
+        }
         let second = Desk::start(
             DeskStore::from_pool(pool.clone()),
             opts,
@@ -8619,7 +8624,7 @@ mod tests {
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
             let (d, sessions, holder_cancel, _hdir) =
-                restarted_with_ended(pool, dir.path(), 1).await;
+                restarted_with_ended(pool, dir.path(), 1, None).await;
             let (kept, kept_pid) = &sessions[0];
             let (ended, ended_pid) = &sessions[1];
             assert_eq!(
@@ -8656,7 +8661,8 @@ mod tests {
                 ..crate::store::tests::record_fixture("offered")
             };
             store.put(&offered).await.unwrap();
-            let (d, _, holder_cancel, _hdir) = restarted_with_ended(pool, dir.path(), 1).await;
+            let (d, _, holder_cancel, _hdir) =
+                restarted_with_ended(pool, dir.path(), 1, None).await;
             assert!(
                 !d.view(offered.id).unwrap().live,
                 "never started on its own"
@@ -8674,8 +8680,6 @@ mod tests {
     async fn another_terminals_session_lost_in_a_restart_is_offered_not_resumed() {
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
-            let store = DeskStore::from_pool(pool.clone());
-            DeskStore::migrate(&pool).await.unwrap();
             let elsewhere = SessionRecord {
                 origin: Origin::External,
                 state: SessionState::Idle,
@@ -8685,8 +8689,8 @@ mod tests {
                 cwd: dir.path().display().to_string(),
                 ..crate::store::tests::record_fixture("iterm")
             };
-            store.put(&elsewhere).await.unwrap();
-            let (d, _, holder_cancel, _hdir) = restarted_with_ended(pool, dir.path(), 1).await;
+            let (d, _, holder_cancel, _hdir) =
+                restarted_with_ended(pool, dir.path(), 1, Some(&elsewhere)).await;
             let v = d.view(elsewhere.id).unwrap();
             assert!(!v.live, "never started by Desk on its own");
             assert!(
@@ -8703,7 +8707,7 @@ mod tests {
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
             let (d, sessions, holder_cancel, _hdir) =
-                restarted_with_ended(pool, dir.path(), 2).await;
+                restarted_with_ended(pool, dir.path(), 2, None).await;
             for (s, _) in &sessions {
                 let v = d.view(s.id).unwrap();
                 assert!(!v.live);
