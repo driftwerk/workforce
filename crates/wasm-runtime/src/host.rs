@@ -848,10 +848,11 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
         )
         .map_err(wt)?;
 
-    // env::wf_vault_get_redacted — read a secret and return it as
-    // `abcd…1234` (first 4 / last 4 chars) for use in agent-visible output
-    // like "is X configured?" tools. Skills that need cleartext for HTTP
-    // headers must use `wf_vault_get` and never embed the result in their
+    // env::wf_vault_get_redacted — read a secret and return it as `***`
+    // (no character of it) for use in agent-visible output like "is X
+    // configured?" tools: a set secret answers `***`, an unset one
+    // nothing. Skills that need cleartext for HTTP headers must use
+    // `wf_vault_get` and never embed the result in their
     // `WasmToolResponse`.
     linker
         .func_wrap(

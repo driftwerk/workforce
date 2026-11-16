@@ -86,26 +86,25 @@ pub(crate) fn labelled_patterns() -> impl Iterator<Item = (&'static str, &'stati
     patterns().iter().map(|p| (p.label, &p.regex))
 }
 
-/// Return a copy of `text` with any matched secret patterns replaced by
-/// `[REDACTED <LABEL>]`. When nothing matches the input is returned unchanged.
+/// Return a copy of `text` with any matched secret patterns replaced whole
+/// by `[REDACTED <LABEL>]`, keeping no prefix or suffix of a secret. When
+/// nothing matches the input is returned unchanged.
 ///
-/// Also renders any session-scoped secret markers (`[[secret:…]]`) as
-/// their `preview` form first, so an accidentally-leaked marker reads
-/// as `sk-an...wXyZ` rather than the full bracket grammar. Order is
-/// independent for correctness — markers don't share characters with
-/// any credential regex — but doing markers first keeps the regex
-/// scan working on shorter strings.
+/// Any session-scoped secret marker (`[[secret:…]]`) is rendered first as
+/// its preview, which never holds a character of the secret. Every
+/// pattern is then matched over that text and overlapping matches merged
+/// ([`workforce_common::redact::redact_spans`]), so a shorter pattern never
+/// leaves a longer secret's tail behind.
 pub fn redact_secrets(text: &str) -> String {
-    let mut out = workforce_common::secret_marker::render_markers_as_preview(text);
-    for p in patterns() {
-        if p.regex.is_match(&out) {
-            out = p
-                .regex
-                .replace_all(&out, format!("[REDACTED {}]", p.label))
-                .into_owned();
-        }
-    }
-    out
+    let out = workforce_common::secret_marker::render_markers_as_preview(text);
+    let found = labelled_patterns()
+        .flat_map(|(label, regex)| {
+            regex
+                .find_iter(&out)
+                .map(move |m| (m.start(), m.end(), label))
+        })
+        .collect();
+    workforce_common::redact::redact_spans(&out, found)
 }
 
 /// `text` with every secret the hub's list or the shared catalogue knows
@@ -129,27 +128,7 @@ pub fn hide_secrets(text: &str) -> String {
             }
         }
     }
-    if found.is_empty() {
-        return text.to_string();
-    }
-    // By start; at one start, the earlier pattern's label wins.
-    found.sort_by_key(|(start, _, _)| *start);
-    let mut merged: Vec<(usize, usize, &'static str)> = Vec::new();
-    for (start, end, label) in found {
-        match merged.last_mut() {
-            Some((_, last_end, _)) if start < *last_end => *last_end = (*last_end).max(end),
-            _ => merged.push((start, end, label)),
-        }
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut at = 0;
-    for (start, end, label) in merged {
-        out.push_str(&text[at..start]);
-        out.push_str(&format!("[REDACTED {label}]"));
-        at = end;
-    }
-    out.push_str(&text[at..]);
-    out
+    workforce_common::redact::redact_spans(text, found)
 }
 
 #[cfg(test)]
@@ -275,11 +254,21 @@ mod tests {
             "cdefghijklmnopqrstuvwxyz0123456789"
         );
         let r = redact_secrets(s);
-        // The ghp_ match runs first and rewrites the tail; what's left is
-        // "Authorization: Bearer [REDACTED GITHUB_PAT]" — the generic sweep
-        // should not then double-redact that into [REDACTED AUTH_HEADER]
-        // (brackets and uppercase don't match [A-Za-z0-9._~+/=-]{20,}).
-        assert!(r.contains("[REDACTED GITHUB_PAT]"));
-        assert_eq!(r.matches("REDACTED").count(), 1);
+        // The generic header and bearer matches hold the ghp_ one: merged,
+        // they are one secret, named by the most specific pattern.
+        assert_eq!(r, "[REDACTED GITHUB_PAT]");
+    }
+
+    /// A shorter match inside a longer secret never leaves its head or
+    /// tail behind: the spans are merged and hidden whole.
+    #[test]
+    fn no_head_or_tail_of_a_secret_is_left() {
+        let pat = concat!("ghp_ab", "cdefghijklmnopqrstuvwxyz0123456789");
+        let s = format!("Authorization: token {pat}.and-a-tail-0123456789abcdef");
+        let r = redact_secrets(&s);
+        assert!(!r.contains("ghp_") && !r.contains("6789"), "{r}");
+        let bearer = format!("bearer {pat}~tail-0123456789abcdefghij");
+        let r = redact_secrets(&bearer);
+        assert!(!r.contains("ghp_") && !r.contains("6789"), "{r}");
     }
 }

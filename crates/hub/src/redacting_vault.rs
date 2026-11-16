@@ -5,7 +5,7 @@
 //! agent-tool boundary is the only redaction site, applied as an output
 //! transform inside `crate::vault_tool::RedactionPolicy`.
 //!
-//! Modes: `Off` (cleartext), `Redact` (`abcd…1234`, default), `Deny`
+//! Modes: `Off` (cleartext), `Redact` (`***`, default), `Deny`
 //! (`None`). A non-secret allowlist passes routing pointers like
 //! `skills/jira/default_workspace` through cleartext.
 
@@ -90,15 +90,15 @@ pub enum Disclosure {
     /// Value passes through unchanged. Either `mode == Off` or the path
     /// is on the non-secret allowlist.
     Cleartext,
-    /// First 4 and last 4 chars (or `***` if too short).
+    /// `***`: no character of the value.
     Redacted,
     /// `None` returned in place of the value.
     Denied,
 }
 
 /// Re-export of [`workforce_common::redact::redact_value`] for callers
-/// that want the shared `abcd…1234` format without pulling in the whole
-/// redact module path.
+/// that want the shared `***` form (no character of the value) without
+/// pulling in the whole redact module path.
 pub use workforce_common::redact::redact_value as redact;
 
 #[cfg(test)]
@@ -107,8 +107,8 @@ mod tests {
 
     #[test]
     fn redact_long_value() {
-        assert_eq!(redact("abcdefghijklmnop"), "abcd…mnop");
-        assert_eq!(redact("0123456789abcdefghijklmnop"), "0123…mnop");
+        assert_eq!(redact("abcdefghijklmnop"), "***");
+        assert_eq!(redact("0123456789abcdefghijklmnop"), "***");
     }
 
     #[test]

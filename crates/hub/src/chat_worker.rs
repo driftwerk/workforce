@@ -32,7 +32,7 @@ const STREAM_DELTA_OVERLAP_BYTES: usize = 80;
 ///      bracket form;
 ///   2. defensively redact any cleartext credential pattern that
 ///      somehow reached the response (e.g. a tool-result that bypassed
-///      tokenization) using `first6...last4`.
+///      tokenization), each replaced whole by `[REDACTED <LABEL>]`.
 ///
 /// Used for `ToolStart` detail strings and complete (non-streamed)
 /// `Response` messages where there is no carry-over context.

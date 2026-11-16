@@ -574,8 +574,8 @@ fn clip(text: &str) -> String {
 
 /// Redact credential patterns from outbound text.
 ///
-/// Replaces detected secrets with `first6...last4` format using the
-/// comprehensive patterns from [`crate::redact`].
+/// Replaces each detected secret whole with `[REDACTED <LABEL>]`, nothing
+/// of it kept, using the comprehensive patterns from [`crate::redact`].
 pub fn redact_credentials(text: &str) -> String {
     crate::redact::redact_secrets(text)
 }

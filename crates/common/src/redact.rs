@@ -4,9 +4,10 @@
 //! Two modes of operation share the same pattern set:
 //!
 //!  * [`redact_secrets`] / [`contains_secret`] — log-side defence. A
-//!    detected secret is replaced with `first6...last4` (e.g.
-//!    `sk-ant...ABCD`); call this on anything heading to disk, stderr,
-//!    or a tracing event.
+//!    detected secret is replaced whole with `[REDACTED <LABEL>]`, no
+//!    prefix or suffix of it kept (a fragment of a credential is itself a
+//!    leak); call this on anything heading to disk, stderr, or a tracing
+//!    event.
 //!  * [`tokenize_secrets`] — LLM-side defence. A detected secret is
 //!    replaced with an opaque marker like
 //!    `[[secret:<id> type=ANTHROPIC_KEY preview=***]]` and the
@@ -73,6 +74,9 @@ pub fn is_credential_field(name: &str) -> bool {
 /// (`sk-ant-…` before generic `sk-…`). The catalogue aims to cover every
 /// credential format an agent or skill is likely to encounter; vendors
 /// without a fixed prefix are caught indirectly via `ENV_CREDENTIAL`.
+/// A pattern's capture group 1, if it has one, MUST be the whole value
+/// (`api_key=<value>`): it alone is hidden, the rest of the match kept.
+/// Any other group is `(?:…)`.
 static LABELLED_PATTERNS: Lazy<Vec<LabelledPattern>> = Lazy::new(|| {
     let raw: &[(&str, &str)] = &[
         // ── LLM providers ──
@@ -243,39 +247,73 @@ pub fn is_public(matched: &str) -> bool {
 static SECRET_PATTERNS: Lazy<Vec<&'static Regex>> =
     Lazy::new(|| LABELLED_PATTERNS.iter().map(|p| &p.regex).collect());
 
-/// Mask a secret value, showing only the first 6 and last 4 characters.
-fn mask_secret(secret: &str) -> String {
-    if secret.len() <= 10 {
-        return "***REDACTED***".to_string();
+/// `text` with each span of `found` (start, end, label) replaced whole by
+/// `[REDACTED <LABEL>]`. Overlapping spans are merged, so a shorter match
+/// never leaves a longer secret's head or tail behind. `found` is in the
+/// patterns' order, most specific first: of spans merged, the one listed
+/// first names them (`GITHUB_PAT` inside a generic `BEARER_TOKEN`). Each
+/// span's ends must fall on char boundaries, as a regex match's do.
+pub fn redact_spans(text: &str, found: Vec<(usize, usize, &'static str)>) -> String {
+    if found.is_empty() {
+        return text.to_string();
     }
-    // Use char-boundary-safe slicing to avoid panicking on multi-byte characters
-    let first_end = secret.floor_char_boundary(6);
-    let last_start = secret.ceil_char_boundary(secret.len().saturating_sub(4));
-    let first = &secret[..first_end];
-    let last = &secret[last_start..];
-    format!("{first}...{last}")
+    let mut found: Vec<(usize, usize, usize, &'static str)> = found
+        .into_iter()
+        .enumerate()
+        .map(|(rank, (start, end, label))| (start, end, rank, label))
+        .collect();
+    found.sort_by_key(|&(start, _, rank, _)| (start, rank));
+    let mut merged: Vec<(usize, usize, usize, &'static str)> = Vec::new();
+    for (start, end, rank, label) in found {
+        match merged.last_mut() {
+            Some(last) if start < last.1 => {
+                last.1 = last.1.max(end);
+                if rank < last.2 {
+                    (last.2, last.3) = (rank, label);
+                }
+            }
+            _ => merged.push((start, end, rank, label)),
+        }
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (start, end, _, label) in merged {
+        out.push_str(&text[at..start]);
+        out.push_str("[REDACTED ");
+        out.push_str(label);
+        out.push(']');
+        at = end;
+    }
+    out.push_str(&text[at..]);
+    out
 }
 
-/// Redact all detected secrets in a string.
+/// Redact all detected secrets in a string: each replaced whole by
+/// `[REDACTED <LABEL>]`, keeping no prefix or suffix of it. Every pattern
+/// is matched over the original text and overlapping matches merged
+/// ([`redact_spans`]). A secret marker (`[[secret:…]]`) and a value public
+/// by design are left as they are.
 pub fn redact_secrets(input: &str) -> String {
-    let mut result = input.to_string();
-
-    for pattern in SECRET_PATTERNS.iter() {
-        let spans = marker_spans(&result);
-        result = pattern
-            .replace_all(&result, |caps: &regex::Captures| {
-                let m = caps.get(0).expect("regex capture 0 missing");
-                let full = m.as_str();
-                if overlaps_any(m.start(), m.end(), &spans) || is_allowlisted(full) {
-                    full.to_string()
-                } else {
-                    mask_secret(full)
+    let markers = marker_spans(input);
+    let markers = &markers;
+    let found = LABELLED_PATTERNS
+        .iter()
+        .flat_map(|p| {
+            p.regex.captures_iter(input).filter_map(move |caps| {
+                let whole = caps.get(0)?;
+                if overlaps_any(whole.start(), whole.end(), markers)
+                    || is_allowlisted(whole.as_str())
+                {
+                    return None;
                 }
+                // A pattern that captures the value (`api_key=<value>`)
+                // hides the value alone, its name kept.
+                let m = caps.get(1).unwrap_or(whole);
+                Some((m.start(), m.end(), p.label))
             })
-            .to_string();
-    }
-
-    result
+        })
+        .collect();
+    redact_spans(input, found)
 }
 
 /// Check if a string likely contains secrets (excluding allowlisted
@@ -327,8 +365,8 @@ pub fn redact_json_strings(value: &mut serde_json::Value, max_depth: u8) -> bool
 /// function falls back to redacting in-place via the same form as
 /// [`redact_secrets`] and emits a `sentinel.audit` warning so the gap
 /// is visible. This keeps the function safe-by-default — the worst case
-/// is the LLM sees `[REDACTED first6...last4]` instead of a usable
-/// marker, never cleartext.
+/// is the LLM sees `[REDACTED <LABEL>]` instead of a usable marker,
+/// never cleartext nor any part of it.
 ///
 /// The pattern list is applied most-specific first; once a region is
 /// replaced with a marker, no other pattern can match the marker text
@@ -424,7 +462,7 @@ fn warn_on_unredacted_credentials(text: &str, session_key: &str) {
         let Some(val) = caps.get(1) else { continue };
         let val_str = val.as_str();
         if val_str.starts_with("[[secret:")
-            || val_str.contains("...")
+            || val_str.starts_with("[REDACTED")
             || val_str.starts_with("***")
             || is_allowlisted(val_str)
         {
@@ -439,29 +477,17 @@ fn warn_on_unredacted_credentials(text: &str, session_key: &str) {
     }
 }
 
-/// Redact a known-secret value to `abcd…1234` form (first 4 / last 4
-/// chars). Values shorter than 16 chars collapse to `***` so tiny
-/// secrets don't leak via short prefixes.
+/// A known-secret value as an LLM-facing tool may show it: always `***`,
+/// whatever its length. No character of it is shown, neither its head nor
+/// its tail: a fragment of a credential is itself a leak, and a prefix
+/// says which credential it is.
 ///
-/// Used by LLM-facing tool boundaries that need to confirm "a credential
-/// is configured" without disclosing the value itself. Distinct from
+/// Used by tool boundaries that need to confirm "a credential is
+/// configured" without disclosing the value itself. Distinct from
 /// [`redact_secrets`], which scans free-form strings for known token
 /// patterns; this one operates on a value already known to be a secret.
-pub fn redact_value(value: &str) -> String {
-    let chars: Vec<char> = value.chars().collect();
-    if chars.len() < 16 {
-        return "***".to_string();
-    }
-    let head: String = chars.iter().take(4).collect();
-    let tail: String = chars
-        .iter()
-        .rev()
-        .take(4)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("{head}…{tail}")
+pub fn redact_value(_value: &str) -> String {
+    "***".to_string()
 }
 
 const UNPARSEABLE_URL: &str = "<unparseable url>";
@@ -631,7 +657,7 @@ mod tests {
         );
         let result = redact_secrets(input);
         assert!(!result.contains("abcdefghijklmnopqrstuvwxyz"));
-        assert!(result.contains("sk-ant...7890"));
+        assert_eq!(result, "Using key [REDACTED ANTHROPIC_OAUTH_TOKEN]");
     }
 
     #[test]
@@ -652,7 +678,33 @@ mod tests {
         let input = concat!("Token: ghp_AB", "CDEFGHIJKLMNOPQRSTUVWXYZabcdefghij1234");
         let result = redact_secrets(input);
         assert!(!result.contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ"));
-        assert!(result.contains("ghp_AB...1234"));
+        assert_eq!(result, "Token: [REDACTED GITHUB_PAT]");
+    }
+
+    /// Never a head nor a tail of a secret, however the patterns overlap: a
+    /// shorter match inside a longer secret is merged into it, and a known
+    /// value is shown as `***` alone.
+    #[test]
+    fn masking_reveals_no_prefix_or_suffix() {
+        let pat = concat!("ghp_AB", "CDEFGHIJKLMNOPQRSTUVWXYZabcdefghij1234");
+        let oauth = concat!("sk-ant", "-oat01-abcdefghijklmnopqrstuvwxyz1234567890");
+        let bearer = format!("Bearer {oauth}");
+        for (text, secret) in [
+            (format!("t={pat}"), pat.to_string()),
+            (format!("Authorization: {bearer}"), oauth.to_string()),
+            (format!("api_key={oauth} and more"), oauth.to_string()),
+        ] {
+            let out = redact_secrets(&text);
+            assert!(out.contains("[REDACTED "), "{out}");
+            for n in [4, 6, 8] {
+                let (head, tail) = (&secret[..n], &secret[secret.len() - 4..]);
+                assert!(!out.contains(head), "{head} of {secret} in {out}");
+                assert!(!out.contains(tail), "{tail} of {secret} in {out}");
+            }
+        }
+        for value in ["short", "a-much-longer-secret-value-0123456789"] {
+            assert_eq!(redact_value(value), "***");
+        }
     }
 
     #[test]
@@ -736,7 +788,7 @@ mod tests {
         let input = concat!("Linear token: lin_ap", "i_aBcDeFgHiJkLmNoPqRsT1234567890");
         let result = redact_secrets(input);
         assert!(!result.contains("aBcDeFgHiJkLmNoPqRsT1234567890"));
-        assert!(result.contains("lin_ap...7890"));
+        assert_eq!(result, "Linear token: [REDACTED LINEAR_API_TOKEN]");
         assert!(contains_secret(input));
     }
 
@@ -756,7 +808,7 @@ mod tests {
         let input = "Brave API key: BSAabcdefghij1234567890ABCDEFG";
         let result = redact_secrets(input);
         assert!(!result.contains("abcdefghij1234567890ABCDEFG"));
-        assert!(result.contains("BSAabc...DEFG"));
+        assert_eq!(result, "Brave API key: [REDACTED BRAVE_SEARCH_KEY]");
         assert!(contains_secret(input));
     }
 
@@ -765,7 +817,7 @@ mod tests {
         let input = "Pairing: wfp_abc123def456ghi789jkl012mno345pqr";
         let result = redact_secrets(input);
         assert!(!result.contains("abc123def456ghi789jkl012mno345pqr"));
-        assert!(result.contains("wfp_ab...5pqr"));
+        assert_eq!(result, "Pairing: [REDACTED WORKFORCE_PAIRING_TOKEN]");
         assert!(contains_secret(input));
     }
 
@@ -774,7 +826,7 @@ mod tests {
         let input = "Key: AGE-SECRET-KEY-1ABCDEFGHIJKLMNOPQRSTUVWXYZ234567890ABCDEFGHIJKLMNO";
         let result = redact_secrets(input);
         assert!(!result.contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567890"));
-        assert!(result.contains("AGE-SE...LMNO"));
+        assert_eq!(result, "Key: [REDACTED AGE_SECRET_KEY]");
         assert!(contains_secret(input));
     }
 
@@ -993,10 +1045,9 @@ mod tests {
         let (out, captured) = tokenize_secrets(input, "sess-1", slack_source());
 
         // No cache → no markers, no captures, but cleartext still
-        // sanitised to the legacy first6...last4 form.
+        // redacted whole, nothing of it kept.
         assert!(captured.is_empty());
-        assert!(!out.contains("abcdefghijklmnopqrstuvwxyz"));
-        assert!(out.contains("sk-ant...7890"));
+        assert_eq!(out, "leaked [REDACTED ANTHROPIC_OAUTH_TOKEN] in transit");
         assert!(parse_markers(&out).is_empty());
     }
 

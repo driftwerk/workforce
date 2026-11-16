@@ -15,7 +15,8 @@
 //!    by every tool here.
 //! 2. **Output redaction** ([`crate::redacting_vault::RedactionPolicy`]):
 //!    when enabled (`[vault] redaction = "redact"` in cloud mode), the
-//!    value returned to the LLM is `abcd…1234` rather than cleartext.
+//!    value returned to the LLM is `***`, no character of it, rather
+//!    than cleartext.
 //!    Built-in adapters and WASM skills bypass this layer — they read
 //!    the raw vault to construct HTTP `Authorization` headers.
 
@@ -1759,7 +1760,7 @@ mod tests {
         .await;
         assert!(res.success);
         let out = res.output;
-        assert_eq!(out["value"], "supe…7890");
+        assert_eq!(out["value"], "***", "no head nor tail of it");
         assert_eq!(out["redacted"], true);
     }
 
@@ -1894,7 +1895,7 @@ mod tests {
             .await;
         assert!(res.success);
         let out = res.output;
-        assert_eq!(out["value"], "alic…xxxx");
+        assert_eq!(out["value"], "***");
     }
 
     /// A Desk link's token is no agent's: `vault.get` refuses it as its
