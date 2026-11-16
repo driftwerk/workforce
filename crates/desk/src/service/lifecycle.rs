@@ -537,8 +537,9 @@ impl Desk {
         Ok(self.0.store.hidden().await?)
     }
 
-    /// The most recently closed sessions: ended, or closed in their own
-    /// terminals; each resumable where its engine allows.
+    /// The most recently closed sessions: each ended from Desk (or a
+    /// handoff's that never took its work up, [`super::finish`]); each
+    /// resumable where its engine allows.
     pub async fn closed_sessions(&self) -> Result<Vec<SessionView>, DeskError> {
         let kept = self.0.store.closed(CLOSED_LISTED).await?;
         let st = self.0.state.lock();
@@ -619,6 +620,13 @@ impl Desk {
     /// another terminal or in one of Desk's ends there.
     pub async fn end(&self, id: Uuid, by: Option<By>) -> Result<SessionView, DeskError> {
         let r = self.load(id).await?;
+        // Only its finish closes it: the person's, or its own boss's.
+        if !super::finish::may_end(by.as_ref(), self.charge_of(id).as_ref()) {
+            return Err(DeskError::Conflict(
+                "only the person, or the boss that started it or was handed it, closes a session"
+                    .into(),
+            ));
+        }
         let running_here = {
             let mut guard = self.0.state.lock();
             let st = &mut *guard;
