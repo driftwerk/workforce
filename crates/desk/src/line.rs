@@ -644,6 +644,168 @@ pub fn reply_to(given: &str) -> Option<ReplyTo> {
         .then(|| ReplyTo::Mark(hex[..MARK].to_ascii_lowercase()))
 }
 
+/// Whether `t` (one word, its brackets and stops trimmed) names a message
+/// as [`reply_to`] reads it: `m:` and its mark, or, `bare`, a mark or id
+/// alone (only where a mark is expected: after "Re", inside "[Desk …]";
+/// elsewhere a run of hex is a commit's).
+fn names_message(t: &str, bare: bool) -> bool {
+    let t = t.trim_matches(|c: char| matches!(c, '[' | ']' | '(' | ')' | ':' | ',' | ';' | '.'));
+    let hex = |h: &str, min: usize| {
+        let digits: String = h.chars().filter(|c| *c != '-').collect();
+        digits.len() >= min && digits.chars().all(|c| c.is_ascii_hexdigit())
+    };
+    match t.strip_prefix("m:") {
+        Some(h) => hex(h, 6),
+        None => bare && (hex(t, MARK) || t.parse::<Uuid>().is_ok()),
+    }
+}
+
+/// `text` without the marks a session copies from what it read to say
+/// what it answers: `[Desk m:0a1b2c3d]` (or `[Desk 0a1b2c3d]`),
+/// `m:0a1b2c3d`, and a `Re` before one ("Re m:9d966bcb:", "Re 9d966bcb:").
+/// They are ids, never words for the person. A line with none is kept as
+/// it was; one left empty is dropped.
+pub fn without_marks(text: &str) -> String {
+    let is_re = |t: &str| t.trim_end_matches(':').eq_ignore_ascii_case("re");
+    let is_desk = |t: &str| {
+        t.strip_prefix('[')
+            .is_some_and(|d| d.eq_ignore_ascii_case("desk"))
+    };
+    let mut lines: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let mut out: Vec<&str> = Vec::new();
+        let mut dropped = false;
+        let mut i = 0;
+        while i < tokens.len() {
+            let t = tokens[i];
+            let next = tokens.get(i + 1).copied();
+            let after = tokens.get(i + 2).copied();
+            // "[Desk m:…]", "[Desk 0a1b2c3d]", split at its space.
+            if is_desk(t) && next.is_some_and(|n| names_message(n, true)) {
+                i += 2;
+                dropped = true;
+                continue;
+            }
+            // "Re m:…", "Re 9d966bcb:": both. "Re: [Desk m:…]": the Re,
+            // and the mark next.
+            if is_re(t) && next.is_some_and(|n| names_message(n, true)) {
+                i += 2;
+                dropped = true;
+                continue;
+            }
+            if is_re(t)
+                && next.is_some_and(is_desk)
+                && after.is_some_and(|a| names_message(a, true))
+            {
+                i += 1;
+                dropped = true;
+                continue;
+            }
+            if names_message(t, false) {
+                i += 1;
+                dropped = true;
+                continue;
+            }
+            out.push(t);
+            i += 1;
+        }
+        if !dropped {
+            lines.push(line.to_string());
+            continue;
+        }
+        let kept = out.join(" ");
+        let kept = kept.trim_start_matches(|c: char| {
+            matches!(c, ':' | '-' | '—' | '–' | ',') || c.is_whitespace()
+        });
+        if !kept.is_empty() {
+            lines.push(kept.to_string());
+        }
+    }
+    lines.join("\n")
+}
+
+/// Whether `sentence` only acknowledges ("Got it, thanks.", "On it.",
+/// "Done as told."): nothing the person would want told. "Done." or
+/// "Working on it." answers a question about the work, and is no
+/// acknowledgement.
+pub fn only_acknowledges(sentence: &str) -> bool {
+    const ACK: &[&str] = &[
+        "ok",
+        "okay",
+        "k",
+        "got it",
+        "noted",
+        "understood",
+        "acknowledged",
+        "ack",
+        "sure",
+        "roger",
+        "yep",
+        "copy",
+        "copy that",
+        "on it",
+        "will do",
+        "sounds good",
+        "thanks",
+        "thank you",
+        "👍",
+        "✅",
+        "done as told",
+        "done as asked",
+        "done as you asked",
+    ];
+    let parts: Vec<String> = sentence
+        .split([',', ';', '.', '!', '—', '-'])
+        .map(|p| {
+            p.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase()
+        })
+        .filter(|p| !p.is_empty())
+        .collect();
+    !parts.is_empty() && parts.iter().all(|p| ACK.contains(&p.as_str()))
+}
+
+/// The fewest words a reply's answer is said in: a short first sentence
+/// ("No.") goes on with the next, its reason.
+const ANSWER_WORDS: usize = 8;
+
+/// What a session's reply says, for the person: past its marks and any
+/// acknowledgement ("Sure. 18 of 20 tables …" says the second), its
+/// sentences up to [`ANSWER_WORDS`] words at least, clipped to `max`
+/// characters. `None` when that leaves nothing: the reply only
+/// acknowledged, or held only a mark.
+pub fn reply_said(text: &str, max: usize) -> Option<String> {
+    let flat = without_marks(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut rest = flat.as_str();
+    let mut said: Vec<String> = Vec::new();
+    while !rest.is_empty() {
+        let sentence = crate::crew::one_line(rest, usize::MAX);
+        if sentence.is_empty() {
+            break;
+        }
+        let Some(at) = rest.find(sentence.as_str()) else {
+            break;
+        };
+        rest = rest[at + sentence.len()..].trim();
+        if said.is_empty() && only_acknowledges(&sentence) {
+            continue;
+        }
+        said.push(sentence);
+        let words: usize = said.iter().map(|s| crate::crew::word_count(s)).sum();
+        if words >= ANSWER_WORDS || said.join(" ").chars().count() >= max {
+            break;
+        }
+    }
+    let said = crate::crew::clip(&said.join(" "), max);
+    (!said.trim().is_empty()).then_some(said)
+}
+
 /// Whether `mark` is `id`'s marker.
 pub fn marks(mark: &str, id: Uuid) -> bool {
     id.simple().to_string().starts_with(mark)
@@ -1053,6 +1215,57 @@ mod tests {
 
     fn none() -> HashSet<String> {
         HashSet::new()
+    }
+
+    #[test]
+    fn a_replys_marks_never_reach_the_person() {
+        assert_eq!(without_marks("Re m:9d966bcb:"), "");
+        assert_eq!(
+            without_marks("Re m:9d966bcb:\n18 of 20 tables are moved."),
+            "18 of 20 tables are moved."
+        );
+        assert_eq!(
+            without_marks("Re: [Desk m:0a1b2c3d] The key is STRIPE_TEST."),
+            "The key is STRIPE_TEST."
+        );
+        assert_eq!(without_marks("Re 9d966bcb: merged."), "merged.");
+        assert_eq!(without_marks("Re: [Desk 9d966bcb] merged."), "merged.");
+        assert_eq!(without_marks("(m:0a1b2c3d) Merged #640."), "Merged #640.");
+        // No mark: kept as it was, its spacing and blank lines too.
+        let plain = "Re: desk setup,  two spaces\n\n✓ Pushed 9d966bcb to main.";
+        assert_eq!(without_marks(plain), plain);
+        assert_eq!(reply_said("Re m:9d966bcb:", 300), None);
+        assert_eq!(reply_said("Re m:9d966bcb:\nDone as told.", 300), None);
+        assert_eq!(reply_said("Got it, thanks!", 300), None);
+        assert_eq!(reply_said("On it.", 300), None);
+        assert_eq!(
+            reply_said(
+                "Re m:9d966bcb:\nSure. 18 of 20 tables are moved; 2 wait on a lock. More later.",
+                300
+            )
+            .as_deref(),
+            Some("18 of 20 tables are moved; 2 wait on a lock.")
+        );
+        // A short answer goes on with its reason.
+        assert_eq!(
+            reply_said(
+                "No. The migration failed on the orders table. I'm retrying.",
+                300
+            )
+            .as_deref(),
+            Some("No. The migration failed on the orders table.")
+        );
+        // To a question about the work, "Done." is the answer.
+        assert_eq!(reply_said("Done.", 300).as_deref(), Some("Done."));
+        assert_eq!(
+            reply_said("Working on it.", 300).as_deref(),
+            Some("Working on it.")
+        );
+        assert!(only_acknowledges("Done as told."));
+        assert!(only_acknowledges("OK, will do."));
+        for answer in ["Yes.", "Done.", "Do that now.", "That will do."] {
+            assert!(!only_acknowledges(answer), "{answer}");
+        }
     }
 
     #[test]
