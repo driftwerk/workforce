@@ -1292,7 +1292,20 @@ impl CrewHub {
         let who = by.clone();
         let mut done = Done::default();
         let said = match self.perform_as(action, by, &mut done).await {
-            Ok(said) => said,
+            Ok(said) => {
+                // Sent: in the picture before anything else is decided.
+                if let Action::Nudge {
+                    to: Target::Session(s),
+                    message,
+                    ..
+                } = action
+                {
+                    if who.party.kind == crew::PartyKind::Manager {
+                        self.picture_instruction(&who.party.id, *s, message, Self::current_turn());
+                    }
+                }
+                said
+            }
             Err(e) => {
                 // Not sent after all: it may be said again.
                 if let Some(t) = told {

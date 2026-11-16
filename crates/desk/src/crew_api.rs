@@ -515,7 +515,17 @@ async fn directive_answer(
         .directive_answer(YOU, &scope, &b.key, b.answer.as_deref())
         .await
     {
-        Ok(Ok(_)) => directive_view(&s, &scope).await,
+        Ok(Ok(kept)) => {
+            // Their directives are their standing orders.
+            s.desk.picture_note(crate::picture::Note::new(
+                crate::picture::What::Order,
+                match kept {
+                    Some(p) => format!("directive: when {}, {}", p.when_text, p.then_text),
+                    None => format!("cleared their answer to the directive {}", b.key),
+                },
+            ));
+            directive_view(&s, &scope).await
+        }
         Ok(Err(why)) => error(StatusCode::BAD_REQUEST, why),
         Err(e) => failed(e),
     }
@@ -541,7 +551,13 @@ async fn directive_own(
         return error(StatusCode::NOT_FOUND, NO_GROUP);
     };
     match s.desk.store().directive_own(YOU, &scope, &b.text).await {
-        Ok(Ok(_)) => directive_view(&s, &scope).await,
+        Ok(Ok(p)) => {
+            s.desk.picture_note(crate::picture::Note::new(
+                crate::picture::What::Order,
+                format!("directive: {}", p.then_text),
+            ));
+            directive_view(&s, &scope).await
+        }
         Ok(Err(why)) => error(StatusCode::BAD_REQUEST, why),
         Err(e) => failed(e),
     }
@@ -619,6 +635,21 @@ async fn kept_preference(s: &CrewApi, id: &str) -> Result<Preference, Response> 
         Ok(_) => Err(error(StatusCode::NOT_FOUND, NO_PREFERENCE)),
         Err(e) => Err(failed(e)),
     }
+}
+
+/// [`preference_result`] for a change the person made: in the bosses'
+/// picture as their standing order, as it changes.
+fn preference_changed(s: &CrewApi, verb: &str, r: eyre::Result<Option<Preference>>) -> Response {
+    if let Ok(Some(p)) = &r {
+        s.desk.picture_note(crate::picture::Note::new(
+            crate::picture::What::Order,
+            format!(
+                "{verb} the preference: when {}, {}",
+                p.when_text, p.then_text
+            ),
+        ));
+    }
+    preference_result(r)
 }
 
 fn preference_result(r: eyre::Result<Option<Preference>>) -> Response {
@@ -731,7 +762,11 @@ async fn preference_patch(
     if change.when_text.is_none() && change.then_text.is_none() && change.scope.is_none() {
         return error(StatusCode::BAD_REQUEST, "Say what changes.");
     }
-    preference_result(s.desk.store().preference_change(p.id, &change).await)
+    preference_changed(
+        &s,
+        "Changed",
+        s.desk.store().preference_change(p.id, &change).await,
+    )
 }
 
 /// The person sets preference `id` aside, resumes it, or forgets it.
@@ -754,7 +789,16 @@ async fn preference_state(
         Ok(p) => p,
         Err(r) => return r,
     };
-    preference_result(s.desk.store().preference_set_state(p.id, state).await)
+    let verb = match state {
+        PrefState::Paused => "Paused",
+        PrefState::Active => "Resumed",
+        _ => "Forgot",
+    };
+    preference_changed(
+        &s,
+        verb,
+        s.desk.store().preference_set_state(p.id, state).await,
+    )
 }
 
 #[derive(Deserialize, Default)]

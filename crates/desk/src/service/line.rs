@@ -615,9 +615,16 @@ impl Desk {
         match &from {
             Sender::Session(id) => {
                 self.0.state.lock().lines.runs.entry(*id).or_default().sent += 1;
+                let what = match kind {
+                    LineKind::Ask => crate::picture::What::SessionAsked,
+                    _ => crate::picture::What::SessionReported,
+                };
+                self.picture_session_said(*id, what, &m.text);
             }
             Sender::Person => {
                 if let Some(v) = &recipient {
+                    // In the picture before anything else is done of it.
+                    self.picture_person_said(v.id, &m.text);
                     self.person_spoke(v.id);
                 }
             }
@@ -772,7 +779,10 @@ impl Desk {
         };
         self.close_line_item(question.id, closer, &why).await;
         match (&by, &asker) {
-            (Sender::Person, Some(v)) => self.person_spoke(v.id),
+            (Sender::Person, Some(v)) => {
+                self.picture_person_said(v.id, &a.text);
+                self.person_spoke(v.id)
+            }
             (Sender::Session(id), _) => {
                 self.0.state.lock().lines.runs.entry(*id).or_default().sent += 1;
             }

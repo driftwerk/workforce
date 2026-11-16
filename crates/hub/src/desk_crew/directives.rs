@@ -152,6 +152,10 @@ impl CrewHub {
                 return Err("action is list, answer, add, forget, stop_asking or ask_again.".into())
             }
         };
+        if action != "stop_asking" && action != "ask_again" {
+            // Their directives are their standing orders.
+            self.picture_order(&said, Self::current_turn());
+        }
         Ok(json!(format!(
             "{said} Confirm it to the person in one line."
         )))

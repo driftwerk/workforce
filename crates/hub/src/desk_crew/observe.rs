@@ -81,6 +81,9 @@ impl CrewHub {
             if !message.starts_with(CHECK_IN) && !self.relayed_turns.lock().contains(&sid) {
                 // Sent: no longer typing it, and here.
                 self.dm_sent(&agent_id);
+                // The person's word lands first: in the picture before
+                // anything of this turn's is done.
+                self.picture_person_told(&agent_id, message);
                 // Messages queued into one turn are all its asks.
                 let mut turns = self.person_turns.lock();
                 let asked = turns.entry(sid.clone()).or_default();
