@@ -324,10 +324,6 @@ pub(crate) fn for_state(state: &Arc<GatewayState>) -> Option<Arc<CrewHub>> {
         .find(|c| Arc::ptr_eq(&c.state, state))
 }
 
-/// Why a Desk room turn for `service` mustn't run: the room is one whose
-/// group's boundary keeps it out now (a boss moved away from it, or an
-/// agent that left), whatever the Desk app sent. `None` off a room, or
-/// without a crew.
 /// The person's follow-up, steered into a boss's running DM turn: in the
 /// picture as their words to it, so any other turn of its decided before
 /// them is decided again.
@@ -342,6 +338,10 @@ pub(crate) fn person_followed_up(service: &AgentService, words: &str) {
     }
 }
 
+/// Why a Desk room turn for `service` mustn't run: the room is one whose
+/// group's boundary keeps it out now (a boss moved away from it, or an
+/// agent that left), whatever the Desk app sent. `None` off a room, or
+/// without a crew.
 pub(crate) async fn room_turn_refused(
     service: &AgentService,
     place: &workforce_common::channels::desk::DeskPlace,

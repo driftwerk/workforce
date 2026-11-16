@@ -39,13 +39,17 @@ async fn in_turn<F: Future>(sid: &str, f: F) -> F::Output {
         .await
 }
 
-/// What the boss's line to `s` carries, oldest first.
+/// What the boss's line to `s` carries, oldest first. Desk's own note
+/// when a boss takes it on ("I'm running this session…", noted, never
+/// sent) isn't anything the boss told it.
 async fn told(d: &Desk, s: uuid::Uuid) -> Vec<String> {
     d.line_thread(s, None, None)
         .await
         .unwrap()
         .into_iter()
-        .filter(|m| m.from.kind == PartyKind::Manager)
+        .filter(|m| {
+            m.from.kind == PartyKind::Manager && m.delivery != workforce_desk::line::Delivery::Noted
+        })
         .map(|m| m.text)
         .collect()
 }
@@ -267,6 +271,69 @@ async fn a_change_to_one_session_holds_no_other_back() {
             stale(&first),
             "only the session the person touched decides again: {first}"
         );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn while_the_person_drives_a_session_the_boss_sends_it_nothing_and_resumes_from_their_words()
+{
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        d.picture_load().await;
+        let s = new_session(&d, dir.path(), "acme-web").await;
+        let url = hook_url(dir.path(), s.id).await;
+        hook(
+            &url,
+            json!({"hook_event_name": "SessionStart", "session_id": "cc-acme-web"}),
+        )
+        .await;
+        let boss = workforce_desk::crew::Party::manager("desk", &super::super::name_of(&overseer));
+        d.take_on(
+            s.id,
+            &boss,
+            workforce_desk::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        let by = || crew.by_overseer("Its work isn't done.").unwrap();
+
+        // The person types into it: the boss's picture has it at once.
+        let theirs = "Don't open a PR yet: I'm reworking the picker myself.";
+        let typed = std::time::Instant::now();
+        hook(&url, json!({"hook_event_name": "UserPromptSubmit", "prompt": theirs})).await;
+        let seen = d.picture_recent("desk", s.id, 5);
+        assert!(typed.elapsed() < Duration::from_secs(1));
+        assert!(seen.iter().any(|r| r.what == What::PersonSaid && r.text == theirs), "{seen:?}");
+
+        // While they drive it, nothing of the boss's goes to it.
+        let said = crew
+            .on_picture(crew.perform(&nudge(s.id, "Open the PR for the picker."), by()))
+            .await
+            .unwrap();
+        assert!(said.starts_with("not sent: the person is driving acme-web"), "{said}");
+        assert!(told(&d, s.id).await.is_empty(), "nothing waits to go in over them");
+
+        // Handed back, the boss's next turn on it starts from what they said.
+        d.hand_back(s.id).await.unwrap();
+        let block = super::super::context::block(
+            &overseer,
+            &format!("{DESK_CHANNEL}:line:{}", s.id),
+            PERSON,
+        )
+        .await
+        .unwrap();
+        assert!(block.contains(theirs), "{block}");
+        let next = "Understood: no PR while you rework the picker. Review the rework and say what it changes.";
+        let sent = crew
+            .on_picture(crew.perform(&nudge(s.id, next), by()))
+            .await
+            .unwrap();
+        assert!(sent.starts_with("told acme-web"), "{sent}");
+        assert_eq!(told(&d, s.id).await, vec![next.to_string()]);
     })
     .await;
 }

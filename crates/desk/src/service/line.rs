@@ -778,7 +778,9 @@ impl Desk {
         self.close_line_item(question.id, closer, &why).await;
         match (&by, &asker) {
             (Sender::Person, Some(v)) => {
-                self.picture_person_said(v.id, &a.text);
+                // Their answer, not them taking the wheel: what a boss has
+                // waiting for the session isn't overtaken by it.
+                self.picture_person_answered(v.id, &a.text);
                 self.person_spoke(v.id)
             }
             (Sender::Session(id), _) => {
@@ -1339,6 +1341,10 @@ impl Desk {
             if self.waited_on(&m) || self.line_gate(&view, &m).is_some() {
                 continue;
             }
+            // Decided before the person's own words there: never handed in.
+            if self.line_overtaken(&m).await {
+                continue;
+            }
             if let Some(taken) = self.0.store.line_take(m.id, Delivery::Handed).await? {
                 self.line_announce(&taken);
                 return Ok(Some(
@@ -1428,6 +1434,10 @@ impl Desk {
         let mut typed_in = false;
         for mut m in inbox {
             if m.delivery == Delivery::Handed || self.waited_on(&m) {
+                continue;
+            }
+            // Decided before the person's own words there: never typed in.
+            if self.line_overtaken(&m).await {
                 continue;
             }
             let now = line::deliverable(&view, typed, plugin);
