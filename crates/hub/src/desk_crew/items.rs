@@ -75,6 +75,32 @@ pub const OPEN_DESCRIPTION: &str = "What you owe the person now (\"what's open?\
 /// A promise to report back what a session says to a status question.
 const REPLIED: &str = "replied";
 
+/// The most of a session's reply said to the person, in characters.
+const REPLY_CHARS: usize = 400;
+
+/// The question a status question's promise ("Report back what X says to
+/// “…”") asked, as asked.
+fn asked_in(promise: &str) -> Option<String> {
+    let from = promise.find('“')? + '“'.len_utf8();
+    let to = promise.rfind('”')?;
+    let q = promise.get(from..to)?.trim();
+    (!q.is_empty()).then(|| q.to_string())
+}
+
+/// A session's answer to the boss, said to the person in one sentence:
+/// what was asked, when, and what it said, in words.
+fn reply_line(name: &str, question: Option<&str>, at: &str, answer: &str) -> String {
+    let answer = answer.trim();
+    let stop = match answer.ends_with(['.', '!', '?', '…']) {
+        true => "",
+        false => ".",
+    };
+    match question {
+        Some(q) => format!("I asked {name} at {at} “{q}”, and it says: {answer}{stop}"),
+        None => format!("{name} answered what I asked it at {at}: {answer}{stop}"),
+    }
+}
+
 /// The state key the nightly sweep keeps its last day under.
 const SWEPT: &str = "hub.crew.items_swept";
 /// The hour, in the person's time, the sweep runs at.
@@ -719,28 +745,95 @@ impl CrewHub {
         }) else {
             return;
         };
-        let reply = crew::one_line(&m.text, 600);
-        let why = format!("{} replied.", m.from.name);
-        if let Ok(Some(closed)) = self
+        // Never relayed raw: its marks dropped, and only what it says past
+        // an acknowledgement. One that only acknowledged ("Done as told.")
+        // is routine: kept on the closed promise, said only if asked.
+        let answered = workforce_desk::line::reply_said(&m.text, REPLY_CHARS);
+        let name = m.from.name.trim();
+        let why = match &answered {
+            Some(a) => format!("{name} replied: {a}"),
+            None => format!(
+                "{name} acknowledged: {}",
+                crew::one_line(&workforce_desk::line::without_marks(&m.text), 200)
+            ),
+        };
+        let Ok(Some(closed)) = self
             .desk
             .store()
             .item_close(p.id, ClosedBy::Boss, &why)
             .await
+        else {
+            return;
+        };
+        let Some(answer) = answered else {
+            return;
+        };
+        let at = closed
+            .opened_at
+            .with_timezone(&self.desk.timezone())
+            .format("%H:%M")
+            .to_string();
+        let text = reply_line(name, asked_in(&closed.text).as_deref(), &at, &answer);
+        let link = workforce_desk::update_write::SessionLink {
+            session_id: session.to_string(),
+            name: name.to_string(),
+            closed: self
+                .desk
+                .view(session)
+                .map_or(true, |v| v.state == SessionState::Closed),
+        };
+        self.say_of_session(&closed.boss, text, link, m.at).await;
+    }
+
+    /// Says `text`, about the session `link` opens, in `boss`'s DM as a
+    /// notice: one item, with the session's link beside it.
+    async fn say_of_session(
+        &self,
+        boss: &str,
+        text: String,
+        link: workforce_desk::update_write::SessionLink,
+        at: DateTime<Utc>,
+    ) {
+        let Some((service, _)) = self.overseer_named(boss) else {
+            return;
+        };
+        let Some(owner) = self.person(Some(&service)) else {
+            return;
+        };
+        let said = workforce_desk::update_write::Said {
+            kind: workforce_desk::update_write::EventKind::Progress,
+            headline: text.clone(),
+            body: String::new(),
+            ids: Vec::new(),
+            not_checked: None,
+            session: Some(link),
+            did: Vec::new(),
+            at: Some(at),
+        };
+        let extras = Extras {
+            update: Some(workforce_desk::update::MentionedUpdate {
+                headline: text.clone(),
+                said: vec![said],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let delivery = crate::desk_surface::Delivery::text(DeliveryKind::Notice, text);
+        if let Err(e) = self
+            .deliver_with_extras(&service, &owner, delivery, &extras)
+            .await
         {
-            let text = format!(
-                "{} answered what I asked it at {}: {reply}",
-                m.from.name,
-                closed
-                    .opened_at
-                    .with_timezone(&self.desk.timezone())
-                    .format("%H:%M")
-            );
-            self.say(&closed.boss, text).await;
+            tracing::info!(error = %e, "a notice in the boss's DM failed");
         }
     }
 
-    /// Says `text` in `boss`'s DM, as a notice.
+    /// Says `text` in `boss`'s DM, as a notice. Never one that says
+    /// nothing: blank, or only a session's marks.
     async fn say(&self, boss: &str, text: String) {
+        let text = workforce_desk::line::without_marks(&text);
+        if text.trim().is_empty() {
+            return;
+        }
         let Some((service, _)) = self.overseer_named(boss) else {
             return;
         };

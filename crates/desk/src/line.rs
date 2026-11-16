@@ -644,6 +644,127 @@ pub fn reply_to(given: &str) -> Option<ReplyTo> {
         .then(|| ReplyTo::Mark(hex[..MARK].to_ascii_lowercase()))
 }
 
+/// `text` without the marks a session copies from what it read to say
+/// what it answers: `[Desk m:0a1b2c3d]`, `m:0a1b2c3d`, and a `Re` before
+/// one ("Re m:9d966bcb:"). They are ids, never words for the person.
+/// Lines left empty are dropped.
+pub fn without_marks(text: &str) -> String {
+    let is_mark = |t: &str| {
+        let t =
+            t.trim_matches(|c: char| matches!(c, '[' | ']' | '(' | ')' | ':' | ',' | ';' | '.'));
+        t.strip_prefix("m:")
+            .is_some_and(|h| h.len() >= 6 && h.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
+    };
+    let is_re = |t: &str| t.trim_end_matches(':').eq_ignore_ascii_case("re");
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let mut out: Vec<&str> = Vec::new();
+        let mut i = 0;
+        while i < tokens.len() {
+            let t = tokens[i];
+            let next = tokens.get(i + 1).copied();
+            // "[Desk m:…]", split at its space.
+            if t.trim_start_matches('[').eq_ignore_ascii_case("desk") && next.is_some_and(is_mark) {
+                i += 2;
+                continue;
+            }
+            // "Re m:…" and "Re: [Desk m:…]".
+            if is_re(t)
+                && next.is_some_and(|n| {
+                    is_mark(n) || n.trim_start_matches('[').eq_ignore_ascii_case("desk")
+                })
+            {
+                i += 1;
+                continue;
+            }
+            if is_mark(t) {
+                i += 1;
+                continue;
+            }
+            out.push(t);
+            i += 1;
+        }
+        let kept = out.join(" ");
+        let kept = kept.trim_start_matches(|c: char| {
+            matches!(c, ':' | '-' | '—' | '–' | ',') || c.is_whitespace()
+        });
+        if !kept.is_empty() {
+            lines.push(kept.to_string());
+        }
+    }
+    lines.join("\n")
+}
+
+/// Whether `sentence` only acknowledges ("Done as told.", "On it.",
+/// "Got it, thanks."): nothing the person would want told.
+pub fn only_acknowledges(sentence: &str) -> bool {
+    const ACK: &[&str] = &[
+        "ok",
+        "okay",
+        "k",
+        "done",
+        "will",
+        "do",
+        "on",
+        "it",
+        "got",
+        "noted",
+        "understood",
+        "acknowledged",
+        "ack",
+        "sure",
+        "roger",
+        "thanks",
+        "thank",
+        "you",
+        "as",
+        "told",
+        "asked",
+        "that",
+        "now",
+        "working",
+        "sounds",
+        "good",
+        "great",
+        "perfect",
+        "yep",
+        "copy",
+        "👍",
+        "✅",
+    ];
+    let words: Vec<String> = sentence
+        .split(|c: char| c.is_whitespace() || matches!(c, ',' | '.' | '!' | ';' | ':' | '—' | '-'))
+        .map(|w| w.trim().to_lowercase())
+        .filter(|w| !w.is_empty())
+        .collect();
+    !words.is_empty() && words.iter().all(|w| ACK.contains(&w.as_str()))
+}
+
+/// What a session's reply says, for the person: its first sentence past
+/// its marks and any acknowledgement ("Sure. 18 of 20 tables …" says the
+/// second), clipped to `max` characters. `None` when that leaves nothing:
+/// the reply only acknowledged, or held only a mark.
+pub fn reply_said(text: &str, max: usize) -> Option<String> {
+    let flat = without_marks(text).replace('\n', " ");
+    let mut rest = flat.trim();
+    while !rest.is_empty() {
+        let sentence = crate::crew::one_line(rest, usize::MAX);
+        if sentence.is_empty() {
+            return None;
+        }
+        if !only_acknowledges(&sentence) {
+            return Some(crate::crew::one_line(rest, max)).filter(|s| !s.trim().is_empty());
+        }
+        // Past it: the rest of the reply.
+        match rest.find(sentence.as_str()) {
+            Some(at) => rest = rest[at + sentence.len()..].trim(),
+            None => return None,
+        }
+    }
+    None
+}
+
 /// Whether `mark` is `id`'s marker.
 pub fn marks(mark: &str, id: Uuid) -> bool {
     id.simple().to_string().starts_with(mark)
@@ -1053,6 +1174,43 @@ mod tests {
 
     fn none() -> HashSet<String> {
         HashSet::new()
+    }
+
+    #[test]
+    fn a_replys_marks_never_reach_the_person() {
+        assert_eq!(without_marks("Re m:9d966bcb:"), "");
+        assert_eq!(
+            without_marks("Re m:9d966bcb:\n18 of 20 tables are moved."),
+            "18 of 20 tables are moved."
+        );
+        assert_eq!(
+            without_marks("Re: [Desk m:0a1b2c3d] The key is STRIPE_TEST."),
+            "The key is STRIPE_TEST."
+        );
+        assert_eq!(without_marks("(m:0a1b2c3d) Merged #640."), "Merged #640.");
+        // A commit's hash is no mark.
+        assert_eq!(
+            without_marks("Pushed 9d966bcb to main."),
+            "Pushed 9d966bcb to main."
+        );
+        assert_eq!(reply_said("Re m:9d966bcb:", 300), None);
+        assert_eq!(reply_said("Re m:9d966bcb:\nDone as told.", 300), None);
+        assert_eq!(reply_said("On it, thanks!", 300), None);
+        assert_eq!(
+            reply_said(
+                "Re m:9d966bcb:\nSure. 18 of 20 tables are moved; 2 wait on a lock. More later.",
+                300
+            )
+            .as_deref(),
+            Some("18 of 20 tables are moved; 2 wait on a lock.")
+        );
+        // An answer that opens on "done" says more than that.
+        assert_eq!(
+            reply_said("Done, the PR is merged.", 300).as_deref(),
+            Some("Done, the PR is merged.")
+        );
+        assert!(only_acknowledges("Done as told."));
+        assert!(!only_acknowledges("Yes."));
     }
 
     #[test]

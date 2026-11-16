@@ -252,10 +252,118 @@ async fn a_status_question_is_a_promise_kept_by_the_sessions_reply() {
         .await;
         assert_eq!(closed.closed_by, Some(ClosedBy::Boss));
         let report = eventually("the reply said", async || {
-            said(&overseer, "acme-web answered what I asked it at")
+            said(&overseer, "I asked acme-web at ")
         })
         .await;
-        assert!(report.contains("The staging key"), "{report}");
+        assert!(
+            report.contains("“Which API key did you use?”, and it says: The staging key"),
+            "{report}"
+        );
+    })
+    .await;
+}
+
+/// The Cufflink case (16 Nov): a session's reply opened on the mark it
+/// answered ("Re m:9d966bcb:") and the boss said only that line. A reply
+/// is said as what was asked and what it answered, in words, with its
+/// session's link; one that only acknowledges, or holds only its mark, is
+/// not posted; no mark ever reaches the person.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sessions_reply_is_said_in_words_never_its_mark() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        let s = new_session(&d, dir.path(), "Cufflink Migration").await;
+        let ask = async |q: &str| {
+            crew.perform(
+                &Action::Nudge {
+                    to: Target::Session(s.id),
+                    message: format!("{STATUS_QUESTION} {q}"),
+                    reply_to: None,
+                },
+                crew.by_overseer("The person asked.").unwrap(),
+            )
+            .await
+            .unwrap();
+            d.store()
+                .items_not_closed(Some("desk"))
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|i| i.kind == OpenKind::Promise && i.text.contains(q))
+                .expect("the promise")
+        };
+        let reply = async |text: &str, promise: uuid::Uuid| {
+            d.line_call(s.id, "tell", &json!({"to": "desk", "text": text}), None)
+                .await
+                .unwrap();
+            eventually("kept by the reply", async || {
+                d.store()
+                    .open_item(promise)
+                    .await
+                    .unwrap()
+                    .filter(|i| i.state == OpenState::Closed)
+            })
+            .await
+        };
+        let dm = || {
+            overseer
+                .sessions
+                .find(DESK_CHANNEL, PERSON)
+                .unwrap()
+                .map(|s| s.messages)
+                .unwrap_or_default()
+        };
+
+        // Only its mark, then only an acknowledgement: nothing is posted.
+        let p = ask("Did you start?").await;
+        let closed = reply("Re m:9d966bcb:", p.id).await;
+        assert!(closed.closed_why.unwrap().starts_with("Cufflink Migration acknowledged"));
+        let p = ask("Is the export paused?").await;
+        reply("Re m:9d966bcb:\nDone as told.", p.id).await;
+
+        // An answer: what was asked and what it said, with its link.
+        let p = ask("How many tables are left?").await;
+        reply(
+            "Re m:9d966bcb:\nSure. 18 of 20 tables are moved; the last 2 wait on a lock.",
+            p.id,
+        )
+        .await;
+        let post = eventually("the answer said", async || {
+            dm().into_iter().find(|m| m.content.starts_with("I asked Cufflink Migration"))
+        })
+        .await;
+        assert!(
+            post.content.contains(
+                "“How many tables are left?”, and it says: 18 of 20 tables are moved; the last 2 wait on a lock."
+            ),
+            "{}",
+            post.content
+        );
+        let extras = d.store().extras(std::slice::from_ref(&post.id)).await.unwrap();
+        let said = &extras[&post.id].update.as_ref().expect("its item").said;
+        assert_eq!(said.len(), 1);
+        assert_eq!(
+            said[0].session.as_ref().map(|l| l.session_id.clone()),
+            Some(s.id.to_string())
+        );
+        // Nothing else was said of these replies, and no mark anywhere.
+        let all = dm();
+        assert!(
+            all.iter().all(|m| !m.content.contains("m:9d966bcb")
+                && !m.content.contains("Re m:")
+                && !m.content.trim().is_empty()),
+            "{:?}",
+            all.iter().map(|m| &m.content).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            all.iter()
+                .filter(|m| m.content.contains("Cufflink Migration"))
+                .count(),
+            1,
+            "{:?}",
+            all.iter().map(|m| &m.content).collect::<Vec<_>>()
+        );
     })
     .await;
 }
