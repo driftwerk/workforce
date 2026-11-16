@@ -43,13 +43,18 @@ pub fn parse_unknown_instance(text: &str) -> Option<UnknownInstance> {
                 available: vec![],
             });
         }
+        // An older hub's Jira said a missing default its own way:
+        // `Default Jira workspace '<name>' not configured. Available: [..]`.
         let head = format!("Unknown {what}: ");
-        let Some(at) = text.find(&head) else {
-            continue;
+        let older = format!("Default {what} ");
+        let (at, len) = match (text.find(&head), text.find(&older)) {
+            (Some(at), _) => (at, head.len()),
+            (None, Some(at)) => (at, older.len()),
+            (None, None) => continue,
         };
-        let rest = &text[at + head.len()..];
+        let rest = &text[at + len..];
         let asked = quoted(rest)?;
-        let list = &rest[rest.find(". Available: [")? + ". Available: [".len()..];
+        let list = &rest[rest.find("Available: [")? + "Available: [".len()..];
         let list = &list[..list.find(']')?];
         let available: Vec<String> = list
             .split(',')
@@ -90,6 +95,17 @@ mod tests {
         assert_eq!(u.what, "Jira workspace");
         assert_eq!(u.asked, "default");
         assert!(u.available.is_empty());
+    }
+
+    #[test]
+    fn an_older_hub_s_jira_default_reads_too() {
+        let u = parse_unknown_instance(
+            "Default Jira workspace 'default' not configured. Available: [\"acme\", \"client\"]",
+        )
+        .unwrap();
+        assert_eq!(u.what, "Jira workspace");
+        assert_eq!(u.asked, "default");
+        assert_eq!(u.available, ["acme", "client"]);
     }
 
     #[test]

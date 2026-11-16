@@ -274,3 +274,124 @@ async fn a_link_without_a_workspace_pauses_plainly_when_there_are_several() {
     })
     .await;
 }
+
+const SITES: [&str; 3] = ["acme", "client", "globex"];
+
+/// A fake Jira of three sites, no default. `older`: a hub not yet updated,
+/// without `jira.workspaces`, whose Jira says a missing default its own way.
+struct FakeJira {
+    name: &'static str,
+    older: bool,
+}
+
+#[async_trait::async_trait]
+impl Tool for FakeJira {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn description(&self) -> &str {
+        "a fake Jira tool of three sites"
+    }
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+    async fn execute(&self, input: Value) -> eyre::Result<ToolResult> {
+        if self.name == "jira.workspaces" {
+            return Ok(ToolResult::success(
+                json!({ "workspaces": SITES, "default": null }),
+                0,
+            ));
+        }
+        let asked = input["workspace"].as_str();
+        let Some(site) = asked.filter(|a| SITES.contains(a)) else {
+            let said = match (self.older, asked) {
+                (true, None) => {
+                    format!("Default Jira workspace 'default' not configured. Available: {SITES:?}")
+                }
+                (_, a) => workforce_core::instances::unknown_instance_text(
+                    "Jira workspace",
+                    a.unwrap_or("default"),
+                    &SITES,
+                ),
+            };
+            return Ok(ToolResult::failure(said, 0));
+        };
+        Ok(ToolResult::success(
+            match self.name {
+                "jira.list_projects" => {
+                    json!({ "projects": [{ "key": site.to_ascii_uppercase(), "name": site }] })
+                }
+                _ => json!({ "issues": [] }),
+            },
+            0,
+        ))
+    }
+}
+
+async fn hub_of_sites(dir: &std::path::Path, older: bool) -> RemoteHub {
+    let fx = fixture(true);
+    with_agents(&fx, dir, &["default"]).await;
+    let service = fx.state.registry.default_agent().unwrap();
+    let mut names: Vec<&'static str> = workforce_desk::board_sync::JIRA_TOOLS.to_vec();
+    names.push("jira.list_projects");
+    if !older {
+        names.push("jira.workspaces");
+    }
+    for name in names {
+        service.tools.register(Arc::new(FakeJira { name, older }));
+    }
+    super::tests::serve_remote(fx, &["jira.*"], Arc::default(), None).await
+}
+
+/// Jira sites as Linear workspaces: listed (or read from an older hub's
+/// own wording), picked, their projects listed, and the pick kept.
+#[tokio::test]
+async fn several_jira_sites_are_picked_from_too() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        // One database for both: each links its own site's project.
+        for (older, site) in [(false, "client"), (true, "globex")] {
+            let dir = tempfile::tempdir().unwrap();
+            let desk = crate::desk_crew::tests::desk(pool.clone(), dir.path()).await;
+            let remote = hub_of_sites(&dir.path().join("remote"), older).await;
+            let local = local_hub(desk.clone(), dir.path());
+            local.link_atlas(&remote).await;
+            let ask = |w: Option<&str>| {
+                let mut b = json!({ "system": "jira", "via": { "kind": "hub", "hub": "atlas" } });
+                if let Some(w) = w {
+                    b["workspace"] = json!(w);
+                }
+                b
+            };
+            let (status, first) = local
+                .send("POST", "/api/desk/boards/link/check", ask(None))
+                .await;
+            assert_eq!(status, StatusCode::OK, "{first}");
+            assert_eq!(first["workspaces"], json!(SITES), "older {older}");
+            assert_eq!(
+                first["workspaceWhy"],
+                "Pick which Jira site: acme, client or globex"
+            );
+            assert!(!first.to_string().contains("'default'"), "{first}");
+            let (_, picked) = local
+                .send("POST", "/api/desk/boards/link/check", ask(Some(site)))
+                .await;
+            let key = site.to_ascii_uppercase();
+            assert_eq!(picked["projects"][0]["key"], key.as_str(), "{picked}");
+            let b = board(&desk, &format!("Client {older}")).await;
+            let (status, linked) = local
+                .send(
+                    "PUT",
+                    &format!("/api/desk/boards/{}/link", b.id),
+                    json!({
+                        "system": "jira", "target": key, "workspace": site,
+                        "via": { "kind": "hub", "hub": "atlas" },
+                        "filter": { "kind": "all", "value": { "includeDone": false } }, "states": {},
+                    }),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{linked}");
+            assert_eq!(linked["sync"]["workspace"], site);
+        }
+    })
+    .await;
+}

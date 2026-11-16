@@ -275,8 +275,9 @@ fn resolve_client(
     prefix_map: &HashMap<String, String>,
     input: &Value,
 ) -> Result<Arc<JiraClient>> {
-    let explicit = input.get("workspace").and_then(|v| v.as_str());
-    let requested = explicit
+    let requested = input
+        .get("workspace")
+        .and_then(|v| v.as_str())
         .map(str::to_string)
         .or_else(|| routed_workspace(clients, prefix_map, input));
     let name = workforce_agent::llm::environment::resolve_instance(
@@ -286,15 +287,12 @@ fn resolve_client(
         clients,
     )
     .map_err(|d| eyre::eyre!("{}", d.message))?;
-    clients.get(&name).cloned().ok_or_else(|| {
-        if explicit == Some(name.as_str()) {
-            unknown_instance("Jira workspace", &name, clients)
-        } else {
-            let mut available: Vec<&str> = clients.keys().map(String::as_str).collect();
-            available.sort_unstable();
-            eyre::eyre!("Default Jira workspace '{name}' not configured. Available: {available:?}")
-        }
-    })
+    // One wording whether it was named or the default: a program reads it
+    // back for the names (`workforce_core::instances`).
+    clients
+        .get(&name)
+        .cloned()
+        .ok_or_else(|| unknown_instance("Jira workspace", &name, clients))
 }
 
 /// Workspace auto-routed from a `project_key` / `issue_key` prefix (uppercased),
@@ -3201,10 +3199,7 @@ mod tests {
             .err()
             .expect("absent default must error")
             .to_string();
-        assert!(
-            err.contains("Default Jira workspace 'gone' not configured"),
-            "{err}"
-        );
+        assert!(err.contains("Unknown Jira workspace: 'gone'"), "{err}");
         assert!(err.contains("acme") && err.contains("client"), "{err}");
         assert!(
             workspace_description(&LiveInstances::fixed_map((*clients).clone(), "gone"))

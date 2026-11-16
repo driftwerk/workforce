@@ -1487,8 +1487,9 @@ async fn check_link(
     }
     // An older hub, without the list, names them when a call goes to none
     // of the person's: the dialog then asks which, as above.
+    // None of theirs at all: nothing to pick, said as the error it is.
     let pick_one = |mut out: Value, e: &RemoteError| match e {
-        RemoteError::Workspace { names, .. } => {
+        RemoteError::Workspace { names, .. } if !names.is_empty() => {
             out["workspaces"] = json!(names);
             out["workspaceWhy"] = json!(e.to_string());
             Some(Json(out).into_response())
@@ -1803,7 +1804,10 @@ async fn link_board(
                 )
             }
             Some(_) => {}
-            None if default.is_some() => link.workspace = default,
+            // "default" is the name of a key kept without one: it stops
+            // naming anything once a named one is added, so isn't kept.
+            None if default.as_deref().is_some_and(|d| d != "default") => link.workspace = default,
+            None if default.is_some() => {}
             None if names.len() > 1 => {
                 return refusal(
                     StatusCode::BAD_REQUEST,
