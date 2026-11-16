@@ -623,8 +623,6 @@ impl Desk {
             }
             Sender::Person => {
                 if let Some(v) = &recipient {
-                    // In the picture before anything else is done of it.
-                    self.picture_person_said(v.id, &m.text);
                     self.person_spoke(v.id);
                 }
             }
@@ -1680,8 +1678,12 @@ impl Desk {
         when: When,
     ) -> Result<LineMessage, LineError> {
         // Theirs before it is queued: a boss's message waiting for the same
-        // idle can't go in ahead of it.
+        // idle can't go in ahead of it, and in the bosses' picture before
+        // anything else is done of it. (What Desk writes on the person's
+        // side, a ticket's notice or an undo, goes through `line_send`
+        // and isn't their words.)
         self.person_drove(id);
+        self.picture_person_said(id, &text);
         self.line_send(
             Sender::Person,
             Send::Tell {
