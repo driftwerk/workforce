@@ -1500,3 +1500,62 @@ async fn a_release_refused_names_the_agent_whose_settings_to_fix() {
     })
     .await;
 }
+
+/// A boss that sends the person's order on to another boss, in answer to
+/// the person's own message, hands on their words: the receiver keeps the
+/// order as the person's, never as a note of the sender's own.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_order_sent_on_for_the_person_is_kept_as_theirs() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let c = clients(dir.path(), pool).await;
+        // Sarah, told of the pause, acts on Acme's session.
+        super::calls_tool_once(
+            &c._llms[1],
+            "asks: Pause the Acme work",
+            "crew_nudge",
+            json!({ "session_id": c.acme.session.id.to_string(), "message": "Pause here until Monday.", "reason": "The person asked for a pause." }),
+        )
+        .await;
+        // Desk's turn answering the person's own message.
+        let dm = c
+            .desk
+            .sessions
+            .find(DESK_CHANNEL, PERSON)
+            .unwrap()
+            .unwrap();
+        let theirs = "Pause the Acme work until Monday, nothing merges";
+        c.crew
+            .person_turns
+            .lock()
+            .insert(dm.id.clone(), theirs.into());
+        let nudge = super::super::actions::Action::Nudge {
+            to: super::super::actions::Target::Agent("sarah".into()),
+            message: "Pause the Acme work until Monday; nothing merges.".into(),
+            reply_to: None,
+        };
+        // Sent from the turn answering the person, as the boss's tool call is.
+        let said = workforce_agent::runner::CURRENT_SESSION_ID
+            .scope(
+                dm.id.clone(),
+                c.crew
+                    .perform(&nudge, c.crew.by_boss(&c.desk, "The person asked for it.")),
+            )
+            .await
+            .unwrap();
+        assert!(said.starts_with("asked"), "{said}");
+        let order = eventually("Sarah keeps the person's order", async || {
+            c.d.store()
+                .items_not_closed(Some("sarah"))
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|i| i.kind == workforce_desk::open_item::OpenKind::Order)
+        })
+        .await;
+        assert_eq!(order.text, theirs, "in the person's words, not Desk's");
+        assert_eq!(order.sessions, vec![c.acme.session.id]);
+        c.crew.person_turns.lock().remove(&dm.id);
+    })
+    .await;
+}

@@ -8,6 +8,7 @@ use std::path::Path;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
+use workforce_common::channels::DESK_CHANNEL;
 use workforce_common::oversight::{switch, Act, Level, Oversight, Scope, TakeOn};
 use workforce_desk::board::TicketState;
 use workforce_desk::charge::How;
@@ -1268,10 +1269,38 @@ impl CrewHub {
     /// how it is undone; an answer to a session's question is said in its
     /// DM from that row. Recording never stops the action.
     pub(crate) async fn perform(&self, action: &Action, by: By) -> Result<String, String> {
+        // The same instruction to the same session again, soon after: said
+        // once, no second message on its line, no second decision.
+        let told = match self.tell_once(action, &by) {
+            Ok(told) => told,
+            Err(at) => {
+                let tz = self.desk.timezone();
+                let name = match action {
+                    Action::Nudge {
+                        to: Target::Session(s),
+                        ..
+                    } => self.session_name(*s),
+                    _ => "it".into(),
+                };
+                return Ok(format!(
+                "already told {name} that at {}; not sent again. Say something new, or wait for its answer",
+                at.with_timezone(&tz).format("%H:%M")
+            ));
+            }
+        };
         let before = self.before(action);
         let who = by.clone();
         let mut done = Done::default();
-        let said = self.perform_as(action, by, &mut done).await?;
+        let said = match self.perform_as(action, by, &mut done).await {
+            Ok(said) => said,
+            Err(e) => {
+                // Not sent after all: it may be said again.
+                if let Some(t) = told {
+                    self.untell(t);
+                }
+                return Err(e);
+            }
+        };
         self.after_action(action, &who, &done).await;
         if let Some(d) = self
             .record_action(action, &who, &said, &done, &before)
@@ -1296,6 +1325,58 @@ impl CrewHub {
             }
         }
         Ok(said)
+    }
+
+    /// Keeps that a boss (`by`) tells `action`'s session this on its line
+    /// now, or, when it told it the same within [`TOLD_AGAIN`] and the
+    /// session hasn't replied since, when it did. Checked and kept under one
+    /// lock, so two calls at once send it once. None: not such a message.
+    #[allow(clippy::type_complexity)]
+    fn tell_once(
+        &self,
+        action: &Action,
+        by: &By,
+    ) -> Result<
+        Option<((String, Uuid), chrono::DateTime<chrono::Utc>)>,
+        chrono::DateTime<chrono::Utc>,
+    > {
+        let Some((s, text)) = told_line(action, by) else {
+            return Ok(None);
+        };
+        // A reply since is the session moving on: the same words to it
+        // again ("Carry on.") are fair.
+        let reply = self.desk.view(s).ok().and_then(|v| v.last_reply);
+        let now = chrono::Utc::now();
+        let key = (by.party.id.clone(), s);
+        let mut all = self.told_lines.lock();
+        // Only what is recent is kept.
+        all.retain(|_, v| {
+            v.retain(|t| now - t.at < TOLD_AGAIN);
+            !v.is_empty()
+        });
+        if let Some(t) = all
+            .get(&key)
+            .and_then(|v| v.iter().rev().find(|t| t.text == text && t.reply == reply))
+        {
+            return Err(t.at);
+        }
+        all.entry(key.clone()).or_default().push(super::ToldLine {
+            text,
+            at: now,
+            reply,
+        });
+        Ok(Some((key, now)))
+    }
+
+    /// Forgets a line [`Self::tell_once`] kept that wasn't sent after all.
+    fn untell(&self, (key, at): ((String, Uuid), chrono::DateTime<chrono::Utc>)) {
+        let mut all = self.told_lines.lock();
+        if let Some(v) = all.get_mut(&key) {
+            v.retain(|t| t.at != at);
+            if v.is_empty() {
+                all.remove(&key);
+            }
+        }
     }
 
     /// [`Self::perform`]'s work: what it left behind that an undo needs
@@ -2283,17 +2364,50 @@ impl CrewHub {
             (Speaker::you(), self.person_name(&owner))
         };
         let message = format!("{says} {prefix}: {text}");
+        // Sent in answer to the person's own message: the receiver keeps
+        // an order of it as theirs, in their words.
+        let theirs = from_overseer
+            .then(|| self.persons_words_in_turn(&by.party.id))
+            .flatten();
         self.desk.note(event);
         let crew = self.me();
         tokio::spawn(async move {
-            if let Err(e) = crew
-                .run_dm_turn(&service, &owner, &message, hop, None, Some(author))
-                .await
-            {
+            let ran = match theirs {
+                Some(words) => {
+                    crew.run_dm_turn_for_them(&service, &owner, &message, hop, author, words)
+                        .await
+                }
+                None => {
+                    crew.run_dm_turn(&service, &owner, &message, hop, None, Some(author))
+                        .await
+                }
+            };
+            if let Err(e) = ran {
                 tracing::warn!(agent_id = %service.agent_id, error = %e, "a message to the crew did not run");
             }
         });
         Ok(format!("{verb} {name}"))
+    }
+
+    /// The person's own words the boss `boss` is answering in its DM now:
+    /// none in a check-in, a relayed turn or no turn.
+    pub(super) fn persons_words_in_turn(&self, boss: &str) -> Option<String> {
+        // The turn this call runs in, not any turn of the boss's DM: a
+        // Slack or monitor turn running beside the person's isn't theirs.
+        let sid = workforce_agent::runner::CURRENT_SESSION_ID
+            .try_with(Clone::clone)
+            .ok()?;
+        let service = self.state.registry.get(boss)?;
+        let owner = self.person(Some(&service))?;
+        let dm = service.sessions.find(DESK_CHANNEL, &owner).ok().flatten()?;
+        if dm.id != sid {
+            return None;
+        }
+        self.person_turns
+            .lock()
+            .get(&sid)
+            .filter(|w| !w.trim().is_empty())
+            .cloned()
     }
 
     /// What the agents call the person `owner`: their name, when the hub
@@ -2354,6 +2468,31 @@ pub(crate) fn same_place_key(folder: &str) -> String {
     match (f.strip_prefix("~/"), std::env::var("HOME")) {
         (Some(rest), Ok(home)) => format!("{}/{rest}", home.trim_end_matches('/')),
         _ => f.to_string(),
+    }
+}
+
+/// How long the same instruction to a session isn't sent again.
+const TOLD_AGAIN: chrono::TimeDelta = chrono::TimeDelta::minutes(20);
+
+/// The session `action` tells something on its line, and what, in plain
+/// form (case, spacing and the closing stop aside), when a boss (`by`)
+/// tells it: an answer to its question is never one.
+fn told_line(action: &Action, by: &By) -> Option<(Uuid, String)> {
+    match action {
+        Action::Nudge {
+            to: Target::Session(s),
+            message,
+            reply_to: None,
+        } if by.party.kind == crew::PartyKind::Manager => {
+            let plain = message
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .trim_end_matches(['.', '!', ' '])
+                .to_lowercase();
+            (!plain.is_empty()).then_some((*s, plain))
+        }
+        _ => None,
     }
 }
 
