@@ -90,7 +90,7 @@ pub enum Disclosure {
     /// Value passes through unchanged. Either `mode == Off` or the path
     /// is on the non-secret allowlist.
     Cleartext,
-    /// First 4 and last 4 chars (or `***` if too short).
+    /// `***`: no character of the value.
     Redacted,
     /// `None` returned in place of the value.
     Denied,

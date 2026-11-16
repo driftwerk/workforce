@@ -74,6 +74,9 @@ pub fn is_credential_field(name: &str) -> bool {
 /// (`sk-ant-…` before generic `sk-…`). The catalogue aims to cover every
 /// credential format an agent or skill is likely to encounter; vendors
 /// without a fixed prefix are caught indirectly via `ENV_CREDENTIAL`.
+/// A pattern's capture group 1, if it has one, MUST be the whole value
+/// (`api_key=<value>`): it alone is hidden, the rest of the match kept.
+/// Any other group is `(?:…)`.
 static LABELLED_PATTERNS: Lazy<Vec<LabelledPattern>> = Lazy::new(|| {
     let raw: &[(&str, &str)] = &[
         // ── LLM providers ──
@@ -248,7 +251,8 @@ static SECRET_PATTERNS: Lazy<Vec<&'static Regex>> =
 /// `[REDACTED <LABEL>]`. Overlapping spans are merged, so a shorter match
 /// never leaves a longer secret's head or tail behind. `found` is in the
 /// patterns' order, most specific first: of spans merged, the one listed
-/// first names them (`GITHUB_PAT` inside a generic `BEARER_TOKEN`).
+/// first names them (`GITHUB_PAT` inside a generic `BEARER_TOKEN`). Each
+/// span's ends must fall on char boundaries, as a regex match's do.
 pub fn redact_spans(text: &str, found: Vec<(usize, usize, &'static str)>) -> String {
     if found.is_empty() {
         return text.to_string();
@@ -458,7 +462,7 @@ fn warn_on_unredacted_credentials(text: &str, session_key: &str) {
         let Some(val) = caps.get(1) else { continue };
         let val_str = val.as_str();
         if val_str.starts_with("[[secret:")
-            || val_str.contains("...")
+            || val_str.starts_with("[REDACTED")
             || val_str.starts_with("***")
             || is_allowlisted(val_str)
         {
