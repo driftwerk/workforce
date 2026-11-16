@@ -3019,7 +3019,8 @@ async fn the_overseer_answers_a_sessions_routine_question_and_gives_the_person_t
         assert_eq!(row.need, workforce_desk::decision::Need::Question);
         assert_eq!(row.why, "5433");
         assert_eq!(line.text, row.what);
-        assert_eq!(notice.content, row.said());
+        assert_eq!(notice.content, "✓ Answered acme-web's question");
+        assert_eq!(row.said(), notice.content);
         assert!(!notice.content.contains("5433"), "{}", notice.content);
 
         let pushing = d
