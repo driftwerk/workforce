@@ -80,6 +80,33 @@ async fn what_the_person_types_into_a_session_is_in_the_picture_within_a_second(
             (What::PersonSaid, "Review #648 read-only.".to_string()),
             "the person's message from Desk, once"
         );
+        // The person's message typed in by Desk (pasted at its prompt) is
+        // theirs once, from when they wrote it, not again as it goes in.
+        let m = d
+            .line_post(a.id, "Then run the tests.".into(), When::Queue)
+            .await
+            .unwrap();
+        d.breaker_typed(a.id, &m.text, Some(&crate::crew::By::you()));
+        hook(
+            &d,
+            a.id,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": m.text}),
+        )
+        .await;
+        let said = words(&d, a.id);
+        assert_eq!(said.len(), 3, "{said:?}");
+        // What Desk writes on the person's side isn't their words.
+        d.line_send(
+            crate::service::Sender::Person,
+            crate::line::Send::Tell {
+                to: crate::line::Target::Session(a.id),
+                text: "ACM-12 was moved to Done; it is no longer yours.".into(),
+                when: When::Queue,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(words(&d, a.id).len(), 3);
         // What the session tells its boss on its line is there too.
         d.line_call(
             a.id,
