@@ -8827,7 +8827,11 @@ async fn pair_device_status(
                 Some(_) => pairing
                     .take_pending_token_async(req.id.clone())
                     .await
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+                    .map_err(|e| {
+                        // The store's error holds no token.
+                        tracing::warn!(error = %e, "Couldn't take an approved device's token");
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?,
                 None => None,
             };
             if taken.is_some() && !collectable {

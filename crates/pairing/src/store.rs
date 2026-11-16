@@ -872,13 +872,17 @@ impl PairingStore for SqlitePairingStore {
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
-        if token.is_some() {
-            conn.execute(
-                "UPDATE device_pairing_requests SET pending_token = NULL WHERE id = ?1",
-                params![id],
-            )?;
+        if token.is_none() {
+            return Ok(None);
         }
-        Ok(token)
+        // Cleared only if still there: one taker alone sees a row change,
+        // even were another connection to share the file.
+        let cleared = conn.execute(
+            "UPDATE device_pairing_requests SET pending_token = NULL
+             WHERE id = ?1 AND pending_token IS NOT NULL",
+            params![id],
+        )?;
+        Ok(token.filter(|_| cleared == 1))
     }
 
     fn find_device_by_client_id(&self, client_id: &str) -> Result<Option<ApprovedDevice>> {
