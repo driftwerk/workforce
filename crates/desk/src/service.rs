@@ -8583,8 +8583,9 @@ mod tests {
                 .unwrap();
             holder.kill(h.id);
         }
-        for _ in 0..100 {
-            let running = holder
+        let mut running = 2;
+        for _ in 0..250 {
+            running = holder
                 .list()
                 .await
                 .unwrap()
@@ -8596,6 +8597,11 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        assert_eq!(
+            running,
+            2 - ends,
+            "the ended ones ended while the hub was away"
+        );
         holder.close();
         let second = Desk::start(
             DeskStore::from_pool(pool.clone()),
@@ -8645,6 +8651,8 @@ mod tests {
             let offered = SessionRecord {
                 state: SessionState::Stopped,
                 restore_offer: true,
+                // A folder that exists: a wrongful resume would start it.
+                cwd: dir.path().display().to_string(),
                 ..crate::store::tests::record_fixture("offered")
             };
             store.put(&offered).await.unwrap();
@@ -8674,6 +8682,7 @@ mod tests {
                 cli_session_id: Some("cli-iterm".into()),
                 external_pid: None,
                 terminal_id: None,
+                cwd: dir.path().display().to_string(),
                 ..crate::store::tests::record_fixture("iterm")
             };
             store.put(&elsewhere).await.unwrap();
@@ -8690,7 +8699,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn after_a_reboot_the_lost_sessions_are_offered_not_resumed() {
+    async fn when_none_of_the_holders_sessions_outlived_the_hub_the_lost_ones_are_offered() {
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
             let (d, sessions, holder_cancel, _hdir) =
