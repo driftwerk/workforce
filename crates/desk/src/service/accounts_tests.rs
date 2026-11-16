@@ -4677,3 +4677,63 @@ async fn an_account_the_provider_turned_away_is_told_once_by_name() {
     })
     .await;
 }
+
+/// The hub restarts and its first call finds Work still turned away: news
+/// to the hub, which forgot, but the refusal the person was already told
+/// of, so its need stays the one they saw (and put off). Another reason,
+/// or one after it served, is news.
+#[tokio::test]
+async fn a_refusal_told_before_a_restart_is_not_told_again() {
+    use crate::engine_accounts::AccountNeed;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let o = || key_options(dir.path(), Arc::new(MemoryKeys::default()));
+        let d = desk(pool.clone(), o()).await;
+        let (work, _, _, _) = two_on_work(&d, dir.path()).await;
+        let reason = "its organisation has turned off Claude Code access";
+        let recheck = chrono::Utc::now() + chrono::Duration::hours(1);
+        d.hub_refused(work, reason, recheck, true);
+        let refused = |d: &Desk| {
+            d.account_needs()
+                .into_iter()
+                .filter(|n| matches!(n, AccountNeed::Refused { .. }))
+                .map(|n| n.id().to_string())
+                .collect::<Vec<_>>()
+        };
+        let first = refused(&d);
+        assert_eq!(first.len(), 1);
+        let mut kept = false;
+        for _ in 0..200 {
+            let e =
+                d.0.store
+                    .state(super::accounts::REFUSED_TOLD)
+                    .await
+                    .unwrap();
+            if e.is_some_and(|e| e.value[work.to_string()]["reason"] == reason) {
+                kept = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(kept, "the refusal the person was told of is kept");
+        drop(d);
+
+        let d = desk(pool.clone(), o()).await;
+        d.hub_refused(work, reason, recheck + chrono::Duration::hours(1), true);
+        assert_eq!(refused(&d), first, "the same need, not news again");
+        // Another reason is news. (A need's id names its second.)
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        d.hub_refused(work, "its bill is unpaid", recheck, true);
+        let other = refused(&d);
+        assert_eq!(other.len(), 1);
+        assert_ne!(other, first);
+        // Served since: the next refusal is news too.
+        d.hub_served(work, chrono::Utc::now());
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        d.hub_refused(work, reason, recheck, true);
+        let again = refused(&d);
+        assert_eq!(again.len(), 1);
+        assert_ne!(again, first);
+    })
+    .await;
+}
