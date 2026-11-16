@@ -199,14 +199,50 @@ pub fn fails_over_to_another_provider(primary: ProviderKind, failover: &[String]
         .any(|spec| routed_kind(spec).is_some_and(|kind| kind != primary))
 }
 
-/// Whether a bare model id is one of Claude's, so the Claude Code CLI can
-/// run it (`haiku`, `sonnet`, `claude-opus-4-7`, `fable`, ...). A model of
-/// another provider, filled in from that agent's own tiers, is not.
+/// Whether a bare model id is one of Claude's as the Claude Code CLI names
+/// it, so the CLI can run it: exactly one of the known ids
+/// ([`known_claude_models`]), with or without `[1m]`. Another provider's
+/// id for a Claude model (`anthropic/claude-haiku-5.5`,
+/// `us.anthropic.claude-…`, Vertex's `claude-…@…`), an id no table here
+/// names, or any model whose name merely holds `claude` or `opus`, is not.
 pub fn is_claude_model(model: &str) -> bool {
     let lower = model.trim().to_ascii_lowercase();
-    ["claude", "fable", "opus", "sonnet", "haiku"]
-        .iter()
-        .any(|c| lower.contains(c))
+    let bare = lower.strip_suffix("[1m]").unwrap_or(&lower);
+    known_claude_models().contains(bare)
+}
+
+/// The Claude model ids the Claude Code CLI runs, as this hub knows them:
+/// the CLI's aliases, the `[claude-code]` and `[anthropic]` tiers, and the
+/// Anthropic API ids the default price list names.
+pub fn known_claude_models() -> &'static std::collections::HashSet<String> {
+    static KNOWN: std::sync::LazyLock<std::collections::HashSet<String>> =
+        std::sync::LazyLock::new(|| {
+            let mut known: std::collections::HashSet<String> =
+                ["opus", "sonnet", "haiku", "fable", "opusplan"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
+            let tiers = TierRegistry::new(None);
+            for key in [ProviderKind::ClaudeCode.canonical_name(), "anthropic"] {
+                for tier in ModelTier::ALL {
+                    if let Some(model) = tiers.resolve_for_tier(tier, key) {
+                        known.insert(model.to_ascii_lowercase());
+                    }
+                }
+            }
+            let priced = workforce_common::cost::load_pricing_toml(
+                workforce_agent::llm::DEFAULT_PRICING_TOML,
+            )
+            .unwrap_or_default();
+            known.extend(
+                priced
+                    .into_keys()
+                    .map(|id| id.to_ascii_lowercase())
+                    .filter(|id| id.starts_with("claude-") && !id.contains(['@', '/', ':'])),
+            );
+            known
+        });
+    &KNOWN
 }
 
 /// The provider kinds that run on a subscription login, in the order an
@@ -843,6 +879,69 @@ impl SharedSubscriptions {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_claude_model_is_one_the_cli_names_whole() {
+        for id in [
+            "haiku",
+            "Sonnet",
+            "opus[1m]",
+            "fable",
+            "opusplan",
+            "claude-opus-4-7",
+            "claude-haiku-5-5",
+            "claude-opus-5",
+            "claude-sonnet-4-5-20250929",
+            "claude-haiku-4-5-20251001",
+            "claude-fable-5-2",
+            "claude-sonnet-4-6[1m]",
+        ] {
+            assert!(super::is_claude_model(id), "{id}");
+        }
+        for id in [
+            "",
+            "gpt-6-luna",
+            "anthropic/claude-haiku-5.5",
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "anthropic.claude-fable-5-1",
+            "claude-sonnet-4-5@20250929",
+            "claude-code:haiku",
+            "openrouter:anthropic/claude-opus-5.5",
+            "deepseek-opus-coder",
+            "my-sonnet-finetune",
+            "claude",
+            "claude-opus",
+            "claude-opus-9-9",
+            "haiku-mini",
+        ] {
+            assert!(!super::is_claude_model(id), "{id}");
+        }
+    }
+
+    /// Every Claude id the tables here name is one the CLI is given: none
+    /// of the known is turned away.
+    #[test]
+    fn every_known_claude_id_is_a_claude_model() {
+        use workforce_agent::llm::tiers::{ModelTier, TierRegistry};
+        let tiers = TierRegistry::new(None);
+        for key in ["claude-code", "anthropic"] {
+            for tier in ModelTier::ALL {
+                let model = tiers.resolve_for_tier(tier, key).unwrap();
+                assert!(super::is_claude_model(&model), "{key} {tier:?}: {model}");
+            }
+        }
+        let priced =
+            workforce_common::cost::load_pricing_toml(workforce_agent::llm::DEFAULT_PRICING_TOML)
+                .unwrap();
+        let anthropic: Vec<_> = priced
+            .keys()
+            .filter(|id| id.starts_with("claude-") && !id.contains(['@', '/', ':']))
+            .collect();
+        assert!(anthropic.len() >= 10, "{anthropic:?}");
+        for id in anthropic {
+            assert!(super::is_claude_model(id), "{id}");
+        }
+    }
+
     use super::*;
 
     #[test]

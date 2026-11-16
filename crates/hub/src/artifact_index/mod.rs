@@ -40,7 +40,17 @@ const COLLECTION: &str = "Artifacts";
 /// Process-global tagger LLM. Set once from `build_inner`; read lazily by the
 /// indexer when it needs to auto-tag. Absent → tagging is skipped (the
 /// embed still runs).
-static TAGGER_LLM: OnceLock<Arc<dyn LlmProvider>> = OnceLock::new();
+static TAGGER_LLM: OnceLock<Tagger> = OnceLock::new();
+
+/// The tagger's provider and the model its calls name: the light
+/// background model of the agent whose provider it is (`[llm]
+/// light_model`, its provider's cheap tier unless set), never that agent's
+/// chat model. `None` is the provider's own (a subscription tagger is built
+/// on its light model).
+struct Tagger {
+    llm: Arc<dyn LlmProvider>,
+    model: Option<String>,
+}
 
 /// Where the tagger's calls are costed. Set once, by the first agent built.
 static TAGGER_COSTS: OnceLock<Arc<CostTracker>> = OnceLock::new();
@@ -50,21 +60,43 @@ const TAGGER_AGENT: &str = "artifacts";
 
 /// Install the LLM used by the artifact auto-tagger (idempotent — first wins).
 pub fn set_tagger_llm(llm: Arc<dyn LlmProvider>) {
-    let _ = TAGGER_LLM.set(llm);
+    let _ = TAGGER_LLM.set(Tagger { llm, model: None });
 }
 
 /// Offer an agent's own provider — its primary alone, never the chain over
 /// it — to the tagger; returns whether it was taken. A subscription agent's
 /// never is: the tagger is process-wide, so that agent's login would pay
-/// for every agent's artifacts.
-pub fn offer_agent_tagger(primary: ProviderKind, llm: Arc<dyn LlmProvider>) -> bool {
-    !primary.is_subscription() && TAGGER_LLM.set(llm).is_ok()
+/// for every agent's artifacts. Its calls name `light`, the agent's light
+/// background model, as that provider names it: one routed to another
+/// provider is no model this one serves, so the provider's own is used.
+pub fn offer_agent_tagger(
+    primary: ProviderKind,
+    llm: Arc<dyn LlmProvider>,
+    light: Option<String>,
+) -> bool {
+    !primary.is_subscription()
+        && TAGGER_LLM
+            .set(Tagger {
+                llm,
+                model: light.and_then(|m| own_model(primary, &m)),
+            })
+            .is_ok()
+}
+
+/// `spec` as `primary`'s own provider names it: bare, or routed to that
+/// provider (`anthropic:claude-haiku-5-5`); `None` when it routes elsewhere.
+fn own_model(primary: ProviderKind, spec: &str) -> Option<String> {
+    match crate::subscription::routed_kind(spec) {
+        None => Some(spec.to_string()),
+        Some(kind) if kind == primary => spec.split_once(':').map(|(_, m)| m.to_string()),
+        Some(_) => None,
+    }
 }
 
 /// The LLM the artifact tagger uses, if one was installed: what shadow
 /// mode's opt-in judge grades with ([`crate::known_item_judge`]).
 pub fn tagger_llm() -> Option<Arc<dyn LlmProvider>> {
-    TAGGER_LLM.get().cloned()
+    TAGGER_LLM.get().map(|t| Arc::clone(&t.llm))
 }
 
 /// Ask `llm` once, as the tagger does, its call costed where the tagger's
@@ -174,7 +206,7 @@ impl<V: ArtifactVectors> ArtifactIndex<V> {
 
     /// Ask the LLM for tags. Returns `[]` on any failure / no LLM.
     async fn auto_tag(&self, a: &Artifact) -> Vec<String> {
-        let Some(llm) = TAGGER_LLM.get() else {
+        let Some(Tagger { llm, model }) = TAGGER_LLM.get() else {
             return Vec::new();
         };
         let system = "You label knowledge-base artifacts. Reply with ONLY 3-7 short \
@@ -186,7 +218,7 @@ impl<V: ArtifactVectors> ArtifactIndex<V> {
             Some(system),
             &[LlmMessage::user(user)],
             &[],
-            None,
+            model.as_deref(),
             Some(64),
             false,
         ))
@@ -491,13 +523,36 @@ mod tests {
             ProviderKind::ClaudeCode,
             ProviderKind::Codex,
         ] {
-            assert!(!offer_agent_tagger(kind, Arc::clone(&llm)), "{kind:?}");
+            assert!(
+                !offer_agent_tagger(kind, Arc::clone(&llm), Some("haiku".into())),
+                "{kind:?}"
+            );
         }
         assert!(
             TAGGER_LLM
                 .get()
-                .is_none_or(|tagger| !Arc::ptr_eq(tagger, &llm)),
+                .is_none_or(|tagger| !Arc::ptr_eq(&tagger.llm, &llm)),
             "a subscription agent's provider never becomes the process-wide tagger"
+        );
+    }
+
+    /// The tagger names its agent's light model as its own provider names
+    /// it; one routed to another provider is left to the provider's own.
+    #[test]
+    fn the_tagger_names_the_light_model_its_provider_serves() {
+        use ProviderKind::{Anthropic, OpenRouter};
+        assert_eq!(
+            own_model(Anthropic, "claude-haiku-5-5").as_deref(),
+            Some("claude-haiku-5-5")
+        );
+        assert_eq!(
+            own_model(Anthropic, "anthropic:claude-haiku-5-5").as_deref(),
+            Some("claude-haiku-5-5")
+        );
+        assert_eq!(own_model(Anthropic, "openrouter:openai/gpt-6-luna"), None);
+        assert_eq!(
+            own_model(OpenRouter, "anthropic/claude-haiku-5.5").as_deref(),
+            Some("anthropic/claude-haiku-5.5")
         );
     }
 
