@@ -1867,11 +1867,17 @@ impl Desk {
         tokio::spawn(desk.clone().watch_background());
         desk.line_load().await;
         tokio::spawn(desk.clone().line_loop());
+        // Lost in this start, not offered by an earlier one.
+        let lost_now: HashSet<Uuid> = recovered.iter().map(|r| r.id).collect();
         recovered.into_iter().for_each(|r| desk.save(r));
         for (id, at) in failed {
             let _ = desk.0.persist.send(Persist::Attention(id, at));
         }
         let running = held.running();
+        // The holder outlived the last hub (it still runs some of its
+        // sessions): this start is a restart of the hub, not of the
+        // computer, and what it lost goes on by itself.
+        let restarted = running.as_ref().is_some_and(|r| !r.is_empty());
         desk.adopt_held(held).await;
         // Devin sessions that ended while the hub was away: what Devin saved
         // is written back, and their files (their hook tokens) go. Not when
@@ -1899,10 +1905,18 @@ impl Desk {
         if let Some(every) = desk.0.opts.adopt_every {
             tokio::spawn(desk.clone().adopt_loop(every));
         }
-        if desk.0.opts.restore == RestorePolicy::Auto {
+        if restores_by_itself(desk.0.opts.restore, restarted) {
             let ids = desk
                 .restore_offer()
                 .into_iter()
+                // At `Ask` only Desk's own, lost in this restart: one from
+                // another terminal ended there, not with the hub (and the
+                // listing may not have said whether its process still runs);
+                // one an earlier start offered is still the person's to take.
+                .filter(|s| {
+                    desk.0.opts.restore == RestorePolicy::Auto
+                        || (s.origin == Origin::Desk && lost_now.contains(&s.id))
+                })
                 .map(|s| s.id)
                 .collect::<Vec<_>>();
             desk.restore(&ids, None).await;
@@ -7652,6 +7666,18 @@ impl Desk {
     }
 }
 
+/// Whether the sessions a start found lost are resumed without asking: at
+/// `Auto`, and at `Ask` when only the hub restarted (`restarted`: the
+/// holder outlived it). A restart never leaves the person's sessions for
+/// them to bring back; a reboot asks.
+fn restores_by_itself(policy: RestorePolicy, restarted: bool) -> bool {
+    match policy {
+        RestorePolicy::Auto => true,
+        RestorePolicy::Ask => restarted,
+        RestorePolicy::Off => false,
+    }
+}
+
 /// What the holder still had when the hub started, by owner.
 #[derive(Default)]
 pub(crate) struct HeldSet {
@@ -8488,6 +8514,206 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(200)).await;
             let saved = DeskStore::from_pool(pool).get(s.id).await.unwrap().unwrap();
             assert_eq!((saved.origin, saved.external_pid), (Origin::Desk, None));
+            holder_cancel.cancel();
+        })
+        .await;
+    }
+
+    #[test]
+    fn only_a_restart_resumes_what_it_lost_without_asking() {
+        assert!(restores_by_itself(RestorePolicy::Auto, false));
+        assert!(restores_by_itself(RestorePolicy::Ask, true));
+        assert!(
+            !restores_by_itself(RestorePolicy::Ask, false),
+            "a reboot asks"
+        );
+        assert!(!restores_by_itself(RestorePolicy::Off, true));
+    }
+
+    /// Two sessions in the holder; the hub stops and `ends` of them end
+    /// while it is away; the next hub starts, at `Ask`.
+    async fn restarted_with_ended(
+        pool: workforce_postgres::PostgresPool,
+        dir: &Path,
+        ends: usize,
+        lost_meanwhile: Option<&SessionRecord>,
+    ) -> (
+        Desk,
+        Vec<(SessionView, u32)>,
+        CancellationToken,
+        tempfile::TempDir,
+    ) {
+        let (hdir, socket, holder_cancel) = crate::holder::tests::holder().await;
+        let mut opts = options(dir);
+        opts.holder = Some(HolderOptions {
+            socket: socket.clone(),
+            token: crate::holder::tests::TOKEN.into(),
+        });
+        DeskStore::migrate(&pool).await.unwrap();
+        let first_cancel = CancellationToken::new();
+        let first = Desk::start(
+            DeskStore::from_pool(pool.clone()),
+            opts.clone(),
+            Default::default(),
+            first_cancel.clone(),
+        )
+        .await
+        .unwrap();
+        let mut sessions = Vec::new();
+        for n in 0..2 {
+            let s = new_session(&first, dir).await;
+            first.change(s.id, |r, _| {
+                r.cli_session_id = Some(format!("cli-{n}"));
+                r.state = SessionState::Idle;
+            });
+            let pid = first.attach(s.id).unwrap().pid().unwrap();
+            sessions.push((s, pid));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        first_cancel.cancel();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let holder = Holder::connect(&socket, crate::holder::tests::TOKEN)
+            .await
+            .unwrap();
+        for (s, _) in sessions.iter().rev().take(ends) {
+            let id = s.id.to_string();
+            let held = holder.list().await.unwrap();
+            let h = held
+                .iter()
+                .find(|h| h.meta["session"].as_str() == Some(id.as_str()))
+                .unwrap();
+            holder.kill(h.id);
+        }
+        let mut running = 2;
+        for _ in 0..250 {
+            running = holder
+                .list()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|h| !h.exited)
+                .count();
+            if running == 2 - ends {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            running,
+            2 - ends,
+            "the ended ones ended while the hub was away"
+        );
+        holder.close();
+        // Running when the last hub stopped, its process gone since.
+        if let Some(r) = lost_meanwhile {
+            DeskStore::from_pool(pool.clone()).put(r).await.unwrap();
+        }
+        let second = Desk::start(
+            DeskStore::from_pool(pool.clone()),
+            opts,
+            Default::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        (second, sessions, holder_cancel, hdir)
+    }
+
+    #[tokio::test]
+    async fn a_session_that_ended_while_the_hub_restarted_goes_on_by_itself() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (d, sessions, holder_cancel, _hdir) =
+                restarted_with_ended(pool, dir.path(), 1, None).await;
+            let (kept, kept_pid) = &sessions[0];
+            let (ended, ended_pid) = &sessions[1];
+            assert_eq!(
+                d.attach(kept.id).unwrap().pid(),
+                Some(*kept_pid),
+                "taken back"
+            );
+            let v = d.view(ended.id).unwrap();
+            assert!(v.live, "resumed without asking: {:?}", v.state);
+            assert_ne!(v.state, SessionState::Closed);
+            assert_ne!(
+                d.attach(ended.id).unwrap().pid(),
+                Some(*ended_pid),
+                "a new process"
+            );
+            assert!(d.restore_offer().is_empty(), "nothing left to bring back");
+            holder_cancel.cancel();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn what_a_reboot_offered_is_still_offered_after_a_later_restart() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let store = DeskStore::from_pool(pool.clone());
+            DeskStore::migrate(&pool).await.unwrap();
+            // Offered after a reboot, and left: the person hasn't taken it.
+            let offered = SessionRecord {
+                state: SessionState::Stopped,
+                restore_offer: true,
+                // A folder that exists: a wrongful resume would start it.
+                cwd: dir.path().display().to_string(),
+                ..crate::store::tests::record_fixture("offered")
+            };
+            store.put(&offered).await.unwrap();
+            let (d, _, holder_cancel, _hdir) =
+                restarted_with_ended(pool, dir.path(), 1, None).await;
+            assert!(
+                !d.view(offered.id).unwrap().live,
+                "never started on its own"
+            );
+            assert!(
+                d.restore_offer().iter().any(|o| o.id == offered.id),
+                "still offered"
+            );
+            holder_cancel.cancel();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn another_terminals_session_lost_in_a_restart_is_offered_not_resumed() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let elsewhere = SessionRecord {
+                origin: Origin::External,
+                state: SessionState::Idle,
+                cli_session_id: Some("cli-iterm".into()),
+                external_pid: None,
+                terminal_id: None,
+                cwd: dir.path().display().to_string(),
+                ..crate::store::tests::record_fixture("iterm")
+            };
+            let (d, _, holder_cancel, _hdir) =
+                restarted_with_ended(pool, dir.path(), 1, Some(&elsewhere)).await;
+            let v = d.view(elsewhere.id).unwrap();
+            assert!(!v.live, "never started by Desk on its own");
+            assert!(
+                d.restore_offer().iter().any(|o| o.id == elsewhere.id),
+                "offered"
+            );
+            holder_cancel.cancel();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn when_none_of_the_holders_sessions_outlived_the_hub_the_lost_ones_are_offered() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (d, sessions, holder_cancel, _hdir) =
+                restarted_with_ended(pool, dir.path(), 2, None).await;
+            for (s, _) in &sessions {
+                let v = d.view(s.id).unwrap();
+                assert!(!v.live);
+                assert_eq!(v.state, SessionState::Stopped, "kept, never closed");
+            }
+            assert_eq!(d.restore_offer().len(), 2, "the person is asked");
             holder_cancel.cancel();
         })
         .await;
