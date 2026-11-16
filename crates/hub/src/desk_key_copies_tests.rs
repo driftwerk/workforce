@@ -21,14 +21,14 @@ const ORG_DATADOG: &str = "org-datadog-shared-secret-0004";
 const ANN_SLACK: &str = "xoxb-ann-slack-secret-0005";
 /// A token GitHub's device flow gave Ann's sign-in on this hub's OAuth app.
 const ANN_GITHUB_SIGNED_IN: &str = "gho_ann_signed_in_secret_0006";
-const ALLAN_ANN_LINEAR: &str = "lin_api_allan_ann_secret_0007";
-const ALLAN_ANN_METABASE: &str = "mb_allan_ann_secret_0008";
-const ALLAN_ANN_JIRA: &str = "allan-ann-jira-secret-0009";
-const ALLAN_BOB_EMAIL: &str = "allan-bob-mail-secret-0010";
-const ALLAN_SHARED: &str = "allan-shared-metabase-0011";
-const ALLAN_ANN_SIGNED_IN: &str = "gho_allan_ann_signed_0012";
-const CLOSED_ANN_LINEAR: &str = "lin_api_closed_ann_0013";
-const ALLAN_ANN_GOOGLE: &str = "allan-ann-google-refresh-0014";
+const ALLAN_ANN_LINEAR: &str = "t7allan-ann-linear-0007";
+const ALLAN_ANN_METABASE: &str = "t8allan-ann-metabase-0008";
+const ALLAN_ANN_JIRA: &str = "t9allan-ann-jira-0009";
+const ALLAN_BOB_EMAIL: &str = "t10allan-bob-mail-0010";
+const ALLAN_SHARED: &str = "t11allan-shared-mb-0011";
+const ALLAN_ANN_SIGNED_IN: &str = "gho_t12allan-signed-0012";
+const CLOSED_ANN_LINEAR: &str = "t13closed-ann-linear-0013";
+const ALLAN_ANN_GOOGLE: &str = "t14allan-google-0014";
 const SECRETS: &[&str] = &[
     ALLAN_ANN_LINEAR,
     ALLAN_ANN_METABASE,
@@ -936,7 +936,7 @@ fn one_connection_in_two_tiers_is_listed_once_from_the_first() {
         allan
             .set(
                 &format!("users/{ann}/skills/linear/workspaces/{key}/api_key"),
-                "k",
+                &format!("k-{key}"),
             )
             .unwrap();
         allan
@@ -963,6 +963,25 @@ fn one_connection_in_two_tiers_is_listed_once_from_the_first() {
         ],
         "Acme from the personal tier only; Allan's own second Acme is shadowed by it too"
     );
+    // An unnamed key at no site is the same connection only when it is the
+    // same key: a different one through Allan is offered too.
+    mine.set(&format!("users/{ann}/skills/github/token"), "ghp_mine")
+        .unwrap();
+    allan
+        .set(&format!("users/{ann}/skills/github/token"), "ghp_allans")
+        .unwrap();
+    bea.set(&format!("users/{ann}/skills/github/token"), "ghp_mine")
+        .unwrap();
+    let github: Vec<_> = connections_of(&sources, &ann)
+        .into_iter()
+        .filter(|l| l.connector == "github")
+        .map(|l| l.agent)
+        .collect();
+    assert_eq!(
+        github,
+        [None, Some("allan".to_string())],
+        "Bea's is the personal one, again"
+    );
     // Without the personal one, the first agent's.
     let got: Vec<_> = connections_of(&sources[1..], &ann)
         .into_iter()
@@ -971,6 +990,8 @@ fn one_connection_in_two_tiers_is_listed_once_from_the_first() {
     assert_eq!(
         got,
         [
+            ("default".to_string(), Some("allan".to_string())),
+            ("default".to_string(), Some("bea".to_string())),
             ("acme".to_string(), Some("allan".to_string())),
             ("acme2".to_string(), Some("allan".to_string())),
             ("other".to_string(), Some("allan".to_string())),

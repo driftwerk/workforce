@@ -441,9 +441,11 @@ fn listed(src: &Source, c: &'static Connector, person: &Uuid, key: &str, shape: 
     }
 }
 
-/// Where a connection is, to tell two copies of one apart: its site and
-/// account, or, with neither, its name (a Linear workspace's).
-fn place(l: &Listed) -> (Option<String>, Option<String>, Option<String>) {
+/// Where a connection is, when that says which workspace it is: its site
+/// and account, or, with neither, the name the person gave it (a Linear
+/// workspace's). `None` for one named only by its service (an unnamed
+/// GitHub or Linear key): nothing then says two are the same workspace.
+fn place(l: &Listed) -> Option<(Option<String>, Option<String>, Option<String>)> {
     let n = |s: &str| {
         s.trim()
             .trim_start_matches("https://")
@@ -453,8 +455,26 @@ fn place(l: &Listed) -> (Option<String>, Option<String>, Option<String>) {
     };
     let site = l.site.as_deref().map(n);
     let account = l.account.as_deref().map(n);
-    let name = (site.is_none() && account.is_none()).then(|| n(&l.name));
-    (site, account, name)
+    if site.is_none() && account.is_none() {
+        return (l.name != l.service).then(|| (None, None, Some(n(&l.name))));
+    }
+    Some((site, account, None))
+}
+
+/// The secret fields' values of connection `key` of `c` in `src`, compared
+/// only with another's here, never handed on.
+fn secrets_of(
+    src: &Source,
+    c: &Connector,
+    person: &Uuid,
+    key: &str,
+    shape: Shape,
+) -> Vec<Option<String>> {
+    c.fields
+        .iter()
+        .filter(|f| f.secret)
+        .map(|f| src.get(person, &field_path(c, f, key, shape)))
+        .collect()
 }
 
 /// The keys of `c` the person keeps in `src`: each instance's, and
@@ -483,33 +503,39 @@ fn keys_in(src: &Source, c: &Connector, person: &Uuid) -> Vec<String> {
 /// by service in the catalog's order, then tier (as `sources` are ordered:
 /// the personal one first, then each agent's by id), then key.
 ///
-/// One connection kept in two tiers (the same service, at the same site
-/// and account, or, with neither, of the same name: [`place`]) is listed
-/// once, from the first tier holding it: the personal one over an agent's,
-/// and an agent's over a later agent's. The personal key is the one the
-/// person uses for all their agents, so it is the one Desk sets up for all
-/// of theirs; one through an agent stays taken from that agent only when
-/// asked for by name.
+/// One connection kept in two tiers is listed once, from the first tier
+/// holding it: the personal one over an agent's, and an agent's over a
+/// later agent's (the rule asked for: the person's own key for all their
+/// agents is the one Desk sets up for all of theirs; at run time an agent's
+/// own key wins over it, and stays copyable by name). Two are one
+/// connection when the same service either holds the same secrets, or sits
+/// at the same [`place`] (the same site and account, or the same name the
+/// person gave it). An unnamed key at no site, in two tiers, with different
+/// secrets, is two connections, each offered.
 pub fn connections_of(sources: &[Source], person: &Uuid) -> Vec<Listed> {
     let mut out: Vec<Listed> = Vec::new();
     for c in CATALOG.iter().filter(|c| copyable(c.id).is_some()) {
-        let from = out.len();
+        // This service's listed so far, and their secrets (never output).
+        let mut seen: Vec<(Listed, Vec<Option<String>>)> = Vec::new();
         for src in sources {
             for key in keys_in(src, c, person) {
                 let Some(shape) = copyable_shape(src, c, person, &key) else {
                     continue;
                 };
                 let l = listed(src, c, person, &key, shape);
+                let secrets = secrets_of(src, c, person, &key, shape);
                 // Only another tier's copy shadows it: two connections of one
                 // tier are each their own.
-                let shadowed = out[from..]
-                    .iter()
-                    .any(|o| o.agent != l.agent && place(o) == place(&l));
+                let shadowed = seen.iter().any(|(o, their)| {
+                    o.agent != l.agent
+                        && (*their == secrets || place(o).is_some_and(|p| Some(p) == place(&l)))
+                });
                 if !shadowed {
-                    out.push(l);
+                    seen.push((l, secrets));
                 }
             }
         }
+        out.extend(seen.into_iter().map(|(l, _)| l));
     }
     out
 }
