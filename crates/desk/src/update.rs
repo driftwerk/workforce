@@ -1362,6 +1362,24 @@ pub fn reask(fields: &[String]) -> String {
     )
 }
 
+/// What a re-ask says: the fields over their bounds (`long`), and the
+/// headlines against the writing contract (`broken`, each with why).
+pub fn reask_for(long: &[String], broken: &[String]) -> String {
+    let mut out = String::new();
+    if !long.is_empty() {
+        out.push_str(&reask(long));
+    }
+    if !broken.is_empty() {
+        out.push_str(&format!(
+            "\n\nThese don't say what the work is the way the person needs: {}. Write only \
+             those again, the work in words first and any id only in brackets after, in the \
+             same JSON shape (leave out every other field).",
+            broken.join("; ")
+        ));
+    }
+    out
+}
+
 /// `again`'s fields over `first`'s: the second answer's shorter words win.
 pub fn merge_composed(mut first: Composed, again: Composed) -> Composed {
     if again.headline.is_some() {

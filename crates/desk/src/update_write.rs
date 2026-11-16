@@ -97,12 +97,16 @@ impl Work {
                 .find_map(|t| t.title.as_deref().map(plain).filter(|t| !t.is_empty()))
         };
         let name = plain(&self.name);
-        title(RefKind::Ticket)
-            .or_else(|| Some(plain(&self.goal)).filter(|g| !g.is_empty()))
-            .or_else(|| title(RefKind::Pr))
-            .or_else(|| (!name.is_empty() && !is_id(&name)).then_some(name))
-            .map(|w| strip_ids(&w))
-            .filter(|w| word_count_past_ids(w) > 0)
+        // Each in turn, past its ids: a ticket titled only "MAN-12" says
+        // nothing, and the goal is tried next.
+        let words = |w: Option<String>| {
+            w.map(|w| strip_ids(&w))
+                .filter(|w| word_count_past_ids(w) > 0)
+        };
+        words(title(RefKind::Ticket))
+            .or_else(|| words(Some(plain(&self.goal))))
+            .or_else(|| words(title(RefKind::Pr)))
+            .or_else(|| words(Some(name).filter(|n| !is_id(n))))
             .unwrap_or_else(|| "a session's work".to_string())
     }
 
@@ -208,16 +212,26 @@ impl Breach {
     }
 }
 
+/// Names shaped like a ticket's key that are words, not tickets: "UTF-8",
+/// "GPT-5", "SHA-256", "ISO-8601", "COVID-19".
+const NOT_KEYS: &[&str] = &[
+    "AES", "ARM", "AVX", "BS", "COVID", "CSS", "EC", "ECMA", "EN", "ES", "GMT", "GPT", "H", "HTML",
+    "HTTP", "IEC", "IEEE", "IPV", "ISO", "MD", "PCI", "PEP", "RFC", "SHA", "SOC", "SSL", "TLS",
+    "UTC", "UTF", "WCAG", "X",
+];
+
 /// The kind of id `token` is, bare of the punctuation around it: a ticket
-/// (`MAN-636`, `PLT-3010`) or a PR (`#640`).
+/// (`MAN-636`, `PLT-3010`) or a PR (`#640`). A key that is a word
+/// ([`NOT_KEYS`]) is none, and so is "#1" to "#9" ("the #1 priority").
 pub fn id_kind(token: &str) -> Option<RefKind> {
     let t = token.trim_matches(|c: char| !c.is_alphanumeric() && c != '#' && c != '-');
     let t = t.trim_end_matches('-');
     if let Some(n) = t.strip_prefix('#') {
-        return (!n.is_empty() && n.chars().all(|c| c.is_ascii_digit())).then_some(RefKind::Pr);
+        return (n.len() >= 2 && n.chars().all(|c| c.is_ascii_digit())).then_some(RefKind::Pr);
     }
     let (key, n) = t.rsplit_once('-')?;
     let ticket = (2..=10).contains(&key.len())
+        && !NOT_KEYS.contains(&key)
         && key.chars().next().is_some_and(|c| c.is_ascii_uppercase())
         && key
             .chars()
@@ -243,17 +257,44 @@ fn bare(token: &str) -> String {
 
 /// The words of `text` with whether each sits inside brackets.
 fn tokens(text: &str) -> Vec<(&str, bool)> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let count = |w: &str, c: char| w.chars().filter(|x| *x == c).count() as i32;
     let mut depth = 0i32;
     let mut out = Vec::new();
-    for w in text.split_whitespace() {
-        let opens = w.chars().filter(|c| *c == '(').count() as i32;
-        let closes = w.chars().filter(|c| *c == ')').count() as i32;
-        // A word opening its own bracket is inside it.
-        let inside = depth > 0 || opens > 0;
-        out.push((w, inside));
+    for (i, w) in words.iter().enumerate() {
+        let (opens, closes) = (count(w, '('), count(w, ')'));
+        // A word opening its own bracket is inside it, and so is one after
+        // an open bracket that closes later; one never closed brackets
+        // nothing after it.
+        let closed_later = || words[i..].iter().any(|w| w.contains(')'));
+        let inside = opens > 0 || (depth > 0 && closed_later());
+        out.push((*w, inside));
         depth = (depth + opens - closes).max(0);
     }
     out
+}
+
+/// The ids `text` says inside brackets, once each.
+fn bracketed_ids(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (w, inside) in tokens(text) {
+        for part in w.split(',') {
+            if inside && id_kind(part).is_some() {
+                let id = bare(part);
+                if !out.contains(&id) {
+                    out.push(id);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `ids` without those `text` already says in brackets (exactly: "#63" is
+/// kept when only "#631" is said).
+fn not_said_in(ids: &mut Vec<String>, text: &[&str]) {
+    let said: Vec<String> = text.iter().flat_map(|t| bracketed_ids(t)).collect();
+    ids.retain(|id| !said.iter().any(|s| s.eq_ignore_ascii_case(id)));
 }
 
 /// The ids `text` says outside brackets, in order, once each.
@@ -343,8 +384,13 @@ pub fn in_words(text: &str, work: &Work) -> (String, Vec<String>) {
             _ => break,
         }
     }
+    // Whether the ids just said were named by a word before them ("PRs
+    // #631, #632 and #633"), and what may come between them.
+    let mut named_run = false;
+    let run_joins = |w: &str| w == "and" || (w.ends_with(',') && id_kind(w).is_some());
     for (i, (w, inside)) in all.iter().enumerate().skip(start) {
         if *inside || id_kind(w).is_none() {
+            named_run &= *w == "and";
             out.push((*w).to_string());
             continue;
         }
@@ -358,8 +404,19 @@ pub fn in_words(text: &str, work: &Work) -> (String, Vec<String>) {
                     .trim_matches(|c: char| !c.is_alphanumeric())
                     .to_lowercase()
                     .as_str(),
-                "pr" | "request" | "ticket" | "issue" | "mr"
+                "pr" | "prs"
+                    | "request"
+                    | "requests"
+                    | "ticket"
+                    | "tickets"
+                    | "issue"
+                    | "issues"
+                    | "mr"
+                    | "mrs"
             );
+        // "PRs #631 and #632", "PRs #631, #632": still named by the word.
+        let named_before = named_before || (named_run && i > start && run_joins(all[i - 1].0));
+        named_run = named_before;
         let said = match (named_before, work.title_of(&id)) {
             (true, _) => format!("({id})"),
             (false, Some(t)) => format!("“{t}” ({id})"),
@@ -378,6 +435,33 @@ pub fn in_words(text: &str, work: &Work) -> (String, Vec<String>) {
     (said, lifted)
 }
 
+/// `text` cut to `n` words, never inside brackets: a cut that would leave
+/// one open ends before it.
+pub fn cut(text: &str, n: usize) -> String {
+    let c = crate::crew::words(text, n);
+    if c.matches('(').count() <= c.matches(')').count() {
+        return c;
+    }
+    let mut depth = 0i32;
+    let mut open_at = None;
+    for (i, ch) in c.char_indices() {
+        match ch {
+            '(' => {
+                if depth == 0 {
+                    open_at = Some(i);
+                }
+                depth += 1;
+            }
+            ')' => depth = (depth - 1).max(0),
+            _ => {}
+        }
+    }
+    match open_at.filter(|_| depth > 0) {
+        Some(at) => format!("{}…", c[..at].trim_end().trim_end_matches('…')),
+        None => c,
+    }
+}
+
 /// `s` with its first letter in upper case.
 pub fn capitalised(s: &str) -> String {
     let mut c = s.chars();
@@ -387,15 +471,69 @@ pub fn capitalised(s: &str) -> String {
     }
 }
 
-/// `s` to read on after a colon: its first letter lowered, unless it
-/// starts an acronym or a name with a capital inside it.
+/// Words a sentence opens on that read on lowered after a colon; any
+/// other first word (a name: "Matt", "Renovate") keeps its capital.
+const OPENERS: &[&str] = &[
+    "A",
+    "Added",
+    "After",
+    "All",
+    "Allowed",
+    "An",
+    "And",
+    "Asked",
+    "Before",
+    "Built",
+    "But",
+    "Changed",
+    "Checked",
+    "Closed",
+    "Deployed",
+    "Fixed",
+    "Found",
+    "Gave",
+    "It",
+    "Its",
+    "Left",
+    "Made",
+    "Merged",
+    "Moved",
+    "Now",
+    "Opened",
+    "Pushed",
+    "Ran",
+    "Released",
+    "Removed",
+    "Restarted",
+    "Sent",
+    "Started",
+    "Stopped",
+    "Tests",
+    "The",
+    "There",
+    "These",
+    "This",
+    "Told",
+    "Updated",
+    "Waiting",
+    "Wrote",
+];
+
+/// `s` to read on after a colon: its first letter lowered when it opens
+/// on a common opening word ([`OPENERS`]), else as it is.
 fn lowered(s: &str) -> String {
-    let mut chars = s.chars();
-    match (chars.next(), chars.next()) {
-        (Some(a), Some(b)) if a.is_uppercase() && b.is_lowercase() => {
-            a.to_lowercase().collect::<String>() + &s[a.len_utf8()..]
+    let first = s
+        .split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .next()
+        .unwrap_or_default();
+    match OPENERS.contains(&first) {
+        true => {
+            let mut c = s.chars();
+            c.next()
+                .map(|a| a.to_lowercase().collect::<String>() + c.as_str())
+                .unwrap_or_default()
         }
-        _ => s.to_string(),
+        false => s.to_string(),
     }
 }
 
@@ -446,6 +584,8 @@ pub fn plain_said(
                 .map(|a| lift(&a))
         });
     let what = capitalised(&work.in_words());
+    // A line that was only its id says nothing once the id is lifted.
+    let happened = happened.filter(|h| h.chars().any(char::is_alphanumeric));
     let headline = match happened {
         Some(h) => sentence(&format!(
             "{what}: {}",
@@ -472,10 +612,10 @@ pub fn plain_said(
     } else if !next.trim().is_empty() {
         body.push(sentence(&format!("Next: {}", lowered(&lift(next)))));
     }
-    let headline = crate::crew::words(&headline, HEADLINE_WORDS);
-    let body = crate::crew::words(&body.join(" "), BODY_WORDS);
+    let headline = cut(&headline, HEADLINE_WORDS);
+    let body = cut(&body.join(" "), BODY_WORDS);
     // An id said in brackets in place isn't said again after.
-    ids.retain(|id| !headline.contains(id.as_str()) && !body.contains(id.as_str()));
+    not_said_in(&mut ids, &[&headline, &body]);
     Said {
         kind,
         headline,
@@ -575,7 +715,7 @@ pub fn said_from(plain: Said, wrote: &Written, work: &Work) -> Said {
         .map(str::trim)
         .filter(|h| !h.is_empty())
     {
-        let h = sentence(&crate::crew::words(h, HEADLINE_WORDS));
+        let h = sentence(&cut(h, HEADLINE_WORDS));
         if ok(&h, "") {
             out.headline = h;
         }
@@ -586,7 +726,7 @@ pub fn said_from(plain: Said, wrote: &Written, work: &Work) -> Said {
         .map(str::trim)
         .filter(|b| !b.is_empty())
     {
-        let (b, lifted) = in_words(&crate::crew::words(b, BODY_WORDS), work);
+        let (b, lifted) = in_words(&cut(b, BODY_WORDS), work);
         for id in lifted {
             if !out.ids.contains(&id) {
                 out.ids.push(id);
@@ -596,22 +736,32 @@ pub fn said_from(plain: Said, wrote: &Written, work: &Work) -> Said {
             out.body = b;
         }
     }
-    let (h, b) = (out.headline.clone(), out.body.clone());
-    out.ids
-        .retain(|id| !h.contains(id.as_str()) && !b.contains(id.as_str()));
+    // 5: the gap keeps the contract too: its ids are said in words, with
+    // the ids in brackets.
     out.not_checked = wrote
         .not_checked
         .as_deref()
         .map(str::trim)
         .filter(|g| !g.is_empty())
         .map(|g| {
-            let g = g
-                .strip_prefix("Not checked:")
-                .or_else(|| g.strip_prefix("Not checked"))
-                .unwrap_or(g)
+            let lower = g.to_lowercase();
+            let g = ["not checked:", "not checked"]
+                .iter()
+                .find(|p| lower.starts_with(*p))
+                .map_or(g, |p| &g[p.len()..])
                 .trim();
-            sentence(&capitalised(&crate::crew::words(g, GAP_WORDS)))
-        });
+            let (g, lifted) = in_words(&cut(g, GAP_WORDS), work);
+            for id in lifted {
+                if !out.ids.contains(&id) {
+                    out.ids.push(id);
+                }
+            }
+            sentence(&capitalised(g.trim()))
+        })
+        .filter(|g| g.chars().any(char::is_alphanumeric));
+    let (h, b) = (out.headline.clone(), out.body.clone());
+    let g = out.not_checked.clone().unwrap_or_default();
+    not_said_in(&mut out.ids, &[&h, &b, &g]);
     out
 }
 
@@ -697,6 +847,104 @@ mod tests {
             bare_ids("merged (#631, #632) and MAN-637 is done"),
             vec!["MAN-637"]
         );
+        // Words shaped like ids are words.
+        for w in [
+            "UTF-8", "GPT-5", "SHA-256", "ISO-8601", "COVID-19", "#1", "(#3)",
+        ] {
+            assert_eq!(id_kind(w), None, "{w}");
+        }
+        assert!(bare_ids("the #1 priority: support UTF-8 names on GPT-5").is_empty());
+        // A bracket never closed brackets nothing after it.
+        assert_eq!(bare_ids("it said (see MAN-12 for more"), vec!["MAN-12"]);
+    }
+
+    /// What reads like an id but is a word is left as it is, written and
+    /// checked; ids are matched exactly, names keep their capitals, the gap
+    /// keeps the contract, and nothing is cut inside brackets.
+    #[test]
+    fn words_shaped_like_ids_and_the_edges_of_the_contract() {
+        let w = rust_fix();
+        assert_eq!(
+            in_words("Fixed UTF-8 paths for GPT-5 calls", &w).0,
+            "Fixed UTF-8 paths for GPT-5 calls"
+        );
+        let mut t = rust_fix();
+        t.titled = vec![Titled {
+            kind: RefKind::Ticket,
+            id: "MAN-9".into(),
+            title: Some("Support UTF-8 names".into()),
+        }];
+        assert_eq!(t.in_words(), "Support UTF-8 names");
+        // A ticket that is only its key: the goal says the work.
+        let mut bare_title = rust_fix();
+        bare_title.titled = vec![Titled {
+            kind: RefKind::Ticket,
+            id: "MAN-12".into(),
+            title: Some("MAN-12".into()),
+        }];
+        bare_title.goal = "Make the nightly build green".into();
+        assert_eq!(bare_title.in_words(), "Make the nightly build green");
+
+        // "PRs #631 and #632": each in brackets, no "the pull request".
+        assert_eq!(
+            in_words("Merged PRs #631 and #632", &w).0,
+            "Merged PRs (#631) and (#632)"
+        );
+
+        // "#63" is still said when only "#631" is in place.
+        let d = done("Merged the pull request (#631)", &[]);
+        let mut w63 = rust_fix();
+        w63.titled.push(Titled {
+            kind: RefKind::Pr,
+            id: "#63".into(),
+            title: None,
+        });
+        let said = plain_said(&w63, &[&d], "", None, vec![], EventKind::Finished);
+        assert!(said.ids.contains(&"#63".to_string()), "{:?}", said.ids);
+        assert!(!said.ids.contains(&"#631".to_string()), "{:?}", said.ids);
+
+        // A name keeps its capital after "waiting on"; an opener is lowered.
+        let s = plain_said(
+            &w,
+            &[&d],
+            "",
+            Some("Matt to review it"),
+            vec![],
+            EventKind::Progress,
+        );
+        assert!(
+            s.body.contains("waiting on Matt to review it"),
+            "{}",
+            s.body
+        );
+        assert_eq!(
+            lowered("Renovate broke the build"),
+            "Renovate broke the build"
+        );
+        assert_eq!(lowered("Merged it"), "merged it");
+        assert_eq!(lowered("“Café” opened"), "“Café” opened");
+
+        // A line that is only its id: the work moved on.
+        let only = done("MAN-636:", &[]);
+        let s = plain_said(&w, &[&only], "", None, vec![], EventKind::Progress);
+        assert!(s.headline.ends_with("moved on."), "{}", s.headline);
+        assert!(s.ids.contains(&"MAN-636".to_string()));
+
+        // The gap: its prefix taken off whatever its case, its ids in words.
+        let wrote = Written {
+            headline: None,
+            body: None,
+            not_checked: Some("not checked: staging hadn't deployed #632".into()),
+        };
+        let out = said_from(s.clone(), &wrote, &w);
+        let gap = out.not_checked.unwrap();
+        assert_eq!(gap, "Staging hadn't deployed the pull request (#632).");
+
+        // Never cut inside brackets.
+        let long = format!("{} (#631 and #632)", vec!["word"; 23].join(" "));
+        let c = cut(&long, 24);
+        assert!(!c.contains('('), "{c}");
+        assert!(c.ends_with('…'), "{c}");
     }
 
     #[test]

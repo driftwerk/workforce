@@ -158,6 +158,7 @@ impl CrewHub {
         away: Option<DateTime<Utc>>,
     ) -> Batch {
         let boss = service.agent_id.as_str();
+        let person = self.person(Some(service));
         let seen = self.desk.seen_by(&o.scope);
         let views: Vec<_> = self
             .desk
@@ -207,7 +208,7 @@ impl CrewHub {
                 continue;
             }
             change = change.max(c);
-            let work = self.work_of(v, Some(a), &new).await;
+            let work = self.work_of(v, Some(a), &new, person.as_deref()).await;
             sessions.push(Changed {
                 id: v.id,
                 name: v.label().to_string(),
@@ -368,10 +369,12 @@ impl CrewHub {
                 // alone, outside brackets): asked once more for those
                 // fields alone, then whatever is still long is clipped and
                 // whatever still breaks it is written plainly.
-                let mut long = update::too_long(&written);
-                long.extend(Self::breaking(b, &written));
-                if !long.is_empty() && self.desk.update_take().await.unwrap_or(false) {
-                    user.push_str(&update::reask(&long));
+                let long = update::too_long(&written);
+                let broken = Self::breaking(b, &written);
+                if !(long.is_empty() && broken.is_empty())
+                    && self.desk.update_take().await.unwrap_or(false)
+                {
+                    user.push_str(&update::reask_for(&long, &broken));
                     match writer
                         .write(boss, owner, update::COMPOSER_SYSTEM, &user)
                         .await
@@ -440,15 +443,8 @@ impl CrewHub {
                     out.push(format!("session {} headline ({})", s.id, said.join("; ")));
                 }
             }
-            if let Some(t) = w.body.as_deref() {
-                let said: Vec<String> = probe("The work moved on.", t)
-                    .iter()
-                    .map(write::Breach::said)
-                    .collect();
-                if !said.is_empty() {
-                    out.push(format!("session {} text ({})", s.id, said.join("; ")));
-                }
-            }
+            // What follows is put right as it is kept (its ids lifted to
+            // the brackets): nothing to ask again.
         }
         out
     }
@@ -462,8 +458,10 @@ impl CrewHub {
         v: &workforce_desk::model::SessionView,
         a: Option<&Account>,
         new: &[Done],
+        person: Option<&str>,
     ) -> Work {
         let store = self.desk.store();
+        let repo = repo_of(v, new);
         let mut tickets = store.session_tickets(v.id).await.unwrap_or_default();
         for t in store.linked_tickets(&[v.id]).await.unwrap_or_default() {
             if !tickets.iter().any(|k| k.id == t.id) {
@@ -493,7 +491,9 @@ impl CrewHub {
                 continue;
             }
             let title = match r.kind {
-                RefKind::Pr => super::github::pr_title(r.url.as_deref(), &r.id),
+                RefKind::Pr => person.and_then(|p| {
+                    super::github::pr_title(p, r.url.as_deref(), repo.as_deref(), &r.id)
+                }),
                 _ => None,
             };
             titled.push(Titled {
@@ -591,7 +591,7 @@ impl CrewHub {
             else {
                 continue;
             };
-            let work = self.work_of(v, None, &[]).await;
+            let work = self.work_of(v, None, &[], Some(owner)).await;
             let kind = write::kind_of(&[], &did);
             said.push(write::plain_said(&work, &[], "", None, did, kind));
         }
