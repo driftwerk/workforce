@@ -253,6 +253,15 @@ impl CrewHub {
             .iter()
             .map(|o| format!("{} (from {})", o.rule(), o.date(tz)))
             .collect();
+        self.picture_order(
+            &format!(
+                "when {}, {} (for {})",
+                p.when_text,
+                p.then_text,
+                p.scope.said()
+            ),
+            Self::current_turn(),
+        );
         let mut said = format!(
             "Kept as preference {}: when {}, {} (for {}).",
             p.id,
@@ -339,6 +348,15 @@ impl CrewHub {
             "resume" => "Resumed",
             _ => "Forgot",
         };
+        self.picture_order(
+            &format!(
+                "{verb} the preference: when {}, {} (for {})",
+                changed.when_text,
+                changed.then_text,
+                changed.scope.said()
+            ),
+            Self::current_turn(),
+        );
         Ok(json!(format!(
             "{verb} the preference from {}: when {}, {} (for {}). Tell the person which, in one line.",
             found.date(tz),
@@ -637,12 +655,14 @@ impl CrewHub {
                 .await
                 .map_err(cant)?;
         }
-        Ok(format!(
+        let said = format!(
             "From now on: when {}, {} (for {}).",
             p.when_text,
             p.then_text,
             p.scope.said()
-        ))
+        );
+        self.picture_order(&said, None);
+        Ok(said)
     }
 
     /// The person undid `undone`, a decision made by their preference

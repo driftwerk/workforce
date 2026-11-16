@@ -615,6 +615,11 @@ impl Desk {
         match &from {
             Sender::Session(id) => {
                 self.0.state.lock().lines.runs.entry(*id).or_default().sent += 1;
+                let what = match kind {
+                    LineKind::Ask => crate::picture::What::SessionAsked,
+                    _ => crate::picture::What::SessionReported,
+                };
+                self.picture_session_said(*id, what, &m.text);
             }
             Sender::Person => {
                 if let Some(v) = &recipient {
@@ -772,7 +777,10 @@ impl Desk {
         };
         self.close_line_item(question.id, closer, &why).await;
         match (&by, &asker) {
-            (Sender::Person, Some(v)) => self.person_spoke(v.id),
+            (Sender::Person, Some(v)) => {
+                self.picture_person_said(v.id, &a.text);
+                self.person_spoke(v.id)
+            }
             (Sender::Session(id), _) => {
                 self.0.state.lock().lines.runs.entry(*id).or_default().sent += 1;
             }
@@ -1670,17 +1678,24 @@ impl Desk {
         when: When,
     ) -> Result<LineMessage, LineError> {
         // Theirs before it is queued: a boss's message waiting for the same
-        // idle can't go in ahead of it.
+        // idle can't go in ahead of it, and in the bosses' picture before
+        // anything else is done of it. (What Desk writes on the person's
+        // side, a ticket's notice or an undo, goes through `line_send`
+        // and isn't their words.)
         self.person_drove(id);
-        self.line_send(
-            Sender::Person,
-            Send::Tell {
-                to: Target::Session(id),
-                text,
-                when,
-            },
-        )
-        .await
+        let m = self
+            .line_send(
+                Sender::Person,
+                Send::Tell {
+                    to: Target::Session(id),
+                    text,
+                    when,
+                },
+            )
+            .await?;
+        // Taken (a refused one isn't their word to it).
+        self.picture_person_said(id, &m.text);
+        Ok(m)
     }
 
     /// Takes back the one message `id` a boss sent a session, while it is

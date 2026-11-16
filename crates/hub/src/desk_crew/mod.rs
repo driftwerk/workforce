@@ -47,6 +47,7 @@ mod line;
 pub(crate) mod machine_grants;
 mod observe;
 mod own_settings;
+mod picture;
 mod plan;
 mod preferences;
 mod read_only;
@@ -687,6 +688,20 @@ impl CrewHub {
         // acts fully: from its grant as it is then.
         crew.desk
             .served_full_with(Arc::new(ServedJudge(Arc::downgrade(&crew))));
+        // The bosses' picture, as Postgres kept it: numbering goes on.
+        let desk = crew.desk.clone();
+        let until = cancel.clone();
+        tokio::spawn(async move {
+            // Until it is read, nothing of it is written: tried again.
+            let mut wait = std::time::Duration::from_secs(1);
+            while !desk.picture_load().await {
+                tokio::select! {
+                    () = until.cancelled() => return,
+                    () = tokio::time::sleep(wait) => {}
+                }
+                wait = (wait * 2).min(std::time::Duration::from_secs(60));
+            }
+        });
         tokio::spawn(watcher::sync_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(watcher::wake_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(decide::decide_loop(Arc::clone(&crew), cancel.clone()));

@@ -1318,7 +1318,61 @@ impl CrewHub {
         let who = by.clone();
         let mut done = Done::default();
         let said = match self.perform_as(action, by, &mut done).await {
-            Ok(said) => said,
+            Ok(said) => {
+                // Sent: in the picture before anything else is decided.
+                if who.party.kind == crew::PartyKind::Manager {
+                    match action {
+                        Action::Nudge {
+                            to: Target::Session(s),
+                            message,
+                            ..
+                        } => self.picture_instruction(
+                            &who.party.id,
+                            *s,
+                            message,
+                            Self::current_turn(),
+                        ),
+                        // A ticket handed to a session is an instruction too.
+                        Action::AssignTicket {
+                            ticket,
+                            to: Handout::Session(s),
+                            ..
+                        } => self.picture_instruction(
+                            &who.party.id,
+                            *s,
+                            &format!("Ticket {ticket} is yours to work on."),
+                            Self::current_turn(),
+                        ),
+                        _ => {}
+                    }
+                } else if who.party.kind == crew::PartyKind::You {
+                    // The person approved a suggestion: their word to the
+                    // session, for every boss of it.
+                    let theirs = match action {
+                        Action::Nudge {
+                            to: Target::Session(s),
+                            message,
+                            ..
+                        } => Some((*s, message.clone())),
+                        Action::AssignTicket {
+                            ticket,
+                            to: Handout::Session(s),
+                            ..
+                        } => Some((*s, format!("Ticket {ticket} is yours to work on."))),
+                        _ => None,
+                    };
+                    if let Some((s, text)) = theirs {
+                        self.desk.picture_note(
+                            workforce_desk::picture::Note::new(
+                                workforce_desk::picture::What::PersonSaid,
+                                text,
+                            )
+                            .session(s),
+                        );
+                    }
+                }
+                said
+            }
             Err(e) => {
                 // Not sent after all: it may be said again.
                 if let Some(t) = told {

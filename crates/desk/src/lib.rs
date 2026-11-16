@@ -79,6 +79,8 @@ pub mod never;
 pub mod open_item;
 pub mod open_item_store;
 pub mod overview;
+pub mod picture;
+pub mod picture_store;
 pub mod plan;
 mod plan_api;
 pub mod plan_store;

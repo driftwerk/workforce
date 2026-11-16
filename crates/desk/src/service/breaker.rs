@@ -878,6 +878,19 @@ impl Desk {
     /// not one Desk typed for someone else, not an engine's own (its
     /// notices are `<…>`-tagged), and not the last one again (a loop or a
     /// schedule submitting it once more).
+    /// Whether `prompt`, about to be read by [`Self::person_prompted`], is
+    /// one Desk typed into `id` (the person's message from Desk, or
+    /// anyone else's): not words typed at its terminal.
+    pub(super) fn desk_typed(&self, id: Uuid, prompt: &str) -> bool {
+        let said = prompt.trim();
+        self.0
+            .state
+            .lock()
+            .live
+            .get(&id)
+            .is_some_and(|l| l.breaker.typed.iter().any(|(t, _)| t == said))
+    }
+
     pub(super) fn person_prompted(&self, id: Uuid, prompt: &str) -> bool {
         let said = prompt.trim();
         if said.is_empty() || said.starts_with('<') {

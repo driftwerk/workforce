@@ -78,6 +78,7 @@ pub use handoff::{HandedOff, HandoffPreview, Hop, LineageView};
 pub use knows_sync::Gather as KnowsGather;
 mod lifecycle;
 mod line;
+mod picture;
 pub use lifecycle::{Clearing, Hidden, Removal, Removed};
 #[cfg(test)]
 mod accounts_tests;
@@ -995,6 +996,8 @@ struct Inner {
     /// The shell terminals run.
     shell: String,
     state: Mutex<State>,
+    /// The bosses' one live picture ([`crate::picture`]).
+    picture: Mutex<crate::picture::Picture>,
     events: broadcast::Sender<DeskEvent>,
     persist: mpsc::UnboundedSender<Persist>,
     hook_base: String,
@@ -1799,6 +1802,7 @@ impl Desk {
                 profiles,
                 ..State::default()
             }),
+            picture: Mutex::default(),
             events: broadcast::channel(256).0,
             persist,
             hook_base,
@@ -5772,8 +5776,16 @@ impl Desk {
             Hook::Prompt(p) => {
                 // The person's own words: a session its breaker holds goes
                 // on, and its line's loop guard starts again.
+                // Typed at its terminal, not by Desk for them: what Desk
+                // typed is in the picture from when it was written.
+                let at_terminal = !self.desk_typed(id, &p);
                 let person = self.person_prompted(id, &p);
                 if person {
+                    // In the bosses' picture first: none of them sends it
+                    // anything decided before it.
+                    if at_terminal {
+                        self.picture_person_said(id, &p);
+                    }
                     self.person_spoke(id);
                     self.person_drove(id);
                 }
@@ -7010,6 +7022,10 @@ impl Desk {
             }
             // A line message Desk typed in is not the person speaking; whose
             // a prompt is, is read once.
+            let at_terminal = match &event {
+                CodexEvent::Prompt(p) => !self.desk_typed(id, p),
+                _ => false,
+            };
             let prompted = match &event {
                 CodexEvent::Prompt(p) => Some(self.person_prompted(id, p)),
                 _ => None,
@@ -7022,6 +7038,9 @@ impl Desk {
                     }
                     None => {
                         if prompted == Some(true) {
+                            if at_terminal {
+                                self.picture_person_said(id, p);
+                            }
                             self.person_spoke(id);
                             self.person_drove(id);
                         }

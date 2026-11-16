@@ -143,7 +143,11 @@ impl CrewHub {
             }
         };
         // Gone with the turn, however it ends, as the person's own are.
-        let _theirs = theirs.map(|words| Theirs::keep(&self.person_turns, &sid, words));
+        let _theirs = theirs.map(|words| {
+            // Theirs, relayed: in this boss's picture as their word.
+            self.picture_person_told(service.agent_id.as_str(), &words);
+            Theirs::keep(&self.person_turns, &sid, words)
+        });
         // The crew's own wake-up, by name, for as long as its turn runs:
         // named only once the turn is the crew's (a session busy with the
         // person's own turn is never named).
