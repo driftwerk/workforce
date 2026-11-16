@@ -100,7 +100,9 @@ mod tests {
         names.iter().any(|name| {
             code.match_indices(name).any(|(at, _)| {
                 let head = &code[..at];
-                if head.ends_with(|c: char| c.is_alphanumeric() || c == '_' || c == ':') {
+                // A module path before it (`crate::model::`) is the same
+                // name; an identifier run into it is a longer one.
+                if head.ends_with(|c: char| c.is_alphanumeric() || c == '_') {
                     // The tail of a longer name.
                     return false;
                 }
@@ -160,6 +162,7 @@ mod tests {
             "    SessionState::Closed",
             "Some(_) => SessionState::Closed,",
             "x || y => SessionState::Closed,",
+            "r.state = crate::model::SessionState::Closed;",
         ] {
             assert!(sets_closed(sets, &full), "{sets}");
         }
@@ -172,8 +175,8 @@ mod tests {
             "Some(SessionState::Closed) => {}",
             "matches!(r.state, SessionState::Stopped | SessionState::Closed)",
             "// r.state = SessionState::Closed",
-            "ClosedKind::SessionState::Closed;",
             "x = SessionState::Closedish;",
+            "x = MySessionState::Closed;",
         ] {
             assert!(!sets_closed(reads, &full), "{reads}");
         }

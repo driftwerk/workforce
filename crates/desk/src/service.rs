@@ -7580,9 +7580,15 @@ impl Desk {
                 // Running here (taken back from the holder): its process is
                 // this hub's to see end, never a listing's.
                 .filter(|r| !st.live.contains_key(&r.id))
-                .map(|r| r.id)
-                .collect()
-        };
+                .map(|r| (r.id, r.external_pid))
+                .collect::<Vec<_>>()
+        }
+        .into_iter()
+        // Its process runs on, listed or not (one the holder keeps that
+        // this hub couldn't take back): not ended.
+        .filter(|(_, pid)| !pid.is_some_and(adopt::alive))
+        .map(|(id, _)| id)
+        .collect();
         for id in gone {
             // Ended in its own terminal while the hub watched: not a loss,
             // and not finished either. It stays, to be resumed or closed by
@@ -8307,6 +8313,12 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(200)).await;
             first_cancel.cancel();
             tokio::time::sleep(Duration::from_millis(300)).await;
+            let kept = DeskStore::from_pool(pool.clone())
+                .get(s.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(kept.origin, Origin::External, "as the next hub reads it");
 
             let second = Desk::start(
                 DeskStore::from_pool(pool.clone()),
@@ -9908,8 +9920,16 @@ mod tests {
             d.reconcile_external(ext(false)).await;
             assert_eq!(d.view(s.id).unwrap().state, SessionState::Idle);
 
+            // Unlisted while its process runs: still running.
+            d.reconcile_external(vec![]).await;
+            assert_eq!(d.view(s.id).unwrap().state, SessionState::Idle);
+
             // Ended there: kept, never closed by a listing that no longer
             // shows it.
+            let mut ended = std::process::Command::new("true").spawn().unwrap();
+            let dead = ended.id() as i32;
+            ended.wait().unwrap();
+            d.change(s.id, |r, _| r.external_pid = Some(dead));
             d.reconcile_external(vec![]).await;
             assert_eq!(d.view(s.id).unwrap().state, SessionState::Stopped);
             assert!(d.list().iter().any(|v| v.id == s.id));

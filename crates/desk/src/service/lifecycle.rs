@@ -615,13 +615,19 @@ impl Desk {
         Ok(done)
     }
 
+    /// Whether `by` may end session `id` ([`super::finish::may_end`]): the
+    /// person, or the boss that started it or was handed it.
+    pub fn may_end(&self, id: Uuid, by: Option<&By>) -> bool {
+        super::finish::may_end(by, self.charge_of(id).as_ref())
+    }
+
     /// Ends a session: stops it if it runs here and closes it, so it leaves
     /// the sessions Desk shows and its history stays, resumable. One in
     /// another terminal or in one of Desk's ends there.
     pub async fn end(&self, id: Uuid, by: Option<By>) -> Result<SessionView, DeskError> {
         let r = self.load(id).await?;
         // Only its finish closes it: the person's, or its own boss's.
-        if !super::finish::may_end(by.as_ref(), self.charge_of(id).as_ref()) {
+        if !self.may_end(id, by.as_ref()) {
             return Err(DeskError::Conflict(
                 "only the person, or the boss that started it or was handed it, closes a session"
                     .into(),
