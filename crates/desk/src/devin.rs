@@ -13,6 +13,23 @@
 //! - matchers are regular expressions on its own tool names (`exec`,
 //!   `edit`, `ask_user_question`).
 //!
+//! Its payloads, as a signed-in 3000.12.57 sent them (the hook capture,
+//! 2026-11-16; [`tests::its_real_payloads_read_as_claude_codes`]):
+//! - every one has `hook_event_name` and `session_id`, and every one after
+//!   `UserPromptSubmit` its `prompt_id`; none has a `cwd`, a
+//!   `transcript_path` or a `permission_mode`;
+//! - a call's id is `tool_use_id`, the same at its `PreToolUse`,
+//!   `PermissionRequest` and `PostToolUse`;
+//! - `exec` is `command` and `workdir` (absolute), `write` is `file_path`
+//!   and `content`, `edit` is `file_path`, `old_string` and `new_string`
+//!   (its paths absolute), `ask_user_question` is `questions` (Claude
+//!   Code's shape, `multi_select` and `answers` beside it at its end);
+//! - `Stop` has `last_assistant_message`, `SessionStart` its `source`
+//!   (`startup`, `resume`);
+//! - `{"decision":"approve"}` to a `PermissionRequest` runs the call at
+//!   once; `{}` leaves Devin's own prompt to the person, as does a hook
+//!   that fails (exit 1): it neither runs the call unasked nor hangs.
+//!
 //! Each hook is a `curl` of the session's hook URL. The URL, with its
 //! token, is in a curl config file only this user can read, never on a
 //! command line `ps` shows. What Devin sends is put in Claude Code's terms
@@ -245,9 +262,10 @@ pub struct Listed {
 }
 
 /// What `devin list --format json` printed (in a folder: its sessions
-/// there). Its entries' shape isn't documented (an empty folder's is
-/// `[]`), so an id and a time are looked for under the names they are
-/// likely to have. None: not a list Desk can read, which includes one with
+/// there). 3000.12.57's is an array of entries with `id`, `state` and
+/// `title` (and no time Desk could read, so [`made_after`] finds none
+/// there; a session's id is its `SessionStart`'s); a time is looked for
+/// under the names it is likely to have, should a later one say it. None: not a list Desk can read, which includes one with
 /// an entry whose id Desk can't find. Read as an empty list, it would say
 /// a conversation Devin still has is gone.
 pub fn listed(printed: &str) -> Option<Vec<Listed>> {
@@ -483,15 +501,6 @@ pub fn normalize(payload: &mut Value, event: Option<&str>) {
             None => p.remove("permission_mode"),
         };
     }
-    // Devin's call id, should it send one under another name.
-    if !p.contains_key("tool_use_id") {
-        if let Some(id) = ["tool_call_id", "call_id"]
-            .iter()
-            .find_map(|k| p.get(*k).filter(|v| v.is_string()).cloned())
-        {
-            p.insert("tool_use_id".into(), id);
-        }
-    }
     if p.get("hook_event_name").and_then(Value::as_str) == Some("PostToolUse") {
         let response = p.get("tool_response");
         if response
@@ -533,11 +542,13 @@ pub fn normalize(payload: &mut Value, event: Option<&str>) {
     input.insert(RAW.into(), json!({ "tool": name, "input": raw }));
     p.insert("tool_name".into(), Value::String(read.tool.into()));
     p.insert("tool_input".into(), Value::Object(input));
-    // Devin's commands run in a shell that stays, wherever it was moved
-    // to: never judged where its payload says Devin started, but where
-    // Desk saw the session go.
+    // A command runs in the `workdir` Devin gives it, never where any
+    // `cwd` of its payload says (it sends none).
     if read.tool == "Bash" {
-        p.remove("cwd");
+        match read.cwd {
+            Some(dir) => p.insert("cwd".into(), Value::String(dir)),
+            None => p.remove("cwd"),
+        };
     }
 }
 
@@ -552,6 +563,8 @@ type Field<'a> = (&'a str, &'a [&'a str], bool);
 struct Read {
     tool: &'static str,
     input: Map<String, Value>,
+    /// Where a command runs: its `workdir`.
+    cwd: Option<String>,
 }
 
 /// The one text `input` has under any of `keys`. `Err`: it has one that
@@ -573,9 +586,13 @@ fn text_of<'a>(input: &'a Map<String, Value>, keys: &[&str]) -> Result<Option<&'
 
 /// What Claude Code calls Devin's tool `name`, and the input fields Desk
 /// reads, from Devin's `input`. Its documented names (docs.devin.ai,
-/// lifecycle hooks); its input fields only `exec`'s (`command`,
-/// `shell_id`) are documented, so each field is looked for under the
-/// names it is likely to have.
+/// lifecycle hooks). `exec`'s, `write`'s, `edit`'s and
+/// `ask_user_question`'s fields are as 3000.12.57 sent them; the other
+/// tools' weren't seen, so each field is looked for under the names it is
+/// likely to have.
+///
+/// `exec` runs in its `workdir`, which must be absolute: one that isn't
+/// (or isn't text) is Devin's own call, as Desk can't say where it runs.
 ///
 /// None (the call keeps Devin's name, which Desk judges as a tool it
 /// doesn't know, never as a safe one): a tool Desk doesn't know (an MCP
@@ -585,7 +602,14 @@ fn text_of<'a>(input: &'a Map<String, Value>, keys: &[&str]) -> Result<Option<&'
 /// whose effect Desk can't read from its input (`write_to_process` types
 /// into a command already running; a subagent runs tools of its own).
 fn tool_of(name: &str, input: &Value) -> Option<Read> {
-    let input = input.as_object()?;
+    let mut input = input.as_object()?.clone();
+    // Where a command runs: absolute, or Desk can't place it.
+    let cwd = match (name, input.remove("workdir")) {
+        (_, None | Some(Value::Null)) => None,
+        ("exec", Some(Value::String(dir))) if Path::new(&dir).is_absolute() => Some(dir),
+        _ => return None,
+    };
+    let input = &input;
     const PATH: [&str; 4] = ["file_path", "path", "file", "filename"];
     // Each tool's fields: what Desk reads, and what it may carry beside.
     let (tool, fields, known): (&'static str, &[Field], &[&str]) = match name {
@@ -685,6 +709,7 @@ fn tool_of(name: &str, input: &Value) -> Option<Read> {
             return Some(Read {
                 tool: claude::DIALOG_TOOL,
                 input: out,
+                cwd: None,
             });
         }
         "exit_plan_mode" => (
@@ -724,7 +749,11 @@ fn tool_of(name: &str, input: &Value) -> Option<Read> {
         }
         _ => {}
     }
-    Some(Read { tool, input: out })
+    Some(Read {
+        tool,
+        input: out,
+        cwd,
+    })
 }
 
 /// The files a patch in `*** Begin Patch` form names: each it adds,
@@ -1421,12 +1450,13 @@ mod tests {
             // One field said two ways.
             ("read", json!({"file_path": "a", "path": "/etc/shadow"})),
             ("exec", json!({"command": "ls", "cmd": "rm -rf /"})),
-            // Run elsewhere than its shell: Desk can't be sure where.
+            // Run where Desk can't place: a `cwd` of its own, a `workdir`
+            // that isn't absolute or isn't text, one on another tool.
             ("exec", json!({"command": "ls", "cwd": "../elsewhere"})),
-            (
-                "exec",
-                json!({"command": "rm -rf build", "workdir": "/Users/sam"}),
-            ),
+            ("exec", json!({"command": "ls", "workdir": "sub"})),
+            ("exec", json!({"command": "ls", "workdir": ""})),
+            ("exec", json!({"command": "ls", "workdir": ["/"]})),
+            ("read", json!({"file_path": "a", "workdir": "/repo"})),
         ] {
             assert_eq!(
                 start(devin, input.clone()).0,
@@ -1439,13 +1469,20 @@ mod tests {
             start("read", json!({"file_path": "a", "path": "a"})).1["file_path"],
             "a"
         );
-        // A command is judged where Desk saw its shell go, never where
-        // the payload says Devin started.
+        // A command is judged in its `workdir`, never where a payload's
+        // `cwd` says (Devin sends none).
         let mut p = json!({"hook_event_name": "PreToolUse", "cwd": "/repo", "tool_name": "exec",
             "tool_input": {"command": "rm -rf build", "shell_id": "1"}});
         normalize(&mut p, None);
         assert_eq!(p["tool_name"], "Bash");
         assert!(p.get("cwd").is_none());
+        let mut p = json!({"hook_event_name": "PermissionRequest", "cwd": "/repo", "tool_name": "exec",
+            "tool_input": {"command": "rm -rf build", "workdir": "/repo/web"}});
+        normalize(&mut p, None);
+        assert_eq!(p["tool_name"], "Bash");
+        assert_eq!(p["cwd"], "/repo/web");
+        assert_eq!(p["tool_input"]["command"], "rm -rf build");
+        assert_eq!(p["tool_input"][RAW]["input"]["workdir"], "/repo/web");
         let mut p = json!({"cwd": "/repo", "tool_name": "read", "tool_input": {"file_path": "a"}});
         normalize(&mut p, None);
         assert_eq!(p["cwd"], "/repo");
@@ -1684,6 +1721,133 @@ mod tests {
         );
     }
 
+    /// Every payload a signed-in 3000.12.57 sent its hooks (the capture of
+    /// 2026-11-16, its ids, paths and prompts replaced), read as Claude
+    /// Code's: none of its tools left as Devin's own, each call by its id.
+    #[test]
+    fn its_real_payloads_read_as_claude_codes() {
+        let records: Vec<Value> = include_str!("../fixtures/devin/6-hooks.jsonl")
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(records.len(), 38);
+        let mut seen = std::collections::BTreeSet::new();
+        for r in &records {
+            let p = &r["payload"];
+            let event = p["hook_event_name"].as_str().unwrap();
+            let tool = p["tool_name"].as_str();
+            seen.insert((event, tool));
+            for k in ["cwd", "transcript_path", "permission_mode"] {
+                assert!(p.get(k).is_none(), "{event} says no {k}");
+            }
+            let mut n = p.clone();
+            normalize(&mut n, None);
+            if let Some(t) = n["tool_name"].as_str() {
+                assert!(!t.starts_with(UNKNOWN), "{event} {tool:?}: {t}");
+            }
+            if tool == Some("exec") {
+                assert_eq!(
+                    n["cwd"], p["tool_input"]["workdir"],
+                    "a command runs in its workdir"
+                );
+            }
+            let id = p["tool_use_id"].as_str().map(str::to_string);
+            match (parsed(p.clone()), event, tool) {
+                (
+                    Hook::SessionStart {
+                        session_id,
+                        resumed,
+                        ..
+                    },
+                    "SessionStart",
+                    None,
+                ) => {
+                    assert_eq!(session_id.as_deref(), p["session_id"].as_str());
+                    assert_eq!(resumed, p["source"] == "resume");
+                }
+                (Hook::Prompt(said), "UserPromptSubmit", None) => {
+                    assert_eq!(Some(said.as_str()), p["prompt"].as_str())
+                }
+                (
+                    Hook::Question { question, asks, .. },
+                    "PreToolUse",
+                    Some("ask_user_question"),
+                ) => {
+                    assert_eq!(question.detail, "Which colour do you prefer?");
+                    assert_eq!(
+                        question.options,
+                        Some(vec!["Red".into(), "Green".into(), "Blue".into()])
+                    );
+                    assert!(asks.is_some(), "held for its boss to answer");
+                }
+                (
+                    Hook::ToolStart {
+                        call, id: started, ..
+                    },
+                    "PreToolUse",
+                    Some(t),
+                ) => {
+                    let want = match t {
+                        "write" => "Write",
+                        "edit" => "Edit",
+                        "exec" => "Bash",
+                        other => panic!("a tool the capture didn't run: {other}"),
+                    };
+                    assert_eq!(call.tool, want);
+                    assert_eq!(started, id);
+                }
+                (Hook::Permission { request, .. }, "PermissionRequest", Some(t)) => {
+                    let want = if t == "write" { "Write" } else { "Edit" };
+                    assert_eq!(request.tool, want);
+                    assert_eq!(request.input["file_path"], p["tool_input"]["file_path"]);
+                }
+                (
+                    Hook::ToolEnd {
+                        id: ended, failed, ..
+                    },
+                    "PostToolUse",
+                    Some(_),
+                ) => {
+                    assert_eq!(ended, id);
+                    assert_eq!(failed, None);
+                }
+                (Hook::Stop { reply, .. }, "Stop", None) => {
+                    assert_eq!(reply.as_deref(), p["last_assistant_message"].as_str())
+                }
+                (Hook::SessionEnd, "SessionEnd", None) => {}
+                (other, e, t) => panic!("{e} {t:?} read as {other:?}"),
+            }
+        }
+        // Every event Desk hooks but `PreCompact`, and every tool it ran.
+        for want in [
+            ("SessionStart", None),
+            ("UserPromptSubmit", None),
+            ("PreToolUse", Some("write")),
+            ("PreToolUse", Some("edit")),
+            ("PreToolUse", Some("exec")),
+            ("PreToolUse", Some("ask_user_question")),
+            ("PermissionRequest", Some("write")),
+            ("PermissionRequest", Some("edit")),
+            ("PostToolUse", Some("ask_user_question")),
+            ("Stop", None),
+            ("SessionEnd", None),
+        ] {
+            assert!(seen.contains(&want), "{want:?}");
+        }
+        // Its question's end says what was picked, beside the question.
+        let ended = records
+            .iter()
+            .map(|r| &r["payload"])
+            .find(|p| {
+                p["hook_event_name"] == "PostToolUse" && p["tool_name"] == "ask_user_question"
+            })
+            .unwrap();
+        let mut n = ended.clone();
+        normalize(&mut n, None);
+        assert_eq!(n["tool_name"], claude::DIALOG_TOOL);
+        assert_eq!(n["tool_input"]["questions"][0]["multiSelect"], false);
+    }
+
     #[test]
     fn its_events_read_as_claude_codes() {
         assert_eq!(
@@ -1740,7 +1904,7 @@ mod tests {
         );
         assert_eq!(
             parsed(
-                json!({"hook_event_name": "PostToolUse", "tool_name": "read", "tool_call_id": "c1",
+                json!({"hook_event_name": "PostToolUse", "tool_name": "read", "tool_use_id": "c1",
                 "tool_input": {"file_path": "a"}, "tool_response": {"success": true, "output": "x", "error": null}})
             ),
             Hook::ToolEnd {

@@ -547,9 +547,10 @@ pub fn facts_of(
         .and_then(|r| r.cwd.as_deref())
         .map(PathBuf::from)
         .filter(|c| c.is_absolute())
-        // Where Devin's own tools read a relative path from, once its
-        // shell has moved, isn't known (its payload's `cwd` may be its
-        // session's folder still): unknown, as the shell's is.
+        // Devin's payloads say no cwd; a command's is its `workdir`. Once
+        // a command has changed directory, whether that `workdir` follows
+        // it (and where its file tools read a relative path from) isn't
+        // known: unknown, as the shell's is.
         .filter(|_| !(engine == Engine::Devin && moved));
     let cwd = match (said, moved) {
         (Some(c), _) => Some(c),
@@ -1424,17 +1425,14 @@ mod tests {
     #[test]
     fn devins_calls_are_judged_on_what_desk_read_of_them() {
         let s = acme("/Users/sam/dev/acme-web");
-        let call = |tool: &str, input: Value| {
+        let request = |tool: &str, input: Value| {
             let mut p = json!({"hook_event_name": "PermissionRequest", "tool_name": tool,
                 "tool_input": input});
             crate::devin::normalize(&mut p, None);
             let tool = p["tool_name"].as_str().unwrap().to_string();
-            judged(
-                Engine::Devin,
-                &asking(&tool, p["tool_input"].clone(), None),
-                &s,
-            )
+            asking(&tool, p["tool_input"].clone(), p["cwd"].as_str())
         };
+        let call = |tool: &str, input: Value| judged(Engine::Devin, &request(tool, input), &s);
         let patch = |files: &[&str]| {
             let body: String = files
                 .iter()
@@ -1457,17 +1455,49 @@ mod tests {
             ),
             Err("changes a file outside acme-web".into())
         );
+        // As 3000.12.57 sends them: absolute paths, and a command's
+        // `workdir`.
         assert_eq!(
             call(
                 "edit",
-                json!({"file_path": "src/a.ts", "old_str": "a", "new_str": "b"})
+                json!({"file_path": "/Users/sam/dev/acme-web/src/a.ts",
+                    "old_string": "a", "new_string": "b"})
             ),
             Ok(())
         );
-        assert_eq!(call("exec", json!({"command": "cargo test"})), Ok(()));
+        assert_eq!(
+            call(
+                "write",
+                json!({"file_path": "/Users/sam/dev/acme-web/notes.md", "content": "x"})
+            ),
+            Ok(())
+        );
+        let exec = |dir: &str| json!({"command": "cargo test", "workdir": dir});
+        assert_eq!(call("exec", exec("/Users/sam/dev/acme-web")), Ok(()));
+        assert_eq!(call("exec", exec("/Users/sam/dev/acme-web/web")), Ok(()));
+        // Run outside its folder: the person's.
+        assert!(call(
+            "exec",
+            json!({"command": "rm -rf build", "workdir": "/Users/sam"})
+        )
+        .is_err());
+        // What only reads is judged as it reads, wherever it runs.
+        assert_eq!(
+            call("exec", json!({"command": "ls", "workdir": "/"})),
+            Ok(())
+        );
+        // Once a command has changed directory, whether `workdir` follows
+        // it isn't known.
+        let rm = json!({"command": "rm -rf build", "workdir": "/Users/sam/dev/acme-web"});
+        let rm = request("exec", rm);
+        assert_eq!(judged_moved(Engine::Devin, &rm, &s, false), Ok(()));
+        assert!(judged_moved(Engine::Devin, &rm, &s, true).is_err());
+        // A `workdir` Desk can't place: Devin's own call.
+        for dir in ["web", "~/dev/acme-web", ""] {
+            assert!(call("exec", exec(dir)).is_err(), "{dir}");
+        }
         // What Desk couldn't read whole: the person's.
         assert!(call("apply_patch", json!({"patch": "--- a/x\n+++ b/x\n"})).is_err());
-        assert!(call("exec", json!({"command": "ls", "workdir": "/"})).is_err());
         assert!(call("Task", json!({"prompt": "anything"})).is_err());
         assert!(call("read", json!({})).is_err());
         // Devin's own MCP servers and settings are the person's to change.

@@ -1,6 +1,7 @@
 //! A Devin session from start to resume, run on a fake `devin` that posts
 //! its hooks the way Desk's hooks post them: `curl -K` of the session's
-//! hook file, the event in its header, payloads as Devin's docs show them.
+//! hook file, the event in its header, payloads in the shape a signed-in
+//! 3000.12.57 sent them (`fixtures/devin/6-hooks.jsonl`).
 
 use std::os::unix::fs::PermissionsExt;
 
@@ -25,18 +26,14 @@ config="$2"
 hook="${{config%.devin.json}}.hook"
 post() {{ curl -sf --max-time 5 -K "$hook" -H "X-Desk-Devin-Event: $1" --data-binary "$2" > /dev/null; }}
 source=startup
-mode=normal
-prev=
 for a in "$@"; do
   [ "$a" = -r ] && source=resume
-  [ "$prev" = --permission-mode ] && mode="$a"
-  prev="$a"
 done
 for a in "$@"; do last="$a"; done
-post SessionStart '{{"session_id":"ses_fake1","source":"'$source'"}}'
-post UserPromptSubmit '{{"session_id":"ses_fake1","prompt_id":"p1","prompt":"'"$last"'"}}'
+post SessionStart '{{"hook_event_name":"SessionStart","session_id":"ses_fake1","source":"'$source'"}}'
+post UserPromptSubmit '{{"hook_event_name":"UserPromptSubmit","session_id":"ses_fake1","prompt_id":"p1","source":"user","prompt":"'"$last"'"}}'
 sed 's/^{{$/{{"notify":"always",/' "$config" > "$d/saved" && cat "$d/saved" > "$config"
-post Stop '{{"session_id":"ses_fake1","prompt_id":"p1","stop_hook_active":false,"permission_mode":"'$mode'","last_assistant_message":"Done: the tests pass."}}'
+post Stop '{{"hook_event_name":"Stop","session_id":"ses_fake1","prompt_id":"p1","stop_hook_active":false,"last_assistant_message":"Done: the tests pass."}}'
 exec sleep 60
 "#,
         dir = dir.display()
@@ -516,7 +513,7 @@ async fn a_devin_session_started_again_at_once_keeps_its_new_runs_files() {
         assert!(set.not_started.is_none(), "{:?}", set.not_started);
         assert_eq!(
             set.confirmed, None,
-            "Devin's mode is never waited on until a real capture says it is sent"
+            "Devin's payloads never say its mode (the capture of 3000.12.57): it is never waited on"
         );
         its_next_hook_lands(&d, s.id, "the new run's Stop landed").await;
         let args = last_args(dir.path());
