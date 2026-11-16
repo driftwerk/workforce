@@ -270,3 +270,202 @@ async fn a_change_to_one_session_holds_no_other_back() {
     })
     .await;
 }
+
+/// The model's answer to the first request carrying `marker`, slow: the
+/// call decides on what it was given as it began, and answers after
+/// `delay`. `body` is the whole response: a tool call (streamed) or a
+/// focused call's text.
+async fn slow_once(llm: &wiremock::MockServer, marker: &str, delay: Duration, answer: Answer) {
+    use wiremock::matchers::{body_partial_json, body_string_contains, method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let chunk = |body: Value| format!("data: {body}\n\n");
+    let m = Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains(marker));
+    let m = match answer {
+        Answer::Tool(tool, arguments) => {
+            let call = [
+                chunk(json!({"id": "c0", "object": "chat.completion.chunk", "model": "mock",
+                    "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [{"index": 0,
+                        "id": "call_1", "type": "function", "function": {"name": tool, "arguments": arguments.to_string()}}]},
+                        "finish_reason": null}]})),
+                chunk(json!({"id": "c0", "object": "chat.completion.chunk", "model": "mock",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}})),
+                "data: [DONE]\n\n".to_string(),
+            ]
+            .concat();
+            m.and(body_partial_json(json!({"stream": true})))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(call)
+                        .set_delay(delay),
+                )
+        }
+        Answer::Text(text) => m
+            .and(body_string_contains(super::super::decide::MARK))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({
+                        "id": "d1", "object": "chat.completion", "model": "mock",
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
+                            "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+                    }))
+                    .set_delay(delay),
+            ),
+    };
+    m.up_to_n_times(1).with_priority(1).mount(llm).await;
+}
+
+enum Answer {
+    Tool(&'static str, Value),
+    Text(&'static str),
+}
+
+/// The bodies of every model request carrying `marker`.
+async fn asked_with(llm: &wiremock::MockServer, marker: &str) -> Vec<String> {
+    llm.received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|r| String::from_utf8_lossy(&r.body).to_string())
+        .filter(|b| b.contains(marker))
+        .collect()
+}
+
+const DIAGNOSIS: &str =
+    "Diagnosed the reports outage: the embed sends the old id form. Option 2 is the permanent fix.";
+const THEIR_WORDS: &str =
+    "Sam has found it and his fix is going up now. The session must not write its own.";
+
+/// The 16 Nov crossing through the real path: the session writes on its
+/// line, the boss's line turn runs (`run_turn`, its model slow), the
+/// person speaks in the chat meanwhile, and the turn's own `crew_nudge`
+/// is refused with what moved.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_line_turn_never_sends_what_it_decided_before_the_persons_words() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, crew, d, llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        d.picture_load().await;
+        let s = new_session(&d, dir.path(), "ledger-migration").await;
+        let prepare = "Good work. Yes, prepare option 2's PR now; don't merge it.";
+        slow_once(
+            &llm,
+            "Option 2 is the permanent fix",
+            Duration::from_millis(1500),
+            Answer::Tool(
+                "crew_nudge",
+                json!({"session_id": s.id.to_string(), "message": prepare, "reason": "Its diagnosis is right."}),
+            ),
+        )
+        .await;
+        d.line_call(s.id, "tell", &json!({"to": "desk", "text": DIAGNOSIS}), None)
+            .await
+            .unwrap();
+        eventually("the line turn deciding", async || {
+            (!asked_with(&llm, "Option 2 is the permanent fix").await.is_empty()).then_some(())
+        })
+        .await;
+        // 13:33:19, while it decides: the person, in the chat.
+        crew.picture_person_told("desk", THEIR_WORDS);
+
+        // Its tool call comes back refused, with the person's words.
+        let told_it = eventually("the turn told what moved", async || {
+            asked_with(&llm, "Not sent: since you decided this").await.into_iter().next()
+        })
+        .await;
+        assert!(told_it.contains("must not write its own"), "{told_it}");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !told(&d, s.id).await.iter().any(|t| t.contains("option 2")),
+            "{:?}",
+            told(&d, s.id).await
+        );
+    })
+    .await;
+}
+
+/// The Act fully idle sweep, the real path: the session's turn ends, the
+/// focused call is slow, the person speaks meanwhile. Its step decided
+/// before their words is never sent; the next sweep decides again, on a
+/// brief that has their words, and that step goes.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_idle_sweep_decides_again_on_the_persons_words_and_sends_only_that() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let full = super::decides_at_once::THEIRS.replace(
+            "quiet_minutes = 30\n",
+            "quiet_minutes = 30\nanswer_after_minutes = 30\n",
+        );
+        let (_overseer, crew, d, llm) = overseeing(&base, pool, "ok", &full, &[]).await;
+        d.picture_load().await;
+        d.boss_bounds_with(workforce_desk::charge::Bounds {
+            home: base.clone(),
+            ..Default::default()
+        });
+        eventually("Desk to know it is unbound", async || {
+            d.boss_unbound("desk").then_some(())
+        })
+        .await;
+        slow_once(
+            &llm,
+            "Option 2 is the permanent fix",
+            Duration::from_millis(1500),
+            Answer::Text("CONTINUE: Prepare option 2's PR now.\nWHY: it is the permanent fix"),
+        )
+        .await;
+        super::decides_at_once::decides(
+            &llm,
+            "Option 2 is the permanent fix",
+            "CONTINUE: Review Sam's PR 648 read-only and report what it changes.\nWHY: Sam owns the fix",
+        )
+        .await;
+        let s = new_session(&d, &base, "ledger-migration").await;
+        let url = hook_url(&base, s.id).await;
+        hook(
+            &url,
+            json!({"hook_event_name": "SessionStart", "session_id": "cc-ledger"}),
+        )
+        .await;
+        hook(
+            &url,
+            json!({"hook_event_name": "Stop", "last_assistant_message": DIAGNOSIS}),
+        )
+        .await;
+        eventually("the focused call deciding", async || {
+            (!super::decides_at_once::calls_about(&llm, "Option 2 is the permanent fix")
+                .await
+                .is_empty())
+            .then_some(())
+        })
+        .await;
+        crew.picture_person_told("desk", THEIR_WORDS);
+
+        // (Taking it on, the boss first says so.)
+        let steps = async || {
+            told(&d, s.id)
+                .await
+                .into_iter()
+                .filter(|t| !t.starts_with("I'm running this session"))
+                .collect::<Vec<_>>()
+        };
+        let sent = eventually("the step decided again", async || {
+            steps().await.into_iter().next()
+        })
+        .await;
+        assert!(sent.starts_with("Review Sam's PR 648"), "{sent}");
+        let calls = super::decides_at_once::calls_about(&llm, "Option 2 is the permanent fix").await;
+        assert!(calls.len() >= 2, "decided again: {}", calls.len());
+        assert!(
+            calls.last().unwrap().contains("must not write its own"),
+            "the second call's brief has the person's words"
+        );
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(steps().await, vec![sent], "the first step never went");
+    })
+    .await;
+}
