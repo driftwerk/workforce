@@ -9,7 +9,7 @@
 //!    or a tracing event.
 //!  * [`tokenize_secrets`] — LLM-side defence. A detected secret is
 //!    replaced with an opaque marker like
-//!    `[[secret:<id> type=ANTHROPIC_KEY preview=sk-an...wXyZ]]` and the
+//!    `[[secret:<id> type=ANTHROPIC_KEY preview=***]]` and the
 //!    cleartext is stashed in the per-session
 //!    [`crate::secret_marker::SecretCache`]. The LLM only ever sees the
 //!    marker; allowlisted "secret-sink" tools (vault.set,
@@ -908,7 +908,7 @@ mod tests {
         let markers = parse_markers(&out);
         assert_eq!(markers.len(), 2);
         assert_ne!(markers[0].id, markers[1].id);
-        assert_eq!(markers[1].preview, "sk-a...6789");
+        assert_eq!(markers[1].preview, "***");
 
         clear_global_cache();
     }
@@ -934,8 +934,8 @@ mod tests {
         assert_eq!(markers.len(), 1);
         assert_eq!(markers[0].label, "ANTHROPIC_KEY");
         assert_eq!(markers[0].id, captured[0].id);
-        // Preview shape is `first4...last4`.
-        assert_eq!(markers[0].preview, "sk-a...7890");
+        // The preview shows no character of the secret.
+        assert_eq!(markers[0].preview, "***");
 
         clear_global_cache();
     }

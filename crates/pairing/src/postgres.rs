@@ -79,10 +79,7 @@ struct EmbeddedPairingMigrations;
 #[async_trait::async_trait]
 impl MigrationRun for EmbeddedPairingMigrations {
     async fn run(&self, client: &mut tokio_postgres::Client) -> Result<(), PostgresError> {
-        embedded::migrations::runner()
-            .run_async(client)
-            .await
-            .map_err(PostgresError::from)?;
+        workforce_postgres::run_embedded(embedded::migrations::runner(), client).await?;
         Ok(())
     }
 }
@@ -375,6 +372,14 @@ impl PairingStore for PostgresPairingStore {
                     &[&cutoff],
                 )
                 .await?;
+            // A token nobody collected in time goes too.
+            let collect_by = cutoff - chrono::Duration::seconds(PENDING_TOKEN_TTL_SECS);
+            conn.execute(
+                "UPDATE device_pairing_requests SET pending_token = NULL
+                 WHERE pending_token IS NOT NULL AND (approved_at IS NULL OR approved_at < $1)",
+                &[&collect_by],
+            )
+            .await?;
             Ok((c + d + n) as usize)
         })
     }

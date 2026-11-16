@@ -364,6 +364,8 @@ pub(crate) async fn run(
         }
         Place::Desk(c) => (c.clone(), None, None),
     };
+    // The boss's own wake: its heavy background model's work.
+    let model = crate::turn_loop::heavy_model(&service);
     let turn = workforce_agent::runner::CURRENT_AUTOMATED_ORIGIN.scope(
         ORIGIN.to_string(),
         service.process_turn(
@@ -376,7 +378,7 @@ pub(crate) async fn run(
             thread.as_deref(),
             None,
             None,
-            None,
+            model.as_deref(),
             None,
             None,
             None,
@@ -536,9 +538,10 @@ mod tests {
             assert!(!raw.contains(gone), "{gone} in {raw}");
         }
         assert!(!text.contains("suggest"), "{text}");
+        // The headline, and each session's name over its one line.
         assert_eq!(
             text.lines().filter(|l| !l.trim().is_empty()).count(),
-            4,
+            7,
             "{text}"
         );
     }
@@ -566,7 +569,10 @@ mod tests {
         let reply = "```\n**Here's the update:**\nRelease unblocked.\n**[acme-web]**\n1. ✔️ **Merged** the fix — CI green\n[acme-api] - For you — Approve the deploy_key rotation\n```";
         let (_, blocks) = briefed(reply);
         let raw = serde_json::to_string(&blocks).unwrap();
-        assert!(raw.contains("*Release unblocked.*"), "{raw}");
+        assert!(
+            raw.contains("*acme-api and acme-web: release unblocked.*"),
+            "{raw}"
+        );
         assert!(
             raw.contains("*acme-web*\\n✓ Merged the fix — CI green"),
             "{raw}"

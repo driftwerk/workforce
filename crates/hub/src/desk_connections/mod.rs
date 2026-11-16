@@ -32,6 +32,7 @@
 
 pub mod catalog;
 pub mod check;
+pub mod gh;
 #[cfg(test)]
 mod tests;
 
@@ -2267,6 +2268,10 @@ struct ConnectBody {
     agent: Option<String>,
     #[serde(default)]
     fields: BTreeMap<String, String>,
+    /// The paired hub these keys were copied from, as Desk's native side
+    /// names it (`desk_key_copies` on that hub): said in the audit row.
+    #[serde(default)]
+    copied_from: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2281,6 +2286,61 @@ struct StartBody {
 struct FieldsBody {
     #[serde(default)]
     fields: BTreeMap<String, String>,
+    /// As [`ConnectBody::copied_from`].
+    #[serde(default)]
+    copied_from: Option<String>,
+}
+
+/// A hub's name as an audit row may say it: one line, at most 80
+/// characters; none when empty.
+fn hub_name(name: Option<&str>) -> Option<String> {
+    let name: String = name?
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_NAME)
+        .collect();
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// The audit row for keys of `connector` copied from hub `from` into
+/// `connection`: "Desk copied your Jira key (Acme) from Patchwork". Never
+/// a value.
+fn audit_copy(
+    routes: &Routes,
+    person: &str,
+    connector: &str,
+    connection: &ConnectionView,
+    from: &str,
+) {
+    let service = catalog::find(connector).map_or(connector, |c| c.name);
+    let of = if connection.name == service {
+        String::new()
+    } else {
+        format!(" ({})", connection.name)
+    };
+    let said = format!("Desk copied your {service} key{of} from {from}");
+    info!(target: "sentinel.audit", identity_id = %person, connector, "desk_connections.copy: {said}");
+    let Some(telemetry) = routes.state.telemetry_store.as_ref() else {
+        return;
+    };
+    let detail = json!({
+        "summary": said,
+        "identity_id": person,
+        "connector": connector,
+        "connection": connection.id,
+        "from": from,
+    })
+    .to_string();
+    if let Err(e) = telemetry.record_audit(
+        &format!("user:{person}"),
+        "desk_connections.copy",
+        &format!("desk_connection:{connector}/{}", connection.id),
+        Some(&detail),
+        workforce_common::admin::AuditOutcome::Success,
+    ) {
+        warn!(error = %e, "a copied connection's audit row wasn't written");
+    }
 }
 
 #[derive(Deserialize)]
@@ -2403,7 +2463,12 @@ async fn connect(
             body.fields,
         )
         .await
-        .map(|c| Json(json!({ "connection": c })))
+        .map(|c| {
+            if let Some(from) = hub_name(body.copied_from.as_deref()) {
+                audit_copy(&r, &person, &connector, &c, &from);
+            }
+            Json(json!({ "connection": c }))
+        })
         .into_response()
 }
 
@@ -2418,7 +2483,12 @@ async fn reconnect(
     r.connections
         .reconnect(&person, &connector, &connection, body.fields)
         .await
-        .map(|c| Json(json!({ "connection": c })))
+        .map(|c| {
+            if let Some(from) = hub_name(body.copied_from.as_deref()) {
+                audit_copy(&r, &person, &connector, &c, &from);
+            }
+            Json(json!({ "connection": c }))
+        })
         .into_response()
 }
 

@@ -390,6 +390,7 @@ fn start_in(dir: &std::path::Path, group: Option<&str>) -> crate::model::NewSess
         approvals: None,
         approve_for_me: false,
         fast: false,
+        model: None,
         account: None,
         env: Default::default(),
         group: group.map(Into::into),

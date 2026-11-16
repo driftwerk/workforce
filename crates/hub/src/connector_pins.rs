@@ -373,6 +373,70 @@ mod tests {
         assert_eq!(changed(&after, &read_only), ["jira"]);
     }
 
+    /// An agent's `config.toml` from before connections could be named
+    /// (no `[skills.connections]`) keeps every connector it had, at the
+    /// tiers it had them, for its flat keys and every instance alike.
+    #[test]
+    fn an_agent_configured_before_connections_were_named_keeps_its_connectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir
+            .path()
+            .join(workforce_common::config_files::WORKSPACE_CONFIG);
+        let pins = AgentPins::new(dir.path().to_path_buf());
+        let paths = |c: &str| {
+            let mut paths = vec![primary(c).unwrap().to_string()];
+            if let Some(prefix) = workforce_common::connector_binding::instance_prefix(c) {
+                paths.push(format!("{prefix}acme/api_token"));
+            }
+            paths
+        };
+        type Want = fn(&str) -> TierPin;
+        let cases: [(Option<&str>, Want); 5] = [
+            // No config at all, and one with no `[skills]`: every connector.
+            (None, |_| TierPin::All),
+            (Some("[note]\nx = 1\n"), |_| TierPin::All),
+            // An empty `[skills]`, as before: still every connector.
+            (Some("[skills]\n"), |_| TierPin::All),
+            // `enabled` named: those on as the person's, the rest off.
+            (
+                Some("[skills]\nenabled = [\"jira\", \"linear\"]\n"),
+                |c| match c {
+                    "jira" | "linear" => TierPin::Mine,
+                    _ => TierPin::Nothing,
+                },
+            ),
+            // Its own connection, without `enabled`: that one its own.
+            (
+                Some("[skills]\nown_credential = [\"jira\"]\n"),
+                |c| match c {
+                    "jira" => TierPin::Own,
+                    _ => TierPin::All,
+                },
+            ),
+        ];
+        for (source, want) in cases {
+            match source {
+                Some(source) => std::fs::write(&config, source).unwrap(),
+                None => {
+                    let _ = std::fs::remove_file(&config);
+                }
+            }
+            pins.forget();
+            let binding = pins.binding();
+            for c in CONNECTORS {
+                assert!(binding.picks(c).is_none(), "{source:?}: {c}");
+                assert_eq!(
+                    binding.is_on(c),
+                    want(c) != TierPin::Nothing,
+                    "{source:?}: {c}"
+                );
+                for path in paths(c) {
+                    assert_eq!(pins.pin(&path), want(c), "{source:?}: {path}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_binding_pins_each_connector() {
         let path = "skills/linear/api_key";

@@ -96,8 +96,28 @@ impl UpdateWriter for HubWriter {
 pub(super) struct Changed {
     pub id: Uuid,
     pub name: String,
+    /// The repository it works in, by name.
+    repo: Option<String>,
+    /// Its account as the update tells of it ([`update::as_told`]).
     account: Account,
     new: Vec<Done>,
+}
+
+impl Changed {
+    /// What the update names it by: its name and repository.
+    fn context(&self) -> String {
+        update::subject(&self.name, self.repo.as_deref())
+    }
+}
+
+/// The repository session `v` works in, by name: a PR's among `new`, else
+/// its git project's folder.
+fn repo_of(v: &workforce_desk::model::SessionView, new: &[Done]) -> Option<String> {
+    let refs: Vec<&workforce_desk::account::Ref> = new.iter().flat_map(|d| &d.refs).collect();
+    // A folder in no repository names none.
+    let project = workforce_desk::git_project(&v.cwd);
+    let in_git = std::path::Path::new(&project).join(".git").exists();
+    update::repo_of(&refs, if in_git { &project } else { "" })
 }
 
 /// What one boss's next update would say now.
@@ -186,8 +206,10 @@ impl CrewHub {
             sessions.push(Changed {
                 id: v.id,
                 name: v.label().to_string(),
+                repo: repo_of(v, &new),
+                // What it waits on is said only when that is new.
+                account: update::as_told(was, a),
                 new,
-                account: a.clone(),
             });
         }
         let mut last = state.last_update_at.unwrap_or(state.since);
@@ -237,21 +259,29 @@ impl CrewHub {
                 .collect(),
             false => Vec::new(),
         };
+        // What waits on the person is said when it is new: opened or changed
+        // since the last update, or due to be said again. One they were
+        // told of and that hasn't moved is its own card, not news again.
+        let new_since =
+            |i: &OpenItem| i.changed_at > last || restated.iter().any(|(r, _)| *r == i.id);
         let for_you: Vec<OpenItem> = open
             .iter()
             .filter(|i| i.kind == OpenKind::Todo && i.state == OpenState::Open && i.said())
+            .filter(|i| new_since(i))
             .cloned()
             .collect();
         let waiting: Vec<OpenItem> = open
             .into_iter()
             .filter(|i| matches!(i.kind, OpenKind::Ask | OpenKind::Confirm))
             .filter(|i| i.said() && i.state == OpenState::Open)
+            .filter(|i| new_since(i))
             .collect();
         let quiet = self
             .quiet_made
             .lock()
             .get(boss)
-            .is_some_and(|m| !m.is_empty());
+            .is_some_and(|m| !m.is_empty())
+            || self.has_closing_notes(boss);
         if !decisions.is_empty() || !kept.is_empty() || quiet {
             change = Change::Result;
         }
@@ -290,6 +320,8 @@ impl CrewHub {
             .iter()
             .rev()
             .filter(|d| d.kind == DecisionKind::Acted)
+            // Said in the closed line, in its own words.
+            .filter(|d| !update::is_close(d))
             .take(update::COMPOSED_DECISIONS)
             .cloned()
             .collect();
@@ -300,7 +332,7 @@ impl CrewHub {
                 let input: Vec<(Uuid, String, &Account, Vec<&Done>)> = b
                     .sessions
                     .iter()
-                    .map(|s| (s.id, s.name.clone(), &s.account, s.new.iter().collect()))
+                    .map(|s| (s.id, s.context(), &s.account, s.new.iter().collect()))
                     .collect();
                 let mut user = update::composer_input(&input);
                 user.push_str(&update::composer_decisions(&acted));
@@ -349,6 +381,7 @@ impl CrewHub {
                 UpdateSession {
                     session_id: s.id.to_string(),
                     name: s.name.clone(),
+                    repo: s.repo.clone(),
                     purpose: s.account.purpose.trim().to_string(),
                     text: written
                         .sessions
@@ -379,13 +412,51 @@ impl CrewHub {
             Ok((spent, cap)) => update::footer(spent, cap),
             Err(_) => None,
         };
+        // Each group of the brief is named by its session and repository,
+        // so a line read alone still says what it is about.
+        let about: std::collections::HashSet<Uuid> = b
+            .decisions
+            .iter()
+            .filter_map(|d| d.session)
+            .chain(b.for_you.iter().filter_map(|i| i.session))
+            .collect();
         let names: HashMap<Uuid, String> = self
             .desk
             .list()
             .into_iter()
-            .map(|v| (v.id, v.label().to_string()))
+            .filter(|v| about.contains(&v.id))
+            .map(|v| {
+                // Named as its paragraph names it, so one session is one
+                // subject however its repository was found.
+                let named = match b.sessions.iter().find(|s| s.id == v.id) {
+                    Some(s) => s.context(),
+                    None => update::subject(v.label(), repo_of(&v, &[]).as_deref()),
+                };
+                (v.id, named)
+            })
             .collect();
         let (brief, more_items) = update::brief(&b.decisions, &decisions, &b.for_you, &names);
+        // The finished sessions it closed, would close, or left open: one
+        // line each.
+        let notes = self.closing_notes(boss, now);
+        let of = |kind: update::ClosedKind| -> Vec<update::ClosedSession> {
+            notes
+                .iter()
+                .filter(|(k, _)| *k == kind)
+                .map(|(_, s)| s.clone())
+                .collect()
+        };
+        let closed: Vec<update::ClosedLine> = update::closed_line(&b.decisions)
+            .into_iter()
+            .chain(update::noted_line(
+                update::ClosedKind::Suggested,
+                of(update::ClosedKind::Suggested),
+            ))
+            .chain(update::noted_line(
+                update::ClosedKind::KeptOpen,
+                of(update::ClosedKind::KeptOpen),
+            ))
+            .collect();
         let mut u = MentionedUpdate {
             sessions,
             decisions,
@@ -404,9 +475,17 @@ impl CrewHub {
             headline: String::new(),
             brief,
             more_items,
+            closed,
         };
-        u.headline = headline.unwrap_or_else(|| update::plain_headline(&u, b.for_you.len()));
-        let decided: Vec<String> = b.decisions.iter().map(BossDecision::said).collect();
+        let headline = headline.unwrap_or_else(|| update::plain_headline(&u, b.for_you.len()));
+        // Never a line without its session: one about one session says it.
+        u.headline = update::situated(&u, &headline, b.for_you.len());
+        let decided: Vec<String> = b
+            .decisions
+            .iter()
+            .filter(|d| !update::is_close(d))
+            .map(BossDecision::said)
+            .collect();
         let text = update::render(&u, &decided);
         (u, text)
     }
@@ -763,15 +842,31 @@ impl CrewHub {
                         .map(|m| m.id.clone())
                 })
         });
-        let extras = Extras {
+        let mut extras = Extras {
             update: Some(p.update.clone()),
             away: p.away.clone(),
             suggestions: self.quiet_suggestions(boss, &p),
             ..Default::default()
         };
         match found {
-            Some(m) => self.keep_extras_of(&m, boss, &extras).await,
+            Some(m) => {
+                // The line on the directives it went with stays with it.
+                extras.directives_open = self
+                    .desk
+                    .store()
+                    .extras(std::slice::from_ref(&m))
+                    .await
+                    .ok()
+                    .and_then(|mut e| e.remove(&m))
+                    .and_then(|e| e.directives_open);
+                self.keep_extras_of(&m, boss, &extras).await
+            }
             None => {
+                // Going out now: at a quiet moment, at most once a day, one
+                // line on the directives still open.
+                if let Some((_, o)) = self.overseer_named(boss) {
+                    extras.directives_open = self.directives_line(boss, &o, &p).await;
+                }
                 let kind = match p.away {
                     Some(_) => DeliveryKind::Away,
                     None => DeliveryKind::Update,
@@ -784,6 +879,17 @@ impl CrewHub {
                     .deliver_with_extras(service, owner, delivery, &extras)
                     .await?;
                 self.on_floor(service, owner, &delivered.session_id, &p);
+                if let Some(n) = &extras.directives_open {
+                    // Said: the next is a day off.
+                    if let Err(e) = self
+                        .desk
+                        .store()
+                        .directive_nudged(workforce_desk::rooms::YOU, &n.boss_scope)
+                        .await
+                    {
+                        tracing::warn!(error = %format!("{e:#}"), "a directives line wasn't kept as said");
+                    }
+                }
                 let message = delivered.message_id;
                 // Sent: kept so, before anything else, so a restart from
                 // here on finds it whatever the DM did since.
@@ -908,6 +1014,7 @@ impl CrewHub {
         if let Some(made) = self.quiet_made.lock().get_mut(service.agent_id.as_str()) {
             made.retain(|(at, _)| *at > cutoff);
         }
+        self.closing_told(service.agent_id.as_str(), cutoff);
         let read = service
             .sessions
             .desk_read(owner, DESK_CHANNEL)
@@ -962,6 +1069,8 @@ pub(super) async fn updates_loop(crew: Arc<CrewHub>, cancel: CancellationToken) 
             _ = every.tick() => {
                 // Held needs-you a restart left: theirs by now.
                 crew.post_due_cards().await;
+                // A boss newly at Act fully asks the person's directives.
+                crew.look_at_directives().await;
                 crew.look_at_updates().await;
             }
             // The person paused typing, came back, or wrote: look now.

@@ -1026,6 +1026,7 @@ mod tests {
             engine_version: None,
             approve_for_me: false,
             fast: false,
+            model: None,
             account: None,
             name: name.into(),
             goal: String::new(),

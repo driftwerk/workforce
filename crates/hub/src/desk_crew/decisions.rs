@@ -38,6 +38,8 @@ pub(crate) struct Done {
     pub line: Option<(Uuid, Delivery)>,
     /// The session it started.
     pub started: Option<Uuid>,
+    /// The session it closed has a conversation to resume.
+    pub resumable: bool,
 }
 
 /// What was true before the action that its undo goes back to.
@@ -50,6 +52,8 @@ pub(crate) struct Before {
     /// A plan its boss reviewed at its start (approved, or changes asked
     /// for): its heading.
     pub plan: Option<String>,
+    /// The name of the session it closes, as the person knew it.
+    pub name: Option<String>,
 }
 
 /// How `action`, done as `done` says, is undone: the kind, and what the
@@ -120,6 +124,18 @@ pub(crate) fn undo_of(action: &Action, done: &Done, before: &Before) -> (Undo, O
                 prompt: None,
             }),
         ),
+        // Reopened by resuming it; one with no conversation has nothing
+        // to resume.
+        Action::Close { session } => {
+            let plan = UndoPlan::Reopen {
+                session: *session,
+                name: before.name.clone().unwrap_or_default(),
+            };
+            match done.resumable {
+                true => (Undo::Reverse, Some(plan)),
+                false => (Undo::None, Some(plan)),
+            }
+        }
         Action::Interrupt { session } => (
             Undo::Reverse,
             Some(UndoPlan::Resume {
@@ -272,6 +288,10 @@ impl CrewHub {
                     _ => Before::default(),
                 }
             }
+            Action::Close { session } => Before {
+                name: self.desk.view(*session).ok().map(|v| v.label().to_string()),
+                ..Before::default()
+            },
             _ => Before::default(),
         }
     }
@@ -354,14 +374,12 @@ impl CrewHub {
             } => format!("Sent {} a message.", self.name_of_session(*s)),
             _ => said_short(said).to_string(),
         };
-        // A boss on another hub is named with its hub, in the lines the
-        // person reads.
-        let (what, brief) = match boss.split_once('/') {
-            Some((hub, agent)) => (
-                format!("{what} (by {agent} on {hub})"),
-                format!("{} (by {agent} on {hub})", brief.trim_end_matches('.')),
-            ),
-            None => (what, brief),
+        // A boss on another hub is named with its hub, and the home's own
+        // as at home, in the lines the person reads.
+        let what = super::remote_decide::named(&boss, what);
+        let brief = match boss.contains('/') {
+            true => super::remote_decide::named(&boss, brief.trim_end_matches('.').to_string()),
+            false => brief,
         };
         // One made by a preference says so (its why already cites it).
         let how = match by.preference {
@@ -711,6 +729,10 @@ impl CrewHub {
                 prompt: prompt.clone(),
             },
             UndoPlan::StopStarted { session } => Action::Stop { session: *session },
+            UndoPlan::Reopen { session, .. } => Action::Resume {
+                session: *session,
+                prompt: None,
+            },
         };
         self.perform(&action, by).await
     }
@@ -805,7 +827,7 @@ mod tests {
         let s = Uuid::new_v4();
         let line = |d| Done {
             line: Some((Uuid::new_v4(), d)),
-            started: None,
+            ..Done::default()
         };
         let nudge = Action::Nudge {
             to: Target::Session(s),
@@ -886,6 +908,30 @@ mod tests {
                 prompt: None
             })
         );
+        // A closed session is reopened by resuming it, named as it was;
+        // one with no conversation has nothing to resume, and is still
+        // known as closed.
+        let close = Action::Close { session: s };
+        let named = Before {
+            name: Some("web".into()),
+            ..Before::default()
+        };
+        let resumable = Done {
+            resumable: true,
+            ..Done::default()
+        };
+        let reopen = Some(UndoPlan::Reopen {
+            session: s,
+            name: "web".into(),
+        });
+        assert_eq!(
+            undo_of(&close, &resumable, &named),
+            (Undo::Reverse, reopen.clone())
+        );
+        assert_eq!(
+            undo_of(&close, &Done::default(), &named),
+            (Undo::None, reopen)
+        );
         assert_eq!(
             undo_of(&Action::Interrupt { session: s }, &Done::default(), &none).1,
             Some(UndoPlan::Resume {
@@ -903,8 +949,8 @@ mod tests {
             fresh: false,
         };
         let started = Done {
-            line: None,
             started: Some(s),
+            ..Done::default()
         };
         assert_eq!(
             undo_of(&start, &started, &none).1,

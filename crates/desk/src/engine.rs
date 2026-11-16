@@ -276,6 +276,14 @@ pub fn boss_safe(engine: Engine) -> bool {
     matches!(engine, Engine::Claude)
 }
 
+/// Whether `model` can be the model of an `engine` session: a name that
+/// reads only as a model's on its command line, never as an option or as
+/// more than one argument ([`crate::plan::model_ok`]); Devin's own rule is
+/// narrower ([`crate::devin::model_ok`]).
+pub fn model_ok(engine: Engine, model: &str) -> bool {
+    crate::plan::model_ok(model) && (engine != Engine::Devin || crate::devin::model_ok(model))
+}
+
 pub fn runs(engine: Engine, view: View) -> bool {
     views(engine).contains(&view)
 }
@@ -556,8 +564,51 @@ struct ClaudeStatus {
     logged_in: bool,
     auth_method: Option<String>,
     org_id: Option<String>,
+    org_name: Option<String>,
     email: Option<String>,
     subscription_type: Option<String>,
+}
+
+/// Whose a Claude Code sign-in's account is, as Settings shows it: its
+/// email, organisation's name and plan. Never its token.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeProfile {
+    pub email: Option<String>,
+    pub org_name: Option<String>,
+    pub plan: Option<String>,
+}
+
+impl ClaudeProfile {
+    /// "kim@example.com, Acme": who the person knows the account as.
+    pub fn who(&self) -> Option<String> {
+        let parts: Vec<&str> = [self.email.as_deref(), self.org_name.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect();
+        (!parts.is_empty()).then(|| parts.join(", "))
+    }
+}
+
+/// The account Claude Code's `auth status --json` names and its profile:
+/// only a claude.ai sign-in names them (a long-lived token is
+/// inference-only, and says nothing of its account).
+pub fn claude_profile(status: &str) -> Option<(crate::identity::Identity, ClaudeProfile)> {
+    let s = serde_json::from_str::<ClaudeStatus>(status).ok()?;
+    if !s.logged_in {
+        return None;
+    }
+    let clean = |v: Option<String>| v.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let email = clean(s.email)?;
+    let identity = crate::identity::Identity::of(s.org_id.as_deref()?, &email)?;
+    Some((
+        identity,
+        ClaudeProfile {
+            email: Some(email),
+            org_name: clean(s.org_name),
+            plan: clean(s.subscription_type),
+        },
+    ))
 }
 
 /// The sign-ins that are a plan's: the claude.ai login and a plan's token.
@@ -629,6 +680,148 @@ pub fn devin_sign_in(env: &BTreeMap<String, String>, exists: impl Fn(&Path) -> b
     }
 }
 
+/// `devin auth status`, on stdout or stderr. Signed out it says
+/// `Not logged in.` (and where its credentials would be); signed in,
+/// 3000.12.57 says `Logged in (via Devin).`, then sections (`Credentials:`,
+/// `User:`, `Account:`, …) of `Key: value` lines, the account's email the
+/// `Email:` of its `User:` section; a line saying it is logged in may name
+/// the email too. Only that email is kept: never the credentials path, the
+/// servers, the team or the organization it prints beside it. Anything
+/// else is [`SignIn::Unknown`], for the caller to read the credentials
+/// file instead ([`devin_sign_in`]).
+pub fn devin_status_sign_in(status: &str) -> SignIn {
+    let lines: Vec<String> = status.lines().map(plain_line).collect();
+    if lines
+        .iter()
+        .any(|l| l.starts_with("not logged in") || l.starts_with("not signed in"))
+    {
+        return SignIn::Out;
+    }
+    let Some(said) = lines
+        .iter()
+        .find(|l| l.starts_with("logged in") || l.starts_with("signed in"))
+    else {
+        return SignIn::Unknown;
+    };
+    let on_its_line = said
+        .split(|c: char| {
+            c.is_whitespace() || matches!(c, '(' | ')' | '<' | '>' | ',' | '"' | '\'' | '`')
+        })
+        .map(|w| w.trim_end_matches(['.', ':', ';']))
+        .find(|w| email_like(w))
+        .map(str::to_string);
+    SignIn::In {
+        via: Via::Vendor,
+        who: on_its_line.or_else(|| devin_user_email(status)),
+        plan: None,
+        ids: Vec::new(),
+    }
+}
+
+/// The `Email:` of `devin auth status`'s `User:` section (a section is
+/// its unindented `Name:` line and the indented lines under it), when it
+/// reads as an email and nothing else.
+fn devin_user_email(status: &str) -> Option<String> {
+    let mut in_user = false;
+    for line in status.lines() {
+        let plain = crate::pty::plain_text(line.as_bytes());
+        if plain.trim().is_empty() {
+            continue;
+        }
+        if !line.starts_with(char::is_whitespace) {
+            in_user = plain.trim().eq_ignore_ascii_case("user:");
+            continue;
+        }
+        if !in_user {
+            continue;
+        }
+        if let Some((key, value)) = plain.trim().split_once(':') {
+            let value = value.trim();
+            if key.trim().eq_ignore_ascii_case("email") && email_like(value) {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// A status line lowercased, without colour codes or a leading mark
+/// (`✓ Logged in`).
+fn plain_line(line: &str) -> String {
+    let plain = crate::pty::plain_text(line.as_bytes());
+    plain
+        .trim()
+        .trim_start_matches(|c: char| !c.is_alphanumeric())
+        .trim()
+        .to_lowercase()
+}
+
+/// Whether `word` reads as an email address and nothing else.
+fn email_like(word: &str) -> bool {
+    let Some((local, domain)) = word.split_once('@') else {
+        return false;
+    };
+    let fine = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '%' | '+' | '-');
+    word.len() <= 254
+        && !local.is_empty()
+        && local.chars().all(fine)
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && domain
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+}
+
+/// The environment Devin's login and `auth status` run in: only what
+/// finds the person's own Devin, its files and the network (home, path,
+/// user, shell, temp, `XDG_*`, locale, terminal, proxies, CA files). No key
+/// or token of any kind reaches it, so Devin signs in by its own login and
+/// never by one ahead of it.
+pub fn devin_login_env(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    env.iter()
+        .filter(|(k, _)| devin_login_var(k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// Whether `name` is one [`devin_login_env`] keeps.
+fn devin_login_var(name: &str) -> bool {
+    const KEPT: &[&str] = &[
+        "HOME",
+        "PATH",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TMPDIR",
+        "LANG",
+        "TERM",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "NODE_EXTRA_CA_CERTS",
+        // To open the sign-in page in the person's browser.
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "BROWSER",
+    ];
+    const PROXIES: &[&str] = &["http_proxy", "https_proxy", "no_proxy", "all_proxy"];
+    KEPT.contains(&name)
+        || PROXIES.iter().any(|p| name.eq_ignore_ascii_case(p))
+        || name.starts_with("XDG_")
+        || name.starts_with("LC_")
+        || devin_setting(name)
+}
+
+/// A `DEVIN_…` setting of the person's that Devin's sign-in sees: only
+/// those its sessions keep ([`crate::devin::DEVIN_KEPT`]), so a sign-in
+/// is checked where its sessions run, and no credential or address of
+/// the person's outranks Devin's own login.
+fn devin_setting(name: &str) -> bool {
+    crate::devin::DEVIN_KEPT.contains(&name.to_ascii_uppercase().as_str())
+}
+
 /// Copilot CLI signs in with a GitHub token from its environment; with
 /// none set, only it can say.
 pub fn copilot_sign_in(env: &BTreeMap<String, String>) -> SignIn {
@@ -691,6 +884,30 @@ pub fn view_of(engine: Engine, program: Option<&Path>, read: Option<&Installed>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session's model is a name, never an option or more than one
+    /// argument; Devin's rule is narrower.
+    #[test]
+    fn a_model_is_only_a_models_name() {
+        for e in [Engine::Claude, Engine::Codex, Engine::Devin] {
+            for m in [
+                "opus",
+                "gpt-6.1-sol",
+                "us.anthropic.claude-sonnet-4-5:0",
+                "a/b",
+            ] {
+                assert!(model_ok(e, m), "{e:?} {m}");
+            }
+            for m in [
+                "-m", "--model", "a b", "a\"b", "a=b", "a\nb", "a;b", "$(x)", "", "é",
+            ] {
+                assert!(!model_ok(e, m), "{e:?} {m:?}");
+            }
+            assert!(!model_ok(e, &"a".repeat(201)));
+        }
+        assert!(model_ok(Engine::Claude, "sonnet[1m]"));
+        assert!(!model_ok(Engine::Devin, "sonnet[1m]"));
+    }
 
     #[test]
     fn claude_code_codex_and_devin_run_and_each_in_a_terminal() {
@@ -822,6 +1039,28 @@ mod tests {
             })
         );
         let token = claude_sign_in(r#"{"loggedIn":true,"authMethod":"oauth_token"}"#);
+        // What a claude.ai sign-in says of its account, from a recorded
+        // `auth status --json` (2.1.325; values made up).
+        let status = include_str!("../fixtures/claude/auth_status.json");
+        let (identity, profile) = claude_profile(status).unwrap();
+        assert_eq!(
+            identity,
+            crate::identity::Identity::of("org-1", "kim@example.com").unwrap()
+        );
+        assert_eq!(
+            profile,
+            ClaudeProfile {
+                email: Some("kim@example.com".into()),
+                org_name: Some("Acme".into()),
+                plan: Some("max".into()),
+            }
+        );
+        assert_eq!(profile.who().as_deref(), Some("kim@example.com, Acme"));
+        assert_eq!(
+            claude_profile(r#"{"loggedIn":true,"authMethod":"oauth_token"}"#),
+            None,
+            "a long-lived token names no account"
+        );
         assert!(token.on_plan());
         assert_eq!(token.plan_account(), Some(LocalAccount::default()));
         let key = claude_sign_in(r#"{"loggedIn":true,"authMethod":"api_key"}"#);
@@ -871,6 +1110,165 @@ mod tests {
             SignIn::In { .. }
         ));
         assert_eq!(copilot_sign_in(&env(&[("GH_TOKEN", "")])), SignIn::Unknown);
+    }
+
+    /// `devin auth status` signed out, as CLI 3000.12.57 printed it.
+    const DEVIN_OUT: &str = include_str!("../fixtures/devin/5-status-out.txt");
+    /// Signed in, as CLI 3000.12.57 printed it (personal values replaced).
+    const DEVIN_STATUS_IN: &str = include_str!("../fixtures/devin/4-status-in.txt");
+    /// Signed in, pieced together from the lines the 3000.12.57 binary
+    /// holds (`Logged in (via `, `File:`, `API server:`, `Devin webapp:`,
+    /// `Devin API:`, `Organization:`), naming no account but an
+    /// organization's address.
+    const DEVIN_IN: &str = "\x1b[32m✓\x1b[0m Logged in (via browser)\n  File:              /home/kim/.local/share/devin/credentials.toml\n  API server:        https://server.codeium.com\n  Devin webapp:      https://app.devin.ai\n  Devin API:         https://api.devin.ai\n  Organization:      ops@acme.example\n  Credentials path:  /home/kim+x@host.example/credentials.toml\n";
+    /// Signed in, naming the account on its logged-in line (`Logged in as `
+    /// is in the binary too).
+    const DEVIN_IN_AS: &str = "Logged in as kim@example.com (via browser)\n  Organization:      Acme\n  Credentials path:  /home/kim/.local/share/devin/credentials.toml\n";
+
+    #[test]
+    fn devins_status_says_out_in_and_only_ever_the_email_it_is_signed_in_as() {
+        assert_eq!(devin_status_sign_in(DEVIN_OUT), SignIn::Out);
+        assert_eq!(
+            devin_status_sign_in("Not logged in. Run `devin auth login` to authenticate.\n"),
+            SignIn::Out
+        );
+        // As 3000.12.57 says it: the email of its User section, nothing else.
+        assert_eq!(
+            devin_status_sign_in(DEVIN_STATUS_IN),
+            SignIn::In {
+                via: Via::Vendor,
+                who: Some("kim@example.com".into()),
+                plan: None,
+                ids: Vec::new(),
+            }
+        );
+        let elsewhere: String = DEVIN_STATUS_IN
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("Email:"))
+            .map(|l| match l.trim_start().starts_with("Team ID:") {
+                true => format!("  Email:   ops@acme.example\n{l}\n"),
+                false => format!("{l}\n"),
+            })
+            .collect();
+        assert!(
+            matches!(
+                devin_status_sign_in(&elsewhere),
+                SignIn::In { who: None, .. }
+            ),
+            "an email outside its User section is never who"
+        );
+        let view = serde_json::to_string(&devin_status_sign_in(DEVIN_STATUS_IN)).unwrap();
+        for never in [
+            "credentials",
+            "Kim Example",
+            "user-0000",
+            "devin-team",
+            "Free",
+        ] {
+            assert!(!view.contains(never), "{view}");
+        }
+        let SignIn::In {
+            via,
+            who,
+            plan,
+            ids,
+        } = devin_status_sign_in(DEVIN_IN)
+        else {
+            panic!("signed in");
+        };
+        assert_eq!(via, Via::Vendor);
+        assert_eq!(
+            who, None,
+            "an organization or a path is never taken for who"
+        );
+        assert_eq!((plan, ids), (None, Vec::<String>::new()));
+        assert!(matches!(
+            devin_status_sign_in(DEVIN_IN_AS),
+            SignIn::In { via: Via::Vendor, who: Some(w), .. } if w == "kim@example.com"
+        ));
+        for garbage in [
+            "",
+            "error: unrecognized subcommand 'status'\n",
+            "Failed to load credentials: invalid TOML\n",
+            "  Credentials path: /home/kim/.local/share/devin/credentials.toml\n",
+            "Warning: you are logged in as kim@example.com elsewhere\n",
+        ] {
+            assert_eq!(devin_status_sign_in(garbage), SignIn::Unknown, "{garbage}");
+        }
+        // Whatever it said is printed nowhere: the view has no path in it.
+        let view = serde_json::to_string(&devin_status_sign_in(DEVIN_IN_AS)).unwrap();
+        assert!(
+            !view.contains("credentials") && !view.contains("Acme"),
+            "{view}"
+        );
+        assert!(email_like("kim.o+desk@mail.example.co"));
+        for not in [
+            "kim@",
+            "@example.com",
+            "kim@localhost",
+            "/a/b@c.d/e",
+            "a@b..",
+            "kim@ex ample.com",
+        ] {
+            assert!(!email_like(not), "{not}");
+        }
+    }
+
+    #[test]
+    fn devin_runs_without_the_keys_that_would_sign_it_in_ahead_of_its_login() {
+        let env: BTreeMap<String, String> = [
+            "HOME",
+            "WINDSURF_API_KEY",
+            "DEVIN_API_KEY",
+            "DEVIN_SESSION_TOKEN",
+            "DEVIN_THEME",
+            "ANTHROPIC_API_KEY",
+            "GITHUB_TOKEN",
+            "XDG_DATA_HOME",
+            "LC_ALL",
+            "HTTPS_PROXY",
+            "no_proxy",
+            "PATH",
+            "ALL_PROXY",
+            "DISPLAY",
+            "BROWSER",
+            "DEVIN_AUTH_MODE",
+            "DEVIN_API_BASE",
+            "DEVIN_WEBAPP_URL",
+            "DEVIN_SERVER_HOST",
+            "DEVIN_OTEL_ENDPOINT",
+            "DEVIN_PASSWORD",
+            "DEVIN_URL_OVERRIDE",
+            "DEVIN_GATEWAY",
+            "DEVIN_SESSION_COOKIE",
+            "DEVIN_GH_PAT",
+            "DEVIN_JWT",
+            "DEVIN_BEARER",
+            "DEVIN_ORIGIN_X",
+            "DEVIN_DATA_DIR",
+            "DEVIN_CONFIG_DIR",
+            "DEVIN_INSECURE",
+            "DEVIN_MODEL",
+        ]
+        .iter()
+        .map(|k| (k.to_string(), "x".to_string()))
+        .collect();
+        let kept: Vec<String> = devin_login_env(&env).into_keys().collect();
+        assert_eq!(
+            kept,
+            [
+                "ALL_PROXY",
+                "BROWSER",
+                "DEVIN_MODEL",
+                "DISPLAY",
+                "HOME",
+                "HTTPS_PROXY",
+                "LC_ALL",
+                "PATH",
+                "XDG_DATA_HOME",
+                "no_proxy"
+            ]
+        );
     }
 
     #[test]

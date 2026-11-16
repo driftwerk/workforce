@@ -41,6 +41,10 @@ pub struct CodexSpawn<'a> {
     pub approve_for_me: bool,
     /// Fast mode: Codex asks the ChatGPT backend's faster tier.
     pub fast: bool,
+    /// The model its thread runs; none, Codex's own default. Given to the
+    /// TUI as a setting, as [`FAST`] is, so it starts (and resumes) the
+    /// thread on it. Only a name [`crate::plan::model_ok`] passes is given.
+    pub model: Option<&'a str>,
     /// The permission mode to start in ([`crate::mode`]), over Approve for
     /// me's; none, its own.
     pub mode: Option<crate::mode::Mode>,
@@ -85,6 +89,10 @@ pub fn spawn(s: &CodexSpawn<'_>) -> Spawn {
     }
     if s.fast {
         args.extend(["-c".to_string(), FAST.to_string()]);
+    }
+    // A TOML string, so it is only ever the value of `model`.
+    if let Some(m) = s.model.filter(|m| crate::plan::model_ok(m)) {
+        args.extend(["-c".to_string(), format!("model={}", toml_string(m))]);
     }
     // Later settings win: the mode Desk keeps for it over Approve for me's.
     if let Some(mode) = s.mode {
@@ -1436,6 +1444,7 @@ pub(crate) mod tests {
             prompt: None,
             approve_for_me: false,
             fast: false,
+            model: None,
             mode: None,
             env: &env,
         });
@@ -1464,6 +1473,7 @@ pub(crate) mod tests {
                 prompt: Some("go"),
                 approve_for_me: true,
                 fast: false,
+                model: None,
                 mode: None,
                 env: &env,
             });
@@ -1507,6 +1517,7 @@ pub(crate) mod tests {
                     prompt: Some("go"),
                     approve_for_me: false,
                     fast,
+                    model: None,
                     mode: None,
                     env: &env,
                 })
@@ -1518,6 +1529,52 @@ pub(crate) mod tests {
                 ["-c", "service_tier=\"priority\"", "--", "go"]
             );
             assert!(!fast(false).iter().any(|a| a.contains("service_tier")));
+        }
+    }
+
+    /// The session's model starts its thread, and resumes it, as a setting
+    /// of its own: a name that could read as anything else never goes in.
+    #[test]
+    fn a_sessions_model_starts_and_resumes_its_thread() {
+        let env = BTreeMap::new();
+        for launch in [Launch::New, Launch::Resume { thread_id: "t1" }] {
+            let args = |model| {
+                spawn(&CodexSpawn {
+                    program: Path::new("/bin/codex"),
+                    cwd: Path::new("/repo"),
+                    socket: Path::new("/run/s.sock"),
+                    launch: match launch {
+                        Launch::New => Launch::New,
+                        Launch::Resume { thread_id } => Launch::Resume { thread_id },
+                    },
+                    prompt: Some("go"),
+                    approve_for_me: false,
+                    fast: false,
+                    model,
+                    mode: None,
+                    env: &env,
+                })
+                .args
+            };
+            let on = args(Some("gpt-6.1-sol"));
+            assert_eq!(
+                &on[on.len() - 4..],
+                ["-c", "model=\"gpt-6.1-sol\"", "--", "go"]
+            );
+            assert!(!args(None).iter().any(|a| a.starts_with("model=")));
+            for bad in [
+                "--yolo",
+                "a\" b",
+                "x\"\nsandbox_mode=\"danger-full-access",
+                "a b",
+            ] {
+                let a = args(Some(bad));
+                assert!(
+                    !a.iter()
+                        .any(|x| x.starts_with("model=") || x.contains("danger") || x == "--yolo"),
+                    "{bad:?}: {a:?}"
+                );
+            }
         }
     }
 

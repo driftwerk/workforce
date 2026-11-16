@@ -40,7 +40,7 @@ pub(super) fn plan_id(account: Uuid) -> String {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum Added {
     /// A pasted token was checked and kept.
-    Account { account: AccountView },
+    Account { account: Box<AccountView> },
     /// Signing in through the engine's own command began.
     SignIn {
         #[serde(rename = "signIn")]
@@ -210,14 +210,23 @@ impl Desk {
                 // As it reads now: with what the CLI sign-in reported while it
                 // was this account.
                 standing: effective.get(&Some(a.id)).cloned(),
-                identity: st.links.get(&a.id).map(|l| accounts::IdentityView {
-                    key: l.identity.key.clone(),
-                    email: l.identity.email.clone(),
-                    linked_by: l.by,
-                    this_computer: st
-                        .own_identity
-                        .as_ref()
-                        .is_some_and(|o| o.key == l.identity.key),
+                identity: st.links.get(&a.id).map(|l| {
+                    let profile = st.profiles.get(&l.identity.key);
+                    accounts::IdentityView {
+                        key: l.identity.key.clone(),
+                        email: l.identity.email.clone(),
+                        linked_by: l.by,
+                        this_computer: st
+                            .own_identity
+                            .as_ref()
+                            .is_some_and(|o| o.key == l.identity.key),
+                        org_name: profile.and_then(|p| p.org_name.clone()),
+                        plan: profile.and_then(|p| p.plan.clone()),
+                    }
+                }),
+                refused: st.refused.get(&a.id).map(|r| accounts::RefusedView {
+                    reason: r.reason.clone(),
+                    recheck_at: r.recheck_at,
                 }),
                 // As last seen: the store is never read under this lock.
                 signed_in: keys.is_some() && st.signed_in_accounts.contains(&a.id),
@@ -615,11 +624,55 @@ impl Desk {
         }
     }
 
+    /// A call of the hub's own on `account` was turned away by the
+    /// provider for the account itself (`reason`, in plain words): it is
+    /// skipped until it is signed in again or `recheck_at`. The Floor says
+    /// so once: when it is `news`, not at every hourly re-check.
+    pub fn hub_refused(
+        &self,
+        account: Uuid,
+        reason: &str,
+        recheck_at: chrono::DateTime<Utc>,
+        news: bool,
+    ) {
+        {
+            let mut st = self.0.state.lock();
+            if !st.accounts.iter().any(|a| a.id == account) {
+                return;
+            }
+            let at = st
+                .refused
+                .get(&account)
+                .filter(|_| !news)
+                .map_or_else(Utc::now, |r| r.at);
+            st.refused.insert(
+                account,
+                accounts::Refused {
+                    reason: reason.to_string(),
+                    recheck_at,
+                    at,
+                },
+            );
+        }
+        tracing::warn!(%account, reason, %recheck_at, "the hub's own call found an account turned away by the provider");
+        self.announce_accounts();
+        if news {
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                let desk = self.clone();
+                rt.spawn(async move { desk.accounts_moved().await });
+            }
+        }
+    }
+
     /// A call of the hub's own on `account`, begun at `at`, succeeded: a
     /// stop it had from before then is over.
     pub fn hub_served(&self, account: Uuid, at: chrono::DateTime<Utc>) {
         if !self.0.state.lock().accounts.iter().any(|a| a.id == account) {
             return;
+        }
+        if self.0.state.lock().refused.remove(&account).is_some() {
+            tracing::info!(%account, "an account the provider turned away serves again");
+            self.announce_accounts();
         }
         // Told from wherever a login is settled, which may have no runtime.
         if tokio::runtime::Handle::try_current().is_err() {
@@ -905,7 +958,9 @@ impl Desk {
                     .into_iter()
                     .find(|a| a.id == account.id)
                     .ok_or_else(|| DeskError::Internal(eyre::eyre!("account not kept")))?;
-                Ok(Added::Account { account: view })
+                Ok(Added::Account {
+                    account: Box::new(view),
+                })
             }
             None => self
                 .start_sign_in(new.engine, name, new.make_default, new.remote, None)
@@ -945,7 +1000,9 @@ impl Desk {
                     .into_iter()
                     .find(|a| a.id == id)
                     .ok_or_else(|| DeskError::Invalid("there is no such account".into()))?;
-                Ok(Added::Account { account: view })
+                Ok(Added::Account {
+                    account: Box::new(view),
+                })
             }
             None => self
                 .start_sign_in(account.engine, account.name, false, again.remote, Some(id))
@@ -1003,6 +1060,7 @@ impl Desk {
             if st.accounts.iter().any(|a| a.id == id) {
                 st.signed_in_accounts.insert(id);
                 st.sign_in_problems.remove(&id);
+                st.refused.remove(&id);
                 st.links.remove(&id);
                 st.prints.remove(&super::identities::Raw::Account(id));
                 // What it knew goes, and when it was signed in is kept: a
@@ -1443,6 +1501,7 @@ impl Desk {
             st.signed_in_accounts.remove(&id);
             st.switches.retain(|_, to| *to != Some(id));
             st.sign_in_problems.remove(&id);
+            st.refused.remove(&id);
             if !deleted {
                 st.sign_in_problems
                     .insert(id, accounts::SignInProblem::NotRemoved);
@@ -1803,6 +1862,57 @@ fn sign_in_needs(st: &super::State) -> Vec<accounts::AccountNeed> {
         .collect()
 }
 
+/// Each account the provider turned away, once per refusal: who it is,
+/// why, and the account Desk uses meanwhile (the first, the default first,
+/// signed in and neither turned away nor full).
+fn refused_needs(st: &super::State) -> Vec<accounts::AccountNeed> {
+    let mut ordered: Vec<&accounts::Account> = st
+        .accounts
+        .iter()
+        .filter(|a| a.engine == Engine::Claude)
+        .collect();
+    ordered.sort_by_key(|a| !a.is_default);
+    let mut out: Vec<accounts::AccountNeed> = st
+        .refused
+        .iter()
+        .filter_map(|(id, refused)| {
+            let account = st.accounts.iter().find(|a| a.id == *id)?;
+            let using = ordered
+                .iter()
+                .find(|a| {
+                    a.id != *id
+                        && st.signed_in_accounts.contains(&a.id)
+                        && !st.sign_in_problems.contains_key(&a.id)
+                        && !st.refused.contains_key(&a.id)
+                        && Desk::full_now(st, Some(a.id)).is_none()
+                })
+                .map(|a| accounts::Side {
+                    id: Some(a.id),
+                    name: a.name.clone(),
+                });
+            let who = st.links.get(id).and_then(|l| {
+                st.profiles
+                    .get(&l.identity.key)
+                    .and_then(crate::engine::ClaudeProfile::who)
+                    .or_else(|| l.identity.email.clone())
+            });
+            Some(accounts::AccountNeed::Refused {
+                id: format!("refused:{}:{}", id.simple(), refused.at.timestamp()),
+                engine: Engine::Claude,
+                account: accounts::Side {
+                    id: Some(*id),
+                    name: account.name.clone(),
+                },
+                who,
+                reason: refused.reason.clone(),
+                using,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.id().cmp(b.id()));
+    out
+}
+
 /// What moving every session off an account did.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1859,6 +1969,7 @@ impl Desk {
             .into_iter()
             .chain(Self::in_terminal_needs(&st))
             .chain(sign_in_needs(&st))
+            .chain(refused_needs(&st))
             .filter(|n| !st.put_off.contains(n.id()))
             // One of each, whatever raised it twice.
             .filter(|n| seen.insert(n.id().to_string()))

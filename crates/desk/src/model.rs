@@ -57,6 +57,9 @@ pub struct SessionRecord {
     pub approve_for_me: bool,
     /// Codex asks the ChatGPT backend's faster tier ("Fast mode").
     pub fast: bool,
+    /// The model it runs, as its engine names it (`opus`, `gpt-6.1-sol`),
+    /// on every start and resume of it; none is the engine's own default.
+    pub model: Option<String>,
     /// The person's account it runs on ([`crate::engine_accounts`]); none:
     /// the CLI's own sign-in on this computer.
     pub account: Option<Uuid>,
@@ -207,6 +210,9 @@ pub struct SessionView {
     pub approve_for_me: bool,
     /// Codex asks the ChatGPT backend's faster tier ("Fast mode").
     pub fast: bool,
+    /// The model it runs, as its engine names it; none is the engine's own
+    /// default.
+    pub model: Option<String>,
     /// The person's account it runs on; none: the CLI's own sign-in.
     pub account: Option<crate::engine_accounts::AccountRef>,
     /// The account it moves to once its turn ends, when a switch waits.
@@ -326,6 +332,7 @@ impl SessionView {
             approvals: r.approvals,
             approve_for_me: r.approve_for_me,
             fast: r.fast,
+            model: r.model.clone(),
             account: None,
             switching_to: None,
             terminal_id: r.terminal_id,
@@ -495,6 +502,12 @@ pub struct NewSession {
     /// which can use the plan's limits sooner.
     #[serde(default)]
     pub fast: bool,
+    /// The model it runs, as its engine names it (`opus`, `gpt-6.1-sol`):
+    /// absent or blank, the engine's own default. A name that could read as
+    /// anything but a model's on its command line is refused
+    /// ([`crate::plan::model_ok`]).
+    #[serde(default)]
+    pub model: Option<String>,
     /// The person's account it runs on: absent, the engine's default
     /// account; `null`, the CLI's own sign-in on this computer.
     #[serde(default, deserialize_with = "present")]

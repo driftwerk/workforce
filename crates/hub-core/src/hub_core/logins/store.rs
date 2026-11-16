@@ -6,7 +6,10 @@
 //! refused (its refresh token works for one copy only), and the slot's
 //! refresh lock is held so an in-flight refresh can neither overwrite a new
 //! login nor bring back one just removed. Any other key passes straight
-//! through to the vault.
+//! through to the vault, except a Desk link (`desk/hubs/...`,
+//! `desk/links/...`, shared or per-user), which no route through here may
+//! write, move or delete: only Desk's own routes keep those
+//! ([`DeskLinkRefused`]).
 
 use std::sync::{Arc, Weak};
 
@@ -19,6 +22,25 @@ use crate::user_config::{LayeredUserVault, USER_PREFIX};
 use crate::vault::Vault;
 
 const ELLIPSES: [&str; 2] = ["…", "..."];
+
+/// A write, move or delete of a Desk link through the vault's own routes.
+/// An engine's boss links and a person's board-sync tokens are kept only by
+/// the routes that make them, never through `/api/vault`, so a page, a
+/// script or an admin can't point a link at another hub.
+#[derive(Debug, thiserror::Error)]
+#[error("this path holds a Desk link, which only Desk's own routes change")]
+pub struct DeskLinkRefused;
+
+/// Refuse `keys` when any is a Desk link.
+fn refuse_desk_links(keys: &[&str]) -> Result<(), DeskLinkRefused> {
+    match keys
+        .iter()
+        .any(|key| workforce_common::vault_scope::is_desk_link(key))
+    {
+        true => Err(DeskLinkRefused),
+        false => Ok(()),
+    }
+}
 
 /// Why a login was not written.
 #[derive(Debug, thiserror::Error)]
@@ -201,6 +223,7 @@ pub async fn set(
     known: impl FnOnce() -> Vec<Arc<Vault>>,
     actor: VaultActor<'_>,
 ) -> Result<(), LoginRefusal> {
+    refuse_desk_links(&[key]).map_err(eyre::Report::new)?;
     match login_slot(vault, key) {
         Some((kind, slot)) => {
             let known = known_for(kind, key, &known(), actor);
@@ -213,6 +236,7 @@ pub async fn set(
 /// Delete `key` from `vault`, a login through [`remove_login`]. Returns
 /// whether anything was stored.
 pub async fn delete(vault: &Arc<Vault>, key: &str, actor: VaultActor<'_>) -> eyre::Result<bool> {
+    refuse_desk_links(&[key])?;
     match login_slot(vault, key) {
         Some((_, slot)) => remove_login(&slot, actor).await,
         None => vault.delete_with_actor(key, actor),
@@ -228,6 +252,7 @@ pub async fn relocate(
     known: impl FnOnce() -> Vec<Arc<Vault>>,
     actor: VaultActor<'_>,
 ) -> Result<(), LoginRefusal> {
+    refuse_desk_links(&[from.1, to.1]).map_err(eyre::Report::new)?;
     match (login_slot(from.0, from.1), login_slot(to.0, to.1)) {
         (None, None) => Ok(crate::vault::move_value(
             (from.0, from.1),

@@ -888,6 +888,8 @@ async fn a_boss_moved_into_a_bossed_group_asks_first_and_what_it_ran_passes_to_t
                             folder: dir.path().to_string_lossy().into_owned(),
                             view: None,
                             needs: vec![],
+                            machine: None,
+                            model: None,
                         }],
                     },
                     board: None,

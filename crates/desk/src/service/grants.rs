@@ -107,6 +107,7 @@ fn refused(r: Refusal) -> DeskError {
         )),
         Refusal::Conflict(why) => DeskError::Conflict(why),
         Refusal::Invalid(why) => DeskError::Invalid(why),
+        Refusal::TooLong { most, why } => DeskError::TooLong { most, why },
     }
 }
 
@@ -214,10 +215,59 @@ impl Desk {
         };
         let mut g = g.clone();
         if let Some(s) = run.stopping.get(group) {
-            g.stopped.get_or_insert(*s);
+            Stopped::onto(&mut g.stopped, *s);
         }
         grant::live(&g, Utc::now(), run.paused.is_some()).map_err(|why| why.say(&g.name))?;
         Ok(g)
+    }
+
+    /// The boss `group`'s live grant names, as the party a session handed
+    /// to it is charged to, when the grant holds session `id` (its
+    /// `members` or `born`, and no other grant's first) and its level does
+    /// more than watch. `Err(None)`
+    /// when no grant names a boss for the group; otherwise why not, in
+    /// plain words.
+    pub fn grant_boss_for(
+        &self,
+        group: &str,
+        id: Uuid,
+    ) -> Result<crate::crew::Party, Option<String>> {
+        let g = match self.grant_live(group) {
+            Ok(g) => g,
+            Err(why) => {
+                let named = self
+                    .0
+                    .grants
+                    .lock()
+                    .grants
+                    .get(group)
+                    .is_some_and(|g| g.boss.is_some());
+                return Err(named.then_some(why));
+            }
+        };
+        let Some(boss) = g.boss.as_ref().filter(|b| b.servable()) else {
+            return Err(None);
+        };
+        let name = match boss {
+            grant::BossRef::Local { agent } => agent.clone(),
+            grant::BossRef::Remote { hub, agent } => format!("{agent} ({hub})"),
+        };
+        if g.level == grant::Level::Watch {
+            return Err(Some(format!(
+                "{name} only watches {}; set them to Act to run work.",
+                g.name
+            )));
+        }
+        // The grant that holds it is this one, as letting go of it judges.
+        if self.grant_group_of(id).as_deref() != Some(group) {
+            return Err(Some(format!(
+                "{} isn't one of the sessions {name} may run in {}.",
+                self.view(id)
+                    .map_or_else(|_| "It".into(), |v| v.label().to_string()),
+                g.name
+            )));
+        }
+        Ok(crate::crew::Party::manager(&boss.party_id(), &name))
     }
 
     /// Every grant here that names a boss, with why it doesn't serve its
@@ -260,7 +310,7 @@ impl Desk {
     fn grant_view_of(run: &GrantsRun, g: &Grant, now: DateTime<Utc>) -> GrantView {
         let mut g = g.clone();
         if let Some(s) = run.stopping.get(&g.group) {
-            g.stopped.get_or_insert(*s);
+            Stopped::onto(&mut g.stopped, *s);
         }
         let why = grant::live(&g, now, run.paused.is_some())
             .err()
@@ -492,10 +542,11 @@ impl Desk {
         // A stop in force, written or not, stays with what is left.
         let stopped = {
             let run = self.0.grants.lock();
-            run.grants
-                .get(group)
-                .and_then(|g| g.stopped)
-                .or_else(|| run.stopping.get(group).copied())
+            let written = run.grants.get(group).and_then(|g| g.stopped);
+            match run.stopping.get(group) {
+                Some(s) => Some(Stopped::over(written, *s)),
+                None => written,
+            }
         };
         self.commit_grants(Vec::new(), Some((group, stopped)), call)
             .await?;
@@ -535,7 +586,8 @@ impl Desk {
                 None => run.grants.keys().cloned().collect(),
             };
             for g in groups {
-                run.stopping.entry(g).or_insert(stop);
+                let held = Stopped::over(run.stopping.get(&g).copied(), stop);
+                run.stopping.insert(g, held);
             }
         }
         let _one = self.0.grant_write.lock().await;
@@ -599,18 +651,13 @@ impl Desk {
             let mut run = self.0.grants.lock();
             for (g, s) in &stops {
                 match run.grants.get_mut(g) {
-                    Some(x) => {
-                        x.stopped.get_or_insert(*s);
-                    }
+                    Some(x) => Stopped::onto(&mut x.stopped, *s),
                     None => {
-                        run.floors
-                            .entry(g.clone())
-                            .or_insert(Floor {
-                                revision: 0,
-                                stopped: None,
-                            })
-                            .stopped
-                            .get_or_insert(*s);
+                        let floor = run.floors.entry(g.clone()).or_insert(Floor {
+                            revision: 0,
+                            stopped: None,
+                        });
+                        Stopped::onto(&mut floor.stopped, *s);
                     }
                 }
                 run.stopping.remove(g);

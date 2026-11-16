@@ -289,6 +289,12 @@ fn keymap_names_one(depth: usize, v: &Value) -> bool {
 
 /// Where the person's own Devin config is: `$XDG_CONFIG_HOME/devin`, else
 /// `~/.config/devin` (Devin's docs; on macOS too). None without a home.
+///
+/// On Windows, Devin's docs put it at `%APPDATA%\devin\config.json`, but
+/// no Devin this hub runs is ever Windows's: the hub runs only on Unix (its
+/// terminals' holder is a Unix socket), and Desk on Windows runs it in WSL,
+/// where Devin is its Linux build and keeps these Linux folders. The same
+/// holds for [`data_folder`].
 pub fn person_path(env: &BTreeMap<String, String>) -> Option<PathBuf> {
     let base = env
         .get("XDG_CONFIG_HOME")
@@ -300,6 +306,24 @@ pub fn person_path(env: &BTreeMap<String, String>) -> Option<PathBuf> {
                 .map(|h| Path::new(h).join(".config"))
         })?;
     Some(base.join("devin/config.json"))
+}
+
+/// Where Devin keeps its data (its sessions, its sign-in):
+/// `$XDG_DATA_HOME/devin`, else `~/.local/share/devin`. None without a
+/// home. On Windows only WSL's Devin runs, with these (see
+/// [`person_path`]); where a Windows build of Devin keeps its data, its
+/// docs don't say.
+pub fn data_folder(env: &BTreeMap<String, String>) -> Option<PathBuf> {
+    let base = env
+        .get("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|d| d.is_absolute())
+        .or_else(|| {
+            env.get("HOME")
+                .filter(|h| !h.is_empty())
+                .map(|h| Path::new(h).join(".local/share"))
+        })?;
+    Some(base.join("devin"))
 }
 
 /// The byte order mark an editor may start a file with.
@@ -916,6 +940,19 @@ mod tests {
             Some(PathBuf::from("/Users/sam/.config/devin/config.json"))
         );
         assert_eq!(person_path(&env(&[])), None);
+        assert_eq!(
+            data_folder(&env(&[("HOME", "/Users/sam")])),
+            Some(PathBuf::from("/Users/sam/.local/share/devin"))
+        );
+        assert_eq!(
+            data_folder(&env(&[("HOME", "/Users/sam"), ("XDG_DATA_HOME", "/d")])),
+            Some(PathBuf::from("/d/devin"))
+        );
+        assert_eq!(
+            data_folder(&env(&[("HOME", "/Users/sam"), ("XDG_DATA_HOME", "rel")])),
+            Some(PathBuf::from("/Users/sam/.local/share/devin"))
+        );
+        assert_eq!(data_folder(&env(&[])), None);
     }
 
     #[test]

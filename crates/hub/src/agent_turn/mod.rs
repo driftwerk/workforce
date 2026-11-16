@@ -515,52 +515,72 @@ impl TurnChain {
                             continue;
                         }
                     };
-                    let attempt = Box::pin(rig.run(
-                        service,
-                        CliTurn {
-                            cli: *cli,
-                            model: model.clone(),
-                            system_prompt: config.system_prompt.clone(),
-                            task: with_seeds(&task, &seeds),
-                            tools: tools.clone(),
-                            max_turns: config.max_rounds,
-                            principal: principal.to_string(),
-                            oversight,
-                            self_serve: config.self_serve,
-                            journal: config.journal.clone(),
-                            progress: progress.clone(),
-                            cancel: cancel.clone(),
-                            timeout: AGENT_TURN_TIMEOUT,
-                        },
-                        Some(&conversation),
-                        inbox,
-                    ))
-                    .await?;
-                    match attempt {
-                        CliAttempt::Served(served) => {
-                            if let Some(progress) = &progress {
-                                let _ = progress
-                                    .send(ProgressEvent::Response {
-                                        text: served.text.clone(),
-                                    })
-                                    .await;
-                                let _ = progress
-                                    .send(done_of(
-                                        &served.usage,
-                                        served.rounds,
-                                        seeds.invocations.len() + served.invocations.len(),
-                                    ))
-                                    .await;
+                    let mut inbox = inbox;
+                    let mut tries = 0;
+                    loop {
+                        tries += 1;
+                        let attempt = Box::pin(rig.run(
+                            service,
+                            CliTurn {
+                                cli: *cli,
+                                model: model.clone(),
+                                system_prompt: config.system_prompt.clone(),
+                                task: with_seeds(&task, &seeds),
+                                tools: tools.clone(),
+                                max_turns: config.max_rounds,
+                                principal: principal.to_string(),
+                                oversight,
+                                self_serve: config.self_serve,
+                                journal: config.journal.clone(),
+                                progress: progress.clone(),
+                                cancel: cancel.clone(),
+                                timeout: AGENT_TURN_TIMEOUT,
+                            },
+                            Some(&conversation),
+                            inbox.take(),
+                        ))
+                        .await?;
+                        match attempt {
+                            CliAttempt::Served(served) => {
+                                if let Some(progress) = &progress {
+                                    let _ = progress
+                                        .send(ProgressEvent::Response {
+                                            text: served.text.clone(),
+                                        })
+                                        .await;
+                                    let _ = progress
+                                        .send(done_of(
+                                            &served.usage,
+                                            served.rounds,
+                                            seeds.invocations.len() + served.invocations.len(),
+                                        ))
+                                        .await;
+                                }
+                                let slot = served.slot.clone();
+                                return Ok(ChainOutcome::Served {
+                                    result: Box::new(served.into_result(seeds.invocations.clone())),
+                                    route: RouteTag::Cli { cli: *cli, slot },
+                                });
                             }
-                            let slot = served.slot.clone();
-                            return Ok(ChainOutcome::Served {
-                                result: Box::new(served.into_result(seeds.invocations.clone())),
-                                route: RouteTag::Cli { cli: *cli, slot },
-                            });
-                        }
-                        CliAttempt::Unserved(miss) => {
-                            tracing::warn!(agent = %service.agent_id, route = %miss.route, reason = %miss.reason, "turn route unserved; trying the next");
-                            misses.push(miss);
+                            // Its login at its limit or turned away: skipped from
+                            // now, so the route runs again on the payer's next
+                            // login of the same plan, when there is one.
+                            CliAttempt::Unserved(miss)
+                                if tries < MAX_LOGINS_PER_ROUTE
+                                    && names_a_login(&miss.reason)
+                                    && service.logins.resolve(cli.login()).is_ok() =>
+                            {
+                                tracing::warn!(agent = %service.agent_id, route = %miss.route, reason = %miss.reason, "turn route's login can't serve; trying the next login");
+                                inbox = match &relay {
+                                    Some(relay) => Some(relay.next_route().await),
+                                    None => None,
+                                };
+                            }
+                            CliAttempt::Unserved(miss) => {
+                                tracing::warn!(agent = %service.agent_id, route = %miss.route, reason = %miss.reason, "turn route unserved; trying the next");
+                                misses.push(miss);
+                                break;
+                            }
                         }
                     }
                 }
@@ -680,6 +700,10 @@ fn names_a_login(reason: &str) -> bool {
         .to_lowercase()
         .contains(SUBSCRIPTION_UNAVAILABLE_MARKER)
 }
+
+/// The most logins one CLI route of a turn is tried on, each refused one
+/// skipped.
+const MAX_LOGINS_PER_ROUTE: usize = 3;
 
 /// Whether a runner route produced output: always, with no slice to ask.
 fn answered(slice: Option<&ChainSlice>) -> bool {

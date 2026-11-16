@@ -31,15 +31,19 @@ mod actions;
 mod answer;
 mod away;
 mod board;
+mod closing;
 pub(crate) mod context;
 pub(crate) mod decide;
 mod decisions;
 mod deliver;
+mod directives;
 mod extras;
+mod github;
 mod handover;
 mod idle;
 mod items;
 mod line;
+pub(crate) mod machine_grants;
 mod observe;
 mod own_settings;
 mod plan;
@@ -47,10 +51,12 @@ mod preferences;
 mod read_only;
 mod reading;
 pub(crate) mod relay;
+pub(crate) mod relayed_decide;
 pub(crate) mod remote_asks;
 pub(crate) mod remote_decide;
 mod scope;
 pub(crate) mod served;
+pub(crate) mod shared_budget;
 mod spend;
 mod tools;
 mod updates;
@@ -135,6 +141,9 @@ pub struct CrewHub {
     deciders: remote_decide::Deciders,
     /// Decisions of bosses being done from the decide loop, by boss.
     served_deciding: Mutex<HashMap<String, usize>>,
+    /// On a machine, the decisions of bosses relayed from the home, and
+    /// when the home last held each at Act fully ([`relayed_decide`]).
+    relayed: Mutex<relayed_decide::Outbox>,
     /// When the overseer's turns in its DM started, by session.
     manager_turns: Mutex<HashMap<String, DateTime<Utc>>>,
     /// Pending approvals a wake-up listed, by the overseer's DM session.
@@ -148,6 +157,9 @@ pub struct CrewHub {
     /// keys paid for, never the person's plans. Act fully holds only under
     /// its budget, and not before this is read.
     spent_today: Mutex<HashMap<String, f64>>,
+    /// What each machine last said each boss's sessions there spent today
+    /// ([`shared_budget`]): one Act fully budget across them all.
+    machine_spent: Mutex<shared_budget::Machines>,
     /// The overseers the tools were last set up for, by agent: each one's
     /// scope and level.
     tooled: Mutex<HashMap<String, (Scope, String)>>,
@@ -189,6 +201,14 @@ pub struct CrewHub {
     /// next update to show.
     quiet_made:
         Mutex<HashMap<String, Vec<(DateTime<Utc>, workforce_desk::crew::MentionedSuggestion)>>>,
+    /// What the closer of finished sessions keeps between looks
+    /// ([`closing`]).
+    closing: Mutex<closing::Closing>,
+    /// How long a finished session rests before it is closed
+    /// ([`closing::SETTLE`]; a test's own).
+    close_settle: Mutex<chrono::Duration>,
+    /// Held while the finished sessions are looked at.
+    closing_now: tokio::sync::Mutex<()>,
     /// The person typing in each boss's DM, by its agent: what it would
     /// post waits for a pause.
     dm_typing: Mutex<HashMap<String, workforce_desk::away::Typing>>,
@@ -217,6 +237,12 @@ pub struct CrewHub {
     plan_failed: Mutex<HashMap<uuid::Uuid, plan::Failed>>,
     /// What failed to start, for its plan's next turn.
     plan_failures: Mutex<Vec<(uuid::Uuid, String)>>,
+    /// Plans' sessions on the person's machines, as last read there, by
+    /// `<machine>/<id>`; and when each machine was last read.
+    machine_seen: Mutex<HashMap<String, plan::MachineSeen>>,
+    machine_read: Mutex<HashMap<String, std::time::Instant>>,
+    /// Each machine's plan reads that failed in a row.
+    machine_down: Mutex<HashMap<String, u32>>,
     /// Sessions a start's work was given to, held from other starts until
     /// [`actions::REUSE_CLAIM`] has passed.
     reuse_claims: Mutex<HashMap<uuid::Uuid, std::time::Instant>>,
@@ -583,11 +609,13 @@ impl CrewHub {
             remote_up: Mutex::default(),
             deciders: Mutex::default(),
             served_deciding: Mutex::default(),
+            relayed: Mutex::default(),
             manager_turns: Mutex::default(),
             listed: Mutex::default(),
             sent: Mutex::default(),
             read: Mutex::default(),
             spent_today: Mutex::default(),
+            machine_spent: Mutex::default(),
             tooled: Mutex::default(),
             poke: tokio::sync::Notify::new(),
             to_work: Mutex::default(),
@@ -602,6 +630,9 @@ impl CrewHub {
             update_writer: Mutex::default(),
             updating: Mutex::default(),
             quiet_made: Mutex::default(),
+            closing: Mutex::default(),
+            close_settle: Mutex::new(closing::SETTLE),
+            closing_now: tokio::sync::Mutex::new(()),
             dm_typing: Mutex::default(),
             presence: Mutex::default(),
             on_screen: Mutex::default(),
@@ -613,6 +644,9 @@ impl CrewHub {
             starting: tokio::sync::Mutex::new(()),
             plan_failed: Mutex::default(),
             plan_failures: Mutex::default(),
+            machine_seen: Mutex::default(),
+            machine_read: Mutex::default(),
+            machine_down: Mutex::default(),
             reuse_claims: Mutex::default(),
             relays: Mutex::default(),
             relay_queued: tokio::sync::Notify::new(),
@@ -636,8 +670,10 @@ impl CrewHub {
         tokio::spawn(watcher::sync_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(watcher::wake_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(decide::decide_loop(Arc::clone(&crew), cancel.clone()));
+        tokio::spawn(relayed_decide::pump_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(answer::answer_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(idle::idle_loop(Arc::clone(&crew), cancel.clone()));
+        tokio::spawn(closing::closing_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(plan::plan_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(items::items_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(updates::updates_loop(Arc::clone(&crew), cancel.clone()));
@@ -817,8 +853,39 @@ impl CrewHub {
         agent: &str,
         o: &'o Oversight,
     ) -> Result<&'o workforce_common::oversight::Full, String> {
-        let spent = self.spent_today.lock().get(agent).copied();
-        fully_for(agent, o, spent)
+        fully_for(agent, o, self.spent_counted(agent, o))
+    }
+
+    /// What Act fully's budget counts as spent today for `agent`, or none
+    /// while that isn't known:
+    /// - a boss relayed from the home (`home/<agent>`, on a machine): its
+    ///   sessions' spend here and everywhere else, as its home's fresh take
+    ///   said ([`relayed_decide`]); none without one;
+    /// - a boss on another hub served here: its sessions' spend here;
+    /// - this hub's own: its scope's spend here and every machine's count
+    ///   ([`shared_budget`]).
+    pub(crate) fn spent_counted(&self, agent: &str, o: &Oversight) -> Option<f64> {
+        if relayed_decide::relayed_party(agent) {
+            return self.relayed_spent(agent);
+        }
+        let here = self.spent_today.lock().get(agent).copied();
+        if workforce_desk::grant::is_served(agent) {
+            return here;
+        }
+        match self.count_from(o) {
+            Some(from) => Some(here? + self.machines_spent(agent, from)?),
+            None => here,
+        }
+    }
+
+    /// The ceiling the overseer `agent` is relayed to a machine with: its
+    /// level in force now (Act while its Act fully budget is spent or
+    /// unread), and its switches.
+    pub(crate) fn ceiling_now(&self, agent: &str, o: &Oversight) -> served::Ceiling {
+        served::Ceiling {
+            level: self.level_now(agent, o).0,
+            act: o.act,
+        }
     }
 
     /// The level the overseer `agent` runs at now, and, when it chose Act
@@ -902,6 +969,7 @@ impl CrewHub {
         let midnight = self
             .desk
             .period_start(workforce_desk::ledger::Period::Day, now);
+        self.load_machines_spent().await;
         let mut spent = HashMap::new();
         let mut shown = HashMap::new();
         for (s, o) in overseers {
@@ -936,6 +1004,11 @@ impl CrewHub {
                 }
             };
             if let Some(budget) = full.budget_usd_per_day() {
+                // The Floor shows what the budget counts: here and on every
+                // machine ([`shared_budget`]).
+                let usd = usd
+                    .zip(self.machines_spent(s.agent_id.as_str(), from))
+                    .map(|(h, m)| h + m);
                 shown.insert(
                     s.agent_id.as_str().to_string(),
                     workforce_desk::floor::FullBudget {
@@ -1117,6 +1190,44 @@ impl CrewHub {
 
 #[async_trait]
 impl Crew for CrewHub {
+    /// Through the relay Desk's native side takes, as a boss's relayed
+    /// call goes: only [`relay::DESK_CALLS`], which no boss's tool sends.
+    async fn machine_call(
+        &self,
+        machine: &str,
+        group: Option<&str>,
+        boss: &str,
+        call: &str,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value, workforce_desk::crew::MachineRefused> {
+        use workforce_desk::crew::MachineRefused;
+        if !relay::DESK_CALLS.contains(&call) || !relay::machine_ok(machine) {
+            return Err(MachineRefused::Refused(format!(
+                "{call} isn't asked of a machine."
+            )));
+        }
+        // The plan's start is the person's, who approved it: the boss's own
+        // ceiling is only what the call carries.
+        let Some((_, o)) = self.overseer_named(boss) else {
+            return Err(MachineRefused::Refused(format!(
+                "{boss} isn't a boss here."
+            )));
+        };
+        let ceiling = self.ceiling_now(boss, &o);
+        let a = self
+            .relay_as(machine, group.unwrap_or(""), call, input, boss, &ceiling)
+            .await?;
+        match a.status {
+            served::ServedStatus::Ok => Ok(a.body),
+            _ => Err(MachineRefused::Refused(
+                a.body
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .map_or_else(|| format!("{machine} refused it."), str::to_string),
+            )),
+        }
+    }
+
     /// Every agent whose config names `group` for a boss is switched off
     /// and names it no more, through the same write as any change (history,
     /// admission, hot reload), so the group opens to the main overseer from

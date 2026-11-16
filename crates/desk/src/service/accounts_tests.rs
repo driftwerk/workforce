@@ -110,6 +110,7 @@ fn session(dir: &Path, account: Option<Option<Uuid>>) -> NewSession {
         approvals: None,
         approve_for_me: false,
         fast: false,
+        model: None,
         account,
         env: Default::default(),
         group: None,
@@ -503,10 +504,10 @@ async fn codex_signs_in_by_its_device_page_and_its_sign_in_is_read_again_at_once
         o.programs.insert(Engine::Codex, codex(dir.path()));
         let d = desk(pool, o).await;
         assert!(
-            d.start_engine_sign_in(Engine::Claude).is_err(),
+            d.start_engine_sign_in(Engine::Claude, false).is_err(),
             "Claude signs in another way"
         );
-        let started = d.start_engine_sign_in(Engine::Codex).unwrap();
+        let started = d.start_engine_sign_in(Engine::Codex, false).unwrap();
         assert_eq!(started.state, EngineSignInState::Starting);
         let state = || d.engine_sign_in(started.id).map(|v| v.state);
         for _ in 0..200 {
@@ -544,8 +545,8 @@ async fn codex_signs_in_by_its_device_page_and_its_sign_in_is_read_again_at_once
 
         // A newer one ends the last; one the page never approved fails in plain words.
         std::fs::remove_file(dir.path().join("approved")).unwrap();
-        let first = d.start_engine_sign_in(Engine::Codex).unwrap();
-        let second = d.start_engine_sign_in(Engine::Codex).unwrap();
+        let first = d.start_engine_sign_in(Engine::Codex, false).unwrap();
+        let second = d.start_engine_sign_in(Engine::Codex, false).unwrap();
         assert!(d.engine_sign_in(first.id).is_err());
         std::fs::write(dir.path().join("refused"), "").unwrap();
         for _ in 0..200 {
@@ -560,11 +561,609 @@ async fn codex_signs_in_by_its_device_page_and_its_sign_in_is_read_again_at_once
         assert_eq!(
             d.engine_sign_in(second.id).unwrap().state,
             EngineSignInState::Failed {
-                why: super::engine_sign_ins::DEVICE_FAILED.into()
+                why: super::engine_sign_ins::DEVICE_FAILED.into(),
+                instead: None,
             }
         );
         assert!(d.cancel_engine_sign_in(second.id).is_ok());
         assert!(d.engine_sign_in(second.id).is_err());
+    })
+    .await;
+}
+
+/// The page Devin 3000.12.57 shows with no browser, as recorded
+/// (fixtures/devin/3-manual.bin; its state and challenge replaced).
+const DEVIN_PAGE: &str = "https://app.devin.ai/auth/cli/continue?state=Zx8q3V1kQ2&prompt=select_account&code_challenge=Q1w2E3r4T5y6U7i8O9p0A1s2D3f4G5h6J7k8L9z0X1c&code_challenge_method=S256&cli_pkce_marker=1";
+/// The code the stand-in takes: it signs in only when given exactly this.
+const DEVIN_TOKEN: &str = "devin-pasted-Qm9vbXNoYWthbGFrYQ-7f3a9c";
+
+/// What Devin 3000.12.57 prints, recorded.
+const DEVIN_PICKER: &[u8] = include_bytes!("../../fixtures/devin/1-picker.bin");
+const DEVIN_BROWSER: &[u8] = include_bytes!("../../fixtures/devin/2-browser.bin");
+const DEVIN_MANUAL: &[u8] = include_bytes!("../../fixtures/devin/3-manual.bin");
+const DEVIN_STATUS_IN: &[u8] = include_bytes!("../../fixtures/devin/4-status-in.txt");
+const DEVIN_STATUS_OUT: &[u8] = include_bytes!("../../fixtures/devin/5-status-out.txt");
+
+/// The terminal's answers to Devin's colour queries (OSC 10, then 11).
+const COLOURS: &[u8] = b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\\x1b]11;rgb:0000/0000/0000\x1b\\";
+
+/// A stand-in Devin, printing the recorded bytes of 3000.12.57 (their
+/// files in `dir`, which a test may change) and, like it, waiting for the
+/// terminal's answers to its queries before it goes on: each one checked
+/// byte for byte. Its sign-in reads as `devin auth status` does (signed in
+/// once `devin-in` is there; by a key, if one reached it).
+///
+/// `auth login` asks the kitty flags and DA1 (not in the recording: real
+/// Devin asks only its colours there and pushes kitty flags; asked here
+/// for robustness, in case a later Devin does), draws its picker, takes one
+/// key (kept in `got-key`; Enter only goes on); with `devin-silent` it then
+/// shows nothing more, with `devin-other` another prompt; else it waits in the browser
+/// until the test writes `devin-approved` (it signs in), `devin-refused`
+/// (it ends) or `devin-no-code` (it says it received no authorization
+/// code). With `--force-manual-token-flow` it draws its page and Code
+/// prompt, reads the code in raw mode, drawing each key itself, and signs
+/// in only by [`DEVIN_TOKEN`], ignoring a hang-up meanwhile, as does the
+/// child it starts (both pids in `login-pids`); with `child-traps` there,
+/// only the child ignores it. Its environment is kept in `login-env`.
+fn devin(dir: &Path) -> PathBuf {
+    let files: [(&str, Vec<u8>); 9] = [
+        ("picker.bin", DEVIN_PICKER.to_vec()),
+        (
+            "picker-answers",
+            [b"\x1b[?0u\x1b[?1;2c", COLOURS, COLOURS].concat(),
+        ),
+        ("browser-wait.bin", devin_browser().0.to_vec()),
+        ("browser-done.bin", devin_browser().1.to_vec()),
+        ("colours", COLOURS.to_vec()),
+        ("colours-twice", COLOURS.repeat(2)),
+        ("manual.bin", DEVIN_MANUAL.to_vec()),
+        ("status-in.txt", DEVIN_STATUS_IN.to_vec()),
+        ("status-out.txt", DEVIN_STATUS_OUT.to_vec()),
+    ];
+    for (name, bytes) in files {
+        std::fs::write(dir.join(name), bytes).unwrap();
+    }
+    let path = dir.join("devin");
+    let d = dir.display();
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\n\
+             answered() {{ dd bs=1 count=$(wc -c < \"$1\") 2>/dev/null > '{d}/got'; cmp -s '{d}/got' \"$1\" || exit 4; }}\n\
+             case \"$1 $2\" in\n\
+             '--version ') echo 'devin 3000.12.57 (96542e930752)' ;;\n\
+             'auth status') if [ -n \"$WINDSURF_API_KEY\" ]; then echo 'Logged in with provided API key.'\n\
+               elif [ -e '{d}/devin-in' ]; then cat '{d}/status-in.txt'\n\
+               else cat '{d}/status-out.txt'; fi ;;\n\
+             'auth login') env > '{d}/login-env'; stty raw -echo\n\
+               if [ \"$3\" = '--force-manual-token-flow' ]; then\n\
+                 if [ -e '{d}/child-traps' ]; then (trap '' HUP; exec sleep 30) </dev/null >/dev/null 2>&1 &\n\
+                 else trap '' HUP; sleep 30 </dev/null >/dev/null 2>&1 & fi\n\
+                 echo \"$$ $!\" > '{d}/login-pids'\n\
+                 cat '{d}/manual.bin'; answered '{d}/colours-twice'\n\
+                 cr=$(printf '\\r'); token=''\n\
+                 while :; do c=$(dd bs=1 count=1 2>/dev/null); [ -n \"$c\" ] || exit 1\n\
+                   [ \"$c\" = \"$cr\" ] && break; token=\"$token$c\"; printf '%s' \"$c\"; done\n\
+                 printf '\\r\\nChecking code %s\\r\\n' \"$token\"\n\
+                 sleep 1\n\
+                 [ \"$token\" = '{DEVIN_TOKEN}' ] || exit 1\n\
+                 touch '{d}/devin-in'; printf 'Login successful! Credentials stored.\\r\\n'; exit 0\n\
+               fi\n\
+               printf '\\033[?u\\033[c'; cat '{d}/picker.bin'; answered '{d}/picker-answers'\n\
+               dd bs=1 count=1 2>/dev/null | od -An -c | tr -d ' \\n' > '{d}/got-key'\n\
+               [ \"$(cat '{d}/got-key')\" = '\\r' ] || exit 3\n\
+               [ -e '{d}/devin-silent' ] && exec sleep 30\n\
+               [ -e '{d}/devin-other' ] && printf '\\r\\n Enter your Windsurf Enterprise subdomain:\\r\\n \\342\\206\\265 submit \\302\\267 esc cancel\\r\\n' && exec sleep 30\n\
+               cat '{d}/browser-wait.bin'; answered '{d}/colours'\n\
+               while [ ! -e '{d}/devin-approved' ] && [ ! -e '{d}/devin-refused' ] && [ ! -e '{d}/devin-no-code' ]; do sleep 0.05; done\n\
+               if [ -e '{d}/devin-no-code' ]; then printf '\\r\\nError: Failed to receive authorization code\\r\\n'; sleep 30; fi\n\
+               [ -e '{d}/devin-approved' ] || exit 1\n\
+               touch '{d}/devin-in'; cat '{d}/browser-done.bin'; answered '{d}/colours' ;;\n\
+             esac\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// The recorded browser login, cut where it waits for the person: its
+/// waiting, and its verifying and signing in.
+fn devin_browser() -> (&'static [u8], &'static [u8]) {
+    let at = DEVIN_BROWSER
+        .windows(5)
+        .rposition(|w| w == b"\x1b[<1u")
+        .unwrap();
+    let at = DEVIN_BROWSER[..at]
+        .windows(5)
+        .rposition(|w| w == b"\x1b[<1u")
+        .unwrap();
+    DEVIN_BROWSER.split_at(at)
+}
+
+/// Why Devin's sign-in `id` failed, once it has.
+async fn devin_failed(d: &Desk, id: Uuid) -> String {
+    use super::engine_sign_ins::EngineSignInState;
+    until(|| match d.engine_sign_in(id).unwrap().state {
+        EngineSignInState::Failed { why, .. } => Some(why),
+        _ => None,
+    })
+    .await
+}
+
+/// The way on Desk is offered beside Devin's failed sign-in `id`.
+fn devin_instead(d: &Desk, id: Uuid) -> Option<String> {
+    match d.engine_sign_in(id).unwrap().state {
+        super::engine_sign_ins::EngineSignInState::Failed { instead, .. } => instead,
+        other => panic!("not failed: {other:?}"),
+    }
+}
+
+/// What Desk says of Devin's sign-in on this computer now.
+fn devin_signed_in(d: &Desk) -> crate::engine::SignIn {
+    d.engines()
+        .into_iter()
+        .find(|e| e.engine == Engine::Devin)
+        .map(|e| e.sign_in)
+        .unwrap()
+}
+
+/// Everything logged, as one string.
+#[derive(Clone, Default)]
+struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl Captured {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Captured;
+    fn make_writer(&'a self) -> Captured {
+        self.clone()
+    }
+}
+
+/// Every run of 6 of `secret`'s characters that `text` repeats.
+fn leaked(text: &str, secret: &str) -> Vec<String> {
+    (0..=secret.len() - 6)
+        .map(|at| &secret[at..at + 6])
+        .filter(|piece| text.contains(piece))
+        .map(str::to_string)
+        .collect()
+}
+
+/// An engine's own sign-in is the hub holder's alone: anyone else the hub
+/// lets in (another administrator, the hub's own token alone) starts none,
+/// reads none's code, types into none and stops none; and no token is
+/// taken from the address, which logs keep.
+#[tokio::test]
+async fn only_the_hub_holder_signs_an_engine_in() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut o = account_options(dir.path(), Arc::new(MemoryKeys::default()));
+        o.programs.insert(Engine::Devin, devin(dir.path()));
+        let d = desk(pool, o).await;
+        let holder = crate::api::sessions_router(d.clone(), crate::testing::allow_all());
+        let other = crate::api::sessions_router(d.clone(), crate::testing::not_holder());
+        let start = serde_json::json!({"engine": "devin", "manual": true});
+        let at = format!("/api/desk/engines/sign-ins/{}", Uuid::new_v4());
+        // Refused before anything is looked up or started.
+        for (method, uri, body) in [
+            (
+                "POST",
+                "/api/desk/engines/sign-ins".to_string(),
+                Some(start.clone()),
+            ),
+            ("GET", at.clone(), None),
+            (
+                "POST",
+                format!("{at}/token"),
+                Some(serde_json::json!({"token": "abc"})),
+            ),
+            ("DELETE", at.clone(), None),
+        ] {
+            let (code, said) = api(&other, method, &uri, body).await;
+            assert_eq!(code, 403, "{method} {uri}: {said}");
+            assert!(said.get("id").is_none(), "{said}");
+        }
+        // A token in the address is refused, even the holder's.
+        for (method, uri, body) in [
+            (
+                "POST",
+                "/api/desk/engines/sign-ins?token=hub-token".to_string(),
+                Some(start),
+            ),
+            ("GET", format!("{at}?token=hub-token"), None),
+            (
+                "POST",
+                format!("{at}/token?token=hub-token"),
+                Some(serde_json::json!({"token": "abc"})),
+            ),
+            ("DELETE", format!("{at}?token=hub-token"), None),
+        ] {
+            let (code, said) = api(&holder, method, &uri, body).await;
+            assert_eq!(code, 400, "{method} {uri}: {said}");
+        }
+        // The holder is let through: a sign-in that isn't there is not found.
+        let (code, _) = api(&holder, "GET", &at, None).await;
+        assert_eq!(code, 404);
+    })
+    .await;
+}
+
+// One thread, so everything the desk spawns logs to the subscriber set here.
+#[tokio::test(flavor = "current_thread")]
+async fn devin_signs_in_by_a_pasted_code_kept_and_said_nowhere() {
+    use super::engine_sign_ins::EngineSignInState;
+    let log = Captured::default();
+    let _logging = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(log.clone())
+            .finish(),
+    );
+    // Under `cargo test` other tests' threads share these callsites. A
+    // second live subscriber keeps tracing from caching "off" for them on
+    // a thread that listens to nothing; what is caught is still only what
+    // this thread logs (its own desk's tasks run here).
+    let _second = tracing::Dispatch::new(tracing_subscriber::registry());
+    tracing::callsite::rebuild_interest_cache();
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut o = account_options(dir.path(), Arc::new(MemoryKeys::default()));
+        o.programs.insert(Engine::Devin, devin(dir.path()));
+        // A key in the hub's environment never counts as Devin's sign-in.
+        o.env
+            .insert("WINDSURF_API_KEY".into(), "wsk-not-a-sign-in".into());
+        let d = desk(pool, o).await;
+        let (_, mut events) = d.subscribe();
+        let app = crate::api::sessions_router(d.clone(), crate::testing::allow_all());
+        until(|| (devin_signed_in(&d) == crate::engine::SignIn::Out).then_some(())).await;
+
+        let (code, started) = api(
+            &app,
+            "POST",
+            "/api/desk/engines/sign-ins",
+            Some(serde_json::json!({"engine": "devin", "manual": true})),
+        )
+        .await;
+        assert_eq!(code, 202, "{started}");
+        assert_eq!(started["state"], "starting");
+        let id: Uuid = serde_json::from_value(started["id"].clone()).unwrap();
+        let state = || d.engine_sign_in(id).unwrap().state;
+        let url = until(|| match state() {
+            EngineSignInState::Paste { url } => Some(url),
+            _ => None,
+        })
+        .await;
+        assert_eq!(url, DEVIN_PAGE);
+        let token_at = format!("/api/desk/engines/sign-ins/{id}/token");
+        let (code, _) = api(
+            &app,
+            "POST",
+            &token_at,
+            Some(serde_json::json!({"token": "\u{1b}[Aexit\r"})),
+        )
+        .await;
+        assert_eq!(
+            code, 400,
+            "a token that would type keys of its own is refused"
+        );
+        let (code, body) = api(
+            &app,
+            "POST",
+            &token_at,
+            Some(serde_json::json!({"token": format!("  {DEVIN_TOKEN}\n")})),
+        )
+        .await;
+        assert_eq!(code, 204, "{body}");
+        // A second is refused: the first was typed.
+        let (code, body) = api(
+            &app,
+            "POST",
+            &token_at,
+            Some(serde_json::json!({"code": DEVIN_TOKEN})),
+        )
+        .await;
+        assert_eq!(code, 409, "{body}");
+        assert!(
+            body.to_string()
+                .contains(super::engine_sign_ins::DEVIN_TYPED_ALREADY),
+            "{body}"
+        );
+        // The terminal echoes it at once, and the CLI draws it: neither is
+        // ever on the screen, from the moment it was typed.
+        for _ in 0..8 {
+            let screen = d.engine_sign_in_screen(id).expect("the CLI still runs");
+            assert!(leaked(&screen, DEVIN_TOKEN).is_empty(), "{screen}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Nor later.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let screen = d.engine_sign_in_screen(id).expect("the CLI still runs");
+        assert!(leaked(&screen, DEVIN_TOKEN).is_empty(), "{screen}");
+        assert!(matches!(state(), EngineSignInState::Paste { .. }));
+
+        // Signed in by exactly that token, and read again at once, as who.
+        until(|| (state() == EngineSignInState::Done).then_some(())).await;
+        assert_eq!(
+            d.engine_sign_in_screen(id),
+            None,
+            "nothing of its screen is kept"
+        );
+        let login_env = std::fs::read_to_string(dir.path().join("login-env")).unwrap();
+        for key in ["WINDSURF_API_KEY", "ANTHROPIC_API_KEY"] {
+            assert!(!login_env.contains(key), "{key} reached the login");
+        }
+        let who = until(|| match devin_signed_in(&d) {
+            crate::engine::SignIn::In { who, .. } => Some(who),
+            _ => None,
+        })
+        .await;
+        assert_eq!(who.as_deref(), Some("kim@example.com"));
+        let (code, _) = api(
+            &app,
+            "POST",
+            &token_at,
+            Some(serde_json::json!({"token": DEVIN_TOKEN})),
+        )
+        .await;
+        assert_eq!(code, 409, "it is no longer waiting for one");
+
+        // The token is in no view, event or log.
+        let (code, view) = api(
+            &app,
+            "GET",
+            &format!("/api/desk/engines/sign-ins/{id}"),
+            None,
+        )
+        .await;
+        assert_eq!((code, view["state"].as_str()), (200, Some("done")));
+        assert!(leaked(&view.to_string(), DEVIN_TOKEN).is_empty(), "{view}");
+        let (_, engines) = api(&app, "GET", "/api/desk/engines", None).await;
+        let engines = engines.to_string();
+        assert!(leaked(&engines, DEVIN_TOKEN).is_empty());
+        assert!(!engines.contains("credentials.toml"), "{engines}");
+        let mut seen = 0;
+        while let Ok(event) = events.try_recv() {
+            seen += 1;
+            let event = serde_json::to_string(&event).unwrap();
+            assert!(leaked(&event, DEVIN_TOKEN).is_empty(), "{event}");
+        }
+        let logged = log.text();
+        assert!(
+            logged.contains("an engine's own sign-in ended"),
+            "the log was caught: {seen} events, {logged}"
+        );
+        assert!(leaked(&logged, DEVIN_TOKEN).is_empty(), "{logged}");
+        // Each step once, its page by scheme, host and path alone; never
+        // its query, nor whom it signed in.
+        assert!(
+            logged.contains("page=\"https://app.devin.ai/auth/cli/continue\""),
+            "{logged}"
+        );
+        assert_eq!(logged.matches("step=\"paste\"").count(), 1, "{logged}");
+        for never in ["state=Zx8", "code_challenge", "kim@example.com", "?state"] {
+            assert!(!logged.contains(never), "{never}: {logged}");
+        }
+
+        // One that is turned away says so in plain words.
+        let again = d.start_engine_sign_in(Engine::Devin, true).unwrap();
+        until(|| {
+            matches!(
+                d.engine_sign_in(again.id).unwrap().state,
+                EngineSignInState::Paste { .. }
+            )
+            .then_some(())
+        })
+        .await;
+        d.engine_sign_in_token(again.id, "devin-pasted-wrong")
+            .unwrap();
+        let failed = until(|| match d.engine_sign_in(again.id).unwrap().state {
+            EngineSignInState::Failed { why, .. } => Some(why),
+            _ => None,
+        })
+        .await;
+        assert_eq!(failed, super::engine_sign_ins::DEVIN_TOKEN_FAILED);
+
+        // Given up on while it waits for a token, it and what it started
+        // end, even ignoring the hang-up.
+        std::fs::remove_file(dir.path().join("login-pids")).unwrap();
+        let given_up = d.start_engine_sign_in(Engine::Devin, true).unwrap();
+        until(|| {
+            matches!(
+                d.engine_sign_in(given_up.id).unwrap().state,
+                EngineSignInState::Paste { .. }
+            )
+            .then_some(())
+        })
+        .await;
+        let pids: Vec<libc::pid_t> =
+            until(|| std::fs::read_to_string(dir.path().join("login-pids")).ok())
+                .await
+                .split_whitespace()
+                .map(|p| p.parse().unwrap())
+                .collect();
+        assert_eq!(pids.len(), 2);
+        d.cancel_engine_sign_in(given_up.id).unwrap();
+        // SAFETY: signal 0 only asks whether the process is there.
+        let alive = |pid| unsafe { libc::kill(pid, 0) } == 0;
+        until(|| pids.iter().all(|&p| !alive(p)).then_some(())).await;
+
+        // One whose CLI goes at the hang-up, but whose child stays: the
+        // child is killed with it all the same.
+        std::fs::write(dir.path().join("child-traps"), "").unwrap();
+        std::fs::remove_file(dir.path().join("login-pids")).unwrap();
+        let left = d.start_engine_sign_in(Engine::Devin, true).unwrap();
+        until(|| {
+            matches!(
+                d.engine_sign_in(left.id).unwrap().state,
+                EngineSignInState::Paste { .. }
+            )
+            .then_some(())
+        })
+        .await;
+        let pids: Vec<libc::pid_t> =
+            until(|| std::fs::read_to_string(dir.path().join("login-pids")).ok())
+                .await
+                .split_whitespace()
+                .map(|p| p.parse().unwrap())
+                .collect();
+        d.cancel_engine_sign_in(left.id).unwrap();
+        until(|| (!alive(pids[0])).then_some(())).await;
+        until(|| (!alive(pids[1])).then_some(())).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn devin_signs_in_in_the_browser_it_opens_from_its_own_picker() {
+    use super::engine_sign_ins::{self as sign_ins, EngineSignInState};
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut o = account_options(dir.path(), Arc::new(MemoryKeys::default()));
+        o.programs.insert(Engine::Devin, devin(dir.path()));
+        let d = desk(pool, o).await;
+        let app = crate::api::sessions_router(d.clone(), crate::testing::allow_all());
+        let state = |id| d.engine_sign_in(id).unwrap().state;
+        until(|| (devin_signed_in(&d) == crate::engine::SignIn::Out).then_some(())).await;
+
+        // Its picker answered with Enter, once its queries are: it waits in
+        // the browser it opened, with no page to show.
+        let started = d.start_engine_sign_in(Engine::Devin, false).unwrap();
+        until(|| (state(started.id) == EngineSignInState::browser()).then_some(())).await;
+        let (code, view) = api(
+            &app,
+            "GET",
+            &format!("/api/desk/engines/sign-ins/{}", started.id),
+            None,
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert_eq!(
+            view,
+            serde_json::json!({
+                "id": started.id,
+                "engine": "devin",
+                "state": "browser",
+                "say": sign_ins::DEVIN_IN_BROWSER,
+                "instead": sign_ins::DEVIN_PASTE_INSTEAD,
+            })
+        );
+        let key = || std::fs::read_to_string(dir.path().join("got-key")).unwrap_or_default();
+        let pressed = until(|| Some(key()).filter(|k| !k.is_empty())).await;
+        assert_eq!(pressed, "\\r", "Enter, once");
+        // A sign-in in the browser takes no code.
+        let (code, _) = api(
+            &app,
+            "POST",
+            &format!("/api/desk/engines/sign-ins/{}/token", started.id),
+            Some(serde_json::json!({"code": DEVIN_TOKEN})),
+        )
+        .await;
+        assert_eq!(code, 409);
+        // Held in the browser past the wait for it to say so: still waiting.
+        tokio::time::sleep(Duration::from_millis(2600)).await;
+        assert_eq!(
+            state(started.id),
+            EngineSignInState::browser(),
+            "still waiting"
+        );
+
+        // Signed in there: done, and read again at once, as who.
+        std::fs::write(dir.path().join("devin-approved"), "").unwrap();
+        until(|| (state(started.id) == EngineSignInState::Done).then_some(())).await;
+        assert!(matches!(
+            devin_signed_in(&d),
+            crate::engine::SignIn::In { who: Some(w), .. } if w == "kim@example.com"
+        ));
+
+        // The browser's answer never came: said in plain words, the CLI ended.
+        std::fs::remove_file(dir.path().join("devin-approved")).unwrap();
+        std::fs::remove_file(dir.path().join("devin-in")).unwrap();
+        std::fs::write(dir.path().join("devin-no-code"), "").unwrap();
+        let lost = d.start_engine_sign_in(Engine::Devin, false).unwrap();
+        assert_eq!(devin_failed(&d, lost.id).await, sign_ins::DEVIN_NO_ANSWER);
+        // A code to paste is offered beside it, as a field, not in words.
+        assert_eq!(
+            devin_instead(&d, lost.id).as_deref(),
+            Some(sign_ins::DEVIN_PASTE_INSTEAD)
+        );
+        std::fs::remove_file(dir.path().join("devin-no-code")).unwrap();
+
+        // Enter taken, then nothing, or something else: never in the
+        // browser, and said plainly once it has waited long enough.
+        for after in ["devin-silent", "devin-other"] {
+            std::fs::write(dir.path().join(after), "").unwrap();
+            let _ = std::fs::remove_file(dir.path().join("got-key"));
+            let stalled = d.start_engine_sign_in(Engine::Devin, false).unwrap();
+            let why = until(|| match state(stalled.id) {
+                EngineSignInState::Failed { why, .. } => Some(why),
+                EngineSignInState::Browser { .. } => panic!("{after}: in the browser"),
+                _ => None,
+            })
+            .await;
+            assert_eq!(why, sign_ins::DEVIN_ASKED_UNKNOWN, "{after}");
+            assert_eq!(
+                devin_instead(&d, stalled.id).as_deref(),
+                Some(sign_ins::DEVIN_PASTE_INSTEAD),
+                "{after}"
+            );
+            assert_eq!(key(), "\\r", "{after}: Enter was pressed");
+            std::fs::remove_file(dir.path().join(after)).unwrap();
+        }
+
+        // A picker Desk doesn't know: never answered, and said plainly.
+        for changed in [
+            String::from_utf8(DEVIN_PICKER.to_vec())
+                .unwrap()
+                .replace("1 Log in with browser", "1 Log in with Windsurf"),
+            String::from_utf8(DEVIN_PICKER.to_vec())
+                .unwrap()
+                .replace(" \u{276d} 1 Log", "   1 Log")
+                .replace("   3 Log", " \u{276d} 3 Log"),
+        ] {
+            std::fs::write(dir.path().join("picker.bin"), changed).unwrap();
+            let _ = std::fs::remove_file(dir.path().join("got-key"));
+            let asked = d.start_engine_sign_in(Engine::Devin, false).unwrap();
+            assert_eq!(
+                devin_failed(&d, asked.id).await,
+                sign_ins::DEVIN_ASKED_UNKNOWN
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(key(), "", "no key was pressed for it");
+        }
+
+        // With no browser, a page on another host is never shown.
+        let lookalike = String::from_utf8(DEVIN_MANUAL.to_vec())
+            .unwrap()
+            .replace("app.devin.ai", "app.devin.ai.evil.example");
+        std::fs::write(dir.path().join("manual.bin"), lookalike).unwrap();
+        let manual = d.start_engine_sign_in(Engine::Devin, true).unwrap();
+        assert_eq!(
+            devin_failed(&d, manual.id).await,
+            sign_ins::DEVIN_PAGE_UNKNOWN
+        );
+        // Nothing is offered beside a failure that offers nothing.
+        assert_eq!(devin_instead(&d, manual.id), None);
+        assert!(
+            d.start_engine_sign_in(Engine::Gemini, false).is_err(),
+            "Gemini signs in another way"
+        );
     })
     .await;
 }
@@ -2379,6 +2978,7 @@ async fn a_session_in_a_terminal_of_its_own_on_a_full_plan_has_its_own_need() {
             engine_version: None,
             approve_for_me: false,
             fast: false,
+            model: None,
             account: None,
             name: "api-fix".into(),
             goal: String::new(),
@@ -4023,6 +4623,57 @@ async fn an_account_removed_while_it_signs_in_again_leaves_no_sign_in_behind() {
             "the token it kept went with it"
         );
         assert!(d.accounts().is_empty(), "nor is it back in the list");
+    })
+    .await;
+}
+
+/// 14:12 on 11/15: a call of the hub's own found Work turned away by its
+/// organisation. The Floor says so once, naming who it is and what Desk
+/// uses meanwhile; an hourly re-check refused again says nothing new, and a
+/// call that serves on it again clears it.
+#[tokio::test]
+async fn an_account_the_provider_turned_away_is_told_once_by_name() {
+    use crate::engine_accounts::AccountNeed;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(
+            pool,
+            key_options(dir.path(), Arc::new(MemoryKeys::default())),
+        )
+        .await;
+        let (work, personal, _, _) = two_on_work(&d, dir.path()).await;
+        let reason = "its organisation has turned off Claude Code access";
+        let recheck = chrono::Utc::now() + chrono::Duration::hours(1);
+        d.hub_refused(work, reason, recheck, true);
+        let refused = |d: &Desk| {
+            d.account_needs()
+                .into_iter()
+                .filter(|n| matches!(n, AccountNeed::Refused { .. }))
+                .collect::<Vec<_>>()
+        };
+        let needs = refused(&d);
+        assert!(
+            matches!(
+                &needs[..],
+                [AccountNeed::Refused { account, reason: r, using: Some(using), .. }]
+                    if account.id == Some(work) && r == reason && using.id == Some(personal)
+            ),
+            "{needs:?}"
+        );
+        let first = needs[0].id().to_string();
+        let view = d.accounts();
+        let shown = view.iter().find(|a| a.id == work).unwrap();
+        assert_eq!(
+            shown.refused.as_ref().map(|r| r.reason.as_str()),
+            Some(reason)
+        );
+        // The hourly re-check refused again: the same need, never a new one.
+        d.hub_refused(work, reason, recheck + chrono::Duration::hours(1), false);
+        assert_eq!(refused(&d)[0].id(), first);
+        // It serves again: nothing is said of it any more.
+        d.hub_served(work, chrono::Utc::now());
+        assert!(refused(&d).is_empty());
+        assert!(d.accounts().iter().all(|a| a.refused.is_none()));
     })
     .await;
 }

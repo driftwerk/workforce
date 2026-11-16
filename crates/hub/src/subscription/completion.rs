@@ -133,14 +133,46 @@ impl CliCompletion {
             CliKind::ClaudeCode => Prompt::Blocks(render(route, messages)?),
             CliKind::Codex => Prompt::Text(text_only(route, messages)?),
         };
-        let login = self
-            .plans
-            .scope()
-            .resolve(route.kind())
-            .map_err(SubscriptionError::NoLogin)?;
         let budget = budget(self.plans.scope().request_cap(model));
         let deadline = Instant::now() + budget;
         let system = system.unwrap_or_default();
+        // A login the round finds at its limit or turned away is skipped
+        // from here on: the call moves straight to the payer's next login of
+        // the same plan, never retried on the one that refused it.
+        let mut refused: Option<eyre::Report> = None;
+        for _ in 0..MAX_LOGINS_PER_CALL {
+            let login = match self.plans.scope().resolve(route.kind()) {
+                Ok(login) => login,
+                Err(_) if refused.is_some() => break,
+                Err(no_login) => return Err(SubscriptionError::NoLogin(no_login).into()),
+            };
+            match self
+                .attempt(&login, system, &prompt, model, (deadline, budget), tx)
+                .await
+            {
+                Err(e) if moves_on(&e) && Instant::now() < deadline => {
+                    tracing::warn!(route = route.label(), error = %e, "completion's login can't serve; trying the payer's next login");
+                    refused = Some(e);
+                }
+                done => return done,
+            }
+        }
+        Err(refused
+            .unwrap_or_else(|| eyre!("{} completion found no login to serve it", route.label())))
+    }
+
+    /// One round of the call on `login`, within `deadline` (`budget` from
+    /// when the call began).
+    async fn attempt(
+        &self,
+        login: &Login,
+        system: &str,
+        prompt: &Prompt,
+        model: &str,
+        (deadline, budget): (Instant, Duration),
+        tx: Option<&mpsc::Sender<StreamEvent>>,
+    ) -> Result<Answer> {
+        let route = self.cli.route();
         let run = keep_alive(tx, async {
             let _permit = tokio::time::timeout_at(
                 deadline,
@@ -158,15 +190,18 @@ impl CliCompletion {
             })??;
             match prompt {
                 Prompt::Blocks(input) => {
-                    self.run_claude(&login, system, input, model, deadline)
+                    self.run_claude(login, system, input.clone(), model, deadline)
                         .await
                 }
-                Prompt::Text(task) => self.run_codex(&login, system, task, model, deadline).await,
+                Prompt::Text(task) => {
+                    self.run_codex(login, system, task.clone(), model, deadline)
+                        .await
+                }
             }
             .map_err(|e| eyre!("{} completion failed: {e}", route.label()))
         })
         .await?;
-        let result = self.served(&login, run)?;
+        let result = self.served(login, run)?;
         Ok(Answer {
             usage: result.usage(),
             text: result.text,
@@ -294,6 +329,22 @@ impl CliCompletion {
             )),
         }
     }
+}
+
+/// The most logins one call is tried on, each refused one skipped.
+const MAX_LOGINS_PER_CALL: usize = 3;
+
+/// Whether `error` says the login it ran on can't serve now, so the payer's
+/// next login of the same plan may: at its limit, signed out or turned away.
+fn moves_on(error: &eyre::Report) -> bool {
+    matches!(
+        error.downcast_ref::<SubscriptionError>(),
+        Some(
+            SubscriptionError::LimitReached { .. }
+                | SubscriptionError::LoginInvalid { .. }
+                | SubscriptionError::AccountRefused { .. }
+        )
+    )
 }
 
 /// Why a round on `login` for `caller` did not succeed: what it says about
@@ -657,7 +708,9 @@ mod tests {
     use workforce_common::subscription::{CredentialTier, SubscriptionKind};
     use workforce_knowledge_service::SummariserBuilder;
 
-    use crate::claude_code::tests::scripted::{answer, print, rejected, result, ScriptedClaude};
+    use crate::claude_code::tests::scripted::{
+        answer, org_disabled, print, rejected, result, ScriptedClaude,
+    };
     use crate::claude_code::ResolvedAuth;
     use crate::subscription::test_support::Metered;
     use crate::subscription::CooldownStore;
@@ -1136,6 +1189,138 @@ mod tests {
             .unwrap();
         assert_eq!(response.text().as_deref(), Some("metered"));
         assert_eq!(*metered.0.lock(), ["backup-model"]);
+    }
+
+    /// 14:12 on 11/15: the login's organisation turned Claude Code off. The
+    /// round is never retried on it, it is skipped until its re-check, and
+    /// the call says why in plain words.
+    #[tokio::test]
+    async fn an_organisation_that_turned_claude_code_off_is_skipped_never_retried() {
+        let (hub, token) = Hub::with_login();
+        hub.claude.reply(None, &org_disabled());
+        let completion = hub.completion();
+        let err = hub.claude.scoped(ask(&completion)).await.unwrap_err();
+        assert!(
+            matches!(
+                subscription_error(&err),
+                SubscriptionError::AccountRefused { reason, .. }
+                    if reason == "its organisation has turned off Claude Code access"
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            classify_error(&err.to_string()),
+            ErrorKind::SubscriptionUnavailable
+        );
+        assert_eq!(hub.claude.calls().len(), 1, "never retried on it");
+        let slot = VaultSlot {
+            vault: Arc::clone(&hub.vault),
+            key: KEY.into(),
+        };
+        let value = Credential::Token(token).fingerprint();
+        let recheck = Utc::now() + crate::subscription::cooldown::REFUSED_RECHECK;
+        assert!(matches!(
+            CooldownStore::global().dead_at(&slot, &value, Utc::now()),
+            Some(Some(r)) if r.recheck_at <= recheck
+        ));
+        let again = hub.claude.scoped(ask(&completion)).await.unwrap_err();
+        assert!(
+            matches!(
+                subscription_error(&again),
+                SubscriptionError::NoLogin(no) if no.misses.iter().any(|(tier, miss)| *tier == CredentialTier::SystemShared
+                    && matches!(miss, Miss::Refused { .. }))
+            ),
+            "{again}"
+        );
+        assert!(
+            again
+                .to_string()
+                .contains("was refused: its organisation has turned off Claude Code access"),
+            "{again}"
+        );
+        assert_eq!(hub.claude.calls().len(), 1, "skipped, not tried again");
+        // Its re-check comes due: the next call tries it again.
+        assert_eq!(
+            CooldownStore::global().dead_at(&slot, &value, recheck + TimeDelta::seconds(1)),
+            None
+        );
+    }
+
+    /// The payer's refused login gives way to their next login of the same
+    /// plan within the one call.
+    #[tokio::test]
+    async fn a_refused_login_gives_way_to_the_payers_next_one_in_the_same_call() {
+        let hub = Hub::new();
+        let agent = Arc::new(Vault::open(&hub.dir.path().join("agent.enc"), "test-key").unwrap());
+        let personal = crate::user_config::per_user_key(ALICE, KEY);
+        let on_agent = format!("alice-agent-{}", uuid::Uuid::new_v4());
+        let on_global = format!("alice-global-{}", uuid::Uuid::new_v4());
+        agent.set(&personal, &on_agent).unwrap();
+        hub.vault.set(&personal, &on_global).unwrap();
+        hub.claude.reply(Some(1), &org_disabled());
+        hub.claude.reply(Some(2), &[result("Hello.")]);
+        let completion = CliCompletion::new(
+            hub.agent_plans(Some(&agent)),
+            CliKind::ClaudeCode,
+            Some("haiku"),
+            None,
+        );
+        let response = CURRENT_USER_ID
+            .scope(ALICE.to_string(), hub.claude.scoped(ask(&completion)))
+            .await
+            .unwrap();
+        assert_eq!(response.text().as_deref(), Some("Hello."));
+        let tokens: Vec<String> = hub.claude.calls().into_iter().map(|c| c.token).collect();
+        assert_eq!(
+            tokens,
+            [on_agent, on_global],
+            "the refused one once, then the next"
+        );
+    }
+
+    /// With no other login of the plan, the chain does not go to another
+    /// provider unless its failover names one: the refusal ends the call.
+    #[tokio::test]
+    async fn a_refused_login_falls_to_another_provider_only_when_the_chain_names_one() {
+        for (failover, served) in [(vec![], false), (vec!["chatgpt".to_string()], true)] {
+            let (hub, _) = Hub::with_login();
+            hub.claude.reply(None, &org_disabled());
+            let other = Arc::new(Metered::default());
+            let chain = FailoverProvider::new(
+                Arc::new(hub.completion()) as Arc<dyn LlmProvider>,
+                FailoverConfig {
+                    failover,
+                    ..Default::default()
+                },
+            );
+            chain
+                .add_external_provider("chatgpt", Arc::clone(&other) as Arc<dyn LlmProvider>)
+                .await;
+            let answer = hub
+                .claude
+                .scoped(chain.create_message(
+                    None,
+                    &[LlmMessage::user("hi")],
+                    &[],
+                    Some("haiku"),
+                    None,
+                    true,
+                ))
+                .await;
+            assert_eq!(answer.is_ok(), served, "{answer:?}");
+            assert_eq!(
+                hub.claude.calls().len(),
+                1,
+                "the refused login is tried once"
+            );
+            if !served {
+                let err = answer.unwrap_err().to_string();
+                assert!(
+                    err.contains("was refused: its organisation has turned off Claude Code access"),
+                    "{err}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

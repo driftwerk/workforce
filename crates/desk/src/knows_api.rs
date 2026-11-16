@@ -1,8 +1,10 @@
 //! `/api/desk/knows`: what each agent knows of the work in Desk ("What they
-//! see"), as the person sets it. The rules are read by whoever may use the
-//! desk; they are changed, and what an agent holds is deleted or kept, by
-//! the person who holds this hub alone: never an agent or a session, so no
-//! agent can widen what it, or another, is told.
+//! see"), as the person sets it. The rules are read and changed, and what an
+//! agent holds is deleted or kept, by the person who holds this hub alone
+//! (`authorize_holder`): never an agent or a session, nor the hub's own
+//! token, so no agent can widen what it, or another, is told. Desk reads
+//! them over its paired path as the person, whose device is no system
+//! administrator's token: the plain `authorize` would refuse it.
 //!
 //! - `GET /api/desk/knows`: every rule that has been set.
 //! - `GET /api/desk/knows/{hub}/{agent}`: one agent's rule (its own work
@@ -71,8 +73,8 @@ fn not_an_agent() -> Response {
 }
 
 async fn rules(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>) -> Response {
-    if let Err(status) = s.auth.authorize(&h, q.token.as_deref()).await {
-        return error(status, "not allowed");
+    if let Err(status) = s.auth.authorize_holder(&h, q.token.as_deref()).await {
+        return error(status, "Only you can see what an agent sees.");
     }
     match s.desk.knows_rules().await {
         Ok(rules) => Json(json!({ "rules": rules })).into_response(),
@@ -86,8 +88,8 @@ async fn rule(
     Query(q): Query<TokenQuery>,
     Path((hub, agent)): Path<(String, String)>,
 ) -> Response {
-    if let Err(status) = s.auth.authorize(&h, q.token.as_deref()).await {
-        return error(status, "not allowed");
+    if let Err(status) = s.auth.authorize_holder(&h, q.token.as_deref()).await {
+        return error(status, "Only you can see what an agent sees.");
     }
     let Some(agent) = agent_of(&hub, &agent) else {
         return not_an_agent();
@@ -200,8 +202,8 @@ async fn log(
     Query(q): Query<TokenQuery>,
     Path((hub, agent)): Path<(String, String)>,
 ) -> Response {
-    if let Err(status) = s.auth.authorize(&h, q.token.as_deref()).await {
-        return error(status, "not allowed");
+    if let Err(status) = s.auth.authorize_holder(&h, q.token.as_deref()).await {
+        return error(status, "Only you can see what an agent sees.");
     }
     let Some(agent) = agent_of(&hub, &agent) else {
         return not_an_agent();
@@ -223,8 +225,8 @@ async fn machines(
     Query(q): Query<TokenQuery>,
     Path((hub, agent)): Path<(String, String)>,
 ) -> Response {
-    if let Err(status) = s.auth.authorize(&h, q.token.as_deref()).await {
-        return error(status, "not allowed");
+    if let Err(status) = s.auth.authorize_holder(&h, q.token.as_deref()).await {
+        return error(status, "Only you can see what an agent sees.");
     }
     let Some(agent) = agent_of(&hub, &agent) else {
         return not_an_agent();
@@ -251,7 +253,8 @@ async fn machines(
     .into_response()
 }
 
-pub(crate) fn knows_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
+/// The rule routes, every one the hub holder's alone.
+pub fn knows_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
     Router::new()
         .route("/api/desk/knows", get(rules))
         .route("/api/desk/knows/{hub}/{agent}", get(rule).put(put_rule))
@@ -536,7 +539,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_the_holder_changes_a_rule_or_chooses_what_is_kept() {
+    async fn only_the_holder_reads_or_changes_a_rule_or_chooses_what_is_kept() {
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
             let app = knows_router(desk(pool, dir.path()).await, Arc::new(NotTheHolder));
@@ -551,11 +554,18 @@ mod tests {
             )
             .await;
             assert_eq!(status, StatusCode::FORBIDDEN);
-            assert_eq!(send(&app, "GET", uri, None).await.0, StatusCode::OK);
-            assert_eq!(
-                send(&app, "GET", "/api/desk/knows", None).await.0,
-                StatusCode::OK
-            );
+            for read in [
+                "/api/desk/knows".to_string(),
+                uri.to_string(),
+                format!("{uri}/log"),
+                format!("{uri}/machines"),
+            ] {
+                assert_eq!(
+                    send(&app, "GET", &read, None).await.0,
+                    StatusCode::FORBIDDEN,
+                    "{read}"
+                );
+            }
         })
         .await;
     }

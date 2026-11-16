@@ -127,6 +127,87 @@ impl SecretStore for LayeredInMem {
     }
 }
 
+/// One agent shared by several people, as a hub's `LayeredUserVault` is:
+/// shared keys (`AgentSpecific`) plus each person's own (`AgentPerUser`),
+/// the latter visible only while that person is `CURRENT_USER_ID`.
+#[derive(Default)]
+pub struct People {
+    shared: Mutex<HashMap<String, String>>,
+    own: Mutex<HashMap<String, HashMap<String, String>>>,
+}
+
+impl People {
+    pub fn new(shared: &[(&str, &str)]) -> Arc<Self> {
+        let people = Self::default();
+        for (k, v) in shared {
+            people
+                .shared
+                .lock()
+                .unwrap()
+                .insert(k.to_string(), v.to_string());
+        }
+        Arc::new(people)
+    }
+
+    /// Give `person` their own `path`.
+    pub fn own(&self, person: &str, path: &str, value: &str) -> &Self {
+        self.own
+            .lock()
+            .unwrap()
+            .entry(person.to_string())
+            .or_default()
+            .insert(path.to_string(), value.to_string());
+        self
+    }
+
+    fn mine(&self) -> HashMap<String, String> {
+        workforce_agent::runner::CURRENT_USER_ID
+            .try_with(|u| u.clone())
+            .ok()
+            .and_then(|u| self.own.lock().unwrap().get(&u).cloned())
+            .unwrap_or_default()
+    }
+}
+
+impl SecretStore for People {
+    fn get(&self, path: &str) -> Option<String> {
+        self.get_user_override(path)
+            .or_else(|| self.shared.lock().unwrap().get(path).cloned())
+    }
+    fn set(&self, p: &str, v: &str) -> eyre::Result<()> {
+        self.shared.lock().unwrap().insert(p.into(), v.into());
+        Ok(())
+    }
+    fn delete(&self, p: &str) -> eyre::Result<bool> {
+        Ok(self.shared.lock().unwrap().remove(p).is_some())
+    }
+    fn list(&self, prefix: Option<&str>) -> Vec<String> {
+        let p = prefix.unwrap_or("");
+        let mut paths: Vec<String> = self
+            .mine()
+            .into_keys()
+            .chain(self.shared.lock().unwrap().keys().cloned())
+            .filter(|k| k.starts_with(p))
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+    fn get_user_override(&self, path: &str) -> Option<String> {
+        self.mine().get(path).cloned()
+    }
+    fn inspect(&self, path: &str) -> Vec<(VaultSource, String)> {
+        let mut tiers = Vec::new();
+        if let Some(v) = self.mine().get(path) {
+            tiers.push((VaultSource::AgentPerUser, v.clone()));
+        }
+        if let Some(v) = self.shared.lock().unwrap().get(path) {
+            tiers.push((VaultSource::AgentSpecific, v.clone()));
+        }
+        tiers
+    }
+}
+
 /// A synthetic `reqwest::Response` for exercising status-mapping paths
 /// without HTTP.
 #[cfg(feature = "reqwest")]

@@ -331,7 +331,8 @@ impl DeskStore {
 
     /// Stops each group's grant, or, for a group with none, leaves a stop a
     /// later grant of it keeps; a grant stopped already keeps its first
-    /// stop. With `call`'s audit when given, even when nothing changed.
+    /// stop, except that the machine's always takes over Desk's
+    /// ([`crate::grant::Stopped::over`]). With `call`'s audit when given, even when nothing changed.
     pub async fn stop_grants(
         &self,
         stops: &[(String, Stopped)],
@@ -346,8 +347,11 @@ impl DeskStore {
                  VALUES ($1, $1, 0, 1, 'watch', 'status', $2, $3, $2, $2, $2) \
                  ON CONFLICT (group_id) DO UPDATE SET \
                    stopped_from = CASE WHEN boss_grants.stopped_at IS NULL \
+                       OR (boss_grants.stopped_from = 'desk' AND EXCLUDED.stopped_from = 'machine') \
                      THEN EXCLUDED.stopped_from ELSE boss_grants.stopped_from END, \
-                   stopped_at = COALESCE(boss_grants.stopped_at, EXCLUDED.stopped_at)",
+                   stopped_at = CASE WHEN boss_grants.stopped_at IS NULL \
+                       OR (boss_grants.stopped_from = 'desk' AND EXCLUDED.stopped_from = 'machine') \
+                     THEN EXCLUDED.stopped_at ELSE boss_grants.stopped_at END",
                 &[group, &s.at, &s.from.as_str()],
             )
             .await

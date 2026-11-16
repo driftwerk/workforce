@@ -102,6 +102,7 @@ impl GatewayParts {
             remote_mcp_tokens: None,
             remote_mcp: Default::default(),
             desk_boss: Default::default(),
+            desk_key_export: Default::default(),
             uplinks: Default::default(),
             permission_evaluator: None,
             destructive_baseline_active: self.destructive_baseline_active,

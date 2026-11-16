@@ -282,6 +282,10 @@ fn pointed_at(name: &str, other: &Client, dir: &Path) -> Vec<(Value, bool)> {
             .map(|by| (json!({ "by": by }), false))
             .collect(),
         "crew.board" => vec![(json!({}), false)],
+        // The person's GitHub, read as them: no scope of Desk's in it.
+        "crew.github_pr" => vec![(json!({ "repo": "acme/web", "number": 1 }), false)],
+        "crew.github_branch" => vec![(json!({ "repo": "acme/web", "branch": "main" }), false)],
+        "crew.github_ci" => vec![(json!({ "repo": "acme/web", "branch": "main" }), false)],
         "crew.decisions" => vec![(json!({}), false)],
         "crew.open_items" => vec![(json!({}), false)],
         // Kept under its own scope, and only its own read or changed.
@@ -293,6 +297,15 @@ fn pointed_at(name: &str, other: &Client, dir: &Path) -> Vec<(Value, bool)> {
             (json!({}), false),
             (
                 json!({ "action": "forget", "preference_id": uuid::Uuid::new_v4().to_string() }),
+                false,
+            ),
+        ],
+        // The person's directives for this boss: its own scope's, whatever
+        // it's pointed at, nothing of another's named.
+        super::super::directives::NAME => vec![
+            (json!({}), false),
+            (
+                json!({ "action": "answer", "key": "merge", "answer": "no" }),
                 false,
             ),
         ],

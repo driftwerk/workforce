@@ -470,6 +470,7 @@ mod tests {
                 engine_version: None,
                 approve_for_me: false,
                 fast: false,
+                model: None,
                 account: None,
                 name: "auth-fix".into(),
                 goal: String::new(),

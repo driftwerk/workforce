@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-fn default_base_url() -> String {
+pub(crate) fn default_base_url() -> String {
     "https://api.linear.app/graphql".to_string()
 }
 

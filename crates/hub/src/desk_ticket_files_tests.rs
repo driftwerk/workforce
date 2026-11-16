@@ -642,3 +642,31 @@ fn desk_cuts_a_description_where_a_jira_search_does() {
         workforce_skills::adapters::jira::tools::SEARCH_DESCRIPTION_MAX
     );
 }
+
+/// A hub that stops offering the issue tools (an adapter dropped by a
+/// restart, say) is said as the board says it, never as a file it can't
+/// send.
+#[tokio::test]
+async fn an_issue_read_from_a_hub_without_its_tools_says_so_as_the_board_does() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let (local, remote, b) = synced_board(&desk, dir.path()).await;
+        seed(&remote.jira, "ACME-1", "Fix the login", &["web"]);
+        local.sync.pass_board(b.id, true).await.unwrap();
+        let t = desk.ticket_by_key("ACME-1").await.unwrap();
+        // Only the issue tool goes: with any jira.* tool left the adapter
+        // reads as loaded, so remote MCP doesn't load it back.
+        for service in remote.state.registry.all_services() {
+            service.tools.unregister("jira.get_issue");
+        }
+        let uri = format!("/api/desk/tickets/{}/read?force=1", t.ticket.id);
+        let a = send(&local, &local.jwt, "POST", &uri, vec![]).await;
+        assert_eq!(a.status, StatusCode::CONFLICT, "{:?}", a.json());
+        assert_eq!(
+            a.json()["error"],
+            "No agent on Atlas you can reach has Jira switched on."
+        );
+    })
+    .await;
+}

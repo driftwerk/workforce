@@ -390,16 +390,33 @@ impl BrowserHooks for DeskHooks {
         let caller = setups
             .turn_caller(read.user, read.agent, read.conversation)
             .ok_or("Desk keeps a new key only in the conversation setting the connection up.")?;
-        setups
-            .keep_key(
-                &caller,
-                read.connector,
-                None,
-                read.origin,
-                read.path,
-                workforce_common::secret::Secret::new(read.key.to_string()),
-            )
-            .map(|kept| kept.test)
+        let kept = setups.keep_key(
+            &caller,
+            read.connector,
+            None,
+            read.origin,
+            read.path,
+            workforce_common::secret::Secret::new(read.key.to_string()),
+        )?;
+        // Every key held: the hub checks it and turns it on, as the setup's
+        // start said it would, while the agent waits.
+        if kept.ready {
+            let id = kept.setup.clone();
+            tokio::spawn(async move { setups.finish(&caller, &id).await });
+        }
+        Ok(kept.test)
+    }
+
+    fn sign_in_owned(
+        &self,
+        user: &str,
+        agent: &str,
+        conversation: &str,
+        url: &str,
+    ) -> Option<String> {
+        let setups = crate::desk_connections::setup::installed()?;
+        let caller = setups.turn_caller(user, agent, conversation)?;
+        setups.sign_in_owned(&caller, url)
     }
 
     fn holds(&self, agent: &str, what: &OnPage) -> Option<String> {

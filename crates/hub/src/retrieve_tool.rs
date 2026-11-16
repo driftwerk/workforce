@@ -198,19 +198,31 @@ impl Tool for RetrieveTool {
             .next_back();
 
         let Some((tool_name, original)) = selected else {
-            let what = parsed
-                .handle
-                .as_deref()
-                .map(|h| format!("handle `{h}`"))
-                .unwrap_or_else(|| format!("tool `{}`", parsed.tool.as_deref().unwrap_or("?")));
-            return Ok(ToolResult::failure(
-                format!(
-                    "no recoverable original for {what} in this session — it may have been \
+            let message = match (&parsed.handle, parsed.tool.as_deref()) {
+                (Some(h), _) => format!(
+                    "no recoverable original for handle `{h}` in this session — it may have been \
                      evicted before retrieval was available, or dropped by the size cap. \
                      Re-run the tool to regenerate it."
                 ),
-                duration(),
-            ));
+                // Asked for a tool that has no output here: it may simply
+                // never have run. This tool only recovers outputs; it says
+                // nothing of whether the tool exists, so a model doesn't
+                // read the miss as "not registered".
+                (None, tool) => {
+                    let tool = tool.unwrap_or("?");
+                    let llm = workforce_agent::runner::to_llm_name(tool);
+                    format!(
+                        "`{tool}` has no earlier output in this session to recover. \
+                         tool.retrieve only brings back outputs that were cut from the \
+                         conversation; it doesn't find or run tools. To run `{tool}`, call \
+                         `{llm}` directly, or through `{}` with name `{llm}`.",
+                        workforce_agent::runner::to_llm_name(
+                            workforce_agent::tools::loading::CALL_TOOL
+                        )
+                    )
+                }
+            };
+            return Ok(ToolResult::failure(message, duration()));
         };
 
         Ok(render_retrieved(
@@ -518,6 +530,32 @@ mod tests {
             .unwrap();
         assert!(!out.success);
         assert!(out.error.unwrap().contains("no recoverable original"));
+    }
+
+    /// Asked for a tool that has never run here (a skill just enabled, say),
+    /// the miss says it only recovers outputs and how to call the tool,
+    /// never anything a model could read as "not registered".
+    #[tokio::test]
+    async fn a_tool_with_no_output_yet_is_pointed_to_calling_it() {
+        let (store, id) = store_with_evicted_output();
+        let tool = RetrieveTool::new(Arc::clone(&store));
+        let out = CURRENT_SESSION_ID
+            .scope(
+                id,
+                tool.execute(serde_json::json!({ "tool": "jira.search" })),
+            )
+            .await
+            .unwrap();
+        assert!(!out.success);
+        let error = out.error.unwrap();
+        assert!(
+            error.contains("call `jira_search` directly, or through `tool_call`"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("not found") && !error.contains("Re-run"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

@@ -2777,7 +2777,7 @@ curl -s -X POST "$url" -H "Authorization: $auth" -H 'Content-Type: application/j
             .await
             .unwrap();
         assert!(!prepared.keeps_home);
-        assert_eq!(prepared.model, "gpt-5.6-sol", "the default alias");
+        assert_eq!(prepared.model, "gpt-6.1-sol", "the default alias");
         let env = env_of(&prepared.invocation.command);
         assert_eq!(env["CODEX_API_KEY"].as_deref(), Some("sk-1"));
         assert!(!env.contains_key("GH_TOKEN"));

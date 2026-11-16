@@ -46,6 +46,7 @@ use super::report::{
 use crate::adapters::utils::coerce_to_u64;
 
 type Clients = Arc<HashMap<String, Arc<XeroClient>>>;
+type Instances = super::tools::Instances;
 
 pub(super) const EXPORT_TOOL_NAME: &str = "xero.export";
 
@@ -816,17 +817,25 @@ fn normalize_date(s: &str) -> String {
 
 // ── Tool ──
 
+/// The caller's entity `input` names (or their default). `clients` is the
+/// caller's own set, so an error names only theirs.
 fn resolve_client(
     clients: &Clients,
     input: &Value,
     default_entity: &str,
 ) -> Result<Arc<XeroClient>> {
-    let name = input["entity"].as_str().unwrap_or(default_entity);
-    clients.get(name).cloned().ok_or_else(|| {
-        let mut available: Vec<&str> = clients.keys().map(String::as_str).collect();
-        available.sort_unstable();
-        eyre!("Unknown Xero entity: '{name}'. Available: {available:?}")
-    })
+    // Through the environment's binding, as every other Xero tool goes.
+    let name = workforce_agent::llm::environment::resolve_instance(
+        "xero",
+        input["entity"].as_str(),
+        default_entity,
+        &**clients,
+    )
+    .map_err(|d| eyre!("{}", d.message))?;
+    clients
+        .get(&name)
+        .cloned()
+        .ok_or_else(|| crate::adapters::utils::unknown_instance("Xero entity", &name, clients))
 }
 
 pub(super) fn export_description() -> &'static str {
@@ -879,17 +888,16 @@ pub(super) fn export_schema() -> Value {
     })
 }
 
-pub(super) fn export_tool(clients: Clients, default_entity: String) -> Arc<dyn Tool> {
+pub(super) fn export_tool(instances: Instances) -> Arc<dyn Tool> {
     Arc::new(XeroExportTool {
-        clients,
-        default_entity,
+        instances,
         schema: export_schema(),
     })
 }
 
 struct XeroExportTool {
-    clients: Clients,
-    default_entity: String,
+    /// Read as the caller on each call.
+    instances: Instances,
     schema: Value,
 }
 
@@ -954,7 +962,8 @@ impl Tool for XeroExportTool {
             Ok(DatasetMode::Transactional) => {}
         }
 
-        let client = match resolve_client(&self.clients, &input, &self.default_entity) {
+        let (clients, default_entity) = self.instances.for_caller();
+        let client = match resolve_client(&clients, &input, &default_entity) {
             Ok(c) => c,
             Err(e) => return Ok(ToolResult::failure(e.to_string(), elapsed_ms(start))),
         };
@@ -1286,7 +1295,8 @@ impl XeroExportTool {
             Some("analytical") => ReportLayout::Analytical,
             _ => ReportLayout::Statement,
         };
-        let entities = report_entities(input, &self.default_entity);
+        let (clients, default_entity) = self.instances.for_caller();
+        let entities = report_entities(input, &default_entity);
         let multi = entities.len() > 1;
         let template = match input["consolidation_template"]
             .as_str()
@@ -1308,11 +1318,7 @@ impl XeroExportTool {
 
         let mut entity_clients = Vec::with_capacity(entities.len());
         for entity in &entities {
-            match resolve_client(
-                &self.clients,
-                &json!({ "entity": entity }),
-                &self.default_entity,
-            ) {
+            match resolve_client(&clients, &json!({ "entity": entity }), &default_entity) {
                 Ok(client) => entity_clients.push((entity.clone(), client)),
                 Err(e) => return Ok(ToolResult::failure(e.to_string(), elapsed_ms(start))),
             }
@@ -1543,14 +1549,14 @@ mod tests {
         let client = Arc::new(XeroClient::with_store_and_endpoints_for_test(
             Arc::new(UserStore) as Arc<dyn SecretStore>,
             "default",
-            None,
             &server.uri(),
         ));
         let mut clients = HashMap::new();
         clients.insert("default".to_string(), client);
         let tool = XeroExportTool {
-            clients: Arc::new(clients),
-            default_entity: "default".to_string(),
+            instances: Arc::new(crate::adapters::utils::LiveInstances::fixed_map(
+                clients, "default",
+            )),
             schema: export_schema(),
         };
 
@@ -1621,7 +1627,6 @@ mod tests {
             Arc::new(XeroClient::with_store_and_endpoints_for_test(
                 Arc::new(UserStore) as Arc<dyn SecretStore>,
                 "e",
-                None,
                 &server.uri(),
             ))
         };
@@ -1629,8 +1634,9 @@ mod tests {
         clients.insert("harbor".to_string(), make());
         clients.insert("beacon".to_string(), make());
         let tool = XeroExportTool {
-            clients: Arc::new(clients),
-            default_entity: "harbor".to_string(),
+            instances: Arc::new(crate::adapters::utils::LiveInstances::fixed_map(
+                clients, "harbor",
+            )),
             schema: export_schema(),
         };
 
@@ -1691,7 +1697,6 @@ mod tests {
             Arc::new(XeroClient::with_store_and_endpoints_for_test(
                 Arc::new(UserStore) as Arc<dyn SecretStore>,
                 "e",
-                None,
                 &server.uri(),
             ))
         };
@@ -1699,8 +1704,9 @@ mod tests {
         clients.insert("harbor".to_string(), make());
         clients.insert("beacon".to_string(), make());
         let tool = XeroExportTool {
-            clients: Arc::new(clients),
-            default_entity: "harbor".to_string(),
+            instances: Arc::new(crate::adapters::utils::LiveInstances::fixed_map(
+                clients, "harbor",
+            )),
             schema: export_schema(),
         };
 
@@ -1738,8 +1744,10 @@ mod tests {
         use workforce_agent::artifacts::FsArtifactStore;
 
         let tool = XeroExportTool {
-            clients: Arc::new(HashMap::new()),
-            default_entity: "x".to_string(),
+            instances: Arc::new(crate::adapters::utils::LiveInstances::fixed_map(
+                HashMap::new(),
+                "x",
+            )),
             schema: export_schema(),
         };
         let dir = tempfile::TempDir::new().unwrap();
@@ -1995,7 +2003,6 @@ mod tests {
         let client = Arc::new(XeroClient::with_store_and_endpoints_for_test(
             Arc::new(UserStore) as Arc<dyn SecretStore>,
             "default",
-            None,
             &server.uri(),
         ));
         let def = dataset_def("invoices").unwrap();
@@ -2049,7 +2056,6 @@ mod tests {
         let client = XeroClient::with_store_and_endpoints_for_test(
             Arc::new(UserStore) as Arc<dyn SecretStore>,
             "default",
-            None,
             &server.uri(),
         );
         let def = dataset_def("invoices").unwrap();

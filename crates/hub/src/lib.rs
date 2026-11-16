@@ -8,6 +8,7 @@ pub mod advisor;
 pub mod advisor_loop;
 pub mod agent_comms_audit;
 pub mod agent_config_write;
+pub mod agent_generation;
 pub mod agent_inbox;
 pub mod agent_llm;
 pub mod agent_message_tool;
@@ -119,6 +120,7 @@ pub mod desk_driver;
 pub mod desk_folder;
 #[cfg(feature = "postgres")]
 pub(crate) mod desk_key_check;
+pub mod desk_key_copies;
 #[cfg(feature = "postgres")]
 pub mod desk_key_models;
 #[cfg(feature = "postgres")]

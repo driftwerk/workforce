@@ -25,7 +25,6 @@ use std::sync::Arc;
 use serde::Serialize;
 use tracing::{info, warn};
 
-use workforce_agent::llm::environment::SkillVariants;
 use workforce_agent::tools::registry::ToolRegistry;
 use workforce_agent::tools::Tool;
 use workforce_common::settings::WorkforceConfig;
@@ -2289,15 +2288,6 @@ pub fn static_skill_tool_names(skill_name: &str) -> Vec<&'static str> {
     }
 }
 
-/// Record the instances a multi-instance skill exposes on the registry it loads
-/// into, which belongs to one agent, or forget them when it exposes one.
-fn record_instances(registry: &ToolRegistry, skill: &str, variants: Option<SkillVariants>) {
-    match variants {
-        Some(variants) => registry.set_instance_source(skill, Arc::new(variants)),
-        None => registry.clear_instance_source(skill),
-    }
-}
-
 /// Load a specific skill's tools using vault credentials.
 pub fn load_skill_from_vault(
     skill_name: &str,
@@ -2459,7 +2449,7 @@ fn github_vault_config(
         .filter_map(|path| {
             let name = path.strip_prefix(prefix)?.strip_suffix(suffix)?.to_string();
             let token = store.get(&path)?;
-            let base_url = address_for(store, &path, &format!("{prefix}{name}/base_url"))
+            let base_url = address_for(store, &format!("{prefix}{name}/base_url"))
                 .unwrap_or_else(|| config.github.base_url.clone());
             Some((
                 name.clone(),
@@ -2543,8 +2533,16 @@ fn load_github_from_vault(
 ) -> eyre::Result<SkillLoadResult> {
     let store = layered_user_store(vault, global_vault);
     let (skill_config, context_hint) = github_vault_config(store.as_ref(), config)?;
+    let context_hint = shared_hint(
+        store.as_ref(),
+        &workforce_skills::adapters::github::GithubSkill::instance_paths(),
+        "skills/github/default_workspace",
+        "GitHub workspaces",
+        "Pass `owner` to pick which workspace's credentials a call uses.",
+        context_hint,
+    );
     let skill = workforce_skills::adapters::github::GithubSkill::with_store(skill_config, store)?;
-    record_instances(registry, "github", skill.variants());
+    registry.set_instance_source("github", skill.instance_source());
     let tools = skill.tools();
     let mut names = Vec::with_capacity(tools.len());
     for tool in tools {
@@ -2560,6 +2558,31 @@ fn load_github_from_vault(
         tool_names: names,
         context_hint,
     })
+}
+
+/// The GitHub adapter for `registry`'s agent, its keys pinned as that
+/// agent's `[skills]` says, built now as the caller in scope and registered
+/// nowhere: Desk's boss checks pull requests and CI with a few of its reads
+/// ([`crate::desk_crew::github`]), and nothing else of it is reachable.
+/// Its instances and keys are read per call as the caller, as a loaded
+/// adapter's are.
+pub(crate) fn github_skill_for(
+    vault: Arc<Vault>,
+    global_vault: Option<Arc<Vault>>,
+    config: &WorkforceConfig,
+    registry: &ToolRegistry,
+) -> eyre::Result<workforce_skills::adapters::github::GithubSkill> {
+    struct Loading;
+    impl Drop for Loading {
+        fn drop(&mut self) {
+            LOADING_PINS.with(|p| p.borrow_mut().take());
+        }
+    }
+    LOADING_PINS.with(|p| *p.borrow_mut() = Some(registry.credential_pins()));
+    let _loading = Loading;
+    let store = layered_user_store(vault, global_vault);
+    let (skill_config, _) = github_vault_config(store.as_ref(), config)?;
+    workforce_skills::adapters::github::GithubSkill::with_store(skill_config, store)
 }
 
 fn load_google_from_vault(
@@ -2651,13 +2674,25 @@ fn load_google_from_vault(
     registry.register(setup_tool);
 
     // Context hint for agent system prompt.
-    let context_hint = if !workspace_names.is_empty() {
-        let mut parts: Vec<String> = workspace_names
+    // Every turn sees this hint: it names only the shared accounts (with
+    // their addresses), never the loader's own.
+    let shared_accounts = shared_instance_names(
+        store.as_ref(),
+        &workforce_skills::adapters::utils::InstancePaths::new(
+            "skills/google/workspaces/",
+            "refresh_token",
+            "",
+        ),
+    );
+    let context_hint = if !shared_accounts.is_empty() {
+        let mut parts: Vec<String> = shared_accounts
             .iter()
             .map(|ws| {
-                let email = store
-                    .get(&format!("skills/google/workspaces/{ws}/email"))
-                    .unwrap_or_else(|| "(unknown)".to_string());
+                let email = shared_get(
+                    store.as_ref(),
+                    &format!("skills/google/workspaces/{ws}/email"),
+                )
+                .unwrap_or_else(|| "(unknown)".to_string());
                 let is_default = default_ws.as_deref() == Some(ws.as_str());
                 if is_default {
                     format!("\"{}\" = {} (default)", ws, email)
@@ -2668,9 +2703,14 @@ fn load_google_from_vault(
             .collect();
         parts.sort();
         Some(format!(
-            "Accounts: {}\nUse the `account` parameter on any Google tool to select which account.",
+            "Shared accounts: {}\nEach person's own Google accounts are used when they call.\nUse the `account` parameter on any Google tool to select which account.",
             parts.join(", ")
         ))
+    } else if !workspace_names.is_empty() {
+        Some(
+            "Google accounts: each person's own, used when they call. Use the `account` parameter on any Google tool to select which account; if a call says the account isn't connected, call google.setup(action='login', no_browser=true)."
+                .to_string(),
+        )
     } else {
         Some(
             "No Google account connected for this user yet. To connect one:\n\
@@ -2842,8 +2882,16 @@ fn load_linear_from_vault(
 ) -> eyre::Result<SkillLoadResult> {
     let store = layered_user_store(vault, global_vault);
     let (skill_config, context_hint) = linear_vault_config(store.as_ref())?;
+    let context_hint = shared_hint(
+        store.as_ref(),
+        &workforce_skills::adapters::linear::LinearSkill::instance_paths(),
+        "skills/linear/default_workspace",
+        "Linear workspaces",
+        "Use the `workspace` parameter on Linear tools to select which workspace; ticket prefixes auto-resolve.",
+        context_hint,
+    );
     let skill = workforce_skills::adapters::linear::LinearSkill::with_store(skill_config, store)?;
-    record_instances(registry, "linear", skill.variants());
+    registry.set_instance_source("linear", skill.instance_source());
     let tools = skill.tools();
     let mut names = Vec::with_capacity(tools.len());
     for tool in tools {
@@ -2887,7 +2935,7 @@ fn jira_vault_config(
             warn!(workspace = name, "Skipping Jira workspace: missing email");
             continue;
         };
-        let site = address_for(store, &path, &format!("{prefix}{name}/site"));
+        let site = address_for(store, &format!("{prefix}{name}/site"));
         let default_project = shared_get(store, &format!("{prefix}{name}/default_project"));
 
         let project_keys: Vec<String> = shared_get(store, &format!("{prefix}{name}/project_keys"))
@@ -2976,7 +3024,7 @@ fn jira_vault_config(
         let api_token = store
             .get("skills/jira/api_token")
             .ok_or_else(|| eyre::eyre!("Missing 'skills/jira/api_token'"))?;
-        let site = address_for(store, "skills/jira/api_token", "skills/jira/site");
+        let site = address_for(store, "skills/jira/site");
         let default_project = shared_get(store, "skills/jira/default_project");
 
         workforce_skills::adapters::jira::JiraSkillConfig {
@@ -3018,8 +3066,16 @@ fn load_jira_from_vault(
 ) -> eyre::Result<SkillLoadResult> {
     let store = layered_user_store(vault, global_vault);
     let (skill_config, context_hint) = jira_vault_config(store.as_ref())?;
+    let context_hint = shared_hint(
+        store.as_ref(),
+        &workforce_skills::adapters::jira::JiraSkill::instance_paths(),
+        "skills/jira/default_workspace",
+        "Jira workspaces",
+        "Use the `workspace` parameter on Jira tools to select which tenant; issue keys auto-route by project prefix.",
+        context_hint,
+    );
     let skill = workforce_skills::adapters::jira::JiraSkill::with_store(skill_config, store)?;
-    record_instances(registry, "jira", skill.variants());
+    registry.set_instance_source("jira", skill.instance_source());
     let tools = skill.tools();
     let mut names = Vec::with_capacity(tools.len());
     for tool in tools {
@@ -3061,9 +3117,9 @@ fn datadog_vault_config(
             warn!(account = name, "Skipping Datadog account: missing app_key");
             continue;
         };
-        let site = address_for(store, &path, &format!("{prefix}{name}/site"))
+        let site = address_for(store, &format!("{prefix}{name}/site"))
             .unwrap_or_else(|| "us1".to_string());
-        let base_url = address_for(store, &path, &format!("{prefix}{name}/base_url"));
+        let base_url = address_for(store, &format!("{prefix}{name}/base_url"));
 
         accounts.insert(
             name.to_string(),
@@ -3118,8 +3174,8 @@ fn datadog_vault_config(
         let app_key = store
             .get("skills/datadog/app_key")
             .ok_or_else(|| eyre::eyre!("Missing 'skills/datadog/app_key'"))?;
-        let site = address_for(store, "skills/datadog/api_key", "skills/datadog/site");
-        let base_url = address_for(store, "skills/datadog/api_key", "skills/datadog/base_url");
+        let site = address_for(store, "skills/datadog/site");
+        let base_url = address_for(store, "skills/datadog/base_url");
 
         workforce_skills::adapters::datadog::DatadogSkillConfig {
             api_key: Some(api_key),
@@ -3153,8 +3209,16 @@ fn load_datadog_from_vault(
 ) -> eyre::Result<SkillLoadResult> {
     let store = layered_user_store(vault, global_vault);
     let (skill_config, context_hint) = datadog_vault_config(store.as_ref())?;
+    let context_hint = shared_hint(
+        store.as_ref(),
+        &workforce_skills::adapters::datadog::DatadogSkill::instance_paths(),
+        "skills/datadog/default_account",
+        "Datadog accounts",
+        "Use the `account` parameter on Datadog tools to select one.",
+        context_hint,
+    );
     let skill = workforce_skills::adapters::datadog::DatadogSkill::with_store(skill_config, store)?;
-    record_instances(registry, "datadog", skill.variants());
+    registry.set_instance_source("datadog", skill.instance_source());
     let tools = skill.tools();
     let mut names = Vec::with_capacity(tools.len());
     for tool in tools {
@@ -3192,7 +3256,7 @@ fn metabase_vault_config(
         let Some(api_key) = store.get(&path) else {
             continue;
         };
-        let site_url = address_for(store, &path, &format!("{prefix}{name}/site_url"));
+        let site_url = address_for(store, &format!("{prefix}{name}/site_url"));
         let max_query_rows = shared_get(store, &format!("{prefix}{name}/max_query_rows"))
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(workforce_skills::adapters::metabase::config::DEFAULT_MAX_QUERY_ROWS);
@@ -3247,7 +3311,7 @@ fn metabase_vault_config(
                  - vault.set('skills/metabase/instances/<name>/{{api_key,site_url}}', '...') for multi-instance"
             )
         })?;
-        let site_url = address_for(store, "skills/metabase/api_key", "skills/metabase/site_url");
+        let site_url = address_for(store, "skills/metabase/site_url");
         let max_query_rows = shared_get(store, "skills/metabase/max_query_rows")
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(workforce_skills::adapters::metabase::config::DEFAULT_MAX_QUERY_ROWS);
@@ -3357,12 +3421,20 @@ fn load_metabase_from_vault(
 ) -> eyre::Result<SkillLoadResult> {
     let store = layered_user_store(vault, global_vault);
     let (skill_config, context_hint) = metabase_vault_config(store.as_ref())?;
+    let context_hint = shared_hint(
+        store.as_ref(),
+        &workforce_skills::adapters::metabase::MetabaseSkill::instance_paths(),
+        "skills/metabase/default_instance",
+        "Metabase instances",
+        "Use the `instance` parameter on Metabase tools to select one.",
+        context_hint,
+    );
     let skill = workforce_skills::adapters::metabase::MetabaseSkill::with_store(
         skill_config,
         store,
         workforce_common::metabase_schema::store(),
     )?;
-    record_instances(registry, "metabase", skill.variants());
+    registry.set_instance_source("metabase", skill.instance_source());
     let tools = skill.tools();
     let mut names = Vec::with_capacity(tools.len());
     for tool in tools {
@@ -3386,100 +3458,33 @@ fn load_xero_from_vault(
     _config: &WorkforceConfig,
     registry: &ToolRegistry,
 ) -> eyre::Result<SkillLoadResult> {
-    use workforce_skills::adapters::xero::{XeroEntityConfig, XeroSkill, XeroSkillConfig};
+    use workforce_skills::adapters::xero::XeroSkill;
 
+    // One loaded skill serves everyone on the agent: which entities exist,
+    // their keys and a pinned tenant are all read per call as the caller.
+    // The loader's own are only asked whether there is anything to load.
     let store = layered_user_store(vault, global_vault);
-    let prefix = "skills/xero/instances/";
-    let suffix = "/client_id";
-
-    let mut entities = std::collections::HashMap::new();
-    for path in store.list(Some(prefix)) {
-        let Some(name) = path
-            .strip_prefix(prefix)
-            .and_then(|s| s.strip_suffix(suffix))
-        else {
-            continue;
-        };
-        let Some(client_id) = store.get(&path) else {
-            continue;
-        };
-        let Some(client_secret) = store.get(&format!("{prefix}{name}/client_secret")) else {
-            warn!(entity = name, "Skipping Xero entity: missing client_secret");
-            continue;
-        };
-        entities.insert(
-            name.to_string(),
-            XeroEntityConfig {
-                client_id,
-                client_secret,
-                tenant_id: store.get(&format!("{prefix}{name}/tenant_id")),
-            },
-        );
+    let paths = XeroSkill::instance_paths();
+    if paths.names(store.as_ref()).is_empty() {
+        return Err(eyre::eyre!(
+            "Missing vault credential. Set either:\n  \
+             - vault.set('skills/xero/client_id', '<id>') + vault.set('skills/xero/client_secret', '<secret>') for a single entity, or\n  \
+             - vault.set('skills/xero/instances/<name>/{{client_id,client_secret}}', '...') for multiple entities"
+        ));
     }
-
     let default_entity = shared_get(store.as_ref(), "skills/xero/default_entity");
-    let effective_default = effective_default(&entities, default_entity.as_deref());
+    let context_hint = Some(shared_instances_hint(
+        store.as_ref(),
+        &paths,
+        default_entity.as_deref(),
+        "Xero entities",
+        "Use the `entity` parameter on Xero tools to select one.",
+        "Single-entity mode. To add another organisation, use: \
+         vault.set('skills/xero/instances/<name>/{client_id,client_secret}', '...')",
+    ));
 
-    let context_hint = if entities.is_empty() {
-        Some(
-            "Single-entity mode. To add another organisation, use: \
-             vault.set('skills/xero/instances/<name>/{client_id,client_secret}', '...')"
-                .to_string(),
-        )
-    } else {
-        let mut names: Vec<String> = entities
-            .keys()
-            .map(|name| {
-                if effective_default.as_deref() == Some(name.as_str()) {
-                    format!("\"{name}\" (default)")
-                } else {
-                    format!("\"{name}\"")
-                }
-            })
-            .collect();
-        names.sort();
-        let mut hint = format!("Xero entities: {}", names.join(", "));
-        if entities.len() > 1 {
-            hint.push_str("\nUse the `entity` parameter on Xero tools to select one.");
-        }
-        Some(hint)
-    };
-
-    let skill_config = if entities.is_empty() {
-        let client_id = store.get("skills/xero/client_id").ok_or_else(|| {
-            eyre::eyre!(
-                "Missing vault credential. Set either:\n  \
-                 - vault.set('skills/xero/client_id', '<id>') + vault.set('skills/xero/client_secret', '<secret>') for a single entity, or\n  \
-                 - vault.set('skills/xero/instances/<name>/{{client_id,client_secret}}', '...') for multiple entities"
-            )
-        })?;
-        let client_secret = store
-            .get("skills/xero/client_secret")
-            .ok_or_else(|| eyre::eyre!("Missing 'skills/xero/client_secret'"))?;
-        XeroSkillConfig {
-            client_id: Some(client_id),
-            client_secret: Some(client_secret),
-            tenant_id: store.get("skills/xero/tenant_id"),
-            entities: std::collections::HashMap::new(),
-            default_entity: None,
-        }
-    } else {
-        info!(
-            skill = "xero",
-            entities = entities.len(),
-            "Multi-entity mode"
-        );
-        XeroSkillConfig {
-            client_id: None,
-            client_secret: None,
-            tenant_id: None,
-            entities,
-            default_entity,
-        }
-    };
-
-    let skill = XeroSkill::with_store(skill_config, store)?;
-    record_instances(registry, "xero", skill.variants());
+    let skill = XeroSkill::with_store(default_entity, store)?;
+    registry.set_instance_source("xero", skill.instance_source());
     let tools = skill.tools();
     let mut names = Vec::with_capacity(tools.len());
     for tool in tools {
@@ -3495,6 +3500,90 @@ fn load_xero_from_vault(
         tool_names: names,
         context_hint,
     })
+}
+
+/// A loaded adapter's hint as every turn may see it: the loader's own when
+/// there are no named instances (single-key mode names none), else one
+/// naming only the shared instances, since the loader's lists their own
+/// workspaces too.
+fn shared_hint(
+    store: &dyn workforce_common::settings::SecretStore,
+    paths: &workforce_skills::adapters::utils::InstancePaths,
+    selector_path: &str,
+    label: &str,
+    choose: &str,
+    loaders: Option<String>,
+) -> Option<String> {
+    if store.list(Some(&paths.prefix)).is_empty() {
+        return loaders;
+    }
+    let selector = shared_get(store, selector_path);
+    Some(shared_instances_hint(
+        store,
+        paths,
+        selector.as_deref(),
+        label,
+        choose,
+        &format!(
+            "{label}: each person's own, read when they call; a call naming none uses their default."
+        ),
+    ))
+}
+
+/// The names of `paths`' instances kept at the shared tiers only (the
+/// agent's and the hub's), never a person's own: what a hint every caller
+/// may see can name.
+fn shared_instance_names(
+    store: &dyn workforce_common::settings::SecretStore,
+    paths: &workforce_skills::adapters::utils::InstancePaths,
+) -> Vec<String> {
+    use workforce_common::settings::VaultSource;
+    let suffix = format!("/{}", paths.marker);
+    let mut names: Vec<String> = [VaultSource::AgentSpecific, VaultSource::Global]
+        .into_iter()
+        .flat_map(|tier| store.list_at_tier(Some(&paths.prefix), tier))
+        .filter_map(|(path, _)| {
+            path.strip_prefix(&paths.prefix)?
+                .strip_suffix(&suffix)
+                .filter(|name| workforce_skills::adapters::utils::is_instance_name(name))
+                .map(str::to_string)
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// A loaded adapter's hint, naming only its shared instances: a person's
+/// own are theirs to know, and the hint is the same for everyone.
+fn shared_instances_hint(
+    store: &dyn workforce_common::settings::SecretStore,
+    paths: &workforce_skills::adapters::utils::InstancePaths,
+    selector: Option<&str>,
+    label: &str,
+    choose: &str,
+    single: &str,
+) -> String {
+    let names = shared_instance_names(store, paths);
+    if names.is_empty() {
+        return single.to_string();
+    }
+    let as_map: std::collections::HashMap<String, ()> =
+        names.iter().map(|n| (n.clone(), ())).collect();
+    let default = effective_default(&as_map, selector);
+    let listed: Vec<String> = names
+        .iter()
+        .map(|name| match default.as_deref() == Some(name.as_str()) {
+            true => format!("\"{name}\" (default)"),
+            false => format!("\"{name}\""),
+        })
+        .collect();
+    let mut hint = format!("{label}: {}", listed.join(", "));
+    if names.len() > 1 {
+        hint.push('\n');
+        hint.push_str(choose);
+    }
+    hint
 }
 
 fn load_spotify_from_vault(
@@ -3557,7 +3646,7 @@ fn load_freeagent_from_vault(
     registry: &ToolRegistry,
 ) -> eyre::Result<SkillLoadResult> {
     use workforce_skills::adapters::freeagent::setup::FreeAgentSetupTool;
-    use workforce_skills::adapters::freeagent::{token_store, FreeAgentSkill};
+    use workforce_skills::adapters::freeagent::FreeAgentSkill;
 
     let store = layered_user_store(vault, global_vault);
     let mut names: Vec<String> = Vec::new();
@@ -3587,15 +3676,24 @@ fn load_freeagent_from_vault(
     names.push(setup_tool.name().to_string());
     registry.register(setup_tool);
 
-    let connected = token_store::list_workspaces(store.as_ref());
+    // Every turn sees this hint: it names only the shared companies, never
+    // the loader's own.
+    let connected = shared_instance_names(
+        store.as_ref(),
+        &workforce_skills::adapters::utils::InstancePaths::new(
+            "skills/freeagent/workspaces/",
+            "refresh_token",
+            "",
+        ),
+    );
     let context_hint = if connected.is_empty() {
         Some(
-            "No FreeAgent company connected yet. Run freeagent.setup(action='login') to connect one."
+            "FreeAgent companies are each person's own. If a call says none is connected, run freeagent.setup(action='login') to connect one."
                 .to_string(),
         )
     } else {
         Some(format!(
-            "Connected FreeAgent companies: {}. Use the `workspace` parameter on freeagent.* tools to select one.",
+            "Shared FreeAgent companies: {}. Each person's own are used when they call. Use the `workspace` parameter on freeagent.* tools to select one.",
             connected.join(", ")
         ))
     };
@@ -3729,9 +3827,17 @@ fn load_postmark_from_vault(
 ) -> eyre::Result<SkillLoadResult> {
     let store = layered_user_store(vault, global_vault);
     let (skill_config, context_hint) = postmark_vault_config(store.as_ref())?;
+    let context_hint = shared_hint(
+        store.as_ref(),
+        &workforce_skills::adapters::postmark::PostmarkSkill::instance_paths(),
+        "skills/postmark/default_workspace",
+        "Postmark workspaces",
+        "Use the `workspace` parameter on Postmark tools to select one.",
+        context_hint,
+    );
     let skill =
         workforce_skills::adapters::postmark::PostmarkSkill::with_store(skill_config, store)?;
-    record_instances(registry, "postmark", skill.variants());
+    registry.set_instance_source("postmark", skill.instance_source());
     let tools = skill.tools();
     let mut names = Vec::with_capacity(tools.len());
     for tool in tools {
@@ -3864,9 +3970,17 @@ fn load_sendgrid_from_vault(
 ) -> eyre::Result<SkillLoadResult> {
     let store = layered_user_store(vault, global_vault);
     let (skill_config, context_hint) = sendgrid_vault_config(store.as_ref())?;
+    let context_hint = shared_hint(
+        store.as_ref(),
+        &workforce_skills::adapters::sendgrid::SendGridSkill::instance_paths(),
+        "skills/sendgrid/default_workspace",
+        "SendGrid workspaces",
+        "Use the `workspace` parameter on SendGrid tools to select one.",
+        Some(context_hint),
+    );
     let skill =
         workforce_skills::adapters::sendgrid::SendGridSkill::with_store(skill_config, store)?;
-    record_instances(registry, "sendgrid", skill.variants());
+    registry.set_instance_source("sendgrid", skill.instance_source());
     let tool_names: Vec<String> = skill
         .tools()
         .into_iter()
@@ -3883,7 +3997,7 @@ fn load_sendgrid_from_vault(
     );
     Ok(SkillLoadResult {
         tool_names,
-        context_hint: Some(context_hint),
+        context_hint,
     })
 }
 
@@ -3957,8 +4071,7 @@ fn load_hubspot_from_vault(
                  - vault.set('skills/hubspot/portals/<name>/access_token', '...') for multi-portal"
             )
         })?;
-        let max_results = store
-            .get("skills/hubspot/max_results")
+        let max_results = shared_get(store.as_ref(), "skills/hubspot/max_results")
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(workforce_skills::adapters::hubspot::config::DEFAULT_MAX_RESULTS);
         workforce_skills::adapters::hubspot::HubspotSkillConfig {
@@ -3978,7 +4091,17 @@ fn load_hubspot_from_vault(
         }
     };
 
+    let context_hint = shared_hint(
+        store.as_ref(),
+        &workforce_skills::adapters::hubspot::HubspotSkill::instance_paths(),
+        "skills/hubspot/default_portal",
+        "HubSpot portals",
+        "Use the `portal` parameter on HubSpot tools to select one.",
+        context_hint,
+    );
+
     let skill = workforce_skills::adapters::hubspot::HubspotSkill::with_store(skill_config, store)?;
+    registry.set_instance_source("hubspot", skill.instance_source());
     let tools = skill.tools();
     let mut names = Vec::with_capacity(tools.len());
     for tool in tools {
@@ -4066,8 +4189,7 @@ fn load_notion_from_vault(
                  - vault.set('skills/notion/workspaces/<name>/token', '...') for multi-workspace"
             )
         })?;
-        let max_results = store
-            .get("skills/notion/max_results")
+        let max_results = shared_get(store.as_ref(), "skills/notion/max_results")
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(workforce_skills::adapters::notion::config::DEFAULT_MAX_RESULTS);
         workforce_skills::adapters::notion::NotionSkillConfig {
@@ -4087,7 +4209,17 @@ fn load_notion_from_vault(
         }
     };
 
+    let context_hint = shared_hint(
+        store.as_ref(),
+        &workforce_skills::adapters::notion::NotionSkill::instance_paths(),
+        "skills/notion/default_workspace",
+        "Notion workspaces",
+        "Use the `workspace` parameter on Notion tools to select one.",
+        context_hint,
+    );
+
     let skill = workforce_skills::adapters::notion::NotionSkill::with_store(skill_config, store)?;
+    registry.set_instance_source("notion", skill.instance_source());
     let tools = skill.tools();
     let mut names = Vec::with_capacity(tools.len());
     for tool in tools {
@@ -4308,8 +4440,12 @@ fn load_email_from_vault(
     let default_account = selector(store.as_ref(), "email", "skills/email/default_account");
 
     let context_hint = {
-        let mut parts: Vec<String> = accounts
-            .keys()
+        // Every turn sees this hint: it names only the shared accounts,
+        // never the loader's own.
+        let paths = workforce_skills::adapters::utils::InstancePaths::new(prefix, "password", "");
+        let shared = shared_instance_names(store.as_ref(), &paths);
+        let mut parts: Vec<String> = shared
+            .iter()
             .map(|name| {
                 let username = shared_get(store.as_ref(), &format!("{prefix}{name}/username"))
                     .unwrap_or_else(|| "per-user account".to_string());
@@ -4321,10 +4457,14 @@ fn load_email_from_vault(
             })
             .collect();
         parts.sort();
-        Some(format!(
-            "Accounts: {}\nUse the `account` parameter on email tools to select which account.",
-            parts.join(", ")
-        ))
+        let own = "Each person's own accounts are read when they call; a call naming none uses their default.";
+        Some(match parts.is_empty() {
+            true => format!("Email accounts: {own}"),
+            false => format!(
+                "Shared accounts: {}\n{own}\nUse the `account` parameter on email tools to select which account.",
+                parts.join(", ")
+            ),
+        })
     };
 
     let acct_count = accounts.len();
@@ -4570,9 +4710,105 @@ pub(crate) fn ensure_adapters_loaded(service: &AgentService, wanted: impl Fn(&st
 mod tests {
     /// On a hub running Desk, a connection's address is the one kept with
     /// its key: a site an agent wrote at its own tier is never where the
-    /// person's key goes, at load or per request.
+    /// person's key goes, at load or per request. And the adapter is shared:
+    /// the site of whoever loaded it is never where someone else's key goes.
     #[tokio::test]
     async fn on_desk_a_connections_address_is_the_one_kept_with_its_key() {
+        use wiremock::matchers::method;
+        use workforce_common::credential_pin::{PinSource, TierPin};
+        struct Every;
+        impl PinSource for Every {
+            fn pin(&self, _: &str) -> TierPin {
+                TierPin::All
+            }
+        }
+        let sams_site = wiremock::MockServer::start().await;
+        let bobs_site = wiremock::MockServer::start().await;
+        for site in [&sams_site, &bobs_site] {
+            wiremock::Mock::given(method("GET"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"accountId": "a-1"})),
+                )
+                .mount(site)
+                .await;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let agent = Arc::new(Vault::open(&dir.path().join("agent"), "k").unwrap());
+        let global = Arc::new(Vault::open(&dir.path().join("global"), "k").unwrap());
+        let ws = |f: &str| format!("skills/jira/workspaces/acme/{f}");
+        for (f, v) in [
+            ("site", sams_site.uri().as_str()),
+            ("email", "sam@acme.example"),
+            ("api_token", "sam-token"),
+        ] {
+            global.set(&format!("users/sam/{}", ws(f)), v).unwrap();
+        }
+        // Bob: a key of his own, no site of his own.
+        for (f, v) in [("email", "bob@acme.example"), ("api_token", "bob-token")] {
+            global.set(&format!("users/bob/{}", ws(f)), v).unwrap();
+        }
+        agent.set(&ws("site"), "https://evil.example").unwrap();
+        let registry = ToolRegistry::new();
+        registry.credential_pins().fill(Arc::new(Every));
+        let config = WorkforceConfig::default();
+
+        // Sam's turn loads Jira. Nothing of Sam's is baked into it.
+        let store = crate::user_config::LayeredUserVault::new(
+            Arc::clone(&agent),
+            Some(Arc::clone(&global)),
+        )
+        .with_pins(registry.credential_pins());
+        CURRENT_USER_ID
+            .scope("sam".to_string(), async {
+                let (baked, _) = jira_vault_config(&store).unwrap();
+                assert_eq!(baked.workspaces["acme"].site, None, "baked from Sam's tier");
+                load_skill_from_vault(
+                    "jira",
+                    Arc::clone(&agent),
+                    Some(Arc::clone(&global)),
+                    &config,
+                    &registry,
+                )
+                .unwrap();
+            })
+            .await;
+        let myself = registry.get("jira.myself").expect("jira.myself");
+        let call = |who: &'static str| {
+            let myself = Arc::clone(&myself);
+            async move {
+                CURRENT_USER_ID
+                    .scope(who.to_string(), myself.execute(serde_json::json!({})))
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // Sam's key goes to Sam's site, per call.
+        assert!(call("sam").await.success);
+        assert_eq!(sams_site.received_requests().await.unwrap().len(), 1);
+
+        // Bob's key has no site: it goes nowhere, least of all Sam's.
+        let bob = call("bob").await;
+        assert!(!bob.success);
+        let err = bob.error.unwrap_or_default();
+        assert!(err.contains("site not configured"), "{err}");
+        assert!(!err.contains(&sams_site.uri()), "{err}");
+        assert_eq!(sams_site.received_requests().await.unwrap().len(), 1);
+
+        // Once Bob keeps a site with his key, it goes there.
+        global
+            .set(&format!("users/bob/{}", ws("site")), &bobs_site.uri())
+            .unwrap();
+        assert!(call("bob").await.success);
+        assert_eq!(bobs_site.received_requests().await.unwrap().len(), 1);
+        assert_eq!(sams_site.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// An administrator's site at the hub's shared `Global` tier is still
+    /// where a key without its own goes, on Desk as before.
+    #[test]
+    fn on_desk_the_hubs_shared_site_still_backs_a_key_without_one() {
         use workforce_common::credential_pin::{PinSlot, PinSource, TierPin};
         struct Every;
         impl PinSource for Every {
@@ -4583,27 +4819,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let agent = Arc::new(Vault::open(&dir.path().join("agent"), "k").unwrap());
         let global = Arc::new(Vault::open(&dir.path().join("global"), "k").unwrap());
-        let ws = |f: &str| format!("skills/jira/workspaces/acme/{f}");
-        for (f, v) in [
-            ("site", "https://acme.atlassian.net"),
-            ("email", "sam@acme.example"),
-            ("api_token", "person-token"),
-        ] {
-            global.set(&format!("users/sam/{}", ws(f)), v).unwrap();
-        }
-        agent.set(&ws("site"), "https://evil.example").unwrap();
+        global
+            .set(
+                "skills/jira/workspaces/acme/site",
+                "https://acme.atlassian.net",
+            )
+            .unwrap();
+        global
+            .set("users/sam/skills/jira/workspaces/acme/api_token", "t")
+            .unwrap();
+        global
+            .set("users/sam/skills/jira/workspaces/acme/email", "e")
+            .unwrap();
         let pins = Arc::new(PinSlot::default());
         pins.fill(Arc::new(Every));
         let store = crate::user_config::LayeredUserVault::new(agent, Some(global)).with_pins(pins);
-        workforce_agent::runner::CURRENT_USER_ID
-            .scope("sam".to_string(), async move {
-                let (config, _) = jira_vault_config(&store).unwrap();
-                assert_eq!(
-                    config.workspaces["acme"].site.as_deref(),
-                    Some("https://acme.atlassian.net")
-                );
-            })
-            .await;
+        CURRENT_USER_ID.sync_scope("sam".to_string(), || {
+            let (config, _) = jira_vault_config(&store).unwrap();
+            assert_eq!(
+                config.workspaces["acme"].site.as_deref(),
+                Some("https://acme.atlassian.net")
+            );
+        });
     }
 
     use super::*;
@@ -4681,6 +4918,195 @@ mod tests {
             listed(SkillCaller::local(None, false)),
             ["gl-global", "gl-org"]
         );
+    }
+
+    /// One agent, two people with Xero keys of their own: Ann's turn loads
+    /// the adapter, Bob uses it. Nothing Bob is shown names Ann's entities,
+    /// he reaches only his own, and the hint every turn sees names neither.
+    #[tokio::test]
+    async fn a_loaded_xero_serves_each_person_their_own_entities() {
+        let agent_vault = new_test_vault();
+        for (who, entity) in [("ann", "harbor"), ("ann", "anchorage"), ("bob", "beacon")] {
+            for (field, value) in [
+                ("client_id", format!("id-{who}-{entity}")),
+                ("client_secret", format!("secret-{who}")),
+                ("tenant_id", format!("T-{entity}")),
+            ] {
+                agent_vault
+                    .set(
+                        &format!("users/{who}/skills/xero/instances/{entity}/{field}"),
+                        &value,
+                    )
+                    .unwrap();
+            }
+        }
+        let registry = ToolRegistry::new();
+        let config = WorkforceConfig::default();
+        let loaded = CURRENT_USER_ID
+            .scope("ann".to_string(), async {
+                load_skill_from_vault("xero", Arc::clone(&agent_vault), None, &config, &registry)
+            })
+            .await
+            .expect("Ann's keys load Xero");
+        let hint = loaded.context_hint.unwrap_or_default();
+        let schemas = serde_json::to_string(&registry.definitions()).unwrap();
+        for ann in ["harbor", "anchorage"] {
+            assert!(!hint.contains(ann), "{hint}");
+            assert!(!schemas.contains(ann), "a schema names {ann}");
+        }
+
+        let tool = registry
+            .get("xero.organisation")
+            .expect("xero.organisation");
+        let (variants, missing) = CURRENT_USER_ID
+            .scope("bob".to_string(), async {
+                let variants = registry.skill_variants();
+                let missing = tool
+                    .execute(serde_json::json!({ "entity": "nope" }))
+                    .await
+                    .unwrap();
+                (variants, missing)
+            })
+            .await;
+        assert!(!variants.contains_key("xero"), "Bob has one entity");
+        let err = missing.error.unwrap_or_default();
+        assert!(err.contains("beacon"), "{err}");
+        assert!(
+            !err.contains("harbor") && !err.contains("anchorage"),
+            "{err}"
+        );
+
+        let ann = CURRENT_USER_ID
+            .scope("ann".to_string(), async { registry.skill_variants() })
+            .await;
+        assert_eq!(ann["xero"].instances, ["anchorage", "harbor"]);
+    }
+
+    /// Every multi-workspace connector, loaded by Ann and used by Bob, with
+    /// workspaces of their own each: nothing the agent is shown names Ann's,
+    /// Bob's environment variants and errors name only his, and Ann's
+    /// still name hers.
+    #[tokio::test]
+    async fn every_connector_serves_each_person_their_own_workspaces() {
+        let adapters = [
+            ("jira", "workspaces"),
+            ("linear", "workspaces"),
+            ("github", "workspaces"),
+            ("datadog", "accounts"),
+            ("metabase", "instances"),
+            ("postmark", "workspaces"),
+            ("sendgrid", "workspaces"),
+            ("hubspot", "portals"),
+            ("notion", "workspaces"),
+        ];
+        let fields = |ws: &str| {
+            [
+                ("api_token", "tok".to_string()),
+                ("api_key", "key".to_string()),
+                ("app_key", "app".to_string()),
+                ("token", "tok".to_string()),
+                ("server_token", "tok".to_string()),
+                ("access_token", "tok".to_string()),
+                ("email", format!("{ws}@example.com")),
+                ("site", format!("https://{ws}.atlassian.net")),
+                ("url", format!("https://{ws}.example.com")),
+            ]
+        };
+        let config = WorkforceConfig::default();
+        for (skill, kind) in adapters {
+            let agent_vault = new_test_vault();
+            for (who, ws) in [
+                ("ann", "annhq"),
+                ("ann", "annlab"),
+                ("bob", "bobhq"),
+                ("bob", "boblab"),
+            ] {
+                for (field, value) in fields(ws) {
+                    agent_vault
+                        .set(
+                            &format!("users/{who}/skills/{skill}/{kind}/{ws}/{field}"),
+                            &value,
+                        )
+                        .unwrap();
+                }
+            }
+            let registry = ToolRegistry::new();
+            let loaded = CURRENT_USER_ID
+                .scope("ann".to_string(), async {
+                    load_skill_from_vault(skill, Arc::clone(&agent_vault), None, &config, &registry)
+                })
+                .await
+                .unwrap_or_else(|e| panic!("{skill}: Ann's keys load it: {e}"));
+            let hint = loaded.context_hint.unwrap_or_default();
+            let schemas = serde_json::to_string(&registry.definitions()).unwrap();
+            for ann in ["annhq", "annlab"] {
+                assert!(!hint.contains(ann), "{skill} hint: {hint}");
+                assert!(!schemas.contains(ann), "{skill}: a schema names {ann}");
+            }
+
+            let (variants, errors) = CURRENT_USER_ID
+                .scope("bob".to_string(), async {
+                    let mut errors = Vec::new();
+                    for name in &loaded.tool_names {
+                        let tool = registry.get(name).unwrap();
+                        let schema = tool.input_schema();
+                        let props = &schema["properties"];
+                        for param in ["workspace", "account", "instance", "portal"] {
+                            if props.get(param).is_some() {
+                                let ran = tool
+                                    .execute(serde_json::json!({ param: "nope" }))
+                                    .await
+                                    .unwrap();
+                                errors.push(ran.error.unwrap_or_default());
+                            }
+                        }
+                    }
+                    (registry.skill_variants(), errors)
+                })
+                .await;
+            assert_eq!(
+                variants.get(skill).map(|v| v.instances.clone()),
+                Some(vec!["bobhq".to_string(), "boblab".to_string()]),
+                "{skill}: Bob's variants"
+            );
+            for err in &errors {
+                assert!(
+                    !err.contains("annhq") && !err.contains("annlab"),
+                    "{skill}: {err}"
+                );
+            }
+            if skill != "github" {
+                assert!(
+                    errors.iter().any(|e| e.contains("bobhq")),
+                    "{skill}: no error named Bob's workspaces: {errors:?}"
+                );
+            }
+            let ann = CURRENT_USER_ID
+                .scope("ann".to_string(), async { registry.skill_variants() })
+                .await;
+            assert_eq!(ann[skill].instances, ["annhq", "annlab"], "{skill}");
+        }
+    }
+
+    /// A person with no Xero keys of their own on an agent with none
+    /// shared: the adapter has nothing to load for them.
+    #[tokio::test]
+    async fn xero_loads_only_for_someone_with_keys() {
+        let agent_vault = new_test_vault();
+        agent_vault
+            .set("users/ann/skills/xero/client_id", "id-ann")
+            .unwrap();
+        let registry = ToolRegistry::new();
+        let config = WorkforceConfig::default();
+        let loaded = CURRENT_USER_ID
+            .scope("bob".to_string(), async {
+                load_skill_from_vault("xero", agent_vault, None, &config, &registry)
+            })
+            .await;
+        let Err(err) = loaded else {
+            panic!("Bob has no keys")
+        };
+        assert!(err.to_string().contains("skills/xero"), "{err}");
     }
 
     /// `load_linear_from_vault` resolves credentials through

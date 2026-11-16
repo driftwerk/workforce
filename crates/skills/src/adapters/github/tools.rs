@@ -1,6 +1,5 @@
 //! GitHub agent-callable tools.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -10,7 +9,7 @@ use tracing::{info, warn};
 use workforce_agent::security::external_content::wrap_external_content;
 use workforce_agent::tools::{Tool, ToolResult};
 
-use crate::adapters::utils::{coerce_to_u64, instance_choices};
+use crate::adapters::utils::{coerce_to_u64, instance_choices, LiveInstances};
 
 use super::app_auth::AppError;
 use super::client::GithubClient;
@@ -26,23 +25,41 @@ fn wrap_field(value: &serde_json::Value, source: &str) -> serde_json::Value {
 }
 
 /// Resolve the owner: use the explicit param, fall back to default_owner, or error.
-fn resolve_owner<'a>(
-    input: &'a serde_json::Value,
-    default_owner: &'a Option<String>,
-) -> std::result::Result<&'a str, String> {
+fn resolve_owner(
+    input: &serde_json::Value,
+    default_owner: &Option<String>,
+) -> std::result::Result<String, String> {
     input["owner"]
         .as_str()
-        .or(default_owner.as_deref())
+        .map(str::to_string)
+        .or_else(|| default_owner.clone())
         .ok_or_else(|| "Missing 'owner' parameter and no default_owner configured".to_string())
+}
+
+/// The owner a call naming none goes to: for a set read per caller, the
+/// caller's own default workspace (a named workspace is its owner), else
+/// the shared `fixed` owner; never the loader's.
+fn caller_owner(clients: &LiveInstances<GithubClient>, fixed: &Option<String>) -> Option<String> {
+    if !clients.is_live() {
+        return fixed.clone();
+    }
+    let (named, default) = clients.for_caller();
+    match default.as_str() {
+        "default" => fixed.clone(),
+        name if named.contains_key(name) => Some(default),
+        _ => fixed.clone(),
+    }
 }
 
 /// Resolve the GitHub client for a given input. If the `owner` matches a configured
 /// workspace name, use that workspace's client. Otherwise use the default.
 fn resolve_client(
-    clients: &HashMap<String, Arc<GithubClient>>,
+    instances: &LiveInstances<GithubClient>,
     default_workspace: &str,
     input: &serde_json::Value,
 ) -> eyre::Result<Arc<GithubClient>> {
+    let (clients, default_workspace) = instances.for_caller_or(default_workspace);
+    let (clients, default_workspace) = (&*clients, default_workspace.as_str());
     let owner = input["owner"].as_str();
     // Explicit `workspace` param (for github.api), else an `owner` that matches a
     // configured workspace name; both post-filtered through the environment lock.
@@ -57,18 +74,19 @@ fn resolve_client(
     )
     .map_err(|d| eyre::eyre!("{}", d.message))?;
     clients.get(&name).cloned().ok_or_else(|| {
-        eyre::eyre!(
-            "Unknown GitHub workspace: '{name}'. Available: {:?}",
-            clients.keys().collect::<Vec<_>>()
-        )
+        crate::adapters::utils::unknown_instance("GitHub workspace", name.as_ref(), clients)
     })
 }
 
 /// Build a dynamic description for the `owner` parameter that includes available org names.
-fn owner_description(
-    clients: &HashMap<String, Arc<GithubClient>>,
-    default_workspace: &str,
-) -> String {
+fn owner_description(instances: &LiveInstances<GithubClient>, default_workspace: &str) -> String {
+    // A set read per caller names no instance: a schema is built once
+    // and shown to everyone.
+    if instances.is_live() {
+        return "GitHub user or org name; one you have a workspace for also selects its credentials. Uses your default if omitted.".into();
+    }
+    let (clients, default_workspace) = instances.for_caller_or(default_workspace);
+    let (clients, default_workspace) = (&*clients, default_workspace.as_str());
     if clients.len() <= 1 {
         return "GitHub user or org name. Uses default if omitted.".to_string();
     }
@@ -81,14 +99,14 @@ fn owner_description(
 // ── github.list_repos ────────────────────────────────────────────────
 
 pub struct GithubListReposTool {
-    clients: Arc<HashMap<String, Arc<GithubClient>>>,
+    clients: Arc<LiveInstances<GithubClient>>,
     default_workspace: String,
     default_owner: Option<String>,
 }
 
 impl GithubListReposTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<GithubClient>>>,
+        clients: Arc<LiveInstances<GithubClient>>,
         default_workspace: String,
         default_owner: Option<String>,
     ) -> Self {
@@ -142,7 +160,7 @@ impl Tool for GithubListReposTool {
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
 
-        let owner = match resolve_owner(&input, &self.default_owner) {
+        let owner = match resolve_owner(&input, &caller_owner(&self.clients, &self.default_owner)) {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
@@ -210,14 +228,14 @@ impl Tool for GithubListReposTool {
 // ── github.get_repo ──────────────────────────────────────────────────
 
 pub struct GithubGetRepoTool {
-    clients: Arc<HashMap<String, Arc<GithubClient>>>,
+    clients: Arc<LiveInstances<GithubClient>>,
     default_workspace: String,
     default_owner: Option<String>,
 }
 
 impl GithubGetRepoTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<GithubClient>>>,
+        clients: Arc<LiveInstances<GithubClient>>,
         default_workspace: String,
         default_owner: Option<String>,
     ) -> Self {
@@ -259,7 +277,7 @@ impl Tool for GithubGetRepoTool {
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
 
-        let owner = match resolve_owner(&input, &self.default_owner) {
+        let owner = match resolve_owner(&input, &caller_owner(&self.clients, &self.default_owner)) {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
@@ -322,14 +340,14 @@ impl Tool for GithubGetRepoTool {
 // ── github.list_issues ───────────────────────────────────────────────
 
 pub struct GithubListIssuesTool {
-    clients: Arc<HashMap<String, Arc<GithubClient>>>,
+    clients: Arc<LiveInstances<GithubClient>>,
     default_workspace: String,
     default_owner: Option<String>,
 }
 
 impl GithubListIssuesTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<GithubClient>>>,
+        clients: Arc<LiveInstances<GithubClient>>,
         default_workspace: String,
         default_owner: Option<String>,
     ) -> Self {
@@ -386,7 +404,7 @@ impl Tool for GithubListIssuesTool {
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
 
-        let owner = match resolve_owner(&input, &self.default_owner) {
+        let owner = match resolve_owner(&input, &caller_owner(&self.clients, &self.default_owner)) {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
@@ -475,14 +493,14 @@ impl Tool for GithubListIssuesTool {
 // ── github.get_issue ─────────────────────────────────────────────────
 
 pub struct GithubGetIssueTool {
-    clients: Arc<HashMap<String, Arc<GithubClient>>>,
+    clients: Arc<LiveInstances<GithubClient>>,
     default_workspace: String,
     default_owner: Option<String>,
 }
 
 impl GithubGetIssueTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<GithubClient>>>,
+        clients: Arc<LiveInstances<GithubClient>>,
         default_workspace: String,
         default_owner: Option<String>,
     ) -> Self {
@@ -528,7 +546,7 @@ impl Tool for GithubGetIssueTool {
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
 
-        let owner = match resolve_owner(&input, &self.default_owner) {
+        let owner = match resolve_owner(&input, &caller_owner(&self.clients, &self.default_owner)) {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
@@ -616,14 +634,14 @@ impl Tool for GithubGetIssueTool {
 // ── github.create_issue ──────────────────────────────────────────────
 
 pub struct GithubCreateIssueTool {
-    clients: Arc<HashMap<String, Arc<GithubClient>>>,
+    clients: Arc<LiveInstances<GithubClient>>,
     default_workspace: String,
     default_owner: Option<String>,
 }
 
 impl GithubCreateIssueTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<GithubClient>>>,
+        clients: Arc<LiveInstances<GithubClient>>,
         default_workspace: String,
         default_owner: Option<String>,
     ) -> Self {
@@ -683,7 +701,7 @@ impl Tool for GithubCreateIssueTool {
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
 
-        let owner = match resolve_owner(&input, &self.default_owner) {
+        let owner = match resolve_owner(&input, &caller_owner(&self.clients, &self.default_owner)) {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
@@ -761,14 +779,14 @@ impl Tool for GithubCreateIssueTool {
 // ── github.list_pulls ────────────────────────────────────────────────
 
 pub struct GithubListPullsTool {
-    clients: Arc<HashMap<String, Arc<GithubClient>>>,
+    clients: Arc<LiveInstances<GithubClient>>,
     default_workspace: String,
     default_owner: Option<String>,
 }
 
 impl GithubListPullsTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<GithubClient>>>,
+        clients: Arc<LiveInstances<GithubClient>>,
         default_workspace: String,
         default_owner: Option<String>,
     ) -> Self {
@@ -807,6 +825,10 @@ impl Tool for GithubListPullsTool {
                     "description": "Filter by state: open, closed, all (default: open)",
                     "enum": ["open", "closed", "all"]
                 },
+                "head": {
+                    "type": "string",
+                    "description": "Only pull requests from this branch: `branch` (in `owner`'s repository) or `user:branch` (from a fork)"
+                },
                 "per_page": {
                     "type": "integer",
                     "description": "Results per page (integer, default: 30, max: 100)",
@@ -821,7 +843,7 @@ impl Tool for GithubListPullsTool {
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
 
-        let owner = match resolve_owner(&input, &self.default_owner) {
+        let owner = match resolve_owner(&input, &caller_owner(&self.clients, &self.default_owner)) {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
@@ -852,6 +874,18 @@ impl Tool for GithubListPullsTool {
             .min(100)
             .to_string();
         query.push(("per_page", &per_page_str));
+        // GitHub filters by `user:branch`; a bare branch is in `owner`'s.
+        let head = input["head"]
+            .as_str()
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .map(|h| match h.contains(':') {
+                true => h.to_string(),
+                false => format!("{owner}:{h}"),
+            });
+        if let Some(head) = head.as_deref() {
+            query.push(("head", head));
+        }
 
         let path = format!("/repos/{}/{}/pulls", owner, repo);
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -873,6 +907,7 @@ impl Tool for GithubListPullsTool {
                             "head": p["head"]["ref"],
                             "base": p["base"]["ref"],
                             "draft": p["draft"],
+                            "merged_at": p["merged_at"],
                             "created_at": p["created_at"],
                             "updated_at": p["updated_at"],
                             "html_url": p["html_url"],
@@ -903,14 +938,14 @@ impl Tool for GithubListPullsTool {
 // ── github.get_pull ──────────────────────────────────────────────────
 
 pub struct GithubGetPullTool {
-    clients: Arc<HashMap<String, Arc<GithubClient>>>,
+    clients: Arc<LiveInstances<GithubClient>>,
     default_workspace: String,
     default_owner: Option<String>,
 }
 
 impl GithubGetPullTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<GithubClient>>>,
+        clients: Arc<LiveInstances<GithubClient>>,
         default_workspace: String,
         default_owner: Option<String>,
     ) -> Self {
@@ -956,7 +991,7 @@ impl Tool for GithubGetPullTool {
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
 
-        let owner = match resolve_owner(&input, &self.default_owner) {
+        let owner = match resolve_owner(&input, &caller_owner(&self.clients, &self.default_owner)) {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
@@ -1036,29 +1071,40 @@ impl Tool for GithubGetPullTool {
             })
             .collect();
 
-        // Fetch CI check status
+        // Fetch CI check status: every check on its head, judged as
+        // github.ci_status judges them (a skipped or neutral one isn't
+        // pending), with the failed ones by name.
         let head_sha = pr["head"]["sha"].as_str().unwrap_or_default();
         let checks_summary = if !head_sha.is_empty() {
             let checks_path = format!("/repos/{}/{}/commits/{}/check-runs", owner, repo, head_sha);
-            match client.get(&checks_path).await {
+            match client
+                .get_with_query(&checks_path, &[("per_page", "100")])
+                .await
+            {
                 Ok(data) => {
                     let runs = data["check_runs"].as_array().cloned().unwrap_or_default();
-                    let total = runs.len();
-                    let success = runs
+                    let gate = evaluate_check_runs(&runs);
+                    let failure = gate.failed_checks.len();
+                    let pending = runs
                         .iter()
-                        .filter(|r| r["conclusion"].as_str() == Some("success"))
+                        .filter(|r| r["status"].as_str() != Some("completed"))
                         .count();
-                    let failure = runs
+                    let cancelled: Vec<&str> = runs
                         .iter()
-                        .filter(|r| {
-                            matches!(
-                                r["conclusion"].as_str(),
-                                Some("failure") | Some("timed_out")
-                            )
-                        })
-                        .count();
-                    let pending = total - success - failure;
-                    serde_json::json!({ "total": total, "success": success, "failure": failure, "pending": pending })
+                        .filter(|r| r["conclusion"].as_str() == Some("cancelled"))
+                        .filter_map(|r| r["name"].as_str())
+                        .collect();
+                    serde_json::json!({
+                        "overall": gate.overall,
+                        "total": gate.total_count,
+                        "success": gate.success_count,
+                        "failure": failure,
+                        "pending": pending,
+                        "skipped": gate.skipped_count,
+                        "neutral": gate.neutral_count,
+                        "failed": gate.failed_checks,
+                        "cancelled": cancelled,
+                    })
                 }
                 Err(_) => serde_json::json!(null),
             }
@@ -1077,7 +1123,13 @@ impl Tool for GithubGetPullTool {
                 "head": pr["head"]["ref"],
                 "base": pr["base"]["ref"],
                 "draft": pr["draft"],
+                "merged": pr["merged"],
+                "merged_at": pr["merged_at"],
+                "merged_by": pr["merged_by"]["login"],
+                "merge_commit_sha": pr["merge_commit_sha"],
                 "mergeable": pr["mergeable"],
+                "mergeable_state": pr["mergeable_state"],
+                "head_sha": pr["head"]["sha"],
                 "additions": pr["additions"],
                 "deletions": pr["deletions"],
                 "changed_files": pr["changed_files"],
@@ -1096,14 +1148,14 @@ impl Tool for GithubGetPullTool {
 // ── github.get_file ──────────────────────────────────────────────────
 
 pub struct GithubGetFileTool {
-    clients: Arc<HashMap<String, Arc<GithubClient>>>,
+    clients: Arc<LiveInstances<GithubClient>>,
     default_workspace: String,
     default_owner: Option<String>,
 }
 
 impl GithubGetFileTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<GithubClient>>>,
+        clients: Arc<LiveInstances<GithubClient>>,
         default_workspace: String,
         default_owner: Option<String>,
     ) -> Self {
@@ -1153,7 +1205,7 @@ impl Tool for GithubGetFileTool {
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
 
-        let owner = match resolve_owner(&input, &self.default_owner) {
+        let owner = match resolve_owner(&input, &caller_owner(&self.clients, &self.default_owner)) {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
@@ -1245,14 +1297,14 @@ impl Tool for GithubGetFileTool {
 // ── github.pr_create ────────────────────────────────────────────────
 
 pub struct GithubPrCreateTool {
-    clients: Arc<HashMap<String, Arc<GithubClient>>>,
+    clients: Arc<LiveInstances<GithubClient>>,
     default_workspace: String,
     default_owner: Option<String>,
 }
 
 impl GithubPrCreateTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<GithubClient>>>,
+        clients: Arc<LiveInstances<GithubClient>>,
         default_workspace: String,
         default_owner: Option<String>,
     ) -> Self {
@@ -1324,7 +1376,7 @@ impl Tool for GithubPrCreateTool {
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
 
-        let owner = match resolve_owner(&input, &self.default_owner) {
+        let owner = match resolve_owner(&input, &caller_owner(&self.clients, &self.default_owner)) {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
@@ -1439,14 +1491,14 @@ impl Tool for GithubPrCreateTool {
 // ── github.pr_diff ──────────────────────────────────────────────────
 
 pub struct GithubPrDiffTool {
-    clients: Arc<HashMap<String, Arc<GithubClient>>>,
+    clients: Arc<LiveInstances<GithubClient>>,
     default_workspace: String,
     default_owner: Option<String>,
 }
 
 impl GithubPrDiffTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<GithubClient>>>,
+        clients: Arc<LiveInstances<GithubClient>>,
         default_workspace: String,
         default_owner: Option<String>,
     ) -> Self {
@@ -1492,7 +1544,7 @@ impl Tool for GithubPrDiffTool {
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
 
-        let owner = match resolve_owner(&input, &self.default_owner) {
+        let owner = match resolve_owner(&input, &caller_owner(&self.clients, &self.default_owner)) {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
@@ -1565,14 +1617,14 @@ impl Tool for GithubPrDiffTool {
 // ── github.pr_review ────────────────────────────────────────────────
 
 pub struct GithubPrReviewTool {
-    clients: Arc<HashMap<String, Arc<GithubClient>>>,
+    clients: Arc<LiveInstances<GithubClient>>,
     default_workspace: String,
     default_owner: Option<String>,
 }
 
 impl GithubPrReviewTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<GithubClient>>>,
+        clients: Arc<LiveInstances<GithubClient>>,
         default_workspace: String,
         default_owner: Option<String>,
     ) -> Self {
@@ -1653,7 +1705,7 @@ impl Tool for GithubPrReviewTool {
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
 
-        let owner = match resolve_owner(&input, &self.default_owner) {
+        let owner = match resolve_owner(&input, &caller_owner(&self.clients, &self.default_owner)) {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
@@ -1745,7 +1797,7 @@ impl Tool for GithubPrReviewTool {
                 Err(e) => failed(e),
             });
         }
-        let fallback_reason = match client.post_as_app(owner, repo, &path, &body_json).await {
+        let fallback_reason = match client.post_as_app(&owner, repo, &path, &body_json).await {
             Ok(Some(review)) => return Ok(submitted(review, "app")),
             Ok(None) => "no GitHub App is configured for this workspace".to_string(),
             Err(AppError::NotInstalled { repo }) => {
@@ -1805,14 +1857,14 @@ fn fallback_comment(event: &str, body: Option<&str>) -> String {
 // ── github.pr_comment ───────────────────────────────────────────────
 
 pub struct GithubPrCommentTool {
-    clients: Arc<HashMap<String, Arc<GithubClient>>>,
+    clients: Arc<LiveInstances<GithubClient>>,
     default_workspace: String,
     default_owner: Option<String>,
 }
 
 impl GithubPrCommentTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<GithubClient>>>,
+        clients: Arc<LiveInstances<GithubClient>>,
         default_workspace: String,
         default_owner: Option<String>,
     ) -> Self {
@@ -1862,7 +1914,7 @@ impl Tool for GithubPrCommentTool {
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
 
-        let owner = match resolve_owner(&input, &self.default_owner) {
+        let owner = match resolve_owner(&input, &caller_owner(&self.clients, &self.default_owner)) {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
@@ -1935,14 +1987,14 @@ impl Tool for GithubPrCommentTool {
 // ── github.pr_merge ─────────────────────────────────────────────────
 
 pub struct GithubPrMergeTool {
-    clients: Arc<HashMap<String, Arc<GithubClient>>>,
+    clients: Arc<LiveInstances<GithubClient>>,
     default_workspace: String,
     default_owner: Option<String>,
 }
 
 impl GithubPrMergeTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<GithubClient>>>,
+        clients: Arc<LiveInstances<GithubClient>>,
         default_workspace: String,
         default_owner: Option<String>,
     ) -> Self {
@@ -2009,7 +2061,7 @@ impl Tool for GithubPrMergeTool {
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
 
-        let owner = match resolve_owner(&input, &self.default_owner) {
+        let owner = match resolve_owner(&input, &caller_owner(&self.clients, &self.default_owner)) {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
@@ -2154,14 +2206,14 @@ impl Tool for GithubPrMergeTool {
 // ── github.issue_comment ──────────────────────────────────────────
 
 pub struct GithubIssueCommentTool {
-    clients: Arc<HashMap<String, Arc<GithubClient>>>,
+    clients: Arc<LiveInstances<GithubClient>>,
     default_workspace: String,
     default_owner: Option<String>,
 }
 
 impl GithubIssueCommentTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<GithubClient>>>,
+        clients: Arc<LiveInstances<GithubClient>>,
         default_workspace: String,
         default_owner: Option<String>,
     ) -> Self {
@@ -2198,7 +2250,7 @@ impl Tool for GithubIssueCommentTool {
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
-        let owner = match resolve_owner(&input, &self.default_owner) {
+        let owner = match resolve_owner(&input, &caller_owner(&self.clients, &self.default_owner)) {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
@@ -2266,14 +2318,14 @@ impl Tool for GithubIssueCommentTool {
 // ── github.issue_update ──────────────────────────────────────────
 
 pub struct GithubIssueUpdateTool {
-    clients: Arc<HashMap<String, Arc<GithubClient>>>,
+    clients: Arc<LiveInstances<GithubClient>>,
     default_workspace: String,
     default_owner: Option<String>,
 }
 
 impl GithubIssueUpdateTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<GithubClient>>>,
+        clients: Arc<LiveInstances<GithubClient>>,
         default_workspace: String,
         default_owner: Option<String>,
     ) -> Self {
@@ -2314,7 +2366,7 @@ impl Tool for GithubIssueUpdateTool {
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
-        let owner = match resolve_owner(&input, &self.default_owner) {
+        let owner = match resolve_owner(&input, &caller_owner(&self.clients, &self.default_owner)) {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
@@ -2399,14 +2451,14 @@ impl Tool for GithubIssueUpdateTool {
 // ── github.dir_list ──────────────────────────────────────────────
 
 pub struct GithubDirListTool {
-    clients: Arc<HashMap<String, Arc<GithubClient>>>,
+    clients: Arc<LiveInstances<GithubClient>>,
     default_workspace: String,
     default_owner: Option<String>,
 }
 
 impl GithubDirListTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<GithubClient>>>,
+        clients: Arc<LiveInstances<GithubClient>>,
         default_workspace: String,
         default_owner: Option<String>,
     ) -> Self {
@@ -2443,7 +2495,7 @@ impl Tool for GithubDirListTool {
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
-        let owner = match resolve_owner(&input, &self.default_owner) {
+        let owner = match resolve_owner(&input, &caller_owner(&self.clients, &self.default_owner)) {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
@@ -2515,14 +2567,14 @@ impl Tool for GithubDirListTool {
 // ── github.compare ───────────────────────────────────────────────
 
 pub struct GithubCompareTool {
-    clients: Arc<HashMap<String, Arc<GithubClient>>>,
+    clients: Arc<LiveInstances<GithubClient>>,
     default_workspace: String,
     default_owner: Option<String>,
 }
 
 impl GithubCompareTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<GithubClient>>>,
+        clients: Arc<LiveInstances<GithubClient>>,
         default_workspace: String,
         default_owner: Option<String>,
     ) -> Self {
@@ -2559,7 +2611,7 @@ impl Tool for GithubCompareTool {
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
-        let owner = match resolve_owner(&input, &self.default_owner) {
+        let owner = match resolve_owner(&input, &caller_owner(&self.clients, &self.default_owner)) {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
@@ -2643,14 +2695,14 @@ impl Tool for GithubCompareTool {
 // ── github.search_code ───────────────────────────────────────────
 
 pub struct GithubSearchCodeTool {
-    clients: Arc<HashMap<String, Arc<GithubClient>>>,
+    clients: Arc<LiveInstances<GithubClient>>,
     default_workspace: String,
     default_owner: Option<String>,
 }
 
 impl GithubSearchCodeTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<GithubClient>>>,
+        clients: Arc<LiveInstances<GithubClient>>,
         default_workspace: String,
         default_owner: Option<String>,
     ) -> Self {
@@ -2813,14 +2865,14 @@ fn build_commit_search_query(
 }
 
 pub struct GithubSearchCommitsTool {
-    clients: Arc<HashMap<String, Arc<GithubClient>>>,
+    clients: Arc<LiveInstances<GithubClient>>,
     default_workspace: String,
     default_owner: Option<String>,
 }
 
 impl GithubSearchCommitsTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<GithubClient>>>,
+        clients: Arc<LiveInstances<GithubClient>>,
         default_workspace: String,
         default_owner: Option<String>,
     ) -> Self {
@@ -2947,14 +2999,14 @@ impl Tool for GithubSearchCommitsTool {
 // ── github.branch_list ───────────────────────────────────────────
 
 pub struct GithubBranchListTool {
-    clients: Arc<HashMap<String, Arc<GithubClient>>>,
+    clients: Arc<LiveInstances<GithubClient>>,
     default_workspace: String,
     default_owner: Option<String>,
 }
 
 impl GithubBranchListTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<GithubClient>>>,
+        clients: Arc<LiveInstances<GithubClient>>,
         default_workspace: String,
         default_owner: Option<String>,
     ) -> Self {
@@ -2991,7 +3043,7 @@ impl Tool for GithubBranchListTool {
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
-        let owner = match resolve_owner(&input, &self.default_owner) {
+        let owner = match resolve_owner(&input, &caller_owner(&self.clients, &self.default_owner)) {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
@@ -3063,14 +3115,14 @@ impl Tool for GithubBranchListTool {
 // ── github.branch_create ─────────────────────────────────────────
 
 pub struct GithubBranchCreateTool {
-    clients: Arc<HashMap<String, Arc<GithubClient>>>,
+    clients: Arc<LiveInstances<GithubClient>>,
     default_workspace: String,
     default_owner: Option<String>,
 }
 
 impl GithubBranchCreateTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<GithubClient>>>,
+        clients: Arc<LiveInstances<GithubClient>>,
         default_workspace: String,
         default_owner: Option<String>,
     ) -> Self {
@@ -3107,7 +3159,7 @@ impl Tool for GithubBranchCreateTool {
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
-        let owner = match resolve_owner(&input, &self.default_owner) {
+        let owner = match resolve_owner(&input, &caller_owner(&self.clients, &self.default_owner)) {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
@@ -3202,14 +3254,14 @@ impl Tool for GithubBranchCreateTool {
 // ── github.branch_delete ─────────────────────────────────────────
 
 pub struct GithubBranchDeleteTool {
-    clients: Arc<HashMap<String, Arc<GithubClient>>>,
+    clients: Arc<LiveInstances<GithubClient>>,
     default_workspace: String,
     default_owner: Option<String>,
 }
 
 impl GithubBranchDeleteTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<GithubClient>>>,
+        clients: Arc<LiveInstances<GithubClient>>,
         default_workspace: String,
         default_owner: Option<String>,
     ) -> Self {
@@ -3245,7 +3297,7 @@ impl Tool for GithubBranchDeleteTool {
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
-        let owner = match resolve_owner(&input, &self.default_owner) {
+        let owner = match resolve_owner(&input, &caller_owner(&self.clients, &self.default_owner)) {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
@@ -3302,14 +3354,14 @@ impl Tool for GithubBranchDeleteTool {
 // ── github.branch_protection ─────────────────────────────────────
 
 pub struct GithubBranchProtectionTool {
-    clients: Arc<HashMap<String, Arc<GithubClient>>>,
+    clients: Arc<LiveInstances<GithubClient>>,
     default_workspace: String,
     default_owner: Option<String>,
 }
 
 impl GithubBranchProtectionTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<GithubClient>>>,
+        clients: Arc<LiveInstances<GithubClient>>,
         default_workspace: String,
         default_owner: Option<String>,
     ) -> Self {
@@ -3345,7 +3397,7 @@ impl Tool for GithubBranchProtectionTool {
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
-        let owner = match resolve_owner(&input, &self.default_owner) {
+        let owner = match resolve_owner(&input, &caller_owner(&self.clients, &self.default_owner)) {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
@@ -3408,14 +3460,14 @@ impl Tool for GithubBranchProtectionTool {
 // ── github.ci_status ─────────────────────────────────────────────
 
 pub struct GithubCiStatusTool {
-    clients: Arc<HashMap<String, Arc<GithubClient>>>,
+    clients: Arc<LiveInstances<GithubClient>>,
     default_workspace: String,
     default_owner: Option<String>,
 }
 
 impl GithubCiStatusTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<GithubClient>>>,
+        clients: Arc<LiveInstances<GithubClient>>,
         default_workspace: String,
         default_owner: Option<String>,
     ) -> Self {
@@ -3451,7 +3503,7 @@ impl Tool for GithubCiStatusTool {
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
-        let owner = match resolve_owner(&input, &self.default_owner) {
+        let owner = match resolve_owner(&input, &caller_owner(&self.clients, &self.default_owner)) {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
@@ -3531,14 +3583,14 @@ impl Tool for GithubCiStatusTool {
 // ── github.workflow_runs ─────────────────────────────────────────
 
 pub struct GithubWorkflowRunsTool {
-    clients: Arc<HashMap<String, Arc<GithubClient>>>,
+    clients: Arc<LiveInstances<GithubClient>>,
     default_workspace: String,
     default_owner: Option<String>,
 }
 
 impl GithubWorkflowRunsTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<GithubClient>>>,
+        clients: Arc<LiveInstances<GithubClient>>,
         default_workspace: String,
         default_owner: Option<String>,
     ) -> Self {
@@ -3576,7 +3628,7 @@ impl Tool for GithubWorkflowRunsTool {
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
-        let owner = match resolve_owner(&input, &self.default_owner) {
+        let owner = match resolve_owner(&input, &caller_owner(&self.clients, &self.default_owner)) {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
@@ -3660,14 +3712,14 @@ impl Tool for GithubWorkflowRunsTool {
 // ── github.workflow_run_logs ─────────────────────────────────────
 
 pub struct GithubWorkflowRunLogsTool {
-    clients: Arc<HashMap<String, Arc<GithubClient>>>,
+    clients: Arc<LiveInstances<GithubClient>>,
     default_workspace: String,
     default_owner: Option<String>,
 }
 
 impl GithubWorkflowRunLogsTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<GithubClient>>>,
+        clients: Arc<LiveInstances<GithubClient>>,
         default_workspace: String,
         default_owner: Option<String>,
     ) -> Self {
@@ -3686,7 +3738,7 @@ impl Tool for GithubWorkflowRunLogsTool {
     }
 
     fn description(&self) -> &str {
-        "Get details and jobs for a specific workflow run"
+        "Get a workflow run's status and conclusion, and its jobs with their steps"
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -3703,7 +3755,7 @@ impl Tool for GithubWorkflowRunLogsTool {
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
-        let owner = match resolve_owner(&input, &self.default_owner) {
+        let owner = match resolve_owner(&input, &caller_owner(&self.clients, &self.default_owner)) {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
@@ -3735,11 +3787,32 @@ impl Tool for GithubWorkflowRunLogsTool {
             }
         };
 
+        // The run itself: whether it is done, and how it ended.
+        let run = client
+            .get(&format!("/repos/{owner}/{repo}/actions/runs/{run_id}"))
+            .await
+            .map(|r| {
+                serde_json::json!({
+                    "id": r["id"],
+                    "name": r["name"],
+                    "event": r["event"],
+                    "head_branch": r["head_branch"],
+                    "head_sha": r["head_sha"],
+                    "status": r["status"],
+                    "conclusion": r["conclusion"],
+                    "run_attempt": r["run_attempt"],
+                    "html_url": r["html_url"],
+                    "created_at": r["created_at"],
+                    "updated_at": r["updated_at"],
+                })
+            })
+            .unwrap_or(serde_json::Value::Null);
+
         // Get jobs for the run (more useful than raw zip logs)
         let path = format!("/repos/{owner}/{repo}/actions/runs/{run_id}/jobs");
         let duration_ms = start.elapsed().as_millis() as u64;
 
-        match client.get(&path).await {
+        match client.get_with_query(&path, &[("per_page", "100")]).await {
             Ok(result) => {
                 let jobs: Vec<serde_json::Value> = result["jobs"]
                     .as_array()
@@ -3773,9 +3846,21 @@ impl Tool for GithubWorkflowRunLogsTool {
                     })
                     .collect();
 
+                let failed_jobs: Vec<&serde_json::Value> = jobs
+                    .iter()
+                    .filter(|j| {
+                        matches!(
+                            j["conclusion"].as_str(),
+                            Some("failure") | Some("timed_out")
+                        )
+                    })
+                    .map(|j| &j["name"])
+                    .collect();
                 Ok(ToolResult::success(
                     serde_json::json!({
+                        "run": run,
                         "total_count": result["total_count"],
+                        "failed_jobs": failed_jobs,
                         "jobs": jobs,
                     }),
                     duration_ms,
@@ -3792,14 +3877,14 @@ impl Tool for GithubWorkflowRunLogsTool {
 // ── github.workflow_rerun ────────────────────────────────────────
 
 pub struct GithubWorkflowRerunTool {
-    clients: Arc<HashMap<String, Arc<GithubClient>>>,
+    clients: Arc<LiveInstances<GithubClient>>,
     default_workspace: String,
     default_owner: Option<String>,
 }
 
 impl GithubWorkflowRerunTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<GithubClient>>>,
+        clients: Arc<LiveInstances<GithubClient>>,
         default_workspace: String,
         default_owner: Option<String>,
     ) -> Self {
@@ -3836,7 +3921,7 @@ impl Tool for GithubWorkflowRerunTool {
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
-        let owner = match resolve_owner(&input, &self.default_owner) {
+        let owner = match resolve_owner(&input, &caller_owner(&self.clients, &self.default_owner)) {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
@@ -3899,14 +3984,14 @@ impl Tool for GithubWorkflowRerunTool {
 // ── github.pr_update ─────────────────────────────────────────────
 
 pub struct GithubPrUpdateTool {
-    clients: Arc<HashMap<String, Arc<GithubClient>>>,
+    clients: Arc<LiveInstances<GithubClient>>,
     default_workspace: String,
     default_owner: Option<String>,
 }
 
 impl GithubPrUpdateTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<GithubClient>>>,
+        clients: Arc<LiveInstances<GithubClient>>,
         default_workspace: String,
         default_owner: Option<String>,
     ) -> Self {
@@ -3988,7 +4073,7 @@ impl Tool for GithubPrUpdateTool {
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
 
-        let owner = match resolve_owner(&input, &self.default_owner) {
+        let owner = match resolve_owner(&input, &caller_owner(&self.clients, &self.default_owner)) {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
@@ -4173,14 +4258,14 @@ impl Tool for GithubPrUpdateTool {
 // ── github.workflow_run_failed_logs ─────────────────────────────
 
 pub struct GithubWorkflowRunFailedLogsTool {
-    clients: Arc<HashMap<String, Arc<GithubClient>>>,
+    clients: Arc<LiveInstances<GithubClient>>,
     default_workspace: String,
     default_owner: Option<String>,
 }
 
 impl GithubWorkflowRunFailedLogsTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<GithubClient>>>,
+        clients: Arc<LiveInstances<GithubClient>>,
         default_workspace: String,
         default_owner: Option<String>,
     ) -> Self {
@@ -4230,7 +4315,7 @@ impl Tool for GithubWorkflowRunFailedLogsTool {
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
 
-        let owner = match resolve_owner(&input, &self.default_owner) {
+        let owner = match resolve_owner(&input, &caller_owner(&self.clients, &self.default_owner)) {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
@@ -4363,7 +4448,7 @@ impl Tool for GithubWorkflowRunFailedLogsTool {
 // ── github.api ──────────────────────────────────────────────────
 
 pub struct GithubApiTool {
-    clients: Arc<HashMap<String, Arc<GithubClient>>>,
+    clients: Arc<LiveInstances<GithubClient>>,
     default_workspace: String,
     #[allow(dead_code)]
     default_owner: Option<String>,
@@ -4371,7 +4456,7 @@ pub struct GithubApiTool {
 
 impl GithubApiTool {
     pub fn new(
-        clients: Arc<HashMap<String, Arc<GithubClient>>>,
+        clients: Arc<LiveInstances<GithubClient>>,
         default_workspace: String,
         default_owner: Option<String>,
     ) -> Self {
@@ -4609,14 +4694,15 @@ fn evaluate_check_runs(check_runs: &[serde_json::Value]) -> CiGateResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     // ── Tool metadata tests (no HTTP needed) ────────────────────────
 
-    fn mock_clients() -> Arc<HashMap<String, Arc<GithubClient>>> {
+    fn mock_clients() -> Arc<LiveInstances<GithubClient>> {
         let client = Arc::new(GithubClient::new("ghp_test", "https://api.github.com").unwrap());
         let mut map = HashMap::new();
         map.insert("default".to_string(), client);
-        Arc::new(map)
+        Arc::new(LiveInstances::from(map))
     }
 
     fn default_ws() -> String {
@@ -4641,22 +4727,31 @@ mod tests {
             ACTIVE_SKILL_INSTANCES.sync_scope(pins, || {
                 let acme = clients.get("acme").unwrap();
                 // No owner → the pin (acme), overriding the "other" default.
-                let c = resolve_client(&clients, "other", &serde_json::json!({})).unwrap();
+                let c = resolve_client(
+                    &LiveInstances::from((clients).clone()),
+                    "other",
+                    &serde_json::json!({}),
+                )
+                .unwrap();
                 assert!(Arc::ptr_eq(&c, acme));
                 // An owner naming the pinned workspace resolves.
-                let c = resolve_client(&clients, "other", &serde_json::json!({ "owner": "acme" }))
-                    .unwrap();
+                let c = resolve_client(
+                    &LiveInstances::from((clients).clone()),
+                    "other",
+                    &serde_json::json!({ "owner": "acme" }),
+                )
+                .unwrap();
                 assert!(Arc::ptr_eq(&c, acme));
                 // An owner naming a DIFFERENT configured workspace is refused.
                 assert!(resolve_client(
-                    &clients,
+                    &LiveInstances::from((clients).clone()),
                     "other",
                     &serde_json::json!({ "owner": "other" })
                 )
                 .is_err());
                 // An explicit mismatching workspace is refused.
                 assert!(resolve_client(
-                    &clients,
+                    &LiveInstances::from((clients).clone()),
                     "other",
                     &serde_json::json!({ "workspace": "other" })
                 )
@@ -5391,8 +5486,11 @@ mod tests {
         use wiremock::matchers::{body_json, header_regex, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        fn clients_for(client: GithubClient) -> Arc<HashMap<String, Arc<GithubClient>>> {
-            Arc::new(HashMap::from([("default".to_string(), Arc::new(client))]))
+        fn clients_for(client: GithubClient) -> Arc<LiveInstances<GithubClient>> {
+            Arc::new(LiveInstances::from(HashMap::from([(
+                "default".to_string(),
+                Arc::new(client),
+            )])))
         }
 
         #[test]

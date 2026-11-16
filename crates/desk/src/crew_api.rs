@@ -409,7 +409,142 @@ fn preference_json(p: &Preference) -> serde_json::Value {
         "lastAppliedAt": p.last_applied_at,
         "overruledCount": p.overruled_count,
         "state": p.state.as_str(),
+        "directive": p.directive,
+        "directiveAnswer": p.directive_answer,
     })
+}
+
+// ── Act fully's directives ──────────────────────────────────────────────
+
+/// The boss scope a request names (`main` when none), if it is a boss
+/// scope here: the main boss, or a group.
+fn directive_scope(s: &CrewApi, boss: Option<&str>) -> Option<String> {
+    let b = boss
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .unwrap_or(crate::preference::MAIN);
+    (b == crate::preference::MAIN || s.desk.is_group(b)).then(|| b.to_string())
+}
+
+const NO_GROUP: &str = "That group isn’t there any more.";
+
+async fn directive_view(s: &CrewApi, scope: &str) -> Response {
+    match s.desk.store().directive_view(YOU, scope).await {
+        Ok((v, _)) => Json(v).into_response(),
+        Err(e) => failed(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct DirectivesQuery {
+    token: Option<String>,
+    boss: Option<String>,
+}
+
+/// How a boss's directives stand: each question with its answer (or the
+/// main boss's, for a group's), the person's own, and the asking.
+async fn directives(State(s): S, h: HeaderMap, Query(q): Query<DirectivesQuery>) -> Response {
+    if let Err(r) = guard(&s, &h, q.token.as_deref()).await {
+        return r;
+    }
+    match directive_scope(&s, q.boss.as_deref()) {
+        Some(scope) => directive_view(&s, &scope).await,
+        None => error(StatusCode::NOT_FOUND, NO_GROUP),
+    }
+}
+
+#[derive(Deserialize)]
+struct DirectiveAnswerBody {
+    boss: Option<String>,
+    key: String,
+    /// An answer's key or label; none clears it.
+    #[serde(default)]
+    answer: Option<String>,
+}
+
+/// The person answers one directive (or clears their answer): the
+/// directives as they now stand.
+async fn directive_answer(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Json(b): Json<DirectiveAnswerBody>,
+) -> Response {
+    if let Err(r) = guard(&s, &h, q.token.as_deref()).await {
+        return r;
+    }
+    let Some(scope) = directive_scope(&s, b.boss.as_deref()) else {
+        return error(StatusCode::NOT_FOUND, NO_GROUP);
+    };
+    match s
+        .desk
+        .store()
+        .directive_answer(YOU, &scope, &b.key, b.answer.as_deref())
+        .await
+    {
+        Ok(Ok(_)) => directive_view(&s, &scope).await,
+        Ok(Err(why)) => error(StatusCode::BAD_REQUEST, why),
+        Err(e) => failed(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct DirectiveOwnBody {
+    boss: Option<String>,
+    text: String,
+}
+
+/// The person adds a directive in their own words.
+async fn directive_own(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Json(b): Json<DirectiveOwnBody>,
+) -> Response {
+    if let Err(r) = guard(&s, &h, q.token.as_deref()).await {
+        return r;
+    }
+    let Some(scope) = directive_scope(&s, b.boss.as_deref()) else {
+        return error(StatusCode::NOT_FOUND, NO_GROUP);
+    };
+    match s.desk.store().directive_own(YOU, &scope, &b.text).await {
+        Ok(Ok(_)) => directive_view(&s, &scope).await,
+        Ok(Err(why)) => error(StatusCode::BAD_REQUEST, why),
+        Err(e) => failed(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct DirectiveAskingBody {
+    boss: Option<String>,
+    #[serde(default)]
+    skipped: Option<bool>,
+    #[serde(default)]
+    stop: Option<bool>,
+}
+
+/// "Skip for now" and "Stop asking", or undone.
+async fn directive_asking(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Json(b): Json<DirectiveAskingBody>,
+) -> Response {
+    if let Err(r) = guard(&s, &h, q.token.as_deref()).await {
+        return r;
+    }
+    let Some(scope) = directive_scope(&s, b.boss.as_deref()) else {
+        return error(StatusCode::NOT_FOUND, NO_GROUP);
+    };
+    match s
+        .desk
+        .store()
+        .directive_asking_change(YOU, &scope, b.skipped, b.stop)
+        .await
+    {
+        Ok(()) => directive_view(&s, &scope).await,
+        Err(e) => failed(e),
+    }
 }
 
 #[derive(Deserialize)]
@@ -536,6 +671,12 @@ async fn preference_patch(
         Ok(p) => p,
         Err(r) => return r,
     };
+    if p.directive.is_some() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "That one is a directive: change it under Directives.",
+        );
+    }
     let words = |t: Option<String>| t.map(|t| t.trim().to_string());
     let (when, then) = (words(body.when_text), words(body.then_text));
     if when.as_deref() == Some("") || then.as_deref() == Some("") {
@@ -718,6 +859,10 @@ pub(crate) fn crew_router(desk: Desk, auth: Arc<dyn Authorize>, crew: Arc<dyn Cr
         )
         .route("/api/desk/preferences/{id}", patch(preference_patch))
         .route("/api/desk/preferences/{id}/{to}", post(preference_state))
+        .route("/api/desk/directives", get(directives))
+        .route("/api/desk/directives/answer", post(directive_answer))
+        .route("/api/desk/directives/own", post(directive_own))
+        .route("/api/desk/directives/asking", post(directive_asking))
         .route("/api/desk/unread", get(unread))
         .route("/api/desk/reads", get(read_points).put(put_reads))
         .route("/api/desk/reads/all", post(all_read))
@@ -1539,6 +1684,65 @@ mod tests {
             assert_eq!((status, all), (StatusCode::OK, json!({ "reads": [] })));
             let (status, _) = send(&app, "POST", "/api/desk/reads/all", json!({ "scope": "everything" })).await;
             assert_eq!(status, StatusCode::OK);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn the_directive_routes_answer_add_and_stop_asking() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let d = desk(pool, dir.path()).await;
+            let app = crew_router(d.clone(), Arc::new(Bearer), Arc::new(Hub::default()));
+            let (status, v) = call(&app, "GET", "/api/desk/directives").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(v["bossScope"], "main");
+            assert_eq!(v["questions"][0]["key"], "merge");
+            assert!(v["questions"][0]["answer"].is_null());
+            let (status, v) = send_json(
+                &app,
+                "POST",
+                "/api/desk/directives/answer",
+                &json!({ "key": "merge", "answer": "checks" }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(v["questions"][0]["answer"], "checks");
+            let (status, _) = send_json(
+                &app,
+                "POST",
+                "/api/desk/directives/answer",
+                &json!({ "key": "merge", "answer": "maybe" }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let (status, v) = send_json(
+                &app,
+                "POST",
+                "/api/desk/directives/own",
+                &json!({ "text": "Never touch billing" }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(v["own"][0]["text"], "Never touch billing");
+            let (_, v) = send_json(
+                &app,
+                "POST",
+                "/api/desk/directives/asking",
+                &json!({ "stop": true }),
+            )
+            .await;
+            assert_eq!(v["stopAsking"], true);
+            // A group that isn't there.
+            let (status, _) = call(&app, "GET", "/api/desk/directives?boss=nope").await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            // The preferences list says which are directives.
+            let (_, list) = call(&app, "GET", "/api/desk/preferences").await;
+            assert!(list
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["directive"] == "merge" && p["directiveAnswer"] == "checks"));
         })
         .await;
     }

@@ -529,6 +529,13 @@ impl PairingStore for SqlitePairingStore {
              WHERE status = 'pending' AND expires_at < ?1",
             params![cutoff_str],
         )?;
+        // A token nobody collected in time goes too.
+        let collect_by = (cutoff - chrono::Duration::seconds(PENDING_TOKEN_TTL_SECS)).to_rfc3339();
+        conn.execute(
+            "UPDATE device_pairing_requests SET pending_token = NULL
+             WHERE pending_token IS NOT NULL AND (approved_at IS NULL OR approved_at < ?1)",
+            params![collect_by],
+        )?;
         Ok(changed + d + n)
     }
 

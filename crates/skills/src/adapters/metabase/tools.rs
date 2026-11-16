@@ -5,7 +5,6 @@
 //! result rows are wrapped via `wrap_external_content` to defend against
 //! prompt injection.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -24,16 +23,20 @@ use workforce_agent::tools::{Tool, ToolResult};
 use super::client::{field_names, qualified_table_name, MetabaseClient};
 use super::config::clamp_limit;
 use super::schema_prompt::DATABASE_ID_STATIC_DESCRIPTION;
-use crate::adapters::utils::{coerce_to_i64, coerce_to_u64, instance_choices};
+use crate::adapters::utils::{
+    coerce_to_i64, coerce_to_u64, instance_choices, LiveInstances, LIVE_INSTANCE_DESCRIPTION,
+};
 use workforce_common::metabase_schema::names_same_table;
 
 // ── shared helpers ──────────────────────────────────────────────────
 
 fn resolve_client(
-    clients: &HashMap<String, Arc<MetabaseClient>>,
+    instances: &LiveInstances<MetabaseClient>,
     default_instance: &str,
     input: &Value,
 ) -> eyre::Result<Arc<MetabaseClient>> {
+    let (clients, default_instance) = instances.for_caller_or(default_instance);
+    let (clients, default_instance) = (&*clients, default_instance.as_str());
     let name = workforce_agent::llm::environment::resolve_instance(
         "metabase",
         input["instance"].as_str(),
@@ -42,17 +45,21 @@ fn resolve_client(
     )
     .map_err(|d| eyre::eyre!("{}", d.message))?;
     clients.get(&name).cloned().ok_or_else(|| {
-        eyre::eyre!(
-            "Unknown Metabase instance: '{name}'. Available: {:?}",
-            clients.keys().collect::<Vec<_>>()
-        )
+        crate::adapters::utils::unknown_instance("Metabase instance", name.as_ref(), clients)
     })
 }
 
 fn instance_description(
-    clients: &HashMap<String, Arc<MetabaseClient>>,
+    instances: &LiveInstances<MetabaseClient>,
     default_instance: &str,
 ) -> String {
+    // A set read per caller names no instance: a schema is built once
+    // and shown to everyone.
+    if instances.is_live() {
+        return LIVE_INSTANCE_DESCRIPTION.into();
+    }
+    let (clients, default_instance) = instances.for_caller_or(default_instance);
+    let (clients, default_instance) = (&*clients, default_instance.as_str());
     if clients.len() <= 1 {
         return "Metabase instance name (for multi-instance setups)".to_string();
     }
@@ -74,10 +81,7 @@ fn wrap_description(mut value: Value, source: &str) -> Value {
     value
 }
 
-fn instance_schema_prop(
-    clients: &HashMap<String, Arc<MetabaseClient>>,
-    default_instance: &str,
-) -> Value {
+fn instance_schema_prop(clients: &LiveInstances<MetabaseClient>, default_instance: &str) -> Value {
     json!({
         "type": "string",
         "description": instance_description(clients, default_instance)
@@ -208,7 +212,7 @@ fn merge_fields(body: &mut Value, input: &Value, keys: &[&str]) {
 
 #[derive(Clone)]
 struct Ctx {
-    clients: Arc<HashMap<String, Arc<MetabaseClient>>>,
+    clients: Arc<LiveInstances<MetabaseClient>>,
     default_instance: String,
 }
 
@@ -228,7 +232,7 @@ macro_rules! metabase_tool {
         }
         impl $struct {
             pub fn new(
-                clients: Arc<HashMap<String, Arc<MetabaseClient>>>,
+                clients: Arc<LiveInstances<MetabaseClient>>,
                 default_instance: String,
             ) -> Self {
                 Self {
@@ -2185,10 +2189,12 @@ impl Tool for DatasetQueryNativeTool {
         "MUTATING (read-execute): run a raw SQL query against a Metabase database. Row-capped; respects database permissions of the API key. SQL dialect MUST match the target database's engine (check `engine` via metabase.database_list); e.g. ILIKE exists only on Postgres-family engines — on MySQL use LOWER(col) LIKE. The `database_id` description carries the real table and column names that have been learned so far — write your SQL from those, and do not invent a name that is not there. If a query still fails on an unknown column or table, the error lists the REAL names — fix the query from that list and resend; do not guess a second time."
     }
     fn input_schema(&self) -> Value {
-        let description = self
-            .ctx
-            .clients
-            .get(&self.ctx.default_instance)
+        // The caller's default instance (shared ones only, with no one in
+        // scope): another person's learned tables are never in it.
+        let (clients, default_instance) =
+            self.ctx.clients.for_caller_or(&self.ctx.default_instance);
+        let description = clients
+            .get(&default_instance)
             .and_then(|c| c.published_description())
             .map_or_else(
                 || DATABASE_ID_STATIC_DESCRIPTION.to_string(),
@@ -2357,9 +2363,10 @@ fn id_as_path_segment(v: &Value) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
-    fn empty_clients() -> Arc<HashMap<String, Arc<MetabaseClient>>> {
-        Arc::new(HashMap::new())
+    fn empty_clients() -> Arc<LiveInstances<MetabaseClient>> {
+        Arc::new(LiveInstances::from(HashMap::new()))
     }
 
     #[test]
@@ -2380,20 +2387,30 @@ mod tests {
             "staging".to_string(),
             Arc::new(MetabaseClient::new("mb_y", "https://mb.staging", 2000).unwrap()),
         );
-        let s = instance_description(&map, "prod");
+        let s = instance_description(&LiveInstances::from((map).clone()), "prod");
         assert!(s.contains("prod"));
         assert!(s.contains("staging"));
         assert!(s.contains("Default: prod"));
-        assert!(instance_description(&map, "gone").contains("Default: none — pass instance"));
+        assert!(
+            instance_description(&LiveInstances::from((map).clone()), "gone")
+                .contains("Default: none — pass instance")
+        );
     }
 
     #[test]
     fn resolve_client_explicit_unknown() {
         let clients = HashMap::new();
-        let err = resolve_client(&clients, "default", &json!({ "instance": "ghost" }))
-            .err()
-            .expect("expected error");
-        assert!(err.to_string().contains("Unknown Metabase instance"));
+        let err = resolve_client(
+            &LiveInstances::from((clients).clone()),
+            "default",
+            &json!({ "instance": "ghost" }),
+        )
+        .err()
+        .expect("expected error");
+        assert!(
+            err.to_string().contains("Metabase instance not configured"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2413,12 +2430,21 @@ mod tests {
         ACTIVE_ENVIRONMENT.sync_scope("harbor-prod".to_string(), || {
             ACTIVE_SKILL_INSTANCES.sync_scope(pins, || {
                 // No instance requested → pinned to prod even though default is staging.
-                let c = resolve_client(&clients, "staging", &json!({})).unwrap();
+                let c = resolve_client(
+                    &LiveInstances::from((clients).clone()),
+                    "staging",
+                    &json!({}),
+                )
+                .unwrap();
                 assert!(Arc::ptr_eq(&c, clients.get("prod").unwrap()));
                 // A sideways switch to staging is refused as dormant.
-                let err = resolve_client(&clients, "staging", &json!({ "instance": "staging" }))
-                    .err()
-                    .expect("expected dormant refusal");
+                let err = resolve_client(
+                    &LiveInstances::from((clients).clone()),
+                    "staging",
+                    &json!({ "instance": "staging" }),
+                )
+                .err()
+                .expect("expected dormant refusal");
                 assert!(err.to_string().contains("dormant"));
             });
         });
@@ -3635,7 +3661,10 @@ mod tests {
             "default".to_string(),
             Arc::clone(&client),
         )]));
-        let tool = DatasetQueryNativeTool::new(clients, "default".to_string());
+        let tool = DatasetQueryNativeTool::new(
+            Arc::new(LiveInstances::from((*clients).clone())),
+            "default".to_string(),
+        );
         let description = |tool: &DatasetQueryNativeTool| {
             tool.input_schema()["properties"]["database_id"]["description"]
                 .as_str()

@@ -89,6 +89,7 @@ fn codex_session(dir: &Path, approve_for_me: bool) -> NewSession {
         approvals: None,
         approve_for_me,
         fast: false,
+        model: None,
         account: None,
         env: Default::default(),
         group: None,
@@ -329,6 +330,7 @@ async fn fast_mode_starts_codex_on_the_priority_tier_and_stays_on() {
         let claude = NewSession {
             engine: Engine::Claude,
             fast: true,
+            model: None,
             ..codex_session(dir.path(), false)
         };
         assert!(
@@ -338,6 +340,7 @@ async fn fast_mode_starts_codex_on_the_priority_tier_and_stays_on() {
         let server = serve(dir.path());
         let fast = NewSession {
             fast: true,
+            model: None,
             ..codex_session(dir.path(), false)
         };
         let s = d.create(fast, None).await.unwrap();
@@ -441,7 +444,13 @@ async fn a_codex_question_shows_its_words_until_the_terminal_answers_it() {
                 ..Default::default()
             },
         )]));
-        d.set_dialog_answerers(std::collections::HashMap::from([(s.id, chrono::Duration::zero())]));
+        d.set_dialog_answerers(std::collections::HashMap::from([(
+            s.id,
+            super::DialogAnswerer {
+                boss: "crew".into(),
+                gap: chrono::Duration::zero(),
+            },
+        )]));
         say(&mut ws, json!({"id": 6, "method": "item/tool/requestUserInput", "params": {
             "threadId": "t1", "turnId": "u2", "itemId": "q-3", "isBlocking": true,
             "questions": [

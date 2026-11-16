@@ -35,6 +35,9 @@ pub struct ClaudeSpawn<'a> {
     pub theme: Option<&'a str>,
     /// The permission mode to start in ([`crate::mode`]); none, its own.
     pub mode: Option<crate::mode::Mode>,
+    /// The model it runs (`--model`); none, Claude Code's own default. Only
+    /// a name [`crate::plan::model_ok`] passes reaches its command line.
+    pub model: Option<&'a str>,
     /// A boss served from a grant runs it: its pre-tool hook fails closed
     /// ([`hook_settings_for`]).
     pub fail_closed: bool,
@@ -100,6 +103,40 @@ fn http_hook(url: &str, timeout_secs: u64) -> Value {
     json!({ "type": "http", "url": url, "timeout": timeout_secs })
 }
 
+/// How long a permission request's hook keeps trying to reach a hub that
+/// is restarting (an install, a crash) before Claude Code's own dialog
+/// asks it instead.
+pub const REACH_FOR_SECS: u64 = 60;
+
+/// A permission request's hook: posted to Desk, and posted again while Desk
+/// can't be reached (refused, reset, an empty reply) or answers with a
+/// server error, every 3 s for up to [`REACH_FOR_SECS`], so a hub restart
+/// never leaves the request to Claude Code's own dialog, where no answer
+/// from Desk reaches it. Any other answer stands as it is (a 404: no such
+/// session, Claude Code's dialog asks). A request Desk had held a while
+/// when it went is reached for afresh. Never posted again once answered.
+/// (The URL's token is in Claude Code's own `--settings` argument already.)
+pub fn reaching_hook(url: &str, timeout_secs: u64) -> Value {
+    debug_assert!(
+        !url.contains('\''),
+        "a hook URL is single-quoted in its command"
+    );
+    let tries = REACH_FOR_SECS / 3;
+    json!({
+        "type": "command",
+        "command": format!(
+            "b=$(cat); n=0; while :; do t0=$(date +%s); \
+             o=$(printf '%s' \"$b\" | curl -s --max-time {timeout_secs} -w '\\n%{{http_code}}' -X POST -H 'Content-Type: application/json' --data-binary @- '{url}'); r=$?; \
+             c=$(printf '%s' \"$o\" | tail -n 1); o=$(printf '%s' \"$o\" | sed '$d'); \
+             if [ $r -eq 0 ]; then case $c in 2??) printf '%s' \"$o\"; exit 0;; 5??) ;; *) exit 0;; esac; \
+             else case $r in 7|52|55|56) ;; *) exit 0;; esac; fi; \
+             [ $(( $(date +%s) - t0 )) -lt 10 ] || n=0; \
+             n=$((n+1)); [ $n -le {tries} ] || exit 0; sleep 3; done"
+        ),
+        "timeout": timeout_secs + REACH_FOR_SECS + 10,
+    })
+}
+
 #[cfg(test)]
 pub fn hook_settings(hook_url: &str, approval_timeout_secs: u64) -> Value {
     hook_settings_for(hook_url, approval_timeout_secs, false)
@@ -137,6 +174,7 @@ pub fn hook_settings_for(hook_url: &str, approval_timeout_secs: u64, fail_closed
                 ),
                 "timeout": timeout + 5,
             }),
+            (_, "PermissionRequest") => reaching_hook(hook_url, timeout),
             _ => http_hook(hook_url, timeout),
         };
         // A question's start has its own entry, waiting long enough for its
@@ -193,6 +231,12 @@ pub fn spawn(s: &ClaudeSpawn<'_>) -> Spawn {
         settings.to_string(),
     ]);
     args.extend(s.mode.into_iter().flat_map(crate::mode::Mode::claude_args));
+    // Its own argument, never an option: a name that could read as one
+    // (`-…`, a space, a quote) is never passed. Desk refuses such a name
+    // before it gets here ([`crate::engine::model_ok`]).
+    if let Some(m) = s.model.filter(|m| crate::plan::model_ok(m)) {
+        args.extend(["--model".to_string(), m.to_string()]);
+    }
     // A session a boss served from a grant runs reads the person's own
     // settings and Desk's alone: none its repository brings (a pull or a
     // merge can add `.claude/settings.json`), which could switch hooks off
@@ -709,7 +753,7 @@ pub(crate) mod tests {
     use super::*;
 
     #[test]
-    fn session_start_is_a_command_hook_and_the_rest_are_http() {
+    fn session_start_and_permission_requests_are_command_hooks_and_the_rest_are_http() {
         let s = hook_settings("http://127.0.0.1:9/hook/a/b", 3600);
         let start = &s["hooks"]["SessionStart"][0]["hooks"][0];
         assert_eq!(start["type"], "command");
@@ -718,11 +762,19 @@ pub(crate) mod tests {
             .unwrap()
             .contains("'http://127.0.0.1:9/hook/a/b'"));
         for e in TOOL_EVENTS.iter().chain(PLAIN_EVENTS.iter()) {
-            assert_eq!(s["hooks"][e][0]["hooks"][0]["type"], "http", "{e}");
+            let kind = match *e {
+                "PermissionRequest" => "command",
+                _ => "http",
+            };
+            assert_eq!(s["hooks"][e][0]["hooks"][0]["type"], kind, "{e}");
         }
-        assert_eq!(
-            s["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"],
-            3600
+        // A permission request keeps trying a hub that restarts.
+        let ask = &s["hooks"]["PermissionRequest"][0]["hooks"][0];
+        assert_eq!(ask["timeout"], 3600 + REACH_FOR_SECS + 10);
+        let command = ask["command"].as_str().unwrap();
+        assert!(
+            command.contains("--max-time 3600 ")
+                && command.contains("'http://127.0.0.1:9/hook/a/b'")
         );
         // Every call but a question's start by the catch-all; that one by
         // its own entry, waiting for its boss.
@@ -747,6 +799,123 @@ pub(crate) mod tests {
         );
     }
 
+    /// Serves `replies` (a status and a body each) at `listener`, one per
+    /// connection: how many requests it was posted.
+    fn serve(
+        listener: std::net::TcpListener,
+        replies: Vec<(u16, &'static str)>,
+    ) -> std::thread::JoinHandle<usize> {
+        use std::io::{Read, Write};
+        std::thread::spawn(move || {
+            let mut served = 0;
+            for (status, body) in replies {
+                let Ok((mut c, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 65536];
+                let mut got = Vec::new();
+                // Headers, then the body its length says.
+                loop {
+                    let n = c.read(&mut buf).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    got.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&got);
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len = text[..end]
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if got.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let _ = write!(
+                    c,
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                if !got.is_empty() {
+                    served += 1;
+                }
+            }
+            served
+        })
+    }
+
+    /// Runs the permission hook's command against `port`, the request on
+    /// its stdin: what it printed.
+    fn run_reaching(port: u16) -> std::process::Child {
+        use std::io::Write;
+        let hook = reaching_hook(&format!("http://127.0.0.1:{port}/hook/s/t"), 30);
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(hook["command"].as_str().unwrap())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(br#"{"hook_event_name":"PermissionRequest","tool_name":"Bash"}"#)
+            .unwrap();
+        child
+    }
+
+    /// A hub restarting while a session asks: the request is posted again
+    /// until it is back, and its answer reaches Claude Code; an error
+    /// status while it starts is tried again too, and once answered it is
+    /// never posted again.
+    #[test]
+    fn a_permission_request_reaches_a_hub_that_restarts() {
+        // Its port, free: nothing listens yet.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let child = run_reaching(port);
+        std::thread::sleep(std::time::Duration::from_secs(4));
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let allow = r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#;
+        let served = serve(
+            listener,
+            vec![(503, "starting"), (200, allow), (200, allow)],
+        );
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), allow);
+        // Nothing is posted after the answer: the third reply is never asked for.
+        let probe = std::net::TcpStream::connect(("127.0.0.1", port));
+        drop(probe);
+        assert_eq!(
+            served.join().unwrap(),
+            2,
+            "posted twice: refused while it started, then answered"
+        );
+    }
+
+    #[test]
+    fn a_permission_request_desk_says_no_session_to_is_not_posted_again() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served = serve(listener, vec![(404, ""), (200, "{}")]);
+        let out = run_reaching(port).wait_with_output().unwrap();
+        assert!(out.status.success());
+        assert!(out.stdout.is_empty(), "Claude Code's own dialog asks it");
+        let probe = std::net::TcpStream::connect(("127.0.0.1", port));
+        drop(probe);
+        assert_eq!(served.join().unwrap(), 1, "a 404 is an answer: posted once");
+    }
+
     #[test]
     fn spawn_args_choose_or_resume_the_conversation() {
         let env = BTreeMap::new();
@@ -761,6 +930,7 @@ pub(crate) mod tests {
             env: &env,
             theme: None,
             mode: None,
+            model: None,
             fail_closed: false,
         };
         let new = spawn(&base(Launch::New { session_id: "abc" }));
@@ -773,6 +943,56 @@ pub(crate) mod tests {
         assert_eq!(new.args.last().unwrap(), "continue");
         let resumed = spawn(&base(Launch::Resume { session_id: "abc" }));
         assert_eq!(&resumed.args[..2], ["--resume", "abc"]);
+    }
+
+    /// The session's model is `--model`'s own argument, before its prompt;
+    /// a name that could read as an option, or as more than one argument,
+    /// never reaches the command line.
+    #[test]
+    fn a_sessions_model_is_its_own_argument_and_never_an_option() {
+        let env = BTreeMap::new();
+        let args = |model| {
+            spawn(&ClaudeSpawn {
+                program: Path::new("/usr/local/bin/claude"),
+                cwd: Path::new("/repo"),
+                name: "n",
+                launch: Launch::New { session_id: "abc" },
+                prompt: Some("go"),
+                hook_url: "http://h",
+                approval_timeout_secs: 60,
+                env: &env,
+                theme: None,
+                mode: None,
+                model,
+                fail_closed: false,
+            })
+            .args
+        };
+        for m in [
+            "opus",
+            "claude-opus-5-5[1m]",
+            "us.anthropic.claude-sonnet-4-5:0",
+        ] {
+            let a = args(Some(m));
+            let at = a.iter().position(|x| x == "--model").unwrap();
+            assert_eq!(a[at + 1], m);
+            assert!(at < a.iter().position(|x| x == "--").unwrap(), "{a:?}");
+        }
+        assert!(!args(None).iter().any(|x| x == "--model"));
+        for bad in [
+            "--dangerously-skip-permissions",
+            "-p",
+            "opus --settings={}",
+            "opus\n",
+            "",
+        ] {
+            let a = args(Some(bad));
+            assert!(!a.iter().any(|x| x == "--model"), "{bad:?}: {a:?}");
+            assert!(
+                !a.iter().any(|x| x == bad && !bad.is_empty()),
+                "{bad:?}: {a:?}"
+            );
+        }
     }
 
     /// The pre-tool hook of a session a served boss runs: Desk's answer
@@ -795,6 +1015,7 @@ pub(crate) mod tests {
                 env: &env,
                 theme: None,
                 mode: None,
+                model: None,
                 fail_closed,
             })
             .args
@@ -865,7 +1086,7 @@ pub(crate) mod tests {
         // Every other hook is as for any session.
         let s = hook_settings_for("http://h", 60, true);
         for e in TOOL_EVENTS.iter().chain(PLAIN_EVENTS.iter()) {
-            let kind = if *e == "PreToolUse" {
+            let kind = if *e == "PreToolUse" || *e == "PermissionRequest" {
                 "command"
             } else {
                 "http"
@@ -897,6 +1118,7 @@ pub(crate) mod tests {
                 env: &env,
                 theme: None,
                 mode: None,
+                model: None,
                 fail_closed,
             });
             let at = s.args.iter().position(|a| a == "--settings").unwrap();
@@ -929,6 +1151,7 @@ pub(crate) mod tests {
                 env: &env,
                 theme,
                 mode: None,
+                model: None,
                 fail_closed: false,
             });
             let at = s.args.iter().position(|a| a == "--settings").unwrap();

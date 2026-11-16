@@ -10,6 +10,9 @@
 //! - **On the machine**, `POST /api/desk/crew/served` hands the call to
 //!   [`CrewHub::serve_crew`], which decides it under the machine's grant
 //!   for the group, as any served boss's call is.
+//! - **That grant** is what the Mac says at `GET /api/desk/machine-grants`
+//!   ([`super::machine_grants`]), which Desk's native side carries to each
+//!   machine.
 //!
 //! Every route here is the hub's own token's alone, from the
 //! `Authorization` header alone (`?token=` is refused), as grants are:
@@ -54,6 +57,10 @@ const MOST_TAKEN: usize = 16;
 const MOST_ANSWER: usize = 256 * 1024;
 /// How long a poll waits for a call when none is queued.
 const POLL_FOR: Duration = Duration::from_secs(25);
+/// The largest call queued, as JSON, its input and all: what Desk's native
+/// side carries of one (its `MOST_BODY`), so a poll's batch of
+/// [`MOST_TAKEN`] also fits what it reads of a poll (`MOST_POLL`).
+const MOST_CALL: usize = 256 * 1024;
 
 /// One call queued for a machine.
 #[derive(Debug, Clone, Serialize)]
@@ -73,6 +80,12 @@ pub struct RelayCall {
     /// no more than these and its grant's.
     pub level: workforce_common::oversight::Level,
     pub act: workforce_common::oversight::Act,
+    /// When this hub stops waiting for its answer: Desk's native side sends
+    /// nothing it can't carry by then, so a call the boss was told may
+    /// not have been done is never done later. Desk leaves it out of what
+    /// it sends the machine, whose `served` route refuses a field it
+    /// doesn't know.
+    pub deadline: chrono::DateTime<chrono::Utc>,
 }
 
 /// What a machine answered.
@@ -92,6 +105,11 @@ pub(crate) struct Relays {
     /// Calls Desk's native side took: they may have been done.
     taken: std::collections::HashSet<Uuid>,
 }
+
+/// What only Desk's own plan runner asks a machine through the relay, never
+/// a boss's tool: its sessions, and a new session started there. Desk's
+/// native side sends each to the machine's own sessions route.
+pub const DESK_CALLS: [&str; 2] = ["desk.sessions", "desk.session_start"];
 
 /// Whether `name` can name a machine: no `/`, `:` or space in it.
 pub fn machine_ok(name: &str) -> bool {
@@ -123,10 +141,27 @@ impl CrewHub {
         agent: &str,
         ceiling: &super::served::Ceiling,
     ) -> Result<RelayAnswer, String> {
+        self.relay_as(machine, group, tool, input, agent, ceiling)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// [`Self::relay`], saying whether what didn't come back may have
+    /// reached the machine.
+    pub(crate) async fn relay_as(
+        &self,
+        machine: &str,
+        group: &str,
+        tool: &str,
+        input: Value,
+        agent: &str,
+        ceiling: &super::served::Ceiling,
+    ) -> Result<RelayAnswer, workforce_desk::crew::MachineRefused> {
+        use workforce_desk::crew::MachineRefused;
         let unreached = || {
-            format!(
+            MachineRefused::Unreached(format!(
                 "{machine} can't be reached: Desk isn't open on this Mac, or {machine} isn't connected."
-            )
+            ))
         };
         // No one takes calls: nothing is queued to wait on.
         let polled = self
@@ -137,35 +172,40 @@ impl CrewHub {
             return Err(unreached());
         }
         let id = Uuid::new_v4();
+        let wait = *self.relay_wait.lock();
+        let call = RelayCall {
+            id,
+            machine: machine.to_string(),
+            group: group.to_string(),
+            tool: tool.to_string(),
+            input,
+            boss: BossRef::Local {
+                agent: agent.to_string(),
+            }
+            .key(),
+            link_id: RELAY_LINK,
+            level: ceiling.level,
+            act: ceiling.act,
+            deadline: chrono::Utc::now()
+                + chrono::Duration::from_std(wait).unwrap_or(chrono::Duration::seconds(30)),
+        };
+        // Too large to carry: never queued, so nothing of it is done.
+        if serde_json::to_vec(&call).map_or(usize::MAX, |b| b.len()) > MOST_CALL {
+            return Err(MachineRefused::Refused(format!(
+                "That call is too large to send to {machine}; send less in it."
+            )));
+        }
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
             let mut r = self.relays.lock();
-            let wait = *self.relay_wait.lock();
             r.queued.retain(|(_, at)| at.elapsed() < wait);
             if r.queued.len() >= MOST_QUEUED || r.waiting.len() >= MOST_WAITING {
                 return Err(unreached());
             }
-            r.queued.push_back((
-                RelayCall {
-                    id,
-                    machine: machine.to_string(),
-                    group: group.to_string(),
-                    tool: tool.to_string(),
-                    input,
-                    boss: BossRef::Local {
-                        agent: agent.to_string(),
-                    }
-                    .key(),
-                    link_id: RELAY_LINK,
-                    level: ceiling.level,
-                    act: ceiling.act,
-                },
-                Instant::now(),
-            ));
+            r.queued.push_back((call, Instant::now()));
             r.waiting.insert(id, tx);
         }
         self.relay_queued.notify_waiters();
-        let wait = *self.relay_wait.lock();
         let got = tokio::time::timeout(wait, rx).await;
         // Whatever came of it, nothing waits for it any more, and a call
         // no one took goes.
@@ -179,11 +219,18 @@ impl CrewHub {
             Ok(Ok(answer)) => Ok(answer),
             // Desk took it: it may have been done there. Not to be sent
             // again as new.
-            _ if taken => Err(format!(
+            _ if taken => Err(MachineRefused::Unknown(format!(
                 "Sent to {machine}, but its outcome isn't known yet: check {machine}'s session (crew.history) before you try it again."
-            )),
+            ))),
             _ => Err(unreached()),
         }
+    }
+
+    /// Whether Desk's native side relays now: it asked for calls lately.
+    pub(crate) fn relaying(&self) -> bool {
+        self.relay_polled
+            .lock()
+            .is_some_and(|at| at.elapsed() < POLL_FOR * 2)
     }
 
     /// The calls queued for machines, up to [`MOST_TAKEN`]: each taken
@@ -299,9 +346,11 @@ fn not_native(s: &RelayApi, h: &HeaderMap, q: &TokenQuery) -> Option<Response> {
             !s.state.auth_token.is_empty()
                 && crate::auth::constant_time_token_eq(given, &s.state.auth_token)
         });
+    // 401: refused before anything is done, so Desk's native side may read
+    // the hub's token again and send it once more.
     (!ours).then(|| {
         (
-            StatusCode::FORBIDDEN,
+            StatusCode::UNAUTHORIZED,
             Json(json!({"error": "only Desk itself relays a boss's calls, with the hub's own token"})),
         )
             .into_response()
@@ -404,28 +453,61 @@ async fn served(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>, body: By
     if !workforce_desk::grant::group_id_ok(&r.group) {
         return bad("that can't be a group");
     }
-    let out = s
-        .crew
-        .serve_crew(
-            ServedCall {
-                tool: r.tool,
-                input: r.input,
-                boss,
-                link_id: Some(RELAY_LINK.to_string()),
-                call_id: Some(r.id),
-                ceiling: Some(super::served::Ceiling {
-                    level,
-                    act: super::served::act_of(&r.act),
-                }),
-            },
-            &r.group,
+    let ceiling = super::served::Ceiling {
+        level,
+        act: super::served::act_of(&r.act),
+    };
+    // The home taking its boss's decisions at Act fully, and answering
+    // them ([`super::relayed_decide`]): the Mac hub's own calls, never a
+    // crew tool's.
+    use super::relayed_decide::{DECIDED, TAKE};
+    let (status, body) = match r.tool.as_str() {
+        TAKE => {
+            s.crew
+                .take_relayed(&boss, &r.group, &r.input, &ceiling)
+                .await
+        }
+        DECIDED => s.crew.relayed_decided(&boss, &r.group, &r.input).await,
+        _ => {
+            let out = s
+                .crew
+                .serve_crew(
+                    ServedCall {
+                        tool: r.tool,
+                        input: r.input,
+                        boss,
+                        link_id: Some(RELAY_LINK.to_string()),
+                        call_id: Some(r.id),
+                        ceiling: Some(ceiling),
+                    },
+                    &r.group,
+                )
+                .await;
+            (out.status, out.body)
+        }
+    };
+    Json(json!({ "status": status, "body": body })).into_response()
+}
+
+/// On the Mac: the grants each of the person's machines should hold for
+/// this hub's own group bosses ([`super::machine_grants`]), for Desk's
+/// native side to carry to them.
+async fn machine_grants(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>) -> Response {
+    native!(s, h, q);
+    match s.crew.machine_grants() {
+        Some(w) => Json(w).into_response(),
+        // Not known yet: Desk writes nothing, and deletes nothing, until it is.
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "this hub hasn't read its bosses yet"})),
         )
-        .await;
-    Json(json!({ "status": out.status, "body": out.body })).into_response()
+            .into_response(),
+    }
 }
 
 pub(crate) fn routes(state: Arc<GatewayState>, crew: Arc<CrewHub>) -> Router {
     Router::new()
+        .route("/api/desk/machine-grants", get(machine_grants))
         .route("/api/desk/crew/relay", get(take))
         .route("/api/desk/crew/relay/{id}", post(answer))
         .route("/api/desk/crew/served", post(served))

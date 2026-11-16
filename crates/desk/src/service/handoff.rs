@@ -967,6 +967,9 @@ impl Desk {
             // As the session handed from ran, or as the agent handing it
             // over runs (`[llm] fast`).
             fast: c.target == Engine::Codex && (r.fast || self.fast_for(c.target, &by.party)),
+            // The model the work ran on, on the same engine; another
+            // engine's names aren't this one's, so it takes its own default.
+            model: r.model.clone().filter(|_| c.target == r.engine),
             account: c.ask.account,
             env: Default::default(),
             group: c.facts.source_group.clone(),

@@ -37,6 +37,8 @@ pub mod decision;
 pub mod decision_store;
 mod devin;
 mod devin_config;
+pub mod directive;
+pub mod directive_store;
 pub mod engine;
 pub mod engine_accounts;
 mod first_run;
@@ -63,6 +65,7 @@ mod line_api;
 pub mod line_store;
 pub mod lineage_store;
 pub mod local;
+pub mod machine_spent_store;
 pub mod memory;
 pub mod memory_derive_store;
 pub mod memory_index_store;
@@ -118,14 +121,18 @@ pub use conversations::{
     Said, SavedMemory, Speaker, SpeakerKind, Thread, Threads,
 };
 pub use crew_store::CheckIn;
+/// Where Devin keeps its data, from the environment given.
+pub use devin_config::data_folder as devin_data_folder;
 /// Where the person's own Devin config is, from the environment given.
 pub use devin_config::person_path as devin_person_config;
+pub use knows_api::knows_router;
 pub use providers::{AccountError, Accounts, Fields, Spec, Standing};
 pub use realtime::{KeySource, Provider, Realtime};
 pub use service::KnowsGather;
 pub use service::{
     agent_subject, plan_subject, pool_subject, session_subject, AgentSpend, AgentVerdict, Boss,
-    BreakerOf, BreakerView, BudgetPatch, BudgetView, BudgetsView, ChargeView, NewBudget, Rules,
+    BreakerOf, BreakerView, BudgetPatch, BudgetView, BudgetsView, ChargeView, DialogAnswerer,
+    NewBudget, Rules,
 };
 pub use service::{check_hub_id, check_hub_url, hub_id_for_url, LinkBoard};
 pub use service::{
@@ -136,16 +143,21 @@ pub use service::{
 };
 pub use service::{AccountAnswer, AccountMoment, AccountRead};
 pub use service::{
-    AssignTo, BoardPatch, ChargedTo, Move, NewBoard, NewSessionFor, NewTicket, TicketPatch,
-    TicketQuery, TicketView,
+    AssignTo, BoardPatch, ChargedTo, MachineSessionFor, Move, NewBoard, NewSessionFor, NewTicket,
+    StartText, TicketPatch, TicketQuery, TicketView,
 };
 pub use service::{
     Changed, NewPlan, OnDrop, PlanDetail, PlanEdit, PlanSummary, PlanTicketView, StartRefused,
+    Started,
 };
 pub use service::{CommentPost, FileBytes, PostVia, READ_FRESH};
 pub use service::{EffectView, HandoverView, MoveAsk, MoveCommit, MoveDone, MovePreview, SentNote};
 pub use service::{GrantView, GrantWritten, GrantsView, Native, Paused};
 pub use service::{HandedOff, HandoffPreview, Hop, LineageView};
+pub use service::{ALREADY_ANSWERED, ASKED_IN_TERMINAL};
 pub use speech::{Audio, Speak, SpeakError, Speech, SpeechProvider, VoiceKey};
 pub use store::DeskStore;
 pub use token_pipe::private_run_dir;
+/// The project a folder belongs to, by git (an update names a session's
+/// repository by it).
+pub use worktree::git_project;

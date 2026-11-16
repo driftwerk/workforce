@@ -50,8 +50,9 @@ use workforce_common::settings::WorkforceConfig;
 
 use crate::coding_sandbox::{remote_launcher_for, McpSurface, SandboxLauncher};
 pub use crate::hub_core::subscriptions::{
-    provider_specs, review_agent_llm, route_models, routed_kind, routed_subscriptions, tier_models,
-    unknown_operator, validate_agent_llm, LOGINS_ARE_NOT_ACCOUNTS,
+    fails_over_to_another_provider, provider_specs, review_agent_llm, route_models, routed_kind,
+    routed_subscriptions, tier_models, unknown_operator, validate_agent_llm,
+    LOGINS_ARE_NOT_ACCOUNTS,
 };
 pub use crate::hub_core::subscriptions::{Finding, Install, Severity, SharedSubscriptions};
 use crate::serve::AgentService;
@@ -227,8 +228,11 @@ mod tests {
         codex: CODEX,
     };
 
+    /// An Anthropic agent's config, checked under the `[llm]` each test
+    /// names: background work's Anthropic defaults left out.
     fn resolved() -> ResolvedConfig {
         ResolvedConfig::resolve(None, None, &WorkforceConfig::default(), "anthropic", None)
+            .without_background_fill()
     }
 
     #[test]

@@ -303,6 +303,10 @@ pub struct AccountView {
     pub plan_key: Option<String>,
     /// Which Anthropic account it is, when known ([`crate::identity`]).
     pub identity: Option<IdentityView>,
+    /// The provider turned its account away (its organisation turned
+    /// Claude Code off, it is on hold): until it is signed in again or
+    /// re-checked.
+    pub refused: Option<RefusedView>,
     /// What this hub knows of its plan: Desk passes it to the person's
     /// other computers' hubs, which have the same account.
     pub standing: Option<Standing>,
@@ -323,6 +327,29 @@ pub struct IdentityView {
     pub linked_by: crate::identity::LinkedBy,
     /// This computer's own Claude Code is signed in to it.
     pub this_computer: bool,
+    /// Its organisation's name, as Claude Code last said it.
+    pub org_name: Option<String>,
+    /// Its plan (`max`, `pro`), as Claude Code last said it.
+    pub plan: Option<String>,
+}
+
+/// An account the provider turned away, as the hub's own call found it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refused {
+    pub reason: String,
+    pub recheck_at: DateTime<Utc>,
+    /// When it was found: one refusal, one need.
+    pub at: DateTime<Utc>,
+}
+
+/// Why the provider turned an account away, as Settings shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefusedView {
+    /// In plain words: "its organisation has turned off Claude Code access".
+    pub reason: String,
+    /// When a call tries it again.
+    pub recheck_at: DateTime<Utc>,
 }
 
 /// What is wrong with an account's sign-in in the store.
@@ -998,6 +1025,19 @@ pub enum AccountNeed {
         account: Side,
         resets_at: Option<DateTime<Utc>>,
     },
+    /// The provider turned `account` away (`reason`): its organisation
+    /// turned Claude Code off, or it is on hold. Desk uses `using` meanwhile,
+    /// when another account can serve. Told once per refusal.
+    #[serde(rename_all = "camelCase")]
+    Refused {
+        id: String,
+        engine: Engine,
+        account: Side,
+        /// "kim@example.com, Acme", when known.
+        who: Option<String>,
+        reason: String,
+        using: Option<Side>,
+    },
     /// Which of the person's accounts this computer's Claude Code is
     /// signed in to isn't known, and a switch depends on it: asked, never
     /// guessed.
@@ -1018,6 +1058,7 @@ impl AccountNeed {
             | AccountNeed::SignIn { id, .. }
             | AccountNeed::Reset { id, .. }
             | AccountNeed::InTerminal { id, .. }
+            | AccountNeed::Refused { id, .. }
             | AccountNeed::WhichSignIn { id, .. } => id,
         }
     }

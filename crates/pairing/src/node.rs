@@ -60,7 +60,8 @@ impl NodePairingService {
         };
         self.store.create_node_request(&req)?;
 
-        info!(node_id, node_name, code, "Created node pairing request");
+        // The code is what proves the person at the node: never logged.
+        info!(node_id, node_name, "Created node pairing request");
         Ok(req)
     }
 
@@ -150,6 +151,22 @@ mod tests {
             device_token_ttl_secs: 2_592_000,
             who_can_connect: WhoCanConnect::default(),
         }
+    }
+
+    #[test]
+    fn a_node_pairing_code_is_never_logged() {
+        let store = Arc::new(SqlitePairingStore::in_memory().unwrap());
+        let svc = NodePairingService::new(store, node_config());
+        let mut code = String::new();
+        let log = crate::logged(|| {
+            let req = svc
+                .request_join("n1", "node-one", "worker", vec![])
+                .unwrap();
+            code = req.code.clone();
+            svc.approve(&req.code, "admin").unwrap();
+        });
+        assert!(log.contains("Created node pairing request"), "{log}");
+        assert!(!code.is_empty() && !log.contains(&code), "{code} in {log}");
     }
 
     #[test]

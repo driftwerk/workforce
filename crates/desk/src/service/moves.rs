@@ -290,7 +290,11 @@ impl Desk {
                 };
                 let board = self.board_of(t.board).await?;
                 ctx.from = board.group.clone();
-                ctx.assigned = t.session().is_some();
+                // A session on one of the person's machines is one too.
+                ctx.assigned = t
+                    .assignee
+                    .as_ref()
+                    .is_some_and(|a| a.kind == crate::crew::PartyKind::Session);
                 ctx.tickets.push(self.ticket_fact(&t, &board).await);
                 ctx.ledger = self
                     .0

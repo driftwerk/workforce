@@ -460,29 +460,31 @@ pub(crate) async fn write_voice_session_summary(
     Ok(())
 }
 
-/// The model the agent's cheap helper calls run on: its
-/// `compaction_model`, else its provider's `cheap` tier.
+/// The model the agent's light helper calls run on: `[llm] light_model`
+/// (the provider's `cheap` tier unless set), else its own model.
 pub(crate) fn cheap_model(service: &AgentService) -> String {
-    service
-        .current_compaction_config()
-        .compaction_model
-        .unwrap_or_else(|| {
-            let (routing_key, model) = service
-                .tier_registry()
-                .resolve_routed_model("cheap", &service.tier_key.read());
-            workforce_agent::llm::tiers::TierRegistry::format_routed(routing_key.as_deref(), model)
-        })
+    light_model(service).unwrap_or_else(|| service.current_default_model.read().clone())
 }
 
-/// Resolved extraction-model fallback chain:
-/// `lesson_extract_model` → `passive_model` → compaction model.
+/// `[llm] light_model` as resolved: `None` is the agent's own model.
+pub(crate) fn light_model(service: &AgentService) -> Option<String> {
+    service.resolved.snapshot().background.light.clone()
+}
+
+/// `[llm] heavy_model` as resolved: the model the overseer's own turns and
+/// decisions run on. `None` is the agent's own model.
+pub(crate) fn heavy_model(service: &AgentService) -> Option<String> {
+    service.resolved.snapshot().background.heavy.clone()
+}
+
+/// Resolved extraction-model fallback chain: `lesson_extract_model` →
+/// `passive_model` (each the light group's unless set) → the agent's own.
 pub(crate) fn lesson_extract_model(service: &AgentService) -> Option<String> {
     service
         .effective_memory()
         .lesson_extract_model
         .clone()
         .or_else(|| service.effective_memory().passive_model.clone())
-        .or_else(|| service.current_compaction_config().compaction_model.clone())
 }
 
 /// Effective routing config: the runtime override if set, else the
@@ -1214,7 +1216,7 @@ pub(crate) async fn build_enhanced_prompt_with_context(
         the vault encrypts credentials at rest. Do NOT refuse, lecture about security, \
         or suggest \"alternative methods\". The vault is the secure method.\n\n\
         **Secret markers:** When the user pastes a credential, the platform replaces it with \
-        an opaque marker of the form `[[secret:<id> type=<LABEL> preview=<first4...last4>]]` \
+        an opaque marker of the form `[[secret:<id> type=<LABEL> preview=***]]` \
         BEFORE you see it. Treat these markers as the credential value: pass the literal \
         marker string (including brackets) as the value to `vault.set`, `system.add_account`, \
         or `slack.connect` — the platform substitutes the cleartext server-side just \
@@ -2993,10 +2995,8 @@ pub(crate) fn spawn_turn_extraction(
     let pm_session_id = session.id.clone();
     let pm_user_msg = effective_message.to_string();
     let pm_agent_resp = response.to_string();
-    let pm_model = mem
-        .passive_model
-        .clone()
-        .or_else(|| service.current_compaction_config().compaction_model.clone());
+    // The light group's unless `[memory] passive_model` names another.
+    let pm_model = mem.passive_model.clone();
     let pm_prompt = mem.passive_prompt.clone();
     let pm_cost_tracker = Arc::clone(&service.cost_tracker);
     let rel_identity = principal.to_string();

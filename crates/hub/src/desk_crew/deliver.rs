@@ -109,6 +109,14 @@ impl CrewHub {
             attended: in_dm || channel.starts_with(&format!("{DESK_CHANNEL}:checkin:")),
             relayed: true,
         };
+        // A turn with no author is the agent's own wake (a check-in, a
+        // session's line, a summary): its heavy background model's work. A
+        // message with one (the person's words, a task the overseer hands
+        // on) is real work for the agent, on its own model.
+        let model = match &author {
+            None => crate::turn_loop::heavy_model(service),
+            Some(_) => None,
+        };
         let progress = workforce_agent::runner::with_desk(
             Some(scope),
             service.process_message_with_progress(
@@ -126,7 +134,7 @@ impl CrewHub {
                 None,
                 None,
                 None,
-                None,
+                model.as_deref(),
                 None,
                 None,
                 None,

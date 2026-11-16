@@ -70,6 +70,13 @@ pub(crate) enum Action {
     Stop {
         session: Uuid,
     },
+    /// Close a session whose work is done: stopped and closed in Desk, off
+    /// the grid and the sidebar, its conversation kept and resumable.
+    /// Never a model's tool: the boss's closer does it
+    /// ([`super::closing`]), or the person accepting its suggestion.
+    Close {
+        session: Uuid,
+    },
     /// End the turn it is on (Esc in its terminal); it runs on.
     Interrupt {
         session: Uuid,
@@ -343,6 +350,9 @@ impl Action {
             "crew.stop" => Self::Stop {
                 session: session()?,
             },
+            super::closing::TOOL => Self::Close {
+                session: session()?,
+            },
             "crew.interrupt" => Self::Interrupt {
                 session: session()?,
             },
@@ -476,6 +486,7 @@ impl Action {
             | Self::Approve { .. }
             | Self::Deny { .. }
             | Self::Stop { .. }
+            | Self::Close { .. }
             | Self::Interrupt { .. }
             | Self::Escalate { .. }
             | Self::TakeOn { .. }
@@ -491,7 +502,10 @@ impl Action {
 fn charge_plain(e: workforce_desk::DeskError) -> String {
     match e {
         workforce_desk::DeskError::Conflict(why) | workforce_desk::DeskError::Invalid(why) => why,
-        e @ workforce_desk::DeskError::CrossesBoss => e.to_string(),
+        e
+        @ (workforce_desk::DeskError::CrossesBoss | workforce_desk::DeskError::TooLong { .. }) => {
+            e.to_string()
+        }
         workforce_desk::DeskError::NotFound => "That session isn’t there any more.".into(),
         workforce_desk::DeskError::Internal(e) => {
             tracing::warn!(error = %e, "a charge failed");
@@ -500,11 +514,52 @@ fn charge_plain(e: workforce_desk::DeskError) -> String {
     }
 }
 
+/// How long a boss's resume or restart is waited for: its turn goes on
+/// past it, never held for the whole of a tool call's time.
+const STARTS_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What a boss is told of a resume or restart Desk didn't finish within
+/// [`STARTS_WITHIN`]: it may still be starting.
+fn still_starting(session: uuid::Uuid) -> String {
+    tracing::warn!(%session, "a boss's resume or restart didn't finish within a minute");
+    format!(
+        "Desk didn't finish starting it within {} seconds; it may still be starting. Look at it \
+         with crew.history in a moment before you start it again.",
+        STARTS_WITHIN.as_secs()
+    )
+}
+
+/// What a boss is told when Desk takes no answer to a request because it
+/// was answered already, or because Claude Code's own dialog asks it now:
+/// what is true and what to do, never a wait to pass on to the person.
+/// `Err` gives the error back for the usual words.
+fn answer_refused(e: workforce_desk::DeskError) -> Result<String, workforce_desk::DeskError> {
+    match &e {
+        workforce_desk::DeskError::Conflict(why) if why == workforce_desk::ALREADY_ANSWERED => Ok(
+            "Already answered (by your own decision, or by the person): nothing waits on it \
+             now, so there is nothing to tell the person."
+                .into(),
+        ),
+        workforce_desk::DeskError::Conflict(why) if why == workforce_desk::ASKED_IN_TERMINAL => Ok(
+            "Claude Code's own dialog in the session's terminal asks this one now, where no \
+             answer from Desk reaches it. At Act fully, while the person isn't in control of the \
+             session, Desk clears that dialog itself within seconds and has the session ask again \
+             in Desk, where your decision is taken at once: nothing for you to do or to pass on. \
+             Otherwise it is the person's, in their terminal."
+                .into(),
+        ),
+        _ => Err(e),
+    }
+}
+
 /// A board change refused, in the words the person reads, as they are.
 fn board_plain(e: workforce_desk::DeskError) -> String {
     match e {
         workforce_desk::DeskError::Conflict(why) | workforce_desk::DeskError::Invalid(why) => why,
-        e @ workforce_desk::DeskError::CrossesBoss => e.to_string(),
+        e
+        @ (workforce_desk::DeskError::CrossesBoss | workforce_desk::DeskError::TooLong { .. }) => {
+            e.to_string()
+        }
         workforce_desk::DeskError::NotFound => "That ticket isn’t there any more.".into(),
         workforce_desk::DeskError::Internal(e) => {
             tracing::warn!(error = %e, "a board change failed");
@@ -557,7 +612,10 @@ impl CrewHub {
     fn mode_hold(&self, action: &Action, o: &Oversight, boss: Option<&str>) -> Option<Gate> {
         let ends = matches!(
             action,
-            Action::Deny { .. } | Action::Stop { .. } | Action::Interrupt { .. }
+            Action::Deny { .. }
+                | Action::Stop { .. }
+                | Action::Close { .. }
+                | Action::Interrupt { .. }
         );
         let session = Self::session_of(action).filter(|_| !ends)?;
         let why = self
@@ -746,6 +804,9 @@ impl CrewHub {
             }
             Action::Interrupt { .. } => (o.act.interrupt, Some(switch::INTERRUPT)),
             Action::Deny { .. } | Action::Stop { .. } => (false, None),
+            // The closer judges its own (`closing`): asked any other way,
+            // it is the person's.
+            Action::Close { .. } => (false, None),
             // Decided above.
             Action::TakeOn { .. } | Action::Release { .. } => (true, None),
             Action::Handoff { .. } | Action::ChangeOversight { .. } => (false, None),
@@ -758,7 +819,7 @@ impl CrewHub {
             (true, _) => Gate::Run,
             (false, Some(label)) => Gate::Suggest(Self::switch_off(label, served)),
             (false, None) => match action {
-                Action::Deny { .. } | Action::Stop { .. } => Gate::Suggest(
+                Action::Deny { .. } | Action::Stop { .. } | Action::Close { .. } => Gate::Suggest(
                     "denying a request or stopping a session is the person's call".into(),
                 ),
                 _ => Gate::Suggest("the person hasn't let you do that without asking".into()),
@@ -804,6 +865,7 @@ impl CrewHub {
             | Action::Approve { session: s, .. }
             | Action::Deny { session: s, .. }
             | Action::Stop { session: s }
+            | Action::Close { session: s }
             | Action::Interrupt { session: s }
             | Action::Resume { session: s, .. }
             | Action::Restart { session: s, .. }
@@ -941,6 +1003,7 @@ impl CrewHub {
             Action::Approve { .. }
             | Action::Deny { .. }
             | Action::Stop { .. }
+            | Action::Close { .. }
             | Action::Interrupt { .. }
             | Action::Escalate { .. }
             | Action::TakeOn { .. }
@@ -1060,6 +1123,7 @@ impl CrewHub {
             | Action::Approve { session: s, .. }
             | Action::Deny { session: s, .. }
             | Action::Stop { session: s }
+            | Action::Close { session: s }
             | Action::Interrupt { session: s }
             | Action::Resume { session: s, .. }
             | Action::Restart { session: s, .. }
@@ -1124,6 +1188,10 @@ impl CrewHub {
                 format!("Deny {}: {}", self.session_name(*session), request(session))
             }
             Action::Stop { session } => format!("Stop {}", self.session_name(*session)),
+            Action::Close { session } => format!(
+                "Close {}: its work is done (its conversation stays, to resume)",
+                self.session_name(*session)
+            ),
             Action::Interrupt { session } => {
                 format!("Interrupt {}", self.session_name(*session))
             }
@@ -1350,7 +1418,7 @@ impl CrewHub {
                         workforce_desk::model::Decision::Allow,
                         Some(by),
                     )
-                    .map_err(plain)?;
+                    .map_err(|e| answer_refused(e).unwrap_or_else(plain))?;
                 Ok(format!("allowed {}", v.label()))
             }
             Action::Deny { session, approval } => {
@@ -1369,7 +1437,7 @@ impl CrewHub {
                 };
                 let v = d
                     .decide(*session, *approval, decision, Some(by))
-                    .map_err(plain)?;
+                    .map_err(|e| answer_refused(e).unwrap_or_else(plain))?;
                 Ok(format!("denied {}", v.label()))
             }
             Action::Stop { session } => {
@@ -1380,21 +1448,39 @@ impl CrewHub {
                 let v = d.stop(*session, Some(by)).map_err(plain)?;
                 Ok(format!("stopped {}", v.label()))
             }
+            Action::Close { session } => {
+                // The shell a tracked session runs in is the person's.
+                let was = d.view(*session).map_err(plain)?;
+                if was.terminal_id.is_some() {
+                    return Err("That session runs in the person's own Desk terminal, so it can't be closed from here.".into());
+                }
+                done.resumable = was.cli_session_id.is_some();
+                let v = d.end(*session, Some(by)).await.map_err(plain)?;
+                Ok(format!("closed {}", v.label()))
+            }
             Action::Interrupt { session } => {
                 let v = d.interrupt(*session, Some(by)).map_err(plain)?;
                 Ok(format!("interrupted {}", v.label()))
             }
+            // Run on their own, so one that outlasts the wait still ends
+            // whole: only the boss stops waiting.
             Action::Resume { session, prompt } => {
-                let v = d
-                    .resume(*session, prompt.clone(), Some(by))
+                let (desk, id, prompt) = (d.clone(), *session, prompt.clone());
+                let started = tokio::spawn(async move { desk.resume(id, prompt, Some(by)).await });
+                let v = tokio::time::timeout(STARTS_WITHIN, started)
                     .await
+                    .map_err(|_| still_starting(id))?
+                    .map_err(|e| format!("resuming it failed: {e}"))?
                     .map_err(plain)?;
                 Ok(format!("resumed {}", v.label()))
             }
             Action::Restart { session, prompt } => {
-                let v = d
-                    .restart(*session, prompt.clone(), by)
+                let (desk, id, prompt) = (d.clone(), *session, prompt.clone());
+                let started = tokio::spawn(async move { desk.restart(id, prompt, by).await });
+                let v = tokio::time::timeout(STARTS_WITHIN, started)
                     .await
+                    .map_err(|_| still_starting(id))?
+                    .map_err(|e| format!("restarting it failed: {e}"))?
                     .map_err(plain)?;
                 Ok(format!("restarted {}", v.label()))
             }
@@ -1573,6 +1659,7 @@ impl CrewHub {
                     // A Codex session the overseer starts runs as fast as
                     // the overseer does (`[llm] fast`).
                     fast: engine == Engine::Codex && service.resolved.snapshot().fast,
+                    model: None,
                     account: None,
                     env: Default::default(),
                     group: self.boss_group(&service, &o),
@@ -2006,6 +2093,7 @@ impl CrewHub {
                 let new = AssignTo::NewSession(NewSessionFor {
                     path: folder.clone(),
                     engine,
+                    model: None,
                 });
                 d.assign_ticket_for(id, Some(new), &by, Some(&charged))
                     .await

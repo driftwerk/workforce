@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use base64::Engine;
 use serde_json::{json, Value};
-use tracing::warn;
+use tracing::{debug, warn};
 use workforce_agent::security::external_content::wrap_external_content;
 
 fn selector(configured: Option<&str>) -> Option<&str> {
@@ -85,6 +85,330 @@ pub fn build_instances<W, C>(
         clients: Arc::new(clients),
         default,
     })
+}
+
+/// Where one adapter's instances live in the vault: each named instance is
+/// `{prefix}{name}/{marker}`, and a single-instance setup keeps its key at
+/// `flat` (it is then the instance `default`).
+#[derive(Clone, Debug)]
+pub struct InstancePaths {
+    pub prefix: String,
+    pub marker: String,
+    pub flat: String,
+}
+
+impl InstancePaths {
+    pub fn new(prefix: &str, marker: &str, flat: &str) -> Self {
+        Self {
+            prefix: prefix.to_string(),
+            marker: marker.to_string(),
+            flat: flat.to_string(),
+        }
+    }
+
+    /// The instances `store` holds for whoever is in scope now: the named
+    /// ones it lists (the shared tiers and the caller's own, never another
+    /// person's), or else `default` when only the flat key resolves.
+    pub fn names(&self, store: &dyn workforce_common::settings::SecretStore) -> Vec<String> {
+        let suffix = format!("/{}", self.marker);
+        let mut names: Vec<String> = store
+            .list(Some(&self.prefix))
+            .into_iter()
+            .filter(|path| store.get(path).is_some())
+            .filter_map(|path| {
+                path.strip_prefix(&self.prefix)?
+                    .strip_suffix(&suffix)
+                    // A nested path isn't an instance at all.
+                    .filter(|name| !name.contains('/'))
+                    .filter(|name| {
+                        let ok = is_instance_name(name);
+                        if !ok {
+                            debug!(prefix = %self.prefix, "instance skipped: its name isn't a plain word");
+                        }
+                        ok
+                    })
+                    .map(str::to_string)
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        if names.is_empty() && store.get(&self.flat).is_some() {
+            names.push("default".to_string());
+        }
+        names
+    }
+
+    /// Whose instance `name` is for the caller: their id when any of its
+    /// values (its own `{prefix}{name}/…` ones, or for `default` the flat
+    /// key) is one of their own, `None` when it's all shared. A client
+    /// built on someone's own keys may hold what it learns from them, so it
+    /// is never shared with anyone else.
+    pub fn owner(
+        &self,
+        store: &dyn workforce_common::settings::SecretStore,
+        name: &str,
+    ) -> Option<String> {
+        let me = workforce_agent::runner::CURRENT_USER_ID
+            .try_with(|u| u.clone())
+            .ok()
+            .filter(|u| !u.is_empty())?;
+        let dir = format!("{}{name}/", self.prefix);
+        let mut paths = store.list(Some(&dir));
+        if store.get(&format!("{dir}{}", self.marker)).is_none() {
+            // The flat keys: the flat key and its siblings.
+            if let Some((parent, _)) = self.flat.rsplit_once('/') {
+                let parent = format!("{parent}/");
+                paths.extend(
+                    store
+                        .list(Some(&parent))
+                        .into_iter()
+                        .filter(|p| !p.starts_with(&self.prefix)),
+                );
+            }
+            paths.push(self.flat.clone());
+        }
+        paths
+            .iter()
+            .any(|path| store.get_user_override(path).is_some())
+            .then_some(me)
+    }
+}
+
+/// The instance parameter's description when the set is read per caller:
+/// it names none, since a tool's schema is built once and shown to everyone.
+pub const LIVE_INSTANCE_DESCRIPTION: &str =
+    "Which of your connections to use (by name). Uses your default if omitted; \
+     a name you don't have is answered with the ones you do.";
+
+/// Whether `name` can name an instance: a plain word (letters, digits, `-`,
+/// `_`, `.`), so a vault path can't put arbitrary text where an instance's
+/// name is shown.
+pub fn is_instance_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// At most this many clients a live set keeps built for shared instances,
+/// and for each person's own. Past it a new client is built for the call
+/// and not kept, so no one's names crowd out anyone else's.
+const MAX_BUILT: usize = 512;
+const MAX_BUILT_PER_PERSON: usize = 32;
+
+type OnBuilt<C> = dyn Fn(&Arc<C>) + Send + Sync;
+
+type MakeClient<C> = dyn Fn(&str) -> eyre::Result<C> + Send + Sync;
+
+/// An adapter's instances, read as the caller on every call.
+///
+/// One loaded adapter serves everyone who uses its agent, so nothing about
+/// which instances exist may come from whoever loaded it: a store-backed set
+/// lists the caller's own (and the shared) instances each time it is asked,
+/// and builds a client for one the first time anyone uses it. A client is
+/// built from its name and the shared tiers only, and resolves its keys per
+/// call, so one cached by name serves every caller alike. A fixed set (no
+/// store: static config) is what it was built with.
+pub struct LiveInstances<C> {
+    fixed: Option<Instances<C>>,
+    live: Option<Live<C>>,
+}
+
+struct Live<C> {
+    store: Arc<dyn workforce_common::settings::SecretStore>,
+    paths: InstancePaths,
+    /// The configured default selector (a shared setting).
+    selector: Option<String>,
+    make: Box<MakeClient<C>>,
+    /// Built clients by (name, owner): `None` for an instance on shared
+    /// keys, the person's id for one on keys of their own.
+    built: std::sync::Mutex<HashMap<(String, Option<String>), Arc<C>>>,
+    on_built: Option<Box<OnBuilt<C>>>,
+}
+
+impl<C> LiveInstances<C> {
+    /// A fixed set: static configuration every caller shares.
+    pub fn fixed(instances: Instances<C>) -> Self {
+        Self {
+            fixed: Some(instances),
+            live: None,
+        }
+    }
+
+    /// A fixed set from a map of clients and its default.
+    pub fn fixed_map(clients: HashMap<String, Arc<C>>, default: &str) -> Self {
+        Self::fixed(Instances {
+            clients: Arc::new(clients),
+            default: default.to_string(),
+        })
+    }
+
+    /// A set read from `store` as the caller, each client made by `make`.
+    pub fn live(
+        store: Arc<dyn workforce_common::settings::SecretStore>,
+        paths: InstancePaths,
+        selector: Option<String>,
+        make: impl Fn(&str) -> eyre::Result<C> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            fixed: None,
+            live: Some(Live {
+                store,
+                paths,
+                selector: selector
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+                make: Box::new(make),
+                built: std::sync::Mutex::new(HashMap::new()),
+                on_built: None,
+            }),
+        }
+    }
+
+    /// Run `hook` on each client a live set builds, once, as it is built.
+    pub fn on_built(mut self, hook: impl Fn(&Arc<C>) + Send + Sync + 'static) -> Self {
+        if let Some(live) = self.live.as_mut() {
+            live.on_built = Some(Box::new(hook));
+        }
+        self
+    }
+
+    /// Whether the set is read per caller (so a tool's schema must not name
+    /// any instance: it is built once and shown to everyone).
+    pub fn is_live(&self) -> bool {
+        self.live.is_some()
+    }
+
+    /// The instances the caller in scope can use, by name, and the one a
+    /// call naming none goes to.
+    pub fn for_caller(&self) -> (Arc<HashMap<String, Arc<C>>>, String) {
+        let Some(live) = self.live.as_ref() else {
+            let fixed = self.fixed.as_ref().expect("a fixed or live set");
+            return (Arc::clone(&fixed.clients), fixed.default.clone());
+        };
+        let names = live.paths.names(live.store.as_ref());
+        let cache = || {
+            live.built
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        let mut clients = HashMap::with_capacity(names.len());
+        for name in names {
+            let owner = live.paths.owner(live.store.as_ref(), &name);
+            let key = (name.clone(), owner.clone());
+            if let Some(client) = cache().get(&key) {
+                clients.insert(name, Arc::clone(client));
+                continue;
+            }
+            // Built outside the lock: a slow or failing build blocks no one.
+            let client = match (live.make)(&name) {
+                Ok(client) => Arc::new(client),
+                Err(e) => {
+                    warn!(instance = %name, error = %e, "instance client not built");
+                    continue;
+                }
+            };
+            let client = {
+                let mut built = cache();
+                match built.get(&key) {
+                    // Another call built it first: use that one.
+                    Some(first) => Arc::clone(first),
+                    None => {
+                        // Only a shared instance's client is handed to the
+                        // hook (which may publish what it learns).
+                        if owner.is_none() {
+                            if let Some(hook) = live.on_built.as_ref() {
+                                hook(&client);
+                            }
+                        }
+                        let (cap, kept) = match owner.as_ref() {
+                            None => (MAX_BUILT, built.keys().filter(|(_, o)| o.is_none()).count()),
+                            Some(_) => (
+                                MAX_BUILT_PER_PERSON,
+                                built.keys().filter(|(_, o)| *o == owner).count(),
+                            ),
+                        };
+                        if kept < cap {
+                            built.insert(key, Arc::clone(&client));
+                        }
+                        client
+                    }
+                }
+            };
+            clients.insert(name, client);
+        }
+        let default = preferred_instance(&clients, live.selector.as_deref())
+            .map(str::to_string)
+            .or_else(|| live.selector.clone())
+            .unwrap_or_else(|| "default".to_string());
+        (Arc::new(clients), default)
+    }
+
+    /// [`Self::for_caller`], except that a fixed set answers with
+    /// `fixed_default` (the default its tool was built with).
+    pub fn for_caller_or(&self, fixed_default: &str) -> (Arc<HashMap<String, Arc<C>>>, String) {
+        match self.live {
+            Some(_) => self.for_caller(),
+            None => (self.for_caller().0, fixed_default.to_string()),
+        }
+    }
+
+    /// The caller's instance names, sorted.
+    pub fn names(&self) -> Vec<String> {
+        let (clients, _) = self.for_caller();
+        let mut names: Vec<String> = clients.keys().cloned().collect();
+        names.sort();
+        names
+    }
+}
+
+/// A live set for an adapter whose loader read a config: each instance's
+/// client is made from that config's entry for its name (its settings were
+/// read from the shared tiers), or from `neutral` for an instance the loader
+/// never saw (another person's). Keys never come from the config: a
+/// store-backed client resolves them per call, as the caller.
+pub fn live_from_config<W, C>(
+    store: Arc<dyn workforce_common::settings::SecretStore>,
+    paths: InstancePaths,
+    selector: Option<String>,
+    resolved: Vec<(String, W)>,
+    neutral: W,
+    make: impl Fn(&str, &W) -> eyre::Result<C> + Send + Sync + 'static,
+) -> LiveInstances<C>
+where
+    W: Send + Sync + 'static,
+{
+    let templates: HashMap<String, W> = resolved.into_iter().collect();
+    LiveInstances::live(store, paths, selector, move |name| {
+        make(name, templates.get(name).unwrap_or(&neutral))
+    })
+}
+
+/// A fixed set from a plain map (its default is `default`; tools that keep
+/// their own default use [`LiveInstances::for_caller_or`]).
+impl<C> From<HashMap<String, Arc<C>>> for LiveInstances<C> {
+    fn from(clients: HashMap<String, Arc<C>>) -> Self {
+        Self::fixed_map(clients, "default")
+    }
+}
+
+impl<C: Send + Sync> workforce_agent::llm::environment::InstanceSource for LiveInstances<C> {
+    fn variants(&self) -> Option<workforce_agent::llm::environment::SkillVariants> {
+        let (clients, default) = self.for_caller();
+        workforce_agent::llm::environment::SkillVariants::of(clients.keys().cloned(), &default)
+    }
+}
+
+/// The error for an instance the caller has none of, naming only theirs.
+pub fn unknown_instance<V>(what: &str, name: &str, clients: &HashMap<String, V>) -> eyre::Report {
+    let mut available: Vec<&str> = clients.keys().map(String::as_str).collect();
+    available.sort_unstable();
+    if available.is_empty() {
+        eyre::eyre!("{what} not configured for you (asked for '{name}'); none of yours is set up.")
+    } else {
+        eyre::eyre!("Unknown {what}: '{name}'. Available: {available:?}")
+    }
 }
 
 /// The `Available: …. Default: ….` tail of an instance parameter's
@@ -553,6 +877,59 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One instance name, `default`, for two people on keys of their own
+    /// and for a shared key: each person's client is theirs alone, the
+    /// shared one is shared, and only the shared one reaches the hook.
+    #[tokio::test]
+    async fn a_client_on_someones_own_keys_is_never_anyone_elses() {
+        use crate::adapters::test_support::People;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use workforce_agent::runner::CURRENT_USER_ID;
+
+        let store = People::new(&[]);
+        store
+            .own("ann", "skills/x/api_key", "k-ann")
+            .own("bob", "skills/x/api_key", "k-bob");
+        let hooked = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&hooked);
+        let set = LiveInstances::live(
+            Arc::clone(&store) as Arc<dyn workforce_common::settings::SecretStore>,
+            InstancePaths::new("skills/x/workspaces/", "api_key", "skills/x/api_key"),
+            None,
+            |name: &str| Ok(name.to_string()),
+        )
+        .on_built(move |_: &Arc<String>| {
+            seen.fetch_add(1, Ordering::SeqCst);
+        });
+        let as_person = |who: &'static str| {
+            let set = &set;
+            CURRENT_USER_ID.sync_scope(who.to_string(), || set.for_caller().0["default"].clone())
+        };
+        let (ann, bob) = (as_person("ann"), as_person("bob"));
+        assert!(!Arc::ptr_eq(&ann, &bob), "Bob was handed Ann's client");
+        assert!(
+            Arc::ptr_eq(&ann, &as_person("ann")),
+            "Ann's client is kept for her"
+        );
+        assert_eq!(
+            hooked.load(Ordering::SeqCst),
+            0,
+            "a person's own client reached the hook"
+        );
+
+        // A shared flat key: one client for everyone without one of their own.
+        workforce_common::settings::SecretStore::set(
+            store.as_ref(),
+            "skills/x/api_key",
+            "k-shared",
+        )
+        .unwrap();
+        let (cy, dee) = (as_person("cy"), as_person("dee"));
+        assert!(Arc::ptr_eq(&cy, &dee));
+        assert!(!Arc::ptr_eq(&cy, &as_person("ann")));
+        assert_eq!(hooked.load(Ordering::SeqCst), 1);
+    }
     use serde_json::json;
 
     // ---- sniff_mime / extension_for_mime ----

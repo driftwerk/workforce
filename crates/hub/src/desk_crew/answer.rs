@@ -444,7 +444,9 @@ impl CrewHub {
         if p.tool == "Plan" {
             return self.review_plan(view, p, boss).await;
         }
-        let release = || self.desk.release_dialog(view.id, p.id);
+        let release = || {
+            self.desk.release_dialog(view.id, p.id);
+        };
         let Some((service, o)) = self.overseer_named(boss) else {
             return release();
         };
@@ -597,7 +599,9 @@ impl CrewHub {
     /// presents it again; or, left to the person, not reviewed in time, or
     /// the person took the session meanwhile, its dialog asks them.
     async fn review_plan(&self, view: &SessionView, p: &PendingApproval, boss: &str) {
-        let release = || self.desk.release_dialog(view.id, p.id);
+        let release = || {
+            self.desk.release_dialog(view.id, p.id);
+        };
         let Some((service, o)) = self.overseer_named(boss) else {
             return release();
         };
@@ -743,19 +747,28 @@ impl CrewHub {
     /// The sessions whose dialog questions an Act fully boss answers itself
     /// now, and how long the person's input keeps each one's theirs: said
     /// to Desk, which holds such a question's start for its boss.
-    pub(super) fn dialog_answerers(&self) -> HashMap<Uuid, chrono::Duration> {
-        self.desk
-            .list()
+    /// The sessions an Act fully boss answers itself (and how long the
+    /// person's input keeps each theirs), and every session looked at.
+    pub(super) fn dialog_answerers(
+        &self,
+    ) -> (HashMap<Uuid, workforce_desk::DialogAnswerer>, HashSet<Uuid>) {
+        let views = self.desk.list();
+        let seen = views.iter().map(|v| v.id).collect();
+        let answered = views
             .iter()
             .filter_map(|v| {
                 let boss = self.boss_over(v)?;
-                if !self.desk.boss_unbound(&boss) {
+                // A boss on another hub answers in its own turns there: Desk
+                // holds nothing for it.
+                if workforce_desk::grant::is_served(&boss) || !self.desk.boss_unbound(&boss) {
                     return None;
                 }
                 let (_, o) = self.overseer_named(&boss)?;
-                Some((v.id, self.answer_gap(&o)))
+                let gap = self.answer_gap(&o);
+                Some((v.id, workforce_desk::DialogAnswerer { boss, gap }))
             })
-            .collect()
+            .collect();
+        (answered, seen)
     }
 
     /// Records that `boss` left `view`'s question `q` to the person, saying

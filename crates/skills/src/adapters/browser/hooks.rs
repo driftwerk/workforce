@@ -168,6 +168,19 @@ pub trait BrowserHooks: Send + Sync {
     fn keep_key(&self, _read: KeyRead<'_>) -> Result<String, String> {
         Err("This hub doesn't set up connections from the browser.".into())
     }
+    /// Why `user`'s `agent` mustn't open a sign-in at `url` in
+    /// `conversation` (its session key): a connection setup there already
+    /// asks the person to sign in to that site on its card, and waits for
+    /// them itself. `None`: it may. A hub with no connections has none.
+    fn sign_in_owned(
+        &self,
+        _user: &str,
+        _agent: &str,
+        _conversation: &str,
+        _url: &str,
+    ) -> Option<String> {
+        None
+    }
     /// Whether the hub's gate decides every browser call before it is made
     /// (Desk's does): a write it decided nothing for is then refused.
     fn gate_decides(&self) -> bool {

@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use eyre::Result;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, RwLock};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::provider::{LlmProvider, ProviderKind};
 use super::streaming::{
@@ -545,6 +545,14 @@ async fn retract(
 /// payer's login can't serve the call. `classify_error` keys on it.
 pub const SUBSCRIPTION_UNAVAILABLE_MARKER: &str = "subscription unavailable";
 
+/// How Claude Code words the provider refusing the subscription account
+/// itself, lower-cased: an organisation that turned Claude Code off, an
+/// account on hold. Retrying the same login is refused the same way.
+pub const ACCOUNT_REFUSALS: &[&str] = &[
+    "has disabled claude subscription access",
+    "your account is on hold and can't use claude code",
+];
+
 /// Marker carried by errors for a request the provider can never serve.
 /// `classify_error` keys on it.
 pub const UNSUPPORTED_REQUEST_MARKER: &str = "request unsupported by provider";
@@ -581,6 +589,14 @@ pub fn classify_error(error: &str) -> ErrorKind {
     // Subscription refusals quote the backend error they came from, whose
     // status ("… error (429): usage limit reached") must not win.
     if lower.contains(SUBSCRIPTION_UNAVAILABLE_MARKER) {
+        return ErrorKind::SubscriptionUnavailable;
+    }
+    // The provider refusing the subscription account itself, quoted bare
+    // by a path that read no login from it: never retried on the same login.
+    if ACCOUNT_REFUSALS
+        .iter()
+        .any(|refusal| lower.contains(refusal))
+    {
         return ErrorKind::SubscriptionUnavailable;
     }
     if lower.contains(UNSUPPORTED_REQUEST_MARKER) {
@@ -1165,10 +1181,30 @@ impl FailoverProvider {
     }
 
     /// The last-resort hub default's entry, when it is worth trying after
-    /// `chain`: not already in it.
-    fn hub_default_entry(&self, chain: &[ChainSpec]) -> Option<ChainSpec> {
-        self.hub_default_to_try(chain)
-            .map(|hub_default| self.routed_entry(hub_default))
+    /// `chain`: not already in it, and not a dearer model than a call that
+    /// asked for a cheap one. A call made on a cheap model (an agent's
+    /// background work) never lands on a stronger one: its plan may be the
+    /// very one at its limit, and its work was sized for the cheap model.
+    /// Judged on the model the call named, not on the chain's order, which
+    /// health may have changed.
+    fn hub_default_entry(&self, chain: &[ChainSpec], requested: Option<&str>) -> Option<ChainSpec> {
+        use super::tiers::ModelTier;
+        let entry = self
+            .hub_default_to_try(chain)
+            .map(|hub_default| self.routed_entry(hub_default))?;
+        let Some(asked) = requested.map(|m| self.routed_entry(m)) else {
+            return Some(entry);
+        };
+        let tier = |spec: &ChainSpec| self.tier_registry.classify(&spec.model);
+        if tier(&asked) == ModelTier::Cheap && tier(&entry) != ModelTier::Cheap {
+            debug!(
+                asked = asked.raw.as_str(),
+                hub_default = entry.raw.as_str(),
+                "no last resort on the hub default: the call asked for a cheap model"
+            );
+            return None;
+        }
+        Some(entry)
     }
 
     /// The provider serving the last-resort `entry`, when it is routable.
@@ -1837,7 +1873,7 @@ impl LlmProvider for FailoverProvider {
                 )
                 .await;
         }
-        let hub_default = self.hub_default_entry(&chain);
+        let hub_default = self.hub_default_entry(&chain, model);
         self.with_failover(
             chain,
             hub_default,
@@ -1875,7 +1911,7 @@ impl LlmProvider for FailoverProvider {
                 )
                 .await;
         }
-        let hub_default = self.hub_default_entry(&chain);
+        let hub_default = self.hub_default_entry(&chain, model);
         self.stream_with_failover(
             chain,
             hub_default,
@@ -3133,6 +3169,22 @@ mod tests {
         )
     }
 
+    /// 14:12 on 11/15: an organisation that turned Claude Code off was read
+    /// as `Unknown` and retried four times on the same login.
+    #[test]
+    fn an_organisation_that_turned_claude_code_off_is_never_retried() {
+        let bare = "claude-code round failed: Your organization has disabled Claude subscription \
+                    access for Claude Code \u{b7} Use an Anthropic API key instead, or ask your \
+                    admin to enable access";
+        let kind = classify_error(bare);
+        assert_eq!(kind, ErrorKind::SubscriptionUnavailable);
+        assert!(!kind.is_retryable() && !kind.is_model_fault());
+        assert_eq!(
+            failure_action(&kind, &RetryConfig::default(), 0, None),
+            FailureAction::Failover
+        );
+    }
+
     #[test]
     fn subscription_marker_beats_429_status_in_classify() {
         assert_eq!(
@@ -3791,6 +3843,44 @@ mod tests {
 
         assert_eq!(result.text(), Some("hub-default-rescue".to_string()));
         assert_eq!(provider.last_used_model().as_deref(), Some("hub-fallback"));
+    }
+
+    /// A call on a cheap model (background work) that fails never lands on
+    /// a dearer hub default: at 10:48 a Haiku call that timed out was sent
+    /// again on Fable, on the plan already at its limit.
+    #[tokio::test]
+    async fn hub_default_never_takes_a_cheap_call_up_a_tier() {
+        let inner = Arc::new(MockOnlyOkOnModel {
+            good_model: "claude-opus-4-6".to_string(),
+            error: "Anthropic API error (500): server error".to_string(),
+        });
+        let config = FailoverConfig {
+            retry: RetryConfig {
+                max_retries: 0,
+                initial_backoff_ms: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let provider =
+            FailoverProvider::new(inner, config).with_hub_default_model("claude-opus-4-6");
+        let err = provider
+            .create_message(None, &[], &[], Some("claude-haiku-4-5"), None, true)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("server error"), "{err}");
+        // A call on any other tier is still rescued, a weaker one too.
+        for asked in ["claude-opus-4-7", "claude-sonnet-4-5", "fable"] {
+            let rescued = provider
+                .create_message(None, &[], &[], Some(asked), None, true)
+                .await
+                .unwrap();
+            assert_eq!(
+                rescued.text(),
+                Some("hub-default-rescue".to_string()),
+                "{asked}"
+            );
+        }
     }
 
     #[tokio::test]

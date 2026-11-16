@@ -103,7 +103,10 @@ pub struct DevicePairingRequest {
     pub expires_at: DateTime<Utc>,
     pub approved_by: Option<String>,
     pub approved_at: Option<DateTime<Utc>>,
-    /// Plaintext token stored temporarily after admin approval so the device can retrieve it.
+    /// The token stored after admin approval so the device can collect it
+    /// once, in plaintext (the device's own record keeps only its hash). It
+    /// is collectable for [`PENDING_TOKEN_TTL_SECS`] after approval, then
+    /// gone: see [`DevicePairingRequest::collectable_token`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_token: Option<String>,
     /// Caller-supplied hint for which existing identity owns this device,
@@ -125,6 +128,22 @@ pub struct DevicePairingRequest {
     /// predate this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_kind: Option<String>,
+}
+
+/// How long after approval a device may collect its token from the status
+/// endpoint. The plaintext copy is cleared after this, collected or not (the
+/// device then pairs again), so a token never sits in the database for good.
+pub const PENDING_TOKEN_TTL_SECS: i64 = 600;
+
+impl DevicePairingRequest {
+    /// The token this request still holds for its device to collect at `now`:
+    /// `None` when none was kept, or when it is past
+    /// [`PENDING_TOKEN_TTL_SECS`] since approval (or of no known approval).
+    pub fn collectable_token(&self, now: DateTime<Utc>) -> Option<&str> {
+        let token = self.pending_token.as_deref()?;
+        let approved_at = self.approved_at?;
+        (now < approved_at + chrono::Duration::seconds(PENDING_TOKEN_TTL_SECS)).then_some(token)
+    }
 }
 
 /// The `linked_ids` key used when a pairing request names no kind. Every

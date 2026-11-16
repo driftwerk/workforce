@@ -61,12 +61,8 @@ pub(super) async fn start_sweeps(service: &Arc<AgentService>) {
                 if !scan_service.leader_gate.is_leader() {
                     continue; // shared stores — one consolidator per fleet
                 }
-                let model = memory.passive_model.clone().or_else(|| {
-                    scan_service
-                        .current_compaction_config()
-                        .compaction_model
-                        .clone()
-                });
+                // The light group's unless `[memory] passive_model` names one.
+                let model = memory.passive_model.clone();
                 let Some(ref store) = scan_service.memory_store else {
                     tracing::debug!(
                         "Session scan skipped — no memory store configured for this agent"

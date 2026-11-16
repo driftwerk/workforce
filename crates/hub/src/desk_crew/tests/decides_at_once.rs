@@ -8,7 +8,8 @@
 //!   for it. The same holds while the person drives the session.
 //! - A deny reaches the session with what to do instead.
 //! - An ask stays the person's, and the DM says what the boss asks.
-//! - A decision call that fails is tried once more, then the DM says so.
+//! - A decision call that fails is tried once more, then decided again
+//!   soon, the DM saying so once.
 //! - What Desk refuses (a write to its own settings; a session its
 //!   breaker paused) waits, said once in the DM, and goes ahead as the
 //!   boss decided once Desk lets it.
@@ -214,26 +215,25 @@ async fn act_fully_hands_each_request_whole_to_the_boss_at_once_and_does_as_it_d
         .unwrap();
         assert_eq!(behavior(&ask.await.unwrap()), "deny");
 
-        // A call that fails is tried once more, then the DM says so.
+        // A call that fails is tried once more, and decided again soon, the
+        // DM saying so once: it never becomes the person's for that.
         let failing = asked(&url, "make deploy-staging");
-        eventually("the DM to say it couldn't decide", async || {
-            (said(&overseer, &["make deploy-staging", "couldn't decide"]) > 0).then_some(())
+        let failed = ["make deploy-staging", "decision call failed"];
+        eventually("the DM to say its decision call failed", async || {
+            (said(&overseer, &failed) > 0).then_some(())
         })
         .await;
-        assert_eq!(
-            calls_about(&llm, "make deploy-staging").await.len(),
-            2,
-            "tried twice"
-        );
-        let p = d.view(s.id).unwrap().pending.expect("still the person's");
-        d.decide(
-            s.id,
-            p.id,
-            workforce_desk::model::Decision::Deny,
-            Some(By::you()),
-        )
-        .unwrap();
-        assert_eq!(behavior(&failing.await.unwrap()), "deny");
+        eventually("it to be decided again", async || {
+            (calls_about(&llm, "make deploy-staging").await.len() >= 4).then_some(())
+        })
+        .await;
+        assert_eq!(said(&overseer, &failed), 1, "said once");
+        decides(&llm, "make deploy-staging", "ALLOW: it deploys staging").await;
+        let answer = tokio::time::timeout(Duration::from_secs(10), failing)
+            .await
+            .expect("decided once its model answers")
+            .unwrap();
+        assert_eq!(behavior(&answer), "allow", "{answer}");
 
         // A write to its own settings, where its budget is, waits however
         // the command reaches them, and its DM says so once.

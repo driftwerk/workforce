@@ -48,6 +48,20 @@ pub enum SubscriptionError {
     },
     #[error("{}: {login} was refused: {detail}", SUBSCRIPTION_UNAVAILABLE_MARKER)]
     Forbidden { login: String, detail: String },
+    /// The provider refused the login's account: its organisation turned
+    /// Claude Code off, or it is on hold. Never retried on the same login.
+    #[error(
+        "{}: {login}{} was refused: {reason}. The provider said: {detail}",
+        SUBSCRIPTION_UNAVAILABLE_MARKER,
+        who_suffix(.who)
+    )]
+    AccountRefused {
+        login: String,
+        /// Whose account: "kim@example.com, Acme", when known.
+        who: Option<String>,
+        reason: String,
+        detail: String,
+    },
     #[error("{marker}: {0}", marker = UNSUPPORTED_REQUEST_MARKER)]
     Uncarried(String),
     #[error(
@@ -68,6 +82,12 @@ pub const THROTTLE_COOLDOWN: TimeDelta = TimeDelta::minutes(1);
 fn until_suffix(until: &Option<DateTime<Utc>>) -> String {
     until
         .map(|t| format!(" until {}", t.to_rfc3339()))
+        .unwrap_or_default()
+}
+
+fn who_suffix(who: &Option<String>) -> String {
+    who.as_ref()
+        .map(|who| format!(" ({who})"))
         .unwrap_or_default()
 }
 

@@ -17,8 +17,9 @@
 //! - The sessions a boss runs too (as it takes on every session): their
 //!   turn's end is judged here, in place of a work turn (`work`). One the
 //!   person took back from it is theirs.
-//! - At most [`CONTINUES`] steps in a row on the boss's word alone: then the
-//!   person is told once, and it waits for them.
+//! - No count of steps holds a session back: Act fully, with every box
+//!   ticked, keeps only the budget, the audit (each step a decision with its
+//!   Undo) and Stop. Lower levels never come here.
 //! - A call that fails or runs past [`WITHIN`] is tried once more; then the
 //!   turn's end goes to the boss's full turn, as before the fast call.
 
@@ -46,9 +47,6 @@ const AT_ONCE: usize = 3;
 
 /// How long ago a turn may have ended and still be judged.
 const RECENT_MINUTES: i64 = 30;
-
-/// How many steps in a row a session takes on its boss's word alone.
-pub(crate) const CONTINUES: u32 = 5;
 
 /// How much of what the boss says the DM shows, and how long its message
 /// to the session may be.
@@ -132,15 +130,6 @@ pub(super) fn next(text: &str) -> Option<Next> {
 /// A finished turn: which session, and how many prompts it had.
 type Key = (Uuid, u64);
 
-/// The steps a session took on its boss's word since the person last gave
-/// it input (then, and how many), and whether the person was told it waits.
-#[derive(Debug, Default, Clone)]
-struct Run {
-    since: Option<DateTime<Utc>>,
-    steps: u32,
-    told: bool,
-}
-
 /// What the loop keeps between looks.
 #[derive(Default)]
 struct Seen {
@@ -149,7 +138,6 @@ struct Seen {
     judged: HashSet<Key>,
     /// Since when each boss has been at Act fully, as seen here.
     unbound_since: HashMap<String, DateTime<Utc>>,
-    runs: HashMap<Uuid, Run>,
     /// Each session's last turn's end as Desk said it: what its full turn
     /// is handed.
     ends: HashMap<Uuid, Event>,
@@ -212,6 +200,15 @@ fn finished(crew: &CrewHub) -> Vec<Uuid> {
         .filter(|v| v.state == SessionState::Done)
         .map(|v| v.id)
         .collect()
+}
+
+/// Whether a call failed for its plan's usage limit (no login with room
+/// left), or for every slot staying busy, which a second call on the same
+/// plan would only meet again. A login to sign in again, or a model the plan
+/// lacks, is not this: those are said like any other failure.
+fn at_limit(error: &str) -> bool {
+    error.contains(workforce_agent::llm::failover::SUBSCRIPTION_UNAVAILABLE_MARKER)
+        && (error.contains("at its usage limit") || error.contains("stayed busy for"))
 }
 
 /// What became of a finished turn handed to its boss.
@@ -317,34 +314,6 @@ impl CrewHub {
             if !fresh || s.judged.contains(&key) {
                 return;
             }
-            // The person's input since starts its steps again.
-            let input = self.desk.last_input_of(view.id);
-            let run = s.runs.entry(view.id).or_default();
-            if run.since != input {
-                *run = Run {
-                    since: input,
-                    ..Run::default()
-                };
-            }
-            if run.steps >= CONTINUES {
-                if run.told {
-                    return;
-                }
-                run.told = true;
-                s.judged.insert(key);
-                let crew = Arc::clone(self);
-                tokio::spawn(async move {
-                    crew.tell_dm(
-                        &boss,
-                        &format!(
-                            "{} has taken {CONTINUES} steps in a row without you, so I've stopped it there: it's yours to look at.",
-                            view.label()
-                        ),
-                    )
-                    .await;
-                });
-                return;
-            }
             s.judged.insert(key);
         }
         let crew = Arc::clone(self);
@@ -410,6 +379,12 @@ impl CrewHub {
                         )
                     }
                 },
+                // Its plan is at its limit: a full turn would only meet the
+                // same limit, so the session is looked at again later.
+                Ok(Err(e)) if at_limit(&e) => {
+                    tracing::info!(session = %view.id, %boss, "the boss's plan is at its limit; a session's finished turn is judged later");
+                    return Judged::Later;
+                }
                 Ok(Err(e)) => {
                     failed = format!(
                         "its model failed: {}",
@@ -451,10 +426,6 @@ impl CrewHub {
             }
             Some(Next::Work(what)) => {
                 tracing::info!(session = %view.id, %boss, what, "a session's next step needs the boss's full turn");
-                // A step on the boss's word too.
-                if let Some(run) = seen.lock().runs.get_mut(&view.id) {
-                    run.steps += 1;
-                }
                 self.hand_to_work(view, seen);
             }
             Some(Next::Ask(ask)) => {
@@ -463,6 +434,9 @@ impl CrewHub {
                     .await;
             }
             Some(Next::Done(why)) => {
+                // Said finished: closed once it has rested, when nothing
+                // is left in it ([`super::closing`]).
+                self.said_done(view, &why);
                 self.record_nothing(boss, view.id, true, &why).await;
             }
             Some(Next::Continue { text, why }) => {
@@ -478,9 +452,6 @@ impl CrewHub {
                 match self.perform(&action, By::manager(boss, &name, &why)).await {
                     Ok(done) => {
                         tracing::info!(session = %view.id, %boss, %done, "the boss told a finished session its next step");
-                        if let Some(run) = seen.lock().runs.get_mut(&view.id) {
-                            run.steps += 1;
-                        }
                     }
                     Err(refused) => {
                         tracing::warn!(session = %view.id, %boss, %refused, "a boss's next step for a session was refused");
@@ -537,7 +508,27 @@ impl CrewHub {
 
 #[cfg(test)]
 mod tests {
-    use super::{next, Next};
+    use super::{at_limit, next, Next};
+
+    #[test]
+    fn only_a_plan_at_its_limit_or_busy_is_looked_at_later() {
+        assert!(at_limit(
+            "subscription unavailable: Kings's Claude is at its usage limit until 2026-11-20T19:00:00Z"
+        ));
+        assert!(at_limit(
+            "subscription unavailable: no Claude login for kings: shared at its usage limit until 2026-11-20 19:00:00 UTC"
+        ));
+        assert!(at_limit(
+            "subscription unavailable: every Claude slot on this hub stayed busy for 30s"
+        ));
+        assert!(!at_limit(
+            "subscription unavailable: Kings's Claude must be signed in again: token revoked"
+        ));
+        assert!(!at_limit(
+            "subscription unavailable: no Claude login for kings"
+        ));
+        assert!(!at_limit("the model timed out"));
+    }
 
     #[test]
     fn its_word_is_a_next_step_with_its_why_done_or_a_question_for_the_person() {

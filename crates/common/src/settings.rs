@@ -15,8 +15,10 @@ use crate::subscription::{CredentialTier, SharedServes};
 pub struct FloorConfig {
     /// When an agent's own plan has no usable login, write a person's line
     /// on another signed-in subscription provider's cheap tier, on that
-    /// person's own login only. Off by default: on a hub many people share
-    /// the line waits for the agent's own plan; Desk's local hub turns it on.
+    /// person's own login only, and only for an agent whose `[llm]
+    /// failover` names another provider (its owner's "Use another
+    /// provider"). Off by default: on a hub many people share the line waits
+    /// for the agent's own plan; Desk's local hub turns it on.
     #[serde(default)]
     pub fallback_providers: bool,
 }
@@ -50,7 +52,8 @@ pub struct ClaimGroundingConfig {
     /// Model for the grounding passes (claim verification, conclusion review,
     /// the editor's code/domain classifier). Accepts a concrete model id or a
     /// tier shorthand (e.g. "cheap", "provider:tier") resolved like the other
-    /// background-task model fields. `None` = the agent's default model.
+    /// background-task model fields. `None` = the agent's heavy background
+    /// model (`[llm] heavy_model`).
     #[serde(default)]
     pub model: Option<String>,
     /// Wall-clock budget for a review that runs on the REPLY PATH — gathering
@@ -783,6 +786,14 @@ pub struct DeskConfig {
     /// Sees): this engine's limits for sending it.
     #[serde(default)]
     pub knows: DeskKnowsSyncConfig,
+    /// Whether a person's paired Desk may copy their own personal keys
+    /// (the `users/<id>/` tier of this hub's vault, never a shared, agent
+    /// or org key) into Desk's vault on their computer, as Settings →
+    /// Connections offers (`/api/me/desk-key-copies`). Off, both routes
+    /// refuse and Desk shows no offer. Live: a change to the config overlay
+    /// takes effect without a restart. Default: on.
+    #[serde(default = "default_true")]
+    pub allow_personal_key_export: bool,
 }
 
 /// `[desk.knows]`: how Desk sends each agent what its rule covers.
@@ -1128,6 +1139,7 @@ impl Default for DeskConfig {
             memory: DeskMemoryConfig::default(),
             bosses: DeskBossesConfig::default(),
             knows: DeskKnowsSyncConfig::default(),
+            allow_personal_key_export: true,
         }
     }
 }
@@ -2725,8 +2737,8 @@ pub struct MemoryConfig {
     /// to extract facts worth remembering.
     #[serde(default)]
     pub passive: bool,
-    /// Model for passive extraction (e.g. "cheap"). Falls back to
-    /// compaction_model, then the agent's default model.
+    /// Model for passive extraction (e.g. "cheap"). Unset, the agent's
+    /// light background model (`[llm] light_model`).
     #[serde(default)]
     pub passive_model: Option<String>,
     /// Minimum token count in the user+assistant turn to trigger passive
@@ -2766,7 +2778,7 @@ pub struct MemoryConfig {
     #[serde(default = "default_consolidation_lookback")]
     pub consolidation_lookback_secs: u64,
     /// Model for the consolidation merge phase (e.g. "cheap").
-    /// If None, uses the agent's default model.
+    /// If None, the agent's light background model (`[llm] light_model`).
     #[serde(default)]
     pub consolidation_model: Option<String>,
     /// Engine for the consolidation turn (`"model"` or `"claude_code"`).
@@ -2790,7 +2802,7 @@ pub struct MemoryConfig {
     #[serde(default)]
     pub lesson_extract: bool,
     /// Model for lesson extraction (e.g. "cheap"). Falls back to
-    /// passive_model, then compaction_model, then the agent's default.
+    /// passive_model, then the agent's light background model.
     #[serde(default)]
     pub lesson_extract_model: Option<String>,
     /// Custom system prompt for lesson extraction.
@@ -7670,6 +7682,37 @@ pub struct AgentLlmConfig {
     /// ```
     #[serde(default)]
     pub fast: Option<bool>,
+    /// The model the agent's light background work runs on: sessions'
+    /// running accounts and the questions answered from them, gists and the
+    /// floor's paragraph, session memory notes, passive memory, lessons,
+    /// consolidation, self-learning, and reading a session's reply. Takes
+    /// the same forms as [`Self::voice_model`] (a tier, a provider tier, a
+    /// concrete id), or `"chat"` for the agent's own model. Unset, the
+    /// provider's `cheap` tier. A feature's own key (`[memory]
+    /// passive_model`, `[self_learning] model`, …) beats it. Read on every
+    /// reload, so an edit applies to the next call.
+    ///
+    /// ```toml
+    /// [llm]
+    /// light_model = "cheap"
+    /// ```
+    #[serde(default)]
+    pub light_model: Option<String>,
+    /// The model the agent's heavier background work runs on: compaction
+    /// and a thread's rollover summary, the overseer's own turns (its
+    /// check-ins, wakes, summaries, and its line, plan and handover turns)
+    /// and its decisions on sessions' prompts, its update briefs, and claim
+    /// grounding. Same forms as [`Self::light_model`], `"chat"` included.
+    /// Unset, the provider's `standard` tier, or the agent's own model where
+    /// that is cheaper. `[compaction] compaction_model` and
+    /// `[claim_grounding] model` beat it.
+    ///
+    /// ```toml
+    /// [llm]
+    /// heavy_model = "standard"
+    /// ```
+    #[serde(default)]
+    pub heavy_model: Option<String>,
     /// Model tier equivalences across providers. Maps tier names ("powerful",
     /// "standard", "cheap") to lists of equivalent models. Used by adaptive
     /// routing and failover to pick the right model when switching providers.
@@ -9994,7 +10037,7 @@ pub const DEFAULT_CODEX_TOOL_TIMEOUT_SECS: u64 = 300;
 /// The short names a round may use for Codex models, and what they resolve to.
 pub const DEFAULT_CODEX_MODELS: &[(&str, &str)] = &[
     ("astra", "gpt-6-astra"),
-    ("sol", "gpt-5.6-sol"),
+    ("sol", "gpt-6.1-sol"),
     ("terra", "gpt-5.6-terra"),
     ("luna", "gpt-5.6-luna"),
 ];

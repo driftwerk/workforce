@@ -27,7 +27,7 @@ use super::CrewHub;
 
 /// Every `crew.*` tool: the ones it has at every level first (its reads,
 /// and what it asks of the person, which is never gated).
-pub const READ: [&str; 14] = [
+pub const READ: [&str; 18] = [
     "crew.overview",
     "crew.activity",
     "crew.account",
@@ -42,6 +42,10 @@ pub const READ: [&str; 14] = [
     super::items::ORDER,
     super::preferences::PREFER,
     super::preferences::PREFERENCES,
+    super::directives::NAME,
+    super::github::PR,
+    super::github::BRANCH,
+    super::github::CI,
 ];
 pub const ACT: [&str; 22] = [
     "crew.nudge",
@@ -387,6 +391,19 @@ impl CrewTool {
             super::preferences::PREFER | super::preferences::PREFERENCES => {
                 crew.preferences_tool(self.name, b, input).await
             }
+            super::directives::NAME => crew.directives_tool(b, input).await,
+            // The person's GitHub, as them: no scope of Desk's to keep to.
+            super::github::PR | super::github::BRANCH | super::github::CI => {
+                super::github::read(
+                    b.service.vault.clone(),
+                    b.service.global_vault.clone(),
+                    &b.service.config,
+                    &b.service.tools,
+                    self.name,
+                    input,
+                )
+                .await
+            }
             _ => Err("not a reading tool".into()),
         }
     }
@@ -400,7 +417,7 @@ impl CrewTool {
             "name": v.label(), "hub_name": v.name, "group": v.group.map(|g| g.name),
             "goal": v.goal, "cwd": v.cwd,
             "last_prompt": v.last_prompt, "last_reply": v.last_reply,
-            "pending": v.pending, "terminal": terminal,
+            "pending": v.pending.as_ref().map(super::decide::pending_for_boss), "terminal": terminal,
         });
         Ok(json!({
             "state": v.state,
@@ -669,10 +686,7 @@ impl CrewTool {
         let (Some(g), machines) = (self.group(), self.machines(crew)) else {
             return local;
         };
-        let ceiling = super::served::Ceiling {
-            level: b.oversight.level,
-            act: b.oversight.act,
-        };
+        let ceiling = crew.ceiling_now(b.service.agent_id.as_str(), &b.oversight);
         let ceiling = &ceiling;
         let asks = machines.iter().map(|m| {
             let crew = Arc::clone(crew);
@@ -729,10 +743,7 @@ impl CrewTool {
                 "You only watch the crew: tell the person what you would do instead.".into(),
             ));
         }
-        let ceiling = super::served::Ceiling {
-            level: b.oversight.level,
-            act: b.oversight.act,
-        };
+        let ceiling = crew.ceiling_now(b.service.agent_id.as_str(), &b.oversight);
         let mut sent = input.clone();
         sent["session_id"] = json!(id.to_string());
         let cited = input["preference"]
@@ -784,6 +795,9 @@ pub(crate) fn describe(name: &str) -> &'static str {
     match name {
             "crew.overview" => "Everyone on the crew now: the person's agents and their Claude Code and Codex sessions, each with its state (needs you, working, quiet, done today, idle, failed, stopped), what it's doing, what it asks (with approval ids), since when, and whether you run it for the person (and whether they are driving it now). slots says how many of the sessions you run are starting or working, of the most you may run at once. For what sessions spent (tokens, cost), use crew.spend.",
             super::spend::NAME => super::spend::DESCRIPTION,
+            super::github::PR | super::github::BRANCH | super::github::CI => {
+                super::github::describe(name)
+            }
             super::decisions::NAME => super::decisions::DESCRIPTION,
             super::items::ASK => super::items::ASK_DESCRIPTION,
             super::items::CLOSE => super::items::CLOSE_DESCRIPTION,
@@ -792,6 +806,7 @@ pub(crate) fn describe(name: &str) -> &'static str {
             super::items::ORDER => super::items::ORDER_DESCRIPTION,
             super::preferences::PREFER => super::preferences::PREFER_DESCRIPTION,
             super::preferences::PREFERENCES => super::preferences::PREFERENCES_DESCRIPTION,
+            super::directives::NAME => super::directives::DESCRIPTION,
             super::board::NAME => super::board::DESCRIPTION,
             super::plan::NAME => super::plan::DESCRIPTION,
             super::plan::UPDATE => super::plan::UPDATE_DESCRIPTION,
@@ -838,6 +853,9 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
     match name {
         "crew.overview" => json!({ "type": "object", "properties": {} }),
         super::spend::NAME => super::spend::schema(),
+        super::github::PR | super::github::BRANCH | super::github::CI => {
+            super::github::schema(name)
+        }
         super::decisions::NAME => super::decisions::schema(),
         super::items::ASK
         | super::items::CLOSE
@@ -847,6 +865,7 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
         super::preferences::PREFER | super::preferences::PREFERENCES => {
             super::preferences::schema(name)
         }
+        super::directives::NAME => super::directives::schema(),
         super::board::NAME => super::board::schema(),
         super::plan::NAME => super::plan::schema(),
         super::plan::UPDATE => super::plan::update_schema(),
