@@ -748,3 +748,57 @@ async fn a_refreshed_or_restarted_idle_session_is_no_update() {
     })
     .await;
 }
+
+/// The writing contract, end to end: a session named only by its ticket's
+/// id is said by what its work is, its ids in brackets, with its link;
+/// the update's headline never opens on the id.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_names_the_work_in_words_with_ids_in_brackets_and_its_session() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        // The model is down: written plainly, to the contract.
+        crew.set_update_writer(Arc::new(Writer(None)));
+        begun(&crew).await;
+        let s = new_session(&d, dir.path(), "MAN-636").await;
+        let mut a = Account::new(s.id, "", chrono::Utc::now());
+        a.purpose = "Stop a bad key file printing the secret key into the logs".into();
+        a.done.push(Done {
+            text: "MAN-636: stopped it now that #640 has merged".into(),
+            refs: vec![Ref {
+                kind: RefKind::Pr,
+                id: "#640".into(),
+                url: Some("https://github.com/acme/keys/pull/640".into()),
+            }],
+            at: chrono::Utc::now(),
+            restated: false,
+        });
+        d.store().session_account_put(&a).await.unwrap();
+        let posted = eventually("the update", async || updates(&overseer).into_iter().next()).await;
+        let extras = eventually("its extras", async || {
+            d.store()
+                .extras(std::slice::from_ref(&posted.id))
+                .await
+                .unwrap()
+                .remove(&posted.id)
+                .and_then(|e| e.update)
+        })
+        .await;
+        let said = &extras.said[0];
+        assert_eq!(workforce_desk::update_write::breaches(said), vec![]);
+        assert_eq!(
+            said.headline,
+            "Stop a bad key file printing the secret key into the logs: stopped it now that the pull request (#640) has merged."
+        );
+        assert_eq!(said.ids, vec!["MAN-636".to_string()]);
+        let link = said.session.as_ref().expect("its session's link");
+        assert_eq!(link.session_id, s.id.to_string());
+        assert_eq!(link.name, "MAN-636");
+        assert!(
+            !extras.headline.starts_with("MAN-636"),
+            "{}",
+            extras.headline
+        );
+    })
+    .await;
+}

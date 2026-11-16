@@ -43,6 +43,7 @@ use workforce_desk::open_item::{OpenItem, OpenKind, OpenState};
 use workforce_desk::update::{
     self, Change, MentionedUpdate, NeedsYou, Pending, Told, UpdateSession, UpdateState, WaitingItem,
 };
+use workforce_desk::update_write::{self as write, Said, Titled, Work};
 
 use super::watcher::Budget;
 use super::{CrewHub, CHECK_IN};
@@ -101,6 +102,9 @@ pub(super) struct Changed {
     /// Its account as the update tells of it ([`update::as_told`]).
     account: Account,
     new: Vec<Done>,
+    /// What its work is, from facts: its goal and its tickets' and PRs'
+    /// titles.
+    pub work: Work,
 }
 
 impl Changed {
@@ -203,6 +207,7 @@ impl CrewHub {
                 continue;
             }
             change = change.max(c);
+            let work = self.work_of(v, Some(a), &new).await;
             sessions.push(Changed {
                 id: v.id,
                 name: v.label().to_string(),
@@ -210,6 +215,7 @@ impl CrewHub {
                 // What it waits on is said only when that is new.
                 account: update::as_told(was, a),
                 new,
+                work,
             });
         }
         let mut last = state.last_update_at.unwrap_or(state.since);
@@ -310,7 +316,12 @@ impl CrewHub {
         owner: &str,
         o: &Oversight,
         b: &Batch,
-    ) -> (Vec<UpdateSession>, Vec<DecisionLine>, Option<String>) {
+    ) -> (
+        Vec<UpdateSession>,
+        Vec<DecisionLine>,
+        Option<String>,
+        HashMap<Uuid, write::Written>,
+    ) {
         let mut written = update::Composed::default();
         let writer = self.update_writer.lock().clone();
         // Only what it did is worth the model's words, the newest first: the
@@ -335,6 +346,9 @@ impl CrewHub {
                     .map(|s| (s.id, s.context(), &s.account, s.new.iter().collect()))
                     .collect();
                 let mut user = update::composer_input(&input);
+                let works: Vec<(Uuid, &Work)> =
+                    b.sessions.iter().map(|s| (s.id, &s.work)).collect();
+                user.push_str(&update::composer_work(&works));
                 user.push_str(&update::composer_decisions(&acted));
                 match writer
                     .write(boss, owner, update::COMPOSER_SYSTEM, &user)
@@ -350,9 +364,12 @@ impl CrewHub {
                         tracing::info!(error = %format!("{e:#}"), "the update's writer failed; written plainly")
                     }
                 }
-                // Over its bounds: asked once more for those fields alone,
-                // then whatever is still long is clipped.
-                let long = update::too_long(&written);
+                // Over its bounds, or against the writing contract (an id
+                // alone, outside brackets): asked once more for those
+                // fields alone, then whatever is still long is clipped and
+                // whatever still breaks it is written plainly.
+                let mut long = update::too_long(&written);
+                long.extend(Self::breaking(b, &written));
                 if !long.is_empty() && self.desk.update_take().await.unwrap_or(false) {
                     user.push_str(&update::reask(&long));
                     match writer
@@ -394,7 +411,108 @@ impl CrewHub {
             .collect();
         let decisions = update::decision_lines(&b.decisions, &written.decisions);
         let headline = written.headline.as_deref().and_then(update::headline_line);
-        (sessions, decisions, headline)
+        (sessions, decisions, headline, written.said)
+    }
+
+    /// What of `c`'s items for `b`'s sessions breaks the writing contract
+    /// ([`write::breaches`]), said for the composer to write again.
+    fn breaking(b: &Batch, c: &update::Composed) -> Vec<String> {
+        let mut out = Vec::new();
+        for s in &b.sessions {
+            let Some(w) = c.said.get(&s.id) else {
+                continue;
+            };
+            let probe = |headline: &str, body: &str| {
+                write::breaches(&Said {
+                    kind: write::EventKind::Progress,
+                    headline: headline.to_string(),
+                    body: body.to_string(),
+                    ids: vec![],
+                    not_checked: None,
+                    session: Some(s.work.link()),
+                    did: vec![],
+                    at: None,
+                })
+            };
+            if let Some(h) = w.headline.as_deref() {
+                let said: Vec<String> = probe(h, "").iter().map(write::Breach::said).collect();
+                if !said.is_empty() {
+                    out.push(format!("session {} headline ({})", s.id, said.join("; ")));
+                }
+            }
+            if let Some(t) = w.body.as_deref() {
+                let said: Vec<String> = probe("The work moved on.", t)
+                    .iter()
+                    .map(write::Breach::said)
+                    .collect();
+                if !said.is_empty() {
+                    out.push(format!("session {} text ({})", s.id, said.join("; ")));
+                }
+            }
+        }
+        out
+    }
+
+    /// What session `v`'s work is, from facts: what it is for (its
+    /// account's purpose, else its goal), the tickets on the board it is
+    /// given or linked to, with their titles, and the PRs it names (`new`),
+    /// with the titles `crew.github_pr` read of them.
+    pub(super) async fn work_of(
+        &self,
+        v: &workforce_desk::model::SessionView,
+        a: Option<&Account>,
+        new: &[Done],
+    ) -> Work {
+        let store = self.desk.store();
+        let mut tickets = store.session_tickets(v.id).await.unwrap_or_default();
+        for t in store.linked_tickets(&[v.id]).await.unwrap_or_default() {
+            if !tickets.iter().any(|k| k.id == t.id) {
+                tickets.push(t);
+            }
+        }
+        let keys = store
+            .ticket_keys(&tickets.iter().map(|t| t.id).collect::<Vec<_>>())
+            .await
+            .unwrap_or_default();
+        let mut titled: Vec<Titled> = tickets
+            .iter()
+            .filter_map(|t| {
+                Some(Titled {
+                    kind: workforce_desk::account::RefKind::Ticket,
+                    id: keys.get(&t.id)?.clone(),
+                    title: Some(t.title.clone()).filter(|t| !t.trim().is_empty()),
+                })
+            })
+            .collect();
+        for r in new.iter().flat_map(|d| &d.refs) {
+            use workforce_desk::account::RefKind;
+            if !matches!(r.kind, RefKind::Pr | RefKind::Ticket)
+                || titled.iter().any(|t| t.id.eq_ignore_ascii_case(&r.id))
+                || write::id_kind(&r.id) != Some(r.kind)
+            {
+                continue;
+            }
+            let title = match r.kind {
+                RefKind::Pr => super::github::pr_title(r.url.as_deref(), &r.id),
+                _ => None,
+            };
+            titled.push(Titled {
+                kind: r.kind,
+                id: r.id.trim().to_string(),
+                title,
+            });
+        }
+        let goal = a
+            .map(|a| a.purpose.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| v.goal.trim().to_string());
+        Work {
+            session_id: v.id.to_string(),
+            name: v.label().to_string(),
+            closed: v.state == SessionState::Closed,
+            goal,
+            titled,
+        }
     }
 
     /// `b` written as an update for `owner`: its extras and its text.
@@ -406,7 +524,7 @@ impl CrewHub {
         b: &Batch,
         now: DateTime<Utc>,
     ) -> (MentionedUpdate, String) {
-        let (sessions, decisions, headline) = self.composed(boss, owner, o, b).await;
+        let (sessions, decisions, headline, wrote) = self.composed(boss, owner, o, b).await;
         let full = self.level_now(boss, o).0 == workforce_common::oversight::Level::Full;
         let footer = match self.desk.cheap_today().await {
             Ok((spent, cap)) => update::footer(spent, cap),
@@ -436,6 +554,47 @@ impl CrewHub {
             })
             .collect();
         let (brief, more_items) = update::brief(&b.decisions, &decisions, &b.for_you, &names);
+        // Said as a teammate says it: one item per piece of work, the
+        // composer's words where they keep the contract, else plainly.
+        let mut said: Vec<Said> = Vec::new();
+        for s in &b.sessions {
+            let new: Vec<&Done> = s.new.iter().collect();
+            let did = update::did_items(&b.decisions, &decisions, Some(s.id));
+            let kind = write::kind_of(&new, &did);
+            let plain = write::plain_said(
+                &s.work,
+                &new,
+                &s.account.next,
+                s.account.waiting_on.as_deref(),
+                did,
+                kind,
+            );
+            said.push(match wrote.get(&s.id) {
+                Some(w) => write::said_from(plain, w, &s.work),
+                None => plain,
+            });
+        }
+        // The sessions it acted on that did nothing new themselves.
+        let views = self.desk.list();
+        let mut acted_on: Vec<Uuid> = Vec::new();
+        for id in b.decisions.iter().filter_map(|d| d.session) {
+            if !acted_on.contains(&id) && !b.sessions.iter().any(|s| s.id == id) {
+                acted_on.push(id);
+            }
+        }
+        for id in &acted_on {
+            let did = update::did_items(&b.decisions, &decisions, Some(*id));
+            let Some(v) = views
+                .iter()
+                .find(|v| v.id == *id)
+                .filter(|_| !did.is_empty())
+            else {
+                continue;
+            };
+            let work = self.work_of(v, None, &[]).await;
+            let kind = write::kind_of(&[], &did);
+            said.push(write::plain_said(&work, &[], "", None, did, kind));
+        }
         // The finished sessions it closed, would close, or left open: one
         // line each.
         let notes = self.closing_notes(boss, now);
@@ -476,8 +635,17 @@ impl CrewHub {
             brief,
             more_items,
             closed,
+            said,
         };
-        let headline = headline.unwrap_or_else(|| update::plain_headline(&u, b.for_you.len()));
+        // Not written: one piece of work's own headline, else in counts.
+        let headline = headline
+            .or_else(|| match u.said.as_slice() {
+                [one] if b.for_you.is_empty() && b.waiting.is_empty() => {
+                    update::headline_line(&one.headline)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| update::plain_headline(&u, b.for_you.len()));
         // Never a line without its session: one about one session says it.
         u.headline = update::situated(&u, &headline, b.for_you.len());
         let decided: Vec<String> = b

@@ -474,7 +474,7 @@ impl CrewHub {
             }
             return Ok(());
         }
-        let (sessions, decisions, _) = self.composed(boss, owner, o, &b).await;
+        let (sessions, decisions, _, _) = self.composed(boss, owner, o, &b).await;
         let full = self.level_now(boss, o).0 == workforce_common::oversight::Level::Full;
         let finished: Vec<(String, String)> = b
             .sessions

@@ -105,6 +105,52 @@ fn number(v: &Value) -> Option<u64> {
     })
 }
 
+/// The titles of the pull requests read here, by `owner/repo#n`: what an
+/// update names a PR by, in words ([`pr_title`]). Each read keeps the
+/// newest; at most [`TITLES`] are kept.
+static PR_TITLES: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<String, String>>,
+> = std::sync::LazyLock::new(Default::default);
+/// The most PR titles kept.
+const TITLES: usize = 2_000;
+
+/// Keeps `title` as the title of `owner/repo`'s PR `n`.
+fn keep_title(owner: &str, repo: &str, n: u64, title: &str) {
+    let title = workforce_desk::crew::one_line(title, 200);
+    if title.is_empty() {
+        return;
+    }
+    let mut kept = PR_TITLES.lock();
+    if kept.len() >= TITLES {
+        kept.clear();
+    }
+    kept.insert(
+        format!("{}/{}#{n}", owner.to_lowercase(), repo.to_lowercase()),
+        title,
+    );
+}
+
+/// The title of PR `id` (`#640`) as last read on GitHub: by its link's
+/// `owner/repo` when it has one, else the one PR of that number read.
+pub(crate) fn pr_title(url: Option<&str>, id: &str) -> Option<String> {
+    let n: u64 = id.trim().trim_start_matches('#').parse().ok()?;
+    let kept = PR_TITLES.lock();
+    let from_link = url.and_then(|u| {
+        let parts: Vec<&str> = u.split("://").nth(1)?.split('/').collect();
+        let at = parts.iter().position(|p| matches!(*p, "pull" | "pulls"))?;
+        (at >= 3).then(|| format!("{}/{}#{n}", parts[at - 2], parts[at - 1]).to_lowercase())
+    });
+    if let Some(key) = from_link {
+        return kept.get(&key).cloned();
+    }
+    let suffix = format!("#{n}");
+    let mut found = kept.iter().filter(|(k, _)| k.ends_with(&suffix));
+    match (found.next(), found.next()) {
+        (Some((_, t)), None) => Some(t.clone()),
+        _ => None,
+    }
+}
+
 /// Runs the boss's GitHub read `name` with `input`, as the person in scope,
 /// through the adapter as `registry`'s agent's keys are pinned.
 pub(crate) async fn read(
@@ -187,6 +233,11 @@ pub(crate) async fn read(
         out.push(r.output);
     }
     let got = out.pop().unwrap_or(Value::Null);
+    if name == PR {
+        if let (Some(n), Some(title)) = (got["number"].as_u64(), got["title"].as_str()) {
+            keep_title(&owner, &repo, n, title);
+        }
+    }
     Ok(match name {
         PR => pull(&got),
         BRANCH => json!({ "pulls": fenced(&got["pulls"]) }),
@@ -381,6 +432,29 @@ mod tests {
                 .mount(server)
                 .await;
         }
+    }
+
+    /// A PR's title read here is what an update names it by: by its link's
+    /// repository, or by its number when only one PR of it was read.
+    #[test]
+    fn a_pull_requests_title_is_kept_for_the_updates() {
+        keep_title("Acme", "Keys", 64_001, "Test every generated key loads back");
+        keep_title("acme", "web", 64_002, "One");
+        keep_title("acme", "api", 64_002, "Two");
+        assert_eq!(
+            pr_title(Some("https://github.com/acme/keys/pull/64001"), "#64001").as_deref(),
+            Some("Test every generated key loads back")
+        );
+        assert_eq!(
+            pr_title(None, "#64001").as_deref(),
+            Some("Test every generated key loads back")
+        );
+        assert_eq!(pr_title(None, "#64002"), None, "two PRs of that number: neither");
+        assert_eq!(
+            pr_title(Some("https://github.com/acme/api/pull/64002"), "#64002").as_deref(),
+            Some("Two")
+        );
+        assert_eq!(pr_title(None, "MAN-1"), None);
     }
 
     #[test]

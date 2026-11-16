@@ -108,6 +108,7 @@ mod transcript;
 pub mod update;
 pub mod update_brief;
 pub mod update_store;
+pub mod update_write;
 pub mod usage;
 mod vt;
 mod worktree;
