@@ -153,18 +153,23 @@ impl Batch {
     /// still finds it changed: a new next step or wait is said then.
     fn right_away(self, c: &Cadence, quiet: bool, was: &HashMap<Uuid, Told>) -> Batch {
         let now = |k: EventKind| cadence::route(k, c, quiet) == Route::RightAway;
+        // What comes next, or what it waits on, changed: progress.
+        let kind_of = |s: &Changed| {
+            let new: Vec<&Done> = s.new.iter().collect();
+            match new.is_empty() {
+                true => EventKind::Progress,
+                false => write::kind_of(&new, &[]),
+            }
+        };
         let mut told = self.told;
         let (sessions, waits): (Vec<Changed>, Vec<Changed>) =
-            self.sessions.into_iter().partition(|s| {
-                let new: Vec<&Done> = s.new.iter().collect();
-                // What comes next, or what it waits on, changed: progress.
-                let kind = match new.is_empty() {
-                    true => EventKind::Progress,
-                    false => write::kind_of(&new, &[]),
-                };
-                now(kind)
-            });
-        for s in &waits {
+            self.sessions.into_iter().partition(|s| now(kind_of(s)));
+        // Held for the roundup: still changed when it comes. Said only if
+        // asked: moved on, so it neither piles up nor comes out later.
+        for s in waits
+            .iter()
+            .filter(|s| cadence::route(kind_of(s), c, quiet) != Route::Ask)
+        {
             match was.get(&s.id) {
                 Some(t) => told.insert(s.id, t.clone()),
                 None => told.remove(&s.id),
