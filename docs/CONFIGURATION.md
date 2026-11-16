@@ -949,7 +949,7 @@ All fields are optional. Only include the fields you want to override — unset 
 | `[compaction]` | `prune_tool_output_max_chars` | usize | Max tool output chars |
 | `[compaction]` | `max_compaction_passes` | u32 | Safety valve |
 | `[compaction]` | `min_messages_to_compact` | usize | Min messages |
-| `[llm]` | `light_model` | String | Light background work: session accounts, gists, memory notes, passive memory, lessons (and their cleanup), consolidation, self-learning, artifact tagging. A tier, `provider:tier`, a model id, or `"chat"` for the agent's own model. Unset: the provider's `cheap` tier |
+| `[llm]` | `light_model` | String | Light background work: session accounts, gists, memory notes, passive memory, lessons (and their cleanup), consolidation, self-learning, artifact tagging (process-wide: the first agent built's light model; on a subscription hub, the provider's `cheap` tier). A tier, `provider:tier`, a model id, or `"chat"` for the agent's own model. Unset: the provider's `cheap` tier |
 | `[llm]` | `heavy_model` | String | Heavier background work: compaction and rollover summaries, the overseer's own turns and decisions, update briefs, claim grounding. Same forms. Unset: the provider's `standard` tier, or the agent's own model where that is on the cheap tier |
 | `[compaction]` | `compaction_model` | String | Model for compaction |
 | `[memory]` | `passive` | bool | Enable post-turn extraction |

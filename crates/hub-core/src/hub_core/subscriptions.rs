@@ -200,15 +200,37 @@ pub fn fails_over_to_another_provider(primary: ProviderKind, failover: &[String]
 }
 
 /// Whether a bare model id is one of Claude's as the Claude Code CLI names
-/// it, so the CLI can run it: exactly one of the known ids
-/// ([`known_claude_models`]), with or without `[1m]`. Another provider's
-/// id for a Claude model (`anthropic/claude-haiku-5.5`,
-/// `us.anthropic.claude-…`, Vertex's `claude-…@…`), an id no table here
-/// names, or any model whose name merely holds `claude` or `opus`, is not.
+/// it, so the CLI can run it: one of the known ids ([`known_claude_models`])
+/// or an id of their shape not listed yet, with or without `[1m]`. Another
+/// provider's id for a Claude model (`anthropic/claude-haiku-5.5`,
+/// `us.anthropic.claude-…`, Vertex's `claude-…@…`), `claude-code`, or any
+/// model whose name merely holds `claude` or `opus`, is not.
 pub fn is_claude_model(model: &str) -> bool {
     let lower = model.trim().to_ascii_lowercase();
     let bare = lower.strip_suffix("[1m]").unwrap_or(&lower);
-    known_claude_models().contains(bare)
+    known_claude_models().contains(bare) || is_claude_shaped(bare)
+}
+
+/// An Anthropic API id of the CLI's own shape that the tables here may not
+/// name yet: `claude-` then one family (`opus`, `sonnet`, `haiku`, `fable`)
+/// and version or date numbers, hyphen-separated (`claude-opus-4-5`,
+/// `claude-sonnet-6-20270101`, `claude-3-5-haiku-20241022`). Nothing else
+/// (`claude-code`, `claude-opus-4.5`, `claude-opus`) passes.
+fn is_claude_shaped(id: &str) -> bool {
+    let Some(rest) = id.strip_prefix("claude-") else {
+        return false;
+    };
+    let (mut families, mut numbers) = (0, 0);
+    for part in rest.split('-') {
+        if matches!(part, "opus" | "sonnet" | "haiku" | "fable") {
+            families += 1;
+        } else if !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()) {
+            numbers += 1;
+        } else {
+            return false;
+        }
+    }
+    families == 1 && numbers >= 1
 }
 
 /// The Claude model ids the Claude Code CLI runs, as this hub knows them:
@@ -238,7 +260,11 @@ pub fn known_claude_models() -> &'static std::collections::HashSet<String> {
                 priced
                     .into_keys()
                     .map(|id| id.to_ascii_lowercase())
-                    .filter(|id| id.starts_with("claude-") && !id.contains(['@', '/', ':'])),
+                    .filter(|id| {
+                        id.starts_with("claude-")
+                            && !id.starts_with("claude-code")
+                            && !id.contains(['@', '/', ':'])
+                    }),
             );
             known
         });
@@ -894,6 +920,9 @@ mod tests {
             "claude-haiku-4-5-20251001",
             "claude-fable-5-2",
             "claude-sonnet-4-6[1m]",
+            "claude-opus-4-5",
+            "claude-opus-9-9",
+            "claude-3-5-haiku-20241022",
         ] {
             assert!(super::is_claude_model(id), "{id}");
         }
@@ -910,7 +939,12 @@ mod tests {
             "my-sonnet-finetune",
             "claude",
             "claude-opus",
-            "claude-opus-9-9",
+            "claude-code",
+            "claude-code-haiku",
+            "claude-opus-4.5",
+            "claude-opus-x",
+            "claude-opus-sonnet-4",
+            "claude--4",
             "haiku-mini",
         ] {
             assert!(!super::is_claude_model(id), "{id}");
@@ -934,7 +968,11 @@ mod tests {
                 .unwrap();
         let anthropic: Vec<_> = priced
             .keys()
-            .filter(|id| id.starts_with("claude-") && !id.contains(['@', '/', ':']))
+            .filter(|id| {
+                id.starts_with("claude-")
+                    && !id.starts_with("claude-code")
+                    && !id.contains(['@', '/', ':'])
+            })
             .collect();
         assert!(anthropic.len() >= 10, "{anthropic:?}");
         for id in anthropic {
