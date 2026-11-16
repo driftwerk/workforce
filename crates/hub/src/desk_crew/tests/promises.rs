@@ -347,6 +347,15 @@ async fn a_sessions_reply_is_said_in_words_never_its_mark() {
             said[0].session.as_ref().map(|l| l.session_id.clone()),
             Some(s.id.to_string())
         );
+        // To a question about the work, "Done." is its answer: said.
+        let p = ask("Is the migration finished?").await;
+        reply("Re m:9d966bcb: Done.", p.id).await;
+        eventually("the done said", async || {
+            dm().into_iter().find(|m| {
+                m.content.contains("“Is the migration finished?”, and it says: Done.")
+            })
+        })
+        .await;
         // Nothing else was said of these replies, and no mark anywhere.
         let all = dm();
         assert!(
@@ -360,7 +369,7 @@ async fn a_sessions_reply_is_said_in_words_never_its_mark() {
             all.iter()
                 .filter(|m| m.content.contains("Cufflink Migration"))
                 .count(),
-            1,
+            2,
             "{:?}",
             all.iter().map(|m| &m.content).collect::<Vec<_>>()
         );

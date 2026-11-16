@@ -773,6 +773,13 @@ impl CrewHub {
             .with_timezone(&self.desk.timezone())
             .format("%H:%M")
             .to_string();
+        // Its ids said to the writing contract: in brackets, after words.
+        let work = workforce_desk::update_write::Work {
+            session_id: session.to_string(),
+            name: name.to_string(),
+            ..Default::default()
+        };
+        let (answer, ids) = workforce_desk::update_write::in_words(&answer, &work);
         let text = reply_line(name, asked_in(&closed.text).as_deref(), &at, &answer);
         let link = workforce_desk::update_write::SessionLink {
             session_id: session.to_string(),
@@ -782,15 +789,18 @@ impl CrewHub {
                 .view(session)
                 .map_or(true, |v| v.state == SessionState::Closed),
         };
-        self.say_of_session(&closed.boss, text, link, m.at).await;
+        self.say_of_session(&closed.boss, text, ids, link, m.at)
+            .await;
     }
 
     /// Says `text`, about the session `link` opens, in `boss`'s DM as a
-    /// notice: one item, with the session's link beside it.
+    /// notice: one item, its `ids` in brackets, with the session's link
+    /// beside it. At once, as the reply comes: not yet by the cadence.
     async fn say_of_session(
         &self,
         boss: &str,
         text: String,
+        ids: Vec<String>,
         link: workforce_desk::update_write::SessionLink,
         at: DateTime<Utc>,
     ) {
@@ -800,11 +810,12 @@ impl CrewHub {
         let Some(owner) = self.person(Some(&service)) else {
             return;
         };
+        let ids_said = ids.clone();
         let said = workforce_desk::update_write::Said {
             kind: workforce_desk::update_write::EventKind::Progress,
             headline: text.clone(),
             body: String::new(),
-            ids: Vec::new(),
+            ids,
             not_checked: None,
             session: Some(link),
             did: Vec::new(),
@@ -818,7 +829,12 @@ impl CrewHub {
             }),
             ..Default::default()
         };
-        let delivery = crate::desk_surface::Delivery::text(DeliveryKind::Notice, text);
+        // Read as text elsewhere (Slack, history): its ids after it.
+        let plain = match ids_said.is_empty() {
+            true => text,
+            false => format!("{text} ({})", ids_said.join(", ")),
+        };
+        let delivery = crate::desk_surface::Delivery::text(DeliveryKind::Notice, plain);
         if let Err(e) = self
             .deliver_with_extras(&service, &owner, delivery, &extras)
             .await

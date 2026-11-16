@@ -519,7 +519,7 @@ impl CrewHub {
         let what = format!(
             "gave you {}'s question “{}”",
             q.from.name,
-            crew::one_line(q.headline(), 160)
+            crew::one_line(&workforce_desk::line::without_marks(q.headline()), 160)
         );
         let mut d = BossDecision::new(&boss, Need::Question, &what, why, How::Escalated)
             .briefly(&format!("Gave you {}'s question.", q.from.name), None);
