@@ -1867,6 +1867,8 @@ impl Desk {
         tokio::spawn(desk.clone().watch_background());
         desk.line_load().await;
         tokio::spawn(desk.clone().line_loop());
+        // Lost in this start, not offered by an earlier one.
+        let lost_now: HashSet<Uuid> = recovered.iter().map(|r| r.id).collect();
         recovered.into_iter().for_each(|r| desk.save(r));
         for (id, at) in failed {
             let _ = desk.0.persist.send(Persist::Attention(id, at));
@@ -1907,10 +1909,14 @@ impl Desk {
             let ids = desk
                 .restore_offer()
                 .into_iter()
-                // At `Ask` only Desk's own: one from another terminal ended
-                // there, not with the hub, and the listing may not have said
-                // whether its process still runs.
-                .filter(|s| desk.0.opts.restore == RestorePolicy::Auto || s.origin == Origin::Desk)
+                // At `Ask` only Desk's own, lost in this restart: one from
+                // another terminal ended there, not with the hub (and the
+                // listing may not have said whether its process still runs);
+                // one an earlier start offered is still the person's to take.
+                .filter(|s| {
+                    desk.0.opts.restore == RestorePolicy::Auto
+                        || (s.origin == Origin::Desk && lost_now.contains(&s.id))
+                })
                 .map(|s| s.id)
                 .collect::<Vec<_>>();
             desk.restore(&ids, None).await;
@@ -8624,6 +8630,33 @@ mod tests {
                 "a new process"
             );
             assert!(d.restore_offer().is_empty(), "nothing left to bring back");
+            holder_cancel.cancel();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn what_a_reboot_offered_is_still_offered_after_a_later_restart() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let store = DeskStore::from_pool(pool.clone());
+            DeskStore::migrate(&pool).await.unwrap();
+            // Offered after a reboot, and left: the person hasn't taken it.
+            let offered = SessionRecord {
+                state: SessionState::Stopped,
+                restore_offer: true,
+                ..crate::store::tests::record_fixture("offered")
+            };
+            store.put(&offered).await.unwrap();
+            let (d, _, holder_cancel, _hdir) = restarted_with_ended(pool, dir.path(), 1).await;
+            assert!(
+                !d.view(offered.id).unwrap().live,
+                "never started on its own"
+            );
+            assert!(
+                d.restore_offer().iter().any(|o| o.id == offered.id),
+                "still offered"
+            );
             holder_cancel.cancel();
         })
         .await;
