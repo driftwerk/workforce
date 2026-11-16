@@ -7433,14 +7433,32 @@ impl Desk {
             .into_iter()
             .filter(|e| !hub.holds(Path::new(&e.cwd)))
             .collect();
-        let table = if hub.knows_its_own() && found.iter().any(|e| e.pid.is_some()) {
-            procs::table().await.unwrap_or_default()
-        } else {
-            Vec::new()
+        // The PTY holder's own children are Desk's sessions, whether this
+        // hub holds them now or lost its link to the holder: never another
+        // terminal's.
+        let holder = self.0.opts.holder.as_ref().and_then(|h| {
+            std::fs::read_to_string(crate::holder::pid_file(&h.socket))
+                .ok()?
+                .trim()
+                .parse::<u32>()
+                .ok()
+        });
+        let table =
+            if (hub.knows_its_own() || holder.is_some()) && found.iter().any(|e| e.pid.is_some()) {
+                procs::table().await.unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+        let holders = |pid: i32| {
+            holder.is_some_and(|holder| {
+                u32::try_from(pid)
+                    .is_ok_and(|pid| table.iter().any(|p| p.pid == pid && p.ppid == holder))
+            })
         };
-        let found = found
-            .into_iter()
-            .filter(|e| !e.pid.is_some_and(|pid| hub.started(&table, pid)));
+        let found = found.into_iter().filter(|e| {
+            !e.pid
+                .is_some_and(|pid| hub.started(&table, pid) || holders(pid))
+        });
         // Ones the person removed stay removed, until they track them again.
         let found: Vec<External> = found
             .filter(|e| !self.is_hidden(Engine::Claude, &e.session_id))
@@ -8369,6 +8387,52 @@ mod tests {
             let saved = DeskStore::from_pool(pool).get(s.id).await.unwrap().unwrap();
             assert_ne!(saved.state, SessionState::Closed);
             assert_eq!((saved.origin, saved.external_pid), (Origin::Desk, None));
+            holder_cancel.cancel();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_session_the_holder_runs_is_never_another_terminals_when_the_hub_loses_it() {
+        with_test_pool(build_pool, |pool| async move {
+            let (_hdir, socket, holder_cancel) = crate::holder::tests::holder().await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut opts = options(dir.path());
+            opts.holder = Some(HolderOptions {
+                socket: socket.clone(),
+                token: crate::holder::tests::TOKEN.into(),
+            });
+            DeskStore::migrate(&pool).await.unwrap();
+            let d = Desk::start(
+                DeskStore::from_pool(pool),
+                opts,
+                Default::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let s = new_session(&d, dir.path()).await;
+            let pid = d.attach(s.id).unwrap().pid().unwrap() as i32;
+            d.change(s.id, |r, _| {
+                r.cli_session_id = Some("cli-held".into());
+                r.state = SessionState::Idle;
+            });
+            // Its link to the holder gone (as a lost connection leaves it):
+            // the process runs on in the holder.
+            let lost = d.0.state.lock().live.remove(&s.id);
+            assert!(lost.is_some());
+            drop(lost);
+            let listed = adopt::parse(
+                json!([{ "pid": pid, "cwd": s.cwd, "kind": "interactive",
+                    "sessionId": "cli-held", "status": "busy" }])
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+            d.reconcile_external(listed).await;
+            let v = d.view(s.id).unwrap();
+            assert_eq!(v.origin, Origin::Desk, "the holder's child is Desk's");
+            assert_ne!(v.state, SessionState::Closed);
             holder_cancel.cancel();
         })
         .await;
