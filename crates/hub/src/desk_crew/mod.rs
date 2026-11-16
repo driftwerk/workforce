@@ -214,6 +214,8 @@ pub struct CrewHub {
     turn_bases: Mutex<picture::Bases>,
     /// One lane per session, for what bosses send it (`picture`).
     lanes: Mutex<picture::Lanes>,
+    /// Turns told their picture moved: the newest row each was told.
+    redecided: Mutex<picture::Redecided>,
     /// Who writes the updates' paragraphs; none: plainly.
     update_writer: Mutex<Option<Arc<dyn updates::UpdateWriter>>>,
     /// The bosses the person asked for a roundup now ("Roundup now").
@@ -653,6 +655,7 @@ impl CrewHub {
             told_lines: Mutex::default(),
             turn_bases: Mutex::default(),
             lanes: Mutex::default(),
+            redecided: Mutex::default(),
             update_writer: Mutex::default(),
             roundup_asked: Mutex::default(),
             updating: Mutex::default(),

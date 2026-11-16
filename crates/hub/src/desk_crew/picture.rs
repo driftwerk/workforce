@@ -68,6 +68,10 @@ pub(super) type Bases = HashMap<String, (Deciding, DateTime<Utc>)>;
 /// One lane per session: what is sent it goes one at a time.
 pub(super) type Lanes = HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>;
 
+/// Turns (and focused calls) told their picture moved: the newest row
+/// each was told, and when.
+pub(super) type Redecided = HashMap<String, (u64, std::time::Instant)>;
+
 /// Whether `refused` is a refusal for a picture that moved: decide again.
 pub(crate) fn stale(refused: &str) -> bool {
     refused.starts_with(STALE)
@@ -210,7 +214,13 @@ impl CrewHub {
         };
         let tz = self.desk.timezone();
         let name = self.session_name(s);
-        let moved = self.desk.picture_since(boss, s, d.basis, Some(&d.turn));
+        // Told since it began what moved: it decides on that now.
+        let basis = self
+            .redecided
+            .lock()
+            .get(&d.turn)
+            .map_or(d.basis, |(seq, _)| d.basis.max(*seq));
+        let moved = self.desk.picture_since(boss, s, basis, Some(&d.turn));
         if !moved.is_empty() {
             // Told now: what it sends next stands on this.
             self.decided_again(&d);
@@ -230,6 +240,8 @@ impl CrewHub {
             .turn
             .as_deref()
             .is_some_and(|t| t == d.turn.as_str());
+        // Judged by what changed, never by wording: with nothing new since
+        // the instruction it carries out, another turn's is a repeat.
         if own || Utc::now() - current.at >= REPEAT_WINDOW {
             return Ok(None);
         }
@@ -248,6 +260,11 @@ impl CrewHub {
     /// The turn `d` was told what changed: it decides on the picture now.
     fn decided_again(&self, d: &Deciding) {
         let now = self.desk.picture_seq();
+        {
+            let mut told = self.redecided.lock();
+            told.retain(|_, (_, at)| at.elapsed() < std::time::Duration::from_secs(6 * 3600));
+            told.insert(d.turn.clone(), (now, std::time::Instant::now()));
+        }
         for (k, _) in self.turn_bases.lock().values_mut() {
             if k.turn == d.turn {
                 k.basis = now;

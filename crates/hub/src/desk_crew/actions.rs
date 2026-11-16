@@ -1080,7 +1080,7 @@ impl CrewHub {
         self.desk.charge_of(session).is_some_and(|c| !c.live())
     }
 
-    fn session_name(&self, id: Uuid) -> String {
+    pub(super) fn session_name(&self, id: Uuid) -> String {
         self.desk
             .view(id)
             .map(|v| v.label().to_string())
@@ -1334,11 +1334,12 @@ impl CrewHub {
                 } else if who.party.kind == crew::PartyKind::You {
                     // The person approved a suggestion: their word to the
                     // session, for every boss of it.
+                    // (An answer of theirs is recorded as it is given.)
                     let theirs = match action {
                         Action::Nudge {
                             to: Target::Session(s),
                             message,
-                            ..
+                            reply_to: None,
                         } => Some((*s, message.clone())),
                         Action::AssignTicket {
                             ticket,
