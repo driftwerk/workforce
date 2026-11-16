@@ -598,12 +598,35 @@ impl CrewHub {
             if let Some(held) = self.mode_hold(action, o, boss.as_deref()) {
                 return held;
             }
+            if let Some(not_its) = self.close_not_its(action, o, boss.as_deref()) {
+                return not_its;
+            }
             // The person driving a session it runs holds nothing: a plain
             // message still waits on its line while they type, as Desk
             // delivers it.
             return Gate::Run;
         }
         self.gate_as(action, o, boss.as_deref(), false)
+    }
+
+    /// Closing a session `boss` neither started nor was handed: only the
+    /// person closes it (Desk refuses anyone else), so it is theirs to
+    /// approve, never run.
+    fn close_not_its(&self, action: &Action, o: &Oversight, boss: Option<&str>) -> Option<Gate> {
+        let Action::Close { session } = action else {
+            return None;
+        };
+        let by = By::manager(boss.unwrap_or_default(), "", "");
+        if self.desk.may_end(*session, Some(&by)) {
+            return None;
+        }
+        Some(match o.level {
+            Level::Watch => Gate::Refuse,
+            _ => Gate::Suggest(
+                "only the person closes a session you didn't start and weren't handed: they close it with one click"
+                    .into(),
+            ),
+        })
     }
 
     /// A session still running in a mode that doesn't ask, set while a
@@ -648,6 +671,9 @@ impl CrewHub {
         }
         if let Some(held) = self.mode_hold(action, o, boss) {
             return held;
+        }
+        if let Some(not_its) = self.close_not_its(action, o, boss) {
+            return not_its;
         }
         // A mode that doesn't ask is an unbound overseer's alone: not even
         // suggested, as Desk refuses it from anyone else. A boss served
