@@ -420,6 +420,7 @@ fn device_surface(surface: &ToolRegistry) -> ToolRegistry {
         .chain(workforce_core::desk::BOARD_SYNC_JIRA_PICK_TOOLS)
         .chain(workforce_core::desk::BOARD_SYNC_LINEAR_TOOLS)
         .chain(workforce_core::desk::BOARD_SYNC_IDENTITY_TOOLS)
+        .chain(workforce_core::desk::BOARD_SYNC_WORKSPACE_TOOLS)
         .chain(workforce_core::desk::BOARD_SYNC_VIEW_TOOLS)
         .chain(DEVICE_SURFACE_EXTRA)
         .filter_map(|name| surface.get(name))
@@ -510,6 +511,7 @@ mod tests {
             .iter()
             .chain(workforce_core::desk::BOARD_SYNC_JIRA_PICK_TOOLS)
             .chain(workforce_core::desk::BOARD_SYNC_LINEAR_TOOLS)
+            .chain(workforce_core::desk::BOARD_SYNC_WORKSPACE_TOOLS)
             .chain(workforce_core::desk::BOARD_SYNC_VIEW_TOOLS)
         {
             assert!(allow.contains(tool), "{tool} is not offered by default");

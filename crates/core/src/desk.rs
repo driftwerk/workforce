@@ -1013,6 +1013,14 @@ pub const BOARD_SYNC_LINEAR_TOOLS: &[&str] = &[
     "linear.teams_list",
 ];
 
+/// Which of the person's Jira sites or Linear workspaces there are, by
+/// name (never a key), and the one a call naming none goes to: what the
+/// link dialog asks first, so a person with several picks one, which the
+/// link keeps and passes on every call. Called when the hub offers them
+/// and never needed: a hub without them names the workspaces in the error
+/// a call without one gets ([`crate::instances`]).
+pub const BOARD_SYNC_WORKSPACE_TOOLS: &[&str] = &["jira.workspaces", "linear.workspaces"];
+
 /// Who the person is on Jira (`jira.myself`) and on Linear
 /// (`linear.viewer`): what "assigned to me", Mine and Take it go by. Where
 /// the hub's key is shared, whom the person chose to be there, else the one

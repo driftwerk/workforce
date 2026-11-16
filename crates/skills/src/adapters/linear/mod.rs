@@ -37,6 +37,7 @@ pub const READ_TOOLS: &[&str] = &[
     "linear.comment_list",
     "linear.states_list",
     "linear.teams_list",
+    "linear.workspaces",
     "linear.project_list",
     "linear.project_get",
     "linear.labels_list",
@@ -257,6 +258,10 @@ impl LinearSkill {
                 self.default_workspace.clone(),
                 Arc::clone(pm),
             )),
+            Arc::new(tools::LinearWorkspacesTool::new(
+                Arc::clone(&self.clients),
+                self.default_workspace.clone(),
+            )),
             Arc::new(tools::LinearProjectListTool::new(
                 Arc::clone(&self.clients),
                 self.default_workspace.clone(),
@@ -336,6 +341,7 @@ impl LinearSkill {
             "linear.comment_add",
             "linear.states_list",
             "linear.teams_list",
+            "linear.workspaces",
             "linear.project_list",
             "linear.project_get",
             "linear.labels_list",
@@ -546,6 +552,11 @@ impl LinearSkill {
                             "workspace": { "type": "string" }
                         }
                     }),
+                },
+                SkillTool {
+                    name: "linear.workspaces".to_string(),
+                    description: "The Linear workspaces you can use, by name, and the one a call naming none goes to".to_string(),
+                    input_schema: serde_json::json!({ "type": "object", "properties": {} }),
                 },
                 SkillTool {
                     name: "linear.project_list".to_string(),
@@ -759,6 +770,10 @@ impl LinearSkill {
                 },
                 SkillPolicy {
                     tool: "linear.teams_list".to_string(),
+                    action: "allow".to_string(),
+                },
+                SkillPolicy {
+                    tool: "linear.workspaces".to_string(),
                     action: "allow".to_string(),
                 },
                 SkillPolicy {

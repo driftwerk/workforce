@@ -275,8 +275,9 @@ fn resolve_client(
     prefix_map: &HashMap<String, String>,
     input: &Value,
 ) -> Result<Arc<JiraClient>> {
-    let explicit = input.get("workspace").and_then(|v| v.as_str());
-    let requested = explicit
+    let requested = input
+        .get("workspace")
+        .and_then(|v| v.as_str())
         .map(str::to_string)
         .or_else(|| routed_workspace(clients, prefix_map, input));
     let name = workforce_agent::llm::environment::resolve_instance(
@@ -286,15 +287,12 @@ fn resolve_client(
         clients,
     )
     .map_err(|d| eyre::eyre!("{}", d.message))?;
-    clients.get(&name).cloned().ok_or_else(|| {
-        if explicit == Some(name.as_str()) {
-            unknown_instance("Jira workspace", &name, clients)
-        } else {
-            let mut available: Vec<&str> = clients.keys().map(String::as_str).collect();
-            available.sort_unstable();
-            eyre::eyre!("Default Jira workspace '{name}' not configured. Available: {available:?}")
-        }
-    })
+    // One wording whether it was named or the default: a program reads it
+    // back for the names (`workforce_core::instances`).
+    clients
+        .get(&name)
+        .cloned()
+        .ok_or_else(|| unknown_instance("Jira workspace", &name, clients))
 }
 
 /// Workspace auto-routed from a `project_key` / `issue_key` prefix (uppercased),
@@ -1840,6 +1838,42 @@ impl Tool for JiraAttachmentReadTool {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// jira.workspaces: the caller's Jira sites, by name
+// ──────────────────────────────────────────────────────────────────────
+
+pub struct JiraWorkspacesTool {
+    instances: Arc<LiveInstances<JiraClient>>,
+}
+
+impl JiraWorkspacesTool {
+    /// Workspaces read as the caller on each call.
+    pub fn new(instances: Arc<LiveInstances<JiraClient>>) -> Self {
+        Self { instances }
+    }
+}
+
+#[async_trait]
+impl Tool for JiraWorkspacesTool {
+    fn name(&self) -> &str {
+        "jira.workspaces"
+    }
+    fn description(&self) -> &str {
+        "The Jira sites (workspaces) you can use, by name, as {workspaces, default}: default is the one a call without `workspace` goes to, or null when you must pass one. Takes no arguments."
+    }
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object", "properties": {}, "required": [] })
+    }
+    async fn execute(&self, _input: Value) -> Result<ToolResult> {
+        let start = std::time::Instant::now();
+        let (clients, default) = self.instances.for_caller();
+        Ok(ToolResult::success(
+            crate::adapters::utils::workspaces_answer(&clients, &default),
+            start.elapsed().as_millis() as u64,
+        ))
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // 12. jira.list_projects
 // ──────────────────────────────────────────────────────────────────────
 
@@ -3165,10 +3199,7 @@ mod tests {
             .err()
             .expect("absent default must error")
             .to_string();
-        assert!(
-            err.contains("Default Jira workspace 'gone' not configured"),
-            "{err}"
-        );
+        assert!(err.contains("Unknown Jira workspace: 'gone'"), "{err}");
         assert!(err.contains("acme") && err.contains("client"), "{err}");
         assert!(
             workspace_description(&LiveInstances::fixed_map((*clients).clone(), "gone"))

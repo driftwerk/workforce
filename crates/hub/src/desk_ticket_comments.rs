@@ -99,7 +99,13 @@ async fn list(
         let hub = r.sync.hub_name(&s.via).await;
         match r
             .sync
-            .remote(s.system, &s.via, &person, s.agent.as_deref())
+            .remote(
+                s.system,
+                &s.via,
+                &person,
+                s.agent.as_deref(),
+                s.workspace.as_deref(),
+            )
             .await
         {
             Ok(remote) => {
@@ -177,7 +183,13 @@ async fn post(
             let hub = r.sync.hub_name(&s.via).await;
             let remote = match r
                 .sync
-                .remote(s.system, &s.via, &person, s.agent.as_deref())
+                .remote(
+                    s.system,
+                    &s.via,
+                    &person,
+                    s.agent.as_deref(),
+                    s.workspace.as_deref(),
+                )
                 .await
             {
                 Ok(remote) => remote,

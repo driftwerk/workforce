@@ -173,15 +173,21 @@ impl DeskStore {
         system: System,
         target: &str,
         via: &crate::board::Via,
+        workspace: Option<&str>,
         not: Uuid,
     ) -> Result<Option<Uuid>> {
         let client = self.pool().get().await?;
         let via = serde_json::to_value(via)?;
+        // One team key can name a team in each of several workspaces. A link
+        // that names none (made before workspaces were kept) went where a
+        // call naming none goes, so it may be any of them.
         client
             .query_opt(
                 "SELECT id FROM boards WHERE sync ->> 'system' = $1 AND sync ->> 'target' = $2 \
-                 AND sync -> 'via' = $4 AND id <> $3 LIMIT 1",
-                &[&system.as_str(), &target, &not, &via],
+                 AND sync -> 'via' = $4 \
+                 AND (sync ->> 'workspace' IS NULL OR $5::text IS NULL OR sync ->> 'workspace' = $5) \
+                 AND id <> $3 LIMIT 1",
+                &[&system.as_str(), &target, &not, &via, &workspace],
             )
             .await?
             .map(|r| r.try_get(0))

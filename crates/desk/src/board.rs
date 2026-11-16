@@ -247,6 +247,17 @@ pub enum Paused {
     /// The board left the group it was linked in (its group was deleted):
     /// a link belongs to one group, so it must be linked again.
     LeftGroup,
+    /// The hub has no Jira site or Linear workspace of the person's by the
+    /// name the link keeps (`asked`), or the link keeps none and they have
+    /// several there (`names`): it must be linked again, picking one.
+    Workspace {
+        /// "Linear workspace" or "Jira site".
+        what: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        asked: Option<String>,
+        #[serde(default)]
+        names: Vec<String>,
+    },
 }
 
 impl Paused {
@@ -268,6 +279,18 @@ impl Paused {
             ),
             Self::Refused { reason } => format!("Paused: {hub} refused: {reason}"),
             Self::LeftGroup => "Paused: this board left the group it was linked in; unlink it and link it again.".into(),
+            Self::Workspace { what, asked, names } => {
+                let names = crate::board_sync::or_list(names);
+                match (asked, names.is_empty()) {
+                    (_, true) => format!("Paused: {hub} has no {what} of yours set up any more."),
+                    (Some(asked), false) => format!(
+                        "Paused: {hub} has no {what} {asked} of yours any more; yours there are {names}."
+                    ),
+                    (None, false) => format!(
+                        "Paused: you have more than one {what} on {hub} ({names}), and this link doesn't say which."
+                    ),
+                }
+            }
         }
     }
 }
@@ -314,6 +337,12 @@ pub struct Sync {
     /// it stops offering them. None: the hub's default agent (`/mcp`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// The Jira site or Linear workspace it syncs, by the name the hub
+    /// keeps it under, where the person has several there: passed on every
+    /// call. None: a link made before this was kept, or a person with one,
+    /// whose calls go where a call naming none goes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
     /// Whose token or keys it syncs with: the person who linked it.
     pub person: String,
     pub filter: Filter,
