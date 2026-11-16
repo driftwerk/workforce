@@ -1119,3 +1119,11 @@ async fn a_prompt_is_never_typed_into_a_dialog() {
     })
     .await;
 }
+
+#[test]
+fn claudes_and_devins_asks_outlive_the_hub_and_codexs_do_not() {
+    use super::asks::asks_outlive_the_hub;
+    assert!(asks_outlive_the_hub(Engine::Claude));
+    assert!(asks_outlive_the_hub(Engine::Devin));
+    assert!(!asks_outlive_the_hub(Engine::Codex));
+}

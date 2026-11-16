@@ -13,3 +13,7 @@ code_challenge) and personal values are replaced. The .bin files are the exact b
                   with the URL wrapped in an OSC 8 hyperlink, then the " Code:" prompt.
 4-status-in.txt   `devin auth status` signed in.
 5-status-out.txt  `devin auth status` signed out.
+6-hooks.jsonl     Every hook payload a signed-in 3000.12.57 sent on macOS, recorded 2026-11-16 by
+                  scripts/devin-capture.py, one per line with its run and the test hook's answer.
+                  Session ids, call ids, prompt ids, prompts, shell ids and paths are replaced.
+                  Run "decide" sent no tool events: Devin ran no tool in it.

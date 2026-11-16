@@ -1061,7 +1061,8 @@ impl Desk {
         let Ok(view) = self.view(id) else {
             return false;
         };
-        let facts = charge::facts_of(view.engine, &pending, &view, &home, false);
+        let moved = self.0.state.lock().live.get(&id).is_some_and(|l| l.moved);
+        let facts = charge::facts_of(view.engine, &pending, &view, &home, moved);
         let named = |p: &std::path::Path| {
             let p = crate::computer::boss::resolve_real(p).unwrap_or_else(|| p.to_path_buf());
             settings.iter().any(|s| p.starts_with(s))
@@ -1070,8 +1071,9 @@ impl Desk {
             // Reading them changes nothing: only a write is the person's.
             charge::What::Change(paths) => paths.iter().any(|p| named(p)),
             charge::What::Read(_) | charge::What::Web { .. } | charge::What::Inside => false,
-            charge::What::Command(command) => command_may_touch_settings(
+            charge::What::Command(command) => command_at_may_touch_settings(
                 command,
+                facts.cwd.as_deref(),
                 std::path::Path::new(&view.cwd),
                 &settings,
                 &home,
@@ -1928,6 +1930,25 @@ fn git_line(dir: &std::path::Path, args: &[&str]) -> Option<String> {
 ///
 /// Words can't catch everything a program might build at run time: the
 /// budget is the person's because Desk's card is how it changes.
+/// [`command_may_touch_settings`] for a command run in `runs_in` (a Devin
+/// command's `workdir`; none when Desk can't tell where it runs), read from
+/// there and from the session's folder `session`. Where it runs not known,
+/// any command that may write counts.
+pub(crate) fn command_at_may_touch_settings(
+    command: &str,
+    runs_in: Option<&std::path::Path>,
+    session: &std::path::Path,
+    settings: &[std::path::PathBuf],
+    home: &std::path::Path,
+) -> bool {
+    match runs_in {
+        None => may_write(command),
+        Some(at) => [at, session]
+            .iter()
+            .any(|base| command_may_touch_settings(command, base, settings, home)),
+    }
+}
+
 pub(crate) fn command_may_touch_settings(
     command: &str,
     cwd: &std::path::Path,
