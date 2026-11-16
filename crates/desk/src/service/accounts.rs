@@ -635,16 +635,26 @@ impl Desk {
         recheck_at: chrono::DateTime<Utc>,
         news: bool,
     ) {
-        {
+        let told_changed = {
             let mut st = self.0.state.lock();
             if !st.accounts.iter().any(|a| a.id == account) {
                 return;
             }
+            // News to the hub's calls may be a restart's forgetting: a
+            // refusal for the same reason the person was told of is that
+            // one still, its need the same.
+            let told = st
+                .refused_told
+                .get(&account)
+                .filter(|t| t.reason == reason)
+                .map(|t| t.at);
             let at = st
                 .refused
                 .get(&account)
                 .filter(|_| !news)
-                .map_or_else(Utc::now, |r| r.at);
+                .map(|r| r.at)
+                .or(told)
+                .unwrap_or_else(Utc::now);
             st.refused.insert(
                 account,
                 accounts::Refused {
@@ -653,6 +663,14 @@ impl Desk {
                     at,
                 },
             );
+            let now_told = Told {
+                reason: reason.to_string(),
+                at,
+            };
+            st.refused_told.insert(account, now_told.clone()) != Some(now_told)
+        };
+        if told_changed {
+            self.keep_refused_told();
         }
         tracing::warn!(%account, reason, %recheck_at, "the hub's own call found an account turned away by the provider");
         self.announce_accounts();
@@ -674,6 +692,7 @@ impl Desk {
             tracing::info!(%account, "an account the provider turned away serves again");
             self.announce_accounts();
         }
+        self.forget_told(account);
         // Told from wherever a login is settled, which may have no runtime.
         if tokio::runtime::Handle::try_current().is_err() {
             let raw = super::identities::Raw::Account(account);
@@ -1076,6 +1095,7 @@ impl Desk {
                 );
             }
         }
+        self.forget_told(id);
         self.keep_prints();
         self.keep_standing();
         self.announce_accounts();
@@ -1518,6 +1538,7 @@ impl Desk {
             }
             on.into_iter().partition(|s| st.live.contains_key(s))
         };
+        self.forget_told(id);
         for s in stopped {
             self.change(s, |r, _| r.account = to);
         }
@@ -1733,6 +1754,17 @@ impl Desk {
 
 /// Where the needs the person put off are kept.
 pub(super) const PUT_OFF: &str = "accounts.putOff";
+/// Where the refusals the person was told of are kept ([`Told`]).
+pub(super) const REFUSED_TOLD: &str = "accounts.refusedTold";
+
+/// A turned-away account's refusal as the person was told of it: why, and
+/// when it was found (its need's id). Kept until a call on the account
+/// serves again or it is signed in again or removed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(super) struct Told {
+    pub reason: String,
+    pub at: chrono::DateTime<Utc>,
+}
 /// The start of the id of the need that asks which account a sign-in is.
 const WHICH_SIGN_IN: &str = "which-sign-in:";
 
@@ -2152,6 +2184,20 @@ impl Desk {
     fn keep_put_off(&self) {
         let ids: Vec<String> = self.0.state.lock().put_off.iter().cloned().collect();
         self.keep_state(PUT_OFF, serde_json::json!(ids));
+    }
+
+    /// Writes the refusals the person was told of.
+    fn keep_refused_told(&self) {
+        let told = serde_json::to_value(&self.0.state.lock().refused_told).unwrap_or_default();
+        self.keep_state(REFUSED_TOLD, told);
+    }
+
+    /// `account`'s refusal is over (it served, or was signed in again or
+    /// removed): another is news again.
+    pub(super) fn forget_told(&self, account: Uuid) {
+        if self.0.state.lock().refused_told.remove(&account).is_some() {
+            self.keep_refused_told();
+        }
     }
 
     /// What a session on `account` reported of its plan's windows.

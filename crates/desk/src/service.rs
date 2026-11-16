@@ -818,6 +818,10 @@ struct State {
     /// Accounts the provider turned away, as the hub's own calls found:
     /// until a call on one serves again or it is signed in again.
     refused: HashMap<Uuid, crate::engine_accounts::Refused>,
+    /// Each turned-away account's refusal the person was told of: its
+    /// reason and when it was found, kept so a restart (which forgets what
+    /// the hub's calls were told) doesn't tell it again as news.
+    refused_told: HashMap<Uuid, accounts::Told>,
     /// Who each Claude identity is (email, organisation, plan), by its key,
     /// as this computer's Claude Code last said while signed in to it.
     profiles: HashMap<String, crate::engine::ClaudeProfile>,
@@ -1654,6 +1658,8 @@ impl Desk {
             serde_json::from_value(kept(identities::RELOGGED).await).unwrap_or_default();
         let put_off: HashSet<String> =
             serde_json::from_value(kept(accounts::PUT_OFF).await).unwrap_or_default();
+        let refused_told: HashMap<Uuid, accounts::Told> =
+            serde_json::from_value(kept(accounts::REFUSED_TOLD).await).unwrap_or_default();
         let profiles: HashMap<String, crate::engine::ClaudeProfile> =
             serde_json::from_value(kept(identities::PROFILES).await).unwrap_or_default();
         let prints: HashMap<identities::Raw, crate::identity::Prints> =
@@ -1788,6 +1794,7 @@ impl Desk {
                 written_by,
                 auto_switch,
                 put_off,
+                refused_told,
                 profiles,
                 ..State::default()
             }),
