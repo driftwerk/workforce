@@ -154,7 +154,7 @@ impl CrewHub {
         };
         if action != "stop_asking" && action != "ask_again" {
             // Their directives are their standing orders.
-            self.picture_order(&said, Self::current_turn());
+            self.picture_order(&said, self.current_turn());
         }
         Ok(json!(format!(
             "{said} Confirm it to the person in one line."

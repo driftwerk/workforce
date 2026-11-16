@@ -260,7 +260,7 @@ impl CrewHub {
                 p.then_text,
                 p.scope.said()
             ),
-            Self::current_turn(),
+            self.current_turn(),
         );
         let mut said = format!(
             "Kept as preference {}: when {}, {} (for {}).",
@@ -355,7 +355,7 @@ impl CrewHub {
                 changed.then_text,
                 changed.scope.said()
             ),
-            Self::current_turn(),
+            self.current_turn(),
         );
         Ok(json!(format!(
             "{verb} the preference from {}: when {}, {} (for {}). Tell the person which, in one line.",

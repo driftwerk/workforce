@@ -126,7 +126,12 @@ impl Happened {
     /// The row in a line a boss reads: when, who, what.
     pub fn said(&self, tz: chrono_tz::Tz) -> String {
         let at = self.at.with_timezone(&tz).format("%H:%M:%S");
-        let text = crate::crew::one_line(&self.text, 400);
+        // All of it, on one line: a later sentence ("…must not write its
+        // own") is often the one that matters.
+        let text = crate::crew::clip(
+            &self.text.split_whitespace().collect::<Vec<_>>().join(" "),
+            600,
+        );
         match self.what {
             What::PersonSaid if self.session.is_some() => {
                 format!("{at} the person, in the session: “{text}”")

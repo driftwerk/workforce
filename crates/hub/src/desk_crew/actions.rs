@@ -1106,7 +1106,7 @@ impl CrewHub {
         self.desk.charge_of(session).is_some_and(|c| !c.live())
     }
 
-    fn session_name(&self, id: Uuid) -> String {
+    pub(super) fn session_name(&self, id: Uuid) -> String {
         self.desk
             .view(id)
             .map(|v| v.label().to_string())
@@ -1295,6 +1295,18 @@ impl CrewHub {
     /// how it is undone; an answer to a session's question is said in its
     /// DM from that row. Recording never stops the action.
     pub(crate) async fn perform(&self, action: &Action, by: By) -> Result<String, String> {
+        // A boss's message to a session goes through the session's lane,
+        // checked against the picture as it is now (`super::picture`).
+        let lane = Self::lane_of(action, &by);
+        let _lane = match lane {
+            Some(s) => Some(self.lane(s).await),
+            None => None,
+        };
+        if let Some(s) = lane {
+            if let Some(said) = self.check_at_send(action, &by.party.id, s).await? {
+                return Ok(said);
+            }
+        }
         // The same instruction to the same session again, soon after: said
         // once, no second message on its line, no second decision.
         let told = match self.tell_once(action, &by) {
@@ -1330,7 +1342,7 @@ impl CrewHub {
                             &who.party.id,
                             *s,
                             message,
-                            Self::current_turn(),
+                            self.current_turn(),
                         ),
                         // A ticket handed to a session is an instruction too.
                         Action::AssignTicket {
@@ -1341,18 +1353,19 @@ impl CrewHub {
                             &who.party.id,
                             *s,
                             &format!("Ticket {ticket} is yours to work on."),
-                            Self::current_turn(),
+                            self.current_turn(),
                         ),
                         _ => {}
                     }
                 } else if who.party.kind == crew::PartyKind::You {
                     // The person approved a suggestion: their word to the
                     // session, for every boss of it.
+                    // (An answer of theirs is recorded as it is given.)
                     let theirs = match action {
                         Action::Nudge {
                             to: Target::Session(s),
                             message,
-                            ..
+                            reply_to: None,
                         } => Some((*s, message.clone())),
                         Action::AssignTicket {
                             ticket,
@@ -1921,6 +1934,12 @@ impl CrewHub {
     ) -> Result<(String, bool), String> {
         match self.perform(nudge, by.clone()).await {
             Ok(done) => Ok((done, true)),
+            // Decided on a picture that moved: decided again, not done
+            // anyway in a new session.
+            Err(why) if super::picture::stale(&why) => {
+                self.unclaim(session);
+                Err(why)
+            }
             Err(why) => {
                 self.unclaim(session);
                 tracing::info!(%session, %why, "a session given a start's work couldn't take it; starting one");

@@ -329,7 +329,8 @@ impl CrewHub {
                 () = cancel.cancelled() => return,
                 j = async {
                     let _slot = slot.acquire().await;
-                    crew.judge_turn_end(&view, &boss, &seen).await
+                    // On the picture as it is as the call begins.
+                    crew.on_picture(crew.judge_turn_end(&view, &boss, &seen)).await
                 } => j,
             };
             if let Judged::Later = judged {
@@ -453,6 +454,9 @@ impl CrewHub {
                     Ok(done) => {
                         tracing::info!(session = %view.id, %boss, %done, "the boss told a finished session its next step");
                     }
+                    // The picture moved while it decided: it decides again
+                    // on it at the next look (a sweep later).
+                    Err(refused) if super::picture::stale(&refused) => return Judged::Later,
                     Err(refused) => {
                         tracing::warn!(session = %view.id, %boss, %refused, "a boss's next step for a session was refused");
                         self.record_turn_left(

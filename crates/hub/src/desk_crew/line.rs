@@ -496,6 +496,11 @@ impl CrewHub {
             }
         }
         let reply = ran.as_ref().map(|(_, r)| r.as_str()).map_err(|_| ());
+        // What its reply settles was decided in the turn, on its picture.
+        let deciding = ran
+            .as_ref()
+            .ok()
+            .and_then(|(sid, _)| self.turn_deciding(sid));
         for (ask, settled) in still_open.iter().zip(settle(reply, still_open.len())) {
             match settled {
                 Settle::Escalate(why) => {
@@ -520,8 +525,17 @@ impl CrewHub {
                     match self.gate(&action, &o) {
                         Gate::Run => {
                             let by = self.by_at_level(by.clone(), &o);
-                            if let Err(e) = self.perform(&action, by).await {
-                                tracing::info!(error = %e, "the overseer's reply didn't answer");
+                            match self.perform_in(deciding.clone(), &action, by.clone()).await {
+                                // Decided before what moved: the question
+                                // isn't left open with no one on it.
+                                Err(e) if super::picture::stale(&e) => {
+                                    let why = "Its answer was decided before something changed, so this came to you.";
+                                    let _ = self.escalate(ask.id, &by, why, Vec::new(), None).await;
+                                }
+                                Err(e) => {
+                                    tracing::info!(error = %e, "the overseer's reply didn't answer");
+                                }
+                                Ok(_) => {}
                             }
                         }
                         Gate::Suggest(why) => {

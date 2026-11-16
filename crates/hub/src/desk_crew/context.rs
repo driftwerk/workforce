@@ -237,6 +237,16 @@ pub(crate) async fn block(service: &AgentService, channel: &str, owner: &str) ->
         (Some(open), Some(listed)) => Some(format!("{}\n\n{listed}", open.trim_end())),
         (open, listed) => open.or(listed),
     };
+    // The live picture: what every turn of the boss's stands on, never
+    // dropped for room (`super::picture`).
+    let named: Vec<(Uuid, String)> = entries.iter().map(|e| (e.id, e.name.clone())).collect();
+    let open = match (
+        open,
+        crew.picture_block(boss.agent_id.as_str(), about, &named),
+    ) {
+        (Some(open), Some(p)) => Some(format!("{}\n\n{}", open.trim_end(), p.trim_end())),
+        (open, p) => open.or(p),
+    };
     let body = body(
         &entries,
         about,

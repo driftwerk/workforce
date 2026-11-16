@@ -210,6 +210,12 @@ pub struct CrewHub {
     /// What each boss last told each session on its line, in plain form,
     /// and when: the same instruction again soon after isn't sent twice.
     told_lines: Mutex<ToldLines>,
+    /// Each running boss turn's basis in the picture (`picture`).
+    turn_bases: Mutex<picture::Bases>,
+    /// One lane per session, for what bosses send it (`picture`).
+    lanes: Mutex<picture::Lanes>,
+    /// Turns told their picture moved: the newest row each was told.
+    redecided: Mutex<picture::Redecided>,
     /// Who writes the updates' paragraphs; none: plainly.
     update_writer: Mutex<Option<Arc<dyn updates::UpdateWriter>>>,
     /// The bosses the person asked for a roundup now ("Roundup now").
@@ -322,6 +328,20 @@ pub(crate) fn for_state(state: &Arc<GatewayState>) -> Option<Arc<CrewHub>> {
 /// group's boundary keeps it out now (a boss moved away from it, or an
 /// agent that left), whatever the Desk app sent. `None` off a room, or
 /// without a crew.
+/// The person's follow-up, steered into a boss's running DM turn: in the
+/// picture as their words to it, so any other turn of its decided before
+/// them is decided again.
+pub(crate) fn person_followed_up(service: &AgentService, words: &str) {
+    if words.starts_with(CHECK_IN) {
+        return;
+    }
+    if let Some(crew) = for_service(service) {
+        if crew.overseer_named(service.agent_id.as_str()).is_some() {
+            crew.picture_person_told(service.agent_id.as_str(), words);
+        }
+    }
+}
+
 pub(crate) async fn room_turn_refused(
     service: &AgentService,
     place: &workforce_common::channels::desk::DeskPlace,
@@ -647,6 +667,9 @@ impl CrewHub {
             person_turns: Mutex::default(),
             relayed_turns: Mutex::default(),
             told_lines: Mutex::default(),
+            turn_bases: Mutex::default(),
+            lanes: Mutex::default(),
+            redecided: Mutex::default(),
             update_writer: Mutex::default(),
             roundup_asked: Mutex::default(),
             updating: Mutex::default(),

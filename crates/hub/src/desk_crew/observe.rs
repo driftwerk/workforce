@@ -36,6 +36,8 @@ pub(super) struct Track {
     /// The overseer's own turn in its DM: not activity, but what its
     /// answer mentions is kept.
     manager_session: Option<String>,
+    /// The picture's key for this turn (`super::picture`): ended with it.
+    deciding: Option<String>,
     /// The room the turn was asked in (or answers to), and the message it
     /// answers, stamped on each of its events.
     place: Option<Place>,
@@ -70,6 +72,19 @@ impl CrewHub {
         let hop = session_id
             .and_then(|sid| self.hops.lock().remove(sid))
             .unwrap_or(0);
+        let mut deciding = None;
+        if let (true, Some(sid)) = (overseer, session_id) {
+            // The person's word lands first: in the picture before anything
+            // of this turn's is done. Then the turn decides on the picture
+            // as it is (`super::picture`), whatever its channel.
+            if channel == DESK_CHANNEL
+                && !message.starts_with(CHECK_IN)
+                && !self.relayed_turns.lock().contains(sid)
+            {
+                self.picture_person_told(&agent_id, message);
+            }
+            deciding = Some(self.picture_turn_began(sid));
+        }
         if overseer && channel == DESK_CHANNEL {
             let sid = session_id?.to_string();
             if !message.starts_with(CHECK_IN) {
@@ -81,9 +96,6 @@ impl CrewHub {
             if !message.starts_with(CHECK_IN) && !self.relayed_turns.lock().contains(&sid) {
                 // Sent: no longer typing it, and here.
                 self.dm_sent(&agent_id);
-                // The person's word lands first: in the picture before
-                // anything of this turn's is done.
-                self.picture_person_told(&agent_id, message);
                 // Messages queued into one turn are all its asks.
                 let mut turns = self.person_turns.lock();
                 let asked = turns.entry(sid.clone()).or_default();
@@ -99,6 +111,7 @@ impl CrewHub {
                 task: None,
                 hop,
                 manager_session: Some(sid),
+                deciding,
                 place,
                 message: asked,
                 done: false,
@@ -141,6 +154,7 @@ impl CrewHub {
             task,
             hop,
             manager_session: None,
+            deciding,
             place,
             message: asked,
             done: false,
@@ -179,6 +193,9 @@ impl Track {
             }
             crew.manager_turns.lock().remove(&sid);
             crew.person_turns.lock().remove(&sid);
+            if let Some(turn) = self.deciding.take() {
+                crew.picture_turn_ended(&sid, &turn);
+            }
             // An update held for this reply may go now.
             crew.update_poke.notify_one();
             return;
@@ -214,6 +231,9 @@ impl Drop for Track {
         if let Some(sid) = &self.manager_session {
             self.crew.manager_turns.lock().remove(sid);
             self.crew.person_turns.lock().remove(sid);
+            if let Some(turn) = &self.deciding {
+                self.crew.picture_turn_ended(sid, turn);
+            }
             self.crew.update_poke.notify_one();
             return;
         }
