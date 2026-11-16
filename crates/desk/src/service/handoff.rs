@@ -290,7 +290,7 @@ impl Desk {
             }
             if self.is_open(id) {
                 self.change(id, |r, _| {
-                    r.state = SessionState::Closed;
+                    r.state = super::finish::closed(super::finish::Finish::HandoffUntaken);
                     r.restore_offer = false;
                 });
             }

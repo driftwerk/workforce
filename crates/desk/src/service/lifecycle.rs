@@ -537,8 +537,9 @@ impl Desk {
         Ok(self.0.store.hidden().await?)
     }
 
-    /// The most recently closed sessions: ended, or closed in their own
-    /// terminals; each resumable where its engine allows.
+    /// The most recently closed sessions: each ended from Desk (or a
+    /// handoff's that never took its work up, [`super::finish`]); each
+    /// resumable where its engine allows.
     pub async fn closed_sessions(&self) -> Result<Vec<SessionView>, DeskError> {
         let kept = self.0.store.closed(CLOSED_LISTED).await?;
         let st = self.0.state.lock();
@@ -614,11 +615,24 @@ impl Desk {
         Ok(done)
     }
 
+    /// Whether `by` may end session `id` ([`super::finish::may_end`]): the
+    /// person, or the boss that started it or was handed it.
+    pub fn may_end(&self, id: Uuid, by: Option<&By>) -> bool {
+        super::finish::may_end(by, self.charge_of(id).as_ref())
+    }
+
     /// Ends a session: stops it if it runs here and closes it, so it leaves
     /// the sessions Desk shows and its history stays, resumable. One in
     /// another terminal or in one of Desk's ends there.
     pub async fn end(&self, id: Uuid, by: Option<By>) -> Result<SessionView, DeskError> {
         let r = self.load(id).await?;
+        // Only its finish closes it: the person's, or its own boss's.
+        if !self.may_end(id, by.as_ref()) {
+            return Err(DeskError::Conflict(
+                "only the person, or the boss that started it or was handed it, closes a session"
+                    .into(),
+            ));
+        }
         let running_here = {
             let mut guard = self.0.state.lock();
             let st = &mut *guard;
@@ -659,7 +673,9 @@ impl Desk {
             }
             None if r.state != SessionState::Closed => {
                 self.0.state.lock().acted.insert(id);
-                self.change(id, |r, _| r.state = SessionState::Closed);
+                self.change(id, |r, _| {
+                    r.state = super::finish::closed(super::finish::Finish::Ended)
+                });
             }
             None => {}
         }
