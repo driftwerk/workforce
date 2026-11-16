@@ -1934,6 +1934,12 @@ impl CrewHub {
     ) -> Result<(String, bool), String> {
         match self.perform(nudge, by.clone()).await {
             Ok(done) => Ok((done, true)),
+            // Decided on a picture that moved: decided again, not done
+            // anyway in a new session.
+            Err(why) if super::picture::stale(&why) => {
+                self.unclaim(session);
+                Err(why)
+            }
             Err(why) => {
                 self.unclaim(session);
                 tracing::info!(%session, %why, "a session given a start's work couldn't take it; starting one");

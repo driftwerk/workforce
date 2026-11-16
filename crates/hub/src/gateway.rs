@@ -2912,6 +2912,11 @@ async fn handle_ws(
                                     continue;
                                 }
                                 if steered.applied() {
+                                    // The person's follow-up is in the bosses'
+                                    // picture like any message of theirs.
+                                    if desk.is_some() {
+                                        crate::desk_crew::person_followed_up(&service, &content);
+                                    }
                                     // Named for the message's own turn, so its
                                     // Desk knows that one got there.
                                     let _ = broadcast_tx.send(

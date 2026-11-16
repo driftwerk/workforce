@@ -324,6 +324,20 @@ pub(crate) fn for_state(state: &Arc<GatewayState>) -> Option<Arc<CrewHub>> {
         .find(|c| Arc::ptr_eq(&c.state, state))
 }
 
+/// The person's follow-up, steered into a boss's running DM turn: in the
+/// picture as their words to it, so any other turn of its decided before
+/// them is decided again.
+pub(crate) fn person_followed_up(service: &AgentService, words: &str) {
+    if words.starts_with(CHECK_IN) {
+        return;
+    }
+    if let Some(crew) = for_service(service) {
+        if crew.overseer_named(service.agent_id.as_str()).is_some() {
+            crew.picture_person_told(service.agent_id.as_str(), words);
+        }
+    }
+}
+
 /// Why a Desk room turn for `service` mustn't run: the room is one whose
 /// group's boundary keeps it out now (a boss moved away from it, or an
 /// agent that left), whatever the Desk app sent. `None` off a room, or
