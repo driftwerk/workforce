@@ -2996,7 +2996,7 @@ async fn the_overseer_answers_a_sessions_routine_question_and_gives_the_person_t
             let dm = overseer.sessions.find(DESK_CHANNEL, PERSON).unwrap()?;
             dm.messages
                 .iter()
-                .find(|m| m.content.starts_with("I decided: answered acme-web's question"))
+                .find(|m| m.content.starts_with("✓ Answered acme-web's question"))
                 .cloned()
         })
         .await;
@@ -3004,8 +3004,10 @@ async fn the_overseer_answers_a_sessions_routine_question_and_gives_the_person_t
             notice.desk.as_ref().and_then(|m| m.delivery),
             Some(workforce_common::channels::desk::DeliveryKind::Notice)
         );
-        // Said from its row: the decision, with the reply's own first
-        // sentence as why, in place of a stock reason.
+        // Said from its row: the decision in short, with the reply's own
+        // first sentence as why, in place of a stock reason; a why that
+        // only says the reply again is left out, as the line never quotes
+        // what was sent.
         let extras = d.store().extras(std::slice::from_ref(&notice.id)).await.unwrap();
         let line = &extras[&notice.id].decisions[0];
         let row = d
@@ -3017,7 +3019,8 @@ async fn the_overseer_answers_a_sessions_routine_question_and_gives_the_person_t
         assert_eq!(row.need, workforce_desk::decision::Need::Question);
         assert_eq!(row.why, "5433");
         assert_eq!(line.text, row.what);
-        assert!(notice.content.contains(&row.what), "{}", notice.content);
+        assert_eq!(notice.content, row.said());
+        assert!(!notice.content.contains("5433"), "{}", notice.content);
 
         let pushing = d
             .line_call(
