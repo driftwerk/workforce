@@ -10,7 +10,7 @@
 //! secret-sink tools (vault.set, …) where the substitution layer
 //! resolves them back to cleartext. Rendering markers here would break
 //! that contract. Cleartext that slipped past tokenization is replaced
-//! with `first6...last4` via [`workforce_common::redact::redact_secrets`]
+//! whole, by `[REDACTED <LABEL>]`, via [`workforce_common::redact::redact_secrets`]
 //! — minting a marker is pointless because we have no way to register
 //! it in the per-session cache from this depth.
 //!
@@ -202,7 +202,7 @@ mod tests {
             panic!("expected text block");
         };
         assert!(!text.contains("abcdefghijklmnopqrstuvwxyz"));
-        assert!(text.contains("sk-ant...7890"));
+        assert_eq!(text, "leaked: [REDACTED ANTHROPIC_OAUTH_TOKEN]");
     }
 
     #[test]
@@ -241,7 +241,10 @@ mod tests {
         )))
         .unwrap();
         assert!(!out.contains("abcdefghijklmnopqrstuvwxyz"));
-        assert!(out.contains("sk-ant...7890"));
+        assert!(
+            out.ends_with("Token: [REDACTED ANTHROPIC_OAUTH_TOKEN]"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -299,7 +302,7 @@ mod tests {
         };
         let val = input["value"].as_str().unwrap();
         assert!(!val.contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ"));
-        assert!(val.contains("ghp_AB...1234"));
+        assert_eq!(val, "[REDACTED GITHUB_PAT]");
     }
 
     #[test]

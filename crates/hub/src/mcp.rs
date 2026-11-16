@@ -1727,7 +1727,7 @@ mod tests {
             let answered = endpoint.handle(&body).await.unwrap();
             assert!(!answered.contains(PAT), "{tool}: {answered}");
             assert!(
-                answered.contains("ghp_AB"),
+                answered.contains("[REDACTED GITHUB_PAT]") && !answered.contains("ghp_"),
                 "{tool} is redacted, not dropped: {answered}"
             );
         }
