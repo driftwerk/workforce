@@ -5,11 +5,73 @@
 //! standing orders, written to the picture as they happen. Desk writes the
 //! rest: the person's words into a session, and what a session says on
 //! its line.
+//!
+//! **One lane per session, checked at send.** Every boss turn (its DM, a
+//! session's line, a work or plan turn, a check-in) and every focused Act
+//! fully call notes the picture's number as it starts: what it decides
+//! on. Whatever it then tells a session goes through that session's lane
+//! in [`CrewHub::perform`], one at a time: if anything touching the
+//! session was written to the picture since it started (the person's
+//! words, another turn's instruction, what the session said, a shared
+//! fact, a standing order), it is not sent; the turn is told what changed
+//! and decides again on it. Sessions' lanes are their own, so a change to
+//! one never holds another back.
+//!
+//! **A repeat is dropped.** An instruction from a later turn or call
+//! while the session's last one still stands isn't sent: it is carrying
+//! that one out. It stands while it was sent in the last
+//! [`REPEAT_WINDOW`] and since then nothing touching the session was
+//! written to the picture, its account says nothing done, and it hasn't
+//! stopped with nothing of its own running (a turn that ends while its
+//! watcher runs is not news).
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
-use workforce_desk::picture::{Note, What};
+use workforce_desk::picture::{Happened, Note, What};
 
+use super::actions::{Action, Target};
 use super::CrewHub;
+
+/// How long a boss's instruction to a session stands as its current one
+/// for [`CrewHub::check_at_send`]'s repeats.
+pub(super) const REPEAT_WINDOW: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
+
+/// How a refusal for a picture that moved starts: a focused call that
+/// meets it decides again.
+pub(crate) const STALE: &str = "Not sent: since you decided this,";
+
+/// How long a turn's basis is kept, at most, when its end isn't seen.
+const BASIS_KEPT: chrono::TimeDelta = chrono::TimeDelta::hours(6);
+
+/// The rows a refusal says, at most.
+const SAID_ROWS: usize = 6;
+
+/// What one boss turn or focused call decides on: its own key (its rows
+/// are its own), and the picture's number when it began.
+#[derive(Debug, Clone)]
+pub(super) struct Deciding {
+    pub turn: String,
+    pub basis: u64,
+}
+
+tokio::task_local! {
+    /// A focused call's [`Deciding`], for the call's whole run.
+    static DECIDING: Deciding;
+}
+
+/// Each running boss turn's [`Deciding`], by its runner session.
+pub(super) type Bases = HashMap<String, (Deciding, DateTime<Utc>)>;
+
+/// One lane per session: what is sent it goes one at a time.
+pub(super) type Lanes = HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>;
+
+/// Whether `refused` is a refusal for a picture that moved: decide again.
+pub(crate) fn stale(refused: &str) -> bool {
+    refused.starts_with(STALE)
+}
 
 impl CrewHub {
     /// The person's own words to `boss` in its DM, as they reach it:
@@ -47,10 +109,236 @@ impl CrewHub {
             .picture_note(Note::new(What::Order, what).turn(turn));
     }
 
-    /// The turn of the boss's this runs in: its runner session's id.
-    pub(super) fn current_turn() -> Option<String> {
-        workforce_agent::runner::CURRENT_SESSION_ID
-            .try_with(Clone::clone)
-            .ok()
+    /// The turn or focused call this runs in, by its key.
+    pub(super) fn current_turn(&self) -> Option<String> {
+        self.deciding_now().map(|d| d.turn)
     }
+
+    /// What the turn or focused call this runs in decides on: none
+    /// outside one (the person, accepting a suggestion).
+    pub(super) fn deciding_now(&self) -> Option<Deciding> {
+        if let Ok(d) = DECIDING.try_with(Clone::clone) {
+            return Some(d);
+        }
+        let sid = workforce_agent::runner::CURRENT_SESSION_ID
+            .try_with(Clone::clone)
+            .ok()?;
+        self.turn_bases.lock().get(&sid).map(|(d, _)| d.clone())
+    }
+
+    /// A boss's turn on runner session `sid` begins now (or takes in the
+    /// person's next message): it decides on the picture as it is.
+    pub(super) fn picture_turn_began(&self, sid: &str) {
+        let basis = self.desk.picture_seq();
+        let now = Utc::now();
+        let mut bases = self.turn_bases.lock();
+        bases.retain(|_, (_, at)| now - *at < BASIS_KEPT);
+        bases.insert(
+            sid.to_string(),
+            (
+                Deciding {
+                    turn: format!("{sid}#{basis}"),
+                    basis,
+                },
+                now,
+            ),
+        );
+    }
+
+    /// The boss's turn on `sid` ended.
+    pub(super) fn picture_turn_ended(&self, sid: &str) {
+        self.turn_bases.lock().remove(sid);
+    }
+
+    /// Runs the focused call `f` on the picture as it is now.
+    pub(super) async fn on_picture<F: std::future::Future>(&self, f: F) -> F::Output {
+        let d = Deciding {
+            turn: format!("call:{}", Uuid::new_v4()),
+            basis: self.desk.picture_seq(),
+        };
+        DECIDING.scope(d, f).await
+    }
+
+    /// What the boss's turn on runner session `sid` decided on, while kept.
+    pub(super) fn turn_deciding(&self, sid: &str) -> Option<Deciding> {
+        self.turn_bases.lock().get(sid).map(|(d, _)| d.clone())
+    }
+
+    /// `action` performed as decided in `d` (a turn that has ended, whose
+    /// reply is acted on after it).
+    pub(super) async fn perform_in(
+        &self,
+        d: Option<Deciding>,
+        action: &Action,
+        by: workforce_desk::crew::By,
+    ) -> Result<String, String> {
+        match d {
+            Some(d) => DECIDING.scope(d, self.perform(action, by)).await,
+            None => self.perform(action, by).await,
+        }
+    }
+
+    /// Session `s`'s lane, held: whatever goes to it waits its turn.
+    pub(super) async fn lane(&self, s: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
+        let lane = Arc::clone(self.lanes.lock().entry(s).or_default());
+        lane.lock_owned().await
+    }
+
+    /// The session a boss's `action` tells something, in its lane.
+    pub(super) fn lane_of(action: &Action, by: &workforce_desk::crew::By) -> Option<Uuid> {
+        match action {
+            Action::Nudge {
+                to: Target::Session(s),
+                ..
+            } if by.party.kind == workforce_desk::crew::PartyKind::Manager => Some(*s),
+            _ => None,
+        }
+    }
+
+    /// `action`, a boss's message to session `s`, checked against the
+    /// picture as it is now, in `s`'s lane: `Err` (starting [`STALE`]) when
+    /// the picture moved since the turn decided it, `Ok(Some)` when it
+    /// repeats the session's current instruction, `Ok(None)` to send it.
+    pub(super) async fn check_at_send(
+        &self,
+        action: &Action,
+        boss: &str,
+        s: Uuid,
+    ) -> Result<Option<String>, String> {
+        let Some(d) = self.deciding_now() else {
+            return Ok(None);
+        };
+        let tz = self.desk.timezone();
+        let name = self.session_name(s);
+        let moved = self.desk.picture_since(boss, s, d.basis, Some(&d.turn));
+        if !moved.is_empty() {
+            // Told now: what it sends next stands on this.
+            self.decided_again(&d);
+            tracing::info!(session = %s, %boss, turn = %d.turn, rows = moved.len(), "a boss's message decided on an old picture wasn't sent; it decides again");
+            return Err(format!(
+                "{STALE} the picture moved for {name}:\n{}\nDecide again on this: send it a new message only if one is still needed and fits what is above, or nothing.",
+                said(&moved, tz)
+            ));
+        }
+        let Action::Nudge { reply_to: None, .. } = action else {
+            return Ok(None);
+        };
+        let Some(current) = self.desk.picture_last_instruction(boss, s) else {
+            return Ok(None);
+        };
+        let own = current
+            .turn
+            .as_deref()
+            .is_some_and(|t| t == d.turn.as_str());
+        if own || Utc::now() - current.at >= REPEAT_WINDOW {
+            return Ok(None);
+        }
+        let since = self.desk.picture_since(boss, s, current.seq, None);
+        if !since.is_empty() || self.session_did_since(s, current.at).await {
+            return Ok(None);
+        }
+        tracing::info!(session = %s, %boss, "a boss's message repeating what the session is carrying out wasn't sent");
+        Ok(Some(format!(
+            "not sent: {name} already has your instruction from {} (“{}”), and nothing about it has changed since: it is carrying it out. Tell it something only once something changes.",
+            current.at.with_timezone(&tz).format("%H:%M"),
+            workforce_desk::crew::one_line(&current.text, 160)
+        )))
+    }
+
+    /// The turn `d` was told what changed: it decides on the picture now.
+    fn decided_again(&self, d: &Deciding) {
+        let now = self.desk.picture_seq();
+        for (k, _) in self.turn_bases.lock().values_mut() {
+            if k.turn == d.turn {
+                k.basis = now;
+            }
+        }
+    }
+
+    /// Whether session `s` moved on since `at`: its account says it did
+    /// something, or it stopped since with nothing of its own still
+    /// running (a turn that ends while its watcher runs is it carrying the
+    /// instruction out). Unreadable, it is taken that it did, so nothing is
+    /// held back.
+    async fn session_did_since(&self, s: Uuid, at: DateTime<Utc>) -> bool {
+        if let Ok(v) = self.desk.view(s) {
+            let stopped = matches!(
+                v.state,
+                workforce_desk::model::SessionState::Done
+                    | workforce_desk::model::SessionState::Idle
+            );
+            if stopped && v.background.is_none() && v.updated_at > at {
+                return true;
+            }
+        }
+        match self.desk.session_accounts_of(&[s]).await {
+            Ok(a) => a
+                .first()
+                .is_some_and(|a| !workforce_desk::update::done_since(None, a, at).is_empty()),
+            Err(_) => true,
+        }
+    }
+
+    /// What a boss turn about `session` (or its DM, with none) reads of
+    /// the picture: what touched the session lately, the person's words to
+    /// it, facts and orders, and its last instruction to each other
+    /// session it runs.
+    pub(super) fn picture_block(
+        &self,
+        boss: &str,
+        about: Option<Uuid>,
+        others: &[(Uuid, String)],
+    ) -> Option<String> {
+        let tz = self.desk.timezone();
+        let mut out = String::new();
+        let mine = self.desk.picture_recent_for(boss, SAID_ROWS);
+        if let Some(r) = workforce_desk::picture::render(&mine, tz) {
+            out.push_str("What the person told you lately, and the facts and standing orders that hold, oldest first:\n");
+            out.push_str(&r);
+            out.push('\n');
+        }
+        if let Some(s) = about {
+            let rows: Vec<Happened> = self
+                .desk
+                .picture_recent(boss, s, SAID_ROWS * 2)
+                .into_iter()
+                .filter(|r| r.session.is_some())
+                .collect();
+            if let Some(r) = workforce_desk::picture::render(&rows, tz) {
+                out.push_str("What happened for the session this turn is about, oldest first (the person's words in it, your instructions from every turn, what it said):\n");
+                out.push_str(&r);
+                out.push('\n');
+            }
+        }
+        let last: Vec<String> = others
+            .iter()
+            .filter(|(id, _)| Some(*id) != about)
+            .filter_map(|(id, name)| {
+                let i = self.desk.picture_last_instruction(boss, *id)?;
+                (Utc::now() - i.at < chrono::TimeDelta::hours(2)).then(|| {
+                    format!(
+                        "- {name}: {} “{}”",
+                        i.at.with_timezone(&tz).format("%H:%M"),
+                        workforce_desk::crew::one_line(&i.text, 160)
+                    )
+                })
+            })
+            .collect();
+        if !last.is_empty() {
+            out.push_str("Your last instruction to each session, from any turn of yours:\n");
+            out.push_str(&last.join("\n"));
+            out.push('\n');
+        }
+        (!out.is_empty()).then_some(out)
+    }
+}
+
+/// `rows`, newest last, at most [`SAID_ROWS`].
+fn said(rows: &[Happened], tz: chrono_tz::Tz) -> String {
+    let from = rows.len().saturating_sub(SAID_ROWS);
+    rows[from..]
+        .iter()
+        .map(|r| format!("- {}", r.said(tz)))
+        .collect::<Vec<_>>()
+        .join("\n")
 }

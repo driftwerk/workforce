@@ -1269,6 +1269,18 @@ impl CrewHub {
     /// how it is undone; an answer to a session's question is said in its
     /// DM from that row. Recording never stops the action.
     pub(crate) async fn perform(&self, action: &Action, by: By) -> Result<String, String> {
+        // A boss's message to a session goes through the session's lane,
+        // checked against the picture as it is now (`super::picture`).
+        let lane = Self::lane_of(action, &by);
+        let _lane = match lane {
+            Some(s) => Some(self.lane(s).await),
+            None => None,
+        };
+        if let Some(s) = lane {
+            if let Some(said) = self.check_at_send(action, &by.party.id, s).await? {
+                return Ok(said);
+            }
+        }
         // The same instruction to the same session again, soon after: said
         // once, no second message on its line, no second decision.
         let told = match self.tell_once(action, &by) {
@@ -1301,7 +1313,7 @@ impl CrewHub {
                 } = action
                 {
                     if who.party.kind == crew::PartyKind::Manager {
-                        self.picture_instruction(&who.party.id, *s, message, Self::current_turn());
+                        self.picture_instruction(&who.party.id, *s, message, self.current_turn());
                     }
                 }
                 said

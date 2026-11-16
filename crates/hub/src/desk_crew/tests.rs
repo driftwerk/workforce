@@ -1884,6 +1884,7 @@ mod decisions;
 mod directives;
 mod items;
 mod learning;
+mod one_picture;
 mod preferences;
 mod promises;
 mod repeats;

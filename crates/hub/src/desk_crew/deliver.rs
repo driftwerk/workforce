@@ -132,6 +132,11 @@ impl CrewHub {
             .is_some()
             .then(|| format!("desk-relay:{}", workforce_desk::crew::new_id()));
         let tx = self.state.broadcast_tx.clone();
+        // Theirs, relayed: in this boss's picture as their word, before
+        // its turn on it begins.
+        if let Some(words) = &theirs {
+            self.picture_person_told(service.agent_id.as_str(), words);
+        }
         let (mut live, inbox) = match service
             .begin_live_turn(&sid, SelfServe::answerable_if(false), None)
             .await
@@ -143,11 +148,7 @@ impl CrewHub {
             }
         };
         // Gone with the turn, however it ends, as the person's own are.
-        let _theirs = theirs.map(|words| {
-            // Theirs, relayed: in this boss's picture as their word.
-            self.picture_person_told(service.agent_id.as_str(), &words);
-            Theirs::keep(&self.person_turns, &sid, words)
-        });
+        let _theirs = theirs.map(|words| Theirs::keep(&self.person_turns, &sid, words));
         // The crew's own wake-up, by name, for as long as its turn runs:
         // named only once the turn is the crew's (a session busy with the
         // person's own turn is never named).

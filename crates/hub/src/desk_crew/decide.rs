@@ -954,7 +954,18 @@ impl CrewHub {
             .await
             .map(|w| format!("\n\n{w}"))
             .unwrap_or_default();
-        (session, format!("{orders}{prefs}"))
+        // The live picture of it: the person's words, every turn's
+        // instructions, what it said (`super::picture`).
+        let picture = self
+            .picture_block(boss, Some(view.id), &[])
+            .map(|p| {
+                format!(
+                    "\n\n{}",
+                    super::watcher::reported(p.trim_end(), "Desk's live picture of this session")
+                )
+            })
+            .unwrap_or_default();
+        (session, format!("{orders}{prefs}{picture}"))
     }
 
     /// What `boss`'s model is given to decide `p`: the whole request, the

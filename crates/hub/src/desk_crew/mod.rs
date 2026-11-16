@@ -210,6 +210,10 @@ pub struct CrewHub {
     /// What each boss last told each session on its line, in plain form,
     /// and when: the same instruction again soon after isn't sent twice.
     told_lines: Mutex<ToldLines>,
+    /// Each running boss turn's basis in the picture (`picture`).
+    turn_bases: Mutex<picture::Bases>,
+    /// One lane per session, for what bosses send it (`picture`).
+    lanes: Mutex<picture::Lanes>,
     /// Who writes the updates' paragraphs; none: plainly.
     update_writer: Mutex<Option<Arc<dyn updates::UpdateWriter>>>,
     /// The bosses the person asked for a roundup now ("Roundup now").
@@ -647,6 +651,8 @@ impl CrewHub {
             person_turns: Mutex::default(),
             relayed_turns: Mutex::default(),
             told_lines: Mutex::default(),
+            turn_bases: Mutex::default(),
+            lanes: Mutex::default(),
             update_writer: Mutex::default(),
             roundup_asked: Mutex::default(),
             updating: Mutex::default(),

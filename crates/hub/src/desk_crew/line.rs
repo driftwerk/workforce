@@ -488,6 +488,11 @@ impl CrewHub {
             }
         }
         let reply = ran.as_ref().map(|(_, r)| r.as_str()).map_err(|_| ());
+        // What its reply settles was decided in the turn, on its picture.
+        let deciding = ran
+            .as_ref()
+            .ok()
+            .and_then(|(sid, _)| self.turn_deciding(sid));
         for (ask, settled) in still_open.iter().zip(settle(reply, still_open.len())) {
             match settled {
                 Settle::Escalate(why) => {
@@ -512,7 +517,7 @@ impl CrewHub {
                     match self.gate(&action, &o) {
                         Gate::Run => {
                             let by = self.by_at_level(by.clone(), &o);
-                            if let Err(e) = self.perform(&action, by).await {
+                            if let Err(e) = self.perform_in(deciding.clone(), &action, by).await {
                                 tracing::info!(error = %e, "the overseer's reply didn't answer");
                             }
                         }
