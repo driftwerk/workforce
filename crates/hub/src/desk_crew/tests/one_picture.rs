@@ -79,7 +79,8 @@ async fn a_line_turn_on_an_old_picture_never_contradicts_the_chat() {
         assert!(refused.contains("Do NOT write your own fix"), "it is told what changed: {refused}");
         assert!(refused.contains(theirs), "and the person's words: {refused}");
 
-        // 13:33:56 the chat's turn asks the session a status question.
+        // 13:33:56 the person asks in the chat, and its turn asks the session.
+        crew.picture_person_told("desk", "Who made the dashboard embed change?");
         crew.picture_turn_began("dm");
         let status = "Who made the dashboard embed change? Answer in three lines from git, read-only, then carry on as you were.";
         in_turn("dm", crew.perform(&nudge(s.id, status), by())).await.unwrap();
@@ -105,6 +106,18 @@ async fn a_line_turn_on_an_old_picture_never_contradicts_the_chat() {
     .await;
 }
 
+const WATCH: &str = "Keep watching production promotion 81234 until it succeeds, then enqueue #639 pinned to its head and confirm it merges. After that, stop and start nothing new.";
+
+fn action_session(a: &Action) -> uuid::Uuid {
+    match a {
+        Action::Nudge {
+            to: Target::Session(s),
+            ..
+        } => *s,
+        other => panic!("{other:?}"),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_relayed_pause_is_never_contradicted_and_one_step_is_told_once() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
@@ -126,8 +139,11 @@ async fn a_relayed_pause_is_never_contradicted_and_one_step_is_told_once() {
                 // A focused call begun before the pause, answering after it.
                 crew.on_picture(async {
                     let _ = decided.await;
-                    crew.perform(&action, crew.by_overseer("Its work isn't done.").unwrap())
-                        .await
+                    let by = || crew.by_overseer("Its work isn't done.").unwrap();
+                    let refused = crew.perform(&action, by()).await;
+                    // 21:12:00 decided again, on the pause it was told of.
+                    let watch = nudge(action_session(&action), WATCH);
+                    (refused, crew.perform(&watch, by()).await)
                 })
                 .await
             })
@@ -141,17 +157,14 @@ async fn a_relayed_pause_is_never_contradicted_and_one_step_is_told_once() {
         let pause = "The person has paused all migration work as of 21:10. Don't start anything new. Finish what is already running, report it, then stop.";
         in_turn("dm", crew.perform(&nudge(s.id, pause), by())).await.unwrap();
         go.send(()).unwrap();
-        let refused = early.await.unwrap().unwrap_err();
+        let (refused, sent) = early.await.unwrap();
+        let refused = refused.unwrap_err();
         assert!(stale(&refused), "the go-ahead is never sent: {refused}");
         assert!(refused.contains("paused all migration work"), "{refused}");
-
-        // 21:12:00 decided again, on the pause.
-        let watch = "Keep watching production promotion 81234 until it succeeds, then enqueue #639 pinned to its head and confirm it merges. After that, stop and start nothing new.";
-        let sent = crew
-            .on_picture(crew.perform(&nudge(s.id, watch), by()))
-            .await
-            .unwrap();
-        assert!(sent.starts_with("told acme-622"), "{sent}");
+        // Decided again on what it was told, the step it was about to run
+        // anyway: the pause already says to finish it, so it isn't sent.
+        let said = sent.unwrap();
+        assert!(said.starts_with("not sent: acme-622 already has your instruction from"), "{said}");
 
         // 21:12:07–21:13:31: the session ends a turn each time it looks at
         // its watcher, and each time the step comes back in new words.
@@ -172,15 +185,15 @@ async fn a_relayed_pause_is_never_contradicted_and_one_step_is_told_once() {
         }
         assert_eq!(
             told(&d, s.id).await,
-            vec![pause.to_string(), watch.to_string()],
-            "the pause, then one step: never the go-ahead, never seven"
+            vec![pause.to_string()],
+            "the pause, carried out: never the go-ahead, never seven steps"
         );
         let rows = d
             .store()
             .decisions_since("desk", chrono::DateTime::UNIX_EPOCH, 50)
             .await
             .unwrap();
-        assert_eq!(rows.iter().filter(|r| r.session == Some(s.id)).count(), 2, "{rows:?}");
+        assert_eq!(rows.iter().filter(|r| r.session == Some(s.id)).count(), 1, "{rows:?}");
 
         // Once the session says something new, the next step goes.
         d.picture_note(
