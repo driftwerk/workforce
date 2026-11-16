@@ -8820,18 +8820,22 @@ async fn pair_device_status(
             Ok(Json(serde_json::json!({ "status": "pending" })))
         }
         workforce_pairing::types::PairingStatus::Approved => {
-            if req.pending_token.is_some() && req.collectable_token(chrono::Utc::now()).is_none() {
+            let collectable = req.collectable_token(chrono::Utc::now()).is_some();
+            // Taken, not read then cleared: of polls racing, one alone is
+            // handed the token.
+            let taken = match req.pending_token {
+                Some(_) => pairing
+                    .take_pending_token_async(req.id.clone())
+                    .await
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+                None => None,
+            };
+            if taken.is_some() && !collectable {
                 // Not collected in time: the copy goes, and the code is as
                 // good as expired (the device pairs again), not "used".
-                let _ = pairing.clear_pending_token_async(req.id.clone()).await;
                 return Err(StatusCode::NOT_FOUND);
             }
-            if let Some(token) = req
-                .collectable_token(chrono::Utc::now())
-                .map(str::to_string)
-            {
-                // One-time token retrieval — clear it after returning
-                let _ = pairing.clear_pending_token_async(req.id.clone()).await;
+            if let Some(token) = taken {
                 Ok(Json(serde_json::json!({
                     "status": "approved",
                     "token": token,

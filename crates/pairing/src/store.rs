@@ -3,7 +3,7 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use eyre::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::types::*;
 
@@ -65,6 +65,9 @@ pub trait PairingStore: Send + Sync {
     ) -> Result<()>;
     fn set_device_pending_token(&self, id: &str, token: &str) -> Result<()>;
     fn clear_device_pending_token(&self, id: &str) -> Result<()>;
+    /// Request `id`'s pending token, cleared in the same statement that
+    /// reads it: of callers racing, one alone gets it.
+    fn take_device_pending_token(&self, id: &str) -> Result<Option<String>>;
     fn find_device_by_client_id(&self, client_id: &str) -> Result<Option<ApprovedDevice>>;
     /// Re-scope every non-revoked device and every pending pairing request
     /// whose scopes differ from `canonical` to exactly `canonical`, returning
@@ -855,6 +858,27 @@ impl PairingStore for SqlitePairingStore {
             params![id],
         )?;
         Ok(())
+    }
+
+    fn take_device_pending_token(&self, id: &str) -> Result<Option<String>> {
+        // RETURNING gives the row as updated (NULL), so the token is read
+        // first; the connection's lock keeps the read and clear as one.
+        let conn = self.lock()?;
+        let token = conn
+            .query_row(
+                "SELECT pending_token FROM device_pairing_requests
+                 WHERE id = ?1 AND pending_token IS NOT NULL",
+                params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if token.is_some() {
+            conn.execute(
+                "UPDATE device_pairing_requests SET pending_token = NULL WHERE id = ?1",
+                params![id],
+            )?;
+        }
+        Ok(token)
     }
 
     fn find_device_by_client_id(&self, client_id: &str) -> Result<Option<ApprovedDevice>> {
