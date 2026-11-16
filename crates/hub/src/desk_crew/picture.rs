@@ -211,10 +211,30 @@ impl CrewHub {
     ) -> Result<Option<String>, String> {
         let tz = self.desk.timezone();
         let name = self.session_name(s);
-        // The person drives it: nothing of the boss's goes to it, and
-        // nothing waits to go in over what they do there. Handed back, the
-        // boss is woken, and its picture has what they said in it.
-        if self.desk.person_in_control(s, self.desk.hold_for(boss)) {
+        // The person drives it: they have the wheel of a session a boss
+        // runs. No instruction of the boss's goes to it then, and none
+        // waits to go in over what they do there. Handed back, the boss is
+        // woken, and its picture has what they said in it.
+        // - Driving is measured in the hub's own minutes too (the gap its
+        //   focused calls wait out, never shorter than the hold), so a call
+        //   that waited out the person never ends refused. With real
+        //   minutes that is exactly the wheel.
+        // - An answer on its line to a question the session asked
+        //   (`reply_to`) still goes, as Desk lets it: the session waits on
+        //   it.
+        // - A session the boss only oversees has no wheel: the focused
+        //   calls wait out the person's input there themselves.
+        let instruction = matches!(action, Action::Nudge { reply_to: None, .. });
+        let gap = || {
+            self.overseer_named(boss).map_or_else(
+                || self.answer_gap(&workforce_common::oversight::Oversight::default()),
+                |(_, o)| self.answer_gap(&o),
+            )
+        };
+        if instruction
+            && self.desk.wheel_of(s).is_some_and(|w| w.person())
+            && self.desk.person_in_control(s, gap())
+        {
             return Ok(Some(format!(
                 "not sent: the person is driving {name} now, so nothing of yours goes to it. When they hand it back (or stop giving it input for a while) you're woken, with what they said in it, and decide then."
             )));

@@ -39,13 +39,17 @@ async fn in_turn<F: Future>(sid: &str, f: F) -> F::Output {
         .await
 }
 
-/// What the boss's line to `s` carries, oldest first.
+/// What the boss's line to `s` carries, oldest first. Desk's own note
+/// when a boss takes it on ("I'm running this session…", noted, never
+/// sent) isn't anything the boss told it.
 async fn told(d: &Desk, s: uuid::Uuid) -> Vec<String> {
     d.line_thread(s, None, None)
         .await
         .unwrap()
         .into_iter()
-        .filter(|m| m.from.kind == PartyKind::Manager)
+        .filter(|m| {
+            m.from.kind == PartyKind::Manager && m.delivery != workforce_desk::line::Delivery::Noted
+        })
         .map(|m| m.text)
         .collect()
 }

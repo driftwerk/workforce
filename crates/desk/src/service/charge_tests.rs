@@ -118,12 +118,30 @@ async fn a_persons_prompt_holds_the_bosss_queued_tell_and_hand_back_delivers_it(
             .unwrap();
         let next = take_next(&d, s.id, Duration::from_secs(1)).await.unwrap();
         assert_eq!(next["id"], json!(mine.id));
+        // Theirs overtook the boss's "Run the tests next.", decided before
+        // it: that one never goes in, not even once handed back (boss one
+        // picture, point 4). Before, it went in on hand-back. A boss's
+        // message after their words, which nothing overtook, still waits
+        // for the wheel and goes in then.
+        let by = By::manager("sarah", "Sarah", "Next step.");
+        let after = d
+            .line_send(
+                Sender::Overseer(by),
+                Send::Tell {
+                    to: Target::Session(s.id),
+                    text: "Then commit it.".into(),
+                    when: When::Queue,
+                },
+            )
+            .await
+            .unwrap();
 
         // Written down once, as Activity says.
         d.charge_settle().await;
         assert_eq!(d.charge_of(s.id).unwrap().wheel, Wheel::Person);
 
-        // The plugin, waiting for a message, gets it once handed back.
+        // The plugin, waiting for a message, gets the one nothing
+        // overtook once handed back; the overtaken one is withdrawn.
         let waiting = {
             let d = d.clone();
             tokio::spawn(async move { d.line_next(s.id, Duration::from_secs(10)).await })
@@ -136,11 +154,20 @@ async fn a_persons_prompt_holds_the_bosss_queued_tell_and_hand_back_delivers_it(
             .expect("handed back, it goes in")
             .unwrap()
             .unwrap();
-        assert_eq!(next["id"], json!(m.id));
+        assert_eq!(next["id"], json!(after.id));
         assert!(next["text"]
             .as_str()
             .unwrap()
-            .contains("tells you: Run the tests next."));
+            .contains("tells you: Then commit it."));
+        assert_eq!(
+            d.0.store
+                .line_message(m.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .delivery,
+            Delivery::Withdrawn
+        );
         // Activity is written behind: looked at until it is.
         for _ in 0..200 {
             let kinds: Vec<Kind> = d
@@ -724,7 +751,7 @@ async fn a_handed_message_that_comes_back_after_a_release_is_withdrawn() {
 }
 
 /// The person's message goes ahead of a boss's that was waiting for the
-/// same idle.
+/// same idle, and the boss's, overtaken by it, is withdrawn.
 #[tokio::test]
 async fn the_persons_message_goes_ahead_of_the_bosss_waiting_one() {
     with_test_pool(build_pool, |pool| async move {
@@ -746,7 +773,23 @@ async fn the_persons_message_goes_ahead_of_the_bosss_waiting_one() {
             .unwrap();
         let next = take_next(&d, s.id, Duration::from_secs(1)).await.unwrap();
         assert_eq!(next["id"], json!(mine.id));
-        assert!(row_waits(&d, boss.id).await);
+        // Their words overtook the boss's, decided before them: it is
+        // withdrawn, never typed in after (boss one picture, point 4), and
+        // the boss decides again on what they said. Before, it kept
+        // waiting and went in next.
+        assert_eq!(
+            d.0.store
+                .line_message(boss.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .delivery,
+            Delivery::Withdrawn
+        );
+        assert!(d
+            .line_next(s.id, Duration::from_millis(300))
+            .await
+            .is_none());
     })
     .await;
 }
