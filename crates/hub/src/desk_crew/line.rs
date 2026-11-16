@@ -220,6 +220,14 @@ impl CrewHub {
             options: Vec::new(),
             draft: None,
         });
+        // The question in its words: never the marks it copied from what
+        // it read ("Re: [Desk m:…]"), and nothing posted when that is all.
+        let headline = workforce_desk::line::without_marks(q.headline());
+        if headline.trim().is_empty() {
+            tracing::info!("a session's question held only marks; nothing to give the person");
+            self.let_go(q.id).await;
+            return;
+        }
         // One item, and one card, however often it is given to the person:
         // escalated again, it is updated and nothing new is posted.
         let mut item = NewItem::ask(
@@ -229,7 +237,7 @@ impl CrewHub {
             &format!(
                 "{} asks: “{}”",
                 q.from.name,
-                crew::one_line(q.headline(), 400)
+                crew::one_line(headline.as_str(), 400)
             ),
         );
         item.dedupe_key = open_item::line_key(q.id);
@@ -259,7 +267,7 @@ impl CrewHub {
         // One line: the question and why in a few words; the rest is
         // behind "more".
         let asked = crew::words(
-            &crew::one_line(q.headline(), 400),
+            &crew::one_line(headline.as_str(), 400),
             workforce_desk::open_item::QUESTION_WORDS,
         );
         let why = workforce_desk::decision::clause(&crew::words(
@@ -273,8 +281,8 @@ impl CrewHub {
         // What the line leaves out of either is behind "more".
         let flat = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
         let mut detail: Vec<String> = Vec::new();
-        if flat(q.headline()) != flat(&asked) {
-            detail.push(q.headline().trim().to_string());
+        if flat(headline.as_str()) != flat(&asked) {
+            detail.push(headline.as_str().trim().to_string());
         }
         if !e.why.trim().is_empty()
             && why.as_deref().map(flat) != workforce_desk::decision::clause(&flat(&e.why))
