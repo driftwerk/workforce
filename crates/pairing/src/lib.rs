@@ -38,7 +38,13 @@ pub(crate) fn logged(run: impl FnOnce()) -> String {
         .with_max_level(tracing::Level::TRACE)
         .with_ansi(false)
         .finish();
-    tracing::subscriber::with_default(subscriber, run);
+    // Tests run on parallel threads with no subscriber of their own: a
+    // callsite first hit there is cached as unwanted, so the cache is rebuilt
+    // once this one is in place.
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
+        run()
+    });
     let bytes = log.0.lock().unwrap().clone();
     String::from_utf8(bytes).unwrap()
 }

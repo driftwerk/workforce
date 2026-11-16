@@ -713,6 +713,25 @@ impl PairingStore for PostgresPairingStore {
         })
     }
 
+    fn take_device_pending_token(&self, id: &str) -> Result<Option<String>> {
+        let id = id.to_string();
+        self.block_on(async move {
+            let conn = self.pool.get().await?;
+            // The old value, from the row as this statement locked it.
+            let row = conn
+                .query_opt(
+                    "UPDATE device_pairing_requests AS r SET pending_token = NULL
+                     FROM (SELECT id, pending_token FROM device_pairing_requests
+                           WHERE id = $1 AND pending_token IS NOT NULL FOR UPDATE) AS old
+                     WHERE r.id = old.id AND r.pending_token IS NOT NULL
+                     RETURNING old.pending_token",
+                    &[&id],
+                )
+                .await?;
+            Ok(row.map(|r| r.get::<_, String>(0)))
+        })
+    }
+
     fn find_device_by_client_id(&self, client_id: &str) -> Result<Option<ApprovedDevice>> {
         let client_id = client_id.to_string();
         self.block_on(async move {
@@ -998,6 +1017,13 @@ mod tests {
             s.set_device_pending_token(&req.id, "tok-plain").unwrap();
             let after = s.get_device_request_by_code("DEVX5678").unwrap().unwrap();
             assert_eq!(after.pending_token.as_deref(), Some("tok-plain"));
+            // Taken once: the next take finds it gone.
+            assert_eq!(
+                s.take_device_pending_token(&req.id).unwrap().as_deref(),
+                Some("tok-plain")
+            );
+            assert_eq!(s.take_device_pending_token(&req.id).unwrap(), None);
+            s.set_device_pending_token(&req.id, "tok-plain").unwrap();
 
             s.update_device_request_status(&req.id, PairingStatus::Approved, Some("admin"))
                 .unwrap();

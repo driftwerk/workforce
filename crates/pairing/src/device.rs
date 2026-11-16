@@ -86,7 +86,7 @@ impl DevicePairingService {
         let req = self
             .store
             .get_device_request_by_code(code)?
-            .ok_or_else(|| eyre::eyre!("Unknown pairing code: {code}"))?;
+            .ok_or_else(|| eyre::eyre!("Unknown pairing code"))?;
 
         if req.status != PairingStatus::Pending {
             return Err(eyre::eyre!(
@@ -97,7 +97,7 @@ impl DevicePairingService {
 
         self.store
             .update_device_request_status(&req.id, PairingStatus::Rejected, None)?;
-        info!(code, "Rejected device pairing");
+        info!("Rejected device pairing");
         Ok(())
     }
 
@@ -331,7 +331,7 @@ impl DevicePairingService {
         tokio::task::spawn_blocking(move || {
             let req = store
                 .get_device_request_by_code(&code)?
-                .ok_or_else(|| eyre::eyre!("Unknown pairing code: {code}"))?;
+                .ok_or_else(|| eyre::eyre!("Unknown pairing code"))?;
             if req.status != PairingStatus::Pending {
                 return Err(eyre::eyre!(
                     "Device pairing request is already {}",
@@ -339,7 +339,7 @@ impl DevicePairingService {
                 ));
             }
             store.update_device_request_status(&req.id, PairingStatus::Rejected, None)?;
-            info!(code, "Rejected device pairing");
+            info!("Rejected device pairing");
             Ok(())
         })
         .await
@@ -378,6 +378,15 @@ impl DevicePairingService {
     pub async fn check_status_async(&self, code: String) -> Result<Option<DevicePairingRequest>> {
         let store = Arc::clone(&self.store);
         tokio::task::spawn_blocking(move || store.get_device_request_by_code(&code))
+            .await
+            .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))?
+    }
+
+    /// The token request `id` holds for its device, taken: read and cleared
+    /// at once, so of status polls racing, one alone is handed it.
+    pub async fn take_pending_token_async(&self, id: String) -> Result<Option<String>> {
+        let store = Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || store.take_device_pending_token(&id))
             .await
             .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))?
     }
@@ -422,7 +431,7 @@ fn approve_in(
 ) -> Result<(ApprovedDevice, String)> {
     let req = store
         .get_device_request_by_code(code)?
-        .ok_or_else(|| eyre::eyre!("Unknown pairing code: {code}"))?;
+        .ok_or_else(|| eyre::eyre!("Unknown pairing code"))?;
 
     if req.status != PairingStatus::Pending {
         return Err(eyre::eyre!(
@@ -769,6 +778,59 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(check.pending_token.is_none());
+    }
+
+    /// Status polls racing for a freshly approved device's token: one alone
+    /// is handed it, however many read at once.
+    #[test]
+    fn a_pending_token_is_taken_once_however_many_ask_at_once() {
+        let store = Arc::new(SqlitePairingStore::in_memory().unwrap());
+        let svc = DevicePairingService::new(store.clone(), device_config());
+        let req = svc
+            .initiate("test-phone", vec!["chat".into()], None, None, None, None)
+            .unwrap();
+        let (_device, token) = svc.approve(&req.code, "admin").unwrap();
+        let start = Arc::new(std::sync::Barrier::new(8));
+        let takers: Vec<_> = (0..8)
+            .map(|_| {
+                let (store, start, id) = (Arc::clone(&store), Arc::clone(&start), req.id.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    store.take_device_pending_token(&id).unwrap()
+                })
+            })
+            .collect();
+        let taken: Vec<String> = takers
+            .into_iter()
+            .filter_map(|t| t.join().unwrap())
+            .collect();
+        assert_eq!(taken, [token]);
+        let after = store
+            .get_device_request_by_code(&req.code)
+            .unwrap()
+            .unwrap();
+        assert!(after.pending_token.is_none());
+    }
+
+    /// Whoever holds a pairing code could still pair with it: rejecting one,
+    /// or naming one that isn't, never logs it nor says it back.
+    #[test]
+    fn a_rejected_or_unknown_code_is_never_logged_or_said_back() {
+        let store = Arc::new(SqlitePairingStore::in_memory().unwrap());
+        let svc = DevicePairingService::new(store, device_config());
+        let req = svc
+            .initiate("test-phone", vec!["chat".into()], None, None, None, None)
+            .unwrap();
+        let mut errors = String::new();
+        let log = crate::logged(|| {
+            svc.reject(&req.code).unwrap();
+            errors.push_str(&format!("{:#}", svc.reject("ZZZZ9999").unwrap_err()));
+        });
+        assert!(log.contains("Rejected device pairing"), "{log}");
+        for code in [req.code.as_str(), "ZZZZ9999"] {
+            assert!(!log.contains(code), "{code} in {log}");
+            assert!(!errors.contains(code), "{code} in {errors}");
+        }
     }
 
     #[test]

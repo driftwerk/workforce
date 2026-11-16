@@ -966,6 +966,7 @@ impl workforce_pairing::PairingStore for FailingPairingStore {
         fn rotate_device_token(&self, id: &str, new_token_hash: &str, new_expires_at: Option<chrono::DateTime<chrono::Utc>>) -> eyre::Result<()>;
         fn set_device_pending_token(&self, id: &str, token: &str) -> eyre::Result<()>;
         fn clear_device_pending_token(&self, id: &str) -> eyre::Result<()>;
+        fn take_device_pending_token(&self, id: &str) -> eyre::Result<Option<String>>;
         fn find_device_by_client_id(&self, client_id: &str) -> eyre::Result<Option<workforce_pairing::ApprovedDevice>>;
         fn normalize_device_scopes(&self, canonical: &[String]) -> eyre::Result<usize>;
         fn create_node_request(&self, req: &workforce_pairing::NodePairingRequest) -> eyre::Result<()>;
