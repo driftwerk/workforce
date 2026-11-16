@@ -3069,19 +3069,49 @@ async fn a_copied_connection_is_audited_here_with_where_it_came_from() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
+    // A copy whose check fails is kept nowhere, and its row says so.
+    let res = app
+        .clone()
+        .oneshot(post(
+            json!({"level": "all", "fields": {"api_key": BAD}, "copied_from": "Patchwork"}),
+        ))
+        .await
+        .unwrap();
+    assert!(!res.status().is_success());
     let rows: Vec<_> = audit
         .recent_audit(100)
         .unwrap()
         .into_iter()
         .filter(|e| e.action == "desk_connections.copy")
         .collect();
-    assert_eq!(rows.len(), 1, "only the copy: {rows:?}");
-    let detail = rows[0].detail.clone().unwrap_or_default();
-    assert!(detail.contains("Desk copied your Linear key"), "{detail}");
-    assert!(detail.contains("from Patchwork"), "{detail}");
+    assert_eq!(rows.len(), 2, "only the copies: {rows:?}");
+    let detail = |at: usize| -> Value {
+        serde_json::from_str(rows[at].detail.as_deref().unwrap_or("{}")).unwrap()
+    };
+    let (kept, failed): (Vec<_>, Vec<_>) = (0..rows.len())
+        .map(detail)
+        .partition(|d| d["check"] == "passed");
+    assert_eq!((kept.len(), failed.len()), (1, 1), "{rows:?}");
+    let said = kept[0]["summary"].as_str().unwrap();
     assert!(
-        !detail.contains(GOOD) && !detail.contains(&GOOD[..8]),
-        "{detail}"
+        said.starts_with("Desk copied your Linear key")
+            && said.ends_with("from Patchwork: its check passed"),
+        "{said}"
     );
-    assert_eq!(rows[0].actor, format!("user:{SARAH}"));
+    assert!(kept[0]["connection"].is_string());
+    assert_eq!(
+        failed[0]["summary"],
+        "Desk didn't keep your Linear key from Patchwork: its check failed"
+    );
+    assert_eq!(failed[0]["check"], "failed");
+    for row in &rows {
+        let text = row.detail.clone().unwrap_or_default();
+        for secret in [GOOD, BAD] {
+            assert!(
+                !text.contains(secret) && !text.contains(&secret[..8]),
+                "{text}"
+            );
+        }
+        assert_eq!(row.actor, format!("user:{SARAH}"));
+    }
 }
