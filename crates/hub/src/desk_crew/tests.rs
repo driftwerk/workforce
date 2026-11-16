@@ -1886,6 +1886,7 @@ mod items;
 mod learning;
 mod preferences;
 mod promises;
+mod repeats;
 mod updates;
 
 mod away;

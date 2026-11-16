@@ -75,12 +75,21 @@ impl CrewHub {
         if let Some(listed) = listed {
             self.listed.lock().insert(sid.clone(), listed);
         }
-        // What another overseer sent on is never the person's word.
-        let _relayed = (in_dm
+        // What another overseer sent on is never the person's word, unless
+        // it was sent in answer to theirs: then their own words, relayed,
+        // are what this turn answers.
+        let by_overseer = in_dm
             && author
                 .as_ref()
-                .is_some_and(|a| a.kind != workforce_desk::conversations::SpeakerKind::You))
-        .then(|| Relayed::mark(&self.relayed_turns, &sid));
+                .is_some_and(|a| a.kind != workforce_desk::conversations::SpeakerKind::You);
+        let _relayed = by_overseer.then(|| Relayed::mark(&self.relayed_turns, &sid));
+        let theirs = by_overseer
+            .then(|| {
+                self.on_behalf
+                    .lock()
+                    .remove(&(agent_id.to_string(), prompt.to_string()))
+            })
+            .flatten();
         // A message of the DM is found again by a mark of its own.
         let relay = author
             .is_some()
@@ -96,6 +105,8 @@ impl CrewHub {
                 bail!("{busy}");
             }
         };
+        // Gone with the turn, however it ends, as the person's own are.
+        let _theirs = theirs.map(|words| Theirs::keep(&self.person_turns, &sid, words));
         // The crew's own wake-up, by name, for as long as its turn runs:
         // named only once the turn is the crew's (a session busy with the
         // person's own turn is never named).
@@ -180,6 +191,30 @@ impl CrewHub {
         }
         drop(live);
         Ok((session_id, answer?))
+    }
+}
+
+/// The person's words a relayed turn answers, kept as that turn's and
+/// dropped when it is done.
+struct Theirs<'a>(
+    &'a parking_lot::Mutex<std::collections::HashMap<String, String>>,
+    String,
+);
+
+impl<'a> Theirs<'a> {
+    fn keep(
+        turns: &'a parking_lot::Mutex<std::collections::HashMap<String, String>>,
+        sid: &str,
+        words: String,
+    ) -> Self {
+        turns.lock().insert(sid.to_string(), words);
+        Self(turns, sid.to_string())
+    }
+}
+
+impl Drop for Theirs<'_> {
+    fn drop(&mut self) {
+        self.0.lock().remove(&self.1);
     }
 }
 

@@ -107,6 +107,9 @@ impl Default for Timing {
     }
 }
 
+/// What each boss last told each session, in normalised words, and when.
+type ToldLines = HashMap<(String, uuid::Uuid), Vec<(String, DateTime<Utc>)>>;
+
 /// A turn an agent is running now.
 #[derive(Debug, Clone)]
 struct Running {
@@ -194,6 +197,14 @@ pub struct CrewHub {
     /// The DM sessions running a message another overseer sent on: not
     /// the person's, so never their order.
     relayed_turns: Mutex<std::collections::HashSet<String>>,
+    /// The person's own words a boss's message to another boss was sent
+    /// in answer to, by the receiver's id and the message: the receiver's
+    /// turn on it keeps an order as theirs (the person's, relayed), never
+    /// the sender's own words.
+    on_behalf: Mutex<HashMap<(String, String), String>>,
+    /// What each boss last told each session on its line, in plain form,
+    /// and when: the same instruction again soon after isn't sent twice.
+    told_lines: Mutex<ToldLines>,
     /// Who writes the updates' paragraphs; none: plainly.
     update_writer: Mutex<Option<Arc<dyn updates::UpdateWriter>>>,
     /// The bosses the person asked for a roundup now ("Roundup now").
@@ -630,6 +641,8 @@ impl CrewHub {
             turn_acts: Mutex::default(),
             person_turns: Mutex::default(),
             relayed_turns: Mutex::default(),
+            on_behalf: Mutex::default(),
+            told_lines: Mutex::default(),
             update_writer: Mutex::default(),
             roundup_asked: Mutex::default(),
             updating: Mutex::default(),
