@@ -778,7 +778,9 @@ impl Desk {
         self.close_line_item(question.id, closer, &why).await;
         match (&by, &asker) {
             (Sender::Person, Some(v)) => {
-                self.picture_person_said(v.id, &a.text);
+                // Their answer, not them taking the wheel: what a boss has
+                // waiting for the session isn't overtaken by it.
+                self.picture_person_answered(v.id, &a.text);
                 self.person_spoke(v.id)
             }
             (Sender::Session(id), _) => {

@@ -277,7 +277,7 @@ impl CrewHub {
             && self.desk.person_in_control(s, gap())
         {
             return Ok(Some(format!(
-                "not sent: the person is driving {name} now, so nothing of yours goes to it. When they hand it back (or stop giving it input for a while) you're woken, with what they said in it, and decide then."
+                "not sent: the person is driving {name} now, so nothing of yours goes to it. When they hand it back (or stop giving it input for a while) you're woken, with what they said in it, and decide then. If the person asked you to tell it this, say so to them in your DM instead."
             )));
         }
         let Some(d) = self.deciding_now() else {

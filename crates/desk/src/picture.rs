@@ -59,6 +59,12 @@ pub enum What {
     Order,
     /// The person handed a session back to its boss.
     HandedBack,
+    /// The person answered a session's question from Desk (`session`):
+    /// their words, but not them taking the session's wheel.
+    PersonAnswered,
+    /// A boss's message waiting to go into `session` was withdrawn unsent:
+    /// the person's own words there came after it.
+    Withdrawn,
 }
 
 impl What {
@@ -71,6 +77,8 @@ impl What {
             What::Fact => "fact",
             What::Order => "order",
             What::HandedBack => "handed_back",
+            What::PersonAnswered => "person_answered",
+            What::Withdrawn => "withdrawn",
         }
     }
 
@@ -83,6 +91,8 @@ impl What {
             "fact" => What::Fact,
             "order" => What::Order,
             "handed_back" => What::HandedBack,
+            "person_answered" => What::PersonAnswered,
+            "withdrawn" => What::Withdrawn,
             _ => return None,
         })
     }
@@ -143,6 +153,10 @@ impl Happened {
             What::Fact => format!("{at} fact: {text}"),
             What::Order => format!("{at} the person's standing order: {text}"),
             What::HandedBack => format!("{at} the person handed it back to you"),
+            What::PersonAnswered => format!("{at} the person answered its question: “{text}”"),
+            What::Withdrawn => format!(
+                "{at} your message “{text}” was withdrawn unsent: the person's own words in the session came after it"
+            ),
         }
     }
 }
@@ -322,16 +336,18 @@ impl Picture {
             .any(|r| r.what == What::PersonSaid && r.session == Some(session))
     }
 
-    /// The last instruction `boss` sent `session`, if any is still kept.
+    /// The last instruction `boss` sent `session`, if any is still kept
+    /// and it went in (none when its last was withdrawn unsent).
     pub fn last_instruction(&self, boss: &str, session: Uuid) -> Option<Happened> {
         self.rows
             .iter()
             .rev()
             .find(|r| {
-                r.what == What::Instruction
+                matches!(r.what, What::Instruction | What::Withdrawn)
                     && r.session == Some(session)
                     && r.boss.as_deref() == Some(boss)
             })
+            .filter(|r| r.what == What::Instruction)
             .cloned()
     }
 }

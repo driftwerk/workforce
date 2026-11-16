@@ -773,6 +773,11 @@ async fn the_persons_message_goes_ahead_of_the_bosss_waiting_one() {
             .unwrap();
         let next = take_next(&d, s.id, Duration::from_secs(1)).await.unwrap();
         assert_eq!(next["id"], json!(mine.id));
+        assert!(d
+            .line_next(s.id, Duration::from_millis(300))
+            .await
+            .is_none());
+        d.line_pump(s.id).await;
         // Their words overtook the boss's, decided before them: it is
         // withdrawn, never typed in after (boss one picture, point 4), and
         // the boss decides again on what they said. Before, it kept
@@ -786,10 +791,6 @@ async fn the_persons_message_goes_ahead_of_the_bosss_waiting_one() {
                 .delivery,
             Delivery::Withdrawn
         );
-        assert!(d
-            .line_next(s.id, Duration::from_millis(300))
-            .await
-            .is_none());
     })
     .await;
 }

@@ -201,6 +201,34 @@ async fn a_boss_message_the_persons_own_words_overtook_is_withdrawn_never_delive
         };
         assert_eq!(delivery(before.id).await, crate::line::Delivery::Withdrawn);
         assert_ne!(delivery(after.id).await, crate::line::Delivery::Withdrawn);
+        // Its boss's picture says it never went in, and it is no longer
+        // the instruction the session carries out.
+        let rows = d.picture_recent("boss", a.id, 10);
+        assert!(
+            rows.iter()
+                .any(|r| r.what == What::Withdrawn && r.text == before.text),
+            "{rows:?}"
+        );
+        d.picture_note(
+            Note::new(What::Instruction, before.text.clone())
+                .boss("boss")
+                .session(a.id),
+        );
+        d.picture_note(
+            Note::new(What::Withdrawn, before.text.clone())
+                .boss("boss")
+                .session(a.id),
+        );
+        assert!(d.picture_last_instruction("boss", a.id).is_none());
+
+        // The person answering its question from Desk isn't them taking
+        // its wheel: a boss's message waiting overtakes nothing.
+        let waiting = queued("Then run the tests.");
+        d.store().put_line(&waiting).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        d.picture_person_answered(a.id, "Use port 5433.");
+        d.line_pump(a.id).await;
+        assert_ne!(delivery(waiting.id).await, crate::line::Delivery::Withdrawn);
     })
     .await;
 }
