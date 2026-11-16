@@ -1180,3 +1180,48 @@ fn a_command_that_may_change_an_agents_settings_is_told_however_it_is_written() 
         assert!(!may(c), "{c}");
     }
 }
+
+/// A command is read where it runs: a Devin `exec` whose `workdir` is an
+/// agent's settings may change them, though its words name no path there;
+/// where it runs not known, any write counts.
+#[test]
+fn a_command_is_read_for_settings_where_it_runs() {
+    let home = std::path::Path::new("/h");
+    let ws = std::path::Path::new("/h/.workforce/agents/desk");
+    let settings = vec![ws.join("config.toml")];
+    let folder = std::path::Path::new("/h/dev/acme");
+    let write = "echo x > config.toml";
+    assert!(!command_at_may_touch_settings(
+        write,
+        Some(folder),
+        folder,
+        &settings,
+        home
+    ));
+    assert!(command_at_may_touch_settings(
+        write,
+        Some(ws),
+        folder,
+        &settings,
+        home
+    ));
+    assert!(command_at_may_touch_settings(
+        write, None, folder, &settings, home
+    ));
+    assert!(!command_at_may_touch_settings(
+        "ls", None, folder, &settings, home
+    ));
+    // As a real Devin `exec` reaches it: its `workdir` is where it runs.
+    let mut p = serde_json::json!({"hook_event_name": "PermissionRequest", "tool_name": "exec",
+        "tool_input": {"command": write, "workdir": ws.to_str().unwrap()}});
+    crate::devin::normalize(&mut p, None);
+    assert_eq!(p["tool_name"], "Bash");
+    let runs_in = std::path::PathBuf::from(p["cwd"].as_str().unwrap());
+    assert!(command_at_may_touch_settings(
+        p["tool_input"]["command"].as_str().unwrap(),
+        Some(&runs_in),
+        folder,
+        &settings,
+        home
+    ));
+}

@@ -19,7 +19,9 @@
 //!   `UserPromptSubmit` its `prompt_id`; none has a `cwd`, a
 //!   `transcript_path` or a `permission_mode`;
 //! - a call's id is `tool_use_id`, the same at its `PreToolUse`,
-//!   `PermissionRequest` and `PostToolUse`;
+//!   `PermissionRequest` and `PostToolUse` (seen for `write` and `edit`;
+//!   no `exec` it sent asked, so an `exec`'s `PermissionRequest`, and its
+//!   `workdir` there, are inferred from its `PreToolUse`);
 //! - `exec` is `command` and `workdir` (absolute), `write` is `file_path`
 //!   and `content`, `edit` is `file_path`, `old_string` and `new_string`
 //!   (its paths absolute), `ask_user_question` is `questions` (Claude
@@ -265,8 +267,9 @@ pub struct Listed {
 /// there). 3000.12.57's is an array of entries with `id`, `state` and
 /// `title` (and no time Desk could read, so [`made_after`] finds none
 /// there; a session's id is its `SessionStart`'s); a time is looked for
-/// under the names it is likely to have, should a later one say it. None: not a list Desk can read, which includes one with
-/// an entry whose id Desk can't find. Read as an empty list, it would say
+/// under the names it is likely to have, should a later one say it.
+/// None: not a list Desk can read, which includes one with an entry whose
+/// id Desk can't find. Read as an empty list, it would say
 /// a conversation Devin still has is gone.
 pub fn listed(printed: &str) -> Option<Vec<Listed>> {
     let v: Value = serde_json::from_str(printed.trim()).ok()?;
