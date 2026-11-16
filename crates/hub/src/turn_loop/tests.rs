@@ -682,7 +682,14 @@ fn assistant_message_is_masked_at_rest() {
     );
     let stored = &session.messages.last().expect("message stored").content;
     assert!(!stored.contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ"));
-    assert!(stored.contains("ghp_"));
+    assert!(
+        !stored.contains("ghp_") && !stored.contains("1234"),
+        "{stored}"
+    );
+    assert!(
+        stored.contains("your key is [REDACTED GITHUB_PAT] — keep it safe"),
+        "{stored}"
+    );
 }
 
 // ── should_inject_session_intro visibility gating ──────────────────
