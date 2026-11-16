@@ -1529,15 +1529,17 @@ async fn an_order_sent_on_for_the_person_is_kept_as_theirs() {
             .person_turns
             .lock()
             .insert(dm.id.clone(), theirs.into());
-        let said = c
-            .crew
-            .perform(
-                &super::super::actions::Action::Nudge {
-                    to: super::super::actions::Target::Agent("sarah".into()),
-                    message: "Pause the Acme work until Monday; nothing merges.".into(),
-                    reply_to: None,
-                },
-                c.crew.by_boss(&c.desk, "The person asked for it."),
+        let nudge = super::super::actions::Action::Nudge {
+            to: super::super::actions::Target::Agent("sarah".into()),
+            message: "Pause the Acme work until Monday; nothing merges.".into(),
+            reply_to: None,
+        };
+        // Sent from the turn answering the person, as the boss's tool call is.
+        let said = workforce_agent::runner::CURRENT_SESSION_ID
+            .scope(
+                dm.id.clone(),
+                c.crew
+                    .perform(&nudge, c.crew.by_boss(&c.desk, "The person asked for it.")),
             )
             .await
             .unwrap();
@@ -1553,7 +1555,6 @@ async fn an_order_sent_on_for_the_person_is_kept_as_theirs() {
         .await;
         assert_eq!(order.text, theirs, "in the person's words, not Desk's");
         assert_eq!(order.sessions, vec![c.acme.session.id]);
-        assert!(c.crew.on_behalf.lock().is_empty(), "handed on once");
         c.crew.person_turns.lock().remove(&dm.id);
     })
     .await;

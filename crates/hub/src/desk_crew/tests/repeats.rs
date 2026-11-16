@@ -56,6 +56,40 @@ async fn the_same_instruction_to_a_session_is_sent_once() {
             .unwrap();
         assert!(elsewhere.starts_with("told acme-api"), "{elsewhere}");
 
+        // Two at once, in one turn: still sent once.
+        let open_pr = nudge(other.id, "Open the PR.");
+        let (a, b) = tokio::join!(crew.perform(&open_pr, by()), crew.perform(&open_pr, by()));
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_eq!(
+            [&a, &b].iter().filter(|x| x.starts_with("told acme-api")).count(),
+            1,
+            "{a} / {b}"
+        );
+        assert!([&a, &b].iter().any(|x| x.starts_with("already told acme-api")));
+
+        // Once the session has answered since, the same words are fair:
+        // "carry on" to one that moved on and stopped again.
+        let url = hook_url(dir.path(), s.id).await;
+        hook(
+            &url,
+            json!({"hook_event_name": "SessionStart", "session_id": "cc-acme-web"}),
+        )
+        .await;
+        hook(
+            &url,
+            json!({"hook_event_name": "Stop", "last_assistant_message": "Rebased; the push was rejected."}),
+        )
+        .await;
+        eventually("its reply", async || {
+            d.view(s.id).ok().and_then(|v| v.last_reply).filter(|r| r.contains("rejected"))
+        })
+        .await;
+        let after = crew
+            .perform(&nudge(s.id, "Rebase onto main and push."), by())
+            .await
+            .unwrap();
+        assert!(after.starts_with("told acme-web"), "{after}");
+
         // The person telling it the same is never held back.
         let person = crew
             .perform(&nudge(s.id, "Rebase onto main and push."), By::you())

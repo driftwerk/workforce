@@ -47,6 +47,31 @@ impl CrewHub {
             .await
     }
 
+    /// [`Self::run_dm_turn`] for a message a boss (`author`) sent on in
+    /// answer to the person's own: `theirs`, their words, are what the
+    /// receiving turn answers, so an order of it is kept as theirs.
+    pub(crate) async fn run_dm_turn_for_them(
+        &self,
+        service: &Arc<AgentService>,
+        owner: &str,
+        prompt: &str,
+        hop: i16,
+        author: Speaker,
+        theirs: String,
+    ) -> Result<(String, String)> {
+        self.run_turn_with(
+            service,
+            owner,
+            DESK_CHANNEL,
+            prompt,
+            hop,
+            None,
+            Some(author),
+            Some(theirs),
+        )
+        .await
+    }
+
     /// [`Self::run_dm_turn`] in `service`'s conversation on `channel`: the
     /// DM, or one of its own off it (a session's line, `desk:line:<id>`),
     /// which keeps that work's context apart from the DM's history. What
@@ -61,6 +86,24 @@ impl CrewHub {
         hop: i16,
         listed: Option<Vec<MentionedApproval>>,
         author: Option<Speaker>,
+    ) -> Result<(String, String)> {
+        self.run_turn_with(service, owner, channel, prompt, hop, listed, author, None)
+            .await
+    }
+
+    /// [`Self::run_turn`], answering `theirs` (the person's words a boss
+    /// sent on) when it is an overseer's message in the DM.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_turn_with(
+        &self,
+        service: &Arc<AgentService>,
+        owner: &str,
+        channel: &str,
+        prompt: &str,
+        hop: i16,
+        listed: Option<Vec<MentionedApproval>>,
+        author: Option<Speaker>,
+        theirs: Option<String>,
     ) -> Result<(String, String)> {
         let agent_id = service.agent_id.as_str();
         let in_dm = channel == DESK_CHANNEL;
@@ -83,13 +126,7 @@ impl CrewHub {
                 .as_ref()
                 .is_some_and(|a| a.kind != workforce_desk::conversations::SpeakerKind::You);
         let _relayed = by_overseer.then(|| Relayed::mark(&self.relayed_turns, &sid));
-        let theirs = by_overseer
-            .then(|| {
-                self.on_behalf
-                    .lock()
-                    .remove(&(agent_id.to_string(), prompt.to_string()))
-            })
-            .flatten();
+        let theirs = theirs.filter(|_| by_overseer);
         // A message of the DM is found again by a mark of its own.
         let relay = author
             .is_some()
@@ -199,6 +236,7 @@ impl CrewHub {
 struct Theirs<'a>(
     &'a parking_lot::Mutex<std::collections::HashMap<String, String>>,
     String,
+    String,
 );
 
 impl<'a> Theirs<'a> {
@@ -207,14 +245,19 @@ impl<'a> Theirs<'a> {
         sid: &str,
         words: String,
     ) -> Self {
-        turns.lock().insert(sid.to_string(), words);
-        Self(turns, sid.to_string())
+        turns.lock().insert(sid.to_string(), words.clone());
+        Self(turns, sid.to_string(), words)
     }
 }
 
 impl Drop for Theirs<'_> {
+    /// Only these words: the person's next turn, begun in the same DM by
+    /// now, keeps its own.
     fn drop(&mut self) {
-        self.0.lock().remove(&self.1);
+        let mut turns = self.0.lock();
+        if turns.get(&self.1) == Some(&self.2) {
+            turns.remove(&self.1);
+        }
     }
 }
 
