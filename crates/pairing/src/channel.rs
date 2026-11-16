@@ -76,7 +76,7 @@ impl ChannelPairingService {
         let mut req = self
             .store
             .get_channel_request_by_code(code)?
-            .ok_or_else(|| eyre::eyre!("Unknown pairing code: {code}"))?;
+            .ok_or_else(|| eyre::eyre!("Unknown pairing code"))?;
 
         if req.status != PairingStatus::Pending {
             return Err(eyre::eyre!(
@@ -128,7 +128,7 @@ impl ChannelPairingService {
         let req = self
             .store
             .get_channel_request_by_code(code)?
-            .ok_or_else(|| eyre::eyre!("Unknown pairing code: {code}"))?;
+            .ok_or_else(|| eyre::eyre!("Unknown pairing code"))?;
 
         if req.status != PairingStatus::Pending {
             return Err(eyre::eyre!(
@@ -139,7 +139,7 @@ impl ChannelPairingService {
 
         self.store
             .update_channel_request_status(&req.id, PairingStatus::Rejected, None)?;
-        info!(code, "Rejected channel pairing");
+        info!("Rejected channel pairing");
         Ok(())
     }
 
@@ -278,7 +278,7 @@ impl ChannelPairingService {
         tokio::task::spawn_blocking(move || {
             let mut req = store
                 .get_channel_request_by_code(&code)?
-                .ok_or_else(|| eyre::eyre!("Unknown pairing code: {code}"))?;
+                .ok_or_else(|| eyre::eyre!("Unknown pairing code"))?;
             if req.status != PairingStatus::Pending {
                 return Err(eyre::eyre!(
                     "Pairing request is already {}",
@@ -319,7 +319,7 @@ impl ChannelPairingService {
         tokio::task::spawn_blocking(move || {
             let req = store
                 .get_channel_request_by_code(&code)?
-                .ok_or_else(|| eyre::eyre!("Unknown pairing code: {code}"))?;
+                .ok_or_else(|| eyre::eyre!("Unknown pairing code"))?;
             if req.status != PairingStatus::Pending {
                 return Err(eyre::eyre!(
                     "Pairing request is already {}",

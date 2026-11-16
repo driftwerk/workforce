@@ -70,7 +70,7 @@ impl NodePairingService {
         let mut req = self
             .store
             .get_node_request_by_code(code)?
-            .ok_or_else(|| eyre::eyre!("Unknown pairing code: {code}"))?;
+            .ok_or_else(|| eyre::eyre!("Unknown pairing code"))?;
 
         if req.status != PairingStatus::Pending {
             return Err(eyre::eyre!(
@@ -108,7 +108,7 @@ impl NodePairingService {
         let req = self
             .store
             .get_node_request_by_code(code)?
-            .ok_or_else(|| eyre::eyre!("Unknown pairing code: {code}"))?;
+            .ok_or_else(|| eyre::eyre!("Unknown pairing code"))?;
 
         if req.status != PairingStatus::Pending {
             return Err(eyre::eyre!(
@@ -119,7 +119,7 @@ impl NodePairingService {
 
         self.store
             .update_node_request_status(&req.id, PairingStatus::Rejected, None)?;
-        info!(code, "Rejected node pairing");
+        info!("Rejected node pairing");
         Ok(())
     }
 

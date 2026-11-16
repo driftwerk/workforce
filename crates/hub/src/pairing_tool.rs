@@ -321,7 +321,8 @@ impl Tool for PairingRejectTool {
             .await
         {
             Ok(()) => {
-                info!(code = %params.code, "Pairing rejected via pairing.reject tool");
+                // Never the code: whoever holds it still could pair with it.
+                info!("Pairing rejected via pairing.reject tool");
                 Ok(ToolResult::success(
                     serde_json::json!({
                         "rejected": true,
@@ -331,7 +332,7 @@ impl Tool for PairingRejectTool {
                 ))
             }
             Err(e) => Ok(ToolResult::failure(
-                format!("Failed to reject pairing code '{}': {}", params.code, e),
+                format!("Failed to reject that pairing code: {e}"),
                 duration(),
             )),
         }
@@ -882,6 +883,17 @@ mod tests {
             .unwrap();
         assert!(result.success, "reject failed: {:?}", result.error);
         assert_eq!(result.output["rejected"], true);
+        // Again, or a code that isn't one: refused without saying the code.
+        for code in [req.code.as_str(), "ZZZZ9999"] {
+            let again = PairingRejectTool::new(f.ctx.clone())
+                .execute(serde_json::json!({ "code": code }))
+                .await
+                .unwrap();
+            assert!(!again.success);
+            let error = again.error.unwrap_or_default();
+            assert!(error.contains("Failed to reject"), "{error}");
+            assert!(!error.contains(code), "{error}");
+        }
 
         let result = PairingPendingTool::new(f.ctx)
             .execute(serde_json::json!({}))

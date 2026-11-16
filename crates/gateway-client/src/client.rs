@@ -538,7 +538,7 @@ impl GatewayRestClient {
 
         if !resp.status().is_success() {
             if resp.status() == reqwest::StatusCode::NOT_FOUND {
-                bail!("Unknown pairing code: {}", code);
+                bail!("Unknown pairing code");
             }
             bail!("Gateway returned {}", resp.status());
         }
@@ -559,7 +559,7 @@ impl GatewayRestClient {
 
         if !resp.status().is_success() {
             if resp.status() == reqwest::StatusCode::NOT_FOUND {
-                bail!("Unknown pairing code: {}", code);
+                bail!("Unknown pairing code");
             }
             bail!("Gateway returned {}", resp.status());
         }

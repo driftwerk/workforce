@@ -192,6 +192,33 @@ async fn the_signed_in_person_gets_the_device_whoever_it_claims_to_be() {
     assert!(hub.device_owner(&other).is_empty());
 }
 
+/// A device's status polls racing just after approval (Desk and its page,
+/// a retry): one alone is handed the token, the rest see it approved.
+#[tokio::test]
+async fn racing_status_polls_hand_the_token_out_once() {
+    let hub = hub().await;
+    let (_, person) = hub.person("racer@example.com", IdentityRole::Member);
+    let code = hub.request_code(None).await["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(hub.approve_self(&person, &code).await.0, StatusCode::OK);
+    let polls = (0..8).map(|_| hub.status(&code));
+    let answers = futures::future::join_all(polls).await;
+    let mut tokens = Vec::new();
+    for (status, body) in &answers {
+        assert_eq!(*status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "approved", "{body}");
+        if let Some(token) = body["token"].as_str() {
+            tokens.push(token.to_string());
+        }
+    }
+    assert_eq!(tokens.len(), 1, "{answers:?}");
+    assert!(tokens[0].starts_with("wfp_"));
+    let (_, later) = hub.status(&code).await;
+    assert!(later.get("token").is_none(), "{later}");
+}
+
 #[tokio::test]
 async fn a_code_is_approved_once() {
     let hub = hub().await;
