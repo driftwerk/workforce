@@ -417,6 +417,25 @@ async fn a_forgotten_session_is_never_recalled_while_the_registry_catches_up() {
 }
 
 #[tokio::test]
+async fn a_boss_never_ends_a_session_it_didnt_start_and_wasnt_handed() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        let boss = By::manager("sarah", "Sarah", "its work is done");
+        let refused = d.end(s.id, Some(boss.clone())).await.unwrap_err();
+        assert!(matches!(refused, DeskError::Conflict(_)), "{refused}");
+        let v = d.view(s.id).unwrap();
+        assert!(v.live, "still running");
+        assert_ne!(v.state, SessionState::Closed);
+        assert!(!d.may_end(s.id, Some(&boss)));
+        assert!(!d.may_end(s.id, None));
+        assert!(d.may_end(s.id, Some(&By::you())));
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn ending_a_session_closes_it_and_it_resumes_from_the_closed_list() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
