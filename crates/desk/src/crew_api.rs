@@ -365,6 +365,39 @@ async fn dm_typing(
     }
 }
 
+/// The boss `agent`'s updates as its card shows them: when its next
+/// roundup comes (null: none comes).
+async fn updates_of(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path(agent): Path<String>,
+) -> Response {
+    if let Err(r) = guard(&s, &h, q.token.as_deref()).await {
+        return r;
+    }
+    match s.crew.next_roundup(&agent) {
+        Some(next) => Json(serde_json::json!({ "nextRoundup": next })).into_response(),
+        None => error(StatusCode::NOT_FOUND, "There is no boss by that name here."),
+    }
+}
+
+/// "Roundup now": the boss `agent` sends its roundup at its next look.
+async fn roundup_now(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path(agent): Path<String>,
+) -> Response {
+    if let Err(r) = guard(&s, &h, q.token.as_deref()).await {
+        return r;
+    }
+    match s.crew.roundup_now(&agent) {
+        true => StatusCode::ACCEPTED.into_response(),
+        false => error(StatusCode::NOT_FOUND, "There is no boss by that name here."),
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PresenceBody {
@@ -852,6 +885,8 @@ pub(crate) fn crew_router(desk: Desk, auth: Arc<dyn Authorize>, crew: Arc<dyn Cr
         .route("/api/desk/items/{id}/always", post(item_always))
         .route("/api/desk/handled", get(handled))
         .route("/api/desk/dm/{agent}/typing", post(dm_typing))
+        .route("/api/desk/updates/{agent}", get(updates_of))
+        .route("/api/desk/updates/{agent}/roundup", post(roundup_now))
         .route("/api/desk/presence", post(presence))
         .route(
             "/api/desk/preferences",

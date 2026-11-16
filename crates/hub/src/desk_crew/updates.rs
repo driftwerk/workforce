@@ -35,6 +35,7 @@ use uuid::Uuid;
 use workforce_common::channels::desk::{DeliveryKind, DeskPlace, DeskTarget};
 use workforce_common::channels::DESK_CHANNEL;
 use workforce_common::oversight::Oversight;
+use workforce_common::oversight::{Cadence, Route};
 use workforce_desk::account::{Account, Done};
 use workforce_desk::crew::Extras;
 use workforce_desk::decision::{BossDecision, DecisionKind, DecisionLine, Need};
@@ -43,7 +44,8 @@ use workforce_desk::open_item::{OpenItem, OpenKind, OpenState};
 use workforce_desk::update::{
     self, Change, MentionedUpdate, NeedsYou, Pending, Told, UpdateSession, UpdateState, WaitingItem,
 };
-use workforce_desk::update_write::{self as write, Said, Titled, Work};
+use workforce_desk::update_cadence::{self as cadence, Roundup, SectionKey};
+use workforce_desk::update_write::{self as write, EventKind, Said, Titled, Work};
 
 use super::watcher::Budget;
 use super::{CrewHub, CHECK_IN};
@@ -135,6 +137,79 @@ pub(super) struct Batch {
     pub for_you: Vec<OpenItem>,
     restated: Vec<(Uuid, bool)>,
     pub told: HashMap<Uuid, Told>,
+    /// Suggestions its quiet check-ins made, or notes on finished
+    /// sessions, wait for the next update.
+    noted: bool,
+}
+
+impl Batch {
+    /// What of it goes right away by the cadence `c` (`quiet`: in the
+    /// quiet hours): the sessions whose news is of a kind that comes at
+    /// once, the decisions that do, and what needs the person when it
+    /// does. What goes in the roundup, or only when asked, is left out;
+    /// what each session's account said is kept whole, so it is all told.
+    fn right_away(self, c: &Cadence, quiet: bool) -> Batch {
+        let now = |k: EventKind| cadence::route(k, c, quiet) == Route::RightAway;
+        let sessions: Vec<Changed> = self
+            .sessions
+            .into_iter()
+            .filter(|s| {
+                let new: Vec<&Done> = s.new.iter().collect();
+                // What comes next, or what it waits on, changed: progress.
+                let kind = match new.is_empty() {
+                    true => EventKind::Progress,
+                    false => write::kind_of(&new, &[]),
+                };
+                now(kind)
+            })
+            .collect();
+        let decisions: Vec<BossDecision> = self
+            .decisions
+            .into_iter()
+            .filter(|d| match d.kind {
+                DecisionKind::LeftAlone | DecisionKind::Undone => now(EventKind::Routine),
+                DecisionKind::Escalated => now(EventKind::NeedsYou),
+                DecisionKind::Acted if update::is_close(d) => now(EventKind::Finished),
+                DecisionKind::Acted => {
+                    cadence::decision_route(d.important.is_some(), c, quiet) == Route::RightAway
+                }
+            })
+            .collect();
+        let needs = now(EventKind::NeedsYou);
+        let kept = match now(EventKind::Finished) {
+            true => self.kept,
+            false => Vec::new(),
+        };
+        let (waiting, for_you, restated) = match needs {
+            true => (self.waiting, self.for_you, self.restated),
+            false => (Vec::new(), Vec::new(), Vec::new()),
+        };
+        let mut change = sessions
+            .iter()
+            .map(|s| match s.new.iter().any(update::is_result) {
+                true => Change::Result,
+                false => Change::Small,
+            })
+            .max()
+            .unwrap_or(Change::None);
+        if !decisions.is_empty() || !kept.is_empty() || (self.noted && needs) {
+            change = Change::Result;
+        }
+        if !restated.is_empty() {
+            change = change.max(Change::Small);
+        }
+        Batch {
+            change,
+            sessions,
+            decisions,
+            kept,
+            waiting,
+            for_you,
+            restated,
+            told: self.told,
+            noted: self.noted && needs,
+        }
+    }
 }
 
 impl CrewHub {
@@ -219,7 +294,11 @@ impl CrewHub {
                 work,
             });
         }
-        let mut last = state.last_update_at.unwrap_or(state.since);
+        // Since what was last said, or left for the roundup.
+        let mut last = state
+            .last_update_at
+            .unwrap_or(state.since)
+            .max(state.routed_at.unwrap_or(state.since));
         if let Some(from) = away {
             last = last.min(from);
         }
@@ -292,6 +371,7 @@ impl CrewHub {
         if !decisions.is_empty() || !kept.is_empty() || quiet {
             change = Change::Result;
         }
+        let noted = quiet;
         if !restated.is_empty() {
             change = change.max(Change::Small);
         }
@@ -304,6 +384,7 @@ impl CrewHub {
             for_you,
             restated,
             told,
+            noted,
         }
     }
 
@@ -334,10 +415,13 @@ impl CrewHub {
             .filter(|d| d.kind == DecisionKind::Acted)
             // Said in the closed line, in its own words.
             .filter(|d| !update::is_close(d))
-            .take(update::COMPOSED_DECISIONS)
             .cloned()
             .collect();
-        acted.reverse();
+        // The important ones first: a roundup lists them in the words
+        // written for them.
+        acted.sort_by_key(|d| d.important.is_none());
+        acted.truncate(update::COMPOSED_DECISIONS);
+        acted.sort_by_key(|d| d.at);
         let something = !b.sessions.is_empty() || !acted.is_empty();
         if let (true, Some(writer), true) = (o.updates.enabled, writer, something) {
             if self.desk.update_take().await.unwrap_or(false) {
@@ -523,8 +607,9 @@ impl CrewHub {
         o: &Oversight,
         b: &Batch,
         now: DateTime<Utc>,
-    ) -> (MentionedUpdate, String) {
+    ) -> (MentionedUpdate, String, bool) {
         let (sessions, decisions, headline, wrote) = self.composed(boss, owner, o, b).await;
+        let composed_headline = headline.is_some();
         let full = self.level_now(boss, o).0 == workforce_common::oversight::Level::Full;
         let footer = match self.desk.cheap_today().await {
             Ok((spent, cap)) => update::footer(spent, cap),
@@ -636,6 +721,7 @@ impl CrewHub {
             more_items,
             closed,
             said,
+            roundup: None,
         };
         // Not written: one piece of work's own headline, else in counts.
         let headline = headline
@@ -655,7 +741,7 @@ impl CrewHub {
             .map(BossDecision::said)
             .collect();
         let text = update::render(&u, &decided);
-        (u, text)
+        (u, text, composed_headline)
     }
 
     /// Looks at every boss's update once: sends one written but not yet
@@ -721,7 +807,29 @@ impl CrewHub {
             }
             (None, None) => false,
         };
-        let b = self.batch(service, o, &state, now, None).await;
+        let c = o.updates.cadence;
+        let tz = self.desk.timezone();
+        // The roundup, when its time has come (or the person asked for one
+        // now), while they are here and nothing is being written to them:
+        // what happened since the last, as one message.
+        if !away && !held {
+            let last = state.roundup_at.unwrap_or(state.since);
+            let asked = self.roundup_asked.lock().remove(boss);
+            if asked || cadence::roundup_due(&c, last, now, &tz) {
+                if let Some(p) = self.roundup(service, &owner, o, &state, last, now).await? {
+                    return self.resume(service, &owner, o, &state, p).await;
+                }
+            }
+        }
+        let all = self.batch(service, o, &state, now, None).await;
+        let something = all.change != Change::None;
+        let b = all.right_away(&c, cadence::quiet_now(&c, now, &tz));
+        if b.change == Change::None && something && state.gather_since.is_none() {
+            // All of it waits for the roundup, or for the person's asking:
+            // routed, and nothing goes now.
+            store.update_routed(boss, now, &b.told).await?;
+            return Ok(());
+        }
         let gather_since = match (b.change, state.gather_since) {
             (Change::None, None) => return Ok(()),
             (Change::None, Some(_)) => {
@@ -767,6 +875,151 @@ impl CrewHub {
         self.resume(service, &owner, o, &state, p).await
     }
 
+    /// `boss`'s roundup of what happened since `since` (shape C), written
+    /// and kept as its pending update before anything is sent; none when it
+    /// would say nothing but routine, which is then skipped. Each section
+    /// only when it says something: what is up to the person, what it
+    /// decided without them that is important (or every one, as they
+    /// chose), what finished, what is worth knowing, what is still going;
+    /// the rest counted as routine. What came right away is folded in.
+    async fn roundup(
+        &self,
+        service: &Arc<AgentService>,
+        owner: &str,
+        o: &Oversight,
+        state: &UpdateState,
+        since: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> eyre::Result<Option<Pending>> {
+        let boss = service.agent_id.as_str();
+        let c = o.updates.cadence;
+        let b = self.batch(service, o, state, now, Some(since)).await;
+        let (mut u, _, composed) = self.written(boss, owner, o, &b, now).await;
+        let mut lines: Vec<(SectionKey, Said)> = Vec::new();
+        // What the person can answer or lift, each with its session.
+        for n in &u.needs_you {
+            let session = n
+                .session_id
+                .as_deref()
+                .and_then(|s| s.parse::<Uuid>().ok())
+                .and_then(|s| self.desk.view(s).ok())
+                .map(|v| write::SessionLink {
+                    session_id: v.id.to_string(),
+                    name: v.label().to_string(),
+                    closed: v.state == SessionState::Closed,
+                });
+            lines.push((
+                SectionKey::UpToYou,
+                Said {
+                    kind: EventKind::NeedsYou,
+                    headline: n.question.clone(),
+                    body: n.not_blocking.clone().unwrap_or_default(),
+                    ids: vec![],
+                    not_checked: None,
+                    session,
+                    did: vec![],
+                    at: None,
+                },
+            ));
+        }
+        // What it decided without them, listed as they chose: each with its
+        // why and its Undo; the rest is routine.
+        let decided_rows: Vec<&BossDecision> = b
+            .decisions
+            .iter()
+            .filter(|d| d.kind == DecisionKind::Acted && !update::is_close(d))
+            .filter(|d| cadence::listed(d.important.is_some(), &c))
+            .collect();
+        let views = self.desk.list();
+        for d in &decided_rows {
+            let Some(l) = u.decisions.iter().find(|l| l.id == d.id.to_string()) else {
+                continue;
+            };
+            let session = match d.session.and_then(|s| views.iter().find(|v| v.id == s)) {
+                Some(v) => Some(self.work_of(v, None, &[], Some(owner)).await.link()),
+                None => None,
+            };
+            let item =
+                update::did_items(std::slice::from_ref(d), std::slice::from_ref(l), d.session);
+            let why = workforce_desk::decision::clause(&l.why);
+            lines.push((
+                SectionKey::Decided,
+                Said {
+                    kind: EventKind::Progress,
+                    headline: write::capitalised(l.action.trim().trim_end_matches('.')),
+                    body: why.map(|w| format!("Because {w}.")).unwrap_or_default(),
+                    ids: vec![],
+                    not_checked: None,
+                    session,
+                    did: item,
+                    at: Some(d.at),
+                },
+            ));
+        }
+        let routine = b
+            .decisions
+            .iter()
+            .filter(|d| matches!(d.kind, DecisionKind::Acted | DecisionKind::LeftAlone))
+            .filter(|d| !update::is_close(d))
+            .count()
+            .saturating_sub(decided_rows.len()) as u32;
+        // Each piece of work, in the section its kind is said in, unless the
+        // person hears of that kind only when they ask.
+        for s in &u.said {
+            if cadence::route(s.kind, &c, false) == Route::Ask {
+                continue;
+            }
+            let mut s = s.clone();
+            // What it decided is said above, or is routine.
+            s.did
+                .retain(|i| !decided_rows.iter().any(|d| d.id.to_string() == i.id));
+            lines.push((SectionKey::of(s.kind), s));
+        }
+        for k in &b.kept {
+            lines.push((
+                SectionKey::Finished,
+                Said {
+                    kind: EventKind::Finished,
+                    headline: k.trim_start_matches('✓').trim().to_string(),
+                    body: String::new(),
+                    ids: vec![],
+                    not_checked: None,
+                    session: None,
+                    did: vec![],
+                    at: None,
+                },
+            ));
+        }
+        let r = Roundup::of(since, lines, routine);
+        if r.is_empty() && u.closed.is_empty() {
+            self.desk.store().update_rounded(boss, now).await?;
+            return Ok(None);
+        }
+        // Its headline is what matters most, in a line: the composer's, or
+        // in counts.
+        if !composed {
+            u.headline = r.plain_headline();
+        }
+        let mut text = cadence::render(&u.headline, &r);
+        for l in &u.closed {
+            text.push_str(&format!("\n\n{}", l.text));
+        }
+        u.roundup = Some(r);
+        let p = Pending {
+            id: Uuid::new_v4(),
+            text,
+            update: u,
+            told: b.told.clone(),
+            restated: vec![],
+            cutoff: Some(now),
+            handed: false,
+            sent: None,
+            away: None,
+        };
+        self.desk.store().update_pend(boss, &p).await?;
+        Ok(Some(p))
+    }
+
     /// `b` written and kept as `boss`'s pending update, before anything is
     /// sent: `handed` to a check-in at Watch and Suggest.
     async fn pend(
@@ -778,7 +1031,7 @@ impl CrewHub {
         now: DateTime<Utc>,
         handed: bool,
     ) -> eyre::Result<Pending> {
-        let (u, text) = self.written(boss, owner, o, b, now).await;
+        let (u, text, _) = self.written(boss, owner, o, b, now).await;
         let p = Pending {
             id: Uuid::new_v4(),
             text,
@@ -1168,10 +1421,16 @@ impl CrewHub {
         let store = self.desk.store();
         let now = Utc::now();
         let cutoff = p.cutoff.unwrap_or(now);
-        // A catch-up ends the absence it covered, once.
+        // A catch-up ends the absence it covered, once; it, or a roundup,
+        // says all that happened up to it, so the next roundup starts there.
         if let Some(a) = &p.away {
             store
                 .update_back(service.agent_id.as_str(), a.since)
+                .await?;
+        }
+        if p.away.is_some() || p.update.roundup.is_some() {
+            store
+                .update_rounded(service.agent_id.as_str(), cutoff)
                 .await?;
         }
         for (item, park) in &p.restated {

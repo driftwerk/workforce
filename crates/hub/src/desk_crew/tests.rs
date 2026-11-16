@@ -135,7 +135,56 @@ async fn calls_tool_once(
 }
 
 fn write_config(service: &AgentService, toml: &str) {
-    AgentWorkspaceConfig::write(&service.workspace, toml).unwrap();
+    AgentWorkspaceConfig::write(&service.workspace, &all_at_once(toml)).unwrap();
+}
+
+/// The cadence keys a test may say for itself.
+const CADENCE_KEYS: [&str; 10] = [
+    "needs_you",
+    "problems",
+    "finished",
+    "progress",
+    "routine",
+    "roundup",
+    "quiet_hours",
+    "quiet_needs_you",
+    "decisions",
+    "also_to",
+];
+
+/// `toml` with its boss's updates all coming at once, as every test
+/// written before the cadence expects (no roundups, no quiet hours, every
+/// decision told), unless it says a cadence of its own.
+fn all_at_once(toml: &str) -> String {
+    let Ok(mut doc) = toml.parse::<toml_edit::DocumentMut>() else {
+        return toml.to_string();
+    };
+    let Some(o) = doc.get_mut("oversight").and_then(|i| i.as_table_like_mut()) else {
+        return toml.to_string();
+    };
+    if !o.contains_key("updates") {
+        o.insert(
+            "updates",
+            toml_edit::Item::Value(toml_edit::Value::InlineTable(Default::default())),
+        );
+    }
+    let Some(u) = o.get_mut("updates").and_then(|i| i.as_table_like_mut()) else {
+        return toml.to_string();
+    };
+    if CADENCE_KEYS.iter().any(|k| u.contains_key(k)) {
+        return doc.to_string();
+    }
+    for (k, v) in [
+        ("finished", "right_away"),
+        ("progress", "right_away"),
+        ("routine", "right_away"),
+        ("roundup", "never"),
+        ("quiet_hours", ""),
+        ("decisions", "important_right_away"),
+    ] {
+        u.insert(k, toml_edit::value(v));
+    }
+    doc.to_string()
 }
 
 /// A gateway serving `agents`, each knowing the registry.

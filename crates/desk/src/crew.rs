@@ -865,6 +865,18 @@ pub trait Crew: Send + Sync {
     fn dm_typing(&self, _agent: &str) -> bool {
         false
     }
+    /// The boss `agent`'s next roundup, as its cadence says: `Some(None)`
+    /// when none comes (roundups never, or none due to come); `None` when
+    /// `agent` is no boss here.
+    fn next_roundup(&self, _agent: &str) -> Option<Option<DateTime<Utc>>> {
+        None
+    }
+    /// The person asks the boss `agent` for its roundup now ("Roundup
+    /// now"): one goes at its next look, unless nothing happened since the
+    /// last. False when `agent` is no boss here.
+    fn roundup_now(&self, _agent: &str) -> bool {
+        false
+    }
     /// What Desk says of the person: whether its window is attended, and
     /// which boss's DM (by its agent) is on screen.
     fn presence(&self, _attending: bool, _dm_on_screen: Option<&str>) {}

@@ -54,6 +54,9 @@ pub(crate) struct Before {
     pub plan: Option<String>,
     /// The name of the session it closes, as the person knew it.
     pub name: Option<String>,
+    /// The request it allows (its tool and what it runs): whether that is
+    /// important to tell.
+    pub request: Option<String>,
 }
 
 /// How `action`, done as `done` says, is undone: the kind, and what the
@@ -188,6 +191,38 @@ fn message_of(action: &Action) -> Option<&str> {
     }
 }
 
+/// Whether `action` (with what was true `before` it, done by `by`) is
+/// important enough to be told ("Decided without you"): it overrode a
+/// session, allowed a request that merges, releases, deletes or spends, or
+/// told a session to do one of those, now or later.
+pub(crate) fn important_of(
+    action: &Action,
+    before: &Before,
+    by: &By,
+) -> Option<workforce_desk::update_cadence::Important> {
+    use workforce_desk::update_cadence::{important, ActionKind};
+    let (kind, text) = match action {
+        Action::Nudge { message, .. } => (ActionKind::Message, message.clone()),
+        // A dialog's question, answered by denying its start with the answer.
+        Action::Deny { .. } if before.question.is_some() => (ActionKind::Message, why_of(by)),
+        // A plan approved, or sent back for changes: no step of its own.
+        Action::Approve { .. } | Action::Deny { .. } if before.plan.is_some() => {
+            (ActionKind::Other, String::new())
+        }
+        Action::Approve { .. } => (
+            ActionKind::Approve,
+            before.request.clone().unwrap_or_default(),
+        ),
+        Action::Deny { .. } => (ActionKind::Deny, String::new()),
+        Action::Stop { .. }
+        | Action::Interrupt { .. }
+        | Action::SetMode { .. }
+        | Action::Close { .. } => (ActionKind::Override, String::new()),
+        _ => (ActionKind::Other, String::new()),
+    };
+    important(kind, &text)
+}
+
 /// What `said` (the action's own account, "started web (…); you run it")
 /// says before its detail: the plain short line.
 fn said_short(said: &str) -> &str {
@@ -292,6 +327,16 @@ impl CrewHub {
                 name: self.desk.view(*session).ok().map(|v| v.label().to_string()),
                 ..Before::default()
             },
+            Action::Approve { session, approval } => Before {
+                request: self
+                    .desk
+                    .view(*session)
+                    .ok()
+                    .and_then(|v| v.pending)
+                    .filter(|p| p.id == *approval)
+                    .map(|p| format!("{}: {}", p.tool, p.detail)),
+                ..Before::default()
+            },
             _ => Before::default(),
         }
     }
@@ -394,6 +439,7 @@ impl CrewHub {
         let (undo, plan) = undo_of(action, done, before);
         d.undo = undo;
         d.action = plan.map(|p| p.value()).unwrap_or(Value::Null);
+        d.important = important_of(action, before, by);
         self.record(&d).await;
         if let Some(p) = d.preference {
             self.preference_used(p).await;

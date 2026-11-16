@@ -159,8 +159,33 @@ impl CrewHub {
         text: String,
         extras: Extras,
     ) -> bool {
-        if self.overseer_named(boss).is_none() {
+        let Some((_, o)) = self.overseer_named(boss) else {
             return false;
+        };
+        // The person's cadence: in the quiet hours they want nothing, or
+        // with what needs them for the roundup, it waits until then, kept
+        // as a held card is.
+        let now = Utc::now();
+        let c = o.updates.cadence;
+        if let Some(at) = workforce_desk::update_cadence::held_until(&c, now, &self.desk.timezone())
+        {
+            let card = HeldCard {
+                id: Uuid::new_v4(),
+                boss: boss.to_string(),
+                item_id,
+                text,
+                extras,
+                post_by: at,
+            };
+            match self.desk.store().card_hold(&card).await {
+                Ok(()) => return true,
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "keeping a needs-you for the person's cadence failed: it goes now");
+                    return self
+                        .deliver_card(boss, &card.text, &card.extras, None)
+                        .await;
+                }
+            }
         }
         let (quiet, cap) = (self.quiet(), self.cap());
         let typing = self

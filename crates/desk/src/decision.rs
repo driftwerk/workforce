@@ -130,6 +130,9 @@ pub struct BossDecision {
     /// The full text sent to the session; none when nothing was sent.
     pub message: Option<String>,
     pub kind: DecisionKind,
+    /// Why it is important enough to be told ("Decided without you"),
+    /// judged when it was made from what the action was; none: routine.
+    pub important: Option<crate::update_cadence::Important>,
 }
 
 impl BossDecision {
@@ -155,6 +158,7 @@ impl BossDecision {
             brief_why: String::new(),
             message: None,
             kind: DecisionKind::Acted,
+            important: None,
         }
     }
 

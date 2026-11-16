@@ -802,3 +802,117 @@ async fn an_update_names_the_work_in_words_with_ids_in_brackets_and_its_session(
     })
     .await;
 }
+
+/// Balanced: what finished waits for the roundup, a problem comes at
+/// once, and the roundup ("Roundup now") says the finished work under
+/// Finished, with what came at once folded in.
+#[tokio::test(flavor = "multi_thread")]
+async fn finished_work_waits_for_the_roundup_and_a_problem_comes_at_once() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let balanced = format!("{ACT}updates = {{ roundup = \"1h\", quiet_hours = \"\" }}\n");
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", &balanced, &[]).await;
+        crew.set_update_writer(Arc::new(Writer(None)));
+        begun(&crew).await;
+        let web = new_session(&d, dir.path(), "acme-web").await;
+        let api = new_session(&d, dir.path(), "acme-api").await;
+        account(&d, web.id, &["Merged PR #622 for the lead picker"], "", "").await;
+        // Past the gather and the ceiling: nothing goes right away.
+        tokio::time::sleep(Duration::from_millis(1600)).await;
+        assert!(updates(&overseer).is_empty(), "finished work waits");
+
+        account(
+            &d,
+            api.id,
+            &["The deploy failed on staging"],
+            "",
+            "Look at the logs",
+        )
+        .await;
+        let posted = eventually("the problem", async || {
+            updates(&overseer).into_iter().next()
+        })
+        .await;
+        let extras = eventually("its extras", async || {
+            d.store()
+                .extras(std::slice::from_ref(&posted.id))
+                .await
+                .unwrap()
+                .remove(&posted.id)
+                .and_then(|e| e.update)
+        })
+        .await;
+        assert!(extras.roundup.is_none(), "a message right away");
+        assert_eq!(extras.said.len(), 1, "{:?}", extras.said);
+        assert_eq!(
+            extras.said[0].kind,
+            workforce_desk::update_write::EventKind::Problem
+        );
+        assert_eq!(
+            extras.said[0].session.as_ref().unwrap().session_id,
+            api.id.to_string()
+        );
+
+        assert!(crew.roundup_now("desk"));
+        let roundup = eventually("the roundup", async || {
+            updates(&overseer).into_iter().nth(1)
+        })
+        .await;
+        let r = eventually("its extras", async || {
+            d.store()
+                .extras(std::slice::from_ref(&roundup.id))
+                .await
+                .unwrap()
+                .remove(&roundup.id)
+                .and_then(|e| e.update)
+                .and_then(|u| u.roundup)
+        })
+        .await;
+        use workforce_desk::update_cadence::SectionKey;
+        let finished = r
+            .sections
+            .iter()
+            .find(|s| s.key == SectionKey::Finished)
+            .expect("Finished");
+        assert_eq!(
+            finished.lines[0].session.as_ref().unwrap().session_id,
+            web.id.to_string()
+        );
+        assert!(
+            r.sections.iter().any(|s| s.key == SectionKey::WorthKnowing),
+            "what came at once is folded in: {r:?}"
+        );
+        assert!(
+            roundup.content.contains("**Finished**"),
+            "{}",
+            roundup.content
+        );
+    })
+    .await;
+}
+
+/// A roundup with nothing to say is skipped: no message, and the next
+/// starts from then.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_roundup_is_skipped() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let balanced = format!("{ACT}updates = {{ roundup = \"1h\", quiet_hours = \"\" }}\n");
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", &balanced, &[]).await;
+        begun(&crew).await;
+        let before = chrono::Utc::now();
+        assert!(crew.roundup_now("desk"));
+        let state = eventually("the roundup looked at", async || {
+            d.store()
+                .update_state("desk", chrono::Utc::now())
+                .await
+                .ok()
+                .filter(|s| s.roundup_at.is_some_and(|at| at >= before))
+        })
+        .await;
+        assert!(state.pending.is_none());
+        assert!(updates(&overseer).is_empty(), "nothing to say: no roundup");
+        assert!(!crew.roundup_now("nobody"));
+    })
+    .await;
+}

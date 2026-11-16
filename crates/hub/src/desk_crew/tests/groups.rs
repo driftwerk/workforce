@@ -309,6 +309,11 @@ fn pointed_at(name: &str, other: &Client, dir: &Path) -> Vec<(Value, bool)> {
                 false,
             ),
         ],
+        // Its own cadence alone: it names no id of anyone's.
+        super::super::cadence_tool::NAME => vec![
+            (json!({}), false),
+            (json!({ "roundup": "2h" }), false),
+        ],
         "crew.promise" => vec![(
             json!({ "session_id": s, "text": "Tell you when it merges", "done_when": "merged" }),
             true,
