@@ -38,6 +38,7 @@ pub const READ_TOOLS: &[&str] = &[
     "jira.list_comments",
     "jira.list_transitions",
     "jira.list_projects",
+    "jira.workspaces",
     "jira.get_project",
     "jira.search_users",
     "jira.myself",
@@ -161,6 +162,7 @@ impl JiraSkill {
             Arc::new(tools::JiraGetAttachmentTool::with_instances(i(), p())),
             Arc::new(tools::JiraAttachmentReadTool::with_instances(i(), p())),
             Arc::new(tools::JiraListProjectsTool::with_instances(i(), p())),
+            Arc::new(tools::JiraWorkspacesTool::new(i())),
             Arc::new(tools::JiraGetProjectTool::with_instances(i(), p())),
             Arc::new(tools::JiraSearchUsersTool::with_instances(i(), p())),
             Arc::new(tools::JiraMyselfTool::with_instances(i(), p())),
@@ -191,6 +193,7 @@ impl JiraSkill {
             "jira.get_attachment",
             "jira.attachment_read",
             "jira.list_projects",
+            "jira.workspaces",
             "jira.get_project",
             "jira.search_users",
             "jira.myself",
@@ -417,6 +420,11 @@ impl JiraSkill {
                     }),
                 ),
                 mk_tool(
+                    "jira.workspaces",
+                    "The Jira sites you can use, by name, and the one a call naming none goes to",
+                    serde_json::json!({ "type": "object", "properties": {} }),
+                ),
+                mk_tool(
                     "jira.get_project",
                     "Get details about a Jira project",
                     serde_json::json!({
@@ -561,6 +569,7 @@ impl JiraSkill {
                 allow("jira.get_attachment"),
                 allow("jira.attachment_read"),
                 allow("jira.list_projects"),
+                allow("jira.workspaces"),
                 allow("jira.get_project"),
                 allow("jira.search_users"),
                 allow("jira.myself"),

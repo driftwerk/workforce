@@ -585,7 +585,13 @@ impl BoardSync {
         };
         let remote = if reprobe {
             match self
-                .offered(s.system, &s.via, &s.person, s.agent.as_deref())
+                .offered(
+                    s.system,
+                    &s.via,
+                    &s.person,
+                    s.agent.as_deref(),
+                    s.workspace.as_deref(),
+                )
                 .await
             {
                 Ok(r) => {
@@ -609,7 +615,13 @@ impl BoardSync {
             }
         } else {
             match self
-                .remote(s.system, &s.via, &s.person, s.agent.as_deref())
+                .remote(
+                    s.system,
+                    &s.via,
+                    &s.person,
+                    s.agent.as_deref(),
+                    s.workspace.as_deref(),
+                )
                 .await
             {
                 Ok(r) => r,
@@ -642,6 +654,21 @@ impl BoardSync {
     /// What reaches `system` `via` a hub (or this one), as `person`; why
     /// not, as a board's pause says it.
     pub async fn remote(
+        &self,
+        system: System,
+        via: &Via,
+        person: &str,
+        agent: Option<&str>,
+        workspace: Option<&str>,
+    ) -> Result<Arc<dyn Remote>, Paused> {
+        self.reach(system, via, person, agent)
+            .await
+            .map(|r| sync::in_workspace(r, system, workspace))
+    }
+
+    /// What reaches `system` `via` a hub (or this one), as `person`, in
+    /// whichever workspace a call names.
+    async fn reach(
         &self,
         system: System,
         via: &Via,
@@ -686,9 +713,12 @@ impl BoardSync {
         via: &Via,
         person: &str,
         prefer: Option<&str>,
+        workspace: Option<&str>,
     ) -> Result<Reached, Paused> {
         let probe = |agent: Option<String>| async move {
-            let remote = self.remote(system, via, person, agent.as_deref()).await?;
+            let remote = self
+                .remote(system, via, person, agent.as_deref(), workspace)
+                .await?;
             let tools = tokio::time::timeout(PROBE_TIMEOUT * 2, remote.tools())
                 .await
                 .map_err(|_| Paused::HubOffline {
@@ -783,9 +813,11 @@ impl BoardSync {
         let hubs = self.desk.sync_hubs().await.ok()?;
         let probes = hubs.into_iter().map(|h| async move {
             let via = Via::Hub { hub: h.id.clone() };
-            let offered =
-                tokio::time::timeout(PROBE_TIMEOUT * 4, self.offered(system, &via, person, None))
-                    .await;
+            let offered = tokio::time::timeout(
+                PROBE_TIMEOUT * 4,
+                self.offered(system, &via, person, None, None),
+            )
+            .await;
             matches!(offered, Ok(Ok(_))).then_some(h.name)
         });
         futures::future::join_all(probes)
@@ -1115,8 +1147,8 @@ async fn put_hub(
         true => {
             let via = Via::Hub { hub: hub.clone() };
             let (jira, linear) = futures::join!(
-                r.sync.offered(System::Jira, &via, &person, None),
-                r.sync.offered(System::Linear, &via, &person, None)
+                r.sync.offered(System::Jira, &via, &person, None, None),
+                r.sync.offered(System::Linear, &via, &person, None, None)
             );
             Some(json!({ "jira": jira.is_ok(), "linear": linear.is_ok() }))
         }
@@ -1166,6 +1198,10 @@ struct CheckBody {
     filter: Option<Filter>,
     #[serde(default)]
     me: Option<String>,
+    /// The Jira site or Linear workspace picked, where the person has
+    /// several there.
+    #[serde(default)]
+    workspace: Option<String>,
 }
 
 /// Who the person is on a shared key, chosen: the members there whose name
@@ -1178,6 +1214,9 @@ struct MeBody {
     /// The board's agent there, tried first.
     #[serde(default)]
     agent: Option<String>,
+    /// The Jira site or Linear workspace, where the person has several.
+    #[serde(default)]
+    workspace: Option<String>,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
@@ -1192,10 +1231,21 @@ async fn reach_for_me(
     body: &MeBody,
     person: &str,
 ) -> Result<(Arc<dyn Remote>, String), Response> {
+    if let Some(w) = body.workspace.as_deref() {
+        if let Err(e) = sync::check_workspace(w) {
+            return Err(refusal(StatusCode::BAD_REQUEST, &e));
+        }
+    }
     let hub = r.sync.hub_name(&body.via).await;
     match r
         .sync
-        .offered(body.system, &body.via, person, body.agent.as_deref())
+        .offered(
+            body.system,
+            &body.via,
+            person,
+            body.agent.as_deref(),
+            body.workspace.as_deref(),
+        )
         .await
     {
         Ok(reached) => Ok((reached.remote, hub)),
@@ -1377,8 +1427,23 @@ async fn check_link(
             return refusal(StatusCode::BAD_REQUEST, &e);
         }
     }
+    if let Some(w) = body.workspace.as_deref() {
+        if let Err(e) = sync::check_workspace(w) {
+            return refusal(StatusCode::BAD_REQUEST, &e);
+        }
+    }
     let hub = r.sync.hub_name(&body.via).await;
-    let reached = match r.sync.offered(body.system, &body.via, &person, None).await {
+    let reached = match r
+        .sync
+        .offered(
+            body.system,
+            &body.via,
+            &person,
+            None,
+            body.workspace.as_deref(),
+        )
+        .await
+    {
         Ok(reached) => reached,
         Err(p) => {
             return (
@@ -1394,6 +1459,42 @@ async fn check_link(
         "offered": true,
         "agent": reached.agent.as_deref().map(|a| json!({ "id": a, "name": workforce_desk::board::agent_title(a) })),
     });
+    // The person's workspaces there, where they have several: one is
+    // picked before any team or project is listed, and every call after
+    // names it.
+    let listed = sync::workspaces(&*remote, body.system).await;
+    if let Some((names, default)) = &listed {
+        if names.len() > 1 {
+            out["workspaces"] = json!(names);
+            out["workspace"] = json!(body.workspace.as_ref().or(default.as_ref()));
+        }
+        let unknown = body
+            .workspace
+            .as_ref()
+            .filter(|w| !names.contains(w))
+            .map(|w| Some(w.clone()));
+        let unpicked =
+            (body.workspace.is_none() && names.len() > 1 && default.is_none()).then_some(None);
+        if let Some(asked) = unknown.or(unpicked) {
+            out["workspaces"] = json!(names);
+            out["workspaceWhy"] = json!(sync::workspace_words(
+                &workspace_kind(body.system),
+                asked.as_deref(),
+                names
+            ));
+            return Json(out).into_response();
+        }
+    }
+    // An older hub, without the list, names them when a call goes to none
+    // of the person's: the dialog then asks which, as above.
+    let pick_one = |mut out: Value, e: &RemoteError| match e {
+        RemoteError::Workspace { names, .. } => {
+            out["workspaces"] = json!(names);
+            out["workspaceWhy"] = json!(e.to_string());
+            Some(Json(out).into_response())
+        }
+        _ => None,
+    };
     let said = |e: RemoteError| {
         (
             StatusCode::BAD_GATEWAY,
@@ -1404,7 +1505,7 @@ async fn check_link(
     if body.system == System::Linear {
         match sync::call(&*remote, body.system, "linear.teams_list", json!({})).await {
             Ok(teams) => out["teams"] = teams_of(&teams),
-            Err(e) => return said(e),
+            Err(e) => return pick_one(out, &e).unwrap_or_else(|| said(e)),
         }
     }
     // Jira's projects, for a picker: asked once, with the first check (no
@@ -1422,7 +1523,13 @@ async fn check_link(
                 json!({ "max_results": 50, "start_at": all.len() }),
             )
             .await;
-            let Ok(page) = got else { break };
+            let page = match got {
+                Ok(page) => page,
+                Err(e @ RemoteError::Workspace { .. }) => {
+                    return pick_one(out, &e).unwrap_or_else(|| said(e))
+                }
+                Err(_) => break,
+            };
             let list = projects_of(&page);
             let n = list.as_array().map_or(0, Vec::len);
             all.extend(list.as_array().cloned().unwrap_or_default());
@@ -1441,6 +1548,9 @@ async fn check_link(
     let states = match remote_states(&*remote, body.system, target, body.target_id.as_deref()).await
     {
         Ok(s) => s,
+        Err(e @ RemoteError::Workspace { .. }) => {
+            return pick_one(out, &e).unwrap_or_else(|| said(e))
+        }
         Err(e) => return said(e),
     };
     out["states"] = json!(states.iter().map(|s| &s.name).collect::<Vec<_>>());
@@ -1503,6 +1613,14 @@ async fn check_link(
         }
     }
     Json(out).into_response()
+}
+
+/// What `system` calls one of a person's instances, as the dialog says it.
+fn workspace_kind(system: System) -> String {
+    match system {
+        System::Jira => "Jira site".into(),
+        System::Linear => "Linear workspace".into(),
+    }
 }
 
 /// The most projects the link dialog lists.
@@ -1643,8 +1761,23 @@ async fn link_board(
             );
         }
     }
+    if let Some(w) = link.workspace.as_deref() {
+        if let Err(e) = sync::check_workspace(w) {
+            return refusal(StatusCode::BAD_REQUEST, &e);
+        }
+    }
     let hub = r.sync.hub_name(&link.via).await;
-    let remote = match r.sync.offered(link.system, &link.via, &person, None).await {
+    let remote = match r
+        .sync
+        .offered(
+            link.system,
+            &link.via,
+            &person,
+            None,
+            link.workspace.as_deref(),
+        )
+        .await
+    {
         Ok(reached) => {
             link.agent = reached.agent;
             reached.remote
@@ -1657,6 +1790,29 @@ async fn link_board(
                 .into_response();
         }
     };
+    // The workspace it syncs, kept on the link and named on every call:
+    // the one picked, which must be the person's there; else the one a call
+    // naming none goes to, so a workspace they add later changes nothing.
+    // With several and none of them the default, one must be picked.
+    if let Some((names, default)) = sync::workspaces(&*remote, link.system).await {
+        match link.workspace.as_ref() {
+            Some(w) if !names.contains(w) => {
+                return refusal(
+                    StatusCode::BAD_REQUEST,
+                    &sync::workspace_words(&workspace_kind(link.system), Some(w), &names),
+                )
+            }
+            Some(_) => {}
+            None if default.is_some() => link.workspace = default,
+            None if names.len() > 1 => {
+                return refusal(
+                    StatusCode::BAD_REQUEST,
+                    &sync::workspace_words(&workspace_kind(link.system), None, &names),
+                )
+            }
+            None => {}
+        }
+    }
     // Who the person is there, kept on the link for "assigned to me",
     // Mine and Take it; an id they typed is theirs to keep.
     match &link.me {
@@ -1691,6 +1847,9 @@ async fn link_board(
     if link.system == System::Linear {
         let teams = match sync::call(&*remote, link.system, "linear.teams_list", json!({})).await {
             Ok(t) => teams_of(&t),
+            Err(e @ RemoteError::Workspace { .. }) => {
+                return refusal(StatusCode::BAD_REQUEST, &e.to_string())
+            }
             Err(e) => return refusal(StatusCode::BAD_GATEWAY, &format!("{hub}: {e}")),
         };
         let named = teams.as_array().into_iter().flatten().any(|t| {
@@ -1788,7 +1947,13 @@ async fn take_ticket(
     }
     let remote = match r
         .sync
-        .remote(s.system, &s.via, &person, s.agent.as_deref())
+        .remote(
+            s.system,
+            &s.via,
+            &person,
+            s.agent.as_deref(),
+            s.workspace.as_deref(),
+        )
         .await
     {
         Ok(remote) => remote,
@@ -1831,7 +1996,13 @@ async fn recheck_me(
     let hub = r.sync.hub_name(&s.via).await;
     let remote = match r
         .sync
-        .remote(s.system, &s.via, &person, s.agent.as_deref())
+        .remote(
+            s.system,
+            &s.via,
+            &person,
+            s.agent.as_deref(),
+            s.workspace.as_deref(),
+        )
         .await
     {
         Ok(remote) => remote,
@@ -1857,3 +2028,7 @@ pub fn install(state: &Arc<GatewayState>, desk: Desk) -> (Arc<BoardSync>, Router
 #[cfg(test)]
 #[path = "desk_board_sync_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "desk_board_workspace_tests.rs"]
+mod workspace_tests;

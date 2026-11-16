@@ -1,5 +1,5 @@
 use super::*;
-use crate::board::{External, Seen, Ticket};
+use crate::board::{External, Paused, Seen, Ticket};
 use crate::crew::Party;
 use serde_json::json;
 
@@ -1597,4 +1597,113 @@ fn a_profile_is_the_one_member_whose_it_is() {
         { "id": "2", "name": "b", "url": "https://linear.app/acme/profiles/ann" },
     ] });
     assert_eq!(profile_member(&twice, "acme", "ann"), None);
+}
+
+/// A remote that keeps what it was called with, and how.
+#[derive(Default)]
+struct Recorder(std::sync::Mutex<Vec<(String, Value, bool)>>);
+
+#[async_trait]
+impl Remote for Recorder {
+    async fn tools(&self) -> Result<Vec<String>, RemoteError> {
+        Ok(vec![])
+    }
+    async fn call(&self, tool: &str, args: Value) -> Result<Value, RemoteError> {
+        self.0.lock().unwrap().push((tool.into(), args, false));
+        Ok(json!({}))
+    }
+    async fn call_quiet(&self, tool: &str, args: Value) -> Result<Value, RemoteError> {
+        self.0.lock().unwrap().push((tool.into(), args, true));
+        Ok(json!({}))
+    }
+}
+
+#[tokio::test]
+async fn a_link_s_workspace_goes_on_its_system_s_calls_only() {
+    for system in [System::Jira, System::Linear] {
+        let rec = std::sync::Arc::new(Recorder::default());
+        let held = in_workspace(rec.clone(), system, Some("mantiscrm"));
+        let own = format!("{}.search", system.as_str());
+        held.call(&own, json!({})).await.unwrap();
+        held.call_quiet(&own, json!({})).await.unwrap();
+        held.call("identity.linear_choose_me", json!({ "clear": true }))
+            .await
+            .unwrap();
+        held.call(&own, json!({ "workspace": "petmobile" }))
+            .await
+            .unwrap();
+        held.call(workspaces_tool(system), json!({})).await.unwrap();
+        held.call("other.tool", json!({})).await.unwrap();
+        let calls = rec.0.lock().unwrap().clone();
+        assert_eq!(calls[0].1["workspace"], "mantiscrm");
+        // Quiet stays quiet.
+        assert!(calls[1].2 && calls[1].1["workspace"] == "mantiscrm");
+        assert_eq!(calls[2].1["workspace"], "mantiscrm");
+        // A call that names one keeps its own.
+        assert_eq!(calls[3].1["workspace"], "petmobile");
+        // The list of them all names none, nor does another system's tool.
+        assert!(calls[4].1.get("workspace").is_none());
+        assert!(calls[5].1.get("workspace").is_none());
+    }
+    // No workspace: the remote as it is.
+    let rec = std::sync::Arc::new(Recorder::default());
+    in_workspace(rec.clone(), System::Linear, None)
+        .call("linear.issue_list", json!({}))
+        .await
+        .unwrap();
+    assert!(rec.0.lock().unwrap()[0].1.get("workspace").is_none());
+}
+
+#[test]
+fn an_unknown_workspace_is_said_plainly_never_as_default() {
+    let failed = |text: &str| {
+        mcp_answer(&json!({ "isError": true, "content": [{ "type": "text", "text": text }] }))
+            .unwrap_err()
+    };
+    let linear = failed(&workforce_core::instances::unknown_instance_text(
+        "Linear workspace",
+        "default",
+        &["driftwerk", "mantiscrm", "petmobile"],
+    ));
+    assert_eq!(
+        linear.to_string(),
+        "Pick which Linear workspace: driftwerk, mantiscrm or petmobile"
+    );
+    let jira = failed(&workforce_core::instances::unknown_instance_text(
+        "Jira workspace",
+        "default",
+        &["acme", "client"],
+    ));
+    assert_eq!(jira.to_string(), "Pick which Jira site: acme or client");
+    let gone = failed(&workforce_core::instances::unknown_instance_text(
+        "Jira workspace",
+        "client",
+        &["acme"],
+    ));
+    assert_eq!(
+        gone.to_string(),
+        "There's no Jira site client of yours there now. Pick which Jira site: acme"
+    );
+    let none = failed(&workforce_core::instances::unknown_instance_text(
+        "Linear workspace",
+        "default",
+        &[],
+    ));
+    assert_eq!(
+        none.to_string(),
+        "No Linear workspace of yours is set up there."
+    );
+    for e in [linear, jira, gone, none] {
+        assert!(!e.to_string().contains("default"), "{e}");
+    }
+    // A Jira site's pause says the same.
+    let p = Paused::Workspace {
+        what: "Jira site".into(),
+        asked: None,
+        names: vec!["acme".into(), "client".into()],
+    };
+    assert_eq!(
+        p.say("Driftwerk"),
+        "Paused: you have more than one Jira site on Driftwerk (acme or client), and this link doesn't say which."
+    );
 }

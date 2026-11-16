@@ -4,6 +4,7 @@ pub mod code_citation;
 pub mod computer;
 pub mod desk;
 pub mod home_secrets;
+pub mod instances;
 pub mod message;
 pub mod participant;
 pub mod policy;

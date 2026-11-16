@@ -67,9 +67,37 @@ pub fn chosen_of(identity: &Identity, on: On, place: &str) -> Option<Value> {
     Some(json!({ "id": id, "name": kept["name"].as_str().unwrap_or(id) }))
 }
 
+/// The `workspace` a call to an identity tool named, for the adapter calls
+/// it makes in turn: the person's Jira site or Linear workspace, where they
+/// have several.
+pub fn workspace_of(input: &Value) -> Option<String> {
+    input["workspace"]
+        .as_str()
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+}
+
+/// `args` naming `workspace`, when there is one.
+pub fn in_workspace(mut args: Value, workspace: Option<&str>) -> Value {
+    if let (Some(w), Some(map)) = (workspace, args.as_object_mut()) {
+        map.insert("workspace".into(), json!(w));
+    }
+    args
+}
+
+/// The identity tools' `workspace` parameter.
+pub fn workspace_param() -> Value {
+    json!({ "type": "string", "description": "Which of your Jira sites or Linear workspaces, by name, where you have several" })
+}
+
 /// Which Jira site or Linear workspace the agent's key is in, as its
 /// identity tool says; "default" when it doesn't say (an older adapter).
-pub async fn place_of(on: On, tools: &ToolRegistry) -> Result<String, String> {
+pub async fn place_of(
+    on: On,
+    tools: &ToolRegistry,
+    workspace: Option<&str>,
+) -> Result<String, String> {
     let (tool, field) = match on {
         On::Jira => ("jira.myself", "site"),
         On::Linear => ("linear.viewer", "workspace"),
@@ -78,7 +106,7 @@ pub async fn place_of(on: On, tools: &ToolRegistry) -> Result<String, String> {
         return Err(format!("This agent has no {} to say where it is.", tool));
     };
     let answer = tool
-        .execute(json!({}))
+        .execute(in_workspace(json!({}), workspace))
         .await
         .map_err(|e| format!("{e:#}"))?;
     if !answer.success {
@@ -205,7 +233,10 @@ impl Tool for MembersNamed {
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
-            "properties": { "name": { "type": "string", "description": "Part of their name, at least 2 characters" } },
+            "properties": {
+                "name": { "type": "string", "description": "Part of their name, at least 2 characters" },
+                "workspace": workspace_param(),
+            },
             "required": ["name"],
             "additionalProperties": false,
         })
@@ -244,7 +275,9 @@ impl Tool for MembersNamed {
                 ms(),
             ));
         };
-        let answer = tool.execute(args).await?;
+        let answer = tool
+            .execute(in_workspace(args, workspace_of(&input).as_deref()))
+            .await?;
         if !answer.success {
             return Ok(ToolResult::failure(
                 answer.error.unwrap_or_else(|| format!("{lookup} failed")),
@@ -316,6 +349,7 @@ impl Tool for ChooseMe {
                 "id": { "type": "string", "description": "Their id there (a Jira accountId, a Linear user id)" },
                 "name": { "type": "string", "description": "Their name there, as shown" },
                 "clear": { "type": "boolean", "description": "Forget your choice" },
+                "workspace": workspace_param(),
             },
             "additionalProperties": false,
         })
@@ -350,7 +384,7 @@ impl Tool for ChooseMe {
         let Some(tools) = self.tools.upgrade() else {
             return Ok(ToolResult::failure("This agent is stopping.", ms()));
         };
-        let place = match place_of(self.on, &tools).await {
+        let place = match place_of(self.on, &tools, workspace_of(&input).as_deref()).await {
             Ok(p) => p,
             Err(e) => return Ok(ToolResult::failure(e, ms())),
         };

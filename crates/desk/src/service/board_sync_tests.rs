@@ -96,6 +96,7 @@ fn link(hub: Option<&str>) -> LinkBoard {
             None => Via::ThisHub,
         },
         agent: None,
+        workspace: None,
         filter: Filter::Label("web".into()),
         me: None,
         me_name: None,
@@ -911,6 +912,7 @@ async fn whole_team(d: &Desk, me: Option<&str>) -> Board {
             target_id: Some(TEAM.into()),
             via: Via::ThisHub,
             agent: None,
+            workspace: None,
             filter: Filter::All {
                 include_done: false,
             },

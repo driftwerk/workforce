@@ -114,8 +114,18 @@ pub fn callable(system: System) -> Vec<&'static str> {
     if system == System::Jira {
         all.extend(workforce_core::desk::BOARD_SYNC_JIRA_PICK_TOOLS);
     }
+    all.push(workspaces_tool(system));
     all.extend(view_tools(system));
     all
+}
+
+/// The hub's tool that names the person's Jira sites or Linear workspaces
+/// ([`workforce_core::desk::BOARD_SYNC_WORKSPACE_TOOLS`]).
+pub fn workspaces_tool(system: System) -> &'static str {
+    match system {
+        System::Jira => "jira.workspaces",
+        System::Linear => "linear.workspaces",
+    }
 }
 
 /// The tools `system`'s sync needs a hub to offer.
@@ -175,6 +185,150 @@ pub enum RemoteError {
     /// next. Not a failure.
     #[error("this pass's calls are spent")]
     Spent,
+    /// The call named no Jira site or Linear workspace the person has
+    /// there (or none, and they have several): which they have, by name.
+    #[error("{}", workspace_words(what, asked.as_deref(), names))]
+    Workspace {
+        /// "Linear workspace" or "Jira site".
+        what: String,
+        /// The one asked for; none: the call named none.
+        asked: Option<String>,
+        names: Vec<String>,
+    },
+}
+
+/// `names` as a person lists them: "a", "a or b", "a, b or c".
+pub fn or_list(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} or {last}", rest.join(", ")),
+    }
+}
+
+/// What a call that named no workspace of the person's says, plainly:
+/// never the "default" a call naming none was sent to.
+pub fn workspace_words(kind: &str, asked: Option<&str>, names: &[String]) -> String {
+    match (asked, names) {
+        (_, []) => format!("No {kind} of yours is set up there."),
+        (None, names) => format!("Pick which {kind}: {}", or_list(names)),
+        (Some(asked), names) => format!(
+            "There's no {kind} {asked} of yours there now. Pick which {kind}: {}",
+            or_list(names)
+        ),
+    }
+}
+
+/// A hub's unknown-instance error as [`RemoteError::Workspace`], if `text`
+/// is one ([`workforce_core::instances`]). "default", a name no one picks,
+/// is a call that named none.
+pub fn workspace_error(text: &str) -> Option<RemoteError> {
+    let u = workforce_core::instances::parse_unknown_instance(text)?;
+    let kind = match u.what.as_str() {
+        "Jira workspace" => "Jira site",
+        _ => "Linear workspace",
+    };
+    Some(RemoteError::Workspace {
+        what: kind.to_string(),
+        asked: Some(u.asked).filter(|a| a != "default" || u.available.contains(a)),
+        names: u.available,
+    })
+}
+
+/// The person's Jira sites or Linear workspaces on the hub `remote`
+/// reaches, by name, and the one a call naming none goes to; `None` when
+/// the hub can't say (an older one, without the tool).
+pub async fn workspaces(
+    remote: &dyn Remote,
+    system: System,
+) -> Option<(Vec<String>, Option<String>)> {
+    let answer = call_quiet(remote, system, workspaces_tool(system), json!({}))
+        .await
+        .ok()?;
+    let names: Vec<String> = answer["workspaces"]
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|n| check_workspace(n).is_ok())
+        .map(str::to_string)
+        .collect();
+    let default = answer["default"]
+        .as_str()
+        .filter(|d| names.iter().any(|n| n == d))
+        .map(str::to_string);
+    Some((names, default))
+}
+
+/// Whether `name` can be a Jira site's or Linear workspace's name as a hub
+/// keeps one: letters, digits, `-`, `_` and `.`, at most 64.
+pub fn check_workspace(name: &str) -> Result<(), String> {
+    let ok = (1..=64).contains(&name.len())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    match ok {
+        true => Ok(()),
+        false => Err("That isn't the name of a workspace.".into()),
+    }
+}
+
+/// `inner`, with every call to `system`'s own tools and to the identity
+/// tools naming `workspace` (where a call doesn't name one itself): a
+/// board linked to one of several Jira sites or Linear workspaces reaches
+/// only that one. Quiet calls stay quiet.
+pub struct InWorkspace {
+    inner: std::sync::Arc<dyn Remote>,
+    system: System,
+    workspace: String,
+}
+
+/// `remote` held to `workspace` when there is one; as it is when there is
+/// none (a link made before workspaces were kept, or a person with one).
+pub fn in_workspace(
+    remote: std::sync::Arc<dyn Remote>,
+    system: System,
+    workspace: Option<&str>,
+) -> std::sync::Arc<dyn Remote> {
+    match workspace.map(str::trim).filter(|w| !w.is_empty()) {
+        Some(w) => std::sync::Arc::new(InWorkspace {
+            inner: remote,
+            system,
+            workspace: w.to_string(),
+        }),
+        None => remote,
+    }
+}
+
+impl InWorkspace {
+    fn scoped(&self, tool: &str, mut args: Value) -> Value {
+        let own = tool
+            .strip_prefix(self.system.as_str())
+            .is_some_and(|t| t.starts_with('.'))
+            || tool.starts_with("identity.");
+        // The list of workspaces is of them all, in none.
+        if own && tool != workspaces_tool(self.system) {
+            if let Some(map) = args.as_object_mut() {
+                map.entry("workspace")
+                    .or_insert_with(|| Value::String(self.workspace.clone()));
+            }
+        }
+        args
+    }
+}
+
+#[async_trait::async_trait]
+impl Remote for InWorkspace {
+    async fn tools(&self) -> Result<Vec<String>, RemoteError> {
+        self.inner.tools().await
+    }
+
+    async fn call(&self, tool: &str, args: Value) -> Result<Value, RemoteError> {
+        self.inner.call(tool, self.scoped(tool, args)).await
+    }
+
+    async fn call_quiet(&self, tool: &str, args: Value) -> Result<Value, RemoteError> {
+        self.inner.call_quiet(tool, self.scoped(tool, args)).await
+    }
 }
 
 /// A Jira or Linear reached one way or another, as the person.
@@ -251,6 +405,10 @@ pub fn mcp_answer(result: &Value) -> Result<Value, RemoteError> {
         .collect::<Vec<_>>()
         .join("\n");
     if result.get("isError").and_then(Value::as_bool) == Some(true) {
+        // Read whole, before any clipping: it names the person's workspaces.
+        if let Some(e) = workspace_error(&text) {
+            return Err(e);
+        }
         let lower = text.to_ascii_lowercase();
         let policy = ["policy denied", "requires the", "not permitted", "denied:"];
         return Err(match policy.iter().any(|p| lower.contains(p)) {

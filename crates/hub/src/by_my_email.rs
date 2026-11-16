@@ -146,16 +146,21 @@ impl Tool for ByMyEmail {
 
     fn description(&self) -> &str {
         match self.on {
-            On::Linear => "Who you are in Linear, as {user: {id, name}, source}: the member you chose to be (source \"chosen\", your own word, not verified), else the one member with the email your sign-in or Slack verified (source \"sign_in\" or \"slack\"). user is null when there's none, several, or no verified email, with why. Takes no arguments.",
-            On::Jira => "Who you are in Jira, as {user: {id, name}, source}: the user you chose to be (source \"chosen\", your own word, not verified), else the one user with the email your sign-in or Slack verified (source \"sign_in\" or \"slack\"). user is null when there's none, several, Jira hides emails, or no verified email, with why. Takes no arguments.",
+            On::Linear => "Who you are in Linear, as {user: {id, name}, source}: the member you chose to be (source \"chosen\", your own word, not verified), else the one member with the email your sign-in or Slack verified (source \"sign_in\" or \"slack\"). user is null when there's none, several, or no verified email, with why. Takes only `workspace`, where you have several.",
+            On::Jira => "Who you are in Jira, as {user: {id, name}, source}: the user you chose to be (source \"chosen\", your own word, not verified), else the one user with the email your sign-in or Slack verified (source \"sign_in\" or \"slack\"). user is null when there's none, several, Jira hides emails, or no verified email, with why. Takes only `workspace`, where you have several.",
         }
     }
 
     fn input_schema(&self) -> Value {
-        json!({ "type": "object", "properties": {}, "additionalProperties": false })
+        json!({
+            "type": "object",
+            "properties": { "workspace": crate::chosen_me::workspace_param() },
+            "additionalProperties": false,
+        })
     }
 
-    async fn execute(&self, _input: Value) -> Result<ToolResult> {
+    async fn execute(&self, input: Value) -> Result<ToolResult> {
+        let workspace = crate::chosen_me::workspace_of(&input);
         let start = Instant::now();
         let ms = || start.elapsed().as_millis() as u64;
         let Some(user) = crate::user_config::current_identity_id() else {
@@ -182,7 +187,9 @@ impl Tool for ByMyEmail {
             .any(|k| crate::chosen_me::is_chosen_key(k))
         {
             if let Some(tools) = self.tools.upgrade() {
-                if let Ok(place) = crate::chosen_me::place_of(self.on, &tools).await {
+                if let Ok(place) =
+                    crate::chosen_me::place_of(self.on, &tools, workspace.as_deref()).await
+                {
                     if let Some(user) = crate::chosen_me::chosen_of(&identity, self.on, &place) {
                         return Ok(ToolResult::success(
                             json!({ "user": user, "why": null, "source": "chosen" }),
@@ -207,7 +214,9 @@ impl Tool for ByMyEmail {
                 ms(),
             ));
         };
-        let answer = tool.execute(args).await?;
+        let answer = tool
+            .execute(crate::chosen_me::in_workspace(args, workspace.as_deref()))
+            .await?;
         if !answer.success {
             return Ok(ToolResult::failure(
                 answer.error.unwrap_or_else(|| format!("{lookup} failed")),

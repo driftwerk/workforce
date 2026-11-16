@@ -507,7 +507,7 @@ pub(crate) async fn remote_hub_of_agents_with(
     .await
 }
 
-async fn serve_remote(
+pub(crate) async fn serve_remote(
     fx: crate::remote_mcp::testing::Fixture,
     allow: &[&str],
     jira: Shared,
@@ -699,6 +699,7 @@ pub(crate) fn link_jira(filter: Filter) -> LinkBoard {
             hub: "atlas".into(),
         },
         agent: None,
+        workspace: None,
         filter,
         me: None,
         me_name: None,

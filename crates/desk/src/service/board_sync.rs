@@ -39,6 +39,10 @@ pub struct LinkBoard {
     /// The agent there whose tools it syncs through: the hub's to find.
     #[serde(skip)]
     pub agent: Option<String>,
+    /// The Jira site or Linear workspace, by name, where the person has
+    /// several there (the hub's link check lists them).
+    #[serde(default)]
+    pub workspace: Option<String>,
     pub filter: Filter,
     /// Who the person is there (their Linear user id or Jira accountId),
     /// for "assigned to me", Mine and Take it: the hub's to look up, or
@@ -228,6 +232,9 @@ impl Desk {
             })?;
             crate::board_sync::check_linear_id(id).map_err(DeskError::Invalid)?;
         }
+        if let Some(w) = link.workspace.as_deref() {
+            crate::board_sync::check_workspace(w).map_err(DeskError::Invalid)?;
+        }
         if let Via::Hub { hub } = &link.via {
             check_hub_id(hub)?;
             if self.sync_hub(hub).await?.is_none() {
@@ -245,7 +252,13 @@ impl Desk {
         if let Some(other) = self
             .0
             .store
-            .board_linked_to(link.system, &link.target, &link.via, id)
+            .board_linked_to(
+                link.system,
+                &link.target,
+                &link.via,
+                link.workspace.as_deref(),
+                id,
+            )
             .await
             .map_err(internal)?
         {
@@ -280,6 +293,7 @@ impl Desk {
             target_id: link.target_id,
             via: link.via,
             agent: link.agent,
+            workspace: link.workspace,
             person: person.to_string(),
             filter: link.filter,
             me_source: link
@@ -518,6 +532,7 @@ fn retried(p: &Paused) -> bool {
             | Paused::NoToken
             | Paused::Missing { .. }
             | Paused::Refused { .. }
+            | Paused::Workspace { .. }
     )
 }
 
@@ -564,6 +579,11 @@ impl Desk {
                 }),
                 RemoteError::Refused(reason) => Some(Paused::Refused {
                     reason: reason.clone(),
+                }),
+                RemoteError::Workspace { what, asked, names } => Some(Paused::Workspace {
+                    what: what.clone(),
+                    asked: asked.clone(),
+                    names: names.clone(),
                 }),
                 _ => None,
             };

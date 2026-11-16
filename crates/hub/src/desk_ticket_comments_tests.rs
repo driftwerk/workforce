@@ -148,6 +148,7 @@ async fn comments_are_read_from_the_issue_and_posted_as_the_person() {
                     },
                     &local.person.id.to_string(),
                     None,
+                    None,
                 )
                 .await
                 .unwrap(),
@@ -295,6 +296,7 @@ async fn no_one_but_the_person_posts_to_the_issue() {
                 },
                 &local.person.id.to_string(),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -396,6 +398,7 @@ async fn a_malformed_read_keeps_every_comment() {
                     hub: "atlas".into(),
                 },
                 &local.person.id.to_string(),
+                None,
                 None,
             )
             .await
@@ -548,6 +551,7 @@ async fn a_history_that_can_t_be_read_never_stops_the_comments() {
                     hub: "atlas".into(),
                 },
                 &local.person.id.to_string(),
+                None,
                 None,
             )
             .await

@@ -404,11 +404,22 @@ impl<C: Send + Sync> workforce_agent::llm::environment::InstanceSource for LiveI
 pub fn unknown_instance<V>(what: &str, name: &str, clients: &HashMap<String, V>) -> eyre::Report {
     let mut available: Vec<&str> = clients.keys().map(String::as_str).collect();
     available.sort_unstable();
-    if available.is_empty() {
-        eyre::eyre!("{what} not configured for you (asked for '{name}'); none of yours is set up.")
-    } else {
-        eyre::eyre!("Unknown {what}: '{name}'. Available: {available:?}")
-    }
+    eyre::eyre!(
+        "{}",
+        workforce_core::instances::unknown_instance_text(what, name, &available)
+    )
+}
+
+/// A `*.workspaces` tool's answer, `{workspaces, default}`: the caller's
+/// instance names, sorted (never a key), and the one a call naming none
+/// goes to, or null when a call must name one.
+pub fn workspaces_answer<V>(clients: &HashMap<String, V>, default: &str) -> Value {
+    let mut names: Vec<&str> = clients.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    json!({
+        "workspaces": names,
+        "default": clients.contains_key(default).then_some(default),
+    })
 }
 
 /// The `Available: …. Default: ….` tail of an instance parameter's
@@ -1456,6 +1467,19 @@ mod tests {
         .err()
         .expect("make failed");
         assert_eq!(err.to_string(), "boom");
+    }
+
+    #[test]
+    fn a_workspaces_answer_names_only_and_a_default_that_exists() {
+        let clients = instances(&["petmobile", "driftwerk", "mantiscrm"]);
+        assert_eq!(
+            workspaces_answer(&clients, "default"),
+            json!({ "workspaces": ["driftwerk", "mantiscrm", "petmobile"], "default": null })
+        );
+        assert_eq!(
+            workspaces_answer(&clients, "mantiscrm")["default"],
+            "mantiscrm"
+        );
     }
 
     #[test]
