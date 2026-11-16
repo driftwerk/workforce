@@ -68,9 +68,12 @@ pub(super) type Bases = HashMap<String, (Deciding, DateTime<Utc>)>;
 /// One lane per session: what is sent it goes one at a time.
 pub(super) type Lanes = HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>;
 
-/// Turns (and focused calls) told their picture moved: the newest row
-/// each was told, and when.
-pub(super) type Redecided = HashMap<String, (u64, std::time::Instant)>;
+/// Turns (and focused calls) told their picture moved for a session: the
+/// newest row each was told for it, and when.
+pub(super) type Redecided = HashMap<(String, Uuid), (u64, std::time::Instant)>;
+
+/// How many moved rows a refusal lists: the basis moves only past them.
+const TOLD_ROWS: usize = 20;
 
 /// Whether `refused` is a refusal for a picture that moved: decide again.
 pub(crate) fn stale(refused: &str) -> bool {
@@ -132,26 +135,41 @@ impl CrewHub {
 
     /// A boss's turn on runner session `sid` begins now (or takes in the
     /// person's next message): it decides on the picture as it is.
-    pub(super) fn picture_turn_began(&self, sid: &str) {
+    /// Its key: the turn's own, for [`Self::picture_turn_ended`].
+    pub(super) fn picture_turn_began(&self, sid: &str) -> String {
         let basis = self.desk.picture_seq();
         let now = Utc::now();
+        let turn = format!("{sid}#{basis}#{}", Uuid::new_v4().simple());
         let mut bases = self.turn_bases.lock();
         bases.retain(|_, (_, at)| now - *at < BASIS_KEPT);
         bases.insert(
             sid.to_string(),
             (
                 Deciding {
-                    turn: format!("{sid}#{basis}"),
+                    turn: turn.clone(),
                     basis,
                 },
                 now,
             ),
         );
+        turn
     }
 
-    /// The boss's turn on `sid` ended.
-    pub(super) fn picture_turn_ended(&self, sid: &str) {
-        self.turn_bases.lock().remove(sid);
+    /// The turn on `old` goes on as `new` (its runner session rolled over).
+    pub(super) fn picture_turn_rolled(&self, old: &str, new: &str) {
+        let mut bases = self.turn_bases.lock();
+        if let Some(b) = bases.get(old).cloned() {
+            bases.insert(new.to_string(), b);
+        }
+    }
+
+    /// The boss's turn `turn` on `sid` ended: its basis goes, unless a
+    /// later turn on `sid` already began.
+    pub(super) fn picture_turn_ended(&self, sid: &str, turn: &str) {
+        let mut bases = self.turn_bases.lock();
+        if bases.get(sid).is_some_and(|(d, _)| d.turn == turn) {
+            bases.remove(sid);
+        }
     }
 
     /// Runs the focused call `f` on the picture as it is now.
@@ -184,17 +202,40 @@ impl CrewHub {
 
     /// Session `s`'s lane, held: whatever goes to it waits its turn.
     pub(super) async fn lane(&self, s: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
-        let lane = Arc::clone(self.lanes.lock().entry(s).or_default());
+        let lane = {
+            let mut lanes = self.lanes.lock();
+            // Lanes no one holds or waits on go.
+            if lanes.len() > 256 {
+                lanes.retain(|_, l| Arc::strong_count(l) > 1);
+            }
+            Arc::clone(lanes.entry(s).or_default())
+        };
         lane.lock_owned().await
     }
 
     /// The session a boss's `action` tells something, in its lane.
     pub(super) fn lane_of(action: &Action, by: &workforce_desk::crew::By) -> Option<Uuid> {
+        if by.party.kind != workforce_desk::crew::PartyKind::Manager {
+            return None;
+        }
+        // Whatever carries the boss's words (or work) to the session.
         match action {
             Action::Nudge {
                 to: Target::Session(s),
                 ..
-            } if by.party.kind == workforce_desk::crew::PartyKind::Manager => Some(*s),
+            }
+            | Action::AssignTicket {
+                to: super::actions::Handout::Session(s),
+                ..
+            }
+            | Action::Resume {
+                session: s,
+                prompt: Some(_),
+            }
+            | Action::Restart {
+                session: s,
+                prompt: Some(_),
+            } => Some(*s),
             _ => None,
         }
     }
@@ -218,16 +259,20 @@ impl CrewHub {
         let basis = self
             .redecided
             .lock()
-            .get(&d.turn)
+            .get(&(d.turn.clone(), s))
             .map_or(d.basis, |(seq, _)| d.basis.max(*seq));
         let moved = self.desk.picture_since(boss, s, basis, Some(&d.turn));
         if !moved.is_empty() {
             // Told now: what it sends next stands on this.
-            self.decided_again(&d);
+            self.decided_again(&d, s, &moved);
             tracing::info!(session = %s, %boss, turn = %d.turn, rows = moved.len(), "a boss's message decided on an old picture wasn't sent; it decides again");
             return Err(format!(
                 "{STALE} the picture moved for {name}:\n{}\nDecide again on this: send it a new message only if one is still needed and fits what is above, or nothing.",
-                said(&moved, tz)
+                moved[..moved.len().min(TOLD_ROWS)]
+                    .iter()
+                    .map(|r| format!("- {}", r.said(tz)))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             ));
         }
         let Action::Nudge { reply_to: None, .. } = action else {
@@ -258,18 +303,17 @@ impl CrewHub {
     }
 
     /// The turn `d` was told what changed: it decides on the picture now.
-    fn decided_again(&self, d: &Deciding) {
-        let now = self.desk.picture_seq();
-        {
-            let mut told = self.redecided.lock();
-            told.retain(|_, (_, at)| at.elapsed() < std::time::Duration::from_secs(6 * 3600));
-            told.insert(d.turn.clone(), (now, std::time::Instant::now()));
-        }
-        for (k, _) in self.turn_bases.lock().values_mut() {
-            if k.turn == d.turn {
-                k.basis = now;
-            }
-        }
+    /// It was told `moved` for session `s` only: for `s`, it decides from
+    /// the newest of them (what it wasn't told still makes it stale), and
+    /// for every other session on what it began with.
+    fn decided_again(&self, d: &Deciding, s: Uuid, moved: &[Happened]) {
+        let shown = &moved[..moved.len().min(TOLD_ROWS)];
+        let Some(newest) = shown.iter().map(|r| r.seq).max() else {
+            return;
+        };
+        let mut told = self.redecided.lock();
+        told.retain(|_, (_, at)| at.elapsed() < std::time::Duration::from_secs(6 * 3600));
+        told.insert((d.turn.clone(), s), (newest, std::time::Instant::now()));
     }
 
     /// Whether session `s` moved on since `at`: its account says it did
@@ -350,12 +394,3 @@ impl CrewHub {
     }
 }
 
-/// `rows`, newest last, at most [`SAID_ROWS`].
-fn said(rows: &[Happened], tz: chrono_tz::Tz) -> String {
-    let from = rows.len().saturating_sub(SAID_ROWS);
-    rows[from..]
-        .iter()
-        .map(|r| format!("- {}", r.said(tz)))
-        .collect::<Vec<_>>()
-        .join("\n")
-}

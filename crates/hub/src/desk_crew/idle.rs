@@ -455,7 +455,7 @@ impl CrewHub {
                         tracing::info!(session = %view.id, %boss, %done, "the boss told a finished session its next step");
                     }
                     // The picture moved while it decided: it decides again
-                    // on it, at once.
+                    // on it at the next look (a sweep later).
                     Err(refused) if super::picture::stale(&refused) => return Judged::Later,
                     Err(refused) => {
                         tracing::warn!(session = %view.id, %boss, %refused, "a boss's next step for a session was refused");

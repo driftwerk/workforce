@@ -36,6 +36,8 @@ pub(super) struct Track {
     /// The overseer's own turn in its DM: not activity, but what its
     /// answer mentions is kept.
     manager_session: Option<String>,
+    /// The picture's key for this turn (`super::picture`): ended with it.
+    deciding: Option<String>,
     /// The room the turn was asked in (or answers to), and the message it
     /// answers, stamped on each of its events.
     place: Option<Place>,
@@ -70,6 +72,7 @@ impl CrewHub {
         let hop = session_id
             .and_then(|sid| self.hops.lock().remove(sid))
             .unwrap_or(0);
+        let mut deciding = None;
         if let (true, Some(sid)) = (overseer, session_id) {
             // The person's word lands first: in the picture before anything
             // of this turn's is done. Then the turn decides on the picture
@@ -80,7 +83,7 @@ impl CrewHub {
             {
                 self.picture_person_told(&agent_id, message);
             }
-            self.picture_turn_began(sid);
+            deciding = Some(self.picture_turn_began(sid));
         }
         if overseer && channel == DESK_CHANNEL {
             let sid = session_id?.to_string();
@@ -108,6 +111,7 @@ impl CrewHub {
                 task: None,
                 hop,
                 manager_session: Some(sid),
+                deciding,
                 place,
                 message: asked,
                 done: false,
@@ -150,6 +154,7 @@ impl CrewHub {
             task,
             hop,
             manager_session: None,
+            deciding,
             place,
             message: asked,
             done: false,
@@ -188,7 +193,9 @@ impl Track {
             }
             crew.manager_turns.lock().remove(&sid);
             crew.person_turns.lock().remove(&sid);
-            crew.picture_turn_ended(&sid);
+            if let Some(turn) = self.deciding.take() {
+                crew.picture_turn_ended(&sid, &turn);
+            }
             // An update held for this reply may go now.
             crew.update_poke.notify_one();
             return;
@@ -224,7 +231,9 @@ impl Drop for Track {
         if let Some(sid) = &self.manager_session {
             self.crew.manager_turns.lock().remove(sid);
             self.crew.person_turns.lock().remove(sid);
-            self.crew.picture_turn_ended(sid);
+            if let Some(turn) = &self.deciding {
+                self.crew.picture_turn_ended(sid, turn);
+            }
             self.crew.update_poke.notify_one();
             return;
         }

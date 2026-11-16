@@ -363,5 +363,8 @@ impl CrewHub {
         if let Some(l) = listed.get(old).cloned() {
             listed.insert(new.to_string(), l);
         }
+        drop(listed);
+        // What it decides on goes with it.
+        self.picture_turn_rolled(old, new);
     }
 }
