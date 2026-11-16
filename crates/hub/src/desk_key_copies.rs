@@ -16,18 +16,25 @@
 //! `/api/me/vault` keeps them) or as an instance
 //! (`users/<id>/skills/jira/workspaces/<key>/…`). The shared tier, an
 //! agent's vault (which keeps its own `users/<id>/` too) and every path
-//! outside the catalog are never opened. Slack's bot token is shared by
-//! nature and Google's tokens are this hub's OAuth client's, so neither is
-//! copied.
+//! outside the catalog are never opened, and of a connection only the
+//! fields its catalog entry names are handed over (an extra kept beside
+//! them, such as GitHub's `app_private_key`, stays here). Slack's bot token
+//! is shared by nature and Google's tokens are this hub's OAuth client's,
+//! so neither is copied. Nor is a GitHub token from a sign-in (GitHub's
+//! device flow, on an OAuth app: `gho_…`, `ghu_…`): revoking that sign-in
+//! here would not revoke a copy on Desk. A personal access token is the
+//! person's own, and is copied.
 //!
 //! Only a paired desktop device's token is taken ([`paired_device`]): the
 //! person it is linked to is the keys' holder. A sign-in (even an
 //! admin's), the hub's own token, a remote-MCP, Sees or boss-link token, an
 //! agent and a phone are each refused, so no tool call reaches either
 //! route. `[desk] allow_personal_key_export` (on by default) turns both
-//! off. Each copied connection leaves one `audit_log` row and one
-//! `sentinel.audit` line ("Desk on <device> copied your Jira key"), never a
-//! value. The copy on Desk is its own: removing either leaves the other.
+//! off. Each connection handed over leaves one `audit_log` row and one
+//! `sentinel.audit` line ("Your Jira key was handed over to Desk on
+//! <device>"), never a value: whether Desk's check then passed is said by
+//! Desk's own hub, in its row. The copy on Desk is its own: removing either
+//! leaves the other.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
@@ -124,6 +131,33 @@ pub fn copyable(id: &str) -> Option<&'static Connector> {
         .iter()
         .find(|c| c.id == id)
         .filter(|c| !c.shared && c.sign_in != SignIn::Google && !c.fields.is_empty())
+}
+
+/// How the tokens GitHub issues to an app on a sign-in begin: an OAuth
+/// app's (`gho_`, the device flow's), a GitHub App's on behalf of a person
+/// (`ghu_`) and its refresh token (`ghr_`). A personal access token is
+/// `ghp_` or `github_pat_`.
+const GITHUB_SIGN_IN_TOKENS: &[&str] = &["gho_", "ghu_", "ghr_"];
+
+/// Whether connection `key` of `c`, kept in `shape`, holds a token from a
+/// sign-in rather than one the person made: never copied, as revoking the
+/// sign-in here would leave the copy working.
+fn from_sign_in(vault: &Vault, c: &Connector, person: &Uuid, key: &str, shape: Shape) -> bool {
+    c.sign_in == SignIn::Github
+        && c.fields.iter().filter(|f| f.secret).any(|f| {
+            vault
+                .get(&personal(person, &field_path(c, f, key, shape)))
+                .is_some_and(|v| {
+                    let v = v.trim_start();
+                    GITHUB_SIGN_IN_TOKENS.iter().any(|p| v.starts_with(p))
+                })
+        })
+}
+
+/// How connection `key` of `c` is kept for `person`, if it is connected
+/// and Desk may copy it (not a sign-in's token).
+fn copyable_shape(vault: &Vault, c: &Connector, person: &Uuid, key: &str) -> Option<Shape> {
+    shape_of(vault, c, person, key).filter(|&shape| !from_sign_in(vault, c, person, key, shape))
 }
 
 /// Whether this hub's admin lets a person's Desk copy their keys, now.
@@ -288,7 +322,7 @@ pub fn connections_of(vault: &Vault, person: &Uuid) -> Vec<Listed> {
         }
         keys.sort();
         for key in keys {
-            if let Some(shape) = shape_of(vault, c, person, &key) {
+            if let Some(shape) = copyable_shape(vault, c, person, &key) {
                 out.push(listed(vault, c, person, &key, shape));
             }
         }
@@ -298,7 +332,7 @@ pub fn connections_of(vault: &Vault, person: &Uuid) -> Vec<Listed> {
 
 /// Connection `key` of `c`, its fields and all, if the person holds it.
 fn take_one(vault: &Vault, c: &'static Connector, person: &Uuid, key: &str) -> Option<Taken> {
-    let shape = shape_of(vault, c, person, key)?;
+    let shape = copyable_shape(vault, c, person, key)?;
     let fields = c
         .fields
         .iter()
@@ -382,6 +416,18 @@ async fn take(
     let Some(vault) = state.vault.as_ref() else {
         return no_vault();
     };
+    // Never listed, so asked for only by name: nothing is handed over.
+    let signed_in = picks.iter().any(|(c, pick)| {
+        shape_of(vault, c, &person, &pick.key)
+            .is_some_and(|shape| from_sign_in(vault, c, &person, &pick.key, shape))
+    });
+    if signed_in {
+        return refused(
+            StatusCode::BAD_REQUEST,
+            "A GitHub sign-in isn't copied: signing it out here wouldn't sign out Desk's copy. \
+             Sign in to GitHub on Desk, or connect it there with a personal access token",
+        );
+    }
     let mut copies = Vec::new();
     let mut missing = Vec::new();
     for (c, pick) in picks {
@@ -396,7 +442,9 @@ async fn take(
     no_store(Json(json!({ "copies": copies, "missing": missing })).into_response())
 }
 
-/// "Desk on Sarah's Mac copied your Jira key (Acme)".
+/// "Your Jira key (Acme) was handed over to Desk on Sarah's Mac": handed
+/// over, as this hub knows no more; Desk's own hub says whether its check
+/// passed and it was kept.
 pub fn summary(device: &str, l: &Listed) -> String {
     let device = device.trim();
     let device = if device.is_empty() {
@@ -409,11 +457,14 @@ pub fn summary(device: &str, l: &Listed) -> String {
     } else {
         format!(" ({})", l.name)
     };
-    format!("Desk on {device} copied your {} key{of}", l.service)
+    format!(
+        "Your {} key{of} was handed over to Desk on {device}",
+        l.service
+    )
 }
 
 /// One `sentinel.audit` line and one `audit_log` row for connection `l`
-/// copied by `device`: never a value.
+/// handed over to `device`: never a value.
 fn audit(
     state: &GatewayState,
     person: &Uuid,

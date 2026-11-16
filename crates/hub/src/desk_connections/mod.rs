@@ -2303,24 +2303,56 @@ fn hub_name(name: Option<&str>) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
-/// The audit row for keys of `connector` copied from hub `from` into
-/// `connection`: "Desk copied your Jira key (Acme) from Patchwork". Never
-/// a value.
-fn audit_copy(
-    routes: &Routes,
-    person: &str,
-    connector: &str,
-    connection: &ConnectionView,
-    from: &str,
-) {
+/// What became of keys Desk copied in from a paired hub.
+enum CopyEnd<'a> {
+    /// Its check passed, and it is kept as this connection.
+    Kept(&'a ConnectionView),
+    /// Not kept: refused so, over connection `connection` when it named one.
+    NotKept {
+        connection: Option<&'a str>,
+        refusal: &'a Refusal,
+    },
+}
+
+/// The audit row for keys of `connector` copied from hub `from`, saying
+/// whether their check passed: "Desk copied your Jira key (Acme) from
+/// Patchwork: its check passed", or "Desk didn't keep your Jira key from
+/// Patchwork: its check failed". The paired hub's own row says only that
+/// it handed them over. Never a value.
+fn audit_copy(routes: &Routes, person: &str, connector: &str, end: CopyEnd<'_>, from: &str) {
+    use workforce_common::admin::AuditOutcome;
     let service = catalog::find(connector).map_or(connector, |c| c.name);
-    let of = if connection.name == service {
-        String::new()
-    } else {
-        format!(" ({})", connection.name)
+    let (said, connection, check, outcome) = match end {
+        CopyEnd::Kept(c) => {
+            let of = if c.name == service {
+                String::new()
+            } else {
+                format!(" ({})", c.name)
+            };
+            (
+                format!("Desk copied your {service} key{of} from {from}: its check passed"),
+                Some(c.id.as_str()),
+                "passed",
+                AuditOutcome::Success,
+            )
+        }
+        CopyEnd::NotKept {
+            connection,
+            refusal,
+        } => {
+            let (why, check) = match refusal {
+                Refusal::TestFailed { .. } => (": its check failed", "failed"),
+                _ => ("", "not_run"),
+            };
+            (
+                format!("Desk didn't keep your {service} key from {from}{why}"),
+                connection,
+                check,
+                AuditOutcome::Error,
+            )
+        }
     };
-    let said = format!("Desk copied your {service} key{of} from {from}");
-    info!(target: "sentinel.audit", identity_id = %person, connector, "desk_connections.copy: {said}");
+    info!(target: "sentinel.audit", identity_id = %person, connector, check, "desk_connections.copy: {said}");
     let Some(telemetry) = routes.state.telemetry_store.as_ref() else {
         return;
     };
@@ -2328,16 +2360,20 @@ fn audit_copy(
         "summary": said,
         "identity_id": person,
         "connector": connector,
-        "connection": connection.id,
+        "connection": connection,
         "from": from,
+        "check": check,
     })
     .to_string();
     if let Err(e) = telemetry.record_audit(
         &format!("user:{person}"),
         "desk_connections.copy",
-        &format!("desk_connection:{connector}/{}", connection.id),
+        &format!(
+            "desk_connection:{connector}/{}",
+            connection.unwrap_or("new")
+        ),
         Some(&detail),
-        workforce_common::admin::AuditOutcome::Success,
+        outcome,
     ) {
         warn!(error = %e, "a copied connection's audit row wasn't written");
     }
@@ -2453,7 +2489,8 @@ async fn connect(
     Json(body): Json<ConnectBody>,
 ) -> Response {
     let person = person!(r, h, q);
-    r.connections
+    let kept = r
+        .connections
         .connect(
             &person,
             &connector,
@@ -2462,13 +2499,18 @@ async fn connect(
             body.agent.as_deref(),
             body.fields,
         )
-        .await
-        .map(|c| {
-            if let Some(from) = hub_name(body.copied_from.as_deref()) {
-                audit_copy(&r, &person, &connector, &c, &from);
-            }
-            Json(json!({ "connection": c }))
-        })
+        .await;
+    if let Some(from) = hub_name(body.copied_from.as_deref()) {
+        let end = match &kept {
+            Ok(c) => CopyEnd::Kept(c),
+            Err(refusal) => CopyEnd::NotKept {
+                connection: None,
+                refusal,
+            },
+        };
+        audit_copy(&r, &person, &connector, end, &from);
+    }
+    kept.map(|c| Json(json!({ "connection": c })))
         .into_response()
 }
 
@@ -2480,15 +2522,21 @@ async fn reconnect(
     Json(body): Json<FieldsBody>,
 ) -> Response {
     let person = person!(r, h, q);
-    r.connections
+    let kept = r
+        .connections
         .reconnect(&person, &connector, &connection, body.fields)
-        .await
-        .map(|c| {
-            if let Some(from) = hub_name(body.copied_from.as_deref()) {
-                audit_copy(&r, &person, &connector, &c, &from);
-            }
-            Json(json!({ "connection": c }))
-        })
+        .await;
+    if let Some(from) = hub_name(body.copied_from.as_deref()) {
+        let end = match &kept {
+            Ok(c) => CopyEnd::Kept(c),
+            Err(refusal) => CopyEnd::NotKept {
+                connection: Some(&connection),
+                refusal,
+            },
+        };
+        audit_copy(&r, &person, &connector, end, &from);
+    }
+    kept.map(|c| Json(json!({ "connection": c })))
         .into_response()
 }
 

@@ -19,7 +19,16 @@ const ANN_GITHUB: &str = "ghp_ann_github_secret_0002";
 const BOB_LINEAR: &str = "lin_api_bob_secret_0003";
 const ORG_DATADOG: &str = "org-datadog-shared-secret-0004";
 const ANN_SLACK: &str = "xoxb-ann-slack-secret-0005";
-const SECRETS: &[&str] = &[ANN_JIRA, ANN_GITHUB, BOB_LINEAR, ORG_DATADOG, ANN_SLACK];
+/// A token GitHub's device flow gave Ann's sign-in on this hub's OAuth app.
+const ANN_GITHUB_SIGNED_IN: &str = "gho_ann_signed_in_secret_0006";
+const SECRETS: &[&str] = &[
+    ANN_JIRA,
+    ANN_GITHUB,
+    BOB_LINEAR,
+    ORG_DATADOG,
+    ANN_SLACK,
+    ANN_GITHUB_SIGNED_IN,
+];
 
 struct Hub {
     app: Router,
@@ -33,9 +42,9 @@ struct Hub {
     _dir: tempfile::TempDir,
 }
 
-/// A hub holding Ann's flat Jira and named GitHub keys, her Slack bot
-/// token, Bob's Linear key and a shared Datadog key; each with a desktop
-/// device paired.
+/// A hub holding Ann's flat Jira and named GitHub keys, a GitHub sign-in
+/// of hers, her Slack bot token, Bob's Linear key and a shared Datadog key;
+/// each with a desktop device paired.
 async fn hub(allow: bool) -> Hub {
     let dir = tempfile::tempdir().unwrap();
     let (fx, devices) = fixture_with_devices(false);
@@ -63,6 +72,12 @@ async fn hub(allow: bool) -> Hub {
     me("skills/jira/api_token", ANN_JIRA, &a);
     me("skills/github/workspaces/acme/token", ANN_GITHUB, &a);
     me("skills/github/workspaces/acme/label", "Acme", &a);
+    me(
+        "skills/github/workspaces/work/token",
+        ANN_GITHUB_SIGNED_IN,
+        &a,
+    );
+    me("skills/github/workspaces/work/label", "Work", &a);
     me("slack.bot_token", ANN_SLACK, &a);
     me("skills/linear/api_key", BOB_LINEAR, &b);
     // The shared tier: the org's, never a person's to copy.
@@ -213,7 +228,7 @@ async fn ann_lists_her_own_personal_connections_and_never_a_value() {
             ("github".to_string(), "acme".to_string()),
             ("jira".to_string(), "default".to_string()),
         ],
-        "her own Jira and GitHub only: not Slack's bot token, not the org's Datadog, not Bob's Linear"
+        "her own Jira and GitHub token only: not her GitHub sign-in, Slack's bot token, the org's Datadog or Bob's Linear"
     );
     let jira = &v["connections"][1];
     assert_eq!(jira["name"], "Jira");
@@ -250,11 +265,11 @@ async fn ann_takes_her_keys_unstored_and_each_copy_is_audited_without_its_value(
         .map(|r| r["summary"].as_str().unwrap())
         .collect();
     assert!(
-        said.contains(&"Desk on Ann's Mac copied your Jira key"),
+        said.contains(&"Your Jira key was handed over to Desk on Ann's Mac"),
         "{said:?}"
     );
     assert!(
-        said.contains(&"Desk on Ann's Mac copied your GitHub key (Acme)"),
+        said.contains(&"Your GitHub key (Acme) was handed over to Desk on Ann's Mac"),
         "{said:?}"
     );
     for r in &rows {
@@ -314,6 +329,56 @@ async fn shared_and_sign_in_keys_are_never_copied() {
     let (status, _, _, _) = hub.take(&hub.ann_desk, &[]).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(hub.copies_audited().is_empty());
+}
+
+/// A GitHub token from a sign-in on this hub's OAuth app is never listed
+/// nor handed over, even asked for by name beside a personal access token:
+/// signing it out here would leave a copy on Desk working.
+#[tokio::test]
+async fn a_github_sign_ins_token_is_never_copied_but_a_personal_access_token_is() {
+    let hub = hub(true).await;
+    let (_, v, _) = hub.list(&hub.ann_desk).await;
+    assert!(
+        !listed_keys(&v).contains(&("github".to_string(), "work".to_string())),
+        "{v}"
+    );
+    for picks in [
+        &[("github", "work")][..],
+        &[("github", "acme"), ("github", "work")][..],
+    ] {
+        let (status, _, v, text) = hub.take(&hub.ann_desk, picks).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{picks:?}: {text}");
+        assert!(v.get("copies").is_none(), "nothing handed over: {text}");
+        assert!(text.contains("sign-in"), "{text}");
+        no_secret_in(&text);
+    }
+    assert!(hub.copies_audited().is_empty());
+
+    // Kept flat too, a space before it or not.
+    let dir = tempfile::tempdir().unwrap();
+    let vault = Vault::open(&dir.path().join("vault"), "test-key").unwrap();
+    let ann = Uuid::new_v4();
+    let github = copyable("github").unwrap();
+    for (token, copied) in [
+        (" gho_flat_sign_in_token", false),
+        ("ghu_app_user_token", false),
+        ("ghp_personal_access_token", true),
+        ("github_pat_fine_grained_token", true),
+    ] {
+        vault
+            .set(&format!("users/{ann}/skills/github/token"), token)
+            .unwrap();
+        assert_eq!(
+            connections_of(&vault, &ann).len(),
+            usize::from(copied),
+            "{token}"
+        );
+        assert_eq!(
+            take_one(&vault, github, &ann, DEFAULT_INSTANCE).is_some(),
+            copied,
+            "{token}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -439,7 +504,7 @@ fn an_instance_named_default_is_preferred_over_the_flat_keys() {
 }
 
 #[test]
-fn the_summary_names_the_device_and_the_connection() {
+fn the_summary_says_handed_over_naming_the_device_and_the_connection() {
     let l = Listed {
         connector: "jira",
         service: "Jira",
@@ -451,10 +516,10 @@ fn the_summary_names_the_device_and_the_connection() {
     };
     assert_eq!(
         summary("Sam's Mac", &l),
-        "Desk on Sam's Mac copied your Jira key (Acme)"
+        "Your Jira key (Acme) was handed over to Desk on Sam's Mac"
     );
     assert_eq!(
         summary(" ", &l),
-        "Desk on a computer copied your Jira key (Acme)"
+        "Your Jira key (Acme) was handed over to Desk on a computer"
     );
 }
