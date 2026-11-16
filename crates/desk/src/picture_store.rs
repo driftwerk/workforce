@@ -129,11 +129,28 @@ mod tests {
             }
             let (rows, top) = store.picture_load(now).await.unwrap();
             assert_eq!(top, 1000, "the largest number given, kept or not");
+            // Postgres keeps microseconds: compared by what each says.
+            let said: Vec<_> = rows
+                .iter()
+                .map(|r| {
+                    (
+                        r.seq,
+                        r.what,
+                        r.text.clone(),
+                        r.turn.clone(),
+                        r.sessions.clone(),
+                    )
+                })
+                .collect();
             assert_eq!(
-                rows,
-                vec![a.clone(), b.clone()],
+                said,
+                vec![
+                    (a.seq, a.what, a.text.clone(), a.turn.clone(), vec![]),
+                    (b.seq, b.what, b.text.clone(), None, vec![s]),
+                ],
                 "the day's rows, once each"
             );
+            assert_eq!(rows[0].session, Some(s));
             let mut again = Picture::default();
             assert!(again.load(rows, top).is_empty());
             let next = again

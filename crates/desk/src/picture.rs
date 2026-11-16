@@ -246,10 +246,8 @@ impl Picture {
             What::Fact | What::Order => now - r.at < FACTS_FOR,
             _ => now - r.at < KEPT_FOR,
         };
-        // The oldest that no longer counts go; facts and orders stay.
-        while self.rows.front().is_some_and(|r| !keeps(r)) {
-            self.rows.pop_front();
-        }
+        // What no longer counts goes; facts and orders stay longer.
+        self.rows.retain(keeps);
         while self.rows.len() > KEPT {
             self.rows.pop_front();
         }
