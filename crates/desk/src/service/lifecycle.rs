@@ -659,7 +659,9 @@ impl Desk {
             }
             None if r.state != SessionState::Closed => {
                 self.0.state.lock().acted.insert(id);
-                self.change(id, |r, _| r.state = SessionState::Closed);
+                self.change(id, |r, _| {
+                    r.state = super::finish::closed(super::finish::Finish::Ended)
+                });
             }
             None => {}
         }

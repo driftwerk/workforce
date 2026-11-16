@@ -121,6 +121,7 @@ mod rooms_tests;
 pub use moves::{EffectView, HandoverView, MoveAsk, MoveCommit, MoveDone, MovePreview, SentNote};
 mod scopes;
 pub use scopes::Boss;
+mod finish;
 #[cfg(test)]
 mod scopes_tests;
 mod terminals;
@@ -5495,7 +5496,7 @@ impl Desk {
         self.change(id, |r, _| {
             // Ended from Desk, whether before its exit was seen or since.
             r.state = if closing || r.state == SessionState::Closed {
-                SessionState::Closed
+                finish::closed(finish::Finish::Ended)
             } else if clean {
                 SessionState::Stopped
             } else {
@@ -7576,12 +7577,17 @@ impl Desk {
                 .values()
                 .filter(|r| r.origin == Origin::External && r.state.is_running())
                 .filter(|r| !present.contains(&r.id))
+                // Running here (taken back from the holder): its process is
+                // this hub's to see end, never a listing's.
+                .filter(|r| !st.live.contains_key(&r.id))
                 .map(|r| r.id)
                 .collect()
         };
         for id in gone {
-            // Closed in its own terminal while the hub watched: not a loss.
-            self.change(id, |r, _| r.state = SessionState::Closed);
+            // Ended in its own terminal while the hub watched: not a loss,
+            // and not finished either. It stays, to be resumed or closed by
+            // the person ([`finish`]).
+            self.change(id, |r, _| r.state = SessionState::Stopped);
         }
     }
 
@@ -8263,6 +8269,71 @@ mod tests {
                 .unwrap();
             tokio::time::sleep(Duration::from_millis(100)).await;
             assert!(h.list().await.unwrap().is_empty());
+            holder_cancel.cancel();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_held_session_recorded_as_another_terminals_is_never_closed_after_a_restart() {
+        with_test_pool(build_pool, |pool| async move {
+            let (_hdir, socket, holder_cancel) = crate::holder::tests::holder().await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut opts = options(dir.path());
+            opts.holder = Some(HolderOptions {
+                socket: socket.clone(),
+                token: crate::holder::tests::TOKEN.into(),
+            });
+            DeskStore::migrate(&pool).await.unwrap();
+            let first_cancel = CancellationToken::new();
+            let first = Desk::start(
+                DeskStore::from_pool(pool.clone()),
+                opts.clone(),
+                Default::default(),
+                first_cancel.clone(),
+            )
+            .await
+            .unwrap();
+            let s = new_session(&first, dir.path()).await;
+            let pid = first.attach(s.id).unwrap().pid().unwrap() as i32;
+            // As the hub of 16 Nov kept it: the holder's process, its record
+            // another terminal's.
+            first.change(s.id, |r, _| {
+                r.cli_session_id = Some("cli-held".into());
+                r.origin = Origin::External;
+                r.external_pid = Some(pid);
+                r.state = SessionState::Idle;
+            });
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            first_cancel.cancel();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            let second = Desk::start(
+                DeskStore::from_pool(pool.clone()),
+                opts.clone(),
+                Default::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(second.view(s.id).unwrap().live, "taken back");
+            // `claude agents` lists it, running in the holder.
+            let listed = adopt::parse(
+                json!([{ "pid": pid, "cwd": s.cwd, "kind": "interactive",
+                    "sessionId": "cli-held", "status": "idle" }])
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+            second.reconcile_external(listed).await;
+            second.reconcile_external(Vec::new()).await;
+            let v = second.view(s.id).unwrap();
+            assert_ne!(v.state, SessionState::Closed, "its process still runs");
+            assert!(v.live);
+            assert_eq!(second.attach(s.id).unwrap().pid(), Some(pid as u32));
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let saved = DeskStore::from_pool(pool).get(s.id).await.unwrap().unwrap();
+            assert_ne!(saved.state, SessionState::Closed);
             holder_cancel.cancel();
         })
         .await;
@@ -9816,7 +9887,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sessions_in_other_terminals_are_adopted_and_closed_when_they_go() {
+    async fn sessions_in_other_terminals_are_adopted_and_kept_when_they_go() {
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
             let d = desk(pool, dir.path()).await;
@@ -9837,9 +9908,11 @@ mod tests {
             d.reconcile_external(ext(false)).await;
             assert_eq!(d.view(s.id).unwrap().state, SessionState::Idle);
 
+            // Ended there: kept, never closed by a listing that no longer
+            // shows it.
             d.reconcile_external(vec![]).await;
-            assert_eq!(d.view(s.id).unwrap().state, SessionState::Closed);
-            assert!(d.list().iter().all(|v| v.id != s.id));
+            assert_eq!(d.view(s.id).unwrap().state, SessionState::Stopped);
+            assert!(d.list().iter().any(|v| v.id == s.id));
         })
         .await;
     }
