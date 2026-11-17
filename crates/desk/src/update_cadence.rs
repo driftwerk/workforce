@@ -257,13 +257,15 @@ const READERS: &[&str] = &[
     "jest",
 ];
 
-/// `git` subcommands that only read.
 /// Subcommands that only read, check, build or test: what they are given
 /// (a test filter, `cargo test -p desk deploy`) is never a step.
 const READING: &[(&str, &[&str])] = &[
     (
         "git",
-        &["grep", "diff", "show", "log", "blame", "status", "fetch"],
+        &[
+            "grep", "diff", "show", "log", "blame", "status", "fetch", "checkout", "switch",
+            "branch",
+        ],
     ),
     (
         "cargo",
@@ -275,7 +277,10 @@ const READING: &[(&str, &[&str])] = &[
     ("npm", &["test"]),
     ("pnpm", &["test", "vitest", "jest", "tsc", "eslint"]),
     ("yarn", &["test", "vitest", "jest", "tsc", "eslint"]),
-    ("npx", &["vitest", "jest", "tsc", "eslint", "prettier"]),
+    (
+        "npx",
+        &["vitest", "jest", "tsc", "eslint", "prettier", "playwright"],
+    ),
 ];
 
 /// Programs that run the script they are given: its file's name says what
@@ -356,15 +361,28 @@ fn pathy(word: &str) -> bool {
     !word.contains(char::is_whitespace) && (word.contains('/') || word.contains('.'))
 }
 
-/// The step one command takes (`words`, quotes removed): by its program
-/// and the words it is given, each whole, never a part of one. A path
-/// counts only when it is what runs: the program, the script an
-/// interpreter runs, or the workflow `gh workflow run` starts. Nothing
-/// for a program that only reads, prose, or what follows `--`.
-fn one_step(words: &[String]) -> Option<Important> {
+/// Verbs that only look, at any level of a program's subcommands (`gh
+/// release list`, `kubectl get deploy`, `docker compose logs`).
+const LOOKS: &[&str] = &[
+    "list", "ls", "view", "show", "status", "checks", "diff", "watch", "get", "describe", "logs",
+    "top", "explain", "ps", "inspect", "images",
+];
+
+/// How many of a command's words after its program name what it does
+/// (`gh pr merge`, `docker stack deploy`): the rest are what it does it to.
+const SUBCOMMANDS: usize = 2;
+
+/// The step one command takes (`words`, quotes removed), `depth` commands
+/// deep in what hosts and shells run: by its program and its first words
+/// ([`SUBCOMMANDS`]), each whole, never a part of one. A path counts only
+/// when it is what runs: the program, the script an interpreter runs, or
+/// the workflow `gh workflow run` starts; what a script is given never
+/// does. Nothing for a program or subcommand that only reads or looks,
+/// for prose, or for what follows `--`.
+fn one_step(words: &[String], depth: usize) -> Option<Important> {
     let words = what_runs(words);
-    let (program, rest) = words.split_first()?;
-    let program = named_as(program);
+    let (first, rest) = words.split_first()?;
+    let program = named_as(first);
     if READERS.contains(&program.as_str()) {
         return None;
     }
@@ -378,11 +396,11 @@ fn one_step(words: &[String]) -> Option<Important> {
                 .skip(1)
                 .map(String::as_str)
                 .collect();
-            return command_step(&remote.join(" "));
+            return command_step(&remote.join(" "), depth + 1);
         }
         "bash" | "sh" | "zsh" => {
             if let Some(script) = rest.iter().skip_while(|w| *w != "-c").nth(1) {
-                return command_step(script);
+                return command_step(script, depth + 1);
             }
         }
         _ => {}
@@ -391,6 +409,7 @@ fn one_step(words: &[String]) -> Option<Important> {
     let flags = |f: &str| args.iter().any(|w| *w == f);
     let runs_script = INTERPRETERS.contains(&program.as_str()) && !flags("-n") && !flags("-c");
     let mut said = vec![program.clone()];
+    let mut subs = 0;
     let mut skip = false;
     for w in &args {
         if std::mem::take(&mut skip) {
@@ -407,26 +426,44 @@ fn one_step(words: &[String]) -> Option<Important> {
         }
         let workflow = said.ends_with(&["workflow".to_string(), "run".to_string()]);
         match pathy(w) {
-            true if runs_script || workflow => said.push(named_as(w)),
+            true if (runs_script && subs == 0) || workflow => said.push(named_as(w)),
             true => {}
-            false => said.extend(w.split_whitespace().map(str::to_lowercase)),
+            false if subs < SUBCOMMANDS && !pathy(first) && program != "find" => {
+                subs += 1;
+                said.extend(
+                    w.split_whitespace()
+                        .take(SUBCOMMANDS)
+                        .map(str::to_lowercase),
+                );
+            }
+            false => {}
         }
     }
     let reads = READING.iter().any(|(p, subs)| {
         *p == program && said.get(1).is_some_and(|sub| subs.contains(&sub.as_str()))
     });
-    match reads {
+    let looks = said[1..].iter().any(|w| LOOKS.contains(&w.as_str()))
+        || (program == "git"
+            && said.get(1).is_some_and(|s| s == "tag")
+            && (flags("-l") || flags("--list")));
+    match reads || looks {
         true => None,
         false => step(&said),
     }
 }
 
+/// How many hosts and shells deep [`command_step`] reads a command.
+const RUN_DEPTH: usize = 16;
+
 /// The step a shell command takes: the first any of its commands takes
-/// ([`one_step`]).
-fn command_step(command: &str) -> Option<Important> {
+/// ([`one_step`]); none past [`RUN_DEPTH`].
+fn command_step(command: &str, depth: usize) -> Option<Important> {
+    if depth > RUN_DEPTH {
+        return None;
+    }
     crate::computer::boss::commands(command)
         .iter()
-        .find_map(|words| one_step(words))
+        .find_map(|words| one_step(words, depth))
 }
 
 /// The step a request a boss allowed takes (`request`: its tool, then
@@ -436,7 +473,7 @@ fn approved_step(request: &str) -> Option<Important> {
     let (tool, detail) = request.split_once(": ").unwrap_or((request, ""));
     match tool.trim() {
         t if FILE_TOOLS.contains(&t) => None,
-        "Bash" => command_step(detail),
+        "Bash" => command_step(detail, 0),
         t => step(&words(&t.replace('_', " "))),
     }
 }

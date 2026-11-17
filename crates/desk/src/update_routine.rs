@@ -486,6 +486,20 @@ mod tests {
             "Bash: python -m pytest -k deploy",
             "Bash: uv run pytest -k merge",
             "Bash: pnpm vitest deploy",
+            "Bash: gh release list",
+            "Bash: gh release view v1.2.0",
+            "Bash: gh pr list --state merged",
+            "Bash: gh run list -w deploy",
+            "Bash: gh workflow view deploy",
+            "Bash: kubectl get deploy",
+            "Bash: kubectl describe deploy web",
+            "Bash: docker compose logs deploy",
+            "Bash: git tag -l",
+            "Bash: git tag --list 'v*'",
+            "Bash: git checkout release",
+            "Bash: npx playwright test release",
+            "Bash: ./scripts/run-tests.sh --filter release",
+            "Bash: find . -type d -name release",
             "Bash: ./tests/stack-deploy-tests.sh $(date +%s)",
             "Bash: git commit -m \"Release the deploy fix\" && echo $(git rev-parse HEAD)",
         ] {
@@ -515,6 +529,12 @@ mod tests {
             ("Bash: ssh host 'cd /srv && ./deploy.sh'", Important::Released),
             ("Bash: psql -c \"DROP TABLE users\" $(echo db)", Important::Deleted),
             ("Bash: env FOO=1 ./deploy.sh", Important::Released),
+            ("Bash: gh release create v1.2.0", Important::Released),
+            ("Bash: git tag v1.2.0", Important::Released),
+            ("Bash: kubectl -n web delete deploy web", Important::Deleted),
+            ("Bash: git push origin --delete old", Important::Deleted),
+            ("Bash: xargs -I {} rm {}", Important::Deleted),
+            ("Bash: npm run deploy", Important::Released),
             ("Bash: sudo -u svc ./deploy.sh", Important::Released),
             ("Bash: timeout 600 ./deploy.sh", Important::Released),
             (
@@ -556,6 +576,8 @@ mod tests {
         // running out of stack.
         let deep = format!("Bash: echo \"{}x{}\"", "$(".repeat(5000), ")".repeat(5000));
         assert_eq!(important(Approve, &deep), None);
+        let hops = format!("Bash: {}true", "ssh h ".repeat(5000));
+        assert_eq!(important(Approve, &hops), None);
         // A message naming the merge queue or a dry run sets nothing to
         // happen; one that queues the release does.
         use ActionKind::Message;
