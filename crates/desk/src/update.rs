@@ -777,6 +777,10 @@ pub struct BriefItem {
     #[serde(default)]
     pub settled_by: Option<SettledBy>,
     pub at: DateTime<Utc>,
+    /// How many decisions a folded run's line stands for ("What I did · N"
+    /// counts each); none on a line of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folded: Option<u32>,
 }
 
 /// One session's lines in an update's brief; `sessionId` null for what
@@ -850,6 +854,7 @@ pub fn brief(
                 undo: None,
                 settled_by: None,
                 at: i.opened_at,
+                folded: None,
             },
         ));
     }
@@ -889,6 +894,7 @@ pub fn brief(
                 undo: l.undo.clone(),
                 settled_by: None,
                 at: d.at,
+                folded: None,
             },
         ));
     }
@@ -938,6 +944,7 @@ pub fn brief_item(d: &BossDecision, l: &DecisionLine) -> BriefItem {
         undo: l.undo.clone(),
         settled_by: None,
         at: d.at,
+        folded: None,
     }
 }
 
@@ -2142,6 +2149,7 @@ mod tests {
                 undo: None,
                 settled_by: None,
                 at: Utc::now(),
+                folded: None,
             }],
             left_alone: 0,
         }];
