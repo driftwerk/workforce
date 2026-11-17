@@ -1358,8 +1358,9 @@ pub fn moves_dir(command: &str) -> bool {
 }
 
 /// Each command `command` runs, as its words with their quotes removed (a
-/// quoted argument one word); split plainly on whitespace and the shell's
-/// separators when Desk can't split it.
+/// quoted argument one word). One Desk can't split is read only up to its
+/// first quote, expansion or heredoc (what follows may be a message's
+/// words), split plainly on whitespace and the shell's separators.
 pub fn commands(command: &str) -> Vec<Vec<String>> {
     match split(command) {
         Ok(cmds) => cmds
@@ -1367,12 +1368,14 @@ pub fn commands(command: &str) -> Vec<Vec<String>> {
             .map(|c| c.words.into_iter().map(|w| w.text).collect())
             .collect(),
         Err(()) => command
+            .split(['\'', '"', '`', '$'])
+            .next()
+            .unwrap_or_default()
+            .split("<<")
+            .next()
+            .unwrap_or_default()
             .split(|c: char| ";&|\n()".contains(c))
-            .map(|c| {
-                c.split_whitespace()
-                    .map(|w| w.trim_matches(|q| q == '\'' || q == '"').to_string())
-                    .collect()
-            })
+            .map(|c| c.split_whitespace().map(str::to_string).collect())
             .collect(),
     }
 }

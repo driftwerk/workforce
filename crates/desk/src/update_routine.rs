@@ -110,9 +110,15 @@ pub fn runs<'a>(
 ) -> Vec<Run<'a>> {
     let mut rows: Vec<&BossDecision> = rows.into_iter().collect();
     rows.sort_by_key(|d| d.at);
-    let mut groups: Vec<((Option<Uuid>, String), Vec<&BossDecision>)> = Vec::new();
+    // What is about no session is grouped by what it names.
+    type Key = (Option<Uuid>, String, Option<String>);
+    let mut groups: Vec<(Key, Vec<&BossDecision>)> = Vec::new();
     for d in rows {
-        let key = (d.session, verb(d));
+        let key = (
+            d.session,
+            verb(d),
+            d.session.is_none().then(|| named_in(d)).flatten(),
+        );
         match groups.iter_mut().find(|(k, _)| *k == key) {
             Some((_, g)) => g.push(d),
             None => groups.push((key, vec![d])),
@@ -120,7 +126,7 @@ pub fn runs<'a>(
     }
     groups
         .into_iter()
-        .map(|((session, verb), rows)| {
+        .map(|((session, verb, _), rows)| {
             let named = session
                 .and_then(name)
                 .or_else(|| rows.iter().find_map(|d| named_in(d)))
@@ -457,6 +463,18 @@ mod tests {
             "Bash: git commit -m \"Merge the deploy fixture fix\"",
             "Bash: shellcheck scripts/deploy.sh",
             "Bash: docker run --rm alpine true",
+            "Bash: git commit -m \"$(cat <<'EOF'\nMerge the deploy fixture fix\n\nDrop the old tag.\nEOF\n)\"",
+            "Bash: gh pr create --title \"Fix it\" --body \"$(cat <<'EOF'\nRelease notes: merge after deploy.\nEOF\n)\"",
+            "Bash: git commit -m \"Fix $X deploy\"",
+            "Bash: git commit -am \"Merge the deploy fix\"",
+            "Bash: git diff -- scripts/deploy.sh",
+            "Bash: git show HEAD:scripts/deploy.sh",
+            "Bash: git grep deploy",
+            "Bash: git -C /repo/.worktrees/release log --oneline",
+            "Bash: cd /repo/.worktrees/release && ls",
+            "Bash: npx vitest run src/merge.test.ts",
+            "Bash: cargo test -- merge",
+            "Bash: bash -n scripts/deploy.sh",
         ] {
             assert_eq!(important(Approve, request), None, "{request}");
         }
@@ -472,6 +490,8 @@ mod tests {
                 Important::Released,
             ),
             ("Bash: rm -rf target/", Important::Deleted),
+            ("Bash: bash scripts/deploy.sh prod", Important::Released),
+            ("Bash: git -C /repo merge origin/main", Important::Merged),
             (
                 "Bash: find /tmp/x -name '*.log' -delete",
                 Important::Deleted,

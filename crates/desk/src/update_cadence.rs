@@ -251,22 +251,28 @@ const READERS: &[&str] = &[
     "df",
     "du",
     "test",
+    "cd",
 ];
+
+/// `git` subcommands that only read.
+const GIT_READERS: &[&str] = &["grep", "diff", "show", "log", "blame", "status", "fetch"];
+
+/// Programs that run the script they are given: its file's name says what
+/// it does (`bash scripts/deploy.sh`), unless it is only checked (`-n`) or
+/// a script is given inline (`-c`).
+const INTERPRETERS: &[&str] = &["bash", "sh", "zsh", "python", "python3", "node"];
 
 /// Wrappers that run the command after them.
 const WRAPPERS: &[&str] = &["sudo", "env", "nohup", "time", "command", "exec", "xargs"];
 
 /// Flags whose value is prose (a commit message, a PR's title or body):
-/// words in it are never the command's step.
-const PROSE: &[&str] = &[
-    "-m",
-    "--message",
-    "--title",
-    "-t",
-    "--body",
-    "-b",
-    "--notes",
-];
+/// words in it are never the command's step. A cluster of short flags
+/// ending in `m` (`-am`) is one too.
+const PROSE: &[&str] = &["--message", "--title", "-t", "--body", "-b", "--notes"];
+
+fn prose(flag: &str) -> bool {
+    PROSE.contains(&flag) || (!flag.starts_with("--") && flag.len() > 1 && flag.ends_with('m'))
+}
 
 /// Flags that delete what the command is given (`find … -delete`).
 const DELETING_FLAGS: &[&str] = &["delete", "prune", "purge"];
@@ -283,39 +289,67 @@ fn named_as(word: &str) -> String {
     stem.to_lowercase()
 }
 
-/// The step a shell command takes: by its program and the words it is
-/// given, each a whole word (a path by its file's name), never a part of
-/// one; nothing for a program that only reads, or for prose.
+/// Whether `word` names a file or folder (`scripts/deploy.sh`,
+/// `promote.yml`) rather than saying something.
+fn pathy(word: &str) -> bool {
+    !word.contains(char::is_whitespace) && (word.contains('/') || word.contains('.'))
+}
+
+/// The step one command takes (`words`, quotes removed): by its program
+/// and the words it is given, each whole, never a part of one. A path
+/// counts only when it is what runs: the program, the script an
+/// interpreter runs, or the workflow `gh workflow run` starts. Nothing
+/// for a program that only reads, prose, or what follows `--`.
+fn one_step(words: &[String]) -> Option<Important> {
+    let mut words = words
+        .iter()
+        .skip_while(|w| w.contains('=') && !w.starts_with('-'))
+        .skip_while(|w| WRAPPERS.contains(&named_as(w).as_str()));
+    let program = named_as(words.next()?);
+    if READERS.contains(&program.as_str()) {
+        return None;
+    }
+    let args: Vec<&String> = words.take_while(|w| *w != "--").collect();
+    let flags = |f: &str| args.iter().any(|w| *w == f);
+    let runs_script = INTERPRETERS.contains(&program.as_str()) && !flags("-n") && !flags("-c");
+    let mut said = vec![program.clone()];
+    let mut skip = false;
+    for w in &args {
+        if std::mem::take(&mut skip) {
+            continue;
+        }
+        if w.starts_with('-') {
+            skip = prose(w);
+            let flag = w.trim_start_matches('-');
+            let flag = flag.split_once('=').map_or(flag, |(f, _)| f);
+            if DELETING_FLAGS.contains(&flag) {
+                said.push(flag.to_string());
+            }
+            continue;
+        }
+        let workflow = said.ends_with(&["workflow".to_string(), "run".to_string()]);
+        match pathy(w) {
+            true if runs_script || workflow => said.push(named_as(w)),
+            true => {}
+            false => said.extend(w.split_whitespace().map(str::to_lowercase)),
+        }
+    }
+    let git_reads = program == "git"
+        && said
+            .get(1)
+            .is_some_and(|sub| GIT_READERS.contains(&sub.as_str()));
+    match git_reads {
+        true => None,
+        false => step(&said),
+    }
+}
+
+/// The step a shell command takes: the first any of its commands takes
+/// ([`one_step`]).
 fn command_step(command: &str) -> Option<Important> {
     crate::computer::boss::commands(command)
         .iter()
-        .find_map(|words| {
-            let mut words = words
-                .iter()
-                .skip_while(|w| w.contains('=') && !w.starts_with('-'))
-                .skip_while(|w| WRAPPERS.contains(&named_as(w).as_str()));
-            let program = named_as(words.next()?);
-            if READERS.contains(&program.as_str()) {
-                return None;
-            }
-            let mut said = vec![program];
-            let mut prose = false;
-            for w in words {
-                match (prose, w.starts_with('-')) {
-                    (true, _) => prose = false,
-                    (false, true) => {
-                        prose = PROSE.contains(&w.as_str());
-                        let flag = w.trim_start_matches('-');
-                        let flag = flag.split_once('=').map_or(flag, |(f, _)| f);
-                        if DELETING_FLAGS.contains(&flag) {
-                            said.push(flag.to_string());
-                        }
-                    }
-                    (false, false) => said.extend(w.split_whitespace().map(named_as)),
-                }
-            }
-            step(&said)
-        })
+        .find_map(|words| one_step(words))
 }
 
 /// The step a request a boss allowed takes (`request`: its tool, then
