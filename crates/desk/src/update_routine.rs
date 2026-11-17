@@ -5,7 +5,9 @@
 //! edits, and local test runs."), the run's decisions behind it in full.
 //!
 //! A roundup lists only the important ones under "Decided without you"
-//! ([`told`]); the routine ones are its "N routine things · Show", as runs.
+//! ([`told`]), one entry a session ([`by_session`]): its count and when,
+//! its decisions under it; the routine ones are its "N routine things ·
+//! Show", as runs.
 //! A message right away folds a run into one line of its "What I did"
 //! ([`folded`]).
 
@@ -14,8 +16,9 @@ use chrono_tz::Tz;
 use uuid::Uuid;
 use workforce_common::oversight::Decided;
 
-use crate::decision::{BossDecision, DecisionKind, DecisionLine};
+use crate::decision::{BossDecision, DecisionKind, DecisionLine, UndoPlan};
 use crate::update::{is_close, BriefItem, BriefKind};
+use crate::update_cadence::Important;
 use crate::update_write::{capitalised, EventKind, Said, SessionLink};
 
 /// Whether `d` is routine: what it did that is not important, or a look
@@ -92,6 +95,7 @@ impl Run<'_> {
             session,
             did,
             at: self.rows.first().map(|d| d.at),
+            decisions: None,
         }
     }
 }
@@ -273,10 +277,11 @@ pub fn themes<'a>(whys: impl IntoIterator<Item = &'a str>) -> Option<String> {
 /// their decisions setting.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Told<'a> {
-    /// Listed one by one under "Decided without you": the important ones.
+    /// Listed under "Decided without you", in their session's entry
+    /// ([`by_session`]): the important ones.
     pub listed: Vec<&'a BossDecision>,
-    /// Listed under it as runs: the routine ones, when the person asked
-    /// for every one.
+    /// Listed in their session's entry too, as runs: the routine ones,
+    /// when the person asked for every one.
     pub listed_runs: Vec<Run<'a>>,
     /// Behind "N routine things · Show", as runs.
     pub routine: Vec<Run<'a>>,
@@ -318,6 +323,166 @@ pub fn told<'a>(
         listed_runs: runs(every, name, tz),
         routine: runs(routine, name, tz),
     }
+}
+
+/// Whether `d` sent a session words (a line, or an answer to its
+/// question), rather than doing something itself.
+fn is_message(d: &BossDecision) -> bool {
+    matches!(d.plan(), Some(UndoPlan::Line { .. }))
+}
+
+/// Whether `d` did something that matters itself: merged, released,
+/// deleted, spent, or overrode a session. A message about doing so (later,
+/// or once CI is green) never is: the session does it, and says so.
+pub fn is_notable(d: &BossDecision) -> bool {
+    d.kind == DecisionKind::Acted
+        && !is_message(d)
+        && d.important.is_some_and(|i| i != Important::Later)
+}
+
+/// How much what an entry of "Decided without you" holds matters, for its
+/// order: something done that matters itself, then what was important
+/// (messages about merging or releasing later), then the routine.
+fn weight(d: &BossDecision) -> u8 {
+    match (is_notable(d), d.important.is_some()) {
+        (true, _) => 2,
+        (false, true) => 1,
+        (false, false) => 0,
+    }
+}
+
+/// What a roundup lists under "Decided without you" for one session (or
+/// for what is about no session): one line, its decisions under it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Entry<'a> {
+    pub session: Option<Uuid>,
+    /// The session as the person knows it; "Crew" for what is about none.
+    pub name: String,
+    /// Its decisions, in the order they were made.
+    pub rows: Vec<&'a BossDecision>,
+}
+
+impl Entry<'_> {
+    /// Its line: one sentence ("Billing Migration · 14 decisions,
+    /// 17:05–17:55"), the session's link, and under it each decision
+    /// (from `lines`, laid out from its rows), the newest first, without
+    /// the session's name again ("Sent it a message"); a run of routine
+    /// ones folded into one line, as "What I did" folds them. Every one has
+    /// its Undo; a Desk shows the first few and the notable ones, the rest
+    /// behind "N more". Its kind is routine so a Desk older than this lists
+    /// it as a run, each of them behind "Show all".
+    pub fn said(&self, lines: &[DecisionLine], session: Option<SessionLink>, tz: &Tz) -> Said {
+        let mut items: Vec<BriefItem> = self
+            .rows
+            .iter()
+            .filter_map(|d| Some(crate::update::brief_item(d, line_of(lines, d)?)))
+            .collect();
+        items.reverse();
+        let rows: Vec<BossDecision> = self.rows.iter().map(|d| (*d).clone()).collect();
+        let mut did = folded(items, &rows, tz);
+        for i in &mut did {
+            i.action = without_name(&i.action, &self.name);
+        }
+        let n: u32 = did.iter().map(|i| i.folded.unwrap_or(1)).sum();
+        let clock = |at: DateTime<Utc>| at.with_timezone(tz).format("%H:%M").to_string();
+        let (from, until) = match (self.rows.first(), self.rows.last()) {
+            (Some(f), Some(l)) => (clock(f.at), clock(l.at)),
+            _ => (String::new(), String::new()),
+        };
+        let count = match n {
+            1 => "1 decision".to_string(),
+            n => format!("{n} decisions"),
+        };
+        let when = match from == until {
+            true => format!(" at {from}"),
+            false => format!(", {from}–{until}"),
+        };
+        Said {
+            kind: EventKind::Routine,
+            headline: format!("{} · {count}{when}", self.name),
+            body: String::new(),
+            ids: vec![],
+            not_checked: None,
+            session,
+            did,
+            at: self.rows.last().map(|d| d.at),
+            decisions: Some(n),
+        }
+    }
+}
+
+/// `action` said under its session's own line: "Sent Billing Migration a
+/// message" as "Sent it a message", "Answered Billing Migration's
+/// question" as "Answered its question". Only the name as whole words: a
+/// session named "web" leaves "website" alone.
+fn without_name(action: &str, name: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() || name == crate::update::CREW_LABEL {
+        return action.to_string();
+    }
+    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '-');
+    let Some(at) = action.match_indices(name).map(|(i, _)| i).find(|&i| {
+        !word(action[..i].chars().next_back()) && !word(action[i + name.len()..].chars().next())
+    }) else {
+        return action.to_string();
+    };
+    let after = &action[at + name.len()..];
+    let (pronoun, rest) = match ["'s", "’s"].iter().find(|p| after.starts_with(*p)) {
+        Some(p) => ("its", &after[p.len()..]),
+        None => ("it", after),
+    };
+    let pronoun = match at {
+        0 => capitalised(pronoun),
+        _ => pronoun.to_string(),
+    };
+    format!("{}{pronoun}{rest}", &action[..at])
+}
+
+/// What a roundup lists under "Decided without you" (`rows`: the
+/// important ones, and every one when the person asked for that), as one
+/// entry a session and one for what is about no session: those that did
+/// something that matters first, then those that only said something
+/// important, the latest first within each. `name` names a session as the
+/// person knows it (else as its decisions did).
+pub fn by_session<'a>(
+    rows: impl IntoIterator<Item = &'a BossDecision>,
+    name: &dyn Fn(Uuid) -> Option<String>,
+) -> Vec<Entry<'a>> {
+    let mut rows: Vec<&BossDecision> = rows.into_iter().collect();
+    rows.sort_by_key(|d| d.at);
+    let mut entries: Vec<Entry> = Vec::new();
+    for d in rows {
+        match entries.iter_mut().find(|e| e.session == d.session) {
+            Some(e) => e.rows.push(d),
+            None => entries.push(Entry {
+                session: d.session,
+                name: String::new(),
+                rows: vec![d],
+            }),
+        }
+    }
+    for e in &mut entries {
+        e.name = match e.session {
+            // Not listed: as its decisions named it, the shortest of
+            // those names ("Billing Migration", not "Billing Migration
+            // again in manual mode").
+            Some(s) => name(s)
+                .or_else(|| {
+                    e.rows
+                        .iter()
+                        .filter_map(|d| named_in(d))
+                        .min_by_key(|n| n.chars().count())
+                })
+                .unwrap_or_else(|| "A session".into()),
+            None => crate::update::CREW_LABEL.into(),
+        };
+    }
+    entries.sort_by_key(|e| {
+        let weight = e.rows.iter().map(|d| weight(d)).max().unwrap_or(0);
+        let latest = e.rows.last().map(|d| d.at);
+        (std::cmp::Reverse(weight), std::cmp::Reverse(latest))
+    });
+    entries
 }
 
 /// How many routine items in a row of one kind a "What I did" folds into
@@ -374,6 +539,7 @@ pub fn folded(items: Vec<BriefItem>, rows: &[BossDecision], tz: &Tz) -> Vec<Brie
             settled_by: None,
             at: i.at,
             folded: Some(each.len() as u32),
+            notable: false,
         });
     }
     out
@@ -725,6 +891,299 @@ mod tests {
         let asked = told(&rows, Decided::Ask, &name, &tz);
         assert!(asked.listed.is_empty());
         assert_eq!(asked.routine_count(), 17);
+    }
+
+    /// An hour like the 17:00 roundup of 17 Nov, its names changed: five
+    /// sessions, most of what the boss decided messages about merging
+    /// later, a few stops and a restart in manual mode, and the routine.
+    fn the_busy_hour() -> (Vec<BossDecision>, Vec<(Uuid, &'static str)>) {
+        use crate::decision::Undo;
+        let billing: Uuid = FIX.parse().unwrap();
+        let leads = Uuid::from_u128(2);
+        let ledger = Uuid::from_u128(3);
+        let lockdown = Uuid::from_u128(4);
+        let headers = Uuid::from_u128(5);
+        let review = Uuid::from_u128(6);
+        let names = vec![
+            (billing, "Billing Migration"),
+            (leads, "Lead Fix"),
+            (ledger, "Ledger Tidy"),
+            (lockdown, "Access Lockdown"),
+            (headers, "Access Headers"),
+            (review, "Review PRs"),
+        ];
+        let name_of = |s: Uuid| names.iter().find(|(id, _)| *id == s).unwrap().1;
+        let told = |s: Uuid, m: u32, text: &str, tag: Option<Important>| {
+            let mut d = BossDecision::new(
+                "desk",
+                Need::Approval,
+                &format!("told {} “{text}”", name_of(s)),
+                "It keeps the plan the person set.",
+                How::Own,
+            );
+            d.at = at(17, m);
+            d.session = Some(s);
+            d.message = Some(text.into());
+            d.brief = format!("Sent {} a message.", name_of(s));
+            d.action = serde_json::json!({
+                "kind": "line", "session": s, "message": Uuid::new_v4(), "text": text,
+            });
+            d.undo = Undo::Withdraw;
+            d.important = tag;
+            d
+        };
+        let did = |s: Uuid, m: u32, what: &str, tag: Option<Important>| {
+            let mut d = BossDecision::new(
+                "desk",
+                Need::Approval,
+                &format!("{what} {}", name_of(s)),
+                "The person asked for it.",
+                How::Own,
+            );
+            d.at = at(17, m);
+            d.session = Some(s);
+            d.important = tag;
+            if what == "stopped" {
+                d.action = serde_json::json!({ "kind": "resume", "session": s });
+                d.undo = Undo::Reverse;
+            }
+            d
+        };
+        let alone = |s: Uuid, m: u32| {
+            let mut d = BossDecision::new(
+                "desk",
+                Need::Approval,
+                &format!("sent {} nothing", name_of(s)),
+                "",
+                How::Own,
+            );
+            d.kind = DecisionKind::LeftAlone;
+            d.at = at(17, m);
+            d.session = Some(s);
+            d
+        };
+        use Important::{Later, Merged, Overrode};
+        let mut rows = vec![
+            told(
+                billing,
+                5,
+                "Wait for the #1 re-review, then merge it.",
+                Some(Merged),
+            ),
+            did(ledger, 17, "allowed", None),
+            did(ledger, 18, "allowed", None),
+            told(
+                billing,
+                19,
+                "Wait for the re-review, then merge.",
+                Some(Merged),
+            ),
+            did(ledger, 20, "allowed", None),
+            did(ledger, 21, "allowed", None),
+            told(ledger, 25, "#2 merged; carry on.", Some(Later)),
+            told(billing, 25, "Yes, flip it once CI is green.", Some(Later)),
+            told(billing, 26, "The person said yes.", Some(Later)),
+            alone(billing, 29),
+            did(ledger, 29, "allowed", None),
+            told(billing, 31, "Watch the checks to green.", Some(Later)),
+            told(
+                billing,
+                31,
+                "Pause the watcher before it queues.",
+                Some(Later),
+            ),
+            told(leads, 32, "Fix the leads issue first.", Some(Later)),
+            told(billing, 32, "No, don't merge yet.", Some(Merged)),
+            did(lockdown, 33, "stopped", Some(Overrode)),
+            did(ledger, 34, "stopped", Some(Overrode)),
+            told(leads, 35, "Fix it now, in this order.", Some(Later)),
+            told(
+                billing,
+                35,
+                "While it waits, merge the other.",
+                Some(Merged),
+            ),
+            did(leads, 37, "restarted", None),
+            told(billing, 38, "Yes, queue it now.", Some(Later)),
+            told(leads, 38, "Good report, carry on.", None),
+            did(review, 39, "started", None),
+            told(billing, 42, "It merged; next.", Some(Later)),
+            told(leads, 46, "A reminder about order.", None),
+            told(billing, 47, "All four are green.", Some(Later)),
+            told(review, 48, "Wait for both reviewers.", None),
+            told(billing, 48, "Keep the design's order.", Some(Later)),
+            told(leads, 49, "Yes, clear more space.", Some(Later)),
+            alone(leads, 50),
+            told(leads, 51, "It is mergeable once CI is green.", Some(Later)),
+            told(headers, 51, "Merge it once its CI is green.", Some(Later)),
+            told(leads, 52, "Yes, dispatch one run.", Some(Later)),
+            told(leads, 52, "The person said yes.", Some(Later)),
+            did(billing, 56, "started again in manual mode", Some(Overrode)),
+            told(billing, 56, "No need to run the clean-up.", Some(Later)),
+            did(billing, 56, "allowed", None),
+            told(leads, 56, "Still waiting on CI.", Some(Later)),
+            told(headers, 59, "Yes, fix it, then merge.", Some(Later)),
+            alone(review, 59),
+        ];
+        // The restart in manual mode overrode it without a plan to undo.
+        rows.iter_mut()
+            .filter(|d| d.what.starts_with("started again"))
+            .for_each(|d| d.what = "started Billing Migration again in manual mode".into());
+        (rows, names)
+    }
+
+    /// "Decided without you" is one entry a session: what did something
+    /// that matters first, then the sessions only told what to do later,
+    /// each a line of its count and when, its decisions under it without
+    /// its name again, the notable ones always shown; the headline counts
+    /// every decision.
+    #[test]
+    fn what_was_decided_without_you_is_one_entry_a_session() {
+        use crate::update_cadence::{render, shown, Roundup, SectionKey};
+        let (rows, names) = the_busy_hour();
+        let tz = chrono_tz::UTC;
+        let name = |s: Uuid| {
+            names
+                .iter()
+                .find(|(id, _)| *id == s)
+                .map(|(_, n)| n.to_string())
+        };
+        let t = told(&rows, Decided::Important, &name, &tz);
+        assert_eq!(t.listed.len(), 26, "every important one is listed");
+        let entries = by_session(t.listed.iter().copied(), &name);
+        let order: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            order,
+            [
+                "Billing Migration",
+                "Ledger Tidy",
+                "Access Lockdown",
+                "Access Headers",
+                "Lead Fix",
+            ],
+            "what did something that matters first, the latest first"
+        );
+        let lines: Vec<DecisionLine> = rows.iter().map(BossDecision::line).collect();
+        let said: Vec<Said> = entries.iter().map(|e| e.said(&lines, None, &tz)).collect();
+        let billing = &said[0];
+        assert_eq!(
+            billing.headline,
+            "Billing Migration · 14 decisions, 17:05–17:56"
+        );
+        assert_eq!(billing.decisions, Some(14));
+        assert_eq!(
+            billing.kind,
+            EventKind::Routine,
+            "an older Desk lists it as a run"
+        );
+        assert_eq!(billing.did.len(), 14);
+        assert!(billing.did[0].at >= billing.did[13].at, "the newest first");
+        assert!(
+            billing
+                .did
+                .iter()
+                .all(|i| !i.action.contains("Billing Migration")),
+            "{:?}",
+            billing.did
+        );
+        let actions: Vec<&str> = billing.did.iter().map(|i| i.action.as_str()).collect();
+        assert!(actions.contains(&"Sent it a message"), "{actions:?}");
+        // The restart in manual mode is notable; the messages about
+        // merging, however tagged, are not.
+        let notable: Vec<&str> = billing
+            .did
+            .iter()
+            .filter(|i| i.notable)
+            .map(|i| i.action.as_str())
+            .collect();
+        assert_eq!(notable, ["Started it again in manual mode"]);
+        let (seen, more) = shown(&billing.did);
+        assert_eq!((seen.len(), more), (4, 10));
+        assert!(seen.iter().any(|i| i.notable));
+        // Every stop has its Undo.
+        let ledger = &said[1];
+        assert_eq!(ledger.headline, "Ledger Tidy · 2 decisions, 17:25–17:34");
+        assert!(
+            ledger.did.iter().all(|i| i.undo.is_some()),
+            "{:?}",
+            ledger.did
+        );
+        assert_eq!(said[2].headline, "Access Lockdown · 1 decision at 17:33");
+        assert_eq!(said[4].headline, "Lead Fix · 7 decisions, 17:32–17:56");
+
+        // The headline counts each decision, not each entry.
+        let r = Roundup::of(
+            at(17, 0),
+            said.iter()
+                .map(|s| (SectionKey::Decided, s.clone()))
+                .collect(),
+            t.routine_count(),
+            vec![],
+        );
+        assert_eq!(r.sections[0].lines.len(), 5);
+        assert_eq!(r.plain_headline(), "26 decided without you.");
+        let text = render("26 decided without you.", &r);
+        assert!(
+            text.contains("- **Billing Migration · 14 decisions"),
+            "{text}"
+        );
+        assert!(text.contains("  - 10 more"), "{text}");
+        assert!(
+            text.contains("  - Started it again in manual mode"),
+            "{text}"
+        );
+
+        // Every one, as the person asked: the routine ones join their
+        // session's entry, folded; still one entry a session.
+        let every = told(&rows, Decided::All, &name, &tz);
+        let listed = every.listed.iter().copied().chain(
+            every
+                .listed_runs
+                .iter()
+                .flat_map(|r| r.rows.iter().copied()),
+        );
+        let entries = by_session(listed, &name);
+        assert_eq!(entries.len(), 6, "Review PRs too, last");
+        assert_eq!(entries[5].name, "Review PRs");
+        let ledger = entries[1].said(&lines, None, &tz);
+        assert_eq!(ledger.decisions, Some(7));
+        assert!(
+            ledger.did.iter().any(|i| i.folded == Some(5)),
+            "{:?}",
+            ledger.did
+        );
+    }
+
+    /// Under its session's line, a decision says "it" for the session:
+    /// the whole name only, its possessive as "its".
+    #[test]
+    fn a_decision_under_its_session_says_it() {
+        assert_eq!(
+            without_name("Sent Billing Migration a message", "Billing Migration"),
+            "Sent it a message"
+        );
+        assert_eq!(
+            without_name("Answered Billing Migration's question", "Billing Migration"),
+            "Answered its question"
+        );
+        assert_eq!(
+            without_name("Answered web’s question", "web"),
+            "Answered its question"
+        );
+        assert_eq!(
+            without_name("Allowed website access", "web"),
+            "Allowed website access"
+        );
+        assert_eq!(
+            without_name("Allowed web-ui, then web", "web"),
+            "Allowed web-ui, then it"
+        );
+        assert_eq!(without_name("web restarted", "web"), "It restarted");
+        assert_eq!(without_name("Stopped it", "Crew"), "Stopped it");
+        // A session no longer listed is named as its decisions named it.
+        let (rows, _) = the_busy_hour();
+        let e = by_session(rows.iter().filter(|d| d.important.is_some()), &|_| None);
+        assert_eq!(e[0].name, "Billing Migration");
     }
 
     /// The reasons of what was allowed are said as themes, never in their

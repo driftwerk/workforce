@@ -781,6 +781,11 @@ pub struct BriefItem {
     /// counts each); none on a line of its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folded: Option<u32>,
+    /// A done line that did something itself (merged, released, deleted,
+    /// spent, overrode a session), never a message about it: always shown,
+    /// however many lines its group keeps behind "N more".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub notable: bool,
 }
 
 /// One session's lines in an update's brief; `sessionId` null for what
@@ -855,6 +860,7 @@ pub fn brief(
                 settled_by: None,
                 at: i.opened_at,
                 folded: None,
+                notable: false,
             },
         ));
     }
@@ -895,6 +901,7 @@ pub fn brief(
                 settled_by: None,
                 at: d.at,
                 folded: None,
+                notable: crate::update_routine::is_notable(d),
             },
         ));
     }
@@ -945,6 +952,7 @@ pub fn brief_item(d: &BossDecision, l: &DecisionLine) -> BriefItem {
         settled_by: None,
         at: d.at,
         folded: None,
+        notable: crate::update_routine::is_notable(d),
     }
 }
 
@@ -2150,6 +2158,7 @@ mod tests {
                 settled_by: None,
                 at: Utc::now(),
                 folded: None,
+                notable: false,
             }],
             left_alone: 0,
         }];

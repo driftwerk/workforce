@@ -183,6 +183,11 @@ pub struct Said {
     pub did: Vec<BriefItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at: Option<DateTime<Utc>>,
+    /// A line of "Decided without you" that stands for one session's
+    /// decisions: how many (each of them in `did`, a folded run counting
+    /// every one it stands for). None on any other line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decisions: Option<u32>,
 }
 
 /// What of the contract a line breaks.
@@ -629,6 +634,7 @@ pub fn plain_said(
             .chain(did.iter().map(|d| d.at))
             .max(),
         did,
+        decisions: None,
     }
 }
 
@@ -1002,6 +1008,7 @@ mod tests {
             did: vec![],
             kind: EventKind::Finished,
             at: None,
+            decisions: None,
         };
         let b = breaches(&terse);
         assert!(b.contains(&Breach::OpensOnId("MAN-636".into())), "{b:?}");

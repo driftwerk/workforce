@@ -820,6 +820,7 @@ impl CrewHub {
             session: Some(link),
             did: Vec::new(),
             at: Some(at),
+            decisions: None,
         };
         let extras = Extras {
             update: Some(workforce_desk::update::MentionedUpdate {
