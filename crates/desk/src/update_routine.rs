@@ -502,6 +502,7 @@ mod tests {
             "Bash: find . -type d -name release",
             "Bash: gh release download v1.2.0",
             "Bash: git push -u origin release",
+            "Bash: git commit -n -m 'Release the deploy fix'",
             "Bash: ./tests/stack-deploy-tests.sh $(date +%s)",
             "Bash: git commit -m \"Release the deploy fix\" && echo $(git rev-parse HEAD)",
         ] {

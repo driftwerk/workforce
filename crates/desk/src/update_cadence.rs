@@ -451,7 +451,8 @@ fn one_step(words: &[String], depth: usize) -> Option<Important> {
     let mut skip = false;
     let mut script = false;
     for w in &args {
-        if std::mem::take(&mut skip) {
+        // A flag's value is never itself a flag (`git commit -n -m …`).
+        if std::mem::take(&mut skip) && !w.starts_with('-') {
             continue;
         }
         // A query's words say what it does, wherever it is given.
