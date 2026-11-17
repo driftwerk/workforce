@@ -158,6 +158,12 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
     ("desk", "access_activity", "person", By(C::DeskActivity)),
     (
         "desk",
+        "charges",
+        "released_by",
+        NotPersonal("who let a session go: `person` or `boss`, never an id"),
+    ),
+    (
+        "desk",
         "access_grants",
         "person",
         NotPersonal("`you`, the one person of the Desk whose own hub this is"),
