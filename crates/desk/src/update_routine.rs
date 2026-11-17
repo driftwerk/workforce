@@ -413,18 +413,29 @@ impl Entry<'_> {
 
 /// `action` said under its session's own line: "Sent Billing Migration a
 /// message" as "Sent it a message", "Answered Billing Migration's
-/// question" as "Answered its question".
+/// question" as "Answered its question". Only the name as whole words: a
+/// session named "web" leaves "website" alone.
 fn without_name(action: &str, name: &str) -> String {
     let name = name.trim();
     if name.is_empty() || name == crate::update::CREW_LABEL {
         return action.to_string();
     }
-    let possessive = format!("{name}'s");
-    match (action.find(&possessive), action.find(name)) {
-        (Some(_), _) => action.replacen(&possessive, "its", 1),
-        (None, Some(_)) => action.replacen(name, "it", 1),
-        (None, None) => action.to_string(),
-    }
+    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '-');
+    let Some(at) = action.match_indices(name).map(|(i, _)| i).find(|&i| {
+        !word(action[..i].chars().next_back()) && !word(action[i + name.len()..].chars().next())
+    }) else {
+        return action.to_string();
+    };
+    let after = &action[at + name.len()..];
+    let (pronoun, rest) = match ["'s", "’s"].iter().find(|p| after.starts_with(*p)) {
+        Some(p) => ("its", &after[p.len()..]),
+        None => ("it", after),
+    };
+    let pronoun = match at {
+        0 => capitalised(pronoun),
+        _ => pronoun.to_string(),
+    };
+    format!("{}{pronoun}{rest}", &action[..at])
 }
 
 /// What a roundup lists under "Decided without you" (`rows`: the
@@ -452,9 +463,17 @@ pub fn by_session<'a>(
     }
     for e in &mut entries {
         e.name = match e.session {
+            // Not listed: as its decisions named it, the shortest of
+            // those names ("Billing Migration", not "Billing Migration
+            // again in manual mode").
             Some(s) => name(s)
-                .or_else(|| e.rows.iter().find_map(|d| named_in(d)))
-                .unwrap_or_else(|| "a session".into()),
+                .or_else(|| {
+                    e.rows
+                        .iter()
+                        .filter_map(|d| named_in(d))
+                        .min_by_key(|n| n.chars().count())
+                })
+                .unwrap_or_else(|| "A session".into()),
             None => crate::update::CREW_LABEL.into(),
         };
     }
@@ -1133,6 +1152,38 @@ mod tests {
             "{:?}",
             ledger.did
         );
+    }
+
+    /// Under its session's line, a decision says "it" for the session:
+    /// the whole name only, its possessive as "its".
+    #[test]
+    fn a_decision_under_its_session_says_it() {
+        assert_eq!(
+            without_name("Sent Billing Migration a message", "Billing Migration"),
+            "Sent it a message"
+        );
+        assert_eq!(
+            without_name("Answered Billing Migration's question", "Billing Migration"),
+            "Answered its question"
+        );
+        assert_eq!(
+            without_name("Answered web’s question", "web"),
+            "Answered its question"
+        );
+        assert_eq!(
+            without_name("Allowed website access", "web"),
+            "Allowed website access"
+        );
+        assert_eq!(
+            without_name("Allowed web-ui, then web", "web"),
+            "Allowed web-ui, then it"
+        );
+        assert_eq!(without_name("web restarted", "web"), "It restarted");
+        assert_eq!(without_name("Stopped it", "Crew"), "Stopped it");
+        // A session no longer listed is named as its decisions named it.
+        let (rows, _) = the_busy_hour();
+        let e = by_session(rows.iter().filter(|d| d.important.is_some()), &|_| None);
+        assert_eq!(e[0].name, "Billing Migration");
     }
 
     /// The reasons of what was allowed are said as themes, never in their
