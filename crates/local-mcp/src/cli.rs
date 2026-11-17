@@ -194,8 +194,8 @@ pub enum ConfigCommand {
         #[arg(long)]
         max_query_rows: Option<u64>,
         /// Cloudflare Access service token id, for an instance behind
-        /// Cloudflare Access. Sent only together with
-        /// `--access-client-secret`.
+        /// Cloudflare Access. Its secret is then prompted for (hidden)
+        /// unless `--access-client-secret` is given.
         #[arg(long)]
         access_client_id: Option<String>,
         /// Cloudflare Access service token secret. Sent only together with
@@ -580,21 +580,24 @@ impl MetabaseFlags {
             && self.access_client_secret.is_none()
     }
 
-    /// The optional fields to store, a blank flag counting as not given.
-    fn optional_fields(&self) -> Vec<(&'static str, String)> {
-        let given = |value: &Option<String>| {
-            value
-                .as_deref()
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(str::to_string)
+    /// The optional fields to store, a blank value counting as not given.
+    /// `ask_secret` supplies the access secret when only its id was given.
+    fn optional_fields(
+        self,
+        ask_secret: impl FnOnce() -> Result<Option<String>>,
+    ) -> Result<Vec<(&'static str, String)>> {
+        let id = self.access_client_id.as_deref().and_then(non_empty);
+        let secret = match (&id, self.access_client_secret.as_deref()) {
+            (Some(_), None) => ask_secret()?,
+            (_, secret) => secret.and_then(non_empty),
         };
-        self.max_query_rows
+        Ok(self
+            .max_query_rows
             .map(|cap| ("max_query_rows", cap.to_string()))
             .into_iter()
-            .chain(given(&self.access_client_id).map(|v| ("access_client_id", v)))
-            .chain(given(&self.access_client_secret).map(|v| ("access_client_secret", v)))
-            .collect()
+            .chain(id.map(|v| ("access_client_id", v)))
+            .chain(secret.map(|v| ("access_client_secret", v)))
+            .collect())
     }
 }
 
@@ -602,21 +605,25 @@ fn configure_metabase(
     store: &LocalSecretStore,
     workspace: Option<String>,
     set_default: Option<String>,
-    flags: MetabaseFlags,
+    mut flags: MetabaseFlags,
 ) -> Result<()> {
     if workspace.is_none() && set_default.is_some() && flags.is_empty() {
         return apply_set_default(store, &METABASE, set_default.as_deref());
     }
-    let site_url = resolve_value(flags.site_url.clone(), "Metabase site URL", false)?
+    let site_url = resolve_value(flags.site_url.take(), "Metabase site URL", false)?
         .trim_end_matches('/')
         .to_string();
-    let fields = [
-        ("site_url", site_url),
-        ("api_key", resolve_value(None, "Metabase API key", true)?),
-    ]
-    .into_iter()
-    .chain(flags.optional_fields())
-    .collect();
+    let api_key = resolve_value(None, "Metabase API key", true)?;
+    let fields = [("site_url", site_url), ("api_key", api_key)]
+        .into_iter()
+        .chain(flags.optional_fields(|| {
+            resolve_optional_value(
+                None,
+                "Cloudflare Access client secret (press Enter to skip)",
+                true,
+            )
+        })?)
+        .collect();
     save_adapter(store, &METABASE, workspace.as_deref(), fields)?;
     apply_set_default(store, &METABASE, set_default.as_deref())
 }
@@ -1145,12 +1152,7 @@ fn resolve_optional_value(
     use std::io::IsTerminal;
 
     if let Some(v) = value {
-        let trimmed = v.trim();
-        return Ok(if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        });
+        return Ok(non_empty(&v));
     }
 
     let raw = if secret && std::io::stdin().is_terminal() {
@@ -1165,12 +1167,14 @@ fn resolve_optional_value(
         buf
     };
 
-    let trimmed = raw.trim();
-    Ok(if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    })
+    Ok(non_empty(&raw))
+}
+
+/// `value` trimmed, a blank one counting as not given.
+fn non_empty(value: &str) -> Option<String> {
+    Some(value.trim())
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
 }
 
 fn print_prompt(label: &str) {
@@ -1273,8 +1277,11 @@ mod tests {
             access_client_id: id.map(str::to_string),
             access_client_secret: secret.map(str::to_string),
         };
+        let never_asked = || -> Result<Option<String>> { panic!("the secret was given") };
         assert_eq!(
-            flags(Some(" test-client-id.access "), Some("not-a-real-secret")).optional_fields(),
+            flags(Some(" test-client-id.access "), Some("not-a-real-secret"))
+                .optional_fields(never_asked)
+                .unwrap(),
             vec![
                 ("max_query_rows", "500".to_string()),
                 ("access_client_id", "test-client-id.access".to_string()),
@@ -1282,8 +1289,26 @@ mod tests {
             ]
         );
         assert_eq!(
-            flags(Some(""), Some("  ")).optional_fields(),
+            flags(Some(""), Some("  "))
+                .optional_fields(never_asked)
+                .unwrap(),
             vec![("max_query_rows", "500".to_string())]
+        );
+        assert_eq!(
+            flags(Some("test-client-id.access"), None)
+                .optional_fields(|| Ok(Some("not-a-real-secret".into())))
+                .unwrap(),
+            vec![
+                ("max_query_rows", "500".to_string()),
+                ("access_client_id", "test-client-id.access".to_string()),
+                ("access_client_secret", "not-a-real-secret".to_string()),
+            ],
+            "the secret is asked for when only the id was given"
+        );
+        assert_eq!(
+            flags(None, None).optional_fields(never_asked).unwrap(),
+            vec![("max_query_rows", "500".to_string())],
+            "nothing is asked without an id"
         );
         assert!(!flags(None, None).is_empty());
         assert!(MetabaseFlags {

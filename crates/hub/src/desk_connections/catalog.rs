@@ -447,6 +447,14 @@ impl Connector {
         }
     }
 
+    /// Where setting `extra` of instance `key` is kept.
+    pub fn extra_at(&self, (flat, sub): (&str, &str), key: &str) -> String {
+        match self.prefix {
+            Some(_) => self.at(key, sub),
+            None => flat.to_string(),
+        }
+    }
+
     /// The path whose value means instance `key` is connected.
     pub fn primary_at(&self, key: &str) -> String {
         match self.prefix {

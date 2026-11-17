@@ -37,11 +37,11 @@ With both set, every request also carries `CF-Access-Client-Id` and `CF-Access-C
 
 The token is sent only to the site it was configured with: a shared token is never paired with a site a user set for their own API key.
 
-In the local MCP companion:
+In the local MCP companion, give the token's id and enter its secret when prompted (it is not echoed):
 
 ```bash
 workforce-local-mcp config metabase --workspace prod --site-url https://mb.example.com \
-  --access-client-id <token-id>.access --access-client-secret <token-secret>
+  --access-client-id <token-id>.access
 ```
 
 ### Row cap

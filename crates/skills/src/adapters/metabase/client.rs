@@ -42,6 +42,24 @@ enum AccessPair {
     Missing(&'static str),
 }
 
+impl AccessToken {
+    fn headers(self) -> [(HeaderName, HeaderValue); 2] {
+        [
+            (HeaderName::from_static(ACCESS_ID_HEADER), self.id),
+            (HeaderName::from_static(ACCESS_SECRET_HEADER), self.secret),
+        ]
+    }
+}
+
+/// The Cloudflare Access headers for a service token's two settings: both,
+/// or none when either is unset.
+pub fn access_headers(id: Option<&str>, secret: Option<&str>) -> Result<HeaderMap> {
+    Ok(match access_pair(id, secret)? {
+        AccessPair::Token(token) => token.headers().into_iter().collect(),
+        AccessPair::Unset | AccessPair::Missing(_) => HeaderMap::new(),
+    })
+}
+
 /// The Cloudflare Access pair from its two settings, blank counting as unset.
 fn access_pair(id: Option<&str>, secret: Option<&str>) -> Result<AccessPair> {
     fn present(value: Option<&str>) -> Option<&str> {
@@ -592,12 +610,7 @@ impl MetabaseClient {
         let mut headers = HeaderMap::new();
         headers.insert(HeaderName::from_static(API_KEY_HEADER), auth);
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.extend(access.into_iter().flat_map(|token| {
-            [
-                (HeaderName::from_static(ACCESS_ID_HEADER), token.id),
-                (HeaderName::from_static(ACCESS_SECRET_HEADER), token.secret),
-            ]
-        }));
+        headers.extend(access.into_iter().flat_map(AccessToken::headers));
         Ok((headers, base_url))
     }
 
@@ -1349,6 +1362,15 @@ mod tests {
         };
         assert_eq!(token.id, ACCESS_ID);
         assert_eq!(token.secret, ACCESS_SECRET);
+    }
+
+    #[test]
+    fn access_headers_are_both_or_none() {
+        let headers = access_headers(Some(ACCESS_ID), Some(ACCESS_SECRET)).unwrap();
+        assert_eq!(headers.get(ACCESS_ID_HEADER).unwrap(), ACCESS_ID);
+        assert!(headers.get(ACCESS_SECRET_HEADER).unwrap().is_sensitive());
+        assert!(access_headers(Some(ACCESS_ID), None).unwrap().is_empty());
+        assert!(access_headers(None, None).unwrap().is_empty());
     }
 
     #[test]

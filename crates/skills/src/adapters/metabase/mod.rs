@@ -81,8 +81,8 @@ impl MetabaseSkill {
     }
 
     /// Build a `MetabaseSkill` whose clients resolve their api_key and
-    /// Cloudflare Access token from `store` per request. Pass a `LayeredUserVault` for per-user
-    /// resolution.
+    /// Cloudflare Access token from `store` per request. Pass a
+    /// `LayeredUserVault` for per-user resolution.
     pub fn with_store(
         config: MetabaseSkillConfig,
         store: Arc<dyn workforce_common::settings::SecretStore>,

@@ -26,7 +26,7 @@ Two optional per-instance settings:
 | HTTP client and headers | `crates/skills/src/adapters/metabase/client.rs` |
 | Skill construction | `crates/skills/src/adapters/metabase/mod.rs` |
 | Hub vault loader and credential hint | `crates/hub/src/skill_loader.rs` (`metabase_vault_config`, `BuiltinSkillMeta` for metabase) |
-| Desk Connections catalog | `crates/hub/src/desk_connections/catalog.rs` |
+| Desk Connections catalog and Test | `crates/hub/src/desk_connections/catalog.rs`, `check.rs`, `mod.rs` (`kept`) |
 | Local MCP CLI (`config metabase`, `config show`) | `crates/local-mcp/src/cli.rs` |
 | Local MCP keychain loader | `crates/local-mcp/src/adapters.rs` |
 | Help page | `end-user-docs/adapters/metabase.mdx` |
@@ -109,12 +109,14 @@ The loader in `metabase_vault_config` builds templates whose credentials the sto
 
 ### 5. Desk Connections
 
-`catalog.rs` lists Metabase's extra per-instance settings in `extras`. Adding both fields there means three things:
+`catalog.rs` lists Metabase's extra per-instance settings in `extras`. Adding both fields there means four things:
 - Disconnecting an instance removes them (`held_at`).
 - Adopting a flat single-instance connection into a named instance carries them along.
 - The catalog consistency test requires them to be in the vault editor's known fields, which item 4 covers.
 
-The Connections form does not ask for them. They are set through the vault, like `max_query_rows`.
+- Testing a kept connection again reads its extras with its fields, and the Metabase Test sends the pair (through the skill's `access_headers`, so the both-or-neither rule still lives in one place). Without that, a working instance behind Access would test as refused.
+
+The Connections form does not ask for them. They are set through the vault, like `max_query_rows`, so a first Connect of an instance behind Access still fails its Test.
 
 ### 6. Config struct and redaction
 
@@ -132,8 +134,9 @@ The local CLI's `config show` already redacts by spec. `access_client_secret` jo
 ### 7. Local MCP CLI
 
 - `METABASE.fields` gains `access_client_id` and `access_client_secret`. `show`, `clear` and workspace clearing iterate the spec, so they handle the new fields with no further code.
-- `config metabase` gains `--access-client-id <ID>` and `--access-client-secret <SECRET>`, following the existing optional-flag pattern (`--max-query-rows`, Postmark's `--account-token`):
-  - The flags are optional, and the command does not prompt for them. Today's flow is unchanged.
+- `config metabase` gains `--access-client-id <ID>` and `--access-client-secret <SECRET>`, following the existing optional-secret pattern (Postmark's `--account-token`):
+  - Without `--access-client-id` nothing is prompted for, so today's flow is unchanged.
+  - With `--access-client-id` and no `--access-client-secret`, the secret is prompted for hidden, like `api_key`, so it stays out of shell history.
   - Supplied values are trimmed. Empty values are skipped, as `resolve_optional_value` does.
   - The `--set-default`-only short-circuit also checks the two new flags.
 - `adapters.rs` (`read_metabase_workspace` and `read_metabase_legacy`) reads both fields with `store.get` into the config. There are no environment-variable fallbacks: keys live in the keychain or vault only.

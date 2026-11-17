@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use serde_json::Value;
+use workforce_skills::adapters::metabase::client::access_headers;
 
 /// What a Test found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,7 +274,14 @@ impl Services {
                         "{}/api/user/current",
                         secure_address("Metabase", field(f, "site_url"))?
                     ))
-                    .header("x-api-key", field(f, "api_key")),
+                    .header("x-api-key", field(f, "api_key"))
+                    .headers(
+                        access_headers(
+                            f.get("access_client_id").map(String::as_str),
+                            f.get("access_client_secret").map(String::as_str),
+                        )
+                        .map_err(|e| Found::Refused(e.to_string()))?,
+                    ),
                 )
                 .await?;
                 match status.is_success() {
