@@ -57,7 +57,7 @@ workforce-oauth-client = { workspace = true, optional = true }
 default = []
 slack = ["reqwest", "tokio-tungstenite", "tokio", "futures", "lru", "pulldown-cmark"]
 teams = ["reqwest", "tokio", "lru", "jsonwebtoken"]
-github = ["reqwest", "tokio", "jsonwebtoken"]
+github = ["reqwest", "tokio", "jsonwebtoken", "sha2"]
 google = ["tokio", "reqwest", "axum", "url", "sha2", "rand", "open", "lettre", "workforce-oauth-client"]
 linear = ["reqwest", "tokio", "url", "sha2"]
 jira = ["reqwest", "reqwest/multipart", "tokio", "pulldown-cmark", "url", "sha2"]

@@ -298,7 +298,7 @@ fn refused(error: &str) -> String {
 /// text or files; its title and names fenced.
 fn pull(p: &Value) -> Value {
     let c = &p["checks"];
-    let checks = match c["total"].as_u64() {
+    let mut checks = match c["total"].as_u64() {
         _ if c.is_null() => json!({ "note": "Its checks couldn't be read: don't say CI passed." }),
         Some(0) => json!({
             "overall": "none yet",
@@ -314,6 +314,10 @@ fn pull(p: &Value) -> Value {
             "neutral": c["neutral"],
         }),
     };
+    // Read without GitHub's check runs: said with what was read.
+    if let Some(read_from) = c["note"].as_str() {
+        checks["read_from"] = json!(read_from);
+    }
     let mut out = json!({
         "number": p["number"],
         "state": p["state"],
@@ -824,5 +828,110 @@ mod tests {
         ] {
             assert!(h.read(Some("ann"), name, input).await.is_err());
         }
+    }
+
+    /// A repository only the person's other connection reaches (a
+    /// fine-grained token for another org) is checked with that one, and
+    /// its checks, which such a token may not read as check runs, are its
+    /// Actions runs and the statuses posted on its head.
+    #[tokio::test]
+    async fn a_pull_request_another_connection_reaches_is_checked_with_it() {
+        let server = MockServer::start().await;
+        no_writes(&server).await;
+        let repo = "/repos/PatchworkOnRails/PatchworkOnRails";
+        for (token, status) in [("ann-token", 404), ("ann-patchwork", 200)] {
+            Mock::given(method("GET"))
+                .and(path(repo))
+                .and(header("authorization", format!("Bearer {token}").as_str()))
+                .respond_with(
+                    ResponseTemplate::new(status).set_body_json(json!({"message": "Not Found"})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        // Nothing of the pull request is read with the key that can't reach it.
+        Mock::given(method("GET"))
+            .and(path(format!("{repo}/pulls/16763")))
+            .and(header("authorization", "Bearer ann-token"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{repo}/pulls/16763")))
+            .and(header("authorization", "Bearer ann-patchwork"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "number": 16763, "title": "Billing export", "state": "open", "merged": false,
+                "mergeable": true, "head": {"ref": "billing", "sha": "c0ffee"}, "base": {"ref": "main"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{repo}/commits/c0ffee/check-runs")))
+            .respond_with(ResponseTemplate::new(403).set_body_json(
+                json!({"message": "Resource not accessible by personal access token"}),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{repo}/commits/c0ffee")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"sha": "c0ffee"})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{repo}/actions/runs")))
+            .and(query_param("head_sha", "c0ffee"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"workflow_runs": [
+                    {"workflow_id": 1, "name": "RSpec", "run_number": 1, "run_attempt": 1,
+                     "status": "completed", "conclusion": "success"}
+                ]})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{repo}/commits/c0ffee/status")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"state": "failure", "statuses": [
+                    {"context": "codeclimate", "state": "failure"}
+                ]}),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+        let h = hub(&server);
+        h.global
+            .set(
+                "users/ann/skills/github/workspaces/default/token",
+                "ann-token",
+            )
+            .unwrap();
+        h.global
+            .set(
+                "users/ann/skills/github/workspaces/patchwork-github-read-only/token",
+                "ann-patchwork",
+            )
+            .unwrap();
+        let pr = h
+            .read(
+                Some("ann"),
+                PR,
+                json!({"repo": "PatchworkOnRails/PatchworkOnRails", "number": 16763}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pr["state"], "open");
+        assert_eq!(pr["checks"]["overall"], "failure");
+        assert_eq!(pr["checks"]["total"], 2);
+        assert!(pr["checks"]["read_from"]
+            .as_str()
+            .unwrap()
+            .contains("Only GitHub Actions runs and commit statuses"));
+        assert!(pr["named"].as_str().unwrap().contains("codeclimate"));
     }
 }

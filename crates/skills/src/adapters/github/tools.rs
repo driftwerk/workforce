@@ -51,9 +51,10 @@ fn caller_owner(clients: &LiveInstances<GithubClient>, fixed: &Option<String>) -
     }
 }
 
-/// Resolve the GitHub client for a given input. If the `owner` matches a configured
-/// workspace name, use that workspace's client. Otherwise use the default.
-fn resolve_client(
+/// Resolve the GitHub client for a given input: an explicit `workspace`,
+/// else an `owner` that is a workspace's name, else for a repository the
+/// connection whose key reaches it ([`reaching`]), else the default.
+async fn resolve_client(
     instances: &LiveInstances<GithubClient>,
     default_workspace: &str,
     input: &serde_json::Value,
@@ -63,19 +64,62 @@ fn resolve_client(
     let owner = input["owner"].as_str();
     // Explicit `workspace` param (for github.api), else an `owner` that matches a
     // configured workspace name; both post-filtered through the environment lock.
-    let requested = input["workspace"]
-        .as_str()
-        .or_else(|| owner.filter(|o| clients.contains_key(*o)));
-    let name = workforce_agent::llm::environment::resolve_instance(
-        "github",
-        requested,
-        default_workspace,
-        clients,
-    )
-    .map_err(|d| eyre::eyre!("{}", d.message))?;
+    let requested = input["workspace"].as_str().or_else(|| {
+        owner.and_then(|o| {
+            clients
+                .keys()
+                .find(|name| name.eq_ignore_ascii_case(o))
+                .map(String::as_str)
+        })
+    });
+    let pick = |requested: Option<&str>| {
+        workforce_agent::llm::environment::resolve_instance(
+            "github",
+            requested,
+            default_workspace,
+            clients,
+        )
+    };
+    let name = pick(requested).map_err(|d| eyre::eyre!("{}", d.message))?;
+    let name = match (requested, owner, input["repo"].as_str()) {
+        (None, Some(owner), Some(repo)) => {
+            reaching(clients, name, owner, repo, |n| pick(Some(n)).is_ok()).await?
+        }
+        _ => name,
+    };
     clients.get(&name).cloned().ok_or_else(|| {
         crate::adapters::utils::unknown_instance("GitHub workspace", name.as_ref(), clients)
     })
+}
+
+/// The connection a call naming none reaches `owner/repo` with: `default`
+/// when its key does, else the first of the others the call may use (by
+/// name) whose key does, as GitHub last said of each key; `default` when
+/// none does, so GitHub's own answer says why. With no other, nothing is
+/// asked.
+async fn reaching(
+    clients: &std::collections::HashMap<String, Arc<GithubClient>>,
+    default: String,
+    owner: &str,
+    repo: &str,
+    may_use: impl Fn(&str) -> bool,
+) -> eyre::Result<String> {
+    let mut others: Vec<&String> = clients
+        .keys()
+        .filter(|name| **name != default && may_use(name))
+        .collect();
+    if others.is_empty() {
+        return Ok(default);
+    }
+    others.sort();
+    for name in std::iter::once(&default).chain(others) {
+        if let Some(client) = clients.get(name) {
+            if client.reaches(owner, repo).await? {
+                return Ok(name.clone());
+            }
+        }
+    }
+    Ok(default)
 }
 
 /// Build a dynamic description for the `owner` parameter that includes available org names.
@@ -164,7 +208,7 @@ impl Tool for GithubListReposTool {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
-        let client = match resolve_client(&self.clients, &self.default_workspace, &input) {
+        let client = match resolve_client(&self.clients, &self.default_workspace, &input).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -281,7 +325,7 @@ impl Tool for GithubGetRepoTool {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
-        let client = match resolve_client(&self.clients, &self.default_workspace, &input) {
+        let client = match resolve_client(&self.clients, &self.default_workspace, &input).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -408,7 +452,7 @@ impl Tool for GithubListIssuesTool {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
-        let client = match resolve_client(&self.clients, &self.default_workspace, &input) {
+        let client = match resolve_client(&self.clients, &self.default_workspace, &input).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -550,7 +594,7 @@ impl Tool for GithubGetIssueTool {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
-        let client = match resolve_client(&self.clients, &self.default_workspace, &input) {
+        let client = match resolve_client(&self.clients, &self.default_workspace, &input).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -705,7 +749,7 @@ impl Tool for GithubCreateIssueTool {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
-        let client = match resolve_client(&self.clients, &self.default_workspace, &input) {
+        let client = match resolve_client(&self.clients, &self.default_workspace, &input).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -847,7 +891,7 @@ impl Tool for GithubListPullsTool {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
-        let client = match resolve_client(&self.clients, &self.default_workspace, &input) {
+        let client = match resolve_client(&self.clients, &self.default_workspace, &input).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -995,7 +1039,7 @@ impl Tool for GithubGetPullTool {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
-        let client = match resolve_client(&self.clients, &self.default_workspace, &input) {
+        let client = match resolve_client(&self.clients, &self.default_workspace, &input).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -1076,13 +1120,8 @@ impl Tool for GithubGetPullTool {
         // pending), with the failed ones by name.
         let head_sha = pr["head"]["sha"].as_str().unwrap_or_default();
         let checks_summary = if !head_sha.is_empty() {
-            let checks_path = format!("/repos/{}/{}/commits/{}/check-runs", owner, repo, head_sha);
-            match client
-                .get_with_query(&checks_path, &[("per_page", "100")])
-                .await
-            {
-                Ok(data) => {
-                    let runs = data["check_runs"].as_array().cloned().unwrap_or_default();
+            match commit_checks(&client, &owner, repo, head_sha).await {
+                Ok(CommitChecks { runs, note }) => {
                     let gate = evaluate_check_runs(&runs);
                     let failure = gate.failed_checks.len();
                     let pending = runs
@@ -1104,6 +1143,7 @@ impl Tool for GithubGetPullTool {
                         "neutral": gate.neutral_count,
                         "failed": gate.failed_checks,
                         "cancelled": cancelled,
+                        "note": note,
                     })
                 }
                 Err(_) => serde_json::json!(null),
@@ -1209,7 +1249,7 @@ impl Tool for GithubGetFileTool {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
-        let client = match resolve_client(&self.clients, &self.default_workspace, &input) {
+        let client = match resolve_client(&self.clients, &self.default_workspace, &input).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -1380,7 +1420,7 @@ impl Tool for GithubPrCreateTool {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
-        let client = match resolve_client(&self.clients, &self.default_workspace, &input) {
+        let client = match resolve_client(&self.clients, &self.default_workspace, &input).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -1548,7 +1588,7 @@ impl Tool for GithubPrDiffTool {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
-        let client = match resolve_client(&self.clients, &self.default_workspace, &input) {
+        let client = match resolve_client(&self.clients, &self.default_workspace, &input).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -1709,7 +1749,7 @@ impl Tool for GithubPrReviewTool {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
-        let client = match resolve_client(&self.clients, &self.default_workspace, &input) {
+        let client = match resolve_client(&self.clients, &self.default_workspace, &input).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -1918,7 +1958,7 @@ impl Tool for GithubPrCommentTool {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
-        let client = match resolve_client(&self.clients, &self.default_workspace, &input) {
+        let client = match resolve_client(&self.clients, &self.default_workspace, &input).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -2065,7 +2105,7 @@ impl Tool for GithubPrMergeTool {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
-        let client = match resolve_client(&self.clients, &self.default_workspace, &input) {
+        let client = match resolve_client(&self.clients, &self.default_workspace, &input).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -2121,16 +2161,12 @@ impl Tool for GithubPrMergeTool {
             ));
         }
 
-        // Check CI status using Check Runs API (not the legacy Combined Status API,
-        // which defaults to "pending" when no legacy statuses exist)
-        let check_runs_path = format!("/repos/{}/{}/commits/{}/check-runs", owner, repo, head_sha);
-        if let Ok(check_runs_response) = client.get(&check_runs_path).await {
-            let check_runs: Vec<serde_json::Value> = check_runs_response["check_runs"]
-                .as_array()
-                .unwrap_or(&vec![])
-                .to_vec();
-
-            let gate = evaluate_check_runs(&check_runs);
+        // Check CI on its head: its check runs, else its Actions runs and
+        // commit statuses (never the combined status's own state, which is
+        // "pending" when no status was posted).
+        if let Ok(CommitChecks { runs, .. }) = commit_checks(&client, &owner, repo, &head_sha).await
+        {
+            let gate = evaluate_check_runs(&runs);
 
             match gate.overall.as_str() {
                 "failure" => {
@@ -2254,7 +2290,7 @@ impl Tool for GithubIssueCommentTool {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
-        let client = match resolve_client(&self.clients, &self.default_workspace, &input) {
+        let client = match resolve_client(&self.clients, &self.default_workspace, &input).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -2370,7 +2406,7 @@ impl Tool for GithubIssueUpdateTool {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
-        let client = match resolve_client(&self.clients, &self.default_workspace, &input) {
+        let client = match resolve_client(&self.clients, &self.default_workspace, &input).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -2499,7 +2535,7 @@ impl Tool for GithubDirListTool {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
-        let client = match resolve_client(&self.clients, &self.default_workspace, &input) {
+        let client = match resolve_client(&self.clients, &self.default_workspace, &input).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -2615,7 +2651,7 @@ impl Tool for GithubCompareTool {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
-        let client = match resolve_client(&self.clients, &self.default_workspace, &input) {
+        let client = match resolve_client(&self.clients, &self.default_workspace, &input).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -2740,7 +2776,7 @@ impl Tool for GithubSearchCodeTool {
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
-        let client = match resolve_client(&self.clients, &self.default_workspace, &input) {
+        let client = match resolve_client(&self.clients, &self.default_workspace, &input).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -2914,7 +2950,7 @@ impl Tool for GithubSearchCommitsTool {
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
-        let client = match resolve_client(&self.clients, &self.default_workspace, &input) {
+        let client = match resolve_client(&self.clients, &self.default_workspace, &input).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -3047,7 +3083,7 @@ impl Tool for GithubBranchListTool {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
-        let client = match resolve_client(&self.clients, &self.default_workspace, &input) {
+        let client = match resolve_client(&self.clients, &self.default_workspace, &input).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -3163,7 +3199,7 @@ impl Tool for GithubBranchCreateTool {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
-        let client = match resolve_client(&self.clients, &self.default_workspace, &input) {
+        let client = match resolve_client(&self.clients, &self.default_workspace, &input).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -3301,7 +3337,7 @@ impl Tool for GithubBranchDeleteTool {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
-        let client = match resolve_client(&self.clients, &self.default_workspace, &input) {
+        let client = match resolve_client(&self.clients, &self.default_workspace, &input).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -3401,7 +3437,7 @@ impl Tool for GithubBranchProtectionTool {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
-        let client = match resolve_client(&self.clients, &self.default_workspace, &input) {
+        let client = match resolve_client(&self.clients, &self.default_workspace, &input).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -3507,7 +3543,7 @@ impl Tool for GithubCiStatusTool {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
-        let client = match resolve_client(&self.clients, &self.default_workspace, &input) {
+        let client = match resolve_client(&self.clients, &self.default_workspace, &input).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -3535,14 +3571,9 @@ impl Tool for GithubCiStatusTool {
             }
         };
 
-        let path = format!("/repos/{owner}/{repo}/commits/{git_ref}/check-runs");
-        let duration_ms = start.elapsed().as_millis() as u64;
-
-        match client.get(&path).await {
-            Ok(result) => {
-                let check_runs: Vec<serde_json::Value> = result["check_runs"]
-                    .as_array()
-                    .unwrap_or(&vec![])
+        match commit_checks(&client, &owner, repo, git_ref).await {
+            Ok(CommitChecks { runs, note }) => {
+                let check_runs: Vec<serde_json::Value> = runs
                     .iter()
                     .map(|cr| {
                         serde_json::json!({
@@ -3568,13 +3599,14 @@ impl Tool for GithubCiStatusTool {
                         "neutral_count": gate.neutral_count,
                         "failed_checks": gate.failed_checks,
                         "check_runs": check_runs,
+                        "note": note,
                     }),
-                    duration_ms,
+                    start.elapsed().as_millis() as u64,
                 ))
             }
             Err(e) => Ok(ToolResult::from_report(
                 &e.wrap_err("Failed to get CI status"),
-                duration_ms,
+                start.elapsed().as_millis() as u64,
             )),
         }
     }
@@ -3632,7 +3664,7 @@ impl Tool for GithubWorkflowRunsTool {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
-        let client = match resolve_client(&self.clients, &self.default_workspace, &input) {
+        let client = match resolve_client(&self.clients, &self.default_workspace, &input).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -3759,7 +3791,7 @@ impl Tool for GithubWorkflowRunLogsTool {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
-        let client = match resolve_client(&self.clients, &self.default_workspace, &input) {
+        let client = match resolve_client(&self.clients, &self.default_workspace, &input).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -3925,7 +3957,7 @@ impl Tool for GithubWorkflowRerunTool {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
-        let client = match resolve_client(&self.clients, &self.default_workspace, &input) {
+        let client = match resolve_client(&self.clients, &self.default_workspace, &input).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -4077,7 +4109,7 @@ impl Tool for GithubPrUpdateTool {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
-        let client = match resolve_client(&self.clients, &self.default_workspace, &input) {
+        let client = match resolve_client(&self.clients, &self.default_workspace, &input).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -4319,7 +4351,7 @@ impl Tool for GithubWorkflowRunFailedLogsTool {
             Ok(o) => o,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
-        let client = match resolve_client(&self.clients, &self.default_workspace, &input) {
+        let client = match resolve_client(&self.clients, &self.default_workspace, &input).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -4511,7 +4543,7 @@ impl Tool for GithubApiTool {
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
 
-        let client = match resolve_client(&self.clients, &self.default_workspace, &input) {
+        let client = match resolve_client(&self.clients, &self.default_workspace, &input).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -4597,6 +4629,149 @@ impl Tool for GithubApiTool {
             )),
         }
     }
+}
+
+// ── A commit's checks ───────────────────────────────────────────────
+
+/// What's said with checks read without GitHub's check runs.
+const ACTIONS_AND_STATUSES: &str = "Only GitHub Actions runs and commit statuses could be read \
+    for this commit: this GitHub key can't read check runs (a personal access token never may), \
+    so checks other apps post there aren't shown.";
+
+/// The checks on a commit, each as a check run (`name`, `status`,
+/// `conclusion`, `html_url`, `started_at`, `completed_at`), and what's said
+/// of where they were read from when it wasn't GitHub's check runs.
+struct CommitChecks {
+    runs: Vec<serde_json::Value>,
+    note: Option<String>,
+}
+
+/// The checks on `git_ref` of `owner/repo`: its check runs; or, for a key
+/// GitHub refuses those (remembered a while, so it isn't asked each time),
+/// the latest run of each of its Actions workflows on that commit with the
+/// statuses outside services posted on it.
+async fn commit_checks(
+    client: &GithubClient,
+    owner: &str,
+    repo: &str,
+    git_ref: &str,
+) -> eyre::Result<CommitChecks> {
+    if !client.check_runs_refused() {
+        let path = format!("/repos/{owner}/{repo}/commits/{git_ref}/check-runs");
+        match client.get_with_query(&path, &[("per_page", "100")]).await {
+            Ok(data) => {
+                return Ok(CommitChecks {
+                    runs: data["check_runs"].as_array().cloned().unwrap_or_default(),
+                    note: None,
+                })
+            }
+            Err(e) if super::client::refuses_check_runs(&e) => client.refuse_check_runs(),
+            Err(e) => return Err(e),
+        }
+    }
+    // Workflow runs are found by the commit's SHA alone.
+    let sha = match git_ref.len() == 40 && git_ref.chars().all(|c| c.is_ascii_hexdigit()) {
+        true => git_ref.to_string(),
+        false => client
+            .get(&format!("/repos/{owner}/{repo}/commits/{git_ref}"))
+            .await?["sha"]
+            .as_str()
+            .unwrap_or(git_ref)
+            .to_string(),
+    };
+    let runs_path = format!("/repos/{owner}/{repo}/actions/runs");
+    let status_path = format!("/repos/{owner}/{repo}/commits/{sha}/status");
+    let runs_query = [("head_sha", sha.as_str()), ("per_page", "100")];
+    let (runs, statuses) = tokio::join!(
+        client.get_with_query(&runs_path, &runs_query),
+        client.get_with_query(&status_path, &[("per_page", "100")]),
+    );
+    let (runs, statuses) = match (runs, statuses) {
+        (Err(e), Err(_)) => return Err(e),
+        read => read,
+    };
+    let note = match (runs.is_ok(), statuses.is_ok()) {
+        (false, _) => format!(
+            "{ACTIONS_AND_STATUSES} Its Actions runs couldn't be read either: don't say CI passed."
+        ),
+        (true, false) => {
+            format!("{ACTIONS_AND_STATUSES} Its commit statuses couldn't be read either.")
+        }
+        (true, true) => ACTIONS_AND_STATUSES.to_string(),
+    };
+    let runs = runs.map(|r| workflow_checks(&r)).unwrap_or_default();
+    let statuses = statuses.map(|s| status_checks(&s)).unwrap_or_default();
+    Ok(CommitChecks {
+        runs: runs.into_iter().chain(statuses).collect(),
+        note: Some(note),
+    })
+}
+
+/// The latest run of each workflow in an `actions/runs` listing, as check
+/// runs: one that couldn't start, or waits on someone's approval, failed.
+fn workflow_checks(listing: &serde_json::Value) -> Vec<serde_json::Value> {
+    let attempt = |r: &serde_json::Value| {
+        (
+            r["run_number"].as_u64().unwrap_or(0),
+            r["run_attempt"].as_u64().unwrap_or(0),
+        )
+    };
+    let mut latest: std::collections::BTreeMap<String, &serde_json::Value> = Default::default();
+    for run in listing["workflow_runs"].as_array().into_iter().flatten() {
+        let workflow = run["workflow_id"]
+            .as_u64()
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| run["name"].as_str().unwrap_or_default().to_string());
+        let newer = latest
+            .get(&workflow)
+            .is_none_or(|kept| attempt(run) > attempt(kept));
+        if newer {
+            latest.insert(workflow, run);
+        }
+    }
+    latest
+        .into_values()
+        .map(|r| {
+            let completed = r["status"].as_str() == Some("completed");
+            let conclusion = match r["conclusion"].as_str() {
+                Some("startup_failure" | "action_required") => serde_json::json!("failure"),
+                _ => r["conclusion"].clone(),
+            };
+            serde_json::json!({
+                "name": r["name"],
+                "status": r["status"],
+                "conclusion": conclusion,
+                "html_url": r["html_url"],
+                "started_at": r["run_started_at"],
+                "completed_at": if completed { r["updated_at"].clone() } else { serde_json::Value::Null },
+            })
+        })
+        .collect()
+}
+
+/// The statuses on a commit (`commits/{sha}/status`), as check runs, named
+/// by their context: an error failed, as a failure did.
+fn status_checks(combined: &serde_json::Value) -> Vec<serde_json::Value> {
+    combined["statuses"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|s| {
+            let (status, conclusion) = match s["state"].as_str() {
+                Some("success") => ("completed", serde_json::json!("success")),
+                Some("failure" | "error") => ("completed", serde_json::json!("failure")),
+                _ => ("pending", serde_json::Value::Null),
+            };
+            serde_json::json!({
+                "name": s["context"],
+                "status": status,
+                "conclusion": conclusion,
+                "html_url": s["target_url"],
+                "started_at": s["created_at"],
+                "completed_at": if status == "completed" { s["updated_at"].clone() } else { serde_json::Value::Null },
+            })
+        })
+        .collect()
 }
 
 // ── CI gate evaluation ──────────────────────────────────────────────
@@ -4709,8 +4884,8 @@ mod tests {
         "default".to_string()
     }
 
-    #[test]
-    fn resolve_client_under_environment_lock() {
+    #[tokio::test]
+    async fn resolve_client_under_environment_lock() {
         use workforce_agent::runner::{ACTIVE_ENVIRONMENT, ACTIVE_SKILL_INSTANCES};
         let clients: HashMap<String, Arc<GithubClient>> = ["acme", "other"]
             .into_iter()
@@ -4723,41 +4898,44 @@ mod tests {
             .collect();
         let pins: workforce_agent::llm::environment::SkillPins =
             [("github".to_string(), vec!["acme".to_string()])].into();
-        ACTIVE_ENVIRONMENT.sync_scope("harbor-prod".to_string(), || {
-            ACTIVE_SKILL_INSTANCES.sync_scope(pins, || {
-                let acme = clients.get("acme").unwrap();
-                // No owner → the pin (acme), overriding the "other" default.
-                let c = resolve_client(
-                    &LiveInstances::from((clients).clone()),
-                    "other",
-                    &serde_json::json!({}),
-                )
-                .unwrap();
+        let set = LiveInstances::from(clients.clone());
+        let acme = clients.get("acme").unwrap();
+        let resolve = |input: serde_json::Value| {
+            let set = &set;
+            async move { resolve_client(set, "other", &input).await }
+        };
+        let checked = async {
+            // No owner → the pin (acme), overriding the "other" default.
+            let c = resolve(serde_json::json!({})).await.unwrap();
+            assert!(Arc::ptr_eq(&c, acme));
+            // An owner naming the pinned workspace resolves, in any case.
+            for owner in ["acme", "ACME"] {
+                let c = resolve(serde_json::json!({ "owner": owner }))
+                    .await
+                    .unwrap();
                 assert!(Arc::ptr_eq(&c, acme));
-                // An owner naming the pinned workspace resolves.
-                let c = resolve_client(
-                    &LiveInstances::from((clients).clone()),
-                    "other",
-                    &serde_json::json!({ "owner": "acme" }),
-                )
+            }
+            // A repository of an owner no workspace is named for: the pin,
+            // and no other is asked whether it reaches it.
+            let c = resolve(serde_json::json!({ "owner": "elsewhere", "repo": "app" }))
+                .await
                 .unwrap();
-                assert!(Arc::ptr_eq(&c, acme));
-                // An owner naming a DIFFERENT configured workspace is refused.
-                assert!(resolve_client(
-                    &LiveInstances::from((clients).clone()),
-                    "other",
-                    &serde_json::json!({ "owner": "other" })
-                )
+            assert!(Arc::ptr_eq(&c, acme));
+            // An owner naming a DIFFERENT configured workspace is refused.
+            assert!(resolve(serde_json::json!({ "owner": "other" }))
+                .await
                 .is_err());
-                // An explicit mismatching workspace is refused.
-                assert!(resolve_client(
-                    &LiveInstances::from((clients).clone()),
-                    "other",
-                    &serde_json::json!({ "workspace": "other" })
-                )
+            // An explicit mismatching workspace is refused.
+            assert!(resolve(serde_json::json!({ "workspace": "other" }))
+                .await
                 .is_err());
-            });
-        });
+        };
+        ACTIVE_ENVIRONMENT
+            .scope(
+                "harbor-prod".to_string(),
+                ACTIVE_SKILL_INSTANCES.scope(pins, checked),
+            )
+            .await;
     }
 
     #[test]
@@ -5624,6 +5802,190 @@ mod tests {
                 .unwrap();
             assert!(out.success);
             assert_eq!(out.output["identity"], "token");
+        }
+    }
+
+    // ── A commit's checks, and the connection a repository is read with ──
+
+    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const SHA: &str = "bf47c41f3aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    /// One connection, `token`, to `server`.
+    fn one(server: &MockServer, token: &str) -> Arc<LiveInstances<GithubClient>> {
+        let client = Arc::new(GithubClient::new(token, &server.uri()).unwrap());
+        Arc::new(LiveInstances::from(HashMap::from([(
+            "default".to_string(),
+            client,
+        )])))
+    }
+
+    #[tokio::test]
+    async fn check_runs_a_token_may_not_read_are_its_actions_runs_and_commit_statuses() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/acme/app/commits/{SHA}/check-runs")))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "message": "Resource not accessible by personal access token"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/app/actions/runs"))
+            .and(query_param("head_sha", SHA))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "workflow_runs": [
+                    {"workflow_id": 1, "name": "CI", "run_number": 7, "run_attempt": 1,
+                     "status": "completed", "conclusion": "failure"},
+                    {"workflow_id": 1, "name": "CI", "run_number": 7, "run_attempt": 2,
+                     "status": "completed", "conclusion": "success"},
+                    {"workflow_id": 2, "name": "Docs", "run_number": 3, "run_attempt": 1,
+                     "status": "completed", "conclusion": "startup_failure"},
+                ]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/acme/app/commits/{SHA}/status")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "state": "failure",
+                "statuses": [
+                    {"context": "ci/circleci", "state": "error", "target_url": "https://circleci.example/1"},
+                    {"context": "vercel", "state": "success"},
+                ]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let tool = GithubCiStatusTool::new(one(&server, "github_pat_x"), default_ws(), None);
+        let input = serde_json::json!({"owner": "acme", "repo": "app", "ref": SHA});
+        for _ in 0..2 {
+            let out = tool.execute(input.clone()).await.unwrap();
+            assert!(out.success, "{:?}", out.error);
+            let o = &out.output;
+            assert_eq!(o["overall"], "failure");
+            assert_eq!(
+                o["total_count"], 4,
+                "the latest attempt of each workflow, and each status: {o}"
+            );
+            assert_eq!(o["success_count"], 2);
+            assert_eq!(
+                o["failed_checks"],
+                serde_json::json!(["Docs", "ci/circleci"])
+            );
+            assert!(o["note"]
+                .as_str()
+                .unwrap()
+                .contains("Only GitHub Actions runs and commit statuses"));
+        }
+        // Asked once: what GitHub said of the key is kept.
+    }
+
+    #[tokio::test]
+    async fn check_runs_it_can_read_are_all_that_is_asked() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/app/commits/main/check-runs"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "check_runs": [{"name": "Clippy", "status": "completed", "conclusion": "success"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        for p in [
+            "/repos/acme/app/actions/runs",
+            "/repos/acme/app/commits/main/status",
+        ] {
+            Mock::given(path(p))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(0)
+                .mount(&server)
+                .await;
+        }
+        let tool = GithubCiStatusTool::new(one(&server, "ghs_app"), default_ws(), None);
+        let out = tool
+            .execute(serde_json::json!({"owner": "acme", "repo": "app", "ref": "main"}))
+            .await
+            .unwrap();
+        assert_eq!(out.output["overall"], "success");
+        assert_eq!(out.output["total_count"], 1);
+        assert!(out.output["note"].is_null());
+    }
+
+    /// A branch's checks without check runs are found by its head's SHA.
+    #[tokio::test]
+    async fn a_branchs_checks_without_check_runs_are_its_heads() {
+        let server = MockServer::start().await;
+        Mock::given(path("/repos/acme/app/commits/main/check-runs"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "message": "Resource not accessible by personal access token"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(path("/repos/acme/app/commits/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"sha": SHA})))
+            .mount(&server)
+            .await;
+        Mock::given(path("/repos/acme/app/actions/runs"))
+            .and(query_param("head_sha", SHA))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "workflow_runs": [{"workflow_id": 1, "name": "CI", "status": "in_progress", "conclusion": null}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Its statuses couldn't be read: its runs still are, and it says so.
+        Mock::given(path(format!("/repos/acme/app/commits/{SHA}/status")))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let tool = GithubCiStatusTool::new(one(&server, "github_pat_y"), default_ws(), None);
+        let out = tool
+            .execute(serde_json::json!({"owner": "acme", "repo": "app", "ref": "main"}))
+            .await
+            .unwrap();
+        assert_eq!(out.output["overall"], "pending");
+        assert!(out.output["note"]
+            .as_str()
+            .unwrap()
+            .contains("commit statuses couldn't be read"));
+    }
+
+    /// A repository only one of the caller's other connections reaches is
+    /// read with that one, and which it is is kept: the default isn't asked
+    /// again.
+    #[tokio::test]
+    async fn a_repository_is_read_with_the_connection_that_reaches_it() {
+        let server = MockServer::start().await;
+        for (token, status, times) in [("mine", 404, 1), ("patchwork", 200, 3)] {
+            Mock::given(method("GET"))
+                .and(path("/repos/PatchworkOnRails/app"))
+                .and(header("authorization", format!("Bearer {token}").as_str()))
+                .respond_with(ResponseTemplate::new(status).set_body_json(
+                    serde_json::json!({"full_name": "PatchworkOnRails/app", "message": "Not Found"}),
+                ))
+                .expect(times)
+                .mount(&server)
+                .await;
+        }
+        let client = |t: &str| Arc::new(GithubClient::new(t, &server.uri()).unwrap());
+        let clients = Arc::new(LiveInstances::from(HashMap::from([
+            ("default".to_string(), client("mine")),
+            (
+                "patchwork-github-read-only".to_string(),
+                client("patchwork"),
+            ),
+        ])));
+        let tool = GithubGetRepoTool::new(clients, default_ws(), None);
+        for _ in 0..2 {
+            let out = tool
+                .execute(serde_json::json!({"owner": "PatchworkOnRails", "repo": "app"}))
+                .await
+                .unwrap();
+            assert!(out.success, "{:?}", out.error);
         }
     }
 }

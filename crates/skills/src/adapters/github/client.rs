@@ -366,6 +366,113 @@ impl GithubClient {
     }
 }
 
+/// What GitHub last said of a key, by a non-secret stand-in for the key and
+/// the host it calls ([`GithubClient::key_id`]): whether it reaches a
+/// repository, and whether it may read check runs. Kept a while, so a
+/// check isn't asked again on every call, and for every caller holding the
+/// same key, since it is the key's own.
+static KEY_FACTS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<String, (bool, std::time::Instant)>>,
+> = std::sync::LazyLock::new(Default::default);
+/// The most key facts kept.
+const KEY_FACTS_KEPT: usize = 4_096;
+/// How long a key's fact is kept.
+const KEY_FACT_FOR: std::time::Duration = std::time::Duration::from_secs(3_600);
+/// How long a repository a key didn't reach is kept so: shorter, as the
+/// person may give the key that repository.
+const UNREACHED_FOR: std::time::Duration = std::time::Duration::from_secs(600);
+
+fn key_fact(key: &str) -> Option<bool> {
+    let facts = KEY_FACTS.lock();
+    facts
+        .get(key)
+        .filter(|(_, until)| *until > std::time::Instant::now())
+        .map(|(fact, _)| *fact)
+}
+
+fn keep_key_fact(key: String, fact: bool, kept_for: std::time::Duration) {
+    let mut facts = KEY_FACTS.lock();
+    if facts.len() >= KEY_FACTS_KEPT {
+        facts.clear();
+    }
+    facts.insert(key, (fact, std::time::Instant::now() + kept_for));
+}
+
+/// GitHub's word that the key may not read what was asked (404, 401, or a
+/// 403 that isn't a rate limit), as against GitHub not answering.
+fn refused(e: &eyre::Report) -> bool {
+    let message = e.to_string();
+    e.downcast_ref::<RateLimitedError>().is_none()
+        && !message.to_lowercase().contains("rate limit exceeded")
+        && ["Not found:", "Authentication failed:", "Forbidden "]
+            .iter()
+            .any(|p| message.starts_with(p))
+}
+
+/// GitHub's word that the key can't read check runs at all: a personal
+/// access token never may ("Resource not accessible by personal access
+/// token"), nor an App without the Checks permission ("… by integration").
+pub fn refuses_check_runs(e: &eyre::Report) -> bool {
+    refused(e) && e.to_string().contains("not accessible by")
+}
+
+impl GithubClient {
+    /// A non-secret stand-in for the key this client calls with now and the
+    /// host it calls: `None` without a key.
+    fn key_id(&self) -> Option<String> {
+        use sha2::{Digest, Sha256};
+        let (headers, base_url) = self.build_request().ok()?;
+        let digest = Sha256::new()
+            .chain_update(headers.get(AUTHORIZATION)?.as_bytes())
+            .chain_update([0u8])
+            .chain_update(base_url.as_bytes())
+            .finalize();
+        Some(digest.iter().take(16).map(|b| format!("{b:02x}")).collect())
+    }
+
+    /// Whether this client's key reaches `owner/repo`: as GitHub last said,
+    /// else asked (`GET /repos/{owner}/{repo}`) and kept. An error only when
+    /// GitHub couldn't say (a rate limit, the network).
+    pub async fn reaches(&self, owner: &str, repo: &str) -> Result<bool> {
+        let Some(id) = self.key_id() else {
+            return Ok(false);
+        };
+        let key = format!(
+            "{id} reaches {}/{}",
+            owner.to_lowercase(),
+            repo.to_lowercase()
+        );
+        if let Some(known) = key_fact(&key) {
+            return Ok(known);
+        }
+        match self.get(&format!("/repos/{owner}/{repo}")).await {
+            Ok(_) => {
+                keep_key_fact(key, true, KEY_FACT_FOR);
+                Ok(true)
+            }
+            Err(e) if refused(&e) => {
+                keep_key_fact(key, false, UNREACHED_FOR);
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Whether GitHub refused this client's key check runs lately.
+    pub fn check_runs_refused(&self) -> bool {
+        self.key_id()
+            .and_then(|id| key_fact(&format!("{id} no check runs")))
+            .unwrap_or(false)
+    }
+
+    /// Keeps that GitHub refused this client's key check runs.
+    pub fn refuse_check_runs(&self) {
+        if let Some(id) = self.key_id() {
+            keep_key_fact(format!("{id} no check runs"), true, KEY_FACT_FOR);
+        }
+    }
+}
+
 /// A non-secret stand-in for an App's identity: its id and a digest of its
 /// key.
 fn app_fingerprint(app: &AppCredentials) -> String {
