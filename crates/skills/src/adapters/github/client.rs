@@ -402,8 +402,10 @@ fn keep_key_fact(key: String, fact: bool, kept_for: std::time::Duration) {
 /// 403 that isn't a rate limit), as against GitHub not answering.
 fn refused(e: &eyre::Report) -> bool {
     let message = e.to_string();
+    // GitHub's own words, after what the status was taken for.
+    let said = message.split_once(": ").map_or("", |(_, said)| said);
     e.downcast_ref::<RateLimitedError>().is_none()
-        && !message.to_lowercase().contains("rate limit")
+        && !said.to_lowercase().contains("rate limit")
         && ["Not found:", "Authentication failed:", "Forbidden "]
             .iter()
             .any(|p| message.starts_with(p))
@@ -591,6 +593,27 @@ mod tests {
             limited.message,
             "Forbidden (rate limit or permissions): You have exceeded a secondary rate limit"
         );
+    }
+
+    #[tokio::test]
+    async fn a_token_refused_check_runs_is_told_from_a_rate_limit() {
+        let pat = canned_response(
+            403,
+            None,
+            r#"{"message":"Resource not accessible by personal access token"}"#,
+        );
+        let pat = GithubClient::handle_response(pat).await.unwrap_err();
+        assert!(refused(&pat) && refuses_check_runs(&pat));
+        let limited = canned_response(
+            403,
+            None,
+            r#"{"message":"You have exceeded a secondary rate limit"}"#,
+        );
+        let limited = GithubClient::handle_response(limited).await.unwrap_err();
+        assert!(!refused(&limited) && !refuses_check_runs(&limited));
+        let missing = canned_response(404, None, r#"{"message":"Not Found"}"#);
+        let missing = GithubClient::handle_response(missing).await.unwrap_err();
+        assert!(refused(&missing) && !refuses_check_runs(&missing));
     }
 
     #[tokio::test]
