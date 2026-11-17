@@ -10,6 +10,8 @@ API key only (Metabase v0.49+). Sent as the `X-API-KEY` header. Generate at `/ad
 - Multi-instance: `skills/metabase/instances/<name>/api_key` + `skills/metabase/instances/<name>/site_url`
 - Default selection: `skills/metabase/default_instance` (only with several instances)
 
+Cloudflare Access (optional, both or neither): `access_client_id` + `access_client_secret`, flat or per instance like `api_key`. Sent as `CF-Access-Client-Id` / `CF-Access-Client-Secret` on every request; half a pair sends neither and logs a warning.
+
 Per-instance row cap (optional): `skills/metabase/instances/<name>/max_query_rows` — clamped to a hard ceiling of 50000 regardless of what's configured.
 
 ## Multi-instance support

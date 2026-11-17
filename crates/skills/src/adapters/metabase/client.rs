@@ -1,10 +1,13 @@
 //! Metabase REST API HTTP client wrapper.
 //!
-//! Auth: `X-API-KEY` header (Metabase v0.49+). All requests target
-//! `{site_url}/api{path}`. Error mapping covers the common auth/permission/rate
-//! failure modes so tool callers get actionable messages.
+//! Auth: `X-API-KEY` header (Metabase v0.49+), plus a Cloudflare Access
+//! service token (`CF-Access-Client-Id` / `CF-Access-Client-Secret`) when the
+//! instance has one. All requests target `{site_url}/api{path}`. Error
+//! mapping covers the common auth/permission/rate failure modes so tool
+//! callers get actionable messages.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use eyre::{eyre, Result};
@@ -21,6 +24,43 @@ use crate::adapters::auth::{companion_for, field_paths, resolve_credential};
 use crate::adapters::utils::retry_after_secs;
 
 const API_KEY_HEADER: &str = "x-api-key";
+const ACCESS_ID_HEADER: &str = "cf-access-client-id";
+const ACCESS_SECRET_HEADER: &str = "cf-access-client-secret";
+
+/// A Cloudflare Access service token, sent beside the API key.
+#[derive(Clone)]
+struct AccessToken {
+    id: HeaderValue,
+    secret: HeaderValue,
+}
+
+/// What an instance's Cloudflare Access settings amount to.
+enum AccessPair {
+    Unset,
+    Token(AccessToken),
+    /// Only one of the two is set; names the one that isn't.
+    Missing(&'static str),
+}
+
+/// The Cloudflare Access pair from its two settings, blank counting as unset.
+fn access_pair(id: Option<&str>, secret: Option<&str>) -> Result<AccessPair> {
+    fn present(value: Option<&str>) -> Option<&str> {
+        value.map(str::trim).filter(|v| !v.is_empty())
+    }
+    match (present(id), present(secret)) {
+        (Some(id), Some(secret)) => {
+            let id = HeaderValue::from_str(id)
+                .map_err(|_| eyre!("Invalid Cloudflare Access client id"))?;
+            let mut secret = HeaderValue::from_str(secret)
+                .map_err(|_| eyre!("Invalid Cloudflare Access client secret"))?;
+            secret.set_sensitive(true);
+            Ok(AccessPair::Token(AccessToken { id, secret }))
+        }
+        (None, None) => Ok(AccessPair::Unset),
+        (Some(_), None) => Ok(AccessPair::Missing("access_client_secret")),
+        (None, Some(_)) => Ok(AccessPair::Missing("access_client_id")),
+    }
+}
 
 /// Thin wrapper around `reqwest::Client` for the Metabase REST API.
 ///
@@ -33,6 +73,10 @@ pub struct MetabaseClient {
     site_url: Option<String>,
     pub max_query_rows: u64,
     static_auth: Option<HeaderValue>,
+    static_access: Option<AccessToken>,
+    /// Whether the warning that the access token isn't sent has been logged,
+    /// so a vault-backed client says it once rather than on every request.
+    access_warned: AtomicBool,
     store: Option<Arc<dyn SecretStore>>,
     workspace: String,
     /// Everything this process has learned about the instance's schema, from
@@ -144,6 +188,8 @@ impl MetabaseClient {
             site_url: Some(site_url.to_string()),
             max_query_rows,
             static_auth: Some(auth),
+            static_access: None,
+            access_warned: AtomicBool::new(false),
             store: None,
             workspace: String::new(),
             snapshot: parking_lot::RwLock::new(InstanceSchema::default()),
@@ -169,6 +215,8 @@ impl MetabaseClient {
             site_url: site_url.map(str::to_string),
             max_query_rows,
             static_auth: None,
+            static_access: None,
+            access_warned: AtomicBool::new(false),
             store: Some(store),
             workspace: workspace.to_string(),
             snapshot: parking_lot::RwLock::new(InstanceSchema::default()),
@@ -176,6 +224,13 @@ impl MetabaseClient {
             schema_store: None,
             published: parking_lot::RwLock::new(None),
         })
+    }
+
+    /// Send a Cloudflare Access service token with every request. Half a
+    /// pair sends neither header and logs a warning.
+    pub fn with_access(mut self, id: Option<&str>, secret: Option<&str>) -> Result<Self> {
+        self.static_access = self.usable(access_pair(id, secret)?);
+        Ok(self)
     }
 
     /// Attach the persistent schema store.
@@ -459,6 +514,54 @@ impl MetabaseClient {
         field_paths("metabase", "instances", &self.workspace, field)
     }
 
+    fn usable(&self, pair: AccessPair) -> Option<AccessToken> {
+        match pair {
+            AccessPair::Token(token) => Some(token),
+            AccessPair::Unset => None,
+            AccessPair::Missing(field) => {
+                self.warn_access_unsent(&format!("{field} is not set"));
+                None
+            }
+        }
+    }
+
+    fn warn_access_unsent(&self, why: &str) {
+        if !self.access_warned.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                instance = %self.workspace,
+                site = self.site_url.as_deref().unwrap_or("per-user site"),
+                "Metabase Cloudflare Access headers not sent: {why}"
+            );
+        }
+    }
+
+    /// The caller's Cloudflare Access token for a request to `base_url`.
+    ///
+    /// The secret is the credential, so its id and site are read beside it
+    /// (see [`companion_for`]); it is sent only when the site it is paired
+    /// with is the one this request goes to, so a shared token never
+    /// reaches a site one user chose for their own key.
+    fn vault_access(&self, store: &dyn SecretStore, base_url: &str) -> Result<Option<AccessToken>> {
+        let (id_ws, id_flat) = self.paths("access_client_id");
+        let (secret_ws, secret_flat) = self.paths("access_client_secret");
+        let Some(secret) = resolve_credential(store, &secret_ws, &secret_flat) else {
+            let id = resolve_credential(store, &id_ws, &id_flat);
+            return Ok(self.usable(access_pair(id.as_ref().map(|r| r.value.as_str()), None)?));
+        };
+        let id = companion_for(store, &secret, &id_ws, &id_flat);
+        let (site_ws, site_flat) = self.paths("site_url");
+        let paired_site = companion_for(store, &secret, &site_ws, &site_flat)
+            .map(|site| api_base(&site))
+            .or_else(|| self.base_url.clone());
+        match access_pair(id.as_deref(), Some(&secret.value))? {
+            AccessPair::Token(_) if paired_site.as_deref() != Some(base_url) => {
+                self.warn_access_unsent("the token is not paired with this site");
+                Ok(None)
+            }
+            pair => Ok(self.usable(pair)),
+        }
+    }
+
     fn build_request(&self) -> Result<(HeaderMap, String)> {
         let (auth, base_url) = match (&self.static_auth, &self.store) {
             (Some(h), _) => (h.clone(), self.base_url.clone()),
@@ -482,9 +585,19 @@ impl MetabaseClient {
                 self.paths("site_url").0
             )
         })?;
+        let access = match &self.store {
+            Some(store) => self.vault_access(store.as_ref(), &base_url)?,
+            None => self.static_access.clone(),
+        };
         let mut headers = HeaderMap::new();
         headers.insert(HeaderName::from_static(API_KEY_HEADER), auth);
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.extend(access.into_iter().flat_map(|token| {
+            [
+                (HeaderName::from_static(ACCESS_ID_HEADER), token.id),
+                (HeaderName::from_static(ACCESS_SECRET_HEADER), token.secret),
+            ]
+        }));
         Ok((headers, base_url))
     }
 
@@ -1068,6 +1181,310 @@ mod tests {
         let client = MetabaseClient::with_store(no_site, "prod", None, 2000).unwrap();
         let err = client.build_request().unwrap_err().to_string();
         assert!(err.contains("site_url not configured"), "{err}");
+    }
+
+    const ACCESS_ID: &str = "test-client-id.access";
+    const ACCESS_SECRET: &str = "not-a-real-access-secret";
+
+    #[derive(Clone, Default)]
+    struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+        type Writer = Logs;
+        fn make_writer(&'a self) -> Logs {
+            self.clone()
+        }
+    }
+
+    impl Logs {
+        fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+            let logs = Self::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .finish();
+            (logs, tracing::subscriber::set_default(subscriber))
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+
+        fn warnings(&self) -> usize {
+            self.text()
+                .lines()
+                .filter(|line| line.contains("Cloudflare Access headers not sent"))
+                .count()
+        }
+    }
+
+    async fn sent_headers(
+        client: &MetabaseClient,
+        server: &wiremock::MockServer,
+    ) -> http::HeaderMap {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path("/api/user/current"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(server)
+            .await;
+        client
+            .get("/user/current", &[])
+            .await
+            .expect("request succeeds");
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .pop()
+            .expect("a request reached the server")
+            .headers
+    }
+
+    fn has_access_headers(headers: &HeaderMap) -> (bool, bool) {
+        (
+            headers.contains_key(ACCESS_ID_HEADER),
+            headers.contains_key(ACCESS_SECRET_HEADER),
+        )
+    }
+
+    #[tokio::test]
+    async fn access_headers_are_sent_when_both_are_set() {
+        let server = wiremock::MockServer::start().await;
+        let client = MetabaseClient::new("mb_test", &server.uri(), 2000)
+            .unwrap()
+            .with_access(Some(ACCESS_ID), Some(ACCESS_SECRET))
+            .unwrap();
+        let headers = sent_headers(&client, &server).await;
+        assert_eq!(headers.get(ACCESS_ID_HEADER).unwrap(), ACCESS_ID);
+        assert_eq!(headers.get(ACCESS_SECRET_HEADER).unwrap(), ACCESS_SECRET);
+        assert_eq!(headers.get(API_KEY_HEADER).unwrap(), "mb_test");
+    }
+
+    #[tokio::test]
+    async fn no_access_headers_when_neither_is_set() {
+        let server = wiremock::MockServer::start().await;
+        let client = MetabaseClient::new("mb_test", &server.uri(), 2000)
+            .unwrap()
+            .with_access(None, None)
+            .unwrap();
+        let headers = sent_headers(&client, &server).await;
+        assert_eq!(has_access_headers(&headers), (false, false));
+        assert_eq!(headers.get(API_KEY_HEADER).unwrap(), "mb_test");
+    }
+
+    #[tokio::test]
+    async fn half_a_pair_sends_neither_header_and_warns_without_the_secret() {
+        for (id, secret, missing) in [
+            (Some(ACCESS_ID), None, "access_client_secret is not set"),
+            (None, Some(ACCESS_SECRET), "access_client_id is not set"),
+        ] {
+            let (logs, _guard) = Logs::capture();
+            let server = wiremock::MockServer::start().await;
+            let client = MetabaseClient::new("mb_test", &server.uri(), 2000)
+                .unwrap()
+                .with_access(id, secret)
+                .unwrap();
+            let headers = sent_headers(&client, &server).await;
+            client.get("/user/current", &[]).await.unwrap();
+            assert_eq!(has_access_headers(&headers), (false, false), "{missing}");
+            assert!(logs.text().contains(missing), "{}", logs.text());
+            assert_eq!(logs.warnings(), 1, "warned once: {}", logs.text());
+            assert!(!logs.text().contains(ACCESS_SECRET), "{}", logs.text());
+        }
+    }
+
+    #[tokio::test]
+    async fn the_secret_never_reaches_the_logs_when_it_is_sent() {
+        let (logs, _guard) = Logs::capture();
+        let server = wiremock::MockServer::start().await;
+        let client = MetabaseClient::new("mb_test", &server.uri(), 2000)
+            .unwrap()
+            .with_access(Some(ACCESS_ID), Some(ACCESS_SECRET))
+            .unwrap();
+        let headers = sent_headers(&client, &server).await;
+        assert_eq!(headers.get(ACCESS_SECRET_HEADER).unwrap(), ACCESS_SECRET);
+        assert!(!logs.text().contains(ACCESS_SECRET), "{}", logs.text());
+        let (built, _) = client.build_request().unwrap();
+        assert!(built.get(ACCESS_SECRET_HEADER).unwrap().is_sensitive());
+        assert!(!format!("{built:?}").contains(ACCESS_SECRET));
+    }
+
+    #[test]
+    fn blank_access_values_count_as_unset() {
+        assert!(matches!(
+            access_pair(None, None).unwrap(),
+            AccessPair::Unset
+        ));
+        assert!(matches!(
+            access_pair(Some("  "), Some("")).unwrap(),
+            AccessPair::Unset
+        ));
+        assert!(matches!(
+            access_pair(Some(ACCESS_ID), Some(" ")).unwrap(),
+            AccessPair::Missing("access_client_secret")
+        ));
+        assert!(matches!(
+            access_pair(Some(""), Some(ACCESS_SECRET)).unwrap(),
+            AccessPair::Missing("access_client_id")
+        ));
+        let AccessPair::Token(token) = access_pair(
+            Some(" test-client-id.access "),
+            Some(" not-a-real-access-secret\n"),
+        )
+        .unwrap() else {
+            panic!("a trimmed pair is a token");
+        };
+        assert_eq!(token.id, ACCESS_ID);
+        assert_eq!(token.secret, ACCESS_SECRET);
+    }
+
+    #[test]
+    fn an_invalid_access_value_errors_without_echoing_it() {
+        let err = access_pair(Some(ACCESS_ID), Some("not-a-real\nsecret"))
+            .err()
+            .expect("a newline is not a header value")
+            .to_string();
+        assert_eq!(err, "Invalid Cloudflare Access client secret");
+        let err = access_pair(Some("bad\u{7f}id"), Some(ACCESS_SECRET))
+            .err()
+            .expect("DEL is not a header value")
+            .to_string();
+        assert_eq!(err, "Invalid Cloudflare Access client id");
+    }
+
+    #[test]
+    fn a_vault_pair_beside_a_shared_key_is_sent() {
+        let store = InMem::from(&[
+            ("skills/metabase/instances/prod/api_key", "mb_shared"),
+            (
+                "skills/metabase/instances/prod/site_url",
+                "https://mb.example.com",
+            ),
+            ("skills/metabase/instances/prod/access_client_id", ACCESS_ID),
+            (
+                "skills/metabase/instances/prod/access_client_secret",
+                ACCESS_SECRET,
+            ),
+        ]);
+        let client = MetabaseClient::with_store(store, "prod", None, 2000).unwrap();
+        let (headers, _) = client.build_request().unwrap();
+        assert_eq!(headers.get(ACCESS_ID_HEADER).unwrap(), ACCESS_ID);
+        assert_eq!(headers.get(ACCESS_SECRET_HEADER).unwrap(), ACCESS_SECRET);
+    }
+
+    #[test]
+    fn a_flat_vault_pair_serves_a_named_instance() {
+        let store = InMem::from(&[
+            ("skills/metabase/instances/prod/api_key", "mb_shared"),
+            ("skills/metabase/access_client_id", ACCESS_ID),
+            ("skills/metabase/access_client_secret", ACCESS_SECRET),
+        ]);
+        let client =
+            MetabaseClient::with_store(store, "prod", Some("https://mb.example.com"), 2000)
+                .unwrap();
+        let (headers, _) = client.build_request().unwrap();
+        assert_eq!(has_access_headers(&headers), (true, true));
+    }
+
+    #[test]
+    fn a_per_user_key_on_the_shared_site_gets_the_shared_pair() {
+        let store = LayeredInMem::new(
+            &[
+                ("skills/metabase/site_url", "https://mb.example.com"),
+                ("skills/metabase/access_client_id", ACCESS_ID),
+                ("skills/metabase/access_client_secret", ACCESS_SECRET),
+            ],
+            &[("skills/metabase/instances/prod/api_key", "mb_mine")],
+        );
+        let client = MetabaseClient::with_store(store, "prod", None, 2000).unwrap();
+        let (headers, base_url) = client.build_request().unwrap();
+        assert_eq!(base_url, "https://mb.example.com/api");
+        assert_eq!(headers.get(API_KEY_HEADER).unwrap(), "mb_mine");
+        assert_eq!(has_access_headers(&headers), (true, true));
+    }
+
+    #[test]
+    fn a_shared_access_secret_is_never_sent_to_a_site_the_user_chose() {
+        let (logs, _guard) = Logs::capture();
+        let store = LayeredInMem::new(
+            &[
+                ("skills/metabase/site_url", "https://mb.example.com"),
+                ("skills/metabase/access_client_id", ACCESS_ID),
+                ("skills/metabase/access_client_secret", ACCESS_SECRET),
+            ],
+            &[
+                ("skills/metabase/instances/prod/api_key", "mb_mine"),
+                (
+                    "skills/metabase/instances/prod/site_url",
+                    "https://mb.mine.example",
+                ),
+            ],
+        );
+        let client = MetabaseClient::with_store(store, "prod", None, 2000).unwrap();
+        let (headers, base_url) = client.build_request().unwrap();
+        client.build_request().unwrap();
+        assert_eq!(base_url, "https://mb.mine.example/api");
+        assert_eq!(has_access_headers(&headers), (false, false));
+        assert!(
+            logs.text().contains("not paired with this site"),
+            "{}",
+            logs.text()
+        );
+        assert_eq!(logs.warnings(), 1, "warned once: {}", logs.text());
+        assert!(!logs.text().contains(ACCESS_SECRET));
+    }
+
+    #[test]
+    fn a_users_own_pair_goes_to_their_own_site() {
+        let store = LayeredInMem::new(
+            &[("skills/metabase/site_url", "https://mb.example.com")],
+            &[
+                ("skills/metabase/instances/prod/api_key", "mb_mine"),
+                (
+                    "skills/metabase/instances/prod/site_url",
+                    "https://mb.mine.example",
+                ),
+                ("skills/metabase/instances/prod/access_client_id", ACCESS_ID),
+                (
+                    "skills/metabase/instances/prod/access_client_secret",
+                    ACCESS_SECRET,
+                ),
+            ],
+        );
+        let client = MetabaseClient::with_store(store, "prod", None, 2000).unwrap();
+        let (headers, base_url) = client.build_request().unwrap();
+        assert_eq!(base_url, "https://mb.mine.example/api");
+        assert_eq!(has_access_headers(&headers), (true, true));
+    }
+
+    #[test]
+    fn half_a_vault_pair_sends_neither_header_and_warns_once() {
+        let (logs, _guard) = Logs::capture();
+        let store = InMem::from(&[
+            ("skills/metabase/api_key", "mb_shared"),
+            ("skills/metabase/access_client_id", ACCESS_ID),
+        ]);
+        let client =
+            MetabaseClient::with_store(store, "default", Some("https://mb.example.com"), 2000)
+                .unwrap();
+        let (headers, _) = client.build_request().unwrap();
+        client.build_request().unwrap();
+        assert_eq!(has_access_headers(&headers), (false, false));
+        assert!(logs.text().contains("access_client_secret is not set"));
+        assert_eq!(logs.warnings(), 1, "warned once: {}", logs.text());
     }
 
     #[tokio::test]

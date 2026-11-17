@@ -41,6 +41,25 @@ surface `403 Forbidden` errors with the affected resource in the message.
 Metabase versions before v0.49 do not support API keys. The skill is not
 compatible with those deployments.
 
+### Cloudflare Access
+
+An instance behind Cloudflare Access also needs a Cloudflare Access service
+token. Store its client id and secret beside the API key, at
+`access_client_id` and `access_client_secret` (flat or per instance, like
+every other field). With both set, every request also sends
+`CF-Access-Client-Id` and `CF-Access-Client-Secret`. With neither, nothing
+extra is sent.
+
+Exactly one of the two is a misconfiguration: neither header is sent and a
+warning naming the missing setting is logged once per client. It is a
+warning rather than an error so an instance that works today keeps working
+while the pair is being set, and one stray setting never disables the other
+instances. The secret is never logged.
+
+On the hub the pair is read per request, like the API key, and is sent only
+to the site an authority over the secret chose: a shared token is never
+paired with a site one user set for their own key.
+
 ## Instances
 
 Each Metabase deployment (a distinct `site_url`) is a separate **instance**.
@@ -78,6 +97,14 @@ Optional: override the row cap for `card_query` / `dashboard_query` /
 workforce vault set skills/metabase/max_query_rows 500
 ```
 
+Optional: a Cloudflare Access service token, for an instance behind
+Cloudflare Access (both or neither):
+
+```bash
+workforce vault set skills/metabase/access_client_id     <token-id>.access
+workforce vault set skills/metabase/access_client_secret <token-secret>
+```
+
 ### Multi instance
 
 ```bash
@@ -87,6 +114,8 @@ workforce vault set skills/metabase/instances/prod/site_url        https://mb.pr
 workforce vault set skills/metabase/instances/staging/api_key      <mb_...>
 workforce vault set skills/metabase/instances/staging/site_url     https://mb.staging.example.com
 workforce vault set skills/metabase/instances/staging/max_query_rows 500
+workforce vault set skills/metabase/instances/staging/access_client_id     <token-id>.access
+workforce vault set skills/metabase/instances/staging/access_client_secret <token-secret>
 
 workforce vault set skills/metabase/default_instance               prod
 ```
@@ -257,6 +286,7 @@ calls to route away from the default deployment.
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | `Authentication failed — check Metabase api_key` | Wrong or revoked key, or Metabase < v0.49 | Re-generate the key at `/admin/settings/authentication/api-keys`. Upgrade to v0.49+ if older. |
+| A Cloudflare login page, redirect or `403` instead of Metabase JSON | The instance is behind Cloudflare Access and the service token is missing, half-set, or not allowed by the Access policy | Set both `access_client_id` and `access_client_secret` for the instance, check the hub log for `Cloudflare Access headers not sent`, and allow the token in a Service Auth rule. |
 | `Forbidden (check collection/database permissions)` | API key's user/group lacks access to that collection or database | Grant the scope in Metabase admin → Permissions, then retry. |
 | `Not found` on a known resource | Wrong instance in a multi-instance setup | Pass `instance="<name>"` explicitly, or set `default_instance`. |
 | Query returned fewer rows than requested | The 2000-row hard cap or a lower per-instance `max_query_rows` | Check `row_cap` on the response. Raise `max_query_rows` (up to 2000) or narrow the query. |

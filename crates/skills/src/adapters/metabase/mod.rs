@@ -71,12 +71,17 @@ impl MetabaseSkill {
             let site_url = inst.site_url.as_deref().ok_or_else(|| {
                 eyre::eyre!("Metabase instance '{name}' has no site_url configured")
             })?;
-            client::MetabaseClient::new(&inst.api_key, site_url, inst.max_query_rows)
+            client::MetabaseClient::new(&inst.api_key, site_url, inst.max_query_rows)?.with_access(
+                inst.access_client_id.as_deref(),
+                inst.access_client_secret
+                    .as_ref()
+                    .map(|secret| secret.expose_secret().as_str()),
+            )
         })
     }
 
-    /// Build a `MetabaseSkill` whose clients resolve their api_key from
-    /// `store` per request. Pass a `LayeredUserVault` for per-user
+    /// Build a `MetabaseSkill` whose clients resolve their api_key and
+    /// Cloudflare Access token from `store` per request. Pass a `LayeredUserVault` for per-user
     /// resolution.
     pub fn with_store(
         config: MetabaseSkillConfig,
@@ -136,6 +141,8 @@ impl MetabaseSkill {
                     api_key: String::new(),
                     site_url: None,
                     max_query_rows: config::default_max_rows(),
+                    access_client_id: None,
+                    access_client_secret: None,
                 },
                 make,
             )
@@ -719,6 +726,8 @@ mod tests {
                             api_key: format!("mb_{name}"),
                             site_url: Some(format!("https://mb.{name}.example.com")),
                             max_query_rows: 2000,
+                            access_client_id: None,
+                            access_client_secret: None,
                         },
                     )
                 })

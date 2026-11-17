@@ -404,7 +404,14 @@ pub const CATALOG: &[Connector] = &[
         primary_sub: "api_key",
         site: Some("site_url"),
         name_hint: "Acme",
-        extras: &[("skills/metabase/max_query_rows", "max_query_rows")],
+        extras: &[
+            ("skills/metabase/max_query_rows", "max_query_rows"),
+            ("skills/metabase/access_client_id", "access_client_id"),
+            (
+                "skills/metabase/access_client_secret",
+                "access_client_secret",
+            ),
+        ],
     },
 ];
 
