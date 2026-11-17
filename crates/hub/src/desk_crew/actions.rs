@@ -728,7 +728,7 @@ impl CrewHub {
         // Taking on a session the person runs is theirs to say, unless
         // they let it take on every one.
         if let Action::TakeOn { session } = action {
-            if self.taken_back(*session) {
+            if self.released(*session) {
                 return Gate::Suggest("the person took this session back from you; offer to take it on again and they accept".into());
             }
             return match o.work.take_on {
@@ -1109,13 +1109,19 @@ impl CrewHub {
     }
 
     /// Whether a boss ran `session` and it was let go: only the person
-    /// hands it back.
+    /// hands it to a boss again.
+    fn released(&self, session: Uuid) -> bool {
+        self.desk.charge_of(session).is_some_and(|c| !c.live())
+    }
+
+    /// Whether the person took `session` back from its boss: no boss acts
+    /// on it until they hand it back ([`Self::left_alone`]).
     pub(crate) fn taken_back(&self, session: Uuid) -> bool {
         self.desk.taken_back(session)
     }
 
     /// Why no boss does `action`, when it is done to a session the person
-    /// took back (or its boss let go): nothing reaches it from any boss
+    /// took back: nothing reaches it from any boss
     /// (a message, an answer, an approval, an interrupt, a ticket) until
     /// the person hands it to one again. Every boss still sees it. Taking
     /// it on again is the person's word ([`Action::TakeOn`]'s own gate).
@@ -1127,11 +1133,8 @@ impl CrewHub {
             } => Some(*s),
             _ => Self::session_of(action),
         }?;
-        let c = self.desk.charge_of(session).filter(|c| !c.live())?;
-        Some(workforce_desk::charge::left_alone(
-            &self.session_name(session),
-            c.released_by,
-        ))
+        self.taken_back(session)
+            .then(|| workforce_desk::charge::left_alone(&self.session_name(session)))
     }
 
     pub(super) fn session_name(&self, id: Uuid) -> String {
@@ -1725,7 +1728,7 @@ impl CrewHub {
                 // yes to its offer.
                 let how = match by.party.kind {
                     crew::PartyKind::You => How::Handed,
-                    _ if self.taken_back(*session) => {
+                    _ if self.released(*session) => {
                         return Err(format!(
                             "The person took {} back; only they can hand it to you again.",
                             self.session_name(*session)

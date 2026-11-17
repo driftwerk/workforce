@@ -532,12 +532,11 @@ impl Desk {
                             if !self.boss_reaches(&by.party.id, group) {
                                 return Err(Refusal::NoSuchSession(id.to_string()).into());
                             }
-                            // Taken back from its boss: no boss writes to
-                            // it until the person hands it to one again.
-                            if let Some(c) = self.charge_of(id).filter(|c| !c.live()) {
+                            // Taken back by the person: no boss writes to
+                            // it until they hand it to one again.
+                            if self.taken_back(id) {
                                 return Err(Refusal::TakenBack(crate::charge::left_alone(
                                     them.label(),
-                                    c.released_by,
                                 ))
                                 .into());
                             }

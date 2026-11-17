@@ -133,18 +133,10 @@ impl Charge {
     }
 }
 
-/// Why no boss acts on `name` once the person took it back from its boss
-/// (or its boss let it go, `by`): only they hand it to a boss again. Said
-/// to the boss, whatever it tried, as a sentence.
-pub fn left_alone(name: &str, by: Option<ReleasedBy>) -> String {
-    match by {
-        Some(ReleasedBy::Boss) => format!(
-            "{name} was let go and the person runs it now; leave it alone until they hand it back."
-        ),
-        _ => {
-            format!("The person took {name} back from you; leave it alone until they hand it back.")
-        }
-    }
+/// Why no boss acts on `name` once the person took it back from its boss:
+/// only they hand it to a boss again. Said to the boss, whatever it tried.
+pub fn left_alone(name: &str) -> String {
+    format!("The person took {name} back from you; leave it alone until they hand it back.")
 }
 
 /// Why a session can't be taken on, in the words the person reads.

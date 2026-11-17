@@ -4,6 +4,7 @@
 //! gone on answering its reports, its requests and a pull request's
 //! change.
 //!
+//! - What it asked its boss and still waits on is the person's.
 //! - What it tells Desk is kept, and no boss's turn replies to it; it is
 //!   told nobody at Desk answers it now.
 //! - Its requests wait on the person: no decision call is made for them,
@@ -37,7 +38,31 @@ async fn a_session_the_person_took_back_gets_nothing_from_its_boss_until_handed_
             d.charge_of(s.id).filter(|c| c.live())
         })
         .await;
+        // A question to its boss, still open as the person takes it back.
+        let asked = d
+            .line_call(
+                s.id,
+                "ask",
+                &json!({"to": "desk", "text": "Shall I drop the old ledger table?", "wait_seconds": 60}),
+                Some(Duration::from_millis(10)),
+            )
+            .await
+            .unwrap();
+        let ask: uuid::Uuid = serde_json::from_value(asked["id"].clone()).unwrap();
         d.release(s.id, &By::you()).await.unwrap();
+        let q = eventually("its question, the person's", async || {
+            d.store()
+                .line_message(ask)
+                .await
+                .unwrap()
+                .filter(|q| q.asked != Some(workforce_desk::line::Asked::Open))
+        })
+        .await;
+        assert_eq!(
+            q.asked,
+            Some(workforce_desk::line::Asked::Escalated),
+            "given to the person, never answered by the boss: {q:?}"
+        );
         let (_, o) = crew.overseer_service().unwrap();
 
         // It reports to Desk: kept, and it is told nobody answers.

@@ -465,10 +465,11 @@ impl CrewHub {
     /// back: its requests and questions are theirs, as for a session no
     /// boss oversees, until they hand it to one again.
     pub(super) fn boss_over(&self, view: &SessionView) -> Option<String> {
-        match self.desk.charge_of(view.id) {
-            Some(c) if c.live() => return Some(c.boss),
-            Some(_) => return None,
-            None => {}
+        if let Some(c) = self.desk.charge_of(view.id).filter(|c| c.live()) {
+            return Some(c.boss);
+        }
+        if self.taken_back(view.id) {
+            return None;
         }
         let (s, o) = self.overseer_of_session(view.id)?;
         (o.level != Level::Watch && tracked(&o, &Party::session(view)))
