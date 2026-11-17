@@ -493,6 +493,13 @@ mod tests {
             ("Bash: bash scripts/deploy.sh prod", Important::Released),
             ("Bash: git -C /repo merge origin/main", Important::Merged),
             (
+                "Bash: git commit -m \"$(cat <<'EOF'\nFix the fixture\nEOF\n)\" && gh pr merge 12 --squash",
+                Important::Merged,
+            ),
+            ("Bash: cd $WT && ./scripts/deploy.sh prod", Important::Released),
+            ("Bash: PR=$(gh pr list --head x -q .[0].number) && gh pr merge $PR", Important::Merged),
+            ("Bash: cd \"$(git rev-parse --show-toplevel)\" && rm -rf build", Important::Deleted),
+            (
                 "Bash: find /tmp/x -name '*.log' -delete",
                 Important::Deleted,
             ),
@@ -521,6 +528,11 @@ mod tests {
         assert_eq!(
             important(Message, "Once CI is green, run the real release."),
             Some(Important::Later)
+        );
+        assert_eq!(important(Message, "No, merge it."), Some(Important::Merged));
+        assert_eq!(
+            important(Message, "Looks good, no blockers. Merge it."),
+            Some(Important::Merged)
         );
     }
 

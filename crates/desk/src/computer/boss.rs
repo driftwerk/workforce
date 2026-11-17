@@ -1358,26 +1358,71 @@ pub fn moves_dir(command: &str) -> bool {
 }
 
 /// Each command `command` runs, as its words with their quotes removed (a
-/// quoted argument one word). One Desk can't split is read only up to its
-/// first quote, expansion or heredoc (what follows may be a message's
-/// words), split plainly on whitespace and the shell's separators.
+/// quoted argument one word). One Desk can't split is read plainly: its
+/// heredocs' bodies and quoted words (a message's words) each one word
+/// `_`, each expansion `$_` with the commands inside it read too, split on
+/// whitespace and the shell's separators.
 pub fn commands(command: &str) -> Vec<Vec<String>> {
     match split(command) {
         Ok(cmds) => cmds
             .into_iter()
             .map(|c| c.words.into_iter().map(|w| w.text).collect())
             .collect(),
-        Err(()) => command
-            .split(['\'', '"', '`', '$'])
-            .next()
-            .unwrap_or_default()
-            .split("<<")
-            .next()
-            .unwrap_or_default()
-            .split(|c: char| ";&|\n()".contains(c))
-            .map(|c| c.split_whitespace().map(str::to_string).collect())
-            .collect(),
+        Err(()) => {
+            let mut inner = Vec::new();
+            let flat = flatten(&unquoted(&without_heredocs(command)), &mut inner);
+            flat.split(|c: char| ";&|\n(){}".contains(c))
+                .map(|c| c.split_whitespace().map(str::to_string).collect())
+                .chain(inner.iter().flat_map(|i| commands(i)))
+                .collect()
+        }
     }
+}
+
+/// `command` without its heredocs' bodies: from the line after `<<WORD`
+/// (`<<-`, `<<'WORD'`, `<<"WORD"`) to the line that is `WORD`.
+fn without_heredocs(command: &str) -> String {
+    let mut out = Vec::new();
+    let mut until: Option<String> = None;
+    for line in command.lines() {
+        if let Some(end) = &until {
+            if line.trim() == end {
+                until = None;
+            }
+            continue;
+        }
+        until = line.split_once("<<").and_then(|(_, rest)| {
+            let word: String = rest
+                .trim_start_matches('-')
+                .trim_start()
+                .trim_start_matches(['\'', '"'])
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            (!word.is_empty()).then_some(word)
+        });
+        out.push(line);
+    }
+    out.join("\n")
+}
+
+/// `text` with each quoted span (`'…'`, `"…"`; an unclosed one to the end)
+/// the one word `_`.
+fn unquoted(text: &str) -> String {
+    let mut out = String::new();
+    let mut open: Option<char> = None;
+    for c in text.chars() {
+        match (open, c) {
+            (None, '\'' | '"') => {
+                open = Some(c);
+                out.push('_');
+            }
+            (None, c) => out.push(c),
+            (Some(q), c) if c == q => open = None,
+            (Some(_), _) => {}
+        }
+    }
+    out
 }
 
 /// `text` with each expansion in it (`$(…)`, `${…}`, `$((…))`, a

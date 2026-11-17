@@ -376,12 +376,13 @@ pub fn important(kind: ActionKind, text: &str) -> Option<Important> {
         ActionKind::Override | ActionKind::Deny => Some(Important::Overrode),
         ActionKind::Approve => approved_step(text),
         ActionKind::Message => {
-            let w = steps_only(words(text));
-            let v = step(&w)?;
-            if held_back(&w) {
-                return None;
-            }
-            Some(match says(&w, LATER) {
+            // Each clause on its own: "No, merge it." merges.
+            let v = text
+                .split([',', '.', ';', ':', '!', '?', '—', '–'])
+                .map(|c| steps_only(words(c)))
+                .filter(|w| !held_back(w))
+                .find_map(|w| step(&w))?;
+            Some(match says(&words(text), LATER) {
                 true => Important::Later,
                 false => v,
             })
