@@ -145,10 +145,9 @@ const HOLD_REACH: usize = 3;
 /// just before it. "Merge it before the freeze" takes the step; "wait for
 /// green CI before merging" and "don't merge" hold it.
 fn held_back(w: &[String]) -> bool {
-    let steps = [MERGE, RELEASE, DELETE, SPEND];
     let mut any = false;
     for (i, x) in w.iter().enumerate() {
-        if !steps.iter().any(|l| l.contains(&x.as_str())) {
+        if !STEPS.iter().any(|(l, _)| l.contains(&x.as_str())) {
             continue;
         }
         any = true;
@@ -188,26 +187,32 @@ fn says(w: &[String], list: &[&str]) -> bool {
     })
 }
 
-/// The step `w` says, as the importance it gives: merging, releasing,
-/// deleting or spending.
+/// The steps, each with the importance it gives.
+const STEPS: [(&[&str], Important); 4] = [
+    (MERGE, Important::Merged),
+    (RELEASE, Important::Released),
+    (DELETE, Important::Deleted),
+    (SPEND, Important::Spent),
+];
+
+/// The first step `w` says (`kubectl delete deploy` deletes), as the
+/// importance it gives: merging, releasing, deleting or spending.
 fn step(w: &[String]) -> Option<Important> {
-    [
-        (MERGE, Important::Merged),
-        (RELEASE, Important::Released),
-        (DELETE, Important::Deleted),
-        (SPEND, Important::Spent),
-    ]
-    .into_iter()
-    .find(|(list, _)| says(w, list))
-    .map(|(_, i)| i)
+    w.iter().find_map(|x| {
+        STEPS
+            .iter()
+            .find(|(list, _)| list.contains(&x.as_str()))
+            .map(|(_, i)| *i)
+    })
 }
 
 /// `w` with each step word that names a thing ("the merge queue") blanked:
 /// it takes no step.
 fn steps_only(mut w: Vec<String>) -> Vec<String> {
-    let steps = [MERGE, RELEASE, DELETE, SPEND];
     for i in 0..w.len().saturating_sub(1) {
-        if NAMED.contains(&w[i + 1].as_str()) && steps.iter().any(|l| l.contains(&w[i].as_str())) {
+        if NAMED.contains(&w[i + 1].as_str())
+            && STEPS.iter().any(|(l, _)| l.contains(&w[i].as_str()))
+        {
             w[i].clear();
         }
     }
@@ -365,8 +370,32 @@ fn pathy(word: &str) -> bool {
 /// release list`, `kubectl get deploy`, `docker compose logs`).
 const LOOKS: &[&str] = &[
     "list", "ls", "view", "show", "status", "checks", "diff", "watch", "get", "describe", "logs",
-    "top", "explain", "ps", "inspect", "images",
+    "top", "explain", "ps", "inspect", "images", "download",
 ];
+
+/// Flags whose value is what a command works on or where (`-n prod`,
+/// `--context prod`, `-U postgres`), never what it does.
+const VALUES: &[&str] = &[
+    "-n",
+    "--namespace",
+    "--context",
+    "-H",
+    "-R",
+    "--repo",
+    "-C",
+    "-U",
+    "-h",
+    "-p",
+];
+
+/// `ssh` flags that take a value before its host.
+const SSH_VALUES: &[&str] = &[
+    "-i", "-p", "-l", "-o", "-J", "-F", "-E", "-b", "-c", "-L", "-R", "-D",
+];
+
+/// Database shells, and their flags whose value is a query to run.
+const SQL: &[&str] = &["psql", "mysql", "sqlite3"];
+const SQL_SCRIPT: &[&str] = &["-c", "--command", "-e", "--execute"];
 
 /// How many of a command's words after its program name what it does
 /// (`gh pr merge`, `docker stack deploy`): the rest are what it does it to.
@@ -386,16 +415,24 @@ fn one_step(words: &[String], depth: usize) -> Option<Important> {
     if READERS.contains(&program.as_str()) {
         return None;
     }
+    // A program that is a step itself (`rm`, `./deploy.sh`) takes it,
+    // whatever it is given.
+    if let Some(i) = step(std::slice::from_ref(&program)) {
+        return Some(i);
+    }
     // A command run elsewhere is read as the command it is: on a host
     // (`ssh prod './deploy.sh'`) or by a shell (`bash -c '…'`).
     match program.as_str() {
         "ssh" => {
-            let remote: Vec<&str> = rest
-                .iter()
-                .skip_while(|w| w.starts_with('-'))
-                .skip(1)
-                .map(String::as_str)
-                .collect();
+            let mut r = rest;
+            while let [flag, more @ ..] = r {
+                r = match flag.as_str() {
+                    f if SSH_VALUES.contains(&f) => more.get(1..).unwrap_or_default(),
+                    f if f.starts_with('-') => more,
+                    _ => break,
+                };
+            }
+            let remote: Vec<&str> = r.iter().skip(1).map(String::as_str).collect();
             return command_step(&remote.join(" "), depth + 1);
         }
         "bash" | "sh" | "zsh" => {
@@ -408,15 +445,32 @@ fn one_step(words: &[String], depth: usize) -> Option<Important> {
     let args: Vec<&String> = rest.iter().take_while(|w| *w != "--").collect();
     let flags = |f: &str| args.iter().any(|w| *w == f);
     let runs_script = INTERPRETERS.contains(&program.as_str()) && !flags("-n") && !flags("-c");
+    let sql = SQL.contains(&program.as_str());
     let mut said = vec![program.clone()];
     let mut subs = 0;
     let mut skip = false;
+    let mut script = false;
     for w in &args {
         if std::mem::take(&mut skip) {
             continue;
         }
+        // A query's words say what it does, wherever it is given.
+        if std::mem::take(&mut script) {
+            said.extend(
+                w.split_whitespace()
+                    .take(SUBCOMMANDS)
+                    .map(str::to_lowercase),
+            );
+            continue;
+        }
+        let workflow = said.ends_with(&["workflow".to_string(), "run".to_string()]);
+        if workflow && !w.starts_with('-') {
+            said.push(named_as(w));
+            continue;
+        }
         if w.starts_with('-') {
-            skip = prose(w);
+            script = sql && SQL_SCRIPT.contains(&w.as_str());
+            skip = prose(w) || VALUES.contains(&w.as_str());
             let flag = w.trim_start_matches('-');
             let flag = flag.split_once('=').map_or(flag, |(f, _)| f);
             if DELETING_FLAGS.contains(&flag) {
@@ -424,9 +478,8 @@ fn one_step(words: &[String], depth: usize) -> Option<Important> {
             }
             continue;
         }
-        let workflow = said.ends_with(&["workflow".to_string(), "run".to_string()]);
         match pathy(w) {
-            true if (runs_script && subs == 0) || workflow => said.push(named_as(w)),
+            true if runs_script && subs == 0 => said.push(named_as(w)),
             true => {}
             false if subs < SUBCOMMANDS && !pathy(first) && program != "find" => {
                 subs += 1;
@@ -442,6 +495,13 @@ fn one_step(words: &[String], depth: usize) -> Option<Important> {
     let reads = READING.iter().any(|(p, subs)| {
         *p == program && said.get(1).is_some_and(|sub| subs.contains(&sub.as_str()))
     });
+    // `git push -d origin x`, `git push origin :x`.
+    if program == "git"
+        && said.get(1).is_some_and(|s| s == "push")
+        && (flags("-d") || args.iter().any(|w| w.starts_with(':')))
+    {
+        return Some(Important::Deleted);
+    }
     let looks = said[1..].iter().any(|w| LOOKS.contains(&w.as_str()))
         || (program == "git"
             && said.get(1).is_some_and(|s| s == "tag")
