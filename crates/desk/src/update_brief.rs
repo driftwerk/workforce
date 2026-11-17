@@ -294,6 +294,7 @@ pub fn parse_reply(reply: &str, at: DateTime<Utc>) -> MentionedUpdate {
                 settled_by: None,
                 at,
                 folded: None,
+                notable: false,
             })
         };
         let (done, for_you) = (done_of(l), for_you_of(l));
@@ -512,6 +513,7 @@ mod tests {
             settled_by: None,
             at: Utc::now(),
             folded: None,
+            notable: false,
         }
     }
 

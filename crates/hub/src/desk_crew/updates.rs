@@ -532,6 +532,7 @@ impl CrewHub {
                     session: Some(s.work.link()),
                     did: vec![],
                     at: None,
+                    decisions: None,
                 })
             };
             if let Some(h) = w.headline.as_deref() {
@@ -957,12 +958,15 @@ impl CrewHub {
                     session,
                     did: vec![],
                     at: None,
+                    decisions: None,
                 },
             ));
         }
-        // What it decided without them, listed as they chose: each important
-        // one with its why and its Undo; the routine ones a line a session
-        // and kind, behind the routine count (listed too when they asked
+        // What it decided without them, listed as they chose: one entry a
+        // session (and one for what is about none), what did something that
+        // matters first, its important decisions under it, each with its
+        // Undo; the routine ones a line a session and kind, behind the
+        // routine count (listed in their session's entry when they asked
         // for every one).
         let views = self.desk.list();
         let tz = self.desk.timezone();
@@ -981,32 +985,16 @@ impl CrewHub {
             })
         };
         let told = routine::told(&b.decisions, c.decisions, &label, &tz);
-        for d in &told.listed {
-            let Some(l) = u.decisions.iter().find(|l| l.id == d.id.to_string()) else {
-                continue;
-            };
-            let session = match d.session.and_then(|s| views.iter().find(|v| v.id == s)) {
-                Some(v) => Some(self.work_of(v, None, &[], Some(owner)).await.link()),
-                None => None,
-            };
-            let item = vec![update::brief_item(d, l)];
-            let why = workforce_desk::decision::clause(&l.why);
-            lines.push((
-                SectionKey::Decided,
-                Said {
-                    kind: EventKind::Progress,
-                    headline: write::capitalised(l.action.trim().trim_end_matches('.')),
-                    body: why.map(|w| format!("Because {w}.")).unwrap_or_default(),
-                    ids: vec![],
-                    not_checked: None,
-                    session,
-                    did: item,
-                    at: Some(d.at),
-                },
-            ));
-        }
-        for r in &told.listed_runs {
-            lines.push((SectionKey::Decided, r.said(&u.decisions, link(r.session))));
+        let listed = told
+            .listed
+            .iter()
+            .copied()
+            .chain(told.listed_runs.iter().flat_map(|r| r.rows.iter().copied()));
+        for e in routine::by_session(listed, &label) {
+            let said = e.said(&u.decisions, link(e.session), &tz);
+            if !said.did.is_empty() {
+                lines.push((SectionKey::Decided, said));
+            }
         }
         // Each piece of work, in the section its kind is said in, unless the
         // person hears of that kind only when they ask.
@@ -1031,6 +1019,7 @@ impl CrewHub {
                     session: None,
                     did: vec![],
                     at: None,
+                    decisions: None,
                 },
             ));
         }

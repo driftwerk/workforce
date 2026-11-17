@@ -18,6 +18,7 @@ use chrono::{DateTime, Duration, NaiveTime, TimeZone, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use workforce_common::oversight::{Cadence, Decided, RoundupEvery, Route};
 
+use crate::update::BriefItem;
 use crate::update_write::{EventKind, Said};
 
 /// Why a decision is important enough to be told.
@@ -893,11 +894,15 @@ impl Roundup {
 
     /// Its one-line headline, written plainly: what is in it, in counts.
     pub fn plain_headline(&self) -> String {
+        // What it decided is counted by decision, though a session's are
+        // one line.
         let n = |k: SectionKey| {
-            self.sections
-                .iter()
-                .find(|s| s.key == k)
-                .map_or(0, |s| s.lines.len())
+            self.sections.iter().find(|s| s.key == k).map_or(0, |s| {
+                s.lines
+                    .iter()
+                    .map(|l| l.decisions.map_or(1, |n| n as usize))
+                    .sum()
+            })
         };
         let mut parts = Vec::new();
         let (fin, up, dec, worth, going) = (
@@ -929,10 +934,49 @@ impl Roundup {
     }
 }
 
+/// How many of a session's decisions its entry of "Decided without you"
+/// shows before "N more" (the notable ones are shown however many).
+pub const ENTRY_SHOWN: usize = 4;
+
+/// The decisions of an entry (`did`, the newest first) it shows: every
+/// notable one, and the newest of the rest up to [`ENTRY_SHOWN`], in
+/// order; and how many it leaves behind "N more".
+pub fn shown(did: &[BriefItem]) -> (Vec<&BriefItem>, usize) {
+    let notable = did.iter().filter(|i| i.notable).count();
+    let mut room = ENTRY_SHOWN.saturating_sub(notable);
+    let mut shown: Vec<&BriefItem> = Vec::new();
+    for i in did {
+        if i.notable {
+            shown.push(i);
+        } else if room > 0 {
+            room -= 1;
+            shown.push(i);
+        }
+    }
+    let more = did.len() - shown.len();
+    (shown, more)
+}
+
 /// A roundup as text, for history, Slack and the model: its headline, each
-/// section's title and lines, and the routine count with a line a run.
+/// section's title and lines (a session's decisions under its line, the
+/// rest counted), and the routine count with a line a run.
 pub fn render(headline: &str, r: &Roundup) -> String {
-    let line = |l: &Said| format!("- {}", crate::update_write::render(l).replace('\n', " · "));
+    let line = |l: &Said| {
+        let mut out = format!("- {}", crate::update_write::render(l).replace('\n', " · "));
+        if l.decisions.is_some() {
+            let (shown, more) = shown(&l.did);
+            for i in shown {
+                out.push_str(&match i.why.as_deref().filter(|w| !w.trim().is_empty()) {
+                    Some(why) => format!("\n  - {} — {why}", i.action),
+                    None => format!("\n  - {}", i.action),
+                });
+            }
+            if more > 0 {
+                out.push_str(&format!("\n  - {more} more"));
+            }
+        }
+        out
+    };
     let mut out = vec![headline.trim().to_string()];
     for s in &r.sections {
         let lines: Vec<String> = s.lines.iter().map(line).collect();
@@ -1225,6 +1269,7 @@ mod tests {
             }),
             did: vec![],
             at: None,
+            decisions: None,
         }
     }
 
