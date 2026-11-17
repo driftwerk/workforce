@@ -45,6 +45,7 @@ use workforce_desk::update::{
     self, Change, MentionedUpdate, NeedsYou, Pending, Told, UpdateSession, UpdateState, WaitingItem,
 };
 use workforce_desk::update_cadence::{self as cadence, Roundup, SectionKey};
+use workforce_desk::update_routine as routine;
 use workforce_desk::update_write::{self as write, EventKind, Said, Titled, Work};
 
 use super::watcher::Budget;
@@ -621,6 +622,7 @@ impl CrewHub {
         now: DateTime<Utc>,
     ) -> (MentionedUpdate, String, bool) {
         let (sessions, decisions, headline, wrote) = self.composed(boss, owner, o, b).await;
+        let tz = self.desk.timezone();
         let composed_headline = headline.is_some();
         let full = self.level_now(boss, o).0 == workforce_common::oversight::Level::Full;
         let footer = match self.desk.cheap_today().await {
@@ -656,7 +658,7 @@ impl CrewHub {
         let mut said: Vec<Said> = Vec::new();
         for s in &b.sessions {
             let new: Vec<&Done> = s.new.iter().collect();
-            let did = update::did_items(&b.decisions, &decisions, Some(s.id));
+            let did = update::did_items(&b.decisions, &decisions, Some(s.id), &tz);
             let kind = write::kind_of(&new, &did);
             let plain = write::plain_said(
                 &s.work,
@@ -680,7 +682,7 @@ impl CrewHub {
             }
         }
         for id in &acted_on {
-            let did = update::did_items(&b.decisions, &decisions, Some(*id));
+            let did = update::did_items(&b.decisions, &decisions, Some(*id), &tz);
             let Some(v) = views
                 .iter()
                 .find(|v| v.id == *id)
@@ -958,16 +960,28 @@ impl CrewHub {
                 },
             ));
         }
-        // What it decided without them, listed as they chose: each with its
-        // why and its Undo; the rest is routine.
-        let decided_rows: Vec<&BossDecision> = b
-            .decisions
-            .iter()
-            .filter(|d| d.kind == DecisionKind::Acted && !update::is_close(d))
-            .filter(|d| cadence::listed(d.important.is_some(), &c))
-            .collect();
+        // What it decided without them, listed as they chose: each important
+        // one with its why and its Undo; the routine ones a line a session
+        // and kind, behind the routine count (listed too when they asked
+        // for every one).
         let views = self.desk.list();
-        for d in &decided_rows {
+        let tz = self.desk.timezone();
+        let label = |id: Uuid| {
+            views
+                .iter()
+                .find(|v| v.id == id)
+                .map(|v| v.label().to_string())
+        };
+        let link = |id: Option<Uuid>| {
+            let v = views.iter().find(|v| Some(v.id) == id)?;
+            Some(write::SessionLink {
+                session_id: v.id.to_string(),
+                name: v.label().to_string(),
+                closed: v.state == SessionState::Closed,
+            })
+        };
+        let told = routine::told(&b.decisions, c.decisions, &label, &tz);
+        for d in &told.listed {
             let Some(l) = u.decisions.iter().find(|l| l.id == d.id.to_string()) else {
                 continue;
             };
@@ -975,8 +989,7 @@ impl CrewHub {
                 Some(v) => Some(self.work_of(v, None, &[], Some(owner)).await.link()),
                 None => None,
             };
-            let item =
-                update::did_items(std::slice::from_ref(d), std::slice::from_ref(l), d.session);
+            let item = vec![update::brief_item(d, l)];
             let why = workforce_desk::decision::clause(&l.why);
             lines.push((
                 SectionKey::Decided,
@@ -992,13 +1005,9 @@ impl CrewHub {
                 },
             ));
         }
-        let routine = b
-            .decisions
-            .iter()
-            .filter(|d| matches!(d.kind, DecisionKind::Acted | DecisionKind::LeftAlone))
-            .filter(|d| !update::is_close(d))
-            .count()
-            .saturating_sub(decided_rows.len()) as u32;
+        for r in &told.listed_runs {
+            lines.push((SectionKey::Decided, r.said(&u.decisions, link(r.session))));
+        }
         // Each piece of work, in the section its kind is said in, unless the
         // person hears of that kind only when they ask.
         for s in &u.said {
@@ -1006,9 +1015,8 @@ impl CrewHub {
                 continue;
             }
             let mut s = s.clone();
-            // What it decided is said above, or is routine.
-            s.did
-                .retain(|i| !decided_rows.iter().any(|d| d.id.to_string() == i.id));
+            // What it decided is said above, or behind the routine count.
+            s.did.clear();
             lines.push((SectionKey::of(s.kind), s));
         }
         for k in &b.kept {
@@ -1026,7 +1034,12 @@ impl CrewHub {
                 },
             ));
         }
-        let r = Roundup::of(since, lines, routine);
+        let runs = told
+            .routine
+            .iter()
+            .map(|r| r.said(&u.decisions, link(r.session)))
+            .collect();
+        let r = Roundup::of(since, lines, told.routine_count(), runs);
         let nothing = r.is_empty() && u.closed.is_empty();
         if nothing && !asked {
             self.desk.store().update_rounded(boss, now).await?;

@@ -107,8 +107,36 @@ const SPEND: &[&str] = &[
 /// when they come just before the step ("don't merge", "wait for CI
 /// before merging", "hold off deploying").
 const HOLD: &[&str] = &[
-    "wait", "hold", "don't", "dont", "not", "never", "before", "until", "pause", "stop", "without",
-    "off",
+    "wait", "hold", "don't", "dont", "not", "no", "never", "before", "until", "pause", "stop",
+    "without", "off",
+];
+/// Words that make the step word before them a thing named rather than a
+/// step taken: "the merge queue", "the merge commit", "the deploy
+/// preview", "a promote dry run".
+const NAMED: &[&str] = &[
+    "queue",
+    "commit",
+    "commits",
+    "review",
+    "reviews",
+    "conflict",
+    "conflicts",
+    "request",
+    "requests",
+    "state",
+    "status",
+    "preview",
+    "dry",
+    "plan",
+    "notes",
+    "step",
+    "steps",
+    "freeze",
+    "window",
+    "button",
+    "gate",
+    "check",
+    "checks",
 ];
 /// How many words before a step a hold word holds it back.
 const HOLD_REACH: usize = 3;
@@ -117,10 +145,9 @@ const HOLD_REACH: usize = 3;
 /// just before it. "Merge it before the freeze" takes the step; "wait for
 /// green CI before merging" and "don't merge" hold it.
 fn held_back(w: &[String]) -> bool {
-    let steps = [MERGE, RELEASE, DELETE, SPEND];
     let mut any = false;
     for (i, x) in w.iter().enumerate() {
-        if !steps.iter().any(|l| l.contains(&x.as_str())) {
+        if !STEPS.iter().any(|(l, _)| l.contains(&x.as_str())) {
             continue;
         }
         any = true;
@@ -160,34 +187,377 @@ fn says(w: &[String], list: &[&str]) -> bool {
     })
 }
 
+/// The steps, each with the importance it gives.
+const STEPS: [(&[&str], Important); 4] = [
+    (MERGE, Important::Merged),
+    (RELEASE, Important::Released),
+    (DELETE, Important::Deleted),
+    (SPEND, Important::Spent),
+];
+
+/// The first step `w` says (`kubectl delete deploy` deletes), as the
+/// importance it gives: merging, releasing, deleting or spending.
+fn step(w: &[String]) -> Option<Important> {
+    w.iter().find_map(|x| {
+        STEPS
+            .iter()
+            .find(|(list, _)| list.contains(&x.as_str()))
+            .map(|(_, i)| *i)
+    })
+}
+
+/// `w` with each step word that names a thing ("the merge queue") blanked:
+/// it takes no step.
+fn steps_only(mut w: Vec<String>) -> Vec<String> {
+    for i in 0..w.len().saturating_sub(1) {
+        if NAMED.contains(&w[i + 1].as_str())
+            && STEPS.iter().any(|(l, _)| l.contains(&w[i].as_str()))
+        {
+            w[i].clear();
+        }
+    }
+    w
+}
+
+/// Tools that only read, search or change files: what they touch is named
+/// by a path, and a path is never a step ("stack-deploy-tests.sh").
+const FILE_TOOLS: &[&str] = &[
+    "Edit",
+    "MultiEdit",
+    "Write",
+    "NotebookEdit",
+    "Read",
+    "Grep",
+    "Glob",
+    "LS",
+    "WebFetch",
+    "WebSearch",
+    "TodoWrite",
+];
+
+/// Programs that only read or check what they are given, whatever its
+/// words: `grep deploy`, `cat promote.yml`, `shellcheck deploy.sh`.
+const READERS: &[&str] = &[
+    "cat",
+    "head",
+    "tail",
+    "less",
+    "grep",
+    "rg",
+    "ls",
+    "jq",
+    "wc",
+    "diff",
+    "echo",
+    "printf",
+    "shellcheck",
+    "stat",
+    "file",
+    "df",
+    "du",
+    "test",
+    "cd",
+    "pytest",
+    "vitest",
+    "jest",
+];
+
+/// Subcommands that only read, check, build or test: what they are given
+/// (a test filter, `cargo test -p desk deploy`) is never a step.
+const READING: &[(&str, &[&str])] = &[
+    (
+        "git",
+        &[
+            "grep", "diff", "show", "log", "blame", "status", "fetch", "checkout", "switch",
+            "branch",
+        ],
+    ),
+    (
+        "cargo",
+        &[
+            "test", "nextest", "check", "clippy", "build", "bench", "fmt",
+        ],
+    ),
+    ("go", &["test", "vet", "build"]),
+    ("npm", &["test"]),
+    ("pnpm", &["test", "vitest", "jest", "tsc", "eslint"]),
+    ("yarn", &["test", "vitest", "jest", "tsc", "eslint"]),
+    (
+        "npx",
+        &["vitest", "jest", "tsc", "eslint", "prettier", "playwright"],
+    ),
+];
+
+/// Programs that run the script they are given: its file's name says what
+/// it does (`bash scripts/deploy.sh`), unless it is only checked (`-n`) or
+/// a script is given inline (`-c`).
+const INTERPRETERS: &[&str] = &["bash", "sh", "zsh", "python", "python3", "node"];
+
+/// Wrappers that run the command after them, past their own flags, the
+/// values of those named here, and a count or duration (`timeout 600`).
+const WRAPPERS: &[&str] = &[
+    "sudo", "env", "nohup", "time", "timeout", "nice", "command", "exec", "xargs",
+];
+const WRAPPER_VALUES: &[&str] = &["-u", "-g", "-n", "-s", "-k"];
+/// Runners whose `run` (or, for Python, `-m`) names the program they run.
+const RUNNERS: &[&str] = &["uv", "poetry", "pipenv", "pdm"];
+
+/// The words of what `words` runs: past assignments, wrappers and their
+/// arguments, a runner's `run` and Python's `-m`.
+fn what_runs(words: &[String]) -> &[String] {
+    let mut w = words;
+    loop {
+        w = match w {
+            [first, rest @ ..] if first.contains('=') && !first.starts_with('-') => rest,
+            [first, rest @ ..] if WRAPPERS.contains(&named_as(first).as_str()) => {
+                let mut r = rest;
+                while let [flag, more @ ..] = r {
+                    r = match flag.as_str() {
+                        f if WRAPPER_VALUES.contains(&f) => more.get(1..).unwrap_or_default(),
+                        f if f.starts_with('-') => more,
+                        f if f.chars().next().is_some_and(|c| c.is_ascii_digit()) => more,
+                        _ => break,
+                    };
+                }
+                r
+            }
+            [first, run, rest @ ..]
+                if RUNNERS.contains(&named_as(first).as_str()) && run == "run" =>
+            {
+                rest
+            }
+            [first, m, rest @ ..]
+                if matches!(named_as(first).as_str(), "python" | "python3") && m == "-m" =>
+            {
+                rest
+            }
+            _ => return w,
+        };
+    }
+}
+
+/// Flags whose value is prose (a commit message, a PR's title or body):
+/// words in it are never the command's step. A cluster of short flags
+/// ending in `m` (`-am`) is one too.
+const PROSE: &[&str] = &["--message", "--title", "-t", "--body", "-b", "--notes"];
+
+fn prose(flag: &str) -> bool {
+    PROSE.contains(&flag) || (!flag.starts_with("--") && flag.len() > 1 && flag.ends_with('m'))
+}
+
+/// Flags that delete what the command is given (`find … -delete`).
+const DELETING_FLAGS: &[&str] = &["delete", "prune", "purge"];
+
+/// A word as a step would be named in it: a path or file by its name less
+/// its extension (`./deploy.sh` is `deploy`, `stack-deploy-tests.sh` is
+/// itself), anything else as it is, in lower case.
+fn named_as(word: &str) -> String {
+    let base = word.rsplit_once('/').map_or(word, |(_, b)| b);
+    let stem = match base.split_once('.') {
+        Some((stem, _)) if !stem.is_empty() => stem,
+        _ => base,
+    };
+    stem.to_lowercase()
+}
+
+/// Whether `word` names a file or folder (`scripts/deploy.sh`,
+/// `promote.yml`) rather than saying something.
+fn pathy(word: &str) -> bool {
+    !word.contains(char::is_whitespace) && (word.contains('/') || word.contains('.'))
+}
+
+/// Verbs that only look, at any level of a program's subcommands (`gh
+/// release list`, `kubectl get deploy`, `docker compose logs`).
+const LOOKS: &[&str] = &[
+    "list", "ls", "view", "show", "status", "checks", "diff", "watch", "get", "describe", "logs",
+    "top", "explain", "ps", "inspect", "images", "download",
+];
+
+/// Flags whose value is what a command works on or where (`-n prod`,
+/// `--context prod`, `-U postgres`), never what it does.
+const VALUES: &[&str] = &[
+    "-n",
+    "--namespace",
+    "--context",
+    "-H",
+    "-R",
+    "--repo",
+    "-C",
+    "-U",
+    "-h",
+    "-p",
+];
+
+/// `ssh` flags that take a value before its host.
+const SSH_VALUES: &[&str] = &[
+    "-i", "-p", "-l", "-o", "-J", "-F", "-E", "-b", "-c", "-L", "-R", "-D",
+];
+
+/// Database shells, and their flags whose value is a query to run.
+const SQL: &[&str] = &["psql", "mysql", "sqlite3"];
+const SQL_SCRIPT: &[&str] = &["-c", "--command", "-e", "--execute"];
+
+/// How many of a command's words after its program name what it does
+/// (`gh pr merge`, `docker stack deploy`): the rest are what it does it to.
+const SUBCOMMANDS: usize = 2;
+
+/// The step one command takes (`words`, quotes removed), `depth` commands
+/// deep in what hosts and shells run: by its program and its first words
+/// ([`SUBCOMMANDS`]), each whole, never a part of one. A path counts only
+/// when it is what runs: the program, the script an interpreter runs, or
+/// the workflow `gh workflow run` starts; what a script is given never
+/// does. Nothing for a program or subcommand that only reads or looks,
+/// for prose, or for what follows `--`.
+fn one_step(words: &[String], depth: usize) -> Option<Important> {
+    let words = what_runs(words);
+    let (first, rest) = words.split_first()?;
+    let program = named_as(first);
+    if READERS.contains(&program.as_str()) {
+        return None;
+    }
+    // A program that is a step itself (`rm`, `./deploy.sh`) takes it,
+    // whatever it is given.
+    if let Some(i) = step(std::slice::from_ref(&program)) {
+        return Some(i);
+    }
+    // A command run elsewhere is read as the command it is: on a host
+    // (`ssh prod './deploy.sh'`) or by a shell (`bash -c '…'`).
+    match program.as_str() {
+        "ssh" => {
+            let mut r = rest;
+            while let [flag, more @ ..] = r {
+                r = match flag.as_str() {
+                    f if SSH_VALUES.contains(&f) => more.get(1..).unwrap_or_default(),
+                    f if f.starts_with('-') => more,
+                    _ => break,
+                };
+            }
+            let remote: Vec<&str> = r.iter().skip(1).map(String::as_str).collect();
+            return command_step(&remote.join(" "), depth + 1);
+        }
+        "bash" | "sh" | "zsh" => {
+            if let Some(script) = rest.iter().skip_while(|w| *w != "-c").nth(1) {
+                return command_step(script, depth + 1);
+            }
+        }
+        _ => {}
+    }
+    let args: Vec<&String> = rest.iter().take_while(|w| *w != "--").collect();
+    let flags = |f: &str| args.iter().any(|w| *w == f);
+    let runs_script = INTERPRETERS.contains(&program.as_str()) && !flags("-n") && !flags("-c");
+    let sql = SQL.contains(&program.as_str());
+    let mut said = vec![program.clone()];
+    let mut subs = 0;
+    let mut skip = false;
+    let mut script = false;
+    for w in &args {
+        // A flag's value is never itself a flag (`git commit -n -m …`).
+        if std::mem::take(&mut skip) && !w.starts_with('-') {
+            continue;
+        }
+        // A query's words say what it does, wherever it is given.
+        if std::mem::take(&mut script) {
+            said.extend(
+                w.split_whitespace()
+                    .take(SUBCOMMANDS)
+                    .map(str::to_lowercase),
+            );
+            continue;
+        }
+        let workflow = said.ends_with(&["workflow".to_string(), "run".to_string()]);
+        if workflow && !w.starts_with('-') {
+            said.push(named_as(w));
+            continue;
+        }
+        if w.starts_with('-') {
+            script = sql && SQL_SCRIPT.contains(&w.as_str());
+            skip = prose(w) || VALUES.contains(&w.as_str());
+            let flag = w.trim_start_matches('-');
+            let flag = flag.split_once('=').map_or(flag, |(f, _)| f);
+            if DELETING_FLAGS.contains(&flag) {
+                said.push(flag.to_string());
+            }
+            continue;
+        }
+        match pathy(w) {
+            true if runs_script && subs == 0 => said.push(named_as(w)),
+            true => {}
+            false if subs < SUBCOMMANDS && !pathy(first) && program != "find" => {
+                subs += 1;
+                said.extend(
+                    w.split_whitespace()
+                        .take(SUBCOMMANDS)
+                        .map(str::to_lowercase),
+                );
+            }
+            false => {}
+        }
+    }
+    let reads = READING.iter().any(|(p, subs)| {
+        *p == program && said.get(1).is_some_and(|sub| subs.contains(&sub.as_str()))
+    });
+    // `git push -d origin x`, `git push origin :x`.
+    if program == "git"
+        && said.get(1).is_some_and(|s| s == "push")
+        && (flags("-d") || args.iter().any(|w| w.starts_with(':')))
+    {
+        return Some(Important::Deleted);
+    }
+    let looks = said[1..].iter().any(|w| LOOKS.contains(&w.as_str()))
+        || (program == "git"
+            && said.get(1).is_some_and(|s| s == "tag")
+            && (flags("-l") || flags("--list")));
+    match reads || looks {
+        true => None,
+        false => step(&said),
+    }
+}
+
+/// How many hosts and shells deep [`command_step`] reads a command.
+const RUN_DEPTH: usize = 16;
+
+/// The step a shell command takes: the first any of its commands takes
+/// ([`one_step`]); none past [`RUN_DEPTH`].
+fn command_step(command: &str, depth: usize) -> Option<Important> {
+    if depth > RUN_DEPTH {
+        return None;
+    }
+    crate::computer::boss::commands(command)
+        .iter()
+        .find_map(|words| one_step(words, depth))
+}
+
+/// The step a request a boss allowed takes (`request`: its tool, then
+/// what it runs, "Bash: gh pr merge 631"): a command by what it runs, a
+/// file tool never, any other tool by its name ("github · merge_pr").
+fn approved_step(request: &str) -> Option<Important> {
+    let (tool, detail) = request.split_once(": ").unwrap_or((request, ""));
+    match tool.trim() {
+        t if FILE_TOOLS.contains(&t) => None,
+        "Bash" => command_step(detail, 0),
+        t => step(&words(&t.replace('_', " "))),
+    }
+}
+
 /// Whether a decision is important, and why: from what kind of action it
 /// was and what it said (`text`: the request it allowed, or the message it
 /// sent). Overriding a session always is; allowing a request is when the
-/// request merges, releases, deletes or spends; a message is when it tells
-/// the session to do one of those, now or later, never when it holds it
-/// back ("wait for green CI before merging").
+/// request merges, releases, deletes or spends (by what it runs, never a
+/// file's name); a message is when it tells the session to do one of
+/// those, now or later, never when it holds it back ("wait for green CI
+/// before merging") or only names a thing ("the merge queue").
 pub fn important(kind: ActionKind, text: &str) -> Option<Important> {
-    let w = words(text);
-    let verb = || {
-        [
-            (MERGE, Important::Merged),
-            (RELEASE, Important::Released),
-            (DELETE, Important::Deleted),
-            (SPEND, Important::Spent),
-        ]
-        .into_iter()
-        .find(|(list, _)| says(&w, list))
-        .map(|(_, i)| i)
-    };
     match kind {
         ActionKind::Override | ActionKind::Deny => Some(Important::Overrode),
-        ActionKind::Approve => verb(),
+        ActionKind::Approve => approved_step(text),
         ActionKind::Message => {
-            let v = verb()?;
-            if held_back(&w) {
-                return None;
-            }
-            Some(match says(&w, LATER) {
+            // Each clause on its own: "No, merge it." merges.
+            let v = text
+                .split([',', '.', ';', ':', '!', '?', '—', '–'])
+                .map(|c| steps_only(words(c)))
+                .filter(|w| !held_back(w))
+                .find_map(|w| step(&w))?;
+            Some(match says(&words(text), LATER) {
                 true => Important::Later,
                 false => v,
             })
@@ -238,17 +608,6 @@ pub fn decision_route(important: bool, c: &Cadence, quiet: bool) -> Route {
     match (r, quiet) {
         (Route::RightAway, true) => Route::Roundup,
         (r, _) => r,
-    }
-}
-
-/// Whether a decision is listed under "Decided without you" in a
-/// roundup: an important one unless the person hears of them only on
-/// asking, any when they asked for every one.
-pub fn listed(important: bool, c: &Cadence) -> bool {
-    match c.decisions {
-        Decided::Ask => false,
-        Decided::All => true,
-        Decided::Important | Decided::ImportantRightAway => important,
     }
 }
 
@@ -403,7 +762,8 @@ pub struct Section {
 /// A roundup (shape C, `extras.update.roundup`): what happened since the
 /// last, by what it means to the person, each section only when it says
 /// something, and how many routine things it left out ("N routine things
-/// · Show").
+/// · Show"), shown as runs: one line a session and kind of decision, each
+/// of them behind it ([`crate::update_routine`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Roundup {
@@ -411,12 +771,20 @@ pub struct Roundup {
     pub sections: Vec<Section>,
     #[serde(default)]
     pub routine: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<Said>,
 }
 
 impl Roundup {
     /// `lines` (each with the section it goes in) as a roundup since
-    /// `since`, its sections in order and each only when it has a line.
-    pub fn of(since: DateTime<Utc>, lines: Vec<(SectionKey, Said)>, routine: u32) -> Self {
+    /// `since`, its sections in order and each only when it has a line;
+    /// `routine` things left out, said as `runs`.
+    pub fn of(
+        since: DateTime<Utc>,
+        lines: Vec<(SectionKey, Said)>,
+        routine: u32,
+        runs: Vec<Said>,
+    ) -> Self {
         let sections = SectionKey::ORDER
             .into_iter()
             .map(|key| Section {
@@ -434,6 +802,7 @@ impl Roundup {
             since,
             sections,
             routine,
+            runs,
         }
     }
 
@@ -481,23 +850,27 @@ impl Roundup {
 }
 
 /// A roundup as text, for history, Slack and the model: its headline, each
-/// section's title and lines, and the routine count.
+/// section's title and lines, and the routine count with a line a run.
 pub fn render(headline: &str, r: &Roundup) -> String {
+    let line = |l: &Said| format!("- {}", crate::update_write::render(l).replace('\n', " · "));
     let mut out = vec![headline.trim().to_string()];
     for s in &r.sections {
-        let lines: Vec<String> = s
-            .lines
-            .iter()
-            .map(|l| format!("- {}", crate::update_write::render(l).replace('\n', " · ")))
-            .collect();
+        let lines: Vec<String> = s.lines.iter().map(line).collect();
         out.push(format!("**{}**\n{}", s.title, lines.join("\n")));
     }
     if r.routine > 0 {
-        out.push(format!(
-            "{} routine {}: ask \"what else did you decide?\"",
+        let count = format!(
+            "{} routine {}",
             r.routine,
             if r.routine == 1 { "thing" } else { "things" }
-        ));
+        );
+        out.push(match r.runs.is_empty() {
+            true => format!("{count}: ask \"what else did you decide?\""),
+            false => {
+                let runs: Vec<String> = r.runs.iter().map(line).collect();
+                format!("{count}:\n{}", runs.join("\n"))
+            }
+        });
     }
     out.join("\n\n")
 }
@@ -660,12 +1033,8 @@ mod tests {
         let c = balanced();
         assert_eq!(decision_route(true, &c, false), Route::Roundup);
         assert_eq!(decision_route(false, &c, false), Route::Ask, "routine");
-        assert!(listed(true, &c) && !listed(false, &c));
         let mut every = c;
-        every.decisions = Decided::All;
-        assert!(listed(false, &every));
         every.decisions = Decided::Ask;
-        assert!(!listed(true, &every));
         assert_eq!(decision_route(true, &every, false), Route::Ask);
     }
 
@@ -784,7 +1153,7 @@ mod tests {
     #[test]
     fn an_empty_roundup_is_skipped_and_sections_come_in_order() {
         let since = at("2026-11-16T08:00:00Z");
-        let routine_only = Roundup::of(since, vec![], 15);
+        let routine_only = Roundup::of(since, vec![], 15, vec![]);
         assert!(routine_only.is_empty());
         let r = Roundup::of(
             since,
@@ -803,6 +1172,7 @@ mod tests {
                 ),
             ],
             15,
+            vec![],
         );
         assert!(!r.is_empty());
         let keys: Vec<SectionKey> = r.sections.iter().map(|s| s.key).collect();

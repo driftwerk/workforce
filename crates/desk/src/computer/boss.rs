@@ -1357,6 +1357,162 @@ pub fn moves_dir(command: &str) -> bool {
     cmds.iter().any(|cmd| moves_cmd(&cmd.words))
 }
 
+/// How deep [`commands`] reads expansions inside expansions.
+const NESTED: usize = 16;
+
+/// Each command `command` runs, as its words with their quotes removed (a
+/// quoted argument one word). One Desk can't split is read plainly: its
+/// heredocs' bodies left out, each expansion `$_` with the commands inside
+/// it read too (to [`NESTED`] deep), each quoted span (a message's words)
+/// one word `_`, split on whitespace and the shell's separators.
+pub fn commands(command: &str) -> Vec<Vec<String>> {
+    commands_in(command, 0)
+}
+
+fn commands_in(command: &str, depth: usize) -> Vec<Vec<String>> {
+    if depth > NESTED {
+        return Vec::new();
+    }
+    match split(command) {
+        Ok(cmds) => cmds
+            .into_iter()
+            .map(|c| c.words.into_iter().map(|w| w.text).collect())
+            .collect(),
+        Err(()) => {
+            let mut inner = Vec::new();
+            let plain = without_prose(&without_heredocs(command));
+            let mut spans = Vec::new();
+            let flat = unquoted(&flatten(&plain, &mut inner), &mut spans);
+            let word = |w: &str| match w.strip_prefix(SPAN).and_then(|n| n.parse::<usize>().ok()) {
+                Some(n) => spans.get(n).cloned().unwrap_or_default(),
+                None => w.to_string(),
+            };
+            flat.split(|c: char| ";&|\n(){}".contains(c))
+                .map(|c| c.split_whitespace().map(word).collect())
+                .chain(inner.iter().flat_map(|i| commands_in(i, depth + 1)))
+                .collect()
+        }
+    }
+}
+
+/// The word a heredoc on `line` ends at (`<<EOF`, `<<-'END-MSG'`), when
+/// it opens one: never a here-string (`<<<`) or a shift (`1<<4`).
+fn heredoc_end(line: &str) -> Option<String> {
+    let (_, rest) = line.split_once("<<")?;
+    let rest = rest.strip_prefix('-').unwrap_or(rest).trim_start();
+    let rest = rest.trim_start_matches(['\'', '"']);
+    let word: String = rest
+        .chars()
+        .take_while(|c| !c.is_whitespace() && !matches!(c, '\'' | '"' | ')' | ';' | '&' | '|'))
+        .collect();
+    word.starts_with(|c: char| c.is_alphabetic() || c == '_')
+        .then_some(word)
+}
+
+/// Whether `line`'s heredoc goes to a shell to run (`ssh prod <<EOF`,
+/// `bash <<EOF`).
+fn feeds_shell(line: &str) -> bool {
+    line.split_whitespace()
+        .next()
+        .is_some_and(|p| matches!(base_name(p), "ssh" | "bash" | "sh" | "zsh"))
+}
+
+/// `command` without its heredocs' bodies: from the line after the one
+/// that opens it to the line that is its end word (or starts with it and
+/// a closing `)`). A heredoc never ended keeps its lines.
+fn without_heredocs(command: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut body: Vec<&str> = Vec::new();
+    let mut until: Option<String> = None;
+    for line in command.lines() {
+        match until.take() {
+            Some(end) => {
+                let t = line.trim();
+                match t.strip_prefix(end.as_str()) {
+                    // What follows the end word on its line still runs.
+                    Some(rest) if rest.is_empty() || rest.starts_with(')') => {
+                        body.clear();
+                        out.push(rest);
+                    }
+                    _ => {
+                        body.push(line);
+                        until = Some(end);
+                    }
+                }
+            }
+            None => {
+                // A heredoc a shell runs is its commands.
+                until = heredoc_end(line).filter(|_| !feeds_shell(line));
+                out.push(line);
+            }
+        }
+    }
+    out.extend(body);
+    out.join("\n")
+}
+
+/// `text` without what can only be words: each `#` comment, each
+/// single-quoted span and each escaped character the one word `_` (none
+/// of them runs), so what is left to flatten holds only real expansions.
+fn without_prose(text: &str) -> String {
+    let mut out = String::new();
+    let mut quoted = false;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        let starts_word =
+            out.is_empty() || out.ends_with(|p: char| p.is_whitespace() || ";&|()".contains(p));
+        match c {
+            '\\' => {
+                chars.next();
+                out.push('_');
+            }
+            // A lone apostrophe ("Don't") hides nothing after it.
+            '\'' if !quoted && chars.clone().any(|d| d == '\'') => {
+                chars.by_ref().find(|d| *d == '\'');
+                out.push('_');
+            }
+            '#' if !quoted && starts_word => {
+                if chars.by_ref().any(|d| d == '\n') {
+                    out.push('\n');
+                }
+            }
+            '"' => {
+                quoted = !quoted;
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// What a quoted span stands for in [`unquoted`]'s text, before its index.
+const SPAN: &str = "\u{1f}";
+
+/// `text` with each double-quoted span (an unclosed one to the end) one
+/// word standing for its text, kept in `spans`: it is one argument, as the
+/// shell has it.
+fn unquoted(text: &str, spans: &mut Vec<String>) -> String {
+    let mut out = String::new();
+    let mut open: Option<String> = None;
+    for c in text.chars() {
+        match (open.as_mut(), c) {
+            (None, '"') => open = Some(String::new()),
+            (None, c) => out.push(c),
+            (Some(_), '"') => {
+                spans.extend(open.take());
+                out.push_str(&format!("{SPAN}{}", spans.len() - 1));
+            }
+            (Some(span), c) => span.push(c),
+        }
+    }
+    if let Some(span) = open {
+        spans.push(span);
+        out.push_str(&format!("{SPAN}{}", spans.len() - 1));
+    }
+    out
+}
+
 /// `text` with each expansion in it (`$(…)`, `${…}`, `$((…))`, a
 /// backtick's) as the one word `$_`, what each holds put in `inner`. An
 /// unclosed one runs to the end.
