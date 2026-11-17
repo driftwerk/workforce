@@ -401,13 +401,67 @@ const SQL_SCRIPT: &[&str] = &["-c", "--command", "-e", "--execute"];
 /// (`gh pr merge`, `docker stack deploy`): the rest are what it does it to.
 const SUBCOMMANDS: usize = 2;
 
+/// Words in a name that say it only tests or checks
+/// (`deploy-preview-tests.sh`, `release:dry-run`): such a name takes no
+/// step, whatever else it says.
+const CHECKING: &[&str] = &[
+    "test", "tests", "spec", "specs", "check", "checks", "lint", "dry", "preview", "plan", "notes",
+    "status", "logs", "list", "view", "diff",
+];
+
+/// A target runner's flags whose value is where or what it runs in (`pnpm
+/// --filter deploy-web build`, `make -f deploy.mk`), never its target.
+const TARGET_VALUES: &[&str] = &[
+    "--filter",
+    "-F",
+    "-w",
+    "--workspace",
+    "--prefix",
+    "--dir",
+    "-f",
+    "--file",
+];
+
+/// Programs whose first words name the target or script they run (`make
+/// deploy-prod`, `npm run deploy:prod`, `npx release-it`).
+const TARGETS: &[&str] = &[
+    "make", "just", "task", "rake", "npm", "pnpm", "yarn", "bun", "npx", "pnpx", "bunx",
+];
+
+/// The step of the steps `found` says, in order: a deletion wherever it
+/// comes (`gh release delete`), else the first.
+fn chief(found: impl IntoIterator<Item = Important>) -> Option<Important> {
+    let found: Vec<Important> = found.into_iter().collect();
+    found
+        .iter()
+        .copied()
+        .find(|i| *i == Important::Deleted)
+        .or(found.first().copied())
+}
+
+/// The step a name takes by its words, split at `-`, `_`, `:`, `.` and
+/// spaces (`deploy-prod`, `deploy:prod`, "Deploy signal"); none when one
+/// of them says it only tests or checks ([`CHECKING`]).
+fn named_step(name: &str) -> Option<Important> {
+    let parts: Vec<String> = name
+        .split(|c: char| matches!(c, '-' | '_' | ':' | '.') || c.is_whitespace())
+        .filter(|p| !p.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    match parts.iter().any(|p| CHECKING.contains(&p.as_str())) {
+        true => None,
+        false => chief(parts.iter().filter_map(|p| step(std::slice::from_ref(p)))),
+    }
+}
+
 /// The step one command takes (`words`, quotes removed), `depth` commands
 /// deep in what hosts and shells run: by its program and its first words
-/// ([`SUBCOMMANDS`]), each whole, never a part of one. A path counts only
-/// when it is what runs: the program, the script an interpreter runs, or
-/// the workflow `gh workflow run` starts; what a script is given never
-/// does. Nothing for a program or subcommand that only reads or looks,
-/// for prose, or for what follows `--`.
+/// ([`SUBCOMMANDS`]). What runs is named by its words ([`named_step`]): the
+/// program, the script an interpreter runs, the workflow `gh workflow run`
+/// starts, and a target runner's target ([`TARGETS`]); any other word only
+/// whole. A path counts only when it is what runs; what a script is given
+/// never does. Nothing for a program or subcommand that only reads or
+/// looks, for prose, or for what follows `--`.
 fn one_step(words: &[String], depth: usize) -> Option<Important> {
     let words = what_runs(words);
     let (first, rest) = words.split_first()?;
@@ -415,9 +469,9 @@ fn one_step(words: &[String], depth: usize) -> Option<Important> {
     if READERS.contains(&program.as_str()) {
         return None;
     }
-    // A program that is a step itself (`rm`, `./deploy.sh`) takes it,
+    // A program that is a step itself (`rm`, `./deploy-prod.sh`) takes it,
     // whatever it is given.
-    if let Some(i) = step(std::slice::from_ref(&program)) {
+    if let Some(i) = named_step(&program) {
         return Some(i);
     }
     // A command run elsewhere is read as the command it is: on a host
@@ -446,7 +500,14 @@ fn one_step(words: &[String], depth: usize) -> Option<Important> {
     let flags = |f: &str| args.iter().any(|w| *w == f);
     let runs_script = INTERPRETERS.contains(&program.as_str()) && !flags("-n") && !flags("-c");
     let sql = SQL.contains(&program.as_str());
+    let targets = TARGETS.contains(&program.as_str());
+    // How many words more name a target runner's target: its first, and
+    // the one after `run` (`npm run deploy:prod`), never a package it
+    // installs (`npm install release-it`).
+    let mut aim = usize::from(targets);
     let mut said = vec![program.clone()];
+    // Which of `said` name what runs, read by their words.
+    let mut named: Vec<usize> = vec![0];
     let mut subs = 0;
     let mut skip = false;
     let mut script = false;
@@ -466,12 +527,15 @@ fn one_step(words: &[String], depth: usize) -> Option<Important> {
         }
         let workflow = said.ends_with(&["workflow".to_string(), "run".to_string()]);
         if workflow && !w.starts_with('-') {
+            named.push(said.len());
             said.push(named_as(w));
             continue;
         }
         if w.starts_with('-') {
             script = sql && SQL_SCRIPT.contains(&w.as_str());
-            skip = prose(w) || VALUES.contains(&w.as_str());
+            skip = prose(w)
+                || VALUES.contains(&w.as_str())
+                || (targets && TARGET_VALUES.contains(&w.as_str()));
             let flag = w.trim_start_matches('-');
             let flag = flag.split_once('=').map_or(flag, |(f, _)| f);
             if DELETING_FLAGS.contains(&flag) {
@@ -480,15 +544,24 @@ fn one_step(words: &[String], depth: usize) -> Option<Important> {
             continue;
         }
         match pathy(w) {
-            true if runs_script && subs == 0 => said.push(named_as(w)),
+            true if runs_script && subs == 0 => {
+                named.push(said.len());
+                said.push(named_as(w));
+            }
             true => {}
             false if subs < SUBCOMMANDS && !pathy(first) && program != "find" => {
                 subs += 1;
+                let from = said.len();
                 said.extend(
                     w.split_whitespace()
                         .take(SUBCOMMANDS)
                         .map(str::to_lowercase),
                 );
+                if aim > 0 {
+                    aim -= 1;
+                    aim += usize::from(matches!(w.as_str(), "run" | "run-script"));
+                    named.extend(from..said.len());
+                }
             }
             false => {}
         }
@@ -509,7 +582,14 @@ fn one_step(words: &[String], depth: usize) -> Option<Important> {
             && (flags("-l") || flags("--list")));
     match reads || looks {
         true => None,
-        false => step(&said),
+        false => chief(
+            said.iter()
+                .enumerate()
+                .filter_map(|(i, w)| match named.contains(&i) {
+                    true => named_step(w),
+                    false => step(std::slice::from_ref(w)),
+                }),
+        ),
     }
 }
 

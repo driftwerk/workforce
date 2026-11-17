@@ -293,6 +293,7 @@ pub fn parse_reply(reply: &str, at: DateTime<Utc>) -> MentionedUpdate {
                 undo: None,
                 settled_by: None,
                 at,
+                folded: None,
             })
         };
         let (done, for_you) = (done_of(l), for_you_of(l));
@@ -510,6 +511,7 @@ mod tests {
             undo: Some("undo".into()),
             settled_by: None,
             at: Utc::now(),
+            folded: None,
         }
     }
 

@@ -373,6 +373,7 @@ pub fn folded(items: Vec<BriefItem>, rows: &[BossDecision], tz: &Tz) -> Vec<Brie
             undo: None,
             settled_by: None,
             at: i.at,
+            folded: Some(each.len() as u32),
         });
     }
     out
@@ -445,6 +446,71 @@ mod tests {
 
     fn name(_: Uuid) -> Option<String> {
         Some("Billing Migration".into())
+    }
+
+    /// What runs is named by its words: a script, a workflow or a target
+    /// that deploys releases, unless its name says it tests or checks.
+    #[test]
+    fn a_step_in_what_runs_is_read_by_its_words() {
+        use ActionKind::Approve;
+        for (request, step) in [
+            ("Bash: ./deploy-prod.sh", Important::Released),
+            ("Bash: ./scripts/deploy_prod.sh eu", Important::Released),
+            ("Bash: bash release-web.sh", Important::Released),
+            ("Bash: make deploy-prod", Important::Released),
+            ("Bash: make -C infra deploy-prod", Important::Released),
+            ("Bash: npm run deploy:prod", Important::Released),
+            ("Bash: pnpm run release:web", Important::Released),
+            ("Bash: just release", Important::Released),
+            ("Bash: just deploy-prod", Important::Released),
+            (
+                "Bash: gh workflow run \"Deploy signal\"",
+                Important::Released,
+            ),
+            (
+                "Bash: gh workflow run 'Release web' -f ref=main",
+                Important::Released,
+            ),
+            ("Bash: gh workflow run deploy-prod.yml", Important::Released),
+            ("Bash: pnpm deploy", Important::Released),
+            ("Bash: cargo release", Important::Released),
+            ("Bash: npx release-it", Important::Released),
+            ("Bash: pnpm --filter web deploy", Important::Released),
+            ("Bash: make -f deploy.mk deploy-prod", Important::Released),
+            ("Bash: make drop-db", Important::Deleted),
+            ("Bash: gh release delete v1.2.0 --yes", Important::Deleted),
+            ("Bash: glab release delete v1.2.0", Important::Deleted),
+        ] {
+            assert_eq!(important(Approve, request), Some(step), "{request}");
+        }
+        // A name that says it tests or checks is not a release.
+        for request in [
+            "Edit: /repo/tests/stack-deploy-tests.sh",
+            "Bash: bash deploy-preview-tests.sh",
+            "Bash: ./tests/stack-deploy-tests.sh",
+            "Bash: ./scripts/deploy-preview.sh prod",
+            "Bash: ./deploy-check.sh",
+            "Bash: make deploy-lint",
+            "Bash: npm run release:dry-run",
+            "Bash: npm run test:deploy",
+            "Bash: just deploy-spec",
+            "Bash: gh workflow run \"Deploy preview\"",
+            "Bash: gh workflow run release-plan.yml",
+            // Words given to other programs are read whole.
+            "Bash: docker run my-release-image",
+            "Bash: git push -u origin release-1.2",
+            // A package installed or a workspace named is not a target.
+            "Bash: npm install release-it",
+            "Bash: pnpm add semantic-release",
+            "Bash: npm uninstall release-it",
+            "Bash: pnpm --filter deploy-web test",
+            "Bash: pnpm --filter deploy-web build",
+            "Bash: pnpm -F release-notes build",
+            "Bash: make release-notes",
+            "Bash: ./deploy-status.sh",
+        ] {
+            assert_eq!(important(Approve, request), None, "{request}");
+        }
     }
 
     /// Steps named "deploy" only in their files are ordinary; what a
@@ -707,6 +773,12 @@ mod tests {
         assert_eq!(
             out[1].detail.as_deref().map(|d| d.lines().count()),
             Some(16)
+        );
+        // "What I did" counts each decision a folded line stands for.
+        let counted: u32 = out.iter().map(|i| i.folded.unwrap_or(1)).sum();
+        assert_eq!(
+            (out[0].folded, out[1].folded, counted),
+            (None, Some(16), 17)
         );
     }
 }
