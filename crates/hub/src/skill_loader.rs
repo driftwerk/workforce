@@ -836,6 +836,10 @@ Generate an API key at: /admin/settings/authentication/api-keys (Metabase v0.49+
 \n\
 card_query and dataset_query_native are row-capped (hard ceiling 2000). Set\n\
 skills/metabase/instances/<name>/max_query_rows to override per instance.\n\
+\n\
+For an instance behind Cloudflare Access, also set its service token (both or neither):\n\
+  vault.set('skills/metabase/instances/<name>/access_client_id',     '<id>.access')\n\
+  vault.set('skills/metabase/instances/<name>/access_client_secret', '<secret>')\n\
 After adding or changing credentials, call system.enable_skill('metabase') to reload.",
             workspace_vault_prefix: "skills/metabase/instances/",
             workspace_credentials: &[
@@ -854,6 +858,18 @@ After adding or changing credentials, call system.enable_skill('metabase') to re
                 WorkspaceCredentialMeta {
                     key: "max_query_rows",
                     description: "Optional per-instance row cap (default 2000, max 2000)",
+                    required: false,
+                addable: true,
+                },
+                WorkspaceCredentialMeta {
+                    key: "access_client_id",
+                    description: "Optional Cloudflare Access service token id (set with access_client_secret)",
+                    required: false,
+                addable: true,
+                },
+                WorkspaceCredentialMeta {
+                    key: "access_client_secret",
+                    description: "Optional Cloudflare Access service token secret (set with access_client_id)",
                     required: false,
                 addable: true,
                 },
@@ -3267,6 +3283,8 @@ fn metabase_vault_config(
                 api_key,
                 site_url,
                 max_query_rows,
+                access_client_id: None,
+                access_client_secret: None,
             },
         );
     }
@@ -3319,6 +3337,8 @@ fn metabase_vault_config(
             api_key: Some(api_key),
             site_url,
             max_query_rows,
+            access_client_id: None,
+            access_client_secret: None,
             instances: std::collections::HashMap::new(),
             default_instance: None,
         }
@@ -3329,6 +3349,8 @@ fn metabase_vault_config(
             api_key: None,
             site_url: None,
             max_query_rows: workforce_skills::adapters::metabase::config::DEFAULT_MAX_QUERY_ROWS,
+            access_client_id: None,
+            access_client_secret: None,
             instances,
             default_instance,
         }

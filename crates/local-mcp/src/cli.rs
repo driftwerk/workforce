@@ -85,8 +85,14 @@ const DATADOG: AdapterSpec = AdapterSpec {
 const METABASE: AdapterSpec = AdapterSpec {
     name: "metabase",
     display: "Metabase",
-    fields: &["site_url", "api_key", "max_query_rows"],
-    secret_fields: &["api_key"],
+    fields: &[
+        "site_url",
+        "api_key",
+        "max_query_rows",
+        "access_client_id",
+        "access_client_secret",
+    ],
+    secret_fields: &["api_key", "access_client_secret"],
 };
 const POSTMARK: AdapterSpec = AdapterSpec {
     name: "postmark",
@@ -187,6 +193,15 @@ pub enum ConfigCommand {
         /// Cap on rows returned by query tools. Default 2000 (hard max).
         #[arg(long)]
         max_query_rows: Option<u64>,
+        /// Cloudflare Access service token id, for an instance behind
+        /// Cloudflare Access. Its secret is then prompted for (hidden)
+        /// unless `--access-client-secret` is given.
+        #[arg(long)]
+        access_client_id: Option<String>,
+        /// Cloudflare Access service token secret. Sent only together with
+        /// `--access-client-id`.
+        #[arg(long)]
+        access_client_secret: Option<String>,
         /// Save credentials under this named workspace. Internally maps to
         /// Metabase's `instances` map in the skill config.
         #[arg(long, value_name = "NAME")]
@@ -364,9 +379,21 @@ fn run_config(store: &LocalSecretStore, command: ConfigCommand) -> Result<()> {
         ConfigCommand::Metabase {
             site_url,
             max_query_rows,
+            access_client_id,
+            access_client_secret,
             workspace,
             set_default,
-        } => configure_metabase(store, workspace, set_default, site_url, max_query_rows),
+        } => configure_metabase(
+            store,
+            workspace,
+            set_default,
+            MetabaseFlags {
+                site_url,
+                max_query_rows,
+                access_client_id,
+                access_client_secret,
+            },
+        ),
         ConfigCommand::Postmark {
             account_token,
             base_url,
@@ -537,32 +564,66 @@ fn configure_datadog(
     apply_set_default(store, &DATADOG, set_default.as_deref())
 }
 
+/// `config metabase`'s optional settings.
+struct MetabaseFlags {
+    site_url: Option<String>,
+    max_query_rows: Option<u64>,
+    access_client_id: Option<String>,
+    access_client_secret: Option<String>,
+}
+
+impl MetabaseFlags {
+    fn is_empty(&self) -> bool {
+        self.site_url.is_none()
+            && self.max_query_rows.is_none()
+            && self.access_client_id.is_none()
+            && self.access_client_secret.is_none()
+    }
+
+    /// The optional fields to store, a blank value counting as not given.
+    /// `ask_secret` supplies the access secret when only its id was given.
+    fn optional_fields(
+        self,
+        ask_secret: impl FnOnce() -> Result<Option<String>>,
+    ) -> Result<Vec<(&'static str, String)>> {
+        let id = self.access_client_id.as_deref().and_then(non_empty);
+        let secret = match (&id, self.access_client_secret.as_deref()) {
+            (Some(_), None) => ask_secret()?,
+            (_, secret) => secret.and_then(non_empty),
+        };
+        Ok(self
+            .max_query_rows
+            .map(|cap| ("max_query_rows", cap.to_string()))
+            .into_iter()
+            .chain(id.map(|v| ("access_client_id", v)))
+            .chain(secret.map(|v| ("access_client_secret", v)))
+            .collect())
+    }
+}
+
 fn configure_metabase(
     store: &LocalSecretStore,
     workspace: Option<String>,
     set_default: Option<String>,
-    site_url: Option<String>,
-    max_query_rows: Option<u64>,
+    mut flags: MetabaseFlags,
 ) -> Result<()> {
-    if workspace.is_none()
-        && set_default.is_some()
-        && site_url.is_none()
-        && max_query_rows.is_none()
-    {
+    if workspace.is_none() && set_default.is_some() && flags.is_empty() {
         return apply_set_default(store, &METABASE, set_default.as_deref());
     }
-    let mut fields = vec![
-        (
-            "site_url",
-            resolve_value(site_url, "Metabase site URL", false)?
-                .trim_end_matches('/')
-                .to_string(),
-        ),
-        ("api_key", resolve_value(None, "Metabase API key", true)?),
-    ];
-    if let Some(cap) = max_query_rows {
-        fields.push(("max_query_rows", cap.to_string()));
-    }
+    let site_url = resolve_value(flags.site_url.take(), "Metabase site URL", false)?
+        .trim_end_matches('/')
+        .to_string();
+    let api_key = resolve_value(None, "Metabase API key", true)?;
+    let fields = [("site_url", site_url), ("api_key", api_key)]
+        .into_iter()
+        .chain(flags.optional_fields(|| {
+            resolve_optional_value(
+                None,
+                "Cloudflare Access client secret (press Enter to skip)",
+                true,
+            )
+        })?)
+        .collect();
     save_adapter(store, &METABASE, workspace.as_deref(), fields)?;
     apply_set_default(store, &METABASE, set_default.as_deref())
 }
@@ -1091,12 +1152,7 @@ fn resolve_optional_value(
     use std::io::IsTerminal;
 
     if let Some(v) = value {
-        let trimmed = v.trim();
-        return Ok(if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        });
+        return Ok(non_empty(&v));
     }
 
     let raw = if secret && std::io::stdin().is_terminal() {
@@ -1111,12 +1167,14 @@ fn resolve_optional_value(
         buf
     };
 
-    let trimmed = raw.trim();
-    Ok(if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    })
+    Ok(non_empty(&raw))
+}
+
+/// `value` trimmed, a blank one counting as not given.
+fn non_empty(value: &str) -> Option<String> {
+    Some(value.trim())
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
 }
 
 fn print_prompt(label: &str) {
@@ -1204,9 +1262,87 @@ mod tests {
         assert!(METABASE.is_secret("api_key"));
         assert!(!METABASE.is_secret("site_url"));
         assert!(!METABASE.is_secret("max_query_rows"));
+        assert!(METABASE.is_secret("access_client_secret"));
+        assert!(!METABASE.is_secret("access_client_id"));
         assert!(POSTMARK.is_secret("server_token"));
         assert!(POSTMARK.is_secret("account_token"));
         assert!(!POSTMARK.is_secret("base_url"));
+    }
+
+    #[test]
+    fn metabase_flags_store_the_access_pair_and_skip_blanks() {
+        let flags = |id: Option<&str>, secret: Option<&str>| MetabaseFlags {
+            site_url: None,
+            max_query_rows: Some(500),
+            access_client_id: id.map(str::to_string),
+            access_client_secret: secret.map(str::to_string),
+        };
+        let never_asked = || -> Result<Option<String>> { panic!("the secret was given") };
+        assert_eq!(
+            flags(Some(" test-client-id.access "), Some("not-a-real-secret"))
+                .optional_fields(never_asked)
+                .unwrap(),
+            vec![
+                ("max_query_rows", "500".to_string()),
+                ("access_client_id", "test-client-id.access".to_string()),
+                ("access_client_secret", "not-a-real-secret".to_string()),
+            ]
+        );
+        assert_eq!(
+            flags(Some(""), Some("  "))
+                .optional_fields(never_asked)
+                .unwrap(),
+            vec![("max_query_rows", "500".to_string())]
+        );
+        assert_eq!(
+            flags(Some("test-client-id.access"), None)
+                .optional_fields(|| Ok(Some("not-a-real-secret".into())))
+                .unwrap(),
+            vec![
+                ("max_query_rows", "500".to_string()),
+                ("access_client_id", "test-client-id.access".to_string()),
+                ("access_client_secret", "not-a-real-secret".to_string()),
+            ],
+            "the secret is asked for when only the id was given"
+        );
+        assert_eq!(
+            flags(None, None).optional_fields(never_asked).unwrap(),
+            vec![("max_query_rows", "500".to_string())],
+            "nothing is asked without an id"
+        );
+        assert!(!flags(None, None).is_empty());
+        assert!(MetabaseFlags {
+            site_url: None,
+            max_query_rows: None,
+            access_client_id: None,
+            access_client_secret: None,
+        }
+        .is_empty());
+        assert!(!MetabaseFlags {
+            site_url: None,
+            max_query_rows: None,
+            access_client_id: None,
+            access_client_secret: Some("not-a-real-secret".into()),
+        }
+        .is_empty());
+    }
+
+    #[test]
+    fn config_show_redacts_the_access_secret() {
+        let shown = format_fields(
+            &METABASE,
+            &[
+                ("site_url".into(), "https://mb.example.com".into()),
+                ("access_client_id".into(), "test-client-id.access".into()),
+                ("access_client_secret".into(), "not-a-real-secret".into()),
+            ],
+        );
+        assert!(
+            shown.contains("access_client_id=test-client-id.access"),
+            "{shown}"
+        );
+        assert!(shown.contains("access_client_secret=****"), "{shown}");
+        assert!(!shown.contains("not-a-real-secret"), "{shown}");
     }
 
     #[test]
@@ -1358,6 +1494,49 @@ mod tests {
                     .is_empty());
                 assert_eq!(store.get(&paths::legacy_field("linear", "api_key")), None);
                 assert_eq!(store.get(&paths::default_workspace("linear")), None);
+            });
+        }
+
+        #[test]
+        fn metabase_access_pair_is_saved_and_shown_redacted() {
+            with_tmp_store(|store| {
+                save_adapter(
+                    store,
+                    &METABASE,
+                    Some("prod"),
+                    vec![
+                        ("site_url", "https://mb.example.com".into()),
+                        ("api_key", "mb_test".into()),
+                        ("access_client_id", "test-client-id.access".into()),
+                        ("access_client_secret", "not-a-real-secret".into()),
+                    ],
+                )
+                .unwrap();
+                assert_eq!(
+                    store.get(&paths::workspace_field(
+                        "metabase",
+                        "prod",
+                        "access_client_secret"
+                    )),
+                    Some("not-a-real-secret".to_string())
+                );
+                let snap = snapshot_adapter(store, &METABASE);
+                let shown = format_fields(&METABASE, &snap.workspaces[0].fields);
+                assert!(
+                    shown.contains("access_client_id=test-client-id.access"),
+                    "{shown}"
+                );
+                assert!(shown.contains("access_client_secret=****"), "{shown}");
+                assert!(!shown.contains("not-a-real-secret"), "{shown}");
+                assert_eq!(clear_workspace(store, &METABASE, "prod").unwrap(), 5);
+                assert_eq!(
+                    store.get(&paths::workspace_field(
+                        "metabase",
+                        "prod",
+                        "access_client_secret"
+                    )),
+                    None
+                );
             });
         }
 

@@ -83,7 +83,8 @@ workforce-local-mcp config datadog --site eu1
 # Prompts for API key + application key
 
 workforce-local-mcp config metabase --site-url https://mb.example.com
-# Prompts for API key
+# Prompts for API key. Behind Cloudflare Access, add the service token's id
+# with --access-client-id <token-id>.access; its secret is then prompted (hidden)
 
 workforce-local-mcp config postmark
 # Prompts for server token (required, hidden) + account token (optional, hidden)

@@ -33,6 +33,7 @@ use eyre::Result;
 use serde_json::Value;
 use tracing::{info, warn};
 use workforce_agent::tools::Tool;
+use workforce_common::secret::Secret;
 use workforce_common::settings::SecretStore;
 use workforce_skills::adapters::datadog::config::DatadogAccountConfig;
 use workforce_skills::adapters::datadog::{DatadogSkill, DatadogSkillConfig};
@@ -344,19 +345,23 @@ fn build_metabase_config(store: &dyn SecretStore) -> Option<MetabaseSkillConfig>
         api_key: None,
         site_url: None,
         max_query_rows: DEFAULT_METABASE_ROW_CAP,
+        access_client_id: None,
+        access_client_secret: None,
         instances,
         default_instance: default_workspace_for(store, "metabase"),
     })
 }
 
 fn read_metabase_workspace(store: &dyn SecretStore, name: &str) -> Option<MetabaseInstanceConfig> {
+    let field = |f: &str| store.get(&paths::workspace_field("metabase", name, f));
     Some(MetabaseInstanceConfig {
-        api_key: store.get(&paths::workspace_field("metabase", name, "api_key"))?,
-        site_url: Some(store.get(&paths::workspace_field("metabase", name, "site_url"))?),
-        max_query_rows: store
-            .get(&paths::workspace_field("metabase", name, "max_query_rows"))
+        api_key: field("api_key")?,
+        site_url: Some(field("site_url")?),
+        max_query_rows: field("max_query_rows")
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_METABASE_ROW_CAP),
+        access_client_id: field("access_client_id"),
+        access_client_secret: field("access_client_secret").map(Secret::new),
     })
 }
 
@@ -376,6 +381,8 @@ fn read_metabase_legacy(store: &dyn SecretStore) -> Option<MetabaseInstanceConfi
             .or_else(|| std::env::var("METABASE_MAX_QUERY_ROWS").ok())
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_METABASE_ROW_CAP),
+        access_client_id: store.get(&field("access_client_id")),
+        access_client_secret: store.get(&field("access_client_secret")).map(Secret::new),
     })
 }
 
@@ -766,6 +773,52 @@ mod tests {
         assert_eq!(
             cfg.instances["staging"].max_query_rows,
             DEFAULT_METABASE_ROW_CAP
+        );
+    }
+
+    #[test]
+    fn metabase_access_pair_is_read_for_named_and_legacy_instances() {
+        let pair = |inst: &MetabaseInstanceConfig| {
+            (
+                inst.access_client_id.clone(),
+                inst.access_client_secret
+                    .as_ref()
+                    .map(|secret| secret.expose_secret().clone()),
+            )
+        };
+        let named = MapStore::with(&[
+            ("skills/metabase/workspaces_index", r#"["prod"]"#),
+            ("skills/metabase/workspaces/prod/api_key", "mb_key"),
+            (
+                "skills/metabase/workspaces/prod/site_url",
+                "https://mb.example.com",
+            ),
+            (
+                "skills/metabase/workspaces/prod/access_client_id",
+                "test-client-id.access",
+            ),
+            (
+                "skills/metabase/workspaces/prod/access_client_secret",
+                "not-a-real-secret",
+            ),
+        ]);
+        let cfg = build_metabase_config(&named).unwrap();
+        assert_eq!(
+            pair(&cfg.instances["prod"]),
+            (
+                Some("test-client-id.access".into()),
+                Some("not-a-real-secret".into())
+            )
+        );
+        let legacy = MapStore::with(&[
+            ("skills/metabase/api_key", "mb_key"),
+            ("skills/metabase/site_url", "https://mb.example.com"),
+            ("skills/metabase/access_client_id", "test-client-id.access"),
+        ]);
+        let cfg = build_metabase_config(&legacy).unwrap();
+        assert_eq!(
+            pair(&cfg.instances["default"]),
+            (Some("test-client-id.access".into()), None)
         );
     }
 

@@ -779,6 +779,42 @@ fn a_disconnected_email_stops_at_once() {
 }
 
 #[tokio::test]
+async fn a_metabase_behind_cloudflare_access_tests_with_its_service_token() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let h = hub().await;
+    let metabase = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/user/current"))
+        .and(header("x-api-key", "mb-key"))
+        .and(header("cf-access-client-id", "test-client-id.access"))
+        .and(header("cf-access-client-secret", "not-a-real-secret"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "email": "sarah@acme.example" })),
+        )
+        .mount(&metabase)
+        .await;
+    for (sub, value) in [
+        ("api_key", "mb-key"),
+        ("site_url", metabase.uri().as_str()),
+        ("access_client_id", "test-client-id.access"),
+        ("access_client_secret", "not-a-real-secret"),
+    ] {
+        h.global
+            .set(
+                &mine(&format!("skills/metabase/instances/default/{sub}")),
+                value,
+            )
+            .unwrap();
+    }
+    let list = h.c.list(SARAH).await;
+    let id = connector(&list, "metabase").connections[0].id.clone();
+    let tested = h.c.test(SARAH, "metabase", &id).await.unwrap();
+    assert_eq!(tested.status, Status::Connected, "{:?}", tested.detail);
+    assert_eq!(tested.account.as_deref(), Some("sarah@acme.example"));
+}
+
+#[tokio::test]
 async fn a_flat_connection_moves_to_a_named_one_at_its_own_tier_and_nothing_is_lost() {
     let h = hub().await;
     // Kept before a service held several: Sarah's for all her agents,
@@ -1028,6 +1064,8 @@ async fn every_setting_an_adapter_reads_moves_with_its_connection() {
         ("skills/metabase/api_key", "mb-key"),
         ("skills/metabase/site_url", "https://mb.acme.example"),
         ("skills/metabase/max_query_rows", "500"),
+        ("skills/metabase/access_client_id", "test-client-id.access"),
+        ("skills/metabase/access_client_secret", "not-a-real-secret"),
         ("skills/jira/api_token", "jira-token"),
         ("skills/jira/email", "sarah@acme.example"),
         ("skills/jira/site", "acme.atlassian.net"),
@@ -1060,6 +1098,14 @@ async fn every_setting_an_adapter_reads_moves_with_its_connection() {
     assert_eq!(
         at("skills/metabase/instances/default/max_query_rows").as_deref(),
         Some("500")
+    );
+    assert_eq!(
+        at("skills/metabase/instances/default/access_client_id").as_deref(),
+        Some("test-client-id.access")
+    );
+    assert_eq!(
+        at("skills/metabase/instances/default/access_client_secret").as_deref(),
+        Some("not-a-real-secret")
     );
     assert_eq!(
         at("skills/jira/workspaces/default/default_project").as_deref(),

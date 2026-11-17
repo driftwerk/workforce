@@ -17,6 +17,33 @@ Configure credentials in vault:
 * **Multiple instances**: Set `skills/metabase/instances/<name>/api_key` and `skills/metabase/instances/<name>/site_url` for each instance
 * **Default instance**: a single configured instance is the default automatically; with several, set `skills/metabase/default_instance` (in a shared tier, `scope='agent_specific'`) to pick which instance is used when no `instance` parameter is provided
 
+### Cloudflare Access
+
+If your Metabase sits behind [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/identity/service-tokens/), create a service token for it in Cloudflare Zero Trust and allow the token in the Access application's policy (a **Service Auth** rule). Then store the token's client id and client secret beside the instance's API key:
+
+* **Single instance**: `skills/metabase/access_client_id` and `skills/metabase/access_client_secret`
+* **Multiple instances**: `skills/metabase/instances/<name>/access_client_id` and `skills/metabase/instances/<name>/access_client_secret`
+
+For example, for an instance named `prod` at `https://mb.example.com`:
+
+```
+vault.set('skills/metabase/instances/prod/site_url',             'https://mb.example.com')
+vault.set('skills/metabase/instances/prod/api_key',              '<mb_...>')
+vault.set('skills/metabase/instances/prod/access_client_id',     '<token-id>.access')
+vault.set('skills/metabase/instances/prod/access_client_secret', '<token-secret>')
+```
+
+With both set, every request also carries `CF-Access-Client-Id` and `CF-Access-Client-Secret`. With neither set, nothing extra is sent. If only one is set, neither header is sent and a warning naming the missing setting is logged once. The secret is never logged.
+
+The token is sent only to the site it was configured with: a shared token is never paired with a site a user set for their own API key.
+
+In the local MCP companion, give the token's id and enter its secret when prompted (it is not echoed):
+
+```bash
+workforce-local-mcp config metabase --workspace prod --site-url https://mb.example.com \
+  --access-client-id <token-id>.access
+```
+
 ### Row cap
 
 All query tools (`metabase.card_query`, `metabase.dashboard_query`, `metabase.dataset_query_native`) enforce a row cap to prevent huge result sets from overwhelming the agent's context window. The default cap is **2000 rows**. You can set a lower per-instance limit via `skills/metabase/instances/<name>/max_query_rows`. Every query response includes the applied `row_cap`.
@@ -83,6 +110,7 @@ If you have multiple instances and no default, you must specify `instance` on ev
 * **External content wrapping**: Card/dashboard descriptions and query result rows are wrapped with prompt-injection markers before being returned to the agent.
 * **Policies**: All tools default to `allow` in `SkillPolicy`. Operators who want a confirmation gate on mutating tools (`*_create`, `*_update`, `*_archive`, `dataset_query_native`) should downgrade those to `require_approval` in their deployment config.
 * **Row cap**: Hard ceiling of 50,000 rows on all query tools. Per-instance overrides may lower but not raise the cap.
+* **Cloudflare Access secret**: `access_client_secret` is never logged, is redacted wherever configuration is shown, and is only sent to the site it was configured with.
 
 ## Reloading
 
@@ -109,7 +137,9 @@ api_key  = "${METABASE_API_KEY}"
 # [instances.prod]
 # site_url       = "https://mb.prod.example.com"
 # api_key        = "${METABASE_API_KEY_PROD}"
-# # max_query_rows = dic2000
+# # max_query_rows = 2000
+# # access_client_id     = "${vault:metabase.instances.prod.access_client_id}"
+# # access_client_secret = "${vault:metabase.instances.prod.access_client_secret}"
 #
 # [instances.staging]
 # site_url       = "https://mb.staging.example.com"

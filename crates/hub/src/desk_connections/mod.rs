@@ -685,7 +685,7 @@ impl Connections {
             .expect("some key is free")
     }
 
-    /// The kept fields of instance `key` at `tier`.
+    /// The kept fields and settings of instance `key` at `tier`.
     fn kept(
         &self,
         c: &Connector,
@@ -699,10 +699,16 @@ impl Connections {
         };
         c.fields
             .iter()
-            .filter_map(|f| {
+            .map(|f| (f.name, c.field_at(f, key)))
+            .chain(
+                c.extras
+                    .iter()
+                    .map(|&extra| (extra.1, c.extra_at(extra, key))),
+            )
+            .filter_map(|(name, path)| {
                 vault
-                    .get(&key_at(tier, person, &c.field_at(f, key)))
-                    .map(|v| (f.name.to_string(), v))
+                    .get(&key_at(tier, person, &path))
+                    .map(|v| (name.to_string(), v))
             })
             .collect()
     }

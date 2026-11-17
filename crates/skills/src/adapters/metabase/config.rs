@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+use workforce_common::secret::Secret;
 
 /// Default row cap when a call supplies no explicit `limit`. Keeps casual
 /// queries polite to the Metabase database; context safety is owned by the
@@ -31,6 +32,14 @@ pub struct MetabaseInstanceConfig {
     /// Cap on rows returned by query tools for this instance.
     #[serde(default = "default_max_rows")]
     pub max_query_rows: u64,
+    /// Cloudflare Access service token id. Sent as `CF-Access-Client-Id`
+    /// together with [`Self::access_client_secret`].
+    #[serde(default)]
+    pub access_client_id: Option<String>,
+    /// Cloudflare Access service token secret. Sent as
+    /// `CF-Access-Client-Secret` together with [`Self::access_client_id`].
+    #[serde(default)]
+    pub access_client_secret: Option<Secret<String>>,
 }
 
 /// Configuration for the Metabase skill.
@@ -47,6 +56,12 @@ pub struct MetabaseSkillConfig {
     /// Single-instance row cap.
     #[serde(default = "default_max_rows")]
     pub max_query_rows: u64,
+    /// Single-instance Cloudflare Access service token id.
+    #[serde(default)]
+    pub access_client_id: Option<String>,
+    /// Single-instance Cloudflare Access service token secret.
+    #[serde(default)]
+    pub access_client_secret: Option<Secret<String>>,
     /// Named instances for multi-instance mode.
     #[serde(default)]
     pub instances: HashMap<String, MetabaseInstanceConfig>,
@@ -66,6 +81,8 @@ impl MetabaseSkillConfig {
                     api_key: api_key.clone(),
                     site_url: self.site_url.clone(),
                     max_query_rows: self.max_query_rows,
+                    access_client_id: self.access_client_id.clone(),
+                    access_client_secret: self.access_client_secret.clone(),
                 },
             ));
         }
@@ -90,6 +107,11 @@ api_key  = "${METABASE_API_KEY}"
 # Row cap for query tools (no-limit default 2000; explicit limits up to 50000)
 # max_query_rows = 50000
 
+# Cloudflare Access service token, for an instance behind Cloudflare Access.
+# Both or neither: sent as CF-Access-Client-Id / CF-Access-Client-Secret.
+# access_client_id     = "${vault:metabase.access_client_id}"
+# access_client_secret = "${vault:metabase.access_client_secret}"
+
 # ── Multi-instance mode ──
 # Uncomment to configure multiple Metabase instances. Tools accept an optional
 # `instance` parameter to target a specific one.
@@ -100,6 +122,8 @@ api_key  = "${METABASE_API_KEY}"
 # site_url       = "https://mb.prod.example.com"
 # api_key        = "${METABASE_API_KEY_PROD}"
 # # max_query_rows = 2000
+# # access_client_id     = "${vault:metabase.instances.prod.access_client_id}"
+# # access_client_secret = "${vault:metabase.instances.prod.access_client_secret}"
 #
 # [instances.staging]
 # site_url       = "https://mb.staging.example.com"
@@ -116,6 +140,8 @@ impl Default for MetabaseSkillConfig {
             api_key: None,
             site_url: None,
             max_query_rows: DEFAULT_MAX_QUERY_ROWS,
+            access_client_id: None,
+            access_client_secret: None,
             instances: HashMap::new(),
             default_instance: None,
         }
@@ -192,12 +218,74 @@ mod tests {
     }
 
     #[test]
+    fn access_settings_deserialize_flat_and_per_instance_and_resolve() {
+        let json = r#"{
+            "api_key": "mb_flat",
+            "site_url": "https://mb.example.com",
+            "access_client_id": "flat-id.access",
+            "access_client_secret": "not-a-real-flat-secret",
+            "instances": {
+                "prod":    { "api_key": "mb_prod", "site_url": "https://mb.prod.example.com",
+                             "access_client_id": "prod-id.access",
+                             "access_client_secret": "not-a-real-prod-secret" },
+                "staging": { "api_key": "mb_staging", "site_url": "https://mb.staging.example.com" }
+            }
+        }"#;
+        let config: MetabaseSkillConfig = serde_json::from_str(json).unwrap();
+        let resolved: HashMap<String, MetabaseInstanceConfig> =
+            config.resolve().into_iter().collect();
+        let pair = |name: &str| {
+            let inst = &resolved[name];
+            (
+                inst.access_client_id.clone(),
+                inst.access_client_secret
+                    .as_ref()
+                    .map(|secret| secret.expose_secret().clone()),
+            )
+        };
+        assert_eq!(
+            pair("default"),
+            (
+                Some("flat-id.access".into()),
+                Some("not-a-real-flat-secret".into())
+            )
+        );
+        assert_eq!(
+            pair("prod"),
+            (
+                Some("prod-id.access".into()),
+                Some("not-a-real-prod-secret".into())
+            )
+        );
+        assert_eq!(pair("staging"), (None, None));
+    }
+
+    #[test]
+    fn the_access_secret_is_redacted_when_config_is_shown() {
+        let json = r#"{
+            "api_key": "mb_flat",
+            "access_client_id": "flat-id.access",
+            "access_client_secret": "not-a-real-flat-secret",
+            "instances": {
+                "prod": { "api_key": "mb_prod", "access_client_secret": "not-a-real-prod-secret" }
+            }
+        }"#;
+        let config: MetabaseSkillConfig = serde_json::from_str(json).unwrap();
+        let shown = format!("{config:?} {:?}", config.resolve());
+        assert!(!shown.contains("not-a-real-flat-secret"), "{shown}");
+        assert!(!shown.contains("not-a-real-prod-secret"), "{shown}");
+        assert!(shown.contains("flat-id.access"), "{shown}");
+    }
+
+    #[test]
     fn default_toml_includes_expected_keys() {
         let toml = MetabaseSkillConfig::default_toml();
         assert!(toml.contains("site_url"));
         assert!(toml.contains("api_key"));
         assert!(toml.contains("instances.prod"));
         assert!(toml.contains("default_instance"));
+        assert!(toml.contains("access_client_id"));
+        assert!(toml.contains("access_client_secret"));
     }
 
     #[test]

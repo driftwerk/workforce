@@ -404,7 +404,14 @@ pub const CATALOG: &[Connector] = &[
         primary_sub: "api_key",
         site: Some("site_url"),
         name_hint: "Acme",
-        extras: &[("skills/metabase/max_query_rows", "max_query_rows")],
+        extras: &[
+            ("skills/metabase/max_query_rows", "max_query_rows"),
+            ("skills/metabase/access_client_id", "access_client_id"),
+            (
+                "skills/metabase/access_client_secret",
+                "access_client_secret",
+            ),
+        ],
     },
 ];
 
@@ -437,6 +444,14 @@ impl Connector {
         match self.prefix {
             Some(_) => self.at(key, field.sub),
             None => field.path.to_string(),
+        }
+    }
+
+    /// Where setting `extra` of instance `key` is kept.
+    pub fn extra_at(&self, (flat, sub): (&str, &str), key: &str) -> String {
+        match self.prefix {
+            Some(_) => self.at(key, sub),
+            None => flat.to_string(),
         }
     }
 

@@ -235,7 +235,7 @@ Query Metabase cards and dashboards, run raw SQL, and manage collections across 
 | Tools loaded | 22 |
 | Required credentials | `skills/metabase/api_key`, `skills/metabase/site_url` |
 | Multi-tenant | Yes — named instances selected via an `instance` tool parameter |
-| Auth | `X-API-KEY` header (Metabase v0.49+) |
+| Auth | `X-API-KEY` header (Metabase v0.49+); optional Cloudflare Access service token (`access_client_id` + `access_client_secret`, sent as `CF-Access-Client-Id` / `CF-Access-Client-Secret`) |
 | Default policies | All tools `allow`; mutating tools are marked in their descriptions |
 
 **Vault setup (single instance):**
