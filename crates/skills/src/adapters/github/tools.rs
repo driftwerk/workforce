@@ -2178,6 +2178,16 @@ impl Tool for GithubPrMergeTool {
         // "pending" when no status was posted).
         // CI that can't be read is never taken as passed.
         let runs = match commit_checks(&client, &owner, repo, &head_sha).await {
+            Ok(CommitChecks {
+                runs,
+                note: Some(_),
+            }) if runs.is_empty() => {
+                return Ok(ToolResult::failure(
+                    "Cannot merge: no CI this GitHub key can read reported on its head, and \
+                     it can't read check runs, which other apps post.",
+                    start.elapsed().as_millis() as u64,
+                ))
+            }
             Ok(CommitChecks { runs, .. }) => runs,
             Err(e) => {
                 return Ok(ToolResult::from_report(
@@ -6087,13 +6097,14 @@ mod tests {
     }
 
     /// Two connections to `server`: the default on `first`, another on
-    /// `second`.
-    fn two(server: &MockServer) -> GithubGetRepoTool {
+    /// `second`. Each test has keys of its own: what GitHub said of a key
+    /// is kept for the whole process.
+    fn two(server: &MockServer, first: &str, second: &str) -> GithubGetRepoTool {
         let client = |t: &str| Arc::new(GithubClient::new(t, &server.uri()).unwrap());
         GithubGetRepoTool::new(
             Arc::new(LiveInstances::from(HashMap::from([
-                ("default".to_string(), client("first")),
-                ("zz-other".to_string(), client("second")),
+                ("default".to_string(), client(first)),
+                ("zz-other".to_string(), client(second)),
             ]))),
             default_ws(),
             None,
@@ -6107,17 +6118,17 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/repos/acme/app"))
-            .and(header("authorization", "Bearer first"))
+            .and(header("authorization", "Bearer reaches-first"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
             .expect(2)
             .mount(&server)
             .await;
-        Mock::given(header("authorization", "Bearer second"))
+        Mock::given(header("authorization", "Bearer reaches-second"))
             .respond_with(ResponseTemplate::new(200))
             .expect(0)
             .mount(&server)
             .await;
-        let out = two(&server)
+        let out = two(&server, "reaches-first", "reaches-second")
             .execute(serde_json::json!({"owner": "acme", "repo": "app"}))
             .await
             .unwrap();
@@ -6129,20 +6140,68 @@ mod tests {
     #[tokio::test]
     async fn a_connection_github_cant_say_of_is_passed_over() {
         let server = MockServer::start().await;
-        Mock::given(header("authorization", "Bearer first"))
+        Mock::given(header("authorization", "Bearer unsaid-first"))
             .respond_with(ResponseTemplate::new(502))
             .mount(&server)
             .await;
         Mock::given(path("/repos/acme/app"))
-            .and(header("authorization", "Bearer second"))
+            .and(header("authorization", "Bearer unsaid-second"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
             .expect(2)
             .mount(&server)
             .await;
-        let out = two(&server)
+        let out = two(&server, "unsaid-first", "unsaid-second")
             .execute(serde_json::json!({"owner": "acme", "repo": "app"}))
             .await
             .unwrap();
         assert!(out.success, "{:?}", out.error);
+    }
+
+    /// A key that can't read check runs, on a commit with no Actions runs or
+    /// statuses, never merges: an app's checks may be there unseen.
+    #[tokio::test]
+    async fn nothing_readable_on_a_head_without_check_runs_never_merges() {
+        let server = MockServer::start().await;
+        Mock::given(path(format!("/repos/acme/app/commits/{SHA}/check-runs")))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "message": "Resource not accessible by personal access token"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(path("/repos/acme/app/actions/runs"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"workflow_runs": []})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/repos/acme/app/commits/{SHA}/status")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"state": "pending", "statuses": []})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(path("/repos/acme/app/pulls/6"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"number": 6, "head": {"sha": SHA, "ref": "x"}}),
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(path("/repos/acme/app/pulls/6/merge"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let merge = GithubPrMergeTool::new(one(&server, "github_pat_empty"), default_ws(), None)
+            .execute(serde_json::json!({"owner": "acme", "repo": "app", "number": 6}))
+            .await
+            .unwrap();
+        assert!(!merge.success);
+        assert!(merge
+            .error
+            .unwrap()
+            .contains("no CI this GitHub key can read"));
     }
 }
