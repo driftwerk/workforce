@@ -1357,12 +1357,22 @@ pub fn moves_dir(command: &str) -> bool {
     cmds.iter().any(|cmd| moves_cmd(&cmd.words))
 }
 
+/// How deep [`commands`] reads expansions inside expansions.
+const NESTED: usize = 16;
+
 /// Each command `command` runs, as its words with their quotes removed (a
 /// quoted argument one word). One Desk can't split is read plainly: its
-/// heredocs' bodies and quoted words (a message's words) each one word
-/// `_`, each expansion `$_` with the commands inside it read too, split on
-/// whitespace and the shell's separators.
+/// heredocs' bodies left out, each expansion `$_` with the commands inside
+/// it read too (to [`NESTED`] deep), each quoted span (a message's words)
+/// one word `_`, split on whitespace and the shell's separators.
 pub fn commands(command: &str) -> Vec<Vec<String>> {
+    commands_in(command, 0)
+}
+
+fn commands_in(command: &str, depth: usize) -> Vec<Vec<String>> {
+    if depth > NESTED {
+        return Vec::new();
+    }
     match split(command) {
         Ok(cmds) => cmds
             .into_iter()
@@ -1370,54 +1380,80 @@ pub fn commands(command: &str) -> Vec<Vec<String>> {
             .collect(),
         Err(()) => {
             let mut inner = Vec::new();
-            let flat = flatten(&unquoted(&without_heredocs(command)), &mut inner);
+            let flat = unquoted(&flatten(&without_heredocs(command), &mut inner));
             flat.split(|c: char| ";&|\n(){}".contains(c))
                 .map(|c| c.split_whitespace().map(str::to_string).collect())
-                .chain(inner.iter().flat_map(|i| commands(i)))
+                .chain(inner.iter().flat_map(|i| commands_in(i, depth + 1)))
                 .collect()
         }
     }
 }
 
-/// `command` without its heredocs' bodies: from the line after `<<WORD`
-/// (`<<-`, `<<'WORD'`, `<<"WORD"`) to the line that is `WORD`.
+/// The word a heredoc on `line` ends at (`<<EOF`, `<<-'END-MSG'`), when
+/// it opens one: never a here-string (`<<<`) or a shift (`1<<4`).
+fn heredoc_end(line: &str) -> Option<String> {
+    let (_, rest) = line.split_once("<<")?;
+    let rest = rest.strip_prefix('-').unwrap_or(rest).trim_start();
+    let rest = rest.trim_start_matches(['\'', '"']);
+    let word: String = rest
+        .chars()
+        .take_while(|c| !c.is_whitespace() && !matches!(c, '\'' | '"' | ')' | ';' | '&' | '|'))
+        .collect();
+    word.starts_with(|c: char| c.is_alphabetic() || c == '_')
+        .then_some(word)
+}
+
+/// `command` without its heredocs' bodies: from the line after the one
+/// that opens it to the line that is its end word (or starts with it and
+/// a closing `)`). A heredoc never ended keeps its lines.
 fn without_heredocs(command: &str) -> String {
-    let mut out = Vec::new();
+    let mut out: Vec<&str> = Vec::new();
+    let mut body: Vec<&str> = Vec::new();
     let mut until: Option<String> = None;
     for line in command.lines() {
-        if let Some(end) = &until {
-            if line.trim() == end {
-                until = None;
+        match until.take() {
+            Some(end) => {
+                let t = line.trim();
+                match t.strip_prefix(end.as_str()) {
+                    // What follows the end word on its line still runs.
+                    Some(rest) if rest.is_empty() || rest.starts_with(')') => {
+                        body.clear();
+                        out.push(rest);
+                    }
+                    _ => {
+                        body.push(line);
+                        until = Some(end);
+                    }
+                }
             }
-            continue;
+            None => {
+                until = heredoc_end(line);
+                out.push(line);
+            }
         }
-        until = line.split_once("<<").and_then(|(_, rest)| {
-            let word: String = rest
-                .trim_start_matches('-')
-                .trim_start()
-                .trim_start_matches(['\'', '"'])
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
-            (!word.is_empty()).then_some(word)
-        });
-        out.push(line);
     }
+    out.extend(body);
     out.join("\n")
 }
 
 /// `text` with each quoted span (`'…'`, `"…"`; an unclosed one to the end)
-/// the one word `_`.
+/// the one word `_`. Outside quotes a backslash makes the next character
+/// plain; inside double quotes it keeps `\"` from closing them.
 fn unquoted(text: &str) -> String {
     let mut out = String::new();
     let mut open: Option<char> = None;
-    for c in text.chars() {
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
         match (open, c) {
+            (None, '\\') => out.extend(chars.next()),
             (None, '\'' | '"') => {
                 open = Some(c);
                 out.push('_');
             }
             (None, c) => out.push(c),
+            (Some('"'), '\\') => {
+                chars.next();
+            }
             (Some(q), c) if c == q => open = None,
             (Some(_), _) => {}
         }

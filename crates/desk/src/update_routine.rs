@@ -475,6 +475,7 @@ mod tests {
             "Bash: npx vitest run src/merge.test.ts",
             "Bash: cargo test -- merge",
             "Bash: bash -n scripts/deploy.sh",
+            "Bash: git commit -F - <<'EOF'\nMerge the deploy fixture fix\nRemove the old tag.\nEOF",
         ] {
             assert_eq!(important(Approve, request), None, "{request}");
         }
@@ -497,6 +498,25 @@ mod tests {
                 Important::Merged,
             ),
             ("Bash: cd $WT && ./scripts/deploy.sh prod", Important::Released),
+            ("Bash: out=\"$(gh pr merge 12 --squash)\"", Important::Merged),
+            ("Bash: echo \"done: $(gh pr merge 12)\"", Important::Merged),
+            (
+                "Bash: git commit -m \"say \\\"it's $X\\\"\" && gh pr merge 12",
+                Important::Merged,
+            ),
+            ("Bash: echo \\\"$X && gh pr merge 12", Important::Merged),
+            (
+                "Bash: python3 -c \"print(1<<4)\" && echo $HOME\ngh pr merge 12",
+                Important::Merged,
+            ),
+            (
+                "Bash: cat <<'END-MSG' > f\nhi\nEND-MSG\ngh pr merge 12",
+                Important::Merged,
+            ),
+            (
+                "Bash: x=\"$(cat <<'EOF'\nhi\nEOF)\" && gh pr merge 12",
+                Important::Merged,
+            ),
             ("Bash: PR=$(gh pr list --head x -q .[0].number) && gh pr merge $PR", Important::Merged),
             ("Bash: cd \"$(git rev-parse --show-toplevel)\" && rm -rf build", Important::Deleted),
             (
@@ -508,6 +528,10 @@ mod tests {
         ] {
             assert_eq!(important(Approve, request), Some(step), "{request}");
         }
+        // However deep its expansions nest, a command is read without
+        // running out of stack.
+        let deep = format!("Bash: echo \"{}x{}\"", "$(".repeat(5000), ")".repeat(5000));
+        assert_eq!(important(Approve, &deep), None);
         // A message naming the merge queue or a dry run sets nothing to
         // happen; one that queues the release does.
         use ActionKind::Message;
