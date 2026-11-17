@@ -403,7 +403,7 @@ fn keep_key_fact(key: String, fact: bool, kept_for: std::time::Duration) {
 fn refused(e: &eyre::Report) -> bool {
     let message = e.to_string();
     e.downcast_ref::<RateLimitedError>().is_none()
-        && !message.to_lowercase().contains("rate limit exceeded")
+        && !message.to_lowercase().contains("rate limit")
         && ["Not found:", "Authentication failed:", "Forbidden "]
             .iter()
             .any(|p| message.starts_with(p))

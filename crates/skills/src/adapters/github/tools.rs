@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use eyre::Result;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use workforce_agent::security::external_content::wrap_external_content;
 use workforce_agent::tools::{Tool, ToolResult};
@@ -67,9 +67,13 @@ async fn resolve_client(
     let requested = input["workspace"].as_str().or_else(|| {
         owner.and_then(|o| {
             clients
-                .keys()
-                .find(|name| name.eq_ignore_ascii_case(o))
-                .map(String::as_str)
+                .get_key_value(o)
+                .or_else(|| {
+                    clients
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(o))
+                })
+                .map(|(name, _)| name.as_str())
         })
     });
     let pick = |requested: Option<&str>| {
@@ -83,7 +87,7 @@ async fn resolve_client(
     let name = pick(requested).map_err(|d| eyre::eyre!("{}", d.message))?;
     let name = match (requested, owner, input["repo"].as_str()) {
         (None, Some(owner), Some(repo)) => {
-            reaching(clients, name, owner, repo, |n| pick(Some(n)).is_ok()).await?
+            reaching(clients, name, owner, repo, |n| pick(Some(n)).is_ok()).await
         }
         _ => name,
     };
@@ -95,31 +99,37 @@ async fn resolve_client(
 /// The connection a call naming none reaches `owner/repo` with: `default`
 /// when its key does, else the first of the others the call may use (by
 /// name) whose key does, as GitHub last said of each key; `default` when
-/// none does, so GitHub's own answer says why. With no other, nothing is
-/// asked.
+/// none does, so GitHub's own answer says why. A key GitHub couldn't say
+/// of (a rate limit, the network) is passed over. With no other, nothing
+/// is asked.
 async fn reaching(
     clients: &std::collections::HashMap<String, Arc<GithubClient>>,
     default: String,
     owner: &str,
     repo: &str,
     may_use: impl Fn(&str) -> bool,
-) -> eyre::Result<String> {
+) -> String {
     let mut others: Vec<&String> = clients
         .keys()
         .filter(|name| **name != default && may_use(name))
         .collect();
     if others.is_empty() {
-        return Ok(default);
+        return default;
     }
     others.sort();
     for name in std::iter::once(&default).chain(others) {
-        if let Some(client) = clients.get(name) {
-            if client.reaches(owner, repo).await? {
-                return Ok(name.clone());
+        let Some(client) = clients.get(name) else {
+            continue;
+        };
+        match client.reaches(owner, repo).await {
+            Ok(true) => return name.clone(),
+            Ok(false) => {}
+            Err(e) => {
+                debug!(connection = %name, error = %format!("{e:#}"), "GitHub couldn't say whether a connection reaches a repository")
             }
         }
     }
-    Ok(default)
+    default
 }
 
 /// Build a dynamic description for the `owner` parameter that includes available org names.
@@ -1133,18 +1143,20 @@ impl Tool for GithubGetPullTool {
                         .filter(|r| r["conclusion"].as_str() == Some("cancelled"))
                         .filter_map(|r| r["name"].as_str())
                         .collect();
-                    serde_json::json!({
-                        "overall": gate.overall,
-                        "total": gate.total_count,
-                        "success": gate.success_count,
-                        "failure": failure,
-                        "pending": pending,
-                        "skipped": gate.skipped_count,
-                        "neutral": gate.neutral_count,
-                        "failed": gate.failed_checks,
-                        "cancelled": cancelled,
-                        "note": note,
-                    })
+                    with_note(
+                        serde_json::json!({
+                            "overall": gate.overall,
+                            "total": gate.total_count,
+                            "success": gate.success_count,
+                            "failure": failure,
+                            "pending": pending,
+                            "skipped": gate.skipped_count,
+                            "neutral": gate.neutral_count,
+                            "failed": gate.failed_checks,
+                            "cancelled": cancelled,
+                        }),
+                        note,
+                    )
                 }
                 Err(_) => serde_json::json!(null),
             }
@@ -2164,29 +2176,36 @@ impl Tool for GithubPrMergeTool {
         // Check CI on its head: its check runs, else its Actions runs and
         // commit statuses (never the combined status's own state, which is
         // "pending" when no status was posted).
-        if let Ok(CommitChecks { runs, .. }) = commit_checks(&client, &owner, repo, &head_sha).await
-        {
-            let gate = evaluate_check_runs(&runs);
+        // CI that can't be read is never taken as passed.
+        let runs = match commit_checks(&client, &owner, repo, &head_sha).await {
+            Ok(CommitChecks { runs, .. }) => runs,
+            Err(e) => {
+                return Ok(ToolResult::from_report(
+                    &e.wrap_err("Cannot merge: its CI couldn't be read"),
+                    start.elapsed().as_millis() as u64,
+                ))
+            }
+        };
+        let gate = evaluate_check_runs(&runs);
 
-            match gate.overall.as_str() {
-                "failure" => {
-                    let failed_names = gate.failed_checks.join(", ");
-                    return Ok(ToolResult::failure(
+        match gate.overall.as_str() {
+            "failure" => {
+                let failed_names = gate.failed_checks.join(", ");
+                return Ok(ToolResult::failure(
                         format!(
                             "Cannot merge: CI checks have failed: [{}]. All checks must pass before merging.",
                             failed_names
                         ),
                         start.elapsed().as_millis() as u64,
                     ));
-                }
-                "pending" => {
-                    return Ok(ToolResult::failure(
-                        "Cannot merge: CI checks are still pending. Wait for all checks to complete.",
-                        start.elapsed().as_millis() as u64,
-                    ));
-                }
-                _ => {} // "success" — proceed with merge
             }
+            "pending" => {
+                return Ok(ToolResult::failure(
+                    "Cannot merge: CI checks are still pending. Wait for all checks to complete.",
+                    start.elapsed().as_millis() as u64,
+                ));
+            }
+            _ => {} // "success" — proceed with merge
         }
 
         let mut body_json = serde_json::json!({ "merge_method": merge_method });
@@ -3591,16 +3610,18 @@ impl Tool for GithubCiStatusTool {
                 let gate = evaluate_check_runs(&check_runs);
 
                 Ok(ToolResult::success(
-                    serde_json::json!({
-                        "overall": gate.overall,
-                        "total_count": gate.total_count,
-                        "success_count": gate.success_count,
-                        "skipped_count": gate.skipped_count,
-                        "neutral_count": gate.neutral_count,
-                        "failed_checks": gate.failed_checks,
-                        "check_runs": check_runs,
-                        "note": note,
-                    }),
+                    with_note(
+                        serde_json::json!({
+                            "overall": gate.overall,
+                            "total_count": gate.total_count,
+                            "success_count": gate.success_count,
+                            "skipped_count": gate.skipped_count,
+                            "neutral_count": gate.neutral_count,
+                            "failed_checks": gate.failed_checks,
+                            "check_runs": check_runs,
+                        }),
+                        note,
+                    ),
                     start.elapsed().as_millis() as u64,
                 ))
             }
@@ -4635,7 +4656,7 @@ impl Tool for GithubApiTool {
 
 /// What's said with checks read without GitHub's check runs.
 const ACTIONS_AND_STATUSES: &str = "Only GitHub Actions runs and commit statuses could be read \
-    for this commit: this GitHub key can't read check runs (a personal access token never may), \
+    for this commit: GitHub doesn't let this key read check runs (a fine-grained personal access token never may), \
     so checks other apps post there aren't shown.";
 
 /// The checks on a commit, each as a check run (`name`, `status`,
@@ -4670,14 +4691,15 @@ async fn commit_checks(
         }
     }
     // Workflow runs are found by the commit's SHA alone.
-    let sha = match git_ref.len() == 40 && git_ref.chars().all(|c| c.is_ascii_hexdigit()) {
-        true => git_ref.to_string(),
-        false => client
+    let sha = if git_ref.len() == 40 && git_ref.chars().all(|c| c.is_ascii_hexdigit()) {
+        git_ref.to_string()
+    } else {
+        client
             .get(&format!("/repos/{owner}/{repo}/commits/{git_ref}"))
             .await?["sha"]
             .as_str()
-            .unwrap_or(git_ref)
-            .to_string(),
+            .ok_or_else(|| eyre::eyre!("GitHub named no commit for {git_ref}"))?
+            .to_string()
     };
     let runs_path = format!("/repos/{owner}/{repo}/actions/runs");
     let status_path = format!("/repos/{owner}/{repo}/commits/{sha}/status");
@@ -4686,60 +4708,65 @@ async fn commit_checks(
         client.get_with_query(&runs_path, &runs_query),
         client.get_with_query(&status_path, &[("per_page", "100")]),
     );
-    let (runs, statuses) = match (runs, statuses) {
-        (Err(e), Err(_)) => return Err(e),
-        read => read,
-    };
-    let note = match (runs.is_ok(), statuses.is_ok()) {
-        (false, _) => format!(
-            "{ACTIONS_AND_STATUSES} Its Actions runs couldn't be read either: don't say CI passed."
+    // Its Actions runs are its CI here: without them nothing says it passed.
+    let runs = workflow_checks(&runs?);
+    let (statuses, note) = match statuses {
+        Ok(s) => (status_checks(&s), ACTIONS_AND_STATUSES.to_string()),
+        Err(_) => (
+            Vec::new(),
+            format!("{ACTIONS_AND_STATUSES} Its commit statuses couldn't be read either."),
         ),
-        (true, false) => {
-            format!("{ACTIONS_AND_STATUSES} Its commit statuses couldn't be read either.")
-        }
-        (true, true) => ACTIONS_AND_STATUSES.to_string(),
     };
-    let runs = runs.map(|r| workflow_checks(&r)).unwrap_or_default();
-    let statuses = statuses.map(|s| status_checks(&s)).unwrap_or_default();
     Ok(CommitChecks {
         runs: runs.into_iter().chain(statuses).collect(),
         note: Some(note),
     })
 }
 
-/// The latest run of each workflow in an `actions/runs` listing, as check
-/// runs: one that couldn't start, or waits on someone's approval, failed.
+/// `checks` with what's said of where they were read from, when anything is.
+fn with_note(mut checks: serde_json::Value, note: Option<String>) -> serde_json::Value {
+    if let Some(note) = note {
+        checks["note"] = serde_json::json!(note);
+    }
+    checks
+}
+
+/// The latest run of each workflow for each event in an `actions/runs`
+/// listing (a workflow run on both push and pull_request is two checks), as
+/// check runs: one that couldn't start failed, and one waiting on someone's
+/// approval is still to run.
 fn workflow_checks(listing: &serde_json::Value) -> Vec<serde_json::Value> {
-    let attempt = |r: &serde_json::Value| {
-        (
-            r["run_number"].as_u64().unwrap_or(0),
-            r["run_attempt"].as_u64().unwrap_or(0),
-        )
-    };
-    let mut latest: std::collections::BTreeMap<String, &serde_json::Value> = Default::default();
+    let newest = |r: &serde_json::Value| (r["run_number"].as_u64(), r["id"].as_u64());
+    let mut latest: std::collections::BTreeMap<(String, String), &serde_json::Value> =
+        Default::default();
     for run in listing["workflow_runs"].as_array().into_iter().flatten() {
         let workflow = run["workflow_id"]
             .as_u64()
             .map(|id| id.to_string())
             .unwrap_or_else(|| run["name"].as_str().unwrap_or_default().to_string());
-        let newer = latest
-            .get(&workflow)
-            .is_none_or(|kept| attempt(run) > attempt(kept));
-        if newer {
-            latest.insert(workflow, run);
+        let key = (
+            workflow,
+            run["event"].as_str().unwrap_or_default().to_string(),
+        );
+        if latest
+            .get(&key)
+            .is_none_or(|kept| newest(run) > newest(kept))
+        {
+            latest.insert(key, run);
         }
     }
     latest
         .into_values()
         .map(|r| {
-            let completed = r["status"].as_str() == Some("completed");
-            let conclusion = match r["conclusion"].as_str() {
-                Some("startup_failure" | "action_required") => serde_json::json!("failure"),
-                _ => r["conclusion"].clone(),
+            let (status, conclusion) = match (r["status"].as_str(), r["conclusion"].as_str()) {
+                (_, Some("action_required")) => (serde_json::json!("waiting"), serde_json::Value::Null),
+                (_, Some("startup_failure")) => (r["status"].clone(), serde_json::json!("failure")),
+                _ => (r["status"].clone(), r["conclusion"].clone()),
             };
+            let completed = status == "completed";
             serde_json::json!({
                 "name": r["name"],
-                "status": r["status"],
+                "status": status,
                 "conclusion": conclusion,
                 "html_url": r["html_url"],
                 "started_at": r["run_started_at"],
@@ -4887,12 +4914,18 @@ mod tests {
     #[tokio::test]
     async fn resolve_client_under_environment_lock() {
         use workforce_agent::runner::{ACTIVE_ENVIRONMENT, ACTIVE_SKILL_INSTANCES};
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
         let clients: HashMap<String, Arc<GithubClient>> = ["acme", "other"]
             .into_iter()
             .map(|n| {
                 (
                     n.to_string(),
-                    Arc::new(GithubClient::new("ghp", "https://api.github.com").unwrap()),
+                    Arc::new(GithubClient::new("ghp", &server.uri()).unwrap()),
                 )
             })
             .collect();
@@ -5837,11 +5870,13 @@ mod tests {
             .and(query_param("head_sha", SHA))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "workflow_runs": [
-                    {"workflow_id": 1, "name": "CI", "run_number": 7, "run_attempt": 1,
-                     "status": "completed", "conclusion": "failure"},
-                    {"workflow_id": 1, "name": "CI", "run_number": 7, "run_attempt": 2,
+                    {"id": 11, "workflow_id": 1, "name": "CI", "event": "push", "run_number": 7,
                      "status": "completed", "conclusion": "success"},
-                    {"workflow_id": 2, "name": "Docs", "run_number": 3, "run_attempt": 1,
+                    {"id": 10, "workflow_id": 1, "name": "CI", "event": "pull_request", "run_number": 6,
+                     "status": "completed", "conclusion": "success"},
+                    {"id": 12, "workflow_id": 1, "name": "CI", "event": "pull_request", "run_number": 8,
+                     "status": "completed", "conclusion": "failure"},
+                    {"id": 13, "workflow_id": 2, "name": "Docs", "event": "push", "run_number": 3,
                      "status": "completed", "conclusion": "startup_failure"},
                 ]
             })))
@@ -5868,13 +5903,14 @@ mod tests {
             let o = &out.output;
             assert_eq!(o["overall"], "failure");
             assert_eq!(
-                o["total_count"], 4,
-                "the latest attempt of each workflow, and each status: {o}"
+                o["total_count"], 5,
+                "the latest run of each workflow for each event, and each status: {o}"
             );
             assert_eq!(o["success_count"], 2);
             assert_eq!(
                 o["failed_checks"],
-                serde_json::json!(["Docs", "ci/circleci"])
+                serde_json::json!(["CI", "Docs", "ci/circleci"]),
+                "a failed pull_request run isn't hidden by a green push run"
             );
             assert!(o["note"]
                 .as_str()
@@ -5896,6 +5932,7 @@ mod tests {
             .mount(&server)
             .await;
         for p in [
+            "/repos/acme/app",
             "/repos/acme/app/actions/runs",
             "/repos/acme/app/commits/main/status",
         ] {
@@ -5987,5 +6024,125 @@ mod tests {
                 .unwrap();
             assert!(out.success, "{:?}", out.error);
         }
+    }
+
+    /// Without its Actions runs nothing says a commit's CI passed: not its
+    /// statuses alone, and never a merge.
+    #[tokio::test]
+    async fn ci_whose_actions_runs_cant_be_read_is_never_passed() {
+        let server = MockServer::start().await;
+        let refused = || {
+            ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "message": "Resource not accessible by personal access token"
+            }))
+        };
+        Mock::given(path(format!("/repos/acme/app/commits/{SHA}/check-runs")))
+            .respond_with(refused())
+            .mount(&server)
+            .await;
+        Mock::given(path("/repos/acme/app/actions/runs"))
+            .respond_with(refused())
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/repos/acme/app/commits/{SHA}/status")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"state": "pending", "statuses": []})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(path("/repos/acme/app/pulls/5"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"number": 5, "head": {"sha": SHA, "ref": "x"}}),
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(path("/repos/acme/app/pulls/5/merge"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let clients = one(&server, "github_pat_z");
+        let ci = GithubCiStatusTool::new(Arc::clone(&clients), default_ws(), None)
+            .execute(serde_json::json!({"owner": "acme", "repo": "app", "ref": SHA}))
+            .await
+            .unwrap();
+        assert!(!ci.success, "{}", ci.output);
+        let merge = GithubPrMergeTool::new(clients, default_ws(), None)
+            .execute(serde_json::json!({"owner": "acme", "repo": "app", "number": 5}))
+            .await
+            .unwrap();
+        assert!(!merge.success);
+        assert!(
+            merge
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("CI couldn't be read"),
+            "{:?}",
+            merge.error
+        );
+    }
+
+    /// Two connections to `server`: the default on `first`, another on
+    /// `second`.
+    fn two(server: &MockServer) -> GithubGetRepoTool {
+        let client = |t: &str| Arc::new(GithubClient::new(t, &server.uri()).unwrap());
+        GithubGetRepoTool::new(
+            Arc::new(LiveInstances::from(HashMap::from([
+                ("default".to_string(), client("first")),
+                ("zz-other".to_string(), client("second")),
+            ]))),
+            default_ws(),
+            None,
+        )
+    }
+
+    /// A default that reaches the repository is used, and no other
+    /// connection is asked.
+    #[tokio::test]
+    async fn the_default_is_used_when_it_reaches_the_repository() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/app"))
+            .and(header("authorization", "Bearer first"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(header("authorization", "Bearer second"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let out = two(&server)
+            .execute(serde_json::json!({"owner": "acme", "repo": "app"}))
+            .await
+            .unwrap();
+        assert!(out.success, "{:?}", out.error);
+    }
+
+    /// A connection GitHub can't say of (it answers 502) is passed over,
+    /// and the call goes on with the next that reaches the repository.
+    #[tokio::test]
+    async fn a_connection_github_cant_say_of_is_passed_over() {
+        let server = MockServer::start().await;
+        Mock::given(header("authorization", "Bearer first"))
+            .respond_with(ResponseTemplate::new(502))
+            .mount(&server)
+            .await;
+        Mock::given(path("/repos/acme/app"))
+            .and(header("authorization", "Bearer second"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let out = two(&server)
+            .execute(serde_json::json!({"owner": "acme", "repo": "app"}))
+            .await
+            .unwrap();
+        assert!(out.success, "{:?}", out.error);
     }
 }
