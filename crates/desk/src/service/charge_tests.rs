@@ -665,6 +665,58 @@ async fn a_release_withdraws_what_the_boss_said_and_starts_no_turn() {
     .await;
 }
 
+/// Taken back by the person, a session gets nothing from any boss: no
+/// message, no interrupt. Desk keeps who let it go across a restart and
+/// shows it, until it is handed to a boss again.
+#[tokio::test]
+async fn a_session_taken_back_is_left_alone_by_every_boss_and_shown_as_the_persons() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        d.take_on(s.id, &sarah(), How::Handed, &Default::default(), &By::you())
+            .await
+            .unwrap();
+        d.release(s.id, &By::you()).await.unwrap();
+        assert!(d.taken_back(s.id));
+        let by = By::manager("sarah", "Sarah", "PR 41 changed.");
+        let refused = d
+            .line_send(Sender::Overseer(by.clone()), boss_tell("Rebase it.", s.id))
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("took"), "{refused}");
+        let interrupted = d.interrupt(s.id, Some(by.clone())).unwrap_err();
+        assert!(
+            interrupted.to_string().contains("leave it alone"),
+            "{interrupted}"
+        );
+        let shown = |d: &Desk| {
+            d.charges_shown()
+                .into_iter()
+                .find(|c| c.session == s.id)
+                .map(|c| serde_json::to_value(c).unwrap())
+        };
+        let v = shown(&d).expect("shown though let go");
+        assert_eq!(v["releasedBy"], "person", "{v}");
+        assert!(v["releasedAt"].is_string(), "{v}");
+        assert!(d.charges().iter().all(|c| c.session != s.id), "not live");
+        // Kept as it is stored, so a restart reads it again.
+        let kept = d.store().charge(s.id).await.unwrap().unwrap();
+        assert_eq!(kept.released_by, Some(crate::charge::ReleasedBy::Person));
+        // Handed to a boss again, it is its boss's as before.
+        d.take_on(s.id, &sarah(), How::Handed, &Default::default(), &By::you())
+            .await
+            .unwrap();
+        assert!(!d.taken_back(s.id));
+        assert_eq!(shown(&d).unwrap()["releasedBy"], Value::Null);
+        d.line_send(Sender::Overseer(by), boss_tell("Rebase it.", s.id))
+            .await
+            .unwrap();
+    })
+    .await;
+}
+
 /// A boss's message already handed to Desk's plugin when the person takes
 /// the session back is withdrawn when it comes back to the queue, dropped
 /// by the plugin or stale, never typed into the session they now run

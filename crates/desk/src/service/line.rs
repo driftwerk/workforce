@@ -138,6 +138,12 @@ const HANDED_FOR: chrono::Duration = chrono::Duration::minutes(2);
 const PUMP_EVERY: Duration = Duration::from_secs(30);
 /// How many thread rows a page holds at most.
 const THREAD_MAX: i64 = 200;
+/// What a session the person took back from its boss is told as it tells
+/// Desk something: kept, but nobody at Desk answers it now.
+pub(crate) const TAKEN_BACK_NOTE: &str =
+    "Desk no longer runs this session: the person took it back \
+    and runs it themselves. This is kept, but nobody at Desk answers it; send Desk no more \
+    reports or questions, and talk to the person (to: \"you\").";
 
 impl Desk {
     /// Which sessions may message each other.
@@ -525,6 +531,14 @@ impl Desk {
                             let group = them.group.as_ref().map(|g| g.id.as_str());
                             if !self.boss_reaches(&by.party.id, group) {
                                 return Err(Refusal::NoSuchSession(id.to_string()).into());
+                            }
+                            // Taken back by the person: no boss writes to
+                            // it until they hand it to one again.
+                            if self.taken_back(id) {
+                                return Err(Refusal::TakenBack(crate::charge::left_alone(
+                                    them.label(),
+                                ))
+                                .into());
                             }
                         }
                         if them.state == SessionState::Closed {
@@ -980,8 +994,18 @@ impl Desk {
                     )
                     .await
                     .map_err(say)?;
-                let note = (m.delivery == Delivery::Held)
-                    .then(|| format!("{} is stopped; it gets this when it runs again.", m.to.name));
+                // Taken back from its boss, it is the person's: what it
+                // tells Desk is kept, and nobody answers it.
+                let note = match m.delivery {
+                    Delivery::Held => Some(format!(
+                        "{} is stopped; it gets this when it runs again.",
+                        m.to.name
+                    )),
+                    _ if m.to.kind == PartyKind::Manager && self.taken_back(caller) => {
+                        Some(TAKEN_BACK_NOTE.to_string())
+                    }
+                    _ => None,
+                };
                 Ok(json!({ "id": m.id, "delivery": m.delivery, "note": note }))
             }
             Call::Reply { to, text } => {

@@ -577,6 +577,8 @@ pub(crate) enum Gate {
     Suggest(Cow<'static, str>),
     /// It may not even suggest (level `watch`).
     Refuse,
+    /// It may neither do it nor suggest it; why, for the overseer.
+    No(Cow<'static, str>),
 }
 
 impl CrewHub {
@@ -592,6 +594,9 @@ impl CrewHub {
             return Gate::Suggest(
                 "your own limits are the person's to change, never yours: they approve it with one click".into(),
             );
+        }
+        if let Some(why) = self.left_alone(action) {
+            return Gate::No(why.into());
         }
         let boss = self.boss_id(o);
         if o.level != Level::Watch && self.unbound(o) {
@@ -669,6 +674,9 @@ impl CrewHub {
                 "your own limits are the person's to change, never yours: they approve it with one click".into(),
             );
         }
+        if let Some(why) = self.left_alone(action) {
+            return Gate::No(why.into());
+        }
         if let Some(held) = self.mode_hold(action, o, boss) {
             return held;
         }
@@ -720,7 +728,7 @@ impl CrewHub {
         // Taking on a session the person runs is theirs to say, unless
         // they let it take on every one.
         if let Action::TakeOn { session } = action {
-            if self.taken_back(*session) {
+            if self.released(*session) {
                 return Gate::Suggest("the person took this session back from you; offer to take it on again and they accept".into());
             }
             return match o.work.take_on {
@@ -1101,9 +1109,32 @@ impl CrewHub {
     }
 
     /// Whether a boss ran `session` and it was let go: only the person
-    /// hands it back.
-    fn taken_back(&self, session: Uuid) -> bool {
+    /// hands it to a boss again.
+    fn released(&self, session: Uuid) -> bool {
         self.desk.charge_of(session).is_some_and(|c| !c.live())
+    }
+
+    /// Whether the person took `session` back from its boss: no boss acts
+    /// on it until they hand it back ([`Self::left_alone`]).
+    pub(crate) fn taken_back(&self, session: Uuid) -> bool {
+        self.desk.taken_back(session)
+    }
+
+    /// Why no boss does `action`, when it is done to a session the person
+    /// took back: nothing reaches it from any boss
+    /// (a message, an answer, an approval, an interrupt, a ticket) until
+    /// the person hands it to one again. Every boss still sees it. Taking
+    /// it on again is the person's word ([`Action::TakeOn`]'s own gate).
+    pub(crate) fn left_alone(&self, action: &Action) -> Option<String> {
+        let session = match action {
+            Action::AssignTicket {
+                to: Handout::Session(s),
+                ..
+            } => Some(*s),
+            _ => Self::session_of(action),
+        }?;
+        self.taken_back(session)
+            .then(|| workforce_desk::charge::left_alone(&self.session_name(session)))
     }
 
     pub(super) fn session_name(&self, id: Uuid) -> String {
@@ -1295,6 +1326,13 @@ impl CrewHub {
     /// how it is undone; an answer to a session's question is said in its
     /// DM from that row. Recording never stops the action.
     pub(crate) async fn perform(&self, action: &Action, by: By) -> Result<String, String> {
+        // A session the person took back gets nothing from any boss,
+        // whichever path its action came by.
+        if by.party.kind == crew::PartyKind::Manager {
+            if let Some(why) = self.left_alone(action) {
+                return Err(why);
+            }
+        }
         // A boss's message to a session goes through the session's lane,
         // checked against the picture as it is now (`super::picture`).
         let lane = Self::lane_of(action, &by);
@@ -1459,6 +1497,12 @@ impl CrewHub {
             reply,
         });
         Ok(Some((key, now)))
+    }
+
+    /// Forgets every line [`Self::tell_once`] kept that `boss` told
+    /// `session`: the person undid one, so it may be said again.
+    pub(super) fn forget_told(&self, boss: &str, session: Uuid) {
+        self.told_lines.lock().remove(&(boss.to_string(), session));
     }
 
     /// Forgets a line [`Self::tell_once`] kept that wasn't sent after all.
@@ -1684,7 +1728,7 @@ impl CrewHub {
                 // yes to its offer.
                 let how = match by.party.kind {
                     crew::PartyKind::You => How::Handed,
-                    _ if self.taken_back(*session) => {
+                    _ if self.released(*session) => {
                         return Err(format!(
                             "The person took {} back; only they can hand it to you again.",
                             self.session_name(*session)

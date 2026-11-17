@@ -400,6 +400,10 @@ pub enum Refusal {
     NotYours,
     #[error("Say {0}.")]
     Missing(&'static str),
+    /// A boss writing to a session the person took back from it.
+    /// Why, as [`crate::charge::left_alone`] says it.
+    #[error("{0}")]
+    TakenBack(String),
     #[error("No session here is called {0:?}; peers lists who you can message.")]
     NoSuchSession(String),
     #[error("More than one session is called {0:?}; use its id from peers.")]

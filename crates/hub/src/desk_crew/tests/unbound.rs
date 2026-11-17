@@ -752,18 +752,25 @@ async fn a_running_session_goes_back_to_its_own_mode_when_unbound_ends() {
                 message: "Run the deploy".into(),
                 reply_to: None,
             };
+            // Taken back by the person, it is left alone altogether.
             let why = eventually("the boss held", async || {
                 let (_, o) = crew.overseer_service()?;
-                match crew.gate(&deploy, &o) {
-                    Gate::Suggest(why) if why.contains("still runs in auto mode") => Some(why),
+                match (crew.gate(&deploy, &o), ends) {
+                    (Gate::No(why), Ends::Released) => Some(why.into_owned()),
+                    (Gate::Suggest(why), _) if why.contains("still runs in auto mode") => {
+                        Some(why.into_owned())
+                    }
                     _ => None,
                 }
             })
             .await;
-            assert!(
-                why.contains("put back in its own mode") || why.contains("puts it back"),
-                "{why}"
-            );
+            match ends {
+                Ends::Released => assert!(why.contains("leave it alone"), "{why}"),
+                _ => assert!(
+                    why.contains("put back in its own mode") || why.contains("puts it back"),
+                    "{why}"
+                ),
+            }
             assert_eq!(d.view(s.id).unwrap().mode, Some(workforce_desk::mode::Mode::Auto), "{ends:?}: mid-turn");
             // Stopping its turn still runs, Desk's side too, and ends it;
             // handed to another boss, it is that boss's to stop, so its turn
@@ -771,6 +778,13 @@ async fn a_running_session_goes_back_to_its_own_mode_when_unbound_ends() {
             let (_, o) = crew.overseer_service().unwrap();
             match ends {
                 Ends::AnotherBoss => hook(&url, json!({"hook_event_name": "Stop"})).await,
+                Ends::Released => {
+                    assert!(matches!(
+                        crew.gate(&Action::Interrupt { session: s.id }, &o),
+                        Gate::No(_)
+                    ));
+                    hook(&url, json!({"hook_event_name": "Stop"})).await
+                }
                 _ => {
                     assert_eq!(crew.gate(&Action::Interrupt { session: s.id }, &o), Gate::Run);
                     let stopped = overseer

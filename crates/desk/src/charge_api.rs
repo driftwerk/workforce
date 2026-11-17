@@ -39,10 +39,23 @@ macro_rules! guarded {
     };
 }
 
-/// Every live charge, with its boss's name and who has the wheel.
-async fn list(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
+#[derive(Deserialize)]
+struct ListQuery {
+    token: Option<String>,
+    /// Also every charge let go (`releasedAt`, `releasedBy`) of a session
+    /// Desk still has. Off, only live ones, as Desks before it read them.
+    #[serde(default)]
+    released: bool,
+}
+
+/// Every live charge, with its boss's name and who has the wheel; with
+/// `?released=true`, every one let go of a session Desk has too.
+async fn list(State(s): S, h: HeaderMap, Query(q): Query<ListQuery>) -> Response {
     guarded!(s, h, q);
-    Json(s.desk.charges()).into_response()
+    match q.released {
+        true => Json(s.desk.charges_shown()).into_response(),
+        false => Json(s.desk.charges()).into_response(),
+    }
 }
 
 #[derive(Deserialize, Default)]

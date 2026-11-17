@@ -461,10 +461,15 @@ fn quoted(ask: &str) -> String {
 
 impl CrewHub {
     /// The boss over `view`: the one that runs it, else the overseer whose
-    /// scope sees it and tracks its kind.
+    /// scope sees it and tracks its kind. None for one the person took
+    /// back: its requests and questions are theirs, as for a session no
+    /// boss oversees, until they hand it to one again.
     pub(super) fn boss_over(&self, view: &SessionView) -> Option<String> {
         if let Some(c) = self.desk.charge_of(view.id).filter(|c| c.live()) {
             return Some(c.boss);
+        }
+        if self.taken_back(view.id) {
+            return None;
         }
         let (s, o) = self.overseer_of_session(view.id)?;
         (o.level != Level::Watch && tracked(&o, &Party::session(view)))

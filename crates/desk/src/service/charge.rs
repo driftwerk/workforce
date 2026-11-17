@@ -98,6 +98,9 @@ pub struct ChargeView {
     pub hold_minutes: i64,
     pub since: DateTime<Utc>,
     pub released_at: Option<DateTime<Utc>>,
+    /// Who let it go, once it was: `person` (they took it back) or `boss`;
+    /// none while it runs, and for one let go before Desk kept who.
+    pub released_by: Option<charge::ReleasedBy>,
 }
 
 #[cfg(test)]
@@ -496,12 +499,42 @@ impl Desk {
             hold_minutes: self.hold_for(&c.boss).num_minutes(),
             since: c.since,
             released_at: c.released_at,
+            released_by: c.released_by,
         }
     }
 
     /// `id`'s charge, released or not.
     pub fn charge_of(&self, id: Uuid) -> Option<Charge> {
         self.0.state.lock().charges.rows.get(&id).cloned()
+    }
+
+    /// Whether the person took `id` back from the boss that ran it: no
+    /// boss acts on it, in any way, until they hand it to one again. Every
+    /// boss still sees it. One its boss (or Desk, for a boss gone or a
+    /// group with a boss of its own) let go is the usual rules', as before.
+    pub fn taken_back(&self, id: Uuid) -> bool {
+        self.charge_of(id)
+            .is_some_and(|c| !c.live() && c.released_by == Some(charge::ReleasedBy::Person))
+    }
+
+    /// What Desk shows of the charges: every live one, and every one let
+    /// go of a session Desk still has (`releasedAt`, `releasedBy`), so a
+    /// session the person took back shows as theirs across restarts until
+    /// they hand it to a boss again.
+    pub fn charges_shown(&self) -> Vec<ChargeView> {
+        let rows: Vec<(Charge, Wheel)> = {
+            let st = self.0.state.lock();
+            st.charges
+                .rows
+                .values()
+                .filter(|c| c.live() || st.records.contains_key(&c.session))
+                .map(|c| (c.clone(), Self::wheel_now(&st, c)))
+                .collect()
+        };
+        let mut views: Vec<ChargeView> =
+            rows.iter().map(|(c, w)| self.charge_view(c, *w)).collect();
+        views.sort_by_key(|v| v.since);
+        views
     }
 
     /// Every live charge, with its boss's name and who has the wheel.
@@ -1095,19 +1128,24 @@ impl Desk {
     /// Whether `by`, when it is a boss, may act on `id` now: a session a
     /// boss runs is acted on only by that boss, and only while it has the
     /// wheel, unless that boss is unbound (Act fully), whom the person
-    /// driving doesn't hold. Anyone else, and a session no boss runs, is
-    /// the hub's rule.
+    /// driving doesn't hold; one the person took back, by no boss at all.
+    /// Anyone else, and a session no boss runs, is the hub's rule.
     pub(crate) fn boss_holds(&self, id: Uuid, by: Option<&By>) -> Result<(), DeskError> {
         let Some(boss) = by.filter(|b| b.party.kind == PartyKind::Manager) else {
-            return Ok(());
-        };
-        let Some(c) = self.charge_of(id).filter(Charge::live) else {
             return Ok(());
         };
         let name = self
             .view(id)
             .map(|v| v.label().to_string())
             .unwrap_or_else(|_| "that session".into());
+        // Taken back by the person: no boss touches it until they hand it
+        // to one again.
+        if self.taken_back(id) {
+            return Err(DeskError::Conflict(charge::left_alone(&name)));
+        }
+        let Some(c) = self.charge_of(id).filter(Charge::live) else {
+            return Ok(());
+        };
         if c.boss != boss.party.id {
             return Err(DeskError::Conflict(format!(
                 "another boss runs {name}; it's theirs or the person's to act on"
@@ -1234,6 +1272,10 @@ impl Desk {
         });
         if terminal && !self.holds_requests_for_boss(id) {
             return Err(DeskError::Conflict(super::ASKED_IN_TERMINAL.into()));
+        }
+        // Taken back by the person: what it asks is theirs alone.
+        if self.taken_back(id) {
+            return self.boss_holds(id, Some(boss));
         }
         if !self.charge_of(id).is_some_and(|c| c.live()) {
             return Ok(());
@@ -1504,8 +1546,13 @@ impl Desk {
         self.charge_withdraw(id).await;
         let now = crew::now();
         c.released_at = Some(now);
+        c.released_by = Some(match by.party.kind {
+            PartyKind::You => charge::ReleasedBy::Person,
+            _ => charge::ReleasedBy::Boss,
+        });
         c.updated_at = now;
         let boss = Party::manager(&c.boss, &self.boss_name(&c.boss));
+        let c_boss = c.boss.clone();
         let served = crate::grant::is_served(&c.boss);
         let wheel = c.wheel;
         let shown = self.put_charge(c, wheel).await?;
@@ -1535,10 +1582,41 @@ impl Desk {
         self.charge_note(
             &view,
             &boss,
-            "I'm no longer running this session: the person runs it on their own now.",
+            "I'm no longer running this session: the person runs it on their own now. \
+             Send Desk no more reports or questions about it; talk to the person.",
         )
         .await;
+        // What it asked its boss and still waits on is the person's now: no
+        // boss answers it.
+        if by.party.kind == PartyKind::You {
+            self.asks_to_person(id, &c_boss).await;
+        }
         Ok(shown)
+    }
+
+    /// Gives the person every question `id` asked `boss` on its line that
+    /// still waits: they took the session back, so no boss answers it.
+    async fn asks_to_person(&self, id: Uuid, boss: &str) {
+        let asks = match self.0.store.line_open_asks(Some(boss)).await {
+            Ok(asks) => asks,
+            Err(e) => {
+                tracing::info!(session = %id, error = %e, "a released session's questions weren't read");
+                return;
+            }
+        };
+        for ask in asks
+            .into_iter()
+            .filter(|a| a.from_session() == Some(id) && a.asked == Some(crate::line::Asked::Open))
+        {
+            let why = crate::line::Escalation {
+                why: "You took this session back, so its question is yours.".into(),
+                options: Vec::new(),
+                draft: None,
+            };
+            if let Err(e) = self.line_escalate(ask.id, &By::you(), why).await {
+                tracing::info!(session = %id, error = %e, "a released session's question wasn't given to the person");
+            }
+        }
     }
 
     /// The person takes the wheel of `id` until they hand it back.

@@ -156,15 +156,18 @@ pub(super) fn cell(s: &str) -> String {
 }
 
 /// Who has the wheel of each session the overseer runs, by session id.
-type Charged = HashMap<String, Wheel>;
+/// Who drives each session the overseer runs; none for one the person
+/// took back from its boss.
+type Charged = HashMap<String, Option<Wheel>>;
 
 /// Whether the overseer runs it, and who drives it now.
 fn charge_cell(i: &Item, charged: &Charged) -> &'static str {
     match charged.get(&i.id) {
         None => "",
-        Some(Wheel::Boss) => "yes",
-        Some(Wheel::Person) => "yes · the person is driving",
-        Some(Wheel::PersonPinned) => "yes · the person is driving until they hand it back",
+        Some(None) => "no · the person took it back: leave it alone",
+        Some(Some(Wheel::Boss)) => "yes",
+        Some(Some(Wheel::Person)) => "yes · the person is driving",
+        Some(Some(Wheel::PersonPinned)) => "yes · the person is driving until they hand it back",
     }
 }
 
@@ -274,13 +277,19 @@ impl CrewTool {
                     b.service.agent_id.as_str().to_string(),
                     b.oversight.work.parallel,
                 );
-                let charged: Charged = crew
+                let mut charged: Charged = crew
                     .desk
                     .charges()
                     .into_iter()
                     .filter(|c| c.boss == boss)
-                    .map(|c| (c.session.to_string(), c.wheel))
+                    .map(|c| (c.session.to_string(), Some(c.wheel)))
                     .collect();
+                // Taken back: seen, and left alone.
+                for i in o.items.iter().filter(|i| i.kind == crew::ItemKind::Session) {
+                    if i.id.parse().is_ok_and(|s| crew.taken_back(s)) {
+                        charged.insert(i.id.clone(), None);
+                    }
+                }
                 let local = json!({
                     "counts": o.counts,
                     "table": reported(&table(&o.items, &o.groups, &charged), "the crew's sessions and agents"),
@@ -573,6 +582,7 @@ impl CrewTool {
         by.preference = applied.as_ref().map(|a| a.id);
         crew.know_question(&action).await;
         match crew.gate(&action, oversight) {
+            Gate::No(why) => Err(why.into_owned()),
             Gate::Refuse => match &action {
                 Action::SetMode { mode, .. } if !mode.asks() && b.oversight.level != Level::Watch => {
                     Err(format!(
@@ -1099,7 +1109,7 @@ mod tests {
             item("auth-fix", None, None),
             item("Ledger migration", Some("monorepo-fd"), Some("Atlas")),
         ];
-        let charged = Charged::from([(items[1].id.clone(), Wheel::Person)]);
+        let charged = Charged::from([(items[1].id.clone(), Some(Wheel::Person))]);
         let t = table(
             &items,
             &["Atlas".to_string(), "Empty".to_string()],

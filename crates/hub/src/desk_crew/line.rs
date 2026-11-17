@@ -355,6 +355,23 @@ impl CrewHub {
         }
     }
 
+    /// Gives every question in `asks` (of `session`) still open to the
+    /// person, saying `why`, as the person's own: no boss is in it.
+    async fn questions_to_person(&self, session: Uuid, asks: &[LineMessage], why: &str) {
+        for ask in asks {
+            match self.desk.store().line_message(ask.id).await {
+                Ok(Some(now)) if now.asked == Some(Asked::Open) => {}
+                _ => continue,
+            }
+            if let Err(e) = self
+                .escalate(ask.id, &By::you(), why, Vec::new(), None)
+                .await
+            {
+                tracing::info!(%session, error = %e, "a question wasn't given to the person");
+            }
+        }
+    }
+
     /// Gives every question in `asks` (of `session`) to the person, saying
     /// `why`: as the overseer of its scope, when there is one.
     async fn all_to_person(&self, session: Uuid, asks: &[LineMessage], why: &str) {
@@ -378,6 +395,22 @@ impl CrewHub {
         messages: Vec<LineMessage>,
         ended: Vec<String>,
     ) {
+        // Taken back from its boss, it is the person's: what it tells Desk
+        // is kept (its thread, the picture) and no boss's turn is spent on
+        // it; what it asks goes to the person.
+        if self.taken_back(session) {
+            let asks: Vec<LineMessage> = messages
+                .into_iter()
+                .filter(|m| m.kind == LineKind::Ask)
+                .collect();
+            self.questions_to_person(
+                session,
+                &asks,
+                "Desk no longer runs this session, so its questions come to you.",
+            )
+            .await;
+            return;
+        }
         // The overseer of the session's scope answers it, and no other.
         let Some((service, o)) = self.overseer_of_session(session) else {
             let asks: Vec<LineMessage> = messages
@@ -548,6 +581,17 @@ impl CrewHub {
                                 tracing::info!(error = %e, "an answer's suggestion wasn't kept");
                             }
                             self.answer_drafted(&action, &by, &why).await;
+                        }
+                        Gate::No(_) => {
+                            let _ = self
+                                .escalate(
+                                    ask.id,
+                                    &By::you(),
+                                    "Desk no longer runs this session, so its questions come to you.",
+                                    Vec::new(),
+                                    None,
+                                )
+                                .await;
                         }
                         Gate::Refuse => {
                             let _ = self
