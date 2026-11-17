@@ -483,6 +483,11 @@ mod tests {
             "Bash: cargo test -p desk deploy",
             "Bash: cd $HOME/x && cargo test -p desk deploy 2>&1 | tail",
             "Bash: pytest -k deploy tests/",
+            "Bash: python -m pytest -k deploy",
+            "Bash: uv run pytest -k merge",
+            "Bash: pnpm vitest deploy",
+            "Bash: ./tests/stack-deploy-tests.sh $(date +%s)",
+            "Bash: git commit -m \"Release the deploy fix\" && echo $(git rev-parse HEAD)",
         ] {
             assert_eq!(important(Approve, request), None, "{request}");
         }
@@ -505,6 +510,17 @@ mod tests {
                 Important::Merged,
             ),
             ("Bash: cd $WT && ./scripts/deploy.sh prod", Important::Released),
+            ("Bash: ssh prod <<'EOF'\ndocker stack deploy -c s.yml web\nEOF", Important::Released),
+            ("Bash: ssh prod \"docker stack deploy -c s.yml $STACK\"", Important::Released),
+            ("Bash: ssh host 'cd /srv && ./deploy.sh'", Important::Released),
+            ("Bash: psql -c \"DROP TABLE users\" $(echo db)", Important::Deleted),
+            ("Bash: env FOO=1 ./deploy.sh", Important::Released),
+            ("Bash: sudo -u svc ./deploy.sh", Important::Released),
+            ("Bash: timeout 600 ./deploy.sh", Important::Released),
+            (
+                "Bash: gh pr comment 5 --body \"$(echo \"Don't merge\")\" && gh pr merge 6",
+                Important::Merged,
+            ),
             ("Bash: cd \"$REPO\"\n# it's green now\ngh pr merge 9 --squash", Important::Merged),
             ("Bash: out=\"$(gh pr merge 12 --squash)\"", Important::Merged),
             ("Bash: echo \"done: $(gh pr merge 12)\"", Important::Merged),

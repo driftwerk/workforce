@@ -273,8 +273,8 @@ const READING: &[(&str, &[&str])] = &[
     ),
     ("go", &["test", "vet", "build"]),
     ("npm", &["test"]),
-    ("pnpm", &["test"]),
-    ("yarn", &["test"]),
+    ("pnpm", &["test", "vitest", "jest", "tsc", "eslint"]),
+    ("yarn", &["test", "vitest", "jest", "tsc", "eslint"]),
     ("npx", &["vitest", "jest", "tsc", "eslint", "prettier"]),
 ];
 
@@ -283,8 +283,48 @@ const READING: &[(&str, &[&str])] = &[
 /// a script is given inline (`-c`).
 const INTERPRETERS: &[&str] = &["bash", "sh", "zsh", "python", "python3", "node"];
 
-/// Wrappers that run the command after them.
-const WRAPPERS: &[&str] = &["sudo", "env", "nohup", "time", "command", "exec", "xargs"];
+/// Wrappers that run the command after them, past their own flags, the
+/// values of those named here, and a count or duration (`timeout 600`).
+const WRAPPERS: &[&str] = &[
+    "sudo", "env", "nohup", "time", "timeout", "nice", "command", "exec", "xargs",
+];
+const WRAPPER_VALUES: &[&str] = &["-u", "-g", "-n", "-s", "-k"];
+/// Runners whose `run` (or, for Python, `-m`) names the program they run.
+const RUNNERS: &[&str] = &["uv", "poetry", "pipenv", "pdm"];
+
+/// The words of what `words` runs: past assignments, wrappers and their
+/// arguments, a runner's `run` and Python's `-m`.
+fn what_runs(words: &[String]) -> &[String] {
+    let mut w = words;
+    loop {
+        w = match w {
+            [first, rest @ ..] if first.contains('=') && !first.starts_with('-') => rest,
+            [first, rest @ ..] if WRAPPERS.contains(&named_as(first).as_str()) => {
+                let mut r = rest;
+                while let [flag, more @ ..] = r {
+                    r = match flag.as_str() {
+                        f if WRAPPER_VALUES.contains(&f) => more.get(1..).unwrap_or_default(),
+                        f if f.starts_with('-') => more,
+                        f if f.chars().next().is_some_and(|c| c.is_ascii_digit()) => more,
+                        _ => break,
+                    };
+                }
+                r
+            }
+            [first, run, rest @ ..]
+                if RUNNERS.contains(&named_as(first).as_str()) && run == "run" =>
+            {
+                rest
+            }
+            [first, m, rest @ ..]
+                if matches!(named_as(first).as_str(), "python" | "python3") && m == "-m" =>
+            {
+                rest
+            }
+            _ => return w,
+        };
+    }
+}
 
 /// Flags whose value is prose (a commit message, a PR's title or body):
 /// words in it are never the command's step. A cluster of short flags
@@ -322,15 +362,32 @@ fn pathy(word: &str) -> bool {
 /// interpreter runs, or the workflow `gh workflow run` starts. Nothing
 /// for a program that only reads, prose, or what follows `--`.
 fn one_step(words: &[String]) -> Option<Important> {
-    let mut words = words
-        .iter()
-        .skip_while(|w| w.contains('=') && !w.starts_with('-'))
-        .skip_while(|w| WRAPPERS.contains(&named_as(w).as_str()));
-    let program = named_as(words.next()?);
+    let words = what_runs(words);
+    let (program, rest) = words.split_first()?;
+    let program = named_as(program);
     if READERS.contains(&program.as_str()) {
         return None;
     }
-    let args: Vec<&String> = words.take_while(|w| *w != "--").collect();
+    // A command run elsewhere is read as the command it is: on a host
+    // (`ssh prod './deploy.sh'`) or by a shell (`bash -c '…'`).
+    match program.as_str() {
+        "ssh" => {
+            let remote: Vec<&str> = rest
+                .iter()
+                .skip_while(|w| w.starts_with('-'))
+                .skip(1)
+                .map(String::as_str)
+                .collect();
+            return command_step(&remote.join(" "));
+        }
+        "bash" | "sh" | "zsh" => {
+            if let Some(script) = rest.iter().skip_while(|w| *w != "-c").nth(1) {
+                return command_step(script);
+            }
+        }
+        _ => {}
+    }
+    let args: Vec<&String> = rest.iter().take_while(|w| *w != "--").collect();
     let flags = |f: &str| args.iter().any(|w| *w == f);
     let runs_script = INTERPRETERS.contains(&program.as_str()) && !flags("-n") && !flags("-c");
     let mut said = vec![program.clone()];

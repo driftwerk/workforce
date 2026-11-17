@@ -1381,9 +1381,14 @@ fn commands_in(command: &str, depth: usize) -> Vec<Vec<String>> {
         Err(()) => {
             let mut inner = Vec::new();
             let plain = without_prose(&without_heredocs(command));
-            let flat = unquoted(&flatten(&plain, &mut inner));
+            let mut spans = Vec::new();
+            let flat = unquoted(&flatten(&plain, &mut inner), &mut spans);
+            let word = |w: &str| match w.strip_prefix(SPAN).and_then(|n| n.parse::<usize>().ok()) {
+                Some(n) => spans.get(n).cloned().unwrap_or_default(),
+                None => w.to_string(),
+            };
             flat.split(|c: char| ";&|\n(){}".contains(c))
-                .map(|c| c.split_whitespace().map(str::to_string).collect())
+                .map(|c| c.split_whitespace().map(word).collect())
                 .chain(inner.iter().flat_map(|i| commands_in(i, depth + 1)))
                 .collect()
         }
@@ -1402,6 +1407,14 @@ fn heredoc_end(line: &str) -> Option<String> {
         .collect();
     word.starts_with(|c: char| c.is_alphabetic() || c == '_')
         .then_some(word)
+}
+
+/// Whether `line`'s heredoc goes to a shell to run (`ssh prod <<EOF`,
+/// `bash <<EOF`).
+fn feeds_shell(line: &str) -> bool {
+    line.split_whitespace()
+        .next()
+        .is_some_and(|p| matches!(base_name(p), "ssh" | "bash" | "sh" | "zsh"))
 }
 
 /// `command` without its heredocs' bodies: from the line after the one
@@ -1428,7 +1441,8 @@ fn without_heredocs(command: &str) -> String {
                 }
             }
             None => {
-                until = heredoc_end(line);
+                // A heredoc a shell runs is its commands.
+                until = heredoc_end(line).filter(|_| !feeds_shell(line));
                 out.push(line);
             }
         }
@@ -1452,7 +1466,8 @@ fn without_prose(text: &str) -> String {
                 chars.next();
                 out.push('_');
             }
-            '\'' if !quoted => {
+            // A lone apostrophe ("Don't") hides nothing after it.
+            '\'' if !quoted && chars.clone().any(|d| d == '\'') => {
                 chars.by_ref().find(|d| *d == '\'');
                 out.push('_');
             }
@@ -1471,22 +1486,29 @@ fn without_prose(text: &str) -> String {
     out
 }
 
-/// `text` with each double-quoted span (an unclosed one to the end) the
-/// one word `_`.
-fn unquoted(text: &str) -> String {
+/// What a quoted span stands for in [`unquoted`]'s text, before its index.
+const SPAN: &str = "\u{1f}";
+
+/// `text` with each double-quoted span (an unclosed one to the end) one
+/// word standing for its text, kept in `spans`: it is one argument, as the
+/// shell has it.
+fn unquoted(text: &str, spans: &mut Vec<String>) -> String {
     let mut out = String::new();
-    let mut open = false;
+    let mut open: Option<String> = None;
     for c in text.chars() {
-        match (open, c) {
-            (_, '"') => {
-                if !open {
-                    out.push('_');
-                }
-                open = !open;
+        match (open.as_mut(), c) {
+            (None, '"') => open = Some(String::new()),
+            (None, c) => out.push(c),
+            (Some(_), '"') => {
+                spans.extend(open.take());
+                out.push_str(&format!("{SPAN}{}", spans.len() - 1));
             }
-            (false, c) => out.push(c),
-            (true, _) => {}
+            (Some(span), c) => span.push(c),
         }
+    }
+    if let Some(span) = open {
+        spans.push(span);
+        out.push_str(&format!("{SPAN}{}", spans.len() - 1));
     }
     out
 }
