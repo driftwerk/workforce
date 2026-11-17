@@ -1380,7 +1380,8 @@ fn commands_in(command: &str, depth: usize) -> Vec<Vec<String>> {
             .collect(),
         Err(()) => {
             let mut inner = Vec::new();
-            let flat = unquoted(&flatten(&without_heredocs(command), &mut inner));
+            let plain = without_prose(&without_heredocs(command));
+            let flat = unquoted(&flatten(&plain, &mut inner));
             flat.split(|c: char| ";&|\n(){}".contains(c))
                 .map(|c| c.split_whitespace().map(str::to_string).collect())
                 .chain(inner.iter().flat_map(|i| commands_in(i, depth + 1)))
@@ -1436,26 +1437,55 @@ fn without_heredocs(command: &str) -> String {
     out.join("\n")
 }
 
-/// `text` with each quoted span (`'…'`, `"…"`; an unclosed one to the end)
-/// the one word `_`. Outside quotes a backslash makes the next character
-/// plain; inside double quotes it keeps `\"` from closing them.
-fn unquoted(text: &str) -> String {
+/// `text` without what can only be words: each `#` comment, each
+/// single-quoted span and each escaped character the one word `_` (none
+/// of them runs), so what is left to flatten holds only real expansions.
+fn without_prose(text: &str) -> String {
     let mut out = String::new();
-    let mut open: Option<char> = None;
+    let mut quoted = false;
     let mut chars = text.chars();
     while let Some(c) = chars.next() {
-        match (open, c) {
-            (None, '\\') => out.extend(chars.next()),
-            (None, '\'' | '"') => {
-                open = Some(c);
+        let starts_word =
+            out.is_empty() || out.ends_with(|p: char| p.is_whitespace() || ";&|()".contains(p));
+        match c {
+            '\\' => {
+                chars.next();
                 out.push('_');
             }
-            (None, c) => out.push(c),
-            (Some('"'), '\\') => {
-                chars.next();
+            '\'' if !quoted => {
+                chars.by_ref().find(|d| *d == '\'');
+                out.push('_');
             }
-            (Some(q), c) if c == q => open = None,
-            (Some(_), _) => {}
+            '#' if !quoted && starts_word => {
+                if chars.by_ref().any(|d| d == '\n') {
+                    out.push('\n');
+                }
+            }
+            '"' => {
+                quoted = !quoted;
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// `text` with each double-quoted span (an unclosed one to the end) the
+/// one word `_`.
+fn unquoted(text: &str) -> String {
+    let mut out = String::new();
+    let mut open = false;
+    for c in text.chars() {
+        match (open, c) {
+            (_, '"') => {
+                if !open {
+                    out.push('_');
+                }
+                open = !open;
+            }
+            (false, c) => out.push(c),
+            (true, _) => {}
         }
     }
     out

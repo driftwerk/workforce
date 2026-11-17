@@ -252,10 +252,31 @@ const READERS: &[&str] = &[
     "du",
     "test",
     "cd",
+    "pytest",
+    "vitest",
+    "jest",
 ];
 
 /// `git` subcommands that only read.
-const GIT_READERS: &[&str] = &["grep", "diff", "show", "log", "blame", "status", "fetch"];
+/// Subcommands that only read, check, build or test: what they are given
+/// (a test filter, `cargo test -p desk deploy`) is never a step.
+const READING: &[(&str, &[&str])] = &[
+    (
+        "git",
+        &["grep", "diff", "show", "log", "blame", "status", "fetch"],
+    ),
+    (
+        "cargo",
+        &[
+            "test", "nextest", "check", "clippy", "build", "bench", "fmt",
+        ],
+    ),
+    ("go", &["test", "vet", "build"]),
+    ("npm", &["test"]),
+    ("pnpm", &["test"]),
+    ("yarn", &["test"]),
+    ("npx", &["vitest", "jest", "tsc", "eslint", "prettier"]),
+];
 
 /// Programs that run the script they are given: its file's name says what
 /// it does (`bash scripts/deploy.sh`), unless it is only checked (`-n`) or
@@ -334,11 +355,10 @@ fn one_step(words: &[String]) -> Option<Important> {
             false => said.extend(w.split_whitespace().map(str::to_lowercase)),
         }
     }
-    let git_reads = program == "git"
-        && said
-            .get(1)
-            .is_some_and(|sub| GIT_READERS.contains(&sub.as_str()));
-    match git_reads {
+    let reads = READING.iter().any(|(p, subs)| {
+        *p == program && said.get(1).is_some_and(|sub| subs.contains(&sub.as_str()))
+    });
+    match reads {
         true => None,
         false => step(&said),
     }

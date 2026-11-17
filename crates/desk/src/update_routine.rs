@@ -476,6 +476,13 @@ mod tests {
             "Bash: cargo test -- merge",
             "Bash: bash -n scripts/deploy.sh",
             "Bash: git commit -F - <<'EOF'\nMerge the deploy fixture fix\nRemove the old tag.\nEOF",
+            "Bash: cd \"$REPO\" && git commit -am 'Fix `deploy` and `rm` handling'",
+            "Bash: cd \"$REPO\" && git commit -am \"Fix \\`deploy\\` step\"",
+            "Bash: cd $R && git commit -m 'note $(release) text'",
+            "Bash: # build then deploy later\nmake build $X",
+            "Bash: cargo test -p desk deploy",
+            "Bash: cd $HOME/x && cargo test -p desk deploy 2>&1 | tail",
+            "Bash: pytest -k deploy tests/",
         ] {
             assert_eq!(important(Approve, request), None, "{request}");
         }
@@ -498,6 +505,7 @@ mod tests {
                 Important::Merged,
             ),
             ("Bash: cd $WT && ./scripts/deploy.sh prod", Important::Released),
+            ("Bash: cd \"$REPO\"\n# it's green now\ngh pr merge 9 --squash", Important::Merged),
             ("Bash: out=\"$(gh pr merge 12 --squash)\"", Important::Merged),
             ("Bash: echo \"done: $(gh pr merge 12)\"", Important::Merged),
             (
