@@ -448,8 +448,8 @@ mod tests {
         Some("Billing Migration".into())
     }
 
-    /// Steps named "deploy" only in their files are ordinary; what a
-    /// command runs is what counts.
+    /// What runs is named by its words: a script, a workflow or a target
+    /// that deploys releases, unless its name says it tests or checks.
     #[test]
     fn a_step_in_what_runs_is_read_by_its_words() {
         use ActionKind::Approve;
@@ -475,6 +475,8 @@ mod tests {
             ("Bash: pnpm deploy", Important::Released),
             ("Bash: cargo release", Important::Released),
             ("Bash: npx release-it", Important::Released),
+            ("Bash: pnpm --filter web deploy", Important::Released),
+            ("Bash: make -f deploy.mk deploy-prod", Important::Released),
             ("Bash: make drop-db", Important::Deleted),
             ("Bash: gh release delete v1.2.0 --yes", Important::Deleted),
             ("Bash: glab release delete v1.2.0", Important::Deleted),
@@ -497,11 +499,22 @@ mod tests {
             // Words given to other programs are read whole.
             "Bash: docker run my-release-image",
             "Bash: git push -u origin release-1.2",
+            // A package installed or a workspace named is not a target.
+            "Bash: npm install release-it",
+            "Bash: pnpm add semantic-release",
+            "Bash: npm uninstall release-it",
+            "Bash: pnpm --filter deploy-web test",
+            "Bash: pnpm --filter deploy-web build",
+            "Bash: pnpm -F release-notes build",
+            "Bash: make release-notes",
+            "Bash: ./deploy-status.sh",
         ] {
             assert_eq!(important(Approve, request), None, "{request}");
         }
     }
 
+    /// Steps named "deploy" only in their files are ordinary; what a
+    /// command runs is what counts.
     #[test]
     fn an_approval_is_judged_by_what_it_runs_never_by_a_files_name() {
         use ActionKind::Approve;

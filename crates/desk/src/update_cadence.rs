@@ -405,7 +405,21 @@ const SUBCOMMANDS: usize = 2;
 /// (`deploy-preview-tests.sh`, `release:dry-run`): such a name takes no
 /// step, whatever else it says.
 const CHECKING: &[&str] = &[
-    "test", "tests", "spec", "specs", "check", "checks", "lint", "dry", "preview", "plan",
+    "test", "tests", "spec", "specs", "check", "checks", "lint", "dry", "preview", "plan", "notes",
+    "status", "logs", "list", "view", "diff",
+];
+
+/// A target runner's flags whose value is where or what it runs in (`pnpm
+/// --filter deploy-web build`, `make -f deploy.mk`), never its target.
+const TARGET_VALUES: &[&str] = &[
+    "--filter",
+    "-F",
+    "-w",
+    "--workspace",
+    "--prefix",
+    "--dir",
+    "-f",
+    "--file",
 ];
 
 /// Programs whose first words name the target or script they run (`make
@@ -487,6 +501,10 @@ fn one_step(words: &[String], depth: usize) -> Option<Important> {
     let runs_script = INTERPRETERS.contains(&program.as_str()) && !flags("-n") && !flags("-c");
     let sql = SQL.contains(&program.as_str());
     let targets = TARGETS.contains(&program.as_str());
+    // How many words more name a target runner's target: its first, and
+    // the one after `run` (`npm run deploy:prod`), never a package it
+    // installs (`npm install release-it`).
+    let mut aim = usize::from(targets);
     let mut said = vec![program.clone()];
     // Which of `said` name what runs, read by their words.
     let mut named: Vec<usize> = vec![0];
@@ -515,7 +533,9 @@ fn one_step(words: &[String], depth: usize) -> Option<Important> {
         }
         if w.starts_with('-') {
             script = sql && SQL_SCRIPT.contains(&w.as_str());
-            skip = prose(w) || VALUES.contains(&w.as_str());
+            skip = prose(w)
+                || VALUES.contains(&w.as_str())
+                || (targets && TARGET_VALUES.contains(&w.as_str()));
             let flag = w.trim_start_matches('-');
             let flag = flag.split_once('=').map_or(flag, |(f, _)| f);
             if DELETING_FLAGS.contains(&flag) {
@@ -537,7 +557,9 @@ fn one_step(words: &[String], depth: usize) -> Option<Important> {
                         .take(SUBCOMMANDS)
                         .map(str::to_lowercase),
                 );
-                if targets {
+                if aim > 0 {
+                    aim -= 1;
+                    aim += usize::from(matches!(w.as_str(), "run" | "run-script"));
                     named.extend(from..said.len());
                 }
             }
