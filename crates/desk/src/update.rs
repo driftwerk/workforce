@@ -907,12 +907,14 @@ pub fn brief(
 
 /// What the boss did for `session` (none: what is about no session), as
 /// brief lines, newest first: what it acted on, never what it left alone
-/// or the sessions it closed (said in the closed line). All of them:
-/// behind "What I did · N".
+/// or the sessions it closed (said in the closed line), each run of
+/// routine ones folded into one line ([`crate::update_routine::folded`],
+/// its times in `tz`). All of them: behind "What I did · N".
 pub fn did_items(
     rows: &[BossDecision],
     lines: &[DecisionLine],
     session: Option<Uuid>,
+    tz: &chrono_tz::Tz,
 ) -> Vec<BriefItem> {
     use crate::decision::DecisionKind;
     let mut done: Vec<(&BossDecision, &DecisionLine)> = rows
@@ -921,18 +923,22 @@ pub fn did_items(
         .filter_map(|d| Some((d, lines.iter().find(|l| l.id == d.id.to_string())?)))
         .collect();
     done.sort_by_key(|(d, _)| std::cmp::Reverse(d.at));
-    done.into_iter()
-        .map(|(d, l)| BriefItem {
-            id: l.id.clone(),
-            kind: BriefKind::Done,
-            action: l.action.trim().trim_end_matches('.').to_string(),
-            why: crate::decision::clause(&l.why),
-            detail: None,
-            undo: l.undo.clone(),
-            settled_by: None,
-            at: d.at,
-        })
-        .collect()
+    let items = done.into_iter().map(|(d, l)| brief_item(d, l)).collect();
+    crate::update_routine::folded(items, rows, tz)
+}
+
+/// What the boss did (`d`, laid out as `l`), as one brief line.
+pub fn brief_item(d: &BossDecision, l: &DecisionLine) -> BriefItem {
+    BriefItem {
+        id: l.id.clone(),
+        kind: BriefKind::Done,
+        action: l.action.trim().trim_end_matches('.').to_string(),
+        why: crate::decision::clause(&l.why),
+        detail: None,
+        undo: l.undo.clone(),
+        settled_by: None,
+        at: d.at,
+    }
 }
 
 /// The update's headline written plainly: what it did, what is the

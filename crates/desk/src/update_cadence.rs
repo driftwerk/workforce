@@ -107,8 +107,36 @@ const SPEND: &[&str] = &[
 /// when they come just before the step ("don't merge", "wait for CI
 /// before merging", "hold off deploying").
 const HOLD: &[&str] = &[
-    "wait", "hold", "don't", "dont", "not", "never", "before", "until", "pause", "stop", "without",
-    "off",
+    "wait", "hold", "don't", "dont", "not", "no", "never", "before", "until", "pause", "stop",
+    "without", "off",
+];
+/// Words that make the step word before them a thing named rather than a
+/// step taken: "the merge queue", "the merge commit", "the deploy
+/// preview", "a promote dry run".
+const NAMED: &[&str] = &[
+    "queue",
+    "commit",
+    "commits",
+    "review",
+    "reviews",
+    "conflict",
+    "conflicts",
+    "request",
+    "requests",
+    "state",
+    "status",
+    "preview",
+    "dry",
+    "plan",
+    "notes",
+    "step",
+    "steps",
+    "freeze",
+    "window",
+    "button",
+    "gate",
+    "check",
+    "checks",
 ];
 /// How many words before a step a hold word holds it back.
 const HOLD_REACH: usize = 3;
@@ -160,30 +188,162 @@ fn says(w: &[String], list: &[&str]) -> bool {
     })
 }
 
+/// The step `w` says, as the importance it gives: merging, releasing,
+/// deleting or spending.
+fn step(w: &[String]) -> Option<Important> {
+    [
+        (MERGE, Important::Merged),
+        (RELEASE, Important::Released),
+        (DELETE, Important::Deleted),
+        (SPEND, Important::Spent),
+    ]
+    .into_iter()
+    .find(|(list, _)| says(w, list))
+    .map(|(_, i)| i)
+}
+
+/// `w` with each step word that names a thing ("the merge queue") blanked:
+/// it takes no step.
+fn steps_only(mut w: Vec<String>) -> Vec<String> {
+    let steps = [MERGE, RELEASE, DELETE, SPEND];
+    for i in 0..w.len().saturating_sub(1) {
+        if NAMED.contains(&w[i + 1].as_str()) && steps.iter().any(|l| l.contains(&w[i].as_str())) {
+            w[i].clear();
+        }
+    }
+    w
+}
+
+/// Tools that only read, search or change files: what they touch is named
+/// by a path, and a path is never a step ("stack-deploy-tests.sh").
+const FILE_TOOLS: &[&str] = &[
+    "Edit",
+    "MultiEdit",
+    "Write",
+    "NotebookEdit",
+    "Read",
+    "Grep",
+    "Glob",
+    "LS",
+    "WebFetch",
+    "WebSearch",
+    "TodoWrite",
+];
+
+/// Programs that only read or check what they are given, whatever its
+/// words: `grep deploy`, `cat promote.yml`, `shellcheck deploy.sh`.
+const READERS: &[&str] = &[
+    "cat",
+    "head",
+    "tail",
+    "less",
+    "grep",
+    "rg",
+    "ls",
+    "jq",
+    "wc",
+    "diff",
+    "echo",
+    "printf",
+    "shellcheck",
+    "stat",
+    "file",
+    "df",
+    "du",
+    "test",
+];
+
+/// Wrappers that run the command after them.
+const WRAPPERS: &[&str] = &["sudo", "env", "nohup", "time", "command", "exec", "xargs"];
+
+/// Flags whose value is prose (a commit message, a PR's title or body):
+/// words in it are never the command's step.
+const PROSE: &[&str] = &[
+    "-m",
+    "--message",
+    "--title",
+    "-t",
+    "--body",
+    "-b",
+    "--notes",
+];
+
+/// Flags that delete what the command is given (`find … -delete`).
+const DELETING_FLAGS: &[&str] = &["delete", "prune", "purge"];
+
+/// A word as a step would be named in it: a path or file by its name less
+/// its extension (`./deploy.sh` is `deploy`, `stack-deploy-tests.sh` is
+/// itself), anything else as it is, in lower case.
+fn named_as(word: &str) -> String {
+    let base = word.rsplit_once('/').map_or(word, |(_, b)| b);
+    let stem = match base.split_once('.') {
+        Some((stem, _)) if !stem.is_empty() => stem,
+        _ => base,
+    };
+    stem.to_lowercase()
+}
+
+/// The step a shell command takes: by its program and the words it is
+/// given, each a whole word (a path by its file's name), never a part of
+/// one; nothing for a program that only reads, or for prose.
+fn command_step(command: &str) -> Option<Important> {
+    crate::computer::boss::commands(command)
+        .iter()
+        .find_map(|words| {
+            let mut words = words
+                .iter()
+                .skip_while(|w| w.contains('=') && !w.starts_with('-'))
+                .skip_while(|w| WRAPPERS.contains(&named_as(w).as_str()));
+            let program = named_as(words.next()?);
+            if READERS.contains(&program.as_str()) {
+                return None;
+            }
+            let mut said = vec![program];
+            let mut prose = false;
+            for w in words {
+                match (prose, w.starts_with('-')) {
+                    (true, _) => prose = false,
+                    (false, true) => {
+                        prose = PROSE.contains(&w.as_str());
+                        let flag = w.trim_start_matches('-');
+                        let flag = flag.split_once('=').map_or(flag, |(f, _)| f);
+                        if DELETING_FLAGS.contains(&flag) {
+                            said.push(flag.to_string());
+                        }
+                    }
+                    (false, false) => said.extend(w.split_whitespace().map(named_as)),
+                }
+            }
+            step(&said)
+        })
+}
+
+/// The step a request a boss allowed takes (`request`: its tool, then
+/// what it runs, "Bash: gh pr merge 631"): a command by what it runs, a
+/// file tool never, any other tool by its name ("github · merge_pr").
+fn approved_step(request: &str) -> Option<Important> {
+    let (tool, detail) = request.split_once(": ").unwrap_or((request, ""));
+    match tool.trim() {
+        t if FILE_TOOLS.contains(&t) => None,
+        "Bash" => command_step(detail),
+        t => step(&words(&t.replace('_', " "))),
+    }
+}
+
 /// Whether a decision is important, and why: from what kind of action it
 /// was and what it said (`text`: the request it allowed, or the message it
 /// sent). Overriding a session always is; allowing a request is when the
-/// request merges, releases, deletes or spends; a message is when it tells
-/// the session to do one of those, now or later, never when it holds it
-/// back ("wait for green CI before merging").
+/// request merges, releases, deletes or spends (by what it runs, never a
+/// file's name); a message is when it tells the session to do one of
+/// those, now or later, never when it holds it back ("wait for green CI
+/// before merging") or only names a thing ("the merge queue").
 pub fn important(kind: ActionKind, text: &str) -> Option<Important> {
-    let w = words(text);
-    let verb = || {
-        [
-            (MERGE, Important::Merged),
-            (RELEASE, Important::Released),
-            (DELETE, Important::Deleted),
-            (SPEND, Important::Spent),
-        ]
-        .into_iter()
-        .find(|(list, _)| says(&w, list))
-        .map(|(_, i)| i)
-    };
     match kind {
         ActionKind::Override | ActionKind::Deny => Some(Important::Overrode),
-        ActionKind::Approve => verb(),
+        ActionKind::Approve => approved_step(text),
         ActionKind::Message => {
-            let v = verb()?;
+            let w = steps_only(words(text));
+            let v = step(&w)?;
             if held_back(&w) {
                 return None;
             }
@@ -238,17 +398,6 @@ pub fn decision_route(important: bool, c: &Cadence, quiet: bool) -> Route {
     match (r, quiet) {
         (Route::RightAway, true) => Route::Roundup,
         (r, _) => r,
-    }
-}
-
-/// Whether a decision is listed under "Decided without you" in a
-/// roundup: an important one unless the person hears of them only on
-/// asking, any when they asked for every one.
-pub fn listed(important: bool, c: &Cadence) -> bool {
-    match c.decisions {
-        Decided::Ask => false,
-        Decided::All => true,
-        Decided::Important | Decided::ImportantRightAway => important,
     }
 }
 
@@ -403,7 +552,8 @@ pub struct Section {
 /// A roundup (shape C, `extras.update.roundup`): what happened since the
 /// last, by what it means to the person, each section only when it says
 /// something, and how many routine things it left out ("N routine things
-/// · Show").
+/// · Show"), shown as runs: one line a session and kind of decision, each
+/// of them behind it ([`crate::update_routine`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Roundup {
@@ -411,12 +561,20 @@ pub struct Roundup {
     pub sections: Vec<Section>,
     #[serde(default)]
     pub routine: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<Said>,
 }
 
 impl Roundup {
     /// `lines` (each with the section it goes in) as a roundup since
-    /// `since`, its sections in order and each only when it has a line.
-    pub fn of(since: DateTime<Utc>, lines: Vec<(SectionKey, Said)>, routine: u32) -> Self {
+    /// `since`, its sections in order and each only when it has a line;
+    /// `routine` things left out, said as `runs`.
+    pub fn of(
+        since: DateTime<Utc>,
+        lines: Vec<(SectionKey, Said)>,
+        routine: u32,
+        runs: Vec<Said>,
+    ) -> Self {
         let sections = SectionKey::ORDER
             .into_iter()
             .map(|key| Section {
@@ -434,6 +592,7 @@ impl Roundup {
             since,
             sections,
             routine,
+            runs,
         }
     }
 
@@ -481,23 +640,27 @@ impl Roundup {
 }
 
 /// A roundup as text, for history, Slack and the model: its headline, each
-/// section's title and lines, and the routine count.
+/// section's title and lines, and the routine count with a line a run.
 pub fn render(headline: &str, r: &Roundup) -> String {
+    let line = |l: &Said| format!("- {}", crate::update_write::render(l).replace('\n', " · "));
     let mut out = vec![headline.trim().to_string()];
     for s in &r.sections {
-        let lines: Vec<String> = s
-            .lines
-            .iter()
-            .map(|l| format!("- {}", crate::update_write::render(l).replace('\n', " · ")))
-            .collect();
+        let lines: Vec<String> = s.lines.iter().map(line).collect();
         out.push(format!("**{}**\n{}", s.title, lines.join("\n")));
     }
     if r.routine > 0 {
-        out.push(format!(
-            "{} routine {}: ask \"what else did you decide?\"",
+        let count = format!(
+            "{} routine {}",
             r.routine,
             if r.routine == 1 { "thing" } else { "things" }
-        ));
+        );
+        out.push(match r.runs.is_empty() {
+            true => format!("{count}: ask \"what else did you decide?\""),
+            false => {
+                let runs: Vec<String> = r.runs.iter().map(line).collect();
+                format!("{count}:\n{}", runs.join("\n"))
+            }
+        });
     }
     out.join("\n\n")
 }
@@ -660,12 +823,8 @@ mod tests {
         let c = balanced();
         assert_eq!(decision_route(true, &c, false), Route::Roundup);
         assert_eq!(decision_route(false, &c, false), Route::Ask, "routine");
-        assert!(listed(true, &c) && !listed(false, &c));
         let mut every = c;
-        every.decisions = Decided::All;
-        assert!(listed(false, &every));
         every.decisions = Decided::Ask;
-        assert!(!listed(true, &every));
         assert_eq!(decision_route(true, &every, false), Route::Ask);
     }
 
@@ -784,7 +943,7 @@ mod tests {
     #[test]
     fn an_empty_roundup_is_skipped_and_sections_come_in_order() {
         let since = at("2026-11-16T08:00:00Z");
-        let routine_only = Roundup::of(since, vec![], 15);
+        let routine_only = Roundup::of(since, vec![], 15, vec![]);
         assert!(routine_only.is_empty());
         let r = Roundup::of(
             since,
@@ -803,6 +962,7 @@ mod tests {
                 ),
             ],
             15,
+            vec![],
         );
         assert!(!r.is_empty());
         let keys: Vec<SectionKey> = r.sections.iter().map(|s| s.key).collect();

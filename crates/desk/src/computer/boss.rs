@@ -1357,6 +1357,26 @@ pub fn moves_dir(command: &str) -> bool {
     cmds.iter().any(|cmd| moves_cmd(&cmd.words))
 }
 
+/// Each command `command` runs, as its words with their quotes removed (a
+/// quoted argument one word); split plainly on whitespace and the shell's
+/// separators when Desk can't split it.
+pub fn commands(command: &str) -> Vec<Vec<String>> {
+    match split(command) {
+        Ok(cmds) => cmds
+            .into_iter()
+            .map(|c| c.words.into_iter().map(|w| w.text).collect())
+            .collect(),
+        Err(()) => command
+            .split(|c: char| ";&|\n()".contains(c))
+            .map(|c| {
+                c.split_whitespace()
+                    .map(|w| w.trim_matches(|q| q == '\'' || q == '"').to_string())
+                    .collect()
+            })
+            .collect(),
+    }
+}
+
 /// `text` with each expansion in it (`$(…)`, `${…}`, `$((…))`, a
 /// backtick's) as the one word `$_`, what each holds put in `inner`. An
 /// unclosed one runs to the end.
