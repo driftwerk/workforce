@@ -1131,7 +1131,7 @@ impl Tool for GithubGetPullTool {
         let head_sha = pr["head"]["sha"].as_str().unwrap_or_default();
         let checks_summary = if !head_sha.is_empty() {
             match commit_checks(&client, &owner, repo, head_sha).await {
-                Ok(CommitChecks { runs, note }) => {
+                Ok(CommitChecks { runs, note, .. }) => {
                     let gate = evaluate_check_runs(&runs);
                     let failure = gate.failed_checks.len();
                     let pending = runs
@@ -2179,8 +2179,18 @@ impl Tool for GithubPrMergeTool {
         // CI that can't be read is never taken as passed.
         let runs = match commit_checks(&client, &owner, repo, &head_sha).await {
             Ok(CommitChecks {
+                complete: false, ..
+            }) => {
+                return Ok(ToolResult::failure(
+                    "Cannot merge: its commit statuses couldn't be read, so what outside \
+                     services said of its head isn't known.",
+                    start.elapsed().as_millis() as u64,
+                ))
+            }
+            Ok(CommitChecks {
                 runs,
                 note: Some(_),
+                ..
             }) if runs.is_empty() => {
                 return Ok(ToolResult::failure(
                     "Cannot merge: no CI this GitHub key can read reported on its head, and \
@@ -2202,12 +2212,12 @@ impl Tool for GithubPrMergeTool {
             "failure" => {
                 let failed_names = gate.failed_checks.join(", ");
                 return Ok(ToolResult::failure(
-                        format!(
-                            "Cannot merge: CI checks have failed: [{}]. All checks must pass before merging.",
-                            failed_names
-                        ),
-                        start.elapsed().as_millis() as u64,
-                    ));
+                    format!(
+                        "Cannot merge: CI checks have failed: [{failed_names}]. All checks must \
+                         pass before merging."
+                    ),
+                    start.elapsed().as_millis() as u64,
+                ));
             }
             "pending" => {
                 return Ok(ToolResult::failure(
@@ -3601,7 +3611,7 @@ impl Tool for GithubCiStatusTool {
         };
 
         match commit_checks(&client, &owner, repo, git_ref).await {
-            Ok(CommitChecks { runs, note }) => {
+            Ok(CommitChecks { runs, note, .. }) => {
                 let check_runs: Vec<serde_json::Value> = runs
                     .iter()
                     .map(|cr| {
@@ -4675,6 +4685,9 @@ const ACTIONS_AND_STATUSES: &str = "Only GitHub Actions runs and commit statuses
 struct CommitChecks {
     runs: Vec<serde_json::Value>,
     note: Option<String>,
+    /// Whether everything that reports on it was read: false when, without
+    /// check runs, its commit statuses couldn't be.
+    complete: bool,
 }
 
 /// The checks on `git_ref` of `owner/repo`: its check runs; or, for a key
@@ -4694,6 +4707,7 @@ async fn commit_checks(
                 return Ok(CommitChecks {
                     runs: data["check_runs"].as_array().cloned().unwrap_or_default(),
                     note: None,
+                    complete: true,
                 })
             }
             Err(e) if super::client::refuses_check_runs(&e) => client.refuse_check_runs(),
@@ -4720,6 +4734,7 @@ async fn commit_checks(
     );
     // Its Actions runs are its CI here: without them nothing says it passed.
     let runs = workflow_checks(&runs?);
+    let complete = statuses.is_ok();
     let (statuses, note) = match statuses {
         Ok(s) => (status_checks(&s), ACTIONS_AND_STATUSES.to_string()),
         Err(_) => (
@@ -4730,6 +4745,7 @@ async fn commit_checks(
     Ok(CommitChecks {
         runs: runs.into_iter().chain(statuses).collect(),
         note: Some(note),
+        complete,
     })
 }
 
@@ -6203,5 +6219,60 @@ mod tests {
             .error
             .unwrap()
             .contains("no CI this GitHub key can read"));
+    }
+
+    /// Without check runs, a head whose Actions runs passed but whose commit
+    /// statuses couldn't be read is never merged: an outside service may have
+    /// failed it.
+    #[tokio::test]
+    async fn unread_commit_statuses_never_merge() {
+        let server = MockServer::start().await;
+        Mock::given(path(format!("/repos/acme/app/commits/{SHA}/check-runs")))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "message": "Resource not accessible by personal access token"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(path("/repos/acme/app/actions/runs"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "workflow_runs": [{"id": 1, "workflow_id": 1, "name": "CI", "event": "pull_request",
+                                   "run_number": 1, "status": "completed", "conclusion": "success"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/repos/acme/app/commits/{SHA}/status")))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "message": "Resource not accessible by personal access token"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(path("/repos/acme/app/pulls/7"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"number": 7, "head": {"sha": SHA, "ref": "x"}}),
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(path("/repos/acme/app/pulls/7/merge"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let merge =
+            GithubPrMergeTool::new(one(&server, "github_pat_no_statuses"), default_ws(), None)
+                .execute(serde_json::json!({"owner": "acme", "repo": "app", "number": 7}))
+                .await
+                .unwrap();
+        assert!(!merge.success);
+        assert!(
+            merge
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("commit statuses couldn't be read"),
+            "{:?}",
+            merge.error
+        );
     }
 }
