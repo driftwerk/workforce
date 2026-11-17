@@ -615,6 +615,11 @@ impl CrewHub {
         };
         match self.undo_plan(&plan, by).await {
             Ok(done) => {
+                // Undone, what the boss told the session was taken back or
+                // corrected: saying it again is a new message, not a repeat.
+                if let UndoPlan::Line { session, .. } = &plan {
+                    self.forget_told(&claimed.boss, *session);
+                }
                 let mut mine = BossDecision::new(
                     &claimed.boss,
                     Need::Undo,

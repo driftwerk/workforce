@@ -391,6 +391,13 @@ impl CrewHub {
         if subject.id == overseer || !tracked(o, subject) {
             return None;
         }
+        // A session the person took back wakes no boss: it sees it, and
+        // leaves it alone.
+        if subject.kind == PartyKind::Session
+            && subject.id.parse().is_ok_and(|s| self.taken_back(s))
+        {
+            return None;
+        }
         // A session it runs wakes it on its own line when its turn ends
         // (`work_line`); one that asks the person wakes it here as before,
         // and so does every turn's end while it only watches.
@@ -510,6 +517,10 @@ impl CrewHub {
                 origin: item.origin,
             };
             if !tracked(o, &party) {
+                continue;
+            }
+            // A session the person took back is left alone.
+            if item.kind == ItemKind::Session && item.id.parse().is_ok_and(|s| self.taken_back(s)) {
                 continue;
             }
             // A session's question the person is in control of, or its Act

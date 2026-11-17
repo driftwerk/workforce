@@ -577,6 +577,8 @@ pub(crate) enum Gate {
     Suggest(Cow<'static, str>),
     /// It may not even suggest (level `watch`).
     Refuse,
+    /// It may neither do it nor suggest it; why, for the overseer.
+    No(Cow<'static, str>),
 }
 
 impl CrewHub {
@@ -592,6 +594,9 @@ impl CrewHub {
             return Gate::Suggest(
                 "your own limits are the person's to change, never yours: they approve it with one click".into(),
             );
+        }
+        if let Some(why) = self.left_alone(action) {
+            return Gate::No(why.into());
         }
         let boss = self.boss_id(o);
         if o.level != Level::Watch && self.unbound(o) {
@@ -668,6 +673,9 @@ impl CrewHub {
             return Gate::Suggest(
                 "your own limits are the person's to change, never yours: they approve it with one click".into(),
             );
+        }
+        if let Some(why) = self.left_alone(action) {
+            return Gate::No(why.into());
         }
         if let Some(held) = self.mode_hold(action, o, boss) {
             return held;
@@ -1102,8 +1110,28 @@ impl CrewHub {
 
     /// Whether a boss ran `session` and it was let go: only the person
     /// hands it back.
-    fn taken_back(&self, session: Uuid) -> bool {
-        self.desk.charge_of(session).is_some_and(|c| !c.live())
+    pub(crate) fn taken_back(&self, session: Uuid) -> bool {
+        self.desk.taken_back(session)
+    }
+
+    /// Why no boss does `action`, when it is done to a session the person
+    /// took back (or its boss let go): nothing reaches it from any boss
+    /// (a message, an answer, an approval, an interrupt, a ticket) until
+    /// the person hands it to one again. Every boss still sees it. Taking
+    /// it on again is the person's word ([`Action::TakeOn`]'s own gate).
+    pub(crate) fn left_alone(&self, action: &Action) -> Option<String> {
+        let session = match action {
+            Action::AssignTicket {
+                to: Handout::Session(s),
+                ..
+            } => Some(*s),
+            _ => Self::session_of(action),
+        }?;
+        let c = self.desk.charge_of(session).filter(|c| !c.live())?;
+        Some(workforce_desk::charge::left_alone(
+            &self.session_name(session),
+            c.released_by,
+        ))
     }
 
     pub(super) fn session_name(&self, id: Uuid) -> String {
@@ -1295,6 +1323,13 @@ impl CrewHub {
     /// how it is undone; an answer to a session's question is said in its
     /// DM from that row. Recording never stops the action.
     pub(crate) async fn perform(&self, action: &Action, by: By) -> Result<String, String> {
+        // A session the person took back gets nothing from any boss,
+        // whichever path its action came by.
+        if by.party.kind == crew::PartyKind::Manager {
+            if let Some(why) = self.left_alone(action) {
+                return Err(why);
+            }
+        }
         // A boss's message to a session goes through the session's lane,
         // checked against the picture as it is now (`super::picture`).
         let lane = Self::lane_of(action, &by);
@@ -1459,6 +1494,12 @@ impl CrewHub {
             reply,
         });
         Ok(Some((key, now)))
+    }
+
+    /// Forgets every line [`Self::tell_once`] kept that `boss` told
+    /// `session`: the person undid one, so it may be said again.
+    pub(super) fn forget_told(&self, boss: &str, session: Uuid) {
+        self.told_lines.lock().remove(&(boss.to_string(), session));
     }
 
     /// Forgets a line [`Self::tell_once`] kept that wasn't sent after all.

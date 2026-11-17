@@ -1025,6 +1025,10 @@ impl CrewHub {
             }
         }
         self.know_question(&action).await;
+        // A session the person took back: not done, nor suggested.
+        if let Some(why) = self.left_alone(&action) {
+            return Err(why);
+        }
         // What no boss does, at every level, before the level is looked at.
         if let Some(n) = self.never_said(&action) {
             if o.level == Level::Watch {
@@ -1053,6 +1057,7 @@ impl CrewHub {
         }
         let by = By::manager(boss, &boss_name(g), reason);
         match self.gate_as(&action, o, Some(boss), true) {
+            Gate::No(why) => Err(why.into_owned()),
             Gate::Refuse => {
                 Err("You only watch the crew: tell the person what you would do instead.".into())
             }

@@ -36,6 +36,13 @@ text_enum!(How {
     Taken => "taken",
 });
 
+text_enum!(ReleasedBy {
+    // The person took it back.
+    Person => "person",
+    // Its boss let it go (or Desk did, for a boss gone).
+    Boss => "boss",
+});
+
 /// Who drives a charged session now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -96,6 +103,9 @@ pub struct Charge {
     pub wheel_since: Option<DateTime<Utc>>,
     pub since: DateTime<Utc>,
     pub released_at: Option<DateTime<Utc>>,
+    /// Who let it go, once it was; none for one released before Desk kept
+    /// it.
+    pub released_by: Option<ReleasedBy>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -112,6 +122,7 @@ impl Charge {
             wheel_since: None,
             since: now,
             released_at: None,
+            released_by: None,
             updated_at: now,
         }
     }
@@ -119,6 +130,20 @@ impl Charge {
     /// Whether a boss runs it now: it hasn't been released.
     pub fn live(&self) -> bool {
         self.released_at.is_none()
+    }
+}
+
+/// Why no boss acts on `name` once the person took it back from its boss
+/// (or its boss let it go, `by`): only they hand it to a boss again. Said
+/// to the boss, whatever it tried, as a sentence.
+pub fn left_alone(name: &str, by: Option<ReleasedBy>) -> String {
+    match by {
+        Some(ReleasedBy::Boss) => format!(
+            "{name} was let go and the person runs it now; leave it alone until they hand it back."
+        ),
+        _ => {
+            format!("The person took {name} back from you; leave it alone until they hand it back.")
+        }
     }
 }
 

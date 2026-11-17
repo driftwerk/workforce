@@ -5,11 +5,11 @@ use eyre::Result;
 use tokio_postgres::Row;
 use uuid::Uuid;
 
-use crate::charge::{Charge, How, Wheel};
+use crate::charge::{Charge, How, ReleasedBy, Wheel};
 use crate::store::DeskStore;
 
 const COLUMNS: &str =
-    "session, group_id, boss, how, wheel, wheel_since, since, released_at, updated_at";
+    "session, group_id, boss, how, wheel, wheel_since, since, released_at, updated_at, released_by";
 
 fn charge(row: &Row) -> Result<Charge> {
     Ok(Charge {
@@ -22,6 +22,10 @@ fn charge(row: &Row) -> Result<Charge> {
         since: row.try_get("since")?,
         released_at: row.try_get("released_at")?,
         updated_at: row.try_get("updated_at")?,
+        released_by: row
+            .try_get::<_, Option<&str>>("released_by")?
+            .map(ReleasedBy::parse)
+            .transpose()?,
     })
 }
 
@@ -32,11 +36,12 @@ impl DeskStore {
         client
             .execute(
                 &format!(
-                    "INSERT INTO charges ({COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                    "INSERT INTO charges ({COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
                      ON CONFLICT (session) DO UPDATE SET group_id = EXCLUDED.group_id, \
                      boss = EXCLUDED.boss, how = EXCLUDED.how, wheel = EXCLUDED.wheel, \
                      wheel_since = EXCLUDED.wheel_since, since = EXCLUDED.since, \
-                     released_at = EXCLUDED.released_at, updated_at = EXCLUDED.updated_at"
+                     released_at = EXCLUDED.released_at, updated_at = EXCLUDED.updated_at, \
+                     released_by = EXCLUDED.released_by"
                 ),
                 &[
                     &c.session,
@@ -48,6 +53,7 @@ impl DeskStore {
                     &c.since,
                     &c.released_at,
                     &c.updated_at,
+                    &c.released_by.map(ReleasedBy::as_str),
                 ],
             )
             .await?;

@@ -39,10 +39,11 @@ macro_rules! guarded {
     };
 }
 
-/// Every live charge, with its boss's name and who has the wheel.
+/// Every live charge, with its boss's name and who has the wheel, and
+/// every one let go (`releasedAt`, `releasedBy`) of a session Desk has.
 async fn list(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
     guarded!(s, h, q);
-    Json(s.desk.charges()).into_response()
+    Json(s.desk.charges_shown()).into_response()
 }
 
 #[derive(Deserialize, Default)]
