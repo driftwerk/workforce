@@ -2389,18 +2389,25 @@ impl Desk {
         let sent_order = push.order.clone();
         let mut order_problem: Option<Option<String>> = None;
         let mut stale_after = false;
+        // A drop held for the person's approval, or out of the pass's calls,
+        // waits for the next push, as every other change here does; what
+        // already went out above (an edit, a move, a comment, a link) is
+        // kept as sent first, so it never goes twice.
+        let mut held: Option<RemoteError> = None;
         if let Some(mv) = &sent_order {
             if let Some((tool, args)) = crate::board_sync::order_call(s.system, &e.key, mv) {
-                budget.take()?;
-                let went = match crate::board_sync::call(remote, s.system, tool, args).await {
-                    Ok(a) if crate::board_sync::order_moved(s.system, &a) => Ok(()),
-                    Ok(_) => Err(RemoteError::Failed("No fields to update".into())),
-                    // Held for the person's approval, or out of calls: the
-                    // drop waits, as every other change here does.
-                    Err(e @ (RemoteError::Waiting { .. } | RemoteError::Spent)) => return Err(e),
-                    Err(e) => Err(e),
+                let went = match budget.take() {
+                    Err(spent) => Err(spent),
+                    Ok(()) => match crate::board_sync::call(remote, s.system, tool, args).await {
+                        Ok(a) if crate::board_sync::order_moved(s.system, &a) => Ok(()),
+                        Ok(_) => Err(RemoteError::Failed("No fields to update".into())),
+                        Err(e) => Err(e),
+                    },
                 };
                 match went {
+                    Err(e @ (RemoteError::Waiting { .. } | RemoteError::Spent)) => {
+                        held = Some(e);
+                    }
                     Ok(()) => {
                         // Linear's new place is the one sent; Jira's new
                         // Rank is read back by the next pull.
@@ -2428,8 +2435,9 @@ impl Desk {
         for _ in 0..3 {
             if let Some(ext) = t.external.as_mut() {
                 crate::board_sync::pushed(ext, &sent, noted, push.body.is_some());
-                // A newer drop made meanwhile goes next time.
-                if sent_order.is_some() && ext.rank_move == sent_order {
+                // A newer drop made meanwhile goes next time, as does a held
+                // one.
+                if held.is_none() && sent_order.is_some() && ext.rank_move == sent_order {
                     ext.rank_move = None;
                     ext.rank_stale = stale_after;
                 }
@@ -2459,7 +2467,10 @@ impl Desk {
                             .queue_push(t.id, t.board, crate::crew::now())
                             .await;
                     }
-                    return Ok(());
+                    return match held {
+                        Some(e) => Err(e),
+                        None => Ok(()),
+                    };
                 }
                 Err(crate::board_store::TicketWrite::Stale) => {
                     t = self.ticket_of(t.id).await.map_err(fail)?;

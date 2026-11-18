@@ -660,6 +660,8 @@ struct FakeLinear {
     profiles: Mutex<Vec<(String, String)>>,
     /// Issues' sortOrder, for those that answer one.
     sorts: Mutex<BTreeMap<u32, f64>>,
+    /// The hub holds a sortOrder change for the person's approval.
+    hold_sort: Mutex<bool>,
 }
 
 impl FakeLinear {
@@ -839,6 +841,9 @@ impl FakeLinear {
                     .and_then(|k| k.strip_prefix("ENG-"))
                     .and_then(|n| n.parse().ok())
                     .unwrap_or(0);
+                if args.get("sort_order").is_some() && *self.hold_sort.lock().unwrap() {
+                    return Ok(json!({ "status": "approval_pending", "request_id": "r-2" }));
+                }
                 let i = issues.get_mut(&n).unwrap();
                 if let Some(at) = args["sort_order"].as_f64() {
                     self.sorts.lock().unwrap().insert(n, at);
@@ -850,6 +855,7 @@ impl FakeLinear {
                 i.1 = "2026-11-09T23:00:00.000Z".into();
                 Ok(json!({ "issue": Self::node(n, i) }))
             }
+            "linear.issue_link" => Ok(json!({ "success": true })),
             other => Err(RemoteError::NotAllowed(other.into())),
         }
     }
@@ -2623,6 +2629,8 @@ struct RankJira {
     issues: Mutex<Vec<(String, String)>>,
     /// What the rank call fails with, when it does.
     refuse: Option<RemoteError>,
+    /// The hub holds the rank call for the person's approval.
+    hold: Mutex<bool>,
     calls: Mutex<Vec<(String, Value)>>,
 }
 
@@ -2636,6 +2644,7 @@ impl RankJira {
                     .collect(),
             ),
             refuse: None,
+            hold: Mutex::new(false),
             calls: Mutex::new(vec![]),
         }
     }
@@ -2696,6 +2705,11 @@ impl Remote for RankJira {
                     return Err(e.clone());
                 }
                 let key = args["issue_key"].as_str().unwrap().to_string();
+                let ranks = args.get("rank_after_issue").is_some()
+                    || args.get("rank_before_issue").is_some();
+                if ranks && *self.hold.lock().unwrap() {
+                    return Ok(json!({ "status": "approval_pending", "request_id": "r-1" }));
+                }
                 let mut sorted: Vec<String> = issues.iter().map(|(_, r)| r.clone()).collect();
                 sorted.sort();
                 let rank_of = |k: &str| issues.iter().find(|(x, _)| x == k).unwrap().1.clone();
@@ -2720,6 +2734,7 @@ impl Remote for RankJira {
                 Ok(json!({ "key": key, "updated": false, "ranked": true }))
             }
             "jira.list_transitions" => Ok(json!({ "transitions": [] })),
+            "jira.add_comment" => Ok(json!({ "id": "c-1" })),
             other => Err(RemoteError::NotAllowed(other.into())),
         }
     }
@@ -3004,6 +3019,131 @@ async fn a_linear_drop_takes_the_sort_order_between_its_neighbours() {
             e.rank_move.is_none() && !e.rank_stale,
             "its place is the one sent"
         );
+        assert_eq!(
+            column_keys(&d, &b, TicketState::Todo).await,
+            ["ENG-1", "ENG-2", "ENG-3"]
+        );
+    })
+    .await;
+}
+
+/// A drop whose rank call the hub holds for approval waits for the next
+/// push; what went out with it (a move's comment there) is kept as sent, so
+/// the retry sends only the rank.
+#[tokio::test]
+async fn a_held_rank_waits_and_what_went_with_it_never_goes_twice() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = d
+            .create_board(NewBoard {
+                name: "Acme".into(),
+                group: None,
+                prefix: None,
+            })
+            .await
+            .unwrap();
+        let mut l = link(None);
+        l.states.insert(TicketState::Review, "In Review".into());
+        let b = d.link_board(b.id, l, "sam").await.unwrap();
+        let jira = RankJira::new(&[("ACME-1", "0|c"), ("ACME-2", "0|a"), ("ACME-3", "0|b")]);
+        d.pull_board(b.id, &jira).await.unwrap();
+        let (one, two) = (id_of(&d, &b, "ACME-1").await, id_of(&d, &b, "ACME-2").await);
+        // Dropped within To do, then moved on to Review before it went out.
+        let mv = crate::service::Move {
+            state: TicketState::Todo,
+            before: Some(two),
+            after: None,
+        };
+        d.move_ticket(one, mv, &By::you()).await.unwrap();
+        let mv = crate::service::Move {
+            state: TicketState::Review,
+            before: None,
+            after: None,
+        };
+        d.move_ticket(one, mv, &By::you()).await.unwrap();
+        *jira.hold.lock().unwrap() = true;
+        due_now(&d, b.id).await;
+        let pushed = d.push_board(b.id, &jira).await.unwrap();
+        assert_eq!(pushed.waiting, 1);
+        let comments = |j: &RankJira| {
+            j.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(t, _)| t == "jira.add_comment")
+                .count()
+        };
+        assert_eq!(comments(&jira), 1);
+        assert_eq!(jira.ranked().len(), 1, "asked, and held");
+        let t = d.ticket(one).await.unwrap().ticket;
+        let e = t.external.as_ref().unwrap();
+        assert!(e.rank_move.is_some(), "the drop still waits");
+        assert_eq!(
+            e.seen.state,
+            Some(TicketState::Review),
+            "the move is kept as sent"
+        );
+        *jira.hold.lock().unwrap() = false;
+        due_now(&d, b.id).await;
+        d.push_board(b.id, &jira).await.unwrap();
+        assert_eq!(comments(&jira), 1, "never commented twice");
+        assert_eq!(jira.ranked().len(), 2);
+        assert_eq!(
+            jira.ranked()[1],
+            json!({ "issue_key": "ACME-1", "rank_after_issue": "ACME-2" })
+        );
+        let t = d.ticket(one).await.unwrap().ticket;
+        assert!(t.external.unwrap().rank_move.is_none());
+        assert!(d.nothing_to_push(b.id).await.unwrap());
+    })
+    .await;
+}
+
+/// On Linear, a held sortOrder change waits too, and a need that went out
+/// with it as a link is never linked twice.
+#[tokio::test]
+async fn a_held_linear_sort_order_waits_and_its_link_goes_once() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = whole_team(&d, Some(ME)).await;
+        let linear = FakeLinear::default();
+        for (n, at) in [(1, -5.0), (2, 10.0), (3, 2.0)] {
+            linear.set(n, "unstarted", n, None);
+            linear.sorts.lock().unwrap().insert(n, at);
+        }
+        d.pull_board(b.id, &linear).await.unwrap();
+        let (one, two, three) = (
+            id_of(&d, &b, "ENG-1").await,
+            id_of(&d, &b, "ENG-2").await,
+            id_of(&d, &b, "ENG-3").await,
+        );
+        let mv = crate::service::Move {
+            state: TicketState::Todo,
+            before: Some(one),
+            after: Some(three),
+        };
+        d.move_ticket(two, mv, &By::you()).await.unwrap();
+        d.need_ticket(two, one, true, &By::you()).await.unwrap();
+        *linear.hold_sort.lock().unwrap() = true;
+        due_now(&d, b.id).await;
+        d.push_board(b.id, &linear).await.unwrap();
+        assert_eq!(linear.calls_of("linear.issue_link").len(), 1);
+        let sorts = |l: &FakeLinear| {
+            l.calls_of("linear.issue_update")
+                .into_iter()
+                .filter(|a| a.get("sort_order").is_some())
+                .count()
+        };
+        assert_eq!(sorts(&linear), 1);
+        *linear.hold_sort.lock().unwrap() = false;
+        due_now(&d, b.id).await;
+        d.push_board(b.id, &linear).await.unwrap();
+        assert_eq!(linear.calls_of("linear.issue_link").len(), 1, "linked once");
+        assert_eq!(sorts(&linear), 2);
+        let t = d.ticket(two).await.unwrap().ticket;
+        assert!(t.external.unwrap().rank_move.is_none());
         assert_eq!(
             column_keys(&d, &b, TicketState::Todo).await,
             ["ENG-1", "ENG-2", "ENG-3"]
