@@ -117,6 +117,13 @@ tokio::task_local! {
     /// session no longer says so: a sub-agent such a turn spawned runs in a
     /// session of its own. Unset for work a person started.
     pub static CURRENT_AUTOMATED_ORIGIN: String;
+    /// Whether a person's message started the turn this work is part of
+    /// (the hub's `serve::chat_turn`), set afresh by each turn as it
+    /// starts, so a turn its tools start (a sub-agent's, a hand-off's) says
+    /// for itself. What a routed approval records, so the turn resumed on
+    /// its decision is a chat turn too. Unset or false for scheduled jobs,
+    /// monitors, workflows, heartbeats and a boss's wakes.
+    pub static CURRENT_CHAT_ORIGIN: bool;
     /// The memory fence a turn started under, as `<agent>\t<fence>`: what
     /// it and the work it spawns (tool calls, passive extraction) remember
     /// is tagged with the scope its agent oversaw when it began, even if the
@@ -745,6 +752,10 @@ pub struct SessionContext {
     /// [`CURRENT_AUTOMATED_ORIGIN`], carried so a job the scheduler tool
     /// creates in the spawned tool task records the automation behind it.
     pub automated_origin: Option<String>,
+    /// [`CURRENT_CHAT_ORIGIN`], carried so an approval routed from the
+    /// spawned tool task (or the gated MCP a CLI engine calls) records
+    /// that a person's message started the turn.
+    pub chat: bool,
     /// [`CURRENT_MEMORY_FENCE`], carried so a write made in the spawned task
     /// is tagged as the turn's.
     pub memory_fence: Option<String>,
@@ -791,6 +802,11 @@ pub struct SessionContext {
     pub desk: Option<workforce_common::channels::desk::DeskScope>,
 }
 
+/// [`CURRENT_CHAT_ORIGIN`], false where unset.
+pub fn chat_origin() -> bool {
+    CURRENT_CHAT_ORIGIN.try_with(|c| *c).unwrap_or(false)
+}
+
 fn task_local_value(
     key: &'static tokio::task::LocalKey<String>,
     keep_empty: bool,
@@ -826,6 +842,7 @@ impl SessionContext {
             workspace_id: task_local_value(&CURRENT_WORKSPACE_ID, false),
             voice_channel: task_local_value(&CURRENT_VOICE_CHANNEL, false),
             automated_origin: task_local_value(&CURRENT_AUTOMATED_ORIGIN, false),
+            chat: chat_origin(),
             memory_fence: task_local_value(&CURRENT_MEMORY_FENCE, false),
             active_mcp_envs: current_active_mcp_envs(),
             active_environment: current_active_environment(),
@@ -926,10 +943,13 @@ impl SessionContext {
             }
         };
         let inner = with_desk(desk, inner);
-        match last_user_comm {
-            Some(clock) => LAST_USER_COMM.scope(clock, inner).await,
-            None => inner.await,
-        }
+        let inner = async {
+            match last_user_comm {
+                Some(clock) => LAST_USER_COMM.scope(clock, inner).await,
+                None => inner.await,
+            }
+        };
+        CURRENT_CHAT_ORIGIN.scope(self.chat, inner).await
     }
 }
 
@@ -1577,6 +1597,10 @@ pub struct PendingApprovalCore {
     pub allow_self_approval: bool,
     pub approver_user_ids: Vec<String>,
     pub ttl: std::time::Duration,
+    /// Whether a person's message started the turn that asked
+    /// ([`CURRENT_CHAT_TURN`]): the turn resumed on its decision is then a
+    /// chat turn too, on the conversation model.
+    pub chat: bool,
 }
 
 /// One tool the resume turn executes deterministically before the first LLM
@@ -1941,6 +1965,7 @@ pub fn route_approval(
                 allow_self_approval: route.allow_self_approval,
                 approver_user_ids: route.approver_user_ids.clone(),
                 ttl: route.ttl,
+                chat: chat_origin(),
             };
             match router.defer(&core) {
                 Ok(()) => RouteResolution::Routed {
@@ -8488,6 +8513,7 @@ mod tests {
             // what made voice-requested reminders arrive in Slack.
             voice_channel: Some("voice-pe".into()),
             automated_origin: Some("heartbeat".into()),
+            chat: true,
             memory_fence: Some("sarah\tdesk-group:acme".into()),
             // The MCP-workspace override must survive capture→scope→capture too:
             // tools run inside the JoinSet::spawn this propagation feeds, so if
@@ -8544,6 +8570,10 @@ mod tests {
             })
             .await;
         let after = captured.lock().unwrap().clone();
+        assert!(
+            after.chat,
+            "a chat turn's spawned work is still the chat turn's"
+        );
         assert_eq!(after.artifact_scope, original.artifact_scope);
         assert_eq!(after.key, original.key);
         assert_eq!(after.memory_fence, original.memory_fence);
@@ -9115,6 +9145,38 @@ mod tests {
         assert_eq!(rows[0].approver_user_ids, vec!["bob".to_string()]);
         assert!(!rows[0].allow_self_approval);
         assert_eq!(rows[0].tool_input, serde_json::json!({"id": 1}));
+    }
+
+    /// A routed approval records whether a person's message started the
+    /// turn that asked, so the turn resumed on its decision is one too.
+    #[tokio::test]
+    async fn a_routed_approval_records_whether_a_chat_turn_asked() {
+        let deferred = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runner = runner_with_router(Arc::new(StubRouter {
+            decision: StubDecision::Routed(vec!["bob".to_string()], false),
+            deferred: Arc::clone(&deferred),
+        }));
+        route_in_scope(&runner).await;
+        CURRENT_CHAT_ORIGIN
+            .scope(true, route_in_scope(&runner))
+            .await;
+        // Carried into a spawned tool task, as the runner spawns them.
+        CURRENT_CHAT_ORIGIN
+            .scope(true, async {
+                let ctx = SessionContext::capture();
+                ctx.scope(route_in_scope(&runner)).await
+            })
+            .await;
+        // A turn that work starts says for itself.
+        CURRENT_CHAT_ORIGIN
+            .scope(
+                true,
+                CURRENT_CHAT_ORIGIN.scope(false, route_in_scope(&runner)),
+            )
+            .await;
+        let rows = deferred.lock().unwrap();
+        let chat: Vec<bool> = rows.iter().map(|r| r.chat).collect();
+        assert_eq!(chat, [false, true, true, false]);
     }
 
     #[tokio::test]

@@ -379,6 +379,7 @@ async fn run(pg: workforce_postgres::PostgresConfig) {
                 allow_self_approval: true,
                 approver_user_ids: vec![person.clone()],
                 ttl: Duration::from_secs(3600),
+                chat: false,
             },
             None,
             None,
