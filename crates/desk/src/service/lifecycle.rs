@@ -139,7 +139,8 @@ impl KeptSession {
             cwd: self.cwd.clone(),
             branch: self.branch.clone(),
             origin: Origin::Desk,
-            state: SessionState::Closed,
+            // As it was when its close ended it.
+            state: super::finish::closed(super::finish::Finish::Ended),
             approvals: self.approvals,
             cli_session_id: Some(self.cli_session_id.clone()),
             transcript: self.transcript.clone(),
