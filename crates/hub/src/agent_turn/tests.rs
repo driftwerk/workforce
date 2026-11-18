@@ -65,7 +65,7 @@ fn codex_first(config: &mut WorkforceConfig) {
 
 /// A hub with a coding worker, its Codex turns seated in workspaces of
 /// their own on this host.
-async fn codex_hub(configure: impl FnOnce(&mut WorkforceConfig)) -> Hub {
+pub(crate) async fn codex_hub(configure: impl FnOnce(&mut WorkforceConfig)) -> Hub {
     seated(
         configure,
         Some(Arc::new(Seats {
@@ -178,7 +178,7 @@ impl Hub {
 
     /// A streamed turn from `user`, fed `inject`: every event it emitted and
     /// what it returned.
-    async fn stream(
+    pub(crate) async fn stream(
         &self,
         user: &str,
         message: &str,
