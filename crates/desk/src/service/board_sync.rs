@@ -2395,6 +2395,9 @@ impl Desk {
                 let went = match crate::board_sync::call(remote, s.system, tool, args).await {
                     Ok(a) if crate::board_sync::order_moved(s.system, &a) => Ok(()),
                     Ok(_) => Err(RemoteError::Failed("No fields to update".into())),
+                    // Held for the person's approval, or out of calls: the
+                    // drop waits, as every other change here does.
+                    Err(e @ (RemoteError::Waiting { .. } | RemoteError::Spent)) => return Err(e),
                     Err(e) => Err(e),
                 };
                 match went {
@@ -2440,7 +2443,9 @@ impl Desk {
                                 .await
                                 .map_err(fail)?;
                         }
-                        Some(None) if s.order_problem.is_some() => {
+                        // Read afresh: an earlier drop in this pass may have
+                        // said one.
+                        Some(None) => {
                             self.change_sync(b.id, |s| s.order_problem = None)
                                 .await
                                 .map_err(fail)?;
