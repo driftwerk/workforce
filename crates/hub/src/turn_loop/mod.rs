@@ -6033,13 +6033,31 @@ pub(crate) async fn stream_admitted(
 
 /// The routes a turn on `spec` runs on: the spec and the agent's live
 /// failover list, as its provider chain resolves them.
+///
+/// When the call is billed to a person who chose their own route for this
+/// agent, their route comes first ([`crate::personal_route`]).
 pub(crate) async fn turn_chain(service: &AgentService, spec: &str) -> crate::agent_turn::TurnChain {
-    match &service.failover_provider {
+    let chain = match &service.failover_provider {
         Some(chain) => crate::agent_turn::TurnChain::group(
             chain.resolve_chain(Some(spec)).await,
             *service.provider_kind.read(),
         ),
         None => pinned_chain(service, spec),
+    };
+    match crate::personal_route::RouteDecider::of(service)
+        .chosen()
+        .await
+    {
+        Some(chosen) => {
+            let model = crate::personal_route::personal_model(
+                &service.tier_registry(),
+                &service.tier_key.read().clone(),
+                spec,
+            );
+            tracing::debug!(agent = %service.agent_id, person = %chosen.person, %model, fallback = chosen.route.fallback.as_str(), "turn on a person's own Claude route");
+            chain.on_personal_route(model, chosen.route.fallback)
+        }
+        None => chain,
     }
 }
 
@@ -6074,10 +6092,14 @@ pub(crate) async fn turn_has_route(service: &AgentService, model: Option<&str>) 
         || service.current_default_model.read().clone(),
         str::to_string,
     );
-    turn_chain(service, &spec).await.kinds().iter().any(|kind| {
-        kind.subscription_route()
-            .is_none_or(|route| service.logins.resolve(route.kind()).is_ok())
+    let chain = turn_chain(service, &spec).await;
+    crate::agent_turn::personal_if(chain.personal_only(), async {
+        chain.kinds().iter().any(|kind| {
+            kind.subscription_route()
+                .is_none_or(|route| service.logins.resolve(route.kind()).is_ok())
+        })
     })
+    .await
 }
 
 /// A runner for one turn on `llm`, offered `tools`.

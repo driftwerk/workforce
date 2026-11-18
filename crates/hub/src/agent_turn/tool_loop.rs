@@ -129,7 +129,11 @@ impl TurnChain {
                         outcome => return outcome,
                     }
                 }
-                TurnRoute::Cli { cli, model } => {
+                TurnRoute::Cli {
+                    cli,
+                    model,
+                    personal,
+                } => {
                     let rig = match rig_or_miss(service, route) {
                         Ok(rig) => rig,
                         Err(miss) => {
@@ -173,7 +177,9 @@ impl TurnChain {
                             cancel: request.cancel.clone().unwrap_or_default(),
                             timeout,
                         };
-                        match rig.run(service, turn, None, None).await {
+                        match super::personal_if(*personal, rig.run(service, turn, None, None))
+                            .await
+                        {
                             Ok(CliAttempt::Served(served)) => {
                                 on_usage(&served.usage, &served.model, Some(&served.served));
                                 return AdvisorLoopOutcome::Success {
@@ -188,7 +194,10 @@ impl TurnChain {
                             Ok(CliAttempt::Unserved(miss))
                                 if tries < MAX_LOGINS_PER_ROUTE
                                     && names_a_login(&miss.reason)
-                                    && service.logins.resolve(cli.login()).is_ok() =>
+                                    && super::personal_if(*personal, async {
+                                        service.logins.resolve(cli.login()).is_ok()
+                                    })
+                                    .await =>
                             {
                                 tracing::warn!(agent = %service.agent_id, route = %miss.route, reason = %miss.reason, "advisor route's login can't serve; trying the next login");
                             }

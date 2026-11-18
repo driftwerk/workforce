@@ -794,6 +794,21 @@ pub(super) async fn build_inner(
         transcriber,
     } = media;
 
+    // Tool-less calls billed to a person on their own route run on their
+    // own Claude login; everything else reaches the agent's provider.
+    let llm: Arc<dyn workforce_agent::llm::provider::LlmProvider> =
+        Arc::new(crate::personal_route::PersonalRouteLlm::new(
+            Arc::from(llm),
+            crate::personal_route::RouteDecider {
+                agent_id: agent_id.to_string(),
+                routes: subscriptions.personal_routes().clone(),
+                config: resolved.clone(),
+            },
+            providers.plans().clone(),
+            config_equivalences_cell.clone(),
+            Arc::clone(&tier_key),
+            Arc::clone(&current_default_model),
+        ));
     info!(agent = %agent_id, "Agent service ready");
     let live_turns = crate::live_turns::LiveTurns::new(agent_id.as_str());
     let service = AgentService {
@@ -802,7 +817,7 @@ pub(super) async fn build_inner(
         agent_id,
         identity: Arc::clone(&identity),
         sessions,
-        llm: Arc::from(llm),
+        llm,
         tools: tools.clone(),
         policy,
         scheduler,

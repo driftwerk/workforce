@@ -79,7 +79,13 @@ fn spec(cli: CliKind, model: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnRoute {
     Runner(Vec<String>),
-    Cli { cli: CliKind, model: String },
+    /// One CLI entry. A person's own route (`personal`) runs on their own
+    /// logins only, never one an agent or the hub shares.
+    Cli {
+        cli: CliKind,
+        model: String,
+        personal: bool,
+    },
 }
 
 impl TurnRoute {
@@ -87,7 +93,7 @@ impl TurnRoute {
     fn name(&self) -> String {
         match self {
             Self::Runner(raws) => raws.join(" → "),
-            Self::Cli { cli, model } => spec(*cli, model),
+            Self::Cli { cli, model, .. } => spec(*cli, model),
         }
     }
 
@@ -126,6 +132,14 @@ pub fn wire(
             error = %e,
             "agent turns on CLI routes not wired: the coding executor cannot be built"
         ),
+    }
+}
+
+/// `work` on the person's own logins only when `personal`.
+pub(crate) async fn personal_if<F: std::future::Future>(personal: bool, work: F) -> F::Output {
+    match personal {
+        true => crate::subscription::personal_logins_only(work).await,
+        false => work.await,
     }
 }
 
@@ -168,6 +182,7 @@ impl TurnChain {
                     routes.push(TurnRoute::Cli {
                         cli,
                         model: spec.model,
+                        personal: false,
                     });
                     route_kinds.push(vec![kind]);
                 }
@@ -225,11 +240,51 @@ impl TurnChain {
             .all(|route| matches!(route, TurnRoute::Runner(_)))
     }
 
+    /// This chain behind a person's own `claude-code` route on `model`: the
+    /// route alone when their fallback is `wait`, so a call it can't serve
+    /// stops and says why; ahead of the chain's own routes when it is
+    /// `hub`, which take the call only before the person's route has
+    /// produced anything.
+    pub fn on_personal_route(
+        self,
+        model: String,
+        fallback: workforce_common::personal_route::RouteFallback,
+    ) -> Self {
+        let kind = ProviderKind::ClaudeCode;
+        let mut chain = Self {
+            routes: vec![TurnRoute::Cli {
+                cli: CliKind::ClaudeCode,
+                model,
+                personal: true,
+            }],
+            route_kinds: vec![vec![kind]],
+            kinds: vec![kind],
+        };
+        if fallback == workforce_common::personal_route::RouteFallback::Hub {
+            chain.routes.extend(self.routes);
+            chain.route_kinds.extend(self.route_kinds);
+            for kind in self.kinds {
+                if !chain.kinds.contains(&kind) {
+                    chain.kinds.push(kind);
+                }
+            }
+        }
+        chain
+    }
+
+    /// Whether every route is a person's own, so whatever the turn draws on
+    /// must be their own logins.
+    pub fn personal_only(&self) -> bool {
+        self.routes
+            .iter()
+            .all(|route| matches!(route, TurnRoute::Cli { personal: true, .. }))
+    }
+
     /// The model a turn's attachments are prepared for: the first route's.
     /// A CLI route reads images natively.
     pub fn media_model(&self, resolved: &str) -> String {
         match self.routes.first() {
-            Some(TurnRoute::Cli { cli, model }) => spec(*cli, model),
+            Some(TurnRoute::Cli { cli, model, .. }) => spec(*cli, model),
             _ => resolved.to_string(),
         }
     }
@@ -380,12 +435,18 @@ impl TurnChain {
             let resolved = service.resolved.snapshot();
             (resolved.effort_level(), resolved.fast)
         };
+        let routes = Box::pin(self.run_routes(service, turn));
+        // A person's own route alone: what the turn finds missing or tells
+        // them to connect is their own login, never a shared one.
+        let routes: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ChainOutcome>> + Send + '_>,
+        > = match self.personal_only() {
+            true => Box::pin(crate::subscription::personal_logins_only(routes)),
+            false => routes,
+        };
         workforce_agent::llm::provider::with_effort_override(
             effort,
-            workforce_agent::llm::provider::with_fast_mode(
-                fast,
-                Box::pin(self.run_routes(service, turn)),
-            ),
+            workforce_agent::llm::provider::with_fast_mode(fast, routes),
         )
         .await
     }
@@ -507,7 +568,11 @@ impl TurnChain {
                         Err(e) => return Err(e),
                     }
                 }
-                TurnRoute::Cli { cli, model } => {
+                TurnRoute::Cli {
+                    cli,
+                    model,
+                    personal,
+                } => {
                     let rig = match rig_or_miss(service, route) {
                         Ok(rig) => rig,
                         Err(miss) => {
@@ -519,25 +584,28 @@ impl TurnChain {
                     let mut tries = 0;
                     loop {
                         tries += 1;
-                        let attempt = Box::pin(rig.run(
-                            service,
-                            CliTurn {
-                                cli: *cli,
-                                model: model.clone(),
-                                system_prompt: config.system_prompt.clone(),
-                                task: with_seeds(&task, &seeds),
-                                tools: tools.clone(),
-                                max_turns: config.max_rounds,
-                                principal: principal.to_string(),
-                                oversight,
-                                self_serve: config.self_serve,
-                                journal: config.journal.clone(),
-                                progress: progress.clone(),
-                                cancel: cancel.clone(),
-                                timeout: AGENT_TURN_TIMEOUT,
-                            },
-                            Some(&conversation),
-                            inbox.take(),
+                        let attempt = Box::pin(personal_if(
+                            *personal,
+                            rig.run(
+                                service,
+                                CliTurn {
+                                    cli: *cli,
+                                    model: model.clone(),
+                                    system_prompt: config.system_prompt.clone(),
+                                    task: with_seeds(&task, &seeds),
+                                    tools: tools.clone(),
+                                    max_turns: config.max_rounds,
+                                    principal: principal.to_string(),
+                                    oversight,
+                                    self_serve: config.self_serve,
+                                    journal: config.journal.clone(),
+                                    progress: progress.clone(),
+                                    cancel: cancel.clone(),
+                                    timeout: AGENT_TURN_TIMEOUT,
+                                },
+                                Some(&conversation),
+                                inbox.take(),
+                            ),
                         ))
                         .await?;
                         match attempt {
@@ -568,7 +636,10 @@ impl TurnChain {
                             CliAttempt::Unserved(miss)
                                 if tries < MAX_LOGINS_PER_ROUTE
                                     && names_a_login(&miss.reason)
-                                    && service.logins.resolve(cli.login()).is_ok() =>
+                                    && personal_if(*personal, async {
+                                        service.logins.resolve(cli.login()).is_ok()
+                                    })
+                                    .await =>
                             {
                                 tracing::warn!(agent = %service.agent_id, route = %miss.route, reason = %miss.reason, "turn route's login can't serve; trying the next login");
                                 inbox = match &relay {
