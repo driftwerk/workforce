@@ -90,6 +90,7 @@ fn row_to_approval(row: &Row) -> Result<PendingApproval> {
         channel_notice_ts: row.try_get("channel_notice_ts")?,
         created_at: row.try_get("created_at")?,
         expires_at: row.try_get("expires_at")?,
+        chat: row.try_get("chat")?,
     })
 }
 
@@ -109,7 +110,7 @@ fn parse_uuid(s: &str) -> Result<uuid::Uuid> {
 
 const SELECT_COLS: &str = "request_id, agent_id, session_key, workspace_id, channel_id, thread_ts,
      requester_id, tool_name, tool_input, reason, allow_self_approval, status,
-     resolved_by, channel_notice, channel_notice_ts, created_at, expires_at";
+     resolved_by, channel_notice, channel_notice_ts, created_at, expires_at, chat";
 
 impl PendingApprovalStore for PostgresPendingApprovalStore {
     fn insert_core(
@@ -130,8 +131,8 @@ impl PendingApprovalStore for PostgresPendingApprovalStore {
                 "INSERT INTO pending_approvals (
                     request_id, agent_id, session_key, workspace_id, channel_id, thread_ts,
                     requester_id, tool_name, tool_input, reason, allow_self_approval, status,
-                    created_at, expires_at
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending', $12, $13)
+                    created_at, expires_at, chat
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending', $12, $13, $14)
                  ON CONFLICT (request_id) DO NOTHING",
                 &[
                     &request_id,
@@ -147,6 +148,7 @@ impl PendingApprovalStore for PostgresPendingApprovalStore {
                     &core.allow_self_approval,
                     &Utc::now(),
                     &expires_at,
+                    &core.chat,
                 ],
             )
             .await

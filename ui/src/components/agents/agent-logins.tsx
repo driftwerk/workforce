@@ -6,6 +6,7 @@ import { InlineCode } from "@/components/ui/inline-code";
 import { Skeleton } from "@/components/ui/skeleton";
 import { LoginStatusBadge } from "@/components/subscriptions/login-status-badge";
 import { LoginConnect } from "@/components/subscriptions/login-connect";
+import { AgentRouteCard } from "@/components/subscriptions/route-cards";
 import { useAgentLogins, useMySubscriptions } from "@/hooks/use-subscriptions";
 import type {
   AgentLoginsView,
@@ -257,5 +258,10 @@ export function AgentLogins({ agentId }: { agentId: string }) {
   if (error || !data) {
     return <div className="text-sm text-destructive py-8 text-center">Failed to load logins: {apiErrorMessage(error)}</div>;
   }
-  return <LoginsView agentId={agentId} view={data} />;
+  return (
+    <div className="space-y-4">
+      <AgentRouteCard agentId={agentId} />
+      <LoginsView agentId={agentId} view={data} />
+    </div>
+  );
 }

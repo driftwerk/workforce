@@ -3279,6 +3279,8 @@ pub(crate) async fn process_turn(
             channel,
             || service.sessions.find(channel, user).ok().flatten(),
         )),
+        // This turn's own: a turn a chat turn's tools start isn't one.
+        chat: crate::serve::in_chat_turn(),
         ..SessionContext::capture()
     }
     .scope(Box::pin(process_admitted(
@@ -4689,6 +4691,8 @@ pub(crate) async fn process_message_with_progress(
     SessionContext {
         user_id: Some(principal.to_string()),
         agent_id: Some(service.agent_id.as_str().to_string()),
+        // This turn's own: a turn a chat turn's tools start isn't one.
+        chat: crate::serve::in_chat_turn(),
         ..SessionContext::capture()
     }
     .scope(Box::pin(stream_admitted(
@@ -5511,7 +5515,9 @@ pub(crate) async fn stream_admitted(
         || Some(session.clone()),
     );
     let in_flight_for_task = crate::memory_fence::TurnInFlight::begin(&service.workspace);
-    let handle = tokio::spawn(workforce_agent::runner::CURRENT_MEMORY_FENCE.scope(memory_fence_for_task, workforce_agent::runner::with_desk(desk_scope_for_task, CURRENT_BILLING_IDENTITY.scope(
+    // Whether a person's message started it, for what its runner asks.
+    let chat_for_task = workforce_agent::runner::chat_origin();
+    let handle = tokio::spawn(workforce_agent::runner::CURRENT_CHAT_ORIGIN.scope(chat_for_task, workforce_agent::runner::CURRENT_MEMORY_FENCE.scope(memory_fence_for_task, workforce_agent::runner::with_desk(desk_scope_for_task, CURRENT_BILLING_IDENTITY.scope(
         billing_identity_for_task.unwrap_or_default(),
         CURRENT_VOICE_CHANNEL.scope(
         voice_channel_for_task,
@@ -6031,7 +6037,7 @@ pub(crate) async fn stream_admitted(
     ),
     ),
     ),
-    ))));
+    )))));
 
     // Everything downstream reads the reply without voice directions; they
     // travel beside it.
@@ -6070,13 +6076,15 @@ pub(crate) async fn turn_chain(service: &AgentService, spec: &str) -> crate::age
         .await
     {
         Some(chosen) => {
+            let cli = chosen.cli;
             let model = crate::personal_route::personal_model(
                 &service.tier_registry(),
                 &service.tier_key.read().clone(),
                 spec,
+                cli,
             );
-            tracing::debug!(agent = %service.agent_id, person = %chosen.person, %model, fallback = chosen.route.fallback.as_str(), "turn on a person's own Claude route");
-            chain.on_personal_route(model, chosen.route.fallback)
+            tracing::debug!(agent = %service.agent_id, person = %chosen.person, route = chosen.route.kind.as_str(), %model, fallback = chosen.route.fallback.as_str(), "turn on a person's own route");
+            chain.on_personal_route(cli, model, chosen.route.fallback)
         }
         None => chain,
     }

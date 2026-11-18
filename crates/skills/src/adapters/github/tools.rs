@@ -15,7 +15,7 @@ use super::app_auth::AppError;
 use super::client::GithubClient;
 
 /// Wrap a JSON string field with security boundary markers if it contains content.
-fn wrap_field(value: &serde_json::Value, source: &str) -> serde_json::Value {
+pub(super) fn wrap_field(value: &serde_json::Value, source: &str) -> serde_json::Value {
     match value.as_str() {
         Some(s) if !s.is_empty() => {
             serde_json::Value::String(wrap_external_content(s, source).wrapped_content)
@@ -25,7 +25,7 @@ fn wrap_field(value: &serde_json::Value, source: &str) -> serde_json::Value {
 }
 
 /// Resolve the owner: use the explicit param, fall back to default_owner, or error.
-fn resolve_owner(
+pub(super) fn resolve_owner(
     input: &serde_json::Value,
     default_owner: &Option<String>,
 ) -> std::result::Result<String, String> {
@@ -39,7 +39,10 @@ fn resolve_owner(
 /// The owner a call naming none goes to: for a set read per caller, the
 /// caller's own default workspace (a named workspace is its owner), else
 /// the shared `fixed` owner; never the loader's.
-fn caller_owner(clients: &LiveInstances<GithubClient>, fixed: &Option<String>) -> Option<String> {
+pub(super) fn caller_owner(
+    clients: &LiveInstances<GithubClient>,
+    fixed: &Option<String>,
+) -> Option<String> {
     if !clients.is_live() {
         return fixed.clone();
     }
@@ -54,7 +57,7 @@ fn caller_owner(clients: &LiveInstances<GithubClient>, fixed: &Option<String>) -
 /// Resolve the GitHub client for a given input: an explicit `workspace`,
 /// else an `owner` that is a workspace's name, else for a repository the
 /// connection whose key reaches it ([`reaching`]), else the default.
-async fn resolve_client(
+pub(super) async fn resolve_client(
     instances: &LiveInstances<GithubClient>,
     default_workspace: &str,
     input: &serde_json::Value,
@@ -133,7 +136,10 @@ async fn reaching(
 }
 
 /// Build a dynamic description for the `owner` parameter that includes available org names.
-fn owner_description(instances: &LiveInstances<GithubClient>, default_workspace: &str) -> String {
+pub(super) fn owner_description(
+    instances: &LiveInstances<GithubClient>,
+    default_workspace: &str,
+) -> String {
     // A set read per caller names no instance: a schema is built once
     // and shown to everyone.
     if instances.is_live() {
@@ -2430,6 +2436,7 @@ impl Tool for GithubIssueUpdateTool {
                 "repo": { "type": "string", "description": "Repository name" },
                 "number": { "type": "integer", "description": "Issue number (integer, required — NOT a string)" },
                 "state": { "type": "string", "enum": ["open", "closed"], "description": "Issue state" },
+                "state_reason": { "type": "string", "enum": ["completed", "not_planned", "reopened"], "description": "Why the state changes; sent with state" },
                 "title": { "type": "string", "description": "New title" },
                 "body": { "type": "string", "description": "New body text" },
                 "labels": { "type": "array", "items": { "type": "string" }, "description": "Labels to set (replaces existing)" },
@@ -2477,6 +2484,15 @@ impl Tool for GithubIssueUpdateTool {
         if let Some(state) = input["state"].as_str() {
             payload.insert("state".to_string(), serde_json::json!(state));
         }
+        if let Some(reason) = input["state_reason"].as_str() {
+            if !["completed", "not_planned", "reopened"].contains(&reason) {
+                return Ok(ToolResult::failure(
+                    "state_reason must be completed, not_planned or reopened",
+                    start.elapsed().as_millis() as u64,
+                ));
+            }
+            payload.insert("state_reason".to_string(), serde_json::json!(reason));
+        }
         if let Some(title) = input["title"].as_str() {
             payload.insert("title".to_string(), serde_json::json!(title));
         }
@@ -2492,7 +2508,7 @@ impl Tool for GithubIssueUpdateTool {
 
         if payload.is_empty() {
             return Ok(ToolResult::failure(
-                "No fields to update. Provide at least one of: state, title, body, labels, assignees",
+                "No fields to update. Provide at least one of: state, state_reason, title, body, labels, assignees",
                 start.elapsed().as_millis() as u64,
             ));
         }

@@ -614,6 +614,7 @@ mod tests {
             channel_notice_ts: None,
             created_at: now,
             expires_at: now,
+            chat: false,
         };
 
         let card = reconstructed_prompt(&service, &row).to_string();
@@ -699,6 +700,7 @@ mod tests {
             allow_self_approval: true,
             approver_user_ids: vec![person.clone()],
             ttl: std::time::Duration::from_secs(3600),
+            chat: false,
         };
         store
             .insert_core(
@@ -805,6 +807,7 @@ mod tests {
             allow_self_approval: false,
             approver_user_ids: vec!["bob".to_string()],
             ttl: std::time::Duration::from_secs(3600),
+            chat: false,
         };
         store
             .insert_core(

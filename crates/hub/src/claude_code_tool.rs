@@ -133,7 +133,13 @@ impl Tool for ClaudeCodeTool {
         }
 
         let agent_id = self.service.agent_id.as_str();
-        let login = match self.service.logins.resolve(SubscriptionKind::Claude) {
+        // Its payer's own login only when their own route says so: the
+        // call came back through the gated MCP, outside the turn's scope.
+        let login = match crate::personal_route::own_logins_if_routed(&self.service, async {
+            self.service.logins.resolve(SubscriptionKind::Claude)
+        })
+        .await
+        {
             Ok(login) => login,
             Err(no_login) => {
                 return Ok(ToolResult::failure(

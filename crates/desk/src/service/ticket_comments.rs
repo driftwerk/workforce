@@ -52,7 +52,12 @@ impl Desk {
     /// more than [`FRESH`] ago, or the issue changed since.
     pub async fn comments_stale(&self, id: Uuid) -> Result<bool, DeskError> {
         let t = self.ticket_of(id).await?;
-        let Some(e) = t.external.as_ref().filter(|e| e.synced) else {
+        // A GitHub issue's comments stay there: its view shows Desk's own.
+        let Some(e) = t
+            .external
+            .as_ref()
+            .filter(|e| e.synced && e.system != crate::board::System::Github)
+        else {
             return Ok(false);
         };
         Ok(match e.details.comments_at {
@@ -69,7 +74,11 @@ impl Desk {
     ) -> Result<Vec<Comment>, RemoteError> {
         let fail = |e: DeskError| RemoteError::Failed(e.to_string());
         let t = self.ticket_of(id).await.map_err(fail)?;
-        let Some(e) = t.external.clone().filter(|e| e.synced) else {
+        let Some(e) = t
+            .external
+            .clone()
+            .filter(|e| e.synced && e.system != crate::board::System::Github)
+        else {
             return self.ticket_comments(id).await.map_err(fail);
         };
         // Before the call: a comment Desk posts from here on may postdate
@@ -79,7 +88,7 @@ impl Desk {
             crate::board::System::Jira => {
                 comments::jira_comments(&comments::jira_pages(&jira_pages(remote, &e.key).await?))
             }
-            crate::board::System::Linear => {
+            crate::board::System::Linear | crate::board::System::Github => {
                 let (tool, args) = comments::list_call(e.system, &e.key);
                 let answer = crate::board_sync::call(remote, e.system, tool, args).await?;
                 comments::linear_comments(&answer)
@@ -135,7 +144,12 @@ impl Desk {
     ) -> Result<(), RemoteError> {
         let fail = |e: DeskError| RemoteError::Failed(e.to_string());
         let t = self.ticket_of(id).await.map_err(fail)?;
-        let Some(e) = t.external.clone().filter(|e| e.synced) else {
+        // GitHub's issue history isn't read: its view shows Desk's own.
+        let Some(e) = t
+            .external
+            .clone()
+            .filter(|e| e.synced && e.system != crate::board::System::Github)
+        else {
             return Ok(());
         };
         let now = crate::crew::now();
@@ -154,7 +168,9 @@ impl Desk {
         let answer = crate::board_sync::call_quiet(remote, e.system, tool, args).await?;
         let events = match e.system {
             crate::board::System::Jira => history::jira_history(&answer, writer.as_deref()),
-            crate::board::System::Linear => history::linear_history(&answer, writer.as_deref()),
+            crate::board::System::Linear | crate::board::System::Github => {
+                history::linear_history(&answer, writer.as_deref())
+            }
         };
         if let Some(events) = events {
             self.0

@@ -65,7 +65,7 @@ fn codex_first(config: &mut WorkforceConfig) {
 
 /// A hub with a coding worker, its Codex turns seated in workspaces of
 /// their own on this host.
-async fn codex_hub(configure: impl FnOnce(&mut WorkforceConfig)) -> Hub {
+pub(crate) async fn codex_hub(configure: impl FnOnce(&mut WorkforceConfig)) -> Hub {
     seated(
         configure,
         Some(Arc::new(Seats {
@@ -178,7 +178,7 @@ impl Hub {
 
     /// A streamed turn from `user`, fed `inject`: every event it emitted and
     /// what it returned.
-    async fn stream(
+    pub(crate) async fn stream(
         &self,
         user: &str,
         message: &str,
@@ -1443,6 +1443,60 @@ async fn claude_effort_none_asks_the_least() {
     medium.claude_login(ALICE);
     medium.ask(ALICE, "hello").await.unwrap();
     assert_eq!(medium.claude.calls()[0].flag("--effort"), Some("medium"));
+}
+
+/// `hub` with its live `[llm.model_preferences]` set to `prefs`, as a
+/// config edit would leave them.
+fn set_model_preferences(hub: &Hub, prefs: &[(&str, &str)]) {
+    let mut resolved = (*hub.service.resolved.snapshot()).clone();
+    resolved.model_preferences = Some(
+        prefs
+            .iter()
+            .map(|(task, model)| (task.to_string(), model.to_string()))
+            .collect(),
+    );
+    hub.service.resolved.store(resolved);
+}
+
+/// A turn a person's message started runs `[llm.model_preferences]
+/// conversation` all the way to the engine, on both turn paths, though its
+/// words read as research; a turn nobody's message started (a scheduled
+/// job's, a monitor's) runs as its words are read, as before.
+#[tokio::test]
+async fn a_persons_turn_reaches_the_engine_on_the_conversation_model() {
+    let hub = hub(claude_first).await;
+    hub.claude_login(ALICE);
+    set_model_preferences(&hub, &[("conversation", "claude-code:haiku")]);
+    let message = "explain what changed overnight";
+    assert_eq!(crate::serve::infer_task_type(message, &[]), "research");
+
+    crate::serve::chat_turn(hub.ask(ALICE, message))
+        .await
+        .unwrap();
+    assert_eq!(hub.claude.calls()[0].flag("--model"), Some("haiku"));
+
+    let (_, streamed) = crate::serve::chat_turn(hub.stream(ALICE, message, None, None)).await;
+    assert_eq!(streamed.unwrap().model, "claude-code:haiku");
+    assert_eq!(hub.claude.calls()[1].flag("--model"), Some("haiku"));
+
+    // Not a chat turn: no research model is set, so the agent's default.
+    hub.ask(ALICE, message).await.unwrap();
+    assert_eq!(hub.claude.calls()[2].flag("--model"), Some("sonnet"));
+    let (_, background) = hub.stream(ALICE, message, None, None).await;
+    assert_eq!(background.unwrap().model, "claude-code:sonnet");
+
+    // Work given a model of its own keeps it, in a chat turn too.
+    set_model_preferences(
+        &hub,
+        &[
+            ("conversation", "claude-code:haiku"),
+            ("research", "claude-code:opus"),
+        ],
+    );
+    crate::serve::chat_turn(hub.ask(ALICE, message))
+        .await
+        .unwrap();
+    assert_eq!(hub.claude.calls()[4].flag("--model"), Some("opus"));
 }
 
 /// `hub` with its live `[llm] effort` set to `effort`, as a config edit

@@ -6043,6 +6043,78 @@ async fn a_check_made_in_desk_checks_in_there_and_stays_its_creators_when_moved(
     );
 }
 
+/// The turn resumed on a decision a person's chat turn asked for runs the
+/// conversation model, as the turn that asked did; one a scheduled job asked
+/// for runs as its words are read, as before.
+#[tokio::test]
+async fn an_approval_resumes_on_the_model_of_the_turn_that_asked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, server) = service_on_mock_llm(tmp.path()).await;
+    let mut resolved = (*service.resolved.snapshot()).clone();
+    resolved.model_preferences = Some(
+        [("conversation".to_string(), "conv-model".to_string())]
+            .into_iter()
+            .collect(),
+    );
+    service.resolved.store(resolved);
+    let agent = service.agent_id.to_string();
+    let registry = Arc::new(crate::agent_registry::AgentRegistry::from_parts(
+        [(agent.clone(), Arc::clone(&service))]
+            .into_iter()
+            .collect(),
+        agent.clone(),
+    ));
+    // `report.publish` reads as data analysis, which has no model set.
+    let row = |id: &str, chat: bool| crate::approvals::PendingApproval {
+        request_id: id.into(),
+        agent_id: agent.clone(),
+        session_key: format!("web:{id}"),
+        workspace_id: None,
+        channel_id: None,
+        thread_ts: None,
+        requester_id: BOB.into(),
+        tool_name: "report.publish".into(),
+        tool_input: serde_json::json!({}),
+        reason: "Publishes".into(),
+        allow_self_approval: true,
+        status: "denied".into(),
+        resolved_by: Some(BOB.into()),
+        channel_notice: None,
+        channel_notice_ts: None,
+        created_at: Utc::now(),
+        expires_at: Utc::now(),
+        chat,
+    };
+    let models = || async {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/v1/chat/completions")
+            .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+            .filter_map(|b| b["model"].as_str().map(str::to_string))
+            .collect::<Vec<_>>()
+    };
+    for (id, chat, model) in [("r-chat", true, "conv-model"), ("r-job", false, "mock")] {
+        let before = models().await.len();
+        crate::approvals::resume::launch_resume(
+            &registry,
+            &row(id, chat),
+            crate::approvals::ApprovalOutcome::Denied,
+            "you",
+        )
+        .await;
+        let seen = models().await;
+        assert!(seen.len() > before, "{id} ran a turn");
+        let turn = &seen[before..];
+        assert!(turn.iter().any(|m| m == model), "{id}: {turn:?}");
+        if !chat {
+            assert!(!turn.iter().any(|m| m == "conv-model"), "{id}: {turn:?}");
+        }
+    }
+}
+
 /// An approval decided after its turn ended resumes answering to the Desk
 /// conversation it was asked in: the answer is saved there as resumed, and
 /// the person's Desk is told of it.
@@ -6078,6 +6150,7 @@ async fn an_approval_decided_later_resumes_in_its_desk_conversation() {
         channel_notice_ts: None,
         created_at: Utc::now(),
         expires_at: Utc::now(),
+        chat: false,
     };
     let registry = Arc::new(crate::agent_registry::AgentRegistry::from_parts(
         [(agent.clone(), Arc::clone(&service))]

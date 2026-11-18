@@ -177,10 +177,7 @@ impl AgentLogins {
     /// allows, skipping logins at their usage limit or refused for good.
     pub fn resolve(&self, kind: SubscriptionKind) -> Result<Login, NoLogin> {
         let payer = crate::user_config::current_payer();
-        let mut policy = self.config.snapshot().logins.clone();
-        if is_personal_only() {
-            policy.tiers.retain(|tier| !tier.is_shared());
-        }
+        let policy = self.policy();
         let login = resolve(
             kind,
             &self.vaults(),
@@ -260,9 +257,19 @@ impl AgentLogins {
             &self.vaults(),
             &crate::user_config::current_payer(),
             &self.owner(),
-            &self.config.snapshot().logins,
+            &self.policy(),
             accepts,
         )
+    }
+
+    /// The agent's `[llm.logins]` as it stands for a call made now: only
+    /// the person's own tiers inside [`personal_logins_only`].
+    fn policy(&self) -> workforce_common::settings::LoginPolicy {
+        let mut policy = self.config.snapshot().logins.clone();
+        if is_personal_only() {
+            policy.tiers.retain(|tier| !tier.is_shared());
+        }
+        policy
     }
 }
 
