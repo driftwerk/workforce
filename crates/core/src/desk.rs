@@ -1013,6 +1013,13 @@ pub const BOARD_SYNC_LINEAR_TOOLS: &[&str] = &[
     "linear.teams_list",
 ];
 
+/// How a board there orders its issues: a Jira project's board's filter's
+/// `ORDER BY` (`jira.board_order`), a Linear view's ordering
+/// (`linear.view_ordering`). Read-only, called when the hub offers them and
+/// never needed: a hub without them sorts the board by Rank or Linear's
+/// manual order, as before.
+pub const BOARD_SYNC_ORDER_TOOLS: &[&str] = &["jira.board_order", "linear.view_ordering"];
+
 /// Which of the person's Jira sites or Linear workspaces there are, by
 /// name (never a key), and the one a call naming none goes to: what the
 /// link dialog asks first, so a person with several picks one, which the
