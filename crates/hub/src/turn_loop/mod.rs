@@ -3041,6 +3041,15 @@ pub(crate) fn spawn_turn_extraction(
     });
 }
 
+/// Who a slash command runs as: the turn's principal, billed where the
+/// turn is.
+fn command_principal(principal: &str) -> workforce_common::session::TurnPrincipal {
+    workforce_common::session::TurnPrincipal {
+        run_as: Some(principal.to_string()),
+        bill_to: crate::user_config::explicit_billing_identity(),
+    }
+}
+
 /// One admission for a prospective LLM turn: nothing runs as a suspended
 /// identity, then the budget. `identity` must be the same principal the
 /// runner will scope `CURRENT_USER_ID` to, so the scope that is checked is
@@ -3239,7 +3248,13 @@ pub(crate) async fn process_turn(
     }
     let with_files = attachments.as_ref().is_some_and(|files| !files.is_empty());
     if let Some(cmd) = crate::commands::command_of(message, with_files) {
-        let result = crate::commands::execute_command(&cmd, service, channel, user).await;
+        // As the person, so a command's own model call (`/compact`'s
+        // summary) runs on their route and is billed to them.
+        let result = crate::user_config::as_principal(
+            &command_principal(principal),
+            crate::commands::execute_command(&cmd, service, channel, user),
+        )
+        .await;
         return Ok(TurnOutcome::Answered(result.text));
     }
 
@@ -4594,9 +4609,13 @@ pub(crate) async fn process_message_with_progress(
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("{}:{}", channel, user));
 
+        let as_them = command_principal(principal);
         let handle = tokio::spawn(async move {
-            let result =
-                crate::commands::execute_command(&cmd, &service, &channel_owned, &user_owned).await;
+            let result = crate::user_config::as_principal(
+                &as_them,
+                crate::commands::execute_command(&cmd, &service, &channel_owned, &user_owned),
+            )
+            .await;
             let _ = progress_tx
                 .send(ProgressEvent::Response {
                     text: result.text.clone(),
