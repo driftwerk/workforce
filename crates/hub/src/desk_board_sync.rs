@@ -2316,7 +2316,7 @@ async fn github_matches(
                 args["after"] = json!(p);
             }
             let a = sync::call(remote, System::Github, "github.project_items", args).await?;
-            let (items, next) = gh::lean_items(&a);
+            let (items, next, _) = gh::lean_items(&a);
             Ok((items.len(), next))
         }
         Some(Target::Repo { owner, repo }) => {

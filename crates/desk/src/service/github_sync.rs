@@ -72,7 +72,8 @@ impl Desk {
             let answer =
                 crate::board_sync::call(remote, System::Github, "github.project_items", args)
                     .await?;
-            let (items, next) = gh::lean_items(&answer);
+            let (items, next, lossy) = gh::lean_items(&answer);
+            out.lossy |= lossy;
             lean.extend(items);
             match next {
                 Some(next) if page.as_deref() == Some(next.as_str()) => {
@@ -95,6 +96,9 @@ impl Desk {
         let cursor = since
             .and_then(|c| chrono::DateTime::parse_from_rfc3339(c).ok())
             .map(|c| c.with_timezone(&chrono::Utc));
+        // Read in the project's order, not oldest change first: the cursor
+        // goes by the latest change seen, less the look-back.
+        out.ordered = false;
         let mut changed: Vec<(usize, &gh::Lean)> = vec![];
         for (n, i) in lean.iter().enumerate() {
             if cursor.is_some_and(|c| i.updated_at < c) {
@@ -314,9 +318,9 @@ impl Desk {
         e: &board::External,
         column: TicketState,
     ) -> Result<(), RemoteError> {
-        let Some(to) = s.states.get(&column) else {
-            return Ok(());
-        };
+        // Done and Dropped close it there even when no column of its maps
+        // to them.
+        let to = s.states.get(&column);
         let from = e.seen.state.and_then(|st| s.states.get(&st));
         let was_closed = matches!(e.seen.state, Some(TicketState::Done | TicketState::Dropped));
         for (tool, args) in gh::move_calls(
@@ -324,7 +328,7 @@ impl Desk {
             &e.key,
             e.id.as_deref(),
             column,
-            to,
+            to.map(String::as_str),
             from.map(String::as_str),
             was_closed,
         ) {

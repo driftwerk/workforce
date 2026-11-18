@@ -3169,6 +3169,10 @@ async fn a_held_linear_sort_order_waits_and_its_link_goes_once() {
 struct FakeGithub {
     /// Key (`acme/web#N`), item id, Status, updated.
     items: Mutex<Vec<(String, String, String, String)>>,
+    /// Items listed raw after these (one the key can't see, say).
+    extra: Mutex<Vec<Value>>,
+    /// Issues gone from the repository, not only from the project.
+    deleted: Mutex<Vec<String>>,
     calls: Mutex<Vec<(String, Value)>>,
 }
 
@@ -3188,6 +3192,8 @@ impl FakeGithub {
                     })
                     .collect(),
             ),
+            extra: Mutex::new(vec![]),
+            deleted: Mutex::new(vec![]),
             calls: Mutex::new(vec![]),
         }
     }
@@ -3239,11 +3245,36 @@ impl Remote for FakeGithub {
                 Some(ids) => Ok(json!({ "items": items.iter()
                     .filter(|i| ids.iter().any(|id| id == &json!(i.1)))
                     .map(|i| self.item(i, true)).collect::<Vec<_>>() })),
-                None => Ok(json!({
-                    "items": items.iter().map(|i| self.item(i, false)).collect::<Vec<_>>(),
-                    "page_info": { "has_next_page": false, "end_cursor": null },
-                })),
+                None => {
+                    let mut listed: Vec<Value> =
+                        items.iter().map(|i| self.item(i, false)).collect();
+                    listed.extend(self.extra.lock().unwrap().iter().cloned());
+                    Ok(json!({
+                        "items": listed,
+                        "page_info": { "has_next_page": false, "end_cursor": null },
+                    }))
+                }
             },
+            // One issue read by its number, as the repository has it: off
+            // the project or not, it is there until deleted.
+            "github.issues_changed" => {
+                let key = format!(
+                    "{}/{}#{}",
+                    args["owner"].as_str().unwrap_or_default(),
+                    args["repo"].as_str().unwrap_or_default(),
+                    args["number"]
+                );
+                if self.deleted.lock().unwrap().contains(&key) {
+                    return Ok(json!({ "issues": [] }));
+                }
+                let (repo, n) = key.split_once('#').unwrap();
+                Ok(json!({ "issues": [{
+                    "repo": repo, "number": n.parse::<u64>().unwrap(),
+                    "title": format!("Issue {key}"), "body": "About it.", "state": "OPEN",
+                    "labels": [], "assignees": [], "updated_at": "2026-11-18T10:00:00Z",
+                    "url": format!("https://github.com/{repo}/issues/{n}"),
+                }] }))
+            }
             "github.project_item_status" | "github.issue_update" | "github.issue_comment" => {
                 Ok(json!({ "ok": true }))
             }
@@ -3418,6 +3449,9 @@ async fn a_github_sweep_shelves_only_what_left_the_project() {
         assert_eq!(pulled.detached, 1, "{pulled:?}");
         let t = ticket_of(&d, &b, "acme/web#2").await.ticket;
         assert!(!t.external.unwrap().synced);
+        // Its issue was read before it was shelved: still there, only off
+        // the project.
+        assert_eq!(gh.called("github.issues_changed").len(), 1);
         assert!(
             ticket_of(&d, &b, "acme/web#1")
                 .await
@@ -3426,6 +3460,69 @@ async fn a_github_sweep_shelves_only_what_left_the_project() {
                 .unwrap()
                 .synced
         );
+    })
+    .await;
+}
+
+/// A listing that can't say what isn't on the project (an item the key
+/// can't see, or no items at all) shelves nothing.
+#[tokio::test]
+async fn a_github_sweep_on_a_listing_it_cant_trust_shelves_nothing() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = github_board(&d).await;
+        let gh = FakeGithub::new(&[
+            ("acme/web#1", "PVTI_1", "Todo"),
+            ("acme/web#2", "PVTI_2", "Todo"),
+        ]);
+        d.pull_board(b.id, &gh).await.unwrap();
+        // The key lost the repository: its items show as redacted.
+        gh.items.lock().unwrap().remove(1);
+        gh.extra.lock().unwrap().push(json!({
+            "item_id": "PVTI_2", "type": "REDACTED", "updated_at": "2026-11-18T10:00:00Z"
+        }));
+        d.change_sync(b.id, |s| s.swept_at = None).await.unwrap();
+        let pulled = d.pull_board(b.id, &gh).await.unwrap();
+        assert_eq!(pulled.detached, 0, "{pulled:?}");
+        assert_eq!(pulled.dropped, 0, "{pulled:?}");
+        // Nothing listed at all: asked again later, not every card shelved.
+        gh.items.lock().unwrap().clear();
+        gh.extra.lock().unwrap().clear();
+        d.change_sync(b.id, |s| s.swept_at = None).await.unwrap();
+        let pulled = d.pull_board(b.id, &gh).await.unwrap();
+        assert_eq!(pulled.detached, 0, "{pulled:?}");
+        for key in ["acme/web#1", "acme/web#2"] {
+            assert!(ticket_of(&d, &b, key).await.ticket.external.unwrap().synced);
+        }
+    })
+    .await;
+}
+
+/// Dropped closes the issue as not planned even with no column mapped to
+/// it, closed before its Status is set.
+#[tokio::test]
+async fn a_github_drop_to_dropped_closes_it_not_planned() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = github_board(&d).await;
+        let gh = FakeGithub::new(&[("acme/web#1", "PVTI_1", "Todo")]);
+        d.pull_board(b.id, &gh).await.unwrap();
+        let one = id_of(&d, &b, "acme/web#1").await;
+        let mv = crate::service::Move {
+            state: TicketState::Dropped,
+            before: None,
+            after: None,
+        };
+        d.move_ticket(one, mv, &By::you()).await.unwrap();
+        due_now(&d, b.id).await;
+        d.push_board(b.id, &gh).await.unwrap();
+        let closed = gh.called("github.issue_update");
+        assert_eq!(closed.len(), 1, "{:?}", gh.calls.lock().unwrap());
+        assert_eq!(closed[0]["state"], "closed");
+        assert_eq!(closed[0]["state_reason"], "not_planned");
+        assert!(gh.called("github.project_item_status").is_empty());
     })
     .await;
 }

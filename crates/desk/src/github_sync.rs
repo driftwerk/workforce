@@ -167,6 +167,11 @@ fn quoted(v: &str) -> String {
 /// `me` is the person's login.
 pub fn project_query(f: &Filter, me: Option<&str>) -> Option<String> {
     match f {
+        // What is closed comes on only with the recently done: without it
+        // the listing is the open items, however many were ever closed.
+        Filter::All {
+            include_done: false,
+        } => Some("is:open".into()),
         Filter::All { .. } | Filter::CurrentCycle => None,
         Filter::AssignedToMe => me.filter(|m| login_ok(m)).map(|m| format!("assignee:{m}")),
         Filter::Label(l) => Some(format!("label:{}", quoted(l))),
@@ -225,28 +230,48 @@ pub struct Lean {
 
 /// A `github.project_items` page: its issues' items, in the project's
 /// order, and the page after it.
-pub fn lean_items(answer: &Value) -> (Vec<Lean>, Option<String>) {
+pub fn lean_items(answer: &Value) -> (Vec<Lean>, Option<String>, bool) {
+    let mut lossy = false;
     let items = answer["items"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|i| i["type"].as_str() == Some("ISSUE"))
         .filter_map(|i| {
-            Some(Lean {
-                item_id: id_of(&i["item_id"])?,
-                key: key_of(i["repo"].as_str()?, i["number"].as_u64()?)?,
-                updated_at: remote_time(&i["updated_at"])?,
-            })
+            match i["type"].as_str() {
+                Some("ISSUE") => {}
+                // An item the key can't see (a repository it lost) is still
+                // on the project: the listing can't say what left it.
+                Some("REDACTED") | None => {
+                    lossy = true;
+                    return None;
+                }
+                // Pull requests and drafts aren't a board's tickets.
+                Some(_) => return None,
+            }
+            let lean = (|| {
+                Some(Lean {
+                    item_id: id_of(&i["item_id"])?,
+                    key: key_of(i["repo"].as_str()?, i["number"].as_u64()?)?,
+                    updated_at: remote_time(&i["updated_at"])?,
+                })
+            })();
+            lossy |= lean.is_none();
+            lean
         })
         .collect();
     let next = match answer["page_info"]["has_next_page"].as_bool() {
-        Some(true) => answer["page_info"]["end_cursor"]
-            .as_str()
-            .filter(|c| !c.is_empty())
-            .map(str::to_string),
+        Some(true) => {
+            let next = answer["page_info"]["end_cursor"]
+                .as_str()
+                .filter(|c| !c.is_empty())
+                .map(str::to_string);
+            // More to come, but no way on to it: not the whole listing.
+            lossy |= next.is_none();
+            next
+        }
         _ => None,
     };
-    (items, next)
+    (items, next, lossy)
 }
 
 /// A node id as GitHub gives one: short, printable, no spaces.
@@ -470,7 +495,7 @@ pub fn move_calls(
     key: &str,
     item: Option<&str>,
     column: TicketState,
-    to: &str,
+    to: Option<&str>,
     from: Option<&str>,
     was_closed: bool,
 ) -> Vec<(&'static str, Value)> {
@@ -480,6 +505,28 @@ pub fn move_calls(
     let issue = json!({ "owner": owner, "repo": repo, "number": number });
     let mut calls = vec![];
     let project = target_of(&s.target).is_some_and(|t| t.is_project());
+    // Closed or reopened first: GitHub's own project workflows set Status
+    // on a close or a reopen, and the column's own Status, after, wins.
+    let closes = matches!(column, TicketState::Done | TicketState::Dropped)
+        || (!project && to.is_some_and(|t| t.eq_ignore_ascii_case("closed")));
+    if closes {
+        let mut args = issue.clone();
+        args["state"] = json!("closed");
+        args["state_reason"] = json!(match column {
+            TicketState::Dropped => "not_planned",
+            _ => "completed",
+        });
+        calls.push(("github.issue_update", args));
+    } else if was_closed {
+        let mut args = issue.clone();
+        args["state"] = json!("open");
+        args["state_reason"] = json!("reopened");
+        calls.push(("github.issue_update", args));
+    }
+    // A column mapped to nothing there only closes or reopens.
+    let Some(to) = to else {
+        return calls;
+    };
     if project {
         if let (Some(project_id), Some(item)) = (s.target_id.as_deref(), item) {
             calls.push((
@@ -500,22 +547,6 @@ pub fn move_calls(
             args["remove"] = json!(remove);
             calls.push(("github.issue_labels", args));
         }
-    }
-    let closes = matches!(column, TicketState::Done | TicketState::Dropped)
-        || (!project && to.eq_ignore_ascii_case("closed"));
-    if closes {
-        let mut args = issue;
-        args["state"] = json!("closed");
-        args["state_reason"] = json!(match column {
-            TicketState::Dropped => "not_planned",
-            _ => "completed",
-        });
-        calls.push(("github.issue_update", args));
-    } else if was_closed {
-        let mut args = issue;
-        args["state"] = json!("open");
-        args["state_reason"] = json!("reopened");
-        calls.push(("github.issue_update", args));
     }
     calls
 }

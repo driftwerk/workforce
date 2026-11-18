@@ -101,14 +101,31 @@ fn a_lean_listing_keeps_only_issues_in_order() {
         ],
         "page_info": {"has_next_page": true, "end_cursor": "Y3Vy"}
     });
-    let (items, next) = lean_items(&answer);
+    let (items, next, lossy) = lean_items(&answer);
     let keys: Vec<&str> = items.iter().map(|i| i.key.as_str()).collect();
     assert_eq!(keys, ["acme/web#3", "acme/api#1"]);
     assert_eq!(items[0].item_id, "PVTI_1");
     assert_eq!(next.as_deref(), Some("Y3Vy"));
-    let (_, last) =
+    // An item the key can't see: the listing can't say what left.
+    assert!(lossy);
+    let (_, last, lossy) =
         lean_items(&json!({"items": [], "page_info": {"has_next_page": false, "end_cursor": "x"}}));
     assert_eq!(last, None);
+    assert!(!lossy);
+    // Pull requests and drafts are passed over, and say nothing is missing.
+    let (_, _, lossy) = lean_items(&json!({"items": [
+        {"item_id": "PVTI_2", "type": "PULL_REQUEST", "updated_at": "2026-11-18T10:00:00Z", "repo": "acme/web", "number": 4}
+    ], "page_info": {"has_next_page": false}}));
+    assert!(!lossy);
+    // More said to come with no way on to it, or an issue that won't read.
+    let (_, next, lossy) =
+        lean_items(&json!({"items": [], "page_info": {"has_next_page": true, "end_cursor": ""}}));
+    assert_eq!(next, None);
+    assert!(lossy);
+    let (_, _, lossy) = lean_items(&json!({"items": [
+        {"item_id": "PVTI 1", "type": "ISSUE", "updated_at": "2026-11-18T10:00:00Z", "repo": "acme/web", "number": 3}
+    ], "page_info": {"has_next_page": false}}));
+    assert!(lossy);
 }
 
 #[test]
@@ -220,7 +237,12 @@ fn filters_become_a_project_query_or_repo_arguments() {
                 include_done: false
             },
             None
-        ),
+        )
+        .as_deref(),
+        Some("is:open")
+    );
+    assert_eq!(
+        project_query(&Filter::All { include_done: true }, None),
         None
     );
     assert_eq!(
@@ -296,7 +318,7 @@ fn a_project_move_sets_status_and_closes_at_done() {
         "acme/web#12",
         Some("PVTI_1"),
         TicketState::Doing,
-        "In Progress",
+        Some("In Progress"),
         Some("Todo"),
         false,
     );
@@ -309,23 +331,40 @@ fn a_project_move_sets_status_and_closes_at_done() {
         "acme/web#12",
         Some("PVTI_1"),
         TicketState::Dropped,
-        "Done",
+        Some("Done"),
         None,
         false,
     );
-    assert_eq!(done[1].0, "github.issue_update");
-    assert_eq!(done[1].1["state"], "closed");
-    assert_eq!(done[1].1["state_reason"], "not_planned");
+    // Closed first, so GitHub's own "closed: Done" workflow doesn't have
+    // the last word on Status.
+    assert_eq!(done[0].0, "github.issue_update");
+    assert_eq!(done[0].1["state"], "closed");
+    assert_eq!(done[0].1["state_reason"], "not_planned");
+    assert_eq!(done[1].0, "github.project_item_status");
+    // Dropped with no column of its mapped there still closes it.
+    let unmapped = move_calls(
+        &s,
+        "acme/web#12",
+        Some("PVTI_1"),
+        TicketState::Dropped,
+        None,
+        Some("Todo"),
+        false,
+    );
+    assert_eq!(unmapped.len(), 1);
+    assert_eq!(unmapped[0].0, "github.issue_update");
+    assert_eq!(unmapped[0].1["state_reason"], "not_planned");
     let back = move_calls(
         &s,
         "acme/web#12",
         Some("PVTI_1"),
         TicketState::Todo,
-        "Todo",
+        Some("Todo"),
         Some("Done"),
         true,
     );
-    assert_eq!(back[1].1["state"], "open");
+    assert_eq!(back[0].1["state"], "open");
+    assert_eq!(back[1].0, "github.project_item_status");
 }
 
 #[test]
@@ -336,7 +375,7 @@ fn a_label_column_adds_and_removes_never_replaces() {
         "acme/web#12",
         None,
         TicketState::Review,
-        "label:review",
+        Some("label:review"),
         Some("label:doing"),
         false,
     );
@@ -350,12 +389,12 @@ fn a_label_column_adds_and_removes_never_replaces() {
         "acme/web#12",
         None,
         TicketState::Done,
-        "Closed",
+        Some("Closed"),
         Some("label:review"),
         false,
     );
-    assert_eq!(closed[0].1["remove"], json!(["review"]));
-    assert_eq!(closed[1].1["state"], "closed");
+    assert_eq!(closed[0].1["state"], "closed");
+    assert_eq!(closed[1].1["remove"], json!(["review"]));
 }
 
 #[test]

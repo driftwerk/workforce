@@ -918,6 +918,8 @@ pub async fn identify(remote: &dyn Remote, system: System) -> Result<Who, Remote
         Err(_) => Who::Unsaid,
     };
     match who {
+        // GitHub shows a shared key no one's email: there is none to match.
+        Who::Shared(why) if system == System::Github => Ok(Who::Shared(why)),
         Who::Shared(_) => by_email(remote, system).await,
         who => Ok(who),
     }

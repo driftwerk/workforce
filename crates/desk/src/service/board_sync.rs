@@ -534,6 +534,9 @@ struct Listed {
     /// A GitHub project's place of every issue it lists, in its own order:
     /// key, item id and place ([`board::github_rank_of`]).
     places: Vec<(String, String, String)>,
+    /// Something listed couldn't be read (an item the key can't see, a
+    /// page with no way on): the listing can't say what isn't on it.
+    lossy: bool,
 }
 
 /// How a pull pass ended: the cursor it got to, whether it swept, and the
@@ -945,6 +948,7 @@ impl Desk {
             next: None,
             ordered: true,
             places: vec![],
+            lossy: false,
         };
         match s.system {
             System::Github => {
@@ -1145,6 +1149,7 @@ impl Desk {
             next,
             ordered,
             places,
+            ..
         } = listed;
         // A GitHub project's order, every pass: what moved there moves here.
         if !places.is_empty() {
@@ -1156,7 +1161,9 @@ impl Desk {
         // filter: the sweep goes by it rather than read it all again.
         // A GitHub project's listing holds only what changed: its sweep
         // lists the project again for what is on it.
-        let whole = (s.cursor.is_none() && resume.is_none() && complete && places.is_empty())
+        let on_project = s.system == System::Github
+            && crate::github_sync::target_of(&s.target).is_some_and(|t| t.is_project());
+        let whole = (s.cursor.is_none() && resume.is_none() && complete && !on_project)
             .then(|| changed.clone());
         let mut top = resume
             .and_then(|l| l.top.as_deref())
@@ -1804,14 +1811,18 @@ impl Desk {
         whole: Option<Vec<Issue>>,
     ) -> Result<(), RemoteError> {
         let fail = |e: eyre::Report| RemoteError::Failed(e.to_string());
+        let on_project = s.system == System::Github
+            && crate::github_sync::target_of(&s.target).is_some_and(|t| t.is_project());
         // Every issue on a GitHub project, changed or not.
         let mut present = std::collections::HashSet::new();
         let issues = match whole {
             Some(issues) => issues,
             None => {
                 let listed = self.matching(s, remote, None, None, &[], budget).await?;
-                // Only a full answer can say what isn't in it.
-                if !listed.complete {
+                // Only a full answer can say what isn't in it, and a
+                // project that lists nothing at all is asked again later
+                // before every card leaves it.
+                if !listed.complete || listed.lossy || (on_project && listed.places.is_empty()) {
                     return Ok(());
                 }
                 present.extend(listed.places.into_iter().map(|(k, _, _)| k));
@@ -1842,20 +1853,6 @@ impl Desk {
             // A whole board lists what is open: a ticket already Done here
             // is where its issue's state put it.
             if s.filter.is_all() && t.state == TicketState::Done {
-                continue;
-            }
-            // A project's whole listing is every item on it, open or
-            // closed: one not in it was taken off it, or left the filter.
-            let on_project = s.system == System::Github
-                && crate::github_sync::target_of(&s.target).is_some_and(|t| t.is_project());
-            if on_project {
-                if self
-                    .detach(b, s, t)
-                    .await
-                    .map_err(|e| RemoteError::Failed(e.to_string()))?
-                {
-                    out.detached += 1;
-                }
                 continue;
             }
             let tool = crate::board_sync::read_issue_call(s.system, &e.key, s.fields.as_ref());
