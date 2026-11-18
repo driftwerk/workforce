@@ -628,3 +628,36 @@ async fn a_request_on_a_release_another_session_holds_is_the_persons_to_allow() 
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_irreversible_orders_that_name_no_job_both_stay_on_the_line() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        d.picture_load().await;
+        let by = || crew.by_overseer("Its next steps.").unwrap();
+        let s = session_in(&d, dir.path(), "harbor", "harbor-release-3").await;
+        let other = session_in(&d, dir.path(), "harbor", "harbor-docs").await;
+        crew.perform(&nudge(s.id, "Run the deploy."), by())
+            .await
+            .unwrap();
+        crew.perform(&nudge(s.id, "Run the release workflow."), by())
+            .await
+            .unwrap();
+        let lines: Vec<String> = told(&d, s.id).await.into_iter().map(|m| m.text).collect();
+        assert_eq!(
+            lines,
+            vec![
+                "Run the deploy.".to_string(),
+                "Run the release workflow.".to_string()
+            ],
+            "nothing says they are one job: neither is withdrawn"
+        );
+        // Nor does either hold a job from another session.
+        crew.perform(&nudge(other.id, "Run the deploy."), by())
+            .await
+            .unwrap();
+        assert_eq!(told(&d, other.id).await.len(), 1);
+    })
+    .await;
+}

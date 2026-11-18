@@ -34,7 +34,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use workforce_desk::assignment::{
-    self, short, Assignment, AssignmentState, Reading, Rule, Target, TargetKind,
+    self, short, Assignment, AssignmentState, Rule, Target, TargetKind,
 };
 use workforce_desk::assignment_store::Reserved;
 use workforce_desk::crew::{self, By, Event, Kind, Party, PartyKind};
@@ -121,6 +121,13 @@ pub(super) struct Reservation {
     pub id: Uuid,
     /// What Desk adds to the order: the guard to check first.
     pub guard: Option<String>,
+}
+
+/// A relayed order kept here before it goes to its machine: its row, and
+/// what to add to what it says.
+pub(super) struct Relayed {
+    pub id: Uuid,
+    pub guard: Option<&'static str>,
 }
 
 /// What [`CrewHub::assign_before`] decided.
@@ -231,24 +238,6 @@ fn quoted(text: &str, max: usize) -> String {
     }
 }
 
-/// `r`, with an irreversible order that names no job ("Run the deploy")
-/// keyed as the unnamed irreversible job in `place`: its session isn't
-/// told to start it twice (R1), but it claims nothing from another
-/// session, as nothing says it is the same job.
-fn unnamed(mut r: Reading, place: &str) -> Reading {
-    if r.irreversible && r.job_key.is_none() {
-        r.job_key = Some(format!("{place}/unnamed"));
-    }
-    r
-}
-
-/// Whether `a` is keyed as an unnamed irreversible job ([`unnamed`]).
-fn unnamed_key(a: &Assignment) -> bool {
-    a.job_key
-        .as_deref()
-        .is_some_and(|k| k.ends_with("/unnamed"))
-}
-
 /// Whether `why`, a send's failure, is an assignment refusing it: never
 /// done some other way instead (a new session started for it).
 pub(super) fn refused(why: &str) -> bool {
@@ -351,11 +340,7 @@ impl CrewHub {
             true => "Two sessions on one job can run it twice, and what it starts can't be undone.",
             false => "Two sessions on one job get in each other's way.",
         };
-        let unnamed = match unnamed_key(h) {
-            true => " Neither order names its job: if they are different jobs, send again saying which with job: \"…\".",
-            false => "",
-        };
-        let refused = match rule {
+        match rule {
             Rule::SameSession => format!(
                 "Not sent: {name} already has this job ({id}, delivered {}). Saying it again can start it twice. Ask it where it stands (crew.ask_session); to change what it does, send with replaces: \"{id}\", and it is told to check first.",
                 h.delivered_at.map_or_else(|| "already".into(), at)
@@ -381,8 +366,7 @@ impl CrewHub {
                     said.join(", ")
                 )
             }
-        };
-        format!("{refused}{unnamed}")
+        }
     }
 
     /// Notes `kind` in Activity: the boss `by` did it, to `a`'s session.
@@ -413,10 +397,7 @@ impl CrewHub {
         let boss = by.party.id.as_str();
         let (repo, place) = self.place_of(s).await;
         let job = order.job.clone().or(ticket);
-        let r = unnamed(
-            assignment::read(&text, job.as_deref(), &place, order.irreversible),
-            &place,
-        );
+        let r = assignment::read(&text, job.as_deref(), &place, order.irreversible);
         let mut a = Assignment::new(boss, s, &text);
         a.job = job.clone();
         a.job_key = r.job_key;
@@ -424,7 +405,7 @@ impl CrewHub {
         a.targets = r.targets.iter().map(Target::key).collect();
         a.irreversible = r.irreversible;
         a.urgent = order.urgent;
-        a.claims = (r.irreversible && !unnamed_key(&a)) || job.is_some();
+        a.claims = r.irreversible || job.is_some();
         a.turn = self.current_turn();
         let internal = |e: eyre::Report| {
             tracing::warn!(error = %format!("{e:#}"), "a boss's assignment couldn't be kept");
@@ -612,7 +593,8 @@ impl CrewHub {
         ok: bool,
     ) {
         match self.desk.store().assignment_sent(r.id, line, ok).await {
-            Ok(Some(a)) if ok => {
+            // Only a job held is news: a plain word to a session is in Activity already.
+            Ok(Some(a)) if ok && (a.claims || a.irreversible) => {
                 let text = format!(
                     "gave {} {} ({}){}",
                     self.holder_name(&a),
@@ -644,7 +626,7 @@ impl CrewHub {
         id: Uuid,
         tool: &str,
         input: &Value,
-    ) -> Result<Option<Uuid>, String> {
+    ) -> Result<Option<Relayed>, String> {
         let text = match tool {
             "crew.nudge"
                 if input["reply_to"]
@@ -660,10 +642,7 @@ impl CrewHub {
             return Ok(None);
         };
         let order = Order::of(input);
-        let r = unnamed(
-            assignment::read(text, order.job.as_deref(), machine, order.irreversible),
-            machine,
-        );
+        let r = assignment::read(text, order.job.as_deref(), machine, order.irreversible);
         let mut a = Assignment::new(boss, id, text);
         a.machine = Some(machine.to_string());
         a.job = order.job.clone();
@@ -671,16 +650,59 @@ impl CrewHub {
         a.targets = r.targets.iter().map(Target::key).collect();
         a.irreversible = r.irreversible;
         a.urgent = order.urgent;
-        a.claims = (r.irreversible && !unnamed_key(&a)) || order.job.is_some();
+        a.claims = r.irreversible || order.job.is_some();
         a.turn = self.current_turn();
-        match self.desk.store().assignment_reserve(&a, None).await {
-            Ok(Reserved::Kept { .. }) => Ok(Some(a.id)),
-            Ok(Reserved::Refused { rule, holder }) => Err(self.refusal(rule, &holder, &a)),
-            Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), "a relayed assignment couldn't be kept");
-                Err("Not sent: Desk couldn't record who holds this job just now, so it sent nothing. Try again in a moment.".into())
+        let internal = |e: eyre::Report| {
+            tracing::warn!(error = %format!("{e:#}"), "a relayed assignment couldn't be kept");
+            "Not sent: Desk couldn't record who holds this job just now, so it sent nothing. Try again in a moment.".to_string()
+        };
+        // Moved to a machine's session: its old holder stands down, and as
+        // a relayed call can't wait here, the order goes now, guarded.
+        let old = match order.replaces.as_deref() {
+            None => None,
+            Some(named) => {
+                let live = self
+                    .desk
+                    .store()
+                    .assignments_of(boss, true)
+                    .await
+                    .map_err(internal)?;
+                let ids: Vec<Uuid> = live.iter().map(|l| l.id).collect();
+                let id = assignment::named(named, &ids).ok_or_else(|| {
+                    format!("Not sent: {named} isn't one of your open assignments; crew.assignments lists them.")
+                })?;
+                live.into_iter().find(|l| l.id == id)
+            }
+        };
+        if let Some(o) = &old {
+            a.replaces = Some(o.id);
+        }
+        let name = self.holder_name(&a);
+        let why = format!("moved to {name}");
+        match self
+            .desk
+            .store()
+            .assignment_reserve(&a, old.as_ref().map(|o| (o.id, why.as_str())))
+            .await
+            .map_err(internal)?
+        {
+            Reserved::Kept { .. } => {}
+            Reserved::Refused { rule, holder } => return Err(self.refusal(rule, &holder, &a)),
+        }
+        if let Some(o) = &old {
+            let gone = o.machine.is_none() && self.holder_gone(o);
+            let same = o.session == a.session && o.machine == a.machine;
+            if !gone && !same {
+                if let Some((service, _)) = self.overseer_named(boss) {
+                    let by = self.by_boss(&service, &why);
+                    self.stand_down(&by, o, &a, &name).await;
+                }
             }
         }
+        Ok(Some(Relayed {
+            id: a.id,
+            guard: old.is_some().then_some(CHECK_FIRST),
+        }))
     }
 
     /// A relayed assignment was done on its machine, or wasn't.
@@ -1015,6 +1037,11 @@ impl CrewHub {
     /// newest first, at most 20.
     pub(super) async fn assignments_block(&self, boss: &str) -> Option<String> {
         let live = self.desk.store().assignments_of(boss, true).await.ok()?;
+        // The jobs it holds, never every plain word it sent.
+        let live: Vec<Assignment> = live
+            .into_iter()
+            .filter(|a| a.claims || a.irreversible || a.state == AssignmentState::Held)
+            .collect();
         if live.is_empty() {
             return None;
         }

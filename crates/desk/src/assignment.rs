@@ -821,7 +821,12 @@ pub fn rule(new: &Assignment, live: &[Live], replacing: Option<Uuid>) -> Ruling 
         let a = &l.a;
         let same_key = a.job_key.is_some() && a.job_key == new.job_key;
         if a.session == new.session && a.machine == new.machine {
-            if !(same_key || (a.job_key.is_none() && new.job_key.is_none())) {
+            // Two orders that name no job are one job only when neither
+            // starts what can't be undone ("Carry on", then "Look at the
+            // flake"): nothing says "Run the deploy" and "Run the release
+            // workflow" are, so neither replaces nor refuses the other.
+            let keyless = a.job_key.is_none() && new.job_key.is_none();
+            if !same_key && (!keyless || a.irreversible || new.irreversible) {
                 continue;
             }
             match (a.state, a.irreversible && l.delivered, new.irreversible) {
@@ -866,6 +871,38 @@ pub fn rule(new: &Assignment, live: &[Live], replacing: Option<Uuid>) -> Ruling 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_irreversible_orders_that_name_no_job_are_two_jobs() {
+        let s = Uuid::new_v4();
+        let order = |text: &str, delivered: bool| {
+            let r = read(text, None, "harbor", false);
+            let mut a = Assignment::new("boss", s, text);
+            a.job_key = r.job_key;
+            a.irreversible = r.irreversible;
+            a.state = AssignmentState::Open;
+            Live { a, delivered }
+        };
+        let deploy = order("Run the deploy.", false);
+        assert!(deploy.a.irreversible && deploy.a.job_key.is_none());
+        let workflow = order("Run the release workflow.", false);
+        assert!(workflow.a.irreversible && workflow.a.job_key.is_none());
+        for went_in in [false, true] {
+            let mut was = order("Run the deploy.", went_in);
+            was.a.id = Uuid::new_v4();
+            match rule(&workflow.a, &[was], None) {
+                Ruling::Send { supersede, .. } => assert!(supersede.is_empty()),
+                other => panic!("{other:?}"),
+            }
+        }
+        // Plain words that name no job still take each other's place.
+        let carry = order("Carry on.", false);
+        let look = order("Look at the flaky test next.", false);
+        match rule(&look.a, &[carry], None) {
+            Ruling::Send { supersede, .. } => assert_eq!(supersede.len(), 1),
+            other => panic!("{other:?}"),
+        }
+    }
 
     fn keys(text: &str) -> Vec<String> {
         targets(text).iter().map(Target::key).collect()

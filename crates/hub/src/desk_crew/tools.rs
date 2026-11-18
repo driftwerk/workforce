@@ -789,9 +789,18 @@ impl CrewTool {
             for f in ["job", "irreversible", "urgent", "replaces"] {
                 o.remove(f);
             }
+            // Taken over: its new holder checks it hasn't been started.
+            if let Some(guard) = assigned.as_ref().and_then(|a| a.guard) {
+                for f in ["message", "prompt"] {
+                    if let Some(t) = o.get(f).and_then(Value::as_str) {
+                        let t = format!("{}\n\n{guard}", t.trim_end());
+                        o.insert(f.into(), json!(t));
+                    }
+                }
+            }
         }
         let relayed = crew.relay(machine, g, name, sent, agent, &ceiling).await;
-        if let Some(a) = assigned {
+        if let Some(a) = assigned.map(|a| a.id) {
             let ok = relayed
                 .as_ref()
                 .is_ok_and(|r| r.status == super::served::ServedStatus::Ok);
