@@ -442,10 +442,14 @@ pub enum UndoPlan {
     /// kept with it: a closed session may no longer be listed to name it.
     /// Kept for what it was even when it can't be undone (no conversation
     /// to resume): an update says it among the sessions it closed.
+    /// `removed`: it was removed from Desk too, and this is what brings it
+    /// back first ([`crate::Desk::restore_removed`]).
     Reopen {
         session: Uuid,
         #[serde(default)]
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        removed: Option<Box<crate::service::KeptSession>>,
     },
 }
 

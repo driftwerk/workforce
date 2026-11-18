@@ -2,8 +2,13 @@
 //! (`closing`), as the person asked on 11/15: "after the Desk agent starts
 //! up sessions to do work, they just hang around forever".
 //!
-//! - One it started whose work is done is closed at Act: off the sidebar,
-//!   its conversation kept, each close a decision whose Undo reopens it.
+//! - One it started whose work is done is closed at Act and removed, as on
+//!   11/18 ("I'm having lots of sessions I have to go close by hand"): off
+//!   the sidebar and the closed list, its conversation and folder kept,
+//!   each close a decision whose Undo brings it back and reopens it.
+//! - Asked to close what is finished, at Act fully it closes and removes
+//!   its own (`crew.close_session`), never one with work left in its
+//!   folder, and only suggests one that isn't its own.
 //! - One the person handed it is only suggested at Act.
 //! - One with uncommitted work, or one the person typed into just now,
 //!   stays open; the first is said once.
@@ -220,14 +225,37 @@ async fn a_boss_closes_the_finished_sessions_it_started_and_never_what_holds_wor
         let (a, b) = (notes.label(), web.label());
         assert!(
             [
-                format!("Closed 2 finished sessions: {a}, {b}."),
-                format!("Closed 2 finished sessions: {b}, {a}.")
+                format!("Closed and removed 2 finished sessions: {a}, {b}."),
+                format!("Closed and removed 2 finished sessions: {b}, {a}.")
             ]
             .contains(&line.text),
             "{}",
             line.text
         );
-        // Its history stays: Undo reopens it.
+        // Removed from Desk as the person's Remove does: off the closed
+        // list, its conversation never adopted again, its folder kept.
+        for (s, folder) in [(&notes, &plain), (&web, &clean)] {
+            let cli = s.cli_session_id.clone().unwrap();
+            eventually("it to be removed", async || {
+                (d.store().get(s.id).await.unwrap().is_none()
+                    && d.hidden_sessions()
+                        .await
+                        .unwrap()
+                        .iter()
+                        .any(|h| h.cli_session_id == cli))
+                .then_some(())
+            })
+            .await;
+            assert!(d.view(s.id).is_err(), "{} still shown", s.name);
+            assert!(!d
+                .closed_sessions()
+                .await
+                .unwrap()
+                .iter()
+                .any(|c| c.id == s.id));
+            assert!(folder.is_dir(), "{}'s folder stays", s.name);
+        }
+        // Its history stays: Undo brings it back and reopens it.
         let undo = rows
             .iter()
             .find(
@@ -239,6 +267,19 @@ async fn a_boss_closes_the_finished_sessions_it_started_and_never_what_holds_wor
             (state(&d, web.id) != SessionState::Closed).then_some(())
         })
         .await;
+        let web_cli = web.cli_session_id.clone().unwrap();
+        eventually("web back in Desk", async || {
+            (d.store().get(web.id).await.unwrap().is_some()
+                && !d
+                    .hidden_sessions()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|h| h.cli_session_id == web_cli))
+            .then_some(())
+        })
+        .await;
+        assert_eq!(d.view(web.id).unwrap().name, web.name);
         // Reopened, it is the person's: never closed as finished again.
         assert!(d.store().close_undone(web.id).await.unwrap());
         assert!(!d.store().close_undone(notes.id).await.unwrap());
@@ -251,6 +292,118 @@ async fn a_boss_closes_the_finished_sessions_it_started_and_never_what_holds_wor
         let left = finished(&d, &crew, &base, &plain, "left", &boss, How::Started).await;
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert_eq!(state(&d, left.id), SessionState::Done);
+    })
+    .await;
+}
+
+/// Act fully, its closer off: only the closes it is asked for.
+const FULL: &str =
+    "[oversight]\nenabled = true\nlevel = \"full\"\n[oversight.work]\nclose_finished = false\n";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn asked_to_close_what_is_finished_a_boss_closes_and_removes_its_own_and_never_what_holds_work(
+) {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (overseer, crew, d, _llm) = overseeing(&base, pool, "ok", FULL, &[]).await;
+        d.boss_bounds_with(workforce_desk::charge::Bounds {
+            home: base.clone(),
+            ..Default::default()
+        });
+        let boss = Party::manager("desk", &super::super::name_of(&overseer));
+        let since = chrono::Utc::now();
+        let clean = base.join("acme-web");
+        repo(&clean, "git@github.com:acme/acme-web.git");
+        let dirty = base.join("acme-api");
+        repo(&dirty, "git@github.com:acme/acme-api.git");
+        let web = finished(&d, &crew, &base, &clean, "web", &boss, How::Started).await;
+        let api = finished(&d, &crew, &base, &dirty, "api", &boss, How::Started).await;
+        std::fs::write(dirty.join("half-done.rs"), "fn main() {}").unwrap();
+        // The person's own, never taken on.
+        let theirs = new_session(&d, &clean, "theirs").await;
+        // Just finished: it rests before any close of the boss's.
+        let r = overseer
+            .tools
+            .get(super::super::closing::TOOL)
+            .unwrap()
+            .execute(json!({ "session_id": web.id.to_string(), "reason": "Finished." }))
+            .await
+            .unwrap();
+        assert!(!r.success, "{r:?}");
+        assert!(d.view(web.id).is_ok());
+        *crew.close_settle.lock() = chrono::Duration::zero();
+
+        let close = overseer
+            .tools
+            .get(super::super::closing::TOOL)
+            .unwrap();
+        let ask = |s: &SessionView| {
+            json!({ "session_id": s.id.to_string(), "reason": "The person asked to close the finished sessions." })
+        };
+        let r = close.execute(ask(&web)).await.unwrap();
+        assert!(r.success, "{r:?}");
+        let cli = web.cli_session_id.clone().unwrap();
+        eventually("web removed", async || {
+            (d.store().get(web.id).await.unwrap().is_none()
+                && d.hidden_sessions()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|h| h.cli_session_id == cli))
+            .then_some(())
+        })
+        .await;
+        assert!(d.view(web.id).is_err());
+        assert!(clean.is_dir());
+        // Work in its folder a close would leave behind: it stays, and why.
+        let r = close.execute(ask(&api)).await.unwrap();
+        assert!(!r.success, "{r:?}");
+        assert!(
+            r.error
+                .as_deref()
+                .is_some_and(|e| e.contains("1 uncommitted file")),
+            "{r:?}"
+        );
+        assert_eq!(state(&d, api.id), SessionState::Done);
+        // Not its own: the person's to close, with one click.
+        let r = close.execute(ask(&theirs)).await.unwrap();
+        assert!(r.output["suggested"].is_string(), "{r:?}");
+        assert_ne!(state(&d, theirs.id), SessionState::Closed);
+
+        // One line in its update; Undo brings it back and resumes it.
+        let rows: Vec<_> = d
+            .store()
+            .decisions_since("desk", since, 50)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(update::is_close)
+            .collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(matches!(
+            rows[0].plan(),
+            Some(UndoPlan::Reopen { removed: Some(_), .. })
+        ));
+        assert_eq!(rows[0].undo, Undo::Reverse);
+        assert_eq!(
+            update::closed_line(&rows).unwrap().text,
+            format!("Closed and removed 1 finished session: {}.", web.label())
+        );
+        crew.undo(rows[0].id).await.unwrap();
+        eventually("web back and reopened", async || {
+            (d.view(web.id)
+                .is_ok_and(|v| v.state != SessionState::Closed && v.name == web.name)
+                && !d
+                    .hidden_sessions()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|h| h.cli_session_id == cli))
+            .then_some(())
+        })
+        .await;
+        assert!(d.store().close_undone(web.id).await.unwrap());
     })
     .await;
 }

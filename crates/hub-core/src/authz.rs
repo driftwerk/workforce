@@ -729,6 +729,7 @@ impl Capability {
                 "crew.approve",
                 "crew.deny",
                 "crew.stop",
+                "crew.close_session",
                 "crew.interrupt",
                 "crew.resume",
                 "crew.restart",
@@ -1092,7 +1093,7 @@ pub fn tool_capability(tool: &str, input: &serde_json::Value) -> Option<Capabili
         | "desk.read" | "desk.wait" | "desk.approve" | "desk.stop" | "desk.interrupt"
         // The crew overseer reads and drives the same terminals.
         | "crew.overview" | "crew.activity" | "crew.history" | "crew.account" | "crew.decisions" | "crew.ask_person" | "crew.close_item" | "crew.open_items" | "crew.promise" | "crew.order" | "crew.spend" | "crew.board" | "crew.nudge" | "crew.ask_session" | "crew.escalate" | "crew.approve"
-        | "crew.deny" | "crew.stop" | "crew.interrupt" | "crew.resume" | "crew.restart" | "crew.start_session"
+        | "crew.deny" | "crew.stop" | "crew.close_session" | "crew.interrupt" | "crew.resume" | "crew.restart" | "crew.start_session"
         | "crew.assign" | "crew.assign_ticket" | "crew.move_ticket" | "crew.take_on" | "crew.release"
         | "crew.plan" | "crew.plan_update" | "crew.board_create" | "crew.handover" => {
             Some(Capability::ShellExec)

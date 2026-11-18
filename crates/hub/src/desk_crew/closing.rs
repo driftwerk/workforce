@@ -1,8 +1,9 @@
 //! The boss closes the sessions it runs once their work is done
 //! (`[oversight.work] close_finished`, on unless the person turns it off),
 //! so they leave the grid and the sidebar instead of hanging around: each
-//! is closed in Desk (`Desk::end`), its conversation kept and resumable,
-//! never deleted.
+//! is closed in Desk (`Desk::end`) and removed from it as the person's
+//! Remove does (`Desk::remove_closed`), off the closed list too, its
+//! conversation and folder kept: never deleted.
 //!
 //! - **Done** is the work finished: its pull request merged on GitHub (as
 //!   the person reads it, [`super::github`]) with none still open, or every
@@ -18,8 +19,12 @@
 //!   HEAD is pushed) keep it open, and the boss says so once.
 //! - **Levels.** At Act fully it closes; at Act it closes the ones it
 //!   started and suggests the rest; below, it suggests. Each close is a
-//!   decision whose Undo reopens it (resumes it), and the boss's next
+//!   decision whose Undo brings it back and resumes it, and the boss's next
 //!   update says them in one line ([`workforce_desk::update::closed_line`]).
+//! - **Asked.** The person asking it to close what is finished, the boss
+//!   closes and removes with `crew.close_session` ([`TOOL`]): at Act fully
+//!   one it may end runs, anything else is a suggestion, and every close
+//!   of a boss's, swept or asked, is held by [`CrewHub::close_held`].
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -52,6 +57,9 @@ pub(crate) const SETTLE: chrono::Duration = chrono::Duration::minutes(10);
 const IDLE_HOURS: i64 = 24;
 /// How long the person's last input keeps a session theirs here.
 const HANDS_OFF_HOURS: i64 = 2;
+/// How long the person's last input keeps a session theirs from any close
+/// of its boss's, asked for or not: they are in it.
+const PERSON_NOW_MINUTES: i64 = 15;
 /// How long an open pull request's state is believed before it is read
 /// again: GitHub's rate limit is everyone's.
 const PULL_AGAIN: Duration = Duration::from_secs(15 * 60);
@@ -344,6 +352,22 @@ async fn origin_of(cwd: &str) -> Option<String> {
         .and_then(|u| github_repo(&u))
 }
 
+/// Whether closing `v` and removing it loses nothing now: at rest, asking
+/// nothing, and nothing uncommitted or unpushed in its folder. Read for a
+/// close the person said yes to, which no boss's gate holds.
+pub(crate) async fn nothing_to_lose(v: &SessionView) -> bool {
+    v.pending.is_none()
+        && v.asked.is_none()
+        && !matches!(
+            v.state,
+            SessionState::Starting
+                | SessionState::Working
+                | SessionState::Blocked
+                | SessionState::Asking
+        )
+        && held(&folder(&v.cwd).await, &[]).is_none()
+}
+
 /// Looks at the bosses' finished sessions every few minutes.
 pub(super) async fn closing_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     let mut every = tokio::time::interval(crew.timing.minute * EVERY_MINUTES);
@@ -625,6 +649,88 @@ impl CrewHub {
                 }
             }
         }
+    }
+
+    /// Why `boss` may not close `v` now, whichever way its close came (its
+    /// sweep, or its own call when the person asked it to close what is
+    /// finished): still at work, asking, waiting on the person, the
+    /// person's now, or with work in its folder a close would leave behind.
+    /// None: it may. Whether it is the boss's to close at all (it started
+    /// it or was handed it) is Desk's to say, as it ends it.
+    pub(super) async fn close_held(&self, v: &SessionView, boss: &str) -> Option<String> {
+        if v.origin != Origin::Desk {
+            return Some("It runs in another terminal, so it's the person's to close.".into());
+        }
+        if v.pending.is_some() || v.asked.is_some() || v.state == SessionState::Asking {
+            return Some(
+                "It's asking something: answer it, or ask the person, before it is closed.".into(),
+            );
+        }
+        if matches!(
+            v.state,
+            SessionState::Starting | SessionState::Working | SessionState::Blocked
+        ) {
+            return Some("It's still working: it is closed only once its turn has ended.".into());
+        }
+        let Some((service, o)) = self.overseer_named(boss) else {
+            return Some("No boss runs it now.".into());
+        };
+        // Rested first, as the closer's own: what it did is seen.
+        if !at_rest(v, Utc::now(), *self.close_settle.lock()) {
+            return Some(format!(
+                "Its turn ended under {} minutes ago: it is closed once it has rested.",
+                self.close_settle.lock().num_minutes().max(1)
+            ));
+        }
+        let now = chrono::Duration::minutes(PERSON_NOW_MINUTES);
+        if self.person_in_for(v.id, Utc::now() - now, self.answer_gap(&o)) {
+            return Some("The person is in it now, so it's theirs to close.".into());
+        }
+        match self.desk.store().items_not_closed(Some(boss)).await {
+            Ok(items) if items.iter().any(|i| i.session == Some(v.id)) => {
+                return Some(
+                    "It waits on the person for something: it stays open until that's answered."
+                        .into(),
+                )
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::info!(session = %v.id, error = %format!("{e:#}"), "the open items couldn't be read; the session isn't closed");
+                return Some(
+                    "What waits on the person couldn't be read, so it stays open for now.".into(),
+                );
+            }
+        }
+        // Work it was given still open is work left.
+        match self.desk.store().session_tickets(v.id).await {
+            Ok(t)
+                if t.iter()
+                    .any(|t| !matches!(t.state, TicketState::Done | TicketState::Dropped)) =>
+            {
+                return Some("Its ticket is still open: it stays open until that's done.".into())
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::info!(session = %v.id, error = %format!("{e:#}"), "a session's tickets couldn't be read; it isn't closed");
+                return Some("Its tickets couldn't be read, so it stays open for now.".into());
+            }
+        }
+        let pulls = self.pulls_of(&service, v).await;
+        if let Some((n, _)) = pulls
+            .iter()
+            .find(|(_, p)| p.as_ref().is_some_and(|p| p.open))
+        {
+            return Some(format!(
+                "Its PR #{n} is still open: it stays open until that's merged or closed."
+            ));
+        }
+        let merged: Vec<String> = pulls
+            .iter()
+            .filter_map(|(_, p)| p.as_ref().filter(|p| p.merged))
+            .filter_map(|p| p.head.clone())
+            .collect();
+        held(&folder(&v.cwd).await, &merged)
+            .map(|kept| format!("It stays open ({kept}): nothing is closed that would lose work."))
     }
 
     /// Notes `s` for `boss`'s next update, once for `session` and `what`.

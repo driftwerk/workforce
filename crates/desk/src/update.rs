@@ -672,10 +672,21 @@ fn named(sessions: &[ClosedSession], with_why: bool) -> String {
 pub fn closed_line(rows: &[BossDecision]) -> Option<ClosedLine> {
     let mut closes: Vec<&BossDecision> = rows.iter().filter(|d| is_close(d)).collect();
     closes.sort_by_key(|d| d.at);
+    // Removed from Desk too, every one: said so.
+    let removed = !closes.is_empty()
+        && closes.iter().all(|d| {
+            matches!(
+                d.plan(),
+                Some(UndoPlan::Reopen {
+                    removed: Some(_),
+                    ..
+                })
+            )
+        });
     let sessions: Vec<ClosedSession> = closes
         .into_iter()
         .filter_map(|d| {
-            let Some(UndoPlan::Reopen { session, name }) = d.plan() else {
+            let Some(UndoPlan::Reopen { session, name, .. }) = d.plan() else {
                 return None;
             };
             let line = d.line();
@@ -696,7 +707,12 @@ pub fn closed_line(rows: &[BossDecision]) -> Option<ClosedLine> {
     (!sessions.is_empty()).then(|| ClosedLine {
         kind: ClosedKind::Closed,
         text: format!(
-            "Closed {}: {}.",
+            "{} {}: {}.",
+            if removed {
+                "Closed and removed"
+            } else {
+                "Closed"
+            },
             finished(sessions.len()),
             named(&sessions, false)
         ),
@@ -2197,9 +2213,44 @@ mod tests {
         d.action = UndoPlan::Reopen {
             session,
             name: name.into(),
+            removed: None,
         }
         .value();
         d
+    }
+
+    #[test]
+    fn sessions_it_closed_and_removed_are_said_so() {
+        let removed = |name: &str| {
+            let mut d = close(name, true, 1);
+            let Some(UndoPlan::Reopen { session, name, .. }) = d.plan() else {
+                unreachable!()
+            };
+            let kept: crate::service::KeptSession = serde_json::from_value(serde_json::json!({
+                "id": session, "engine": "claude", "view": "terminal", "name": name,
+                "cwd": "/work/web", "approvals": "desk", "cliSessionId": session.to_string(),
+                "createdAt": Utc::now(),
+            }))
+            .unwrap();
+            d.action = UndoPlan::Reopen {
+                session,
+                name,
+                removed: Some(Box::new(kept)),
+            }
+            .value();
+            d
+        };
+        let rows = vec![removed("api"), removed("web")];
+        assert_eq!(
+            closed_line(&rows).unwrap().text,
+            "Closed and removed 2 finished sessions: api, web."
+        );
+        // One closed before removing was: said as it was.
+        let rows = vec![removed("api"), close("web", true, 5)];
+        assert_eq!(
+            closed_line(&rows).unwrap().text,
+            "Closed 2 finished sessions: web, api."
+        );
     }
 
     #[test]

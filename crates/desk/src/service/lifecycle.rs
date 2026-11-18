@@ -51,6 +51,113 @@ pub struct Removed {
     pub transcripts: u64,
 }
 
+/// What a boss's removal of a session it closed keeps of it, so the
+/// decision's Undo brings it back as it was: its record's own fields, and
+/// the sidebar group it was in. Kept in the decision's undo plan, so it
+/// outlives the record and a restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeptSession {
+    pub id: Uuid,
+    pub engine: Engine,
+    pub view: crate::model::View,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub goal: String,
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    pub approvals: crate::model::Approvals,
+    pub cli_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_version: Option<String>,
+    #[serde(default)]
+    pub approve_for_me: bool,
+    #[serde(default)]
+    pub fast: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<Uuid>,
+    #[serde(default)]
+    pub folder_chosen: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reply: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl KeptSession {
+    /// What of `r` is kept, in `group`; none when it has no conversation
+    /// of its engine's to resume.
+    fn of(r: &SessionRecord, group: Option<String>) -> Option<Self> {
+        Some(Self {
+            id: r.id,
+            engine: r.engine,
+            view: r.view,
+            name: r.name.clone(),
+            display_name: r.display_name.clone(),
+            goal: r.goal.clone(),
+            cwd: r.cwd.clone(),
+            branch: r.branch.clone(),
+            approvals: r.approvals,
+            cli_session_id: r.cli_session_id.clone()?,
+            transcript: r.transcript.clone(),
+            engine_version: r.engine_version.clone(),
+            approve_for_me: r.approve_for_me,
+            fast: r.fast,
+            model: r.model.clone(),
+            account: r.account,
+            folder_chosen: r.folder_chosen,
+            last_prompt: r.last_prompt.clone(),
+            last_reply: r.last_reply.clone(),
+            group,
+            created_at: r.created_at,
+        })
+    }
+
+    /// The record it was, closed.
+    fn record(&self) -> SessionRecord {
+        SessionRecord {
+            id: self.id,
+            engine: self.engine,
+            view: self.view,
+            engine_version: self.engine_version.clone(),
+            approve_for_me: self.approve_for_me,
+            fast: self.fast,
+            model: self.model.clone(),
+            account: self.account,
+            name: self.name.clone(),
+            goal: self.goal.clone(),
+            cwd: self.cwd.clone(),
+            branch: self.branch.clone(),
+            origin: Origin::Desk,
+            // As it was when its close ended it.
+            state: super::finish::closed(super::finish::Finish::Ended),
+            approvals: self.approvals,
+            cli_session_id: Some(self.cli_session_id.clone()),
+            transcript: self.transcript.clone(),
+            last_prompt: self.last_prompt.clone(),
+            last_reply: self.last_reply.clone(),
+            external_pid: None,
+            restore_offer: false,
+            terminal_id: None,
+            display_name: self.display_name.clone(),
+            asked: None,
+            folder_chosen: self.folder_chosen,
+            created_at: self.created_at,
+            updated_at: Utc::now(),
+        }
+    }
+}
+
 /// Clears finished sessions in bulk.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -696,6 +803,114 @@ impl Desk {
             ));
         }
         Ok(view)
+    }
+
+    /// Removes a session that was just closed ([`Self::end`]) as the
+    /// person's Remove does (its record, what Activity says of it, its read
+    /// points, its place in the sidebar, and its CLI session hidden, all in
+    /// one transaction), keeping what Desk remembers of it, its engine's
+    /// transcript and its folder, so the closer's Undo brings it back
+    /// ([`Self::restore_removed`]). What is kept for that; none when it
+    /// stays closed instead: it has no conversation of its engine's to
+    /// resume, or it is a Devin session, whose files go with its record.
+    /// Refused when it isn't closed, or runs, by the time it is removed.
+    pub async fn remove_closed(&self, id: Uuid) -> Result<Option<KeptSession>, DeskError> {
+        let r = self.load(id).await?;
+        if r.engine == Engine::Devin {
+            return Ok(None);
+        }
+        let group =
+            crate::scope::group_of(&super::session_item(id), &self.layout()).map(str::to_string);
+        let Some(kept) = KeptSession::of(&r, group) else {
+            return Ok(None);
+        };
+        let hidden = Hidden {
+            engine: r.engine,
+            cli_session_id: kept.cli_session_id.clone(),
+            name: r.display_name.clone().unwrap_or_else(|| r.name.clone()),
+            cwd: r.cwd.clone(),
+            hidden_at: Utc::now(),
+        };
+        let written = self
+            .forget_as(id, Some(hidden), Memory::Keep, |st, now| {
+                if now.state != SessionState::Closed || st.live.contains_key(&id) {
+                    return Err(DeskError::Conflict(
+                        "it started again since it was closed".into(),
+                    ));
+                }
+                Ok(())
+            })
+            .await?;
+        // Written before it is said removed, so no Undo can run ahead of
+        // the write and be undone by it.
+        if !written.await.unwrap_or(false) {
+            tracing::warn!(%id, "a removed session's removal wasn't written: it comes back closed when the hub restarts");
+            // Not said removed: its decision has no removal to undo.
+            return Ok(None);
+        }
+        Ok(Some(kept))
+    }
+
+    /// Brings back a session [`Self::remove_closed`] removed: its record,
+    /// closed, under its own id, in the group it was in, and its CLI
+    /// session tracked again. Resuming it is the caller's. One that is back
+    /// already is left as it is; one whose CLI session Desk tracks again
+    /// under another record (adopted since) isn't made twice.
+    pub async fn restore_removed(&self, kept: &KeptSession) -> Result<SessionView, DeskError> {
+        let id = kept.id;
+        if let Ok(v) = self.view(id) {
+            return Ok(v);
+        }
+        // Still in the registry (its removal never written): as it is.
+        if self.0.store.get(id).await?.is_some() {
+            self.0.state.lock().forgotten.remove(&id);
+            self.load(id).await?;
+            self.unhide(kept.engine, &kept.cli_session_id);
+            self.publish(id);
+            return self.view(id);
+        }
+        let record = kept.record();
+        {
+            let mut st = self.0.state.lock();
+            if st.records.contains_key(&id) {
+                drop(st);
+                return self.view(id);
+            }
+            if st.records.values().any(|r| {
+                r.engine == kept.engine
+                    && r.cli_session_id.as_deref() == Some(kept.cli_session_id.as_str())
+            }) {
+                return Err(DeskError::Conflict(
+                    "Desk tracks its conversation again already, as another session".into(),
+                ));
+            }
+            st.forgotten.remove(&id);
+            st.records.insert(id, record.clone());
+        }
+        // Written before anything can resume it.
+        if let Err(e) = self.0.store.put(&record).await {
+            let mut st = self.0.state.lock();
+            st.records.remove(&id);
+            st.forgotten.insert(id);
+            return Err(DeskError::Internal(e));
+        }
+        self.unhide(kept.engine, &kept.cli_session_id);
+        if let Some(g) = kept
+            .group
+            .as_deref()
+            .filter(|g| self.layout().groups.iter().any(|x| x.id == *g))
+        {
+            let item = super::session_item(id);
+            // Back in its group is no move: nothing of a move is done.
+            self.0.scopes.lock().placing.insert(id);
+            let put = self.change_layout(|l| l.put(&item, g, None)).await;
+            self.0.scopes.lock().placing.remove(&id);
+            if let Err(e) = put {
+                tracing::warn!(%id, error = %e, "a session brought back is ungrouped: its group couldn't be put back");
+            }
+        }
+        self.publish(id);
+        self.view(id)
     }
 }
 

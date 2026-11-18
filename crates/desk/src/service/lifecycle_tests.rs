@@ -787,3 +787,64 @@ async fn a_session_at_work_across_a_restart_keeps_its_turn_and_one_lost_with_the
     })
     .await;
 }
+
+/// A boss's close removes the session as the person's Remove does, but
+/// never its transcript or its folder, and what it keeps brings it back as
+/// it was: closed, under its own id, tracked again, and resumable.
+#[tokio::test]
+async fn a_session_a_boss_closed_is_removed_keeping_its_transcript_and_comes_back_on_undo() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let file = claude_transcript(&home, "cc-9");
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let was = SessionRecord {
+            origin: Origin::Desk,
+            state: SessionState::Closed,
+            cli_session_id: Some("cc-9".into()),
+            transcript: Some(file.to_string_lossy().into_owned()),
+            cwd: work.to_string_lossy().into_owned(),
+            display_name: Some("Release notes".into()),
+            external_pid: None,
+            terminal_id: None,
+            ..record_fixture("app-9")
+        };
+        let claude = claude_listing(dir.path(), Some(&[]));
+        let d = desk_at_home(pool, dir.path(), Some(&home), claude, &[&was]).await;
+        let store = DeskStore::from_pool(d.0.store.pool().clone());
+        let kept = d.remove_closed(was.id).await.unwrap().unwrap();
+        // Written once it says so: nothing waits on the queue.
+        assert!(d.view(was.id).is_err());
+        assert!(store.get(was.id).await.unwrap().is_none());
+        assert_eq!(store.hidden().await.unwrap()[0].cli_session_id, "cc-9");
+        assert!(d.closed_sessions().await.unwrap().is_empty());
+        assert!(file.exists() && file.with_file_name("cc-9").is_dir());
+        assert!(work.is_dir());
+
+        let back = d.restore_removed(&kept).await.unwrap();
+        assert_eq!(
+            (back.id, back.state, back.label(), back.cwd.as_str()),
+            (
+                was.id,
+                SessionState::Closed,
+                "Release notes",
+                was.cwd.as_str()
+            )
+        );
+        assert!(store.get(was.id).await.unwrap().is_some());
+        assert!(!d.is_hidden(Engine::Claude, "cc-9"));
+        // Again is the same session, not a second.
+        assert_eq!(d.restore_removed(&kept).await.unwrap().id, was.id);
+        let resumed = d.resume(was.id, None, None).await.unwrap();
+        assert_eq!((resumed.id, resumed.live), (was.id, true));
+
+        // A running one is never removed from under it.
+        let s = new_session(&d, dir.path()).await;
+        assert!(matches!(
+            d.remove_closed(s.id).await,
+            Err(DeskError::Conflict(_))
+        ));
+    })
+    .await;
+}

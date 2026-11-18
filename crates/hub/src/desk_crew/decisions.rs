@@ -40,6 +40,9 @@ pub(crate) struct Done {
     pub started: Option<Uuid>,
     /// The session it closed has a conversation to resume.
     pub resumable: bool,
+    /// The session it closed was removed from Desk too: what brings it
+    /// back on Undo.
+    pub removed: Option<workforce_desk::KeptSession>,
 }
 
 /// What was true before the action that its undo goes back to.
@@ -133,6 +136,7 @@ pub(crate) fn undo_of(action: &Action, done: &Done, before: &Before) -> (Undo, O
             let plan = UndoPlan::Reopen {
                 session: *session,
                 name: before.name.clone().unwrap_or_default(),
+                removed: done.removed.clone().map(Box::new),
             };
             match done.resumable {
                 true => (Undo::Reverse, Some(plan)),
@@ -780,10 +784,24 @@ impl CrewHub {
                 prompt: prompt.clone(),
             },
             UndoPlan::StopStarted { session } => Action::Stop { session: *session },
-            UndoPlan::Reopen { session, .. } => Action::Resume {
-                session: *session,
-                prompt: None,
-            },
+            UndoPlan::Reopen {
+                session, removed, ..
+            } => {
+                // Removed too: back in Desk first, closed, then resumed.
+                if let Some(kept) = removed {
+                    self.desk.restore_removed(kept).await.map_err(|e| match e {
+                        workforce_desk::DeskError::Internal(e) => {
+                            tracing::warn!(error = %e, "a removed session couldn't be brought back");
+                            "Something went wrong on this Mac.".to_string()
+                        }
+                        other => format!("It couldn't be brought back: {other}"),
+                    })?;
+                }
+                Action::Resume {
+                    session: *session,
+                    prompt: None,
+                }
+            }
         };
         self.perform(&action, by).await
     }
@@ -974,6 +992,7 @@ mod tests {
         let reopen = Some(UndoPlan::Reopen {
             session: s,
             name: "web".into(),
+            removed: None,
         });
         assert_eq!(
             undo_of(&close, &resumable, &named),
