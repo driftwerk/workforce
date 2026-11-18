@@ -897,6 +897,20 @@ impl CrewHub {
                     .into(),
             );
         }
+        // An irreversible request on a job another session holds, as
+        // irreversible: never the boss's to allow (R5), the person's.
+        if matches!(verdict, Verdict::Allow(_)) {
+            if let Some(conflict) = Box::pin(self.request_conflict(boss, view.id, p)).await {
+                if !still() {
+                    return Outcome::NotOurs;
+                }
+                self.desk.let_go(view.id, p.id);
+                self.record_left(boss, view, p, &conflict).await;
+                return Outcome::Waits(format!(
+                    "I'd have allowed it, but {conflict}; it's yours to answer"
+                ));
+            }
+        }
         let by = By::manager(boss, &name, &why);
         let deciding = self.deciding(boss);
         let performed = self.perform(&action, by.clone()).await;

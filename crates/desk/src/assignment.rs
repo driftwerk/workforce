@@ -181,7 +181,10 @@ impl Assignment {
 
     /// Its targets, read back.
     pub fn parsed_targets(&self) -> Vec<Target> {
-        self.targets.iter().filter_map(|t| Target::parse(t)).collect()
+        self.targets
+            .iter()
+            .filter_map(|t| Target::parse(t))
+            .collect()
     }
 }
 
@@ -316,15 +319,18 @@ fn words(text: &str) -> Vec<Word> {
                 push(&mut cur, &mut out, sentence, clause);
                 clause += 1;
             }
-            '\'' | '’' | '‘' | '"' | '“' | '”' | '(' | ')' | '[' | ']' | '{' | '}' | '`'
-            | '*' => push(&mut cur, &mut out, sentence, clause),
+            '\'' | '’' | '‘' | '"' | '“' | '”' | '(' | ')' | '[' | ']' | '{' | '}' | '`' | '*' => {
+                push(&mut cur, &mut out, sentence, clause)
+            }
             c if c.is_whitespace() => push(&mut cur, &mut out, sentence, clause),
             c => cur.push(c),
         }
     }
     push(&mut cur, &mut out, sentence, clause);
     for w in &mut out {
-        let t = w.text.trim_matches(|c: char| matches!(c, '.' | ',' | '!' | '?'));
+        let t = w
+            .text
+            .trim_matches(|c: char| matches!(c, '.' | ',' | '!' | '?'));
         w.text = t.to_string();
     }
     out.retain(|w| !w.text.is_empty());
@@ -374,7 +380,8 @@ fn environment(w: &str) -> Option<&'static str> {
 /// A release number as said after "release": `4`, `4,`, `r4`.
 fn release_number(w: &str) -> Option<String> {
     let w = w.strip_prefix('#').unwrap_or(w);
-    digits(w).then(|| w.trim_start_matches('0').to_string())
+    digits(w)
+        .then(|| w.trim_start_matches('0').to_string())
         .map(|n| if n.is_empty() { "0".into() } else { n })
 }
 
@@ -409,7 +416,10 @@ fn targets_at(ws: &[Word]) -> Vec<(usize, Target)> {
                 } else {
                     break;
                 }
-                if w == "release" && any && ws.get(j).is_some_and(|n| n.text != "and" && n.text != "or") {
+                if w == "release"
+                    && any
+                    && ws.get(j).is_some_and(|n| n.text != "and" && n.text != "or")
+                {
                     break;
                 }
             }
@@ -461,7 +471,10 @@ fn targets_at(ws: &[Word]) -> Vec<(usize, Target)> {
 /// What `text` names: releases, PRs, workflow files, commits, run ids and
 /// environments, each once.
 pub fn targets(text: &str) -> Vec<Target> {
-    targets_at(&words(text)).into_iter().map(|(_, t)| t).collect()
+    targets_at(&words(text))
+        .into_iter()
+        .map(|(_, t)| t)
+        .collect()
 }
 
 /// The verbs that start, on their own, what can't be taken back.
@@ -501,10 +514,43 @@ const DETERMINERS: &[&str] = &[
 /// The words after a verb that make it a noun ("release notes", "merge
 /// conflict", "deploy key").
 const NOUN_AFTER: &[&str] = &[
-    "notes", "note", "conflict", "conflicts", "request", "requests", "queue", "train",
-    "candidate", "process", "plan", "pipeline", "step", "steps", "job", "window", "status",
-    "script", "file", "prep", "branch", "log", "logs", "key", "keys", "is", "was", "has",
-    "had", "can", "will", "went", "ran", "of", "succeeded", "failed", "finished",
+    "notes",
+    "note",
+    "conflict",
+    "conflicts",
+    "request",
+    "requests",
+    "queue",
+    "train",
+    "candidate",
+    "process",
+    "plan",
+    "pipeline",
+    "step",
+    "steps",
+    "job",
+    "window",
+    "status",
+    "script",
+    "file",
+    "prep",
+    "branch",
+    "log",
+    "logs",
+    "key",
+    "keys",
+    "is",
+    "was",
+    "has",
+    "had",
+    "can",
+    "will",
+    "went",
+    "ran",
+    "of",
+    "succeeded",
+    "failed",
+    "finished",
 ];
 
 /// Whether the words just before `at`, in its clause, turn it down
@@ -517,8 +563,18 @@ fn negated(ws: &[Word], at: usize) -> bool {
         .any(|w| {
             matches!(
                 w.text.as_str(),
-                "not" | "never" | "don" | "dont" | "t" | "without" | "nor" | "no" | "avoid"
-                    | "neither" | "stop" | "instead"
+                "not"
+                    | "never"
+                    | "don"
+                    | "dont"
+                    | "t"
+                    | "without"
+                    | "nor"
+                    | "no"
+                    | "avoid"
+                    | "neither"
+                    | "stop"
+                    | "instead"
             )
         })
 }
@@ -539,8 +595,7 @@ fn acts(ws: &[Word], has_target: bool) -> Vec<usize> {
             .map(|n| n.text.as_str());
         // "release 4", "promote 44389184927": a number right after names
         // the thing, not what to do to it ("merge #711" still acts).
-        let numbered = matches!(t, "release" | "promote" | "deploy")
-            && next.is_some_and(|n| digits(n));
+        let numbered = matches!(t, "release" | "promote" | "deploy") && next.is_some_and(digits);
         let noun = numbered
             || prev.is_some_and(|p| DETERMINERS.contains(&p))
             || next.is_some_and(|n| NOUN_AFTER.contains(&n));
@@ -705,7 +760,10 @@ pub enum Ruling {
         supersede: Vec<Uuid>,
         follow_up: bool,
     },
-    Refused { rule: Rule, holder: Uuid },
+    Refused {
+        rule: Rule,
+        holder: Uuid,
+    },
 }
 
 /// Whether two sets of environments can be the same place: either says
@@ -721,12 +779,19 @@ fn same_place(a: &[Target], b: &[Target]) -> bool {
     ea.is_empty() || eb.is_empty() || ea.iter().any(|e| eb.contains(e))
 }
 
+/// Where `a`'s job is done, as its key says (`<place>/<kind>/<id>`).
+fn key_place(a: &Assignment) -> Option<&str> {
+    let k = a.job_key.as_deref()?;
+    let mut parts = k.rsplitn(3, '/');
+    let (_, _, place) = (parts.next()?, parts.next()?, parts.next()?);
+    Some(place)
+}
+
 /// Whether `a` and `b` (assignment targets) share something other than an
 /// environment, in places that can be the same.
 pub fn share_target(a: &[Target], b: &[Target]) -> bool {
     same_place(a, b)
-        && a
-            .iter()
+        && a.iter()
             .filter(|t| t.kind != TargetKind::Environment)
             .any(|t| b.contains(t))
 }
@@ -771,7 +836,16 @@ pub fn rule(new: &Assignment, live: &[Live], replacing: Option<Uuid>) -> Ruling 
             refuse(Rule::SameJob, a.id, &mut refused);
             continue;
         }
-        let same_repo = a.repo.is_none() || new.repo.is_none() || a.repo == new.repo;
+        let same_repo = match (&a.repo, &new.repo) {
+            (Some(x), Some(y)) => x == y,
+            // Neither knows its repository: the folders its jobs are keyed
+            // in tell them apart, when both say.
+            (None, None) => match (key_place(a), key_place(new)) {
+                (Some(x), Some(y)) => x == y,
+                _ => true,
+            },
+            _ => true,
+        };
         if a.irreversible
             && new.irreversible
             && same_repo
@@ -818,7 +892,12 @@ mod tests {
         }
         assert_eq!(
             keys(OWN_4),
-            vec!["run:44383453606", "run:44388058690", "release:4", "release:3"]
+            vec![
+                "run:44383453606",
+                "run:44388058690",
+                "release:4",
+                "release:3"
+            ]
         );
         let d3 = keys(DISPATCH_3);
         assert!(d3.contains(&"commit:f40816536a2fa8d947706f7f7a2c3f6d951a0123".into()));
@@ -879,7 +958,10 @@ mod tests {
         // A commit has letters and digits; a word of hex letters isn't one.
         assert_eq!(keys("at f408165 now"), vec!["commit:f408165"]);
         assert!(keys("the facade decade").is_empty());
-        assert!(keys("abc1234").len() == 1 && keys("abc12").is_empty(), "seven at least");
+        assert!(
+            keys("abc1234").len() == 1 && keys("abc12").is_empty(),
+            "seven at least"
+        );
         // A run id is nine digits or more; a date isn't one.
         assert_eq!(keys("rerun 44383453606"), vec!["run:44383453606"]);
         assert!(keys("on 20261118, and 202611181230").is_empty());
@@ -890,7 +972,10 @@ mod tests {
         // Releases, PRs and workflows however they are written.
         assert_eq!(keys("R4"), vec!["release:4"]);
         assert_eq!(keys("release-4"), vec!["release:4"]);
-        assert_eq!(keys("PR 708 and pr #709 and #710"), vec!["pr:708", "pr:709", "pr:710"]);
+        assert_eq!(
+            keys("PR 708 and pr #709 and #710"),
+            vec!["pr:708", "pr:709", "pr:710"]
+        );
         assert_eq!(
             keys("run .github/workflows/promote.yml in prod"),
             vec!["workflow:promote.yml", "env:production"]
@@ -899,10 +984,23 @@ mod tests {
 
     #[test]
     fn a_named_job_keys_by_its_target_else_by_its_words() {
-        let r = read("Carry on with it.", Some("the Harbor release 4"), "harbor", false);
+        let r = read(
+            "Carry on with it.",
+            Some("the Harbor release 4"),
+            "harbor",
+            false,
+        );
         assert_eq!(r.job_key.as_deref(), Some("harbor/release/4"));
-        let r = read("Carry on with it.", Some("Rotate the prod database password"), "harbor", false);
-        assert_eq!(r.job_key.as_deref(), Some("harbor/job/rotate database password"));
+        let r = read(
+            "Carry on with it.",
+            Some("Rotate the prod database password"),
+            "harbor",
+            false,
+        );
+        assert_eq!(
+            r.job_key.as_deref(),
+            Some("harbor/job/rotate database password")
+        );
         assert_eq!(read("Run the tests.", None, "harbor", false).job_key, None);
     }
 
@@ -983,10 +1081,21 @@ mod tests {
                 }
             )
         };
-        assert!(refused("Deploy Harbor production release 4; it carries #711."));
-        assert!(refused("Deploy release 4, which carries #711."), "no environment: any");
-        assert!(!refused("Deploy release 4 to staging; it carries #711."), "another place");
-        assert!(!refused("Deploy release 4 to production."), "nothing shared");
+        assert!(refused(
+            "Deploy Harbor production release 4; it carries #711."
+        ));
+        assert!(
+            refused("Deploy release 4, which carries #711."),
+            "no environment: any"
+        );
+        assert!(
+            !refused("Deploy release 4 to staging; it carries #711."),
+            "another place"
+        );
+        assert!(
+            !refused("Deploy release 4 to production."),
+            "nothing shared"
+        );
         // Another repository is another job.
         let mut other = live(b, "Deploy release 4, which carries #711.", false).a;
         other.repo = Some("acme/other".into());
@@ -996,7 +1105,10 @@ mod tests {
     #[test]
     fn plain_words_to_many_sessions_hold_nothing() {
         let sessions: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
-        let held: Vec<Live> = sessions.iter().map(|s| live(*s, "Run the tests.", true)).collect();
+        let held: Vec<Live> = sessions
+            .iter()
+            .map(|s| live(*s, "Run the tests.", true))
+            .collect();
         let new = live(Uuid::new_v4(), "Run the tests.", false).a;
         assert!(matches!(rule(&new, &held, None), Ruling::Send { .. }));
         // Two mentions of one PR, neither a claim, don't refuse each other.

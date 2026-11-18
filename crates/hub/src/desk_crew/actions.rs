@@ -1368,6 +1368,58 @@ impl CrewHub {
     /// how it is undone; an answer to a session's question is said in its
     /// DM from that row. Recording never stops the action.
     pub(crate) async fn perform(&self, action: &Action, by: By) -> Result<String, String> {
+        // Boxed: its future is large, and is awaited from deep in a turn.
+        Box::pin(self.perform_with(action, by, &super::assignments::Order::default())).await
+    }
+
+    /// [`Self::perform`], with what the boss's tool said of its `order`:
+    /// the job it hands out, kept as an assignment
+    /// ([`super::assignments`]) reserved before it is sent.
+    pub(crate) async fn perform_with(
+        &self,
+        action: &Action,
+        by: By,
+        order: &super::assignments::Order,
+    ) -> Result<String, String> {
+        // A held order going out that isn't sent after all holds nothing.
+        let unheld = |why: &str| {
+            let why = why.to_string();
+            async move {
+                if let Some(id) = order.released {
+                    let _ = self
+                        .desk
+                        .store()
+                        .assignment_close(
+                            id,
+                            workforce_desk::assignment::AssignmentState::Failed,
+                            "desk",
+                            &crew::one_line(&why, 300),
+                        )
+                        .await;
+                }
+            }
+        };
+        // R5: a boss allows no irreversible request on a job another
+        // session holds, as irreversible, whichever path it came by.
+        if let (crew::PartyKind::Manager, Action::Approve { session, approval }) =
+            (by.party.kind, action)
+        {
+            let pending = self
+                .desk
+                .view(*session)
+                .ok()
+                .and_then(|v| v.pending)
+                .filter(|p| p.id == *approval);
+            if let Some(p) = pending {
+                if let Some(conflict) =
+                    Box::pin(self.request_conflict(&by.party.id, *session, &p)).await
+                {
+                    return Err(format!(
+                        "Not allowed: {conflict}. It's the person's to answer."
+                    ));
+                }
+            }
+        }
         // A session the person took back gets nothing from any boss,
         // whichever path its action came by.
         if by.party.kind == crew::PartyKind::Manager {
@@ -1383,8 +1435,16 @@ impl CrewHub {
             None => None,
         };
         if let Some(s) = lane {
-            if let Some(said) = self.check_at_send(action, &by.party.id, s).await? {
-                return Ok(said);
+            match self.check_at_send(action, &by.party.id, s).await {
+                Ok(Some(said)) => {
+                    unheld(&said).await;
+                    return Ok(said);
+                }
+                Err(why) => {
+                    unheld(&why).await;
+                    return Err(why);
+                }
+                Ok(None) => {}
             }
         }
         // The same instruction to the same session again, soon after: said
@@ -1392,6 +1452,7 @@ impl CrewHub {
         let told = match self.tell_once(action, &by) {
             Ok(told) => told,
             Err(at) => {
+                unheld("it was said already").await;
                 let tz = self.desk.timezone();
                 let name = match action {
                     Action::Nudge {
@@ -1406,10 +1467,37 @@ impl CrewHub {
             ));
             }
         };
+        // Who holds which job: reserved before it is sent, or refused.
+        let reserved = match Box::pin(self.assign_before(action, &by, order)).await {
+            Ok(super::assignments::Before::Send(r)) => Some(r),
+            Ok(super::assignments::Before::Not) => None,
+            Ok(super::assignments::Before::Held(said)) => {
+                if let Some(t) = told {
+                    self.untell(t);
+                }
+                return Ok(said);
+            }
+            Err(why) => {
+                if let Some(t) = told {
+                    self.untell(t);
+                }
+                return Err(why);
+            }
+        };
+        let guarded = reserved
+            .as_ref()
+            .and_then(|r| r.guard.as_deref())
+            .and_then(|g| super::assignments::guarded(action, g));
+        let action = guarded.as_ref().unwrap_or(action);
         let before = self.before(action);
         let who = by.clone();
         let mut done = Done::default();
-        let said = match self.perform_as(action, by, &mut done).await {
+        let performed = self.perform_as(action, by, &mut done).await;
+        if let Some(r) = &reserved {
+            Box::pin(self.assign_after(r, &who, done.line.map(|(id, _)| id), performed.is_ok()))
+                .await;
+        }
+        let said = match performed {
             Ok(said) => {
                 // Sent: in the picture before anything else is decided.
                 if who.party.kind == crew::PartyKind::Manager {
@@ -2082,7 +2170,8 @@ impl CrewHub {
             Ok(done) => Ok((done, true)),
             // Decided on a picture that moved: decided again, not done
             // anyway in a new session.
-            Err(why) if super::picture::stale(&why) => {
+            // Or refused as another session's job: no new session does it.
+            Err(why) if super::picture::stale(&why) || super::assignments::refused(&why) => {
                 self.unclaim(session);
                 Err(why)
             }

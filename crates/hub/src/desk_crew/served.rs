@@ -430,7 +430,11 @@ impl CrewHub {
                 .await
                 .map(|v| (ServedStatus::Ok, v))
         } else {
-            self.served_act(tool, &call.input, &grant, &o, &boss).await
+            // A call the home relayed is kept as an assignment at the
+            // home; one of a boss served from its own hub, here.
+            let relayed = call.link_id.as_deref() == Some(super::relay::RELAY_LINK);
+            self.served_act(tool, &call.input, &grant, &o, &boss, relayed)
+                .await
         };
         // The boss answered a request itself: its ask to the person is
         // closed.
@@ -956,6 +960,7 @@ impl CrewHub {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn served_act(
         self: &Arc<Self>,
         tool: &'static str,
@@ -963,7 +968,10 @@ impl CrewHub {
         g: &Grant,
         o: &Oversight,
         boss: &str,
+        relayed: bool,
     ) -> Result<(ServedStatus, Value), String> {
+        let mut order = super::assignments::Order::of(input);
+        order.unrecorded = relayed;
         let reason = input["reason"]
             .as_str()
             .map(str::trim)
@@ -1067,7 +1075,7 @@ impl CrewHub {
                     Action::StartSession { .. } => {
                         self.served_start(&action, g, o, boss, by).await?
                     }
-                    _ => self.perform(&action, by).await?,
+                    _ => Box::pin(self.perform_with(&action, by, &order)).await?,
                 };
                 Ok((ServedStatus::Ok, json!({ "done": done })))
             }

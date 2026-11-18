@@ -1873,6 +1873,7 @@ mod act_fully_budget;
 mod decides_at_once;
 
 mod answers_questions;
+mod assignments;
 
 mod terminal_asks;
 

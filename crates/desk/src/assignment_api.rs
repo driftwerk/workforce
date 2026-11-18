@@ -104,7 +104,12 @@ async fn close(
         .map(str::trim)
         .filter(|n| !n.is_empty())
         .unwrap_or("You closed it.");
-    match s.desk.store().assignment_close(id, state, "person", why).await {
+    match s
+        .desk
+        .store()
+        .assignment_close(id, state, "person", why)
+        .await
+    {
         Ok(Some(a)) => {
             s.desk.note(Event::new(
                 Kind::AssignmentClosed,

@@ -87,7 +87,7 @@ pub enum Reserved {
         follow_up: bool,
     },
     /// Not kept: `rule` refuses it, for the live assignment `holder`.
-    Refused { rule: Rule, holder: Assignment },
+    Refused { rule: Rule, holder: Box<Assignment> },
 }
 
 impl DeskStore {
@@ -123,21 +123,21 @@ impl DeskStore {
                 a,
             })
             .collect();
-        let (supersede, follow_up) =
-            match assignment::rule(new, &live, replacing.map(|(id, _)| id)) {
-                Ruling::Refused { rule, holder } => {
-                    let holder = live
-                        .into_iter()
-                        .find(|l| l.a.id == holder)
-                        .map(|l| l.a)
-                        .ok_or_else(|| eyre::eyre!("the holder went missing"))?;
-                    return Ok(Reserved::Refused { rule, holder });
-                }
-                Ruling::Send {
-                    supersede,
-                    follow_up,
-                } => (supersede, follow_up),
-            };
+        let (supersede, follow_up) = match assignment::rule(new, &live, replacing.map(|(id, _)| id))
+        {
+            Ruling::Refused { rule, holder } => {
+                let holder = live
+                    .into_iter()
+                    .find(|l| l.a.id == holder)
+                    .map(|l| Box::new(l.a))
+                    .ok_or_else(|| eyre::eyre!("the holder went missing"))?;
+                return Ok(Reserved::Refused { rule, holder });
+            }
+            Ruling::Send {
+                supersede,
+                follow_up,
+            } => (supersede, follow_up),
+        };
         let now = crate::crew::now();
         let why = format!("superseded by {}", assignment::short(new.id));
         let mut superseded = Vec::new();
@@ -212,7 +212,7 @@ impl DeskStore {
                 if let Some(holder) = holder {
                     return Ok(Reserved::Refused {
                         rule: Rule::SameJob,
-                        holder,
+                        holder: Box::new(holder),
                     });
                 }
             }
@@ -401,6 +401,19 @@ impl DeskStore {
             .transpose()
     }
 
+    /// The held assignment `id` waits on the answer to `stand_down`, the
+    /// line message telling its old holder to stand down.
+    pub async fn assignment_wait_on(&self, id: Uuid, stand_down: Uuid) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "UPDATE boss_assignments SET stand_down = $2 WHERE id = $1",
+                &[&id, &stand_down],
+            )
+            .await?;
+        Ok(())
+    }
+
     /// The person's order `item` is what `boss`'s turn on runner session
     /// `sid` (its turn keys start `<sid>#`) served, since `since`.
     pub async fn assignments_serve_item(
@@ -434,7 +447,7 @@ impl DeskStore {
                        SELECT a.id, ( \
                          SELECT l.id FROM line_messages l \
                          WHERE l.sender ->> 'id' = a.boss AND l.recipient ->> 'id' = a.session::text \
-                         AND l.text = a.text AND l.at >= a.sent_at - interval '1 second' \
+                         AND starts_with(l.text, a.text) AND l.at >= a.sent_at - interval '1 second' \
                          ORDER BY l.at LIMIT 1) AS line \
                        FROM boss_assignments a WHERE a.state = 'sending' AND a.sent_at < $1) \
                      UPDATE boss_assignments a SET \
@@ -563,7 +576,10 @@ mod tests {
                 async move { store.assignment(id).await.unwrap().unwrap() }
             };
             let a = now(sent.id).await;
-            assert_eq!((a.state, a.line_message), (AssignmentState::Open, Some(m.id)));
+            assert_eq!(
+                (a.state, a.line_message),
+                (AssignmentState::Open, Some(m.id))
+            );
             assert_eq!(now(lost.id).await.state, AssignmentState::Failed);
             assert_eq!(now(fresh.id).await.state, AssignmentState::Sending);
             // Failed holds no job: it may be given again.
@@ -591,7 +607,10 @@ mod tests {
                 1,
             );
             store.put_line(&m).await.unwrap();
-            store.assignment_sent(first.id, Some(m.id), true).await.unwrap();
+            store
+                .assignment_sent(first.id, Some(m.id), true)
+                .await
+                .unwrap();
             // Still queued: a new order takes its place.
             let again = order("boss", s, "Start Harbor production release 3 now.");
             match store.assignment_reserve(&again, None).await.unwrap() {
