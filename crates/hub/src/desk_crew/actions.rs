@@ -36,10 +36,12 @@ pub(crate) enum Handout {
     Session(Uuid),
     Agent(String),
     /// A session started for it, which the overseer runs: `engine` None is
-    /// `[oversight.work] engine`.
+    /// `[oversight.work] engine`, and `model` None its model there (see
+    /// [`CrewHub::runs_on`]).
     NewSession {
         folder: String,
         engine: Option<Engine>,
+        model: Option<String>,
     },
 }
 
@@ -99,6 +101,9 @@ pub(crate) enum Action {
         name: Option<String>,
         /// None: `[oversight.work] engine`.
         engine: Option<Engine>,
+        /// The model the person asked for; none is `[oversight.work] model`
+        /// on that engine, or another engine's own default.
+        model: Option<String>,
         view: Option<View>,
         /// A new branch to work on, in a worktree of its own.
         worktree: Option<String>,
@@ -188,6 +193,8 @@ struct Input {
     goal: Option<String>,
     name: Option<String>,
     engine: Option<Engine>,
+    /// `crew.start_session`'s model, when the person asked for one.
+    model: Option<String>,
     view: Option<View>,
     worktree: Option<String>,
     /// `crew.start_session`'s `new`: a new session, whatever is there.
@@ -276,12 +283,35 @@ fn handout(to: Option<Value>) -> Result<Handout, String> {
             }
             None => None,
         };
+        // Kept as said: `""` asks for the engine's own model.
+        let model = n
+            .get("model")
+            .and_then(Value::as_str)
+            .map(|m| m.trim().to_string());
         return Ok(Handout::NewSession {
             folder: folder.into(),
             engine,
+            model,
         });
     }
     Err(say())
+}
+
+/// The model a session on `engine` runs: `asked` when the person asked for
+/// one (`""` being that engine's own default), else `[oversight.work]
+/// model` when `engine` is the default engine, else none (that engine's own
+/// default).
+pub(crate) fn model_on(engine: Engine, asked: Option<&str>, o: &Oversight) -> Option<String> {
+    let model = match asked {
+        Some(m) => Some(m),
+        None => (Engine::parse(o.work.engine.trim()).ok() == Some(engine))
+            .then_some(o.work.model.as_deref())
+            .flatten(),
+    };
+    model
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
 }
 
 fn blank_none(raw: Option<String>) -> Option<String> {
@@ -372,6 +402,8 @@ impl Action {
                 goal: text(i.goal, "the goal")?,
                 name: blank_none(i.name),
                 engine: i.engine,
+                // Kept as said: `""` asks for the engine's own model.
+                model: i.model.map(|m| m.trim().to_string()),
                 view: i.view,
                 worktree: blank_none(i.worktree),
                 fresh: i.fresh.unwrap_or(false),
@@ -1907,6 +1939,7 @@ impl CrewHub {
             goal,
             name,
             engine,
+            model,
             view,
             worktree,
             ..
@@ -1919,7 +1952,7 @@ impl CrewHub {
             .await
             .ok_or("No one oversees the crew to start sessions for.")?;
         let boss = Party::manager(service.agent_id.as_str(), &super::name_of(&service));
-        let engine = self.engine_or_default(*engine, &o)?;
+        let (engine, model) = self.runs_on(*engine, model.as_deref(), &o)?;
         let view = self.startable(engine, *view)?;
         let _one = self.starting.lock().await;
         self.slot_free(&boss, &o, &by)?;
@@ -1946,7 +1979,7 @@ impl CrewHub {
                     // A Codex session the overseer starts runs as fast as
                     // the overseer does (`[llm] fast`).
                     fast: engine == Engine::Codex && service.resolved.snapshot().fast,
-                    model: None,
+                    model,
                     account: None,
                     env: Default::default(),
                     group: self.boss_group(&service, &o),
@@ -2129,6 +2162,41 @@ impl CrewHub {
         }
     }
 
+    /// The engine and model a session the overseer starts runs on: the
+    /// person's default (`[oversight.work] engine` and `model`) unless the
+    /// person asked for another. An engine asked for that is the default
+    /// one still runs the default model; another runs its own default
+    /// model unless a model is asked for too.
+    pub(crate) fn runs_on(
+        &self,
+        engine: Option<Engine>,
+        model: Option<&str>,
+        o: &Oversight,
+    ) -> Result<(Engine, Option<String>), String> {
+        let engine = self.engine_or_default(engine, o)?;
+        let model_arg = model;
+        let model = model_on(engine, model, o);
+        if let Some(m) = &model {
+            if !workforce_desk::engine::model_ok(engine, m) {
+                // No model named: the bad one is the person's default.
+                return Err(if model_arg.is_none() {
+                    format!(
+                        "The person's default model for new sessions, \"{m}\", isn't one {} takes; ask them to change it in your settings, or name a model {} takes.",
+                        engine.title(),
+                        engine.title()
+                    )
+                } else {
+                    format!(
+                        "\"{m}\" isn't a model {} takes; say one as {} names it, or leave model out.",
+                        engine.title(),
+                        engine.title()
+                    )
+                });
+            }
+        }
+        Ok((engine, model))
+    }
+
     /// Whether `boss` has a slot free for one more session it starts, when
     /// `by` is the overseer itself: the person saying yes to a start is
     /// theirs to decide. Call it holding `starting`.
@@ -2206,7 +2274,12 @@ impl CrewHub {
             } => {
                 let t = self.ticket_named(ticket, *id, seen).await?;
                 let key = t.key.clone().unwrap_or_else(|| ticket.clone());
-                if let Handout::NewSession { folder, engine } = to {
+                if let Handout::NewSession {
+                    folder,
+                    engine,
+                    model,
+                } = to
+                {
                     if let Some(runs) = self.plan_runs_of(t.ticket.id).await {
                         let (Some(wants), Some(at)) = (runs.engine, runs.folder) else {
                             return Err(format!("{key} doesn't say where its session runs."));
@@ -2218,6 +2291,13 @@ impl CrewHub {
                             ));
                         }
                         *engine = Some(wants);
+                        // As its plan says: the ticket's model was the
+                        // person's default, or their word, when it was
+                        // drafted (`plan::fill_model`); none there is the
+                        // engine's own, never today's default.
+                        if model.is_none() {
+                            *model = Some(runs.model.clone().unwrap_or_default());
+                        }
                     }
                 }
                 *planned = matches!(to, Handout::NewSession { .. })
@@ -2357,13 +2437,17 @@ impl CrewHub {
                 .assign_ticket(id, Some(AssignTo::Agent(a.clone())), &by)
                 .await
                 .map_err(board_plain)?,
-            Handout::NewSession { folder, engine } => {
+            Handout::NewSession {
+                folder,
+                engine,
+                model,
+            } => {
                 let (service, o) = self
                     .boss_for(&by)
                     .await
                     .ok_or("No one oversees the crew to start sessions for.")?;
                 let boss = Party::manager(service.agent_id.as_str(), &super::name_of(&service));
-                let engine = self.engine_or_default(*engine, &o)?;
+                let (engine, model) = self.runs_on(*engine, model.as_deref(), &o)?;
                 self.startable(engine, None)?;
                 self.slot_free(&boss, &o, &by)?;
                 // A plan's ticket starts nothing while the breaker holds
@@ -2386,7 +2470,7 @@ impl CrewHub {
                 let new = AssignTo::NewSession(NewSessionFor {
                     path: folder.clone(),
                     engine,
-                    model: None,
+                    model,
                 });
                 d.assign_ticket_for(id, Some(new), &by, Some(&charged))
                     .await
@@ -2711,6 +2795,62 @@ fn told_line(action: &Action, by: &By) -> Option<(Uuid, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session the boss starts runs on the person's default engine and
+    /// model; one the person asked for runs as asked.
+    #[test]
+    fn a_boss_started_session_runs_the_persons_default_engine_and_model_unless_asked() {
+        let mut o = Oversight::default();
+        o.work.engine = "codex".into();
+        o.work.model = Some("gpt-6.1-sol".into());
+        // Nothing said: the default engine and its model.
+        assert_eq!(
+            model_on(Engine::Codex, None, &o).as_deref(),
+            Some("gpt-6.1-sol")
+        );
+        // Another engine asked for: that engine's own default, never a
+        // model of the default engine's.
+        assert_eq!(model_on(Engine::Claude, None, &o), None);
+        // A model asked for wins, and `""` is the engine's own.
+        assert_eq!(
+            model_on(Engine::Claude, Some("opus"), &o).as_deref(),
+            Some("opus")
+        );
+        assert_eq!(model_on(Engine::Codex, Some(""), &o), None);
+        // No default model: the engine's own.
+        o.work.model = None;
+        assert_eq!(model_on(Engine::Codex, None, &o), None);
+    }
+
+    #[test]
+    fn a_start_and_a_new_sessions_hand_out_read_the_model_asked_for() {
+        let a = Action::parse(
+            "crew.start_session",
+            &json!({"folder": "/work/acme", "goal": "Fix it", "model": " opus "}),
+        )
+        .unwrap();
+        assert!(
+            matches!(&a, Action::StartSession { engine: None, model: Some(m), .. } if m == "opus")
+        );
+        let a = Action::parse(
+            "crew.start_session",
+            &json!({"folder": "/work/acme", "goal": "Fix it", "model": ""}),
+        )
+        .unwrap();
+        // `""` is said: the engine's own model, not the person's default.
+        assert!(matches!(&a, Action::StartSession { model: Some(m), .. } if m.is_empty()));
+        assert_eq!(
+            handout(Some(
+                json!({"newSession": {"folder": "/work/acme", "engine": "codex", "model": "gpt-6.1-sol"}})
+            ))
+            .unwrap(),
+            Handout::NewSession {
+                folder: "/work/acme".into(),
+                engine: Some(Engine::Codex),
+                model: Some("gpt-6.1-sol".into()),
+            }
+        );
+    }
 
     #[test]
     fn actions_parse_from_tool_input_and_back_from_a_suggestion() {

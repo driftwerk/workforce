@@ -13,7 +13,7 @@
 //! max_checkins_per_hour = 6
 //! max_checkins_per_day = 100
 //! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = true, interrupt = false, message_agents = false, message_terminal_sessions = false, answer_sessions = true, hand_off = false, set_mode = false }
-//! work = { prefer_sessions = true, parallel = 4, take_on = "handed", engine = "claude", max_turns_per_hour = 60, close_finished = true }
+//! work = { prefer_sessions = true, parallel = 4, take_on = "handed", engine = "claude", model = "", max_turns_per_hour = 60, close_finished = true }
 //! full = { repos = ["acme/acme-web", "~/dev/globex-api"], workflows = ["deploy.yml", "promote.yml"], budget_usd_per_day = 25 }
 //! updates = { cheap_calls_per_day = 500, account_questions_per_day = 60, close_from_accounts = false, enabled = true, every_minutes = 3, max_wait_minutes = 10, away_after_minutes = 15 }
 //! ```
@@ -326,6 +326,16 @@ impl TakeOn {
     }
 }
 
+/// Whether `m` reads as a model's name as Desk starts a session on one
+/// (`workforce_desk`'s rule): short, a letter or digit first, then letters,
+/// digits and `- _ . : / [ ] @`.
+fn model_name_ok(m: &str) -> bool {
+    m.len() <= 100
+        && m.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && m.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.:/[]@".contains(c))
+}
+
 /// How the overseer runs sessions for the person.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Work {
@@ -338,6 +348,10 @@ pub struct Work {
     pub take_on: TakeOn,
     /// The engine new sessions run on when nothing says another.
     pub engine: String,
+    /// The model they run on `engine`, as that engine names it; none (or
+    /// `""`) is the engine's own default. A session on another engine runs
+    /// that engine's default unless a model is asked for.
+    pub model: Option<String>,
     /// Its turns for its sessions' turn ends, in any hour.
     pub max_turns_per_hour: u32,
     /// It closes the sessions it runs once their work is done
@@ -682,6 +696,7 @@ impl Default for Oversight {
                 parallel: 4,
                 take_on: TakeOn::Handed,
                 engine: "claude".into(),
+                model: None,
                 max_turns_per_hour: 60,
                 close_finished: true,
             },
@@ -1066,6 +1081,17 @@ impl Oversight {
                 )
             }
         };
+        let model = match work.and_then(|t| t.get("model")) {
+            None => d.work.model.clone(),
+            Some(Value::String(s)) if s.trim().is_empty() => None,
+            Some(Value::String(s)) if model_name_ok(s.trim()) => Some(s.trim().to_string()),
+            Some(_) => {
+                return Err(
+                    "Its default model must be a model's name: letters, digits and - _ . : / [ ] @, starting with a letter or digit."
+                        .into(),
+                )
+            }
+        };
         let every_minutes = whole(
             updates,
             "every_minutes",
@@ -1275,6 +1301,7 @@ impl Oversight {
                 )?,
                 take_on,
                 engine,
+                model,
                 max_turns_per_hour: whole(
                     work,
                     "max_turns_per_hour",
@@ -1765,16 +1792,25 @@ mod tests {
         assert!(d.prefer_sessions);
         assert_eq!((d.parallel, d.take_on), (4, TakeOn::Handed));
         assert_eq!((d.engine.as_str(), d.max_turns_per_hour), ("claude", 60));
+        assert_eq!(d.model, None, "the engine's own default model");
+        assert_eq!(
+            parse("[oversight]\nwork = { model = \"\" }\n")
+                .unwrap()
+                .work
+                .model,
+            None,
+            "an empty model is the engine's default"
+        );
         assert!(
             d.close_finished,
             "it closes its finished sessions unless told not to"
         );
         let inline = parse(
-            "[oversight]\nwork = { prefer_sessions = false, parallel = 12, take_on = \"all\", engine = \"codex\", max_turns_per_hour = 1, close_finished = false }\n",
+            "[oversight]\nwork = { prefer_sessions = false, parallel = 12, take_on = \"all\", engine = \"codex\", model = \"gpt-6.1-sol\", max_turns_per_hour = 1, close_finished = false }\n",
         )
         .unwrap();
         let table = parse(
-            "[oversight]\n[oversight.work]\nprefer_sessions = false\nparallel = 12\ntake_on = \"all\"\nengine = \"codex\"\nmax_turns_per_hour = 1\nclose_finished = false\n",
+            "[oversight]\n[oversight.work]\nprefer_sessions = false\nparallel = 12\ntake_on = \"all\"\nengine = \"codex\"\nmodel = \"gpt-6.1-sol\"\nmax_turns_per_hour = 1\nclose_finished = false\n",
         )
         .unwrap();
         assert_eq!(inline, table);
@@ -1785,6 +1821,7 @@ mod tests {
                 parallel: 12,
                 take_on: TakeOn::All,
                 engine: "codex".into(),
+                model: Some("gpt-6.1-sol".into()),
                 max_turns_per_hour: 1,
                 close_finished: false,
             }
@@ -1825,6 +1862,14 @@ mod tests {
             (
                 "[oversight]\nwork = { engine = 3 }\n",
                 "Its default engine must be named in one word, such as claude or codex.",
+            ),
+            (
+                "[oversight]\nwork = { model = \"-rf\" }\n",
+                "Its default model must be a model's name: letters, digits and - _ . : / [ ] @, starting with a letter or digit.",
+            ),
+            (
+                "[oversight]\nwork = { model = 5 }\n",
+                "Its default model must be a model's name: letters, digits and - _ . : / [ ] @, starting with a letter or digit.",
             ),
             (
                 "[oversight]\nwork = { max_turns_per_hour = 0 }\n",

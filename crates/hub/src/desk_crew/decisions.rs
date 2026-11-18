@@ -1014,6 +1014,7 @@ mod tests {
             goal: "g".into(),
             name: None,
             engine: None,
+            model: None,
             view: None,
             worktree: None,
             fresh: false,
