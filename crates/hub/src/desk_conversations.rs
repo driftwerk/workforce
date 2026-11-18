@@ -694,7 +694,19 @@ fn threads_of(
             Cursor::Newest,
             workforce_desk::conversations::PAGE_MAX,
         )?;
+        let working = running(&head.id);
         let Some(last) = page.messages.last() else {
+            // A thread its parent started shows no replies until its first
+            // turn answers; it is listed while that turn runs.
+            if working {
+                threads.push(Thread {
+                    parent: parent.to_string(),
+                    replies: 0,
+                    last_at: head.updated_at,
+                    authors: Vec::new(),
+                    working,
+                });
+            }
             continue;
         };
         let mut authors = Vec::new();
@@ -708,7 +720,7 @@ fn threads_of(
             replies: page.messages.len(),
             last_at: last.at,
             authors,
-            working: running(&head.id),
+            working,
         });
     }
     threads.sort_by_key(|t| std::cmp::Reverse(t.last_at));
@@ -1300,11 +1312,10 @@ mod tests {
         // the id it was sent with, and answers it there.
         let mut thread = store.get_or_create(&channel, ME, "scout").unwrap();
         thread.add_user_message("what shall we ship?", Some(&parent));
-        thread.add_assistant_message("the importer", 1);
         store.save(&thread).unwrap();
-        for m in &thread.messages {
-            store.append_to_archive(&thread.id, m).unwrap();
-        }
+        store
+            .append_to_archive(&thread.id, &thread.messages[0])
+            .unwrap();
         let file = workforce_core::desk::DeskFile {
             artifact_id: "art-1".into(),
             agent_id: "scout".into(),
@@ -1347,6 +1358,26 @@ mod tests {
             head.messages.iter().any(|m| m.id == parent),
             "in the DM's context"
         );
+
+        // Listed while its first turn runs, before any reply.
+        let running = |id: &str| id == thread.id;
+        let listed = threads_of(&store, &scout(), ME, running).unwrap();
+        assert_eq!(listed.threads.len(), 1);
+        assert_eq!(
+            (listed.threads[0].replies, listed.threads[0].working),
+            (0, true)
+        );
+        assert!(listed.threads[0].authors.is_empty());
+        assert!(threads_of(&store, &scout(), ME, |_| false)
+            .unwrap()
+            .threads
+            .is_empty());
+        let mut thread = store.get(&thread.id).unwrap().unwrap();
+        thread.add_assistant_message("the importer", 1);
+        store.save(&thread).unwrap();
+        store
+            .append_to_archive(&thread.id, thread.messages.last().unwrap())
+            .unwrap();
 
         // The thread reads as its replies, the question shown in the DM alone.
         let own = page(&store, &scout(), ME, &channel, Cursor::Newest, 10).unwrap();

@@ -5660,12 +5660,14 @@ async fn a_desk_message_that_starts_a_thread_is_kept_in_the_dm_and_answered_in_t
     );
     // The thread holds it as its question, and the answer.
     let thread = service.sessions.find(&channel, "owner-1").unwrap().unwrap();
-    let roles: Vec<_> = thread.messages.iter().map(|m| m.role.clone()).collect();
+    let said: Vec<_> = thread
+        .messages
+        .iter()
+        .filter(|m| m.role != MessageRole::System)
+        .collect();
+    let roles: Vec<_> = said.iter().map(|m| m.role.clone()).collect();
     assert_eq!(roles, [MessageRole::User, MessageRole::Assistant]);
-    assert_eq!(
-        thread.messages[0].external_id.as_deref(),
-        Some(parent.as_str())
-    );
+    assert_eq!(said[0].external_id.as_deref(), Some(parent.as_str()));
 }
 
 /// Asks `text` in owner-1's Desk DM under the client id `asked`, as an edit
