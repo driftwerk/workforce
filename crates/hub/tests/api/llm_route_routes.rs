@@ -171,6 +171,17 @@ impl Hub {
     }
 }
 
+/// Why `kind` can't be picked, as `view`'s options say; `None` when it can.
+fn refused<'a>(view: &'a Value, kind: &str) -> Option<&'a str> {
+    let option = view["options"]
+        .as_array()
+        .unwrap_or_else(|| panic!("options listed: {view}"))
+        .iter()
+        .find(|option| option["kind"] == kind)
+        .unwrap_or_else(|| panic!("{kind} listed: {view}"));
+    option["refused"].as_str()
+}
+
 fn claude(fallback: &str) -> Value {
     json!({ "kind": "claude-code", "fallback": fallback })
 }
@@ -182,6 +193,11 @@ async fn a_person_sets_their_every_agent_route_with_a_login_of_their_own() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["available"], true);
     assert_eq!(body["route"], Value::Null);
+    assert!(
+        refused(&body, "claude-code").is_some_and(|why| why.contains("Claude login")),
+        "greyed out until she connects her own: {body}"
+    );
+    assert!(refused(&body, "devin").is_some(), "{body}");
 
     let (status, body) = hub
         .put(&hub.alice, "/api/me/llm-route", claude("wait"))
@@ -199,8 +215,10 @@ async fn a_person_sets_their_every_agent_route_with_a_login_of_their_own() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["route"], claude("hub"));
+    assert_eq!(refused(&body, "claude-code"), None, "{body}");
     let (_, body) = hub.get(&hub.alice, "/api/me/llm-route").await;
     assert_eq!(body["route"], claude("hub"));
+    assert_eq!(refused(&body, "claude-code"), None, "offered now: {body}");
 
     let (_, theirs) = hub.get(&hub.bob, "/api/me/llm-route").await;
     assert_eq!(theirs["route"], Value::Null, "Bob's setting is his own");
@@ -226,6 +244,7 @@ async fn the_per_agent_setting_wins_and_hub_refuses_the_every_agent_one() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["route"], Value::Null);
     assert_eq!(body["effective"], claude("wait"), "as in her settings");
+    assert_eq!(refused(&body, "claude-code"), None, "{body}");
 
     let (status, body) = hub.put(&hub.alice, path, json!("hub")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -331,6 +350,10 @@ async fn an_agent_that_opted_out_or_narrowed_the_kinds_refuses_a_route_of_its_ow
     });
     let (_, body) = hub.get(&hub.alice, path).await;
     assert_eq!(body["available"], false, "{body}");
+    assert!(
+        refused(&body, "claude-code").is_some_and(|why| why.contains("this agent")),
+        "greyed out with the agent's reason: {body}"
+    );
     let (status, body) = hub.put(&hub.alice, path, claude("wait")).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(
