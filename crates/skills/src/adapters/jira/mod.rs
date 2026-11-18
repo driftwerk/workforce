@@ -275,7 +275,7 @@ impl JiraSkill {
                 ),
                 mk_tool(
                     "jira.update_issue",
-                    "Update fields on an existing Jira issue. Descriptions accept markdown (rendered to ADF) or raw ADF.",
+                    "Update fields on an existing Jira issue, and/or rank it before or after another issue on its boards. Descriptions accept markdown (rendered to ADF) or raw ADF.",
                     serde_json::json!({
                         "type": "object",
                         "properties": {
@@ -285,7 +285,9 @@ impl JiraSkill {
                             "description": { "type": "string" },
                             "labels": { "type": "array", "items": { "type": "string" } },
                             "priority": { "type": "string" },
-                            "fields": { "type": "object" }
+                            "fields": { "type": "object" },
+                            "rank_before_issue": { "type": "string" },
+                            "rank_after_issue": { "type": "string" }
                         },
                         "required": ["issue_key"]
                     }),

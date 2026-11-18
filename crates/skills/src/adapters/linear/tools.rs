@@ -489,6 +489,7 @@ fn list_query(params: &str, limit: u64, page: &str, filter_clause: &str, rich: b
                     description
                     priority
                     priorityLabel
+                    sortOrder
                     state {{
                         id
                         name
@@ -638,6 +639,7 @@ impl Tool for LinearIssueGetTool {
                     description
                     priority
                     priorityLabel
+                    sortOrder
                     state {
                         id
                         name
@@ -846,6 +848,7 @@ impl Tool for LinearIssueSearchTool {
                         description
                         priority
                         priorityLabel
+                        sortOrder
                         state {
                             id
                             name
@@ -1185,6 +1188,10 @@ impl Tool for LinearIssueUpdateTool {
                     "items": { "type": "string" },
                     "description": "New label UUID strings (replaces existing)"
                 },
+                "sort_order": {
+                    "type": "number",
+                    "description": "New place in manually sorted lists (lower first): a value between two neighbouring issues' sortOrder puts it between them"
+                },
                 "workspace": {
                     "type": "string",
                     "description": workspace_description(&self.clients, &self.default_workspace)
@@ -1284,6 +1291,9 @@ impl Tool for LinearIssueUpdateTool {
         if let Some(label_ids) = input["label_ids"].as_array() {
             update_input.insert("labelIds".to_string(), serde_json::json!(label_ids));
         }
+        if let Some(at) = input["sort_order"].as_f64().filter(|f| f.is_finite()) {
+            update_input.insert("sortOrder".to_string(), serde_json::json!(at));
+        }
 
         if update_input.is_empty() {
             return Ok(ToolResult::failure(
@@ -1302,6 +1312,7 @@ impl Tool for LinearIssueUpdateTool {
                         title
                         description
                         priority
+                        sortOrder
                         state {
                             id
                             name

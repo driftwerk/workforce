@@ -81,9 +81,10 @@ fn attachment_summaries(fields: &Value) -> Vec<Value> {
 }
 
 /// The roles a site's own custom fields play, by the field ids a caller
-/// names (`custom_fields`): `points`, `sprint`, `start_date` and
-/// `development`. Ids differ per site; `jira.list_fields` finds them.
-const CUSTOM_ROLES: &[&str] = &["points", "sprint", "start_date", "development"];
+/// names (`custom_fields`): `points`, `sprint`, `start_date`,
+/// `development` and `rank` (Jira Software's Rank, each issue's place on
+/// its boards). Ids differ per site; `jira.list_fields` finds them.
+const CUSTOM_ROLES: &[&str] = &["points", "sprint", "start_date", "development", "rank"];
 
 /// The custom field ids `input.custom_fields` names, by role: only ids
 /// that look like one (`customfield_123`), so nothing else is asked for.
@@ -240,6 +241,8 @@ fn issue_extras(
             "points" => v.as_f64().map_or(Value::Null, |p| json!(p)),
             "start_date" => v.as_str().map_or(Value::Null, |d| json!(d)),
             "development" => development_summary(v),
+            // A LexoRank (`0|i0000f:`): Jira's own string, never a person's.
+            "rank" => v.as_str().map_or(Value::Null, |r| json!(r)),
             // A sprint field holds every sprint the issue was in: each
             // one's name (wrapped), state and dates.
             _ => Value::Array(
@@ -502,7 +505,7 @@ impl Tool for JiraSearchTool {
                 "fields": { "type": "array", "items": { "type": "string" }, "description": "Field IDs to return (default: summary,status,assignee,priority,updated)" },
                 "next_page_token": { "type": "string", "description": "Pagination cursor from a previous response" },
                 "max_results": { "type": "integer", "description": "Page size (default 50, max 100)" },
-                "custom_fields": { "type": "object", "description": "This site's custom field ids by role, from jira.list_fields: points, sprint, start_date, development (e.g. {\"points\": \"customfield_10016\"}). Each comes back under its role's name." }
+                "custom_fields": { "type": "object", "description": "This site's custom field ids by role, from jira.list_fields: points, sprint, start_date, development, rank (e.g. {\"points\": \"customfield_10016\"}). Each comes back under its role's name." }
             },
             "required": ["jql"]
         })
@@ -654,7 +657,7 @@ impl Tool for JiraGetIssueTool {
             "properties": {
                 "workspace": { "type": "string", "description": self.workspace_desc() },
                 "issue_key": { "type": "string", "description": "Issue key, e.g. 'ENG-123'" },
-                "custom_fields": { "type": "object", "description": "This site's custom field ids by role, from jira.list_fields: points, sprint, start_date, development. Each comes back under its role's name." },
+                "custom_fields": { "type": "object", "description": "This site's custom field ids by role, from jira.list_fields: points, sprint, start_date, development, rank. Each comes back under its role's name." },
                 "description_adf": { "type": "boolean", "description": "Also answer the description as Jira stores it (Atlassian Document Format), as JSON text under `description_adf`." },
                 "changelog": { "type": "boolean", "description": "Also answer the issue's change history (`changelog`): its newest 100 entries, oldest first." }
             },
@@ -890,7 +893,7 @@ impl Tool for JiraUpdateIssueTool {
         "jira.update_issue"
     }
     fn description(&self) -> &str {
-        "Update fields on an existing Jira issue. Descriptions accept markdown (rendered to ADF) or a raw ADF object."
+        "Update fields on an existing Jira issue, and/or move it on its boards (rank it before or after another issue). Descriptions accept markdown (rendered to ADF) or a raw ADF object."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -902,7 +905,9 @@ impl Tool for JiraUpdateIssueTool {
                 "description": { "type": "string", "description": "Markdown string (rendered to ADF) or raw ADF object." },
                 "labels": { "type": "array", "items": { "type": "string" } },
                 "priority": { "type": "string" },
-                "fields": { "type": "object", "description": "Raw fields object merged into the update payload (use for custom fields)" }
+                "fields": { "type": "object", "description": "Raw fields object merged into the update payload (use for custom fields)" },
+                "rank_before_issue": { "type": "string", "description": "Move the issue to just above this one (an issue key) on its boards. Give this or rank_after_issue." },
+                "rank_after_issue": { "type": "string", "description": "Move the issue to just below this one (an issue key) on its boards." }
             },
             "required": ["issue_key"]
         })
@@ -936,30 +941,104 @@ impl Tool for JiraUpdateIssueTool {
             }
         }
 
-        if fields.is_empty() {
+        let rank = match rank_body(&key, &input) {
+            Ok(r) => r,
+            Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
+        };
+        if fields.is_empty() && rank.is_none() {
             return Ok(ToolResult::failure(
                 "No fields to update".to_string(),
                 start.elapsed().as_millis() as u64,
             ));
         }
 
-        let body = json!({ "fields": Value::Object(fields) });
-        let path = format!("{REST}/issue/{key}");
-        let duration_ms = start.elapsed().as_millis() as u64;
-        match client.put(&path, &body).await {
-            Ok(_) => Ok(ToolResult::success(
-                json!({ "key": key, "updated": true }),
-                duration_ms,
-            )),
-            Err(e) => {
+        let updated = !fields.is_empty();
+        if updated {
+            let body = json!({ "fields": Value::Object(fields) });
+            let path = format!("{REST}/issue/{key}");
+            if let Err(e) = client.put(&path, &body).await {
                 let e = enrich_priority_error(e, &client).await;
-                Ok(ToolResult::from_report(
+                return Ok(ToolResult::from_report(
                     &e.wrap_err(format!("Failed to update {key}")),
                     start.elapsed().as_millis() as u64,
-                ))
+                ));
             }
         }
+        let ranked = rank.is_some();
+        if let Some(body) = rank {
+            // 204 when it moved; 207 with each issue's errors when it didn't.
+            let failed = match client.put(&format!("{AGILE}/issue/rank"), &body).await {
+                Ok(answer) => rank_errors(&answer),
+                Err(e) => Some(format!("{e:#}")),
+            };
+            if let Some(why) = failed {
+                let said = match updated {
+                    true => format!("Updated {key}, but couldn't rank it: {why}"),
+                    false => format!("Couldn't rank {key}: {why}"),
+                };
+                return Ok(ToolResult::failure(
+                    said,
+                    start.elapsed().as_millis() as u64,
+                ));
+            }
+        }
+        Ok(ToolResult::success(
+            json!({ "key": key, "updated": updated, "ranked": ranked }),
+            start.elapsed().as_millis() as u64,
+        ))
     }
+}
+
+/// The body of Jira Software's rank call (`PUT /rest/agile/1.0/issue/rank`)
+/// for `key`, from `rank_before_issue` or `rank_after_issue`: None when
+/// neither is given; refused when both are, or one isn't an issue key.
+fn rank_body(key: &str, input: &Value) -> std::result::Result<Option<Value>, String> {
+    let before = input["rank_before_issue"]
+        .as_str()
+        .filter(|s| !s.is_empty());
+    let after = input["rank_after_issue"].as_str().filter(|s| !s.is_empty());
+    let (field, other) = match (before, after) {
+        (None, None) => return Ok(None),
+        (Some(_), Some(_)) => {
+            return Err("Give one of rank_before_issue or rank_after_issue, not both.".into())
+        }
+        (Some(b), None) => ("rankBeforeIssue", b),
+        (None, Some(a)) => ("rankAfterIssue", a),
+    };
+    if !issue_key_ok(other) || other == key {
+        return Err(format!(
+            "{other} isn't another issue's key to rank {key} by."
+        ));
+    }
+    Ok(Some(json!({ "issues": [key], field: other })))
+}
+
+/// What a rank call's 207 answer says went wrong for its issue, if
+/// anything (a 204 answers nothing).
+fn rank_errors(answer: &Value) -> Option<String> {
+    let failed: Vec<String> = answer["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["status"].as_u64().is_some_and(|s| s >= 300))
+        .map(|e| {
+            let errors: Vec<&str> = e["errors"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            match errors.is_empty() {
+                true => format!("status {}", e["status"]),
+                false => errors.join("; "),
+            }
+        })
+        .collect();
+    (!failed.is_empty()).then(|| clip_text(&failed.join("; "), 300))
+}
+
+fn clip_text(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1065,7 +1144,8 @@ jira_tool_struct!(JiraListFieldsTool);
 
 /// The custom fields `jira.list_fields` finds by role, from `/field`: the
 /// story points (Jira Software's own estimate first), the sprint, the start
-/// date and the Development summary. Absent when the site has none.
+/// date, the Development summary and the Rank. Absent when the site has
+/// none.
 fn field_roles(fields: &[Value]) -> Value {
     let custom = |f: &&Value| f["custom"].as_bool() == Some(true);
     let schema = |f: &Value| {
@@ -1104,11 +1184,16 @@ fn field_roles(fields: &[Value]) -> Value {
         .find(|f| schema(f).ends_with(":devsummarycf"))
         .or_else(|| all.iter().find(|f| named(f, "Development")))
         .copied();
+    let rank = all
+        .iter()
+        .find(|f| schema(f) == "com.pyxis.greenhopper.jira:gh-lexo-rank")
+        .copied();
     json!({
         "points": id(points),
         "sprint": id(sprint),
         "start_date": id(start),
         "development": id(development),
+        "rank": id(rank),
     })
 }
 
@@ -1118,7 +1203,7 @@ impl Tool for JiraListFieldsTool {
         "jira.list_fields"
     }
     fn description(&self) -> &str {
-        "This Jira site's own custom fields by role (story points, sprint, start date, Development), for jira.search's and jira.get_issue's custom_fields, and its priorities, highest first."
+        "This Jira site's own custom fields by role (story points, sprint, start date, Development, Rank), for jira.search's and jira.get_issue's custom_fields, and its priorities, highest first."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -2896,15 +2981,106 @@ mod tests {
             json!({ "id": "customfield_10020", "name": "Sprint", "custom": true, "schema": { "type": "array", "custom": "com.pyxis.greenhopper.jira:gh-sprint" } }),
             json!({ "id": "customfield_10015", "name": "Start date", "custom": true, "schema": { "type": "date", "custom": "com.atlassian.jira.plugin.system.customfieldtypes:datepicker" } }),
             json!({ "id": "customfield_10000", "name": "Development", "custom": true, "schema": { "type": "any", "custom": "com.atlassian.jira.plugins.jira-development-integration-plugin:devsummarycf" } }),
+            json!({ "id": "customfield_10019", "name": "Rank", "custom": true, "schema": { "type": "any", "custom": "com.pyxis.greenhopper.jira:gh-lexo-rank" } }),
         ];
         assert_eq!(
             field_roles(&fields),
             json!({ "points": "customfield_10016", "sprint": "customfield_10020",
-                "start_date": "customfield_10015", "development": "customfield_10000" })
+                "start_date": "customfield_10015", "development": "customfield_10000",
+                "rank": "customfield_10019" })
         );
         assert_eq!(
             field_roles(&fields[..2]),
-            json!({ "points": "customfield_10026", "sprint": null, "start_date": null, "development": null })
+            json!({ "points": "customfield_10026", "sprint": null, "start_date": null, "development": null, "rank": null })
+        );
+    }
+
+    #[test]
+    fn a_search_row_carries_its_rank_by_role() {
+        let f = json!({ "customfield_10019": "0|i0002f:" });
+        let custom = custom_fields(&json!({ "custom_fields": { "rank": "customfield_10019" } }));
+        let out = Value::Object(issue_extras(&f, Some(&[][..]), &custom, "jira.search"));
+        assert_eq!(out["rank"], "0|i0002f:");
+    }
+
+    #[test]
+    fn a_rank_names_one_other_issue() {
+        assert_eq!(rank_body("ENG-1", &json!({})), Ok(None));
+        assert_eq!(
+            rank_body("ENG-1", &json!({ "rank_before_issue": "ENG-2" })),
+            Ok(Some(
+                json!({ "issues": ["ENG-1"], "rankBeforeIssue": "ENG-2" })
+            ))
+        );
+        assert_eq!(
+            rank_body("ENG-1", &json!({ "rank_after_issue": "ENG-3" })),
+            Ok(Some(
+                json!({ "issues": ["ENG-1"], "rankAfterIssue": "ENG-3" })
+            ))
+        );
+        for bad in [
+            json!({ "rank_before_issue": "ENG-2", "rank_after_issue": "ENG-3" }),
+            json!({ "rank_after_issue": "../x" }),
+            json!({ "rank_after_issue": "ENG-1" }),
+        ] {
+            assert!(rank_body("ENG-1", &bad).is_err(), "{bad}");
+        }
+    }
+
+    /// A rank call moves the issue with Jira Software's own call; one Jira
+    /// answers with a 207 of errors is a failure, in its words.
+    #[tokio::test]
+    async fn update_issue_ranks_and_says_when_jira_refused() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/agile/1.0/issue/rank"))
+            .and(body_json(
+                json!({ "issues": ["ENG-1"], "rankAfterIssue": "ENG-2" }),
+            ))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/agile/1.0/issue/rank"))
+            .and(body_json(
+                json!({ "issues": ["ENG-1"], "rankBeforeIssue": "ENG-9" }),
+            ))
+            .respond_with(
+                ResponseTemplate::new(207).set_body_json(json!({ "entries": [
+                { "issueId": 1, "issueKey": "ENG-1", "status": 403,
+                  "errors": ["You don't have permission to rank issues."] } ] })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let clients: ClientMap = Arc::new(
+            [("acme".to_string(), make_client(&server.uri()))]
+                .into_iter()
+                .collect(),
+        );
+        let tool = JiraUpdateIssueTool::new(clients, "acme".into(), Arc::default());
+        let r = tool
+            .execute(json!({ "issue_key": "ENG-1", "rank_after_issue": "ENG-2" }))
+            .await
+            .unwrap();
+        assert!(r.success, "{:?}", r.error);
+        assert_eq!(r.output["ranked"], true);
+        assert_eq!(r.output["updated"], false);
+        let r = tool
+            .execute(json!({ "issue_key": "ENG-1", "rank_before_issue": "ENG-9" }))
+            .await
+            .unwrap();
+        assert!(!r.success);
+        assert!(
+            r.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("permission to rank"),
+            "{:?}",
+            r.error
         );
     }
 
