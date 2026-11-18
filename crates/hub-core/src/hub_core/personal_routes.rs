@@ -72,6 +72,11 @@ pub trait PersonRouteStore: Send + Sync {
     ) -> Result<Option<AgentRoute>>;
     /// `person`'s latest changes, newest first, at most `limit`.
     async fn changes(&self, person: Uuid, limit: usize) -> Result<Vec<RouteChange>>;
+    /// Everyone with a setting kept, and how many.
+    async fn people(&self) -> Result<Vec<(String, usize)>>;
+    /// Removes `person`'s settings (their audit rows stay, as records); how
+    /// many there were.
+    async fn forget_person(&self, person: Uuid) -> Result<usize>;
 }
 
 /// How long a person's settings are trusted before they are read again: a
@@ -275,5 +280,28 @@ impl PersonRouteStore for MemoryRouteStore {
             .take(limit)
             .map(|(_, change)| change.clone())
             .collect())
+    }
+
+    async fn people(&self) -> Result<Vec<(String, usize)>> {
+        let inner = self.inner.lock();
+        let mut counts = std::collections::BTreeMap::<Uuid, usize>::new();
+        for person in inner.every_agent.keys() {
+            *counts.entry(*person).or_default() += 1;
+        }
+        for (person, _) in inner.per_agent.keys() {
+            *counts.entry(*person).or_default() += 1;
+        }
+        Ok(counts
+            .into_iter()
+            .map(|(person, count)| (person.to_string(), count))
+            .collect())
+    }
+
+    async fn forget_person(&self, person: Uuid) -> Result<usize> {
+        let mut inner = self.inner.lock();
+        let before = inner.every_agent.len() + inner.per_agent.len();
+        inner.every_agent.remove(&person);
+        inner.per_agent.retain(|(who, _), _| *who != person);
+        Ok(before - inner.every_agent.len() - inner.per_agent.len())
     }
 }

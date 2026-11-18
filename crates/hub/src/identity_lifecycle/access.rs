@@ -738,6 +738,71 @@ impl Holding for BudgetOverrides {
     }
 }
 
+/// A person's choice of their own subscription route, for every agent or
+/// one: theirs alone, so it goes with them (a merge keeps the surviving
+/// person's own choice). The record of each change stays, as an audit row.
+pub struct LlmRoutes;
+
+impl LlmRoutes {
+    fn store(
+        cx: &Context<'_>,
+    ) -> Result<Option<std::sync::Arc<dyn crate::hub_core::personal_routes::PersonRouteStore>>>
+    {
+        Ok(cx.hub()?.subscriptions().personal_routes().store())
+    }
+
+    async fn remove(cx: &Context<'_>, who: &Person, apply: bool) -> Result<Tally> {
+        let Some(store) = Self::store(cx)? else {
+            return Ok(Tally::default());
+        };
+        let held = store
+            .people()
+            .await?
+            .into_iter()
+            .find(|(person, _)| *person == who.key())
+            .map_or(0, |(_, count)| count);
+        if apply && held > 0 {
+            store.forget_person(who.id).await?;
+            cx.hub()?.subscriptions().personal_routes().forget(who.id);
+        }
+        Ok(Tally::counted(held))
+    }
+}
+
+#[async_trait]
+impl Holding for LlmRoutes {
+    async fn owners(&self, cx: &Context<'_>) -> Result<Owners> {
+        let Some(store) = Self::store(cx)? else {
+            return Ok(Owners::default());
+        };
+        Ok(Owners::counted(store.people().await?))
+    }
+
+    async fn held(&self, cx: &Context<'_>, who: &Person) -> Result<Tally> {
+        Self::remove(cx, who, false).await
+    }
+
+    async fn merge(
+        &self,
+        cx: &Context<'_>,
+        from: &Person,
+        _: &Person,
+        apply: bool,
+    ) -> Result<Tally> {
+        Self::remove(cx, from, apply).await
+    }
+
+    async fn delete(
+        &self,
+        cx: &Context<'_>,
+        who: &Person,
+        _: Option<&Person>,
+        apply: bool,
+    ) -> Result<Tally> {
+        Self::remove(cx, who, apply).await
+    }
+}
+
 /// The people budget overrides raise a ceiling for.
 pub(super) fn identity_overrides(
     overrides: Vec<crate::budget_overrides::BudgetOverride>,

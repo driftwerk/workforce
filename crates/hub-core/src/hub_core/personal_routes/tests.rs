@@ -114,6 +114,34 @@ async fn keeps_settings(store: Arc<dyn PersonRouteStore>) {
     assert!(changes.iter().all(|change| change.actor == actor));
     assert_eq!(store.changes(alice, 2).await.unwrap().len(), 2);
     assert!(store.changes(bob, 10).await.unwrap().is_empty());
+
+    // What a person's removal finds and erases: their settings, not the
+    // record of their changes.
+    store
+        .set_every_agent(alice, Some(CLAUDE), &actor)
+        .await
+        .unwrap();
+    for agent in ["lattice", "quill"] {
+        store
+            .set_for_agent(alice, agent, Some(AgentRoute::Hub), &actor)
+            .await
+            .unwrap();
+    }
+    let alice_key = alice.to_string();
+    let held = |people: Vec<(String, usize)>| {
+        people
+            .into_iter()
+            .find(|(who, _)| *who == alice_key)
+            .map(|(_, n)| n)
+    };
+    assert_eq!(held(store.people().await.unwrap()), Some(3));
+    assert_eq!(store.forget_person(alice).await.unwrap(), 3);
+    assert_eq!(held(store.people().await.unwrap()), None);
+    assert_eq!(
+        store.settings(alice, Some("quill")).await.unwrap(),
+        RouteSettings::default()
+    );
+    assert_eq!(store.changes(alice, 100).await.unwrap().len(), 8);
 }
 
 #[tokio::test]

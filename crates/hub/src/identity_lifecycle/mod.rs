@@ -75,6 +75,8 @@ pub enum Category {
     PermissionRules,
     ApproverSlots,
     BudgetOverrides,
+    /// The person's choice of their own subscription route.
+    LlmRoutes,
     Approvals,
     ScheduledJobs,
     Definitions,
@@ -105,7 +107,7 @@ pub enum Category {
 }
 
 impl Category {
-    pub const ALL: [Category; 34] = [
+    pub const ALL: [Category; 35] = [
         Self::IdentityRecord,
         Self::RemoteMcpTokens,
         Self::Devices,
@@ -115,6 +117,7 @@ impl Category {
         Self::PermissionRules,
         Self::ApproverSlots,
         Self::BudgetOverrides,
+        Self::LlmRoutes,
         Self::Approvals,
         Self::ScheduledJobs,
         Self::Definitions,
@@ -156,7 +159,8 @@ impl Category {
             Self::RoleGrants
             | Self::PermissionRules
             | Self::ApproverSlots
-            | Self::BudgetOverrides => (M::Drop, D::Erase),
+            | Self::BudgetOverrides
+            | Self::LlmRoutes => (M::Drop, D::Erase),
             Self::Approvals => (M::Move, D::Erase),
             Self::ScheduledJobs | Self::Definitions => (
                 M::Move,
@@ -206,6 +210,7 @@ impl Category {
             | Self::PermissionRules
             | Self::ApproverSlots
             | Self::BudgetOverrides
+            | Self::LlmRoutes
             | Self::Approvals
             | Self::ScheduledJobs
             | Self::Definitions
@@ -235,6 +240,7 @@ impl Category {
             | Self::PermissionRules
             | Self::ApproverSlots
             | Self::BudgetOverrides
+            | Self::LlmRoutes
             | Self::Memories
             | Self::PersonalFiles
             | Self::Vault
@@ -272,6 +278,7 @@ impl Category {
             Self::PermissionRules => "permission_rules",
             Self::ApproverSlots => "approver_slots",
             Self::BudgetOverrides => "budget_overrides",
+            Self::LlmRoutes => "llm_routes",
             Self::Approvals => "approvals",
             Self::ScheduledJobs => "scheduled_jobs",
             Self::Definitions => "definitions",
@@ -858,6 +865,7 @@ pub fn pausable(category: Category) -> Option<&'static dyn Pausable> {
         | Category::PermissionRules
         | Category::ApproverSlots
         | Category::BudgetOverrides
+        | Category::LlmRoutes
         | Category::Approvals
         | Category::HeartbeatChecks
         | Category::LearningPlans
@@ -894,6 +902,7 @@ pub fn holding(category: Category) -> &'static dyn Holding {
         Category::PermissionRules => &access::PermissionRules,
         Category::ApproverSlots => &access::ApproverSlots,
         Category::BudgetOverrides => &access::BudgetOverrides,
+        Category::LlmRoutes => &access::LlmRoutes,
         Category::Approvals => &access::Approvals,
         Category::ScheduledJobs => &automation::ScheduledJobs,
         Category::Definitions => &automation::Definitions,

@@ -741,6 +741,7 @@ fn a_hand_over_moves_personal_content_only_when_asked_and_never_carries_access()
         Category::PermissionRules,
         Category::ApproverSlots,
         Category::BudgetOverrides,
+        Category::LlmRoutes,
         Category::RemoteMcpTokens,
         Category::Devices,
         Category::ChannelAllowlist,
