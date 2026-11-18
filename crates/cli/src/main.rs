@@ -3375,6 +3375,8 @@ async fn spawn_and_wire_agent(
         ctx.global_vault.clone(),
     );
     workforce_hub::desk_driver::register_tools(&service);
+    // A theme for the person's Desk, on every hub.
+    workforce_hub::desk_themes::register(&service);
     workforce_hub::agent_registry::AgentRegistry::wire_coding_session_tools_for(
         &service,
         Arc::clone(&ctx.project_store),
@@ -5685,6 +5687,13 @@ rules:
                         agent_svc.register_tool(label_tool);
                     }
                     tracing::info!("Session label tool registered on all agents");
+                }
+
+                // Desk themes on every agent built at boot, as the live-spawn
+                // path does for one spawned later: on every hub, Desk sessions
+                // on or not.
+                for agent_svc in registry_for_slack.all_services() {
+                    workforce_hub::desk_themes::register(&agent_svc);
                 }
 
                 // Build the hub-wide knowledge maintenance runner first so

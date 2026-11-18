@@ -283,6 +283,11 @@ pub struct CrewHub {
     /// When Desk's native side last asked for calls: while it hasn't
     /// lately, nothing is queued and a machine is said not reached at once.
     relay_polled: Mutex<Option<std::time::Instant>>,
+    /// The day the person was offered a card to raise the day's spent
+    /// metered cheap calls ([`own_settings`]).
+    notes_offered: Mutex<Option<chrono::NaiveDate>>,
+    /// When the day's metered cheap calls were last looked at for that.
+    notes_looked: Mutex<Option<std::time::Instant>>,
 }
 
 static CREWS: Mutex<Vec<Weak<CrewHub>>> = Mutex::new(Vec::new());
@@ -698,6 +703,8 @@ impl CrewHub {
             relay_queued: tokio::sync::Notify::new(),
             relay_wait: Mutex::new(Duration::from_secs(30)),
             relay_polled: Mutex::new(None),
+            notes_offered: Mutex::new(None),
+            notes_looked: Mutex::new(None),
         });
         {
             let mut crews = CREWS.lock();
@@ -834,17 +841,22 @@ impl CrewHub {
                 .collect(),
         );
         // The cheap model's day for every session's account: the main
-        // boss's, the accounts being shared (else the first boss's).
+        // boss's, the accounts being shared (else the first boss's). Spent
+        // and metered, the person may raise it from its card.
+        let main = list
+            .iter()
+            .find(|(_, o)| o.scope == Scope::Ungrouped)
+            .or(list.first());
         self.desk.set_account_limits(
-            list.iter()
-                .find(|(_, o)| o.scope == Scope::Ungrouped)
-                .or(list.first())
-                .map(|(_, o)| workforce_desk::account::Limits {
-                    cheap_calls_per_day: o.updates.cheap_calls_per_day,
-                    account_questions_per_day: o.updates.account_questions_per_day,
-                })
-                .unwrap_or_default(),
+            main.map(|(_, o)| workforce_desk::account::Limits {
+                cheap_calls_per_day: o.updates.cheap_calls_per_day,
+                account_questions_per_day: o.updates.account_questions_per_day,
+            })
+            .unwrap_or_default(),
         );
+        if let Some((s, o)) = main {
+            self.notes_look(s, o);
+        }
         // No boss allows a change to any agent's own settings, its own
         // limits among them.
         self.desk.withhold_agent_settings(
