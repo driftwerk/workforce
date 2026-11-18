@@ -862,7 +862,7 @@ impl Desk {
         let fresh = s
             .fields
             .as_ref()
-            .is_some_and(|f| f.rank_asked && now - f.read_at < crate::board_sync::FIELDS_FRESH);
+            .is_some_and(|f| crate::board_sync::fields_fresh(f, now));
         if s.system != System::Jira || fresh || budget.take().is_err() {
             return Ok(s);
         }
@@ -872,7 +872,8 @@ impl Desk {
             {
                 Ok(answer) => crate::board_sync::jira_fields(&answer, now),
                 // What was read before stays: one failed read never takes a
-                // board's points and sprints away. Asked again in a day.
+                // board's points and sprints away. Asked again in a day, or
+                // soon while Rank isn't known.
                 Err(e) => {
                     tracing::info!(board = %id, error = %e, "the Jira site's fields weren't read");
                     board::JiraFields {
