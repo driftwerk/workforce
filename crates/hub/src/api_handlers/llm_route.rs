@@ -15,6 +15,9 @@ use axum::Json;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use workforce_agent::llm::provider::ProviderKind;
+use workforce_agent::llm::responses::ChatGptModel;
+use workforce_agent::llm::tiers::{ModelTier, TierRegistry};
 use workforce_common::personal_route::{
     AgentRoute, PersonalRoute, PersonalRouteKind, PersonalRoutesConfig,
 };
@@ -48,6 +51,20 @@ pub struct RouteOption {
     title: &'static str,
     /// Why it can't be picked here; none when it can.
     refused: Option<String>,
+    /// The models a route of this kind can be set to run, beside the tiers
+    /// (`cheap`, `standard`, `powerful`), most capable first.
+    models: Vec<String>,
+    /// What each kind of work runs on when the person sets none.
+    defaults: RouteDefaults,
+}
+
+/// What each kind of work on a route runs when the person sets none, as a
+/// picker says it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RouteDefaults {
+    conversation: String,
+    light: String,
+    heavy: String,
 }
 
 /// The person's every-agent setting as they see it.
@@ -180,7 +197,7 @@ fn has_worker(service: &AgentService) -> bool {
 /// a working login of its kind or not, on a hub with its coding worker or
 /// not; `None` when it can.
 fn refusal(
-    route: PersonalRoute,
+    route: &PersonalRoute,
     hub_on: bool,
     switch: &PersonalRoutesConfig,
     has_login: bool,
@@ -214,6 +231,73 @@ fn refusal(
     None
 }
 
+/// The models a route of `kind` can be set to run beside the tiers: the
+/// Claude Code models the hub's tiers name, or the models a ChatGPT plan
+/// serves (never one retired from it).
+fn route_models(kind: PersonalRouteKind, tiers: &TierRegistry) -> Vec<String> {
+    match kind {
+        PersonalRouteKind::ClaudeCode => {
+            crate::subscription::tier_models(ProviderKind::ClaudeCode, tiers)
+        }
+        PersonalRouteKind::Codex => ChatGptModel::ALL
+            .iter()
+            .map(|model| model.id().to_string())
+            .collect(),
+        PersonalRouteKind::Devin => Vec::new(),
+    }
+}
+
+/// What each kind of work on a route of `kind` runs when the person sets
+/// none.
+fn route_defaults(kind: PersonalRouteKind) -> RouteDefaults {
+    let same = |s: &str| RouteDefaults {
+        conversation: s.to_string(),
+        light: s.to_string(),
+        heavy: s.to_string(),
+    };
+    match kind {
+        PersonalRouteKind::Codex => same(crate::subscription::completion::CODEX_PLAN_MODEL),
+        // The tier the agent asks for, on Claude.
+        _ => RouteDefaults {
+            conversation: "the agent's own tier".into(),
+            light: "the agent's light tier".into(),
+            heavy: "the agent's heavy tier".into(),
+        },
+    }
+}
+
+/// Why the models `route` names can't be kept, checked against what a
+/// login of its kind serves; `None` when they can. A retired model is
+/// refused with when it was retired and what to use instead.
+fn model_refusal(route: &PersonalRoute, tiers: &TierRegistry) -> Option<String> {
+    if let Some(key) = route.unknown_preference() {
+        return Some(format!(
+            "a route sets only its conversation model under model_preferences, not \"{key}\""
+        ));
+    }
+    let offered = route_models(route.kind, tiers);
+    for (work, model) in route.named() {
+        if ModelTier::from_name(model).is_some() {
+            continue;
+        }
+        match route.kind {
+            PersonalRouteKind::Codex => {
+                if let Err(refused) = ChatGptModel::parse(model) {
+                    return Some(format!("your {work} model can't be used: {refused}"));
+                }
+            }
+            PersonalRouteKind::ClaudeCode if !offered.iter().any(|m| m == model) => {
+                return Some(format!(
+                    "your {work} model can't be used: {model} isn't a Claude model this hub runs (pick one of {})",
+                    offered.join(", ")
+                ));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Every kind as `person` may pick it where `switch` holds, `has_login`
 /// saying whether they hold a working login of a kind of their own, on a
 /// hub with its coding worker or not.
@@ -222,6 +306,7 @@ fn options(
     switch: &PersonalRoutesConfig,
     has_login: impl Fn(PersonalRouteKind) -> bool,
     worker: bool,
+    tiers: &TierRegistry,
 ) -> Vec<RouteOption> {
     PersonalRouteKind::ALL
         .into_iter()
@@ -229,15 +314,14 @@ fn options(
             kind,
             title: kind.title(),
             refused: refusal(
-                PersonalRoute {
-                    kind,
-                    fallback: Default::default(),
-                },
+                &PersonalRoute::new(kind, Default::default()),
                 hub_on,
                 switch,
                 has_login(kind),
                 worker,
             ),
+            models: route_models(kind, tiers),
+            defaults: route_defaults(kind),
         })
         .collect()
 }
@@ -263,6 +347,7 @@ fn every_agent_options(
         switch,
         |kind| has_own_login(kind, &global, &[CredentialTier::GlobalUser], person),
         true,
+        &hub_tiers(state),
     )
 }
 
@@ -288,7 +373,17 @@ fn agent_options(
             )
         },
         has_worker(service),
+        &service.tier_registry(),
     )
+}
+
+/// The tiers models are named by for every agent: the host agent's.
+fn hub_tiers(state: &GatewayState) -> TierRegistry {
+    state
+        .registry
+        .host()
+        .map(|host| host.tier_registry())
+        .unwrap_or_else(|| TierRegistry::new(None))
 }
 
 fn refused(reason: String) -> ApiError {
@@ -338,19 +433,21 @@ pub async fn put_my_route(
     let routes = routes(&state)?;
     let store = store(&routes)?;
     let switch = routes.switch();
-    if let Some(route) = write.route {
+    if let Some(route) = &write.route {
         let global = Vaults {
             agent: None,
             global: state.vault.as_ref(),
         };
         let has_login = has_own_login(route.kind, &global, &[CredentialTier::GlobalUser], person);
-        if let Some(reason) = refusal(route, routes.switch().enabled, &switch, has_login, true) {
+        if let Some(reason) = refusal(route, routes.switch().enabled, &switch, has_login, true)
+            .or_else(|| model_refusal(route, &hub_tiers(&state)))
+        {
             return Err(refused(reason));
         }
     }
     let actor = person.to_string();
     let before = store
-        .set_every_agent(person, write.route, &actor)
+        .set_every_agent(person, write.route.clone(), &actor)
         .await
         .map_err(store_failed)?;
     routes.forget(person);
@@ -426,7 +523,7 @@ pub async fn put_my_agent_route(
     let routes = routes(&state)?;
     let store = store(&routes)?;
     let switch = switch_for(&routes, &service);
-    if let Some(AgentRoute::Personal(route)) = write.route {
+    if let Some(AgentRoute::Personal(route)) = &write.route {
         let has_login = has_own_login(
             route.kind,
             &service.logins.vaults(),
@@ -439,13 +536,15 @@ pub async fn put_my_agent_route(
             &switch,
             has_login,
             has_worker(&service),
-        ) {
+        )
+        .or_else(|| model_refusal(route, &service.tier_registry()))
+        {
             return Err(refused(reason));
         }
     }
     let actor = person.to_string();
     let before = store
-        .set_for_agent(person, &agent_id, write.route, &actor)
+        .set_for_agent(person, &agent_id, write.route.clone(), &actor)
         .await
         .map_err(store_failed)?;
     routes.forget(person);
@@ -466,10 +565,8 @@ mod tests {
     use super::*;
     use workforce_common::personal_route::RouteFallback;
 
-    const CLAUDE: PersonalRoute = PersonalRoute {
-        kind: PersonalRouteKind::ClaudeCode,
-        fallback: RouteFallback::Wait,
-    };
+    const CLAUDE: PersonalRoute =
+        PersonalRoute::new(PersonalRouteKind::ClaudeCode, RouteFallback::Wait);
 
     fn on() -> PersonalRoutesConfig {
         PersonalRoutesConfig {
@@ -480,9 +577,9 @@ mod tests {
 
     #[test]
     fn a_route_is_refused_off_unoffered_unbuilt_or_without_a_login() {
-        assert_eq!(refusal(CLAUDE, true, &on(), true, false), None);
+        assert_eq!(refusal(&CLAUDE, true, &on(), true, false), None);
         assert!(
-            refusal(CLAUDE, false, &PersonalRoutesConfig::default(), true, true)
+            refusal(&CLAUDE, false, &PersonalRoutesConfig::default(), true, true)
                 .unwrap()
                 .contains("doesn't run")
         );
@@ -490,34 +587,28 @@ mod tests {
             enabled: true,
             allow: vec![PersonalRouteKind::Codex],
         };
-        assert!(refusal(CLAUDE, true, &codex_only, true, true)
+        assert!(refusal(&CLAUDE, true, &codex_only, true, true)
             .unwrap()
             .contains("isn't offered"));
-        let devin = PersonalRoute {
-            kind: PersonalRouteKind::Devin,
-            fallback: RouteFallback::Hub,
-        };
-        assert!(refusal(devin, true, &on(), true, true)
+        let devin = PersonalRoute::new(PersonalRouteKind::Devin, RouteFallback::Hub);
+        assert!(refusal(&devin, true, &on(), true, true)
             .unwrap()
             .contains("isn't available yet"));
-        assert!(refusal(CLAUDE, true, &on(), false, true)
+        assert!(refusal(&CLAUDE, true, &on(), false, true)
             .unwrap()
             .contains("connect your own Claude login"));
     }
 
     #[test]
     fn a_codex_route_needs_the_hubs_coding_worker_and_her_own_login() {
-        let codex = PersonalRoute {
-            kind: PersonalRouteKind::Codex,
-            fallback: RouteFallback::Wait,
-        };
-        assert_eq!(refusal(codex, true, &on(), true, true), None);
+        let codex = PersonalRoute::new(PersonalRouteKind::Codex, RouteFallback::Wait);
+        assert_eq!(refusal(&codex, true, &on(), true, true), None);
         assert_eq!(
-            refusal(codex, true, &on(), true, false).as_deref(),
+            refusal(&codex, true, &on(), true, false).as_deref(),
             Some(crate::personal_route::CODEX_NEEDS_WORKER),
             "refused with a plain reason off the worker"
         );
-        assert!(refusal(codex, true, &on(), false, true)
+        assert!(refusal(&codex, true, &on(), false, true)
             .unwrap()
             .contains("connect your own ChatGPT (Codex) login"));
     }
@@ -533,6 +624,7 @@ mod tests {
             &codex_and_claude,
             |kind| kind == PersonalRouteKind::ClaudeCode,
             false,
+            &TierRegistry::new(None),
         );
         let kinds: Vec<_> = listed.iter().map(|option| option.kind).collect();
         assert_eq!(
@@ -554,7 +646,13 @@ mod tests {
             .contains("isn't offered"));
         assert!(refused(PersonalRouteKind::Codex).is_some());
 
-        let off = options(false, &codex_and_claude, |_| true, true);
+        let off = options(
+            false,
+            &codex_and_claude,
+            |_| true,
+            true,
+            &TierRegistry::new(None),
+        );
         assert!(off.iter().all(|option| option
             .refused
             .as_deref()
@@ -573,5 +671,49 @@ mod tests {
         assert_eq!(hub.route, Some(AgentRoute::Hub));
         assert!(serde_json::from_str::<RouteWrite<PersonalRoute>>(r#"{"route":"hub"}"#).is_err());
         assert!(serde_json::from_str::<RouteWrite<AgentRoute>>(r#"{"rout":"hub"}"#).is_err());
+    }
+
+    #[test]
+    fn a_routes_models_are_checked_against_what_its_login_serves() {
+        let tiers = TierRegistry::new(None);
+        let mut codex = PersonalRoute::new(PersonalRouteKind::Codex, RouteFallback::Wait);
+        codex
+            .model_preferences
+            .insert("conversation".into(), "gpt-6.1-sol".into());
+        codex.light_model = Some("cheap".into());
+        codex.heavy_model = Some("chat".into());
+        assert_eq!(
+            model_refusal(&codex, &tiers),
+            None,
+            "a model, a tier and chat"
+        );
+
+        codex.heavy_model = Some("gpt-5.5".into());
+        let retired = model_refusal(&codex, &tiers).unwrap();
+        assert!(
+            retired.contains("heavy")
+                && retired.contains("retired")
+                && retired.contains("gpt-6.1-sol"),
+            "said in plain words, with what to use: {retired}"
+        );
+
+        let mut claude = CLAUDE.clone();
+        claude.light_model = Some("gpt-6.1-sol".into());
+        assert!(model_refusal(&claude, &tiers)
+            .unwrap()
+            .contains("isn't a Claude model"));
+        let first = route_models(PersonalRouteKind::ClaudeCode, &tiers)
+            .into_iter()
+            .next()
+            .expect("the hub's tiers name Claude Code models");
+        claude.light_model = Some(first);
+        assert_eq!(model_refusal(&claude, &tiers), None);
+
+        claude
+            .model_preferences
+            .insert("coding".into(), "opus".into());
+        assert!(model_refusal(&claude, &tiers)
+            .unwrap()
+            .contains("only its conversation model"));
     }
 }

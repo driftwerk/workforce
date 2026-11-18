@@ -20,10 +20,7 @@ use crate::subscription::test_support::SKY;
 const BOB: &str = "0b7d3c1e-5f2a-4c8b-9d6e-1a2b3c4d5e6f";
 
 fn claude(fallback: RouteFallback) -> PersonalRoute {
-    PersonalRoute {
-        kind: PersonalRouteKind::ClaudeCode,
-        fallback,
-    }
+    PersonalRoute::new(PersonalRouteKind::ClaudeCode, fallback)
 }
 
 fn switch_on(config: &mut WorkforceConfig) {
@@ -334,10 +331,7 @@ async fn an_isolated_run_for_her_runs_on_her_login() {
 // ── Codex ───────────────────────────────────────────────────────────────
 
 fn codex(fallback: RouteFallback) -> PersonalRoute {
-    PersonalRoute {
-        kind: PersonalRouteKind::Codex,
-        fallback,
-    }
+    PersonalRoute::new(PersonalRouteKind::Codex, fallback)
 }
 
 /// A hub whose agent runs on ChatGPT, with its coding worker (where Codex
@@ -402,7 +396,14 @@ fn every_tier_maps_to_the_one_codex_plan_model() {
         "claude-opus-4-8",
     ] {
         assert_eq!(
-            super::personal_model(&tiers, "anthropic", spec, CliKind::Codex),
+            super::personal_model(
+                &tiers,
+                "anthropic",
+                spec,
+                CliKind::Codex,
+                &codex(RouteFallback::Wait),
+                workforce_common::personal_route::RouteWork::Other,
+            ),
             crate::subscription::completion::CODEX_PLAN_MODEL,
             "{spec}"
         );
@@ -520,6 +521,169 @@ async fn her_background_call_runs_as_a_codex_one_shot_on_her_own_login() {
     assert_eq!(
         served.route,
         workforce_common::subscription::SubscriptionRoute::Codex
+    );
+    assert_eq!(hub.chatgpt_requests().await, 0);
+}
+
+// ── The models a person chose for their route ───────────────────────────
+
+/// `route` with `conversation`, `light` and `heavy` chosen.
+fn with_models(
+    mut route: PersonalRoute,
+    conversation: Option<&str>,
+    light: Option<&str>,
+    heavy: Option<&str>,
+) -> PersonalRoute {
+    if let Some(m) = conversation {
+        route
+            .model_preferences
+            .insert("conversation".into(), m.into());
+    }
+    route.light_model = light.map(str::to_string);
+    route.heavy_model = heavy.map(str::to_string);
+    route
+}
+
+#[test]
+fn each_kind_of_work_runs_the_model_she_chose_else_the_routes_default() {
+    use crate::hub_core::subscriptions::CliKind;
+    use workforce_common::personal_route::RouteWork;
+    let tiers = workforce_agent::llm::tiers::TierRegistry::new(None);
+    let model = |cli, route: &PersonalRoute, work| {
+        super::personal_model(&tiers, "anthropic", "standard", cli, route, work)
+    };
+
+    let on_claude = with_models(
+        claude(RouteFallback::Wait),
+        Some("haiku"),
+        Some("powerful"),
+        Some("chat"),
+    );
+    assert_eq!(
+        model(CliKind::ClaudeCode, &on_claude, RouteWork::Conversation),
+        "haiku"
+    );
+    assert_eq!(
+        model(CliKind::ClaudeCode, &on_claude, RouteWork::Light),
+        "opus",
+        "a tier is Claude's model at it"
+    );
+    assert_eq!(
+        model(CliKind::ClaudeCode, &on_claude, RouteWork::Heavy),
+        "haiku",
+        "chat is the conversation model"
+    );
+    assert_eq!(
+        model(CliKind::ClaudeCode, &on_claude, RouteWork::Other),
+        "sonnet",
+        "a job's turn keeps the agent's tier"
+    );
+    assert_eq!(
+        model(
+            CliKind::ClaudeCode,
+            &claude(RouteFallback::Wait),
+            RouteWork::Conversation
+        ),
+        "sonnet",
+        "nothing chosen is the agent's tier"
+    );
+
+    let on_codex = with_models(
+        codex(RouteFallback::Wait),
+        Some("gpt-6-astra"),
+        Some("gpt-6-luna"),
+        Some("cheap"),
+    );
+    assert_eq!(
+        model(CliKind::Codex, &on_codex, RouteWork::Conversation),
+        "gpt-6-astra"
+    );
+    assert_eq!(
+        model(CliKind::Codex, &on_codex, RouteWork::Light),
+        "gpt-6-luna"
+    );
+    let plan = crate::subscription::completion::CODEX_PLAN_MODEL;
+    assert_eq!(
+        model(CliKind::Codex, &on_codex, RouteWork::Heavy),
+        plan,
+        "a tier on Codex is the one plan model"
+    );
+    assert_eq!(model(CliKind::Codex, &on_codex, RouteWork::Other), plan);
+}
+
+#[tokio::test]
+async fn her_chat_turn_runs_the_conversation_model_she_chose_and_a_job_its_tier() {
+    let (hub, store) = routed().await;
+    hub.claude_login(ALICE);
+    let route = with_models(claude(RouteFallback::Wait), Some("haiku"), None, None);
+    choose(&hub, &store, ALICE, Some(route)).await;
+    hub.claude.reply(None, &answer("Claude answers."));
+
+    crate::serve::chat_turn(hub.ask(ALICE, "hello there"))
+        .await
+        .unwrap();
+    assert_eq!(hub.claude.calls()[0].flag("--model"), Some("haiku"));
+
+    hub.claude.reply(None, &answer("Digest."));
+    hub.ask(ALICE, "nightly digest").await.unwrap();
+    let job = hub.claude.calls()[1].flag("--model").map(str::to_string);
+    assert!(
+        matches!(job.as_deref(), Some("opus" | "sonnet")),
+        "a turn no message of hers started keeps the agent's tier: {job:?}"
+    );
+}
+
+#[tokio::test]
+async fn her_background_calls_run_the_light_and_heavy_codex_models_she_chose() {
+    let (hub, store) = routed_on_worker().await;
+    chatgpt_login_of(&hub, ALICE);
+    let route = with_models(
+        codex(RouteFallback::Wait),
+        None,
+        Some("gpt-6-luna"),
+        Some("gpt-6-astra"),
+    );
+    choose(&hub, &store, ALICE, Some(route)).await;
+    let light = hub
+        .service
+        .resolved
+        .snapshot()
+        .background
+        .light
+        .clone()
+        .expect("the agent's light model");
+    let llm = Arc::clone(&hub.service.llm);
+    let messages = [LlmMessage::user("Summarise this conversation.")];
+    let call = |model: Option<String>| {
+        let llm = Arc::clone(&llm);
+        let messages = messages.clone();
+        let program = hub.codex.program();
+        async move {
+            CURRENT_USER_ID
+                .scope(
+                    ALICE.to_string(),
+                    crate::coding_engine::codex::tests::CODEX.scope(
+                        program,
+                        llm.create_message(None, &messages, &[], model.as_deref(), None, false),
+                    ),
+                )
+                .await
+                .unwrap()
+        }
+    };
+
+    call(Some(light)).await;
+    call(None).await;
+
+    let model = |n| {
+        let config: toml::Table = hub.codex.recorded(n, "config").parse().unwrap();
+        config["model"].as_str().unwrap().to_string()
+    };
+    assert_eq!(model(1), "gpt-6-luna", "light work on her light model");
+    assert_eq!(
+        model(2),
+        "gpt-6-astra",
+        "anything else billed to her is heavy"
     );
     assert_eq!(hub.chatgpt_requests().await, 0);
 }

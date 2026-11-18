@@ -49,11 +49,41 @@ fn fallback(value: &str) -> Result<RouteFallback> {
         .ok_or_else(|| eyre::eyre!("unknown route fallback {value:?}"))
 }
 
-fn route(kind_value: &str, fallback_value: &str) -> Result<PersonalRoute> {
-    Ok(PersonalRoute {
-        kind: kind(kind_value)?,
-        fallback: fallback(fallback_value)?,
+/// The models a route runs, as the `llm_models` column keeps them.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct Models {
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    model_preferences: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    light_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    heavy_model: Option<String>,
+}
+
+/// `route`'s models for the `llm_models` column; `None` for its defaults.
+fn models_json(route: &PersonalRoute) -> Option<String> {
+    (!route.default_models()).then(|| {
+        serde_json::to_string(&Models {
+            model_preferences: route.model_preferences.clone(),
+            light_model: route.light_model.clone(),
+            heavy_model: route.heavy_model.clone(),
+        })
+        .unwrap_or_default()
     })
+}
+
+fn route(kind_value: &str, fallback_value: &str, models: Option<&str>) -> Result<PersonalRoute> {
+    let mut route = PersonalRoute::new(kind(kind_value)?, fallback(fallback_value)?);
+    if let Some(models) = models {
+        // A setting whose models can't be read runs on the defaults.
+        let models: Models = serde_json::from_str(models)
+            .inspect_err(|e| tracing::warn!(target: "llm_route", error = %e, "a route's models can't be read; it runs its defaults"))
+            .unwrap_or_default();
+        route.model_preferences = models.model_preferences;
+        route.light_model = models.light_model;
+        route.heavy_model = models.heavy_model;
+    }
+    Ok(route)
 }
 
 fn agent_route(row: &tokio_postgres::Row) -> Result<AgentRoute> {
@@ -63,12 +93,13 @@ fn agent_route(row: &tokio_postgres::Row) -> Result<AgentRoute> {
             row.get::<_, Option<&str>>("llm_kind").unwrap_or_default(),
             row.get::<_, Option<&str>>("llm_fallback")
                 .unwrap_or_default(),
+            row.get::<_, Option<&str>>("llm_models"),
         )?)),
     }
 }
 
-fn as_json(route: Option<AgentRoute>) -> Option<String> {
-    route.map(|route| serde_json::to_string(&route).unwrap_or_default())
+fn as_json(route: Option<&AgentRoute>) -> Option<String> {
+    route.map(|route| serde_json::to_string(route).unwrap_or_default())
 }
 
 fn from_json(value: Option<String>) -> Option<AgentRoute> {
@@ -116,16 +147,16 @@ impl PersonRouteStore for PostgresRouteStore {
         let person = person.to_string();
         let every_agent = conn
             .query_opt(
-                "SELECT llm_kind, llm_fallback FROM user_settings WHERE identity_id = $1",
+                "SELECT llm_kind, llm_fallback, llm_models FROM user_settings WHERE identity_id = $1",
                 &[&person],
             )
             .await?
-            .map(|row| route(row.get("llm_kind"), row.get("llm_fallback")))
+            .map(|row| route(row.get("llm_kind"), row.get("llm_fallback"), row.get("llm_models")))
             .transpose()?;
         let this_agent = match agent_id {
             Some(agent_id) => conn
                 .query_opt(
-                    "SELECT llm_route, llm_kind, llm_fallback FROM user_agent_settings \
+                    "SELECT llm_route, llm_kind, llm_fallback, llm_models FROM user_agent_settings \
                      WHERE identity_id = $1 AND agent_id = $2",
                     &[&person, &agent_id],
                 )
@@ -151,20 +182,21 @@ impl PersonRouteStore for PostgresRouteStore {
         let person = person.to_string();
         let before = tx
             .query_opt(
-                "SELECT llm_kind, llm_fallback FROM user_settings WHERE identity_id = $1 FOR UPDATE",
+                "SELECT llm_kind, llm_fallback, llm_models FROM user_settings WHERE identity_id = $1 FOR UPDATE",
                 &[&person],
             )
             .await?
-            .map(|row| route(row.get("llm_kind"), row.get("llm_fallback")))
+            .map(|row| route(row.get("llm_kind"), row.get("llm_fallback"), row.get("llm_models")))
             .transpose()?;
-        match route_now {
+        match &route_now {
             Some(r) => {
                 tx.execute(
-                    "INSERT INTO user_settings (identity_id, llm_kind, llm_fallback, updated_at) \
-                     VALUES ($1, $2, $3, now()) \
+                    "INSERT INTO user_settings (identity_id, llm_kind, llm_fallback, llm_models, updated_at) \
+                     VALUES ($1, $2, $3, $4, now()) \
                      ON CONFLICT (identity_id) DO UPDATE SET llm_kind = EXCLUDED.llm_kind, \
-                         llm_fallback = EXCLUDED.llm_fallback, updated_at = EXCLUDED.updated_at",
-                    &[&person, &r.kind.as_str(), &r.fallback.as_str()],
+                         llm_fallback = EXCLUDED.llm_fallback, llm_models = EXCLUDED.llm_models, \
+                         updated_at = EXCLUDED.updated_at",
+                    &[&person, &r.kind.as_str(), &r.fallback.as_str(), &models_json(r)],
                 )
                 .await?;
             }
@@ -181,8 +213,8 @@ impl PersonRouteStore for PostgresRouteStore {
             &[
                 &person,
                 &None::<String>,
-                &as_json(before.map(AgentRoute::Personal)),
-                &as_json(route_now.map(AgentRoute::Personal)),
+                &as_json(before.clone().map(AgentRoute::Personal).as_ref()),
+                &as_json(route_now.map(AgentRoute::Personal).as_ref()),
                 &actor,
             ],
         )
@@ -203,29 +235,33 @@ impl PersonRouteStore for PostgresRouteStore {
         let person = person.to_string();
         let before = tx
             .query_opt(
-                "SELECT llm_route, llm_kind, llm_fallback FROM user_agent_settings \
+                "SELECT llm_route, llm_kind, llm_fallback, llm_models FROM user_agent_settings \
                  WHERE identity_id = $1 AND agent_id = $2 FOR UPDATE",
                 &[&person, &agent_id],
             )
             .await?
             .map(|row| agent_route(&row))
             .transpose()?;
-        match route_now {
+        match &route_now {
             Some(r) => {
-                let (word, kind, fallback) = match r {
-                    AgentRoute::Hub => ("hub", None, None),
-                    AgentRoute::Personal(p) => {
-                        ("personal", Some(p.kind.as_str()), Some(p.fallback.as_str()))
-                    }
+                let (word, kind, fallback, models) = match r {
+                    AgentRoute::Hub => ("hub", None, None, None),
+                    AgentRoute::Personal(p) => (
+                        "personal",
+                        Some(p.kind.as_str()),
+                        Some(p.fallback.as_str()),
+                        models_json(p),
+                    ),
                 };
                 tx.execute(
                     "INSERT INTO user_agent_settings \
-                         (identity_id, agent_id, llm_route, llm_kind, llm_fallback, updated_at) \
-                     VALUES ($1, $2, $3, $4, $5, now()) \
+                         (identity_id, agent_id, llm_route, llm_kind, llm_fallback, llm_models, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, now()) \
                      ON CONFLICT (identity_id, agent_id) DO UPDATE SET \
                          llm_route = EXCLUDED.llm_route, llm_kind = EXCLUDED.llm_kind, \
-                         llm_fallback = EXCLUDED.llm_fallback, updated_at = EXCLUDED.updated_at",
-                    &[&person, &agent_id, &word, &kind, &fallback],
+                         llm_fallback = EXCLUDED.llm_fallback, llm_models = EXCLUDED.llm_models, \
+                         updated_at = EXCLUDED.updated_at",
+                    &[&person, &agent_id, &word, &kind, &fallback, &models],
                 )
                 .await?;
             }
@@ -242,8 +278,8 @@ impl PersonRouteStore for PostgresRouteStore {
             &[
                 &person,
                 &Some(agent_id),
-                &as_json(before),
-                &as_json(route_now),
+                &as_json(before.as_ref()),
+                &as_json(route_now.as_ref()),
                 &actor,
             ],
         )

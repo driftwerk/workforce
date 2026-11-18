@@ -6052,11 +6052,20 @@ pub(crate) async fn turn_chain(service: &AgentService, spec: &str) -> crate::age
     {
         Some(chosen) => {
             let cli = chosen.cli;
+            // A chat turn runs the conversation model the person chose for
+            // their route; any other turn its default.
+            let work = if crate::serve::in_chat_turn() {
+                workforce_common::personal_route::RouteWork::Conversation
+            } else {
+                workforce_common::personal_route::RouteWork::Other
+            };
             let model = crate::personal_route::personal_model(
                 &service.tier_registry(),
                 &service.tier_key.read().clone(),
                 spec,
                 cli,
+                &chosen.route,
+                work,
             );
             tracing::debug!(agent = %service.agent_id, person = %chosen.person, route = chosen.route.kind.as_str(), %model, fallback = chosen.route.fallback.as_str(), "turn on a person's own route");
             chain.on_personal_route(cli, model, chosen.route.fallback)

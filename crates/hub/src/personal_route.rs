@@ -17,7 +17,9 @@ use workforce_agent::llm::provider::{LlmProvider, ProviderKind};
 use workforce_agent::llm::streaming::StreamEvent;
 use workforce_agent::llm::tiers::TierRegistry;
 use workforce_agent::llm::types::{LlmMessage, LlmResponse, LlmToolDef};
-use workforce_common::personal_route::{PersonalRoute, PersonalRouteKind, RouteFallback};
+use workforce_common::personal_route::{
+    PersonalRoute, PersonalRouteKind, RouteFallback, RouteWork,
+};
 use workforce_common::subscription::Payer;
 
 use crate::hub_core::personal_routes::PersonalRoutes;
@@ -52,7 +54,7 @@ pub fn provider_of(cli: CliKind) -> ProviderKind {
 }
 
 /// A person's own route, chosen for one call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chosen {
     pub person: Uuid,
     pub route: PersonalRoute,
@@ -120,17 +122,33 @@ impl RouteDecider {
     }
 }
 
-/// The model a call on `spec` runs on a person's route on `cli`. On Claude
-/// Code, the spec's own tier (a tier name, a `provider:tier`, or the tier
-/// its model sits at in the agent's registry). On Codex every tier runs the
-/// one ChatGPT-plan model ([`crate::subscription::completion::CODEX_PLAN_MODEL`]),
-/// so the agent behaves the same whatever tier it asked for.
-pub fn personal_model(tiers: &TierRegistry, tier_key: &str, spec: &str, cli: CliKind) -> String {
+/// The model a call on `spec` for `work` runs on `route`, on `cli`: the
+/// model the person chose for that kind of work when they chose one, else
+/// the route's default. On Claude Code the default is the spec's own tier
+/// (a tier name, a `provider:tier`, or the tier its model sits at in the
+/// agent's registry). On Codex every tier runs the one ChatGPT-plan model
+/// ([`crate::subscription::completion::CODEX_PLAN_MODEL`]), so the agent
+/// behaves the same whatever tier it asked for.
+pub fn personal_model(
+    tiers: &TierRegistry,
+    tier_key: &str,
+    spec: &str,
+    cli: CliKind,
+    route: &PersonalRoute,
+    work: RouteWork,
+) -> String {
+    if let Some(chosen) = route.for_work(work) {
+        return own_model(tiers, chosen, cli);
+    }
     if cli == CliKind::Codex {
         return crate::subscription::completion::CODEX_PLAN_MODEL.to_string();
     }
     let (_, model) = tiers.resolve_routed_model(spec, tier_key);
-    let tier = tiers.classify(&model);
+    claude_at(tiers, tiers.classify(&model))
+}
+
+/// The Claude Code model at `tier`, as the agent's registry names it.
+fn claude_at(tiers: &TierRegistry, tier: workforce_agent::llm::tiers::ModelTier) -> String {
     let kind = ProviderKind::ClaudeCode;
     tiers
         .resolve_for_tier(tier, kind.canonical_name())
@@ -140,6 +158,33 @@ pub fn personal_model(tiers: &TierRegistry, tier_key: &str, spec: &str, cli: Cli
                 .next()
         })
         .unwrap_or_else(|| "sonnet".to_string())
+}
+
+/// The model a person's own choice `chosen` names on `cli`: a tier is the
+/// route's model at it, anything else the model itself.
+fn own_model(tiers: &TierRegistry, chosen: &str, cli: CliKind) -> String {
+    match (
+        workforce_agent::llm::tiers::ModelTier::from_name(chosen),
+        cli,
+    ) {
+        (Some(_), CliKind::Codex) => crate::subscription::completion::CODEX_PLAN_MODEL.to_string(),
+        (Some(tier), CliKind::ClaudeCode) => claude_at(tiers, tier),
+        (None, _) => chosen.to_string(),
+    }
+}
+
+/// The kind of background work a tool-less call on `spec` is: light when it
+/// runs the agent's light model, else heavy (an agent whose light and heavy
+/// models are one reads as light).
+pub fn background_work(
+    spec: &str,
+    background: &crate::resolved_config::BackgroundModels,
+) -> RouteWork {
+    if background.light.as_deref() == Some(spec) {
+        RouteWork::Light
+    } else {
+        RouteWork::Heavy
+    }
 }
 
 /// The agent's provider, with its tool-less calls made for a person on
@@ -191,11 +236,14 @@ impl PersonalRouteLlm {
         let fallback = chosen.route.fallback;
         let cli = chosen.cli;
         let spec = model.map_or_else(|| self.default_model.read().clone(), str::to_string);
+        let work = background_work(&spec, &self.decider.config.snapshot().background);
         let model = personal_model(
             &TierRegistry::from_cell(&self.tiers),
             &self.tier_key.read(),
             &spec,
             cli,
+            &chosen.route,
+            work,
         );
         match self.plans.provider(provider_of(cli), Some(&model), None) {
             Ok(provider) => Some(Ok((provider, model, fallback))),

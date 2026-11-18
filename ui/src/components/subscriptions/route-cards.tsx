@@ -4,17 +4,22 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Skeleton } from "@/components/ui/skeleton";
 import { apiErrorMessage } from "@/lib/api-error";
 import { useMyAgentRoute, useMyRoute, useSetMyAgentRoute, useSetMyRoute } from "@/hooks/use-llm-route";
-import type { PersonalRouteKind, RouteFallback } from "@/lib/api/llm-route";
+import { keptModels, withModel, type PersonalRoute, type PersonalRouteKind, type RouteFallback, type RouteOption } from "@/lib/api/llm-route";
 import {
   HUB_CHOICE,
   kindRows,
   ROUTE_LABELS,
+  RouteModelsPicker,
   RoutePicker,
   whereDataGoes,
   type RouteChoice,
 } from "@/components/subscriptions/route-picker";
 
 const isKind = (choice: RouteChoice): choice is PersonalRouteKind => choice !== "settings" && choice !== "hub";
+
+/** The hub's option for `kind`, when it offers models to choose from. */
+const withModels = (options: RouteOption[], kind: PersonalRouteKind | undefined) =>
+  options.find((option) => option.kind === kind && option.models !== undefined);
 
 /** Why nothing here can be picked, from the first refusal, when the hub or
  *  the agent runs everyone on its own route. */
@@ -65,9 +70,22 @@ export function MyModelsCard() {
             pending={save.isPending}
             error={save.error}
             onChange={(choice, fallback) =>
-              save.mutate(isKind(choice) ? { kind: choice, fallback } : null)
+              save.mutate(
+                isKind(choice) ? { ...keptModels(data.route, choice), kind: choice, fallback } : null,
+              )
             }
           />
+        )}
+        {data?.available && data.route && withModels(data.options, data.route.kind) && (
+          <div className="mt-4">
+            <RouteModelsPicker
+              name="my-route-models"
+              option={withModels(data.options, data.route.kind)!}
+              route={data.route}
+              pending={save.isPending}
+              onChange={(work, model) => save.mutate(withModel(data.route as PersonalRoute, work, model))}
+            />
+          </div>
         )}
       </CardContent>
     </Card>
@@ -125,10 +143,21 @@ export function AgentRouteCard({ agentId }: { agentId: string }) {
                   ? null
                   : choice === "hub"
                     ? "hub"
-                    : { kind: choice, fallback },
+                    : { ...keptModels(own, choice), kind: choice, fallback },
               )
             }
           />
+        )}
+        {data?.available && own && withModels(data.options, own.kind) && (
+          <div className="mt-4">
+            <RouteModelsPicker
+              name={`agent-route-models-${agentId}`}
+              option={withModels(data.options, own.kind)!}
+              route={own}
+              pending={save.isPending}
+              onChange={(work, model) => save.mutate(withModel(own, work, model))}
+            />
+          </div>
         )}
       </CardContent>
     </Card>

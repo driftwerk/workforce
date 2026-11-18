@@ -22,7 +22,7 @@ pub mod postgres;
 mod tests;
 
 /// A person's two settings as they bear on one agent.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct RouteSettings {
     /// Their setting for every agent.
     pub every_agent: Option<PersonalRoute>,
@@ -33,7 +33,7 @@ pub struct RouteSettings {
 impl RouteSettings {
     /// The route the person chose for this agent; `None` is the hub's.
     pub fn chosen(&self) -> Option<PersonalRoute> {
-        chosen_route(self.every_agent, self.this_agent)
+        chosen_route(self.every_agent.clone(), self.this_agent.clone())
     }
 }
 
@@ -155,7 +155,7 @@ impl PersonalRoutes {
             return Ok(RouteSettings::default());
         };
         let key = (person, agent_id.to_string());
-        if let Some((at, settings)) = self.cache.lock().get(&key).copied() {
+        if let Some((at, settings)) = self.cache.lock().get(&key).cloned() {
             if at.elapsed() < SETTINGS_TTL {
                 return Ok(settings);
             }
@@ -163,7 +163,7 @@ impl PersonalRoutes {
         let settings = store.settings(person, Some(agent_id)).await?;
         self.cache
             .lock()
-            .insert(key, (std::time::Instant::now(), settings));
+            .insert(key, (std::time::Instant::now(), settings.clone()));
         Ok(settings)
     }
 
@@ -213,9 +213,9 @@ impl PersonRouteStore for MemoryRouteStore {
     async fn settings(&self, person: Uuid, agent_id: Option<&str>) -> Result<RouteSettings> {
         let inner = self.inner.lock();
         Ok(RouteSettings {
-            every_agent: inner.every_agent.get(&person).copied(),
+            every_agent: inner.every_agent.get(&person).cloned(),
             this_agent: agent_id
-                .and_then(|agent| inner.per_agent.get(&(person, agent.to_string())).copied()),
+                .and_then(|agent| inner.per_agent.get(&(person, agent.to_string())).cloned()),
         })
     }
 
@@ -226,7 +226,7 @@ impl PersonRouteStore for MemoryRouteStore {
         actor: &str,
     ) -> Result<Option<PersonalRoute>> {
         let mut inner = self.inner.lock();
-        let before = match route {
+        let before = match route.clone() {
             Some(route) => inner.every_agent.insert(person, route),
             None => inner.every_agent.remove(&person),
         };
@@ -234,7 +234,7 @@ impl PersonRouteStore for MemoryRouteStore {
             person,
             RouteChange {
                 agent_id: None,
-                before: before.map(AgentRoute::Personal),
+                before: before.clone().map(AgentRoute::Personal),
                 after: route.map(AgentRoute::Personal),
                 actor: actor.to_string(),
                 at: Utc::now(),
@@ -252,7 +252,7 @@ impl PersonRouteStore for MemoryRouteStore {
     ) -> Result<Option<AgentRoute>> {
         let mut inner = self.inner.lock();
         let key = (person, agent_id.to_string());
-        let before = match route {
+        let before = match route.clone() {
             Some(route) => inner.per_agent.insert(key, route),
             None => inner.per_agent.remove(&key),
         };
@@ -260,7 +260,7 @@ impl PersonRouteStore for MemoryRouteStore {
             person,
             RouteChange {
                 agent_id: Some(agent_id.to_string()),
-                before,
+                before: before.clone(),
                 after: route,
                 actor: actor.to_string(),
                 at: Utc::now(),

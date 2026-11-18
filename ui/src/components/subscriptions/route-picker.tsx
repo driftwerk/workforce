@@ -2,7 +2,14 @@ import { Link } from "react-router";
 import { Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { apiErrorMessage } from "@/lib/api-error";
-import type { PersonalRouteKind, RouteFallback, RouteOption } from "@/lib/api/llm-route";
+import {
+  chosenModel,
+  type PersonalRouteKind,
+  type RouteFallback,
+  type RouteModels,
+  type RouteOption,
+  type RouteWork,
+} from "@/lib/api/llm-route";
 
 /** What a person can run their work on: the hub's models, one of their own
  *  subscriptions, or (on one agent) whatever their own settings say. */
@@ -157,5 +164,83 @@ export function RoutePicker({
       )}
       {error != null && <p className="text-sm text-destructive">{apiErrorMessage(error)}</p>}
     </div>
+  );
+}
+
+/** Each kind of work a route's models are chosen for, as its row says it:
+ *  the same three an agent's own model settings name. */
+const WORK: { work: RouteWork; name: string; what: string }[] = [
+  { work: "conversation", name: "Conversation", what: "Your chats with an agent" },
+  { work: "light", name: "Light background", what: "Session notes, gists, memory and running accounts" },
+  { work: "heavy", name: "Heavy background", what: "Check-ins, decisions, updates and compaction" },
+];
+
+const TIERS = [
+  ["cheap", "Cheapest tier"],
+  ["standard", "Everyday tier"],
+  ["powerful", "Most capable tier"],
+] as const;
+
+/** The default's value in a picker: the setting left unset. */
+const DEFAULT = "";
+
+/** The models a person's own route runs by kind of work: the route's
+ *  default, a tier, or one of the models its provider offers (and for
+ *  background work, the conversation model). Each change saves at once. */
+export function RouteModelsPicker({
+  name,
+  option,
+  route,
+  pending,
+  onChange,
+}: {
+  name: string;
+  /** The kind as the hub offers it, with its models. */
+  option: RouteOption;
+  route: RouteModels;
+  pending: boolean;
+  onChange: (work: RouteWork, model: string | undefined) => void;
+}) {
+  const models = option.models ?? [];
+  return (
+    <fieldset className="space-y-2" disabled={pending}>
+      <legend className="mb-2 text-sm font-medium">Models on {ROUTE_LABELS[option.kind]}</legend>
+      {WORK.map(({ work, name: label, what }) => {
+        const set = chosenModel(route, work);
+        // A model the hub no longer lists stays shown as chosen.
+        const unlisted = set && !models.includes(set) && !TIERS.some(([t]) => t === set) && set !== "chat";
+        const id = `${name}-${work}`;
+        return (
+          <div key={work} className="flex flex-wrap items-center justify-between gap-2 rounded-md border p-3 text-sm">
+            <label htmlFor={id}>
+              <span className="font-medium">{label}</span>
+              <span className="block text-xs text-muted-foreground">{what}</span>
+            </label>
+            <select
+              id={id}
+              className="rounded-md border bg-background px-3 py-2 text-sm"
+              value={set ?? DEFAULT}
+              onChange={(e) => onChange(work, e.target.value === DEFAULT ? undefined : e.target.value)}
+            >
+              <option value={DEFAULT}>
+                Default{option.defaults ? ` (${option.defaults[work]})` : ""}
+              </option>
+              {work !== "conversation" && <option value="chat">Same as conversation</option>}
+              {TIERS.map(([tier, tierLabel]) => (
+                <option key={tier} value={tier}>
+                  {tierLabel}
+                </option>
+              ))}
+              {models.map((model) => (
+                <option key={model} value={model}>
+                  {model}
+                </option>
+              ))}
+              {unlisted && <option value={set}>{set}</option>}
+            </select>
+          </div>
+        );
+      })}
+    </fieldset>
   );
 }
