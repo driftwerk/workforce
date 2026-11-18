@@ -848,9 +848,10 @@ impl Desk {
     }
 
     /// `s` with its Jira site's own fields (points, sprint, start date,
-    /// Development, priorities) read when they never were, or a day ago.
-    /// They are never needed: a hub that can't list them is asked again a
-    /// day later, and its cards show none.
+    /// Development, priorities, Rank) read when they never were, or a day
+    /// ago, or a quarter of an hour ago while Rank isn't known. They are
+    /// never needed: a hub that can't list them is asked again later, and
+    /// its cards show none.
     async fn read_fields(
         &self,
         id: Uuid,
