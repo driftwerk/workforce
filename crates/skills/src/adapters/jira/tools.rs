@@ -4076,6 +4076,7 @@ mod tests {
         assert_eq!(r.output["order_by"], "priority DESC, Rank ASC");
         assert_eq!(r.output["rank_field"], "customfield_10019");
         assert_eq!(r.output["board"]["name"], "ENG board");
+        assert_eq!(r.output["truncated"], false);
         let r = tool.execute(json!({ "project_key": "OPS" })).await.unwrap();
         assert!(r.success, "{:?}", r.error);
         assert!(r.output["board"].is_null());
@@ -4101,6 +4102,10 @@ mod tests {
             .await
             .unwrap();
         assert!(r.output["board"].is_null());
+        assert!(r.output["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("isn't one of"));
         let r = tool
             .execute(json!({ "project_key": "ENG\" OR 1=1" }))
             .await
