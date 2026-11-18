@@ -1732,7 +1732,9 @@ impl Desk {
         };
         // Whatever stops it after, what it claimed goes again: the plan as
         // approved never had them.
-        let done: Result<PlanDetail, DeskError> = async {
+        // True once there is something new to save; the save is outside, so
+        // one that fails after it committed never lets them go.
+        let done: Result<bool, DeskError> = async {
             let mut revision = revision;
             if let Some(b) = budget.filter(|b| *b != next.budget) {
                 let before = next.clone();
@@ -1752,7 +1754,7 @@ impl Desk {
                 p.revision = revision;
             }
             if p.approved_revision == Some(revision) {
-                return self.plan_detail(p.clone()).await;
+                return Ok(false);
             }
             match p.approved_revision {
                 // Its tickets are what it says: they go to To do.
@@ -1818,13 +1820,17 @@ impl Desk {
                 (n, _) => format!("approved revision {n} of the plan"),
             };
             self.plan_note(&p, by, Kind::PlanApproved, text);
-            self.plan_saved(&p).await
+            Ok(true)
         }
         .await;
-        if done.is_err() {
-            self.unclaim(&p, &claimed).await;
+        match done {
+            Err(e) => {
+                self.unclaim(&p, &claimed).await;
+                Err(e)
+            }
+            Ok(false) => self.plan_detail(p).await,
+            Ok(true) => self.plan_saved(&p).await,
         }
-        done
     }
 
     /// Pauses plan `id` for `why`: it starts nothing until it is resumed.
