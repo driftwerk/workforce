@@ -178,7 +178,8 @@ async fn adopt_in<C: tokio_postgres::GenericClient>(
             &format!(
                 "UPDATE tickets SET plan = $2, engine = $3, folder = $4, view = $5, machine = $6, \
                  model = $7, adopted = true, version = version + 1 \
-                 WHERE id = $1 AND (({ADOPTABLE}) OR (plan = $2 AND adopted))"
+                 WHERE id = $1 AND (({ADOPTABLE}) OR (plan = $2 AND adopted AND assignee IS NULL \
+                 AND state IN ('backlog', 'todo')))"
             ),
             &[
                 &ticket,

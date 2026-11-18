@@ -1643,7 +1643,10 @@ impl Desk {
                 None => TicketState::Backlog,
                 Some(_) => TicketState::Todo,
             };
-            self.plan_rows_follow(&p, &from, &next, column, by).await?;
+            if let Err(e) = self.plan_rows_follow(&p, &from, &next, column, by).await {
+                self.unclaim(&p, &claimed).await;
+                return Err(e);
+            }
             if p.approved_revision.is_some() {
                 p.approved_revision = Some(n);
                 // What it may spend is what applies now.
@@ -1720,96 +1723,108 @@ impl Desk {
         let mut next = self.newest(&p).await?;
         // A change it approves claims what it takes on before anything is
         // written: one taken meanwhile refuses it as it was.
-        if p.approved_revision.is_some() {
-            let applied = self.applied(&p).await?;
-            self.claim_taken_on(&p, &applied, &next).await?;
-        }
-        let mut revision = revision;
-        if let Some(b) = budget.filter(|b| *b != next.budget) {
-            let before = next.clone();
-            next.budget = b;
-            if let Some(why) = next.budget.as_ref().and_then(PlanBudget::problem) {
-                return Err(DeskError::Invalid(why));
-            }
-            let summary = plan::describe(&before, &next);
-            let applied = self.applied(&p).await?;
-            let started = self.started(&p).await?;
-            let kind = plan::plan_change(&applied, &next, &started)
-                .map_err(|e| DeskError::Conflict(e.to_string()))?
-                .unwrap_or(Change::Minor);
-            revision = p.revision + 1;
-            self.add_revision(&p, revision, by, kind, &summary, &next)
-                .await?;
-            p.revision = revision;
-        }
-        if p.approved_revision == Some(revision) {
-            return self.plan_detail(p).await;
-        }
-        match p.approved_revision {
-            // Its tickets are what it says: they go to To do.
-            None => {
-                let rows = self.0.store.plan_tickets(p.id).await.map_err(internal)?;
-                let place: HashMap<Uuid, usize> = next
-                    .tickets
-                    .iter()
-                    .enumerate()
-                    .map(|(i, t)| (t.id, i))
-                    .collect();
-                let mut queued: Vec<Ticket> = rows
-                    .into_iter()
-                    .filter(|t| t.state == TicketState::Backlog)
-                    .collect();
-                queued.sort_by_key(|t| place.get(&t.id).copied().unwrap_or(usize::MAX));
-                for mut t in queued {
-                    // One taken on moves as any move of the person's would,
-                    // so its issue moves too.
-                    if next.ticket(t.id).is_some_and(|x| x.adopted) {
-                        let mv = Move {
-                            state: TicketState::Todo,
-                            before: None,
-                            after: None,
-                        };
-                        self.move_read(t, mv, by).await?;
-                        continue;
-                    }
-                    let at = crew::now();
-                    self.to_column(&mut t, TicketState::Todo, at).await?;
-                    self.save_ticket(&mut t).await?;
-                    if let Ok(v) = self.view_ticket(t).await {
-                        self.announce(DeskEvent::Ticket {
-                            ticket: Box::new(v),
-                        });
-                    }
-                }
-                p.state = PlanState::Running;
-            }
-            // A change of scope: it applies now.
+        let claimed = match p.approved_revision {
             Some(_) => {
                 let applied = self.applied(&p).await?;
-                let started = self.started(&p).await?;
-                plan::plan_change(&applied, &next, &started)
-                    .map_err(|e| DeskError::Conflict(e.to_string()))?;
-                self.plan_rows_follow(&p, &applied, &next, TicketState::Todo, by)
-                    .await?;
-                p.goal.clone_from(&next.goal);
+                self.claim_taken_on(&p, &applied, &next).await?
             }
-        }
-        p.approved_revision = Some(revision);
-        p.parallel = next.parallel;
-        p.updated_at = crew::now();
-        // What it may spend is what was approved.
-        self.keep_plan_budget(&p, next.budget.as_ref(), by).await?;
-        let text = match (revision, &next.budget) {
-            (1, None) => format!("approved the plan: {}", crew::one_line(&p.goal, 120)),
-            (1, Some(b)) => format!(
-                "approved the plan, capped at {}: {}",
-                b.words(),
-                crew::one_line(&p.goal, 120)
-            ),
-            (n, _) => format!("approved revision {n} of the plan"),
+            None => vec![],
         };
-        self.plan_note(&p, by, Kind::PlanApproved, text);
-        self.plan_saved(&p).await
+        // Whatever stops it after, what it claimed goes again: the plan as
+        // approved never had them.
+        let done: Result<PlanDetail, DeskError> = async {
+            let mut revision = revision;
+            if let Some(b) = budget.filter(|b| *b != next.budget) {
+                let before = next.clone();
+                next.budget = b;
+                if let Some(why) = next.budget.as_ref().and_then(PlanBudget::problem) {
+                    return Err(DeskError::Invalid(why));
+                }
+                let summary = plan::describe(&before, &next);
+                let applied = self.applied(&p).await?;
+                let started = self.started(&p).await?;
+                let kind = plan::plan_change(&applied, &next, &started)
+                    .map_err(|e| DeskError::Conflict(e.to_string()))?
+                    .unwrap_or(Change::Minor);
+                revision = p.revision + 1;
+                self.add_revision(&p, revision, by, kind, &summary, &next)
+                    .await?;
+                p.revision = revision;
+            }
+            if p.approved_revision == Some(revision) {
+                return self.plan_detail(p.clone()).await;
+            }
+            match p.approved_revision {
+                // Its tickets are what it says: they go to To do.
+                None => {
+                    let rows = self.0.store.plan_tickets(p.id).await.map_err(internal)?;
+                    let place: HashMap<Uuid, usize> = next
+                        .tickets
+                        .iter()
+                        .enumerate()
+                        .map(|(i, t)| (t.id, i))
+                        .collect();
+                    let mut queued: Vec<Ticket> = rows
+                        .into_iter()
+                        .filter(|t| t.state == TicketState::Backlog)
+                        .collect();
+                    queued.sort_by_key(|t| place.get(&t.id).copied().unwrap_or(usize::MAX));
+                    for mut t in queued {
+                        // One taken on moves as any move of the person's would,
+                        // so its issue moves too.
+                        if next.ticket(t.id).is_some_and(|x| x.adopted) {
+                            let mv = Move {
+                                state: TicketState::Todo,
+                                before: None,
+                                after: None,
+                            };
+                            self.move_read(t, mv, by).await?;
+                            continue;
+                        }
+                        let at = crew::now();
+                        self.to_column(&mut t, TicketState::Todo, at).await?;
+                        self.save_ticket(&mut t).await?;
+                        if let Ok(v) = self.view_ticket(t).await {
+                            self.announce(DeskEvent::Ticket {
+                                ticket: Box::new(v),
+                            });
+                        }
+                    }
+                    p.state = PlanState::Running;
+                }
+                // A change of scope: it applies now.
+                Some(_) => {
+                    let applied = self.applied(&p).await?;
+                    let started = self.started(&p).await?;
+                    plan::plan_change(&applied, &next, &started)
+                        .map_err(|e| DeskError::Conflict(e.to_string()))?;
+                    self.plan_rows_follow(&p, &applied, &next, TicketState::Todo, by)
+                        .await?;
+                    p.goal.clone_from(&next.goal);
+                }
+            }
+            p.approved_revision = Some(revision);
+            p.parallel = next.parallel;
+            p.updated_at = crew::now();
+            // What it may spend is what was approved.
+            self.keep_plan_budget(&p, next.budget.as_ref(), by).await?;
+            let text = match (revision, &next.budget) {
+                (1, None) => format!("approved the plan: {}", crew::one_line(&p.goal, 120)),
+                (1, Some(b)) => format!(
+                    "approved the plan, capped at {}: {}",
+                    b.words(),
+                    crew::one_line(&p.goal, 120)
+                ),
+                (n, _) => format!("approved revision {n} of the plan"),
+            };
+            self.plan_note(&p, by, Kind::PlanApproved, text);
+            self.plan_saved(&p).await
+        }
+        .await;
+        if done.is_err() {
+            self.unclaim(&p, &claimed).await;
+        }
+        done
     }
 
     /// Pauses plan `id` for `why`: it starts nothing until it is resumed.
