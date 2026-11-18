@@ -1044,6 +1044,25 @@ pub fn infer_task_type(prompt: &str, tool_names: &[&str]) -> String {
     "conversation".to_string()
 }
 
+/// The `[llm.model_preferences]` key for plain chatting.
+pub const CONVERSATION: &str = "conversation";
+
+/// The task type a chat turn's model is picked by: what [`infer_task_type`]
+/// reads `message` as, when the person set a model for that; otherwise
+/// `conversation`, when they set one for chatting. Keyword inference reads
+/// "explain", "what is" or "plan" in everyday chat as research or planning,
+/// and a conversation model the person chose is meant for those turns too,
+/// unless they chose another for that kind of work.
+pub fn chat_task_type(prefs: Option<&HashMap<String, String>>, message: &str) -> String {
+    let inferred = infer_task_type(message, &[]);
+    match prefs {
+        Some(p) if !p.contains_key(&inferred) && p.contains_key(CONVERSATION) => {
+            CONVERSATION.to_string()
+        }
+        _ => inferred,
+    }
+}
+
 /// A live, read-only view of an in-flight turn. Updated by the Slack progress
 /// consumer as `ProgressEvent`s flow, and read by `cmd: status` so a human can
 /// ask "what's happening?" without interrupting the run — and, because it
@@ -2110,6 +2129,21 @@ impl AgentService {
     ) -> String {
         self.resolve_model_with_source(session, task_type, message)
             .0
+    }
+
+    /// The model a chat turn runs on: as [`Self::resolve_model`] picks it,
+    /// by the task type [`chat_task_type`] reads `message` as, so a turn
+    /// that is plain chatting runs `[llm.model_preferences] conversation`.
+    /// Only for turns that answer a message: background and isolated work
+    /// keep their own.
+    pub fn resolve_chat_model(
+        &self,
+        session: &workforce_common::session::Session,
+        message: &str,
+    ) -> String {
+        let snap = self.resolved.snapshot();
+        let task = chat_task_type(snap.model_preferences.as_ref(), message);
+        self.resolve_model(session, Some(&task), Some(message))
     }
 
     /// Get the current compaction config, preferring runtime override if set.
@@ -3464,6 +3498,41 @@ pub fn install_computer_gates(gates: ComputerGates) -> bool {
 
 #[cfg(test)]
 pub mod tests {
+
+    /// A chat turn runs the conversation model the person picked, whatever
+    /// keyword its message has, unless they picked another model for the
+    /// kind of work it reads as.
+    #[test]
+    fn a_chat_turn_runs_the_conversation_model_unless_its_work_has_its_own() {
+        let prefs = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let chat = prefs(&[("conversation", "haiku")]);
+        for m in [
+            "hi, how's it going?",
+            "what is the plan for today?",
+            "explain that again",
+        ] {
+            assert_eq!(chat_task_type(Some(&chat), m), "conversation", "{m}");
+        }
+        // Work the person gave its own model keeps it.
+        let both = prefs(&[("conversation", "haiku"), ("coding", "opus")]);
+        assert_eq!(
+            chat_task_type(Some(&both), "implement the login page"),
+            "coding"
+        );
+        assert_eq!(
+            chat_task_type(Some(&both), "what is the plan?"),
+            "conversation"
+        );
+        // No conversation model: as inferred, as before.
+        let coding = prefs(&[("coding", "opus")]);
+        assert_eq!(chat_task_type(Some(&coding), "what is X?"), "research");
+        assert_eq!(chat_task_type(None, "what is X?"), "research");
+    }
 
     use workforce_agent::llm::prefix::ReplayPrefix;
 
