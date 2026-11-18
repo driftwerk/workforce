@@ -882,7 +882,9 @@ async fn run(
     // Each link's group conversation, and its thread in the person's Slack
     // DM with the agent, is opened when the link is minted. A link minted
     // before that was, or whose person has linked Slack since, has them
-    // opened as its engine connects: once, as at the mint.
+    // opened as its engine connects: once, as at the mint. The link was
+    // proved above; its own minting device only finds the token again
+    // (live, the person's), it authorises nothing more.
     for (_, live) in &accepted {
         let Some(device) = live.token.minted_by_device().map(str::to_string) else {
             continue;

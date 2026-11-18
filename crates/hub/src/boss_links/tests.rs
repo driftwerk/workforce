@@ -2107,7 +2107,7 @@ mod uplink_tests {
             let allan = Arc::clone(&allan);
             let (key, person, ts) = (key.clone(), person.clone(), ts.clone());
             tokio::spawn(async move {
-                // As Slack's dispatch runs it: streamed, in the DM's thread.
+                // As Slack's dispatch calls it: streamed, in the DM's thread.
                 let progress = crate::serve::chat_turn(allan.process_message_with_progress(
                     &key,
                     &person,
@@ -2251,8 +2251,50 @@ mod uplink_tests {
         assert!(slack.0.lock()[0].contains("acme · Desk"));
         drop(first);
         let _again = open_link(addr, &acme.plaintext, acme.record.id, &devbox, "devbox").await;
+
+        // Two engines of a group that has none yet, connecting at once:
+        // one thread.
+        let (mac, linux) = (key(), key());
+        let globex_mac = links::mint(
+            hub.state(),
+            sam.id,
+            &device.id,
+            &request(&mac, "globex", "mac"),
+        )
+        .unwrap();
+        let globex_linux = links::mint(
+            hub.state(),
+            sam.id,
+            &device.id,
+            &request(&linux, "globex", "linux"),
+        )
+        .unwrap();
+        let (_m, _l) = tokio::join!(
+            open_link(
+                addr,
+                &globex_mac.plaintext,
+                globex_mac.record.id,
+                &mac,
+                "mac"
+            ),
+            open_link(
+                addr,
+                &globex_linux.plaintext,
+                globex_linux.record.id,
+                &linux,
+                "linux"
+            ),
+        );
+        for _ in 0..100 {
+            if slack.0.lock().len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert_eq!(slack.0.lock().len(), 1, "once");
+        let posted = slack.0.lock().clone();
+        assert_eq!(posted.len(), 2, "acme's once, globex's once: {posted:?}");
+        assert!(posted[1].contains("globex · Desk"), "{posted:?}");
     }
 
     #[tokio::test]
