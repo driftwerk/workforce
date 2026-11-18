@@ -3102,8 +3102,8 @@ async fn handle_ws(
                                 };
 
                                 // Process message with progress events
-                                match service
-                                    .process_message_with_progress(
+                                match crate::serve::chat_turn(
+                                    service.process_message_with_progress(
                                         &channel,
                                         session_owner,
                                         None,
@@ -3128,8 +3128,9 @@ async fn handle_ws(
                                         Some(live.cancel_token()),
                                         voice_channel.as_deref(),
                                         desk.as_ref(),
-                                    )
-                                    .await
+                                    ),
+                                )
+                                .await
                                 {
                                     Ok(progress) => {
                                         let session_id = progress.session_id.clone();

@@ -1044,6 +1044,24 @@ pub fn infer_task_type(prompt: &str, tool_names: &[&str]) -> String {
     "conversation".to_string()
 }
 
+tokio::task_local! {
+    /// Set while a turn a person's message started runs ([`chat_turn`]).
+    static CHAT_TURN: ();
+}
+
+/// Runs `turn` as a chat turn: one a person's message started (Slack, a
+/// Desk or web chat, a retry or follow-up of one), which runs the
+/// conversation model ([`AgentService::resolve_chat_model`]). Scheduled
+/// jobs, monitors, workflows, heartbeats and a boss's own wakes aren't.
+pub async fn chat_turn<F: std::future::Future>(turn: F) -> F::Output {
+    CHAT_TURN.scope((), turn).await
+}
+
+/// Whether this runs inside [`chat_turn`].
+pub fn in_chat_turn() -> bool {
+    CHAT_TURN.try_with(|_| ()).is_ok()
+}
+
 /// The `[llm.model_preferences]` key for plain chatting.
 pub const CONVERSATION: &str = "conversation";
 
@@ -2131,18 +2149,34 @@ impl AgentService {
             .0
     }
 
-    /// The model a chat turn runs on: as [`Self::resolve_model`] picks it,
-    /// by the task type [`chat_task_type`] reads `message` as, so a turn
-    /// that is plain chatting runs `[llm.model_preferences] conversation`.
-    /// Only for turns that answer a message: background and isolated work
-    /// keep their own.
+    /// The model a turn that answers `message` runs on. In a chat turn (one
+    /// a person's message started: [`chat_turn`]) that is plain chatting,
+    /// `[llm.model_preferences] conversation` (see [`chat_task_type`]);
+    /// anywhere else, and with no conversation model, as
+    /// [`Self::resolve_model`] infers it, as before.
     pub fn resolve_chat_model(
         &self,
         session: &workforce_common::session::Session,
         message: &str,
     ) -> String {
+        if !in_chat_turn() {
+            return self.resolve_model(session, None, Some(message));
+        }
         let snap = self.resolved.snapshot();
-        let task = chat_task_type(snap.model_preferences.as_ref(), message);
+        let inferred = infer_task_type(message, &[]);
+        // A model the agent learned for the kind of work it reads as
+        // stays that kind's.
+        let learned = || {
+            matches!(
+                self.telemetry_store
+                    .get_agent_model_preference(self.agent_id.as_str(), &inferred),
+                Ok(Some(_))
+            )
+        };
+        let task = match chat_task_type(snap.model_preferences.as_ref(), message) {
+            t if t == CONVERSATION && inferred != CONVERSATION && learned() => inferred.clone(),
+            t => t,
+        };
         self.resolve_model(session, Some(&task), Some(message))
     }
 
@@ -3532,6 +3566,16 @@ pub mod tests {
         let coding = prefs(&[("coding", "opus")]);
         assert_eq!(chat_task_type(Some(&coding), "what is X?"), "research");
         assert_eq!(chat_task_type(None, "what is X?"), "research");
+    }
+
+    /// Only a turn a person's message started is a chat turn: a scheduled
+    /// job, a monitor or a boss's wake never runs the conversation model.
+    #[tokio::test]
+    async fn only_a_turn_a_persons_message_started_is_a_chat_turn() {
+        assert!(!in_chat_turn());
+        assert!(chat_turn(async { in_chat_turn() }).await);
+        // It ends with the turn.
+        assert!(!in_chat_turn());
     }
 
     use workforce_agent::llm::prefix::ReplayPrefix;

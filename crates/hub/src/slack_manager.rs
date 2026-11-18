@@ -3770,8 +3770,8 @@ pub fn spawn_slack_dispatch_loop(
                             }
                         }
 
-                        let progress_result = svc
-                            .process_message_with_progress(
+                        let progress_result =
+                            crate::serve::chat_turn(svc.process_message_with_progress(
                                 &session_key,
                                 &effective_user,
                                 None,
@@ -3811,7 +3811,7 @@ pub fn spawn_slack_dispatch_loop(
                                 Some(cancel_token.clone()),
                                 None, // Slack turns are typed, never spoken,
                                 None,
-                            )
+                            ))
                             .await;
 
                         // Slack delivers answers as messages, not chat chips, so
@@ -5245,23 +5245,22 @@ pub fn spawn_slack_dispatch_loop(
                                 format!("{} {}", command, text)
                             };
 
-                            match svc
-                                .process_message(
-                                    &session_key,
-                                    &user,
-                                    &prompt,
-                                    None,
-                                    None,
-                                    Some(&channel),
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                )
-                                .await
+                            match crate::serve::chat_turn(svc.process_message(
+                                &session_key,
+                                &user,
+                                &prompt,
+                                None,
+                                None,
+                                Some(&channel),
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                            ))
+                            .await
                             {
                                 Ok(response) => response,
                                 Err(e) => {
@@ -11616,7 +11615,7 @@ pub async fn resume_turn(
     crate::user_config::as_principal(principal, async {
         match delivery {
             ResumeDelivery::Thread((channel, thread)) => {
-                svc.process_message(
+                crate::serve::chat_turn(svc.process_message(
                     &session.channel,
                     &session.owner,
                     prompt,
@@ -11630,7 +11629,7 @@ pub async fn resume_turn(
                     None,
                     None,
                     run_as,
-                )
+                ))
                 .await
             }
             ResumeDelivery::Session => {
@@ -11760,34 +11759,33 @@ async fn resume_in_session(
             None,
         )
         .await?;
-    let started = svc
-        .process_message_with_progress(
-            &session.channel,
-            &session.owner,
-            run_as,
-            prompt,
-            None,
-            Some(&session.id),
-            None,
-            None,
-            None,
-            None,
-            Some(inbox),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(live.cancel_token()),
-            None,
-            None,
-        )
-        .await;
+    let started = crate::serve::chat_turn(svc.process_message_with_progress(
+        &session.channel,
+        &session.owner,
+        run_as,
+        prompt,
+        None,
+        Some(&session.id),
+        None,
+        None,
+        None,
+        None,
+        Some(inbox),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(live.cancel_token()),
+        None,
+        None,
+    ))
+    .await;
     let progress = match started {
         Ok(progress) => progress,
         Err(_) if live.is_cancelled() => {

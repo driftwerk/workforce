@@ -147,7 +147,7 @@ async fn attempt(service: &Arc<AgentService>, next: &NextTurn) -> eyre::Result<S
     let progress = HELD_ONLY
         .scope(
             (),
-            service.process_message_with_progress(
+            crate::serve::chat_turn(service.process_message_with_progress(
                 &next.channel,
                 &next.user,
                 Some(&next.run_as),
@@ -172,7 +172,7 @@ async fn attempt(service: &Arc<AgentService>, next: &NextTurn) -> eyre::Result<S
                 Some(live.cancel_token()),
                 None,
                 Some(&next.desk),
-            ),
+            )),
         )
         .await?;
     let conducted = crate::live_turns::conduct(&mut live, service, progress, |mut rx| async move {
