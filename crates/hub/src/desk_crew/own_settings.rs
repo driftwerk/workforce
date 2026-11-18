@@ -314,6 +314,9 @@ fn table_in<'t>(
         .ok_or_else(|| format!("[{key}] in its config.toml isn't a table, so nothing was changed."))
 }
 
+/// How often the main boss's day of metered cheap calls is looked at.
+const NOTES_LOOK: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl CrewHub {
     /// Once a day, once the day's metered cheap calls are spent: a card in
     /// the DM of `boss` (whose `[oversight.updates]` sets the ceiling) that
@@ -325,12 +328,17 @@ impl CrewHub {
         boss: &crate::serve::AgentService,
         o: &workforce_common::oversight::Oversight,
     ) {
-        if !self.desk.cheap_ceiling_hit_today() {
+        // Read from the store, so a restart on a spent day still says so;
+        // never on a plan.
+        if !self.desk.notes_spent().await {
             return;
         }
-        let today = chrono::Utc::now()
-            .with_timezone(&self.desk.timezone())
-            .date_naive();
+        let cap = o.updates.cheap_calls_per_day;
+        // None allowed is the person's choice, not a day spent.
+        if cap == 0 {
+            return;
+        }
+        let today = self.desk.cheap_day();
         {
             let mut offered = self.notes_offered.lock();
             if *offered == Some(today) {
@@ -338,8 +346,7 @@ impl CrewHub {
             }
             *offered = Some(today);
         }
-        let cap = o.updates.cheap_calls_per_day;
-        let raised = (u64::from(cap.max(1)) * 2).min(MAX_CHEAP_CALLS as u64) as u32;
+        let raised = (u64::from(cap) * 2).min(MAX_CHEAP_CALLS as u64) as u32;
         if raised <= cap {
             return;
         }
@@ -362,6 +369,8 @@ impl CrewHub {
             Ok(s) => s,
             Err(e) => {
                 tracing::info!(boss = %agent, error = %e, "the card to raise the notes ceiling wasn't kept");
+                // Offered again on the next look.
+                *self.notes_offered.lock() = None;
                 return;
             }
         };
@@ -375,6 +384,24 @@ impl CrewHub {
         };
         self.card(&agent, None, format!("{why} Allow {raised} a day?"), extras)
             .await;
+    }
+
+    /// Looks, at most every [`NOTES_LOOK`], whether the main boss `boss`'s
+    /// day of metered cheap calls is spent, and offers its card if so.
+    pub(super) fn notes_look(
+        &self,
+        boss: &std::sync::Arc<crate::serve::AgentService>,
+        o: &workforce_common::oversight::Oversight,
+    ) {
+        {
+            let mut looked = self.notes_looked.lock();
+            if looked.is_some_and(|at| at.elapsed() < NOTES_LOOK) {
+                return;
+            }
+            *looked = Some(std::time::Instant::now());
+        }
+        let (crew, boss, o) = (self.me(), std::sync::Arc::clone(boss), o.clone());
+        tokio::spawn(async move { crew.offer_more_notes(&boss, &o).await });
     }
 
     /// Makes `change` to the overseer `agent`'s own `[oversight]`, as the

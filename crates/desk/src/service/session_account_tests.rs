@@ -1483,3 +1483,83 @@ async fn an_idle_sessions_restart_or_reread_says_nothing_new() {
     })
     .await;
 }
+
+/// A boss update's call is reconciled as accounts' are: expected on a
+/// plan but run metered, it counts against the ceiling; failed, it is
+/// given back.
+#[tokio::test]
+async fn an_updates_call_is_counted_by_what_paid_for_it_and_given_back_when_it_failed() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::answering(&[]);
+        let (d, _id, _cancel) = start(&pool, dir.path(), &fake).await;
+        d.set_account_limits(Limits {
+            cheap_calls_per_day: 1,
+            account_questions_per_day: 0,
+        });
+        // Expected on a plan, served metered: the metered day is spent.
+        assert!(d.update_take(Billing::Plan).await.unwrap());
+        d.update_paid(Billing::Plan, Ok(Some(Billing::Metered)))
+            .await;
+        let today = d.cheap_today().await.unwrap();
+        assert_eq!((today.metered, today.on_plan), (1, 0));
+        assert!(!d.update_take(Billing::Metered).await.unwrap());
+        // A failed call gives back what it took, on a plan or metered.
+        assert!(d.update_take(Billing::Plan).await.unwrap());
+        d.update_paid(Billing::Plan, Err(())).await;
+        let today = d.cheap_today().await.unwrap();
+        assert_eq!((today.metered, today.on_plan), (1, 0));
+        d.set_account_limits(Limits {
+            cheap_calls_per_day: 2,
+            account_questions_per_day: 0,
+        });
+        assert!(d.update_take(Billing::Metered).await.unwrap());
+        d.update_paid(Billing::Metered, Err(())).await;
+        assert_eq!(d.cheap_today().await.unwrap().metered, 1);
+        // Served as expected: nothing moves.
+        assert!(d.update_take(Billing::Metered).await.unwrap());
+        d.update_paid(Billing::Metered, Ok(Some(Billing::Metered)))
+            .await;
+        assert_eq!(d.cheap_today().await.unwrap().metered, 2);
+    })
+    .await;
+}
+
+/// The day spent, said only while calls are metered: moved onto a plan it
+/// isn't, and a restart on a spent day reads it from the store.
+#[tokio::test]
+async fn a_spent_day_is_said_only_while_metered_and_holds_across_a_restart() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::answering(&[]);
+        let limits = Limits {
+            cheap_calls_per_day: 1,
+            account_questions_per_day: 0,
+        };
+        {
+            let (d, _id, cancel) = start(&pool, dir.path(), &fake).await;
+            d.set_account_limits(limits);
+            assert!(!d.notes_spent().await);
+            assert!(d.update_take(Billing::Metered).await.unwrap());
+            assert!(!d.update_take(Billing::Metered).await.unwrap());
+            assert!(d.cheap_ceiling_hit_today());
+            // Onto a plan: its calls are made, and nothing says spent.
+            *fake.on_plan.lock() = true;
+            assert!(!d.notes_spent().await);
+            assert!(!d.cheap_ceiling_hit_today());
+            *fake.on_plan.lock() = false;
+            cancel.cancel();
+        }
+        // Restarted: nothing refused yet, but the store says it's spent.
+        let dir2 = tempfile::tempdir().unwrap();
+        let (d, _id, _cancel) = start(&pool, dir2.path(), &fake).await;
+        d.set_account_limits(limits);
+        assert!(!d.cheap_ceiling_hit_today());
+        assert!(d.notes_spent().await);
+        assert!(
+            d.cheap_ceiling_hit_today(),
+            "the boss's picture says so again"
+        );
+    })
+    .await;
+}

@@ -63,6 +63,9 @@ pub(super) struct AccountRun {
     /// The day the metered ceiling last refused a call: accounts are said
     /// plainly for the rest of it, and the boss's picture says so.
     ceiling_hit: Mutex<Option<NaiveDate>>,
+    /// What the accountant's route was last paid by: a plan's calls are
+    /// never held, so nothing is said spent on one.
+    last_billing: Mutex<Option<Billing>>,
     /// When each running turn's `now` was last written, and what its tail
     /// was then.
     mid_turn: Mutex<HashMap<Uuid, (Instant, u64)>>,
@@ -86,6 +89,7 @@ impl AccountRun {
             flights: Mutex::default(),
             limits: Mutex::default(),
             ceiling_hit: Mutex::default(),
+            last_billing: Mutex::default(),
             mid_turn: Mutex::default(),
             looked: Mutex::default(),
             ended: Mutex::default(),
@@ -705,10 +709,12 @@ impl Desk {
 
     /// What the accountant's next call is paid by: metered with none.
     async fn account_billing(&self) -> Billing {
-        match &self.0.accounts.accountant {
+        let billing = match &self.0.accounts.accountant {
             Some(a) => a.billing().await,
             None => Billing::Metered,
-        }
+        };
+        *self.0.accounts.last_billing.lock() = Some(billing);
+        billing
     }
 
     /// Takes one of the day's cheap calls of `kind`, on the accountant's
@@ -792,6 +798,45 @@ impl Desk {
         self.cheap_take(CheapKind::Update, billing).await
     }
 
+    /// An update's call taken as `billing` was made: `Ok(served)` with what
+    /// paid for it, as accounts' calls are reconciled; `Err` gives it back.
+    pub async fn update_paid(&self, billing: Billing, made: Result<Option<Billing>, ()>) {
+        match made {
+            Ok(served) => self.cheap_paid(CheapKind::Update, billing, served).await,
+            Err(()) => {
+                if let Err(e) = self.cheap_untake(CheapKind::Update, billing).await {
+                    tracing::info!(
+                        error = format!("{e:#}"),
+                        "a failed update's call wasn't given back"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Whether the day's metered cheap calls are spent, read from the
+    /// store (so it holds across a restart), on the accountant's route:
+    /// never on a plan. Marks the day as [`Self::cheap_ceiling_hit_today`]
+    /// reads it.
+    pub async fn notes_spent(&self) -> bool {
+        if self.account_billing().await == Billing::Plan {
+            return false;
+        }
+        let day = self.derive_day();
+        let cap = self.0.accounts.limits.lock().cheap_calls_per_day;
+        let spent = cap > 0
+            && self
+                .0
+                .store
+                .cheap_calls(day)
+                .await
+                .is_ok_and(|n| n >= i64::from(cap));
+        if spent {
+            *self.0.accounts.ceiling_hit.lock() = Some(day);
+        }
+        spent || self.cheap_ceiling_hit_today()
+    }
+
     /// The day's cheap calls so far: metered against the ceiling, and those
     /// a plan served.
     pub async fn cheap_today(&self) -> eyre::Result<CheapToday> {
@@ -824,6 +869,12 @@ impl Desk {
     /// Read without waiting on the store.
     pub fn cheap_ceiling_hit_today(&self) -> bool {
         *self.0.accounts.ceiling_hit.lock() == Some(self.derive_day())
+            && *self.0.accounts.last_billing.lock() != Some(Billing::Plan)
+    }
+
+    /// The day the cheap calls are counted by.
+    pub fn cheap_day(&self) -> NaiveDate {
+        self.derive_day()
     }
 
     /// Asks the model `system` and `user` about session `id` for `call`,

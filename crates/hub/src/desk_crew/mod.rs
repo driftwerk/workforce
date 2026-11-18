@@ -285,6 +285,8 @@ pub struct CrewHub {
     /// The day the person was offered a card to raise the day's spent
     /// metered cheap calls ([`own_settings`]).
     notes_offered: Mutex<Option<chrono::NaiveDate>>,
+    /// When the day's metered cheap calls were last looked at for that.
+    notes_looked: Mutex<Option<std::time::Instant>>,
 }
 
 static CREWS: Mutex<Vec<Weak<CrewHub>>> = Mutex::new(Vec::new());
@@ -701,6 +703,7 @@ impl CrewHub {
             relay_wait: Mutex::new(Duration::from_secs(30)),
             relay_polled: Mutex::new(None),
             notes_offered: Mutex::new(None),
+            notes_looked: Mutex::new(None),
         });
         {
             let mut crews = CREWS.lock();
@@ -839,10 +842,6 @@ impl CrewHub {
             .iter()
             .find(|(_, o)| o.scope == Scope::Ungrouped)
             .or(list.first());
-        if let Some((s, o)) = main.filter(|_| self.desk.cheap_ceiling_hit_today()) {
-            let (crew, s, o) = (self.me(), Arc::clone(s), o.clone());
-            tokio::spawn(async move { crew.offer_more_notes(&s, &o).await });
-        }
         self.desk.set_account_limits(
             main.map(|(_, o)| workforce_desk::account::Limits {
                 cheap_calls_per_day: o.updates.cheap_calls_per_day,
@@ -850,6 +849,9 @@ impl CrewHub {
             })
             .unwrap_or_default(),
         );
+        if let Some((s, o)) = main {
+            self.notes_look(s, o);
+        }
         // No boss allows a change to any agent's own settings, its own
         // limits among them.
         self.desk.withhold_agent_settings(

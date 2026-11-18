@@ -303,7 +303,9 @@ impl DeskStore {
     }
 
     /// Moves a call of `kind` counted on `day` as `plan` (else metered) to
-    /// the other count: what paid for it wasn't what was expected.
+    /// the other count: what paid for it wasn't what was expected. Moved to
+    /// metered it isn't held to the ceiling: it was made and paid already,
+    /// and is counted so the next take sees it.
     pub async fn cheap_rebill(&self, day: NaiveDate, kind: CheapKind, plan: bool) -> Result<()> {
         let client = self.pool().get().await?;
         let sql = match plan {
