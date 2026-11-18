@@ -163,10 +163,10 @@ pub(crate) async fn on_own_claude(service: &crate::serve::AgentService, person: 
     store
         .set_every_agent(
             person.parse().unwrap(),
-            Some(PersonalRoute {
-                kind: PersonalRouteKind::ClaudeCode,
-                fallback: RouteFallback::Wait,
-            }),
+            Some(PersonalRoute::new(
+                PersonalRouteKind::ClaudeCode,
+                RouteFallback::Wait,
+            )),
             "test",
         )
         .await

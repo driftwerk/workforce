@@ -7,14 +7,10 @@ use workforce_common::personal_route::{
 
 use super::*;
 
-const CLAUDE: PersonalRoute = PersonalRoute {
-    kind: PersonalRouteKind::ClaudeCode,
-    fallback: RouteFallback::Wait,
-};
-const CLAUDE_OR_HUB: PersonalRoute = PersonalRoute {
-    kind: PersonalRouteKind::ClaudeCode,
-    fallback: RouteFallback::Hub,
-};
+const CLAUDE: PersonalRoute =
+    PersonalRoute::new(PersonalRouteKind::ClaudeCode, RouteFallback::Wait);
+const CLAUDE_OR_HUB: PersonalRoute =
+    PersonalRoute::new(PersonalRouteKind::ClaudeCode, RouteFallback::Hub);
 
 /// What every store keeps: the two settings apart, the narrower winning,
 /// each person's own, and every change noted.
@@ -142,6 +138,44 @@ async fn keeps_settings(store: Arc<dyn PersonRouteStore>) {
         RouteSettings::default()
     );
     assert_eq!(store.changes(alice, 100).await.unwrap().len(), 8);
+
+    // The models a route runs are kept with it, for every agent and one,
+    // and noted in its change; a route set again without them drops them.
+    let mut codex = PersonalRoute::new(PersonalRouteKind::Codex, RouteFallback::Hub);
+    codex
+        .model_preferences
+        .insert("conversation".into(), "gpt-6-astra".into());
+    codex.light_model = Some("cheap".into());
+    codex.heavy_model = Some("chat".into());
+    store
+        .set_every_agent(bob, Some(codex.clone()), &actor)
+        .await
+        .unwrap();
+    store
+        .set_for_agent(
+            bob,
+            "quill",
+            Some(AgentRoute::Personal(codex.clone())),
+            &actor,
+        )
+        .await
+        .unwrap();
+    let kept = store.settings(bob, Some("quill")).await.unwrap();
+    assert_eq!(kept.every_agent, Some(codex.clone()));
+    assert_eq!(kept.this_agent, Some(AgentRoute::Personal(codex.clone())));
+    assert_eq!(
+        store.changes(bob, 1).await.unwrap()[0].after,
+        Some(AgentRoute::Personal(codex.clone()))
+    );
+    let plain = PersonalRoute::new(PersonalRouteKind::Codex, RouteFallback::Hub);
+    store
+        .set_every_agent(bob, Some(plain.clone()), &actor)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.settings(bob, None).await.unwrap().every_agent,
+        Some(plain)
+    );
 }
 
 #[tokio::test]

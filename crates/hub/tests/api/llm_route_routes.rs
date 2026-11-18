@@ -397,3 +397,60 @@ async fn an_agent_that_opted_out_or_narrowed_the_kinds_refuses_a_route_of_its_ow
         "an empty body isn't read as a clear"
     );
 }
+
+#[tokio::test]
+async fn her_routes_models_are_kept_and_a_retired_one_is_refused_in_plain_words() {
+    let hub = Hub::on().await;
+    hub.chatgpt_login(&hub.alice);
+
+    let (_, body) = hub.get(&hub.alice, "/api/me/llm-route").await;
+    let codex = body["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|option| option["kind"] == "codex")
+        .unwrap()
+        .clone();
+    let models: Vec<&str> = codex["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m.as_str())
+        .collect();
+    assert!(
+        models.contains(&"gpt-6.1-sol"),
+        "the plan's models: {codex}"
+    );
+    assert!(!models.contains(&"gpt-5.5"), "never a retired one");
+    assert_eq!(codex["defaults"]["conversation"], "gpt-6.1-sol");
+
+    let chosen = json!({
+        "kind": "codex",
+        "fallback": "wait",
+        "model_preferences": { "conversation": "gpt-6-astra" },
+        "light_model": "cheap",
+        "heavy_model": "chat",
+    });
+    let (status, body) = hub
+        .put(&hub.alice, "/api/me/llm-route", chosen.clone())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["route"], chosen);
+    let (_, body) = hub.get(&hub.alice, "/api/me/llm-route").await;
+    assert_eq!(body["route"], chosen, "kept");
+
+    let retired = json!({ "kind": "codex", "fallback": "wait", "heavy_model": "gpt-5.5" });
+    let (status, body) = hub.put(&hub.alice, "/api/me/llm-route", retired).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let why = body["error"].as_str().unwrap();
+    assert!(
+        why.contains("heavy") && why.contains("retired") && why.contains("gpt-6.1-sol"),
+        "{why}"
+    );
+    let (_, body) = hub.get(&hub.alice, "/api/me/llm-route").await;
+    assert_eq!(body["route"], chosen, "a refused change keeps what she had");
+
+    let unknown = json!({ "kind": "codex", "fallback": "wait", "model_preferences": { "coding": "gpt-6-sol" } });
+    let (status, _) = hub.put(&hub.alice, "/api/me/llm-route", unknown).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
