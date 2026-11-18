@@ -292,6 +292,73 @@ impl GithubClient {
         Self::handle_response(response).await
     }
 
+    /// POST a GraphQL query and return its `data`. An answer carrying `errors`
+    /// fails, partial `data` or not: a rate limit as [`RateLimitedError`],
+    /// anything else as `GitHub GraphQL {types}: {messages}`.
+    pub async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        let (headers, base_url) = self.build_request()?;
+        let response = self
+            .client
+            .post(graphql_url(&base_url))
+            .headers(headers)
+            .json(&serde_json::json!({ "query": query, "variables": variables }))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Self::handle_response(response).await;
+        }
+        let header_u64 = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok())
+        };
+        let exhausted = header_u64("x-ratelimit-remaining") == Some(0);
+        let retry_after = retry_after_secs(response.headers()).or_else(|| {
+            header_u64("x-ratelimit-reset")
+                .map(|reset| reset.saturating_sub(Utc::now().timestamp().max(0) as u64))
+        });
+        let mut body = response.json::<Value>().await?;
+        let errors = body["errors"].as_array().filter(|e| !e.is_empty());
+        let Some(errors) = errors else {
+            return Ok(body["data"].take());
+        };
+        let types: Vec<&str> = errors
+            .iter()
+            .map(|e| e["type"].as_str().unwrap_or("UNKNOWN"))
+            .collect();
+        let messages: Vec<&str> = errors
+            .iter()
+            .filter_map(|e| e["message"].as_str())
+            .collect();
+        let message = messages.join("; ");
+        if exhausted || types.contains(&"RATE_LIMITED") {
+            return Err(RateLimitedError::new(
+                format!("GitHub GraphQL rate limited: {message}"),
+                retry_after,
+            )
+            .into());
+        }
+        let mut distinct: Vec<&str> = Vec::new();
+        for t in types {
+            if !distinct.contains(&t) {
+                distinct.push(t);
+            }
+        }
+        Err(eyre!("GitHub GraphQL {}: {message}", distinct.join(", ")))
+    }
+
+    /// Whether the token a call is made with now is the caller's own (a
+    /// per-user tier of the vault), not a shared one.
+    pub fn token_is_personal(&self) -> bool {
+        let Some(store) = self.store.as_ref() else {
+            return false;
+        };
+        let (ws, flat) = self.paths("token");
+        resolve_credential(store.as_ref(), &ws, &flat).is_some_and(|r| r.per_user)
+    }
+
     /// GET request that returns the response as plain text (for log endpoints).
     pub async fn get_text(&self, path: &str) -> Result<String> {
         let (headers, base_url) = self.build_request()?;
@@ -363,6 +430,16 @@ impl GithubClient {
                 _ => Err(eyre!("GitHub API error ({}): {}", status, message)),
             }
         }
+    }
+}
+
+/// The GraphQL endpoint of an API base: `{base}/graphql` for github.com, and
+/// `/api/graphql` where the base ends in GitHub Enterprise Server's `/api/v3`.
+pub fn graphql_url(base: &str) -> String {
+    let base = base.trim_end_matches('/');
+    match base.strip_suffix("/api/v3") {
+        Some(host) => format!("{host}/api/graphql"),
+        None => format!("{base}/graphql"),
     }
 }
 

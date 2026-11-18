@@ -376,6 +376,16 @@ const READS: &[&str] = &[
     "view",
 ];
 
+/// Tools whose words say otherwise of them: `status` names a read in
+/// `github.ci_status` but sets a board column in `github.project_item_status`.
+const NAMED: &[(&str, bool)] = &[
+    ("github.viewer", true),
+    ("github.issues_changed", true),
+    ("github.repo_labels", true),
+    ("github.project_item_status", false),
+    ("github.issue_labels", false),
+];
+
 /// Whether connector `tool` only reads. Its name after the connector, split
 /// into words (`gmail.search`, `issue_list`): a read names a read word and
 /// no change; anything else, a generic `api` passthrough included, is a
@@ -384,6 +394,9 @@ pub fn is_read(tool: &str) -> bool {
     let Some((_, action)) = tool.split_once('.') else {
         return false;
     };
+    if let Some((_, read)) = NAMED.iter().find(|(name, _)| *name == tool) {
+        return *read;
+    }
     let words: Vec<&str> = action.split(['.', '_']).collect();
     words.iter().any(|w| READS.contains(w))
         && !words.iter().any(|w| WRITES.contains(w) || *w == "api")
@@ -401,6 +414,12 @@ mod tests {
             "linear.issue_history",
             "github.pr_diff",
             "github.workflow_run_logs",
+            "github.viewer",
+            "github.projects_list",
+            "github.project_get",
+            "github.project_items",
+            "github.issues_changed",
+            "github.repo_labels",
             "google.gmail.search",
             "google.chat.messages_list",
             "email.inbox",
@@ -424,6 +443,10 @@ mod tests {
             "github.pr_comment",
             "github.api",
             "github.branch_protection",
+            "github.project_item_status",
+            "github.project_item_move",
+            "github.project_item_add",
+            "github.issue_labels",
             "google.gmail.send",
             "google.gmail.draft_send",
             "email.send",
