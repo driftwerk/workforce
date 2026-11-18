@@ -1223,6 +1223,8 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route("/api/budget/overrides", axum::routing::put(crate::api_handlers::budget::put_override))
         .route("/api/budget/overrides/clear", axum::routing::post(crate::api_handlers::budget::clear_override))
         .with_state(Arc::clone(&state))
+        // The person's Desk takes agents' theme calls: on every hub.
+        .merge(crate::desk_themes::router(Arc::clone(&state)))
         .merge(desk_routes(state))
         .fallback(static_fallback);
     hardened(app)
