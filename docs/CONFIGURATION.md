@@ -430,7 +430,7 @@ shared_serves = "anyone"                                                # defaul
 
 See `end-user-docs/concepts/subscriptions.mdx`.
 
-**People's own routes (`[llm.personal_routes]`):** whether a person may run everything billable to them on their own subscription instead of the hub's model route. Off by default. Set in `workforce.toml` or the config overlay (hot-reloaded).
+**People's own routes (`[llm.personal_routes]`):** whether a person may run everything billable to them on their own subscription instead of the hub's model route. Off by default. Set in `workforce.toml` (read at start) or the config overlay (applied live, no restart).
 
 ```toml
 [llm.personal_routes]

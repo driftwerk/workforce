@@ -72,7 +72,11 @@ fn as_json(route: Option<AgentRoute>) -> Option<String> {
 }
 
 fn from_json(value: Option<String>) -> Option<AgentRoute> {
-    value.and_then(|value| serde_json::from_str(&value).ok())
+    value.and_then(|value| {
+        serde_json::from_str(&value)
+            .inspect_err(|e| tracing::warn!(target: "llm_route", error = %e, "an audit row's route can't be read; shown as none"))
+            .ok()
+    })
 }
 
 impl PostgresRouteStore {

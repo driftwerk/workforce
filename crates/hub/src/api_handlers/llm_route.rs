@@ -65,13 +65,21 @@ pub struct MyAgentRouteView {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteWrite<T> {
-    /// The new setting; none clears it.
-    #[serde(default = "none")]
+    /// The new setting; `null` clears it. The key is required, so an empty
+    /// body is refused rather than read as a clear.
+    #[serde(
+        deserialize_with = "present",
+        bound(deserialize = "T: Deserialize<'de>")
+    )]
     route: Option<T>,
 }
 
-fn none<T>() -> Option<T> {
-    None
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 fn routes(state: &GatewayState) -> Result<PersonalRoutes, ApiError> {
@@ -148,10 +156,18 @@ fn has_own_login(
 
 /// Why `route` can't be chosen where `switch` holds, the person holding
 /// a working login of its kind or not; `None` when it can.
-fn refusal(route: PersonalRoute, switch: &PersonalRoutesConfig, has_login: bool) -> Option<String> {
+fn refusal(
+    route: PersonalRoute,
+    hub_on: bool,
+    switch: &PersonalRoutesConfig,
+    has_login: bool,
+) -> Option<String> {
     let title = route.kind.title();
-    if !switch.enabled {
+    if !hub_on {
         return Some("this hub doesn't run people's work on their own subscriptions".into());
+    }
+    if !switch.enabled {
+        return Some("this agent always runs on the hub's own route".into());
     }
     if !switch.allow.contains(&route.kind) {
         return Some(format!(
@@ -221,7 +237,7 @@ pub async fn put_my_route(
             global: state.vault.as_ref(),
         };
         let has_login = has_own_login(route.kind, &global, &[CredentialTier::GlobalUser], person);
-        if let Some(reason) = refusal(route, &switch, has_login) {
+        if let Some(reason) = refusal(route, routes.switch().enabled, &switch, has_login) {
             return Err(refused(reason));
         }
     }
@@ -311,7 +327,7 @@ pub async fn put_my_agent_route(
             &[CredentialTier::AgentUser, CredentialTier::GlobalUser],
             person,
         );
-        if let Some(reason) = refusal(route, &switch, has_login) {
+        if let Some(reason) = refusal(route, routes.switch().enabled, &switch, has_login) {
             return Err(refused(reason));
         }
     }
@@ -351,15 +367,17 @@ mod tests {
 
     #[test]
     fn a_route_is_refused_off_unoffered_unbuilt_or_without_a_login() {
-        assert_eq!(refusal(CLAUDE, &on(), true), None);
-        assert!(refusal(CLAUDE, &PersonalRoutesConfig::default(), true)
-            .unwrap()
-            .contains("doesn't run"));
+        assert_eq!(refusal(CLAUDE, true, &on(), true), None);
+        assert!(
+            refusal(CLAUDE, false, &PersonalRoutesConfig::default(), true)
+                .unwrap()
+                .contains("doesn't run")
+        );
         let codex_only = PersonalRoutesConfig {
             enabled: true,
             allow: vec![PersonalRouteKind::Codex],
         };
-        assert!(refusal(CLAUDE, &codex_only, true)
+        assert!(refusal(CLAUDE, true, &codex_only, true)
             .unwrap()
             .contains("isn't offered"));
         for kind in [PersonalRouteKind::Codex, PersonalRouteKind::Devin] {
@@ -367,19 +385,21 @@ mod tests {
                 kind,
                 fallback: RouteFallback::Hub,
             };
-            assert!(refusal(route, &on(), true)
+            assert!(refusal(route, true, &on(), true)
                 .unwrap()
                 .contains("isn't available yet"));
         }
-        assert!(refusal(CLAUDE, &on(), false)
+        assert!(refusal(CLAUDE, true, &on(), false)
             .unwrap()
             .contains("connect your own Claude login"));
     }
 
     #[test]
-    fn a_write_with_no_route_clears_the_setting() {
-        let clear: RouteWrite<AgentRoute> = serde_json::from_str("{}").unwrap();
-        assert_eq!(clear.route, None);
+    fn a_null_route_clears_the_setting_and_an_empty_body_is_refused() {
+        assert!(
+            serde_json::from_str::<RouteWrite<AgentRoute>>("{}").is_err(),
+            "an empty body isn't read as a clear"
+        );
         let null: RouteWrite<AgentRoute> = serde_json::from_str(r#"{"route":null}"#).unwrap();
         assert_eq!(null.route, None);
         let hub: RouteWrite<AgentRoute> = serde_json::from_str(r#"{"route":"hub"}"#).unwrap();

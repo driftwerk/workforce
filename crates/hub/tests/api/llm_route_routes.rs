@@ -11,7 +11,9 @@ use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
 use serde_json::{json, Value};
 use workforce_common::locking::LockManager;
-use workforce_common::personal_route::PersonalRoutesConfig;
+use workforce_common::personal_route::{
+    AgentPersonalRoutes, PersonalRouteKind, PersonalRoutesConfig,
+};
 use workforce_hub::agent_registry::AgentRegistry;
 use workforce_hub::gateway::router;
 use workforce_hub::hub_core::personal_routes::{MemoryRouteStore, PersonRouteStore};
@@ -30,6 +32,7 @@ struct Hub {
     state: Arc<workforce_hub::gateway::GatewayState>,
     vault: Arc<Vault>,
     store: Arc<MemoryRouteStore>,
+    service: Arc<AgentService>,
     alice: Identity,
     bob: Identity,
     _dirs: (tempfile::TempDir, tempfile::TempDir),
@@ -74,7 +77,9 @@ impl Hub {
         .await
         .unwrap();
         let registry = AgentRegistry::from_parts(
-            [("scout".to_string(), service)].into_iter().collect(),
+            [("scout".to_string(), Arc::clone(&service))]
+                .into_iter()
+                .collect(),
             "scout".into(),
         );
         let state = GatewayParts {
@@ -90,6 +95,7 @@ impl Hub {
             state,
             vault,
             store,
+            service,
             alice,
             bob,
             _dirs: (data, vaults),
@@ -142,6 +148,15 @@ impl Hub {
     }
 }
 
+impl Hub {
+    /// The agent's own `[llm.personal_routes]`, as its config now says.
+    fn agent_routes(&self, own: AgentPersonalRoutes) {
+        let mut resolved = (*self.service.resolved.snapshot()).clone();
+        resolved.personal_routes = Some(own);
+        self.service.resolved.store(resolved);
+    }
+}
+
 fn claude(fallback: &str) -> Value {
     json!({ "kind": "claude-code", "fallback": fallback })
 }
@@ -154,12 +169,20 @@ async fn a_person_sets_their_every_agent_route_with_a_login_of_their_own() {
     assert_eq!(body["available"], true);
     assert_eq!(body["route"], Value::Null);
 
-    let (status, body) = hub.put(&hub.alice, "/api/me/llm-route", claude("wait")).await;
-    assert_eq!(status, StatusCode::CONFLICT, "no login of her own yet: {body}");
+    let (status, body) = hub
+        .put(&hub.alice, "/api/me/llm-route", claude("wait"))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "no login of her own yet: {body}"
+    );
     assert!(body["error"].as_str().unwrap().contains("Claude login"));
 
     hub.claude_login(&hub.alice);
-    let (status, body) = hub.put(&hub.alice, "/api/me/llm-route", claude("hub")).await;
+    let (status, body) = hub
+        .put(&hub.alice, "/api/me/llm-route", claude("hub"))
+        .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["route"], claude("hub"));
     let (_, body) = hub.get(&hub.alice, "/api/me/llm-route").await;
@@ -181,7 +204,8 @@ async fn a_person_sets_their_every_agent_route_with_a_login_of_their_own() {
 async fn the_per_agent_setting_wins_and_hub_refuses_the_every_agent_one() {
     let hub = Hub::on().await;
     hub.claude_login(&hub.alice);
-    hub.put(&hub.alice, "/api/me/llm-route", claude("wait")).await;
+    hub.put(&hub.alice, "/api/me/llm-route", claude("wait"))
+        .await;
 
     let path = "/api/me/agents/scout/llm-route";
     let (status, body) = hub.get(&hub.alice, path).await;
@@ -193,10 +217,18 @@ async fn the_per_agent_setting_wins_and_hub_refuses_the_every_agent_one() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["route"], "hub");
     assert_eq!(body["every_agent"], claude("wait"));
-    assert_eq!(body["effective"], Value::Null, "this agent stays on the hub's route");
+    assert_eq!(
+        body["effective"],
+        Value::Null,
+        "this agent stays on the hub's route"
+    );
 
     let (_, body) = hub.put(&hub.alice, path, claude("hub")).await;
-    assert_eq!(body["effective"], claude("hub"), "the narrower setting wins");
+    assert_eq!(
+        body["effective"],
+        claude("hub"),
+        "the narrower setting wins"
+    );
 
     let (_, body) = hub.put(&hub.alice, path, Value::Null).await;
     assert_eq!(body["route"], Value::Null);
@@ -212,7 +244,9 @@ async fn a_route_is_refused_while_the_switch_is_off_and_for_unroutable_kinds() {
     off.claude_login(&off.alice);
     let (_, body) = off.get(&off.alice, "/api/me/llm-route").await;
     assert_eq!(body["available"], false);
-    let (status, body) = off.put(&off.alice, "/api/me/llm-route", claude("wait")).await;
+    let (status, body) = off
+        .put(&off.alice, "/api/me/llm-route", claude("wait"))
+        .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     let (status, _) = off.put(&off.alice, "/api/me/llm-route", Value::Null).await;
     assert_eq!(status, StatusCode::OK, "clearing is always allowed");
@@ -228,10 +262,68 @@ async fn a_route_is_refused_while_the_switch_is_off_and_for_unroutable_kinds() {
             )
             .await;
         assert_eq!(status, StatusCode::CONFLICT, "{kind}: {body}");
-        assert!(body["error"].as_str().unwrap().contains("isn't available yet"));
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("isn't available yet"));
     }
     let (status, _) = on
         .put(&on.alice, "/api/me/llm-route", json!({ "kind": "gemini" }))
         .await;
     assert!(status.is_client_error(), "an unknown kind is refused");
+}
+
+#[tokio::test]
+async fn an_agent_that_opted_out_or_narrowed_the_kinds_refuses_a_route_of_its_own() {
+    let hub = Hub::on().await;
+    hub.claude_login(&hub.alice);
+    let path = "/api/me/agents/scout/llm-route";
+    hub.agent_routes(AgentPersonalRoutes {
+        enabled: Some(false),
+        allow: None,
+    });
+    let (_, body) = hub.get(&hub.alice, path).await;
+    assert_eq!(body["available"], false, "{body}");
+    let (status, body) = hub.put(&hub.alice, path, claude("wait")).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("this agent"),
+        "{body}"
+    );
+    let (status, _) = hub.put(&hub.alice, path, json!("hub")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "keeping it on the hub's route is always allowed"
+    );
+
+    hub.agent_routes(AgentPersonalRoutes {
+        enabled: None,
+        allow: Some(vec![PersonalRouteKind::Codex]),
+    });
+    let (status, body) = hub.put(&hub.alice, path, claude("wait")).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("isn't offered here"),
+        "{body}"
+    );
+    let (status, _) = hub
+        .put(&hub.alice, "/api/me/llm-route", claude("wait"))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the every-agent setting follows the hub's switch"
+    );
+
+    let (status, _) = hub
+        .call(&hub.alice, Method::PUT, path, Some(json!({})))
+        .await;
+    assert!(
+        status.is_client_error(),
+        "an empty body isn't read as a clear"
+    );
 }
