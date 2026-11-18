@@ -3375,6 +3375,8 @@ async fn spawn_and_wire_agent(
         ctx.global_vault.clone(),
     );
     workforce_hub::desk_driver::register_tools(&service);
+    // A theme for the person's Desk, on every hub.
+    workforce_hub::desk_themes::register(&service);
     workforce_hub::agent_registry::AgentRegistry::wire_coding_session_tools_for(
         &service,
         Arc::clone(&ctx.project_store),

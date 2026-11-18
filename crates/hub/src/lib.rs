@@ -135,6 +135,7 @@ pub mod desk_memory_index;
 pub(crate) mod desk_pool;
 pub(crate) mod desk_reads;
 pub(crate) mod desk_surface;
+pub mod desk_themes;
 #[cfg(feature = "postgres")]
 pub mod desk_ticket_comments;
 #[cfg(feature = "postgres")]
