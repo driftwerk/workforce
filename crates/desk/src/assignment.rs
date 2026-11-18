@@ -8,11 +8,13 @@
 //! - what an instruction names ([`targets`]: a release, a PR, a commit, a
 //!   run, a workflow file, an environment) and whether it starts something
 //!   that can't be taken back ([`irreversible`]);
-//! - the job it is, as one key ([`job_key`]);
+//! - the job it is, only ever as the boss declares it with the order
+//!   ([`Job`]: kind, target repository, key), never from its words;
+//! - whether the words name a job another session holds, so the boss is
+//!   asked to confirm ([`looks_like`]: a backstop that never claims);
 //! - whether it may go, against the boss's live assignments ([`rule`]):
-//!   the same session told to start what it already has (R1), a second
-//!   session given a job another holds (R2), or two irreversible orders in
-//!   one repository that act on the same thing (R3).
+//!   the same session told to start what it already has (R1), or a second
+//!   session given a job another holds (R2, and R3 by keys in one form).
 //!
 //! [`crate::assignment_store`] keeps the rows and checks the rules under
 //! the boss's lock; the hub's `desk_crew` sends, holds and releases.
@@ -690,6 +692,11 @@ fn dry(ws: &[Word], sentence: usize) -> bool {
 
 /// The irreversible acts `ws` asks for: the word each verb is at.
 fn acts(ws: &[Word], has_target: bool) -> Vec<usize> {
+    // A merge acts on a PR or a commit, never only on an environment
+    // ("merge main into dev").
+    let names_more_than_a_place = targets_at(ws)
+        .iter()
+        .any(|(_, t)| t.kind != TargetKind::Environment);
     let mut out = Vec::new();
     for (i, w) in ws.iter().enumerate() {
         let t = w.text.as_str();
@@ -742,7 +749,11 @@ fn acts(ws: &[Word], has_target: bool) -> Vec<usize> {
         let fires = force
             || command
             || (roll_back && (has_target || next_but_one_pronoun(ws, i)))
-            || (ACTS.contains(&t) && !noun && (has_target || pronoun || undone_follows()))
+            || (ACTS.contains(&t)
+                && !noun
+                && ((has_target && (t != "merge" || names_more_than_a_place))
+                    || pronoun
+                    || undone_follows()))
             || (STARTS.contains(&t) && undone_follows());
         if fires && !negated(ws, i) && !dry(ws, w.sentence) {
             out.push(i);
@@ -763,31 +774,6 @@ pub fn irreversible(text: &str) -> bool {
     !acts(&ws, has).is_empty()
 }
 
-/// The target `text` acts on, when it asks for something irreversible: the
-/// strongest in the sentence of its first act, the nearest if two are as
-/// strong; else the strongest it names.
-fn acted_on(text: &str) -> Option<Target> {
-    let ws = words(text);
-    let found = targets_at(&ws);
-    let acts = acts(&ws, !found.is_empty());
-    let nearest = acts.first().and_then(|&at| {
-        let sentence = ws[at].sentence;
-        found
-            .iter()
-            .filter(|(i, t)| ws[*i].sentence == sentence && t.kind != TargetKind::Environment)
-            .min_by_key(|(i, t)| (t.kind, i.abs_diff(at)))
-            .map(|(_, t)| t.clone())
-    });
-    nearest.or_else(|| {
-        // Said only under a no ("don't start release 4"): it names no job.
-        if acts.is_empty() && !found.is_empty() && is_negated_order(&ws) {
-            return None;
-        }
-        let only: Vec<Target> = found.into_iter().map(|(_, t)| t).collect();
-        strongest(&only).cloned()
-    })
-}
-
 /// Whether `ws` asks for an irreversible act only to say not to do it.
 fn is_negated_order(ws: &[Word]) -> bool {
     ws.iter().enumerate().any(|(i, w)| {
@@ -795,61 +781,174 @@ fn is_negated_order(ws: &[Word]) -> bool {
     })
 }
 
-/// The words of a job the boss named that say what it is: lower case,
-/// words only, without stop-words and environments.
-fn job_words(job: &str) -> String {
-    const STOP: &[&str] = &[
-        "a", "an", "the", "of", "to", "for", "and", "or", "in", "on", "at", "it", "its", "now",
-        "job", "please",
-    ];
-    job.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty() && !STOP.contains(w) && environment(w).is_none())
-        .collect::<Vec<_>>()
-        .join(" ")
+/// The job an order hands out, as the boss declares it with the order
+/// (`job: { kind, target, key }`): what kind of work, in which repository,
+/// and the job's own id. Two orders are the same job when their kind,
+/// target and key are, however each was written ([`Job::new`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Job {
+    pub kind: String,
+    pub target: String,
+    pub key: String,
 }
 
-/// What an instruction is, read.
+impl Job {
+    /// The job of `kind` in `target`, keyed `key`, each in one form:
+    /// `Mantis-CRM/monorepo.git` and `github.com/mantis-crm/monorepo` are
+    /// one target; `release-4`, `Release 4`, `r4` and `4` one release;
+    /// `pr-711`, `#711` and `711` one merge. None when one of them says
+    /// nothing.
+    pub fn new(kind: &str, target: &str, key: &str) -> Option<Self> {
+        let kind = normal_kind(kind)?;
+        let target = normal_target(target)?;
+        let key = normal_key(&kind, key)?;
+        Some(Self { kind, target, key })
+    }
+
+    /// As kept: `<target>/<kind>/<key>`.
+    pub fn as_key(&self) -> String {
+        format!("{}/{}/{}", self.target, self.kind, self.key)
+    }
+
+    /// Read back from its key.
+    pub fn of_key(key: &str) -> Option<Self> {
+        let mut parts = key.rsplitn(3, '/');
+        let (k, kind, target) = (parts.next()?, parts.next()?, parts.next()?);
+        Some(Self {
+            kind: kind.into(),
+            target: target.into(),
+            key: k.into(),
+        })
+    }
+
+    /// As the person reads it: "release 4 of mantis-crm/monorepo".
+    pub fn said(&self) -> String {
+        let what = match self.kind.as_str() {
+            "merge" => format!("the merge of #{}", self.key),
+            k => format!("{k} {}", self.key),
+        };
+        format!("{what} of {}", self.target)
+    }
+}
+
+/// A kind in one form: lower case, one word, singular.
+fn normal_kind(kind: &str) -> Option<String> {
+    let k: String = kind
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect();
+    let k = k.trim_matches('-').to_string();
+    let k = match k.as_str() {
+        "pr" | "pull-request" | "merges" => "merge".to_string(),
+        "releases" => "release".into(),
+        "deploys" | "deployment" | "deployments" => "deploy".into(),
+        "migrations" => "migration".into(),
+        "roll-back" | "rollbacks" => "rollback".into(),
+        "promotion" | "promotions" => "promote".into(),
+        _ => k,
+    };
+    (!k.is_empty() && !k.contains('/')).then_some(k)
+}
+
+/// A repository in one form: `owner/name`, lower case, without its host,
+/// scheme or `.git`.
+fn normal_target(target: &str) -> Option<String> {
+    let mut t = target.trim().to_lowercase();
+    for p in ["https://", "http://", "ssh://", "git@"] {
+        if let Some(rest) = t.strip_prefix(p) {
+            t = rest.to_string();
+        }
+    }
+    for host in ["github.com/", "github.com:", "www.github.com/", "gitlab.com/", "gitlab.com:"] {
+        if let Some(rest) = t.strip_prefix(host) {
+            t = rest.to_string();
+        }
+    }
+    let t = t.trim_end_matches('/');
+    let t = t.strip_suffix(".git").unwrap_or(t).trim_matches('/');
+    (!t.is_empty() && !t.contains(char::is_whitespace)).then(|| t.to_string())
+}
+
+/// A job's own id in one form: what names it once its kind is said, so
+/// `release-4`, `Release 4`, `r4` and `4` are all `4`.
+fn normal_key(kind: &str, key: &str) -> Option<String> {
+    let mut k = key.trim().to_lowercase();
+    let seps = |c: char| matches!(c, '-' | '_' | ' ' | '#' | ':' | '=' | '/' | '.');
+    let words: &[&str] = match kind {
+        "merge" => &["pull-request", "pull", "pr", "merge"],
+        "release" | "deploy" | "promote" | "rollback" | "dispatch" | "publish" | "tag" => {
+            &["release", "deploy", "promote", "rollback", "dispatch", "publish", "tag"]
+        }
+        _ => &[],
+    };
+    loop {
+        let before = k.clone();
+        for w in words.iter().copied().chain(std::iter::once(kind)) {
+            if let Some(rest) = k.strip_prefix(w) {
+                if rest.is_empty() || rest.starts_with(seps) || rest.starts_with(|c: char| c.is_ascii_digit()) {
+                    k = rest.trim_start_matches(seps).to_string();
+                }
+            }
+        }
+        k = k.trim_start_matches(seps).to_string();
+        if k == before {
+            break;
+        }
+    }
+    // r4, v1.4.0: the letter only marks a number.
+    if let Some(rest) = k.strip_prefix(['r', 'v']) {
+        if numberish(rest) {
+            k = rest.to_string();
+        }
+    }
+    let k = k.trim_end_matches(seps).to_string();
+    let k = if digits(&k) {
+        let n = k.trim_start_matches('0');
+        if n.is_empty() { "0".to_string() } else { n.to_string() }
+    } else {
+        k.split_whitespace().collect::<Vec<_>>().join("-")
+    };
+    (!k.is_empty()).then_some(k)
+}
+
+/// Whether `text` names `job` as something to do: a release, PR, run,
+/// commit or workflow that is the job's own key, said in an order (not
+/// only in one not to do it). Never a claim: what a boss is asked to
+/// confirm before it sends ([`Reading`]).
+pub fn looks_like(text: &str, job: &Job) -> bool {
+    let ws = words(text);
+    let found = targets_at(&ws);
+    if acts(&ws, !found.is_empty()).is_empty() && is_negated_order(&ws) {
+        return false;
+    }
+    found.iter().any(|(_, t)| {
+        let fits = match t.kind {
+            TargetKind::Pr => job.kind == "merge",
+            TargetKind::Release => job.kind != "merge",
+            TargetKind::Environment => false,
+            TargetKind::Workflow | TargetKind::Commit | TargetKind::Run => true,
+        };
+        fits && normal_key(&job.kind, &t.id).as_deref() == Some(job.key.as_str())
+    })
+}
+
+/// What an instruction's words say, read: what it names, and whether it
+/// starts something that can't be taken back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reading {
-    pub job_key: Option<String>,
     pub targets: Vec<Target>,
     pub irreversible: bool,
 }
 
-/// Reads an instruction: `text`, the job the boss named (`job`), in the
-/// repository `place` (its origin's name, else its folder's), with
-/// `irreversible` as the boss said it (true is honoured whatever the text
-/// says).
-///
-/// Its key is `<place>/<kind>/<id>` from the target it acts on (the job's
-/// own targets first; a release before a PR, a workflow, a commit, a
-/// run), else `<place>/job/<the job's words>`; none when nothing names a
-/// job: such an instruction holds no job.
-pub fn read(text: &str, job: Option<&str>, place: &str, said_irreversible: bool) -> Reading {
-    let job = job.map(str::trim).filter(|j| !j.is_empty());
-    let mut all: Vec<Target> = job.map(targets).unwrap_or_default();
-    for t in targets(text) {
-        if !all.contains(&t) {
-            all.push(t);
-        }
-    }
-    let irreversible = said_irreversible || irreversible(text);
-    let keyed = job
-        .and_then(|j| strongest(&targets(j)).cloned())
-        .or_else(|| acted_on(text));
-    let job_key = match (keyed, job) {
-        (Some(t), _) => Some(format!("{place}/{}/{}", t.kind.as_str(), t.id)),
-        (None, Some(j)) => {
-            let w = job_words(j);
-            (!w.is_empty()).then(|| format!("{place}/job/{w}"))
-        }
-        (None, None) => None,
-    };
+/// Reads `text`, with `said_irreversible` as the boss said it (true is
+/// honoured whatever the text says). The words never make a job: a job
+/// is only ever the one the boss declared ([`Job`]).
+pub fn read(text: &str, said_irreversible: bool) -> Reading {
     Reading {
-        job_key,
-        targets: all,
-        irreversible,
+        targets: targets(text),
+        irreversible: said_irreversible || irreversible(text),
     }
 }
 
@@ -870,8 +969,6 @@ pub enum Rule {
     Held,
     /// R2: another session holds this job.
     SameJob,
-    /// R3: another session's irreversible order acts on the same thing.
-    SharedTarget,
 }
 
 /// What [`rule`] decides of a new order.
@@ -890,38 +987,15 @@ pub enum Ruling {
     },
 }
 
-/// Whether two sets of environments can be the same place: either says
-/// none (any), or they share one.
-fn same_place(a: &[Target], b: &[Target]) -> bool {
-    let env = |t: &[Target]| -> Vec<String> {
-        t.iter()
-            .filter(|t| t.kind == TargetKind::Environment)
-            .map(|t| t.id.clone())
-            .collect()
-    };
-    let (ea, eb) = (env(a), env(b));
-    ea.is_empty() || eb.is_empty() || ea.iter().any(|e| eb.contains(e))
+/// Whether two jobs' keys are one job.
+fn same_job(a: Option<&str>, b: Option<&str>) -> bool {
+    matches!((a, b), (Some(a), Some(b)) if a == b)
 }
 
-/// Where `a`'s job is done, as its key says (`<place>/<kind>/<id>`).
-fn key_place(a: &Assignment) -> Option<&str> {
-    let k = a.job_key.as_deref()?;
-    let mut parts = k.rsplitn(3, '/');
-    let (_, _, place) = (parts.next()?, parts.next()?, parts.next()?);
-    Some(place)
-}
-
-/// Whether `a` and `b` (assignment targets) share something other than an
-/// environment, in places that can be the same.
-pub fn share_target(a: &[Target], b: &[Target]) -> bool {
-    same_place(a, b)
-        && a.iter()
-            .filter(|t| t.kind != TargetKind::Environment)
-            .any(|t| b.contains(t))
-}
-
-/// Whether `new` may go, against the boss's `live` assignments, leaving
-/// out `replacing` (the one it takes over from, with `replaces`).
+/// Whether `new` (a declared job) may go, against the boss's `live`
+/// assignments, leaving out `replacing` (the one it takes over, with
+/// `replaces`). Only declared jobs are compared: an order's words never
+/// refuse another's.
 pub fn rule(new: &Assignment, live: &[Live], replacing: Option<Uuid>) -> Ruling {
     let mut supersede = Vec::new();
     let mut follow_up = false;
@@ -931,28 +1005,18 @@ pub fn rule(new: &Assignment, live: &[Live], replacing: Option<Uuid>) -> Ruling 
             Rule::SameSession => 0,
             Rule::Held => 1,
             Rule::SameJob => 2,
-            Rule::SharedTarget => 3,
         };
         if refused.is_none_or(|(was, _)| rank(r) < rank(was)) {
             *refused = Some((r, id));
         }
     };
-    let new_targets = new.parsed_targets();
     for l in live
         .iter()
         .filter(|l| l.a.state.live() && Some(l.a.id) != replacing && l.a.id != new.id)
+        .filter(|l| same_job(l.a.job_key.as_deref(), new.job_key.as_deref()))
     {
         let a = &l.a;
-        let same_key = a.job_key.is_some() && a.job_key == new.job_key;
         if a.session == new.session && a.machine == new.machine {
-            // Two orders that name no job are one job only when neither
-            // starts what can't be undone ("Carry on", then "Look at the
-            // flake"): nothing says "Run the deploy" and "Run the release
-            // workflow" are, so neither replaces nor refuses the other.
-            let keyless = a.job_key.is_none() && new.job_key.is_none();
-            if !same_key && (!keyless || a.irreversible || new.irreversible) {
-                continue;
-            }
             match (a.state, a.irreversible && l.delivered, new.irreversible) {
                 (AssignmentState::Held, ..) => refuse(Rule::Held, a.id, &mut refused),
                 (_, true, true) => refuse(Rule::SameSession, a.id, &mut refused),
@@ -961,26 +1025,8 @@ pub fn rule(new: &Assignment, live: &[Live], replacing: Option<Uuid>) -> Ruling 
             }
             continue;
         }
-        if same_key && (a.claims || new.claims) {
+        if a.claims || new.claims {
             refuse(Rule::SameJob, a.id, &mut refused);
-            continue;
-        }
-        let same_repo = match (&a.repo, &new.repo) {
-            (Some(x), Some(y)) => x == y,
-            // Neither knows its repository: the folders its jobs are keyed
-            // in tell them apart, when both say.
-            (None, None) => match (key_place(a), key_place(new)) {
-                (Some(x), Some(y)) => x == y,
-                _ => true,
-            },
-            _ => true,
-        };
-        if a.irreversible
-            && new.irreversible
-            && same_repo
-            && share_target(&a.parsed_targets(), &new_targets)
-        {
-            refuse(Rule::SharedTarget, a.id, &mut refused);
         }
     }
     match refused {
@@ -996,38 +1042,6 @@ pub fn rule(new: &Assignment, live: &[Live], replacing: Option<Uuid>) -> Ruling 
 mod tests {
     use super::*;
 
-    #[test]
-    fn two_irreversible_orders_that_name_no_job_are_two_jobs() {
-        let s = Uuid::new_v4();
-        let order = |text: &str, delivered: bool| {
-            let r = read(text, None, "harbor", false);
-            let mut a = Assignment::new("boss", s, text);
-            a.job_key = r.job_key;
-            a.irreversible = r.irreversible;
-            a.state = AssignmentState::Open;
-            Live { a, delivered }
-        };
-        let deploy = order("Run the deploy.", false);
-        assert!(deploy.a.irreversible && deploy.a.job_key.is_none());
-        let workflow = order("Run the release workflow.", false);
-        assert!(workflow.a.irreversible && workflow.a.job_key.is_none());
-        for went_in in [false, true] {
-            let mut was = order("Run the deploy.", went_in);
-            was.a.id = Uuid::new_v4();
-            match rule(&workflow.a, &[was], None) {
-                Ruling::Send { supersede, .. } => assert!(supersede.is_empty()),
-                other => panic!("{other:?}"),
-            }
-        }
-        // Plain words that name no job still take each other's place.
-        let carry = order("Carry on.", false);
-        let look = order("Look at the flaky test next.", false);
-        match rule(&look.a, &[carry], None) {
-            Ruling::Send { supersede, .. } => assert_eq!(supersede.len(), 1),
-            other => panic!("{other:?}"),
-        }
-    }
-
     fn keys(text: &str) -> Vec<String> {
         targets(text).iter().map(Target::key).collect()
     }
@@ -1041,16 +1055,15 @@ mod tests {
 
     #[test]
     fn the_nights_orders_name_their_release_and_cant_be_taken_back() {
-        for (text, key) in [
-            (OWN_4, "harbor/release/4"),
-            (URGENT_4, "harbor/release/4"),
-            (DISPATCH_3, "harbor/release/3"),
-            (URGENT_3, "harbor/release/3"),
-        ] {
-            let r = read(text, None, "harbor", false);
-            assert!(r.irreversible, "{text}");
-            assert_eq!(r.job_key.as_deref(), Some(key), "{text}");
+        for text in [OWN_4, URGENT_4, DISPATCH_3, URGENT_3] {
+            assert!(read(text, false).irreversible, "{text}");
         }
+        // The night's words, read: the backstop sees release 4 and 3 in them.
+        let four = Job::new("release", "harbor/monorepo", "release-4").unwrap();
+        let three = Job::new("release", "harbor/monorepo", "3").unwrap();
+        assert!(looks_like(OWN_4, &four) && looks_like(URGENT_4, &four));
+        assert!(looks_like(DISPATCH_3, &three) && looks_like(URGENT_3, &three));
+        assert!(!looks_like(URGENT_3, &four));
         assert_eq!(
             keys(OWN_4),
             vec![
@@ -1119,9 +1132,9 @@ mod tests {
             "Don't dispatch release 4; Second batch prep has it.",
             "Never merge #711 yourself.",
         ] {
-            let r = read(text, None, "harbor", false);
-            assert!(!r.irreversible, "{text}");
-            assert_eq!(r.job_key, None, "{text}");
+            assert!(!read(text, false).irreversible, "{text}");
+            let four = Job::new("release", "harbor/monorepo", "4").unwrap();
+            assert!(!looks_like(text, &four), "a no names nothing to confirm: {text}");
         }
         assert_eq!(
             keys("Do NOT start releases 4, 5 or 6"),
@@ -1130,7 +1143,7 @@ mod tests {
         // A no in its own clause doesn't reach the next one.
         assert!(irreversible("Don't wait, dispatch release 4 now."));
         // The boss saying so is honoured.
-        assert!(read("Carry on.", Some("release 4"), "harbor", true).irreversible);
+        assert!(read("Carry on.", true).irreversible);
     }
 
     #[test]
@@ -1170,34 +1183,51 @@ mod tests {
     }
 
     #[test]
-    fn a_named_job_keys_by_its_target_else_by_its_words() {
-        let r = read(
-            "Carry on with it.",
-            Some("the Harbor release 4"),
-            "harbor",
-            false,
-        );
-        assert_eq!(r.job_key.as_deref(), Some("harbor/release/4"));
-        let r = read(
-            "Carry on with it.",
-            Some("Rotate the prod database password"),
-            "harbor",
-            false,
-        );
+    fn a_declared_job_is_one_key_however_it_is_written() {
+        let key = |kind: &str, target: &str, key: &str| Job::new(kind, target, key).unwrap().as_key();
+        let four = "mantis-crm/monorepo/release/4";
+        for (kind, target, k) in [
+            ("release", "mantis-crm/monorepo", "release-4"),
+            ("Release", "Mantis-CRM/monorepo", "Release 4"),
+            ("releases", "https://github.com/mantis-crm/monorepo.git", "r4"),
+            ("release", "git@github.com:mantis-crm/monorepo.git", "4"),
+            ("release", "github.com/mantis-crm/monorepo/", "#4"),
+        ] {
+            assert_eq!(key(kind, target, k), four, "{kind} {target} {k}");
+        }
+        for k in ["pr-711", "#711", "711", "PR 711", "pull/711"] {
+            assert_eq!(key("pr", "acme/harbor", k), "acme/harbor/merge/711", "{k}");
+        }
+        assert_eq!(key("release", "acme/harbor", "v1.4.0"), "acme/harbor/release/1.4.0");
         assert_eq!(
-            r.job_key.as_deref(),
-            Some("harbor/job/rotate database password")
+            key("migration", "acme/harbor", "Ledger table v2"),
+            "acme/harbor/migration/ledger-table-v2"
         );
-        assert_eq!(read("Run the tests.", None, "harbor", false).job_key, None);
+        assert!(Job::new("release", "", "4").is_none());
+        assert!(Job::new("release", "acme/harbor", " ").is_none());
+        let job = Job::of_key(four).unwrap();
+        assert_eq!(job.said(), "release 4 of mantis-crm/monorepo");
     }
 
-    fn live(session: Uuid, text: &str, delivered: bool) -> Live {
-        let r = read(text, None, "harbor", false);
+    #[test]
+    fn the_backstop_sees_a_held_job_said_only_when_it_is_asked_for() {
+        let four = Job::new("release", "harbor/monorepo", "4").unwrap();
+        let pr = Job::new("merge", "harbor/monorepo", "711").unwrap();
+        assert!(looks_like("Pick up release 4 and watch it through.", &four));
+        assert!(looks_like("Review #711.", &pr), "a mention asks to confirm, never claims");
+        assert!(!looks_like("Review #711.", &four));
+        assert!(!looks_like("Release 5 is next.", &four));
+        assert!(!looks_like("Don't start release 4.", &four));
+        assert!(!looks_like("Carry on with the auth reset.", &four));
+    }
+
+    fn live(session: Uuid, text: &str, job: Option<&str>, delivered: bool) -> Live {
+        let r = read(text, false);
         let mut a = Assignment::new("desk", session, text);
-        a.job_key = r.job_key;
+        a.job_key = job.map(|j| Job::new("release", "acme/harbor", j).unwrap().as_key());
         a.targets = r.targets.iter().map(Target::key).collect();
         a.irreversible = r.irreversible;
-        a.claims = r.irreversible;
+        a.claims = a.job_key.is_some();
         a.repo = Some("acme/harbor".into());
         a.state = AssignmentState::Open;
         Live { a, delivered }
@@ -1206,9 +1236,9 @@ mod tests {
     #[test]
     fn the_rules_refuse_a_second_holder_and_a_second_start() {
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-        let held = [live(a, OWN_4, true)];
-        // R2: release 4 to another session.
-        let new = live(b, URGENT_4, false).a;
+        let held = [live(a, OWN_4, Some("release-4"), true)];
+        // R2: release 4 to another session, however it is keyed.
+        let new = live(b, URGENT_4, Some("Release 4"), false).a;
         assert_eq!(
             rule(&new, &held, None),
             Ruling::Refused {
@@ -1221,9 +1251,12 @@ mod tests {
             rule(&new, &held, Some(held[0].a.id)),
             Ruling::Send { .. }
         ));
+        // Another release is another job.
+        let five = live(b, "Start release 5.", Some("5"), false).a;
+        assert!(matches!(rule(&five, &held, None), Ruling::Send { .. }));
         // R1: release 3 again to the same session, once the first went in.
-        let first = [live(a, DISPATCH_3, true)];
-        let again = live(a, URGENT_3, false).a;
+        let first = [live(a, DISPATCH_3, Some("3"), true)];
+        let again = live(a, URGENT_3, Some("3"), false).a;
         assert!(matches!(
             rule(&again, &first, None),
             Ruling::Refused {
@@ -1232,7 +1265,7 @@ mod tests {
             }
         ));
         // Not yet delivered: the new one takes its place.
-        let waiting = [live(a, DISPATCH_3, false)];
+        let waiting = [live(a, DISPATCH_3, Some("3"), false)];
         assert_eq!(
             rule(&again, &waiting, None),
             Ruling::Send {
@@ -1241,7 +1274,7 @@ mod tests {
             }
         );
         // A word on a job it holds is sent and holds nothing.
-        let word = live(a, "When release 3 finishes, send Desk its run id.", false).a;
+        let word = live(a, "When release 3 finishes, send Desk its run id.", Some("3"), false).a;
         assert_eq!(
             rule(&word, &first, None),
             Ruling::Send {
@@ -1249,69 +1282,9 @@ mod tests {
                 follow_up: true
             }
         );
-    }
-
-    #[test]
-    fn r3_catches_the_same_release_said_two_ways_and_an_environment_left_out() {
-        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-        let mut first = live(a, "Merge #711 and deploy it to production.", true);
-        first.a.job_key = Some("harbor/pr/711".into());
-        let held = [first];
-        let refused = |text: &str| {
-            let mut n = live(b, text, false).a;
-            n.job_key = Some("harbor/release/4".into());
-            matches!(
-                rule(&n, &held, None),
-                Ruling::Refused {
-                    rule: Rule::SharedTarget,
-                    ..
-                }
-            )
-        };
-        assert!(refused(
-            "Deploy Harbor production release 4; it carries #711."
-        ));
-        assert!(
-            refused("Deploy release 4, which carries #711."),
-            "no environment: any"
-        );
-        assert!(
-            !refused("Deploy release 4 to staging; it carries #711."),
-            "another place"
-        );
-        assert!(
-            !refused("Deploy release 4 to production."),
-            "nothing shared"
-        );
-        // Another repository is another job.
-        let mut other = live(b, "Deploy release 4, which carries #711.", false).a;
-        other.repo = Some("acme/other".into());
-        assert!(matches!(rule(&other, &held, None), Ruling::Send { .. }));
-    }
-
-    #[test]
-    fn plain_words_to_many_sessions_hold_nothing() {
-        let sessions: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
-        let held: Vec<Live> = sessions
-            .iter()
-            .map(|s| live(*s, "Run the tests.", true))
-            .collect();
-        let new = live(Uuid::new_v4(), "Run the tests.", false).a;
-        assert!(matches!(rule(&new, &held, None), Ruling::Send { .. }));
-        // Two mentions of one PR, neither a claim, don't refuse each other.
-        let review = [live(sessions[0], "Review #648 read-only.", true)];
-        let mut other = live(sessions[1], "Rebase on #648 once it lands.", false).a;
-        other.claims = false;
-        assert!(matches!(rule(&other, &review, None), Ruling::Send { .. }));
-        // The same session's last plain word gives way to its next.
-        let next = live(sessions[0], "Now run the linter.", false).a;
-        assert_eq!(
-            rule(&next, &held, None),
-            Ruling::Send {
-                supersede: vec![held[0].a.id],
-                follow_up: false
-            }
-        );
+        // An order that declares no job is never compared.
+        let mention = live(b, "Write the release notes for release 4.", None, false).a;
+        assert!(matches!(rule(&mention, &held, None), Ruling::Send { .. }));
     }
 
     #[test]

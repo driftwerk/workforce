@@ -471,15 +471,21 @@ mod tests {
     use workforce_postgres::test_support::with_test_pool;
 
     use super::*;
-    use crate::assignment::{read, Target};
+    use crate::assignment::{read, Job, Target, TargetKind};
 
+    /// The boss's order `text` to `session`, declaring the release it names.
     fn order(boss: &str, session: Uuid, text: &str) -> Assignment {
-        let r = read(text, None, "harbor", false);
+        let r = read(text, false);
         let mut a = Assignment::new(boss, session, text);
-        a.job_key = r.job_key;
+        let release = r
+            .targets
+            .iter()
+            .find(|t| t.kind == TargetKind::Release)
+            .map(|t| t.id.clone());
+        a.job_key = release.map(|k| Job::new("release", "acme/harbor", &k).unwrap().as_key());
         a.targets = r.targets.iter().map(Target::key).collect();
         a.irreversible = r.irreversible;
-        a.claims = r.irreversible;
+        a.claims = a.job_key.is_some();
         a.repo = Some("acme/harbor".into());
         a
     }
