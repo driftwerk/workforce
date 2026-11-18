@@ -183,3 +183,34 @@ fn the_switch_is_shared_by_every_holder_and_narrowed_per_agent() {
     routes.attach_store(Arc::new(MemoryRouteStore::default()));
     assert!(held.store().is_some());
 }
+
+#[tokio::test]
+async fn settings_are_read_once_a_while_and_again_after_a_change_here() {
+    let routes = PersonalRoutes::new(PersonalRoutesConfig::default());
+    let alice = Uuid::new_v4();
+    assert_eq!(
+        routes.settings(alice, "quill").await.unwrap(),
+        RouteSettings::default(),
+        "no store, no settings"
+    );
+    let store = Arc::new(MemoryRouteStore::default());
+    routes.attach_store(Arc::clone(&store) as Arc<dyn PersonRouteStore>);
+    assert_eq!(
+        routes.settings(alice, "quill").await.unwrap().chosen(),
+        None
+    );
+    store
+        .set_every_agent(alice, Some(CLAUDE), "alice")
+        .await
+        .unwrap();
+    assert_eq!(
+        routes.settings(alice, "quill").await.unwrap().chosen(),
+        None,
+        "trusted until SETTINGS_TTL"
+    );
+    routes.forget(alice);
+    assert_eq!(
+        routes.settings(alice, "quill").await.unwrap().chosen(),
+        Some(CLAUDE)
+    );
+}

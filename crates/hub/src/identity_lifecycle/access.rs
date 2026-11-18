@@ -763,6 +763,7 @@ impl LlmRoutes {
             .map_or(0, |(_, count)| count);
         if apply && held > 0 {
             store.forget_person(who.id).await?;
+            cx.hub()?.subscriptions().personal_routes().forget(who.id);
         }
         Ok(Tally::counted(held))
     }

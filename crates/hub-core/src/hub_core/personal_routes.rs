@@ -79,12 +79,21 @@ pub trait PersonRouteStore: Send + Sync {
     async fn forget_person(&self, person: Uuid) -> Result<usize>;
 }
 
+/// How long a person's settings are trusted before they are read again: a
+/// change made on another hub instance reaches this one within it; one made
+/// here, at once.
+pub const SETTINGS_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+type Cached = (std::time::Instant, RouteSettings);
+
 /// The hub's people's-routes state every agent shares: the switch as the
-/// config now says it, and the store once boot has opened it.
+/// config now says it, the store once boot has opened it, and what was last
+/// read of people's settings.
 #[derive(Clone, Default)]
 pub struct PersonalRoutes {
     switch: Arc<parking_lot::RwLock<PersonalRoutesConfig>>,
     store: Arc<parking_lot::RwLock<Option<Arc<dyn PersonRouteStore>>>>,
+    cache: Arc<parking_lot::Mutex<std::collections::HashMap<(Uuid, String), Cached>>>,
 }
 
 impl std::fmt::Debug for PersonalRoutes {
@@ -101,6 +110,7 @@ impl PersonalRoutes {
         Self {
             switch: Arc::new(parking_lot::RwLock::new(switch)),
             store: Default::default(),
+            cache: Default::default(),
         }
     }
 
@@ -130,11 +140,36 @@ impl PersonalRoutes {
     /// Keeps people's settings in `store` from now on.
     pub fn attach_store(&self, store: Arc<dyn PersonRouteStore>) {
         *self.store.write() = Some(store);
+        self.cache.lock().clear();
     }
 
     /// Where people's settings are kept; `None` without Postgres.
     pub fn store(&self) -> Option<Arc<dyn PersonRouteStore>> {
         self.store.read().clone()
+    }
+
+    /// `person`'s settings for `agent_id`, read again once older than
+    /// [`SETTINGS_TTL`]; none without a store.
+    pub async fn settings(&self, person: Uuid, agent_id: &str) -> Result<RouteSettings> {
+        let Some(store) = self.store() else {
+            return Ok(RouteSettings::default());
+        };
+        let key = (person, agent_id.to_string());
+        if let Some((at, settings)) = self.cache.lock().get(&key).copied() {
+            if at.elapsed() < SETTINGS_TTL {
+                return Ok(settings);
+            }
+        }
+        let settings = store.settings(person, Some(agent_id)).await?;
+        self.cache
+            .lock()
+            .insert(key, (std::time::Instant::now(), settings));
+        Ok(settings)
+    }
+
+    /// Drops what is cached of `person`'s settings, after they change.
+    pub fn forget(&self, person: Uuid) {
+        self.cache.lock().retain(|(who, _), _| *who != person);
     }
 }
 

@@ -246,6 +246,7 @@ pub async fn put_my_route(
         .set_every_agent(person, write.route, &actor)
         .await
         .map_err(store_failed)?;
+    routes.forget(person);
     tracing::info!(
         target: "llm_route",
         person = %person,
@@ -335,6 +336,7 @@ pub async fn put_my_agent_route(
         .set_for_agent(person, &agent_id, write.route, &actor)
         .await
         .map_err(store_failed)?;
+    routes.forget(person);
     tracing::info!(
         target: "llm_route",
         person = %person,

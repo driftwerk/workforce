@@ -284,12 +284,14 @@ fn turn_chain_groups_cli_entries_and_runner_runs_in_configured_order() {
             ]),
             TurnRoute::Cli {
                 cli: CliKind::ClaudeCode,
-                model: "sonnet".into()
+                model: "sonnet".into(),
+                personal: false
             },
             TurnRoute::Runner(vec!["gemini:gemini-3.1-pro".into()]),
             TurnRoute::Cli {
                 cli: CliKind::ClaudeCode,
-                model: "opus".into()
+                model: "opus".into(),
+                personal: false
             },
         ]
     );
@@ -304,7 +306,8 @@ fn turn_chain_groups_cli_entries_and_runner_runs_in_configured_order() {
         on_primary.routes(),
         [TurnRoute::Cli {
             cli: CliKind::ClaudeCode,
-            model: "sonnet".into()
+            model: "sonnet".into(),
+            personal: false
         }],
         "an unprefixed entry runs on the agent's primary"
     );

@@ -218,6 +218,7 @@ pub mod slack_email;
 pub mod verified_email;
 pub use hub_core::permissions_audit;
 pub mod permissions_writer;
+pub mod personal_route;
 pub mod pictures;
 pub mod pipeline;
 pub mod pipeline_api;
