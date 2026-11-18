@@ -59,6 +59,7 @@ fn planned(n: u128, title: &str, needs: &[u128]) -> Planned {
         needs: needs.iter().map(|&x| u(x)).collect(),
         machine: None,
         model: None,
+        adopted: false,
     }
 }
 
@@ -97,6 +98,7 @@ fn is_dir(p: &str) -> bool {
 fn draft_ticket(title: &str, needs: &[usize]) -> DraftTicket {
     DraftTicket {
         id: None,
+        adopt: None,
         title: title.into(),
         body: String::new(),
         engine: None,

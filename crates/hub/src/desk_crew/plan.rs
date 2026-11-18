@@ -181,7 +181,12 @@ pass start_now with those words quoted, and Desk starts it. Use it for work of m
 engine defaults to your default engine. board names a board you have by its prefix; when the person \
 asks for a new board, or the work deserves its own, pass new_board ({name, prefix}) instead and \
 Desk makes it in your group first, so you never ask the person to make one. With neither, it goes \
-on your group's board. Each ticket runs where the person said: pass machine (like devbox) for the \
+on your group's board. To plan work on tickets already on a board (a synced Linear or Jira board \
+too, like \"fix the recent bugs on Mantis\"), find them with crew.find_tickets and give each as \
+{adopt: its key, folder} instead of a title: the plan runs sessions on those tickets as they are, \
+none is copied, and their moves, comments and PR links go back to their issues; one someone has, \
+or another plan has, is refused. It may mix them with new tickets, which go on a board of Desk's \
+own. Each ticket runs where the person said: pass machine (like devbox) for the \
 plan or per ticket, with that machine's own folder paths, and honour it; said nowhere, it runs on \
 the machine its group's sessions run on, else this computer. model sets the model its session \
 runs, for the plan or per ticket.";
@@ -194,9 +199,10 @@ have with that prefix is given back as it is. Make it yourself when the person a
 then crew.plan with board, or crew.plan_update with board to move a plan onto it. Say why.";
 
 pub const UPDATE_DESCRIPTION: &str = "Keep a plan of yours current (plan_id): give every ticket \
-it is to have, in order, each by its id or key when it is one it has (leave both out to add one), \
-with needs by place in the list. Reordering, needs, titles and descriptions, and where a ticket \
-not started runs apply at once; adding or dropping a ticket, or changing the goal, waits for the \
+it is to have, in order, each by its id or key when it is one it has (leave both out to add one, \
+or give adopt: a key from crew.find_tickets to take that ticket on as it is), with needs by place \
+in the list. Leaving out one it took on lets it go where it is, never dropped. Reordering, needs, \
+titles and descriptions, and where a ticket not started runs apply at once; adding or dropping a ticket, or changing the goal, waits for the \
 person to approve, while the plan runs on as approved. A draft the person hasn't approved stays \
 one: unbound, start_now with the person's own words asking to start it approves it. board (a \
 prefix) or new_board moves the whole plan to that board in your group, each ticket re-filed under \
@@ -211,8 +217,9 @@ fn ticket_schema() -> Value {
     json!({ "type": "object", "properties": {
         "id": { "type": "string", "description": "A ticket of the plan's, by its id (crew.plan_update)" },
         "key": { "type": "string", "description": "A ticket of the plan's, by its key, like ACM-12 (crew.plan_update)" },
-        "title": { "type": "string" },
-        "body": { "type": "string", "description": "What the session is to do: its first prompt reads it" },
+        "adopt": { "type": "string", "description": "A ticket already on one of your boards to take on as it is, by its key (like MAN-465, from crew.find_tickets), a synced Linear or Jira issue too: its own title and description are what its session reads, so leave title and body out" },
+        "title": { "type": "string", "description": "A new ticket's title; not with adopt" },
+        "body": { "type": "string", "description": "What the session is to do: its first prompt reads it. Not with adopt" },
         "engine": { "type": "string", "description": "claude or codex, only when the person named one for it; the person's default engine when not said, so omit it otherwise" },
         "folder": { "type": "string", "description": "Absolute path of the project folder it works in, on the computer it runs on: on a machine, that machine's own path (as crew.overview shows its sessions' folders)" },
         "machine": machine_schema("Where this ticket runs"),
@@ -220,7 +227,7 @@ fn ticket_schema() -> Value {
         "view": { "type": "string", "enum": ["terminal"] },
         "needs": { "type": "array", "items": { "type": "integer", "minimum": 0 },
             "description": "The places (from 0) in this list of the tickets it needs done first" }
-    }, "required": ["title", "folder"] })
+    }, "required": ["folder"] })
 }
 
 fn new_board_schema() -> Value {
@@ -342,8 +349,13 @@ fn plain(e: workforce_desk::DeskError) -> String {
 }
 
 /// The tickets of a tool's input: as written, with a ticket named by its
-/// key read as its id among `known` (key → id).
-fn tickets_of(input: &Value, known: &HashMap<String, Uuid>) -> Result<Vec<DraftTicket>, String> {
+/// key read as its id among `known` (key → id), and one it takes on by
+/// the id `adopted` found for its place.
+fn tickets_of(
+    input: &Value,
+    known: &HashMap<String, Uuid>,
+    adopted: &HashMap<usize, Uuid>,
+) -> Result<Vec<DraftTicket>, String> {
     let Some(list) = input.get("tickets").and_then(Value::as_array) else {
         return Err("Say the tickets.".into());
     };
@@ -352,6 +364,31 @@ fn tickets_of(input: &Value, known: &HashMap<String, Uuid>) -> Result<Vec<DraftT
         .map(|(i, t)| {
             let mut t = t.clone();
             if let Some(o) = t.as_object_mut() {
+                match adopted.get(&i) {
+                    Some(id) => {
+                        if o.get("title").and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty()) {
+                            return Err(format!(
+                                "Ticket {} takes a ticket on: its title is that ticket's, so leave title out.",
+                                i + 1
+                            ));
+                        }
+                        o.insert("adopt".into(), json!(id.to_string()));
+                        o.remove("title");
+                        o.remove("body");
+                    }
+                    None => {
+                        o.remove("adopt");
+                        if o.get("title").and_then(Value::as_str).is_none_or(|s| s.trim().is_empty())
+                            && o.get("id").is_none_or(Value::is_null)
+                            && o.get("key").is_none_or(Value::is_null)
+                        {
+                            return Err(format!(
+                                "Ticket {} needs a title, or adopt: the key of a ticket to take on.",
+                                i + 1
+                            ));
+                        }
+                    }
+                }
                 if o.get("id").is_none_or(Value::is_null) {
                     if let Some(key) = o.get("key").and_then(Value::as_str) {
                         let id = known.get(&key.trim().to_uppercase()).ok_or_else(|| {
@@ -467,6 +504,7 @@ fn plan_out(p: &PlanDetail) -> Value {
             "folder": t.folder,
             "machine": t.machine,
             "model": t.model,
+            "adopted": t.adopted,
             "needs": t.ticket.ticket.needs.iter().filter_map(|n| place.get(n)).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
     })
@@ -480,6 +518,39 @@ struct Gathered {
 
 impl CrewHub {
     // ── The tools ───────────────────────────────────────────────────────
+
+    /// The tickets a plan tool's input takes on (`adopt`: a key), each by
+    /// its place in the list, as the ticket it names on a board the boss
+    /// sees; one it doesn't see, or that isn't there, is refused alike.
+    async fn adopted_of(&self, b: &Bound, input: &Value) -> Result<HashMap<usize, Uuid>, String> {
+        let mut out = HashMap::new();
+        let Some(list) = input.get("tickets").and_then(Value::as_array) else {
+            return Ok(out);
+        };
+        for (i, t) in list.iter().enumerate() {
+            let Some(key) = t
+                .get("adopt")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|k| !k.is_empty())
+            else {
+                continue;
+            };
+            let seen = &b.seen;
+            let found = self.desk.ticket_by_key_in(key, |g| seen.sees(g)).await.ok();
+            let board = match &found {
+                Some(v) => self.desk.group_of_board(v.ticket.board).await.ok(),
+                None => None,
+            };
+            match (found, board) {
+                (Some(v), Some(g)) if b.seen.sees(g.as_deref()) => {
+                    out.insert(i, v.ticket.id);
+                }
+                _ => return Err(self.not_ours(&b.oversight.scope)),
+            }
+        }
+        Ok(out)
+    }
 
     /// `crew.plan` and `crew.plan_update`, for the boss `b`.
     pub(super) async fn plan_tool(
@@ -651,12 +722,20 @@ impl CrewHub {
             .map(str::trim)
             .filter(|g| !g.is_empty())
             .ok_or("Say the goal.")?;
-        let tickets = tickets_of(input, &HashMap::new())?;
+        let adopted = self.adopted_of(b, input).await?;
+        let tickets = tickets_of(input, &HashMap::new(), &adopted)?;
         let start_now = start_now_of(input)?;
         if tickets.iter().any(|t| t.id.is_some()) {
             return Err("A new plan's tickets have no ids yet.".into());
         }
-        let board = self.board_named(b, input).await?;
+        // Said nowhere, it is on the board of the first ticket it takes on.
+        let board = match self.board_named(b, input).await? {
+            Some(id) => Some(id),
+            None => match (0..tickets.len()).find_map(|i| adopted.get(&i)) {
+                Some(id) => Some(self.desk.ticket(*id).await.map_err(plain)?.ticket.board),
+                None => None,
+            },
+        };
         let parallel = match input.get("parallel").and_then(Value::as_i64) {
             Some(n) => Some(i16::try_from(n).map_err(|_| "parallel is a number from 1 to 12.")?),
             None => None,
@@ -769,7 +848,8 @@ impl CrewHub {
         let start_now = start_now_of(input)?;
         let tickets = match input.get("tickets") {
             Some(_) => {
-                let mut t = tickets_of(input, &known)?;
+                let adopted = self.adopted_of(b, input).await?;
+                let mut t = tickets_of(input, &known, &adopted)?;
                 // Said for the plan, or else where its group's sessions run:
                 // each new ticket that doesn't say. The others stay where
                 // they run unless a ticket says otherwise.
@@ -1898,6 +1978,7 @@ mod tests {
     fn a_ticket_on_the_persons_default_engine_runs_their_default_model() {
         let ticket = |engine: Option<&str>, model: Option<&str>| DraftTicket {
             id: None,
+            adopt: None,
             title: "t".into(),
             body: String::new(),
             engine: engine.map(str::to_string),

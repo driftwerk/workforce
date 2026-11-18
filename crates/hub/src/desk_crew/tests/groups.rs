@@ -282,6 +282,15 @@ fn pointed_at(name: &str, other: &Client, dir: &Path) -> Vec<(Value, bool)> {
             .map(|by| (json!({ "by": by }), false))
             .collect(),
         "crew.board" => vec![(json!({}), false)],
+        // Only its own boards are searched: another's, named, is as none.
+        "crew.find_tickets" => vec![
+            (json!({}), false),
+            (json!({ "q": other.ticket }), false),
+            (
+                json!({ "board": other.ticket.split('-').next().unwrap_or_default() }),
+                false,
+            ),
+        ],
         // The person's GitHub, read as them: no scope of Desk's in it.
         "crew.github_pr" => vec![(json!({ "repo": "acme/web", "number": 1 }), false)],
         "crew.github_branch" => vec![(json!({ "repo": "acme/web", "branch": "main" }), false)],
@@ -418,6 +427,14 @@ fn pointed_at(name: &str, other: &Client, dir: &Path) -> Vec<(Value, bool)> {
                     "goal": "Ship it",
                     "new_board": { "name": "Mine now", "group": other.group },
                     "tickets": [{ "title": "Look around", "folder": dir.to_string_lossy() }],
+                }),
+                true,
+            ),
+            // Another's ticket, taken on by its key, isn't there.
+            (
+                json!({
+                    "goal": "Ship it",
+                    "tickets": [{ "adopt": other.ticket, "folder": dir.to_string_lossy() }],
                 }),
                 true,
             ),

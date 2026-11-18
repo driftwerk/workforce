@@ -39,6 +39,7 @@ mod decisions;
 mod deliver;
 mod directives;
 mod extras;
+mod find;
 mod github;
 mod handover;
 mod idle;

@@ -41,6 +41,7 @@ pub mod directive;
 pub mod directive_store;
 pub mod engine;
 pub mod engine_accounts;
+pub mod find;
 mod first_run;
 pub mod floor;
 pub mod folders;
@@ -149,8 +150,8 @@ pub use service::{
 };
 pub use service::{AccountAnswer, AccountMoment, AccountRead};
 pub use service::{
-    AssignTo, BoardPatch, ChargedTo, MachineSessionFor, Move, NewBoard, NewSessionFor, NewTicket,
-    StartText, TicketPatch, TicketQuery, TicketView,
+    AssignTo, BoardPatch, ChargedTo, Found, MachineSessionFor, Move, NewBoard, NewSessionFor,
+    NewTicket, StartText, TicketPatch, TicketQuery, TicketView,
 };
 pub use service::{
     Changed, NewPlan, OnDrop, PlanDetail, PlanEdit, PlanSummary, PlanTicketView, StartRefused,

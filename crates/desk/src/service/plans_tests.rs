@@ -26,6 +26,7 @@ fn draft(dir: &Path, titles: &[(&str, &[usize])]) -> Draft {
             .iter()
             .map(|(title, needs)| DraftTicket {
                 id: None,
+                adopt: None,
                 title: (*title).into(),
                 body: String::new(),
                 engine: None,
@@ -57,6 +58,7 @@ fn kept(p: &PlanDetail) -> Vec<DraftTicket> {
         .iter()
         .map(|t| DraftTicket {
             id: Some(t.ticket.ticket.id),
+            adopt: None,
             title: t.ticket.ticket.title.clone(),
             body: t.ticket.ticket.body.clone(),
             engine: t.engine.map(|e| e.as_str().to_string()),
