@@ -361,6 +361,13 @@ fn around(
         .map_err(internal)?
         .ok_or_else(unknown)?
         .1;
+    // The question a thread's parent asked is shown in the DM, not here.
+    let parent = workforce_core::desk::dm_thread_parent(channel);
+    if entry.role == MessageRole::User
+        && parent.is_some_and(|p| entry.external_id.as_deref() == Some(p))
+    {
+        return Err(unknown());
+    }
     let mut middle = said(&entry, agent, held.as_deref_mut()).ok_or_else(unknown)?;
     if middle.from == Author::Agent {
         middle.text = crate::spoken_text::kept_text(head, &middle.text).into_owned();
@@ -1389,6 +1396,21 @@ mod tests {
             (parent.as_str(), 1)
         );
         assert_eq!(listed.threads[0].authors, [Author::Agent]);
+        // Nor is a page of the thread read around it.
+        let question = thread
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::User)
+            .unwrap();
+        assert!(page(
+            &store,
+            &scout(),
+            ME,
+            &channel,
+            Cursor::Around(&question.id),
+            10
+        )
+        .is_err());
     }
 
     const ME: &str = "identity-1";

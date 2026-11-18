@@ -66,7 +66,9 @@ pub(crate) fn set_aside(
     }
     let named =
         latest.id == edit.replaces || latest.external_id.as_deref() == Some(edit.replaces.as_str());
-    if !named {
+    // A message that started a thread was answered there: it is the
+    // thread's parent, not a question of the DM's to ask again.
+    if !named || latest.desk.as_ref().is_some_and(|d| d.starts_thread) {
         return Err(EditRefused.into());
     }
     let aside = SetAside {
@@ -293,6 +295,25 @@ mod tests {
                 &said(MessageRole::Assistant, "hi", None)
             )
         ));
+    }
+
+    #[test]
+    fn a_message_that_started_a_thread_is_not_edited() {
+        let store = InMemorySessionStore::new();
+        let mut session = store.get_or_create("desk", "person-1", "agent-a").unwrap();
+        let mut top = said(MessageRole::User, "what shall we ship?", Some("client-1"));
+        top.desk = Some(DeskMark {
+            speaker: Some(DeskSpeaker::Person),
+            starts_thread: true,
+            ..DeskMark::default()
+        });
+        store.append_to_archive(&session.id, &top).unwrap();
+        session.messages.push(top);
+        store.save(&session).unwrap();
+        let asked = SessionMessage::user("what shall we ship now?", Some("client-2"), None, None);
+        let refused = set_aside(&store, &session.id, &edit("client-1"), &asked).unwrap_err();
+        assert!(refused.downcast_ref::<EditRefused>().is_some(), "{refused}");
+        assert_eq!(texts(&store, &session.id).1, ["what shall we ship?"]);
     }
 
     #[test]
