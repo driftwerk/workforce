@@ -4584,6 +4584,19 @@ async fn a_session_the_boss_starts_runs_the_persons_default_engine_and_model() {
             .await
             .unwrap();
         assert_eq!(started("asked").model.as_deref(), Some("sonnet"));
+
+        // Claude Code's own default asked for: not the person's default.
+        let by = crew.by_overseer("Sam asked for Claude Code's own").unwrap();
+        crew.perform(&start("own", Some("")), by).await.unwrap();
+        assert_eq!(started("own").model, None);
+
+        // A name no engine takes is refused, not dropped at launch.
+        let by = crew.by_overseer("Odd").unwrap();
+        assert!(crew
+            .perform(&start("odd", Some("-rf")), by)
+            .await
+            .unwrap_err()
+            .contains("isn't a model Claude Code takes"));
     })
     .await;
 }

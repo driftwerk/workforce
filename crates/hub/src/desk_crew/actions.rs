@@ -283,7 +283,11 @@ fn handout(to: Option<Value>) -> Result<Handout, String> {
             }
             None => None,
         };
-        let model = n.get("model").and_then(word).map(str::to_string);
+        // Kept as said: `""` asks for the engine's own model.
+        let model = n
+            .get("model")
+            .and_then(Value::as_str)
+            .map(|m| m.trim().to_string());
         return Ok(Handout::NewSession {
             folder: folder.into(),
             engine,
@@ -398,7 +402,8 @@ impl Action {
                 goal: text(i.goal, "the goal")?,
                 name: blank_none(i.name),
                 engine: i.engine,
-                model: blank_none(i.model),
+                // Kept as said: `""` asks for the engine's own model.
+                model: i.model.map(|m| m.trim().to_string()),
                 view: i.view,
                 worktree: blank_none(i.worktree),
                 fresh: i.fresh.unwrap_or(false),
@@ -2169,7 +2174,17 @@ impl CrewHub {
         o: &Oversight,
     ) -> Result<(Engine, Option<String>), String> {
         let engine = self.engine_or_default(engine, o)?;
-        Ok((engine, model_on(engine, model, o)))
+        let model = model_on(engine, model, o);
+        if let Some(m) = &model {
+            if !workforce_desk::engine::model_ok(engine, m) {
+                return Err(format!(
+                    "\"{m}\" isn't a model {} takes; say one as {} names it, or leave model out.",
+                    engine.title(),
+                    engine.title()
+                ));
+            }
+        }
+        Ok((engine, model))
     }
 
     /// Whether `boss` has a slot free for one more session it starts, when
@@ -2266,10 +2281,12 @@ impl CrewHub {
                             ));
                         }
                         *engine = Some(wants);
-                        // As its plan says: a ticket's model is the
-                        // person's word, and none there is the default.
+                        // As its plan says: the ticket's model was the
+                        // person's default, or their word, when it was
+                        // drafted (`plan::fill_model`); none there is the
+                        // engine's own, never today's default.
                         if model.is_none() {
-                            model.clone_from(&runs.model);
+                            *model = Some(runs.model.clone().unwrap_or_default());
                         }
                     }
                 }
@@ -2810,7 +2827,8 @@ mod tests {
             &json!({"folder": "/work/acme", "goal": "Fix it", "model": ""}),
         )
         .unwrap();
-        assert!(matches!(&a, Action::StartSession { model: None, .. }));
+        // `""` is said: the engine's own model, not the person's default.
+        assert!(matches!(&a, Action::StartSession { model: Some(m), .. } if m.is_empty()));
         assert_eq!(
             handout(Some(
                 json!({"newSession": {"folder": "/work/acme", "engine": "codex", "model": "gpt-6.1-sol"}})

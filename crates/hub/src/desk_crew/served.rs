@@ -1133,6 +1133,11 @@ impl CrewHub {
         // Started where it was checked, as the disk spells it.
         let folder = &folder.to_string_lossy().into_owned();
         let engine = engine.unwrap_or(Engine::Claude);
+        if let Some(m) = model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            if !workforce_desk::engine::model_ok(engine, m) {
+                return Err(format!("\"{m}\" isn't a model {} takes.", engine.title()));
+            }
+        }
         if !workforce_desk::engine::boss_safe(engine) {
             return Err(format!(
                 "A boss on another hub runs only sessions Desk checks every call of, so not {}.",
@@ -1166,7 +1171,11 @@ impl CrewHub {
                     fast: false,
                     // Only what the person asked for: a served boss's
                     // default is its engine's own.
-                    model: model.clone(),
+                    model: model
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|m| !m.is_empty())
+                        .map(str::to_string),
                     account: None,
                     env: Default::default(),
                     group: (g.group != workforce_desk::UNGROUPED).then(|| g.group.clone()),
