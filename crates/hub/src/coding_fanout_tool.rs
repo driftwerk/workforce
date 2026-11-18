@@ -196,6 +196,12 @@ struct WaveSpec {
     subtasks: Vec<String>,
     channel: Option<String>,
     thread: Option<String>,
+    /// Whether its coders run on their payer's own logins only
+    /// ([`crate::personal_route::own_logins_only`]), as decided when the
+    /// wave was asked for; kept in the journal, so a wave taken up after a
+    /// restart keeps it.
+    #[serde(default)]
+    own_logins: bool,
 }
 
 /// All a replica needs to take up a wave another left.
@@ -749,12 +755,15 @@ impl Executor {
             description: "coding.fanout",
             resume: crate::mcp_gate::RouteResume::Nowhere,
         };
-        let run = self.engine.run(
-            Arc::clone(&sandbox),
-            &round,
-            &ctx,
-            Some(self.token.clone()),
-            None,
+        let run = crate::agent_turn::personal_if(
+            self.spec.own_logins,
+            self.engine.run(
+                Arc::clone(&sandbox),
+                &round,
+                &ctx,
+                Some(self.token.clone()),
+                None,
+            ),
         );
         let result = match (&self.wave, jobs) {
             (Some(wave), Some(_)) => {
@@ -1088,14 +1097,20 @@ impl Tool for CodingFanoutTool {
 
         let identity_id = crate::user_config::current_identity_id();
         let (engine, _) = crate::coding_engine::picked(&self.engine, &self.service, None);
-        if let Err(reason) = engine.preflight(&RoundContext {
-            service: &self.service,
-            identity: identity_id.as_deref(),
-            stand_in: SCHEDULER,
-            ticket_id: None,
-            description: "coding.fanout",
-            resume: crate::mcp_gate::RouteResume::Nowhere,
-        }) {
+        // Its payer's own logins only when their own route says so: the
+        // call came back through the gated MCP, outside the turn's scope.
+        let own_logins = crate::personal_route::own_logins_only(&self.service).await;
+        let preflight = async {
+            engine.preflight(&RoundContext {
+                service: &self.service,
+                identity: identity_id.as_deref(),
+                stand_in: SCHEDULER,
+                ticket_id: None,
+                description: "coding.fanout",
+                resume: crate::mcp_gate::RouteResume::Nowhere,
+            })
+        };
+        if let Err(reason) = crate::agent_turn::personal_if(own_logins, preflight).await {
             return Ok(ToolResult::failure(reason.reason, elapsed()));
         }
 
@@ -1146,6 +1161,7 @@ impl Tool for CodingFanoutTool {
             subtasks: subtasks.clone(),
             channel: channel.clone(),
             thread,
+            own_logins,
         };
 
         // No channel (e.g. a gateway session) — run inline and return the
@@ -1428,6 +1444,7 @@ mod tests {
                 subtasks: vec!["add widget".into(), "write tests".into()],
                 channel: Some("C1".into()),
                 thread: Some("100.1".into()),
+                own_logins: false,
             }
         }
 

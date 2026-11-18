@@ -1065,12 +1065,15 @@ impl Tool for CodingSessionTool {
         // Fail fast before the expensive workspace provision when the engine
         // the round runs on cannot serve this user (identity is in scope, so
         // per-user tokens resolve).
-        if let Err(refusal) = self.engine_of(&plan).preflight(&ctx) {
+        // Its payer's own logins only when their own route says so: the
+        // call came back through the gated MCP, outside the turn's scope.
+        let own = crate::personal_route::own_logins_only(&self.service).await;
+        let preflight = async { self.engine_of(&plan).preflight(&ctx) };
+        if let Err(refusal) = crate::agent_turn::personal_if(own, preflight).await {
             return Ok(ToolResult::failure(refusal.reason, elapsed()));
         }
-        Ok(self
-            .drive(&plan, &input, &session_id, &ctx, None, start)
-            .await)
+        let drive = self.drive(&plan, &input, &session_id, &ctx, None, start);
+        Ok(crate::agent_turn::personal_if(own, drive).await)
     }
 
     async fn collect(
@@ -1105,6 +1108,7 @@ impl Tool for CodingSessionTool {
         };
         let ctx = self.round_context(plan.identity.as_deref());
         let drive = self.drive(&plan, &input, &session_id, &ctx, from, start);
+        let drive = crate::personal_route::own_logins_if_routed(&self.service, drive);
         Ok(crate::user_config::as_principal(&plan.principal(), drive).await)
     }
 

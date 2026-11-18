@@ -330,3 +330,130 @@ async fn an_isolated_run_for_her_runs_on_her_login() {
         "a workflow step runs on her own login"
     );
 }
+
+/// The `claude_code` tool called as `person`, as a call that came back
+/// through the gated MCP restores them: none of the turn's scope but its
+/// principal.
+async fn claude_code_as(hub: &Hub, person: &str) -> workforce_agent::tools::ToolResult {
+    use workforce_agent::tools::Tool;
+    let workdir = hub.dir.path().to_path_buf();
+    let tool = crate::claude_code_tool::ClaudeCodeTool::new(
+        Arc::clone(&hub.service),
+        vec![workdir.clone()],
+    );
+    let input = serde_json::json!({
+        "task": "fix the bug",
+        "workdir": workdir.to_string_lossy(),
+    });
+    crate::user_config::as_principal(
+        &workforce_common::session::TurnPrincipal::run_as(Some(person.to_string())),
+        hub.claude.scoped(tool.execute(input)),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn her_claude_code_call_waits_for_her_own_login_never_a_shared_one() {
+    let (hub, store) = routed().await;
+    shared_claude_login(&hub);
+    choose(&hub, &store, ALICE, Some(claude(RouteFallback::Wait))).await;
+
+    let refused = claude_code_as(&hub, ALICE).await;
+
+    assert!(!refused.success);
+    assert!(
+        refused
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("connect your Claude plan")),
+        "she's told to connect her own: {:?}",
+        refused.error
+    );
+    assert!(hub.claude.calls().is_empty(), "not on the shared login");
+
+    let token = hub.claude_login(ALICE);
+    hub.claude.reply(None, &answer("Fixed."));
+    claude_code_as(&hub, ALICE).await;
+
+    let calls = hub.claude.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].token, token, "her own login");
+}
+
+#[tokio::test]
+async fn her_claude_code_call_may_draw_on_a_shared_login_when_she_chose_hub_or_no_route() {
+    let (hub, store) = routed().await;
+    shared_claude_login(&hub);
+    hub.claude.reply(None, &answer("Fixed."));
+
+    choose(&hub, &store, ALICE, Some(claude(RouteFallback::Hub))).await;
+    claude_code_as(&hub, ALICE).await;
+    choose(&hub, &store, ALICE, None).await;
+    claude_code_as(&hub, ALICE).await;
+
+    let tokens: Vec<String> = hub.claude.calls().into_iter().map(|c| c.token).collect();
+    assert_eq!(
+        tokens,
+        vec!["shared-token".to_string(); 2],
+        "her fallback to the hub, and no route at all, keep today's logins"
+    );
+}
+
+/// `work` as a coding round for Alice decides its logins: her principal
+/// restored, nothing else of a turn's scope.
+async fn as_alice<F: std::future::Future>(
+    service: &crate::serve::AgentService,
+    work: F,
+) -> F::Output {
+    crate::user_config::as_principal(
+        &workforce_common::session::TurnPrincipal::run_as(Some(ALICE.to_string())),
+        super::own_logins_if_routed(service, work),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_coding_round_and_a_collected_one_for_her_draw_on_her_own_logins_only() {
+    let (hub, store) = routed().await;
+    shared_claude_login(&hub);
+    choose(&hub, &store, ALICE, Some(claude(RouteFallback::Wait))).await;
+    let service = &hub.service;
+    let ctx = crate::coding_engine::RoundContext {
+        service,
+        identity: Some(ALICE),
+        stand_in: workforce_common::subscription::SCHEDULER,
+        ticket_id: None,
+        description: "coding.session",
+        resume: crate::mcp_gate::RouteResume::Nowhere,
+    };
+
+    let refused = as_alice(service, async {
+        ctx.login(SubscriptionKind::Claude).map(drop)
+    })
+    .await
+    .expect_err("no shared login for her round");
+    assert!(
+        refused.reason.contains("connect your Claude plan"),
+        "{}",
+        refused.reason
+    );
+    let held = as_alice(service, async {
+        service
+            .logins
+            .holding(SubscriptionKind::Claude, &|_| true)
+            .map(drop)
+    })
+    .await;
+    assert!(
+        held.is_none(),
+        "a collected round never goes on with a shared login"
+    );
+
+    choose(&hub, &store, ALICE, None).await;
+    assert!(as_alice(service, async {
+        ctx.login(SubscriptionKind::Claude).map(drop)
+    })
+    .await
+    .is_ok());
+}
