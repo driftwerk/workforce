@@ -184,6 +184,20 @@ fn a_closed_issue_without_a_mapped_status_is_done_or_dropped() {
         issue_of(&v, &map, true, None).unwrap().column(&map),
         Some(TicketState::Dropped)
     );
+    // Dropped here with no Dropped status there: closed not planned, its
+    // Status left at Todo. It stays Dropped, not back to Todo.
+    v["status"] = json!("Todo");
+    assert_eq!(
+        issue_of(&v, &map, true, None).unwrap().column(&map),
+        Some(TicketState::Dropped)
+    );
+    // Closed with its Status at a done-like one: that one, as it is.
+    let done = states(&[(TicketState::Todo, "Todo"), (TicketState::Done, "Shipped")]);
+    v["state_reason"] = json!("COMPLETED");
+    v["status"] = json!("Shipped");
+    assert_eq!(issue_of(&v, &done, true, None).unwrap().state, "Shipped");
+    v["status"] = json!("Todo");
+    assert_eq!(issue_of(&v, &done, true, None).unwrap().state, "Shipped");
 }
 
 #[test]

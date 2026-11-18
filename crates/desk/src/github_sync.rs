@@ -343,7 +343,28 @@ pub fn issue_of(
         _ => None,
     };
     let state = match project {
-        true => name_of(&v["status"]).unwrap_or_default(),
+        true => {
+            let status = name_of(&v["status"]).unwrap_or_default();
+            // A closed issue is done or dropped whatever its Status says (a
+            // project with no Dropped status keeps its old one): its column
+            // is the one closing it means.
+            match &state_kind {
+                Some(kind) => {
+                    let shut = match kind.as_str() {
+                        "canceled" => TicketState::Dropped,
+                        _ => TicketState::Done,
+                    };
+                    match crate::board_sync::column_for(states, &status, Some(kind)) {
+                        Some(TicketState::Done | TicketState::Dropped) => status,
+                        _ => states.get(&shut).cloned().unwrap_or_else(|| match shut {
+                            TicketState::Dropped => "Dropped".into(),
+                            _ => "Done".into(),
+                        }),
+                    }
+                }
+                None => status,
+            }
+        }
         false => repo_state(closed == Some(true), &labels, states),
     };
     let assignee = v.get("assignees").map(|a| {
