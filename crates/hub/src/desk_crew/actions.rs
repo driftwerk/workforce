@@ -1695,19 +1695,26 @@ impl CrewHub {
                         return Err(why);
                     }
                 }
+                // The person's yes to a suggestion made a while ago: what has
+                // changed since is closed as they said, but removed only
+                // when it still has nothing to lose.
+                let removable = by.party.kind == crew::PartyKind::Manager
+                    || super::closing::nothing_to_lose(&was).await;
                 done.resumable = was.cli_session_id.is_some();
                 let name = was.label().to_string();
                 match d.end(*session, Some(by)).await {
                     Ok(_) => {}
                     // Still stopping: it closes once it has.
                     Err(workforce_desk::DeskError::Conflict(why))
-                        if d.view(*session).is_ok_and(|v| v.live) =>
+                        if why.contains("taking a while to stop") =>
                     {
                         let deadline = tokio::time::Instant::now() + CLOSES_WITHIN;
-                        while d
-                            .view(*session)
-                            .is_ok_and(|v| v.state != SessionState::Closed)
-                        {
+                        loop {
+                            match d.view(*session) {
+                                Ok(v) if v.state == SessionState::Closed => break,
+                                Ok(_) => {}
+                                Err(e) => return Err(plain(e)),
+                            }
                             if tokio::time::Instant::now() > deadline {
                                 return Err(plain(workforce_desk::DeskError::Conflict(why)));
                             }
@@ -1715,6 +1722,11 @@ impl CrewHub {
                         }
                     }
                     Err(e) => return Err(plain(e)),
+                }
+                if !removable {
+                    return Ok(format!(
+                        "closed {name}; it stays among the closed sessions, as it has work in its folder or was busy"
+                    ));
                 }
                 // Gone from Desk as the person's Remove takes it, its
                 // conversation and folder kept: Undo brings it back.

@@ -322,6 +322,17 @@ async fn asked_to_close_what_is_finished_a_boss_closes_and_removes_its_own_and_n
         std::fs::write(dirty.join("half-done.rs"), "fn main() {}").unwrap();
         // The person's own, never taken on.
         let theirs = new_session(&d, &clean, "theirs").await;
+        // Just finished: it rests before any close of the boss's.
+        let r = overseer
+            .tools
+            .get(super::super::closing::TOOL)
+            .unwrap()
+            .execute(json!({ "session_id": web.id.to_string(), "reason": "Finished." }))
+            .await
+            .unwrap();
+        assert!(!r.success, "{r:?}");
+        assert!(d.view(web.id).is_ok());
+        *crew.close_settle.lock() = chrono::Duration::zero();
 
         let close = overseer
             .tools

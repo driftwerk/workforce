@@ -352,6 +352,22 @@ async fn origin_of(cwd: &str) -> Option<String> {
         .and_then(|u| github_repo(&u))
 }
 
+/// Whether closing `v` and removing it loses nothing now: at rest, asking
+/// nothing, and nothing uncommitted or unpushed in its folder. Read for a
+/// close the person said yes to, which no boss's gate holds.
+pub(crate) async fn nothing_to_lose(v: &SessionView) -> bool {
+    v.pending.is_none()
+        && v.asked.is_none()
+        && !matches!(
+            v.state,
+            SessionState::Starting
+                | SessionState::Working
+                | SessionState::Blocked
+                | SessionState::Asking
+        )
+        && held(&folder(&v.cwd).await, &[]).is_none()
+}
+
 /// Looks at the bosses' finished sessions every few minutes.
 pub(super) async fn closing_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     let mut every = tokio::time::interval(crew.timing.minute * EVERY_MINUTES);
@@ -659,6 +675,13 @@ impl CrewHub {
         let Some((service, o)) = self.overseer_named(boss) else {
             return Some("No boss runs it now.".into());
         };
+        // Rested first, as the closer's own: what it did is seen.
+        if !at_rest(v, Utc::now(), *self.close_settle.lock()) {
+            return Some(format!(
+                "Its turn ended under {} minutes ago: it is closed once it has rested.",
+                self.close_settle.lock().num_minutes().max(1)
+            ));
+        }
         let now = chrono::Duration::minutes(PERSON_NOW_MINUTES);
         if self.person_in_for(v.id, Utc::now() - now, self.answer_gap(&o)) {
             return Some("The person is in it now, so it's theirs to close.".into());
@@ -678,9 +701,30 @@ impl CrewHub {
                 );
             }
         }
-        let merged: Vec<String> = self
-            .pulls_of(&service, v)
-            .await
+        // Work it was given still open is work left.
+        match self.desk.store().session_tickets(v.id).await {
+            Ok(t)
+                if t.iter()
+                    .any(|t| !matches!(t.state, TicketState::Done | TicketState::Dropped)) =>
+            {
+                return Some("Its ticket is still open: it stays open until that's done.".into())
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::info!(session = %v.id, error = %format!("{e:#}"), "a session's tickets couldn't be read; it isn't closed");
+                return Some("Its tickets couldn't be read, so it stays open for now.".into());
+            }
+        }
+        let pulls = self.pulls_of(&service, v).await;
+        if let Some((n, _)) = pulls
+            .iter()
+            .find(|(_, p)| p.as_ref().is_some_and(|p| p.open))
+        {
+            return Some(format!(
+                "Its PR #{n} is still open: it stays open until that's merged or closed."
+            ));
+        }
+        let merged: Vec<String> = pulls
             .iter()
             .filter_map(|(_, p)| p.as_ref().filter(|p| p.merged))
             .filter_map(|p| p.head.clone())

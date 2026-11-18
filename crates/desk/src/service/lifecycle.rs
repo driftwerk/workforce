@@ -823,15 +823,28 @@ impl Desk {
         let Some(kept) = KeptSession::of(&r, group) else {
             return Ok(None);
         };
-        self.remove_as(id, None, Memory::Keep, |st, now| {
-            if now.state != SessionState::Closed || st.live.contains_key(&id) {
-                return Err(DeskError::Conflict(
-                    "it started again since it was closed".into(),
-                ));
-            }
-            Ok(())
-        })
-        .await?;
+        let hidden = Hidden {
+            engine: r.engine,
+            cli_session_id: kept.cli_session_id.clone(),
+            name: r.display_name.clone().unwrap_or_else(|| r.name.clone()),
+            cwd: r.cwd.clone(),
+            hidden_at: Utc::now(),
+        };
+        let written = self
+            .forget_as(id, Some(hidden), Memory::Keep, |st, now| {
+                if now.state != SessionState::Closed || st.live.contains_key(&id) {
+                    return Err(DeskError::Conflict(
+                        "it started again since it was closed".into(),
+                    ));
+                }
+                Ok(())
+            })
+            .await?;
+        // Written before it is said removed, so no Undo can run ahead of
+        // the write and be undone by it.
+        if !written.await.unwrap_or(false) {
+            tracing::warn!(%id, "a removed session's removal wasn't written: it comes back closed when the hub restarts");
+        }
         Ok(Some(kept))
     }
 

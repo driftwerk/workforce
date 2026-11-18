@@ -814,8 +814,8 @@ async fn a_session_a_boss_closed_is_removed_keeping_its_transcript_and_comes_bac
         let d = desk_at_home(pool, dir.path(), Some(&home), claude, &[&was]).await;
         let store = DeskStore::from_pool(d.0.store.pool().clone());
         let kept = d.remove_closed(was.id).await.unwrap().unwrap();
+        // Written once it says so: nothing waits on the queue.
         assert!(d.view(was.id).is_err());
-        d.persisted().await;
         assert!(store.get(was.id).await.unwrap().is_none());
         assert_eq!(store.hidden().await.unwrap()[0].cli_session_id, "cc-9");
         assert!(d.closed_sessions().await.unwrap().is_empty());
