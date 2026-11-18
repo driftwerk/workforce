@@ -476,6 +476,25 @@ impl DeskStore {
             .collect()
     }
 
+    /// Closes every boss's item not closed whose key starts with `prefix`
+    /// (the stalls a restart forgot): how many.
+    pub async fn item_close_of_key_prefix(
+        &self,
+        prefix: &str,
+        by: ClosedBy,
+        why: &str,
+    ) -> Result<u64> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .execute(
+                "UPDATE boss_open_items SET state = 'closed', closed_at = now(), changed_at = now(), \
+                 closed_by = $2, closed_why = $3 \
+                 WHERE left(dedupe_key, length($1)) = $1 AND state <> 'closed'",
+                &[&prefix, &by.as_str(), &why],
+            )
+            .await?)
+    }
+
     /// Opens item `id` again, closed by a step that then didn't take: false
     /// when it isn't closed, or another of its key is open by now.
     pub async fn item_reopen(&self, id: Uuid) -> Result<bool> {

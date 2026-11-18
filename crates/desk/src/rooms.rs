@@ -23,6 +23,14 @@ use crate::store::DeskStore;
 pub const MAX_HOPS: i16 = workforce_core::desk::MAX_HOPS as i16;
 /// Agent messages allowed in a room (or thread) before you speak again.
 pub const TURN_BUDGET: i64 = 12;
+/// Messages a session in a boss's charge may send while its boss answers
+/// it, before the person speaks again. Each answer from its own boss starts
+/// [`TURN_BUDGET`] again (that is the designed conversation, not a loop);
+/// this caps the whole exchange, so two agents answering each other can't
+/// run on without the person. Five sessions' budgets: a long stretch of
+/// boss-led work (a session reports up to about five times between its
+/// boss's messages), and one reply from the person lifts it.
+pub const BOSS_RUN_CEILING: i64 = 60;
 /// What Desk calls the hub on its own Mac, in member keys and sources.
 pub const LOCAL_HUB: &str = "local";
 /// What a message for a thread that has since been deleted opens with, in
