@@ -37,6 +37,7 @@ pub(crate) fn prune_contract(store: &dyn PendingApprovalStore) {
             allow_self_approval: false,
             approver_user_ids: vec![],
             ttl: std::time::Duration::from_secs(3600),
+            chat: false,
         };
         store.insert_core(&core, None, None, expires_at).unwrap();
         store.add_target(&core.request_id, "dave", "U1").unwrap();
@@ -116,6 +117,7 @@ pub(crate) fn pending_for_contract(store: &dyn PendingApprovalStore) {
         allow_self_approval: true,
         approver_user_ids: vec![],
         ttl: std::time::Duration::from_secs(3600),
+        chat: false,
     };
     let now = Utc::now();
     let later = now + chrono::Duration::hours(1);
@@ -185,6 +187,7 @@ pub(crate) fn identity_operations_contract(store: &dyn PendingApprovalStore) {
         allow_self_approval: false,
         approver_user_ids: vec![],
         ttl: std::time::Duration::from_secs(3600),
+        chat: false,
     };
     let expires = Utc::now() + chrono::Duration::hours(1);
     let pending = core("alice");

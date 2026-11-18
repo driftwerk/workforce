@@ -75,6 +75,7 @@ mod tests {
             channel_notice_ts: None,
             created_at: chrono::Utc::now(),
             expires_at: chrono::Utc::now(),
+            chat: false,
         };
         assert_eq!(
             asking(&row, "  "),

@@ -137,21 +137,26 @@ async fn run_turn(
     // resume must pass the requester as `user` to reload the *original*
     // conversation (with the agent's "I've requested approval…" turn) rather
     // than minting a fresh empty session. `run_as` resolves the requester's
-    // creds/memory the same way the original turn did.
-    svc.process_message(
-        &row.session_key,
-        &row.requester_id,
-        directive,
-        None,
-        None,
-        row.channel_id.as_deref(),
-        row.thread_ts.as_deref(),
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(&row.requester_id),
+    // creds/memory the same way the original turn did. A person's message
+    // started the turn that asked: this one carries it on, as a chat turn
+    // (a scheduled job's, a monitor's or a wake's stays as it was).
+    crate::serve::chat_turn_if(
+        row.chat,
+        svc.process_message(
+            &row.session_key,
+            &row.requester_id,
+            directive,
+            None,
+            None,
+            row.channel_id.as_deref(),
+            row.thread_ts.as_deref(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&row.requester_id),
+        ),
     )
     .await
 }
