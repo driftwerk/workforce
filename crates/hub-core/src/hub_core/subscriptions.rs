@@ -200,6 +200,16 @@ pub fn fails_over_to_another_provider(primary: ProviderKind, failover: &[String]
         .any(|spec| routed_kind(spec).is_some_and(|kind| kind != primary))
 }
 
+/// Whether a call on an agent whose own provider is `primary`, for `model`
+/// (a bare id runs on `primary`; a spec naming a provider runs there),
+/// with `failover` as its `[llm] failover`, can only be served by a
+/// subscription plan: its route is a plan's, and no failover entry routes
+/// to a provider that isn't. Anything else may be metered.
+pub fn plan_only(primary: ProviderKind, model: &str, failover: &[String]) -> bool {
+    let routed = |spec: &str| routed_kind(spec).unwrap_or(primary);
+    routed(model).is_subscription() && failover.iter().all(|spec| routed(spec).is_subscription())
+}
+
 /// Whether a bare model id is one of Claude's as the Claude Code CLI names
 /// it, so the CLI can run it: one of the known ids ([`known_claude_models`])
 /// or an id of their shape not listed yet, with or without `[1m]`. Another
@@ -914,6 +924,38 @@ impl SharedSubscriptions {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_call_is_on_a_plan_only_when_nothing_on_its_route_is_metered() {
+        use super::{plan_only, ProviderKind};
+        let none: [String; 0] = [];
+        assert!(plan_only(ProviderKind::ClaudeCode, "haiku", &none));
+        assert!(plan_only(ProviderKind::ChatGpt, "gpt-5.4-mini", &none));
+        assert!(!plan_only(
+            ProviderKind::Anthropic,
+            "claude-haiku-4-5",
+            &none
+        ));
+        assert!(!plan_only(ProviderKind::Bedrock, "haiku", &none));
+        // A failover that can reach an API key may bill.
+        assert!(!plan_only(
+            ProviderKind::ClaudeCode,
+            "haiku",
+            &["anthropic:sonnet".to_string()]
+        ));
+        // Another plan to fall over to is still a plan.
+        assert!(plan_only(
+            ProviderKind::ClaudeCode,
+            "haiku",
+            &["chatgpt".to_string()]
+        ));
+        // A light model routed to a metered provider is metered.
+        assert!(!plan_only(
+            ProviderKind::ClaudeCode,
+            "anthropic:haiku",
+            &none
+        ));
+    }
+
     #[test]
     fn a_claude_model_is_one_the_cli_names_whole() {
         for id in [

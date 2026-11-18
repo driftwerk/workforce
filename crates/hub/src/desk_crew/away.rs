@@ -515,7 +515,7 @@ impl CrewHub {
         let tz = self.desk.timezone();
         let decided: Vec<String> = b.decisions.iter().map(|d| timed(d, tz)).collect();
         let footer = match self.desk.cheap_today().await {
-            Ok((spent, cap)) => workforce_desk::update::footer(spent, cap),
+            Ok(today) => workforce_desk::update::footer(&today),
             Err(_) => None,
         };
         let u = MentionedUpdate {

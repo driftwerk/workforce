@@ -1195,10 +1195,21 @@ pub fn render_brief(u: &MentionedUpdate) -> String {
     out.join("\n\n")
 }
 
-/// The footer near the day's ceiling (80% of it spent), or none.
-pub fn footer(spent: i64, cap: u32) -> Option<String> {
-    (cap > 0 && spent * 5 >= i64::from(cap) * 4)
-        .then(|| format!("Notes today: {spent} of {cap} cheap calls."))
+/// The footer near the day's metered ceiling (80% of it spent), or none;
+/// said plainly once it is spent. Calls a plan serves have no ceiling, so
+/// on a plan there is none to say.
+pub fn footer(today: &crate::account::CheapToday) -> Option<String> {
+    let (spent, cap) = (today.metered, today.cap);
+    if today.billing == crate::account::Billing::Plan || cap == 0 {
+        return None;
+    }
+    if today.spent() {
+        return Some(format!(
+            "Notes today: all {cap} metered cheap calls are spent, so sessions' summaries are written plainly from their last words until tomorrow."
+        ));
+    }
+    (spent * 5 >= i64::from(cap) * 4)
+        .then(|| format!("Notes today: {spent} of {cap} metered cheap calls."))
 }
 
 /// The composer's instructions: per session, in the boss's voice, where it
@@ -1615,7 +1626,7 @@ mod tests {
                 options: vec![],
                 detail: None,
             }],
-            footer: footer(410, 500),
+            footer: footer(&metered(410, 500)),
             ..Default::default()
         };
         let decided =
@@ -1627,9 +1638,47 @@ mod tests {
         );
         assert!(out.contains("\n\nI decided: told acme-api to wait for green CI — it was red.\n\n"));
         assert!(out.contains("Still waiting on you:\n- Which key should staging use? (40 min)"));
-        assert!(out.ends_with("_Notes today: 410 of 500 cheap calls._"));
-        assert_eq!(footer(399, 500), None);
+        assert!(out.ends_with("_Notes today: 410 of 500 metered cheap calls._"));
+        assert_eq!(footer(&metered(399, 500)), None);
         assert_eq!(u.sessions[0].refs.len(), 1);
+    }
+
+    fn metered(spent: i64, cap: u32) -> crate::account::CheapToday {
+        crate::account::CheapToday {
+            metered: spent,
+            on_plan: 0,
+            cap,
+            billing: crate::account::Billing::Metered,
+        }
+    }
+
+    #[test]
+    fn the_footer_says_a_metered_ceiling_and_nothing_on_a_plan() {
+        let spent = footer(&metered(500, 500)).unwrap();
+        assert!(
+            spent.contains("all 500 metered cheap calls are spent"),
+            "{spent}"
+        );
+        assert!(spent.contains("written plainly"), "{spent}");
+        let on_plan = crate::account::CheapToday {
+            metered: 0,
+            on_plan: 4000,
+            cap: 500,
+            billing: crate::account::Billing::Plan,
+        };
+        assert_eq!(
+            footer(&on_plan),
+            None,
+            "a plan's calls have no ceiling to say"
+        );
+        assert!(!on_plan.spent());
+        // Calls made on a key earlier today don't make a plan's spent.
+        let switched = crate::account::CheapToday {
+            metered: 600,
+            ..on_plan
+        };
+        assert!(!switched.spent());
+        assert_eq!(footer(&switched), None);
     }
 
     #[test]
