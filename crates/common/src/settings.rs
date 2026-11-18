@@ -9381,6 +9381,21 @@ impl RemoteMcpConfig {
         "identity.linear_member_by_my_email",
         "identity.linear_members_named",
         "identity.linear_choose_me",
+        // GitHub boards: never github.api, a delete or a merge.
+        "github.project_get",
+        "github.project_items",
+        "github.project_item_status",
+        "github.project_item_move",
+        "github.project_item_add",
+        "github.issues_changed",
+        "github.create_issue",
+        "github.issue_update",
+        "github.issue_labels",
+        "github.issue_comment",
+        "github.viewer",
+        "github.projects_list",
+        "github.list_repos",
+        "github.repo_labels",
         "help",
     ];
 

@@ -255,6 +255,7 @@ mod tests {
             allow_self_approval: false,
             approver_user_ids: vec!["bob".to_string()],
             ttl: std::time::Duration::from_secs(3600),
+            chat: false,
         }
     }
 

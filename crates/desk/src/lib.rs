@@ -45,6 +45,7 @@ mod first_run;
 pub mod floor;
 pub mod folders;
 pub mod gist;
+pub mod github_sync;
 pub mod grant;
 mod grant_api;
 pub mod grant_store;

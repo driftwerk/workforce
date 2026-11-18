@@ -33,6 +33,7 @@ pub fn identity_tool(system: System) -> &'static str {
     match system {
         System::Jira => "jira.myself",
         System::Linear => "linear.viewer",
+        System::Github => "github.viewer",
     }
 }
 
@@ -43,6 +44,8 @@ pub fn by_email_tool(system: System) -> &'static str {
     match system {
         System::Jira => "identity.jira_user_by_my_email",
         System::Linear => "identity.linear_member_by_my_email",
+        // No hub offers it: GitHub shows a shared key no one's email.
+        System::Github => "identity.github_user_by_my_email",
     }
 }
 
@@ -63,6 +66,7 @@ pub fn members_tool(system: System) -> &'static str {
     match system {
         System::Jira => "identity.jira_users_named",
         System::Linear => "identity.linear_members_named",
+        System::Github => "identity.github_users_named",
     }
 }
 
@@ -97,6 +101,7 @@ pub fn choose_tool(system: System) -> &'static str {
     match system {
         System::Jira => "identity.jira_choose_me",
         System::Linear => "identity.linear_choose_me",
+        System::Github => "identity.github_choose_me",
     }
 }
 
@@ -111,10 +116,12 @@ pub fn callable(system: System) -> Vec<&'static str> {
         members_tool(system),
         choose_tool(system),
     ]);
-    if system == System::Jira {
-        all.extend(workforce_core::desk::BOARD_SYNC_JIRA_PICK_TOOLS);
+    match system {
+        System::Jira => all.extend(workforce_core::desk::BOARD_SYNC_JIRA_PICK_TOOLS),
+        System::Github => all.extend(workforce_core::desk::BOARD_SYNC_GITHUB_PICK_TOOLS),
+        System::Linear => {}
     }
-    all.push(ordering_tool(system));
+    all.extend(ordering_tool(system));
     all.push(workspaces_tool(system));
     all.extend(view_tools(system));
     all
@@ -126,6 +133,7 @@ pub fn workspaces_tool(system: System) -> &'static str {
     match system {
         System::Jira => "jira.workspaces",
         System::Linear => "linear.workspaces",
+        System::Github => "github.workspaces",
     }
 }
 
@@ -134,6 +142,7 @@ pub fn tools_of(system: System) -> &'static [&'static str] {
     match system {
         System::Jira => JIRA_TOOLS,
         System::Linear => LINEAR_TOOLS,
+        System::Github => crate::github_sync::TOOLS,
     }
 }
 
@@ -434,11 +443,14 @@ fn clip(s: &str, n: usize) -> String {
 /// key (a capital, then capitals, digits or `_`, up to 20) or a Linear
 /// team key (a capital, then capitals or digits, up to 10).
 pub fn check_target(system: System, target: &str) -> Result<(), String> {
+    if system == System::Github {
+        return crate::github_sync::check_target(target);
+    }
     let mut chars = target.chars();
     let first = chars.next().is_some_and(|c| c.is_ascii_uppercase());
     let (max, underscore) = match system {
         System::Jira => (20, true),
-        System::Linear => (10, false),
+        _ => (10, false),
     };
     let rest =
         chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || (underscore && c == '_'));
@@ -449,10 +461,16 @@ pub fn check_target(system: System, target: &str) -> Result<(), String> {
             system.title(),
             match system {
                 System::Jira => "project",
-                System::Linear => "team",
+                _ => "team",
             }
         )),
     }
+}
+
+/// A Jira, Linear or GitHub issue's key as typed: [`parse_issue_key`], or
+/// a GitHub one (`owner/repo#12`), lowercased.
+pub fn parse_any_key(s: &str) -> Option<String> {
+    parse_issue_key(s).or_else(|| crate::github_sync::parse_key(s))
 }
 
 /// An issue's key as typed (`acme-482`, ` ACME-482 `), uppercased, when it
@@ -468,6 +486,9 @@ pub fn parse_issue_key(s: &str) -> Option<String> {
 /// Whether the issue `key` is in the project or team `target`: what
 /// keeps another project's issues off a board whatever its filter says.
 pub fn key_in_target(key: &str, target: &str) -> bool {
+    if target.contains('/') {
+        return crate::github_sync::key_in_target(key, target);
+    }
     parse_issue_key(key).is_some_and(|k| {
         k.rsplit_once('-')
             .is_some_and(|(project, _)| project == target)
@@ -484,6 +505,23 @@ pub fn check_filter(system: System, f: &Filter, me: Option<&str>) -> Result<(), 
         {
             Err("A label is a word or two, without quotes or backslashes.".into())
         }
+        (System::Github, Filter::Milestone(m))
+            if m.trim().is_empty() || m.contains('"') || m.contains('\\') || m.len() > 200 =>
+        {
+            Err("A milestone is its title, without quotes or backslashes.".into())
+        }
+        (_, Filter::Milestone(_)) if system != System::Github => {
+            Err("Only a GitHub board filters by milestone.".into())
+        }
+        (System::Github, Filter::Query(q)) => crate::github_sync::check_query(q),
+        (System::Github, Filter::AssignedToMe)
+            if me.is_none_or(|m| check_me(system, m).is_err()) =>
+        {
+            Err("Say which GitHub login is yours, for \"assigned to me\".".into())
+        }
+        (System::Github, Filter::CurrentCycle) => Err(
+            "A GitHub board takes a label, a milestone or a project filter, not a cycle.".into(),
+        ),
         (System::Jira, Filter::Query(q)) => check_jql(q),
         (System::Linear, Filter::Query(q)) => linear_query(q).map(|_| ()),
         (System::Linear, Filter::AssignedToMe) if me.is_none_or(|m| !uuid_like(m)) => {
@@ -612,6 +650,8 @@ pub fn jql(project: &str, f: &Filter, since: Option<&str>, shared_me: Option<&st
         Filter::CurrentCycle => "sprint in openSprints()".to_string(),
         Filter::Label(l) => format!("labels = \"{}\"", l.trim()),
         Filter::Query(q) => q.trim().to_string(),
+        // Never Jira's (`check_filter`): the whole project.
+        Filter::Milestone(_) => String::new(),
     };
     let since = since
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
@@ -686,6 +726,7 @@ pub fn read_issue_call(
             json!({ "issue_key": key, "custom_fields": custom_fields_arg(fields) }),
         ),
         System::Linear => ("linear.issue_get", json!({ "identifier": key })),
+        System::Github => ("github.issues_changed", crate::github_sync::read_args(key)),
     }
 }
 
@@ -703,11 +744,13 @@ pub const FIELDS_FRESH: Duration = Duration::days(1);
 
 /// The hub's tool that says how `system`'s board orders its issues
 /// ([`workforce_core::desk::BOARD_SYNC_ORDER_TOOLS`]): called when offered,
-/// never needed.
-pub fn ordering_tool(system: System) -> &'static str {
+/// never needed. None on GitHub: a project's items come in its own order,
+/// moved by hand there.
+pub fn ordering_tool(system: System) -> Option<&'static str> {
     match system {
-        System::Jira => "jira.board_order",
-        System::Linear => "linear.view_ordering",
+        System::Jira => Some("jira.board_order"),
+        System::Linear => Some("linear.view_ordering"),
+        System::Github => None,
     }
 }
 
@@ -720,7 +763,9 @@ pub fn linear_view_type(f: &Filter) -> &'static str {
         Filter::Query(q) if linear_query(q).is_ok_and(|o| o.contains_key("project_id")) => {
             "project"
         }
-        Filter::All { .. } | Filter::Label(_) | Filter::Query(_) => "allIssues",
+        Filter::All { .. } | Filter::Label(_) | Filter::Milestone(_) | Filter::Query(_) => {
+            "allIssues"
+        }
     }
 }
 
@@ -729,6 +774,7 @@ pub fn ordering_args(s: &crate::board::Sync) -> Value {
     match s.system {
         System::Jira => json!({ "project_key": s.target }),
         System::Linear => json!({ "view_type": linear_view_type(&s.filter) }),
+        System::Github => json!({}),
     }
 }
 
@@ -777,6 +823,7 @@ fn fallback_words(system: System) -> &'static str {
     match system {
         System::Jira => "Jira's Rank",
         System::Linear => "Linear's manual order",
+        System::Github => "the project's own order",
     }
 }
 
@@ -1159,7 +1206,7 @@ pub fn linear_args(
                 args[k] = v;
             }
         }
-        Filter::Label(_) | Filter::CurrentCycle => {}
+        Filter::Label(_) | Filter::CurrentCycle | Filter::Milestone(_) => {}
     }
     args
 }
@@ -1259,6 +1306,8 @@ pub async fn identify(remote: &dyn Remote, system: System) -> Result<Who, Remote
         Err(_) => Who::Unsaid,
     };
     match who {
+        // GitHub shows a shared key no one's email: there is none to match.
+        Who::Shared(why) if system == System::Github => Ok(Who::Shared(why)),
         Who::Shared(_) => by_email(remote, system).await,
         who => Ok(who),
     }
@@ -1323,13 +1372,16 @@ pub fn by_email_of(system: System, answer: &Value) -> Who {
 /// the key it used is their own, with an id the sync can put where it goes
 /// (a Linear id, a Jira accountId).
 pub fn identity_of(system: System, answer: &Value) -> Who {
+    if system == System::Github {
+        return crate::github_sync::viewer_of(answer);
+    }
     match answer.get("personal").and_then(Value::as_bool) {
         Some(true) => {}
         Some(false) => return Who::Shared(NoMatch::Unasked),
         None => return Who::Unsaid,
     }
     let (id, name) = match system {
-        System::Jira => (&answer["account_id"], &answer["display_name"]),
+        System::Jira | System::Github => (&answer["account_id"], &answer["display_name"]),
         System::Linear => (
             &answer["id"],
             match answer["display_name"].as_str() {
@@ -1355,6 +1407,7 @@ pub fn identity_of(system: System, answer: &Value) -> Who {
 pub fn check_me(system: System, id: &str) -> Result<(), String> {
     let ok = match system {
         System::Linear => uuid_like(id),
+        System::Github => crate::github_sync::login_ok(id),
         System::Jira => {
             (1..=128).contains(&id.len())
                 && id
@@ -1380,6 +1433,11 @@ pub fn take_call(system: System, key: &str, me: &str) -> (&'static str, Value) {
             "linear.issue_update",
             json!({ "identifier": key, "assignee_id": me }),
         ),
+        System::Github => {
+            let mut args = crate::github_sync::read_args(key);
+            args["assignees"] = json!([me]);
+            ("github.issue_update", args)
+        }
     }
 }
 
@@ -2954,6 +3012,8 @@ pub fn order_call(
     mv: &crate::board::RankMove,
 ) -> Option<(&'static str, Value)> {
     match system {
+        // A project's item moves by its own id ([`order_call_for`]).
+        System::Github => None,
         System::Jira => {
             let mut args = json!({ "issue_key": key });
             match (&mv.above, &mv.below) {
@@ -2973,12 +3033,30 @@ pub fn order_call(
     }
 }
 
+/// The call that moves the ticket's issue `e` where `mv` says, on the
+/// board linked by `s`: [`order_call`], or on a GitHub project the move of
+/// its item after the one `mv` names (or to the top).
+pub fn order_call_for(
+    s: &crate::board::Sync,
+    e: &crate::board::External,
+    mv: &crate::board::RankMove,
+) -> Option<(&'static str, Value)> {
+    match s.system {
+        System::Github => {
+            crate::github_sync::order_call(s.target_id.as_deref(), e.id.as_deref(), mv)
+                .map(|args| ("github.project_item_move", args))
+        }
+        _ => order_call(s.system, &e.key, mv),
+    }
+}
+
 /// Whether `answer` says the order call moved the issue: a hub that only
 /// updated other fields, or none, didn't.
 pub fn order_moved(system: System, answer: &Value) -> bool {
     match system {
         System::Jira => answer["ranked"].as_bool() == Some(true),
         System::Linear => answer["issue"]["sortOrder"].is_number(),
+        System::Github => answer["moved"].as_bool() == Some(true),
     }
 }
 
@@ -3176,7 +3254,8 @@ pub fn spoken_title(t: &Ticket) -> String {
 
 /// Whether `p` is a remote ([`remote_party`]): its changes came from there.
 pub fn is_remote_party(p: &Party) -> bool {
-    p.kind == PartyKind::Desk && (p.id.starts_with("jira:") || p.id.starts_with("linear:"))
+    p.kind == PartyKind::Desk
+        && (p.id.starts_with("jira:") || p.id.starts_with("linear:") || p.id.starts_with("github:"))
 }
 
 /// The party a pulled change is by: the remote, never the person.

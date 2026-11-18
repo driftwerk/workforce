@@ -830,14 +830,19 @@ impl Desk {
         if !s.moves_by_hand() {
             return Ok(());
         }
-        let mut column: Vec<Ticket> = self
+        let all: Vec<Ticket> = self
             .0
             .store
             .board_tickets(t.board)
             .await
             .map_err(internal)?
             .into_iter()
-            .filter(|c| c.state == mv.state && c.id != t.id)
+            .filter(|c| c.id != t.id)
+            .collect();
+        let mut column: Vec<Ticket> = all
+            .iter()
+            .filter(|c| c.state == mv.state)
+            .cloned()
             .collect();
         column.sort_by(board::upstream_cmp);
         let at = |id: Uuid| column.iter().position(|c| c.id == id);
@@ -855,7 +860,7 @@ impl Desk {
         }
         let key = |c: Option<&Ticket>| c.and_then(|c| c.external.as_ref()).map(|e| e.key.clone());
         let (place, sort_order) = match s.system {
-            board::System::Jira => {
+            board::System::Jira | board::System::Github => {
                 // A neighbour whose place isn't known leaves none to sort
                 // between: the card sorts where it was until its Rank is read.
                 fn side(c: Option<&Ticket>) -> Option<Option<&str>> {
@@ -887,16 +892,47 @@ impl Desk {
             }
         };
         let paused = s.paused.is_some() || Desk::left_its_group(&b);
+        // A GitHub project's item goes after the item above it there: the
+        // card above in the column, else the one before the card below in
+        // the whole project's order, else to the top.
+        let (after_item, to_top) = match s.system {
+            board::System::Github => match above {
+                Some(a) => (a.external.as_ref().and_then(|e| e.id.clone()), false),
+                None => {
+                    let below_at = below.and_then(|c| c.upstream_rank.as_deref());
+                    let before = below_at.and_then(|at| {
+                        all.iter()
+                            .filter(|c| {
+                                ours(c) && c.external.as_ref().is_some_and(|e| e.id.is_some())
+                            })
+                            .filter_map(|c| c.upstream_rank.as_deref().map(|r| (r, c)))
+                            .filter(|(r, _)| r.as_bytes() < at.as_bytes())
+                            .max_by(|x, y| x.0.as_bytes().cmp(y.0.as_bytes()))
+                            .and_then(|(_, c)| c.external.as_ref().and_then(|e| e.id.clone()))
+                    });
+                    match (below_at, before) {
+                        (Some(_), Some(b)) => (Some(b), false),
+                        (Some(_), None) => (None, true),
+                        // The card below has no place there yet: nowhere
+                        // to say.
+                        (None, _) => (None, false),
+                    }
+                }
+            },
+            _ => (None, false),
+        };
         let up = board::RankMove {
             above: key(above),
             below: key(below),
             sort_order,
+            after_item,
+            to_top,
         };
         if place.is_some() {
             t.upstream_rank = place;
         }
         let e = t.external.as_mut().expect("a synced ticket");
-        let goes = !paused && crate::board_sync::order_call(s.system, &e.key, &up).is_some();
+        let goes = !paused && crate::board_sync::order_call_for(s, e, &up).is_some();
         if goes {
             e.rank_move = Some(up);
             e.rank_stale = false;

@@ -419,6 +419,8 @@ fn device_surface(surface: &ToolRegistry) -> ToolRegistry {
         .iter()
         .chain(workforce_core::desk::BOARD_SYNC_JIRA_PICK_TOOLS)
         .chain(workforce_core::desk::BOARD_SYNC_LINEAR_TOOLS)
+        .chain(workforce_core::desk::BOARD_SYNC_GITHUB_TOOLS)
+        .chain(workforce_core::desk::BOARD_SYNC_GITHUB_PICK_TOOLS)
         .chain(workforce_core::desk::BOARD_SYNC_IDENTITY_TOOLS)
         .chain(workforce_core::desk::BOARD_SYNC_WORKSPACE_TOOLS)
         .chain(workforce_core::desk::BOARD_SYNC_VIEW_TOOLS)
@@ -512,6 +514,8 @@ mod tests {
             .iter()
             .chain(workforce_core::desk::BOARD_SYNC_JIRA_PICK_TOOLS)
             .chain(workforce_core::desk::BOARD_SYNC_LINEAR_TOOLS)
+            .chain(workforce_core::desk::BOARD_SYNC_GITHUB_TOOLS)
+            .chain(workforce_core::desk::BOARD_SYNC_GITHUB_PICK_TOOLS)
             .chain(workforce_core::desk::BOARD_SYNC_WORKSPACE_TOOLS)
             .chain(workforce_core::desk::BOARD_SYNC_VIEW_TOOLS)
             .chain(workforce_core::desk::BOARD_SYNC_ORDER_TOOLS)
@@ -521,6 +525,10 @@ mod tests {
         for wide in [
             "jira.*",
             "linear.*",
+            "github.*",
+            "github.api",
+            "github.pr_merge",
+            "github.branch_delete",
             "jira.api",
             "jira.delete_issue",
             "linear.issue_bulk_update",

@@ -508,6 +508,8 @@ pub async fn asked(
         allow_self_approval: true,
         approver_user_ids: vec![person.clone()],
         ttl,
+        // A linked engine's ask: nothing resumes on it.
+        chat: false,
     };
     if let Err(e) = store.insert_core(
         &core,
@@ -1022,6 +1024,7 @@ mod tests {
             channel_notice_ts: None,
             created_at: Utc::now(),
             expires_at: Utc::now(),
+            chat: false,
         };
         let anywhere = row(json!(["allow", "deny", "stop"]));
         assert_eq!(refuses(&anywhere, PermissionChoice::AllowOnce), None);

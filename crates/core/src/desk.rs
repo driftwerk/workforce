@@ -1020,6 +1020,34 @@ pub const BOARD_SYNC_LINEAR_TOOLS: &[&str] = &[
 /// manual order, as before.
 pub const BOARD_SYNC_ORDER_TOOLS: &[&str] = &["jira.board_order", "linear.view_ordering"];
 
+/// The GitHub tools a Desk board's sync may call on a hub: a project's
+/// items (in its own order), their Status and place, a repository's issues
+/// changed since a time, and an issue's title, body, state, labels,
+/// comments and (Take it, only when no one has it) assignee. Never
+/// `github.api`, a delete, a merge or a push.
+pub const BOARD_SYNC_GITHUB_TOOLS: &[&str] = &[
+    "github.project_get",
+    "github.project_items",
+    "github.project_item_status",
+    "github.project_item_move",
+    "github.project_item_add",
+    "github.issues_changed",
+    "github.create_issue",
+    "github.issue_update",
+    "github.issue_labels",
+    "github.issue_comment",
+];
+
+/// The read-only GitHub tools a board may also call, and never needs: who
+/// the key is (`github.viewer`), and the projects, repositories, labels
+/// and milestones the link dialog picks from.
+pub const BOARD_SYNC_GITHUB_PICK_TOOLS: &[&str] = &[
+    "github.viewer",
+    "github.projects_list",
+    "github.list_repos",
+    "github.repo_labels",
+];
+
 /// Which of the person's Jira sites or Linear workspaces there are, by
 /// name (never a key), and the one a call naming none goes to: what the
 /// link dialog asks first, so a person with several picks one, which the

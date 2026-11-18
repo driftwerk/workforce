@@ -1062,6 +1062,14 @@ pub fn in_chat_turn() -> bool {
     CHAT_TURN.try_with(|_| ()).is_ok()
 }
 
+/// [`chat_turn`] when `chat`; else `turn` as it is.
+pub async fn chat_turn_if<F: std::future::Future>(chat: bool, turn: F) -> F::Output {
+    match chat {
+        true => chat_turn(turn).await,
+        false => turn.await,
+    }
+}
+
 /// The `[llm.model_preferences]` key for plain chatting.
 pub const CONVERSATION: &str = "conversation";
 

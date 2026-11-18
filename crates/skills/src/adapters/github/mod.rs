@@ -6,6 +6,7 @@
 //! Supports both single-token and multi-org configurations.
 
 pub mod app_auth;
+pub mod board;
 pub mod client;
 pub mod config;
 pub mod event_handler;
@@ -48,6 +49,12 @@ pub const READ_TOOLS: &[&str] = &[
     "github.workflow_runs",
     "github.workflow_run_logs",
     "github.workflow_run_failed_logs",
+    "github.viewer",
+    "github.projects_list",
+    "github.project_get",
+    "github.project_items",
+    "github.issues_changed",
+    "github.repo_labels",
 ];
 
 /// Write/mutating GitHub tools. `github.workflow_rerun` triggers a workflow and
@@ -66,6 +73,10 @@ pub const WRITE_TOOLS: &[&str] = &[
     "github.workflow_rerun",
     "github.pr_update",
     "github.api",
+    "github.project_item_status",
+    "github.project_item_move",
+    "github.project_item_add",
+    "github.issue_labels",
 ];
 
 /// The GitHub skill — provides tools for interacting with the GitHub REST API.
@@ -322,6 +333,57 @@ impl GithubSkill {
                 self.default_workspace.clone(),
                 self.default_owner.clone(),
             )),
+            // Desk's GitHub board sync
+            Arc::new(board::GithubViewerTool::new(
+                Arc::clone(&self.clients),
+                self.default_workspace.clone(),
+                self.default_owner.clone(),
+            )),
+            Arc::new(board::GithubProjectsListTool::new(
+                Arc::clone(&self.clients),
+                self.default_workspace.clone(),
+                self.default_owner.clone(),
+            )),
+            Arc::new(board::GithubProjectGetTool::new(
+                Arc::clone(&self.clients),
+                self.default_workspace.clone(),
+                self.default_owner.clone(),
+            )),
+            Arc::new(board::GithubProjectItemsTool::new(
+                Arc::clone(&self.clients),
+                self.default_workspace.clone(),
+                self.default_owner.clone(),
+            )),
+            Arc::new(board::GithubIssuesChangedTool::new(
+                Arc::clone(&self.clients),
+                self.default_workspace.clone(),
+                self.default_owner.clone(),
+            )),
+            Arc::new(board::GithubRepoLabelsTool::new(
+                Arc::clone(&self.clients),
+                self.default_workspace.clone(),
+                self.default_owner.clone(),
+            )),
+            Arc::new(board::GithubProjectItemStatusTool::new(
+                Arc::clone(&self.clients),
+                self.default_workspace.clone(),
+                self.default_owner.clone(),
+            )),
+            Arc::new(board::GithubProjectItemMoveTool::new(
+                Arc::clone(&self.clients),
+                self.default_workspace.clone(),
+                self.default_owner.clone(),
+            )),
+            Arc::new(board::GithubProjectItemAddTool::new(
+                Arc::clone(&self.clients),
+                self.default_workspace.clone(),
+                self.default_owner.clone(),
+            )),
+            Arc::new(board::GithubIssueLabelsTool::new(
+                Arc::clone(&self.clients),
+                self.default_workspace.clone(),
+                self.default_owner.clone(),
+            )),
         ]
     }
 
@@ -358,6 +420,16 @@ impl GithubSkill {
             "github.pr_update",
             "github.workflow_run_failed_logs",
             "github.api",
+            "github.viewer",
+            "github.projects_list",
+            "github.project_get",
+            "github.project_items",
+            "github.issues_changed",
+            "github.repo_labels",
+            "github.project_item_status",
+            "github.project_item_move",
+            "github.project_item_add",
+            "github.issue_labels",
         ]
     }
 
@@ -574,7 +646,8 @@ impl GithubSkill {
                             "owner": { "type": "string" },
                             "repo": { "type": "string" },
                             "number": { "type": "integer" },
-                            "state": { "type": "string" }
+                            "state": { "type": "string" },
+                            "state_reason": { "type": "string" }
                         },
                         "required": ["repo", "number"]
                     }),
@@ -800,6 +873,86 @@ impl GithubSkill {
                         "required": ["method", "path"]
                     }),
                 },
+                SkillTool {
+                    name: "github.viewer".to_string(),
+                    description: "Who the GitHub token belongs to".to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {}
+                    }),
+                },
+                SkillTool {
+                    name: "github.projects_list".to_string(),
+                    description: "List GitHub Projects (v2) of a user or organisation".to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"owner":{"type":"string"}}
+                    }),
+                },
+                SkillTool {
+                    name: "github.project_get".to_string(),
+                    description: "Get a GitHub Project (v2) with its fields and Status options".to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"owner":{"type":"string"},"number":{"type":"integer"}}, "required": ["number"]
+                    }),
+                },
+                SkillTool {
+                    name: "github.project_items".to_string(),
+                    description: "List the items of a GitHub Project (v2)".to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"project_id":{"type":"string"},"query":{"type":"string"},"after":{"type":"string"},"full":{"type":"boolean"},"ids":{"type":"array","items":{"type":"string"}},"field":{"type":"string"}}, "required": ["project_id"]
+                    }),
+                },
+                SkillTool {
+                    name: "github.issues_changed".to_string(),
+                    description: "Read a repository's issues by last update".to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"owner":{"type":"string"},"repo":{"type":"string"},"number":{"type":"integer"},"since":{"type":"string"},"state":{"type":"string"},"labels":{"type":"string"},"milestone":{"type":"string"},"assignee":{"type":"string"},"page":{"type":"integer"},"per_page":{"type":"integer"}}, "required": ["repo"]
+                    }),
+                },
+                SkillTool {
+                    name: "github.repo_labels".to_string(),
+                    description: "List a repository's labels and open milestones".to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"owner":{"type":"string"},"repo":{"type":"string"}}, "required": ["repo"]
+                    }),
+                },
+                SkillTool {
+                    name: "github.project_item_status".to_string(),
+                    description: "Set a GitHub Project (v2) item's Status".to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"project_id":{"type":"string"},"item_id":{"type":"string"},"status":{"type":"string"},"field":{"type":"string"}}, "required": ["project_id","item_id","status"]
+                    }),
+                },
+                SkillTool {
+                    name: "github.project_item_move".to_string(),
+                    description: "Reorder a GitHub Project (v2) item".to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"project_id":{"type":"string"},"item_id":{"type":"string"},"after_id":{"type":["string","null"]}}, "required": ["project_id","item_id"]
+                    }),
+                },
+                SkillTool {
+                    name: "github.project_item_add".to_string(),
+                    description: "Add an issue to a GitHub Project (v2)".to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"project_id":{"type":"string"},"owner":{"type":"string"},"repo":{"type":"string"},"number":{"type":"integer"}}, "required": ["project_id","repo","number"]
+                    }),
+                },
+                SkillTool {
+                    name: "github.issue_labels".to_string(),
+                    description: "Add or remove labels on an issue".to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"owner":{"type":"string"},"repo":{"type":"string"},"number":{"type":"integer"},"add":{"type":"array","items":{"type":"string"}},"remove":{"type":"array","items":{"type":"string"}}}, "required": ["repo","number"]
+                    }),
+                },
             ],
 
             event_sources: vec![SkillEventSource {
@@ -938,6 +1091,46 @@ impl GithubSkill {
                 },
                 SkillPolicy {
                     tool: "github.api".to_string(),
+                    action: "allow".to_string(),
+                },
+                SkillPolicy {
+                    tool: "github.viewer".to_string(),
+                    action: "allow".to_string(),
+                },
+                SkillPolicy {
+                    tool: "github.projects_list".to_string(),
+                    action: "allow".to_string(),
+                },
+                SkillPolicy {
+                    tool: "github.project_get".to_string(),
+                    action: "allow".to_string(),
+                },
+                SkillPolicy {
+                    tool: "github.project_items".to_string(),
+                    action: "allow".to_string(),
+                },
+                SkillPolicy {
+                    tool: "github.issues_changed".to_string(),
+                    action: "allow".to_string(),
+                },
+                SkillPolicy {
+                    tool: "github.repo_labels".to_string(),
+                    action: "allow".to_string(),
+                },
+                SkillPolicy {
+                    tool: "github.project_item_status".to_string(),
+                    action: "allow".to_string(),
+                },
+                SkillPolicy {
+                    tool: "github.project_item_move".to_string(),
+                    action: "allow".to_string(),
+                },
+                SkillPolicy {
+                    tool: "github.project_item_add".to_string(),
+                    action: "allow".to_string(),
+                },
+                SkillPolicy {
+                    tool: "github.issue_labels".to_string(),
                     action: "allow".to_string(),
                 },
             ],

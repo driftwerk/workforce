@@ -1892,6 +1892,7 @@ fn a_drop_goes_out_as_one_order_call() {
         above: above.map(str::to_string),
         below: below.map(str::to_string),
         sort_order: sort,
+        ..Default::default()
     };
     assert_eq!(
         order_call(
@@ -1967,6 +1968,7 @@ fn a_pull_takes_the_place_there_unless_a_drop_waits() {
         above: Some("ACME-1".into()),
         below: None,
         sort_order: None,
+        ..Default::default()
     };
     t.external.as_mut().unwrap().rank_move = Some(mv.clone());
     assert_eq!(push_of(&t, &[]).order, Some(mv));
@@ -2192,8 +2194,10 @@ fn a_linear_board_follows_the_view_its_filter_shows() {
     assert!(callable(System::Linear).contains(&"linear.view_ordering"));
     assert!(callable(System::Jira).contains(&"jira.board_order"));
     for s in [System::Jira, System::Linear] {
-        assert!(workforce_core::desk::BOARD_SYNC_ORDER_TOOLS.contains(&ordering_tool(s)));
+        assert!(workforce_core::desk::BOARD_SYNC_ORDER_TOOLS.contains(&ordering_tool(s).unwrap()));
     }
+    // A GitHub project's items come in its own order: nothing to ask.
+    assert_eq!(ordering_tool(System::Github), None);
 }
 
 /// Most of a board's open issues without a place there: it catches up.
