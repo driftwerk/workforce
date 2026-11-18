@@ -70,6 +70,7 @@ reload.
 | `jira.dev_status` | An issue's development: its pull requests (state, author, repo, branches), branches, commit count and builds. |
 | `jira.list_remote_links` | The web links on an issue (Confluence pages, designs, other trackers): title, address, app and relation. |
 | `jira.list_boards` | List Jira Software boards (Agile API). |
+| `jira.board_order` | How a project's board orders its issues: its filter's ORDER BY and its Rank field. |
 | `jira.list_sprints` | List sprints on a board, optionally filtered by state. |
 | `jira.add_worklog` | Log time on an issue. |
 | `jira.api` | Escape hatch for arbitrary REST calls. Path must include `/rest/api/3` or `/rest/agile/1.0`. |

@@ -2244,6 +2244,182 @@ impl Tool for JiraListBoardsTool {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// 15b. jira.board_order (Agile)
+// ──────────────────────────────────────────────────────────────────────
+
+jira_tool_struct!(JiraBoardOrderTool);
+
+/// Whether `key` can be a Jira project's key (`ENG`), so nothing but a key
+/// ever goes into the query.
+fn project_key_ok(key: &str) -> bool {
+    let mut c = key.chars();
+    c.next().is_some_and(|c| c.is_ascii_uppercase())
+        && c.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        && key.len() <= 20
+}
+
+/// The `ORDER BY` clause of `jql`, as written after the keyword: the last
+/// one outside quotes. None when it has none.
+fn order_by_clause(jql: &str) -> Option<String> {
+    let b = jql.as_bytes();
+    let word = |at: usize, w: &[u8]| {
+        b.len() >= at + w.len() && b[at..at + w.len()].eq_ignore_ascii_case(w)
+    };
+    let edge = |at: usize| {
+        b.get(at)
+            .is_none_or(|c| !c.is_ascii_alphanumeric() && *c != b'_')
+    };
+    let mut quote: Option<u8> = None;
+    let mut found = None;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        match quote {
+            Some(_) if c == b'\\' => i += 1,
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == b'"' || c == b'\'' => quote = Some(c),
+            None if word(i, b"order") && (i == 0 || edge(i - 1)) => {
+                let mut j = i + 5;
+                while b.get(j).is_some_and(u8::is_ascii_whitespace) {
+                    j += 1;
+                }
+                if j > i + 5 && word(j, b"by") && edge(j + 2) {
+                    found = Some(j + 2);
+                }
+            }
+            None => {}
+        }
+        i += 1;
+    }
+    let clause = jql.get(found?..)?.trim();
+    (!clause.is_empty()).then(|| clause.chars().take(500).collect())
+}
+
+#[async_trait]
+impl Tool for JiraBoardOrderTool {
+    fn name(&self) -> &str {
+        "jira.board_order"
+    }
+    fn description(&self) -> &str {
+        "How a Jira project's board orders its issues: the board (or the one asked for), its filter's ORDER BY clause and the Rank field it ranks by. Read-only."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "workspace": { "type": "string", "description": self.workspace_desc() },
+                "project_key": { "type": "string", "description": "The project whose board it is, e.g. 'ENG'" },
+                "board_id": { "type": "integer", "description": "One board of the project's; without, the project's only board" }
+            },
+            "required": ["project_key"]
+        })
+    }
+    async fn execute(&self, input: Value) -> Result<ToolResult> {
+        let start = std::time::Instant::now();
+        let ms = || start.elapsed().as_millis() as u64;
+        let client = resolve_or_fail!(self, input, start);
+        let key = match required_str(&input, "project_key") {
+            Ok(k) if project_key_ok(k) => k.to_string(),
+            Ok(_) => return Ok(ToolResult::failure("Not a Jira project key", ms())),
+            Err(e) => return Ok(ToolResult::failure(e, ms())),
+        };
+        let (boards, truncated): (Vec<Value>, bool) = match client
+            .get_with_query(
+                &format!("{AGILE}/board"),
+                &[("projectKeyOrId", key.as_str()), ("maxResults", "50")],
+            )
+            .await
+        {
+            Ok(v) => (
+                v["values"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|b| json!({ "id": b["id"], "name": b["name"], "type": b["type"] }))
+                    .collect(),
+                v["isLast"].as_bool() == Some(false),
+            ),
+            Err(e) => {
+                return Ok(ToolResult::from_report(
+                    &e.wrap_err(format!("Failed to list {key}'s boards")),
+                    ms(),
+                ))
+            }
+        };
+        let asked = coerce_to_u64(&input["board_id"]);
+        let board = match asked {
+            Some(id) => boards
+                .iter()
+                .find(|b| b["id"].as_u64() == Some(id))
+                .cloned(),
+            None if boards.len() == 1 => boards.first().cloned(),
+            None => None,
+        };
+        let Some(board) = board else {
+            // None, several, or not the project's: no board to say for.
+            let note = match (asked, boards.len()) {
+                (Some(id), _) => format!("Board {id} isn't one of {key}'s boards listed here"),
+                (None, 0) => format!("{key} has no board"),
+                (None, _) => format!("{key} has several boards: pass board_id"),
+            };
+            return Ok(ToolResult::success(
+                json!({ "boards": boards, "truncated": truncated, "board": null,
+                        "order_by": null, "note": note }),
+                ms(),
+            ));
+        };
+        let id = board["id"].as_u64().unwrap_or_default();
+        let config = match client
+            .get(&format!("{AGILE}/board/{id}/configuration"))
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(ToolResult::from_report(
+                    &e.wrap_err(format!("Failed to read board {id}'s configuration")),
+                    ms(),
+                ))
+            }
+        };
+        let rank_field = config["ranking"]["rankCustomFieldId"]
+            .as_u64()
+            .map(|n| format!("customfield_{n}"));
+        let filter = config["filter"]["id"]
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| config["filter"]["id"].as_u64().map(|n| n.to_string()))
+            .filter(|f| !f.is_empty() && f.chars().all(|c| c.is_ascii_digit()));
+        let Some(filter) = filter else {
+            return Ok(ToolResult::failure(
+                format!("Board {id} doesn't say which filter it shows"),
+                ms(),
+            ));
+        };
+        // A filter not shared with the key's user can't be read: the board
+        // and its Rank field are still said.
+        let (order_by, note) = match client.get(&format!("{REST}/filter/{filter}")).await {
+            Ok(v) => (order_by_clause(v["jql"].as_str().unwrap_or_default()), None),
+            Err(e) => {
+                warn!(error = %e, board = id, "a board's filter wasn't read");
+                (None, Some(format!("Board {id}'s filter couldn't be read")))
+            }
+        };
+        Ok(ToolResult::success(
+            json!({
+                "boards": boards,
+                "truncated": truncated,
+                "board": board,
+                "order_by": order_by,
+                "rank_field": rank_field,
+                "note": note,
+            }),
+            ms(),
+        ))
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // 16. jira.list_sprints (Agile)
 // ──────────────────────────────────────────────────────────────────────
 
@@ -3799,5 +3975,141 @@ mod tests {
         assert!(desc.contains("acme"));
         assert!(desc.contains("client"));
         assert!(desc.contains("Default: acme"));
+    }
+
+    /// The ORDER BY of a board's filter is read as written, the last one
+    /// outside quotes; none when it has none.
+    #[test]
+    fn order_by_is_read_from_a_filter_s_jql() {
+        assert_eq!(
+            order_by_clause("project = ENG ORDER BY Rank ASC").as_deref(),
+            Some("Rank ASC")
+        );
+        assert_eq!(
+            order_by_clause("project = ENG order   by priority DESC, created").as_deref(),
+            Some("priority DESC, created")
+        );
+        assert_eq!(
+            order_by_clause("summary ~ \"order by x\" ORDER BY cf[10019]").as_deref(),
+            Some("cf[10019]")
+        );
+        assert_eq!(order_by_clause("project = ENG"), None);
+        assert_eq!(order_by_clause("labels = reorder_by"), None);
+        assert_eq!(
+            order_by_clause("summary ~ \"é\" ORDER BY duedate").as_deref(),
+            Some("duedate")
+        );
+        assert_eq!(
+            order_by_clause(r#"summary ~ "a \" order by b" ORDER BY created DESC"#).as_deref(),
+            Some("created DESC")
+        );
+        assert_eq!(
+            order_by_clause("summary ~ 'order by x' ORDER BY updated").as_deref(),
+            Some("updated")
+        );
+        let long = format!("project = ENG ORDER BY {}", "x".repeat(900));
+        assert_eq!(order_by_clause(&long).map(|c| c.len()), Some(500));
+    }
+
+    /// The project's one board is read through to its filter's ORDER BY
+    /// and its Rank field; with several boards and none asked for, none is.
+    #[tokio::test]
+    async fn board_order_reads_the_board_s_filter() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/agile/1.0/board"))
+            .and(query_param("projectKeyOrId", "ENG"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "values": [{ "id": 7, "name": "ENG board", "type": "scrum",
+                             "location": { "projectKey": "ENG" } }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/agile/1.0/board"))
+            .and(query_param("projectKeyOrId", "OPS"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "values": [{ "id": 8, "name": "A", "type": "kanban" },
+                           { "id": 9, "name": "B", "type": "scrum" }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/agile/1.0/board/7/configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": 7,
+                "filter": { "id": "10040", "self": "x" },
+                "ranking": { "rankCustomFieldId": 10019 }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/agile/1.0/board/9/configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": 9, "filter": { "id": 10050 }, "ranking": { "rankCustomFieldId": 10019 }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/filter/10050"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/filter/10040"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "10040",
+                "jql": "project = ENG ORDER BY priority DESC, Rank ASC"
+            })))
+            .mount(&server)
+            .await;
+        let clients: ClientMap = Arc::new(
+            [("acme".to_string(), make_client(&server.uri()))]
+                .into_iter()
+                .collect(),
+        );
+        let tool = JiraBoardOrderTool::new(clients, "acme".into(), Arc::default());
+        let r = tool.execute(json!({ "project_key": "ENG" })).await.unwrap();
+        assert!(r.success, "{:?}", r.error);
+        assert_eq!(r.output["order_by"], "priority DESC, Rank ASC");
+        assert_eq!(r.output["rank_field"], "customfield_10019");
+        assert_eq!(r.output["board"]["name"], "ENG board");
+        assert_eq!(r.output["truncated"], false);
+        let r = tool.execute(json!({ "project_key": "OPS" })).await.unwrap();
+        assert!(r.success, "{:?}", r.error);
+        assert!(r.output["board"].is_null());
+        assert!(r.output["order_by"].is_null());
+        assert_eq!(r.output["boards"].as_array().map(Vec::len), Some(2));
+        assert!(r.output["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("several boards"));
+        let r = tool
+            .execute(json!({ "project_key": "OPS", "board_id": 9 }))
+            .await
+            .unwrap();
+        assert!(r.success, "{:?}", r.error);
+        assert_eq!(r.output["board"]["name"], "B");
+        assert!(
+            r.output["order_by"].is_null(),
+            "its filter couldn't be read"
+        );
+        assert_eq!(r.output["rank_field"], "customfield_10019");
+        let r = tool
+            .execute(json!({ "project_key": "OPS", "board_id": 77 }))
+            .await
+            .unwrap();
+        assert!(r.output["board"].is_null());
+        assert!(r.output["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("isn't one of"));
+        let r = tool
+            .execute(json!({ "project_key": "ENG\" OR 1=1" }))
+            .await
+            .unwrap();
+        assert!(!r.success, "nothing but a key goes into the query");
     }
 }
