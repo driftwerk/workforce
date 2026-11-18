@@ -49,24 +49,28 @@ impl SummaryLlm for LlmProviderSummaryAdapter {
         // The shared index is the hub's own upkeep, whoever started the
         // pass (a tool, the REST trigger, a webhook, the maintenance loop):
         // it runs on the hub's route, and no person behind it is expected.
-        let (response, served) = with_served_log(crate::subscription::unowned_by_design(
-            self.provider.create_message(
-                None,
-                &messages,
-                &[],
-                Some(&self.model),
-                Some(max_tokens as u32),
-                false,
-            ),
-        ))
+        // Whoever is in scope is cleared, so no person's login serves it
+        // and no person is billed for it.
+        let (response, served) = crate::user_config::as_principal(
+            &workforce_common::session::TurnPrincipal::default(),
+            with_served_log(crate::subscription::unowned_by_design(
+                self.provider.create_message(
+                    None,
+                    &messages,
+                    &[],
+                    Some(&self.model),
+                    Some(max_tokens as u32),
+                    false,
+                ),
+            )),
+        )
         .await;
         let response = response?;
 
         if let Some(ref ct) = self.cost_tracker {
-            let identity = crate::user_config::current_identity_id();
             ct.record(CostEntry {
                 task_type: Some("knowledge_summary"),
-                identity_id: identity.as_deref(),
+                identity_id: None,
                 description: Some("knowledge:summary"),
                 served,
                 ..CostEntry::new(

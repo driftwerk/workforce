@@ -4,6 +4,8 @@
 
 use std::sync::Arc;
 
+use serde_json::json;
+
 use workforce_agent::llm::types::LlmMessage;
 use workforce_agent::runner::{with_served_log, CURRENT_USER_ID};
 use workforce_common::personal_route::{
@@ -13,7 +15,7 @@ use workforce_common::settings::WorkforceConfig;
 use workforce_common::subscription::{CredentialTier, SubscriptionKind};
 
 use crate::agent_turn::tests::{hub, Hub, ALICE};
-use crate::claude_code::tests::scripted::{answer, result};
+use crate::claude_code::tests::scripted::{answer, assistant, print, rejected, result};
 use crate::hub_core::personal_routes::{MemoryRouteStore, PersonRouteStore};
 use crate::subscription::test_support::SKY;
 
@@ -329,6 +331,164 @@ async fn an_isolated_run_for_her_runs_on_her_login() {
         calls[0].token, token,
         "a workflow step runs on her own login"
     );
+}
+
+#[tokio::test]
+async fn at_her_plans_limit_wait_stops_and_a_turn_while_it_cools_spawns_nothing() {
+    let (hub, store) = routed().await;
+    hub.claude_login(ALICE);
+    shared_claude_login(&hub);
+    hub.chatgpt_login(ALICE).await;
+    choose(&hub, &store, ALICE, Some(claude(RouteFallback::Wait))).await;
+    hub.claude.reply(None, &rejected());
+
+    let err = hub.ask(ALICE, "hello").await.unwrap_err().to_string();
+
+    assert!(
+        err.contains("is at its usage limit until"),
+        "the turn stops and says her plan is at its limit: {err}"
+    );
+    assert_eq!(hub.claude.calls().len(), 1, "once, on her login");
+    assert_eq!(hub.chatgpt_requests().await, 0, "she chose to wait");
+
+    let again = hub.ask(ALICE, "hello again").await.unwrap_err().to_string();
+    assert!(again.contains("at its usage limit until"), "{again}");
+    assert_eq!(
+        hub.claude.calls().len(),
+        1,
+        "a cooling login spawns no claude"
+    );
+    assert_eq!(
+        hub.chatgpt_requests().await,
+        0,
+        "nor reaches the hub's route"
+    );
+}
+
+#[tokio::test]
+async fn at_her_plans_limit_hub_answers_on_the_agents_route() {
+    let (hub, store) = routed().await;
+    hub.claude_login(ALICE);
+    hub.chatgpt_login(ALICE).await;
+    choose(&hub, &store, ALICE, Some(claude(RouteFallback::Hub))).await;
+    hub.claude.reply(None, &rejected());
+
+    assert_eq!(hub.ask(ALICE, "why is the sky blue?").await.unwrap(), SKY);
+    assert_eq!(hub.claude.calls().len(), 1);
+    assert_eq!(hub.chatgpt_requests().await, 1);
+}
+
+#[tokio::test]
+async fn hub_hands_over_a_failure_before_output_but_never_one_after() {
+    let (hub, store) = routed().await;
+    hub.claude_login(ALICE);
+    hub.chatgpt_login(ALICE).await;
+    choose(&hub, &store, ALICE, Some(claude(RouteFallback::Hub))).await;
+    hub.claude.script(
+        None,
+        &format!(
+            "{}exit 1\n",
+            print(&[
+                assistant("msg-1", "Looking into it now."),
+                json!({
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": true,
+                    "num_turns": 2,
+                    "result": "API Error: 500 Internal server error",
+                }),
+            ])
+        ),
+    );
+
+    let err = hub.ask(ALICE, "why is the sky blue?").await.unwrap_err();
+
+    assert!(err.to_string().contains("500"), "{err:#}");
+    assert_eq!(
+        hub.chatgpt_requests().await,
+        0,
+        "her route produced output, so it is never handed over"
+    );
+
+    hub.claude.script(None, "exit 1\n");
+    assert_eq!(hub.ask(ALICE, "why is the sky blue?").await.unwrap(), SKY);
+    assert_eq!(hub.claude.calls().len(), 2);
+    assert_eq!(hub.chatgpt_requests().await, 1, "handed over before output");
+}
+
+#[tokio::test]
+async fn her_compact_command_summarises_on_her_own_login() {
+    let (hub, store) = routed().await;
+    let token = hub.claude_login(ALICE);
+    shared_claude_login(&hub);
+    choose(&hub, &store, ALICE, Some(claude(RouteFallback::Wait))).await;
+    let mut session = hub
+        .service
+        .sessions
+        .get_or_create("web", ALICE, hub.service.agent_id.as_str())
+        .unwrap();
+    for n in 0..30 {
+        session.add_user_message(&format!("Question {n} about the deploy."), None);
+        session.add_assistant_message(&format!("Answer {n}: it rolled out fine."), 40);
+    }
+    hub.service.sessions.save(&session).unwrap();
+    hub.claude.reply(None, &[result("The summary.")]);
+
+    let reply = hub.claude.scoped(hub.ask(ALICE, "/compact")).await.unwrap();
+
+    assert!(reply.contains("Compacted"), "{reply}");
+    let calls = hub.claude.calls();
+    assert!(!calls.is_empty(), "the summary ran on claude");
+    for call in &calls {
+        assert_eq!(call.token, token, "her own login, never the shared one");
+    }
+    assert_eq!(hub.chatgpt_requests().await, 0);
+}
+
+#[tokio::test]
+async fn a_knowledge_summary_made_while_she_is_in_scope_is_the_hubs_own_upkeep() {
+    use workforce_knowledge_service::SummariserBuilder as _;
+
+    let (hub, store) = routed().await;
+    let token = hub.claude_login(ALICE);
+    shared_claude_login(&hub);
+    choose(&hub, &store, ALICE, Some(claude(RouteFallback::Wait))).await;
+    let mut config = WorkforceConfig::default();
+    config.hub.data_dir = hub.dir.path().display().to_string();
+    let plans = crate::subscription::PlanLogins::new(
+        crate::subscription::Subscriptions::new(&config),
+        crate::subscription::CredentialScope::system(
+            Arc::clone(hub.service.vault.as_ref().unwrap()),
+            &config.subscription,
+        ),
+    );
+    let summariser = crate::knowledge::HubSummariserBuilder::new(
+        workforce_common::settings::KnowledgeSummariserConfig {
+            provider: "claude-code".into(),
+            model: "claude-code:cheap".into(),
+            ..Default::default()
+        },
+    )
+    .with_plans(Some(plans))
+    .build()
+    .unwrap();
+    hub.claude.reply(None, &answer("A module summary."));
+
+    // A knowledge tool call she made starts the pass.
+    let summary = CURRENT_USER_ID
+        .scope(
+            ALICE.to_string(),
+            hub.claude
+                .scoped(summariser.generate_text("Summarise this module.", 200)),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(summary, "A module summary.");
+    let calls = hub.claude.calls();
+    assert_eq!(calls.len(), 1);
+    assert_ne!(calls[0].token, token, "never her login");
+    assert_eq!(calls[0].token, "shared-token", "the hub's own");
 }
 
 /// The `claude_code` tool called as `person`, as a call that came back
