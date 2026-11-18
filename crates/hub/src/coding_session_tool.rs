@@ -1455,6 +1455,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn her_round_from_a_wait_route_never_draws_on_a_shared_login() {
+        const ALICE: &str = "6f1c1c3e-2a51-4a8e-9a57-0d6b1c9f2b11";
+        let b = bench_with(
+            Rounds {
+                logins: Some(Mutex::new(Vec::new())),
+                ..Default::default()
+            },
+            Seats::default(),
+        )
+        .await;
+        crate::coding_testing::on_own_claude(&b.tool.service, ALICE).await;
+        let input = serde_json::json!({ "message": ASK });
+
+        // As the gated MCP runs it: her principal and the session, nothing
+        // else of the turn's scope.
+        workforce_agent::runner::CURRENT_SESSION_ID
+            .scope(
+                b.session_id.clone(),
+                crate::user_config::as_principal(
+                    &TurnPrincipal::run_as(Some(ALICE.into())),
+                    b.tool.execute(input),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let logins = b.engine.logins.as_ref().unwrap().lock().unwrap().clone();
+        assert!(
+            matches!(logins.as_slice(), [Err(reason)] if reason.contains("connect your Claude plan")),
+            "she's told to connect her own, never served the shared one: {logins:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn collecting_bills_the_round_s_own_payer() {
         let b = bench(false).await;
         let input = serde_json::json!({ "message": ASK });

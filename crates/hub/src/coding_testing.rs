@@ -145,6 +145,43 @@ fn committed_checkout(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `person` on their own Claude route for `service`'s agent, waiting rather
+/// than falling back, with the hub's switch on and a shared Claude login on
+/// the agent beside it.
+pub(crate) async fn on_own_claude(service: &crate::serve::AgentService, person: &str) {
+    use crate::hub_core::personal_routes::{MemoryRouteStore, PersonRouteStore};
+    use workforce_common::personal_route::{
+        PersonalRoute, PersonalRouteKind, PersonalRoutesConfig, RouteFallback,
+    };
+    let routes = service.subscriptions().personal_routes();
+    routes.set_switch(PersonalRoutesConfig {
+        enabled: true,
+        ..Default::default()
+    });
+    let store = Arc::new(MemoryRouteStore::default());
+    routes.attach_store(Arc::clone(&store) as Arc<dyn PersonRouteStore>);
+    store
+        .set_every_agent(
+            person.parse().unwrap(),
+            Some(PersonalRoute {
+                kind: PersonalRouteKind::ClaudeCode,
+                fallback: RouteFallback::Wait,
+            }),
+            "test",
+        )
+        .await
+        .unwrap();
+    service
+        .vault
+        .as_ref()
+        .expect("the agent's vault")
+        .set(
+            workforce_common::subscription::SubscriptionKind::Claude.vault_key(),
+            "shared-token",
+        )
+        .unwrap();
+}
+
 /// The answer every round of [`Rounds`] gives.
 pub(crate) const ANSWER: &str = "done\nPR_URL: https://github.com/o/r/pull/1";
 
@@ -163,6 +200,11 @@ pub(crate) struct Rounds {
     /// Files each round writes into its workspace, by path and content.
     pub(crate) writes: Vec<(&'static str, &'static str)>,
     pub(crate) answers: Mutex<std::collections::VecDeque<&'static str>>,
+    /// When set, each round resolves its Claude login as an engine does
+    /// and keeps the tier that served it, or why none did.
+    pub(crate) logins: Option<
+        Mutex<Vec<std::result::Result<workforce_common::subscription::CredentialTier, String>>>,
+    >,
 }
 
 impl Rounds {
@@ -222,10 +264,17 @@ impl CodingEngine for Rounds {
         &self,
         sandbox: Arc<dyn CodingSandbox>,
         round: &CodingRound,
-        _: &RoundContext<'_>,
+        ctx: &RoundContext<'_>,
         _: Option<tokio_util::sync::CancellationToken>,
         progress: Option<tokio::sync::mpsc::Sender<workforce_agent::runner::ProgressEvent>>,
     ) -> Result<CliRoundResult> {
+        if let Some(logins) = &self.logins {
+            let login = ctx
+                .login(workforce_common::subscription::SubscriptionKind::Claude)
+                .map(|login| login.tier)
+                .map_err(|refusal| refusal.reason);
+            logins.lock().unwrap().push(login);
+        }
         if let (Some(jobs), Some(call)) = (round.jobs.as_ref(), ToolCall::current()) {
             call.checkpoint(jobs.job().as_str()).await?;
         }

@@ -202,6 +202,21 @@ struct WaveSpec {
     /// restart keeps it.
     #[serde(default)]
     own_logins: bool,
+    /// Whom the wave's spend is charged to when not [`Self::identity`]; kept
+    /// with it so a detached or resumed wave's coders run, and resolve their
+    /// logins, as the payer that asked for it.
+    #[serde(default)]
+    bill_to: Option<String>,
+}
+
+impl WaveSpec {
+    /// Who the wave's coders run as and bill to.
+    fn principal(&self) -> workforce_common::session::TurnPrincipal {
+        workforce_common::session::TurnPrincipal {
+            run_as: self.identity.clone(),
+            bill_to: self.bill_to.clone(),
+        }
+    }
 }
 
 /// All a replica needs to take up a wave another left.
@@ -849,11 +864,14 @@ impl Executor {
         // Move each owned `Coder` into its future (a closure taking `&Coder` and
         // returning a future borrowing it can't satisfy the higher-ranked
         // lifetime bound `buffer_unordered` needs).
-        let mut stream = stream::iter(
-            coders
-                .into_iter()
-                .map(|coder| async move { (coder.index, self.run_coder(&coder).await) }),
-        )
+        let mut stream = stream::iter(coders.into_iter().map(|coder| async move {
+            // A detached or resumed wave runs in a task of its own:
+            // its coders take up the payer the wave was asked for.
+            let principal = self.spec.principal();
+            let outcome =
+                crate::user_config::as_principal(&principal, self.run_coder(&coder)).await;
+            (coder.index, outcome)
+        }))
         .buffer_unordered(self.spec.max_parallel.max(1));
 
         let drain = async {
@@ -1162,6 +1180,7 @@ impl Tool for CodingFanoutTool {
             channel: channel.clone(),
             thread,
             own_logins,
+            bill_to: crate::user_config::explicit_billing_identity(),
         };
 
         // No channel (e.g. a gateway session) — run inline and return the
@@ -1391,6 +1410,10 @@ mod tests {
         }
 
         async fn host_with(seats: Seats, board: Board) -> Host {
+            host_of(seats, board, Rounds::default()).await
+        }
+
+        async fn host_of(seats: Seats, board: Board, engine: Rounds) -> Host {
             let tmp = tempfile::tempdir().unwrap();
             let mut config = workforce_common::settings::WorkforceConfig::default();
             config.hub.data_dir = tmp.path().to_string_lossy().to_string();
@@ -1412,7 +1435,7 @@ mod tests {
             projects
                 .put(&Project::new(service.agent_id.as_str(), "p1"))
                 .unwrap();
-            let engine = Arc::new(Rounds::default());
+            let engine = Arc::new(engine);
             let seats = Arc::new(seats);
             let sessions = Arc::clone(&service.sessions);
             let tool = Arc::new(CodingFanoutTool::new(
@@ -1445,6 +1468,7 @@ mod tests {
                 channel: Some("C1".into()),
                 thread: Some("100.1".into()),
                 own_logins: false,
+                bill_to: None,
             }
         }
 
@@ -1598,6 +1622,52 @@ mod tests {
             assert!(h.sessions.journal(&h.key).unwrap().is_empty());
             assert_eq!(h.seats.closed.lock().unwrap().len(), 2);
             assert!(h.last_edit().contains("2/2 subtasks"));
+        }
+
+        #[tokio::test]
+        async fn a_detached_wave_for_her_runs_its_coders_on_her_own_login() {
+            use workforce_common::subscription::{CredentialTier, SubscriptionKind};
+            const ALICE: &str = "6f1c1c3e-2a51-4a8e-9a57-0d6b1c9f2b11";
+            let h = host_of(
+                Seats::default(),
+                Board::default(),
+                Rounds {
+                    logins: Some(Mutex::new(Vec::new())),
+                    ..Default::default()
+                },
+            )
+            .await;
+            let service = &h.tool.service;
+            crate::coding_testing::on_own_claude(service, ALICE).await;
+            service
+                .vault
+                .as_ref()
+                .unwrap()
+                .set(
+                    &crate::user_config::per_user_key(ALICE, SubscriptionKind::Claude.vault_key()),
+                    &format!("{ALICE}-own"),
+                )
+                .unwrap();
+            let wave_spec = WaveSpec {
+                identity: Some(ALICE.into()),
+                own_logins: true,
+                ..spec()
+            };
+            let wave = Wave::hold(&h.sessions, &h.key).unwrap();
+
+            // Run here, in a task with no payer in scope, as a detached or
+            // resumed wave runs.
+            h.tool
+                .executor(wave_spec, h.project(), wave, None)
+                .run()
+                .await;
+
+            let logins = h.engine.logins.as_ref().unwrap().lock().unwrap().clone();
+            assert_eq!(
+                logins,
+                vec![Ok(CredentialTier::AgentUser); 2],
+                "each coder on her own login, none refused or on the shared one"
+            );
         }
 
         #[tokio::test]

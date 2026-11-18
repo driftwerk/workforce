@@ -101,6 +101,10 @@ impl RouteDecider {
 /// hub shares. With `fallback = hub` the person chose to let the hub's route
 /// serve when theirs can't, so the agent's logins resolve as they always do:
 /// the person's own first, then a shared one as `[llm.logins]` allows.
+///
+/// It narrows every kind of login, not only the route's: a Codex round for
+/// a person on a `claude-code` route that waits runs on their own ChatGPT
+/// login too, since everything billed to them stays on their own plans.
 pub(crate) async fn own_logins_only(service: &crate::serve::AgentService) -> bool {
     RouteDecider::of(service)
         .chosen()
