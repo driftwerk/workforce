@@ -132,6 +132,7 @@ mod tests {
                     })
                     .collect(),
                 edit: None,
+                starts_thread: false,
             },
             target: DeskTarget {
                 place,

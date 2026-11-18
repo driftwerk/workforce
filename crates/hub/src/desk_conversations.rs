@@ -223,6 +223,13 @@ fn read_with(
     let unknown = |side: &str| {
         ConversationError::Invalid(format!("{side} names no message of this conversation"))
     };
+    // A thread started by its parent holds the person's message as the
+    // question its first turn answered; it is shown once, in the DM.
+    let parent = workforce_core::desk::dm_thread_parent(channel);
+    let shown_here = |e: &TranscriptEntry| {
+        !(e.role == MessageRole::User
+            && parent.is_some_and(|p| e.external_id.as_deref() == Some(p)))
+    };
     let (mut read_from, after, mut cursor_at) = match cursor {
         Cursor::Newest => (None, None, None),
         Cursor::Before(id) => {
@@ -274,6 +281,7 @@ fn read_with(
         gathered.extend(
             newer
                 .into_iter()
+                .filter(|e| shown_here(e))
                 .filter_map(|e| said(e, agent, held.as_deref_mut()))
                 .map(|mut said| {
                     if said.from == Author::Agent {
@@ -772,6 +780,56 @@ fn copy_to_dm(
     Ok(Copied { id: message.id })
 }
 
+/// Keeps the person's message that starts the thread on itself
+/// (`desk.thread_starts`) in their DM, as the thread's parent: under the id
+/// it was sent with (`parent`, also its client id), in the DM's transcript
+/// and context, marked as starting a thread and carrying its `files`. The
+/// agent answers it in the thread, whose session holds it as the question.
+/// Kept once: a message the DM holds already (the same turn run again) is
+/// left as it is.
+pub(crate) fn start_thread(
+    store: &dyn SessionStore,
+    agent_id: &str,
+    owner: &str,
+    parent: &str,
+    text: &str,
+    files: Vec<workforce_core::desk::DeskFile>,
+) -> eyre::Result<()> {
+    if let Some(head) = store.find(DESK_CHANNEL, owner)? {
+        if crate::desk_surface::message_in_chain(store, &head.id, parent)?.is_some() {
+            return Ok(());
+        }
+    }
+    let text = text.trim().to_string();
+    let message = workforce_common::session::SessionMessage {
+        id: parent.to_string(),
+        role: MessageRole::User,
+        tokens: workforce_common::session::estimate_tokens(&text),
+        content: text,
+        tool_data: None,
+        timestamp: Utc::now(),
+        external_id: Some(parent.to_string()),
+        attachments: None,
+        trust_level: None,
+        actor: None,
+        desk: Some(workforce_core::desk::DeskMark {
+            speaker: Some(workforce_core::desk::DeskSpeaker::Person),
+            files,
+            starts_thread: true,
+            ..Default::default()
+        }),
+    };
+    let session_id = crate::desk_surface::save_on_head(
+        store,
+        || store.get_or_create(DESK_CHANNEL, owner, agent_id),
+        &message,
+    )?;
+    if let Err(e) = store.append_to_archive(&session_id, &message) {
+        tracing::warn!(%session_id, error = %e, "archiving a message that started a thread");
+    }
+    Ok(())
+}
+
 /// How many of a person's sessions with one agent are looked through for
 /// the Desk conversations that changed.
 const ACTIVE_SEARCHED: usize = 1_000;
@@ -1231,6 +1289,75 @@ mod tests {
             );
             assert!(refused.is_err(), "{thread_of}");
         }
+    }
+
+    #[test]
+    fn a_message_that_starts_a_thread_is_its_parent_in_the_dm_and_shown_once() {
+        let store = InMemorySessionStore::new();
+        let parent = uuid::Uuid::new_v4().to_string();
+        let channel = workforce_core::desk::dm_thread_channel(&parent);
+        // The thread's turn holds the person's message as its question, under
+        // the id it was sent with, and answers it there.
+        let mut thread = store.get_or_create(&channel, ME, "scout").unwrap();
+        thread.add_user_message("what shall we ship?", Some(&parent));
+        thread.add_assistant_message("the importer", 1);
+        store.save(&thread).unwrap();
+        for m in &thread.messages {
+            store.append_to_archive(&thread.id, m).unwrap();
+        }
+        let file = workforce_core::desk::DeskFile {
+            artifact_id: "art-1".into(),
+            agent_id: "scout".into(),
+            filename: "plan.md".into(),
+            media_type: "text/markdown".into(),
+            size: 3,
+            width: None,
+            height: None,
+            caption: None,
+        };
+        for _ in 0..2 {
+            start_thread(
+                &store,
+                "scout",
+                ME,
+                &parent,
+                " what shall we ship? ",
+                vec![file.clone()],
+            )
+            .unwrap();
+        }
+
+        let dm = page(&store, &scout(), ME, DESK_CHANNEL, Cursor::Newest, 10).unwrap();
+        assert_eq!(
+            texts(&dm),
+            [("what shall we ship?", Author::User)],
+            "kept once"
+        );
+        let top = &dm.messages[0];
+        assert_eq!(
+            (top.id.as_str(), top.client_id.as_deref()),
+            (parent.as_str(), Some(parent.as_str()))
+        );
+        let mark = top.mark.clone().unwrap();
+        assert!(mark.starts_thread);
+        assert_eq!(mark.thread_of, None, "a message of the DM, not a copy");
+        assert_eq!(top.attachments.len(), 1);
+        let head = store.find(DESK_CHANNEL, ME).unwrap().unwrap();
+        assert!(
+            head.messages.iter().any(|m| m.id == parent),
+            "in the DM's context"
+        );
+
+        // The thread reads as its replies, the question shown in the DM alone.
+        let own = page(&store, &scout(), ME, &channel, Cursor::Newest, 10).unwrap();
+        assert_eq!(texts(&own), [("the importer", Author::Agent)]);
+        let listed = threads_of(&store, &scout(), ME, |_| false).unwrap();
+        assert_eq!(listed.threads.len(), 1);
+        assert_eq!(
+            (listed.threads[0].parent.as_str(), listed.threads[0].replies),
+            (parent.as_str(), 1)
+        );
+        assert_eq!(listed.threads[0].authors, [Author::Agent]);
     }
 
     const ME: &str = "identity-1";

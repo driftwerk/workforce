@@ -5061,6 +5061,19 @@ pub(crate) async fn stream_admitted(
             attachments.as_deref(),
         )
         .await;
+        // A message starting the thread on itself is the thread's parent:
+        // kept in the DM first, so the thread is one of the DM's from its
+        // first reply. Not kept there, the turn doesn't run.
+        if let Some(parent) = desk.turn.thread_started() {
+            crate::desk_conversations::start_thread(
+                service.sessions.as_ref(),
+                service.agent_id.as_str(),
+                &session.owner,
+                &parent,
+                store_content,
+                files.clone(),
+            )?;
+        }
         if let Some(asked) = session.messages.last_mut() {
             asked.desk = Some(workforce_common::channels::desk::DeskMark {
                 files,

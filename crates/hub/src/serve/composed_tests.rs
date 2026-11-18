@@ -5570,6 +5570,104 @@ fn load_policy_registers_builtin_rules_in_default_config() {
     }
 }
 
+/// A message starting the thread on itself: kept in the DM under its own id
+/// as the thread's parent, answered in the thread, and shown once.
+#[tokio::test]
+async fn a_desk_message_that_starts_a_thread_is_kept_in_the_dm_and_answered_in_the_thread() {
+    use workforce_common::channels::desk::{
+        dm_thread_channel, DeskPlace, DeskSpeaker, DeskTurn, DeskTurnContext, DESK_CHANNEL,
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, _server) = service_on_mock_llm(tmp.path()).await;
+    let asked = uuid::Uuid::from_u128(31);
+    let parent = asked.to_string();
+    let channel = dm_thread_channel(&parent);
+    let turn = DeskTurn {
+        place: DeskPlace::Dm {
+            thread: Some(parent.clone()),
+        },
+        speaker: DeskSpeaker::Person,
+        hop: 0,
+        context: Vec::new(),
+        message: Some(asked),
+        spoken: false,
+        voice: None,
+        members: Vec::new(),
+        edit: None,
+        starts_thread: true,
+    };
+    let desk = DeskTurnContext::new(
+        turn.validated(&channel).unwrap(),
+        &channel,
+        None,
+        false,
+        Some("ref-1".into()),
+        "reply-1".into(),
+    );
+    let MessageProgress {
+        mut progress_rx,
+        handle,
+        ..
+    } = service
+        .process_message_with_progress(
+            &channel,
+            "owner-1",
+            None,
+            "what shall we ship?",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&desk),
+        )
+        .await
+        .unwrap();
+    while progress_rx.recv().await.is_some() {}
+    handle.await.unwrap().unwrap();
+
+    // In the DM, under the id it was sent with, marked as starting a thread.
+    let dm = service
+        .sessions
+        .find(DESK_CHANNEL, "owner-1")
+        .unwrap()
+        .unwrap();
+    let top = dm.messages.iter().find(|m| m.id == parent).unwrap();
+    assert_eq!(top.content, "what shall we ship?");
+    assert_eq!(top.external_id.as_deref(), Some(parent.as_str()));
+    assert!(top
+        .desk
+        .as_ref()
+        .is_some_and(|d| d.starts_thread && d.thread_of.is_none()));
+    assert!(
+        !dm.messages.iter().any(|m| m.role == MessageRole::Assistant),
+        "answered in the thread, not the DM"
+    );
+    // The thread holds it as its question, and the answer.
+    let thread = service.sessions.find(&channel, "owner-1").unwrap().unwrap();
+    let roles: Vec<_> = thread.messages.iter().map(|m| m.role.clone()).collect();
+    assert_eq!(roles, [MessageRole::User, MessageRole::Assistant]);
+    assert_eq!(
+        thread.messages[0].external_id.as_deref(),
+        Some(parent.as_str())
+    );
+}
+
 /// Asks `text` in owner-1's Desk DM under the client id `asked`, as an edit
 /// of `replaces` when it names one, and runs the turn to its end.
 async fn desk_dm_ask(
@@ -5591,6 +5689,7 @@ async fn desk_dm_ask(
         voice: None,
         members: Vec::new(),
         edit: replaces.map(|replaces| DeskEdit { replaces }),
+        starts_thread: false,
     };
     let desk = DeskTurnContext::new(
         turn.validated(DESK_CHANNEL).unwrap(),
@@ -5788,6 +5887,7 @@ async fn a_desk_room_turn_is_told_where_it_is_and_keeps_its_place() {
         voice: None,
         members: Vec::new(),
         edit: None,
+        starts_thread: false,
     };
     let desk = DeskTurnContext::new(
         turn.clone().validated(&channel).unwrap(),
