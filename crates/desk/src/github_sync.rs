@@ -354,8 +354,11 @@ pub fn issue_of(
                         "canceled" => TicketState::Dropped,
                         _ => TicketState::Done,
                     };
+                    // Closed as not planned stays Dropped even when GitHub's
+                    // own "closed: Done" workflow moved its Status to Done.
                     match crate::board_sync::column_for(states, &status, Some(kind)) {
-                        Some(TicketState::Done | TicketState::Dropped) => status,
+                        Some(TicketState::Dropped) => status,
+                        Some(TicketState::Done) if shut == TicketState::Done => status,
                         _ => states.get(&shut).cloned().unwrap_or_else(|| match shut {
                             TicketState::Dropped => "Dropped".into(),
                             _ => "Done".into(),

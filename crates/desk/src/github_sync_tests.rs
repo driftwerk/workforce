@@ -198,6 +198,14 @@ fn a_closed_issue_without_a_mapped_status_is_done_or_dropped() {
     assert_eq!(issue_of(&v, &done, true, None).unwrap().state, "Shipped");
     v["status"] = json!("Todo");
     assert_eq!(issue_of(&v, &done, true, None).unwrap().state, "Shipped");
+    // Closed not planned, its Status then moved to Done by GitHub's own
+    // workflow: still Dropped.
+    v["state_reason"] = json!("NOT_PLANNED");
+    v["status"] = json!("Shipped");
+    assert_eq!(
+        issue_of(&v, &done, true, None).unwrap().column(&done),
+        Some(TicketState::Dropped)
+    );
 }
 
 #[test]
