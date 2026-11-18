@@ -879,6 +879,23 @@ async fn run(
     }
     let ids: HashSet<Uuid> = accepted.iter().map(|(id, _)| *id).collect();
     uplinks.resend(&socket, &ids).await;
+    // Each link's group conversation, and its thread in the person's Slack
+    // DM with the agent, is opened when the link is minted. A link minted
+    // before that was, or whose person has linked Slack since, has them
+    // opened as its engine connects: once, as at the mint.
+    for (_, live) in &accepted {
+        let Some(device) = live.token.minted_by_device().map(str::to_string) else {
+            continue;
+        };
+        let (state, person, token) = (Arc::clone(&state), live.person.id, live.token.id);
+        tokio::spawn(async move {
+            if let Err((status, why)) =
+                super::conversation::ensure(&state, person, &device, token, true).await
+            {
+                tracing::warn!(%status, why, "a connected boss link's conversation wasn't opened");
+            }
+        });
+    }
     // The loop: results and pongs up, pings down, every link checked again
     // at each ping.
     let mut ticker = tokio::time::interval(timing.ping_every);

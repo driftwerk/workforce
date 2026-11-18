@@ -1978,6 +1978,283 @@ mod uplink_tests {
         }
     }
 
+    /// Allan's model answers the first request carrying `marker` with a
+    /// call to `tool`.
+    async fn calls_tool_once(
+        server: &wiremock::MockServer,
+        marker: &str,
+        tool: &str,
+        arguments: Value,
+    ) {
+        use wiremock::matchers::{body_partial_json, body_string_contains, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let chunk = |body: Value| format!("data: {body}\n\n");
+        let call = [
+            chunk(json!({"id": "c0", "object": "chat.completion.chunk", "model": "mock",
+                "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [{"index": 0,
+                    "id": "call_1", "type": "function", "function": {"name": tool, "arguments": arguments.to_string()}}]},
+                    "finish_reason": null}]})),
+            chunk(json!({"id": "c0", "object": "chat.completion.chunk", "model": "mock",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}})),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        // Only a request that offers the tool: the turn's own, not a
+        // side call reading the same words.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains(marker))
+            .and(body_string_contains(format!("\"{tool}\"")))
+            .and(body_partial_json(json!({"stream": true})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(call),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(server)
+            .await;
+    }
+
+    /// The whole way, as Sam lives it: Desk makes Allan Acme's boss, Allan
+    /// opens Acme's thread in Sam's Slack DM with him, Sam asks there how
+    /// Acme is doing, Allan reads Acme's sessions on devbox through the
+    /// link and answers, and what devbox asks Sam comes as a card in that
+    /// thread.
+    #[tokio::test]
+    async fn sam_directs_allan_as_acmes_boss_from_slack_end_to_end() {
+        use crate::boss_links::slack::session_key_for;
+        let hub = hub(on()).await;
+        let (mut sam, _device, desk) = hub.sam();
+        sam.linked_ids.insert("slack".into(), "U0SAM".into());
+        hub.fx.identities.update(&sam).unwrap();
+        let person = sam.id.to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let llms = own_agents(&hub, dir.path()).await;
+        let allan = hub.fx.state.registry.get("allan").unwrap();
+        allan.set_identity_store(hub.fx.identities.clone());
+        let slack = Arc::new(FakeSlack::default());
+        allan.surface_registry.write().await.register(
+            workforce_common::channels::SurfaceKey::workspace("slack", "T1"),
+            Arc::clone(&slack) as Arc<dyn workforce_common::channels::ChannelSurface>,
+        );
+        let store: Arc<dyn crate::approvals::store::PendingApprovalStore> =
+            Arc::new(crate::approvals::SqlitePendingApprovalStore::in_memory().unwrap());
+        allan.set_pending_approval_store(Arc::clone(&store));
+        let registry = &hub.state().registry;
+        registry.insert(registry.default_id(), Arc::clone(&allan));
+
+        // 1. Desk makes Allan Acme's boss for devbox, as it asks for it.
+        let devbox = key();
+        let body = serde_json::from_value::<crate::api_handlers::desk_boss_links::MintBody>(
+            json!({
+                "agent_id": "allan",
+                "group": {"key": "d-1/acme", "name": "Acme"},
+                "engine": {"id": "devbox", "name": "devbox", "public_key": devbox.public_key().to_text()},
+            }),
+        )
+        .unwrap();
+        let (status, Json(minted)) = crate::api_handlers::desk_boss_links::create(
+            State(Arc::clone(&hub.fx.state)),
+            bearer(&desk),
+            Json(body),
+        )
+        .await
+        .map_err(|(status, _)| status)
+        .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        let minted = serde_json::to_value(minted).unwrap();
+
+        // 2. Allan opens Acme's thread in Sam's DM with him, there and then.
+        assert_eq!(minted["slack"]["state"], "open", "{minted}");
+        let thread = minted["slack"]["key"].as_str().unwrap().to_string();
+        let ts = thread.rsplit(':').next().unwrap().to_string();
+        let posted = slack.0.lock().clone();
+        assert_eq!(posted.len(), 1, "{posted:?}");
+        assert!(posted[0].starts_with("|*Acme · Desk*"), "{posted:?}");
+
+        // devbox's engine takes the link up, on the hub the turns run on,
+        // as the gateway makes it.
+        let addr = serve(&hub).await;
+        crate::boss_links::tools::serve_for(&hub.fx.state);
+        let token_id: Uuid = minted["id"].as_str().unwrap().parse().unwrap();
+        let mut engine = open_link(
+            addr,
+            minted["token"].as_str().unwrap(),
+            token_id,
+            &devbox,
+            "devbox",
+        )
+        .await;
+
+        // 3. Sam replies in the thread: Slack's dispatch keys his reply to
+        // the thread's own conversation, and runs it as his chat turn.
+        let key = session_key_for(
+            &allan,
+            "T1",
+            "D0SAM",
+            Some(&ts),
+            &person,
+            "slack:T1:D0SAM".into(),
+        );
+        assert_eq!(key, thread);
+        let ask = "How is Acme doing on devbox?";
+        // The model names tools as the provider spells them.
+        calls_tool_once(&llms[0], ask, "crew_overview", json!({})).await;
+        let mut turn = {
+            let allan = Arc::clone(&allan);
+            let (key, person, ts) = (key.clone(), person.clone(), ts.clone());
+            tokio::spawn(async move {
+                // As Slack's dispatch runs it: streamed, in the DM's thread.
+                let progress = crate::serve::chat_turn(allan.process_message_with_progress(
+                    &key,
+                    &person,
+                    None,
+                    ask,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("D0SAM"),
+                    Some(&ts),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("T1"),
+                    None,
+                    None,
+                    None,
+                    None,
+                ))
+                .await?;
+                let mut rx = progress.progress_rx;
+                while rx.recv().await.is_some() {}
+                progress
+                    .handle
+                    .await
+                    .map_err(|e| eyre::eyre!("{e}"))?
+                    .map(|run| run.response)
+            })
+        };
+
+        // 4. Allan's overview goes down Acme's link to devbox, and devbox's
+        // answer comes back up into his turn.
+        let call = tokio::select! {
+            call = next_call(&mut engine) => call,
+            ended = &mut turn => panic!("the turn ended without calling down: {ended:?}"),
+        };
+        assert_eq!(call["tool"], "crew.overview");
+        assert_eq!(call["linkId"], minted["link_id"]);
+        let status_line = "acme-web on devbox: tests passing, waiting for review";
+        send(
+            &mut engine,
+            json!({"type": "result", "callId": call["callId"], "status": "ok", "body": status_line}),
+        )
+        .await;
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(20), turn)
+            .await
+            .expect("the turn ends")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply, "done");
+        let read_back = llms[0]
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| String::from_utf8_lossy(&r.body).contains(status_line));
+        assert!(read_back, "devbox's answer reached Allan's model");
+        let session = allan.sessions.find(&thread, &person).unwrap().unwrap();
+        assert!(
+            session.messages.iter().any(|m| m.content == ask),
+            "Sam's words are the thread's"
+        );
+
+        // What devbox then asks Sam comes as a card in Acme's thread.
+        let asked = Uuid::new_v4();
+        send(
+            &mut engine,
+            json!({"type": "ask", "askId": asked, "nonce": "a1".repeat(32),
+                   "linkId": minted["link_id"], "class": "anywhere",
+                   "summary": "acme-web asks to push to main", "detail": "git push origin main",
+                   "options": ["allow", "deny", "stop"],
+                   "expiresAt": (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339(),
+                   "subject": Uuid::new_v4()}),
+        )
+        .await;
+        let mut card = None;
+        for _ in 0..100 {
+            card = slack
+                .0
+                .lock()
+                .iter()
+                .skip(1)
+                .find(|p| p.starts_with(&format!("{ts}|")))
+                .cloned();
+            if card.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let card = card.expect("a card in Acme's thread");
+        assert!(card.contains("push to main"), "{card}");
+    }
+
+    /// A link minted before its thread was opened at the mint (or whose
+    /// person linked Slack since) has it opened when its engine connects:
+    /// once, however often it reconnects.
+    #[tokio::test]
+    async fn a_links_thread_is_opened_when_its_engine_connects() {
+        let hub = hub(on()).await;
+        let (mut sam, device, _) = hub.sam();
+        sam.linked_ids.insert("slack".into(), "U0SAM".into());
+        hub.fx.identities.update(&sam).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        own_agents(&hub, dir.path()).await;
+        let allan = hub.fx.state.registry.get("allan").unwrap();
+        allan.set_identity_store(hub.fx.identities.clone());
+        let slack = Arc::new(FakeSlack::default());
+        allan.surface_registry.write().await.register(
+            workforce_common::channels::SurfaceKey::workspace("slack", "T1"),
+            Arc::clone(&slack) as Arc<dyn workforce_common::channels::ChannelSurface>,
+        );
+        let devbox = key();
+        let acme = links::mint(
+            hub.state(),
+            sam.id,
+            &device.id,
+            &request(&devbox, "acme", "devbox"),
+        )
+        .unwrap();
+        assert!(slack.0.lock().is_empty(), "minted without its thread");
+        let addr = serve(&hub).await;
+        let posted = || async {
+            for _ in 0..100 {
+                let n = slack.0.lock().len();
+                if n > 0 {
+                    return n;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            0
+        };
+        let first = open_link(addr, &acme.plaintext, acme.record.id, &devbox, "devbox").await;
+        assert_eq!(posted().await, 1);
+        assert!(slack.0.lock()[0].contains("acme · Desk"));
+        drop(first);
+        let _again = open_link(addr, &acme.plaintext, acme.record.id, &devbox, "devbox").await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(slack.0.lock().len(), 1, "once");
+    }
+
     #[tokio::test]
     async fn a_slack_dm_thread_the_link_opens_is_the_groups_boss_conversation() {
         use crate::boss_links::conversation::{ensure, BossConversation};
