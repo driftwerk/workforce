@@ -190,16 +190,14 @@ impl Tool for KnowledgeIndexTool {
                         let mode = action.as_str();
                         let svc = self.service.clone();
                         let root_clone = root.clone();
-                        // The shared index is the hub's own upkeep, whoever
-                        // asked for it: on the hub's route, not theirs.
-                        tokio::spawn(crate::subscription::unowned_by_design(async move {
+                        tokio::spawn(async move {
                             if let Err(e) = svc.trigger_for(&root_clone).await {
                                 tracing::warn!(
                                     root = %root_clone.display(),
                                     "Background indexing failed: {}", e
                                 );
                             }
-                        }));
+                        });
                         Ok(ToolResult::success(
                             serde_json::json!({
                                 "status": "started",
@@ -231,15 +229,14 @@ impl Tool for KnowledgeIndexTool {
 
                 let svc = self.service.clone();
                 let root_clone = root.clone();
-                // The hub's own upkeep, as above.
-                tokio::spawn(crate::subscription::unowned_by_design(async move {
+                tokio::spawn(async move {
                     if let Err(e) = svc.trigger_full_index_for(&root_clone).await {
                         tracing::warn!(
                             root = %root_clone.display(),
                             "Background full indexing failed: {}", e
                         );
                     }
-                }));
+                });
 
                 Ok(ToolResult::success(
                     serde_json::json!({

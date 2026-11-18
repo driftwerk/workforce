@@ -4,8 +4,10 @@
 //! the person background work is billed to. A person's own route can only
 //! follow a call that carries one, so every origin says here where its
 //! payer comes from, and the places a call runs with no person at all are
-//! listed in [`WITHOUT_A_PERSON`]. A new origin does not compile until it is
-//! given a source.
+//! listed in [`WITHOUT_A_PERSON`]. A new origin does not compile until
+//! [`payer_source`] gives it a source (add it to [`ORIGINS`] too). These
+//! lists are kept by hand: they say where payers come from, they don't prove
+//! each call site is scoped.
 
 use workforce_common::subscription::Origin;
 
@@ -103,7 +105,7 @@ pub struct NoPerson {
 pub const WITHOUT_A_PERSON: &[NoPerson] = &[
     NoPerson {
         origin: Origin::Knowledge,
-        what: "the shared knowledge index's summaries (a background pass, or one a knowledge tool call starts)",
+        what: "the shared knowledge index's summaries, however the pass started (the maintenance loop, a knowledge tool call, the REST trigger, a webhook)",
         why: "the index is the hub's own, whoever asks for it",
     },
     NoPerson {
