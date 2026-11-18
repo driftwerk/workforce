@@ -1033,8 +1033,11 @@ impl CrewHub {
     ) -> Result<String, String> {
         // The hub's own work for the person whose Desk this is: it may run
         // on their accounts when the install's login is at its limit.
-        crate::hub_core::logins::install_pool::hub_own_work(decision_call(service, system, prompt))
-            .await
+        // It has no person in scope by design: a personal hub's Desk.
+        crate::hub_core::logins::install_pool::hub_own_work(crate::subscription::unowned_by_design(
+            decision_call(service, system, prompt),
+        ))
+        .await
     }
 
     /// Records that `boss` left `view`'s request `p` to the person, saying

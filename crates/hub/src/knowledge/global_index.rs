@@ -234,7 +234,8 @@ impl MaintenanceRunner {
         seed.disarm();
 
         let me = Arc::clone(self);
-        tokio::spawn(async move {
+        // A knowledge pass is the hub's own upkeep: no person behind it.
+        tokio::spawn(crate::subscription::unowned_by_design(async move {
             match me.run_under_guard_owned(guard, scope, mode, targets).await {
                 Ok(PassRunOutcome::Completed(report)) => info!(
                     target_count = report.target_count,
@@ -244,7 +245,7 @@ impl MaintenanceRunner {
                 Ok(_) => {}
                 Err(e) => warn!(error = %e, "background knowledge pass errored"),
             }
-        });
+        }));
 
         PassRunOutcome::Started {
             message: STARTED_MESSAGE,
