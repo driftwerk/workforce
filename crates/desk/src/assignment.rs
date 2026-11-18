@@ -377,13 +377,44 @@ fn environment(w: &str) -> Option<&'static str> {
     })
 }
 
-/// A release number as said after "release": `4`, `4,`, `r4`.
+/// A version as released: `1.4.0`, `v4.2` (its `v` dropped).
+fn version(w: &str) -> Option<&str> {
+    let v = w.strip_prefix('v').unwrap_or(w);
+    let parts: Vec<&str> = v.split('.').collect();
+    ((2..=4).contains(&parts.len()) && parts.iter().all(|p| digits(p))).then_some(v)
+}
+
+/// A number or a version: what follows "release" when it names one.
+fn numberish(w: &str) -> bool {
+    digits(w) || version(w).is_some()
+}
+
+/// A release number as said after "release": `4`, `4,`, `#4`, `1.4.0`.
 fn release_number(w: &str) -> Option<String> {
     let w = w.strip_prefix('#').unwrap_or(w);
+    if let Some(v) = version(w) {
+        return Some(v.to_string());
+    }
     digits(w)
         .then(|| w.trim_start_matches('0').to_string())
         .map(|n| if n.is_empty() { "0".into() } else { n })
 }
+
+/// The words after `#3` that make it a ranking, not a PR ("#1 priority").
+const NOT_A_PR_AFTER: &[&str] = &[
+    "priority", "thing", "goal", "choice", "pick", "rule", "spot", "place", "seed", "fan",
+];
+
+/// The `gh pr` subcommands that name a PR after them (`gh pr merge 711`).
+const GH_PR: &[&str] = &[
+    "merge", "view", "checkout", "close", "review", "edit", "ready", "diff", "checks",
+];
+
+/// The words of a sentence that say releases are what it is about: an
+/// `R4` names a release only beside one ("cut R4"; Cloudflare's R2 isn't).
+const RELEASE_WORDS: &[&str] = &[
+    "release", "releases", "promote", "deploy", "ship", "cut", "rollout", "tag",
+];
 
 /// What `text` names, each once, in the order it says them, with the word
 /// each starts at.
@@ -429,15 +460,37 @@ fn targets_at(ws: &[Word]) -> Vec<(usize, Target)> {
                 add(i, Target::new(TargetKind::Release, num), &mut out);
             }
         }
-        if let Some(num) = w.strip_prefix('r').filter(|n| digits(n) && n.len() <= 3) {
+        let sentence = ws[i].sentence;
+        let about_releases = || {
+            ws.iter()
+                .filter(|o| o.sentence == sentence)
+                .any(|o| RELEASE_WORDS.contains(&o.text.as_str()))
+        };
+        if let Some(num) = w
+            .strip_prefix('r')
+            .filter(|n| digits(n) && n.len() <= 3)
+            .filter(|_| about_releases())
+        {
             add(i, Target::new(TargetKind::Release, num), &mut out);
         }
-        // #708, PR 708, PR #708, pr-708, pull/708.
+        // v1.4.0, v4.2: a release by its version.
+        if w.starts_with('v') {
+            if let Some(v) = version(w) {
+                add(i, Target::new(TargetKind::Release, v), &mut out);
+            }
+        }
+        // #708, PR 708, PR #708, pr-708, pull/708, gh pr merge 708.
         if let Some(n) = w.strip_prefix('#').filter(|n| digits(n)) {
-            add(i, Target::new(TargetKind::Pr, n), &mut out);
+            if !next.is_some_and(|n| NOT_A_PR_AFTER.contains(&n)) {
+                add(i, Target::new(TargetKind::Pr, n), &mut out);
+            }
         }
         if w == "pr" {
-            if let Some(n) = next
+            let after = match next {
+                Some(sub) if GH_PR.contains(&sub) => ws.get(i + 2).map(|n| n.text.as_str()),
+                n => n,
+            };
+            if let Some(n) = after
                 .map(|n| n.strip_prefix('#').unwrap_or(n))
                 .filter(|n| digits(n))
             {
@@ -457,7 +510,12 @@ fn targets_at(ws: &[Word]) -> Vec<(usize, Target)> {
         if commit_like(w) {
             add(i, Target::new(TargetKind::Commit, w), &mut out);
         }
-        if digits(w) && w.len() >= 9 && !date_like(w) {
+        // A run id: GitHub's are nine to eleven digits; a longer number
+        // (an AWS account's twelve) is one only when said to be a run.
+        let said_run = i
+            .checked_sub(1)
+            .is_some_and(|p| matches!(ws[p].text.as_str(), "run" | "runs" | "run_id" | "run-id"));
+        if digits(w) && w.len() >= 9 && (w.len() <= 11 || said_run) && !date_like(w) {
             add(i, Target::new(TargetKind::Run, w), &mut out);
         }
         if let Some(env) = environment(w) {
@@ -551,6 +609,11 @@ const NOUN_AFTER: &[&str] = &[
     "succeeded",
     "failed",
     "finished",
+    "already",
+    "exists",
+    "existed",
+    "still",
+    "looks",
 ];
 
 /// Whether the words just before `at`, in its clause, turn it down
@@ -559,7 +622,10 @@ fn negated(ws: &[Word], at: usize) -> bool {
     let clause = ws[at].clause;
     ws[at.saturating_sub(4)..at]
         .iter()
+        .rev()
         .filter(|w| w.clause == clause)
+        // "Stop waiting and merge #711": a no before an and is its own.
+        .take_while(|w| !matches!(w.text.as_str(), "and" | "then" | "but"))
         .any(|w| {
             matches!(
                 w.text.as_str(),
@@ -579,6 +645,49 @@ fn negated(ws: &[Word], at: usize) -> bool {
         })
 }
 
+/// The package managers whose `publish` can't be taken back.
+const PUBLISHERS: &[&str] = &["npm", "cargo", "yarn", "pnpm", "twine", "gem", "poetry"];
+
+/// The objects that stand for what was named before ("merge it").
+const PRONOUNS: &[&str] = &["it", "this", "that", "them"];
+
+/// The verbs whose "it" is something that ships ("dispatch it"); "delete
+/// it" of a scratch file isn't one.
+const SHIPS_IT: &[&str] = &[
+    "release", "deploy", "promote", "publish", "tag", "dispatch", "rollback", "redeploy", "merge",
+];
+
+/// Whether "roll back it" / "roll it back" speaks of something named.
+fn next_but_one_pronoun(ws: &[Word], i: usize) -> bool {
+    ws.get(i + 2)
+        .is_some_and(|n| n.clause == ws[i].clause && PRONOUNS.contains(&n.text.as_str()))
+}
+
+/// Whether sentence `sentence` of `ws` is a dry run (`--dry-run`, "a dry
+/// run of it"), which takes nothing irreversible; "dry run off", or "as
+/// dry run 4438…" (one done before) isn't.
+fn dry(ws: &[Word], sentence: usize) -> bool {
+    let words: Vec<&Word> = ws.iter().filter(|w| w.sentence == sentence).collect();
+    words.iter().enumerate().any(|(k, w)| {
+        let t = w.text.as_str();
+        if t.contains("dry-run=false") || t.contains("dry_run=false") {
+            return false;
+        }
+        let flag = matches!(t, "--dry-run" | "-dry-run" | "dry-run" | "dry_run" | "--dry")
+            || t.starts_with("--dry-run=")
+            || t.starts_with("dry_run=");
+        let said = t == "dry"
+            && words
+                .get(k + 1)
+                .is_some_and(|n| matches!(n.text.as_str(), "run" | "runs"));
+        let after = words.get(k + if said { 2 } else { 1 }).map(|n| n.text.as_str());
+        let before = k.checked_sub(1).map(|p| words[p].text.as_str());
+        (flag || said)
+            && !matches!(after, Some("off" | "false" | "disabled"))
+            && !matches!(before, Some("as" | "like" | "same" | "from" | "after"))
+    })
+}
+
 /// The irreversible acts `ws` asks for: the word each verb is at.
 fn acts(ws: &[Word], has_target: bool) -> Vec<usize> {
     let mut out = Vec::new();
@@ -588,14 +697,22 @@ fn acts(ws: &[Word], has_target: bool) -> Vec<usize> {
             .checked_sub(1)
             .map(|p| &ws[p])
             .filter(|p| p.clause == w.clause)
-            .map(|p| p.text.as_str());
+            .map(|p| p.text.as_str())
+            .filter(|p| *p != "please");
         let next = ws
             .get(i + 1)
             .filter(|n| n.clause == w.clause)
             .map(|n| n.text.as_str());
-        // "release 4", "promote 44389184927": a number right after names
-        // the thing, not what to do to it ("merge #711" still acts).
-        let numbered = matches!(t, "release" | "promote" | "deploy") && next.is_some_and(digits);
+        let after_next = ws
+            .get(i + 2)
+            .filter(|n| n.clause == w.clause)
+            .map(|n| n.text.as_str());
+        // "own release 4", "Release 4 can start": a number right after
+        // names the thing; first in its clause and going on ("Release 4
+        // now.", "Deploy 4 to prod") it is what to do. "merge #711" acts.
+        let numbered = matches!(t, "release" | "promote" | "deploy")
+            && next.is_some_and(numberish)
+            && (prev.is_some() || after_next.is_some_and(|n| NOUN_AFTER.contains(&n)));
         let noun = numbered
             || prev.is_some_and(|p| DETERMINERS.contains(&p))
             || next.is_some_and(|n| NOUN_AFTER.contains(&n));
@@ -603,6 +720,11 @@ fn acts(ws: &[Word], has_target: bool) -> Vec<usize> {
             || t == "--force"
             || (t == "force" && next.is_some_and(|n| n.starts_with("push")));
         let roll_back = t == "roll" && next == Some("back");
+        // What a command line does that can't be taken back.
+        let command = (t == "publish" && prev.is_some_and(|p| PUBLISHERS.contains(&p)))
+            || (t == "apply" && prev == Some("terraform"))
+            || (t == "release" && prev == Some("gh") && next == Some("create"))
+            || t.ends_with("/dispatches");
         let undone_follows = || {
             ws[i + 1..]
                 .iter()
@@ -616,11 +738,13 @@ fn acts(ws: &[Word], has_target: bool) -> Vec<usize> {
                         || n.text.starts_with("release=")
                 })
         };
+        let pronoun = SHIPS_IT.contains(&t) && next.is_some_and(|n| PRONOUNS.contains(&n));
         let fires = force
-            || (roll_back && has_target)
-            || (ACTS.contains(&t) && !noun && (has_target || undone_follows()))
+            || command
+            || (roll_back && (has_target || next_but_one_pronoun(ws, i)))
+            || (ACTS.contains(&t) && !noun && (has_target || pronoun || undone_follows()))
             || (STARTS.contains(&t) && undone_follows());
-        if fires && !negated(ws, i) {
+        if fires && !negated(ws, i) && !dry(ws, w.sentence) {
             out.push(i);
         }
     }
@@ -964,8 +1088,27 @@ mod tests {
             "gh workflow run promote.yml -f release=4",
             "Force-push the branch.",
             "Roll back release 4 in production.",
+            "Release 4 now.",
+            "Deploy 4 to prod",
+            "Stop waiting and merge #711",
+            "Dispatch it.",
+            "gh pr merge 711 --squash",
+            "gh release create v1.4.0",
+            "npm publish",
+            "cargo publish -p workforce-desk",
+            "terraform apply -auto-approve",
+            "gh api repos/acme/harbor/actions/workflows/promote.yml/dispatches",
         ] {
             assert!(irreversible(asked), "{asked}");
+        }
+        for not in [
+            "gh workflow run promote.yml -f release=4 --dry-run",
+            "Do a dry run of release 4 first.",
+            "Delete it.",
+            "Merge main into dev.",
+            "Release 4 can start",
+        ] {
+            assert!(!irreversible(not), "{not}");
         }
     }
 
@@ -1007,7 +1150,14 @@ mod tests {
         assert!(keys("Ack m:5068bfae, re a:3f2a1b2c and [Desk m:0a1b2c3d]").is_empty());
         assert!(keys("id 0c9d3f6e-1a2b-4c5d-8e9f-0123456789ab").is_empty());
         // Releases, PRs and workflows however they are written.
-        assert_eq!(keys("R4"), vec!["release:4"]);
+        assert_eq!(keys("Cut R4 now"), vec!["release:4"]);
+        assert!(keys("Upload it to the R2 bucket").is_empty(), "Cloudflare's R2");
+        assert!(keys("This is the #1 priority").is_empty());
+        assert!(keys("account 123456789012").is_empty(), "an AWS account");
+        assert_eq!(keys("run 123456789012"), vec!["run:123456789012"]);
+        assert_eq!(keys("release 1.4.0"), vec!["release:1.4.0"]);
+        assert_eq!(keys("Deploy v4.2 to prod"), vec!["release:4.2", "env:production"]);
+        assert_eq!(keys("gh pr merge 711"), vec!["pr:711"]);
         assert_eq!(keys("release-4"), vec!["release:4"]);
         assert_eq!(
             keys("PR 708 and pr #709 and #710"),
