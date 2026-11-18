@@ -202,6 +202,8 @@ export function RouteModelsPicker({
   onChange: (work: RouteWork, model: string | undefined) => void;
 }) {
   const models = option.models ?? [];
+  // Every tier on Codex is the one plan model, so only its models are offered.
+  const tiers = option.kind === "codex" ? [] : TIERS;
   return (
     <fieldset className="space-y-2" disabled={pending}>
       <legend className="mb-2 text-sm font-medium">Models on {ROUTE_LABELS[option.kind]}</legend>
@@ -226,7 +228,7 @@ export function RouteModelsPicker({
                 Default{option.defaults ? ` (${option.defaults[work]})` : ""}
               </option>
               {work !== "conversation" && <option value="chat">Same as conversation</option>}
-              {TIERS.map(([tier, tierLabel]) => (
+              {tiers.map(([tier, tierLabel]) => (
                 <option key={tier} value={tier}>
                   {tierLabel}
                 </option>
