@@ -43,6 +43,10 @@ pub(super) const REPEAT_WINDOW: chrono::TimeDelta = chrono::TimeDelta::minutes(1
 /// meets it decides again.
 pub(crate) const STALE: &str = "Not sent: since you decided this,";
 
+/// What every boss turn reads once the day's metered cheap calls are
+/// spent.
+pub(super) const NOTES_SPENT: &str = "Sessions' summaries are written plainly from their last words for the rest of today: the day's metered cheap calls are spent (`[oversight.updates] cheap_calls_per_day`). They may be out of date: check a session (crew.account, crew.ask_session) before you say anything has or hasn't happened.";
+
 /// How long a turn's basis is kept, at most, when its end isn't seen.
 const BASIS_KEPT: chrono::TimeDelta = chrono::TimeDelta::hours(6);
 
@@ -380,6 +384,11 @@ impl CrewHub {
     ) -> Option<String> {
         let tz = self.desk.timezone();
         let mut out = String::new();
+        // Accounts said plainly read like fresh ones: never taken for them.
+        if self.desk.cheap_ceiling_hit_today() {
+            out.push_str(NOTES_SPENT);
+            out.push('\n');
+        }
         let mine = self.desk.picture_recent_for(boss, SAID_ROWS);
         if let Some(r) = workforce_desk::picture::render(&mine, tz) {
             out.push_str("What the person told you lately, and the facts and standing orders that hold, oldest first:\n");

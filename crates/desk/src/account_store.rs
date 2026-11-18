@@ -204,7 +204,8 @@ impl DeskStore {
             .collect()
     }
 
-    /// The cheap model's calls on `day`, of every kind.
+    /// The cheap model's metered calls on `day`, of every kind: what the
+    /// day's ceiling holds.
     pub async fn cheap_calls(&self, day: NaiveDate) -> Result<i64> {
         let client = self.pool().get().await?;
         Ok(client
@@ -260,12 +261,71 @@ impl DeskStore {
         Ok(true)
     }
 
-    /// Gives back a call of `kind` counted on `day` that no model took.
+    /// Gives back a metered call of `kind` counted on `day` that no model
+    /// took.
     pub async fn cheap_untake(&self, day: NaiveDate, kind: CheapKind) -> Result<()> {
         let client = self.pool().get().await?;
         client
             .execute(
                 "UPDATE desk_cheap_calls SET calls = GREATEST(calls - 1, 0) \
+                 WHERE day = $1 AND kind = $2",
+                &[&day, &kind.as_str()],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The cheap model's calls on `day` that a subscription plan served:
+    /// counted only to be shown, never held to a ceiling.
+    pub async fn cheap_plan_calls(&self, day: NaiveDate) -> Result<i64> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .query_one(
+                "SELECT COALESCE(SUM(plan_calls), 0)::int8 FROM desk_cheap_calls WHERE day = $1",
+                &[&day],
+            )
+            .await?
+            .try_get(0)?)
+    }
+
+    /// Counts a call of `kind` on `day` that a subscription plan serves:
+    /// no ceiling holds it, so it is always made.
+    pub async fn cheap_take_on_plan(&self, day: NaiveDate, kind: CheapKind) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "INSERT INTO desk_cheap_calls (day, kind, plan_calls) VALUES ($1, $2, 1) \
+                 ON CONFLICT (day, kind) DO UPDATE SET plan_calls = desk_cheap_calls.plan_calls + 1",
+                &[&day, &kind.as_str()],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Moves a call of `kind` counted on `day` as `plan` (else metered) to
+    /// the other count: what paid for it wasn't what was expected.
+    pub async fn cheap_rebill(&self, day: NaiveDate, kind: CheapKind, plan: bool) -> Result<()> {
+        let client = self.pool().get().await?;
+        let sql = match plan {
+            true => {
+                "UPDATE desk_cheap_calls SET plan_calls = GREATEST(plan_calls - 1, 0), calls = calls + 1 \
+                 WHERE day = $1 AND kind = $2"
+            }
+            false => {
+                "UPDATE desk_cheap_calls SET calls = GREATEST(calls - 1, 0), plan_calls = plan_calls + 1 \
+                 WHERE day = $1 AND kind = $2"
+            }
+        };
+        client.execute(sql, &[&day, &kind.as_str()]).await?;
+        Ok(())
+    }
+
+    /// Gives back a plan call of `kind` counted on `day` that no model took.
+    pub async fn cheap_untake_on_plan(&self, day: NaiveDate, kind: CheapKind) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "UPDATE desk_cheap_calls SET plan_calls = GREATEST(plan_calls - 1, 0) \
                  WHERE day = $1 AND kind = $2",
                 &[&day, &kind.as_str()],
             )
@@ -472,6 +532,47 @@ mod tests {
                 .cheap_take(day, CheapKind::Account, 3, None)
                 .await
                 .unwrap());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn calls_a_plan_serves_are_counted_apart_and_never_held_to_the_ceiling() {
+        with_test_pool(build_pool, |pool| async move {
+            DeskStore::migrate(&pool).await.unwrap();
+            let store = DeskStore::from_pool(pool);
+            let day = NaiveDate::from_ymd_opt(2026, 11, 18).unwrap();
+            assert!(store
+                .cheap_take(day, CheapKind::Account, 1, None)
+                .await
+                .unwrap());
+            assert!(
+                !store
+                    .cheap_take(day, CheapKind::Account, 1, None)
+                    .await
+                    .unwrap(),
+                "the metered ceiling holds"
+            );
+            for _ in 0..5 {
+                store
+                    .cheap_take_on_plan(day, CheapKind::Account)
+                    .await
+                    .unwrap();
+            }
+            store
+                .cheap_take_on_plan(day, CheapKind::Question)
+                .await
+                .unwrap();
+            store
+                .cheap_untake_on_plan(day, CheapKind::Question)
+                .await
+                .unwrap();
+            assert_eq!(store.cheap_plan_calls(day).await.unwrap(), 5);
+            assert_eq!(
+                store.cheap_calls(day).await.unwrap(),
+                1,
+                "a plan's calls never count against the metered ceiling"
+            );
         })
         .await;
     }

@@ -11,12 +11,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use parking_lot::Mutex;
 use uuid::Uuid;
 
 use super::{Desk, DeskError};
-use crate::account::{self, Account, Accountant, Call, Context, Limits, Read, Tail, Written};
+use crate::account::{
+    self, Account, Accountant, Billing, Call, CheapToday, Context, Limits, Read, Tail, Written,
+};
 use crate::account_store::{CheapKind, Put};
 
 /// How often running turns are looked at for a `now` to write.
@@ -58,6 +60,9 @@ pub(super) struct AccountRun {
     pub(super) accountant: Option<Arc<dyn Accountant>>,
     flights: Mutex<HashMap<Uuid, Flight>>,
     limits: Mutex<Limits>,
+    /// The day the metered ceiling last refused a call: accounts are said
+    /// plainly for the rest of it, and the boss's picture says so.
+    ceiling_hit: Mutex<Option<NaiveDate>>,
     /// When each running turn's `now` was last written, and what its tail
     /// was then.
     mid_turn: Mutex<HashMap<Uuid, (Instant, u64)>>,
@@ -80,6 +85,7 @@ impl AccountRun {
             accountant,
             flights: Mutex::default(),
             limits: Mutex::default(),
+            ceiling_hit: Mutex::default(),
             mid_turn: Mutex::default(),
             looked: Mutex::default(),
             ended: Mutex::default(),
@@ -160,7 +166,11 @@ impl Desk {
     /// The ceilings the cheap model is held to: the main boss's
     /// `[oversight.updates]`, as the hub reads it.
     pub fn set_account_limits(&self, limits: Limits) {
-        *self.0.accounts.limits.lock() = limits;
+        let was = std::mem::replace(&mut *self.0.accounts.limits.lock(), limits);
+        // Raised: what it holds is looked at again on the next call.
+        if limits.cheap_calls_per_day > was.cheap_calls_per_day {
+            *self.0.accounts.ceiling_hit.lock() = None;
+        }
     }
 
     /// The person looked at session `id` (read it, typed in it).
@@ -693,39 +703,127 @@ impl Desk {
         Tail { said, screen }
     }
 
-    /// Takes one of the day's cheap calls of `kind`; false past a ceiling.
-    pub(super) async fn account_take(&self, kind: CheapKind) -> eyre::Result<bool> {
+    /// What the accountant's next call is paid by: metered with none.
+    async fn account_billing(&self) -> Billing {
+        match &self.0.accounts.accountant {
+            Some(a) => a.billing().await,
+            None => Billing::Metered,
+        }
+    }
+
+    /// Takes one of the day's cheap calls of `kind`, on the accountant's
+    /// route: what it is paid by, or None past a metered ceiling.
+    pub(super) async fn account_take(&self, kind: CheapKind) -> eyre::Result<Option<Billing>> {
+        let billing = self.account_billing().await;
+        Ok(self.cheap_take(kind, billing).await?.then_some(billing))
+    }
+
+    /// Takes one of the day's cheap calls of `kind` paid by `billing`: a
+    /// plan's always (counted only to be shown), a metered one within the
+    /// day's ceilings. False past one, and the day is marked spent.
+    async fn cheap_take(&self, kind: CheapKind, billing: Billing) -> eyre::Result<bool> {
+        let day = self.derive_day();
+        if billing == Billing::Plan {
+            self.0.store.cheap_take_on_plan(day, kind).await?;
+            return Ok(true);
+        }
         let limits = *self.0.accounts.limits.lock();
         let share = match kind {
             CheapKind::Question => Some(limits.account_questions_per_day),
             CheapKind::Account | CheapKind::Update => None,
         };
-        self.0
+        let taken = self
+            .0
             .store
-            .cheap_take(self.derive_day(), kind, limits.cheap_calls_per_day, share)
+            .cheap_take(day, kind, limits.cheap_calls_per_day, share)
+            .await?;
+        // A question's own share spent leaves accounts written as before.
+        if !taken && kind != CheapKind::Question {
+            let first = self.0.accounts.ceiling_hit.lock().replace(day) != Some(day);
+            if first {
+                tracing::warn!(
+                    cap = limits.cheap_calls_per_day,
+                    "the day's metered cheap calls are spent: sessions' accounts are said plainly until tomorrow"
+                );
+            }
+        }
+        Ok(taken)
+    }
+
+    /// Gives back a call of `kind` paid by `billing` that no model took.
+    async fn cheap_untake(&self, kind: CheapKind, billing: Billing) -> eyre::Result<()> {
+        let day = self.derive_day();
+        match billing {
+            Billing::Plan => self.0.store.cheap_untake_on_plan(day, kind).await,
+            Billing::Metered => self.0.store.cheap_untake(day, kind).await,
+        }
+    }
+
+    /// A call of `kind` counted as `taken` was paid by `served`: moved to
+    /// that count when they differ, so the ceiling holds what metered calls
+    /// really cost.
+    async fn cheap_paid(&self, kind: CheapKind, taken: Billing, served: Option<Billing>) {
+        let Some(served) = served.filter(|s| *s != taken) else {
+            return;
+        };
+        if served == Billing::Metered {
+            tracing::warn!(
+                kind = kind.as_str(),
+                "a cheap call expected on a plan ran metered; it counts against the day's ceiling"
+            );
+        }
+        if let Err(e) = self
+            .0
+            .store
+            .cheap_rebill(self.derive_day(), kind, taken == Billing::Plan)
             .await
+        {
+            tracing::info!(
+                error = format!("{e:#}"),
+                "couldn't move a cheap call to what paid for it"
+            );
+        }
     }
 
-    /// Takes one of the day's cheap calls for a boss's update; false past
-    /// the ceiling, when it is written plainly.
-    pub async fn update_take(&self) -> eyre::Result<bool> {
-        self.account_take(CheapKind::Update).await
+    /// Takes one of the day's cheap calls for a boss's update, paid by
+    /// `billing` (its writer's route); false past the metered ceiling, when
+    /// it is written plainly.
+    pub async fn update_take(&self, billing: Billing) -> eyre::Result<bool> {
+        self.cheap_take(CheapKind::Update, billing).await
     }
 
-    /// The day's cheap calls so far, and the ceiling on them.
-    pub async fn cheap_today(&self) -> eyre::Result<(i64, u32)> {
+    /// The day's cheap calls so far: metered against the ceiling, and those
+    /// a plan served.
+    pub async fn cheap_today(&self) -> eyre::Result<CheapToday> {
+        let day = self.derive_day();
         let cap = self.0.accounts.limits.lock().cheap_calls_per_day;
-        Ok((self.0.store.cheap_calls(self.derive_day()).await?, cap))
+        Ok(CheapToday {
+            metered: self.0.store.cheap_calls(day).await?,
+            on_plan: self.0.store.cheap_plan_calls(day).await?,
+            cap,
+            billing: self.account_billing().await,
+        })
     }
 
-    /// Whether the day's cheap calls are spent.
+    /// Whether sessions' accounts are said plainly now: their calls are
+    /// metered and the day's ceiling is spent. On a plan, never.
     pub async fn account_thin(&self) -> bool {
+        if self.account_billing().await == Billing::Plan {
+            return false;
+        }
         let cap = self.0.accounts.limits.lock().cheap_calls_per_day;
         self.0
             .store
             .cheap_calls(self.derive_day())
             .await
             .is_ok_and(|n| n >= i64::from(cap))
+    }
+
+    /// Whether the metered ceiling refused a call today: what the boss's
+    /// picture says, so it doesn't take a plain account for a fresh one.
+    /// Read without waiting on the store.
+    pub fn cheap_ceiling_hit_today(&self) -> bool {
+        *self.0.accounts.ceiling_hit.lock() == Some(self.derive_day())
     }
 
     /// Asks the model `system` and `user` about session `id` for `call`,
@@ -743,16 +841,16 @@ impl Desk {
         let Some(accountant) = self.0.accounts.accountant.clone() else {
             return Ok(None);
         };
-        match self.account_take(kind).await {
-            Ok(true) => {}
-            Ok(false) => return Ok(None),
+        let billing = match self.account_take(kind).await {
+            Ok(Some(billing)) => billing,
+            Ok(None) => return Ok(None),
             Err(e) => {
                 // The day's count can't be read: no model is asked, and
                 // the account is said plainly.
                 tracing::warn!(session = %id, error = format!("{e:#}"), "couldn't count the cheap model's calls; a session's account is said plainly");
                 return Ok(None);
             }
-        }
+        };
         self.0
             .accounts
             .calls
@@ -763,10 +861,13 @@ impl Desk {
         )
         .await;
         match asked {
-            Ok(Ok(text)) => Ok(Some(text)),
+            Ok(Ok(answered)) => {
+                self.cheap_paid(kind, billing, answered.served).await;
+                Ok(Some(answered.text))
+            }
             Ok(Err(e)) => {
                 // No model took it: the day's count is given back.
-                self.0.store.cheap_untake(self.derive_day(), kind).await?;
+                self.cheap_untake(kind, billing).await?;
                 tracing::info!(session = %id, error = format!("{e:#}"), "the model couldn't write a session's account; it is said plainly");
                 Ok(None)
             }
@@ -980,10 +1081,10 @@ impl Desk {
         };
         // Past the ceiling, or the count can't be read: the account's own
         // path says it plainly.
-        if !self.account_take(CheapKind::Account).await.unwrap_or(false) {
+        let Some(billing) = self.account_take(CheapKind::Account).await.unwrap_or(None) else {
             self.derive_unshare(share).await;
             return Ok(WithNotes::Alone);
-        }
+        };
         match self.derive_shared_take().await {
             Ok(true) => {}
             taken => {
@@ -991,7 +1092,7 @@ impl Desk {
                     tracing::info!(session = %id, error = format!("{e:#}"), "couldn't count a reading for notes; the account is refreshed alone");
                 }
                 self.derive_unshare(share).await;
-                self.account_untake(id).await;
+                self.account_untake(id, billing).await;
                 return Ok(WithNotes::Alone);
             }
         }
@@ -1012,6 +1113,8 @@ impl Desk {
         .await;
         match asked {
             Ok(Ok(answered)) => {
+                self.cheap_paid(CheapKind::Account, billing, answered.served)
+                    .await;
                 let both = account::parse_shared(&answered.text);
                 self.derive_shared_kept(share, both.notes.as_ref(), &answered.model)
                     .await;
@@ -1023,7 +1126,7 @@ impl Desk {
                 tracing::info!(session = %id, error = format!("{e:#}"), "the model couldn't refresh an account and read notes in one call; the account is asked alone");
                 self.derive_unshare(share).await;
                 self.derive_shared_untake().await;
-                self.account_untake(id).await;
+                self.account_untake(id, billing).await;
                 Ok(WithNotes::Alone)
             }
             Err(_) => {
@@ -1037,13 +1140,8 @@ impl Desk {
     }
 
     /// Gives back an account refresh's count that no model took.
-    async fn account_untake(&self, id: Uuid) {
-        if let Err(e) = self
-            .0
-            .store
-            .cheap_untake(self.derive_day(), CheapKind::Account)
-            .await
-        {
+    async fn account_untake(&self, id: Uuid, billing: Billing) {
+        if let Err(e) = self.cheap_untake(CheapKind::Account, billing).await {
             tracing::info!(session = %id, error = format!("{e:#}"), "couldn't give back a cheap call's count");
         }
     }

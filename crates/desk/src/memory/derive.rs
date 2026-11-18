@@ -469,6 +469,9 @@ pub struct Answered {
     pub text: String,
     /// The model's name, as `memory_items.by` keeps it after `model:`.
     pub model: String,
+    /// What paid for the call, when the answerer knows: a cheap call
+    /// counted the other way is moved to it.
+    pub served: Option<crate::account::Billing>,
 }
 
 /// Whose model writes the notes, as the panel says it.
@@ -562,6 +565,7 @@ pub mod fake {
                 Ok(text) => Ok(Answered {
                     text,
                     model: "fake-cheap".into(),
+                    served: None,
                 }),
                 Err(e) => Err(eyre::eyre!(e)),
             }

@@ -63,6 +63,11 @@ pub(crate) trait UpdateWriter: Send + Sync {
         system: &str,
         user: &str,
     ) -> eyre::Result<String>;
+
+    /// What `boss`'s next update call is paid by.
+    async fn billing(&self, _boss: &str) -> workforce_desk::account::Billing {
+        workforce_desk::account::Billing::Metered
+    }
 }
 
 /// The hub's writer: the floor's cheap model, booked as `desk:update`.
@@ -93,6 +98,16 @@ impl UpdateWriter for HubWriter {
             )
             .await
             .map(|(text, _)| text)
+    }
+
+    async fn billing(&self, boss: &str) -> workforce_desk::account::Billing {
+        let subject = workforce_desk::floor::Subject::Agent {
+            agent_id: boss.to_string(),
+            session_id: String::new(),
+        };
+        self.model
+            .billing(Some(&subject), crate::floor::gists::Call::UPDATE)
+            .await
     }
 }
 
@@ -437,7 +452,8 @@ impl CrewHub {
         acted.sort_by_key(|d| d.at);
         let something = !b.sessions.is_empty() || !acted.is_empty();
         if let (true, Some(writer), true) = (o.updates.enabled, writer, something) {
-            if self.desk.update_take().await.unwrap_or(false) {
+            let billing = writer.billing(boss).await;
+            if self.desk.update_take(billing).await.unwrap_or(false) {
                 let input: Vec<(Uuid, String, &Account, Vec<&Done>)> = b
                     .sessions
                     .iter()
@@ -469,7 +485,7 @@ impl CrewHub {
                 let long = update::too_long(&written);
                 let broken = Self::breaking(b, &written);
                 if !(long.is_empty() && broken.is_empty())
-                    && self.desk.update_take().await.unwrap_or(false)
+                    && self.desk.update_take(billing).await.unwrap_or(false)
                 {
                     user.push_str(&update::reask_for(&long, &broken));
                     match writer
@@ -627,7 +643,7 @@ impl CrewHub {
         let composed_headline = headline.is_some();
         let full = self.level_now(boss, o).0 == workforce_common::oversight::Level::Full;
         let footer = match self.desk.cheap_today().await {
-            Ok((spent, cap)) => update::footer(spent, cap),
+            Ok(today) => update::footer(&today),
             Err(_) => None,
         };
         // Each group of the brief is named by its session and repository,
