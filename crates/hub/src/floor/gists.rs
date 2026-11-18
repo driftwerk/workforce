@@ -1122,7 +1122,7 @@ async fn answer_on(
         Call::GIST,
     )
     .await
-    .map(|(text, _)| text)
+    .map(|(text, _, _)| text)
 }
 
 /// What a call on the floor's model is for: how long its answer may be,
@@ -1192,7 +1192,8 @@ impl Call {
 }
 
 /// [`answer_on`], `quiet` as [`written_on`] has it, for `call`: the text,
-/// and the model that wrote it.
+/// the model that wrote it, and what paid for it (a plan when a
+/// subscription served it, else metered).
 #[allow(clippy::too_many_arguments)]
 async fn answer_with(
     primary: Arc<crate::serve::AgentService>,
@@ -1203,7 +1204,7 @@ async fn answer_with(
     system: &str,
     user: &str,
     call: Call,
-) -> eyre::Result<(String, String)> {
+) -> eyre::Result<(String, String, workforce_desk::account::Billing)> {
     use workforce_agent::llm::provider::with_reasoning_suppressed;
     use workforce_agent::llm::types::LlmMessage;
     use workforce_agent::runner::with_served_log;
@@ -1270,6 +1271,10 @@ async fn answer_with(
                 person.map(|p| p.to_string())
             }
         };
+        let billing = match served.is_some() {
+            true => workforce_desk::account::Billing::Plan,
+            false => workforce_desk::account::Billing::Metered,
+        };
         primary.cost_tracker.record(CostEntry {
             task_type: Some(call.task),
             identity_id: identity.as_deref(),
@@ -1285,6 +1290,7 @@ async fn answer_with(
         return Ok((
             response.all_text().unwrap_or_default(),
             response.model.clone(),
+            billing,
         ));
     }
     Err(failed.unwrap_or_else(|| {
@@ -1306,6 +1312,20 @@ impl HubModel {
         user: &str,
         call: Call,
     ) -> eyre::Result<(String, String)> {
+        self.answer_billed(subject, owner, system, user, call)
+            .await
+            .map(|(text, model, _)| (text, model))
+    }
+
+    /// [`Self::answer_for`], and what paid for the call.
+    pub(crate) async fn answer_billed(
+        &self,
+        subject: Option<&Subject>,
+        owner: Option<&str>,
+        system: &str,
+        user: &str,
+        call: Call,
+    ) -> eyre::Result<(String, String, workforce_desk::account::Billing)> {
         let registry = &self.state.registry;
         let service = match subject {
             Some(Subject::Agent { agent_id, .. }) => registry.get(agent_id),
@@ -1323,6 +1343,39 @@ impl HubModel {
         };
         let admits = |agent: &str, person: &str| registry.admits(agent, person);
         answer_with(service, others, admits, fallback, owner, system, user, call).await
+    }
+}
+
+impl HubModel {
+    /// What a call for `call` on `subject`'s account would be paid by, from
+    /// the route [`Self::answer_for`] runs it on: a plan only when the
+    /// agent's own provider is a subscription's, its model for the call
+    /// routes to one, and nothing in its failover can reach a metered
+    /// provider. Its fallbacks to other providers are plans by design
+    /// ([`fallbacks`]).
+    pub(crate) async fn billing(
+        &self,
+        subject: Option<&Subject>,
+        call: Call,
+    ) -> workforce_desk::account::Billing {
+        use workforce_desk::account::Billing;
+        let registry = &self.state.registry;
+        let Some(service) = match subject {
+            Some(Subject::Agent { agent_id, .. }) => registry.get(agent_id),
+            _ => None,
+        }
+        .or_else(|| registry.host()) else {
+            return Billing::Metered;
+        };
+        let primary = *service.provider_kind.read();
+        let failover = match service.failover_provider.as_ref() {
+            Some(chain) => chain.get_chain().await,
+            None => Vec::new(),
+        };
+        match crate::subscription::plan_only(primary, &floor_model(&service, call), &failover) {
+            true => Billing::Plan,
+            false => Billing::Metered,
+        }
     }
 }
 

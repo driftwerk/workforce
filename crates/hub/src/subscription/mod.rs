@@ -51,8 +51,8 @@ use workforce_common::settings::WorkforceConfig;
 
 use crate::coding_sandbox::{remote_launcher_for, McpSurface, SandboxLauncher};
 pub use crate::hub_core::subscriptions::{
-    fails_over_to_another_provider, provider_specs, review_agent_llm, route_models, routed_kind,
-    routed_subscriptions, tier_models, unknown_operator, validate_agent_llm,
+    fails_over_to_another_provider, plan_only, provider_specs, review_agent_llm, route_models,
+    routed_kind, routed_subscriptions, tier_models, unknown_operator, validate_agent_llm,
     LOGINS_ARE_NOT_ACCOUNTS,
 };
 pub use crate::hub_core::subscriptions::{Finding, Install, Severity, SharedSubscriptions};

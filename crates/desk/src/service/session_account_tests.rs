@@ -12,7 +12,7 @@ use uuid::Uuid;
 use workforce_postgres::test_support::with_test_pool;
 
 use super::{AccountMoment as Moment, Boss, Desk};
-use crate::account::{Account, Accountant, Call, Limits};
+use crate::account::{Account, Accountant, Billing, Call, Limits};
 use crate::engine::Engine;
 use crate::ledger_store::Cursor;
 use crate::memory::derive::fake::FakeDeriver;
@@ -43,6 +43,10 @@ struct Fake {
     shared_slow: Mutex<Duration>,
     /// Runs as such a call is made.
     shared_during: Mutex<Option<Box<dyn Fn() -> tokio::task::JoinHandle<()> + Send + Sync>>>,
+    /// Its calls run on a subscription plan.
+    on_plan: Mutex<bool>,
+    /// What it says paid for each call, whatever it predicted.
+    served: Mutex<Option<Billing>>,
 }
 
 impl Fake {
@@ -73,7 +77,7 @@ impl Accountant for Fake {
         _system: &str,
         user: &str,
         call: Call,
-    ) -> eyre::Result<String> {
+    ) -> eyre::Result<crate::memory::derive::Answered> {
         self.asked.lock().push((session, call, user.to_string()));
         let during = self.during.lock().as_ref().map(|f| f());
         if let Some(h) = during {
@@ -81,10 +85,23 @@ impl Accountant for Fake {
         }
         let slow = *self.slow.lock();
         tokio::time::sleep(slow).await;
-        self.answers
+        let text = self
+            .answers
             .lock()
             .pop()
-            .ok_or_else(|| eyre::eyre!("no answer left"))
+            .ok_or_else(|| eyre::eyre!("no answer left"))?;
+        Ok(crate::memory::derive::Answered {
+            text,
+            model: "fake".into(),
+            served: *self.served.lock(),
+        })
+    }
+
+    async fn billing(&self) -> Billing {
+        match *self.on_plan.lock() {
+            true => Billing::Plan,
+            false => Billing::Metered,
+        }
     }
 
     fn shares_reads(&self) -> bool {
@@ -117,6 +134,7 @@ impl Accountant for Fake {
         next.map(|text| crate::memory::derive::Answered {
             text,
             model: "fake-shared".into(),
+            served: *self.served.lock(),
         })
         .map_err(|e| eyre::eyre!(e))
     }
@@ -404,6 +422,149 @@ async fn a_refresh_that_loses_its_write_merges_onto_the_newer_account() {
             "nothing the rival kept is lost"
         );
         assert_eq!(kept(&d, id).await, a);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn on_a_plan_no_ceiling_holds_the_model_and_metered_it_is_said_once_spent() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::answering(&[ANSWER, ANSWER, ANSWER]);
+        *fake.on_plan.lock() = true;
+        let (d, id, _cancel) = start(&pool, dir.path(), &fake).await;
+        let store = DeskStore::from_pool(pool.clone());
+        // The ceiling is spent before a single call: a plan pays nothing
+        // metered, so it doesn't hold.
+        d.set_account_limits(Limits {
+            cheap_calls_per_day: 0,
+            account_questions_per_day: 0,
+        });
+        for (i, key) in ["p1", "p2"].into_iter().enumerate() {
+            harvested(
+                &store,
+                id,
+                &[exchange(key, 5, &"A long answer. ".repeat(60), 4 + i)],
+            )
+            .await;
+            let a = d
+                .account_refresh(id, Moment::TurnEnd)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(a.by_model, "a plan's call is made past any ceiling");
+        }
+        assert_eq!(fake.calls(), 2);
+        assert!(!d.account_thin().await);
+        assert!(!d.cheap_ceiling_hit_today());
+        let today = d.cheap_today().await.unwrap();
+        assert_eq!(
+            (today.on_plan, today.metered),
+            (2, 0),
+            "counted, to be shown"
+        );
+        assert_eq!(today.billing, Billing::Plan);
+        assert_eq!(crate::update::footer(&today), None);
+        // The same calls metered, one a day: the plan's two never counted
+        // against it, so one is made, then the ceiling holds, accounts are
+        // said plainly, and that is said.
+        *fake.on_plan.lock() = false;
+        d.set_account_limits(Limits {
+            cheap_calls_per_day: 1,
+            account_questions_per_day: 0,
+        });
+        harvested(
+            &store,
+            id,
+            &[exchange("m1", 5, &"A third long answer. ".repeat(60), 6)],
+        )
+        .await;
+        let a = d
+            .account_refresh(id, Moment::TurnEnd)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(a.by_model);
+        assert_eq!(
+            fake.calls(),
+            3,
+            "the plan's calls left the metered day whole"
+        );
+        assert!(!d.cheap_ceiling_hit_today());
+        harvested(
+            &store,
+            id,
+            &[exchange("m2", 4, &"Another long answer. ".repeat(60), 7)],
+        )
+        .await;
+        let a = d
+            .account_refresh(id, Moment::TurnEnd)
+            .await
+            .unwrap()
+            .unwrap();
+        // The account keeps having been written by the model once; what it
+        // says now is plain.
+        assert!(
+            a.now.starts_with("Finished: Another long answer."),
+            "past the metered ceiling it is said plainly: {}",
+            a.now
+        );
+        assert_eq!(fake.calls(), 3, "no metered call past the ceiling");
+        assert!(d.account_thin().await);
+        assert!(d.cheap_ceiling_hit_today(), "the boss's picture says so");
+        let today = d.cheap_today().await.unwrap();
+        assert!(crate::update::footer(&today).is_some_and(|f| f.contains("written plainly")));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_call_is_counted_by_what_paid_for_it() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::answering(&[ANSWER, ANSWER]);
+        let (d, id, _cancel) = start(&pool, dir.path(), &fake).await;
+        let store = DeskStore::from_pool(pool.clone());
+        d.set_account_limits(Limits {
+            cheap_calls_per_day: 1,
+            account_questions_per_day: 0,
+        });
+        // Expected metered, served by a plan (a person's own login): it
+        // leaves the metered ceiling untouched.
+        *fake.served.lock() = Some(Billing::Plan);
+        harvested(
+            &store,
+            id,
+            &[exchange("r1", 5, &"A long answer. ".repeat(60), 4)],
+        )
+        .await;
+        assert!(
+            d.account_refresh(id, Moment::TurnEnd)
+                .await
+                .unwrap()
+                .unwrap()
+                .by_model
+        );
+        let today = d.cheap_today().await.unwrap();
+        assert_eq!((today.metered, today.on_plan), (0, 1));
+        // So the next metered call still fits under the ceiling of one.
+        *fake.served.lock() = Some(Billing::Metered);
+        harvested(
+            &store,
+            id,
+            &[exchange("r2", 4, &"Another long answer. ".repeat(60), 5)],
+        )
+        .await;
+        assert!(
+            d.account_refresh(id, Moment::TurnEnd)
+                .await
+                .unwrap()
+                .unwrap()
+                .by_model
+        );
+        let today = d.cheap_today().await.unwrap();
+        assert_eq!((today.metered, today.on_plan), (1, 1));
+        assert!(d.account_thin().await, "the metered ceiling is now spent");
     })
     .await;
 }
@@ -1319,6 +1480,86 @@ async fn an_idle_sessions_restart_or_reread_says_nothing_new() {
         assert!(!line.restated, "{line:?}");
         assert_ne!(real.cursor.tail, first.cursor.tail);
         cancel.cancel();
+    })
+    .await;
+}
+
+/// A boss update's call is reconciled as accounts' are: expected on a
+/// plan but run metered, it counts against the ceiling; failed, it is
+/// given back.
+#[tokio::test]
+async fn an_updates_call_is_counted_by_what_paid_for_it_and_given_back_when_it_failed() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::answering(&[]);
+        let (d, _id, _cancel) = start(&pool, dir.path(), &fake).await;
+        d.set_account_limits(Limits {
+            cheap_calls_per_day: 1,
+            account_questions_per_day: 0,
+        });
+        // Expected on a plan, served metered: the metered day is spent.
+        assert!(d.update_take(Billing::Plan).await.unwrap());
+        d.update_paid(Billing::Plan, Ok(Some(Billing::Metered)))
+            .await;
+        let today = d.cheap_today().await.unwrap();
+        assert_eq!((today.metered, today.on_plan), (1, 0));
+        assert!(!d.update_take(Billing::Metered).await.unwrap());
+        // A failed call gives back what it took, on a plan or metered.
+        assert!(d.update_take(Billing::Plan).await.unwrap());
+        d.update_paid(Billing::Plan, Err(())).await;
+        let today = d.cheap_today().await.unwrap();
+        assert_eq!((today.metered, today.on_plan), (1, 0));
+        d.set_account_limits(Limits {
+            cheap_calls_per_day: 2,
+            account_questions_per_day: 0,
+        });
+        assert!(d.update_take(Billing::Metered).await.unwrap());
+        d.update_paid(Billing::Metered, Err(())).await;
+        assert_eq!(d.cheap_today().await.unwrap().metered, 1);
+        // Served as expected: nothing moves.
+        assert!(d.update_take(Billing::Metered).await.unwrap());
+        d.update_paid(Billing::Metered, Ok(Some(Billing::Metered)))
+            .await;
+        assert_eq!(d.cheap_today().await.unwrap().metered, 2);
+    })
+    .await;
+}
+
+/// The day spent, said only while calls are metered: moved onto a plan it
+/// isn't, and a restart on a spent day reads it from the store.
+#[tokio::test]
+async fn a_spent_day_is_said_only_while_metered_and_holds_across_a_restart() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::answering(&[]);
+        let limits = Limits {
+            cheap_calls_per_day: 1,
+            account_questions_per_day: 0,
+        };
+        {
+            let (d, _id, cancel) = start(&pool, dir.path(), &fake).await;
+            d.set_account_limits(limits);
+            assert!(!d.notes_spent().await);
+            assert!(d.update_take(Billing::Metered).await.unwrap());
+            assert!(!d.update_take(Billing::Metered).await.unwrap());
+            assert!(d.cheap_ceiling_hit_today());
+            // Onto a plan: its calls are made, and nothing says spent.
+            *fake.on_plan.lock() = true;
+            assert!(!d.notes_spent().await);
+            assert!(!d.cheap_ceiling_hit_today());
+            *fake.on_plan.lock() = false;
+            cancel.cancel();
+        }
+        // Restarted: nothing refused yet, but the store says it's spent.
+        let dir2 = tempfile::tempdir().unwrap();
+        let (d, _id, _cancel) = start(&pool, dir2.path(), &fake).await;
+        d.set_account_limits(limits);
+        assert!(!d.cheap_ceiling_hit_today());
+        assert!(d.notes_spent().await);
+        assert!(
+            d.cheap_ceiling_hit_today(),
+            "the boss's picture says so again"
+        );
     })
     .await;
 }

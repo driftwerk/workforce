@@ -223,9 +223,9 @@ impl Deriver for HubDeriver {
             id: session,
             engine,
         };
-        let (text, model) = self
+        let (text, model, served) = self
             .model
-            .answer_for(
+            .answer_billed(
                 Some(&subject),
                 None,
                 system,
@@ -238,7 +238,11 @@ impl Deriver for HubDeriver {
                 },
             )
             .await?;
-        Ok(Answered { text, model })
+        Ok(Answered {
+            text,
+            model,
+            served: Some(served),
+        })
     }
 
     fn written_by(&self) -> WrittenBy {
@@ -301,7 +305,7 @@ impl workforce_desk::account::Accountant for HubAccountant {
         system: &str,
         user: &str,
         call: workforce_desk::account::Call,
-    ) -> eyre::Result<String> {
+    ) -> eyre::Result<Answered> {
         use crate::floor::gists::Call;
         use workforce_desk::account::Call as For;
         let subject = workforce_desk::floor::Subject::Session {
@@ -313,10 +317,23 @@ impl workforce_desk::account::Accountant for HubAccountant {
             For::Now => Call::ACCOUNT_NOW,
             For::Question => Call::ACCOUNT_QUESTION,
         };
+        let (text, model, served) = self
+            .model
+            .answer_billed(Some(&subject), None, system, user, call)
+            .await?;
+        Ok(Answered {
+            text,
+            model,
+            served: Some(served),
+        })
+    }
+
+    async fn billing(&self) -> workforce_desk::account::Billing {
+        // A session's account is written on the hub's own agent
+        // ([`crate::floor::gists::HubModel::answer_for`] with a session).
         self.model
-            .answer_for(Some(&subject), None, system, user, call)
+            .billing(None, crate::floor::gists::Call::ACCOUNT)
             .await
-            .map(|(text, _)| text)
     }
 
     fn shares_reads(&self) -> bool {
@@ -334,9 +351,9 @@ impl workforce_desk::account::Accountant for HubAccountant {
             id: session,
             engine,
         };
-        let (text, model) = self
+        let (text, model, served) = self
             .model
-            .answer_for(
+            .answer_billed(
                 Some(&subject),
                 None,
                 system,
@@ -344,7 +361,11 @@ impl workforce_desk::account::Accountant for HubAccountant {
                 crate::floor::gists::Call::ACCOUNT_NOTES,
             )
             .await?;
-        Ok(Answered { text, model })
+        Ok(Answered {
+            text,
+            model,
+            served: Some(served),
+        })
     }
 
     async fn gist(

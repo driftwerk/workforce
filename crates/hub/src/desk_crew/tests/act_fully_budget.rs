@@ -274,3 +274,67 @@ fn a_cleared_time_is_never_after_now() {
         "yesterday's"
     );
 }
+
+/// The day's metered cheap calls spent: the main boss's DM gets one card a
+/// day, and accepting it raises the ceiling in the running hub at once,
+/// with no hand edit of config.toml.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_spent_metered_day_is_raised_from_its_card_and_held_at_once() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = "[oversight]\nenabled = true\nlevel = \"act\"\n\n[oversight.updates]\ncheap_calls_per_day = 1\n";
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", cfg, &[]).await;
+        let cards = async |d: &Desk| {
+            d.store()
+                .suggestions(100)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|s| s.action["tool"] == super::super::own_settings::NAME)
+                .collect::<Vec<_>>()
+        };
+        crew.overseers();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(cards(&d).await.is_empty(), "nothing spent, nothing offered");
+        // Spent: one metered call of one a day.
+        assert!(d
+            .update_take(workforce_desk::account::Billing::Metered)
+            .await
+            .unwrap());
+        *crew.notes_looked.lock() = None;
+        crew.overseers();
+        let card = eventually("the card", async || cards(&d).await.into_iter().next()).await;
+        assert!(
+            card.text
+                .starts_with("Allow 2 metered cheap calls a day for sessions' summaries"),
+            "{card:?}"
+        );
+        assert_eq!(card.action["input"]["agent_id"], overseer.agent_id.as_str());
+        assert!(d.cheap_ceiling_hit_today());
+        // Once a day, however often it is looked at.
+        for _ in 0..2 {
+            *crew.notes_looked.lock() = None;
+            crew.overseers();
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(cards(&d).await.len(), 1);
+        // Accepted: saved as Desk's settings save it, held at once.
+        crew.accept(&card).await.unwrap();
+        let after = std::fs::read_to_string(
+            overseer
+                .workspace
+                .join(workforce_common::config_files::WORKSPACE_CONFIG),
+        )
+        .unwrap();
+        assert!(after.contains("cheap_calls_per_day = 2"), "{after}");
+        crew.overseers();
+        let (_, o) = crew.overseer_service().unwrap();
+        assert_eq!(o.updates.cheap_calls_per_day, 2);
+        assert!(!d.cheap_ceiling_hit_today(), "raised: not spent any more");
+        assert!(d
+            .update_take(workforce_desk::account::Billing::Metered)
+            .await
+            .unwrap());
+    })
+    .await;
+}

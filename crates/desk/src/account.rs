@@ -977,8 +977,41 @@ pub enum Call {
     Question,
 }
 
-/// The day's ceilings on the cheap model, from the main boss's
-/// `[oversight.updates]`.
+/// What pays for a call on the cheap model, decided per call from the
+/// route it runs on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Billing {
+    /// A subscription plan (a Claude or ChatGPT login): nothing metered to
+    /// cap, so no ceiling holds it. A plan at its own usage limit is its
+    /// plan-limit path's, never this count's.
+    Plan,
+    /// A metered API key or a cloud account: the day's ceilings hold it.
+    Metered,
+}
+
+/// The day's cheap calls so far, as the person is told of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheapToday {
+    /// Metered calls, against [`Limits::cheap_calls_per_day`].
+    pub metered: i64,
+    /// Calls a subscription plan served: shown, never capped.
+    pub on_plan: i64,
+    /// The metered ceiling.
+    pub cap: u32,
+    /// What the accountant's calls run on now.
+    pub billing: Billing,
+}
+
+impl CheapToday {
+    /// Whether accounts are said plainly now: metered, and the day's
+    /// ceiling spent.
+    pub fn spent(&self) -> bool {
+        self.billing == Billing::Metered && self.metered >= i64::from(self.cap)
+    }
+}
+
+/// The day's ceilings on the cheap model's metered calls, from the main
+/// boss's `[oversight.updates]`. A plan's calls are never held to them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     /// Refreshes, questions and (later) updates together.
@@ -1002,7 +1035,7 @@ impl Default for Limits {
 #[async_trait::async_trait]
 pub trait Accountant: Send + Sync {
     /// The model's answer to `system` and `user` about session `session`,
-    /// booked as `call`.
+    /// booked as `call`, and what paid for it.
     async fn answer(
         &self,
         session: Uuid,
@@ -1010,7 +1043,13 @@ pub trait Accountant: Send + Sync {
         system: &str,
         user: &str,
         call: Call,
-    ) -> eyre::Result<String>;
+    ) -> eyre::Result<crate::memory::derive::Answered>;
+
+    /// What the next call would be paid by, from the route it runs on:
+    /// a plan only when nothing on that route can reach a metered one.
+    async fn billing(&self) -> Billing {
+        Billing::Metered
+    }
 
     /// Whether [`Self::answer_shared`] may be asked: one call that
     /// refreshes an account and reads the same exchanges for notes.

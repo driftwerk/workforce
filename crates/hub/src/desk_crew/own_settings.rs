@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
-use workforce_common::oversight::{Level, MAX_FULL_BUDGET_USD};
+use workforce_common::oversight::{Level, MAX_CHEAP_CALLS, MAX_FULL_BUDGET_USD};
 use workforce_orchestrator::workflow_store::EditContext;
 
 use super::{name_of, CrewHub};
@@ -70,6 +70,7 @@ pub fn schema() -> Value {
         "clear_spent_today": { "type": "boolean", "description": "Start today's count of Act fully's budget again from when the person approves" },
         "anywhere": { "type": "boolean", "description": "Act fully anywhere: not limited to the named repositories and workflows" },
         "act": { "type": "object", "properties": switches, "additionalProperties": false, "description": "Switches to turn on (true) or off (false)" },
+        "cheap_calls_per_day": { "type": "integer", "minimum": 1, "maximum": MAX_CHEAP_CALLS, "description": "The day's metered cheap calls for sessions' summaries (calls on a Claude or ChatGPT plan are never held to it)" },
         "reason": { "type": "string", "description": "What the person asked for, in a sentence they read on the card" }
     }, "required": ["reason"] })
 }
@@ -83,6 +84,9 @@ pub(crate) struct Change {
     pub clear_spent_today: bool,
     pub anywhere: Option<bool>,
     pub act: BTreeMap<String, bool>,
+    /// `[oversight.updates] cheap_calls_per_day`: the metered ceiling on
+    /// sessions' summaries.
+    pub cheap_calls_per_day: Option<u32>,
 }
 
 impl Change {
@@ -132,14 +136,22 @@ impl Change {
                 c.act.insert(k.clone(), on);
             }
         }
+        if let Some(v) = input.get("cheap_calls_per_day").filter(|v| !v.is_null()) {
+            let n = v
+                .as_u64()
+                .filter(|n| *n >= 1 && *n <= MAX_CHEAP_CALLS as u64)
+                .ok_or(format!(
+                    "cheap_calls_per_day must be a whole number from 1 to {MAX_CHEAP_CALLS}."
+                ))?;
+            c.cheap_calls_per_day = Some(n as u32);
+        }
         if c == Self::default() {
-            return Err("Say what to change: level, budget_usd_per_day, remove_budget, clear_spent_today, anywhere or act.".into());
+            return Err("Say what to change: level, budget_usd_per_day, remove_budget, clear_spent_today, anywhere, act or cheap_calls_per_day.".into());
         }
         Ok(c)
     }
 
     /// It as the tool's input, to keep in a suggestion.
-    #[cfg(test)]
     pub(crate) fn input(&self) -> Value {
         let mut o = serde_json::Map::new();
         if let Some(l) = self.level {
@@ -162,6 +174,9 @@ impl Change {
         }
         if !self.act.is_empty() {
             o.insert("act".into(), json!(self.act));
+        }
+        if let Some(n) = self.cheap_calls_per_day {
+            o.insert("cheap_calls_per_day".into(), json!(n));
         }
         Value::Object(o)
     }
@@ -202,6 +217,11 @@ impl Change {
                 "turn {} {}",
                 if *on { "on" } else { "off" },
                 switch_title(k)
+            ));
+        }
+        if let Some(n) = self.cheap_calls_per_day {
+            parts.push(format!(
+                "allow {n} metered cheap calls a day for sessions' summaries"
             ));
         }
         parts.join("; ")
@@ -257,6 +277,10 @@ impl Change {
                 act.insert(k, toml_edit::value(*on));
             }
         }
+        if let Some(n) = self.cheap_calls_per_day {
+            let updates = table_in(oversight, "updates")?;
+            updates.insert("cheap_calls_per_day", toml_edit::value(i64::from(n)));
+        }
         Ok(doc.to_string())
     }
 }
@@ -290,7 +314,96 @@ fn table_in<'t>(
         .ok_or_else(|| format!("[{key}] in its config.toml isn't a table, so nothing was changed."))
 }
 
+/// How often the main boss's day of metered cheap calls is looked at.
+const NOTES_LOOK: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl CrewHub {
+    /// Once a day, once the day's metered cheap calls are spent: a card in
+    /// the DM of `boss` (whose `[oversight.updates]` sets the ceiling) that
+    /// the person raises it from with one click, saved as Desk's settings
+    /// save it, so it holds at once. Nothing is offered on a plan: its
+    /// calls are never held to the ceiling.
+    pub(super) async fn offer_more_notes(
+        &self,
+        boss: &crate::serve::AgentService,
+        o: &workforce_common::oversight::Oversight,
+    ) {
+        // Read from the store, so a restart on a spent day still says so;
+        // never on a plan.
+        if !self.desk.notes_spent().await {
+            return;
+        }
+        let cap = o.updates.cheap_calls_per_day;
+        // None allowed is the person's choice, not a day spent.
+        if cap == 0 {
+            return;
+        }
+        let today = self.desk.cheap_day();
+        {
+            let mut offered = self.notes_offered.lock();
+            if *offered == Some(today) {
+                return;
+            }
+            *offered = Some(today);
+        }
+        let raised = (u64::from(cap) * 2).min(MAX_CHEAP_CALLS as u64) as u32;
+        if raised <= cap {
+            return;
+        }
+        let agent = boss.agent_id.as_str().to_string();
+        let change = Change {
+            cheap_calls_per_day: Some(raised),
+            ..Change::default()
+        };
+        let why = format!(
+            "Today's {cap} metered cheap calls for sessions' summaries are spent, so summaries are written plainly from sessions' last words until tomorrow and may be out of date."
+        );
+        let mut input = change.input();
+        input["agent_id"] = json!(agent);
+        let action = super::actions::Action::ChangeOversight {
+            agent: agent.clone(),
+            change,
+        };
+        let by = workforce_desk::crew::By::manager(&agent, &name_of(boss), &why);
+        let suggestion = match self.suggest(NAME, &input, &action, &by).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::info!(boss = %agent, error = %e, "the card to raise the notes ceiling wasn't kept");
+                // Offered again on the next look.
+                *self.notes_offered.lock() = None;
+                return;
+            }
+        };
+        let extras = workforce_desk::crew::Extras {
+            suggestions: vec![workforce_desk::crew::MentionedSuggestion {
+                id: suggestion.id.clone(),
+                text: suggestion.text.clone(),
+                state: suggestion.state,
+            }],
+            ..Default::default()
+        };
+        self.card(&agent, None, format!("{why} Allow {raised} a day?"), extras)
+            .await;
+    }
+
+    /// Looks, at most every [`NOTES_LOOK`], whether the main boss `boss`'s
+    /// day of metered cheap calls is spent, and offers its card if so.
+    pub(super) fn notes_look(
+        &self,
+        boss: &std::sync::Arc<crate::serve::AgentService>,
+        o: &workforce_common::oversight::Oversight,
+    ) {
+        {
+            let mut looked = self.notes_looked.lock();
+            if looked.is_some_and(|at| at.elapsed() < NOTES_LOOK) {
+                return;
+            }
+            *looked = Some(std::time::Instant::now());
+        }
+        let (crew, boss, o) = (self.me(), std::sync::Arc::clone(boss), o.clone());
+        tokio::spawn(async move { crew.offer_more_notes(&boss, &o).await });
+    }
+
     /// Makes `change` to the overseer `agent`'s own `[oversight]`, as the
     /// person approved it: through their own path, its config.toml saved
     /// as Desk's settings save it, never the agent's.
@@ -352,6 +465,32 @@ mod tests {
         assert!(Change::parse(&json!({"budget_usd_per_day": 5, "remove_budget": true})).is_err());
         assert!(Change::parse(&json!({"act": {"publish": true}})).is_err());
         assert!(Change::parse(&json!({"level": "boss"})).is_err());
+    }
+
+    #[test]
+    fn the_notes_ceiling_is_raised_in_place_and_read_back() {
+        let c = Change::parse(&json!({"cheap_calls_per_day": 1000, "reason": "Spent."})).unwrap();
+        assert_eq!(
+            c.describe(),
+            "allow 1000 metered cheap calls a day for sessions' summaries"
+        );
+        assert_eq!(Change::parse(&c.input()).unwrap(), c);
+        assert!(Change::parse(&json!({"cheap_calls_per_day": 0})).is_err());
+        assert!(Change::parse(&json!({"cheap_calls_per_day": 10_001})).is_err());
+        // An inline table stays inline, and what else it says is kept.
+        let body = "[oversight]\nenabled = true\nupdates = { cheap_calls_per_day = 500, account_questions_per_day = 60 }\n";
+        let out = c.apply(body, chrono::Utc::now()).unwrap();
+        let doc: toml::Table = toml::from_str(&out).unwrap();
+        let o = workforce_common::oversight::Oversight::of(doc.get("oversight")).unwrap();
+        assert_eq!(o.updates.cheap_calls_per_day, 1000);
+        assert_eq!(o.updates.account_questions_per_day, 60);
+        // With none yet, the table is made.
+        let out = c
+            .apply("[oversight]\nenabled = true\n", chrono::Utc::now())
+            .unwrap();
+        let doc: toml::Table = toml::from_str(&out).unwrap();
+        let o = workforce_common::oversight::Oversight::of(doc.get("oversight")).unwrap();
+        assert_eq!(o.updates.cheap_calls_per_day, 1000);
     }
 
     #[test]
