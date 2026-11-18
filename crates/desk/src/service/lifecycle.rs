@@ -844,6 +844,8 @@ impl Desk {
         // the write and be undone by it.
         if !written.await.unwrap_or(false) {
             tracing::warn!(%id, "a removed session's removal wasn't written: it comes back closed when the hub restarts");
+            // Not said removed: its decision has no removal to undo.
+            return Ok(None);
         }
         Ok(Some(kept))
     }
