@@ -705,7 +705,11 @@ pub const RANKLESS_FRESH: Duration = Duration::minutes(15);
 
 /// Whether fields read at their `read_at` are still good at `now`.
 pub fn fields_fresh(f: &crate::board::JiraFields, now: DateTime<Utc>) -> bool {
-    let keep = if f.rank.is_some() { FIELDS_FRESH } else { RANKLESS_FRESH };
+    let keep = if f.rank.is_some() {
+        FIELDS_FRESH
+    } else {
+        RANKLESS_FRESH
+    };
     f.rank_asked && now - f.read_at < keep
 }
 
