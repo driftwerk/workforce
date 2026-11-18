@@ -768,6 +768,7 @@ pub fn ordering_unknown(system: System, now: DateTime<Utc>) -> crate::board::Sou
         )),
         read_at: now,
         retry_at: None,
+        wants_priorities: false,
     }
 }
 
@@ -827,6 +828,7 @@ pub fn linear_ordering(answer: &Value, now: DateTime<Utc>) -> crate::board::Sour
         note: Some(note),
         read_at: now,
         retry_at: None,
+        wants_priorities: false,
     };
     let Some((v, from)) = picked else {
         return manual(match personal || custom {
@@ -858,6 +860,7 @@ pub fn linear_ordering(answer: &Value, now: DateTime<Utc>) -> crate::board::Sour
         note: None,
         read_at: now,
         retry_at: None,
+        wants_priorities: false,
     }
 }
 
@@ -972,6 +975,7 @@ pub fn jira_ordering(
         note: Some(note),
         read_at: now,
         retry_at: None,
+        wants_priorities: false,
     };
     let Some(board) = answer["board"].is_object().then(|| {
         short(&answer["board"]["name"], 60)
@@ -998,6 +1002,7 @@ pub fn jira_ordering(
     .flatten()
     .collect();
     let mut by: Vec<OrderKey> = vec![];
+    let mut wants_priorities = false;
     for (name, dir) in jql_order_keys(clause) {
         let Some(field) = jql_field(&name, &ids) else {
             if by.is_empty() {
@@ -1010,10 +1015,14 @@ pub fn jira_ordering(
         };
         if field == F::Priority && priorities_of(fields).is_empty() {
             if by.is_empty() {
-                return rank(format!(
-                    "Jira orders {board} by priority, but the site's priorities weren't read, so this follows Jira's Rank."
-                ));
+                return SourceOrder {
+                    wants_priorities: true,
+                    ..rank(format!(
+                        "Jira orders {board} by priority, but the site's priorities weren't read, so this follows Jira's Rank."
+                    ))
+                };
             }
+            wants_priorities = true;
             break;
         }
         let desc = dir.unwrap_or(field == F::Priority);
@@ -1033,6 +1042,7 @@ pub fn jira_ordering(
         note: None,
         read_at: now,
         retry_at: None,
+        wants_priorities,
     }
 }
 

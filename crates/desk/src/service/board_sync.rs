@@ -917,12 +917,12 @@ impl Desk {
     ) -> Result<Sync, DeskError> {
         // A Jira ordering is derived with the site's fields (its Rank
         // field, its priorities): fields read since are read with again.
-        // Only one that fell short (said so in its note) and whose fields
-        // now have the site's priorities: fields without Rank are read
-        // again every quarter of an hour, and a full one wouldn't change.
+        // Only one cut short for want of the site's priorities, once they
+        // are read: fields without Rank are read again every quarter of an
+        // hour, and any other ordering wouldn't change.
         let fields_since = |o: &board::SourceOrder| {
             s.system == System::Jira
-                && o.note.is_some()
+                && o.wants_priorities
                 && s.fields
                     .as_ref()
                     .is_some_and(|f| f.read_at > o.read_at && !f.priorities.is_empty())

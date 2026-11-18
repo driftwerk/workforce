@@ -521,6 +521,10 @@ pub struct SourceOrder {
     /// sooner than the fields' cadence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_at: Option<DateTime<Utc>>,
+    /// Cut short by the site's priorities not being read yet: read again
+    /// once they are.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wants_priorities: bool,
 }
 
 /// An issue a pull couldn't take in, and when it is tried again.

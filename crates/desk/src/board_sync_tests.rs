@@ -2134,6 +2134,13 @@ fn a_jira_board_s_order_by_is_followed_as_far_as_desk_can() {
     let o = jira_ordering(&board(json!("priority DESC")), None, "ENG", now);
     assert!(o.by.is_empty());
     assert!(o.note.as_deref().unwrap().contains("priorities"));
+    assert!(o.wants_priorities);
+    // Cut short later in the list: followed so far, and read again.
+    let o = jira_ordering(&board(json!("created DESC, priority")), None, "ENG", now);
+    assert_eq!(o.by, order(&[(F::Created, true, true)]));
+    assert!(o.wants_priorities);
+    let o = jira_ordering(&board(json!("Rank")), Some(&fields), "ENG", now);
+    assert!(!o.wants_priorities);
 }
 
 /// Only an ordering by hand there moves an issue's place on a drop.
@@ -2157,6 +2164,7 @@ fn a_drop_moves_its_issue_only_while_the_board_there_is_ordered_by_hand() {
             note: None,
             read_at: now,
             retry_at: None,
+            wants_priorities: false,
         });
         assert_eq!(s.moves_by_hand(), hand, "{:?}", s.ordering);
     }

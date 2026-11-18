@@ -3351,7 +3351,7 @@ async fn a_passing_failure_keeps_the_order_and_asks_again_soon() {
                 o.read_at = later - chrono::Duration::minutes(1);
                 o.retry_at = None;
                 // One read before the site's priorities were.
-                o.note = Some("Jira's priorities weren't read yet".into());
+                o.wants_priorities = true;
                 f.read_at = later;
             }
         })
