@@ -1598,7 +1598,7 @@ pub struct PendingApprovalCore {
     pub approver_user_ids: Vec<String>,
     pub ttl: std::time::Duration,
     /// Whether a person's message started the turn that asked
-    /// ([`CURRENT_CHAT_TURN`]): the turn resumed on its decision is then a
+    /// ([`CURRENT_CHAT_ORIGIN`]): the turn resumed on its decision is then a
     /// chat turn too, on the conversation model.
     pub chat: bool,
 }

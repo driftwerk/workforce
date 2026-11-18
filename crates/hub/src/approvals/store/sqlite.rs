@@ -87,10 +87,15 @@ impl SqlitePendingApprovalStore {
             .prepare("SELECT 1 FROM pragma_table_info('pending_approvals') WHERE name = 'chat'")?
             .exists([])?;
         if !has_chat {
-            conn.execute_batch(
+            // Another process opening the DB at the same moment may add it
+            // first: then it is there, as wanted.
+            if let Err(e) = conn.execute_batch(
                 "ALTER TABLE pending_approvals ADD COLUMN chat INTEGER NOT NULL DEFAULT 0;",
-            )
-            .wrap_err("Failed to add pending_approvals.chat")?;
+            ) {
+                if !e.to_string().contains("duplicate column name") {
+                    return Err(e).wrap_err("Failed to add pending_approvals.chat");
+                }
+            }
         }
         Ok(())
     }
