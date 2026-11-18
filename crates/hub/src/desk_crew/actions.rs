@@ -2174,14 +2174,24 @@ impl CrewHub {
         o: &Oversight,
     ) -> Result<(Engine, Option<String>), String> {
         let engine = self.engine_or_default(engine, o)?;
+        let model_arg = model;
         let model = model_on(engine, model, o);
         if let Some(m) = &model {
             if !workforce_desk::engine::model_ok(engine, m) {
-                return Err(format!(
-                    "\"{m}\" isn't a model {} takes; say one as {} names it, or leave model out.",
-                    engine.title(),
-                    engine.title()
-                ));
+                // No model named: the bad one is the person's default.
+                return Err(if model_arg.is_none() {
+                    format!(
+                        "The person's default model for new sessions, \"{m}\", isn't one {} takes; ask them to change it in your settings, or name a model {} takes.",
+                        engine.title(),
+                        engine.title()
+                    )
+                } else {
+                    format!(
+                        "\"{m}\" isn't a model {} takes; say one as {} names it, or leave model out.",
+                        engine.title(),
+                        engine.title()
+                    )
+                });
             }
         }
         Ok((engine, model))
