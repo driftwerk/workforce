@@ -1763,7 +1763,7 @@ impl Connections {
                 .header("Accept", "application/json")
                 .form(&[
                     ("client_id", client_id.as_str()),
-                    ("scope", "repo read:org"),
+                    ("scope", GITHUB_DEVICE_SCOPES),
                 ])
                 .send()
                 .await
@@ -2682,3 +2682,8 @@ async fn cancel(
         false => refusal(StatusCode::NOT_FOUND, "There's no such sign-in"),
     }
 }
+
+/// What GitHub's device sign-in asks for: repositories and their issues,
+/// the person's organisations, and Projects, which a Desk board synced with
+/// a GitHub project reads and arranges (`project` reads and writes them).
+pub const GITHUB_DEVICE_SCOPES: &str = "repo read:org project";

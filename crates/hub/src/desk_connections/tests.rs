@@ -187,7 +187,11 @@ async fn services(github: Arc<Github>) -> Services {
         )
         .route(
             "/login/device/code",
-            post_route(|| async {
+            post_route(|Form(form): Form<BTreeMap<String, String>>| async move {
+                // A board synced with a GitHub project needs Projects.
+                let scopes: Vec<&str> = form.get("scope").map(|s| s.split(' ').collect()).unwrap_or_default();
+                assert!(scopes.contains(&"project"), "{scopes:?}");
+                assert!(scopes.contains(&"repo"), "{scopes:?}");
                 Json(json!({
                     "device_code": "dev-code-secret",
                     "user_code": "ABCD-1234",
