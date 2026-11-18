@@ -382,6 +382,8 @@ pub enum Refusal {
     Budget,
     #[error("Loop guard: you have sent {BOSS_RUN_CEILING} messages since the person last spoke to you. Desk has told the person. Stop here and wait: their reply comes to you as a message. Don't send again until then; it is refused the same way.")]
     Ceiling,
+    #[error("Loop guard: you have sent {TURN_BUDGET} messages to other sessions since the person last spoke to you. Desk has told the person. Stop messaging sessions and wait for them; you can still tell Desk how it stands.")]
+    Peers,
     #[error("{0} isn't one you can message here: {1}.")]
     Unreachable(String, &'static str),
     #[error("{0} has ended; it can't be messaged.")]
@@ -564,8 +566,10 @@ pub fn guard(hop: i16, run: &LineRun, to_session: bool) -> Result<(), Refusal> {
     if run.since_person >= BOSS_RUN_CEILING as usize {
         return Err(Refusal::Ceiling);
     }
-    if run.sent >= TURN_BUDGET as usize || (to_session && run.to_sessions >= TURN_BUDGET as usize)
-    {
+    if to_session && run.to_sessions >= TURN_BUDGET as usize {
+        return Err(Refusal::Peers);
+    }
+    if run.sent >= TURN_BUDGET as usize {
         return Err(Refusal::Budget);
     }
     Ok(())
@@ -580,6 +584,9 @@ pub fn stalled_why(r: &Refusal) -> Option<String> {
         }
         Refusal::Ceiling => {
             format!("it has sent {BOSS_RUN_CEILING} messages to Desk without hearing from you")
+        }
+        Refusal::Peers => {
+            format!("it has sent {TURN_BUDGET} messages to other sessions without hearing from you")
         }
         Refusal::Hops => format!("its messages were handed on {MAX_HOPS} times without you"),
         _ => return None,
@@ -1543,7 +1550,7 @@ mod tests {
             run.sent_one(true);
             run.boss_spoke();
         }
-        assert_eq!(guard(1, &run, true), Err(Refusal::Budget));
+        assert_eq!(guard(1, &run, true), Err(Refusal::Peers));
         assert_eq!(guard(1, &run, false), Ok(()), "Desk still hears it");
     }
 

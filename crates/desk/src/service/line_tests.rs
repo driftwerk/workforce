@@ -1866,20 +1866,22 @@ async fn another_boss_never_starts_a_sessions_budget_and_sessions_keep_theirs() 
         }
         assert!(matches!(
             d.line_send(Sender::Session(a.id), tell(b.id, "one more")).await,
-            Err(LineError::Refused(Refusal::Budget))
+            Err(LineError::Refused(Refusal::Peers))
         ));
-        // A boss that isn't its own: its budget holds as it always did.
-        let mut run = d.line_run(b.id);
-        run.sent = crate::rooms::TURN_BUDGET as usize;
-        d.0.state.lock().lines.runs.insert(b.id, run);
-        let other = By::manager("max", "Max", "Not his.");
-        let _ = d
-            .line_send(Sender::Overseer(other), tell(b.id, "go on"))
-            .await;
-        assert_eq!(
-            tell_desk(&d, b.id, "report").await,
-            Err(Refusal::Budget.to_string())
-        );
+        // It can still tell Desk how it stands.
+        tell_desk(&d, a.id, "blocked on b").await.unwrap();
+        let needs = d.line_needs();
+        assert_eq!(needs.len(), 1);
+        assert!(needs[0].ask.contains("messages to other sessions"));
+        // Its boss answering doesn't lift this one; the person does.
+        d.line_send(Sender::Overseer(by), tell(a.id, "go on"))
+            .await
+            .unwrap();
+        assert_eq!(d.line_needs().len(), 1);
+        d.line_post(a.id, "carry on".into(), When::Queue)
+            .await
+            .unwrap();
+        assert!(d.line_needs().is_empty());
     })
     .await;
 }
@@ -1948,7 +1950,77 @@ async fn a_stopped_session_is_one_need_of_the_persons_until_they_speak_to_it() {
             .await
             .unwrap();
         assert!(d.line_needs().is_empty(), "its run started again");
+        until_async(|| {
+            let d = d.clone();
+            async move { stalled_items(&d, s.id).await.is_empty() }
+        })
+        .await;
+        let mut resumed = 0;
+        while let Ok(e) = events.try_recv() {
+            if let DeskEvent::Activity { event } = e {
+                if event.kind == Kind::Resumed {
+                    resumed += 1;
+                }
+            }
+        }
+        assert_eq!(resumed, 2, "each lift is said, so the Floor reads it gone");
         tell_desk(&d, s.id, "going on").await.unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn its_bosss_answer_starts_the_askers_budget_again() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let by = sarah_bosses(&d);
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        let r = d
+            .line_call(
+                s.id,
+                "ask",
+                &json!({"to": "you", "text": "Port?", "wait_seconds": 0}),
+                None,
+            )
+            .await
+            .unwrap();
+        let ask: Uuid = serde_json::from_value(r["id"].clone()).unwrap();
+        let mut q = row(&d, ask).await;
+        q.to = Party::manager("sarah", "Sarah");
+        d.0.store.put_line(&q).await.unwrap();
+        d.0.state.lock().lines.runs.entry(s.id).or_default().sent =
+            crate::rooms::TURN_BUDGET as usize;
+        d.line_answer(ask, Sender::Overseer(by), "5433".into())
+            .await
+            .unwrap();
+        assert_eq!(d.line_run(s.id).sent, 0);
+        assert_eq!(d.line_run(s.id).since_person, 1, "still counts to the ceiling");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_chain_handed_on_too_far_is_a_need_and_a_restart_closes_its_item() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        sarah_bosses(&d);
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        d.0.state.lock().lines.runs.entry(s.id).or_default().cause = crate::rooms::MAX_HOPS;
+        assert_eq!(
+            tell_desk(&d, s.id, "again").await,
+            Err(Refusal::Hops.to_string())
+        );
+        let needs = d.line_needs();
+        assert_eq!(needs.len(), 1);
+        assert!(needs[0].ask.contains("handed on"));
+        assert_eq!(stalled_items(&d, s.id).await.len(), 1);
+        // After a restart its run starts again: the item no longer holds.
+        d.line_load().await;
+        assert!(stalled_items(&d, s.id).await.is_empty());
     })
     .await;
 }

@@ -334,12 +334,35 @@ impl Desk {
             if let Err(e) = self.0.store.item_open(&item).await {
                 tracing::warn!(session = %me.id, error = %e, "couldn't keep a stalled session for its boss's updates");
             }
+            // Lifted while it opened: its close may have run first.
+            if !self.0.state.lock().lines.stalled.contains_key(&me.id) {
+                let key = crate::open_item::stalled_key(me.id);
+                if let Err(e) = self
+                    .0
+                    .store
+                    .item_close_of_key(&key, ClosedBy::Superseded, "It carried on.")
+                    .await
+                {
+                    tracing::warn!(session = %me.id, error = %e, "couldn't close a stalled session's item");
+                }
+            }
         }
     }
 
-    /// `id`'s stall is over: its boss's item closes.
+    /// `id`'s stall is over: said in Activity (so the Floor reads it
+    /// gone), and its boss's item closes.
     fn stall_lifted(&self, id: Uuid, by: ClosedBy, why: &'static str) {
+        if let Ok(v) = self.view(id) {
+            let it = Party::session(&v);
+            self.note(Event::new(
+                Kind::Resumed,
+                it.clone(),
+                Some(it),
+                format!("can carry on: {}", why.to_lowercase().trim_end_matches('.')),
+            ));
+        }
         let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(session = %id, "no runtime to close a stalled session's item; a restart closes it");
             return;
         };
         let store = self.0.store.clone();
@@ -612,9 +635,7 @@ impl Desk {
                 if let Err(r) = line::guard(checked, &run, to_session) {
                     // Only the budget its boss's answers renew is lifted
                     // by them.
-                    let boss_lifts = r == Refusal::Budget
-                        && run.sent >= crate::rooms::TURN_BUDGET as usize;
-                    self.line_stalled(me, &r, boss_lifts).await;
+                    self.line_stalled(me, &r, r == Refusal::Budget).await;
                     return Err(r.into());
                 }
                 let overseer = self.line_overseer(me.group.as_ref().map(|g| g.id.as_str()));
