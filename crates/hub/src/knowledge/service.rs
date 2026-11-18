@@ -46,13 +46,18 @@ impl SummaryLlm for LlmProviderSummaryAdapter {
                 text: prompt.to_string(),
             }],
         }];
-        let (response, served) = with_served_log(self.provider.create_message(
-            None,
-            &messages,
-            &[],
-            Some(&self.model),
-            Some(max_tokens as u32),
-            false,
+        // The shared index is the hub's own upkeep, whoever started the
+        // pass (a tool, the REST trigger, a webhook, the maintenance loop):
+        // it runs on the hub's route, and no person behind it is expected.
+        let (response, served) = with_served_log(crate::subscription::unowned_by_design(
+            self.provider.create_message(
+                None,
+                &messages,
+                &[],
+                Some(&self.model),
+                Some(max_tokens as u32),
+                false,
+            ),
         ))
         .await;
         let response = response?;

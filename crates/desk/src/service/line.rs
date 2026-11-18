@@ -52,6 +52,21 @@ pub(crate) struct Lines {
     /// When each session's line last had a message for the person, and
     /// last an exchange of its own: what its thread is unread by.
     pub(crate) seen: HashMap<Uuid, Seen>,
+    /// The sessions the loop guard stopped, until the person speaks to
+    /// them (or, for a stop its boss lifts, their boss does): each a need
+    /// of the person's on the Floor, said once.
+    stalled: HashMap<Uuid, Stalled>,
+}
+
+/// A session the loop guard stopped.
+#[derive(Debug, Clone)]
+struct Stalled {
+    since: DateTime<Utc>,
+    /// What the person is told, in full.
+    text: String,
+    /// Its boss speaking to it starts it again: it was stopped by the
+    /// budget its boss's answers renew.
+    boss_lifts: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -236,9 +251,127 @@ impl Desk {
 
     /// The person spoke to `id`: its loop guard starts again.
     pub(super) fn person_spoke(&self, id: Uuid) {
-        let mut st = self.0.state.lock();
-        st.lines.runs.remove(&id);
-        st.lines.spoke.insert(id, Utc::now());
+        let lifted = {
+            let mut st = self.0.state.lock();
+            st.lines.runs.remove(&id);
+            st.lines.spoke.insert(id, Utc::now());
+            st.lines.stalled.remove(&id).is_some()
+        };
+        if lifted {
+            self.stall_lifted(id, ClosedBy::Person, "You spoke to it.");
+        }
+    }
+
+    /// `boss` spoke to `id`: when it is the session's own boss, its budget
+    /// starts again (its ceiling and its budget for other sessions don't),
+    /// and a stop that budget made is lifted. Whether it was.
+    fn boss_spoke(&self, id: Uuid, boss: &str) -> bool {
+        if !self.own_boss(id, boss) {
+            return false;
+        }
+        let lifted = {
+            let mut st = self.0.state.lock();
+            st.lines.runs.entry(id).or_default().boss_spoke();
+            match st.lines.stalled.get(&id) {
+                Some(s) if s.boss_lifts => st.lines.stalled.remove(&id).is_some(),
+                _ => false,
+            }
+        };
+        if lifted {
+            self.stall_lifted(id, ClosedBy::Boss, "Its boss answered it.");
+        }
+        true
+    }
+
+    /// The boss that has `id` now: its charge's while one runs it, else
+    /// its scope's.
+    fn boss_of_session(&self, id: Uuid) -> Option<String> {
+        if let Some(c) = self.charge_of(id).filter(crate::charge::Charge::live) {
+            return Some(c.boss);
+        }
+        let group = self.group_of_member(&super::session_item(id));
+        self.boss_of(&self.scope_of_group(group.as_deref()))
+            .map(|b| b.agent)
+    }
+
+    /// Whether `boss` is `id`'s own boss.
+    fn own_boss(&self, id: Uuid, boss: &str) -> bool {
+        self.boss_of_session(id).is_some_and(|b| b == boss)
+    }
+
+    /// The loop guard refused `me` with `r`: the person is told, once a
+    /// stall, on the Floor, in Activity, and in its boss's updates.
+    async fn line_stalled(&self, me: &SessionView, r: &Refusal, boss_lifts: bool) {
+        let Some(why) = line::stalled_why(r) else {
+            return;
+        };
+        let text = format!("{} {why}", me.label());
+        {
+            let mut st = self.0.state.lock();
+            if st.lines.stalled.contains_key(&me.id) {
+                return;
+            }
+            st.lines.stalled.insert(
+                me.id,
+                Stalled {
+                    since: Utc::now(),
+                    text: text.clone(),
+                    boss_lifts,
+                },
+            );
+        }
+        tracing::info!(session = %me.id, refusal = %r, "the line's loop guard stopped a session; the person is told");
+        let it = Party::session(me);
+        self.note(Event::new(Kind::NeedsYou, it.clone(), Some(it), why));
+        if let Some(boss) = self.boss_of_session(me.id) {
+            let mut item = crate::open_item::NewItem::ask(
+                &boss,
+                crate::open_item::OpenKind::Todo,
+                Some(me.id),
+                &text,
+            );
+            item.dedupe_key = crate::open_item::stalled_key(me.id);
+            if let Err(e) = self.0.store.item_open(&item).await {
+                tracing::warn!(session = %me.id, error = %e, "couldn't keep a stalled session for its boss's updates");
+            }
+            // Lifted while it opened: its close may have run first.
+            if !self.0.state.lock().lines.stalled.contains_key(&me.id) {
+                let key = crate::open_item::stalled_key(me.id);
+                if let Err(e) = self
+                    .0
+                    .store
+                    .item_close_of_key(&key, ClosedBy::Superseded, "It carried on.")
+                    .await
+                {
+                    tracing::warn!(session = %me.id, error = %e, "couldn't close a stalled session's item");
+                }
+            }
+        }
+    }
+
+    /// `id`'s stall is over: said in Activity (so the Floor reads it
+    /// gone), and its boss's item closes.
+    fn stall_lifted(&self, id: Uuid, by: ClosedBy, why: &'static str) {
+        if let Ok(v) = self.view(id) {
+            let it = Party::session(&v);
+            self.note(Event::new(
+                Kind::Resumed,
+                it.clone(),
+                Some(it),
+                format!("can carry on: {}", why.to_lowercase().trim_end_matches('.')),
+            ));
+        }
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(session = %id, "no runtime to close a stalled session's item; a restart closes it");
+            return;
+        };
+        let store = self.0.store.clone();
+        rt.spawn(async move {
+            let key = crate::open_item::stalled_key(id);
+            if let Err(e) = store.item_close_of_key(&key, by, why).await {
+                tracing::warn!(session = %id, error = %e, "couldn't close a stalled session's item");
+            }
+        });
     }
 
     /// When the person last took part in `id` in the session itself: typed
@@ -498,7 +631,13 @@ impl Desk {
                     Target::Person => hop.min(crate::rooms::MAX_HOPS),
                     Target::Overseer | Target::Session(_) => hop,
                 };
-                line::guard(checked, run.sent)?;
+                let to_session = matches!(to, Target::Session(_));
+                if let Err(r) = line::guard(checked, &run, to_session) {
+                    // Only the budget its boss's answers renew is lifted
+                    // by them.
+                    self.line_stalled(me, &r, r == Refusal::Budget).await;
+                    return Err(r.into());
+                }
                 let overseer = self.line_overseer(me.group.as_ref().map(|g| g.id.as_str()));
                 let recipient = line::reach(
                     me,
@@ -520,7 +659,7 @@ impl Desk {
                     Sender::Overseer(by) => (by.party.clone(), by.hop.max(1)),
                     _ => (Party::you(), 0),
                 };
-                line::guard(hop, 0)?;
+                line::guard(hop, &LineRun::default(), false)?;
                 let recipient = match to {
                     Target::Session(id) => {
                         let them = find(id).ok_or(DeskError::NotFound)?;
@@ -628,7 +767,14 @@ impl Desk {
         }
         match &from {
             Sender::Session(id) => {
-                self.0.state.lock().lines.runs.entry(*id).or_default().sent += 1;
+                self.0
+                    .state
+                    .lock()
+                    .lines
+                    .runs
+                    .entry(*id)
+                    .or_default()
+                    .sent_one(m.to_session().is_some());
                 let what = match kind {
                     LineKind::Ask => crate::picture::What::SessionAsked,
                     _ => crate::picture::What::SessionReported,
@@ -640,7 +786,13 @@ impl Desk {
                     self.person_spoke(v.id);
                 }
             }
-            Sender::Overseer(_) => {}
+            // Its own boss speaking to it is the designed conversation:
+            // its budget starts again.
+            Sender::Overseer(by) => {
+                if let Some(v) = &recipient {
+                    self.boss_spoke(v.id, &by.party.id);
+                }
+            }
         }
         self.line_noted(&m);
         self.line_announce(&m);
@@ -798,12 +950,22 @@ impl Desk {
                 self.person_spoke(v.id)
             }
             (Sender::Session(id), _) => {
-                self.0.state.lock().lines.runs.entry(*id).or_default().sent += 1;
+                self.0
+                    .state
+                    .lock()
+                    .lines
+                    .runs
+                    .entry(*id)
+                    .or_default()
+                    .sent_one(question.from_session().is_some());
             }
-            // The overseer's answers count against the session that asked:
-            // its budget holds the exchange, not the overseer's.
-            (Sender::Overseer(_), Some(v)) => {
-                self.0.state.lock().lines.runs.entry(v.id).or_default().sent += 1;
+            // Its own boss's answer starts the asker's budget again; any
+            // other overseer's counts against it: its budget holds the
+            // exchange, not the overseer's.
+            (Sender::Overseer(b), Some(v)) => {
+                if !self.boss_spoke(v.id, &b.party.id) {
+                    self.0.state.lock().lines.runs.entry(v.id).or_default().sent += 1;
+                }
             }
             _ => {}
         }
@@ -1519,6 +1681,20 @@ impl Desk {
         }
         // After a restart no call waits on what was asked before it.
         self.line_sweep_waits().await;
+        // Nor is any session stopped: its run starts again, so what the
+        // bosses were told of stalls before it no longer holds.
+        if let Err(e) = self
+            .0
+            .store
+            .item_close_of_key_prefix(
+                crate::open_item::STALLED_KEY,
+                ClosedBy::Lapsed,
+                "Desk restarted, so the session can carry on.",
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "couldn't close the stalled sessions' items from before a restart");
+        }
         match self.0.store.line_open_asks(None).await {
             Ok(asks) => {
                 let mut st = self.0.state.lock();
@@ -1651,6 +1827,7 @@ impl Desk {
         }
         let mut st = self.0.state.lock();
         st.lines.runs.remove(&id);
+        st.lines.stalled.remove(&id);
         st.lines.spoke.remove(&id);
         st.lines.pending.remove(&id);
         st.lines.plugin.remove(&id);
@@ -1848,6 +2025,30 @@ impl Desk {
     /// counts its needs: answered by a reply.
     pub fn line_needs(&self) -> Vec<crate::floor::Need> {
         let st = self.0.state.lock();
+        let stalled = st.lines.stalled.iter().map(|(id, s)| {
+            let view = st.records.get(id).map(|r| Self::view_of(&st, r));
+            crate::floor::Need {
+                id: format!("stalled:{id}"),
+                kind: crate::floor::NeedKind::Question,
+                who: crate::floor::Who {
+                    kind: PartyKind::Session,
+                    id: id.to_string(),
+                    name: view
+                        .as_ref()
+                        .map_or_else(|| "A session".into(), |v| v.label().to_string()),
+                    engine: view.as_ref().map(|v| v.engine),
+                },
+                ask: s.text.clone(),
+                chose: None,
+                why: None,
+                options: None,
+                since: s.since,
+                place: crate::floor::Place::Session,
+                answer: crate::floor::Answer::Reply,
+                group: None,
+                boss: None,
+            }
+        });
         st.lines
             .for_you
             .values()
@@ -1878,6 +2079,7 @@ impl Desk {
                 group: None,
                 boss: None,
             })
+            .chain(stalled)
             .collect()
     }
 

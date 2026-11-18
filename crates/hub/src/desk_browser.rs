@@ -735,12 +735,10 @@ pub async fn stop_everything() {
 /// uses is connected now, every profile it connects from, and where to get
 /// the extension.
 async fn settings_view(r: &Routes) -> serde_json::Value {
-    let store_url = (!crate::desk_chrome::STORE_ID.is_empty()).then(|| {
-        format!(
-            "https://chromewebstore.google.com/detail/{}",
-            crate::desk_chrome::STORE_ID
-        )
-    });
+    let store_url = format!(
+        "https://chromewebstore.google.com/detail/{}",
+        crate::desk_chrome::STORE_ID
+    );
     json!({
         "settings": r.settings.get(),
         "chrome": {

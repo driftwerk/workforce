@@ -324,6 +324,14 @@ pub fn order_text_key(text: &str, sessions: &[Uuid]) -> String {
     format!("order:text:{}:{hex}", ids.join(","))
 }
 
+/// What every stalled session's item's key starts with.
+pub const STALLED_KEY: &str = "stalled:";
+
+/// The key of a session the line's loop guard stopped: one item a stall.
+pub fn stalled_key(session: Uuid) -> String {
+    format!("{STALLED_KEY}{session}")
+}
+
 /// The key of a session's question on its line.
 pub fn line_key(message: Uuid) -> String {
     format!("line:{message}")

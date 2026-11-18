@@ -50,15 +50,16 @@ impl CrewHub {
         let model = crate::turn_loop::cheap_model(&service);
         // The hub's own work for the person whose Desk this is: it may run
         // on their accounts when the install's login is at its limit.
+        // It has no person in scope by design: a personal hub's Desk.
         let (response, served) = crate::hub_core::logins::install_pool::hub_own_work(
-            with_served_log(service.llm.create_message(
+            crate::subscription::unowned_by_design(with_served_log(service.llm.create_message(
                 Some(SYSTEM),
                 &[LlmMessage::user(tail)],
                 &[],
                 Some(&model),
                 Some(8),
                 true,
-            )),
+            ))),
         )
         .await;
         let response = response

@@ -15,6 +15,7 @@ mod device_login_tests;
 pub use crate::hub_core::logins::limits;
 pub mod llm;
 pub mod logins;
+pub mod payers;
 pub use crate::hub_core::logins::resolve;
 pub use crate::hub_core::logins::store;
 pub use crate::hub_core::pools;

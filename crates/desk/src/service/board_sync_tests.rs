@@ -658,6 +658,10 @@ struct FakeLinear {
     described: Mutex<BTreeMap<u32, String>>,
     /// Members the hub finds by name, with their profile: (slug, full name).
     profiles: Mutex<Vec<(String, String)>>,
+    /// Issues' sortOrder, for those that answer one.
+    sorts: Mutex<BTreeMap<u32, f64>>,
+    /// The hub holds a sortOrder change for the person's approval.
+    hold_sort: Mutex<bool>,
 }
 
 impl FakeLinear {
@@ -714,6 +718,7 @@ impl Remote for FakeLinear {
         let mut answer = self.answer(tool, args).await?;
         // A described issue: its description, at a Linear address.
         let described = self.described.lock().unwrap();
+        let sorts = self.sorts.lock().unwrap();
         let nodes = match answer.get_mut("issues") {
             Some(Value::Array(a)) => a.iter_mut().collect::<Vec<_>>(),
             _ => answer.get_mut("issue").into_iter().collect(),
@@ -727,6 +732,9 @@ impl Remote for FakeLinear {
             if let Some(body) = described.get(&n) {
                 i["description"] = json!(body);
                 i["url"] = json!(format!("https://linear.app/acme/issue/ENG-{n}"));
+            }
+            if let Some(at) = sorts.get(&n) {
+                i["sortOrder"] = json!(at);
             }
         }
         Ok(answer)
@@ -833,16 +841,21 @@ impl FakeLinear {
                     .and_then(|k| k.strip_prefix("ENG-"))
                     .and_then(|n| n.parse().ok())
                     .unwrap_or(0);
+                if args.get("sort_order").is_some() && *self.hold_sort.lock().unwrap() {
+                    return Ok(json!({ "status": "approval_pending", "request_id": "r-2" }));
+                }
                 let i = issues.get_mut(&n).unwrap();
-                i.2 = self
-                    .racer
-                    .lock()
-                    .unwrap()
-                    .clone()
-                    .or_else(|| args["assignee_id"].as_str().map(str::to_string));
+                if let Some(at) = args["sort_order"].as_f64() {
+                    self.sorts.lock().unwrap().insert(n, at);
+                }
+                let racer = self.racer.lock().unwrap().clone();
+                if racer.is_some() || args.get("assignee_id").is_some() {
+                    i.2 = racer.or_else(|| args["assignee_id"].as_str().map(str::to_string));
+                }
                 i.1 = "2026-11-09T23:00:00.000Z".into();
                 Ok(json!({ "issue": Self::node(n, i) }))
             }
+            "linear.issue_link" => Ok(json!({ "success": true })),
             other => Err(RemoteError::NotAllowed(other.into())),
         }
     }
@@ -2601,6 +2614,547 @@ async fn a_body_read_as_adf_stays_through_pulls_until_its_description_changes() 
         );
         let v = d.read_ticket_issue(id, &jira, true).await.unwrap();
         assert_eq!(v.ticket.body, t.body, "and opened again, the same");
+    })
+    .await;
+}
+
+// ── A synced board's order there ─────────────────────────────────────────
+
+/// A Jira project whose issues carry their Rank, ranked by the rank call
+/// (`jira.update_issue`'s `rank_after_issue` / `rank_before_issue`): one
+/// ranked moves just after the issue it is ranked after (or before the one
+/// it goes before), unless it refuses.
+struct RankJira {
+    /// (key, Rank), all updated at once.
+    issues: Mutex<Vec<(String, String)>>,
+    /// What the rank call fails with, when it does.
+    refuse: Option<RemoteError>,
+    /// The hub holds the rank call for the person's approval.
+    hold: Mutex<bool>,
+    calls: Mutex<Vec<(String, Value)>>,
+}
+
+impl RankJira {
+    fn new(ranks: &[(&str, &str)]) -> Self {
+        Self {
+            issues: Mutex::new(
+                ranks
+                    .iter()
+                    .map(|(k, r)| (k.to_string(), r.to_string()))
+                    .collect(),
+            ),
+            refuse: None,
+            hold: Mutex::new(false),
+            calls: Mutex::new(vec![]),
+        }
+    }
+
+    fn row(key: &str, rank: &str, full: bool) -> Value {
+        let mut v = json!({ "key": key, "summary": format!("Issue {key}"), "status": "To Do",
+            "updated": "2026-11-09T10:00:00.000+0000", "labels": ["web"], "rank": rank });
+        if full {
+            v["description_html"] = json!("<p>About it.</p>");
+        }
+        v
+    }
+
+    fn ranked(&self) -> Vec<Value> {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(t, a)| {
+                t == "jira.update_issue"
+                    && (a.get("rank_after_issue").is_some() || a.get("rank_before_issue").is_some())
+            })
+            .map(|(_, a)| a.clone())
+            .collect()
+    }
+}
+
+#[async_trait]
+impl Remote for RankJira {
+    async fn tools(&self) -> Result<Vec<String>, RemoteError> {
+        Ok(crate::board_sync::JIRA_TOOLS
+            .iter()
+            .map(|t| t.to_string())
+            .collect())
+    }
+
+    async fn call(&self, tool: &str, args: Value) -> Result<Value, RemoteError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((tool.to_string(), args.clone()));
+        let mut issues = self.issues.lock().unwrap();
+        match tool {
+            "jira.search" => Ok(json!({
+                "issues": issues.iter().map(|(k, r)| Self::row(k, r, false)).collect::<Vec<_>>(),
+                "is_last": true,
+            })),
+            "jira.get_issue" => {
+                let key = args["issue_key"].as_str().unwrap_or_default();
+                issues
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(k, r)| Self::row(k, r, true))
+                    .ok_or_else(|| RemoteError::Failed("404".into()))
+            }
+            "jira.update_issue" => {
+                if let Some(e) = &self.refuse {
+                    return Err(e.clone());
+                }
+                let key = args["issue_key"].as_str().unwrap().to_string();
+                let ranks = args.get("rank_after_issue").is_some()
+                    || args.get("rank_before_issue").is_some();
+                if ranks && *self.hold.lock().unwrap() {
+                    return Ok(json!({ "status": "approval_pending", "request_id": "r-1" }));
+                }
+                let mut sorted: Vec<String> = issues.iter().map(|(_, r)| r.clone()).collect();
+                sorted.sort();
+                let rank_of = |k: &str| issues.iter().find(|(x, _)| x == k).unwrap().1.clone();
+                let new = match (
+                    args["rank_after_issue"].as_str(),
+                    args["rank_before_issue"].as_str(),
+                ) {
+                    (Some(a), _) => {
+                        let a = rank_of(a);
+                        let next = sorted.iter().find(|r| **r > a).cloned();
+                        crate::board::place_between(Some(&a), next.as_deref())
+                    }
+                    (None, Some(b)) => {
+                        let b = rank_of(b);
+                        let prev = sorted.iter().rev().find(|r| **r < b).cloned();
+                        crate::board::place_between(prev.as_deref(), Some(&b))
+                    }
+                    _ => return Ok(json!({ "key": key, "updated": true })),
+                }
+                .unwrap();
+                issues.iter_mut().find(|(k, _)| *k == key).unwrap().1 = new;
+                Ok(json!({ "key": key, "updated": false, "ranked": true }))
+            }
+            "jira.list_transitions" => Ok(json!({ "transitions": [] })),
+            "jira.add_comment" => Ok(json!({ "id": "c-1" })),
+            other => Err(RemoteError::NotAllowed(other.into())),
+        }
+    }
+}
+
+/// The keys of board `b`'s tickets in `state`, in the board's order.
+async fn column_keys(d: &Desk, b: &Board, state: TicketState) -> Vec<String> {
+    d.0.store
+        .board_tickets(b.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.state == state)
+        .filter_map(|t| t.external.map(|e| e.key))
+        .collect()
+}
+
+async fn id_of(d: &Desk, b: &Board, key: &str) -> uuid::Uuid {
+    ticket_of(d, b, key).await.ticket.id
+}
+
+/// Issues come onto the board in their Rank's order there, whatever order
+/// they changed in, and each ticket says its place as `upstreamRank`.
+#[tokio::test]
+async fn a_synced_board_shows_its_issues_in_the_source_s_order() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = synced(&d, "Acme", None).await;
+        let jira = RankJira::new(&[("ACME-1", "0|c"), ("ACME-2", "0|a"), ("ACME-3", "0|b")]);
+        d.pull_board(b.id, &jira).await.unwrap();
+        assert_eq!(
+            column_keys(&d, &b, TicketState::Todo).await,
+            ["ACME-2", "ACME-3", "ACME-1"]
+        );
+        let v = serde_json::to_value(ticket_of(&d, &b, "ACME-2").await).unwrap();
+        assert_eq!(v["upstreamRank"], "0|a");
+        // Moved there by someone else: the next pull's order wins.
+        jira.issues.lock().unwrap()[0].1 = "0|0".into();
+        d.pull_board(b.id, &jira).await.unwrap();
+        assert_eq!(
+            column_keys(&d, &b, TicketState::Todo).await,
+            ["ACME-1", "ACME-2", "ACME-3"]
+        );
+    })
+    .await;
+}
+
+/// A drop within a column sorts the card where it fell at once, ranks its
+/// issue there after the one above it, and the next pull reads the Rank
+/// Jira gave it.
+#[tokio::test]
+async fn a_drop_within_a_column_moves_the_issue_there() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = synced(&d, "Acme", None).await;
+        let jira = RankJira::new(&[("ACME-1", "0|c"), ("ACME-2", "0|a"), ("ACME-3", "0|b")]);
+        d.pull_board(b.id, &jira).await.unwrap();
+        let (one, two, three) = (
+            id_of(&d, &b, "ACME-1").await,
+            id_of(&d, &b, "ACME-2").await,
+            id_of(&d, &b, "ACME-3").await,
+        );
+        let mv = crate::service::Move {
+            state: TicketState::Todo,
+            before: Some(two),
+            after: Some(three),
+        };
+        let v = d.move_ticket(one, mv, &By::you()).await.unwrap();
+        let place = v.ticket.upstream_rank.clone().unwrap();
+        assert!("0|a" < place.as_str() && place.as_str() < "0|b", "{place}");
+        assert_eq!(
+            column_keys(&d, &b, TicketState::Todo).await,
+            ["ACME-2", "ACME-1", "ACME-3"]
+        );
+        due_now(&d, b.id).await;
+        d.push_board(b.id, &jira).await.unwrap();
+        assert_eq!(
+            jira.ranked(),
+            [json!({ "issue_key": "ACME-1", "rank_after_issue": "ACME-2" })]
+        );
+        let t = d.ticket(one).await.unwrap().ticket;
+        let e = t.external.as_ref().unwrap();
+        assert!(e.rank_move.is_none());
+        assert!(e.rank_stale, "Jira's new Rank is read back");
+        assert!(d.nothing_to_push(b.id).await.unwrap());
+        let theirs = jira.issues.lock().unwrap()[0].1.clone();
+        d.pull_board(b.id, &jira).await.unwrap();
+        let t = d.ticket(one).await.unwrap().ticket;
+        assert_eq!(t.upstream_rank.as_deref(), Some(theirs.as_str()));
+        assert!(!t.external.unwrap().rank_stale);
+        assert_eq!(
+            column_keys(&d, &b, TicketState::Todo).await,
+            ["ACME-2", "ACME-1", "ACME-3"]
+        );
+        // Dropped at the top, it goes before the issue below it.
+        let mv = crate::service::Move {
+            state: TicketState::Todo,
+            before: None,
+            after: Some(two),
+        };
+        d.move_ticket(three, mv, &By::you()).await.unwrap();
+        due_now(&d, b.id).await;
+        d.push_board(b.id, &jira).await.unwrap();
+        assert_eq!(
+            jira.ranked()[1],
+            json!({ "issue_key": "ACME-3", "rank_before_issue": "ACME-2" })
+        );
+        assert!(d
+            .board_of(b.id)
+            .await
+            .unwrap()
+            .sync
+            .unwrap()
+            .order_problem
+            .is_none());
+    })
+    .await;
+}
+
+/// A drop Jira won't take (no right to rank, a hub without the call) stands
+/// here, is said once on the sync bar, never pauses the board or is sent
+/// again, and the next pull puts the card back where its issue is.
+#[tokio::test]
+async fn a_drop_that_can_t_go_there_stands_here_and_says_so() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = synced(&d, "Acme", None).await;
+        for refuse in [
+            RemoteError::Failed(
+                "Couldn't rank ACME-1: You don't have permission to rank issues.".into(),
+            ),
+            RemoteError::Missing("jira.update_issue".into()),
+        ] {
+            let mut jira =
+                RankJira::new(&[("ACME-1", "0|c"), ("ACME-2", "0|a"), ("ACME-3", "0|b")]);
+            jira.refuse = Some(refuse);
+            d.pull_board(b.id, &jira).await.unwrap();
+            let (one, two) = (id_of(&d, &b, "ACME-1").await, id_of(&d, &b, "ACME-2").await);
+            let mv = crate::service::Move {
+                state: TicketState::Todo,
+                before: Some(two),
+                after: None,
+            };
+            d.move_ticket(one, mv, &By::you()).await.unwrap();
+            due_now(&d, b.id).await;
+            d.push_board(b.id, &jira).await.unwrap();
+            assert_eq!(jira.ranked().len(), 1);
+            let s = d.board_of(b.id).await.unwrap().sync.unwrap();
+            assert!(s.paused.is_none(), "{:?}", s.paused);
+            assert!(s.backoff_until.is_none());
+            let said = s.order_problem.clone().unwrap();
+            assert!(said.contains("ACME-1"), "{said}");
+            assert!(d.nothing_to_push(b.id).await.unwrap(), "never sent again");
+            assert_eq!(
+                column_keys(&d, &b, TicketState::Todo).await,
+                ["ACME-2", "ACME-1", "ACME-3"],
+                "the drop stands here"
+            );
+            let t = d.ticket(one).await.unwrap().ticket;
+            assert!(t.external.as_ref().unwrap().rank_stale);
+            d.pull_board(b.id, &jira).await.unwrap();
+            assert_eq!(
+                column_keys(&d, &b, TicketState::Todo).await,
+                ["ACME-2", "ACME-3", "ACME-1"],
+                "its place there wins"
+            );
+            let s = d.board_of(b.id).await.unwrap().sync.unwrap();
+            assert_eq!(
+                s.order_problem.as_deref(),
+                Some(said.as_str()),
+                "said until a drop goes"
+            );
+            assert_eq!(jira.ranked().len(), 1);
+        }
+    })
+    .await;
+}
+
+/// A board whose sync is paused never moves an issue there: the drop stands
+/// here, and once it is resumed the issue's place there wins.
+#[tokio::test]
+async fn a_paused_board_never_moves_an_issue_there() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = synced(&d, "Acme", None).await;
+        let jira = RankJira::new(&[("ACME-1", "0|c"), ("ACME-2", "0|a"), ("ACME-3", "0|b")]);
+        d.pull_board(b.id, &jira).await.unwrap();
+        d.pause_board(b.id, true).await.unwrap();
+        let (one, two) = (id_of(&d, &b, "ACME-1").await, id_of(&d, &b, "ACME-2").await);
+        let mv = crate::service::Move {
+            state: TicketState::Todo,
+            before: Some(two),
+            after: None,
+        };
+        let v = d.move_ticket(one, mv, &By::you()).await.unwrap();
+        let e = v.ticket.external.as_ref().unwrap();
+        assert!(e.rank_move.is_none() && e.rank_stale);
+        d.pause_board(b.id, false).await.unwrap();
+        due_now(&d, b.id).await;
+        d.push_board(b.id, &jira).await.unwrap();
+        assert!(jira.ranked().is_empty());
+        d.pull_board(b.id, &jira).await.unwrap();
+        assert_eq!(
+            column_keys(&d, &b, TicketState::Todo).await,
+            ["ACME-2", "ACME-3", "ACME-1"]
+        );
+    })
+    .await;
+}
+
+/// A move to another column changes only its state there, as ever.
+#[tokio::test]
+async fn a_move_to_another_column_ranks_nothing_there() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = synced(&d, "Acme", None).await;
+        let jira = RankJira::new(&[("ACME-1", "0|c"), ("ACME-2", "0|a")]);
+        d.pull_board(b.id, &jira).await.unwrap();
+        let one = id_of(&d, &b, "ACME-1").await;
+        let mv = crate::service::Move {
+            state: TicketState::Doing,
+            before: None,
+            after: None,
+        };
+        let v = d.move_ticket(one, mv, &By::you()).await.unwrap();
+        let e = v.ticket.external.as_ref().unwrap();
+        assert!(e.rank_move.is_none() && !e.rank_stale);
+        assert_eq!(v.ticket.upstream_rank.as_deref(), Some("0|c"));
+        due_now(&d, b.id).await;
+        d.push_board(b.id, &jira).await.unwrap();
+        assert!(jira.ranked().is_empty());
+    })
+    .await;
+}
+
+/// On Linear a drop takes the sortOrder between its neighbours' (lower
+/// first, negatives too), sent with `linear.issue_update`, and is its place.
+#[tokio::test]
+async fn a_linear_drop_takes_the_sort_order_between_its_neighbours() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = whole_team(&d, Some(ME)).await;
+        let linear = FakeLinear::default();
+        for (n, at) in [(1, -5.0), (2, 10.0), (3, 2.0)] {
+            linear.set(n, "unstarted", n, None);
+            linear.sorts.lock().unwrap().insert(n, at);
+        }
+        d.pull_board(b.id, &linear).await.unwrap();
+        assert_eq!(
+            column_keys(&d, &b, TicketState::Todo).await,
+            ["ENG-1", "ENG-3", "ENG-2"]
+        );
+        let (one, two, three) = (
+            id_of(&d, &b, "ENG-1").await,
+            id_of(&d, &b, "ENG-2").await,
+            id_of(&d, &b, "ENG-3").await,
+        );
+        let mv = crate::service::Move {
+            state: TicketState::Todo,
+            before: Some(one),
+            after: Some(three),
+        };
+        let v = d.move_ticket(two, mv, &By::you()).await.unwrap();
+        assert_eq!(v.ticket.upstream_rank, crate::board::linear_rank_of(-1.5));
+        due_now(&d, b.id).await;
+        d.push_board(b.id, &linear).await.unwrap();
+        let sent: Vec<Value> = linear
+            .calls_of("linear.issue_update")
+            .into_iter()
+            .filter(|a| a.get("sort_order").is_some())
+            .collect();
+        assert_eq!(sent, [json!({ "identifier": "ENG-2", "sort_order": -1.5 })]);
+        let t = d.ticket(two).await.unwrap().ticket;
+        let e = t.external.as_ref().unwrap();
+        assert!(
+            e.rank_move.is_none() && !e.rank_stale,
+            "its place is the one sent"
+        );
+        assert_eq!(
+            column_keys(&d, &b, TicketState::Todo).await,
+            ["ENG-1", "ENG-2", "ENG-3"]
+        );
+    })
+    .await;
+}
+
+/// A drop whose rank call the hub holds for approval waits for the next
+/// push; what went out with it (a move's comment there) is kept as sent, so
+/// the retry sends only the rank.
+#[tokio::test]
+async fn a_held_rank_waits_and_what_went_with_it_never_goes_twice() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = d
+            .create_board(NewBoard {
+                name: "Acme".into(),
+                group: None,
+                prefix: None,
+            })
+            .await
+            .unwrap();
+        let mut l = link(None);
+        l.states.insert(TicketState::Review, "In Review".into());
+        let b = d.link_board(b.id, l, "sam").await.unwrap();
+        let jira = RankJira::new(&[("ACME-1", "0|c"), ("ACME-2", "0|a"), ("ACME-3", "0|b")]);
+        d.pull_board(b.id, &jira).await.unwrap();
+        let (one, two) = (id_of(&d, &b, "ACME-1").await, id_of(&d, &b, "ACME-2").await);
+        // Dropped within To do, then moved on to Review before it went out.
+        let mv = crate::service::Move {
+            state: TicketState::Todo,
+            before: Some(two),
+            after: None,
+        };
+        d.move_ticket(one, mv, &By::you()).await.unwrap();
+        let mv = crate::service::Move {
+            state: TicketState::Review,
+            before: None,
+            after: None,
+        };
+        d.move_ticket(one, mv, &By::you()).await.unwrap();
+        *jira.hold.lock().unwrap() = true;
+        due_now(&d, b.id).await;
+        let pushed = d.push_board(b.id, &jira).await.unwrap();
+        assert_eq!(pushed.waiting, 1);
+        let comments = |j: &RankJira| {
+            j.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(t, _)| t == "jira.add_comment")
+                .count()
+        };
+        assert_eq!(comments(&jira), 1);
+        assert_eq!(jira.ranked().len(), 1, "asked, and held");
+        let t = d.ticket(one).await.unwrap().ticket;
+        let e = t.external.as_ref().unwrap();
+        assert!(e.rank_move.is_some(), "the drop still waits");
+        assert_eq!(
+            e.seen.state,
+            Some(TicketState::Review),
+            "the move is kept as sent"
+        );
+        *jira.hold.lock().unwrap() = false;
+        // Held, it waits its usual while: not sent again at once.
+        d.push_board(b.id, &jira).await.unwrap();
+        assert_eq!(
+            jira.ranked().len(),
+            1,
+            "not retried before its wait is over"
+        );
+        due_now(&d, b.id).await;
+        d.push_board(b.id, &jira).await.unwrap();
+        assert_eq!(comments(&jira), 1, "never commented twice");
+        assert_eq!(jira.ranked().len(), 2);
+        assert_eq!(
+            jira.ranked()[1],
+            json!({ "issue_key": "ACME-1", "rank_after_issue": "ACME-2" })
+        );
+        let t = d.ticket(one).await.unwrap().ticket;
+        assert!(t.external.unwrap().rank_move.is_none());
+        assert!(d.nothing_to_push(b.id).await.unwrap());
+    })
+    .await;
+}
+
+/// On Linear, a held sortOrder change waits too, and a need that went out
+/// with it as a link is never linked twice.
+#[tokio::test]
+async fn a_held_linear_sort_order_waits_and_its_link_goes_once() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = whole_team(&d, Some(ME)).await;
+        let linear = FakeLinear::default();
+        for (n, at) in [(1, -5.0), (2, 10.0), (3, 2.0)] {
+            linear.set(n, "unstarted", n, None);
+            linear.sorts.lock().unwrap().insert(n, at);
+        }
+        d.pull_board(b.id, &linear).await.unwrap();
+        let (one, two, three) = (
+            id_of(&d, &b, "ENG-1").await,
+            id_of(&d, &b, "ENG-2").await,
+            id_of(&d, &b, "ENG-3").await,
+        );
+        let mv = crate::service::Move {
+            state: TicketState::Todo,
+            before: Some(one),
+            after: Some(three),
+        };
+        d.move_ticket(two, mv, &By::you()).await.unwrap();
+        d.need_ticket(two, one, true, &By::you()).await.unwrap();
+        *linear.hold_sort.lock().unwrap() = true;
+        due_now(&d, b.id).await;
+        d.push_board(b.id, &linear).await.unwrap();
+        assert_eq!(linear.calls_of("linear.issue_link").len(), 1);
+        let sorts = |l: &FakeLinear| {
+            l.calls_of("linear.issue_update")
+                .into_iter()
+                .filter(|a| a.get("sort_order").is_some())
+                .count()
+        };
+        assert_eq!(sorts(&linear), 1);
+        *linear.hold_sort.lock().unwrap() = false;
+        due_now(&d, b.id).await;
+        d.push_board(b.id, &linear).await.unwrap();
+        assert_eq!(linear.calls_of("linear.issue_link").len(), 1, "linked once");
+        assert_eq!(sorts(&linear), 2);
+        let t = d.ticket(two).await.unwrap().ticket;
+        assert!(t.external.unwrap().rank_move.is_none());
+        assert_eq!(
+            column_keys(&d, &b, TicketState::Todo).await,
+            ["ENG-1", "ENG-2", "ENG-3"]
+        );
     })
     .await;
 }

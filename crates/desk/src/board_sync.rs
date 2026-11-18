@@ -663,6 +663,7 @@ pub fn custom_fields_arg(fields: Option<&crate::board::JiraFields>) -> Value {
         ("sprint", &f.sprint),
         ("start_date", &f.start_date),
         ("development", &f.development),
+        ("rank", &f.rank),
     ] {
         if let Some(id) = id {
             out.insert(role.into(), json!(id));
@@ -710,6 +711,8 @@ pub fn jira_fields(answer: &Value, at: DateTime<Utc>) -> crate::board::JiraField
         sprint: id("sprint"),
         start_date: id("start_date"),
         development: id("development"),
+        rank: id("rank"),
+        rank_asked: true,
         priorities: answer["priorities"]
             .as_array()
             .into_iter()
@@ -1043,6 +1046,19 @@ pub struct Issue {
     /// without who has each, its priority, points or PRs, which the ticket
     /// keeps from the children's own search.
     pub children_partial: bool,
+    /// Its place on its board there, as [`Ticket::upstream_rank`] keeps it,
+    /// when the answer says (a hub that reads Jira's Rank or Linear's
+    /// sortOrder).
+    pub upstream_rank: Option<String>,
+}
+
+/// Jira's Rank as an answer gives it: a LexoRank (`0|i0000f:`), held only
+/// when it is short printable ASCII, as every one is.
+fn jira_rank(v: &Value) -> Option<String> {
+    v.as_str()
+        .filter(|r| !r.is_empty() && r.len() <= 255)
+        .filter(|r| r.bytes().all(|b| b.is_ascii_graphic()))
+        .map(str::to_string)
 }
 
 /// `body` held to what Desk keeps, and whether it was cut.
@@ -1653,6 +1669,7 @@ pub fn jira_issue(i: &Value, site: &str) -> Option<Issue> {
         files: crate::ticket_files::jira_files(i),
         facts: jira_facts(i),
         children_partial: true,
+        upstream_rank: jira_rank(&i["rank"]),
         key,
     })
 }
@@ -1715,6 +1732,9 @@ pub fn linear_issue(i: &Value) -> Option<Issue> {
         files: Some(files),
         facts,
         children_partial: false,
+        upstream_rank: i["sortOrder"]
+            .as_f64()
+            .and_then(crate::board::linear_rank_of),
     })
 }
 
@@ -2526,12 +2546,91 @@ pub struct Push {
     pub state: Option<TicketState>,
     /// The keys of the issues it now needs and didn't.
     pub needs: Vec<String>,
+    /// Its drop within its column, for its issue's place there.
+    pub order: Option<crate::board::RankMove>,
 }
 
 impl Push {
     pub fn is_empty(&self) -> bool {
-        self.title.is_none() && self.body.is_none() && self.state.is_none() && self.needs.is_empty()
+        self.title.is_none()
+            && self.body.is_none()
+            && self.state.is_none()
+            && self.needs.is_empty()
+            && self.order.is_none()
     }
+}
+
+/// The call that moves issue `key` to where `mv` says on `system`: on
+/// Jira, ranked after the issue above it (else before the one below); on
+/// Linear, given the sortOrder between theirs. None when it says nowhere.
+/// A hub from before these took them answers "No fields to update".
+pub fn order_call(
+    system: System,
+    key: &str,
+    mv: &crate::board::RankMove,
+) -> Option<(&'static str, Value)> {
+    match system {
+        System::Jira => {
+            let mut args = json!({ "issue_key": key });
+            match (&mv.above, &mv.below) {
+                (Some(above), _) => args["rank_after_issue"] = json!(above),
+                (None, Some(below)) => args["rank_before_issue"] = json!(below),
+                (None, None) => return None,
+            }
+            Some(("jira.update_issue", args))
+        }
+        System::Linear => {
+            let at = mv.sort_order.filter(|f| f.is_finite())?;
+            Some((
+                "linear.issue_update",
+                json!({ "identifier": key, "sort_order": at }),
+            ))
+        }
+    }
+}
+
+/// Whether `answer` says the order call moved the issue: a hub that only
+/// updated other fields, or none, didn't.
+pub fn order_moved(system: System, answer: &Value) -> bool {
+    match system {
+        System::Jira => answer["ranked"].as_bool() == Some(true),
+        System::Linear => answer["issue"]["sortOrder"].is_number(),
+    }
+}
+
+/// The order call's failure in the person's words, for the sync bar.
+pub fn order_words(system: System, key: &str, e: &RemoteError) -> String {
+    let why = match e {
+        RemoteError::Failed(w) if w.contains("No fields to update") => {
+            "the hub it syncs through can't reorder issues yet".to_string()
+        }
+        RemoteError::Missing(_) | RemoteError::NotAllowed(_) => {
+            "the hub it syncs through can't reorder issues".to_string()
+        }
+        other => clip(&other.to_string(), 200),
+    };
+    format!(
+        "{key} stays where you dropped it here, but couldn't be moved on {}: {why}. Its place there comes back on the next sync.",
+        system.title()
+    )
+}
+
+/// Takes `issue`'s place there onto `t`, unless a drop of it here is still
+/// to go out; the place is then read, so a mark that it may differ is
+/// cleared. Whether anything changed.
+pub fn take_rank(t: &mut Ticket, issue: &Issue) -> bool {
+    let Some(e) = t.external.as_mut() else {
+        return false;
+    };
+    if e.rank_move.is_some() {
+        return false;
+    }
+    let mut changed = std::mem::take(&mut e.rank_stale);
+    if issue.upstream_rank.is_some() && issue.upstream_rank != t.upstream_rank {
+        t.upstream_rank = issue.upstream_rank.clone();
+        changed = true;
+    }
+    changed
 }
 
 /// What a push of `t` sends, with `needs` the keys of what it needs now.
@@ -2555,6 +2654,7 @@ pub fn push_of(t: &Ticket, needs: &[String]) -> Push {
             .filter(|k| !seen.needs.contains(k))
             .cloned()
             .collect(),
+        order: e.rank_move.clone(),
     }
 }
 

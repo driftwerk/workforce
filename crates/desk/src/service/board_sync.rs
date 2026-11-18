@@ -312,6 +312,7 @@ impl Desk {
             backoff_until: None,
             failures: 0,
             problem: None,
+            order_problem: None,
             retry: Default::default(),
             listing: None,
             assignees_swept: true,
@@ -357,6 +358,8 @@ impl Desk {
         for mut t in self.0.store.board_tickets(id).await.map_err(internal)? {
             if let Some(e) = t.external.as_mut().filter(|e| e.synced) {
                 e.synced = false;
+                e.rank_move = None;
+                t.upstream_rank = None;
                 if self.save_ticket(&mut t).await.is_ok() {
                     if let Ok(v) = self.view_ticket(t).await {
                         self.announce(DeskEvent::Ticket {
@@ -478,6 +481,9 @@ impl Budget {
 
 /// The most members one Linear description's mentions are looked up for.
 const MENTIONS_MAX: usize = 5;
+
+/// The most tickets a pass reads the place there of, when it may differ.
+const PLACES_PER_PASS: usize = 10;
 
 /// How far before the latest change a read-through Linear listing saw its
 /// cursor goes.
@@ -856,7 +862,7 @@ impl Desk {
         let fresh = s
             .fields
             .as_ref()
-            .is_some_and(|f| now - f.read_at < crate::board_sync::FIELDS_FRESH);
+            .is_some_and(|f| f.rank_asked && now - f.read_at < crate::board_sync::FIELDS_FRESH);
         if s.system != System::Jira || fresh || budget.take().is_err() {
             return Ok(s);
         }
@@ -871,6 +877,7 @@ impl Desk {
                     tracing::info!(board = %id, error = %e, "the Jira site's fields weren't read");
                     board::JiraFields {
                         read_at: now,
+                        rank_asked: true,
                         ..s.fields.clone().unwrap_or_default()
                     }
                 }
@@ -1060,6 +1067,13 @@ impl Desk {
                 Err(e) => return Err(e),
             }
         }
+        // Tickets whose place here may not be their issue's there: each
+        // issue's place is read, and wins.
+        match self.reread_places(b, s, remote, budget).await {
+            Ok(()) => {}
+            Err(RemoteError::Spent) => return Ok(stopped(None)),
+            Err(e) => return Err(e),
+        }
         // A Linear listing goes on where the last pass left it, while it is
         // still the listing from this cursor.
         let resume = s.listing.as_ref().filter(|l| l.since == s.cursor);
@@ -1167,6 +1181,59 @@ impl Desk {
             }
         }
         Ok(end(false))
+    }
+
+    /// Reads the place there of each of board `b`'s tickets marked as maybe
+    /// not where its issue is ([`board::External::rank_stale`]), at most
+    /// [`PLACES_PER_PASS`] a pass: its issue's place wins, and the mark goes.
+    /// One that can't be read now is read on a later pass.
+    async fn reread_places(
+        &self,
+        b: &Board,
+        s: &Sync,
+        remote: &dyn Remote,
+        budget: &mut Budget,
+    ) -> Result<(), RemoteError> {
+        let fail = |e: eyre::Report| RemoteError::Failed(e.to_string());
+        let marked: Vec<String> = self
+            .0
+            .store
+            .board_tickets(b.id)
+            .await
+            .map_err(fail)?
+            .into_iter()
+            .filter(|t| {
+                t.external
+                    .as_ref()
+                    .is_some_and(|e| e.rank_stale && e.rank_move.is_none() && e.writable_by(s.link))
+            })
+            .filter_map(|t| t.external.map(|e| e.key))
+            .take(PLACES_PER_PASS)
+            .collect();
+        for key in marked {
+            let issue = match self.fetch_issue(s, remote, budget, &key).await {
+                Ok(Some(issue)) => issue,
+                // Gone from the project: the sweep sees to its ticket.
+                Ok(None) => continue,
+                Err(RemoteError::Failed(why)) => {
+                    tracing::info!(board = %b.id, issue = %key, error = %why, "an issue's place wasn't read");
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            // As any listed issue is: newer there, it is pulled whole.
+            match self
+                .take_in(b, s, remote, budget, &issue, &mut Pulled::default())
+                .await
+            {
+                Ok(()) => {}
+                Err(RemoteError::Failed(why)) => {
+                    tracing::info!(board = %b.id, issue = %key, error = %why, "an issue's place wasn't taken");
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 
     /// The issue `key`, read whole; `None` when it isn't in the board's
@@ -1349,6 +1416,7 @@ impl Desk {
             changed = true;
         }
         changed |= self.pulled_needs(s, &mut t, &was, issue).await?;
+        changed |= crate::board_sync::take_rank(&mut t, issue);
         if !changed {
             return Ok(());
         }
@@ -1563,9 +1631,10 @@ impl Desk {
             },
             None => false,
         };
+        let ranked = crate::board_sync::take_rank(&mut t, issue);
         if said.is_empty() {
             self.save_ticket(&mut t).await?;
-            if files || needs {
+            if files || needs || ranked {
                 if let Ok(v) = self.view_ticket(t).await {
                     self.announce(DeskEvent::Ticket {
                         ticket: Box::new(v),
@@ -1635,10 +1704,13 @@ impl Desk {
                     crate::board_sync::priorities(s),
                 ),
                 dev: None,
+                rank_move: None,
+                rank_stale: false,
             }),
             created_by: by.party.clone(),
             pinned: false,
             snoozed_until: None,
+            upstream_rank: issue.upstream_rank.clone(),
             snoozed_at: None,
             state_at: at,
             created_at: at,
@@ -1770,6 +1842,9 @@ impl Desk {
             return Ok(false);
         };
         e.synced = false;
+        e.rank_move = None;
+        // Off its link, its place there no longer orders it here.
+        t.upstream_rank = None;
         self.save_ticket(&mut t).await?;
         let key = t.key(b).unwrap_or_default();
         let text = format!(
@@ -1789,7 +1864,9 @@ impl Desk {
         if let Some(e) = t.external.as_mut() {
             e.synced = false;
             e.seen.state = Some(TicketState::Dropped);
+            e.rank_move = None;
         }
+        t.upstream_rank = None;
         self.save_ticket(&mut t).await?;
         let key = t.key(b).unwrap_or_default();
         if let Some(session) = was.as_ref().and_then(crate::line::session_of) {
@@ -1835,7 +1912,9 @@ impl Desk {
             true => {
                 if let Some(e) = t.external.as_mut() {
                     e.kept = true;
+                    e.rank_move = None;
                 }
+                t.upstream_rank = None;
                 self.save_ticket(&mut t).await?;
                 let text = format!("kept {key} on the board, no longer synced");
                 self.ticket_changed(t, by, Kind::TicketEdited, None, text)
@@ -2302,6 +2381,48 @@ impl Desk {
                 .await?;
             }
         }
+        // Its drop within its column, for its issue's place there. Whatever
+        // stops it (no right to rank there, a board not ordered by Rank, a
+        // hub without the call, a rate limit), the drop stands here, its
+        // place there wins on the next pull, and the sync bar says so once:
+        // it never fails the push or pauses the board.
+        let sent_order = push.order.clone();
+        let mut order_problem: Option<Option<String>> = None;
+        let mut stale_after = false;
+        // A drop held for the person's approval, or out of the pass's calls,
+        // waits for the next push, as every other change here does; what
+        // already went out above (an edit, a move, a comment, a link) is
+        // kept as sent first, so it never goes twice.
+        let mut held: Option<RemoteError> = None;
+        if let Some(mv) = &sent_order {
+            if let Some((tool, args)) = crate::board_sync::order_call(s.system, &e.key, mv) {
+                let went = match budget.take() {
+                    Err(spent) => Err(spent),
+                    Ok(()) => match crate::board_sync::call(remote, s.system, tool, args).await {
+                        Ok(a) if crate::board_sync::order_moved(s.system, &a) => Ok(()),
+                        Ok(_) => Err(RemoteError::Failed("No fields to update".into())),
+                        Err(e) => Err(e),
+                    },
+                };
+                match went {
+                    Err(e @ (RemoteError::Waiting { .. } | RemoteError::Spent)) => {
+                        held = Some(e);
+                    }
+                    Ok(()) => {
+                        // Linear's new place is the one sent; Jira's new
+                        // Rank is read back by the next pull.
+                        stale_after = s.system == System::Jira;
+                        order_problem = Some(None);
+                    }
+                    Err(err) => {
+                        tracing::info!(board = %b.id, issue = %e.key, error = %err, "an issue's place wasn't moved");
+                        stale_after = true;
+                        order_problem =
+                            Some(Some(crate::board_sync::order_words(s.system, &e.key, &err)));
+                    }
+                }
+            }
+        }
         // What the issue now says, as far as this push knows: kept on the
         // ticket as it is now, so what changed meanwhile goes next time.
         let sent = Seen {
@@ -2314,10 +2435,31 @@ impl Desk {
         for _ in 0..3 {
             if let Some(ext) = t.external.as_mut() {
                 crate::board_sync::pushed(ext, &sent, noted, push.body.is_some());
+                // A newer drop made meanwhile goes next time, as does a held
+                // one.
+                if held.is_none() && sent_order.is_some() && ext.rank_move == sent_order {
+                    ext.rank_move = None;
+                    ext.rank_stale = stale_after;
+                }
             }
             match self.0.store.put_ticket(&mut t).await {
                 Ok(()) => {
                     out.updated += 1;
+                    match order_problem.take() {
+                        Some(Some(words)) => {
+                            self.change_sync(b.id, move |s| s.order_problem = Some(words))
+                                .await
+                                .map_err(fail)?;
+                        }
+                        // Read afresh: an earlier drop in this pass may have
+                        // said one.
+                        Some(None) => {
+                            self.change_sync(b.id, |s| s.order_problem = None)
+                                .await
+                                .map_err(fail)?;
+                        }
+                        _ => {}
+                    }
                     if crate::board_sync::push_of(&t, &sent.needs) != Default::default() {
                         let _ = self
                             .0
@@ -2325,7 +2467,10 @@ impl Desk {
                             .queue_push(t.id, t.board, crate::crew::now())
                             .await;
                     }
-                    return Ok(());
+                    return match held {
+                        Some(e) => Err(e),
+                        None => Ok(()),
+                    };
                 }
                 Err(crate::board_store::TicketWrite::Stale) => {
                     t = self.ticket_of(t.id).await.map_err(fail)?;
@@ -2575,6 +2720,8 @@ impl Desk {
             html_prints: vec![],
             details: Default::default(),
             dev: None,
+            rank_move: None,
+            rank_stale: false,
         });
         loop {
             match self.0.store.put_ticket(&mut t).await {

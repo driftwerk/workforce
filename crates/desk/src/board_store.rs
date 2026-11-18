@@ -17,7 +17,7 @@ use crate::store::DeskStore;
 const BOARD: &str = "id, name, group_id, prefix, next_number, sync, created_at, updated_at";
 const TICKET: &str = "id, board, number, title, body, state, rank, assignee, created_by, \
                       pinned, snoozed_until, snoozed_at, state_at, created_at, updated_at, version, \
-                      external";
+                      external, upstream_rank";
 
 fn board(row: &Row) -> Result<Board> {
     Ok(Board {
@@ -31,6 +31,10 @@ fn board(row: &Row) -> Result<Board> {
         updated_at: row.try_get("updated_at")?,
     })
 }
+
+/// A column's order, as [`crate::board::upstream_cmp`] says it: a synced
+/// ticket's place there first, compared byte-wise ("C"), then Desk's own.
+const COLUMN_ORDER: &str = "state, upstream_rank COLLATE \"C\" NULLS LAST, rank, number";
 
 /// A JSON column, as what it holds.
 pub(crate) fn json_of<T: serde::de::DeserializeOwned>(v: Option<Value>) -> Result<Option<T>> {
@@ -56,6 +60,7 @@ fn ticket(row: &Row) -> Result<Ticket> {
         body: row.try_get("body")?,
         state: TicketState::parse(row.try_get("state")?)?,
         rank: row.try_get("rank")?,
+        upstream_rank: row.try_get("upstream_rank")?,
         assignee: party(row.try_get("assignee")?)?,
         needs: vec![],
         links: vec![],
@@ -233,7 +238,8 @@ impl DeskStore {
             .query_opt(
                 "UPDATE tickets SET title = $3, body = $4, state = $5, rank = $6, \
                  assignee = $7, pinned = $8, snoozed_until = $9, snoozed_at = $10, \
-                 state_at = $11, updated_at = $12, external = $13, version = version + 1 \
+                 state_at = $11, updated_at = $12, external = $13, upstream_rank = $14, \
+                 version = version + 1 \
                  WHERE id = $1 AND version = $2 RETURNING version",
                 &[
                     &t.id,
@@ -249,6 +255,7 @@ impl DeskStore {
                     &t.state_at,
                     &t.updated_at,
                     &t.external.as_ref().map(serde_json::to_value).transpose()?,
+                    &t.upstream_rank,
                 ],
             )
             .await?;
@@ -447,7 +454,7 @@ impl DeskStore {
         let client = self.pool().get().await?;
         let rows = client
             .query(
-                &format!("SELECT {TICKET} FROM tickets WHERE {wher} ORDER BY state, rank, number"),
+                &format!("SELECT {TICKET} FROM tickets WHERE {wher} ORDER BY {COLUMN_ORDER}"),
                 args,
             )
             .await?;
@@ -613,7 +620,7 @@ pub(crate) async fn insert_ticket_in<C: tokio_postgres::GenericClient>(
         .execute(
             &format!(
                 "INSERT INTO tickets ({TICKET}) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)"
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)"
             ),
             &[
                 &t.id,
@@ -633,6 +640,7 @@ pub(crate) async fn insert_ticket_in<C: tokio_postgres::GenericClient>(
                 &t.updated_at,
                 &t.version,
                 &t.external.as_ref().map(serde_json::to_value).transpose()?,
+                &t.upstream_rank,
             ],
         )
         .await

@@ -40,9 +40,9 @@ use crate::gateway::{authenticate_ws, ws_token, GatewayState};
 pub const PROTOCOL: u64 = 1;
 /// What the signature over a challenge covers: this, then the nonce.
 pub const PROOF_PREFIX: &str = "desk-chrome-v1:";
-/// Desk's extension in the Chrome Web Store, once it is there; until then
-/// "Add Desk to Chrome" says it isn't yet.
-pub const STORE_ID: &str = "";
+/// Desk's extension in the Chrome Web Store: "Add Desk to Chrome" opens its
+/// listing. The same id as Desk's `desk-chrome-host` `STORE_ID`.
+pub const STORE_ID: &str = "hoacknhfncdpkigbnbmndenpepaadogg";
 
 /// How long the extension has to say hello and prove itself.
 const HANDSHAKE: Duration = Duration::from_secs(15);

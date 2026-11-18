@@ -148,7 +148,11 @@ pub fn maybe_roll_over(
             );
             let sealed_id = session.id.clone();
             let new_id = next.id.clone();
-            tokio::spawn(seed_or_unwedge(store, engine, sealed_id, new_id, keep));
+            // The carry-over summary is a model call billed to whoever the
+            // turn is for: it keeps their identity across the spawn.
+            crate::runner::spawn_in_session_context(seed_or_unwedge(
+                store, engine, sealed_id, new_id, keep,
+            ));
         }
         Err(e) => {
             tracing::warn!(error = %e, session = %session.id, "Rollover seal/mint failed; staying on current session");
@@ -759,6 +763,74 @@ mod tests {
             "carry-over summary is prepended ahead of the verbatim turns"
         );
         assert_eq!(seeded.messages.len(), 5, "summary + 4 verbatim turns");
+    }
+
+    /// LLM stub that reports who the call runs as and is billed to.
+    struct WhoLlm(tokio::sync::mpsc::UnboundedSender<(Option<String>, Option<String>)>);
+
+    #[async_trait]
+    impl LlmProvider for WhoLlm {
+        async fn create_message(
+            &self,
+            _system_prompt: Option<&str>,
+            _messages: &[LlmMessage],
+            _tools: &[LlmToolDef],
+            _model: Option<&str>,
+            _max_tokens: Option<u32>,
+            _enable_cache: bool,
+        ) -> Result<LlmResponse> {
+            let _ = self.0.send((
+                crate::runner::CURRENT_USER_ID.try_with(String::clone).ok(),
+                crate::runner::CURRENT_BILLING_IDENTITY
+                    .try_with(String::clone)
+                    .ok(),
+            ));
+            Ok(LlmResponse {
+                content: vec![ContentBlock::Text {
+                    text: "Summary.".to_string(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+                model: "mock".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn the_carryover_summary_runs_as_and_bills_whoever_the_turn_is_for() {
+        let store: Arc<dyn SessionStore> = Arc::new(InMemorySessionStore::new());
+        let mut session = session_with("ios", "u", 10, 30);
+        store.save(&session).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let engine = CompactionEngine::new(
+            small_config(),
+            Arc::new(WhoLlm(tx)),
+            Some("mock".to_string()),
+        );
+        crate::runner::CURRENT_USER_ID
+            .scope(
+                "alice".to_string(),
+                crate::runner::CURRENT_BILLING_IDENTITY.scope("team-a".to_string(), async {
+                    maybe_roll_over(
+                        Arc::clone(&store),
+                        engine,
+                        &mut session,
+                        &small_config(),
+                        ReservedContext::default(),
+                    )
+                }),
+            )
+            .await;
+        assert!(session.is_sealed(), "the session rolled over");
+        let who = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the carry-over summary was asked for")
+            .unwrap();
+        assert_eq!(
+            who,
+            (Some("alice".to_string()), Some("team-a".to_string())),
+            "the spawned summary keeps the turn's identity and billing"
+        );
     }
 
     #[tokio::test]

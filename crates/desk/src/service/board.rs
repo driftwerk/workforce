@@ -671,6 +671,7 @@ impl Desk {
             created_by: by.party.clone(),
             pinned: false,
             snoozed_until: None,
+            upstream_rank: None,
             snoozed_at: None,
             state_at: at,
             created_at: at,
@@ -752,6 +753,11 @@ impl Desk {
     ) -> Result<TicketView, DeskError> {
         let rank = self.drop_rank(&t, &mv).await?;
         let from = t.state;
+        // Within its column, a synced ticket's issue moves there too; to
+        // another, only its state goes, as ever.
+        if from == mv.state {
+            self.order_upstream(&mut t, &mv, by).await?;
+        }
         set_state(&mut t, mv.state, now());
         t.rank = rank;
         let off = match by.party.kind != PartyKind::Session && board::unassigns(mv.state) {
@@ -800,6 +806,101 @@ impl Desk {
         let subject = t.assignee.clone().or(was);
         self.ticket_changed(t, by, Kind::TicketMoved, subject, text)
             .await
+    }
+
+    /// A drop of synced ticket `t` within its column, for its issue's place
+    /// there. Where it now sorts here among the column's issues (between
+    /// the places of the issues above and below it, in the board's order,
+    /// [`board::upstream_cmp`]), and, unless the board's sync is paused or
+    /// `by` is the sync itself, the move queued for its next push. One that
+    /// can't go out is marked, so its issue's place wins on the next pull.
+    /// `t` is not saved.
+    async fn order_upstream(&self, t: &mut Ticket, mv: &Move, by: &By) -> Result<(), DeskError> {
+        let b = self.board_of(t.board).await?;
+        let Some(s) = b.sync.as_ref() else {
+            return Ok(());
+        };
+        let writable = t.external.as_ref().is_some_and(|e| e.writable_by(s.link));
+        if !writable || crate::board_sync::is_remote_party(&by.party) {
+            return Ok(());
+        }
+        let mut column: Vec<Ticket> = self
+            .0
+            .store
+            .board_tickets(t.board)
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .filter(|c| c.state == mv.state && c.id != t.id)
+            .collect();
+        column.sort_by(board::upstream_cmp);
+        let at = |id: Uuid| column.iter().position(|c| c.id == id);
+        let idx = match (mv.before, mv.after) {
+            (Some(b), _) => at(b).map(|i| i + 1),
+            (None, Some(a)) => at(a),
+            (None, None) => None,
+        }
+        .unwrap_or(column.len());
+        let ours = |c: &&Ticket| c.external.as_ref().is_some_and(|e| e.writable_by(s.link));
+        let above = column[..idx].iter().rev().find(ours);
+        let below = column[idx..].iter().find(ours);
+        if above.is_none() && below.is_none() {
+            return Ok(());
+        }
+        let key = |c: Option<&Ticket>| c.and_then(|c| c.external.as_ref()).map(|e| e.key.clone());
+        let (place, sort_order) = match s.system {
+            board::System::Jira => {
+                // A neighbour whose place isn't known leaves none to sort
+                // between: the card sorts where it was until its Rank is read.
+                fn side(c: Option<&Ticket>) -> Option<Option<&str>> {
+                    match c {
+                        None => Some(None),
+                        Some(c) => c.upstream_rank.as_deref().map(Some),
+                    }
+                }
+                let place = match (side(above), side(below)) {
+                    (Some(a), Some(b)) => board::place_between(a, b),
+                    _ => None,
+                };
+                (place, None)
+            }
+            board::System::Linear => {
+                let side = |c: Option<&Ticket>| match c {
+                    None => Some(None),
+                    Some(c) => c
+                        .upstream_rank
+                        .as_deref()
+                        .and_then(board::linear_sort_order)
+                        .map(Some),
+                };
+                let at = match (side(above), side(below)) {
+                    (Some(a), Some(b)) => board::sort_order_between(a, b),
+                    _ => None,
+                };
+                (at.and_then(board::linear_rank_of), at)
+            }
+        };
+        let paused = s.paused.is_some() || Desk::left_its_group(&b);
+        let up = board::RankMove {
+            above: key(above),
+            below: key(below),
+            sort_order,
+        };
+        if place.is_some() {
+            t.upstream_rank = place;
+        }
+        let e = t.external.as_mut().expect("a synced ticket");
+        let goes = !paused && crate::board_sync::order_call(s.system, &e.key, &up).is_some();
+        if goes {
+            e.rank_move = Some(up);
+            e.rank_stale = false;
+        } else {
+            // Paused, or nowhere to say: the drop stands here until the
+            // next pull, whose place there wins.
+            e.rank_move = None;
+            e.rank_stale = true;
+        }
+        Ok(())
     }
 
     /// The rank `t` takes dropped where `mv` says, spacing the column out
