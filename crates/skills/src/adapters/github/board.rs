@@ -543,7 +543,7 @@ impl Tool for GithubProjectItemsTool {
                     return Err(eyre!("'ids' takes 1 to {MOST_IDS} item ids"));
                 }
                 let data = client
-                    .graphql(
+                    .graphql_nodes(
                         &format!(
                             "query($ids: [ID!]!, $field: String!) {{ nodes(ids: $ids) {{ \
                              ... on ProjectV2Item {{ {} }} }} }}",
@@ -713,7 +713,13 @@ impl Tool for GithubProjectItemMoveTool {
         let out = async {
             let project = req_str(&input, "project_id")?;
             let item = req_str(&input, "item_id")?;
-            let after = input["after_id"].as_str().filter(|a| !a.is_empty());
+            // Null or absent is the top; anything else must be an item's id,
+            // never quietly the top.
+            let after = match &input["after_id"] {
+                Value::Null => None,
+                Value::String(a) if !a.is_empty() => Some(a.as_str()),
+                _ => return Err(eyre!("'after_id' is an item's id, or null for the top")),
+            };
             let client = self.client(&input).await?;
             client
                 .graphql(
@@ -1481,7 +1487,8 @@ mod tests {
                 {"id": "PVTI_a", "type": "ISSUE", "updatedAt": "2026-11-01T00:00:00Z",
                  "fieldValueByName": {"name": "Build"}, "content": issue_node(12)},
                 null
-            ]}}),
+            ]}, "errors": [{"type": "NOT_FOUND", "path": ["nodes", 1],
+                "message": "Could not resolve to a node with the global id of 'PVTI_gone'"}]}),
         )
         .await;
         let out = tool(GithubProjectItemsTool::new, &server)
@@ -1495,6 +1502,34 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["status"], "Build");
         assert!(out.output.get("page_info").is_none());
+    }
+
+    #[tokio::test]
+    async fn items_by_id_still_fail_on_any_other_error() {
+        let server = MockServer::start().await;
+        graphql_answers(
+            &server,
+            json!({"variables": {"ids": ["PVTI_a"], "field": "Status"}}),
+            json!({"data": {"nodes": [null]}, "errors": [{"type": "FORBIDDEN", "message": "Resource not accessible"}]}),
+        )
+        .await;
+        let out = tool(GithubProjectItemsTool::new, &server)
+            .execute(json!({"project_id": "PVT_1", "ids": ["PVTI_a"]}))
+            .await
+            .unwrap();
+        assert!(!out.success);
+        assert!(out.error.unwrap_or_default().contains("FORBIDDEN"));
+    }
+
+    #[tokio::test]
+    async fn a_move_after_something_not_an_id_is_refused_not_sent_to_the_top() {
+        let server = MockServer::start().await;
+        let out = tool(GithubProjectItemMoveTool::new, &server)
+            .execute(json!({"project_id": "PVT_1", "item_id": "PVTI_a", "after_id": 3}))
+            .await
+            .unwrap();
+        assert!(!out.success);
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -296,6 +296,17 @@ impl GithubClient {
     /// fails, partial `data` or not: a rate limit as [`RateLimitedError`],
     /// anything else as `GitHub GraphQL {types}: {messages}`.
     pub async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        self.graphql_with(query, variables, false).await
+    }
+
+    /// [`Self::graphql`] for a `nodes(ids:)` read: an id that is gone is a
+    /// `null` node with a `NOT_FOUND` error beside it, which leaves the rest
+    /// read; any other error still fails.
+    pub async fn graphql_nodes(&self, query: &str, variables: Value) -> Result<Value> {
+        self.graphql_with(query, variables, true).await
+    }
+
+    async fn graphql_with(&self, query: &str, variables: Value, gone_ok: bool) -> Result<Value> {
         let (headers, base_url) = self.build_request()?;
         let response = self
             .client
@@ -333,6 +344,13 @@ impl GithubClient {
             .filter_map(|e| e["message"].as_str())
             .collect();
         let message = messages.join("; ");
+        if gone_ok
+            && !exhausted
+            && types.iter().all(|t| *t == "NOT_FOUND")
+            && body["data"]["nodes"].is_array()
+        {
+            return Ok(body["data"].take());
+        }
         if exhausted || types.contains(&"RATE_LIMITED") {
             return Err(RateLimitedError::new(
                 format!("GitHub GraphQL rate limited: {message}"),
