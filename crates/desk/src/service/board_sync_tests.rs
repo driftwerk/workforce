@@ -3085,6 +3085,13 @@ async fn a_held_rank_waits_and_what_went_with_it_never_goes_twice() {
             "the move is kept as sent"
         );
         *jira.hold.lock().unwrap() = false;
+        // Held, it waits its usual while: not sent again at once.
+        d.push_board(b.id, &jira).await.unwrap();
+        assert_eq!(
+            jira.ranked().len(),
+            1,
+            "not retried before its wait is over"
+        );
         due_now(&d, b.id).await;
         d.push_board(b.id, &jira).await.unwrap();
         assert_eq!(comments(&jira), 1, "never commented twice");
