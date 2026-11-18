@@ -1065,12 +1065,15 @@ impl Tool for CodingSessionTool {
         // Fail fast before the expensive workspace provision when the engine
         // the round runs on cannot serve this user (identity is in scope, so
         // per-user tokens resolve).
-        if let Err(refusal) = self.engine_of(&plan).preflight(&ctx) {
+        // Its payer's own logins only when their own route says so: the
+        // call came back through the gated MCP, outside the turn's scope.
+        let own = crate::personal_route::own_logins_only(&self.service).await;
+        let preflight = async { self.engine_of(&plan).preflight(&ctx) };
+        if let Err(refusal) = crate::agent_turn::personal_if(own, preflight).await {
             return Ok(ToolResult::failure(refusal.reason, elapsed()));
         }
-        Ok(self
-            .drive(&plan, &input, &session_id, &ctx, None, start)
-            .await)
+        let drive = self.drive(&plan, &input, &session_id, &ctx, None, start);
+        Ok(crate::agent_turn::personal_if(own, drive).await)
     }
 
     async fn collect(
@@ -1105,6 +1108,7 @@ impl Tool for CodingSessionTool {
         };
         let ctx = self.round_context(plan.identity.as_deref());
         let drive = self.drive(&plan, &input, &session_id, &ctx, from, start);
+        let drive = crate::personal_route::own_logins_if_routed(&self.service, drive);
         Ok(crate::user_config::as_principal(&plan.principal(), drive).await)
     }
 
@@ -1448,6 +1452,40 @@ mod tests {
         assert!(!plan.to_string().contains("ghp_plain"));
         assert_eq!(plan["identity"], "alice");
         assert_eq!(b.checkpoints(), vec![format!("{}.0.0", b.round())]);
+    }
+
+    #[tokio::test]
+    async fn her_round_from_a_wait_route_never_draws_on_a_shared_login() {
+        const ALICE: &str = "6f1c1c3e-2a51-4a8e-9a57-0d6b1c9f2b11";
+        let b = bench_with(
+            Rounds {
+                logins: Some(Mutex::new(Vec::new())),
+                ..Default::default()
+            },
+            Seats::default(),
+        )
+        .await;
+        crate::coding_testing::on_own_claude(&b.tool.service, ALICE).await;
+        let input = serde_json::json!({ "message": ASK });
+
+        // As the gated MCP runs it: her principal and the session, nothing
+        // else of the turn's scope.
+        workforce_agent::runner::CURRENT_SESSION_ID
+            .scope(
+                b.session_id.clone(),
+                crate::user_config::as_principal(
+                    &TurnPrincipal::run_as(Some(ALICE.into())),
+                    b.tool.execute(input),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let logins = b.engine.logins.as_ref().unwrap().lock().unwrap().clone();
+        assert!(
+            matches!(logins.as_slice(), [Err(reason)] if reason.contains("connect your Claude plan")),
+            "she's told to connect her own, never served the shared one: {logins:?}"
+        );
     }
 
     #[tokio::test]
