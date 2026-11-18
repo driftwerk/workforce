@@ -1146,11 +1146,14 @@ async fn put_hub(
     let offers = match tried {
         true => {
             let via = Via::Hub { hub: hub.clone() };
-            let (jira, linear) = futures::join!(
+            let (jira, linear, github) = futures::join!(
                 r.sync.offered(System::Jira, &via, &person, None, None),
-                r.sync.offered(System::Linear, &via, &person, None, None)
+                r.sync.offered(System::Linear, &via, &person, None, None),
+                r.sync.offered(System::Github, &via, &person, None, None)
             );
-            Some(json!({ "jira": jira.is_ok(), "linear": linear.is_ok() }))
+            Some(
+                json!({ "jira": jira.is_ok(), "linear": linear.is_ok(), "github": github.is_ok() }),
+            )
         }
         false => None,
     };
@@ -1202,6 +1205,10 @@ struct CheckBody {
     /// several there.
     #[serde(default)]
     workspace: Option<String>,
+    /// The GitHub account or organisation whose projects and repositories
+    /// to list: none, the person's own.
+    #[serde(default)]
+    owner: Option<String>,
 }
 
 /// Who the person is on a shared key, chosen: the members there whose name
@@ -1339,6 +1346,11 @@ async fn count_matches(
     let mut page: Option<String> = None;
     for _ in 0..pages {
         let (found, next) = match system {
+            System::Github => {
+                let (n, more) =
+                    github_matches(remote, target, target_id, filter, me, page.as_deref()).await?;
+                (n, more)
+            }
             System::Jira => {
                 let mut args = json!({ "jql": sync::jql(target, filter, None, shared_me), "max_results": sync::PAGE, "fields": ["summary"] });
                 if let Some(p) = &page {
@@ -1398,7 +1410,7 @@ async fn check_link(
     State(r): S,
     h: HeaderMap,
     Query(q): Query<TokenQuery>,
-    Json(body): Json<CheckBody>,
+    Json(mut body): Json<CheckBody>,
 ) -> Response {
     let person = person!(r, h, q);
     if let Some(target) = body.target.as_deref() {
@@ -1406,11 +1418,20 @@ async fn check_link(
             return refusal(StatusCode::BAD_REQUEST, &e);
         }
     }
+    if let Some(owner) = body.owner.as_deref() {
+        if !workforce_desk::github_sync::login_ok(owner) {
+            return refusal(
+                StatusCode::BAD_REQUEST,
+                &format!("{owner:?} isn't a GitHub account."),
+            );
+        }
+    }
     // A filter is checked before any call; Linear's "assigned to me" once
     // the hub has said who the person is there.
     if let Some(filter) = &body.filter {
-        let asks_me =
-            body.system == System::Linear && *filter == Filter::AssignedToMe && body.me.is_none();
+        let asks_me = matches!(body.system, System::Linear | System::Github)
+            && *filter == Filter::AssignedToMe
+            && body.me.is_none();
         if !asks_me {
             if let Err(e) = sync::check_filter(body.system, filter, body.me.as_deref()) {
                 return refusal(StatusCode::BAD_REQUEST, &e);
@@ -1423,7 +1444,11 @@ async fn check_link(
         }
     }
     if let Some(id) = body.target_id.as_deref() {
-        if let Err(e) = sync::check_linear_id(id) {
+        let checked = match body.system {
+            System::Github => workforce_desk::github_sync::check_node_id(id),
+            _ => sync::check_linear_id(id),
+        };
+        if let Err(e) = checked {
             return refusal(StatusCode::BAD_REQUEST, &e);
         }
     }
@@ -1514,6 +1539,44 @@ async fn check_link(
     // list them (a token minted before the tool was offered can't, and the
     // key is typed). Never asks anyone to approve it. Jira Cloud pages at
     // 50, so up to two pages are read for the 100 shown.
+    // GitHub's projects and repositories of the owner asked for (else the
+    // person's own), for the pickers: asked with the first check, quietly.
+    if body.system == System::Github && body.target.is_none() {
+        let owner = match body.owner.clone() {
+            Some(o) => Some(o),
+            None => sync::call_quiet(&*remote, body.system, "github.viewer", json!({}))
+                .await
+                .ok()
+                .and_then(|v| v["login"].as_str().map(str::to_string))
+                .filter(|l| workforce_desk::github_sync::login_ok(l)),
+        };
+        if let Some(owner) = owner {
+            out["owner"] = json!(owner);
+            match sync::call_quiet(
+                &*remote,
+                body.system,
+                "github.projects_list",
+                json!({ "owner": owner }),
+            )
+            .await
+            {
+                Ok(list) => out["projects"] = github_projects_of(&owner, &list),
+                // A key that can't read projects: said, and repositories
+                // are still offered.
+                Err(e) => out["projectsWhy"] = json!(github_scope_words(&e)),
+            }
+            if let Ok(list) = sync::call_quiet(
+                &*remote,
+                body.system,
+                "github.list_repos",
+                json!({ "owner": owner, "sort": "updated", "per_page": 100 }),
+            )
+            .await
+            {
+                out["repos"] = github_repos_of(&list);
+            }
+        }
+    }
     if body.system == System::Jira && body.target.is_none() {
         let mut all: Vec<Value> = Vec::new();
         while all.len() < MAX_PROJECTS {
@@ -1546,9 +1609,56 @@ async fn check_link(
     let Some(target) = body.target.as_deref() else {
         return Json(out).into_response();
     };
+    // A repository's milestones, for the milestone filter.
+    if body.system == System::Github
+        && workforce_desk::github_sync::target_of(target).is_some_and(|t| !t.is_project())
+    {
+        let (owner, repo) = target.split_once('/').unwrap_or_default();
+        if let Ok(v) = sync::call_quiet(
+            &*remote,
+            body.system,
+            "github.repo_labels",
+            json!({ "owner": owner, "repo": repo }),
+        )
+        .await
+        {
+            out["milestones"] = json!(v["milestones"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|m| m["title"].as_str())
+                .map(|t| sync::unfence(t).0)
+                .collect::<Vec<_>>());
+        }
+    }
+    // A project typed by owner and number is found by them: its id is said
+    // back, for the link to carry.
+    if body.system == System::Github && body.target_id.is_none() {
+        match github_project_id(&*remote, target).await {
+            Ok(Some(id)) => {
+                out["targetId"] = json!(id);
+                body.target_id = Some(id);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({ "error": format!("{hub}: {}", github_scope_words(&e)) })),
+                )
+                    .into_response()
+            }
+        }
+    }
     let states = match remote_states(&*remote, body.system, target, body.target_id.as_deref()).await
     {
         Ok(s) => s,
+        Err(e) if body.system == System::Github => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("{hub}: {}", github_scope_words(&e)) })),
+            )
+                .into_response()
+        }
         Err(e @ RemoteError::Workspace { .. }) => {
             return pick_one(out, &e).unwrap_or_else(|| said(e))
         }
@@ -1621,6 +1731,7 @@ fn workspace_kind(system: System) -> String {
     match system {
         System::Jira => "Jira site".into(),
         System::Linear => "Linear workspace".into(),
+        System::Github => "GitHub connection".into(),
     }
 }
 
@@ -1680,6 +1791,7 @@ pub async fn remote_states(
     target_id: Option<&str>,
 ) -> Result<Vec<RemoteState>, RemoteError> {
     match system {
+        System::Github => github_states(remote, target, target_id).await,
         System::Linear => {
             let answer = sync::call(
                 remote,
@@ -1867,6 +1979,27 @@ async fn link_board(
             );
         }
     }
+    // A GitHub project is named by owner and number and by its id: the
+    // two must be one project there.
+    if link.system == System::Github {
+        if link.target_id.is_none() {
+            match github_project_id(&*remote, &link.target).await {
+                Ok(id) => link.target_id = id,
+                Err(e) => {
+                    return refusal(
+                        StatusCode::BAD_REQUEST,
+                        &format!("{hub}: {}", github_scope_words(&e)),
+                    )
+                }
+            }
+        }
+        if let Err(e) = github_states(&*remote, &link.target, link.target_id.as_deref()).await {
+            return refusal(
+                StatusCode::BAD_REQUEST,
+                &format!("{hub}: {}", github_scope_words(&e)),
+            );
+        }
+    }
     match r.sync.desk.link_board(id, link, &person).await {
         Ok(b) => Json(b).into_response(),
         Err(e) => e.into_response(),
@@ -2036,3 +2169,164 @@ pub(crate) mod tests;
 #[cfg(test)]
 #[path = "desk_board_workspace_tests.rs"]
 mod workspace_tests;
+
+// ── GitHub ───────────────────────────────────────────────────────────────
+
+/// A GitHub key's refusal in the person's words: one that can't read
+/// projects says what to do (sign in again with Projects allowed, or link
+/// the repository's issues), never a command to run.
+pub(crate) fn github_scope_words(e: &RemoteError) -> String {
+    let said = e.to_string();
+    let lower = said.to_ascii_lowercase();
+    if lower.contains("insufficient_scopes")
+        || lower.contains("read:project")
+        || lower.contains("resource not accessible")
+        || lower.contains("forbidden")
+    {
+        return "This GitHub key can't read projects. Connect GitHub again with Projects allowed, or link the repository's issues instead. (A fine-grained token never reaches a project owned by a person's account.)".into();
+    }
+    said
+}
+
+/// A projects list as the dialog shows it: its target (`owner/projects/7`),
+/// name and id; closed ones left out.
+fn github_projects_of(owner: &str, answer: &Value) -> Value {
+    Value::Array(
+        answer["projects"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|p| p["closed"].as_bool() != Some(true))
+            .filter_map(|p| {
+                let n = p["number"].as_u64()?;
+                let id = p["id"].as_str()?;
+                Some(json!({
+                    "key": format!("{owner}/projects/{n}"),
+                    "name": sync::unfence(p["title"].as_str().unwrap_or_default()).0,
+                    "id": id,
+                }))
+            })
+            .collect(),
+    )
+}
+
+/// A repositories list as the dialog shows it: `owner/repo`.
+fn github_repos_of(answer: &Value) -> Value {
+    Value::Array(
+        answer["repos"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|r| r["full_name"].as_str())
+            .filter(|n| workforce_desk::github_sync::check_repo(n).is_ok())
+            .map(|n| json!({ "key": n, "name": n }))
+            .collect(),
+    )
+}
+
+/// The states a GitHub board's columns can be: a project's Status options
+/// (the project checked to be the one `target_id` names), or a
+/// repository's open, closed and labels.
+async fn github_states(
+    remote: &dyn Remote,
+    target: &str,
+    target_id: Option<&str>,
+) -> Result<Vec<RemoteState>, RemoteError> {
+    use workforce_desk::github_sync::{self as gh, Target};
+    match gh::target_of(target) {
+        Some(Target::Project { owner, number }) => {
+            let p = sync::call(
+                remote,
+                System::Github,
+                "github.project_get",
+                json!({ "owner": owner, "number": number }),
+            )
+            .await?;
+            if target_id.is_some_and(|id| p["id"].as_str() != Some(id)) {
+                return Err(RemoteError::Failed(format!(
+                    "{target} isn't the project with that id"
+                )));
+            }
+            if p["status"].is_null() {
+                return Err(RemoteError::Failed(format!(
+                    "{target} has no Status field to make columns of"
+                )));
+            }
+            Ok(gh::project_states(&p))
+        }
+        Some(Target::Repo { owner, repo }) => {
+            let v = sync::call(
+                remote,
+                System::Github,
+                "github.repo_labels",
+                json!({ "owner": owner, "repo": repo }),
+            )
+            .await?;
+            Ok(gh::repo_states(&v))
+        }
+        None => Err(RemoteError::Failed(format!(
+            "{target} isn't a GitHub project or repository"
+        ))),
+    }
+}
+
+/// The id of the project `target` names by owner and number, or `None`
+/// when `target` is a repository.
+async fn github_project_id(
+    remote: &dyn Remote,
+    target: &str,
+) -> Result<Option<String>, RemoteError> {
+    use workforce_desk::github_sync::{self as gh, Target};
+    let Some(Target::Project { owner, number }) = gh::target_of(target) else {
+        return Ok(None);
+    };
+    let p = sync::call(
+        remote,
+        System::Github,
+        "github.project_get",
+        json!({ "owner": owner, "number": number }),
+    )
+    .await?;
+    match p["id"].as_str() {
+        Some(id) if gh::check_node_id(id).is_ok() => Ok(Some(id.to_string())),
+        _ => Err(RemoteError::Failed(format!(
+            "{target} isn't a project there"
+        ))),
+    }
+}
+
+/// One page of what a GitHub board's filter matches, counted: the issues on
+/// it, and the page after.
+async fn github_matches(
+    remote: &dyn Remote,
+    target: &str,
+    target_id: Option<&str>,
+    filter: &Filter,
+    me: Option<&str>,
+    page: Option<&str>,
+) -> Result<(usize, Option<String>), RemoteError> {
+    use workforce_desk::github_sync::{self as gh, Target};
+    match gh::target_of(target) {
+        Some(Target::Project { .. }) => {
+            let mut args = json!({ "project_id": target_id.unwrap_or_default() });
+            if let Some(q) = gh::project_query(filter, me) {
+                args["query"] = json!(q);
+            }
+            if let Some(p) = page {
+                args["after"] = json!(p);
+            }
+            let a = sync::call(remote, System::Github, "github.project_items", args).await?;
+            let (items, next) = gh::lean_items(&a);
+            Ok((items.len(), next))
+        }
+        Some(Target::Repo { owner, repo }) => {
+            let n: u32 = page.and_then(|p| p.parse().ok()).unwrap_or(1);
+            let args = gh::repo_args(&owner, &repo, filter, me, None, n);
+            let a = sync::call(remote, System::Github, "github.issues_changed", args).await?;
+            let found = a["issues"].as_array().map_or(0, Vec::len);
+            let next = a["next_page"].as_u64().map(|n| n.to_string());
+            Ok((found, next))
+        }
+        None => Ok((0, None)),
+    }
+}

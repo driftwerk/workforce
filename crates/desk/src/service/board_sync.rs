@@ -21,6 +21,9 @@ use crate::board_sync_store::SyncHub;
 use crate::crew::{By, Kind};
 use crate::model::DeskEvent;
 
+#[path = "github_sync.rs"]
+mod github;
+
 fn internal(e: eyre::Report) -> DeskError {
     DeskError::Internal(e)
 }
@@ -68,6 +71,10 @@ pub struct LinkBoard {
     #[serde(default)]
     pub keep_tickets: bool,
     pub states: BTreeMap<TicketState, String>,
+    /// On a GitHub project, the repository (`owner/repo`) a ticket made
+    /// here becomes an issue in.
+    #[serde(default)]
+    pub repo: Option<String>,
 }
 
 /// Whether `id` can name a hub here: lowercase letters, digits and `-`.
@@ -235,6 +242,25 @@ impl Desk {
         if let Some(w) = link.workspace.as_deref() {
             crate::board_sync::check_workspace(w).map_err(DeskError::Invalid)?;
         }
+        if link.system == System::Github {
+            let project =
+                crate::github_sync::target_of(&link.target).is_some_and(|t| t.is_project());
+            match (project, link.target_id.as_deref()) {
+                (true, Some(id)) => {
+                    crate::github_sync::check_node_id(id).map_err(DeskError::Invalid)?
+                }
+                (true, None) => {
+                    return Err(DeskError::Invalid(
+                        "Say which GitHub project, by its id from the hub's list of projects."
+                            .into(),
+                    ))
+                }
+                (false, _) => {}
+            }
+            if let Some(r) = link.repo.as_deref() {
+                crate::github_sync::check_repo(r).map_err(DeskError::Invalid)?;
+            }
+        }
         if let Via::Hub { hub } = &link.via {
             check_hub_id(hub)?;
             if self.sync_hub(hub).await?.is_none() {
@@ -291,6 +317,10 @@ impl Desk {
             system: link.system,
             target: link.target,
             target_id: link.target_id,
+            repo: link
+                .repo
+                .filter(|_| link.system == System::Github)
+                .map(|r| r.to_ascii_lowercase()),
             via: link.via,
             agent: link.agent,
             workspace: link.workspace,
@@ -501,6 +531,9 @@ struct Listed {
     /// Read oldest change first (Jira, or a Linear that doesn't page), so
     /// what was read is all there is up to its last.
     ordered: bool,
+    /// A GitHub project's place of every issue it lists, in its own order:
+    /// key, item id and place ([`board::github_rank_of`]).
+    places: Vec<(String, String, String)>,
 }
 
 /// How a pull pass ended: the cursor it got to, whether it swept, and the
@@ -911,8 +944,13 @@ impl Desk {
             complete: true,
             next: None,
             ordered: true,
+            places: vec![],
         };
         match s.system {
+            System::Github => {
+                self.github_matching(s, remote, since, budget, &mut out)
+                    .await?
+            }
             System::Jira => {
                 // A shared key's "assigned to me" is whom the person's
                 // verified email names, never the key's owner.
@@ -1106,10 +1144,20 @@ impl Desk {
             complete,
             next,
             ordered,
+            places,
         } = listed;
+        // A GitHub project's order, every pass: what moved there moves here.
+        if !places.is_empty() {
+            self.take_places(b, s, &places)
+                .await
+                .map_err(|e| RemoteError::Failed(e.to_string()))?;
+        }
         // A listing from no cursor, read through in this pass, is the whole
         // filter: the sweep goes by it rather than read it all again.
-        let whole = (s.cursor.is_none() && resume.is_none() && complete).then(|| changed.clone());
+        // A GitHub project's listing holds only what changed: its sweep
+        // lists the project again for what is on it.
+        let whole = (s.cursor.is_none() && resume.is_none() && complete && places.is_empty())
+            .then(|| changed.clone());
         let mut top = resume
             .and_then(|l| l.top.as_deref())
             .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
@@ -1246,11 +1294,15 @@ impl Desk {
         key: &str,
     ) -> Result<Option<Issue>, RemoteError> {
         budget.take()?;
+        if s.system == System::Github {
+            return self.github_fetch(s, remote, key).await;
+        }
         let (tool, args) = crate::board_sync::read_issue_call(s.system, key, s.fields.as_ref());
         let v = crate::board_sync::call(remote, s.system, tool, args).await?;
         let issue = match s.system {
             System::Jira => crate::board_sync::jira_issue(&v, ""),
             System::Linear => crate::board_sync::linear_issue(v.get("issue").unwrap_or(&v)),
+            System::Github => None,
         };
         Ok(issue.filter(|i| crate::board_sync::key_in_target(&i.key, &s.target)))
     }
@@ -1321,7 +1373,7 @@ impl Desk {
         if issue.body.is_some() {
             return Ok(match s.system {
                 System::Linear => Self::with_mentions(remote, budget, issue.clone()).await,
-                System::Jira => issue.clone(),
+                System::Jira | System::Github => issue.clone(),
             });
         }
         budget.take()?;
@@ -1752,6 +1804,8 @@ impl Desk {
         whole: Option<Vec<Issue>>,
     ) -> Result<(), RemoteError> {
         let fail = |e: eyre::Report| RemoteError::Failed(e.to_string());
+        // Every issue on a GitHub project, changed or not.
+        let mut present = std::collections::HashSet::new();
         let issues = match whole {
             Some(issues) => issues,
             None => {
@@ -1760,6 +1814,7 @@ impl Desk {
                 if !listed.complete {
                     return Ok(());
                 }
+                present.extend(listed.places.into_iter().map(|(k, _, _)| k));
                 listed.issues
             }
         };
@@ -1778,12 +1833,29 @@ impl Desk {
                     .map_err(|e| RemoteError::Failed(e.to_string()))?;
                 continue;
             }
+            if present.contains(&e.key) {
+                continue;
+            }
             if e.made_here || t.state == TicketState::Dropped {
                 continue;
             }
             // A whole board lists what is open: a ticket already Done here
             // is where its issue's state put it.
             if s.filter.is_all() && t.state == TicketState::Done {
+                continue;
+            }
+            // A project's whole listing is every item on it, open or
+            // closed: one not in it was taken off it, or left the filter.
+            let on_project = s.system == System::Github
+                && crate::github_sync::target_of(&s.target).is_some_and(|t| t.is_project());
+            if on_project {
+                if self
+                    .detach(b, s, t)
+                    .await
+                    .map_err(|e| RemoteError::Failed(e.to_string()))?
+                {
+                    out.detached += 1;
+                }
                 continue;
             }
             let tool = crate::board_sync::read_issue_call(s.system, &e.key, s.fields.as_ref());
@@ -1796,6 +1868,7 @@ impl Desk {
                         System::Linear => {
                             crate::board_sync::linear_issue(v.get("issue").unwrap_or(&v))
                         }
+                        System::Github => github::github_read_one(s, &v),
                     };
                     // Moved to another project: no longer this board's.
                     let gone = read
@@ -2290,6 +2363,11 @@ impl Desk {
             None if t.created_by.kind != crate::crew::PartyKind::You => return Ok(()),
             // A ticket the board had before it was linked stays on Desk only.
             None if s.local_before.is_some_and(|at| t.created_at <= at) => return Ok(()),
+            // A GitHub project with no repository for new tickets: they stay
+            // on Desk, and the link says how to change that.
+            None if s.system == System::Github && github::new_issues_repo(s).is_none() => {
+                return Ok(())
+            }
             None => {
                 let made = self.create_issue(b, s, remote, budget, t, q).await?;
                 out.created += 1;
@@ -2329,16 +2407,29 @@ impl Desk {
                     }
                     a
                 }
+                System::Github => {
+                    let mut a = crate::github_sync::read_args(&e.key);
+                    if let Some(title) = &push.title {
+                        a["title"] = json!(title);
+                    }
+                    if let Some(body) = &push.body {
+                        a["body"] = json!(body);
+                    }
+                    a
+                }
             };
             let tool = match s.system {
                 System::Jira => "jira.update_issue",
                 System::Linear => "linear.issue_update",
+                System::Github => "github.issue_update",
             };
             crate::board_sync::call(remote, s.system, tool, args).await?;
         }
         let mut commented = false;
         if let Some(state) = push.state {
-            if let Some(name) = s.states.get(&state) {
+            if s.system == System::Github {
+                self.github_move(s, remote, budget, &e, state).await?;
+            } else if let Some(name) = s.states.get(&state) {
                 self.transition(s, remote, budget, &e.key, name).await?;
             }
             let pr = t.links.iter().rev().find_map(|l| match l {
@@ -2358,6 +2449,11 @@ impl Desk {
                         "linear.comment_add",
                         json!({ "identifier": e.key, "body": note }),
                     ),
+                    System::Github => {
+                        let mut a = crate::github_sync::read_args(&e.key);
+                        a["body"] = json!(note);
+                        ("github.issue_comment", a)
+                    }
                 };
                 crate::board_sync::call(remote, s.system, tool, args).await?;
                 commented = true;
@@ -2395,7 +2491,7 @@ impl Desk {
         // kept as sent first, so it never goes twice.
         let mut held: Option<RemoteError> = None;
         if let Some(mv) = &sent_order {
-            if let Some((tool, args)) = crate::board_sync::order_call(s.system, &e.key, mv) {
+            if let Some((tool, args)) = crate::board_sync::order_call_for(s, &e, mv) {
                 let went = match budget.take() {
                     Err(spent) => Err(spent),
                     Ok(()) => match crate::board_sync::call(remote, s.system, tool, args).await {
@@ -2494,6 +2590,8 @@ impl Desk {
     ) -> Result<(), RemoteError> {
         budget.take()?;
         match s.system {
+            // Its own moves ([`Self::github_move`]).
+            System::Github => Ok(()),
             System::Jira => {
                 let list = crate::board_sync::call(
                     remote,
@@ -2608,10 +2706,20 @@ impl Desk {
         }
         let (key, issue_id, url) = match found {
             Some(made) => made,
+            None if s.system == System::Github => {
+                self.0
+                    .store
+                    .creating(t.id, now)
+                    .await
+                    .map_err(|e| fail(internal(e)))?;
+                budget.take()?;
+                self.github_create(s, remote, budget, &reference, &t.title, &t.body)
+                    .await?
+            }
             None => {
                 let issue_type = match s.system {
                     System::Jira => Some(self.issue_type(s, remote, budget).await?),
-                    System::Linear => None,
+                    System::Linear | System::Github => None,
                 };
                 self.0
                     .store
@@ -2636,6 +2744,7 @@ impl Desk {
                             }),
                         )
                     }
+                    System::Github => unreachable!("made above"),
                     System::Linear => {
                         let body = format!(
                             "{}\n\n(Desk ref: {reference})",
@@ -2765,7 +2874,11 @@ impl Desk {
         reference: &str,
     ) -> Result<Made, RemoteError> {
         budget.take()?;
+        if s.system == System::Github {
+            return self.github_find_made(s, remote, budget, reference).await;
+        }
         let found = match s.system {
+            System::Github => vec![],
             System::Jira => {
                 let answer = crate::board_sync::call(
                     remote,

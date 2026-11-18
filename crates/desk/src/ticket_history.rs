@@ -124,6 +124,8 @@ pub fn history_call(system: System, key: &str) -> (&'static str, Value) {
             "linear.issue_history",
             serde_json::json!({ "identifier": key, "limit": HISTORY_MAX }),
         ),
+        // Never read (`read_ticket_history`).
+        System::Github => ("github.issues_changed", crate::github_sync::read_args(key)),
     }
 }
 
@@ -137,6 +139,7 @@ pub fn writer_of(system: System, answer: &Value) -> Option<String> {
     let id = match system {
         System::Jira => &answer["account_id"],
         System::Linear => &answer["id"],
+        System::Github => &answer["login"],
     };
     id.as_str()
         .map(str::trim)

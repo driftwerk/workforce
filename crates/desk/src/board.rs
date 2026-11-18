@@ -68,6 +68,7 @@ impl Board {
 text_enum!(System {
     Linear => "linear",
     Jira => "jira",
+    Github => "github",
 });
 
 impl System {
@@ -75,6 +76,7 @@ impl System {
         match self {
             Self::Linear => "Linear",
             Self::Jira => "Jira",
+            Self::Github => "GitHub",
         }
     }
 }
@@ -108,7 +110,10 @@ pub enum Filter {
     /// The open sprint (Jira) or the active cycle.
     CurrentCycle,
     Label(String),
-    /// Raw JQL, or a Linear filter as a JSON object.
+    /// A GitHub milestone, by its title.
+    Milestone(String),
+    /// Raw JQL, a Linear filter as a JSON object, or a GitHub project's
+    /// filter (`label:bug -status:Done`).
     Query(String),
 }
 
@@ -299,6 +304,7 @@ impl Paused {
 fn system_of_tools(tools: &[String]) -> &'static str {
     match tools.first().map(String::as_str) {
         Some(t) if t.starts_with("linear") => "Linear",
+        Some(t) if t.starts_with("github") => "GitHub",
         _ => "Jira",
     }
 }
@@ -326,11 +332,17 @@ pub struct Sync {
     /// imported or made are ever written to.
     pub link: Uuid,
     pub system: System,
-    /// The Jira project's key, or the Linear team's.
+    /// The Jira project's key, or the Linear team's; on GitHub a project
+    /// (`owner/projects/7`) or a repository's issues (`owner/repo`).
     pub target: String,
-    /// The Linear team's id, which its tools take.
+    /// The Linear team's id, which its tools take; a GitHub project's node
+    /// id (`PVT_…`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_id: Option<String>,
+    /// On a GitHub project, the repository (`owner/repo`) a ticket made in
+    /// Desk is made an issue in: none, and such tickets stay on Desk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
     pub via: Via,
     /// The agent on the hub whose tools it syncs through (`/mcp/agents/{id}`):
     /// the one that offers them all, found when it is linked and again when
@@ -524,7 +536,7 @@ pub struct External {
 /// Where a drop within a column puts an issue there: next to the issues of
 /// the cards above and below it (their keys), and on Linear the sortOrder
 /// between theirs.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RankMove {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -533,6 +545,13 @@ pub struct RankMove {
     pub below: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort_order: Option<f64>,
+    /// On a GitHub project: the item the dropped one goes after there
+    /// (`afterId`), and whether it goes to the very top (no item before
+    /// it). Neither: nowhere to say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_item: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub to_top: bool,
 }
 
 /// What a synced ticket's issue says of itself: its priority, labels,
@@ -1131,6 +1150,13 @@ pub fn linear_sort_order(rank: &str) -> Option<f64> {
         _ => !key,
     };
     Some(f64::from_bits(bits)).filter(|f| f.is_finite())
+}
+
+/// A GitHub project item's place, from its index in the project's own
+/// order (Projects v2 keeps an order, never a value): 1024 apart, as ten
+/// digits, so it sorts byte-wise and a drop's guess fits between two.
+pub fn github_rank_of(index: usize) -> String {
+    format!("{:010}", (index as u64).saturating_mul(1024))
 }
 
 /// The gap Linear's sortOrder leaves past the end of a list.

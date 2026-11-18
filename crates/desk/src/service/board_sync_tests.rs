@@ -89,6 +89,7 @@ fn jira(n: usize, failing: &[&str]) -> FakeJira {
 fn link(hub: Option<&str>) -> LinkBoard {
     LinkBoard {
         system: System::Jira,
+        repo: None,
         target: "ACME".into(),
         target_id: None,
         via: match hub {
@@ -921,6 +922,7 @@ async fn whole_team(d: &Desk, me: Option<&str>) -> Board {
         b.id,
         LinkBoard {
             system: System::Linear,
+            repo: None,
             target: "ENG".into(),
             target_id: Some(TEAM.into()),
             via: Via::ThisHub,
@@ -3154,6 +3156,275 @@ async fn a_held_linear_sort_order_waits_and_its_link_goes_once() {
         assert_eq!(
             column_keys(&d, &b, TicketState::Todo).await,
             ["ENG-1", "ENG-2", "ENG-3"]
+        );
+    })
+    .await;
+}
+
+// ── GitHub ───────────────────────────────────────────────────────────────
+
+/// A GitHub project, as the hub's board tools answer (fixtures built from
+/// their shapes, never recorded): items in its own order, each with its
+/// issue's Status; every call kept.
+struct FakeGithub {
+    /// Key (`acme/web#N`), item id, Status, updated.
+    items: Mutex<Vec<(String, String, String, String)>>,
+    calls: Mutex<Vec<(String, Value)>>,
+}
+
+impl FakeGithub {
+    fn new(items: &[(&str, &str, &str)]) -> Self {
+        Self {
+            items: Mutex::new(
+                items
+                    .iter()
+                    .map(|(k, id, st)| {
+                        (
+                            k.to_string(),
+                            id.to_string(),
+                            st.to_string(),
+                            "2026-11-18T10:00:00Z".to_string(),
+                        )
+                    })
+                    .collect(),
+            ),
+            calls: Mutex::new(vec![]),
+        }
+    }
+
+    fn called(&self, tool: &str) -> Vec<Value> {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(t, _)| t == tool)
+            .map(|(_, a)| a.clone())
+            .collect()
+    }
+
+    fn item(&self, i: &(String, String, String, String), full: bool) -> Value {
+        let (repo, n) = i.0.split_once('#').unwrap();
+        let mut v = json!({ "item_id": i.1, "type": "ISSUE", "updated_at": i.3,
+            "repo": repo, "number": n.parse::<u64>().unwrap() });
+        if full {
+            v["title"] = json!(format!("Issue {}", i.0));
+            v["body"] = json!("About it.");
+            v["state"] = json!("OPEN");
+            v["labels"] = json!(["web"]);
+            v["assignees"] = json!([]);
+            v["url"] = json!(format!("https://github.com/{repo}/issues/{n}"));
+            v["status"] = json!(i.2);
+        }
+        v
+    }
+}
+
+#[async_trait]
+impl Remote for FakeGithub {
+    async fn tools(&self) -> Result<Vec<String>, RemoteError> {
+        Ok(crate::github_sync::TOOLS
+            .iter()
+            .map(|t| t.to_string())
+            .collect())
+    }
+
+    async fn call(&self, tool: &str, args: Value) -> Result<Value, RemoteError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((tool.to_string(), args.clone()));
+        let items = self.items.lock().unwrap().clone();
+        match tool {
+            "github.project_items" => match args["ids"].as_array() {
+                Some(ids) => Ok(json!({ "items": items.iter()
+                    .filter(|i| ids.iter().any(|id| id == &json!(i.1)))
+                    .map(|i| self.item(i, true)).collect::<Vec<_>>() })),
+                None => Ok(json!({
+                    "items": items.iter().map(|i| self.item(i, false)).collect::<Vec<_>>(),
+                    "page_info": { "has_next_page": false, "end_cursor": null },
+                })),
+            },
+            "github.project_item_status" | "github.issue_update" | "github.issue_comment" => {
+                Ok(json!({ "ok": true }))
+            }
+            "github.project_item_move" => Ok(json!({ "moved": true, "item_id": args["item_id"] })),
+            other => Err(RemoteError::NotAllowed(other.into())),
+        }
+    }
+}
+
+async fn github_board(d: &Desk) -> Board {
+    let b = d
+        .create_board(NewBoard {
+            name: "Web".into(),
+            group: None,
+            prefix: None,
+        })
+        .await
+        .unwrap();
+    let mut l = link(None);
+    l.system = System::Github;
+    l.target = "acme/projects/7".into();
+    l.target_id = Some("PVT_kwDOA".into());
+    l.filter = Filter::All {
+        include_done: false,
+    };
+    l.states = BTreeMap::from([
+        (TicketState::Todo, "Todo".to_string()),
+        (TicketState::Doing, "In Progress".to_string()),
+        (TicketState::Done, "Done".to_string()),
+    ]);
+    d.link_board(b.id, l, "sam").await.unwrap()
+}
+
+/// A project's issues come on in its own order, in their Status's column;
+/// moved there, they move here on the next pass with no issue read again.
+#[tokio::test]
+async fn a_github_project_comes_on_in_its_own_order() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = github_board(&d).await;
+        let gh = FakeGithub::new(&[
+            ("acme/web#3", "PVTI_3", "Todo"),
+            ("acme/api#1", "PVTI_1", "Todo"),
+            ("acme/web#2", "PVTI_2", "In Progress"),
+        ]);
+        let pulled = d.pull_board(b.id, &gh).await.unwrap();
+        assert_eq!(pulled.imported, 3, "{pulled:?}");
+        assert_eq!(
+            column_keys(&d, &b, TicketState::Todo).await,
+            ["acme/web#3", "acme/api#1"]
+        );
+        assert_eq!(
+            column_keys(&d, &b, TicketState::Doing).await,
+            ["acme/web#2"]
+        );
+        let t = ticket_of(&d, &b, "acme/web#3").await.ticket;
+        assert_eq!(t.upstream_rank.as_deref(), Some("0000000000"));
+        assert_eq!(t.external.unwrap().id.as_deref(), Some("PVTI_3"));
+        // Reordered there, nothing else changed.
+        gh.items.lock().unwrap().swap(0, 1);
+        let full_before = gh
+            .called("github.project_items")
+            .iter()
+            .filter(|a| a.get("ids").is_some())
+            .count();
+        d.pull_board(b.id, &gh).await.unwrap();
+        assert_eq!(
+            column_keys(&d, &b, TicketState::Todo).await,
+            ["acme/api#1", "acme/web#3"]
+        );
+        let full_after = gh
+            .called("github.project_items")
+            .iter()
+            .filter(|a| a.get("ids").is_some())
+            .count();
+        assert_eq!(
+            full_before, full_after,
+            "only the lean listing is read for order"
+        );
+    })
+    .await;
+}
+
+/// A drag moves the item there after the card above it, or to the top; a
+/// move to another column sets its Status, and Done closes its issue.
+#[tokio::test]
+async fn a_github_drop_and_move_go_out_as_the_project_s_own() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = github_board(&d).await;
+        let gh = FakeGithub::new(&[
+            ("acme/web#1", "PVTI_1", "Todo"),
+            ("acme/web#2", "PVTI_2", "Todo"),
+            ("acme/web#3", "PVTI_3", "Todo"),
+        ]);
+        d.pull_board(b.id, &gh).await.unwrap();
+        let (one, two, three) = (
+            id_of(&d, &b, "acme/web#1").await,
+            id_of(&d, &b, "acme/web#2").await,
+            id_of(&d, &b, "acme/web#3").await,
+        );
+        // #1 dropped between #2 and #3.
+        let mv = crate::service::Move {
+            state: TicketState::Todo,
+            before: Some(two),
+            after: Some(three),
+        };
+        d.move_ticket(one, mv, &By::you()).await.unwrap();
+        assert_eq!(
+            column_keys(&d, &b, TicketState::Todo).await,
+            ["acme/web#2", "acme/web#1", "acme/web#3"]
+        );
+        due_now(&d, b.id).await;
+        d.push_board(b.id, &gh).await.unwrap();
+        assert_eq!(
+            gh.called("github.project_item_move"),
+            [json!({ "project_id": "PVT_kwDOA", "item_id": "PVTI_1", "after_id": "PVTI_2" })]
+        );
+        // #3 dropped at the top: no item before it there.
+        let mv = crate::service::Move {
+            state: TicketState::Todo,
+            before: None,
+            after: Some(two),
+        };
+        d.move_ticket(three, mv, &By::you()).await.unwrap();
+        due_now(&d, b.id).await;
+        d.push_board(b.id, &gh).await.unwrap();
+        assert_eq!(
+            gh.called("github.project_item_move")[1],
+            json!({ "project_id": "PVT_kwDOA", "item_id": "PVTI_3", "after_id": null })
+        );
+        // Done: its Status, then its issue closed as completed.
+        let mv = crate::service::Move {
+            state: TicketState::Done,
+            before: None,
+            after: None,
+        };
+        d.move_ticket(two, mv, &By::you()).await.unwrap();
+        due_now(&d, b.id).await;
+        d.push_board(b.id, &gh).await.unwrap();
+        let status = gh.called("github.project_item_status");
+        assert_eq!(status.last().unwrap()["status"], "Done");
+        assert_eq!(status.last().unwrap()["item_id"], "PVTI_2");
+        let closed = gh.called("github.issue_update");
+        assert_eq!(closed.last().unwrap()["state"], "closed");
+        assert_eq!(closed.last().unwrap()["number"], 2);
+    })
+    .await;
+}
+
+/// The sweep keeps what is still on the project, changed or not, and puts
+/// an item taken off it on the Left-the-filter shelf.
+#[tokio::test]
+async fn a_github_sweep_shelves_only_what_left_the_project() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = github_board(&d).await;
+        let gh = FakeGithub::new(&[
+            ("acme/web#1", "PVTI_1", "Todo"),
+            ("acme/web#2", "PVTI_2", "Todo"),
+        ]);
+        d.pull_board(b.id, &gh).await.unwrap();
+        d.change_sync(b.id, |s| s.swept_at = None).await.unwrap();
+        let pulled = d.pull_board(b.id, &gh).await.unwrap();
+        assert_eq!(pulled.detached, 0, "{pulled:?}");
+        gh.items.lock().unwrap().remove(1);
+        d.change_sync(b.id, |s| s.swept_at = None).await.unwrap();
+        let pulled = d.pull_board(b.id, &gh).await.unwrap();
+        assert_eq!(pulled.detached, 1, "{pulled:?}");
+        let t = ticket_of(&d, &b, "acme/web#2").await.ticket;
+        assert!(!t.external.unwrap().synced);
+        assert!(
+            ticket_of(&d, &b, "acme/web#1")
+                .await
+                .ticket
+                .external
+                .unwrap()
+                .synced
         );
     })
     .await;

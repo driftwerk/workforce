@@ -693,6 +693,7 @@ pub(crate) fn states() -> BTreeMap<TicketState, String> {
 pub(crate) fn link_jira(filter: Filter) -> LinkBoard {
     LinkBoard {
         system: System::Jira,
+        repo: None,
         target: "ACME".into(),
         target_id: None,
         via: Via::Hub {
@@ -2134,4 +2135,39 @@ async fn a_policy_refusal_keeps_its_back_off() {
         assert_ne!(s.failures, 0);
     })
     .await;
+}
+
+// ── GitHub ───────────────────────────────────────────────────────────────
+
+/// A key that can't read projects is told what to do in words, never a
+/// command; and the dialog's lists are the open projects and real
+/// repositories, as the hub's GitHub tools answer them.
+#[test]
+fn github_link_check_words_and_lists() {
+    let scopes = RemoteError::Failed(
+        "GitHub GraphQL INSUFFICIENT_SCOPES: Your token has not been granted the required scopes to execute this query. The 'id' field requires one of the following scopes: ['read:project']".into(),
+    );
+    let said = github_scope_words(&scopes);
+    assert!(said.contains("can't read projects"), "{said}");
+    assert!(said.contains("repository's issues"), "{said}");
+    assert!(!said.contains("gh auth"), "{said}");
+    assert_eq!(
+        github_scope_words(&RemoteError::Failed("boom".into())),
+        "boom"
+    );
+    let projects = github_projects_of(
+        "acme",
+        &json!({ "projects": [
+            { "id": "PVT_1", "number": 7, "title": "Roadmap", "closed": false },
+            { "id": "PVT_2", "number": 8, "title": "Old", "closed": true },
+        ] }),
+    );
+    assert_eq!(
+        projects,
+        json!([{ "key": "acme/projects/7", "name": "Roadmap", "id": "PVT_1" }])
+    );
+    let repos = github_repos_of(&json!({ "repos": [
+        { "full_name": "acme/web" }, { "full_name": "not a repo" },
+    ] }));
+    assert_eq!(repos, json!([{ "key": "acme/web", "name": "acme/web" }]));
 }
