@@ -1612,6 +1612,11 @@ const DESK_SEARCH: &str = "desk.search";
 /// a reply in one also sent to the DM by
 /// `POST /api/desk/conversations/{agent}/messages`.
 const DESK_DM_THREADS: &str = "desk.dm_threads";
+/// A message in a DM may start the thread on itself
+/// ([`workforce_common::channels::desk::DeskTurn::starts_thread`]): sent on
+/// the thread's channel under the id the thread names, it is kept in the DM
+/// as the thread's parent and answered in the thread from the first reply.
+const DESK_THREAD_STARTS: &str = "desk.thread_starts";
 /// A person may delete their own message in their DM, and forget what the
 /// agent remembered from it
 /// (`DELETE /api/desk/conversations/{agent}/messages/{id}`).
@@ -1689,6 +1694,7 @@ pub(crate) fn desk_features(of_a_person: bool) -> Vec<String> {
         // Searching is too.
         .chain(deliveries.then_some(DESK_SEARCH))
         .chain(deliveries.then_some(DESK_DM_THREADS))
+        .chain(deliveries.then_some(DESK_THREAD_STARTS))
         .chain(deliveries.then_some(DESK_DELIVERIES))
         .chain(signals)
         .chain(reads)

@@ -5076,6 +5076,7 @@ pub(crate) async fn stream_admitted(
             trust_level,
         );
     }
+    let mut started = None;
     if let Some(desk) = desk.filter(|_| held.is_none()) {
         let files = crate::desk_attachments::carried(
             Arc::clone(&service.sessions),
@@ -5084,6 +5085,10 @@ pub(crate) async fn stream_admitted(
             attachments.as_deref(),
         )
         .await;
+        started = desk
+            .turn
+            .thread_started()
+            .map(|parent| (parent, files.clone()));
         if let Some(asked) = session.messages.last_mut() {
             asked.desk = Some(workforce_common::channels::desk::DeskMark {
                 files,
@@ -5095,6 +5100,19 @@ pub(crate) async fn stream_admitted(
     let turn_message_id = session.messages.get(archive_base).map(|m| m.id.clone());
 
     turn_claim.unless_cancelled(&cancel_token).await?;
+    // A message starting the thread on itself is the thread's parent: kept
+    // in the DM once the turn will run, so the thread is one of the DM's
+    // from its first reply. Not kept there, the turn doesn't run.
+    if let Some((parent, files)) = started {
+        crate::desk_conversations::start_thread(
+            service.sessions.as_ref(),
+            service.agent_id.as_str(),
+            &session.owner,
+            &parent,
+            store_content,
+            files,
+        )?;
+    }
     stamp_tool_whitelist(&mut session);
     let privacy = prompt_privacy(
         user,

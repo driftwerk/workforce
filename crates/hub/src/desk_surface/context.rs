@@ -199,6 +199,7 @@ mod tests {
                 voice: None,
                 members: Vec::new(),
                 edit: None,
+                starts_thread: false,
             },
             target: DeskTarget {
                 place: DeskPlace::Dm { thread: None },

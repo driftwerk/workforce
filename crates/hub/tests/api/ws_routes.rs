@@ -337,6 +337,7 @@ async fn a_desk_connection_sends_turns_the_agent_reads_in_their_place() {
             "desk.delete",
             "desk.search",
             "desk.dm_threads",
+            "desk.thread_starts",
             "desk.deliveries",
         ]
     } else {

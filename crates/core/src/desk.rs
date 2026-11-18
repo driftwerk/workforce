@@ -351,6 +351,12 @@ pub struct DeskTurn {
     /// agent answers this one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edit: Option<DeskEdit>,
+    /// This message starts the thread it is asked in
+    /// (`desk.thread_starts`): it is the thread's parent, kept in the DM
+    /// under the id it was sent with, and the agent answers it in the
+    /// thread, from the first reply.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub starts_thread: bool,
 }
 
 /// What a Desk turn that edits the person's latest message replaces.
@@ -375,6 +381,8 @@ pub enum DeskTurnError {
     /// An edit sent under the id of the message it replaces: sent again, it
     /// would name its own new version and set that answer aside too.
     EditReusesId,
+    /// A message starting a thread anywhere but the DM thread on itself.
+    StartsAnotherThread,
 }
 
 impl std::fmt::Display for DeskTurnError {
@@ -385,6 +393,9 @@ impl std::fmt::Display for DeskTurnError {
             Self::TooManyHops => "agents have handed this on too many times already",
             Self::EditOutsideDm => "only your latest message in a direct message can be edited",
             Self::EditReusesId => "an edit must be sent under a new message id",
+            Self::StartsAnotherThread => {
+                "a message starts the thread on itself, in a direct message"
+            }
         })
     }
 }
@@ -415,6 +426,9 @@ impl DeskTurn {
             if self.message.is_some_and(|id| id.to_string() == replaces) {
                 return Err(DeskTurnError::EditReusesId);
             }
+        }
+        if self.starts_thread && !self.starts_its_own_thread() {
+            return Err(DeskTurnError::StartsAnotherThread);
         }
         Ok(Self {
             place: self.place.clipped(),
@@ -495,6 +509,7 @@ impl DeskTurn {
             voice: None,
             members: Vec::new(),
             edit: None,
+            starts_thread: false,
         })
     }
 
@@ -506,6 +521,29 @@ impl DeskTurn {
             edited: self.edit.is_some(),
             ..self.place.mark()
         }
+    }
+
+    /// Whether this is the person's message in the DM thread on itself, as
+    /// a message that starts a thread must be: the thread's parent is the
+    /// id it is sent under.
+    fn starts_its_own_thread(&self) -> bool {
+        let on = match &self.place {
+            DeskPlace::Dm {
+                thread: Some(parent),
+            } => parent,
+            _ => return false,
+        };
+        !self.is_hand_off()
+            && self.edit.is_none()
+            && self.message.is_some_and(|id| id.to_string() == *on)
+    }
+
+    /// The id of the DM message this turn starts the thread on: its own,
+    /// when it starts one.
+    pub fn thread_started(&self) -> Option<String> {
+        self.starts_thread
+            .then(|| self.message.map(|id| id.to_string()))
+            .flatten()
     }
 
     /// Whether another agent, not the person, said this.
@@ -658,6 +696,10 @@ pub struct DeskMark {
     /// carries `thread_of` too.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub thread_copy: bool,
+    /// The person's message in the DM that started the thread on itself
+    /// (`desk.thread_starts`): the agent answered it there, not in the DM.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub starts_thread: bool,
     /// The person's message is their edit of an earlier one, which reads
     /// "(edited)".
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1140,6 +1182,7 @@ mod tests {
             voice: None,
             members: Vec::new(),
             edit: None,
+            starts_thread: false,
         }
     }
 
@@ -1199,6 +1242,71 @@ mod tests {
         let dm = DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
         assert_eq!(dm.channel, DESK_CHANNEL);
         assert_eq!(target.dm().place, DeskPlace::Dm { thread: None });
+    }
+
+    #[test]
+    fn a_message_starts_only_the_dm_thread_on_itself() {
+        let id = Uuid::from_u128(21);
+        let parent = id.to_string();
+        let channel = dm_thread_channel(&parent);
+        let starts = |place: DeskPlace, message: Option<Uuid>| DeskTurn {
+            message,
+            starts_thread: true,
+            ..turn(place)
+        };
+        let on_itself = starts(
+            DeskPlace::Dm {
+                thread: Some(parent.clone()),
+            },
+            Some(id),
+        );
+        let read = on_itself.clone().validated(&channel).unwrap();
+        assert_eq!(read.thread_started(), Some(parent.clone()));
+        let wire = serde_json::to_value(&on_itself).unwrap();
+        assert_eq!(wire["starts_thread"], true);
+        assert!(
+            serde_json::to_value(turn(DeskPlace::Dm { thread: None }))
+                .unwrap()
+                .get("starts_thread")
+                .is_none(),
+            "a turn starting nothing says nothing"
+        );
+
+        let refused = |t: DeskTurn, on: &str| t.validated(on).unwrap_err();
+        // Under another id than the thread's, or none.
+        let other = Uuid::from_u128(22);
+        for message in [Some(other), None] {
+            let t = starts(
+                DeskPlace::Dm {
+                    thread: Some(parent.clone()),
+                },
+                message,
+            );
+            assert_eq!(refused(t, &channel), DeskTurnError::StartsAnotherThread);
+        }
+        // In the DM itself, or in a room.
+        let t = starts(DeskPlace::Dm { thread: None }, Some(id));
+        assert_eq!(refused(t, DESK_CHANNEL), DeskTurnError::StartsAnotherThread);
+        let t = starts(in_room(None), Some(id));
+        assert_eq!(
+            refused(t, &format!("desk:{ROOM}")),
+            DeskTurnError::StartsAnotherThread
+        );
+        // Handed on by another agent.
+        let t = DeskTurn {
+            speaker: DeskSpeaker::Agent {
+                name: "helper".into(),
+            },
+            ..on_itself.clone()
+        };
+        assert_eq!(refused(t, &channel), DeskTurnError::StartsAnotherThread);
+        assert_eq!(
+            turn(DeskPlace::Dm {
+                thread: Some(parent)
+            })
+            .thread_started(),
+            None
+        );
     }
 
     #[test]
