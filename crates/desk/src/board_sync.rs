@@ -121,6 +121,7 @@ pub fn callable(system: System) -> Vec<&'static str> {
         System::Github => all.extend(workforce_core::desk::BOARD_SYNC_GITHUB_PICK_TOOLS),
         System::Linear => {}
     }
+    all.extend(ordering_tool(system));
     all.push(workspaces_tool(system));
     all.extend(view_tools(system));
     all
@@ -738,6 +739,378 @@ pub fn priorities(s: &crate::board::Sync) -> &[String] {
 /// How long a Jira site's fields, once read, are kept before they are read
 /// again.
 pub const FIELDS_FRESH: Duration = Duration::days(1);
+
+// ── The board's order there ──────────────────────────────────────────────
+
+/// The hub's tool that says how `system`'s board orders its issues
+/// ([`workforce_core::desk::BOARD_SYNC_ORDER_TOOLS`]): called when offered,
+/// never needed. None on GitHub: a project's items come in its own order,
+/// moved by hand there.
+pub fn ordering_tool(system: System) -> Option<&'static str> {
+    match system {
+        System::Jira => Some("jira.board_order"),
+        System::Linear => Some("linear.view_ordering"),
+        System::Github => None,
+    }
+}
+
+/// The kind of Linear view a board's filter shows the team's issues in,
+/// as Linear's `ViewType` names it: whose ordering it follows.
+pub fn linear_view_type(f: &Filter) -> &'static str {
+    match f {
+        Filter::AssignedToMe => "myIssues",
+        Filter::CurrentCycle => "cycle",
+        Filter::Query(q) if linear_query(q).is_ok_and(|o| o.contains_key("project_id")) => {
+            "project"
+        }
+        Filter::All { .. } | Filter::Label(_) | Filter::Milestone(_) | Filter::Query(_) => {
+            "allIssues"
+        }
+    }
+}
+
+/// The arguments [`ordering_tool`] takes for `s`'s board.
+pub fn ordering_args(s: &crate::board::Sync) -> Value {
+    match s.system {
+        System::Jira => json!({ "project_key": s.target }),
+        System::Linear => json!({ "view_type": linear_view_type(&s.filter) }),
+        System::Github => json!({}),
+    }
+}
+
+/// How soon an ordering whose read failed for a passing reason (the hub
+/// offline, slowed down) is asked for again.
+pub const ORDERING_RETRY: Duration = Duration::minutes(15);
+
+/// Someone else's name (a board's, a filter's field) as an ordering says
+/// it: one line, no control characters, at most `max` characters.
+fn plain_name(text: &str, max: usize) -> String {
+    let clean: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    crate::crew::one_line(clean.trim(), max)
+}
+
+/// Whether `o`, read at its `read_at`, is still good at `now`: read again
+/// on the fields' cadence.
+pub fn ordering_fresh(o: &crate::board::SourceOrder, now: DateTime<Utc>) -> bool {
+    match o.retry_at {
+        Some(at) => now < at,
+        None => now - o.read_at < FIELDS_FRESH,
+    }
+}
+
+/// What a board sorts by where its hub couldn't say how the board there is
+/// ordered: its manual order or Rank, said so.
+pub fn ordering_unknown(system: System, now: DateTime<Utc>) -> crate::board::SourceOrder {
+    crate::board::SourceOrder {
+        by: vec![],
+        from: None,
+        note: Some(format!(
+            "The hub can't say how this board is ordered on {}, so it follows {}.",
+            system.title(),
+            fallback_words(system)
+        )),
+        read_at: now,
+        retry_at: None,
+        wants_priorities: false,
+    }
+}
+
+/// What a board falls back to there, as a person says it.
+fn fallback_words(system: System) -> &'static str {
+    match system {
+        System::Jira => "Jira's Rank",
+        System::Linear => "Linear's manual order",
+        System::Github => "the project's own order",
+    }
+}
+
+fn key(field: crate::board::OrderField, desc: bool) -> crate::board::OrderKey {
+    crate::board::OrderKey {
+        field,
+        desc,
+        empty_first: false,
+    }
+}
+
+/// How a Linear view's settings (`linear.view_ordering`'s answer) say it
+/// orders its issues. A custom view goes by the settings in force for the
+/// person, else its workspace default; a team's view by the person's own
+/// settings for that kind of view, read only with their own key (a shared
+/// key's are its owner's). Linear's own directions: a priority going up is
+/// Urgent first (Linear numbers Urgent 1), a date unsaid is the latest
+/// first, a due date unsaid the soonest; issues without one are last
+/// whichever way. Priority's ties go by Linear's place among the issues of
+/// the priority. Anything else is the manual order, said so.
+pub fn linear_ordering(answer: &Value, now: DateTime<Utc>) -> crate::board::SourceOrder {
+    use crate::board::{OrderField as F, SourceOrder};
+    let personal = answer["personal"].as_bool() == Some(true);
+    let set = |v: &Value| v.is_object() && v["ordering"].is_string();
+    let custom = answer["custom_view"].is_object();
+    let picked = if custom {
+        [
+            (
+                personal,
+                &answer["effective"],
+                "the view's settings as you have them",
+            ),
+            (personal, &answer["user"], "your own settings for the view"),
+            (
+                true,
+                &answer["organization"],
+                "the workspace's default for the view",
+            ),
+        ]
+        .into_iter()
+        .find(|(ok, v, _)| *ok && set(v))
+        .map(|(_, v, from)| (v, from))
+    } else {
+        (personal && set(&answer["user"])).then(|| (&answer["user"], "your own view settings"))
+    };
+    let manual = |note: String| SourceOrder {
+        by: vec![],
+        from: None,
+        note: Some(note),
+        read_at: now,
+        retry_at: None,
+        wants_priorities: false,
+    };
+    let Some((v, from)) = picked else {
+        return manual(match personal || custom {
+            true => "Linear doesn't let Desk read how the team's view is ordered for you, so this follows Linear's manual order.".into(),
+            false => "The hub's Linear key is shared, so your own view settings can't be read; this follows Linear's manual order.".into(),
+        });
+    };
+    let ordering = v["ordering"].as_str().unwrap_or_default();
+    let direction = v["direction"].as_str();
+    let by = match ordering {
+        "manual" => vec![key(F::Manual, false)],
+        "priority" => vec![
+            key(F::Priority, direction != Some("desc")),
+            key(F::PrioritySort, false),
+        ],
+        "dateCreated" => vec![key(F::Created, direction != Some("asc"))],
+        "dateUpdated" => vec![key(F::Updated, direction != Some("asc"))],
+        "dueDate" => vec![key(F::Due, direction == Some("desc"))],
+        other => {
+            return manual(format!(
+                "Linear orders this view by {}, which Desk can't follow yet, so this follows Linear's manual order.",
+                linear_ordering_words(other)
+            ))
+        }
+    };
+    SourceOrder {
+        by,
+        from: Some(from.into()),
+        note: None,
+        read_at: now,
+        retry_at: None,
+        wants_priorities: false,
+    }
+}
+
+/// A Linear ordering Desk doesn't follow, as a person says it.
+fn linear_ordering_words(ordering: &str) -> String {
+    match ordering {
+        "title" => "title".into(),
+        "workflowState" => "status".into(),
+        "assignee" => "assignee".into(),
+        "estimate" => "estimate".into(),
+        "linkCount" => "link count".into(),
+        "dateMyActivity" => "your last activity".into(),
+        _ => {
+            let w: String = ordering
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .take(40)
+                .flat_map(|c| match c.is_ascii_uppercase() {
+                    true => vec![' ', c.to_ascii_lowercase()],
+                    false => vec![c],
+                })
+                .collect();
+            match w.trim() {
+                "" => "a setting it didn't name".into(),
+                w => w.to_string(),
+            }
+        }
+    }
+}
+
+/// The fields of a JQL `ORDER BY` clause, in order, each with its
+/// direction as written (None when unsaid): commas outside quotes part
+/// them.
+pub fn jql_order_keys(clause: &str) -> Vec<(String, Option<bool>)> {
+    let mut parts = vec![];
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    for c in clause.chars() {
+        match quote {
+            Some(q) if c == q => {
+                quote = None;
+                cur.push(c);
+            }
+            Some(_) => cur.push(c),
+            None if c == '"' || c == '\'' => {
+                quote = Some(c);
+                cur.push(c);
+            }
+            None if c == ',' => parts.push(std::mem::take(&mut cur)),
+            None => cur.push(c),
+        }
+    }
+    parts.push(cur);
+    parts
+        .into_iter()
+        .filter_map(|p| {
+            let p = p.trim();
+            if p.is_empty() {
+                return None;
+            }
+            let (field, dir) = match p.rsplit_once(char::is_whitespace) {
+                Some((f, d)) if d.eq_ignore_ascii_case("asc") => (f.trim(), Some(false)),
+                Some((f, d)) if d.eq_ignore_ascii_case("desc") => (f.trim(), Some(true)),
+                _ => (p, None),
+            };
+            let field = field.trim_matches(|c| c == '"' || c == '\'').trim();
+            Some((field.to_string(), dir))
+        })
+        .collect()
+}
+
+/// Which field a JQL `ORDER BY` names, of those Desk follows: `rank` is
+/// Rank by name, or the site's Rank field by id (`cf[10019]`,
+/// `customfield_10019`).
+fn jql_field(name: &str, rank_ids: &[&str]) -> Option<crate::board::OrderField> {
+    use crate::board::OrderField as F;
+    let lower = name.to_ascii_lowercase();
+    let id = lower
+        .strip_prefix("cf[")
+        .and_then(|n| n.strip_suffix(']'))
+        .map(|n| format!("customfield_{n}"))
+        .unwrap_or_else(|| lower.clone());
+    if rank_ids.iter().any(|r| r.eq_ignore_ascii_case(&id)) {
+        return Some(F::Rank);
+    }
+    Some(match lower.as_str() {
+        "rank" => F::Rank,
+        "priority" => F::Priority,
+        "created" | "createddate" => F::Created,
+        "updated" | "updateddate" => F::Updated,
+        "duedate" | "due" => F::Due,
+        _ => return None,
+    })
+}
+
+/// How a Jira project's board (`jira.board_order`'s answer) orders its
+/// issues: its filter's `ORDER BY`, key by key, as far as Desk can follow
+/// it (a later key it can't ends the list; the first is Rank, said so).
+/// A direction unsaid is Jira's own: a priority highest first, the rest
+/// going up. An empty value sorts as the greatest, last going up and
+/// first going down. With no one board to read (none, or several), Rank.
+pub fn jira_ordering(
+    answer: &Value,
+    fields: Option<&crate::board::JiraFields>,
+    project: &str,
+    now: DateTime<Utc>,
+) -> crate::board::SourceOrder {
+    use crate::board::{OrderField as F, OrderKey, SourceOrder};
+    let rank = |note: String| SourceOrder {
+        by: vec![],
+        from: None,
+        note: Some(note),
+        read_at: now,
+        retry_at: None,
+        wants_priorities: false,
+    };
+    let Some(board) = answer["board"].is_object().then(|| {
+        short(&answer["board"]["name"], 60)
+            .map(|n| plain_name(&n, 60))
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| format!("{project}'s board"))
+    }) else {
+        let n = answer["boards"].as_array().map_or(0, Vec::len);
+        return rank(match n {
+            0 => format!("{project} has no board on Jira Desk can read, so this follows Jira's Rank."),
+            n => format!("{project} has {n} boards on Jira, so this follows Jira's Rank rather than pick one."),
+        });
+    };
+    let Some(clause) = answer["order_by"].as_str().filter(|c| !c.trim().is_empty()) else {
+        return rank(format!(
+            "{board}'s filter doesn't say an order, so this follows Jira's Rank."
+        ));
+    };
+    let ids: Vec<&str> = [
+        answer["rank_field"].as_str(),
+        fields.and_then(|f| f.rank.as_deref()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let mut by: Vec<OrderKey> = vec![];
+    let mut wants_priorities = false;
+    for (name, dir) in jql_order_keys(clause) {
+        let Some(field) = jql_field(&name, &ids) else {
+            if by.is_empty() {
+                return rank(format!(
+                    "Jira orders {board} by {}, which Desk can't follow yet, so this follows Jira's Rank.",
+                    plain_name(&name, 40)
+                ));
+            }
+            break;
+        };
+        if field == F::Priority && priorities_of(fields).is_empty() {
+            if by.is_empty() {
+                return SourceOrder {
+                    wants_priorities: true,
+                    ..rank(format!(
+                        "Jira orders {board} by priority, but the site's priorities weren't read, so this follows Jira's Rank."
+                    ))
+                };
+            }
+            wants_priorities = true;
+            break;
+        }
+        let desc = dir.unwrap_or(field == F::Priority);
+        by.push(OrderKey {
+            field,
+            desc,
+            empty_first: desc,
+        });
+        if field == F::Rank {
+            // Rank is every issue's own: nothing after it ever decides.
+            break;
+        }
+    }
+    SourceOrder {
+        by,
+        from: Some(format!("{board}'s filter")),
+        note: None,
+        read_at: now,
+        retry_at: None,
+        wants_priorities,
+    }
+}
+
+fn priorities_of(fields: Option<&crate::board::JiraFields>) -> &[String] {
+    fields.map_or(&[], |f| f.priorities.as_slice())
+}
+
+/// Whether most of `tickets`' open issues on link `link` have no place
+/// there yet: a board linked before places were kept, or whose Rank wasn't
+/// known, catches up on its next pass rather than its next sweep.
+pub fn places_missing(tickets: &[Ticket], link: Uuid) -> bool {
+    let open: Vec<&Ticket> = tickets
+        .iter()
+        .filter(|t| {
+            !matches!(t.state, TicketState::Done | TicketState::Dropped)
+                && t.external.as_ref().is_some_and(|e| e.writable_by(link))
+        })
+        .collect();
+    let missing = open.iter().filter(|t| t.upstream_rank.is_none()).count();
+    !open.is_empty() && missing * 2 > open.len()
+}
 
 /// How long fields read without Jira's Rank are kept: a hub that didn't
 /// say where Rank is (one from before it could, or one that failed) is
@@ -2238,6 +2611,7 @@ fn jira_facts(i: &Value) -> Facts {
         reporter,
         created: any_time(&i["created"]),
         start: due_of(&i["start_date"]),
+        priority_sort: None,
         comments: count_of(&i["comment_total"]).or_else(|| count_of(&i["comment_count"])),
         prs: jira_prs(i),
         children: vec![],
@@ -2347,6 +2721,7 @@ fn linear_facts(i: &Value) -> Facts {
         reporter: short(&i["creator"]["name"], 80),
         created: any_time(&i["createdAt"]),
         start: None,
+        priority_sort: i["prioritySortOrder"].as_f64().filter(|p| p.is_finite()),
         comments: None,
         prs: linear_prs(i),
         children: vec![],

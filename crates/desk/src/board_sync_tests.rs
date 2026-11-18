@@ -1990,6 +1990,246 @@ fn a_pull_takes_the_place_there_unless_a_drop_waits() {
     );
 }
 
+fn sync_for(system: System) -> crate::board::Sync {
+    serde_json::from_value(json!({
+        "link": Uuid::new_v4(), "system": system, "target": "ENG",
+        "via": { "kind": "thisHub" }, "person": "you", "filter": { "kind": "all", "value": {} },
+        "states": {}
+    }))
+    .expect("a sync")
+}
+
+fn ticket_on(link: Uuid) -> Ticket {
+    let mut t = synced(TicketState::Todo);
+    t.external.as_mut().unwrap().link = link;
+    t
+}
+
+fn order(by: &[(crate::board::OrderField, bool, bool)]) -> Vec<crate::board::OrderKey> {
+    by.iter()
+        .map(|&(field, desc, empty_first)| crate::board::OrderKey {
+            field,
+            desc,
+            empty_first,
+        })
+        .collect()
+}
+
+/// A Linear view's ordering, as its settings say it: the person's own,
+/// read with their own key; priority with its ties by Linear's place in
+/// it; a date unsaid the latest first; anything else the manual order,
+/// said so.
+#[test]
+fn a_linear_view_s_ordering_is_followed_as_its_settings_say() {
+    use crate::board::OrderField as F;
+    let now = chrono::Utc::now();
+    let team = |ordering: Value, direction: Value, personal: bool| {
+        json!({ "view_type": "allIssues", "personal": personal, "organization": null, "effective": null,
+                "user": { "ordering": ordering, "direction": direction, "layout": "list" } })
+    };
+    let o = linear_ordering(&team(json!("priority"), Value::Null, true), now);
+    assert_eq!(
+        o.by,
+        order(&[(F::Priority, true, false), (F::PrioritySort, false, false)])
+    );
+    assert_eq!(o.from.as_deref(), Some("your own view settings"));
+    assert!(o.note.is_none());
+    let o = linear_ordering(&team(json!("priority"), json!("desc"), true), now);
+    assert_eq!(o.by[0], order(&[(F::Priority, false, false)])[0]);
+    let o = linear_ordering(&team(json!("dateCreated"), Value::Null, true), now);
+    assert_eq!(o.by, order(&[(F::Created, true, false)]));
+    let o = linear_ordering(&team(json!("dateUpdated"), json!("asc"), true), now);
+    assert_eq!(o.by, order(&[(F::Updated, false, false)]));
+    let o = linear_ordering(&team(json!("dueDate"), Value::Null, true), now);
+    assert_eq!(o.by, order(&[(F::Due, false, false)]));
+    let o = linear_ordering(&team(json!("manual"), Value::Null, true), now);
+    assert_eq!(o.by, order(&[(F::Manual, false, false)]));
+    // Not followed: the manual order, said so.
+    let o = linear_ordering(&team(json!("workflowState"), Value::Null, true), now);
+    assert!(o.by.is_empty());
+    assert!(o.note.as_deref().unwrap().contains("by status"));
+    // A shared key's settings are its owner's, never the person's.
+    let o = linear_ordering(&team(json!("priority"), Value::Null, false), now);
+    assert!(o.by.is_empty());
+    assert!(o.note.as_deref().unwrap().contains("shared"));
+    // None set: Linear doesn't say the team's own.
+    let o = linear_ordering(
+        &json!({ "view_type": "allIssues", "personal": true, "user": null }),
+        now,
+    );
+    assert!(o.by.is_empty());
+    assert!(o.note.as_deref().unwrap().contains("manual order"));
+    // A custom view: what applies to the person, else its workspace default.
+    let o = linear_ordering(
+        &json!({ "custom_view": { "id": "v", "name": "Backlog" }, "personal": false,
+                 "effective": { "ordering": "dateCreated" },
+                 "organization": { "ordering": "priority" }, "user": null }),
+        now,
+    );
+    assert_eq!(o.by[0].field, F::Priority);
+    assert_eq!(
+        o.from.as_deref(),
+        Some("the workspace's default for the view")
+    );
+}
+
+/// A Jira board's filter's ORDER BY, key by key as far as Desk follows it:
+/// Rank by name or by its field's id, Jira's own directions unsaid, and an
+/// empty value greatest. No one board, no clause, or a first key Desk
+/// can't follow is Rank, said so.
+#[test]
+fn a_jira_board_s_order_by_is_followed_as_far_as_desk_can() {
+    use crate::board::OrderField as F;
+    let now = chrono::Utc::now();
+    let fields = crate::board::JiraFields {
+        rank: Some("customfield_10019".into()),
+        priorities: vec!["Highest".into(), "High".into(), "Medium".into()],
+        read_at: now,
+        rank_asked: true,
+        ..Default::default()
+    };
+    let board = |clause: Value| {
+        json!({ "board": { "id": 7, "name": "ENG board" }, "boards": [{ "id": 7 }],
+                "order_by": clause, "rank_field": "customfield_10019" })
+    };
+    let o = jira_ordering(&board(json!("Rank ASC")), Some(&fields), "ENG", now);
+    assert_eq!(o.by, order(&[(F::Rank, false, false)]));
+    assert_eq!(o.from.as_deref(), Some("ENG board's filter"));
+    let o = jira_ordering(&board(json!("cf[10019]")), Some(&fields), "ENG", now);
+    assert_eq!(o.by, order(&[(F::Rank, false, false)]));
+    let o = jira_ordering(
+        &board(json!("priority, \"Due Date\" , duedate DESC, Rank")),
+        Some(&fields),
+        "ENG",
+        now,
+    );
+    // "Due Date" isn't a field Desk follows: the list ends there.
+    assert_eq!(o.by, order(&[(F::Priority, true, true)]));
+    let o = jira_ordering(
+        &board(json!("priority DESC, created ASC, Rank ASC, updated")),
+        Some(&fields),
+        "ENG",
+        now,
+    );
+    assert_eq!(
+        o.by,
+        order(&[
+            (F::Priority, true, true),
+            (F::Created, false, false),
+            (F::Rank, false, false)
+        ])
+    );
+    let o = jira_ordering(&board(json!("updatedDate DESC")), Some(&fields), "ENG", now);
+    assert_eq!(o.by, order(&[(F::Updated, true, true)]));
+    // Rank, said so.
+    for (answer, says) in [
+        (board(json!("status ASC")), "by status"),
+        (board(Value::Null), "doesn't say an order"),
+        (json!({ "board": null, "boards": [{}, {}] }), "2 boards"),
+        (json!({ "board": null, "boards": [] }), "no board"),
+    ] {
+        let o = jira_ordering(&answer, Some(&fields), "ENG", now);
+        assert!(o.by.is_empty(), "{answer}");
+        assert!(o.note.as_deref().unwrap().contains(says), "{:?}", o.note);
+    }
+    // By priority with the site's priorities unread: Rank.
+    let o = jira_ordering(&board(json!("priority DESC")), None, "ENG", now);
+    assert!(o.by.is_empty());
+    assert!(o.note.as_deref().unwrap().contains("priorities"));
+    assert!(o.wants_priorities);
+    // Cut short later in the list: followed so far, and read again.
+    let o = jira_ordering(&board(json!("created DESC, priority")), None, "ENG", now);
+    assert_eq!(o.by, order(&[(F::Created, true, true)]));
+    assert!(o.wants_priorities);
+    let o = jira_ordering(&board(json!("Rank")), Some(&fields), "ENG", now);
+    assert!(!o.wants_priorities);
+}
+
+/// Only an ordering by hand there moves an issue's place on a drop.
+#[test]
+fn a_drop_moves_its_issue_only_while_the_board_there_is_ordered_by_hand() {
+    use crate::board::OrderField as F;
+    let mut s = sync_for(System::Linear);
+    assert!(s.moves_by_hand(), "unread: as before");
+    let now = chrono::Utc::now();
+    for (by, hand) in [
+        (vec![], true),
+        (order(&[(F::Manual, false, false)]), true),
+        (order(&[(F::Rank, false, false)]), true),
+        (order(&[(F::Rank, true, true)]), false),
+        (order(&[(F::Priority, true, false)]), false),
+        (order(&[(F::Created, true, false)]), false),
+    ] {
+        s.ordering = Some(crate::board::SourceOrder {
+            by,
+            from: None,
+            note: None,
+            read_at: now,
+            retry_at: None,
+            wants_priorities: false,
+        });
+        assert_eq!(s.moves_by_hand(), hand, "{:?}", s.ordering);
+    }
+}
+
+/// Which Linear view a board's filter follows the ordering of.
+#[test]
+fn a_linear_board_follows_the_view_its_filter_shows() {
+    assert_eq!(
+        linear_view_type(&Filter::All {
+            include_done: false
+        }),
+        "allIssues"
+    );
+    assert_eq!(linear_view_type(&Filter::AssignedToMe), "myIssues");
+    assert_eq!(linear_view_type(&Filter::CurrentCycle), "cycle");
+    assert_eq!(
+        linear_view_type(&Filter::Query(r#"{"project_id": "p1"}"#.into())),
+        "project"
+    );
+    assert_eq!(
+        linear_view_type(&Filter::Query(r#"{"state": "Todo"}"#.into())),
+        "allIssues"
+    );
+    assert!(callable(System::Linear).contains(&"linear.view_ordering"));
+    assert!(callable(System::Jira).contains(&"jira.board_order"));
+    for s in [System::Jira, System::Linear] {
+        assert!(workforce_core::desk::BOARD_SYNC_ORDER_TOOLS.contains(&ordering_tool(s).unwrap()));
+    }
+    // A GitHub project's items come in its own order: nothing to ask.
+    assert_eq!(ordering_tool(System::Github), None);
+}
+
+/// Most of a board's open issues without a place there: it catches up.
+#[test]
+fn a_board_most_of_whose_issues_have_no_place_catches_up() {
+    let link = Uuid::new_v4();
+    let t = |ranked: bool, state: TicketState| {
+        let mut t = ticket_on(link);
+        t.state = state;
+        t.upstream_rank = ranked.then(|| "0|a".to_string());
+        t
+    };
+    use TicketState::*;
+    assert!(places_missing(
+        &[t(false, Todo), t(false, Doing), t(true, Todo)],
+        link
+    ));
+    assert!(
+        !places_missing(&[t(false, Todo), t(true, Todo)], link),
+        "half isn't most"
+    );
+    assert!(
+        !places_missing(&[t(false, Done), t(false, Dropped), t(true, Todo)], link),
+        "only open ones count"
+    );
+    assert!(!places_missing(&[], link));
+    assert!(
+        !places_missing(&[t(false, Todo)], Uuid::new_v4()),
+        "another link's"
+    );
+}
+
 #[test]
 fn fields_without_rank_are_asked_for_again_soon() {
     let now = chrono::Utc::now();

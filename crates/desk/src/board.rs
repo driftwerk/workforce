@@ -431,6 +431,112 @@ pub struct Sync {
     /// sweep reads first: one that ran out of calls goes on from there.
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub children_next: usize,
+    /// How the board there orders its issues, once read: what "As on Jira"
+    /// or "As on Linear" sorts by. None on a link read before it was kept,
+    /// or from a hub that can't say, which sorts by the manual order or Rank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordering: Option<SourceOrder>,
+    /// When a sweep last read through the filter: a board most of whose
+    /// open tickets have no place there sweeps again on its next pass once
+    /// its fields or ordering were read after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub places_swept_at: Option<DateTime<Utc>>,
+}
+
+impl Sync {
+    /// Whether a drop within a column moves its issue's place there: only
+    /// while the board there is ordered by hand (Linear's manual order,
+    /// Jira's Rank going up). Under any other ordering the column sorts
+    /// itself.
+    pub fn moves_by_hand(&self) -> bool {
+        self.ordering
+            .as_ref()
+            .and_then(|o| o.by.first())
+            // Rank going down would put a drop's neighbours the wrong way
+            // round there.
+            .is_none_or(|k| {
+                k.field == OrderField::Manual || (k.field == OrderField::Rank && !k.desc)
+            })
+    }
+}
+
+/// What a board there sorts its issues by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OrderField {
+    /// Linear's manual order (`sortOrder`).
+    Manual,
+    /// Jira Software's Rank.
+    Rank,
+    /// The issue's priority: Linear's urgency, a Jira site's priorities
+    /// in their own order.
+    Priority,
+    /// Linear's place among the issues of its priority
+    /// ([`Facts::priority_sort`]), lower first: priority's tie-break there.
+    PrioritySort,
+    Created,
+    Updated,
+    Due,
+}
+
+impl OrderField {
+    /// As the Order chip names it, after "by".
+    pub fn words(self) -> &'static str {
+        match self {
+            Self::Manual => "manual order",
+            Self::Rank => "rank",
+            Self::Priority => "priority",
+            Self::PrioritySort => "priority order",
+            Self::Created => "created date",
+            Self::Updated => "last updated",
+            Self::Due => "due date",
+        }
+    }
+}
+
+/// One key a board there sorts by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderKey {
+    pub field: OrderField,
+    /// Highest first: the most urgent priority, the latest date, the
+    /// highest Rank. Manual order is never reversed.
+    #[serde(default)]
+    pub desc: bool,
+    /// Issues without it come first (Jira puts an empty value at the end
+    /// going up and the start going down); else last, as Linear always
+    /// does.
+    #[serde(default)]
+    pub empty_first: bool,
+}
+
+/// How a board there orders its issues, as Desk follows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceOrder {
+    /// The keys it sorts by, first first; then each column's issues are in
+    /// their manual order or Rank, then by number. Empty: as before, by
+    /// the manual order or Rank alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub by: Vec<OrderKey>,
+    /// Where it was read, in plain words ("your own view settings",
+    /// "the ENG board's filter").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// Why it couldn't be followed, in plain words, when it couldn't: the
+    /// columns then sort by the manual order or Rank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// When it was last asked for.
+    pub read_at: DateTime<Utc>,
+    /// A read that failed for a passing reason is asked for again then,
+    /// sooner than the fields' cadence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_at: Option<DateTime<Utc>>,
+    /// Cut short by the site's priorities not being read yet: read again
+    /// once they are.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wants_priorities: bool,
 }
 
 /// An issue a pull couldn't take in, and when it is tried again.
@@ -628,6 +734,11 @@ pub struct Facts {
     pub created: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start: Option<chrono::NaiveDate>,
+    /// Linear's place for it among the issues of its priority
+    /// (`prioritySortOrder`, lower first): how a view ordered by priority
+    /// orders each priority's issues.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority_sort: Option<f64>,
     /// How many comments it has, when the listing says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comments: Option<u32>,

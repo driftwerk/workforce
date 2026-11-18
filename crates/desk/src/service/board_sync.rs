@@ -349,6 +349,8 @@ impl Desk {
             local_before,
             fields: None,
             children_next: 0,
+            ordering: None,
+            places_swept_at: None,
         };
         self.0
             .store
@@ -662,6 +664,7 @@ impl Desk {
             s.pulled_at = Some(now);
             if swept {
                 s.swept_at = Some(now);
+                s.places_swept_at = Some(now);
                 s.assignees_swept = true;
             }
             if cursor.is_some() {
@@ -696,11 +699,16 @@ impl Desk {
         }
         let mut budget = Budget(crate::board_sync::CALLS_PER_PASS);
         let s = self.read_fields(id, s, remote, &mut budget, now).await?;
+        let s = self.read_ordering(id, s, remote, &mut budget, now).await?;
         // A board linked before who has each issue was kept reads it for
-        // every ticket on its first pass.
+        // every ticket on its first pass; one most of whose open issues
+        // have no place yet, on the pass after its fields or ordering were
+        // read (once each read: one whose places can't come waits for its
+        // sweep as before).
         let sweep = !s.assignees_swept
             || s.swept_at
-                .is_none_or(|at| now - at >= crate::board_sync::SWEEP_EVERY);
+                .is_none_or(|at| now - at >= crate::board_sync::SWEEP_EVERY)
+            || self.places_wanted(&b, &s).await?;
         let mut out = Pulled::default();
         let mut retry = s.retry.clone();
         match self
@@ -928,6 +936,120 @@ impl Desk {
                 fields: Some(fields),
                 ..s
             }))
+    }
+
+    /// `s` with how its board there orders its issues read when it never
+    /// was, or on the fields' cadence. Never needed: a hub without the tool,
+    /// or one that failed, leaves the board sorted by Rank or the manual
+    /// order, said so, and asked again on the same cadence; an ordering read
+    /// before stays through a failed read.
+    async fn read_ordering(
+        &self,
+        id: Uuid,
+        s: Sync,
+        remote: &dyn Remote,
+        budget: &mut Budget,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Sync, DeskError> {
+        // A Jira ordering is derived with the site's fields (its Rank
+        // field, its priorities): fields read since are read with again.
+        // Only one cut short for want of the site's priorities, once they
+        // are read: fields without Rank are read again every quarter of an
+        // hour, and any other ordering wouldn't change.
+        let fields_since = |o: &board::SourceOrder| {
+            s.system == System::Jira
+                && o.wants_priorities
+                && s.fields
+                    .as_ref()
+                    .is_some_and(|f| f.read_at > o.read_at && !f.priorities.is_empty())
+        };
+        let fresh = s
+            .ordering
+            .as_ref()
+            .is_some_and(|o| crate::board_sync::ordering_fresh(o, now) && !fields_since(o));
+        let Some(tool) = crate::board_sync::ordering_tool(s.system) else {
+            return Ok(s);
+        };
+        if fresh || budget.take().is_err() {
+            return Ok(s);
+        }
+        let args = crate::board_sync::ordering_args(&s);
+        let ordering = match crate::board_sync::call_quiet(remote, s.system, tool, args).await {
+            Ok(answer) => match s.system {
+                System::Jira => {
+                    crate::board_sync::jira_ordering(&answer, s.fields.as_ref(), &s.target, now)
+                }
+                System::Linear | System::Github => crate::board_sync::linear_ordering(&answer, now),
+            },
+            Err(e) => {
+                tracing::info!(board = %id, error = %e, "the board's order there wasn't read");
+                // A hub without the tool, or that won't let the sync call
+                // it, can't say: said so, asked again on the cadence. Any
+                // other failure is passing: what was read stands, and it is
+                // asked again soon.
+                let lasting = matches!(e, RemoteError::Missing(_) | RemoteError::NotAllowed(_));
+                let soon = Some(now + crate::board_sync::ORDERING_RETRY);
+                match (s.ordering.clone(), lasting) {
+                    (_, true) => crate::board_sync::ordering_unknown(s.system, now),
+                    (Some(was), false) => board::SourceOrder {
+                        read_at: now,
+                        retry_at: soon,
+                        ..was
+                    },
+                    (None, false) => board::SourceOrder {
+                        retry_at: soon,
+                        ..crate::board_sync::ordering_unknown(s.system, now)
+                    },
+                }
+            }
+        };
+        let kept = ordering.clone();
+        Ok(self
+            .change_sync(id, move |s| s.ordering = Some(kept))
+            .await?
+            .unwrap_or(Sync {
+                ordering: Some(ordering),
+                ..s
+            }))
+    }
+
+    /// Whether board `b` sweeps now for its issues' places: most of its
+    /// open tickets have none, and its fields or ordering were read since
+    /// its last sweep.
+    async fn places_wanted(&self, b: &Board, s: &Sync) -> Result<bool, DeskError> {
+        let read = [
+            // Fields read without Rank are read again every quarter of
+            // an hour; only the ordering's daily read counts for those. A
+            // read that failed and is asked again soon isn't a new one.
+            s.fields
+                .as_ref()
+                .filter(|f| f.rank.is_some())
+                .map(|f| f.read_at),
+            s.ordering
+                .as_ref()
+                .filter(|o| o.retry_at.is_none())
+                .map(|o| o.read_at),
+        ]
+        .into_iter()
+        .flatten()
+        .max();
+        let due = match (read, s.places_swept_at) {
+            (None, _) => false,
+            (Some(_), None) => true,
+            (Some(read), Some(swept)) => read > swept,
+        };
+        if !due {
+            return Ok(false);
+        }
+        let tickets = self.0.store.board_tickets(b.id).await.map_err(internal)?;
+        if crate::board_sync::places_missing(&tickets, s.link) {
+            return Ok(true);
+        }
+        // Their places are there: not looked at again until the next read.
+        let now = crate::crew::now();
+        self.change_sync(b.id, |s| s.places_swept_at = Some(now))
+            .await?;
+        Ok(false)
     }
 
     /// The issues `s`'s filter matches since `since` (all, without), oldest

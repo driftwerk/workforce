@@ -1055,6 +1055,13 @@ pub const BOARD_SYNC_LINEAR_TOOLS: &[&str] = &[
     "linear.teams_list",
 ];
 
+/// How a board there orders its issues: a Jira project's board's filter's
+/// `ORDER BY` (`jira.board_order`), a Linear view's ordering
+/// (`linear.view_ordering`). Read-only, called when the hub offers them and
+/// never needed: a hub without them sorts the board by Rank or Linear's
+/// manual order, as before.
+pub const BOARD_SYNC_ORDER_TOOLS: &[&str] = &["jira.board_order", "linear.view_ordering"];
+
 /// The GitHub tools a Desk board's sync may call on a hub: a project's
 /// items (in its own order), their Status and place, a repository's issues
 /// changed since a time, and an issue's title, body, state, labels,

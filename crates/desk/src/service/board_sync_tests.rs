@@ -2633,6 +2633,8 @@ struct RankJira {
     refuse: Option<RemoteError>,
     /// The hub holds the rank call for the person's approval.
     hold: Mutex<bool>,
+    /// The board's filter's ORDER BY, when `jira.board_order` answers.
+    order_by: Mutex<Option<String>>,
     calls: Mutex<Vec<(String, Value)>>,
 }
 
@@ -2647,6 +2649,7 @@ impl RankJira {
             ),
             refuse: None,
             hold: Mutex::new(false),
+            order_by: Mutex::new(None),
             calls: Mutex::new(vec![]),
         }
     }
@@ -2735,6 +2738,13 @@ impl Remote for RankJira {
                 issues.iter_mut().find(|(k, _)| *k == key).unwrap().1 = new;
                 Ok(json!({ "key": key, "updated": false, "ranked": true }))
             }
+            "jira.board_order" => match self.order_by.lock().unwrap().clone() {
+                Some(clause) if clause == "!offline" => Err(RemoteError::Offline("down".into())),
+                Some(clause) => Ok(json!({ "boards": [{ "id": 7, "name": "ACME board" }],
+                    "board": { "id": 7, "name": "ACME board" }, "order_by": clause,
+                    "rank_field": "customfield_10019" })),
+                None => Err(RemoteError::Missing(tool.into())),
+            },
             "jira.list_transitions" => Ok(json!({ "transitions": [] })),
             "jira.add_comment" => Ok(json!({ "id": "c-1" })),
             other => Err(RemoteError::NotAllowed(other.into())),
@@ -3523,6 +3533,204 @@ async fn a_github_drop_to_dropped_closes_it_not_planned() {
         assert_eq!(closed[0]["state"], "closed");
         assert_eq!(closed[0]["state_reason"], "not_planned");
         assert!(gh.called("github.project_item_status").is_empty());
+    })
+    .await;
+}
+
+/// A board ordered there by something other than Rank says so, and a drop
+/// within a column then never moves its issue there; once it is by Rank
+/// again (read on the fields' cadence), a drop does.
+#[tokio::test]
+async fn a_drop_moves_nothing_there_while_the_board_is_ordered_by_more_than_rank() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = synced(&d, "Acme", None).await;
+        let jira = RankJira::new(&[("ACME-1", "0|c"), ("ACME-2", "0|a"), ("ACME-3", "0|b")]);
+        *jira.order_by.lock().unwrap() = Some("created DESC, Rank ASC".into());
+        d.pull_board(b.id, &jira).await.unwrap();
+        let s = d.board_sync(b.id).await.unwrap().unwrap().1;
+        let o = s.ordering.clone().unwrap();
+        assert_eq!(o.by[0].field, crate::board::OrderField::Created);
+        assert_eq!(o.from.as_deref(), Some("ACME board's filter"));
+        assert!(!s.moves_by_hand());
+        let (one, two, three) = (
+            id_of(&d, &b, "ACME-1").await,
+            id_of(&d, &b, "ACME-2").await,
+            id_of(&d, &b, "ACME-3").await,
+        );
+        let mv = || crate::service::Move {
+            state: TicketState::Todo,
+            before: Some(two),
+            after: Some(three),
+        };
+        d.move_ticket(one, mv(), &By::you()).await.unwrap();
+        let t = d.ticket(one).await.unwrap().ticket;
+        assert!(t.external.as_ref().unwrap().rank_move.is_none());
+        assert_eq!(
+            t.upstream_rank.as_deref(),
+            Some("0|c"),
+            "its place there stands"
+        );
+        due_now(&d, b.id).await;
+        d.push_board(b.id, &jira).await.unwrap();
+        assert!(jira.ranked().is_empty());
+        // By Rank there again, read a day on: a drop moves its issue.
+        *jira.order_by.lock().unwrap() = Some("Rank ASC".into());
+        d.change_sync(b.id, |s| {
+            if let Some(o) = s.ordering.as_mut() {
+                o.read_at -= chrono::Duration::days(2);
+            }
+        })
+        .await
+        .unwrap();
+        d.pull_board(b.id, &jira).await.unwrap();
+        assert!(d.board_sync(b.id).await.unwrap().unwrap().1.moves_by_hand());
+        d.move_ticket(one, mv(), &By::you()).await.unwrap();
+        let t = d.ticket(one).await.unwrap().ticket;
+        assert!(t.external.as_ref().unwrap().rank_move.is_some());
+    })
+    .await;
+}
+
+/// A hub that can't say how the board there is ordered leaves it by Rank,
+/// said so, and a board most of whose issues have no place yet sweeps on
+/// its next pass once the ordering is read.
+#[tokio::test]
+async fn a_board_without_its_order_or_places_says_so_and_catches_up() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = synced(&d, "Acme", None).await;
+        let jira = RankJira::new(&[("ACME-1", "0|c"), ("ACME-2", "0|a"), ("ACME-3", "0|b")]);
+        d.pull_board(b.id, &jira).await.unwrap();
+        let s = d.board_sync(b.id).await.unwrap().unwrap().1;
+        let o = s.ordering.clone().unwrap();
+        assert!(o.by.is_empty());
+        assert!(o.note.as_deref().unwrap().contains("Jira's Rank"), "{o:?}");
+        assert!(s.moves_by_hand());
+        // Their places lost (a board linked before they were kept), its
+        // last sweep just now: the pass after the ordering is read again
+        // sweeps, and reads them.
+        for k in ["ACME-1", "ACME-2", "ACME-3"] {
+            let id = id_of(&d, &b, k).await;
+            let mut t = d.ticket(id).await.unwrap().ticket;
+            t.upstream_rank = None;
+            d.save_ticket(&mut t).await.unwrap();
+        }
+        let now = crate::crew::now();
+        d.change_sync(b.id, |s| {
+            s.swept_at = Some(now);
+            s.places_swept_at = Some(now - chrono::Duration::minutes(1));
+            if let Some(o) = s.ordering.as_mut() {
+                o.read_at = now;
+            }
+        })
+        .await
+        .unwrap();
+        d.pull_board(b.id, &jira).await.unwrap();
+        let t = d
+            .ticket(id_of(&d, &b, "ACME-2").await)
+            .await
+            .unwrap()
+            .ticket;
+        assert_eq!(t.upstream_rank.as_deref(), Some("0|a"));
+        let s = d.board_sync(b.id).await.unwrap().unwrap().1;
+        assert!(s.places_swept_at.unwrap() >= now);
+    })
+    .await;
+}
+
+/// A passing failure to read the order there keeps what was read and asks
+/// again soon; one before anything was read says so and asks soon too.
+/// Fields read since an ordering was read are read with again.
+#[tokio::test]
+async fn a_passing_failure_keeps_the_order_and_asks_again_soon() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = synced(&d, "Acme", None).await;
+        let jira = RankJira::new(&[("ACME-1", "0|c")]);
+        *jira.order_by.lock().unwrap() = Some("!offline".into());
+        d.pull_board(b.id, &jira).await.unwrap();
+        let o = d
+            .board_sync(b.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .ordering
+            .unwrap();
+        let now = crate::crew::now();
+        assert!(o.by.is_empty());
+        assert!(
+            !crate::board_sync::ordering_fresh(&o, now + chrono::Duration::minutes(16)),
+            "asked again within a quarter of an hour"
+        );
+        // Read: by priority.
+        *jira.order_by.lock().unwrap() = Some("priority DESC".into());
+        d.change_sync(b.id, |s| {
+            s.fields = Some(crate::board::JiraFields {
+                priorities: vec!["High".into(), "Low".into()],
+                rank_asked: true,
+                rank: Some("customfield_10019".into()),
+                read_at: now,
+                ..Default::default()
+            });
+            if let Some(o) = s.ordering.as_mut() {
+                o.read_at -= chrono::Duration::days(2);
+                o.retry_at = None;
+            }
+        })
+        .await
+        .unwrap();
+        d.pull_board(b.id, &jira).await.unwrap();
+        let o = d
+            .board_sync(b.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .ordering
+            .unwrap();
+        assert_eq!(o.by[0].field, crate::board::OrderField::Priority);
+        // A day on, the hub offline: still by priority, asked again soon.
+        d.change_sync(b.id, |s| {
+            if let Some(o) = s.ordering.as_mut() {
+                o.read_at -= chrono::Duration::days(2);
+                o.retry_at = None;
+            }
+        })
+        .await
+        .unwrap();
+        *jira.order_by.lock().unwrap() = Some("!offline".into());
+        d.pull_board(b.id, &jira).await.unwrap();
+        let s = d.board_sync(b.id).await.unwrap().unwrap().1;
+        assert_eq!(
+            s.ordering.as_ref().unwrap().by[0].field,
+            crate::board::OrderField::Priority
+        );
+        assert!(!s.moves_by_hand());
+        // Fields read after the ordering: the ordering is read with them.
+        *jira.order_by.lock().unwrap() = Some("Rank ASC".into());
+        let later = crate::crew::now() + chrono::Duration::seconds(1);
+        d.change_sync(b.id, |s| {
+            if let (Some(f), Some(o)) = (s.fields.as_mut(), s.ordering.as_mut()) {
+                o.read_at = later - chrono::Duration::minutes(1);
+                o.retry_at = None;
+                // One read before the site's priorities were.
+                o.wants_priorities = true;
+                f.read_at = later;
+            }
+        })
+        .await
+        .unwrap();
+        d.pull_board(b.id, &jira).await.unwrap();
+        let s = d.board_sync(b.id).await.unwrap().unwrap().1;
+        assert_eq!(
+            s.ordering.unwrap().by[0].field,
+            crate::board::OrderField::Rank
+        );
     })
     .await;
 }

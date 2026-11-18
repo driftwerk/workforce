@@ -824,6 +824,12 @@ impl Desk {
         if !writable || crate::board_sync::is_remote_party(&by.party) {
             return Ok(());
         }
+        // Ordered there by priority, a date …: the column sorts itself, and
+        // a drop never moves its issue's place (Linear's manual order is
+        // the whole workspace's).
+        if !s.moves_by_hand() {
+            return Ok(());
+        }
         let all: Vec<Ticket> = self
             .0
             .store
