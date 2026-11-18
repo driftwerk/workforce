@@ -210,7 +210,7 @@ export function RouteModelsPicker({
       {WORK.map(({ work, name: label, what }) => {
         const set = chosenModel(route, work);
         // A model the hub no longer lists stays shown as chosen.
-        const unlisted = set && !models.includes(set) && !TIERS.some(([t]) => t === set) && set !== "chat";
+        const unlisted = set && !models.includes(set) && !tiers.some(([t]) => t === set) && set !== "chat";
         const id = `${name}-${work}`;
         return (
           <div key={work} className="flex flex-wrap items-center justify-between gap-2 rounded-md border p-3 text-sm">
