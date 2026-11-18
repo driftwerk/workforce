@@ -177,6 +177,12 @@ pub struct Planned {
     /// engine's own default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// A ticket taken on from a board (one of the person's own, or a synced
+    /// Linear or Jira issue) rather than made by the plan: its id is that
+    /// ticket's, its title is kept here only to name it, and the plan never
+    /// writes its words, deletes, drops or re-files it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub adopted: bool,
 }
 
 /// What a draft says of this computer as a ticket's machine.
@@ -363,6 +369,12 @@ pub struct Draft {
 pub struct DraftTicket {
     #[serde(default)]
     pub id: Option<Uuid>,
+    /// A ticket already on a board of the group the plan takes on instead
+    /// of making one: its title and description are that ticket's, so
+    /// `title` and `body` aren't said.
+    #[serde(default)]
+    pub adopt: Option<Uuid>,
+    #[serde(default)]
     pub title: String,
     #[serde(default)]
     pub body: String,
@@ -432,6 +444,8 @@ pub enum Problem {
     BadModel { ticket: usize, model: String },
     #[error("Ticket {ticket} isn't one this plan has; leave out its id to add it.")]
     UnknownTicket { ticket: usize },
+    #[error("Ticket {ticket} takes on a ticket that isn't on a board of the plan's group.")]
+    UnknownAdopt { ticket: usize },
     #[error("Ticket {ticket} is in the list twice.")]
     Twice { ticket: usize },
     #[error("Ticket {ticket} needs ticket {need}, which isn't in the list.")]
@@ -469,18 +483,50 @@ pub fn snapshot_of(
     default_engine: Engine,
     new_id: &mut dyn FnMut() -> Uuid,
 ) -> Result<Snapshot, Vec<Problem>> {
+    snapshot_with(draft, before, default_engine, &HashMap::new(), new_id)
+}
+
+/// [`snapshot_of`], with the tickets the draft may take on (`adoptable`:
+/// each by its id, with its title): one a ticket of the draft adopts that
+/// `before` doesn't have must be among them.
+pub fn snapshot_with(
+    draft: &Draft,
+    before: Option<&Snapshot>,
+    default_engine: Engine,
+    adoptable: &HashMap<Uuid, String>,
+    new_id: &mut dyn FnMut() -> Uuid,
+) -> Result<Snapshot, Vec<Problem>> {
     let mut problems = Vec::new();
     let mut seen = HashSet::new();
     let mut ids = Vec::with_capacity(draft.tickets.len());
+    // Each ticket that takes one on, with that ticket's title.
+    let mut adopted: HashMap<usize, String> = HashMap::new();
     for (i, t) in draft.tickets.iter().enumerate() {
         let ticket = i + 1;
-        let id = match t.id {
-            Some(id) if before.is_none_or(|b| b.ticket(id).is_none()) => {
+        let had = |id: Uuid| before.and_then(|b| b.ticket(id));
+        let id = match (t.adopt, t.id) {
+            // One the plan has already, by either name.
+            (Some(id), _) | (None, Some(id)) if had(id).is_some_and(|w| w.adopted) => {
+                adopted.insert(i, had(id).map(|w| w.title.clone()).unwrap_or_default());
+                id
+            }
+            (Some(id), _) => {
+                match (had(id), adoptable.get(&id)) {
+                    (None, Some(title)) => {
+                        adopted.insert(i, title.clone());
+                    }
+                    // A ticket of the plan's own isn't taken on.
+                    (Some(_), _) => problems.push(Problem::UnknownAdopt { ticket }),
+                    (None, None) => problems.push(Problem::UnknownAdopt { ticket }),
+                }
+                id
+            }
+            (None, Some(id)) if had(id).is_none() => {
                 problems.push(Problem::UnknownTicket { ticket });
                 id
             }
-            Some(id) => id,
-            None => new_id(),
+            (None, Some(id)) => id,
+            (None, None) => new_id(),
         };
         if !seen.insert(id) {
             problems.push(Problem::Twice { ticket });
@@ -565,16 +611,23 @@ pub fn snapshot_of(
             }
         }
         if let Some(engine) = engine {
+            // A ticket taken on is named by its own title; its words are its
+            // board's, never the plan's.
+            let (title, body) = match adopted.get(&i) {
+                Some(title) => (title.trim().to_string(), String::new()),
+                None => (t.title.trim().to_string(), t.body.trim().to_string()),
+            };
             tickets.push(Planned {
                 id: ids[i],
-                title: t.title.trim().to_string(),
-                body: t.body.trim().to_string(),
+                title,
+                body,
                 engine,
                 folder: t.folder.trim().to_string(),
                 view,
                 needs,
                 machine,
                 model,
+                adopted: adopted.contains_key(&i),
             });
         }
     }
@@ -624,15 +677,16 @@ pub fn validate(
     for (i, t) in s.tickets.iter().enumerate() {
         let ticket = i + 1;
         let title = t.title.trim();
-        if title.is_empty() {
+        // A ticket taken on says what its board says.
+        if title.is_empty() && !t.adopted {
             problems.push(Problem::NoTitle { ticket });
         }
         let len = title.chars().count();
-        if len > TITLE_MAX {
+        if len > TITLE_MAX && !t.adopted {
             problems.push(Problem::LongTitle { ticket, len });
         }
         let len = t.body.chars().count();
-        if len > BODY_MAX {
+        if len > BODY_MAX && !t.adopted {
             problems.push(Problem::LongBody { ticket, len });
         }
         let folder = t.folder.trim();
@@ -1051,11 +1105,17 @@ pub fn describe(before: &Snapshot, after: &Snapshot) -> String {
         ));
     }
     for t in after.added(before) {
-        said.push(format!("added {}", q(t)));
+        said.push(match t.adopted {
+            true => format!("took on {}", q(t)),
+            false => format!("added {}", q(t)),
+        });
     }
     for id in after.dropped(before) {
         if let Some(t) = before.ticket(id) {
-            said.push(format!("dropped {}", q(t)));
+            said.push(match t.adopted {
+                true => format!("let go of {}", q(t)),
+                false => format!("dropped {}", q(t)),
+            });
         }
     }
     let kept: HashSet<Uuid> = before
@@ -1087,10 +1147,10 @@ pub fn describe(before: &Snapshot, after: &Snapshot) -> String {
         let Some(was) = before.ticket(t.id) else {
             continue;
         };
-        if was.title != t.title {
+        if was.title != t.title && !t.adopted {
             said.push(format!("renamed {} {}", q(was), q(t)));
         }
-        if was.body != t.body {
+        if was.body != t.body && !t.adopted {
             said.push(format!("edited what {} says", q(t)));
         }
         let needs = |p: &Planned| p.needs.iter().copied().collect::<HashSet<Uuid>>();

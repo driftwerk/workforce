@@ -184,6 +184,18 @@ pub struct TicketQuery {
 /// How many tickets a search gives at most.
 const SEARCH_MAX: i64 = 20;
 
+/// A ticket [`Desk::find_tickets`] found, with its board's name and what
+/// holds it: someone on it, or an open plan.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Found {
+    #[serde(flatten)]
+    pub view: TicketView,
+    pub board_name: String,
+    /// The open plan it is in, by id, with its goal.
+    pub plan: Option<(Uuid, String)>,
+}
+
 fn internal(e: eyre::Report) -> DeskError {
     DeskError::Internal(e)
 }
@@ -478,6 +490,87 @@ impl Desk {
                 && matched.as_ref().is_none_or(|m| m.contains(&t.id))
         });
         Ok(views)
+    }
+
+    /// The tickets `f` asks for on the boards whose group `sees` takes,
+    /// newest first, at most `limit` of them, with how many matched in
+    /// all. A board named that isn't one of those is refused, saying which
+    /// there are.
+    pub async fn find_tickets(
+        &self,
+        f: &crate::find::TicketFind,
+        sees: impl Fn(Option<&str>) -> bool,
+        limit: usize,
+    ) -> Result<(Vec<Found>, usize), DeskError> {
+        let boards: Vec<Board> = self
+            .boards()
+            .await?
+            .into_iter()
+            .filter(|b| sees(b.group.as_deref()))
+            .collect();
+        let named = f.board.as_deref().map(str::trim).filter(|n| !n.is_empty());
+        let on: Vec<&Board> = boards
+            .iter()
+            .filter(|b| named.is_none_or(|n| crate::find::board_named(b, n)))
+            .collect();
+        if let (Some(n), true) = (named, on.is_empty()) {
+            let names: Vec<String> = boards
+                .iter()
+                .map(|b| match &b.prefix {
+                    Some(p) => format!("{} ({p})", b.name),
+                    None => b.name.clone(),
+                })
+                .collect();
+            return Err(DeskError::Invalid(match names.is_empty() {
+                true => format!("No board of yours is called {n:?}; you have none."),
+                false => format!(
+                    "No board of yours is called {n:?}; yours are {}.",
+                    names.join(", ")
+                ),
+            }));
+        }
+        let mut found: Vec<(Found, DateTime<Utc>)> = Vec::new();
+        for b in on {
+            let me = b.sync.as_ref().and_then(|s| s.me.as_deref());
+            for v in self.tickets(b.id, &TicketQuery::default()).await? {
+                if !crate::find::matches(f, me, v.key.as_deref(), &v.ticket) {
+                    continue;
+                }
+                let at = crate::find::created(&v.ticket);
+                found.push((
+                    Found {
+                        view: v,
+                        board_name: b.name.clone(),
+                        plan: None,
+                    },
+                    at,
+                ));
+            }
+        }
+        found.sort_by(|a, b| b.1.cmp(&a.1));
+        let total = found.len();
+        found.truncate(limit.min(crate::find::FIND_MAX));
+        let mut out = Vec::with_capacity(found.len());
+        for (mut f, _) in found {
+            if let Some(id) = self
+                .0
+                .store
+                .plan_of_ticket(f.view.ticket.id)
+                .await
+                .map_err(internal)?
+            {
+                if let Some(p) = self.0.store.plan(id).await.map_err(internal)? {
+                    if !matches!(
+                        p.state,
+                        crate::plan::PlanState::Done | crate::plan::PlanState::Dropped
+                    ) {
+                        f.plan = Some((p.id, p.goal));
+                    }
+                }
+            }
+            out.push(f);
+        }
+        Ok((out, total))
     }
 
     /// Tickets for the palette: by their words, or by their key.
@@ -1262,7 +1355,12 @@ impl Desk {
             .collect())
     }
 
-    async fn unassign(&self, mut t: Ticket, key: &str, by: &By) -> Result<TicketView, DeskError> {
+    pub(super) async fn unassign(
+        &self,
+        mut t: Ticket,
+        key: &str,
+        by: &By,
+    ) -> Result<TicketView, DeskError> {
         let Some(was) = t.assignee.take() else {
             return self.view_ticket(t).await;
         };

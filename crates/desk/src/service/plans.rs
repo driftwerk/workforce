@@ -28,7 +28,7 @@ use crate::plan::{
     self, Change, Draft, DraftTicket, Paused, Plan, PlanBudget, PlanState, PlanTicket, Planned,
     Problem, Progress, Revision, Snapshot, Start,
 };
-use crate::plan_store::{BeginStart, Runs, Starting};
+use crate::plan_store::{Adopt, BeginStart, Runs, Starting};
 use workforce_core::budget::{BudgetScope, Standing};
 
 /// What the desk keeps of plans in memory: the ones waiting on the person,
@@ -75,6 +75,9 @@ pub struct PlanTicketView {
     pub machine: Option<String>,
     /// The model its session runs; none is its engine's default.
     pub model: Option<String>,
+    /// Taken on from its board, not made by the plan: its key and link are
+    /// its board's (a Linear or Jira issue's, when synced).
+    pub adopted: bool,
     /// Its session is being started.
     pub starting: bool,
     /// What holds its session, while Desk's breaker does: the ticket is
@@ -302,10 +305,18 @@ impl Desk {
     /// `plan`'s tickets as the runner and the card read them.
     pub async fn plan_tickets(&self, plan: Uuid) -> Result<Vec<PlanTicket>, DeskError> {
         let (tickets, runs, starting) = self.plan_rows(plan).await?;
+        let ours: HashSet<Uuid> = tickets.iter().map(|t| t.id).collect();
         let views = self.views(tickets).await?;
         Ok(views
             .into_iter()
-            .map(|v| plan_ticket(&v, runs.get(&v.ticket.id), starting.contains(&v.ticket.id)))
+            .map(|v| {
+                plan_ticket(
+                    &v,
+                    runs.get(&v.ticket.id),
+                    starting.contains(&v.ticket.id),
+                    &ours,
+                )
+            })
             .collect())
     }
 
@@ -387,6 +398,7 @@ impl Desk {
 
     async fn plan_detail(&self, p: Plan) -> Result<PlanDetail, DeskError> {
         let (tickets, runs, starting) = self.plan_rows(p.id).await?;
+        let ours: HashSet<Uuid> = tickets.iter().map(|t| t.id).collect();
         let views = self.views(tickets).await?;
         let mut shown: Vec<PlanTicketView> = views
             .into_iter()
@@ -401,6 +413,7 @@ impl Desk {
                     view: r.view,
                     machine: r.machine,
                     model: r.model,
+                    adopted: r.adopted,
                     ticket: v,
                 }
             })
@@ -421,7 +434,7 @@ impl Desk {
         });
         let rows: Vec<PlanTicket> = shown
             .iter()
-            .map(|t| plan_ticket(&t.ticket, runs.get(&t.ticket.ticket.id), t.starting))
+            .map(|t| plan_ticket(&t.ticket, runs.get(&t.ticket.ticket.id), t.starting, &ours))
             .collect();
         let revisions = self.0.store.revisions(p.id).await.map_err(internal)?;
         // Its budget as kept, once approved, counted now.
@@ -646,8 +659,18 @@ impl Desk {
         by: &By,
     ) -> Result<PlanDetail, DeskError> {
         let _write = self.0.plan_write.lock().await;
-        let mut s =
-            plan::snapshot_of(&new.draft, None, new.engine, &mut Uuid::new_v4).map_err(problems)?;
+        let taking = self
+            .adoptable(&new.draft.tickets, None, new.group.as_deref(), None)
+            .await?;
+        let mut s = plan::snapshot_with(
+            &new.draft,
+            None,
+            new.engine,
+            &titles_of(&taking),
+            &mut Uuid::new_v4,
+        )
+        .map_err(problems)?;
+        keep_needs(&mut s, &taking, &HashMap::new());
         s.parallel = new.parallel;
         s.budget = new.budget;
         plan::validate(&s, &self.engines(), &|f| Path::new(f).is_dir()).map_err(problems)?;
@@ -656,7 +679,16 @@ impl Desk {
                 "A plan runs from 1 to 12 sessions at once.".into(),
             ));
         }
-        let b = match new.board {
+        // It shows on the board said, else on the board of the tickets it
+        // takes on, else on the group's own; what it makes goes on a board
+        // of Desk's own, never a synced one.
+        let first_taken = s
+            .tickets
+            .iter()
+            .find(|t| t.adopted)
+            .and_then(|t| taking.get(&t.id))
+            .map(|t| t.board);
+        let b = match new.board.or(first_taken) {
             Some(id) => {
                 let b = self.board_of(id).await?;
                 if b.group != new.group {
@@ -664,17 +696,14 @@ impl Desk {
                         "That board isn't in the group you run.".into(),
                     ));
                 }
-                if let Some(sync) = &b.sync {
-                    return Err(DeskError::Invalid(format!(
-                        "{} is synced with {} {}: a plan's tickets go on a board of Desk's own.",
-                        b.name,
-                        sync.system.title(),
-                        sync.target
-                    )));
-                }
                 b
             }
             None => self.plan_board(new.group.as_deref()).await?,
+        };
+        let makes = s.tickets.iter().any(|t| !t.adopted);
+        let made_on = match makes {
+            true => self.new_tickets_board(&b).await?,
+            false => b.clone(),
         };
         let at = crew::now();
         let p = Plan {
@@ -691,21 +720,51 @@ impl Desk {
             created_at: at,
             updated_at: at,
         };
-        let summary = format!(
-            "Proposed {} tickets for “{}”",
-            s.tickets.len(),
-            crew::one_line(&s.goal, 120)
-        );
+        let taken = s.tickets.iter().filter(|t| t.adopted).count();
+        let summary = match taken {
+            0 => format!(
+                "Proposed {} tickets for “{}”",
+                s.tickets.len(),
+                crew::one_line(&s.goal, 120)
+            ),
+            n => format!(
+                "Proposed {} tickets ({n} taken on from the board) for “{}”",
+                s.tickets.len(),
+                crew::one_line(&s.goal, 120)
+            ),
+        };
         // The plan, its tickets and its first revision, in one write.
         let mut rank = self
-            .end_rank(b.id, TicketState::Backlog, Uuid::nil())
+            .end_rank(made_on.id, TicketState::Backlog, Uuid::nil())
             .await?;
         let mut rows: Vec<(Ticket, Runs)> = Vec::with_capacity(s.tickets.len());
+        let mut adopt: Vec<(Uuid, Runs, Vec<Uuid>)> = Vec::new();
         for t in &s.tickets {
+            let runs = Runs {
+                plan: Some(p.id),
+                engine: Some(t.engine),
+                folder: Some(t.folder.clone()),
+                view: t.view,
+                machine: t.machine.clone(),
+                model: t.model.clone(),
+                adopted: t.adopted,
+            };
+            if t.adopted {
+                // Only the needs it doesn't have already.
+                let had = taking.get(&t.id).map(|r| r.needs.as_slice()).unwrap_or(&[]);
+                let more = t
+                    .needs
+                    .iter()
+                    .filter(|n| !had.contains(n))
+                    .copied()
+                    .collect();
+                adopt.push((t.id, runs, more));
+                continue;
+            }
             rows.push((
                 Ticket {
                     id: t.id,
-                    board: b.id,
+                    board: made_on.id,
                     number: 0,
                     title: t.title.clone(),
                     body: t.body.clone(),
@@ -725,14 +784,7 @@ impl Desk {
                     updated_at: at,
                     version: 0,
                 },
-                Runs {
-                    plan: Some(p.id),
-                    engine: Some(t.engine),
-                    folder: Some(t.folder.clone()),
-                    view: t.view,
-                    machine: t.machine.clone(),
-                    model: t.model.clone(),
-                },
+                runs,
             ));
             rank += RANK_STEP;
         }
@@ -745,13 +797,18 @@ impl Desk {
             summary,
             snapshot: s.clone(),
         };
-        self.0
-            .store
-            .add_plan(&p, &mut rows, &r)
-            .await
-            .map_err(internal)?;
+        if let Err(e) = self.0.store.add_plan(&p, &mut rows, &adopt, &r).await {
+            return Err(self.adopt_failed(e, None).await);
+        }
         for (t, _) in rows {
             if let Ok(v) = self.view_ticket(t).await {
+                self.announce(DeskEvent::Ticket {
+                    ticket: Box::new(v),
+                });
+            }
+        }
+        for (id, _, _) in &adopt {
+            if let Ok(v) = self.ticket(*id).await {
                 self.announce(DeskEvent::Ticket {
                     ticket: Box::new(v),
                 });
@@ -764,6 +821,233 @@ impl Desk {
             format!("proposed a plan: {}", crew::one_line(&p.goal, 120)),
         );
         self.plan_saved(&p).await
+    }
+
+    // ── Taking tickets on ───────────────────────────────────────────────
+
+    /// The tickets of `draft` that take one on and `before` doesn't have,
+    /// each as it is now: on a board of `group`, in Backlog or To do, with
+    /// no one on it and in no other open plan than `plan`. One that isn't
+    /// is refused in words the boss reads, naming it by its key.
+    async fn adoptable(
+        &self,
+        draft: &[DraftTicket],
+        before: Option<&Snapshot>,
+        group: Option<&str>,
+        plan: Option<Uuid>,
+    ) -> Result<HashMap<Uuid, Ticket>, DeskError> {
+        let mut out = HashMap::new();
+        for (i, d) in draft.iter().enumerate() {
+            let Some(id) = d.adopt else {
+                continue;
+            };
+            if before.is_some_and(|b| b.ticket(id).is_some()) || out.contains_key(&id) {
+                continue;
+            }
+            let outside = || {
+                DeskError::Invalid(format!(
+                    "Ticket {} takes on a ticket that isn't on a board of the plan's group.",
+                    i + 1
+                ))
+            };
+            let t = match self.ticket_of(id).await {
+                Ok(t) => t,
+                Err(DeskError::NotFound) => return Err(outside()),
+                Err(e) => return Err(e),
+            };
+            if self.board_of(t.board).await?.group.as_deref() != group {
+                return Err(outside());
+            }
+            if let Some(why) = self.held_why(&t, plan).await? {
+                return Err(DeskError::Conflict(why));
+            }
+            out.insert(id, t);
+        }
+        Ok(out)
+    }
+
+    /// Why `t` can't be taken on by a plan (`plan`, when one has it
+    /// already): someone has it, it started, or another open plan has it.
+    async fn held_why(&self, t: &Ticket, plan: Option<Uuid>) -> Result<Option<String>, DeskError> {
+        let key = self.key_of(t).await?;
+        if let Some(a) = &t.assignee {
+            let who = match a.kind {
+                PartyKind::You => "the person's".to_string(),
+                _ => format!("{}'s", a.name),
+            };
+            return Ok(Some(format!(
+                "{key} is {who} already: a plan never takes a ticket someone has. Leave it out, or ask the person to let it go."
+            )));
+        }
+        if !matches!(t.state, TicketState::Backlog | TicketState::Todo) {
+            return Ok(Some(format!(
+                "{key} is in {} already: a plan takes on only tickets that haven't started (Backlog or To do).",
+                t.state.title()
+            )));
+        }
+        if let Some(other) = self
+            .0
+            .store
+            .plan_of_ticket(t.id)
+            .await
+            .map_err(internal)?
+            .filter(|o| Some(*o) != plan)
+        {
+            if let Some(o) = self.0.store.plan(other).await.map_err(internal)? {
+                if !matches!(o.state, PlanState::Done | PlanState::Dropped) {
+                    return Ok(Some(format!(
+                        "{key} is in another plan already (“{}”): a ticket is in one plan at a time.",
+                        crew::one_line(&o.goal, 80)
+                    )));
+                }
+            }
+        }
+        if self
+            .0
+            .store
+            .starting_of(t.id)
+            .await
+            .map_err(internal)?
+            .is_some()
+        {
+            return Ok(Some(format!("{key} is starting a session now.")));
+        }
+        Ok(None)
+    }
+
+    /// A claim that failed, in the boss's words: the ticket taken meanwhile
+    /// is read again to say why.
+    async fn adopt_failed(&self, e: Adopt, plan: Option<Uuid>) -> DeskError {
+        match e {
+            Adopt::Held(id) => match self.ticket_of(id).await {
+                Ok(t) => match self.held_why(&t, plan).await {
+                    Ok(Some(why)) => DeskError::Conflict(why),
+                    Ok(None) => DeskError::Conflict(format!(
+                        "{} changed as the plan took it on; read it again.",
+                        self.key_of(&t).await.unwrap_or_else(|_| "A ticket".into())
+                    )),
+                    Err(e) => e,
+                },
+                Err(DeskError::NotFound) => {
+                    DeskError::Conflict("A ticket it takes on is gone from its board.".into())
+                }
+                Err(e) => e,
+            },
+            Adopt::Other(e) => internal(e),
+        }
+    }
+
+    /// The board a plan on `b` makes its new tickets on: `b`, or, when `b`
+    /// is synced, its group's own board of Desk's (a plan's words never
+    /// become a client's issues).
+    async fn new_tickets_board(&self, b: &Board) -> Result<Board, DeskError> {
+        match b.sync {
+            None => Ok(b.clone()),
+            Some(_) => self.plan_board(b.group.as_deref()).await,
+        }
+    }
+
+    /// Lets `t`, a ticket plan `p` took on, go where it is: its sessions
+    /// stopped or left running as the person's own (`on`), or, dropped from
+    /// a plan that goes on (`None`), taken off whoever the plan gave it to;
+    /// it is the plan's no longer, and the plan's own needs between it and
+    /// the plan's other tickets go. It is never moved, so its issue says
+    /// what it said.
+    async fn plan_let_go(
+        &self,
+        p: &Plan,
+        t: Ticket,
+        on: Option<OnDrop>,
+        by: &By,
+    ) -> Result<(), DeskError> {
+        // One that isn't the plan's now (let go, or someone else's) is
+        // left alone: its sessions are someone else's to stop.
+        if self.0.store.plan_of_ticket(t.id).await.map_err(internal)? != Some(p.id) {
+            return Ok(());
+        }
+        let sessions: Vec<Uuid> = t
+            .links
+            .iter()
+            .filter_map(|l| match l {
+                Link::Session { session } => Some(*session),
+                _ => None,
+            })
+            .filter(|s| self.view(*s).is_ok_and(|v| v.state != SessionState::Closed))
+            .collect();
+        let held_by_plan = t
+            .assignee
+            .as_ref()
+            .and_then(crate::line::session_of)
+            .is_some_and(|s| sessions.contains(&s));
+        let id = t.id;
+        match on {
+            Some(OnDrop::Leave) => {
+                for s in sessions {
+                    if self.charge_of(s).is_some_and(|c| c.live()) {
+                        if let Err(e) = self.release(s, by).await {
+                            tracing::info!(session = %s, error = %e, "a dropped plan's session wasn't let go");
+                        }
+                    }
+                }
+            }
+            Some(OnDrop::Stop) | None => {
+                if on.is_some() {
+                    for s in &sessions {
+                        if let Err(e) = self.stop(*s, Some(by.clone())) {
+                            tracing::info!(session = %s, error = %e, "a dropped plan's session wasn't stopped");
+                        }
+                    }
+                }
+                if held_by_plan {
+                    let key = self.key_of(&t).await?;
+                    if on.is_none() {
+                        if let Some(session) = t.assignee.as_ref().and_then(crate::line::session_of)
+                        {
+                            let text = format!(
+                                "{key} left the plan; it is no longer yours. Stop working on it unless you are asked again."
+                            );
+                            self.tell_session(session, text, by).await;
+                        }
+                    }
+                    self.unassign(t, &key, by).await?;
+                }
+            }
+        }
+        // Only the needs the plan added go; one the person or the tracker
+        // had stays, as does one its issue has there now too.
+        let mut unneeded = Vec::new();
+        for (a, b) in self
+            .0
+            .store
+            .plan_added_needs(p.id, id)
+            .await
+            .map_err(internal)?
+        {
+            let upstream = match (self.ticket_of(a).await, self.ticket_of(b).await) {
+                (Ok(from), Ok(to)) => match (&from.external, &to.external) {
+                    (Some(f), Some(t)) => f.seen.needs.contains(&t.key),
+                    _ => false,
+                },
+                _ => false,
+            };
+            if !upstream {
+                unneeded.push((a, b));
+            }
+        }
+        self.0
+            .store
+            .release_ticket(p.id, id, &unneeded)
+            .await
+            .map_err(internal)?;
+        let touched = unneeded.iter().map(|(a, _)| *a).chain([id]);
+        for t in touched.collect::<HashSet<_>>() {
+            if let Ok(v) = self.ticket(t).await {
+                self.announce(DeskEvent::Ticket {
+                    ticket: Box::new(v),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// The board a plan in `group` goes on: the group's first, or one made
@@ -881,6 +1165,21 @@ impl Desk {
         }
         let _one = self.0.plan_starting.lock().await;
         let rows = self.0.store.plan_tickets(p.id).await.map_err(internal)?;
+        // One it took on stays on its own board, and isn't moved.
+        let taken: HashSet<Uuid> = self
+            .0
+            .store
+            .plan_runs(p.id)
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .filter(|(_, r)| r.adopted)
+            .map(|(id, _)| id)
+            .collect();
+        let rows: Vec<Ticket> = rows
+            .into_iter()
+            .filter(|t| !taken.contains(&t.id))
+            .collect();
         // One filed in another tracker keeps its place there: moving it
         // would cut its link.
         if let Some(t) = rows.iter().find(|t| t.external.is_some()) {
@@ -965,15 +1264,31 @@ impl Desk {
         column: TicketState,
         by: &By,
     ) -> Result<(), DeskError> {
-        let b = self.board_of(p.board).await?;
-        if b.sync.is_some() && !after.added(before).is_empty() {
-            return Err(DeskError::Invalid(format!(
-                "{} is synced: a plan adds no tickets to it.",
-                b.name
-            )));
-        }
+        let shown = self.board_of(p.board).await?;
+        let makes = after.added(before).iter().any(|t| !t.adopted);
+        let b = match makes {
+            true => self.new_tickets_board(&shown).await?,
+            false => shown,
+        };
+        // Every one taken on is claimed before anything is written: one
+        // someone took meanwhile refuses the change whole.
+        self.claim_taken_on(p, before, after).await?;
         let mut rank = self.end_rank(b.id, column, Uuid::nil()).await?;
         for t in after.added(before) {
+            // One taken on is queued where it is once the plan runs: what
+            // it says is its board's.
+            if t.adopted {
+                let row = self.ticket_of(t.id).await?;
+                if column == TicketState::Todo && row.state == TicketState::Backlog {
+                    let mv = Move {
+                        state: TicketState::Todo,
+                        before: None,
+                        after: None,
+                    };
+                    self.move_read(row, mv, by).await?;
+                }
+                continue;
+            }
             let at = crew::now();
             let mut row = Ticket {
                 id: t.id,
@@ -1005,6 +1320,11 @@ impl Desk {
             let Ok(t) = self.ticket_of(id).await else {
                 continue;
             };
+            // One taken on goes back where it is, never deleted or dropped.
+            if before.ticket(id).is_some_and(|w| w.adopted) {
+                self.plan_let_go(p, t, None, by).await?;
+                continue;
+            }
             match p.approved_revision {
                 None => {
                     self.0.store.delete_ticket(id).await.map_err(internal)?;
@@ -1024,7 +1344,8 @@ impl Desk {
         // What every kept ticket says, needs and runs in.
         let ours: HashSet<Uuid> = after.tickets.iter().map(|t| t.id).collect();
         for t in &after.tickets {
-            let was = before.ticket(t.id);
+            // What one taken on says is its board's: never written here.
+            let was = before.ticket(t.id).filter(|_| !t.adopted);
             let mut row = self.ticket_of(t.id).await?;
             let mut changed = false;
             if was.is_some_and(|w| w.title != t.title) {
@@ -1039,7 +1360,7 @@ impl Desk {
                 row.updated_at = crew::now();
                 self.save_ticket(&mut row).await?;
             }
-            if was.is_some_and(|w| {
+            if before.ticket(t.id).is_some_and(|w| {
                 (w.engine, &w.folder, w.view, &w.machine, &w.model)
                     != (t.engine, &t.folder, t.view, &t.machine, &t.model)
             }) {
@@ -1058,7 +1379,11 @@ impl Desk {
                 .filter(|n| ours.contains(n))
                 .collect();
             for n in want.difference(&had) {
-                self.0.store.put_need(t.id, *n).await.map_err(internal)?;
+                self.0
+                    .store
+                    .put_plan_need(t.id, *n, p.id)
+                    .await
+                    .map_err(internal)?;
             }
             for n in had.difference(&want) {
                 self.0.store.delete_need(t.id, *n).await.map_err(internal)?;
@@ -1075,6 +1400,45 @@ impl Desk {
         Ok(())
     }
 
+    /// Claims for `p` every ticket `after` takes on that `before` didn't,
+    /// all or none: when one can't be, those claimed here go again and it
+    /// is refused, saying why. One already `p`'s is claimed again as it is.
+    async fn claim_taken_on(
+        &self,
+        p: &Plan,
+        before: &Snapshot,
+        after: &Snapshot,
+    ) -> Result<Vec<Uuid>, DeskError> {
+        let mut claimed = Vec::new();
+        for t in after.added(before).into_iter().filter(|t| t.adopted) {
+            let runs = Runs {
+                plan: Some(p.id),
+                engine: Some(t.engine),
+                folder: Some(t.folder.clone()),
+                view: t.view,
+                machine: t.machine.clone(),
+                model: t.model.clone(),
+                adopted: true,
+            };
+            if let Err(e) = self.0.store.adopt_ticket(t.id, &runs).await {
+                self.unclaim(p, &claimed).await;
+                return Err(self.adopt_failed(e, Some(p.id)).await);
+            }
+            claimed.push(t.id);
+        }
+        Ok(claimed)
+    }
+
+    /// Lets the tickets `ids` that [`Self::claim_taken_on`] claimed for `p`
+    /// go again, as they were: nothing else was written of them.
+    async fn unclaim(&self, p: &Plan, ids: &[Uuid]) {
+        for id in ids {
+            if let Err(e) = self.0.store.release_ticket(p.id, *id, &[]).await {
+                tracing::warn!(ticket = %id, error = %e, "a ticket claimed for a refused plan change wasn't let go");
+            }
+        }
+    }
+
     async fn put_runs(&self, p: &Plan, t: &Planned) -> Result<(), DeskError> {
         self.0
             .store
@@ -1087,6 +1451,7 @@ impl Desk {
                     view: t.view,
                     machine: t.machine.clone(),
                     model: t.model.clone(),
+                    adopted: t.adopted,
                 },
             )
             .await
@@ -1098,7 +1463,13 @@ impl Desk {
     async fn plan_reorder(&self, p: &Plan, s: &Snapshot) -> Result<(), DeskError> {
         let rows = self.0.store.plan_tickets(p.id).await.map_err(internal)?;
         for column in [TicketState::Backlog, TicketState::Todo] {
-            let mut queued: Vec<&Ticket> = rows.iter().filter(|t| t.state == column).collect();
+            // One taken on keeps its place on its board: its order there is
+            // the person's, or its tracker's.
+            let mut queued: Vec<&Ticket> = rows
+                .iter()
+                .filter(|t| t.state == column)
+                .filter(|t| !s.ticket(t.id).is_some_and(|x| x.adopted))
+                .collect();
             if queued.len() < 2 {
                 continue;
             }
@@ -1189,16 +1560,32 @@ impl Desk {
         let newest = self.newest(&p).await?;
         let applied = self.applied(&p).await?;
         let mut next = match &edit.tickets {
-            Some(tickets) => plan::snapshot_of(
-                &Draft {
-                    goal: edit.goal.clone().unwrap_or_else(|| newest.goal.clone()),
-                    tickets: tickets.clone(),
-                },
-                Some(&newest),
-                engine,
-                &mut Uuid::new_v4,
-            )
-            .map_err(problems)?,
+            Some(tickets) => {
+                let taking = self
+                    .adoptable(tickets, Some(&newest), p.group.as_deref(), Some(p.id))
+                    .await?;
+                let mut next = plan::snapshot_with(
+                    &Draft {
+                        goal: edit.goal.clone().unwrap_or_else(|| newest.goal.clone()),
+                        tickets: tickets.clone(),
+                    },
+                    Some(&newest),
+                    engine,
+                    &titles_of(&taking),
+                    &mut Uuid::new_v4,
+                )
+                .map_err(problems)?;
+                if !taking.is_empty() {
+                    let mut rows = HashMap::new();
+                    for t in next.tickets.iter().filter(|t| t.adopted) {
+                        if !taking.contains_key(&t.id) {
+                            rows.insert(t.id, self.ticket_of(t.id).await?);
+                        }
+                    }
+                    keep_needs(&mut next, &taking, &rows);
+                }
+                next
+            }
             None => newest.clone(),
         };
         if let Some(goal) = &edit.goal {
@@ -1236,18 +1623,30 @@ impl Desk {
         let waits =
             p.approved_revision.is_some() && !person && !unbound && (asks || kind == Change::Scope);
         let n = p.revision + 1;
-        self.add_revision(&p, n, by, kind, &summary, &next).await?;
+        let from = match p.approved_revision {
+            None => newest,
+            Some(_) => applied,
+        };
+        // What it takes on is claimed before the revision is written, so a
+        // ticket taken meanwhile refuses it with nothing written.
+        let claimed = match waits {
+            true => vec![],
+            false => self.claim_taken_on(&p, &from, &next).await?,
+        };
+        if let Err(e) = self.add_revision(&p, n, by, kind, &summary, &next).await {
+            self.unclaim(&p, &claimed).await;
+            return Err(e);
+        }
         p.revision = n;
         if !waits {
             let column = match p.approved_revision {
                 None => TicketState::Backlog,
                 Some(_) => TicketState::Todo,
             };
-            let from = match p.approved_revision {
-                None => newest,
-                Some(_) => applied,
-            };
-            self.plan_rows_follow(&p, &from, &next, column, by).await?;
+            if let Err(e) = self.plan_rows_follow(&p, &from, &next, column, by).await {
+                self.unclaim(&p, &claimed).await;
+                return Err(e);
+            }
             if p.approved_revision.is_some() {
                 p.approved_revision = Some(n);
                 // What it may spend is what applies now.
@@ -1322,81 +1721,116 @@ impl Desk {
             return self.plan_detail(p).await;
         }
         let mut next = self.newest(&p).await?;
-        let mut revision = revision;
-        if let Some(b) = budget.filter(|b| *b != next.budget) {
-            let before = next.clone();
-            next.budget = b;
-            if let Some(why) = next.budget.as_ref().and_then(PlanBudget::problem) {
-                return Err(DeskError::Invalid(why));
-            }
-            let summary = plan::describe(&before, &next);
-            let applied = self.applied(&p).await?;
-            let started = self.started(&p).await?;
-            let kind = plan::plan_change(&applied, &next, &started)
-                .map_err(|e| DeskError::Conflict(e.to_string()))?
-                .unwrap_or(Change::Minor);
-            revision = p.revision + 1;
-            self.add_revision(&p, revision, by, kind, &summary, &next)
-                .await?;
-            p.revision = revision;
-        }
-        if p.approved_revision == Some(revision) {
-            return self.plan_detail(p).await;
-        }
-        match p.approved_revision {
-            // Its tickets are what it says: they go to To do.
-            None => {
-                let rows = self.0.store.plan_tickets(p.id).await.map_err(internal)?;
-                let place: HashMap<Uuid, usize> = next
-                    .tickets
-                    .iter()
-                    .enumerate()
-                    .map(|(i, t)| (t.id, i))
-                    .collect();
-                let mut queued: Vec<Ticket> = rows
-                    .into_iter()
-                    .filter(|t| t.state == TicketState::Backlog)
-                    .collect();
-                queued.sort_by_key(|t| place.get(&t.id).copied().unwrap_or(usize::MAX));
-                for mut t in queued {
-                    let at = crew::now();
-                    self.to_column(&mut t, TicketState::Todo, at).await?;
-                    self.save_ticket(&mut t).await?;
-                    if let Ok(v) = self.view_ticket(t).await {
-                        self.announce(DeskEvent::Ticket {
-                            ticket: Box::new(v),
-                        });
-                    }
-                }
-                p.state = PlanState::Running;
-            }
-            // A change of scope: it applies now.
+        // A change it approves claims what it takes on before anything is
+        // written: one taken meanwhile refuses it as it was.
+        let claimed = match p.approved_revision {
             Some(_) => {
                 let applied = self.applied(&p).await?;
-                let started = self.started(&p).await?;
-                plan::plan_change(&applied, &next, &started)
-                    .map_err(|e| DeskError::Conflict(e.to_string()))?;
-                self.plan_rows_follow(&p, &applied, &next, TicketState::Todo, by)
-                    .await?;
-                p.goal.clone_from(&next.goal);
+                self.claim_taken_on(&p, &applied, &next).await?
             }
-        }
-        p.approved_revision = Some(revision);
-        p.parallel = next.parallel;
-        p.updated_at = crew::now();
-        // What it may spend is what was approved.
-        self.keep_plan_budget(&p, next.budget.as_ref(), by).await?;
-        let text = match (revision, &next.budget) {
-            (1, None) => format!("approved the plan: {}", crew::one_line(&p.goal, 120)),
-            (1, Some(b)) => format!(
-                "approved the plan, capped at {}: {}",
-                b.words(),
-                crew::one_line(&p.goal, 120)
-            ),
-            (n, _) => format!("approved revision {n} of the plan"),
+            None => vec![],
         };
-        self.plan_note(&p, by, Kind::PlanApproved, text);
-        self.plan_saved(&p).await
+        // Whatever stops it after, what it claimed goes again: the plan as
+        // approved never had them.
+        // True once there is something new to save; the save is outside, so
+        // one that fails after it committed never lets them go.
+        let done: Result<bool, DeskError> = async {
+            let mut revision = revision;
+            if let Some(b) = budget.filter(|b| *b != next.budget) {
+                let before = next.clone();
+                next.budget = b;
+                if let Some(why) = next.budget.as_ref().and_then(PlanBudget::problem) {
+                    return Err(DeskError::Invalid(why));
+                }
+                let summary = plan::describe(&before, &next);
+                let applied = self.applied(&p).await?;
+                let started = self.started(&p).await?;
+                let kind = plan::plan_change(&applied, &next, &started)
+                    .map_err(|e| DeskError::Conflict(e.to_string()))?
+                    .unwrap_or(Change::Minor);
+                revision = p.revision + 1;
+                self.add_revision(&p, revision, by, kind, &summary, &next)
+                    .await?;
+                p.revision = revision;
+            }
+            if p.approved_revision == Some(revision) {
+                return Ok(false);
+            }
+            match p.approved_revision {
+                // Its tickets are what it says: they go to To do.
+                None => {
+                    let rows = self.0.store.plan_tickets(p.id).await.map_err(internal)?;
+                    let place: HashMap<Uuid, usize> = next
+                        .tickets
+                        .iter()
+                        .enumerate()
+                        .map(|(i, t)| (t.id, i))
+                        .collect();
+                    let mut queued: Vec<Ticket> = rows
+                        .into_iter()
+                        .filter(|t| t.state == TicketState::Backlog)
+                        .collect();
+                    queued.sort_by_key(|t| place.get(&t.id).copied().unwrap_or(usize::MAX));
+                    for mut t in queued {
+                        // One taken on moves as any move of the person's would,
+                        // so its issue moves too.
+                        if next.ticket(t.id).is_some_and(|x| x.adopted) {
+                            let mv = Move {
+                                state: TicketState::Todo,
+                                before: None,
+                                after: None,
+                            };
+                            self.move_read(t, mv, by).await?;
+                            continue;
+                        }
+                        let at = crew::now();
+                        self.to_column(&mut t, TicketState::Todo, at).await?;
+                        self.save_ticket(&mut t).await?;
+                        if let Ok(v) = self.view_ticket(t).await {
+                            self.announce(DeskEvent::Ticket {
+                                ticket: Box::new(v),
+                            });
+                        }
+                    }
+                    p.state = PlanState::Running;
+                }
+                // A change of scope: it applies now.
+                Some(_) => {
+                    let applied = self.applied(&p).await?;
+                    let started = self.started(&p).await?;
+                    plan::plan_change(&applied, &next, &started)
+                        .map_err(|e| DeskError::Conflict(e.to_string()))?;
+                    self.plan_rows_follow(&p, &applied, &next, TicketState::Todo, by)
+                        .await?;
+                    p.goal.clone_from(&next.goal);
+                }
+            }
+            p.approved_revision = Some(revision);
+            p.parallel = next.parallel;
+            p.updated_at = crew::now();
+            // What it may spend is what was approved.
+            self.keep_plan_budget(&p, next.budget.as_ref(), by).await?;
+            let text = match (revision, &next.budget) {
+                (1, None) => format!("approved the plan: {}", crew::one_line(&p.goal, 120)),
+                (1, Some(b)) => format!(
+                    "approved the plan, capped at {}: {}",
+                    b.words(),
+                    crew::one_line(&p.goal, 120)
+                ),
+                (n, _) => format!("approved revision {n} of the plan"),
+            };
+            self.plan_note(&p, by, Kind::PlanApproved, text);
+            Ok(true)
+        }
+        .await;
+        match done {
+            Err(e) => {
+                self.unclaim(&p, &claimed).await;
+                Err(e)
+            }
+            Ok(false) => self.plan_detail(p).await,
+            Ok(true) => self.plan_saved(&p).await,
+        }
     }
 
     /// Pauses plan `id` for `why`: it starts nothing until it is resumed.
@@ -1575,6 +2009,16 @@ impl Desk {
         let n = p.revision + 1;
         self.add_revision(&p, n, by, Change::Minor, &summary, &applied)
             .await?;
+        // A ticket the change took on that an approval left claimed goes
+        // back as it was: the plan as approved never had it.
+        let newest = self.newest(&p).await?;
+        let gone: Vec<Uuid> = newest
+            .added(&applied)
+            .into_iter()
+            .filter(|t| t.adopted)
+            .map(|t| t.id)
+            .collect();
+        self.unclaim(&p, &gone).await;
         p.revision = n;
         p.approved_revision = Some(n);
         p.updated_at = crew::now();
@@ -1645,7 +2089,25 @@ impl Desk {
             }
         }
         let rows = self.0.store.plan_tickets(p.id).await.map_err(internal)?;
+        let taken: HashSet<Uuid> = self
+            .0
+            .store
+            .plan_runs(p.id)
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .filter(|(_, r)| r.adopted)
+            .map(|(id, _)| id)
+            .collect();
         for t in rows {
+            // One taken on goes back where it is, whatever its column: one
+            // done stays the plan's record.
+            if taken.contains(&t.id) {
+                if t.state != TicketState::Done {
+                    self.plan_let_go(&p, t, Some(on), by).await?;
+                }
+                continue;
+            }
             let sessions: Vec<Uuid> = t
                 .links
                 .iter()
@@ -2272,15 +2734,29 @@ impl Desk {
     }
 }
 
-/// `v`, a plan's ticket, as the plan's rules read it.
-fn plan_ticket(v: &super::TicketView, runs: Option<&Runs>, starting: bool) -> PlanTicket {
+/// `v`, a plan's ticket, as the plan's rules read it. A need of it
+/// outside the plan (`ours`, its tickets) holds it back only until that
+/// ticket is done: one taken on from a synced board may be blocked there
+/// by an issue the plan doesn't have.
+fn plan_ticket(
+    v: &super::TicketView,
+    runs: Option<&Runs>,
+    starting: bool,
+    ours: &HashSet<Uuid>,
+) -> PlanTicket {
     let r = runs.cloned().unwrap_or_default();
     PlanTicket {
         id: v.ticket.id,
         key: v.key.clone(),
         state: v.ticket.state,
         rank: v.ticket.rank,
-        needs: v.ticket.needs.clone(),
+        needs: v
+            .ticket
+            .needs
+            .iter()
+            .filter(|n| ours.contains(n) || v.blockers.contains(n))
+            .copied()
+            .collect(),
         engine: r.engine,
         folder: r.folder,
         view: r.view,
@@ -2288,6 +2764,31 @@ fn plan_ticket(v: &super::TicketView, runs: Option<&Runs>, starting: bool) -> Pl
         model: r.model,
         assigned: v.ticket.assignee.is_some(),
         starting,
+    }
+}
+
+/// The titles of the tickets a draft takes on, as
+/// [`plan::snapshot_with`] reads them.
+fn titles_of(taking: &HashMap<Uuid, Ticket>) -> HashMap<Uuid, String> {
+    taking.iter().map(|(id, t)| (*id, t.said_title())).collect()
+}
+
+/// The needs the tickets `s` takes on now (`taking`) have already on
+/// another of its tickets, or another of its tickets taken on has on them
+/// (`rows`, every ticket taken on as it is), kept in `s`: a plan never
+/// drops a need it found.
+fn keep_needs(s: &mut Snapshot, taking: &HashMap<Uuid, Ticket>, rows: &HashMap<Uuid, Ticket>) {
+    let ids: HashSet<Uuid> = s.tickets.iter().map(|t| t.id).collect();
+    for t in s.tickets.iter_mut().filter(|t| t.adopted) {
+        let Some(row) = taking.get(&t.id).or_else(|| rows.get(&t.id)) else {
+            continue;
+        };
+        for n in &row.needs {
+            let fresh = taking.contains_key(&t.id) || taking.contains_key(n);
+            if fresh && ids.contains(n) && !t.needs.contains(n) && *n != t.id {
+                t.needs.push(*n);
+            }
+        }
     }
 }
 
@@ -2326,3 +2827,7 @@ fn plan_why(s: &Snapshot, parallel: Option<i16>) -> String {
 #[cfg(test)]
 #[path = "plans_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "plans_adopt_tests.rs"]
+mod adopt_tests;

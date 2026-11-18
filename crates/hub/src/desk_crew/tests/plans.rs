@@ -1702,3 +1702,109 @@ async fn a_machine_start_whose_retry_cant_read_there_keeps_its_link() {
     })
     .await;
 }
+
+/// "Plan fixing the open bugs": the boss finds the person's tickets on the
+/// board with crew.find_tickets, proposes a plan that takes two on as they
+/// are beside a new one, the person approves it, and the runner starts a
+/// session on the very ticket it took on, under its own key.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_boss_finds_tickets_and_plans_on_them_as_they_are() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
+        let b = d
+            .create_board(workforce_desk::NewBoard {
+                name: "Mantis".into(),
+                group: None,
+                prefix: Some("MAN".into()),
+            })
+            .await
+            .unwrap();
+        let mut keys = Vec::new();
+        for title in ["The cart empties on reload", "Login loops on Safari", "Old banner"] {
+            let t = d
+                .create_ticket(
+                    workforce_desk::NewTicket {
+                        board: b.id,
+                        title: title.into(),
+                        body: "Seen on the 17th.".into(),
+                        state: Some(TicketState::Todo),
+                        needs: vec![],
+                    },
+                    &By::you(),
+                )
+                .await
+                .unwrap();
+            keys.push(t.key.unwrap());
+        }
+        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("the plan tools", async || {
+            overseer.tools.has("crew.find_tickets").then_some(())
+        })
+        .await;
+        let found = overseer
+            .tools
+            .get("crew.find_tickets")
+            .unwrap()
+            .execute(json!({ "board": "mantis", "q": "o", "state": ["todo"] }))
+            .await
+            .unwrap();
+        assert!(found.success, "{found:?}");
+        assert_eq!(found.output["found"], 3, "{:?}", found.output);
+        assert_eq!(found.output["free"], 3);
+        let r = overseer
+            .tools
+            .get("crew.plan")
+            .unwrap()
+            .execute(json!({ "goal": "Fix the open bugs", "tickets": [
+                { "adopt": keys[0], "folder": dir.path().to_string_lossy() },
+                { "adopt": keys[1].to_lowercase(), "folder": dir.path().to_string_lossy(), "needs": [0] },
+                { "title": "Write the release note", "folder": dir.path().to_string_lossy(), "needs": [1] },
+            ]}))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        let proposed = &r.output["proposed"];
+        assert_eq!(proposed["tickets"][0]["key"], keys[0]);
+        assert_eq!(proposed["tickets"][0]["adopted"], true);
+        assert_eq!(proposed["tickets"][2]["adopted"], false);
+        let id: uuid::Uuid = proposed["plan_id"].as_str().unwrap().parse().unwrap();
+        // Taken: the same ticket in another plan is refused by its key.
+        let again = overseer
+            .tools
+            .get("crew.plan")
+            .unwrap()
+            .execute(json!({ "goal": "Again", "tickets": [
+                { "adopt": keys[0], "folder": dir.path().to_string_lossy() },
+            ]}))
+            .await
+            .unwrap();
+        assert!(!again.success);
+        let said = again.error.unwrap_or_default();
+        assert!(said.contains(&format!("{} is in another plan already", keys[0])), "{said}");
+        // A title beside adopt is refused: its words are the ticket's.
+        let both = overseer
+            .tools
+            .get("crew.plan")
+            .unwrap()
+            .execute(json!({ "goal": "Again", "tickets": [
+                { "adopt": keys[2], "title": "Mine", "folder": dir.path().to_string_lossy() },
+            ]}))
+            .await
+            .unwrap();
+        assert!(!both.success);
+
+        d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let first = eventually("its first ticket's session", async || {
+            d.list().into_iter().find(|v| v.name == keys[0])
+        })
+        .await;
+        let t = d.ticket_by_key(&keys[0]).await.unwrap();
+        assert_eq!(t.ticket.session(), Some(first.id));
+        assert_eq!(t.ticket.title, "The cart empties on reload", "as it was");
+        // Nothing copied: the board has its three and the plan's new one.
+        assert_eq!(d.tickets(b.id, &Default::default()).await.unwrap().len(), 4);
+        assert_eq!(proposed["tickets"][2]["key"], "MAN-4");
+    })
+    .await;
+}

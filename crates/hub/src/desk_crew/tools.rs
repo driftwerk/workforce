@@ -27,7 +27,7 @@ use super::CrewHub;
 
 /// Every `crew.*` tool: the ones it has at every level first (its reads,
 /// and what it asks of the person, which is never gated).
-pub const READ: [&str; 19] = [
+pub const READ: [&str; 20] = [
     "crew.overview",
     "crew.activity",
     "crew.account",
@@ -35,6 +35,7 @@ pub const READ: [&str; 19] = [
     "crew.history",
     super::spend::NAME,
     super::board::NAME,
+    super::find::NAME,
     super::items::ASK,
     super::items::CLOSE,
     super::items::OPEN,
@@ -394,6 +395,7 @@ impl CrewTool {
                     .await
             }
             super::board::NAME => crew.board(seen).await,
+            super::find::NAME => crew.find_tickets_tool(b, input).await,
             super::items::ASK
             | super::items::CLOSE
             | super::items::OPEN
@@ -822,6 +824,7 @@ pub(crate) fn describe(name: &str) -> &'static str {
             super::directives::NAME => super::directives::DESCRIPTION,
             super::cadence_tool::NAME => super::cadence_tool::DESCRIPTION,
             super::board::NAME => super::board::DESCRIPTION,
+            super::find::NAME => super::find::DESCRIPTION,
             super::plan::NAME => super::plan::DESCRIPTION,
             super::plan::UPDATE => super::plan::UPDATE_DESCRIPTION,
             super::plan::BOARD_CREATE => super::plan::BOARD_CREATE_DESCRIPTION,
@@ -883,6 +886,7 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
         super::directives::NAME => super::directives::schema(),
         super::cadence_tool::NAME => super::cadence_tool::schema(),
         super::board::NAME => super::board::schema(),
+        super::find::NAME => super::find::schema(),
         super::plan::NAME => super::plan::schema(),
         super::plan::UPDATE => super::plan::update_schema(),
         super::plan::BOARD_CREATE => super::plan::board_create_schema(),

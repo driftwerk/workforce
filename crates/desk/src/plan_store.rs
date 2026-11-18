@@ -124,6 +124,78 @@ pub struct Runs {
     pub machine: Option<String>,
     /// The model its session runs; none is its engine's default.
     pub model: Option<String>,
+    /// Taken on from a board, not made by the plan: never deleted, dropped,
+    /// renamed or re-filed by it. Read only: [`DeskStore::put_runs`] leaves
+    /// it, [`DeskStore::adopt_ticket`] and [`DeskStore::release_ticket`]
+    /// set it.
+    pub adopted: bool,
+}
+
+/// What a ticket a plan takes on must be as it is claimed: no one has it,
+/// it hasn't started, no open plan has it, and no session is starting for
+/// it. `$1` is the ticket.
+const ADOPTABLE: &str = "assignee IS NULL AND state IN ('backlog', 'todo') \
+     AND (plan IS NULL OR plan IN (SELECT id FROM plans WHERE state IN ('done', 'dropped'))) \
+     AND NOT EXISTS (SELECT 1 FROM ticket_links l WHERE l.ticket = $1 AND l.kind = 'starting')";
+
+/// Why a ticket couldn't be taken on.
+#[derive(Debug, thiserror::Error)]
+pub enum Adopt {
+    /// Someone has it, it started, another plan has it, or it is gone:
+    /// read it again to say which.
+    #[error("the ticket can't be taken on as it is")]
+    Held(Uuid),
+    #[error(transparent)]
+    Other(#[from] eyre::Report),
+}
+
+impl From<tokio_postgres::Error> for Adopt {
+    fn from(e: tokio_postgres::Error) -> Self {
+        Self::Other(eyre::Report::new(e).wrap_err("taking a ticket on"))
+    }
+}
+
+impl From<serde_json::Error> for Adopt {
+    fn from(e: serde_json::Error) -> Self {
+        Self::Other(eyre::Report::new(e))
+    }
+}
+
+impl From<workforce_postgres::PostgresError> for Adopt {
+    fn from(e: workforce_postgres::PostgresError) -> Self {
+        Self::Other(eyre::Report::new(e))
+    }
+}
+
+/// Claims `ticket` for plan `runs.plan`, while it is [`ADOPTABLE`].
+async fn adopt_in<C: tokio_postgres::GenericClient>(
+    client: &C,
+    ticket: Uuid,
+    runs: &Runs,
+) -> Result<(), Adopt> {
+    let n = client
+        .execute(
+            &format!(
+                "UPDATE tickets SET plan = $2, engine = $3, folder = $4, view = $5, machine = $6, \
+                 model = $7, adopted = true, version = version + 1 \
+                 WHERE id = $1 AND (({ADOPTABLE}) OR (plan = $2 AND adopted AND assignee IS NULL \
+                 AND state IN ('backlog', 'todo')))"
+            ),
+            &[
+                &ticket,
+                &runs.plan,
+                &runs.engine.map(Engine::as_str),
+                &runs.folder,
+                &runs.view.map(View::as_str),
+                &runs.machine,
+                &runs.model,
+            ],
+        )
+        .await?;
+    match n {
+        1 => Ok(()),
+        _ => Err(Adopt::Held(ticket)),
+    }
 }
 
 /// A `starting` link: the session about to start for a ticket.
@@ -142,7 +214,8 @@ impl DeskStore {
     }
 
     /// Re-files plan `p` on board `to`, in one step: `p` written as it
-    /// says (its board `to`), and each of its tickets numbered on `to` in
+    /// says (its board `to`), and each of its own tickets (never one it took
+    /// on, which stays on its board) numbered on `to` in
     /// the order they were numbered, still in the plan, with what they
     /// need, their links, history and assignment kept. The tickets as they
     /// are now, in that order.
@@ -151,7 +224,8 @@ impl DeskStore {
         let tx = client.transaction().await?;
         let ids: Vec<Uuid> = tx
             .query(
-                "SELECT id FROM tickets WHERE plan = $1 AND board <> $2 ORDER BY number",
+                "SELECT id FROM tickets WHERE plan = $1 AND board <> $2 AND NOT adopted \
+                 ORDER BY number",
                 &[&p.id, &to],
             )
             .await?
@@ -268,13 +342,16 @@ impl DeskStore {
     }
 
     /// Writes where `ticket` runs, and which plan it is in. The ticket's
-    /// version moves on: a start read before is refused.
+    /// version moves on: a start read before is refused. One taken on that
+    /// is no longer the plan's (let go, or another plan's now) is left as
+    /// it is: only a claim takes it again.
     pub async fn put_runs(&self, ticket: Uuid, runs: &Runs) -> Result<()> {
         let client = self.pool().get().await?;
         client
             .execute(
                 "UPDATE tickets SET plan = $2, engine = $3, folder = $4, view = $5, \
-                 machine = $6, model = $7, version = version + 1 WHERE id = $1",
+                 machine = $6, model = $7, version = version + 1 \
+                 WHERE id = $1 AND (plan = $2 OR (plan IS NULL AND NOT adopted))",
                 &[
                     &ticket,
                     &runs.plan,
@@ -294,7 +371,8 @@ impl DeskStore {
         let client = self.pool().get().await?;
         client
             .query(
-                "SELECT id, plan, engine, folder, view, machine, model FROM tickets WHERE plan = $1",
+                "SELECT id, plan, engine, folder, view, machine, model, adopted FROM tickets \
+                 WHERE plan = $1",
                 &[&plan_id],
             )
             .await?
@@ -311,6 +389,7 @@ impl DeskStore {
                         view: view.as_deref().map(View::parse).transpose()?,
                         machine: r.try_get("machine")?,
                         model: r.try_get("model")?,
+                        adopted: r.try_get("adopted")?,
                     },
                 ))
             })
@@ -359,7 +438,7 @@ impl DeskStore {
             .query_opt(
                 "UPDATE tickets SET state = $3, rank = $4, state_at = $5, updated_at = $5, \
                  version = version + 1 WHERE id = $1 AND version = $2 AND plan = $6 \
-                 RETURNING version, engine, folder, view, machine, model",
+                 RETURNING version, engine, folder, view, machine, model, adopted",
                 &[
                     &t.id,
                     &t.version,
@@ -393,21 +472,101 @@ impl DeskStore {
             view: view.as_deref().map(View::parse).transpose()?,
             machine: row.try_get(4)?,
             model: row.try_get(5)?,
+            adopted: row.try_get(6)?,
         })
     }
 
+    /// Takes `ticket` on for the plan `runs.plan`, as it runs there, while
+    /// no one has it, it hasn't started and no open plan has it.
+    pub async fn adopt_ticket(&self, ticket: Uuid, runs: &Runs) -> Result<(), Adopt> {
+        let client = self.pool().get().await?;
+        adopt_in(&**client, ticket, runs).await
+    }
+
+    /// Adds that `ticket` needs `needs`, as plan `plan`'s own; whether it
+    /// was added (false: it was there already, and stays whose it was).
+    pub async fn put_plan_need(&self, ticket: Uuid, needs: Uuid, plan: Uuid) -> Result<bool> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .execute(
+                "INSERT INTO ticket_needs (ticket, needs, plan) VALUES ($1, $2, $3) \
+                 ON CONFLICT DO NOTHING",
+                &[&ticket, &needs, &plan],
+            )
+            .await?
+            > 0)
+    }
+
+    /// The needs plan `plan` added that `ticket` is in, either way, as
+    /// `(ticket, needs)`.
+    pub async fn plan_added_needs(&self, plan: Uuid, ticket: Uuid) -> Result<Vec<(Uuid, Uuid)>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                "SELECT ticket, needs FROM ticket_needs WHERE plan = $1 \
+                 AND (ticket = $2 OR needs = $2)",
+                &[&plan, &ticket],
+            )
+            .await?
+            .iter()
+            .map(|r| Ok((r.try_get(0)?, r.try_get(1)?)))
+            .collect()
+    }
+
+    /// Lets `ticket` go from plan `plan`, where it is: no longer the
+    /// plan's, with nothing said of where it runs, and without the needs
+    /// `unneeded` (`(ticket, needs)`), the plan's own between its tickets.
+    /// False when it wasn't the plan's.
+    pub async fn release_ticket(
+        &self,
+        plan: Uuid,
+        ticket: Uuid,
+        unneeded: &[(Uuid, Uuid)],
+    ) -> Result<bool> {
+        let mut client = self.pool().get().await?;
+        let tx = client.transaction().await?;
+        let n = tx
+            .execute(
+                "UPDATE tickets SET plan = NULL, engine = NULL, folder = NULL, view = NULL, \
+                 machine = NULL, model = NULL, adopted = false, version = version + 1 \
+                 WHERE id = $1 AND plan = $2",
+                &[&ticket, &plan],
+            )
+            .await?;
+        if n == 1 {
+            for (t, needs) in unneeded {
+                tx.execute(
+                    "DELETE FROM ticket_needs WHERE ticket = $1 AND needs = $2",
+                    &[t, needs],
+                )
+                .await?;
+            }
+        }
+        tx.commit()
+            .await
+            .context("letting a ticket go from a plan")?;
+        Ok(n == 1)
+    }
+
     /// Writes a new plan, its tickets (numbered on its board, with where
-    /// each runs and what each needs) and its first revision, at once: a
-    /// plan is never half there.
+    /// each runs and what each needs), the tickets it takes on (`adopt`:
+    /// each claimed with where it runs, and given what it needs) and its
+    /// first revision, at once: a plan is never half there.
     pub async fn add_plan(
         &self,
         p: &Plan,
         tickets: &mut [(Ticket, Runs)],
+        adopt: &[(Uuid, Runs, Vec<Uuid>)],
         r: &Revision,
-    ) -> Result<()> {
+    ) -> Result<(), Adopt> {
         let mut client = self.pool().get().await?;
         let tx = client.transaction().await?;
         put_plan_in(&*tx, p).await?;
+        // Each ticket it takes on, claimed as it is now: one someone took
+        // meanwhile refuses the whole plan.
+        for (id, runs, _) in adopt {
+            adopt_in(&*tx, *id, runs).await?;
+        }
         for (t, runs) in tickets.iter_mut() {
             let row = tx
                 .query_one(
@@ -434,11 +593,17 @@ impl DeskStore {
             )
             .await?;
         }
-        for (t, _) in tickets.iter() {
-            for n in &t.needs {
+        let needs = tickets
+            .iter()
+            .map(|(t, _)| (t.id, t.needs.as_slice()))
+            .chain(adopt.iter().map(|(id, _, n)| (*id, n.as_slice())));
+        for (id, list) in needs {
+            for n in list {
+                // One there already (the person's, the tracker's) stays theirs.
                 tx.execute(
-                    "INSERT INTO ticket_needs (ticket, needs) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-                    &[&t.id, n],
+                    "INSERT INTO ticket_needs (ticket, needs, plan) VALUES ($1, $2, $3) \
+                     ON CONFLICT DO NOTHING",
+                    &[&id, n, &p.id],
                 )
                 .await?;
             }
@@ -620,6 +785,7 @@ mod tests {
                         needs: vec![],
                         machine: None,
                         model: None,
+                        adopted: false,
                     }],
                 },
             };
@@ -640,6 +806,7 @@ mod tests {
                 view: Some(View::Terminal),
                 machine: Some("devbox".into()),
                 model: Some("gpt-5.5".into()),
+                adopted: false,
             };
             s.put_runs(t.id, &runs).await.unwrap();
             assert_eq!(s.plan_runs(p.id).await.unwrap(), vec![(t.id, runs)]);
@@ -664,6 +831,7 @@ mod tests {
                 view: None,
                 machine: None,
                 model: None,
+                adopted: false,
             },
         )
         .await
@@ -735,6 +903,7 @@ mod tests {
                     view: None,
                     machine: None,
                     model: None,
+                    adopted: false,
                 },
             )
             .await
@@ -801,6 +970,7 @@ mod tests {
                 view: None,
                 machine: None,
                 model: None,
+                adopted: false,
             };
             let mut rows = vec![(first, runs.clone()), (second, runs)];
             let r = Revision {
@@ -812,7 +982,7 @@ mod tests {
                 summary: "Proposed".into(),
                 snapshot: Snapshot::default(),
             };
-            s.add_plan(&p, &mut rows, &r).await.unwrap();
+            s.add_plan(&p, &mut rows, &[], &r).await.unwrap();
             assert_eq!(rows[1].0.number, 2);
             assert_eq!(s.plan_runs(p.id).await.unwrap().len(), 2);
             let b2 = s.ticket(rows[1].0.id).await.unwrap().unwrap();
@@ -820,7 +990,7 @@ mod tests {
             assert!(s.revision(p.id, 1).await.unwrap().is_some());
             // The same again fails whole: nothing more is written.
             let mut again = vec![(mk("c", vec![]), Runs::default())];
-            assert!(s.add_plan(&p, &mut again, &r).await.is_err());
+            assert!(s.add_plan(&p, &mut again, &[], &r).await.is_err());
             assert!(s.ticket(again[0].0.id).await.unwrap().is_none());
         })
         .await;
