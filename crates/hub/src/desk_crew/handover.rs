@@ -215,13 +215,21 @@ impl CrewHub {
                 .await;
             if let Err(e) = &done {
                 tracing::warn!(handover = %note.id, error = %e, "a handover's note wasn't delivered");
+                // Its request may have answered already: the person is told
+                // here, where they read what the boss does.
+                crew.tell_dm(
+                    &boss,
+                    &format!("The handover note sent to me couldn't be delivered: {e}"),
+                )
+                .await;
             }
             done
         });
         match tokio::time::timeout(super::mind::FOCUSED_WAIT, &mut turn).await {
             Ok(Ok(done)) => done,
             Ok(Err(e)) => Err(format!("The note couldn't be delivered: {e}.")),
-            // Its boss is busy: the note waits for it, and goes in turn.
+            // Its boss is busy, or its turn on the note runs long: the note
+            // goes on in its task, and a failure is said in the boss's DM.
             Err(_) => Ok(()),
         }
     }

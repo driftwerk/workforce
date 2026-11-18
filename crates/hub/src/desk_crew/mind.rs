@@ -340,7 +340,7 @@ impl CrewHub {
         self.minds.person_running(boss)
     }
 
-    /// Waits, at most [`STARVE`], while one of the person's own turns runs
+    /// Waits, at most [`PERSON_YIELD`], while one of the person's own turns runs
     /// in `boss`'s DM: crew work started on its own (a plan's turn, an
     /// update's or a summary's check-in) yields to them, as the loops'
     /// does. Nothing waits that already holds the mind.
@@ -349,7 +349,7 @@ impl CrewHub {
             return;
         }
         let since = Instant::now();
-        while self.minds.person_running(boss) && since.elapsed() < STARVE {
+        while self.minds.person_running(boss) && since.elapsed() < PERSON_YIELD {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
@@ -363,9 +363,11 @@ impl CrewHub {
     }
 
     /// Whether work for `boss` held back since `due` may start now: its
-    /// mind is free, or it has waited [`STARVE`] and queues for it.
+    /// mind is free, or it has waited [`STARVE`] and queues for it (never
+    /// while one of the person's own turns runs, for at most
+    /// [`PERSON_YIELD`]).
     pub(super) fn mind_may_start(&self, boss: &str, due: Instant) -> bool {
-        self.mind_free(boss) || due.elapsed() >= STARVE
+        self.mind_free(boss) || (due.elapsed() >= STARVE && !self.minds.person_running(boss))
     }
 
     /// What `boss`'s mind is doing, while held.
