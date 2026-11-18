@@ -347,6 +347,129 @@ async fn a_ticket_someone_holds_is_refused_plainly() {
     .await;
 }
 
+/// A change the person approves that takes on a ticket someone took
+/// meanwhile is refused whole: nothing of it is claimed, the plan runs on as
+/// it was, and once the ticket is free the same approval goes through.
+#[tokio::test]
+async fn a_change_whose_ticket_was_taken_meanwhile_claims_nothing() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = synced(&d, 3).await;
+        let one = by_key(&d, &b, "ACME-1").await;
+        let two = by_key(&d, &b, "ACME-2").await;
+        let three = by_key(&d, &b, "ACME-3").await;
+        let p = d
+            .propose_plan(
+                plan_of(vec![adopt(one.id, dir.path(), &[])]),
+                &sarah(),
+                &by_sarah(),
+            )
+            .await
+            .unwrap();
+        let id = p.summary.plan.id;
+        d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let mut tickets = vec![DraftTicket {
+            id: Some(one.id),
+            folder: dir.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        }];
+        tickets.push(adopt(two.id, dir.path(), &[]));
+        tickets.push(adopt(three.id, dir.path(), &[]));
+        let changed = d
+            .change_plan(
+                id,
+                PlanEdit {
+                    revision: Some(1),
+                    tickets: Some(tickets),
+                    ..Default::default()
+                },
+                Engine::Claude,
+                false,
+                &by_sarah(),
+            )
+            .await
+            .unwrap();
+        assert!(!changed.applied, "taking more on waits for the person");
+        // The person takes ACME-3 before approving.
+        let c = d.0.store.pool().get().await.unwrap();
+        let you = serde_json::to_value(Party::you()).unwrap();
+        c.execute(
+            "UPDATE tickets SET assignee = $2 WHERE id = $1",
+            &[&three.id, &you],
+        )
+        .await
+        .unwrap();
+        let e = d.approve_plan(id, 2, &By::you()).await.unwrap_err();
+        assert!(
+            e.to_string().contains("ACME-3 is the person's already"),
+            "{e}"
+        );
+        assert_eq!(
+            d.0.store.plan_of_ticket(two.id).await.unwrap(),
+            None,
+            "nothing of it claimed"
+        );
+        assert_eq!(
+            d.plan(id).await.unwrap().summary.plan.approved_revision,
+            Some(1)
+        );
+        // Let go, the same approval goes through: no claim left behind.
+        c.execute(
+            "UPDATE tickets SET assignee = NULL WHERE id = $1",
+            &[&three.id],
+        )
+        .await
+        .unwrap();
+        drop(c);
+        let p = d.approve_plan(id, 2, &By::you()).await.unwrap();
+        assert_eq!(p.tickets.len(), 3);
+        assert!(p.tickets.iter().all(|t| t.adopted));
+        assert_eq!(d.0.store.plan_of_ticket(three.id).await.unwrap(), Some(id));
+    })
+    .await;
+}
+
+/// Letting go removes only the needs the plan added: one the person had
+/// between two tickets it took on stays when the plan drops.
+#[tokio::test]
+async fn letting_go_keeps_the_needs_the_person_had() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = synced(&d, 3).await;
+        let one = by_key(&d, &b, "ACME-1").await;
+        let two = by_key(&d, &b, "ACME-2").await;
+        let three = by_key(&d, &b, "ACME-3").await;
+        // The person's own: ACME-2 needs ACME-1.
+        assert!(d.0.store.put_need(two.id, one.id).await.unwrap());
+        let p = d
+            .propose_plan(
+                plan_of(vec![
+                    adopt(one.id, dir.path(), &[]),
+                    adopt(two.id, dir.path(), &[0]),
+                    adopt(three.id, dir.path(), &[0]),
+                ]),
+                &sarah(),
+                &by_sarah(),
+            )
+            .await
+            .unwrap();
+        let id = p.summary.plan.id;
+        d.drop_plan(id, OnDrop::Stop, &By::you()).await.unwrap();
+        assert_eq!(
+            d.ticket(two.id).await.unwrap().ticket.needs,
+            vec![one.id],
+            "the person's need stays"
+        );
+        assert!(
+            d.ticket(three.id).await.unwrap().ticket.needs.is_empty(),
+            "the plan's own goes"
+        );
+    })
+    .await;
+}
+
 /// A draft that drops a ticket it took on leaves it on its board; dropping
 /// a running plan lets its taken tickets go where they are, its started
 /// one taken off its stopped session, never moved to Dropped; and an edit

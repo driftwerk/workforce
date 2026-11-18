@@ -177,7 +177,8 @@ async fn adopt_in<C: tokio_postgres::GenericClient>(
         .execute(
             &format!(
                 "UPDATE tickets SET plan = $2, engine = $3, folder = $4, view = $5, machine = $6, \
-                 model = $7, adopted = true, version = version + 1 WHERE id = $1 AND {ADOPTABLE}"
+                 model = $7, adopted = true, version = version + 1 \
+                 WHERE id = $1 AND (({ADOPTABLE}) OR (plan = $2 AND adopted))"
             ),
             &[
                 &ticket,
@@ -340,13 +341,16 @@ impl DeskStore {
     }
 
     /// Writes where `ticket` runs, and which plan it is in. The ticket's
-    /// version moves on: a start read before is refused.
+    /// version moves on: a start read before is refused. One taken on that
+    /// is no longer the plan's (let go, or another plan's now) is left as
+    /// it is: only a claim takes it again.
     pub async fn put_runs(&self, ticket: Uuid, runs: &Runs) -> Result<()> {
         let client = self.pool().get().await?;
         client
             .execute(
                 "UPDATE tickets SET plan = $2, engine = $3, folder = $4, view = $5, \
-                 machine = $6, model = $7, version = version + 1 WHERE id = $1",
+                 machine = $6, model = $7, version = version + 1 \
+                 WHERE id = $1 AND (plan = $2 OR (plan IS NULL AND NOT adopted))",
                 &[
                     &ticket,
                     &runs.plan,
@@ -478,6 +482,36 @@ impl DeskStore {
         adopt_in(&**client, ticket, runs).await
     }
 
+    /// Adds that `ticket` needs `needs`, as plan `plan`'s own; whether it
+    /// was added (false: it was there already, and stays whose it was).
+    pub async fn put_plan_need(&self, ticket: Uuid, needs: Uuid, plan: Uuid) -> Result<bool> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .execute(
+                "INSERT INTO ticket_needs (ticket, needs, plan) VALUES ($1, $2, $3) \
+                 ON CONFLICT DO NOTHING",
+                &[&ticket, &needs, &plan],
+            )
+            .await?
+            > 0)
+    }
+
+    /// The needs plan `plan` added that `ticket` is in, either way, as
+    /// `(ticket, needs)`.
+    pub async fn plan_added_needs(&self, plan: Uuid, ticket: Uuid) -> Result<Vec<(Uuid, Uuid)>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                "SELECT ticket, needs FROM ticket_needs WHERE plan = $1 \
+                 AND (ticket = $2 OR needs = $2)",
+                &[&plan, &ticket],
+            )
+            .await?
+            .iter()
+            .map(|r| Ok((r.try_get(0)?, r.try_get(1)?)))
+            .collect()
+    }
+
     /// Lets `ticket` go from plan `plan`, where it is: no longer the
     /// plan's, with nothing said of where it runs, and without the needs
     /// `unneeded` (`(ticket, needs)`), the plan's own between its tickets.
@@ -564,9 +598,11 @@ impl DeskStore {
             .chain(adopt.iter().map(|(id, _, n)| (*id, n.as_slice())));
         for (id, list) in needs {
             for n in list {
+                // One there already (the person's, the tracker's) stays theirs.
                 tx.execute(
-                    "INSERT INTO ticket_needs (ticket, needs) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-                    &[&id, n],
+                    "INSERT INTO ticket_needs (ticket, needs, plan) VALUES ($1, $2, $3) \
+                     ON CONFLICT DO NOTHING",
+                    &[&id, n, &p.id],
                 )
                 .await?;
             }

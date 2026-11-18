@@ -53,7 +53,8 @@ pub(crate) fn since_of(said: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, 
     if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
         return Ok(d.and_hms_opt(0, 0, 0).unwrap_or_default().and_utc());
     }
-    let (n, unit) = s.split_at(s.len().saturating_sub(1));
+    let at = s.char_indices().last().map_or(0, |(i, _)| i);
+    let (n, unit) = s.split_at(at);
     let n: i64 = n.trim().parse().map_err(|_| bad_since(said))?;
     let span = match unit.to_ascii_lowercase().as_str() {
         "h" => Duration::hours(n),
@@ -233,5 +234,6 @@ mod tests {
             .unwrap_err()
             .contains("doesn't read"));
         assert!(since_of("7y", now).is_err());
+        assert!(since_of("7д", now).is_err(), "never a panic");
     }
 }

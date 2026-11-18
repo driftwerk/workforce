@@ -960,6 +960,11 @@ impl Desk {
         on: Option<OnDrop>,
         by: &By,
     ) -> Result<(), DeskError> {
+        // One that isn't the plan's now (let go, or someone else's) is
+        // left alone: its sessions are someone else's to stop.
+        if self.0.store.plan_of_ticket(t.id).await.map_err(internal)? != Some(p.id) {
+            return Ok(());
+        }
         let sessions: Vec<Uuid> = t
             .links
             .iter()
@@ -1008,22 +1013,25 @@ impl Desk {
                 }
             }
         }
-        let rows = self.0.store.plan_tickets(p.id).await.map_err(internal)?;
-        let me = rows.iter().find(|r| r.id == id);
+        // Only the needs the plan added go; one the person or the tracker
+        // had stays, as does one its issue has there now too.
         let mut unneeded = Vec::new();
-        for o in rows.iter().filter(|o| o.id != id) {
-            // A need its issue has there too stays: it is the tracker's.
-            let upstream = |from: &Ticket, to: &Ticket| match (&from.external, &to.external) {
-                (Some(f), Some(t)) => f.seen.needs.contains(&t.key),
+        for (a, b) in self
+            .0
+            .store
+            .plan_added_needs(p.id, id)
+            .await
+            .map_err(internal)?
+        {
+            let upstream = match (self.ticket_of(a).await, self.ticket_of(b).await) {
+                (Ok(from), Ok(to)) => match (&from.external, &to.external) {
+                    (Some(f), Some(t)) => f.seen.needs.contains(&t.key),
+                    _ => false,
+                },
                 _ => false,
             };
-            if let Some(me) = me {
-                if me.needs.contains(&o.id) && !upstream(me, o) {
-                    unneeded.push((id, o.id));
-                }
-                if o.needs.contains(&id) && !upstream(o, me) {
-                    unneeded.push((o.id, id));
-                }
+            if !upstream {
+                unneeded.push((a, b));
             }
         }
         self.0
@@ -1262,23 +1270,14 @@ impl Desk {
             true => self.new_tickets_board(&shown).await?,
             false => shown,
         };
+        // Every one taken on is claimed before anything is written: one
+        // someone took meanwhile refuses the change whole.
+        self.claim_taken_on(p, before, after).await?;
         let mut rank = self.end_rank(b.id, column, Uuid::nil()).await?;
         for t in after.added(before) {
-            // One taken on is claimed where it is, and queued once the plan
-            // runs: what it says is its board's.
+            // One taken on is queued where it is once the plan runs: what
+            // it says is its board's.
             if t.adopted {
-                let runs = Runs {
-                    plan: Some(p.id),
-                    engine: Some(t.engine),
-                    folder: Some(t.folder.clone()),
-                    view: t.view,
-                    machine: t.machine.clone(),
-                    model: t.model.clone(),
-                    adopted: true,
-                };
-                if let Err(e) = self.0.store.adopt_ticket(t.id, &runs).await {
-                    return Err(self.adopt_failed(e, Some(p.id)).await);
-                }
                 let row = self.ticket_of(t.id).await?;
                 if column == TicketState::Todo && row.state == TicketState::Backlog {
                     let mv = Move {
@@ -1380,7 +1379,11 @@ impl Desk {
                 .filter(|n| ours.contains(n))
                 .collect();
             for n in want.difference(&had) {
-                self.0.store.put_need(t.id, *n).await.map_err(internal)?;
+                self.0
+                    .store
+                    .put_plan_need(t.id, *n, p.id)
+                    .await
+                    .map_err(internal)?;
             }
             for n in had.difference(&want) {
                 self.0.store.delete_need(t.id, *n).await.map_err(internal)?;
@@ -1395,6 +1398,45 @@ impl Desk {
             }
         }
         Ok(())
+    }
+
+    /// Claims for `p` every ticket `after` takes on that `before` didn't,
+    /// all or none: when one can't be, those claimed here go again and it
+    /// is refused, saying why. One already `p`'s is claimed again as it is.
+    async fn claim_taken_on(
+        &self,
+        p: &Plan,
+        before: &Snapshot,
+        after: &Snapshot,
+    ) -> Result<Vec<Uuid>, DeskError> {
+        let mut claimed = Vec::new();
+        for t in after.added(before).into_iter().filter(|t| t.adopted) {
+            let runs = Runs {
+                plan: Some(p.id),
+                engine: Some(t.engine),
+                folder: Some(t.folder.clone()),
+                view: t.view,
+                machine: t.machine.clone(),
+                model: t.model.clone(),
+                adopted: true,
+            };
+            if let Err(e) = self.0.store.adopt_ticket(t.id, &runs).await {
+                self.unclaim(p, &claimed).await;
+                return Err(self.adopt_failed(e, Some(p.id)).await);
+            }
+            claimed.push(t.id);
+        }
+        Ok(claimed)
+    }
+
+    /// Lets the tickets `ids` that [`Self::claim_taken_on`] claimed for `p`
+    /// go again, as they were: nothing else was written of them.
+    async fn unclaim(&self, p: &Plan, ids: &[Uuid]) {
+        for id in ids {
+            if let Err(e) = self.0.store.release_ticket(p.id, *id, &[]).await {
+                tracing::warn!(ticket = %id, error = %e, "a ticket claimed for a refused plan change wasn't let go");
+            }
+        }
     }
 
     async fn put_runs(&self, p: &Plan, t: &Planned) -> Result<(), DeskError> {
@@ -1581,16 +1623,25 @@ impl Desk {
         let waits =
             p.approved_revision.is_some() && !person && !unbound && (asks || kind == Change::Scope);
         let n = p.revision + 1;
-        self.add_revision(&p, n, by, kind, &summary, &next).await?;
+        let from = match p.approved_revision {
+            None => newest,
+            Some(_) => applied,
+        };
+        // What it takes on is claimed before the revision is written, so a
+        // ticket taken meanwhile refuses it with nothing written.
+        let claimed = match waits {
+            true => vec![],
+            false => self.claim_taken_on(&p, &from, &next).await?,
+        };
+        if let Err(e) = self.add_revision(&p, n, by, kind, &summary, &next).await {
+            self.unclaim(&p, &claimed).await;
+            return Err(e);
+        }
         p.revision = n;
         if !waits {
             let column = match p.approved_revision {
                 None => TicketState::Backlog,
                 Some(_) => TicketState::Todo,
-            };
-            let from = match p.approved_revision {
-                None => newest,
-                Some(_) => applied,
             };
             self.plan_rows_follow(&p, &from, &next, column, by).await?;
             if p.approved_revision.is_some() {
@@ -1667,6 +1718,12 @@ impl Desk {
             return self.plan_detail(p).await;
         }
         let mut next = self.newest(&p).await?;
+        // A change it approves claims what it takes on before anything is
+        // written: one taken meanwhile refuses it as it was.
+        if p.approved_revision.is_some() {
+            let applied = self.applied(&p).await?;
+            self.claim_taken_on(&p, &applied, &next).await?;
+        }
         let mut revision = revision;
         if let Some(b) = budget.filter(|b| *b != next.budget) {
             let before = next.clone();
@@ -1931,6 +1988,16 @@ impl Desk {
         let n = p.revision + 1;
         self.add_revision(&p, n, by, Change::Minor, &summary, &applied)
             .await?;
+        // A ticket the change took on that an approval left claimed goes
+        // back as it was: the plan as approved never had it.
+        let newest = self.newest(&p).await?;
+        let gone: Vec<Uuid> = newest
+            .added(&applied)
+            .into_iter()
+            .filter(|t| t.adopted)
+            .map(|t| t.id)
+            .collect();
+        self.unclaim(&p, &gone).await;
         p.revision = n;
         p.approved_revision = Some(n);
         p.updated_at = crew::now();

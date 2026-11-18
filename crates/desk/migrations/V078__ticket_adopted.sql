@@ -4,3 +4,7 @@
 -- from the plan, lets it go where it is. Additive: one column, false for
 -- every ticket there is.
 ALTER TABLE tickets ADD COLUMN adopted BOOLEAN NOT NULL DEFAULT false;
+-- The plan that added a need, when one did: letting a ticket go removes
+-- only those, never a need the person or the tracker had. Null for every
+-- need there is.
+ALTER TABLE ticket_needs ADD COLUMN plan UUID;
