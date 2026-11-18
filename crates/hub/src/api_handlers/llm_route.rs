@@ -18,6 +18,7 @@ use uuid::Uuid;
 use workforce_common::personal_route::{
     AgentRoute, PersonalRoute, PersonalRouteKind, PersonalRoutesConfig,
 };
+use workforce_common::settings::ExecutorKind;
 use workforce_common::subscription::{AgentOwner, CredentialTier};
 
 use crate::gateway::{AgentViewer, GatewayState};
@@ -35,7 +36,7 @@ fn err(status: StatusCode, msg: &str) -> ApiError {
 
 /// The kinds a route can run on today; the others are refused with a plain
 /// reason rather than kept and silently left on the hub's route.
-const ROUTABLE: [PersonalRouteKind; 1] = [PersonalRouteKind::ClaudeCode];
+const ROUTABLE: [PersonalRouteKind; 2] = [PersonalRouteKind::ClaudeCode, PersonalRouteKind::Codex];
 
 /// One kind of route as the person may pick it where they are: every kind
 /// is listed, each with why it can't be picked when it can't, so a picker
@@ -170,13 +171,20 @@ fn has_own_login(
     })
 }
 
+/// Whether `service` runs Codex: only on the hub's coding worker.
+fn has_worker(service: &AgentService) -> bool {
+    service.config.coding_session.executor.kind == ExecutorKind::Remote
+}
+
 /// Why `route` can't be chosen where `switch` holds, the person holding
-/// a working login of its kind or not; `None` when it can.
+/// a working login of its kind or not, on a hub with its coding worker or
+/// not; `None` when it can.
 fn refusal(
     route: PersonalRoute,
     hub_on: bool,
     switch: &PersonalRoutesConfig,
     has_login: bool,
+    worker: bool,
 ) -> Option<String> {
     let title = route.kind.title();
     if !hub_on {
@@ -195,6 +203,9 @@ fn refusal(
             "running your work on your {title} isn't available yet"
         ));
     }
+    if route.kind == PersonalRouteKind::Codex && !worker {
+        return Some(crate::personal_route::CODEX_NEEDS_WORKER.into());
+    }
     if !has_login {
         return Some(format!(
             "connect your own {title} login in My Settings first"
@@ -204,11 +215,13 @@ fn refusal(
 }
 
 /// Every kind as `person` may pick it where `switch` holds, `has_login`
-/// saying whether they hold a working login of a kind of their own.
+/// saying whether they hold a working login of a kind of their own, on a
+/// hub with its coding worker or not.
 fn options(
     hub_on: bool,
     switch: &PersonalRoutesConfig,
     has_login: impl Fn(PersonalRouteKind) -> bool,
+    worker: bool,
 ) -> Vec<RouteOption> {
     PersonalRouteKind::ALL
         .into_iter()
@@ -223,6 +236,7 @@ fn options(
                 hub_on,
                 switch,
                 has_login(kind),
+                worker,
             ),
         })
         .collect()
@@ -242,9 +256,14 @@ fn every_agent_options(
         global: state.vault.as_ref(),
     };
     let hub_on = switch.enabled && routes.store().is_some();
-    options(hub_on, switch, |kind| {
-        has_own_login(kind, &global, &[CredentialTier::GlobalUser], person)
-    })
+    // As the every-agent PUT checks it: an agent without the worker
+    // refuses a Codex turn when it comes.
+    options(
+        hub_on,
+        switch,
+        |kind| has_own_login(kind, &global, &[CredentialTier::GlobalUser], person),
+        true,
+    )
 }
 
 /// The kinds `person` may pick for `service`: their own logins on the agent
@@ -257,14 +276,19 @@ fn agent_options(
     person: Uuid,
 ) -> Vec<RouteOption> {
     let hub_on = routes.switch().enabled && routes.store().is_some();
-    options(hub_on, switch, |kind| {
-        has_own_login(
-            kind,
-            &service.logins.vaults(),
-            &[CredentialTier::AgentUser, CredentialTier::GlobalUser],
-            person,
-        )
-    })
+    options(
+        hub_on,
+        switch,
+        |kind| {
+            has_own_login(
+                kind,
+                &service.logins.vaults(),
+                &[CredentialTier::AgentUser, CredentialTier::GlobalUser],
+                person,
+            )
+        },
+        has_worker(service),
+    )
 }
 
 fn refused(reason: String) -> ApiError {
@@ -302,7 +326,9 @@ pub async fn get_my_route(
 
 /// `PUT /api/me/llm-route` — sets or clears the caller's setting for every
 /// agent. A route needs the caller's own login of its kind for the whole
-/// hub (in My Settings), since it serves every agent.
+/// hub (in My Settings), since it serves every agent. A Codex route is kept
+/// whatever each agent's coding worker: an agent without one refuses it
+/// (per agent here, and at turn time).
 pub async fn put_my_route(
     State(state): State<Arc<GatewayState>>,
     headers: HeaderMap,
@@ -318,7 +344,7 @@ pub async fn put_my_route(
             global: state.vault.as_ref(),
         };
         let has_login = has_own_login(route.kind, &global, &[CredentialTier::GlobalUser], person);
-        if let Some(reason) = refusal(route, routes.switch().enabled, &switch, has_login) {
+        if let Some(reason) = refusal(route, routes.switch().enabled, &switch, has_login, true) {
             return Err(refused(reason));
         }
     }
@@ -407,7 +433,13 @@ pub async fn put_my_agent_route(
             &[CredentialTier::AgentUser, CredentialTier::GlobalUser],
             person,
         );
-        if let Some(reason) = refusal(route, routes.switch().enabled, &switch, has_login) {
+        if let Some(reason) = refusal(
+            route,
+            routes.switch().enabled,
+            &switch,
+            has_login,
+            has_worker(&service),
+        ) {
             return Err(refused(reason));
         }
     }
@@ -448,9 +480,9 @@ mod tests {
 
     #[test]
     fn a_route_is_refused_off_unoffered_unbuilt_or_without_a_login() {
-        assert_eq!(refusal(CLAUDE, true, &on(), true), None);
+        assert_eq!(refusal(CLAUDE, true, &on(), true, false), None);
         assert!(
-            refusal(CLAUDE, false, &PersonalRoutesConfig::default(), true)
+            refusal(CLAUDE, false, &PersonalRoutesConfig::default(), true, true)
                 .unwrap()
                 .contains("doesn't run")
         );
@@ -458,21 +490,36 @@ mod tests {
             enabled: true,
             allow: vec![PersonalRouteKind::Codex],
         };
-        assert!(refusal(CLAUDE, true, &codex_only, true)
+        assert!(refusal(CLAUDE, true, &codex_only, true, true)
             .unwrap()
             .contains("isn't offered"));
-        for kind in [PersonalRouteKind::Codex, PersonalRouteKind::Devin] {
-            let route = PersonalRoute {
-                kind,
-                fallback: RouteFallback::Hub,
-            };
-            assert!(refusal(route, true, &on(), true)
-                .unwrap()
-                .contains("isn't available yet"));
-        }
-        assert!(refusal(CLAUDE, true, &on(), false)
+        let devin = PersonalRoute {
+            kind: PersonalRouteKind::Devin,
+            fallback: RouteFallback::Hub,
+        };
+        assert!(refusal(devin, true, &on(), true, true)
+            .unwrap()
+            .contains("isn't available yet"));
+        assert!(refusal(CLAUDE, true, &on(), false, true)
             .unwrap()
             .contains("connect your own Claude login"));
+    }
+
+    #[test]
+    fn a_codex_route_needs_the_hubs_coding_worker_and_her_own_login() {
+        let codex = PersonalRoute {
+            kind: PersonalRouteKind::Codex,
+            fallback: RouteFallback::Wait,
+        };
+        assert_eq!(refusal(codex, true, &on(), true, true), None);
+        assert_eq!(
+            refusal(codex, true, &on(), true, false).as_deref(),
+            Some(crate::personal_route::CODEX_NEEDS_WORKER),
+            "refused with a plain reason off the worker"
+        );
+        assert!(refusal(codex, true, &on(), false, true)
+            .unwrap()
+            .contains("connect your own ChatGPT (Codex) login"));
     }
 
     #[test]
@@ -481,9 +528,12 @@ mod tests {
             enabled: true,
             allow: vec![PersonalRouteKind::ClaudeCode, PersonalRouteKind::Codex],
         };
-        let listed = options(true, &codex_and_claude, |kind| {
-            kind == PersonalRouteKind::ClaudeCode
-        });
+        let listed = options(
+            true,
+            &codex_and_claude,
+            |kind| kind == PersonalRouteKind::ClaudeCode,
+            false,
+        );
         let kinds: Vec<_> = listed.iter().map(|option| option.kind).collect();
         assert_eq!(
             kinds,
@@ -504,7 +554,7 @@ mod tests {
             .contains("isn't offered"));
         assert!(refused(PersonalRouteKind::Codex).is_some());
 
-        let off = options(false, &codex_and_claude, |_| true);
+        let off = options(false, &codex_and_claude, |_| true, true);
         assert!(off.iter().all(|option| option
             .refused
             .as_deref()

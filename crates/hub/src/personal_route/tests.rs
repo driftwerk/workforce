@@ -330,3 +330,196 @@ async fn an_isolated_run_for_her_runs_on_her_login() {
         "a workflow step runs on her own login"
     );
 }
+
+// ── Codex ───────────────────────────────────────────────────────────────
+
+fn codex(fallback: RouteFallback) -> PersonalRoute {
+    PersonalRoute {
+        kind: PersonalRouteKind::Codex,
+        fallback,
+    }
+}
+
+/// A hub whose agent runs on ChatGPT, with its coding worker (where Codex
+/// runs), people's routes on and kept.
+async fn routed_on_worker() -> (Hub, Arc<MemoryRouteStore>) {
+    let hub = crate::agent_turn::tests::codex_hub(|config| {
+        switch_on(config);
+        config.coding_session.executor.kind = workforce_common::settings::ExecutorKind::Remote;
+    })
+    .await;
+    let store = Arc::new(MemoryRouteStore::default());
+    hub.service
+        .subscriptions()
+        .personal_routes()
+        .attach_store(Arc::clone(&store) as Arc<dyn PersonRouteStore>);
+    (hub, store)
+}
+
+/// `person`'s own ChatGPT login, kept where the hub's own ChatGPT route
+/// would never be asked for it; returns its access token.
+fn chatgpt_login_of(hub: &Hub, person: &str) -> String {
+    crate::serve::testing::store_chatgpt_login(&hub.service, person)
+}
+
+/// A ChatGPT login the agent shares with everyone; returns its access token.
+fn shared_chatgpt_login(hub: &Hub) -> String {
+    let access = format!("shared-{}", uuid::Uuid::new_v4());
+    hub.service
+        .vault
+        .as_ref()
+        .unwrap()
+        .set(
+            SubscriptionKind::ChatGpt.vault_key(),
+            &crate::subscription::test_support::login(
+                &format!("acct-{}", uuid::Uuid::new_v4()),
+                &access,
+                "rt-0",
+            ),
+        )
+        .unwrap();
+    access
+}
+
+/// The access token Codex run `n` was handed.
+fn codex_access(hub: &Hub, n: usize) -> String {
+    crate::subscription::AuthJson::parse(&hub.codex.recorded(n, "auth"))
+        .unwrap()
+        .access_token()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn every_tier_maps_to_the_one_codex_plan_model() {
+    use crate::hub_core::subscriptions::CliKind;
+    let tiers = workforce_agent::llm::tiers::TierRegistry::new(None);
+    for spec in [
+        "cheap",
+        "standard",
+        "powerful",
+        "anthropic:powerful",
+        "claude-opus-4-8",
+    ] {
+        assert_eq!(
+            super::personal_model(&tiers, "anthropic", spec, CliKind::Codex),
+            crate::subscription::completion::CODEX_PLAN_MODEL,
+            "{spec}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn her_turn_runs_on_her_own_codex_login_on_the_worker() {
+    let (hub, store) = routed_on_worker().await;
+    let access = chatgpt_login_of(&hub, ALICE);
+    shared_chatgpt_login(&hub);
+    choose(&hub, &store, ALICE, Some(codex(RouteFallback::Wait))).await;
+
+    let (_, result) = hub.stream(ALICE, "hello there", None, None).await;
+
+    let result = result.unwrap();
+    assert_eq!(
+        result.response,
+        crate::coding_engine::codex::tests::SCRIPTED_ANSWER
+    );
+    assert_eq!(result.model, "codex:gpt-6.1-sol");
+    assert_eq!(hub.codex.runs(), 1);
+    assert_eq!(
+        codex_access(&hub, 1),
+        access,
+        "her own login, not the shared one"
+    );
+    let config: toml::Table = hub.codex.recorded(1, "config").parse().unwrap();
+    assert_eq!(config["model"].as_str(), Some("gpt-6.1-sol"));
+    assert_eq!(
+        hub.chatgpt_requests().await,
+        0,
+        "never the agent's own route"
+    );
+    assert!(hub.claude.calls().is_empty());
+}
+
+#[tokio::test]
+async fn without_her_codex_login_wait_stops_and_never_draws_on_a_shared_one() {
+    let (hub, store) = routed_on_worker().await;
+    shared_chatgpt_login(&hub);
+    choose(&hub, &store, ALICE, Some(codex(RouteFallback::Wait))).await;
+
+    let reply = hub.ask(ALICE, "hello").await;
+
+    assert_eq!(hub.codex.runs(), 0, "not on the shared login: {reply:?}");
+    assert_eq!(hub.chatgpt_requests().await, 0, "she chose to wait");
+}
+
+#[tokio::test]
+async fn someone_elses_turn_never_uses_her_codex_login() {
+    let (hub, store) = routed_on_worker().await;
+    chatgpt_login_of(&hub, ALICE);
+    choose(&hub, &store, ALICE, Some(codex(RouteFallback::Wait))).await;
+    hub.chatgpt_login(BOB).await;
+
+    assert_eq!(hub.ask(BOB, "why is the sky blue?").await.unwrap(), SKY);
+    assert_eq!(hub.codex.runs(), 0);
+}
+
+#[tokio::test]
+async fn off_the_worker_wait_refuses_her_codex_route_with_a_plain_reason() {
+    let (hub, store) = routed().await;
+    chatgpt_login_of(&hub, ALICE);
+    choose(&hub, &store, ALICE, Some(codex(RouteFallback::Wait))).await;
+
+    let err = hub.ask(ALICE, "hello").await.unwrap_err();
+
+    assert!(
+        format!("{err:#}").contains(super::CODEX_NEEDS_WORKER),
+        "{err:#}"
+    );
+    assert_eq!(hub.codex.runs(), 0);
+    assert_eq!(hub.chatgpt_requests().await, 0, "she chose to wait");
+}
+
+#[tokio::test]
+async fn off_the_worker_hub_runs_her_turn_on_the_agents_route() {
+    let (hub, store) = routed().await;
+    hub.chatgpt_login(ALICE).await;
+    choose(&hub, &store, ALICE, Some(codex(RouteFallback::Hub))).await;
+
+    assert_eq!(hub.ask(ALICE, "why is the sky blue?").await.unwrap(), SKY);
+    assert_eq!(hub.codex.runs(), 0);
+}
+
+#[tokio::test]
+async fn her_background_call_runs_as_a_codex_one_shot_on_her_own_login() {
+    let (hub, store) = routed_on_worker().await;
+    let access = chatgpt_login_of(&hub, ALICE);
+    shared_chatgpt_login(&hub);
+    choose(&hub, &store, ALICE, Some(codex(RouteFallback::Wait))).await;
+    let llm = Arc::clone(&hub.service.llm);
+    let messages = [LlmMessage::user("Summarise this conversation.")];
+
+    let (answer, served) = with_served_log(CURRENT_USER_ID.scope(
+        ALICE.to_string(),
+        crate::coding_engine::codex::tests::CODEX.scope(
+            hub.codex.program(),
+            llm.create_message(None, &messages, &[], None, None, false),
+        ),
+    ))
+    .await;
+
+    assert_eq!(
+        answer.unwrap().text().as_deref(),
+        Some(crate::coding_engine::codex::tests::SCRIPTED_ANSWER)
+    );
+    assert_eq!(hub.codex.runs(), 1);
+    assert_eq!(codex_access(&hub, 1), access);
+    let config: toml::Table = hub.codex.recorded(1, "config").parse().unwrap();
+    assert_eq!(config["model"].as_str(), Some("gpt-6.1-sol"));
+    let served = served.expect("what paid is noted for the cost row");
+    assert_eq!(served.tier, CredentialTier::AgentUser);
+    assert_eq!(
+        served.route,
+        workforce_common::subscription::SubscriptionRoute::Codex
+    );
+    assert_eq!(hub.chatgpt_requests().await, 0);
+}
