@@ -4698,24 +4698,24 @@ async fn chat_handler(
         );
     }
 
-    match service
-        .process_turn(
-            channel,
-            &owner,
-            &req.message,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            task_id.as_deref(),
-            Some(rest_chat_trust(&state, &caller)),
-            None,
-            crate::serve::RunAuthor::Other,
-        )
-        .await
+    // A person's message over REST: a chat turn.
+    match crate::serve::chat_turn(service.process_turn(
+        channel,
+        &owner,
+        &req.message,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        task_id.as_deref(),
+        Some(rest_chat_trust(&state, &caller)),
+        None,
+        crate::serve::RunAuthor::Other,
+    ))
+    .await
     {
         Ok(turn) => {
             // Resolved AFTER the turn: a stale-resume or watermark rollover
