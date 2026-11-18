@@ -273,4 +273,44 @@ impl PersonRouteStore for PostgresRouteStore {
             })
             .collect())
     }
+
+    async fn people(&self) -> Result<Vec<(String, usize)>> {
+        let conn = self.pool.get().await?;
+        let rows = conn
+            .query(
+                "SELECT identity_id, count(*) AS n FROM ( \
+                   SELECT identity_id FROM user_settings \
+                   UNION ALL SELECT identity_id FROM user_agent_settings \
+                 ) kept GROUP BY identity_id ORDER BY identity_id",
+                &[],
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let n: i64 = row.get("n");
+                (row.get("identity_id"), usize::try_from(n).unwrap_or(0))
+            })
+            .collect())
+    }
+
+    async fn forget_person(&self, person: Uuid) -> Result<usize> {
+        let mut conn = self.pool.get().await?;
+        let tx = conn.transaction().await?;
+        let person = person.to_string();
+        let every = tx
+            .execute(
+                "DELETE FROM user_settings WHERE identity_id = $1",
+                &[&person],
+            )
+            .await?;
+        let each = tx
+            .execute(
+                "DELETE FROM user_agent_settings WHERE identity_id = $1",
+                &[&person],
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(usize::try_from(every + each).unwrap_or(usize::MAX))
+    }
 }
