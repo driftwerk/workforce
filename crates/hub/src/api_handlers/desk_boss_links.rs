@@ -72,6 +72,11 @@ pub struct MintedView {
     /// The name this hub goes by in an uplink's challenge: the engine dials
     /// it, and signs it.
     hub: Option<String>,
+    /// The group's thread in the person's Slack DM with the agent: open,
+    /// or why not ([`crate::boss_links::slack::Thread::view`]). None when
+    /// the group's conversation couldn't be opened at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slack: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -138,6 +143,26 @@ pub async fn create(
         renews: body.renews,
     };
     let minted = links::mint(&state, person, &device.id, &req).map_err(rejection)?;
+    // Linked, the agent opens the group's conversation, and its thread in
+    // the person's Slack DM with it, at once (remote bosses §4.5): that is
+    // where the person directs it from, where its wakes post and where its
+    // asks' cards go. Once per group; a renewal or the group's next engine
+    // finds them open. The link stands whatever this comes to.
+    let slack = match crate::boss_links::conversation::ensure(
+        &state,
+        person,
+        &device.id,
+        minted.record.id,
+        true,
+    )
+    .await
+    {
+        Ok(opened) => opened.slack.map(|thread| thread.view()),
+        Err((status, why)) => {
+            tracing::warn!(%status, why, link = %minted.link.link_id, "a new boss link's conversation wasn't opened");
+            None
+        }
+    };
     Ok((
         StatusCode::CREATED,
         Json(MintedView {
@@ -146,6 +171,7 @@ pub async fn create(
             token: minted.plaintext,
             expires_at: minted.record.expires_at,
             hub: crate::boss_links::auth::this_hub(&state),
+            slack,
         }),
     ))
 }

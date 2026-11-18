@@ -698,6 +698,21 @@ pub fn priorities(s: &crate::board::Sync) -> &[String] {
 /// again.
 pub const FIELDS_FRESH: Duration = Duration::days(1);
 
+/// How long fields read without Jira's Rank are kept: a hub that didn't
+/// say where Rank is (one from before it could, or one that failed) is
+/// asked again soon, so its board takes Jira's order once it can.
+pub const RANKLESS_FRESH: Duration = Duration::minutes(15);
+
+/// Whether fields read at their `read_at` are still good at `now`.
+pub fn fields_fresh(f: &crate::board::JiraFields, now: DateTime<Utc>) -> bool {
+    let keep = if f.rank.is_some() {
+        FIELDS_FRESH
+    } else {
+        RANKLESS_FRESH
+    };
+    f.rank_asked && now - f.read_at < keep
+}
+
 /// The site's fields `jira.list_fields` answered, read at `at`.
 pub fn jira_fields(answer: &Value, at: DateTime<Utc>) -> crate::board::JiraFields {
     let id = |role: &str| {

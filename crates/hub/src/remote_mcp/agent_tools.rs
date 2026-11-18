@@ -692,39 +692,40 @@ impl ChatTool {
         };
         let cancel = CancellationToken::new();
         let (inject_tx, inject_rx) = mpsc::channel(INJECT_BUFFER);
-        let progress = service
-            .process_message_with_progress(
-                &channel,
-                &uid,
-                None,
-                &args.message,
-                None,
-                resume.as_deref(),
-                None,
-                None,
-                None,
-                None,
-                Some(crate::serve::TurnInbox {
-                    rx: inject_rx,
-                    self_serve: workforce_agent::tools::approval::SelfServe::Answerable,
-                    heard: None,
-                }),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(self.trust_for(&uid)),
-                Some(cancel.clone()),
-                None,
-                None,
-            )
-            .await
-            .map_err(|e| ToolResult::failure(format!("could not start the turn: {e:#}"), 0))?;
+        // The person's message, sent through their own MCP client: a chat
+        // turn.
+        let progress = crate::serve::chat_turn(service.process_message_with_progress(
+            &channel,
+            &uid,
+            None,
+            &args.message,
+            None,
+            resume.as_deref(),
+            None,
+            None,
+            None,
+            None,
+            Some(crate::serve::TurnInbox {
+                rx: inject_rx,
+                self_serve: workforce_agent::tools::approval::SelfServe::Answerable,
+                heard: None,
+            }),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(self.trust_for(&uid)),
+            Some(cancel.clone()),
+            None,
+            None,
+        ))
+        .await
+        .map_err(|e| ToolResult::failure(format!("could not start the turn: {e:#}"), 0))?;
         Ok(open_turn(
             &self.ctx,
             uid,
