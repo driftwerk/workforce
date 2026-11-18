@@ -6192,6 +6192,12 @@ pub struct LlmConfig {
     /// `chatgpt` route (`[llm.logins]`).
     #[serde(default)]
     pub logins: LoginPolicy,
+    /// Whether people may run their work on their own subscriptions on this
+    /// hub, and on which (`[llm.personal_routes]`). The install's switch:
+    /// an agent's own section can only narrow it, so merging an agent's
+    /// `[llm]` never changes this.
+    #[serde(default)]
+    pub personal_routes: crate::personal_route::PersonalRoutesConfig,
 }
 
 /// Where an agent looks for a subscription login and whom its shared login
@@ -6515,6 +6521,7 @@ impl Default for LlmConfig {
             video: None,
             speech: None,
             logins: LoginPolicy::default(),
+            personal_routes: Default::default(),
         }
     }
 }
@@ -7541,6 +7548,7 @@ impl AgentConfig {
                     .logins
                     .clone()
                     .unwrap_or_else(|| global.logins.clone()),
+                personal_routes: global.personal_routes.clone(),
             },
         }
     }
@@ -7764,6 +7772,11 @@ pub struct AgentLlmConfig {
     /// `[llm.logins]`; a present value replaces it whole.
     #[serde(default)]
     pub logins: Option<LoginPolicy>,
+    /// The agent's own `[llm.personal_routes]`: `enabled = false` opts it
+    /// out of people's own routes, `allow` narrows the kinds. It can never
+    /// turn on what the install's switch leaves off.
+    #[serde(default)]
+    pub personal_routes: Option<crate::personal_route::AgentPersonalRoutes>,
 }
 
 /// Per-agent vault configuration overrides.
@@ -8253,6 +8266,7 @@ impl AgentWorkspaceConfig {
                 video: ws.video.clone().or_else(|| base.video.clone()),
                 speech: ws.speech.clone().or_else(|| base.speech.clone()),
                 logins: ws.logins.clone().unwrap_or_else(|| base.logins.clone()),
+                personal_routes: base.personal_routes.clone(),
             },
         }
     }

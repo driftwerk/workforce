@@ -49,6 +49,9 @@ mod desk_link_routes;
 #[path = "api/eval_routes.rs"]
 mod eval_routes;
 
+#[path = "api/llm_route_routes.rs"]
+mod llm_route_routes;
+
 #[path = "api/login_store_routes.rs"]
 mod login_store_routes;
 

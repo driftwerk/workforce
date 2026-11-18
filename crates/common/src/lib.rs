@@ -44,6 +44,7 @@ pub mod connector_binding;
 pub mod credential_pin;
 pub mod oversight;
 pub mod persona;
+pub mod personal_route;
 pub mod pg_text;
 pub mod quarantine;
 pub mod redact;

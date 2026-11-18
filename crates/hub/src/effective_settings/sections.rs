@@ -154,6 +154,7 @@ fn tables(service: &AgentService, resolved: &ResolvedConfig) -> Vec<Layered> {
         handoff,
         video_frames,
         logins,
+        personal_routes,
         llm_timeouts: _,
         tiers,
         // Shown and edited on the agent's own Environments tab.
@@ -281,6 +282,14 @@ fn tables(service: &AgentService, resolved: &ResolvedConfig) -> Vec<Layered> {
             // What a reload applies to the running agent without a restart.
             .effective_field("default_model", &*service.current_default_model.read())
             .effective_field("logins", logins)
+            // The hub's live switch as the agent's own section narrows it.
+            .effective_field(
+                "personal_routes",
+                &service
+                    .subscriptions()
+                    .personal_routes()
+                    .for_agent(personal_routes.as_ref()),
+            )
             .when(
                 service.failover_provider.is_some() || service.token_pool.is_some(),
                 |llm| llm.effective_field("retry", &reloaded.retry),

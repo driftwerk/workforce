@@ -19,6 +19,7 @@ pub mod identity_display;
 pub mod identity_lifecycle;
 pub mod know_how;
 pub mod lessons;
+pub mod llm_route;
 pub mod memory;
 pub mod my_settings;
 pub mod owned_skills;

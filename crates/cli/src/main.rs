@@ -3231,6 +3231,10 @@ fn spawn_overlay_agent_watcher(ctx: OverlayWatcherCtx) {
                 }
             };
             ctx.desk_boss.set(new_config.desk_boss.clone());
+            ctx.subscriptions
+                .shared()
+                .personal_routes()
+                .set_switch(new_config.llm.personal_routes.clone());
             ctx.desk_key_export
                 .set(new_config.desk.allow_personal_key_export);
             let default_id = ctx.registry.default_id().to_string();
@@ -3958,6 +3962,9 @@ rules:
             // The hub's subscriptions, booted once and handed to every agent.
             let subscriptions =
                 workforce_hub::subscription::Subscriptions::boot(&wf_config, global_vault.as_ref());
+            if let Some(store) = workforce_hub::hub_core::personal_routes::open(&wf_config).await {
+                subscriptions.shared().personal_routes().attach_store(store);
+            }
 
             // Build the default agent service with scheduler and reactions
             let (default_service, scheduler) =
