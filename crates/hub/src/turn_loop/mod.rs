@@ -3520,7 +3520,7 @@ pub(crate) async fn process_admitted(
     // (e.g. memory consolidation runs on `cheap`).
     let resolved_model = model_override
         .map(str::to_string)
-        .unwrap_or_else(|| service.resolve_model(&session, None, Some(message)));
+        .unwrap_or_else(|| service.resolve_chat_model(&session, message));
 
     // Reasoning depth for this turn. A spoken turn is judged on how fast
     // it starts talking, so `[llm] voice_thinking_budget_tokens` replaces
@@ -5120,7 +5120,7 @@ pub(crate) async fn stream_admitted(
     let resolved_model = if let Some(model) = step_model {
         model.to_string()
     } else {
-        service.resolve_model(&session, None, Some(message))
+        service.resolve_chat_model(&session, message)
     };
 
     // Reasoning depth for this turn. A spoken turn is judged on how fast

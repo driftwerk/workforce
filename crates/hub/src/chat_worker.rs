@@ -235,36 +235,35 @@ async fn run_chat_turn(
             })
             .collect()
     });
-    let started = service
-        .process_message_with_progress(
-            &request.channel,
-            &request.user,
-            None,
-            &request.content,
-            None,
-            Some(&requested),
-            session_attachments,
-            None,
-            None,
-            None,
-            Some(inbox),
-            request.display_content.as_deref(),
-            None, // no ticket_id for chat workers
-            None, // no step_max_rounds for chat workers
-            None, // no step_model for chat workers
-            None, // no context_eviction_interval
-            None, // no context_eviction_keep_last
-            None, // no tool_whitelist
-            None, // no persona override
-            None, // no workspace_id — chat workers operate outside Slack context
-            // No trust classification — chat workers run system-initiated
-            // work — save that another agent's hand-off is never the person's.
-            crate::desk_surface::hand_off_trust(request.desk.as_ref().map(|desk| &desk.turn), None),
-            Some(live.cancel_token()),
-            request.voice_channel.as_deref(),
-            request.desk.as_ref(),
-        )
-        .await;
+    let started = crate::serve::chat_turn(service.process_message_with_progress(
+        &request.channel,
+        &request.user,
+        None,
+        &request.content,
+        None,
+        Some(&requested),
+        session_attachments,
+        None,
+        None,
+        None,
+        Some(inbox),
+        request.display_content.as_deref(),
+        None, // no ticket_id for chat workers
+        None, // no step_max_rounds for chat workers
+        None, // no step_model for chat workers
+        None, // no context_eviction_interval
+        None, // no context_eviction_keep_last
+        None, // no tool_whitelist
+        None, // no persona override
+        None, // no workspace_id — chat workers operate outside Slack context
+        // No trust classification — chat workers run system-initiated
+        // work — save that another agent's hand-off is never the person's.
+        crate::desk_surface::hand_off_trust(request.desk.as_ref().map(|desk| &desk.turn), None),
+        Some(live.cancel_token()),
+        request.voice_channel.as_deref(),
+        request.desk.as_ref(),
+    ))
+    .await;
     let progress = match started {
         Ok(progress) => progress,
         Err(_) if live.is_cancelled() => return (requested, Vec::new(), Some(live)),

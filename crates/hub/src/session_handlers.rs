@@ -557,11 +557,11 @@ pub async fn retry_session_message(
     }
 
     // Re-process the original message content against the now-truncated session.
-    match service
-        .process_message(
-            &channel, &owner, &content, None, None, None, None, None, None, None, None, None, None,
-        )
-        .await
+    // A retry of a person's message, as it was: a chat turn.
+    match crate::serve::chat_turn(service.process_message(
+        &channel, &owner, &content, None, None, None, None, None, None, None, None, None, None,
+    ))
+    .await
     {
         Ok(response) => Json(serde_json::json!({
             "session_id": session_id,
