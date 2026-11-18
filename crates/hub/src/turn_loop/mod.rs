@@ -6051,13 +6051,15 @@ pub(crate) async fn turn_chain(service: &AgentService, spec: &str) -> crate::age
         .await
     {
         Some(chosen) => {
+            let cli = chosen.cli;
             let model = crate::personal_route::personal_model(
                 &service.tier_registry(),
                 &service.tier_key.read().clone(),
                 spec,
+                cli,
             );
-            tracing::debug!(agent = %service.agent_id, person = %chosen.person, %model, fallback = chosen.route.fallback.as_str(), "turn on a person's own Claude route");
-            chain.on_personal_route(model, chosen.route.fallback)
+            tracing::debug!(agent = %service.agent_id, person = %chosen.person, route = chosen.route.kind.as_str(), %model, fallback = chosen.route.fallback.as_str(), "turn on a person's own route");
+            chain.on_personal_route(cli, model, chosen.route.fallback)
         }
         None => chain,
     }

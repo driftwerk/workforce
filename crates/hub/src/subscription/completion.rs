@@ -56,11 +56,17 @@ const fn context_window(cli: CliKind) -> u32 {
     }
 }
 
+/// The one model a ChatGPT plan's Codex runs, for a completion that names
+/// none and for every tier of a person's own Codex route. The design named
+/// gpt-5.5, retired from ChatGPT sign-ins on 14 Oct 2026; this is its
+/// replacement.
+pub(crate) const CODEX_PLAN_MODEL: &str = "gpt-6.1-sol";
+
 /// The model a completion on `cli` runs when none is named.
 const fn default_model(cli: CliKind) -> &'static str {
     match cli {
         CliKind::ClaudeCode => "sonnet",
-        CliKind::Codex => "gpt-6.1-sol",
+        CliKind::Codex => CODEX_PLAN_MODEL,
     }
 }
 

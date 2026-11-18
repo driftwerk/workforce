@@ -149,12 +149,37 @@ impl Hub {
 }
 
 impl Hub {
+    /// `who`'s own ChatGPT login for the whole hub.
+    fn chatgpt_login(&self, who: &Identity) {
+        self.vault
+            .set(
+                &format!("users/{}/codex/auth_json", who.id),
+                &workforce_hub_core::hub_core::logins::test_support::login(
+                    &format!("acct-{}", uuid::Uuid::new_v4()),
+                    "alice",
+                    "rt-0",
+                ),
+            )
+            .unwrap();
+    }
+
     /// The agent's own `[llm.personal_routes]`, as its config now says.
     fn agent_routes(&self, own: AgentPersonalRoutes) {
         let mut resolved = (*self.service.resolved.snapshot()).clone();
         resolved.personal_routes = Some(own);
         self.service.resolved.store(resolved);
     }
+}
+
+/// Why `kind` can't be picked, as `view`'s options say; `None` when it can.
+fn refused<'a>(view: &'a Value, kind: &str) -> Option<&'a str> {
+    let option = view["options"]
+        .as_array()
+        .unwrap_or_else(|| panic!("options listed: {view}"))
+        .iter()
+        .find(|option| option["kind"] == kind)
+        .unwrap_or_else(|| panic!("{kind} listed: {view}"));
+    option["refused"].as_str()
 }
 
 fn claude(fallback: &str) -> Value {
@@ -168,6 +193,11 @@ async fn a_person_sets_their_every_agent_route_with_a_login_of_their_own() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["available"], true);
     assert_eq!(body["route"], Value::Null);
+    assert!(
+        refused(&body, "claude-code").is_some_and(|why| why.contains("Claude login")),
+        "greyed out until she connects her own: {body}"
+    );
+    assert!(refused(&body, "devin").is_some(), "{body}");
 
     let (status, body) = hub
         .put(&hub.alice, "/api/me/llm-route", claude("wait"))
@@ -185,8 +215,10 @@ async fn a_person_sets_their_every_agent_route_with_a_login_of_their_own() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["route"], claude("hub"));
+    assert_eq!(refused(&body, "claude-code"), None, "{body}");
     let (_, body) = hub.get(&hub.alice, "/api/me/llm-route").await;
     assert_eq!(body["route"], claude("hub"));
+    assert_eq!(refused(&body, "claude-code"), None, "offered now: {body}");
 
     let (_, theirs) = hub.get(&hub.bob, "/api/me/llm-route").await;
     assert_eq!(theirs["route"], Value::Null, "Bob's setting is his own");
@@ -212,6 +244,7 @@ async fn the_per_agent_setting_wins_and_hub_refuses_the_every_agent_one() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["route"], Value::Null);
     assert_eq!(body["effective"], claude("wait"), "as in her settings");
+    assert_eq!(refused(&body, "claude-code"), None, "{body}");
 
     let (status, body) = hub.put(&hub.alice, path, json!("hub")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -239,7 +272,7 @@ async fn the_per_agent_setting_wins_and_hub_refuses_the_every_agent_one() {
 }
 
 #[tokio::test]
-async fn a_route_is_refused_while_the_switch_is_off_and_for_unroutable_kinds() {
+async fn a_route_is_refused_while_the_switch_is_off_for_unroutable_kinds_and_without_a_login() {
     let off = Hub::new(PersonalRoutesConfig::default()).await;
     off.claude_login(&off.alice);
     let (_, body) = off.get(&off.alice, "/api/me/llm-route").await;
@@ -253,7 +286,10 @@ async fn a_route_is_refused_while_the_switch_is_off_and_for_unroutable_kinds() {
 
     let on = Hub::on().await;
     on.claude_login(&on.alice);
-    for kind in ["codex", "devin"] {
+    for (kind, refused) in [
+        ("codex", "connect your own ChatGPT (Codex) login"),
+        ("devin", "isn't available yet"),
+    ] {
         let (status, body) = on
             .put(
                 &on.alice,
@@ -262,15 +298,45 @@ async fn a_route_is_refused_while_the_switch_is_off_and_for_unroutable_kinds() {
             )
             .await;
         assert_eq!(status, StatusCode::CONFLICT, "{kind}: {body}");
-        assert!(body["error"]
-            .as_str()
-            .unwrap()
-            .contains("isn't available yet"));
+        assert!(
+            body["error"].as_str().unwrap().contains(refused),
+            "{kind}: {body}"
+        );
     }
     let (status, _) = on
         .put(&on.alice, "/api/me/llm-route", json!({ "kind": "gemini" }))
         .await;
     assert!(status.is_client_error(), "an unknown kind is refused");
+}
+
+#[tokio::test]
+async fn a_codex_route_is_kept_for_every_agent_and_refused_on_an_agent_without_a_coding_worker() {
+    let hub = Hub::on().await;
+    hub.chatgpt_login(&hub.alice);
+    let codex = json!({ "kind": "codex", "fallback": "wait" });
+
+    let (status, body) = hub
+        .put(&hub.alice, "/api/me/llm-route", codex.clone())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["route"], codex);
+
+    let (status, body) = hub
+        .put(&hub.alice, "/api/me/agents/scout/llm-route", codex)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body["error"].as_str(),
+        Some(workforce_hub::personal_route::CODEX_NEEDS_WORKER),
+        "an agent without the hub's coding worker says why"
+    );
+    let devin = json!({ "kind": "devin", "fallback": "wait" });
+    let (status, body) = hub.put(&hub.alice, "/api/me/llm-route", devin).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("isn't available yet"));
 }
 
 #[tokio::test]
@@ -284,6 +350,10 @@ async fn an_agent_that_opted_out_or_narrowed_the_kinds_refuses_a_route_of_its_ow
     });
     let (_, body) = hub.get(&hub.alice, path).await;
     assert_eq!(body["available"], false, "{body}");
+    assert!(
+        refused(&body, "claude-code").is_some_and(|why| why.contains("this agent")),
+        "greyed out with the agent's reason: {body}"
+    );
     let (status, body) = hub.put(&hub.alice, path, claude("wait")).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(

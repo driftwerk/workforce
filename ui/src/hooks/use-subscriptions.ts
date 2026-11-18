@@ -13,7 +13,15 @@ import { nextFlowUi, pollFlow } from "@/lib/subscriptions/device-flow";
 const CURRENT_FLOW_KEY = ["device-flow-current"];
 
 function invalidateLogins(qc: QueryClient) {
-  for (const queryKey of [["my-subscriptions"], ["my-integrations"], ["agent-logins"], CURRENT_FLOW_KEY]) {
+  for (const queryKey of [
+    ["my-subscriptions"],
+    ["my-integrations"],
+    ["agent-logins"],
+    // Which own routes can be picked follows which logins work.
+    ["my-llm-route"],
+    ["my-agent-llm-route"],
+    CURRENT_FLOW_KEY,
+  ]) {
     qc.invalidateQueries({ queryKey });
   }
 }

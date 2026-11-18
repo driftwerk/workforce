@@ -3350,6 +3350,8 @@ async fn a_passing_failure_keeps_the_order_and_asks_again_soon() {
             if let (Some(f), Some(o)) = (s.fields.as_mut(), s.ordering.as_mut()) {
                 o.read_at = later - chrono::Duration::minutes(1);
                 o.retry_at = None;
+                // One read before the site's priorities were.
+                o.note = Some("Jira's priorities weren't read yet".into());
                 f.read_at = later;
             }
         })

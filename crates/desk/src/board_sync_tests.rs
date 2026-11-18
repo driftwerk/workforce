@@ -2217,3 +2217,32 @@ fn a_board_most_of_whose_issues_have_no_place_catches_up() {
         "another link's"
     );
 }
+
+#[test]
+fn fields_without_rank_are_asked_for_again_soon() {
+    let now = chrono::Utc::now();
+    let read = |rank: Option<&str>, ago: Duration| crate::board::JiraFields {
+        rank: rank.map(str::to_string),
+        rank_asked: true,
+        read_at: now - ago,
+        ..Default::default()
+    };
+    // With Rank, kept for the day.
+    assert!(fields_fresh(
+        &read(Some("customfield_10019"), Duration::hours(2)),
+        now
+    ));
+    assert!(!fields_fresh(
+        &read(Some("customfield_10019"), Duration::days(2)),
+        now
+    ));
+    // Without, asked again after a quarter of an hour.
+    assert!(fields_fresh(&read(None, Duration::minutes(5)), now));
+    assert!(!fields_fresh(&read(None, Duration::minutes(20)), now));
+    // Read before Rank was asked for: asked again at once.
+    let old = crate::board::JiraFields {
+        rank_asked: false,
+        ..read(Some("customfield_10019"), Duration::minutes(1))
+    };
+    assert!(!fields_fresh(&old, now));
+}
