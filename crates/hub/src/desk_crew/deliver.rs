@@ -147,6 +147,10 @@ impl CrewHub {
                 bail!("{busy}");
             }
         };
+        // Started holding the boss's mind: its tools hold it too. Marked
+        // once the turn is its own, never while the session is busy with
+        // another.
+        let _under = self.turn_under_mind(agent_id, &sid);
         // Gone with the turn, however it ends, as the person's own are.
         let _theirs = theirs.map(|words| Theirs::keep(&self.person_turns, &sid, words));
         // The crew's own wake-up, by name, for as long as its turn runs:
@@ -364,6 +368,7 @@ impl CrewHub {
             listed.insert(new.to_string(), l);
         }
         drop(listed);
+        self.mind_turn_rolled(old, new);
         // What it decides on goes with it.
         self.picture_turn_rolled(old, new);
     }

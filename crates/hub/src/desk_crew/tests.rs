@@ -1885,6 +1885,7 @@ mod directives;
 mod items;
 mod learning;
 mod left_alone;
+mod one_mind;
 mod one_picture;
 mod preferences;
 mod promises;
@@ -6068,4 +6069,250 @@ fn only_the_same_folder_or_worktree_is_the_same_place() {
         same_place_key("/r/acme-web")
     );
     assert_ne!(same_place_key("/r/acme-api"), same_place_key("/r/acme-web"));
+}
+
+/// One mind per boss (designs/boss-orders-and-serial-turns.md §2): two
+/// wakes of the same boss decide one after the other, never on the same
+/// picture at once; another boss is not held by it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bosss_two_wakes_decide_one_at_a_time_and_another_boss_is_not_held() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let crew = CrewHub::start(hub(&[]), d, FAST, CancellationToken::new());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
+        let step = |name: &'static str, boss: &'static str| {
+            let (crew, tx) = (Arc::clone(&crew), tx.clone());
+            tokio::spawn(async move {
+                crew.with_mind(boss, name, async {
+                    tx.send(name).unwrap();
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    tx.send(name).unwrap();
+                })
+                .await
+            })
+        };
+        let first = step("check-in", "desk");
+        // Held by the first: the second waits, and the boss isn't free for
+        // crew work meanwhile.
+        assert_eq!(rx.recv().await, Some("check-in"));
+        assert_eq!(crew.mind_holder("desk").unwrap().what, "check-in");
+        let second = step("line", "desk");
+        let other = step("other boss", "ops");
+        assert_eq!(
+            rx.recv().await,
+            Some("other boss"),
+            "another boss isn't held"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!crew.mind_free("desk"));
+        let order: Vec<_> = [
+            rx.recv().await,
+            rx.recv().await,
+            rx.recv().await,
+            rx.recv().await,
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|n| *n != "other boss")
+        .collect();
+        assert_eq!(
+            order,
+            ["check-in", "line", "line"],
+            "the second began only once the first ended"
+        );
+        for h in [first, second, other] {
+            h.await.unwrap();
+        }
+        assert!(crew.mind_free("desk") && crew.mind_holder("desk").is_none());
+    })
+    .await;
+}
+
+/// A step of the boss's own inside a stretch holding its mind (its turn's
+/// tool, on the turn's runner session, in a task of its own; a turn rolled
+/// onto a new runner session) goes on without waiting: no deadlock.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_step_inside_a_turn_holding_the_mind_goes_on_without_waiting() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let crew = CrewHub::start(hub(&[]), d, FAST, CancellationToken::new());
+        let quick = Duration::from_millis(200);
+        let c = Arc::clone(&crew);
+        let out = crew
+            .with_mind("desk", "a session's line", async move {
+                // Nested in the same task.
+                let nested = c.mind_within("desk", "nested", quick, async { 1 }).await;
+                assert!(matches!(nested, Ok(1)));
+                // A tool of the turn, run in a task of its own on the turn's
+                // runner session.
+                let _under = c.turn_under_mind("desk", "runner-1").unwrap();
+                let c2 = Arc::clone(&c);
+                let tool = tokio::spawn(workforce_agent::runner::CURRENT_SESSION_ID.scope(
+                    "runner-1".to_string(),
+                    async move {
+                        c2.mind_within("desk", "tool", quick, async { 2 })
+                            .await
+                            .ok()
+                    },
+                ));
+                assert_eq!(tool.await.unwrap(), Some(2));
+                // Rolled over: the new runner session is still under it.
+                c.mind_turn_rolled("runner-1", "runner-2");
+                let c3 = Arc::clone(&c);
+                let rolled = tokio::spawn(workforce_agent::runner::CURRENT_SESSION_ID.scope(
+                    "runner-2".to_string(),
+                    async move {
+                        c3.mind_within("desk", "tool", quick, async { 3 })
+                            .await
+                            .ok()
+                    },
+                ));
+                assert_eq!(rolled.await.unwrap(), Some(3));
+                // A stranger's task, on no turn of it, waits and gives up.
+                let c4 = Arc::clone(&c);
+                let stranger = tokio::spawn(async move {
+                    c4.mind_within("desk", "stranger", quick, async { 4 })
+                        .await
+                        .is_err()
+                });
+                assert!(
+                    stranger.await.unwrap(),
+                    "only the holder's own steps skip the wait"
+                );
+                5
+            })
+            .await;
+        assert_eq!(out, 5);
+        // The turn's done: its runner sessions are no longer the mind's.
+        let c = Arc::clone(&crew);
+        let held = crew
+            .with_mind("desk", "next", async move {
+                tokio::spawn(workforce_agent::runner::CURRENT_SESSION_ID.scope(
+                    "runner-2".to_string(),
+                    async move {
+                        c.mind_within("desk", "late tool", quick, async {})
+                            .await
+                            .is_err()
+                    },
+                ))
+                .await
+                .unwrap()
+            })
+            .await;
+        assert!(held, "a finished turn's runner session holds nothing");
+    })
+    .await;
+}
+
+/// The person's own turns in the boss's DM never wait on its mind, and
+/// while one runs no crew work of the boss's starts; a focused call that
+/// can't have the mind within its wait is handed back, not run.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_persons_turn_never_waits_and_holds_crew_work_back_while_it_runs() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let crew = CrewHub::start(hub(&[]), d, FAST, CancellationToken::new());
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+        let c = Arc::clone(&crew);
+        let holder = tokio::spawn(async move {
+            c.with_mind("desk", "a check-in", async move {
+                held_tx.send(()).unwrap();
+                go_rx.await.unwrap();
+            })
+            .await
+        });
+        held_rx.await.unwrap();
+        // The person's turn begins at once, the mind held or not.
+        let person = crew.person_turn_began("desk");
+        // A focused call can't have it within its wait: handed back unrun.
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        let focused = crew
+            .mind_within("desk", "answering", Duration::from_millis(200), async {
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .await;
+        assert!(focused.is_err() && !ran.load(std::sync::atomic::Ordering::SeqCst));
+        go_tx.send(()).unwrap();
+        holder.await.unwrap();
+        // The mind is free, but the person's turn still runs: no crew turn
+        // starts.
+        assert!(crew.mind_holder("desk").is_none());
+        assert!(!crew.mind_free("desk"));
+        let second = crew.person_turn_began("desk");
+        drop(person);
+        assert!(
+            !crew.mind_free("desk"),
+            "one of the person's turns still runs"
+        );
+        drop(second);
+        assert!(crew.mind_free("desk"));
+    })
+    .await;
+}
+
+/// A stretch dropped or panicking while it holds the boss's mind frees it,
+/// as one that ends does: the boss's crew work is never left stopped.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stretch_aborted_or_panicking_frees_the_mind() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let crew = CrewHub::start(hub(&[]), d, FAST, CancellationToken::new());
+        let c = Arc::clone(&crew);
+        let held = tokio::spawn(async move {
+            c.with_mind("desk", "a line", std::future::pending::<()>())
+                .await
+        });
+        eventually("held", async || crew.mind_holder("desk").map(|_| ())).await;
+        held.abort();
+        let _ = held.await;
+        assert!(crew.mind_free("desk"), "aborted: free");
+        let c = Arc::clone(&crew);
+        let panicked = tokio::spawn(async move {
+            c.with_mind("desk", "a check-in", async { panic!("a turn panicked") })
+                .await
+        });
+        assert!(panicked.await.is_err());
+        assert!(crew.mind_free("desk"), "panicked: free");
+        // And the next one has it at once.
+        let had = crew
+            .mind_within("desk", "next", Duration::from_millis(100), async { 7 })
+            .await;
+        assert!(matches!(had, Ok(7)));
+    })
+    .await;
+}
+
+/// Past the longest wait a step goes on without the mind, rather than a
+/// wedged boss stopping it; work held back for a busy mind is started once
+/// it has waited long enough, to queue for the mind in turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wedged_mind_is_waited_for_only_so_long() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let crew = CrewHub::start(hub(&[]), d, FAST, CancellationToken::new());
+        crew.set_mind_wait_max(Duration::from_millis(300));
+        let c = Arc::clone(&crew);
+        let _wedged = tokio::spawn(async move {
+            c.with_mind("desk", "a wedged turn", std::future::pending::<()>())
+                .await
+        });
+        eventually("held", async || crew.mind_holder("desk").map(|_| ())).await;
+        let started = std::time::Instant::now();
+        let out = crew.with_mind("desk", "a check-in", async { 3 }).await;
+        assert_eq!(out, 3, "it went on without the mind");
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        // Held back while busy, started once it has waited its while.
+        let now = std::time::Instant::now();
+        assert!(!crew.mind_may_start("desk", now));
+        if let Some(long_ago) = now.checked_sub(super::mind::STARVE) {
+            assert!(crew.mind_may_start("desk", long_ago));
+        }
+    })
+    .await;
 }

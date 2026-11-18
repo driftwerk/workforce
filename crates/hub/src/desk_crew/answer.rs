@@ -314,12 +314,32 @@ impl CrewHub {
                 () = cancel.cancelled() => return,
                 a = async {
                     let _slot = slot.acquire().await;
-                    // On the picture as it is as the call begins.
-                    crew.on_picture(crew.answer_question(&view, &question, &boss)).await
+                    // On the picture as it is as the call begins, with
+                    // nothing else of the boss's deciding at once.
+                    crew.mind_within(
+                        &boss,
+                        "answering a session's question",
+                        super::mind::FOCUSED_WAIT,
+                        crew.on_picture(crew.answer_question(&view, &question, &boss)),
+                    )
+                    .await
+                    .ok()
                 } => a,
             };
-            if let Answered::Later = answered {
-                asked.lock().remove(&key);
+            match answered {
+                Some(Answered::Later) => {
+                    asked.lock().remove(&key);
+                }
+                // Its boss stayed busy past the wait: asked again after as
+                // long again, so it never stands in line for the mind
+                // without a break, holding the boss's other work back.
+                None => {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(super::mind::FOCUSED_WAIT).await;
+                        asked.lock().remove(&key);
+                    });
+                }
+                Some(Answered::Done) => {}
             }
         });
     }
