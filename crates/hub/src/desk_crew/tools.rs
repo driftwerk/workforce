@@ -48,13 +48,14 @@ pub const READ: [&str; 19] = [
     super::github::BRANCH,
     super::github::CI,
 ];
-pub const ACT: [&str; 22] = [
+pub const ACT: [&str; 23] = [
     "crew.nudge",
     "crew.ask_session",
     "crew.escalate",
     "crew.approve",
     "crew.deny",
     "crew.stop",
+    super::closing::TOOL,
     "crew.interrupt",
     "crew.resume",
     "crew.restart",
@@ -834,7 +835,8 @@ pub(crate) fn describe(name: &str) -> &'static str {
             "crew.escalate" => "Give a question a session asked you on its Desk line to the person (message_id): say why in reason, offer answers in options, and draft one in draft if you can. Use it for anything that pushes, deletes, deploys, spends, sends to people or changes scope, and whenever you are unsure; at Act fully, only for what the person's own orders and preferences don't cover (they are the rule, both ways).",
             "crew.approve" => "Allow a session's pending request (session_id, approval_id from crew.overview).",
             "crew.deny" => "Deny a session's pending request (session_id, approval_id from crew.overview).",
-            "crew.stop" => "Stop a running Desk session; its conversation is kept. A session the person started in a Desk terminal can't be stopped (the shell is theirs): interrupt it instead.",
+            "crew.stop" => "Stop a running Desk session; its conversation is kept and it stays on the grid. A session the person started in a Desk terminal can't be stopped (the shell is theirs): interrupt it instead. To close a session whose work is done, use crew.close_session instead.",
+            super::closing::TOOL => "Close a session whose work is done and remove it from Desk (off the grid, the sidebar and the closed list), as the person's Remove does: its conversation and folder stay on this Mac, and the Undo on your decision brings it back. Use it, not crew.stop or crew.release, when the person asks you to close finished sessions. Only one you started or were handed runs (another is a one-click suggestion to the person), and only at rest: never one working, asking, waiting on the person, that the person is in now, or with uncommitted files or unpushed commits in its folder (you're told why it stays open).",
             "crew.interrupt" => "End the turn a working session is on, as Esc in its terminal: it, and the terminal it runs in, keep running, and the shell stays the person's. Works for sessions started in a Desk terminal too.",
             "crew.resume" => "Resume a stopped session, optionally with a prompt. A session in another terminal can only be resumed once it has ended there.",
             "crew.restart" => "Stop a session and resume it with a new prompt, e.g. to get it unstuck.",
@@ -930,10 +932,12 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
             })),
             &["session_id", "approval_id"],
         ),
-        "crew.stop" | "crew.interrupt" | "crew.take_on" | "crew.release" => act(
-            props(json!({ "session_id": session_schema() })),
-            &["session_id"],
-        ),
+        "crew.stop" | "crew.interrupt" | "crew.take_on" | "crew.release" | super::closing::TOOL => {
+            act(
+                props(json!({ "session_id": session_schema() })),
+                &["session_id"],
+            )
+        }
         "crew.resume" | "crew.restart" => act(
             props(json!({
                 "session_id": session_schema(),

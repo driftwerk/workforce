@@ -71,10 +71,12 @@ pub(crate) enum Action {
     Stop {
         session: Uuid,
     },
-    /// Close a session whose work is done: stopped and closed in Desk, off
-    /// the grid and the sidebar, its conversation kept and resumable.
-    /// Never a model's tool: the boss's closer does it
-    /// ([`super::closing`]), or the person accepting its suggestion.
+    /// Close a session whose work is done: stopped, closed and removed
+    /// from Desk (off the grid, the sidebar and the closed list), its
+    /// conversation and folder kept, so its Undo brings it back. The boss's
+    /// closer does it ([`super::closing`]), the boss itself when the person
+    /// asks it to close what is finished (`crew.close_session`), or the
+    /// person accepting its suggestion.
     Close {
         session: Uuid,
     },
@@ -518,6 +520,9 @@ fn charge_plain(e: workforce_desk::DeskError) -> String {
 /// How long a boss's resume or restart is waited for: its turn goes on
 /// past it, never held for the whole of a tool call's time.
 const STARTS_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long a close waits, past Desk's own wait, for a session still
+/// stopping to have closed, so it is removed as it closes.
+const CLOSES_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// What a boss is told of a resume or restart Desk didn't finish within
 /// [`STARTS_WITHIN`]: it may still be starting.
@@ -839,9 +844,11 @@ impl CrewHub {
             }
             Action::Interrupt { .. } => (o.act.interrupt, Some(switch::INTERRUPT)),
             Action::Deny { .. } | Action::Stop { .. } => (false, None),
-            // The closer judges its own (`closing`): asked any other way,
-            // it is the person's.
-            Action::Close { .. } => (false, None),
+            // At Act fully its own close of a session it may end runs (one
+            // it may not is a suggestion, above), held as every close of a
+            // boss's is ([`super::closing`]); below, the closer judges its
+            // own and anything else is the person's.
+            Action::Close { .. } => (o.level == Level::Full, None),
             // Decided above.
             Action::TakeOn { .. } | Action::Release { .. } => (true, None),
             Action::Handoff { .. } | Action::ChangeOversight { .. } => (false, None),
@@ -854,7 +861,10 @@ impl CrewHub {
             (true, _) => Gate::Run,
             (false, Some(label)) => Gate::Suggest(Self::switch_off(label, served)),
             (false, None) => match action {
-                Action::Deny { .. } | Action::Stop { .. } | Action::Close { .. } => Gate::Suggest(
+                Action::Close { .. } => Gate::Suggest(
+                    "closing and removing a session is the person's call below Act fully: they do it with one click".into(),
+                ),
+                Action::Deny { .. } | Action::Stop { .. } => Gate::Suggest(
                     "denying a request or stopping a session is the person's call".into(),
                 ),
                 _ => Gate::Suggest("the person hasn't let you do that without asking".into()),
@@ -1247,7 +1257,7 @@ impl CrewHub {
             }
             Action::Stop { session } => format!("Stop {}", self.session_name(*session)),
             Action::Close { session } => format!(
-                "Close {}: its work is done (its conversation stays, to resume)",
+                "Close and remove {}: its work is done (its conversation stays on this Mac)",
                 self.session_name(*session)
             ),
             Action::Interrupt { session } => {
@@ -1672,9 +1682,56 @@ impl CrewHub {
                 if was.terminal_id.is_some() {
                     return Err("That session runs in the person's own Desk terminal, so it can't be closed from here.".into());
                 }
+                // A boss's, however it came: only what is at rest, nobody's
+                // now and has nothing to lose.
+                if by.party.kind == crew::PartyKind::Manager {
+                    if !d.may_end(*session, Some(&by)) {
+                        return Err(
+                            "Only the person closes a session you didn't start and weren't handed."
+                                .into(),
+                        );
+                    }
+                    if let Some(why) = self.close_held(&was, &by.party.id).await {
+                        return Err(why);
+                    }
+                }
                 done.resumable = was.cli_session_id.is_some();
-                let v = d.end(*session, Some(by)).await.map_err(plain)?;
-                Ok(format!("closed {}", v.label()))
+                let name = was.label().to_string();
+                match d.end(*session, Some(by)).await {
+                    Ok(_) => {}
+                    // Still stopping: it closes once it has.
+                    Err(workforce_desk::DeskError::Conflict(why))
+                        if d.view(*session).is_ok_and(|v| v.live) =>
+                    {
+                        let deadline = tokio::time::Instant::now() + CLOSES_WITHIN;
+                        while d
+                            .view(*session)
+                            .is_ok_and(|v| v.state != SessionState::Closed)
+                        {
+                            if tokio::time::Instant::now() > deadline {
+                                return Err(plain(workforce_desk::DeskError::Conflict(why)));
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    }
+                    Err(e) => return Err(plain(e)),
+                }
+                // Gone from Desk as the person's Remove takes it, its
+                // conversation and folder kept: Undo brings it back.
+                match d.remove_closed(*session).await {
+                    Ok(Some(kept)) => {
+                        done.removed = Some(kept);
+                        Ok(format!("closed and removed {name}"))
+                    }
+                    Ok(None) => Ok(format!("closed {name}")),
+                    Err(e) => {
+                        tracing::warn!(%session, error = %e, "a closed session couldn't be removed from Desk");
+                        Ok(format!(
+                            "closed {name}, which stays among the closed sessions: {}",
+                            plain(e).trim_end_matches('.')
+                        ))
+                    }
+                }
             }
             Action::Interrupt { session } => {
                 let v = d.interrupt(*session, Some(by)).map_err(plain)?;
