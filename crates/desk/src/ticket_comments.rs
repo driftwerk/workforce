@@ -334,6 +334,7 @@ pub fn posted_id(system: System, answer: &Value) -> Option<String> {
     let v = match system {
         System::Jira => &answer["comment_id"],
         System::Linear => &answer["comment"]["id"],
+        System::Github => &answer["id"],
     };
     match v {
         Value::String(s) if !s.is_empty() => Some(s.clone()),
@@ -355,6 +356,8 @@ pub fn list_call(system: System, key: &str) -> (&'static str, Value) {
             "linear.comment_list",
             serde_json::json!({ "identifier": key, "limit": READ_MAX }),
         ),
+        // Never read (`read_ticket_comments`): the issue, for its words.
+        System::Github => ("github.issues_changed", crate::github_sync::read_args(key)),
     }
 }
 
@@ -369,6 +372,11 @@ pub fn add_call(system: System, key: &str, body: &str) -> (&'static str, Value) 
             "linear.comment_add",
             serde_json::json!({ "identifier": key, "body": body }),
         ),
+        System::Github => {
+            let mut args = crate::github_sync::read_args(key);
+            args["body"] = serde_json::json!(body);
+            ("github.issue_comment", args)
+        }
     }
 }
 

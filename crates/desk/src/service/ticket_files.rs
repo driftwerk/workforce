@@ -101,7 +101,9 @@ impl Desk {
         };
         let now = crate::crew::now();
         let fresh = e.details.read_at.is_some_and(|at| now - at < READ_FRESH);
-        if (fresh && !force) || !e.synced {
+        // A GitHub issue's files and development stay there; the pull keeps
+        // the rest of what it says.
+        if (fresh && !force) || !e.synced || e.system == System::Github {
             return self.view_ticket(t).await.map_err(fail);
         }
         // The board's link knows the Jira site's own fields.
@@ -133,7 +135,7 @@ impl Desk {
                     links.as_ref().and_then(ticket_dev::jira_links),
                 )
             }
-            System::Linear => {
+            System::Linear | System::Github => {
                 let v = read.await?;
                 let dev = ticket_dev::linear_dev(v.get("issue").unwrap_or(&v));
                 let (work, links) = dev.map_or((None, None), |(w, l)| (Some(w), Some(l)));
@@ -143,6 +145,7 @@ impl Desk {
         let issue = match e.system {
             System::Jira => crate::board_sync::jira_issue(&v, ""),
             System::Linear => crate::board_sync::linear_issue(v.get("issue").unwrap_or(&v)),
+            System::Github => None,
         }
         .filter(|i| i.key == e.key)
         .ok_or_else(|| RemoteError::Failed(format!("{} couldn't be read", e.key)))?;
@@ -162,7 +165,7 @@ impl Desk {
                 let own = v["self"].as_str().unwrap_or(&e.url);
                 self.adf_body(id, &v, own).await
             }
-            System::Linear => None,
+            System::Linear | System::Github => None,
         };
         let mut t = self.ticket_of(id).await.map_err(fail)?;
         if let Some(ext) = t.external.as_mut() {

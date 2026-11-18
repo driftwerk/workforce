@@ -54,6 +54,10 @@ pub struct PendingApproval {
     pub channel_notice_ts: Option<String>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+    /// A person's message started the turn that asked: the turn resumed on
+    /// its decision is a chat turn too (`serve::chat_turn`). False for rows
+    /// written before this was recorded, which resume as they always did.
+    pub chat: bool,
 }
 
 impl PendingApproval {

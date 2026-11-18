@@ -122,6 +122,38 @@ impl RouteDecider {
     }
 }
 
+/// Whether the logins a call made now draws on, outside a turn's own
+/// routes, must be the payer's own: a coding session, a fan-out or a
+/// `claude_code` call billed to a person whose own route is on for this
+/// agent. Such work starts in a tool call that came back through the gated
+/// MCP, so it never inherits the turn's [`personal_logins_only`] scope; it
+/// decides again here from the principal that call restored.
+///
+/// With `fallback = wait` it is their own logins only, so the work stops
+/// and says to connect one rather than draw on a login the agent or the
+/// hub shares. With `fallback = hub` the person chose to let the hub's route
+/// serve when theirs can't, so the agent's logins resolve as they always do:
+/// the person's own first, then a shared one as `[llm.logins]` allows.
+///
+/// It narrows every kind of login, not only the route's: a Codex round for
+/// a person on a `claude-code` route that waits runs on their own ChatGPT
+/// login too, since everything billed to them stays on their own plans.
+pub(crate) async fn own_logins_only(service: &crate::serve::AgentService) -> bool {
+    RouteDecider::of(service)
+        .chosen()
+        .await
+        .is_some_and(|chosen| chosen.route.fallback == RouteFallback::Wait)
+}
+
+/// `work` on the payer's own logins only when [`own_logins_only`] says so.
+pub(crate) async fn own_logins_if_routed<F: std::future::Future>(
+    service: &crate::serve::AgentService,
+    work: F,
+) -> F::Output {
+    let own = own_logins_only(service).await;
+    crate::agent_turn::personal_if(own, work).await
+}
+
 /// The model a call on `spec` for `work` runs on `route`, on `cli`: the
 /// model the person chose for that kind of work when they chose one, else
 /// the route's default. On Claude Code the default is the spec's own tier

@@ -82,6 +82,21 @@ impl SqlitePendingApprovalStore {
             ",
         )
         .wrap_err("Failed to initialise pending-approval schema")?;
+        // Added after the table first shipped: an older DB gets it, unset.
+        let has_chat = conn
+            .prepare("SELECT 1 FROM pragma_table_info('pending_approvals') WHERE name = 'chat'")?
+            .exists([])?;
+        if !has_chat {
+            // Another process opening the DB at the same moment may add it
+            // first: then it is there, as wanted.
+            if let Err(e) = conn.execute_batch(
+                "ALTER TABLE pending_approvals ADD COLUMN chat INTEGER NOT NULL DEFAULT 0;",
+            ) {
+                if !e.to_string().contains("duplicate column name") {
+                    return Err(e).wrap_err("Failed to add pending_approvals.chat");
+                }
+            }
+        }
         Ok(())
     }
 
@@ -103,6 +118,7 @@ fn parse_approval(row: &Row<'_>) -> rusqlite::Result<PendingApproval> {
     let allow_self_approval: i64 = row.get("allow_self_approval")?;
     let created_at: String = row.get("created_at")?;
     let expires_at: String = row.get("expires_at")?;
+    let chat: i64 = row.get("chat")?;
     Ok(PendingApproval {
         request_id: row.get("request_id")?,
         agent_id: row.get("agent_id")?,
@@ -121,6 +137,7 @@ fn parse_approval(row: &Row<'_>) -> rusqlite::Result<PendingApproval> {
         channel_notice_ts: row.get("channel_notice_ts")?,
         created_at: parse_ts(&created_at),
         expires_at: parse_ts(&expires_at),
+        chat: chat != 0,
     })
 }
 
@@ -136,7 +153,7 @@ fn parse_target(row: &Row<'_>) -> rusqlite::Result<Target> {
 
 const SELECT_COLS: &str = "request_id, agent_id, session_key, workspace_id, channel_id, thread_ts,
      requester_id, tool_name, tool_input, reason, allow_self_approval, status,
-     resolved_by, channel_notice, channel_notice_ts, created_at, expires_at";
+     resolved_by, channel_notice, channel_notice_ts, created_at, expires_at, chat";
 
 impl PendingApprovalStore for SqlitePendingApprovalStore {
     fn insert_core(
@@ -152,8 +169,8 @@ impl PendingApprovalStore for SqlitePendingApprovalStore {
             "INSERT INTO pending_approvals (
                 request_id, agent_id, session_key, workspace_id, channel_id, thread_ts,
                 requester_id, tool_name, tool_input, reason, allow_self_approval, status,
-                created_at, expires_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'pending', ?12, ?13)
+                created_at, expires_at, chat
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'pending', ?12, ?13, ?14)
              ON CONFLICT (request_id) DO NOTHING",
             params![
                 core.request_id,
@@ -169,6 +186,7 @@ impl PendingApprovalStore for SqlitePendingApprovalStore {
                 core.allow_self_approval as i64,
                 Utc::now().to_rfc3339(),
                 expires_at.to_rfc3339(),
+                core.chat as i64,
             ],
         )
         .wrap_err("insert_core failed")?;
@@ -399,6 +417,7 @@ mod tests {
             allow_self_approval: false,
             approver_user_ids: vec!["bob".to_string()],
             ttl: std::time::Duration::from_secs(3600),
+            chat: false,
         }
     }
 
@@ -431,6 +450,45 @@ mod tests {
         assert_eq!(targets[0].slack_user_id, "U_BOB");
         assert_eq!(targets[0].dm_channel.as_deref(), Some("D_BOB"));
         assert_eq!(targets[0].message_ts.as_deref(), Some("111.1"));
+    }
+
+    /// Whether a chat turn asked is kept; a DB from before the column was
+    /// added gets it, and its rows read as not.
+    #[test]
+    fn a_chat_turns_approval_is_kept_as_one_and_an_older_db_upgrades() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("approvals.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE pending_approvals (
+                    request_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
+                    session_key TEXT NOT NULL, workspace_id TEXT, channel_id TEXT,
+                    thread_ts TEXT, requester_id TEXT NOT NULL, tool_name TEXT NOT NULL,
+                    tool_input TEXT NOT NULL, reason TEXT NOT NULL,
+                    allow_self_approval INTEGER NOT NULL, status TEXT NOT NULL,
+                    resolved_by TEXT, resolved_at TEXT, channel_notice TEXT,
+                    channel_notice_ts TEXT, created_at TEXT NOT NULL, expires_at TEXT NOT NULL
+                );
+                INSERT INTO pending_approvals VALUES ('old', 'a', 'slack:ws:C1:', NULL, 'C1',
+                    NULL, 'alice', 'vault.delete', '{}', 'r', 0, 'pending', NULL, NULL, NULL,
+                    NULL, '2026-11-18T00:00:00Z', '2099-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        }
+        let store = SqlitePendingApprovalStore::open(&path).unwrap();
+        assert!(!store.get("old").unwrap().unwrap().chat);
+        let expires = Utc::now() + chrono::Duration::hours(1);
+        let mut asked = core("r1");
+        asked.chat = true;
+        store.insert_core(&asked, None, None, expires).unwrap();
+        store.insert_core(&core("r2"), None, None, expires).unwrap();
+        assert!(store.get("r1").unwrap().unwrap().chat);
+        assert!(!store.get("r2").unwrap().unwrap().chat);
+        drop(store);
+        // Opened again, nothing more to add.
+        let again = SqlitePendingApprovalStore::open(&path).unwrap();
+        assert!(again.get("r1").unwrap().unwrap().chat);
     }
 
     #[test]
