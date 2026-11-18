@@ -1865,7 +1865,8 @@ async fn another_boss_never_starts_a_sessions_budget_and_sessions_keep_theirs() 
                 .unwrap();
         }
         assert!(matches!(
-            d.line_send(Sender::Session(a.id), tell(b.id, "one more")).await,
+            d.line_send(Sender::Session(a.id), tell(b.id, "one more"))
+                .await,
             Err(LineError::Refused(Refusal::Peers))
         ));
         // It can still tell Desk how it stands.
@@ -1996,7 +1997,11 @@ async fn its_bosss_answer_starts_the_askers_budget_again() {
             .await
             .unwrap();
         assert_eq!(d.line_run(s.id).sent, 0);
-        assert_eq!(d.line_run(s.id).since_person, 1, "still counts to the ceiling");
+        assert_eq!(
+            d.line_run(s.id).since_person,
+            1,
+            "still counts to the ceiling"
+        );
     })
     .await;
 }
