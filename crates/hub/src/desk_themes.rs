@@ -69,9 +69,12 @@ const HOLD_MOST: Duration = Duration::from_secs(25);
 const MOST_QUEUED: usize = 8;
 /// The largest call carried: a theme is a few dozen colours.
 const MOST_INPUT: usize = 16 * 1024;
-/// The largest answer taken from Desk, and handed to the model: a theme's
-/// every colour, and the names of the person's themes.
-pub const MOST_ANSWER: usize = 64 * 1024;
+/// The largest answer taken from Desk: a theme's every colour, and the
+/// names of the person's themes and proposals.
+pub const MOST_ANSWER: usize = 256 * 1024;
+/// The most of an answer handed to the model; beyond it, it is cut and
+/// said to be.
+pub const MOST_FOR_MODEL: usize = 64 * 1024;
 
 pub const JOBS_PATH: &str = "/api/me/desk-theme-jobs";
 pub const ANSWER_PATH: &str = "/api/me/desk-theme-jobs/{id}";
@@ -162,12 +165,20 @@ impl Jobs {
         };
         self.queued.notify_waiters();
         tokio::pin!(rx);
-        let answer = match tokio::time::timeout(within, &mut rx).await {
-            Ok(a) => Some(a),
+        // An answer that lands as a wait ends is still taken: `answer`
+        // forgets the call as it sends, so it is looked for before
+        // `taken`.
+        let mut answer = tokio::time::timeout(within, &mut rx).await.ok();
+        if answer.is_none() {
+            answer = rx.try_recv().ok().map(Ok);
+        }
+        if answer.is_none() && self.taken(id) {
             // Desk took it and may be saving it: a little longer.
-            Err(_) if self.taken(id) => tokio::time::timeout(TAKEN_GRACE, &mut rx).await.ok(),
-            Err(_) => None,
-        };
+            answer = tokio::time::timeout(TAKEN_GRACE, &mut rx).await.ok();
+            if answer.is_none() {
+                answer = rx.try_recv().ok().map(Ok);
+            }
+        }
         match answer {
             Some(Ok(answer)) => Ok(answer),
             _ if self.taken(id) => Err(
@@ -245,6 +256,23 @@ impl Jobs {
         };
         w.tx.send(answer).is_ok()
     }
+}
+
+/// Desk's answer as the model is handed it: whole, or cut at
+/// [`MOST_FOR_MODEL`] and said to be.
+fn for_model(body: Value) -> Value {
+    let text = body.to_string();
+    if text.len() <= MOST_FOR_MODEL {
+        return body;
+    }
+    let mut end = MOST_FOR_MODEL;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    json!({
+        "cut": format!("Desk's answer was {} bytes; this is the first {end}.", text.len()),
+        "answer": &text[..end],
+    })
 }
 
 /// Forgets a call when its ask ends, however it ends.
@@ -415,7 +443,8 @@ impl Tool for ThemeTool {
         let Some(person) = CURRENT_USER_ID
             .try_with(|u| u.clone())
             .ok()
-            .filter(|u| Uuid::parse_str(u).is_ok())
+            .and_then(|u| Uuid::parse_str(&u).ok())
+            .map(|u| u.to_string())
         else {
             return Ok(ToolResult::failure(
                 "Themes are made for a person, in their conversation with you.",
@@ -444,7 +473,7 @@ impl Tool for ThemeTool {
             at: Utc::now(),
         };
         Ok(match jobs().ask(&person, job, ANSWER_WITHIN).await {
-            Ok(Answer { ok: true, body }) => ToolResult::success(body, ms()),
+            Ok(Answer { ok: true, body }) => ToolResult::success(for_model(body), ms()),
             Ok(Answer { body, .. }) => ToolResult::failure(
                 body.get("error")
                     .and_then(Value::as_str)
@@ -692,6 +721,15 @@ mod tests {
         assert_eq!(q.take("kim").len(), 1);
         let e = asking.await.unwrap().unwrap_err();
         assert!(e.contains("may have saved it"), "{e}");
+    }
+
+    #[test]
+    fn a_long_answer_is_cut_for_the_model_and_said_to_be() {
+        let small = json!({ "id": "moss" });
+        assert_eq!(for_model(small.clone()), small);
+        let big = for_model(json!({ "themes": "é".repeat(MOST_FOR_MODEL) }));
+        assert!(big["cut"].as_str().unwrap().contains("bytes"));
+        assert!(big["answer"].as_str().unwrap().len() <= MOST_FOR_MODEL);
     }
 
     #[tokio::test]
