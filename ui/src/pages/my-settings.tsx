@@ -35,6 +35,7 @@ import { VaultTable } from "@/components/vault/vault-table";
 import { VaultMoveDialog } from "@/components/vault/vault-move-dialog";
 import { VaultSecretForm } from "@/components/vault/vault-secret-form";
 import { RemoteMcpTokensCard } from "@/components/remote-mcp/remote-mcp-tokens-card";
+import { MyModelsCard } from "@/components/subscriptions/route-cards";
 import type { VaultEntryView, VaultTier } from "@/lib/api/vault";
 import { apiErrorMessage } from "@/lib/api-error";
 import { SecretInput } from "@/components/subscriptions/secret-input";
@@ -724,6 +725,7 @@ export default function MySettingsPage() {
       </div>
 
       <div className="space-y-4">
+        <MyModelsCard />
         <SubscriptionSections />
         <GoogleSection status={integrations.google ?? EMPTY_STATUS} />
         <EmailSection status={integrations.email ?? EMPTY_STATUS} />

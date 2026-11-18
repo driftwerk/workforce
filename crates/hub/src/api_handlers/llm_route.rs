@@ -37,6 +37,18 @@ fn err(status: StatusCode, msg: &str) -> ApiError {
 /// reason rather than kept and silently left on the hub's route.
 const ROUTABLE: [PersonalRouteKind; 1] = [PersonalRouteKind::ClaudeCode];
 
+/// One kind of route as the person may pick it where they are: every kind
+/// is listed, each with why it can't be picked when it can't, so a picker
+/// greys it out with the reason rather than leaving it off.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RouteOption {
+    kind: PersonalRouteKind,
+    /// How the kind reads to a person: "Claude".
+    title: &'static str,
+    /// Why it can't be picked here; none when it can.
+    refused: Option<String>,
+}
+
 /// The person's every-agent setting as they see it.
 #[derive(Debug, Serialize)]
 pub struct MyRouteView {
@@ -45,6 +57,8 @@ pub struct MyRouteView {
     /// The kinds they may pick here.
     allow: Vec<PersonalRouteKind>,
     route: Option<PersonalRoute>,
+    /// Every kind, and whether they may pick it for every agent now.
+    options: Vec<RouteOption>,
 }
 
 /// The person's setting for one agent as they see it.
@@ -60,6 +74,8 @@ pub struct MyAgentRouteView {
     every_agent: Option<PersonalRoute>,
     /// The route their work on this agent takes; none is the hub's.
     effective: Option<PersonalRoute>,
+    /// Every kind, and whether they may pick it for this agent now.
+    options: Vec<RouteOption>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -187,6 +203,70 @@ fn refusal(
     None
 }
 
+/// Every kind as `person` may pick it where `switch` holds, `has_login`
+/// saying whether they hold a working login of a kind of their own.
+fn options(
+    hub_on: bool,
+    switch: &PersonalRoutesConfig,
+    has_login: impl Fn(PersonalRouteKind) -> bool,
+) -> Vec<RouteOption> {
+    PersonalRouteKind::ALL
+        .into_iter()
+        .map(|kind| RouteOption {
+            kind,
+            title: kind.title(),
+            refused: refusal(
+                PersonalRoute {
+                    kind,
+                    fallback: Default::default(),
+                },
+                hub_on,
+                switch,
+                has_login(kind),
+            ),
+        })
+        .collect()
+}
+
+/// The kinds `person` may pick for every agent: their own logins for the
+/// whole hub, as the every-agent PUT checks them. A hub that keeps no
+/// settings offers none.
+fn every_agent_options(
+    state: &GatewayState,
+    routes: &PersonalRoutes,
+    switch: &PersonalRoutesConfig,
+    person: Uuid,
+) -> Vec<RouteOption> {
+    let global = Vaults {
+        agent: None,
+        global: state.vault.as_ref(),
+    };
+    let hub_on = switch.enabled && routes.store().is_some();
+    options(hub_on, switch, |kind| {
+        has_own_login(kind, &global, &[CredentialTier::GlobalUser], person)
+    })
+}
+
+/// The kinds `person` may pick for `service`: their own logins on the agent
+/// or the whole hub, as the per-agent PUT checks them. A hub that keeps no
+/// settings offers none.
+fn agent_options(
+    routes: &PersonalRoutes,
+    service: &AgentService,
+    switch: &PersonalRoutesConfig,
+    person: Uuid,
+) -> Vec<RouteOption> {
+    let hub_on = routes.switch().enabled && routes.store().is_some();
+    options(hub_on, switch, |kind| {
+        has_own_login(
+            kind,
+            &service.logins.vaults(),
+            &[CredentialTier::AgentUser, CredentialTier::GlobalUser],
+            person,
+        )
+    })
+}
+
 fn refused(reason: String) -> ApiError {
     (
         StatusCode::CONFLICT,
@@ -214,6 +294,7 @@ pub async fn get_my_route(
     };
     Ok(Json(MyRouteView {
         available: switch.enabled && routes.store().is_some(),
+        options: every_agent_options(&state, &routes, &switch, person),
         allow: switch.allow,
         route,
     }))
@@ -256,6 +337,7 @@ pub async fn put_my_route(
     );
     Ok(Json(MyRouteView {
         available: switch.enabled,
+        options: every_agent_options(&state, &routes, &switch, person),
         allow: switch.allow,
         route: write.route,
     }))
@@ -264,6 +346,7 @@ pub async fn put_my_route(
 async fn agent_view(
     store: Option<&Arc<dyn PersonRouteStore>>,
     switch: PersonalRoutesConfig,
+    options: Vec<RouteOption>,
     person: Uuid,
     agent_id: &str,
 ) -> ApiResult<MyAgentRouteView> {
@@ -284,6 +367,7 @@ async fn agent_view(
         route: settings.this_agent,
         every_agent: settings.every_agent,
         effective,
+        options,
     }))
 }
 
@@ -297,13 +381,9 @@ pub async fn get_my_agent_route(
     let (person, claims) = super::identity::require_person(&state, &headers)?;
     let service = agent_for(&state, claims, &agent_id)?;
     let routes = routes(&state)?;
-    agent_view(
-        routes.store().as_ref(),
-        switch_for(&routes, &service),
-        person,
-        &agent_id,
-    )
-    .await
+    let switch = switch_for(&routes, &service);
+    let options = agent_options(&routes, &service, &switch, person);
+    agent_view(routes.store().as_ref(), switch, options, person, &agent_id).await
 }
 
 /// `PUT /api/me/agents/{id}/llm-route` — sets the caller's setting for one
@@ -345,7 +425,8 @@ pub async fn put_my_agent_route(
         after = ?write.route,
         "a person's route for an agent changed"
     );
-    agent_view(Some(&store), switch, person, &agent_id).await
+    let options = agent_options(&routes, &service, &switch, person);
+    agent_view(Some(&store), switch, options, person, &agent_id).await
 }
 
 #[cfg(test)]
@@ -392,6 +473,42 @@ mod tests {
         assert!(refusal(CLAUDE, true, &on(), false)
             .unwrap()
             .contains("connect your own Claude login"));
+    }
+
+    #[test]
+    fn every_kind_is_listed_with_why_it_cant_be_picked() {
+        let codex_and_claude = PersonalRoutesConfig {
+            enabled: true,
+            allow: vec![PersonalRouteKind::ClaudeCode, PersonalRouteKind::Codex],
+        };
+        let listed = options(true, &codex_and_claude, |kind| {
+            kind == PersonalRouteKind::ClaudeCode
+        });
+        let kinds: Vec<_> = listed.iter().map(|option| option.kind).collect();
+        assert_eq!(
+            kinds,
+            PersonalRouteKind::ALL.to_vec(),
+            "every kind, in order"
+        );
+        let refused = |kind| {
+            listed
+                .iter()
+                .find(|option| option.kind == kind)
+                .unwrap()
+                .refused
+                .clone()
+        };
+        assert_eq!(refused(PersonalRouteKind::ClaudeCode), None);
+        assert!(refused(PersonalRouteKind::Devin)
+            .unwrap()
+            .contains("isn't offered"));
+        assert!(refused(PersonalRouteKind::Codex).is_some());
+
+        let off = options(false, &codex_and_claude, |_| true);
+        assert!(off.iter().all(|option| option
+            .refused
+            .as_deref()
+            .is_some_and(|r| r.contains("doesn't run"))));
     }
 
     #[test]
