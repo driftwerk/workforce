@@ -20,7 +20,7 @@
 //!   ([`super::hold`]); none of this hub's own `crew.*` is offered: the crew
 //!   it reaches is the link's.
 
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -36,17 +36,17 @@ use crate::desk_crew::served::{SERVED_ACT, SERVED_READ};
 use crate::gateway::GatewayState;
 use crate::serve::AgentService;
 
-/// The hub this process serves, for the turns it runs: set once when its
-/// gateway is built.
-static HUB: OnceLock<Weak<GatewayState>> = OnceLock::new();
+/// The hub this process serves, for the turns it runs: set when its
+/// gateway is built (the latest one built, should a process build more).
+static HUB: parking_lot::RwLock<Weak<GatewayState>> = parking_lot::RwLock::new(Weak::new());
 
 /// Makes `state` the hub whose uplinks the boss tools call.
 pub fn serve_for(state: &Arc<GatewayState>) {
-    let _ = HUB.set(Arc::downgrade(state));
+    *HUB.write() = Arc::downgrade(state);
 }
 
 fn hub() -> Option<Arc<GatewayState>> {
-    HUB.get()?.upgrade()
+    HUB.read().upgrade()
 }
 
 /// How a tool reaches the group's engines.

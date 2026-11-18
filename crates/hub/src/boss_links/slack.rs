@@ -253,6 +253,9 @@ impl Thread {
     }
 }
 
+/// How long Slack is given to take a thread's first message.
+const SLACK_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// One opening at a time, so two calls never post two threads.
 static OPENING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -301,9 +304,14 @@ pub async fn open_thread(service: &AgentService, boss: &mut Session, meta: &Valu
     let first = format!(
         "*{group} · Desk*\nTalk to me about {group} in this thread: here I can see and run its sessions, as your Desk lets me. Anywhere else, I can't."
     );
-    let Ok(sent) = surface
-        .send_message(&OutboundMessage::text(&dm, first))
-        .await
+    // Bounded: a link's mint waits on it, and every other opening on the
+    // lock; one not opened now is opened when an engine of the link next
+    // connects.
+    let Ok(Ok(sent)) = tokio::time::timeout(
+        SLACK_WITHIN,
+        surface.send_message(&OutboundMessage::text(&dm, first)),
+    )
+    .await
     else {
         return Thread::Unavailable("Slack didn't take the thread's first message.");
     };
