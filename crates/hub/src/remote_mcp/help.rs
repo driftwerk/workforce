@@ -38,6 +38,7 @@ const FAMILY_TOPICS: &[(&str, &str)] = &[
     ("hubspot", "adapters/hubspot"),
     ("linear", "adapters/linear"),
     ("jira", "adapters/jira"),
+    ("github", "adapters/github"),
 ];
 
 #[derive(Debug)]
