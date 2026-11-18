@@ -4238,8 +4238,10 @@ pub(crate) async fn run_isolated(
         registry: tools,
         exclusive: precurated,
     };
+    // Chosen as the run's principal, whose payer a person's own route
+    // follows: the caller's task-locals are gone by here (see below).
     let chain = match &run.route {
-        IsolatedRoute::Agent => turn_chain(service, &model).await,
+        IsolatedRoute::Agent => as_principal(principal, turn_chain(service, &model)).await,
         IsolatedRoute::Pinned(spec) => pinned_chain(service, spec),
     };
     let tool_principal = principal

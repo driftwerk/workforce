@@ -146,23 +146,29 @@ impl PersonalRouteLlm {
         &self,
         tools: &[LlmToolDef],
         model: Option<&str>,
-    ) -> Option<(Arc<dyn LlmProvider>, String, RouteFallback)> {
+    ) -> Option<Result<(Arc<dyn LlmProvider>, String, RouteFallback)>> {
         if !tools.is_empty() {
             return None;
         }
         let chosen = self.decider.chosen().await?;
+        let fallback = chosen.route.fallback;
         let spec = model.map_or_else(|| self.default_model.read().clone(), str::to_string);
         let model = personal_model(
             &TierRegistry::from_cell(&self.tiers),
             &self.tier_key.read(),
             &spec,
         );
-        let provider = self
+        match self
             .plans
             .provider(ProviderKind::ClaudeCode, Some(&model), None)
-            .inspect_err(|e| tracing::warn!(agent = %self.decider.agent_id, error = %e, "a person's Claude route can't be built"))
-            .ok()?;
-        Some((provider, model, chosen.route.fallback))
+        {
+            Ok(provider) => Some(Ok((provider, model, fallback))),
+            Err(e) => {
+                tracing::warn!(agent = %self.decider.agent_id, error = %e, "a person's Claude route can't be built");
+                // Waiting means the call never reaches the hub's route.
+                (fallback == RouteFallback::Wait).then(|| Err(e))
+            }
+        }
     }
 
     fn fell_back(&self, error: &eyre::Report) {
@@ -185,7 +191,8 @@ impl LlmProvider for PersonalRouteLlm {
         max_tokens: Option<u32>,
         enable_cache: bool,
     ) -> Result<LlmResponse> {
-        if let Some((provider, own_model, fallback)) = self.personal(tools, model).await {
+        if let Some(personal) = self.personal(tools, model).await {
+            let (provider, own_model, fallback) = personal?;
             let answer = personal_logins_only(provider.create_message(
                 system_prompt,
                 messages,
@@ -222,7 +229,8 @@ impl LlmProvider for PersonalRouteLlm {
         enable_cache: bool,
         tx: mpsc::Sender<StreamEvent>,
     ) -> Result<()> {
-        if let Some((provider, own_model, fallback)) = self.personal(tools, model).await {
+        if let Some(personal) = self.personal(tools, model).await {
+            let (provider, own_model, fallback) = personal?;
             // A one-shot completion streams its answer only once it has
             // it, so a failure has sent nothing the hub's route would
             // repeat.

@@ -181,9 +181,13 @@ async fn a_turn_with_no_person_stays_on_the_agents_route() {
     shared_claude_login(&hub);
     choose(&hub, &store, ALICE, Some(claude(RouteFallback::Hub))).await;
 
-    let _ = hub.ask("scheduler", "nightly digest").await;
+    let reply = hub.ask("scheduler", "nightly digest").await;
 
-    assert!(hub.claude.calls().is_empty());
+    assert!(hub.claude.calls().is_empty(), "{reply:?}");
+    assert!(
+        hub.chatgpt_requests().await > 0 || reply.is_err(),
+        "it tried the agent's own route: {reply:?}"
+    );
 }
 
 #[tokio::test]
@@ -270,4 +274,59 @@ async fn her_background_call_runs_as_a_one_shot_on_her_own_login() {
     let served = served.expect("what paid is noted for the cost row");
     assert_eq!(served.tier, CredentialTier::AgentUser);
     assert_eq!(hub.chatgpt_requests().await, 0);
+}
+
+#[tokio::test]
+async fn a_call_run_as_her_but_billed_to_someone_else_stays_on_the_agents_route() {
+    let (hub, store) = routed().await;
+    hub.claude_login(ALICE);
+    choose(&hub, &store, ALICE, Some(claude(RouteFallback::Wait))).await;
+    hub.chatgpt_login(ALICE).await;
+
+    let reply = workforce_agent::runner::CURRENT_BILLING_IDENTITY
+        .scope(BOB.to_string(), hub.ask(ALICE, "why is the sky blue?"))
+        .await;
+
+    assert!(hub.claude.calls().is_empty(), "not her route: {reply:?}");
+}
+
+#[tokio::test]
+async fn an_isolated_run_for_her_runs_on_her_login() {
+    let (hub, store) = routed().await;
+    let token = hub.claude_login(ALICE);
+    shared_claude_login(&hub);
+    choose(&hub, &store, ALICE, Some(claude(RouteFallback::Wait))).await;
+    hub.claude.reply(None, &answer("Step done."));
+
+    // As a workflow step or subagent runs: spawned, so nothing of the
+    // caller's scope is left but the principal it passes.
+    let run = crate::serve::IsolatedRun {
+        principal: workforce_common::session::TurnPrincipal {
+            run_as: Some(ALICE.into()),
+            bill_to: None,
+        },
+        route: crate::serve::IsolatedRoute::Agent,
+    };
+    let result = hub
+        .service
+        .run_isolated(
+            "workflow",
+            "summarise the step",
+            None,
+            None,
+            &run,
+            crate::job_runner::AgentProfile::Worker,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.response, "Step done.");
+    let calls = hub.claude.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].token, token,
+        "a workflow step runs on her own login"
+    );
 }
