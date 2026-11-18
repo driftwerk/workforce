@@ -391,6 +391,11 @@ pub struct Sync {
     /// What it last couldn't do, in the hub's words.
     #[serde(default)]
     pub problem: Option<String>,
+    /// The last drop here that couldn't move its issue there, in plain
+    /// words: said on the sync bar until a later one goes out. Kept apart
+    /// from `problem`, which each good pass clears.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_problem: Option<String>,
     /// Issues a pull couldn't take in, tried again on their own back-off
     /// while the cursor goes on past them.
     #[serde(default)]
@@ -503,6 +508,31 @@ pub struct External {
     /// on a hub without the tools. Never pushed, and the pull leaves it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dev: Option<Dev>,
+    /// A drop within its column here, waiting to go out to its issue's
+    /// place there: the next push sends it, and no pull moves its place
+    /// meanwhile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank_move: Option<RankMove>,
+    /// Its place here may not be its issue's there (a move that didn't go
+    /// out, one made while the sync was paused, or a Jira move whose new
+    /// Rank wasn't read back): the next pull reads its issue's place, which
+    /// wins.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rank_stale: bool,
+}
+
+/// Where a drop within a column puts an issue there: next to the issues of
+/// the cards above and below it (their keys), and on Linear the sortOrder
+/// between theirs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RankMove {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub above: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub below: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_order: Option<f64>,
 }
 
 /// What a synced ticket's issue says of itself: its priority, labels,
@@ -815,6 +845,13 @@ pub struct JiraFields {
     pub start_date: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub development: Option<String>,
+    /// Jira Software's Rank (a LexoRank): each issue's place on its boards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank: Option<String>,
+    /// The read asked for the Rank too: one from before it was is read
+    /// again at once.
+    #[serde(default)]
+    pub rank_asked: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub priorities: Vec<String>,
     pub read_at: DateTime<Utc>,
@@ -925,6 +962,13 @@ pub struct Ticket {
     pub body: String,
     pub state: TicketState,
     pub rank: f64,
+    /// Its issue's place on its Jira or Linear board, as a string that sorts
+    /// byte-wise (plain `<`, never a locale's collation) the way the source
+    /// sorts ([`upstream_cmp`]): Jira's Rank as it is, Linear's sortOrder as
+    /// [`linear_rank_of`] writes it. None on a ticket of Desk's own, one off
+    /// its link, or one whose place wasn't read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_rank: Option<String>,
     pub assignee: Option<Party>,
     pub needs: Vec<Uuid>,
     pub links: Vec<Link>,
@@ -1038,6 +1082,130 @@ pub fn rank_between(before: Option<f64>, after: Option<f64>) -> Option<f64> {
         (Some(b), Some(a)) => {
             let mid = b + (a - b) / 2.0;
             (b < mid && mid < a).then_some(mid)
+        }
+    }
+}
+
+// ── A synced board's order there ─────────────────────────────────────────
+
+/// Two tickets of a column in the order the board shows them: those with
+/// their issue's place there first, by it (byte-wise, as Postgres's "C"
+/// collation and JavaScript's `<` compare), then the rest by Desk's own
+/// rank, then by number.
+pub fn upstream_cmp(a: &Ticket, b: &Ticket) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let place = match (&a.upstream_rank, &b.upstream_rank) {
+        (Some(x), Some(y)) => x.as_bytes().cmp(y.as_bytes()),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    };
+    place
+        .then(a.rank.total_cmp(&b.rank))
+        .then(a.number.cmp(&b.number))
+}
+
+/// Linear's sortOrder as a string that sorts byte-wise as the float does:
+/// its bits, the sign bit flipped for a positive and every bit for a
+/// negative, as 16 hex digits. None for NaN or an infinity.
+pub fn linear_rank_of(sort_order: f64) -> Option<String> {
+    if !sort_order.is_finite() {
+        return None;
+    }
+    let bits = sort_order.to_bits();
+    let key = match bits >> 63 {
+        1 => !bits,
+        _ => bits | (1 << 63),
+    };
+    Some(format!("{key:016x}"))
+}
+
+/// The sortOrder [`linear_rank_of`] wrote; None for any other string.
+pub fn linear_sort_order(rank: &str) -> Option<f64> {
+    if rank.len() != 16 || !rank.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    let key = u64::from_str_radix(rank, 16).ok()?;
+    let bits = match key >> 63 {
+        1 => key & !(1 << 63),
+        _ => !key,
+    };
+    Some(f64::from_bits(bits)).filter(|f| f.is_finite())
+}
+
+/// The gap Linear's sortOrder leaves past the end of a list.
+const SORT_STEP: f64 = 1024.0;
+
+/// A sortOrder between the issues above and below a drop; None when there
+/// is no room between them (equal, or too close for a double to part).
+pub fn sort_order_between(above: Option<f64>, below: Option<f64>) -> Option<f64> {
+    let step = |x: f64| SORT_STEP.max(x.abs() / 1024.0);
+    let at = match (above, below) {
+        (None, None) => 0.0,
+        (Some(a), None) => a + step(a),
+        (None, Some(b)) => b - step(b),
+        (Some(a), Some(b)) => a + (b - a) / 2.0,
+    };
+    let fits = above.is_none_or(|a| a < at) && below.is_none_or(|b| at < b);
+    (at.is_finite() && fits).then_some(at)
+}
+
+/// The characters a place string between two others is made of (printable
+/// ASCII; `!` the least): every LexoRank's are among them.
+const PLACE_MIN: u8 = b'!';
+const PLACE_MAX: u8 = b'~';
+
+/// A string strictly between `above` and `below` byte-wise (None: no bound
+/// that side): where a card dropped between two Jira issues sorts until its
+/// issue's own new Rank is read. None when either is made of other
+/// characters, ends in the least one, or isn't below the other.
+pub fn place_between(above: Option<&str>, below: Option<&str>) -> Option<String> {
+    let ok = |s: &str| {
+        !s.is_empty()
+            && s.bytes().all(|b| (PLACE_MIN..=PLACE_MAX).contains(&b))
+            && s.as_bytes().last() != Some(&PLACE_MIN)
+    };
+    if above.is_some_and(|a| !ok(a)) || below.is_some_and(|b| !ok(b)) {
+        return None;
+    }
+    if let (Some(a), Some(b)) = (above, below) {
+        if a.as_bytes() >= b.as_bytes() {
+            return None;
+        }
+    }
+    let mid = midpoint(above.unwrap_or("").as_bytes(), below.map(str::as_bytes));
+    let s = String::from_utf8(mid).ok()?;
+    let fits = above.is_none_or(|a| a.as_bytes() < s.as_bytes())
+        && below.is_none_or(|b| s.as_bytes() < b.as_bytes());
+    fits.then_some(s)
+}
+
+/// Fractional indexing over [`PLACE_MIN`]..=[`PLACE_MAX`]: a string between
+/// `a` (`""`: the least) and `b` (None: past every string), `a < b`.
+fn midpoint(a: &[u8], b: Option<&[u8]>) -> Vec<u8> {
+    if let Some(b) = b {
+        let n = (0..b.len())
+            .take_while(|&i| a.get(i).copied().unwrap_or(PLACE_MIN) == b[i])
+            .count();
+        if n > 0 {
+            let mut out = b[..n].to_vec();
+            out.extend(midpoint(a.get(n..).unwrap_or(&[]), Some(&b[n..])));
+            return out;
+        }
+    }
+    let lo = a.first().map_or(0, |c| (c - PLACE_MIN) as u32);
+    let hi = b.map_or((PLACE_MAX - PLACE_MIN) as u32 + 1, |b| {
+        (b[0] - PLACE_MIN) as u32
+    });
+    if hi - lo > 1 {
+        return vec![PLACE_MIN + ((lo + hi).div_ceil(2)) as u8];
+    }
+    match b {
+        Some(b) if b.len() > 1 => vec![b[0]],
+        _ => {
+            let mut out = vec![PLACE_MIN + lo as u8];
+            out.extend(midpoint(a.get(1..).unwrap_or(&[]), None));
+            out
         }
     }
 }
@@ -1433,6 +1601,7 @@ mod tests {
             created_by: Party::you(),
             pinned: false,
             snoozed_until: None,
+            upstream_rank: None,
             snoozed_at: None,
             state_at: now,
             created_at: now,

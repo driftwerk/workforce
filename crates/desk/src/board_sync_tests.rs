@@ -20,6 +20,7 @@ fn ticket(state: TicketState) -> Ticket {
         created_by: Party::you(),
         pinned: false,
         snoozed_until: None,
+        upstream_rank: None,
         snoozed_at: None,
         state_at: now,
         created_at: now,
@@ -54,6 +55,8 @@ fn synced(state: TicketState) -> Ticket {
         html_prints: vec![],
         details: Default::default(),
         dev: None,
+        rank_move: None,
+        rank_stale: false,
     });
     t
 }
@@ -279,6 +282,7 @@ fn a_pull_changes_only_what_changed_since_the_ticket_saw_it() {
         due: None,
         files: None,
         children_partial: false,
+        upstream_rank: None,
     };
     let p = pulled(&t, &issue, &states);
     assert_eq!(p.title.as_deref(), Some("Fix the login page"));
@@ -1705,5 +1709,281 @@ fn an_unknown_workspace_is_said_plainly_never_as_default() {
     assert_eq!(
         p.say("Driftwerk"),
         "Paused: you have more than one Jira site on Driftwerk (acme or client), and this link doesn't say which."
+    );
+}
+
+// ── A synced board's order there ─────────────────────────────────────────
+
+/// Linear's sortOrder as a string sorts byte-wise as the floats do,
+/// negatives and zeros included, and reads back to the same float.
+#[test]
+fn a_linear_sort_order_sorts_as_its_string() {
+    use crate::board::{linear_rank_of, linear_sort_order};
+    let floats = [
+        f64::MIN,
+        -1.0e12,
+        -2048.5,
+        -1.0,
+        -1.0e-300,
+        -0.0,
+        0.0,
+        1.0e-300,
+        0.5,
+        1.0,
+        1024.0,
+        65_535.75,
+        1.0e15,
+        f64::MAX,
+    ];
+    let ranks: Vec<String> = floats.iter().map(|f| linear_rank_of(*f).unwrap()).collect();
+    for w in ranks.windows(2) {
+        assert!(w[0] < w[1], "{} sorts before {}", w[0], w[1]);
+    }
+    for (f, r) in floats.iter().zip(&ranks) {
+        assert_eq!(r.len(), 16);
+        assert_eq!(linear_sort_order(r).unwrap().to_bits(), f.to_bits(), "{f}");
+    }
+    assert_eq!(linear_rank_of(f64::NAN), None);
+    assert_eq!(linear_rank_of(f64::INFINITY), None);
+    assert_eq!(
+        linear_sort_order("0|i0000f:"),
+        None,
+        "a Jira rank isn't one"
+    );
+    assert_eq!(linear_sort_order("FFFFFFFFFFFFFFFF"), None);
+}
+
+/// A drop between two Linear issues takes the sortOrder between theirs; at
+/// either end, a step past the end one, however large.
+#[test]
+fn a_linear_drop_goes_between_its_neighbours() {
+    use crate::board::sort_order_between;
+    assert_eq!(sort_order_between(Some(-10.0), Some(-4.0)), Some(-7.0));
+    assert_eq!(sort_order_between(Some(-1.0), Some(1.0)), Some(0.0));
+    assert_eq!(sort_order_between(Some(3.0), None), Some(3.0 + 1024.0));
+    assert_eq!(sort_order_between(None, Some(-3.0)), Some(-3.0 - 1024.0));
+    assert_eq!(sort_order_between(None, None), Some(0.0));
+    let big = 1.0e300;
+    assert!(sort_order_between(Some(big), None).unwrap() > big);
+    assert_eq!(sort_order_between(Some(5.0), Some(5.0)), None);
+    let next = f64::from_bits(5.0f64.to_bits() + 1);
+    assert_eq!(sort_order_between(Some(5.0), Some(next)), None);
+    assert_eq!(sort_order_between(Some(f64::MAX), None), None);
+}
+
+/// Jira's LexoRanks sort as their strings; a place between two always
+/// sorts between them, however often a drop goes into the same gap.
+#[test]
+fn a_place_between_two_jira_ranks_sorts_between_them() {
+    use crate::board::place_between;
+    let ranks = ["0|hzzzzz:", "0|i00007:", "0|i0000f:", "0|i0000f:i", "1|a"];
+    for w in ranks.windows(2) {
+        let p = place_between(Some(w[0]), Some(w[1])).unwrap();
+        assert!(
+            w[0] < p.as_str() && p.as_str() < w[1],
+            "{} < {p} < {}",
+            w[0],
+            w[1]
+        );
+    }
+    let first = place_between(None, Some("0|hzzzzz:")).unwrap();
+    assert!(first.as_str() < "0|hzzzzz:");
+    let last = place_between(Some("0|i0000f:"), None).unwrap();
+    assert!(last.as_str() > "0|i0000f:");
+    // Into the same gap, again and again, from either side.
+    let (mut lo, mut hi) = ("0|i00007:".to_string(), "0|i00008:".to_string());
+    for n in 0..200 {
+        let p = place_between(Some(&lo), Some(&hi)).unwrap();
+        assert!(lo < p && p < hi, "{lo} < {p} < {hi}");
+        match n % 2 {
+            0 => lo = p,
+            _ => hi = p,
+        }
+    }
+    assert_eq!(
+        place_between(Some("0|b"), Some("0|a")),
+        None,
+        "out of order"
+    );
+    assert_eq!(place_between(Some("0|a"), Some("0|a")), None);
+    assert_eq!(
+        place_between(Some("0 |a"), None),
+        None,
+        "a space isn't a rank's"
+    );
+    assert_eq!(place_between(Some(""), None), None);
+}
+
+/// The board's order: issues by their place there, then the rest by
+/// Desk's own rank.
+#[test]
+fn a_column_sorts_by_place_there_then_desk_s_rank() {
+    let with = |n: i32, rank: f64, place: Option<&str>| {
+        let mut t = ticket(TicketState::Todo);
+        t.number = n;
+        t.rank = rank;
+        t.upstream_rank = place.map(str::to_string);
+        t
+    };
+    let mut column = [
+        with(1, 1.0, None),
+        with(2, 9.0, Some("0|i0000f:")),
+        with(3, 5.0, Some("0|hzzzzz:")),
+        with(4, 0.5, None),
+        with(5, 2.0, Some("0|i00007:")),
+    ];
+    column.sort_by(crate::board::upstream_cmp);
+    let order: Vec<i32> = column.iter().map(|t| t.number).collect();
+    assert_eq!(order, [3, 5, 2, 4, 1]);
+}
+
+/// A search row's or a read's Rank, and a Linear issue's sortOrder, come
+/// in as the place each sorts by.
+#[test]
+fn an_issue_s_place_comes_in_from_jira_and_linear() {
+    let row = json!({ "key": "ACME-1", "summary": "x", "status": "To Do",
+        "updated": "2026-11-09T10:00:00.000+0000", "rank": "0|i0000f:" });
+    assert_eq!(
+        jira_issue(&row, "").unwrap().upstream_rank.as_deref(),
+        Some("0|i0000f:")
+    );
+    let mut bare = row.clone();
+    bare["rank"] = json!(null);
+    assert_eq!(jira_issue(&bare, "").unwrap().upstream_rank, None);
+    bare["rank"] = json!("bad rank\n");
+    assert_eq!(jira_issue(&bare, "").unwrap().upstream_rank, None);
+    let linear = |sort: Value| {
+        linear_issue(
+            &json!({ "identifier": "ENG-1", "title": "x", "description": "",
+            "state": { "name": "Todo", "type": "unstarted" },
+            "updatedAt": "2026-11-09T10:00:00.000Z", "sortOrder": sort }),
+        )
+        .unwrap()
+        .upstream_rank
+    };
+    assert_eq!(linear(json!(-12.5)), crate::board::linear_rank_of(-12.5));
+    assert!(linear(json!(-12.5)) < linear(json!(3.0)));
+    assert_eq!(linear(json!(null)), None);
+}
+
+/// A site's Rank field is read with its others and asked for on each call.
+#[test]
+fn a_jira_site_s_rank_field_is_read_and_asked_for() {
+    let f = jira_fields(
+        &json!({ "fields": { "points": "customfield_10016", "rank": "customfield_10019" } }),
+        Utc::now(),
+    );
+    assert_eq!(f.rank.as_deref(), Some("customfield_10019"));
+    assert!(f.rank_asked);
+    assert_eq!(custom_fields_arg(Some(&f))["rank"], "customfield_10019");
+    let none = jira_fields(&json!({ "fields": { "rank": "Rank" } }), Utc::now());
+    assert_eq!(
+        none.rank, None,
+        "only a custom field's id is ever asked for"
+    );
+}
+
+/// A drop goes out as one call: Jira ranks after the issue above (else
+/// before the one below), Linear takes the sortOrder between them.
+#[test]
+fn a_drop_goes_out_as_one_order_call() {
+    use crate::board::RankMove;
+    let mv = |above: Option<&str>, below: Option<&str>, sort: Option<f64>| RankMove {
+        above: above.map(str::to_string),
+        below: below.map(str::to_string),
+        sort_order: sort,
+    };
+    assert_eq!(
+        order_call(
+            System::Jira,
+            "ACME-3",
+            &mv(Some("ACME-1"), Some("ACME-2"), None)
+        ),
+        Some((
+            "jira.update_issue",
+            json!({ "issue_key": "ACME-3", "rank_after_issue": "ACME-1" })
+        ))
+    );
+    assert_eq!(
+        order_call(System::Jira, "ACME-3", &mv(None, Some("ACME-2"), None)),
+        Some((
+            "jira.update_issue",
+            json!({ "issue_key": "ACME-3", "rank_before_issue": "ACME-2" })
+        ))
+    );
+    assert_eq!(
+        order_call(System::Jira, "ACME-3", &mv(None, None, None)),
+        None
+    );
+    assert_eq!(
+        order_call(
+            System::Linear,
+            "ENG-3",
+            &mv(Some("ENG-1"), None, Some(-7.5))
+        ),
+        Some((
+            "linear.issue_update",
+            json!({ "identifier": "ENG-3", "sort_order": -7.5 })
+        ))
+    );
+    assert_eq!(
+        order_call(System::Linear, "ENG-3", &mv(Some("ENG-1"), None, None)),
+        None
+    );
+    assert!(order_moved(
+        System::Jira,
+        &json!({ "key": "ACME-3", "ranked": true })
+    ));
+    assert!(!order_moved(
+        System::Jira,
+        &json!({ "key": "ACME-3", "updated": true })
+    ));
+    assert!(order_moved(
+        System::Linear,
+        &json!({ "issue": { "sortOrder": -7.5 } })
+    ));
+    assert!(!order_moved(System::Linear, &json!({ "issue": {} })));
+    let words = order_words(
+        System::Jira,
+        "ACME-3",
+        &RemoteError::Failed("No fields to update".into()),
+    );
+    assert!(words.contains("can't reorder issues yet"), "{words}");
+}
+
+/// A drop waiting to go out is pushed, and no pull moves its place
+/// meanwhile; a pull otherwise takes the place there and clears its mark.
+#[test]
+fn a_pull_takes_the_place_there_unless_a_drop_waits() {
+    let mut t = synced(TicketState::Todo);
+    t.upstream_rank = Some("0|b".into());
+    let mut issue = jira_issue(
+        &json!({ "key": "ACME-482", "summary": "Fix the login", "status": "To Do",
+            "updated": "2026-11-09T10:00:00.000+0000", "rank": "0|c" }),
+        "",
+    )
+    .unwrap();
+    let mv = crate::board::RankMove {
+        above: Some("ACME-1".into()),
+        below: None,
+        sort_order: None,
+    };
+    t.external.as_mut().unwrap().rank_move = Some(mv.clone());
+    assert_eq!(push_of(&t, &[]).order, Some(mv));
+    assert!(!take_rank(&mut t, &issue));
+    assert_eq!(t.upstream_rank.as_deref(), Some("0|b"));
+    let e = t.external.as_mut().unwrap();
+    e.rank_move = None;
+    e.rank_stale = true;
+    assert!(take_rank(&mut t, &issue));
+    assert_eq!(t.upstream_rank.as_deref(), Some("0|c"));
+    assert!(!t.external.as_ref().unwrap().rank_stale);
+    assert!(!take_rank(&mut t, &issue), "nothing new");
+    issue.upstream_rank = None;
+    assert!(!take_rank(&mut t, &issue));
+    assert_eq!(
+        t.upstream_rank.as_deref(),
+        Some("0|c"),
+        "an answer without one leaves it"
     );
 }

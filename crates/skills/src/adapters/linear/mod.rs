@@ -445,6 +445,7 @@ impl LinearSkill {
                             "state_id": { "type": "string" },
                             "priority": { "type": "integer" },
                             "assignee_id": { "type": "string" },
+                            "sort_order": { "type": "number" },
                             "workspace": { "type": "string" }
                         },
                         "required": ["identifier"]

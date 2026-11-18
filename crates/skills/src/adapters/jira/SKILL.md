@@ -54,7 +54,7 @@ reload.
 | `jira.search` | JQL search via the new `/rest/api/3/search/jql` endpoint, with cursor pagination (`next_page_token`). Asking for the `description` field adds its rendered HTML (`description_html`). |
 | `jira.get_issue` | Full issue + comments + rendered description. |
 | `jira.create_issue` | Create issue. Descriptions accept markdown (rendered to ADF) or a raw ADF object. |
-| `jira.update_issue` | Update fields on an existing issue. Custom fields via the `fields` passthrough. |
+| `jira.update_issue` | Update fields on an existing issue. Custom fields via the `fields` passthrough; `rank_before_issue` / `rank_after_issue` move it on its boards. |
 | `jira.delete_issue` | Permanent delete (requires the right permission). |
 | `jira.assign_issue` | Assign by `accountId`; pass `null` to unassign. |
 | `jira.add_comment` | Add a comment. Bodies accept markdown (rendered to ADF) or a raw ADF object. |
