@@ -3,8 +3,9 @@
 //! the agent hasn't opted out. One decision ([`chosen`]), made where a
 //! turn's routes are resolved ([`crate::turn_loop::turn_chain`]) and where a
 //! tool-less call reaches the agent's provider ([`PersonalRouteLlm`]).
-//! Everything after it is the path a `claude-code` route always takes, on
-//! the person's own logins only: never a login an agent or the hub shares.
+//! Everything after it is the path a `claude-code` or `codex` route always
+//! takes, on the person's own logins only: never a login an agent or the hub
+//! shares. A `codex` route runs only where the hub has its coding worker.
 
 use std::sync::Arc;
 
@@ -20,17 +21,43 @@ use workforce_common::personal_route::{PersonalRoute, PersonalRouteKind, RouteFa
 use workforce_common::subscription::Payer;
 
 use crate::hub_core::personal_routes::PersonalRoutes;
+use crate::hub_core::subscriptions::CliKind;
 use crate::resolved_config::ConfigCell;
 use crate::subscription::{personal_logins_only, PlanLogins};
 
 /// The kinds a person's route runs on so far.
-const ROUTED: [PersonalRouteKind; 1] = [PersonalRouteKind::ClaudeCode];
+const ROUTED: [PersonalRouteKind; 2] = [PersonalRouteKind::ClaudeCode, PersonalRouteKind::Codex];
+
+/// Why a person's own Codex can't take their work on an agent: Codex's own
+/// shell can't be switched off in the hub's process, so it runs only on the
+/// hub's coding worker.
+pub const CODEX_NEEDS_WORKER: &str =
+    "running your work on your ChatGPT (Codex) needs this hub's coding worker, and it has none";
+
+/// The CLI a person's route of `kind` runs on, once it runs on one.
+pub fn cli_of(kind: PersonalRouteKind) -> Option<CliKind> {
+    match kind {
+        PersonalRouteKind::ClaudeCode => Some(CliKind::ClaudeCode),
+        PersonalRouteKind::Codex => Some(CliKind::Codex),
+        PersonalRouteKind::Devin => None,
+    }
+}
+
+/// The provider kind a CLI's calls run on.
+pub fn provider_of(cli: CliKind) -> ProviderKind {
+    match cli {
+        CliKind::ClaudeCode => ProviderKind::ClaudeCode,
+        CliKind::Codex => ProviderKind::Codex,
+    }
+}
 
 /// A person's own route, chosen for one call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Chosen {
     pub person: Uuid,
     pub route: PersonalRoute,
+    /// The CLI the route runs on.
+    pub cli: CliKind,
 }
 
 /// What decides one agent's calls' routes.
@@ -84,8 +111,12 @@ impl RouteDecider {
             .inspect_err(|e| tracing::warn!(agent = %self.agent_id, error = %format!("{e:#}"), "a person's route could not be read; the call runs on the hub's route"))
             .ok()?;
         let route = settings.chosen()?;
-        (switch.admits(route.kind) && ROUTED.contains(&route.kind))
-            .then_some(Chosen { person, route })
+        let cli = cli_of(route.kind)?;
+        (switch.admits(route.kind) && ROUTED.contains(&route.kind)).then_some(Chosen {
+            person,
+            route,
+            cli,
+        })
     }
 }
 
@@ -121,10 +152,15 @@ pub(crate) async fn own_logins_if_routed<F: std::future::Future>(
     crate::agent_turn::personal_if(own, work).await
 }
 
-/// The model a call on `spec` runs on a person's `claude-code` route: the
-/// spec's own tier (a tier name, a `provider:tier`, or the tier its model
-/// sits at in the agent's registry), on Claude Code.
-pub fn personal_model(tiers: &TierRegistry, tier_key: &str, spec: &str) -> String {
+/// The model a call on `spec` runs on a person's route on `cli`. On Claude
+/// Code, the spec's own tier (a tier name, a `provider:tier`, or the tier
+/// its model sits at in the agent's registry). On Codex every tier runs the
+/// one ChatGPT-plan model ([`crate::subscription::completion::CODEX_PLAN_MODEL`]),
+/// so the agent behaves the same whatever tier it asked for.
+pub fn personal_model(tiers: &TierRegistry, tier_key: &str, spec: &str, cli: CliKind) -> String {
+    if cli == CliKind::Codex {
+        return crate::subscription::completion::CODEX_PLAN_MODEL.to_string();
+    }
     let (_, model) = tiers.resolve_routed_model(spec, tier_key);
     let tier = tiers.classify(&model);
     let kind = ProviderKind::ClaudeCode;
@@ -139,7 +175,8 @@ pub fn personal_model(tiers: &TierRegistry, tier_key: &str, spec: &str) -> Strin
 }
 
 /// The agent's provider, with its tool-less calls made for a person on
-/// their own route as one-shot completions on their own Claude login: a
+/// their own route as one-shot completions on their own Claude or Codex
+/// login (Codex's on the hub's coding worker): a
 /// background call (compaction, a summary, a classifier) billed to them.
 /// A call with tools, or one with no person's route behind it, reaches the
 /// agent's provider untouched; a turn's own routes are chosen apart from
@@ -184,19 +221,18 @@ impl PersonalRouteLlm {
         }
         let chosen = self.decider.chosen().await?;
         let fallback = chosen.route.fallback;
+        let cli = chosen.cli;
         let spec = model.map_or_else(|| self.default_model.read().clone(), str::to_string);
         let model = personal_model(
             &TierRegistry::from_cell(&self.tiers),
             &self.tier_key.read(),
             &spec,
+            cli,
         );
-        match self
-            .plans
-            .provider(ProviderKind::ClaudeCode, Some(&model), None)
-        {
+        match self.plans.provider(provider_of(cli), Some(&model), None) {
             Ok(provider) => Some(Ok((provider, model, fallback))),
             Err(e) => {
-                tracing::warn!(agent = %self.decider.agent_id, error = %e, "a person's Claude route can't be built");
+                tracing::warn!(agent = %self.decider.agent_id, route = chosen.route.kind.as_str(), error = %e, "a person's own route can't be built");
                 // Waiting means the call never reaches the hub's route.
                 (fallback == RouteFallback::Wait).then(|| Err(e))
             }
@@ -207,7 +243,7 @@ impl PersonalRouteLlm {
         tracing::info!(
             agent = %self.decider.agent_id,
             error = %format!("{error:#}"),
-            "a person's own Claude route couldn't serve a background call; it runs on the hub's route as they chose"
+            "a person's own route couldn't serve a background call; it runs on the hub's route as they chose"
         );
     }
 }

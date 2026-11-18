@@ -144,11 +144,25 @@ pub(crate) async fn personal_if<F: std::future::Future>(personal: bool, work: F)
 }
 
 /// What runs a CLI `route` on this hub, else the route's miss.
+/// A person's own Codex route on a hub without its coding worker misses
+/// with the reason they read, rather than the CLI's own.
 fn rig_or_miss(service: &AgentService, route: &TurnRoute) -> Result<Arc<AgentTurnRig>, RouteMiss> {
-    service
+    let rig = service
         .turn_rig
         .get::<AgentTurnRig>()
-        .ok_or_else(|| route.miss("CLI turns are not wired on this hub"))
+        .ok_or_else(|| route.miss("CLI turns are not wired on this hub"))?;
+    let personal_codex = matches!(
+        route,
+        TurnRoute::Cli {
+            cli: CliKind::Codex,
+            personal: true,
+            ..
+        }
+    );
+    match personal_codex && !rig.has_codex_worker() {
+        true => Err(route.miss(crate::personal_route::CODEX_NEEDS_WORKER)),
+        false => Ok(rig),
+    }
 }
 
 /// A turn's routes, in the order the chain is configured.
@@ -240,20 +254,21 @@ impl TurnChain {
             .all(|route| matches!(route, TurnRoute::Runner(_)))
     }
 
-    /// This chain behind a person's own `claude-code` route on `model`: the
+    /// This chain behind a person's own route on `cli` and `model`: the
     /// route alone when their fallback is `wait`, so a call it can't serve
     /// stops and says why; ahead of the chain's own routes when it is
     /// `hub`, which take the call only before the person's route has
     /// produced anything.
     pub fn on_personal_route(
         self,
+        cli: CliKind,
         model: String,
         fallback: workforce_common::personal_route::RouteFallback,
     ) -> Self {
-        let kind = ProviderKind::ClaudeCode;
+        let kind = crate::personal_route::provider_of(cli);
         let mut chain = Self {
             routes: vec![TurnRoute::Cli {
-                cli: CliKind::ClaudeCode,
+                cli,
                 model,
                 personal: true,
             }],

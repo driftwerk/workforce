@@ -149,6 +149,20 @@ impl Hub {
 }
 
 impl Hub {
+    /// `who`'s own ChatGPT login for the whole hub.
+    fn chatgpt_login(&self, who: &Identity) {
+        self.vault
+            .set(
+                &format!("users/{}/codex/auth_json", who.id),
+                &workforce_hub_core::hub_core::logins::test_support::login(
+                    &format!("acct-{}", uuid::Uuid::new_v4()),
+                    "alice",
+                    "rt-0",
+                ),
+            )
+            .unwrap();
+    }
+
     /// The agent's own `[llm.personal_routes]`, as its config now says.
     fn agent_routes(&self, own: AgentPersonalRoutes) {
         let mut resolved = (*self.service.resolved.snapshot()).clone();
@@ -239,7 +253,7 @@ async fn the_per_agent_setting_wins_and_hub_refuses_the_every_agent_one() {
 }
 
 #[tokio::test]
-async fn a_route_is_refused_while_the_switch_is_off_and_for_unroutable_kinds() {
+async fn a_route_is_refused_while_the_switch_is_off_for_unroutable_kinds_and_without_a_login() {
     let off = Hub::new(PersonalRoutesConfig::default()).await;
     off.claude_login(&off.alice);
     let (_, body) = off.get(&off.alice, "/api/me/llm-route").await;
@@ -253,7 +267,10 @@ async fn a_route_is_refused_while_the_switch_is_off_and_for_unroutable_kinds() {
 
     let on = Hub::on().await;
     on.claude_login(&on.alice);
-    for kind in ["codex", "devin"] {
+    for (kind, refused) in [
+        ("codex", "connect your own ChatGPT (Codex) login"),
+        ("devin", "isn't available yet"),
+    ] {
         let (status, body) = on
             .put(
                 &on.alice,
@@ -262,15 +279,45 @@ async fn a_route_is_refused_while_the_switch_is_off_and_for_unroutable_kinds() {
             )
             .await;
         assert_eq!(status, StatusCode::CONFLICT, "{kind}: {body}");
-        assert!(body["error"]
-            .as_str()
-            .unwrap()
-            .contains("isn't available yet"));
+        assert!(
+            body["error"].as_str().unwrap().contains(refused),
+            "{kind}: {body}"
+        );
     }
     let (status, _) = on
         .put(&on.alice, "/api/me/llm-route", json!({ "kind": "gemini" }))
         .await;
     assert!(status.is_client_error(), "an unknown kind is refused");
+}
+
+#[tokio::test]
+async fn a_codex_route_is_kept_for_every_agent_and_refused_on_an_agent_without_a_coding_worker() {
+    let hub = Hub::on().await;
+    hub.chatgpt_login(&hub.alice);
+    let codex = json!({ "kind": "codex", "fallback": "wait" });
+
+    let (status, body) = hub
+        .put(&hub.alice, "/api/me/llm-route", codex.clone())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["route"], codex);
+
+    let (status, body) = hub
+        .put(&hub.alice, "/api/me/agents/scout/llm-route", codex)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body["error"].as_str(),
+        Some(workforce_hub::personal_route::CODEX_NEEDS_WORKER),
+        "an agent without the hub's coding worker says why"
+    );
+    let devin = json!({ "kind": "devin", "fallback": "wait" });
+    let (status, body) = hub.put(&hub.alice, "/api/me/llm-route", devin).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("isn't available yet"));
 }
 
 #[tokio::test]
