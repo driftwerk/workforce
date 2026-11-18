@@ -16,11 +16,18 @@
 //!   bases are: a step for the same boss inside a turn holding its mind
 //!   goes on without waiting.
 //! - **Bounded.** Past [`WAIT_MAX`] a waiter goes on without the mind and
-//!   says so: a wedged boss is worse than two minds.
+//!   says so: a wedged boss is worse than two minds. Work the loops hold
+//!   back while the mind is busy (line turns, check-ins, plan turns) is
+//!   started anyway once it has waited [`STARVE`], and queues for the mind
+//!   in turn; the person's own turn holds crew work back for at most
+//!   [`PERSON_YIELD`].
+//! - **Never leaked.** What holds the mind is marked by a guard: a stretch
+//!   that panics or is dropped frees it as one that ends does.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -31,8 +38,15 @@ use super::CrewHub;
 pub(super) const WAIT_MAX: Duration = Duration::from_secs(20 * 60);
 
 /// The longest a focused call waits for its boss's mind: past it the item
-/// is left for the boss's next look, or its full turn.
+/// is handed on (to a work turn, or to the session's line).
 pub(super) const FOCUSED_WAIT: Duration = Duration::from_secs(60);
+
+/// How long work the loops hold back for a busy mind waits before it is
+/// started anyway, to queue for the mind in turn.
+pub(super) const STARVE: Duration = Duration::from_secs(2 * 60);
+
+/// The longest one of the person's turns holds the boss's crew work back.
+pub(super) const PERSON_YIELD: Duration = Duration::from_secs(10 * 60);
 
 /// A wait this long is worth a warning.
 const WAIT_SAID: Duration = Duration::from_secs(60);
@@ -45,7 +59,6 @@ pub(super) struct Holding {
 }
 
 /// Every boss's mind, and who holds it.
-#[derive(Default)]
 pub(super) struct Minds {
     locks: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// What each held mind is doing.
@@ -55,8 +68,26 @@ pub(super) struct Minds {
     /// The runner sessions of turns running under a boss's mind: the boss,
     /// and the runner session the turn began on (it may roll over).
     turns: parking_lot::Mutex<HashMap<String, (String, String)>>,
-    /// The person's own turns running in each boss's DM.
-    person: parking_lot::Mutex<HashMap<String, usize>>,
+    /// The person's own turns running in each boss's DM, by mark, with
+    /// when each began.
+    person: parking_lot::Mutex<HashMap<String, HashMap<u64, Instant>>>,
+    marks: AtomicU64,
+    /// [`WAIT_MAX`], shorter in tests.
+    wait_max: parking_lot::Mutex<Duration>,
+}
+
+impl Default for Minds {
+    fn default() -> Self {
+        Self {
+            locks: Default::default(),
+            holding: Default::default(),
+            waiting: Default::default(),
+            turns: Default::default(),
+            person: Default::default(),
+            marks: AtomicU64::new(0),
+            wait_max: parking_lot::Mutex::new(WAIT_MAX),
+        }
+    }
 }
 
 tokio::task_local! {
@@ -78,6 +109,15 @@ impl Minds {
         workforce_agent::runner::CURRENT_SESSION_ID
             .try_with(|sid| self.turns.lock().get(sid).is_some_and(|(b, _)| b == boss))
             .unwrap_or(false)
+    }
+
+    /// Whether one of the person's turns in `boss`'s DM runs, begun within
+    /// [`PERSON_YIELD`].
+    fn person_running(&self, boss: &str) -> bool {
+        self.person
+            .lock()
+            .get(boss)
+            .is_some_and(|t| t.values().any(|at| at.elapsed() < PERSON_YIELD))
     }
 }
 
@@ -101,6 +141,7 @@ impl Drop for TurnUnder<'_> {
 pub(super) struct PersonTurn {
     crew: std::sync::Weak<CrewHub>,
     boss: String,
+    mark: u64,
 }
 
 impl Drop for PersonTurn {
@@ -109,9 +150,9 @@ impl Drop for PersonTurn {
             return;
         };
         let mut person = crew.minds.person.lock();
-        if let Some(n) = person.get_mut(&self.boss) {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
+        if let Some(t) = person.get_mut(&self.boss) {
+            t.remove(&self.mark);
+            if t.is_empty() {
                 person.remove(&self.boss);
             }
         }
@@ -136,6 +177,19 @@ impl Drop for Waiting<'_> {
     }
 }
 
+/// Says what holds a boss's mind while it is held: gone with the stretch,
+/// however it ends (done, dropped, or panicked).
+struct HoldingMark<'a> {
+    minds: &'a Minds,
+    boss: String,
+}
+
+impl Drop for HoldingMark<'_> {
+    fn drop(&mut self) {
+        self.minds.holding.lock().remove(&self.boss);
+    }
+}
+
 impl CrewHub {
     /// Runs `f` holding `boss`'s mind, doing `what`, waiting for it as long
     /// as [`WAIT_MAX`]; past that `f` runs without it, said.
@@ -151,14 +205,15 @@ impl CrewHub {
     ) -> impl Future<Output = F::Output> + 'a {
         let f = Box::pin(f);
         async move {
-            match self.mind_held(boss, what, WAIT_MAX, f).await {
+            let wait = *self.minds.wait_max.lock();
+            match self.mind_held(boss, what, wait, f).await {
                 Ok(out) => out,
                 Err(f) => {
                     let holder = self.mind_holder(boss);
                     tracing::warn!(
                         %boss,
                         %what,
-                        waited_secs = WAIT_MAX.as_secs(),
+                        waited_secs = wait.as_secs(),
                         holder = ?holder.as_ref().map(|h| &h.what),
                         held_secs = ?holder.as_ref().map(|h| h.since.elapsed().as_secs()),
                         "a boss's mind stayed held too long; this goes on without it"
@@ -189,11 +244,12 @@ impl CrewHub {
         f: Pin<Box<F>>,
     ) -> Result<F::Output, Pin<Box<F>>> {
         if self.minds.held_here(boss) {
-            return Ok(f.await);
+            // A turn it starts runs under the mind too.
+            return Ok(HELD.scope(boss.to_string(), f).await);
         }
         let lock = self.minds.lock_of(boss);
         let asked = Instant::now();
-        let guard = {
+        let (guard, holding) = {
             *self
                 .minds
                 .waiting
@@ -204,24 +260,33 @@ impl CrewHub {
                 minds: &self.minds,
                 boss: boss.to_string(),
             };
-            match tokio::time::timeout(wait, lock.lock_owned()).await {
+            let guard = match tokio::time::timeout(wait, lock.lock_owned()).await {
                 Ok(guard) => guard,
                 Err(_) => return Err(f),
-            }
+            };
+            // Marked held before it stops being waited for: never free
+            // between the two.
+            self.minds.holding.lock().insert(
+                boss.to_string(),
+                Holding {
+                    what: what.to_string(),
+                    since: Instant::now(),
+                },
+            );
+            let mark = HoldingMark {
+                minds: &self.minds,
+                boss: boss.to_string(),
+            };
+            (guard, mark)
         };
         let waited = asked.elapsed();
         if waited >= WAIT_SAID {
             tracing::warn!(%boss, %what, waited_secs = waited.as_secs(), "a boss's step waited for its mind");
         }
-        self.minds.holding.lock().insert(
-            boss.to_string(),
-            Holding {
-                what: what.to_string(),
-                since: Instant::now(),
-            },
-        );
         let out = HELD.scope(boss.to_string(), f).await;
-        self.minds.holding.lock().remove(boss);
+        // The mark goes before the lock: the next holder's own mark is
+        // never removed by this one.
+        drop(holding);
         drop(guard);
         Ok(out)
     }
@@ -229,7 +294,7 @@ impl CrewHub {
     /// The turn on runner session `sid` of `boss`'s runs under its mind,
     /// when the code starting it holds the mind: its tools are the mind's.
     pub(super) fn turn_under_mind(&self, boss: &str, sid: &str) -> Option<TurnUnder<'_>> {
-        if !HELD.try_with(|b| b == boss).unwrap_or(false) {
+        if !self.minds.held_here(boss) {
             return None;
         }
         self.minds
@@ -254,15 +319,38 @@ impl CrewHub {
     /// A turn the person typed in `boss`'s DM began: counted until the
     /// returned mark goes.
     pub(super) fn person_turn_began(&self, boss: &str) -> PersonTurn {
-        *self
-            .minds
+        let mark = self.minds.marks.fetch_add(1, Ordering::Relaxed);
+        self.minds
             .person
             .lock()
             .entry(boss.to_string())
-            .or_default() += 1;
+            .or_default()
+            .insert(mark, Instant::now());
         PersonTurn {
             crew: self.me.clone(),
             boss: boss.to_string(),
+            mark,
+        }
+    }
+
+    /// Whether one of the person's own turns runs in `boss`'s DM (begun
+    /// within [`PERSON_YIELD`]): crew work yields to it.
+    #[cfg(test)]
+    pub(super) fn person_turn_running(&self, boss: &str) -> bool {
+        self.minds.person_running(boss)
+    }
+
+    /// Waits, at most [`STARVE`], while one of the person's own turns runs
+    /// in `boss`'s DM: crew work started on its own (a plan's turn, an
+    /// update's or a summary's check-in) yields to them, as the loops'
+    /// does. Nothing waits that already holds the mind.
+    pub(super) async fn yield_to_person(&self, boss: &str) {
+        if self.minds.held_here(boss) {
+            return;
+        }
+        let since = Instant::now();
+        while self.minds.person_running(boss) && since.elapsed() < STARVE {
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
 
@@ -271,11 +359,23 @@ impl CrewHub {
     pub(super) fn mind_free(&self, boss: &str) -> bool {
         !self.minds.holding.lock().contains_key(boss)
             && !self.minds.waiting.lock().contains_key(boss)
-            && !self.minds.person.lock().contains_key(boss)
+            && !self.minds.person_running(boss)
+    }
+
+    /// Whether work for `boss` held back since `due` may start now: its
+    /// mind is free, or it has waited [`STARVE`] and queues for it.
+    pub(super) fn mind_may_start(&self, boss: &str, due: Instant) -> bool {
+        self.mind_free(boss) || due.elapsed() >= STARVE
     }
 
     /// What `boss`'s mind is doing, while held.
     pub(super) fn mind_holder(&self, boss: &str) -> Option<Holding> {
         self.minds.holding.lock().get(boss).cloned()
+    }
+
+    /// Shortens [`WAIT_MAX`], for tests.
+    #[cfg(test)]
+    pub(super) fn set_mind_wait_max(&self, wait: Duration) {
+        *self.minds.wait_max.lock() = wait;
     }
 }

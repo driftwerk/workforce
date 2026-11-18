@@ -38,7 +38,7 @@ use crate::serve::AgentService;
 pub const LINE: &str = "[Desk line]";
 
 /// How long a session's messages are gathered into one turn.
-const GATHER: Duration = Duration::from_secs(3);
+pub(super) const GATHER: Duration = Duration::from_secs(3);
 
 /// How often the sessions a boss runs are looked at for requests it owes
 /// an answer to.
@@ -937,10 +937,13 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
         // The longest waiting first: each boss starts one at a time.
         due.sort_by_key(|(_, since)| *since);
         let mut busy: HashSet<String> = running.values().filter_map(|(_, b)| b.clone()).collect();
-        for (session, _) in due {
+        for (session, since) in due {
             let boss = crew.line_boss(session);
             if let Some(b) = &boss {
-                if busy.contains(b) || !crew.mind_free(b) {
+                // One line turn per boss at a time; while its mind is busy
+                // what its sessions say gathers, until it has waited long
+                // enough to queue for the mind in turn.
+                if busy.contains(b) || !crew.mind_may_start(b, since) {
                     continue;
                 }
             }

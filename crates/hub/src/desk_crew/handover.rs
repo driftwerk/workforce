@@ -200,14 +200,30 @@ impl CrewHub {
             );
         };
         // What it does on the note it decides with nothing else of its own
-        // deciding at once ([`super::mind`]).
+        // deciding at once ([`super::mind`]), in a task of its own: the
+        // person's request that sent it, waiting at most a focused call's
+        // wait, neither holds the turn up nor, dropped, cuts it short.
         let boss = service.agent_id.as_str().to_string();
-        self.with_mind(
-            &boss,
-            "a handover's note",
-            self.deliver_handover_now(h, service),
-        )
-        .await
+        let (crew, note) = (self.me(), h.clone());
+        let mut turn = tokio::spawn(async move {
+            let done = crew
+                .with_mind(
+                    &boss,
+                    "a handover's note",
+                    crew.deliver_handover_now(&note, service),
+                )
+                .await;
+            if let Err(e) = &done {
+                tracing::warn!(handover = %note.id, error = %e, "a handover's note wasn't delivered");
+            }
+            done
+        });
+        match tokio::time::timeout(super::mind::FOCUSED_WAIT, &mut turn).await {
+            Ok(Ok(done)) => done,
+            Ok(Err(e)) => Err(format!("The note couldn't be delivered: {e}.")),
+            // Its boss is busy: the note waits for it, and goes in turn.
+            Err(_) => Ok(()),
+        }
     }
 
     async fn deliver_handover_now(

@@ -6253,3 +6253,66 @@ async fn the_persons_turn_never_waits_and_holds_crew_work_back_while_it_runs() {
     })
     .await;
 }
+
+/// A stretch dropped or panicking while it holds the boss's mind frees it,
+/// as one that ends does: the boss's crew work is never left stopped.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stretch_aborted_or_panicking_frees_the_mind() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let crew = CrewHub::start(hub(&[]), d, FAST, CancellationToken::new());
+        let c = Arc::clone(&crew);
+        let held = tokio::spawn(async move {
+            c.with_mind("desk", "a line", std::future::pending::<()>())
+                .await
+        });
+        eventually("held", async || crew.mind_holder("desk").map(|_| ())).await;
+        held.abort();
+        let _ = held.await;
+        assert!(crew.mind_free("desk"), "aborted: free");
+        let c = Arc::clone(&crew);
+        let panicked = tokio::spawn(async move {
+            c.with_mind("desk", "a check-in", async { panic!("a turn panicked") })
+                .await
+        });
+        assert!(panicked.await.is_err());
+        assert!(crew.mind_free("desk"), "panicked: free");
+        // And the next one has it at once.
+        let had = crew
+            .mind_within("desk", "next", Duration::from_millis(100), async { 7 })
+            .await;
+        assert!(matches!(had, Ok(7)));
+    })
+    .await;
+}
+
+/// Past the longest wait a step goes on without the mind, rather than a
+/// wedged boss stopping it; work held back for a busy mind is started once
+/// it has waited long enough, to queue for the mind in turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wedged_mind_is_waited_for_only_so_long() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let crew = CrewHub::start(hub(&[]), d, FAST, CancellationToken::new());
+        crew.set_mind_wait_max(Duration::from_millis(300));
+        let c = Arc::clone(&crew);
+        let _wedged = tokio::spawn(async move {
+            c.with_mind("desk", "a wedged turn", std::future::pending::<()>())
+                .await
+        });
+        eventually("held", async || crew.mind_holder("desk").map(|_| ())).await;
+        let started = std::time::Instant::now();
+        let out = crew.with_mind("desk", "a check-in", async { 3 }).await;
+        assert_eq!(out, 3, "it went on without the mind");
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        // Held back while busy, started once it has waited its while.
+        let now = std::time::Instant::now();
+        assert!(!crew.mind_may_start("desk", now));
+        if let Some(long_ago) = now.checked_sub(super::mind::STARVE) {
+            assert!(crew.mind_may_start("desk", long_ago));
+        }
+    })
+    .await;
+}

@@ -1722,6 +1722,7 @@ impl CrewHub {
             Ok(detail) => detail.summary.plan.boss,
             Err(_) => return,
         };
+        self.yield_to_person(&boss).await;
         self.with_mind(&boss, "a plan's turn", self.plan_turn_now(id, lines))
             .await;
     }

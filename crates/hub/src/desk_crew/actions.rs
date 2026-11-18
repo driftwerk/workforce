@@ -2668,15 +2668,26 @@ impl CrewHub {
         self.desk.note(event);
         let crew = self.me();
         tokio::spawn(async move {
-            let ran = match theirs {
-                Some(words) => {
-                    crew.run_dm_turn_for_them(&service, &owner, &message, hop, author, words)
-                        .await
+            let turn = async {
+                match theirs {
+                    Some(words) => {
+                        crew.run_dm_turn_for_them(&service, &owner, &message, hop, author, words)
+                            .await
+                    }
+                    None => {
+                        crew.run_dm_turn(&service, &owner, &message, hop, None, Some(author))
+                            .await
+                    }
                 }
-                None => {
-                    crew.run_dm_turn(&service, &owner, &message, hop, None, Some(author))
-                        .await
-                }
+            };
+            // Another boss's message is the receiver's own deciding: under
+            // its mind ([`super::mind`]), in this task of its own, so the
+            // sender never waits on it. The person's yes is their turn.
+            let ran = if from_overseer {
+                let to = service.agent_id.as_str().to_string();
+                crew.with_mind(&to, "a message from the crew", turn).await
+            } else {
+                turn.await
             };
             if let Err(e) = ran {
                 tracing::warn!(agent_id = %service.agent_id, error = %e, "a message to the crew did not run");

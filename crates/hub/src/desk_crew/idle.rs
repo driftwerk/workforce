@@ -331,15 +331,24 @@ impl CrewHub {
                     let _slot = slot.acquire().await;
                     // On the picture as it is as the call begins, with
                     // nothing else of the boss's deciding at once: a boss
-                    // busy past the wait looks again later.
-                    crew.mind_within(
-                        &boss,
-                        "a session's turn end",
-                        super::mind::FOCUSED_WAIT,
-                        crew.on_picture(crew.judge_turn_end(&view, &boss, &seen)),
-                    )
-                    .await
-                    .unwrap_or(Judged::Later)
+                    // busy past the wait gets it in its full turn, which
+                    // queues for its mind in turn.
+                    match crew
+                        .mind_within(
+                            &boss,
+                            "a session's turn end",
+                            super::mind::FOCUSED_WAIT,
+                            crew.on_picture(crew.judge_turn_end(&view, &boss, &seen)),
+                        )
+                        .await
+                    {
+                        Ok(j) => j,
+                        Err(unrun) => {
+                            drop(unrun);
+                            crew.hand_to_work(&view, &seen);
+                            Judged::Done
+                        }
+                    }
                 } => j,
             };
             if let Judged::Later = judged {

@@ -31,7 +31,8 @@ async fn two_sessions_reports_are_decided_one_after_the_other_on_one_picture() {
         slow_once(
             &llm,
             "cut and tested on the payments side",
-            Duration::from_millis(2000),
+            // Longer than a line's gather: B comes due while A decides.
+            Duration::from_millis(7000),
             Answer::Tool(
                 "crew_nudge",
                 json!({"session_id": a.id.to_string(), "message": RUN, "reason": "It is ready."}),
@@ -58,7 +59,7 @@ async fn two_sessions_reports_are_decided_one_after_the_other_on_one_picture() {
         d.line_call(b.id, "tell", &json!({"to": "desk", "text": READY_B}), None)
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(1200)).await;
+        tokio::time::sleep(super::super::line::GATHER + Duration::from_millis(1500)).await;
         assert!(
             asked_with(&llm, "notes are written on the web side")
                 .await
@@ -87,6 +88,70 @@ async fn two_sessions_reports_are_decided_one_after_the_other_on_one_picture() {
             "{:?}",
             told(&d, b.id).await
         );
+    })
+    .await;
+}
+
+/// The person's own turn in the boss's DM is counted while it runs (crew
+/// work yields to it) and never waits for the boss's mind.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_persons_dm_turn_is_counted_while_it_runs_and_never_waits() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, _d, llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        // The DM's answer, slow: its turn runs a while.
+        slow_once(
+            &llm,
+            "How is release 3 going",
+            Duration::from_millis(1500),
+            Answer::Tool("crew_overview", json!({})),
+        )
+        .await;
+        // The boss's mind is held by something else the whole time.
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+        let c = Arc::clone(&crew);
+        let holder = tokio::spawn(async move {
+            c.with_mind("desk", "a check-in", async move {
+                go_rx.await.ok();
+            })
+            .await
+        });
+        eventually("the mind held", async || {
+            crew.mind_holder("desk").map(|_| ())
+        })
+        .await;
+        // The person's own words in the boss's DM, as Desk sends them.
+        let (c, o) = (Arc::clone(&crew), Arc::clone(&overseer));
+        let turn = tokio::spawn(async move {
+            c.run_dm_turn(
+                &o,
+                PERSON,
+                "How is release 3 going?",
+                0,
+                None,
+                Some(workforce_desk::Speaker::you()),
+            )
+            .await
+        });
+        eventually("the person's turn counted", async || {
+            crew.person_turn_running("desk").then_some(())
+        })
+        .await;
+        assert!(!crew.mind_free("desk"));
+        // It reached the model with the mind still held: it never waited.
+        eventually("the person's turn deciding", async || {
+            (!asked_with(&llm, "How is release 3 going").await.is_empty()).then_some(())
+        })
+        .await;
+        assert!(crew.mind_holder("desk").is_some());
+        turn.await.unwrap().unwrap();
+        eventually("no longer counted", async || {
+            (!crew.person_turn_running("desk")).then_some(())
+        })
+        .await;
+        go_tx.send(()).unwrap();
+        holder.await.unwrap();
+        assert!(crew.mind_free("desk"));
     })
     .await;
 }

@@ -876,7 +876,8 @@ impl CrewHub {
         }
         let id = service.agent_id.as_str().to_string();
         // Under its mind ([`super::mind`]); the wake loop's check-ins hold
-        // it already.
+        // it already. Begun by itself, it yields to the person's own turn.
+        self.yield_to_person(&id).await;
         self.with_mind(
             &id,
             "a check-in",
@@ -1221,8 +1222,9 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 continue;
             }
             // Its mind is busy, or the person's own turn runs in its DM:
-            // what it found keeps gathering for its next look.
-            if !crew.mind_free(&id) {
+            // what it found keeps gathering for its next look, until it has
+            // waited long enough to queue for the mind in turn.
+            if w.window.is_some_and(|at| !crew.mind_may_start(&id, at)) {
                 continue;
             }
             if w.held_until.is_some_and(|until| Utc::now() < until) {

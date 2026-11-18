@@ -761,20 +761,37 @@ impl CrewHub {
 
     /// Looks at every boss's update once: sends one written but not yet
     /// gone, starts gathering on news, and sends what is due.
+    /// Every boss's update, one after another, waited for: as the loop
+    /// looks, in tests ([`Self::look_at_updates_apart`]).
+    #[cfg(test)]
     pub(crate) async fn look_at_updates(&self) {
         for (service, o) in self.overseers() {
-            let boss = service.agent_id.to_string();
-            // One look at a boss's update at a time: a wake-up's check-in
-            // may be writing it.
-            let Some(_one) = Updating::begin(&self.updating, &boss) else {
-                continue;
-            };
-            // What the person settled in a session themselves is no longer
-            // theirs to answer here.
-            self.settle_in_sessions(&boss).await;
-            if let Err(e) = self.update_of(&service, &o).await {
-                tracing::warn!(agent = %service.agent_id, error = %format!("{e:#}"), "a boss's update failed");
-            }
+            self.look_at_update(&service, &o).await;
+        }
+    }
+
+    /// As [`Self::look_at_updates`], each boss's look in a task of its own:
+    /// one whose check-in waits for its busy mind ([`super::mind`]) holds
+    /// no other boss's update, nor the loop, back.
+    fn look_at_updates_apart(&self) {
+        for (service, o) in self.overseers() {
+            let crew = self.me();
+            tokio::spawn(async move { crew.look_at_update(&service, &o).await });
+        }
+    }
+
+    async fn look_at_update(&self, service: &Arc<AgentService>, o: &Oversight) {
+        let boss = service.agent_id.to_string();
+        // One look at a boss's update at a time: a wake-up's check-in may
+        // be writing it.
+        let Some(_one) = Updating::begin(&self.updating, &boss) else {
+            return;
+        };
+        // What the person settled in a session themselves is no longer
+        // theirs to answer here.
+        self.settle_in_sessions(&boss).await;
+        if let Err(e) = self.update_of(service, o).await {
+            tracing::warn!(agent = %service.agent_id, error = %format!("{e:#}"), "a boss's update failed");
         }
     }
 
@@ -1543,10 +1560,10 @@ pub(super) async fn updates_loop(crew: Arc<CrewHub>, cancel: CancellationToken) 
                 crew.post_due_cards().await;
                 // A boss newly at Act fully asks the person's directives.
                 crew.look_at_directives().await;
-                crew.look_at_updates().await;
+                crew.look_at_updates_apart();
             }
             // The person paused typing, came back, or wrote: look now.
-            () = crew.update_poke.notified() => crew.look_at_updates().await,
+            () = crew.update_poke.notified() => crew.look_at_updates_apart(),
         }
     }
 }

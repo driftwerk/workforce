@@ -112,8 +112,6 @@ impl CrewHub {
         // the answer. The person's next connect rolls a stale one.
         let session = service.sessions.get_or_create(channel, owner, agent_id)?;
         let sid = session.id.clone();
-        // Started holding the boss's mind: its tools hold it too.
-        let _under = self.turn_under_mind(agent_id, &sid);
         if hop > 0 {
             self.hops.lock().insert(sid.clone(), hop);
         }
@@ -149,6 +147,10 @@ impl CrewHub {
                 bail!("{busy}");
             }
         };
+        // Started holding the boss's mind: its tools hold it too. Marked
+        // once the turn is its own, never while the session is busy with
+        // another.
+        let _under = self.turn_under_mind(agent_id, &sid);
         // Gone with the turn, however it ends, as the person's own are.
         let _theirs = theirs.map(|words| Theirs::keep(&self.person_turns, &sid, words));
         // The crew's own wake-up, by name, for as long as its turn runs:
