@@ -158,6 +158,7 @@ When `project_keys` are configured, calling `jira.get_issue` with `OPS-42` auto-
 | `jira.get_project` | Project detail with issue types |
 | `jira.search_users` | User picker — returns `accountId` |
 | `jira.list_boards` | Jira Software (Agile) boards |
+| `jira.board_order` | How a project's board orders its issues (its filter's ORDER BY, its Rank field) |
 | `jira.list_sprints` | Sprints on a board, optionally filtered by state |
 | `jira.add_worklog` | Log time on an issue |
 | `jira.api` | Escape hatch for arbitrary REST calls |

@@ -5188,6 +5188,7 @@ mod tests {
         assert!(r.output["organization"].is_null());
         for bad in [
             serde_json::json!({ "view_type": "allIssues) { x }" }),
+            serde_json::json!({ "view_type": "triage2" }),
             serde_json::json!({ "custom_view_id": "v1\") { x }" }),
         ] {
             let r = tool.execute(bad.clone()).await.unwrap();

@@ -2324,19 +2324,22 @@ impl Tool for JiraBoardOrderTool {
             Ok(_) => return Ok(ToolResult::failure("Not a Jira project key", ms())),
             Err(e) => return Ok(ToolResult::failure(e, ms())),
         };
-        let boards: Vec<Value> = match client
+        let (boards, truncated): (Vec<Value>, bool) = match client
             .get_with_query(
                 &format!("{AGILE}/board"),
                 &[("projectKeyOrId", key.as_str()), ("maxResults", "50")],
             )
             .await
         {
-            Ok(v) => v["values"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|b| json!({ "id": b["id"], "name": b["name"], "type": b["type"] }))
-                .collect(),
+            Ok(v) => (
+                v["values"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|b| json!({ "id": b["id"], "name": b["name"], "type": b["type"] }))
+                    .collect(),
+                v["isLast"].as_bool() == Some(false),
+            ),
             Err(e) => {
                 return Ok(ToolResult::from_report(
                     &e.wrap_err(format!("Failed to list {key}'s boards")),
@@ -2355,8 +2358,14 @@ impl Tool for JiraBoardOrderTool {
         };
         let Some(board) = board else {
             // None, several, or not the project's: no board to say for.
+            let note = match (asked, boards.len()) {
+                (Some(id), _) => format!("Board {id} isn't one of {key}'s boards listed here"),
+                (None, 0) => format!("{key} has no board"),
+                (None, _) => format!("{key} has several boards: pass board_id"),
+            };
             return Ok(ToolResult::success(
-                json!({ "boards": boards, "board": null, "order_by": null }),
+                json!({ "boards": boards, "truncated": truncated, "board": null,
+                        "order_by": null, "note": note }),
                 ms(),
             ));
         };
@@ -2387,21 +2396,23 @@ impl Tool for JiraBoardOrderTool {
                 ms(),
             ));
         };
-        let jql = match client.get(&format!("{REST}/filter/{filter}")).await {
-            Ok(v) => v["jql"].as_str().unwrap_or_default().to_string(),
+        // A filter not shared with the key's user can't be read: the board
+        // and its Rank field are still said.
+        let (order_by, note) = match client.get(&format!("{REST}/filter/{filter}")).await {
+            Ok(v) => (order_by_clause(v["jql"].as_str().unwrap_or_default()), None),
             Err(e) => {
-                return Ok(ToolResult::from_report(
-                    &e.wrap_err(format!("Failed to read board {id}'s filter")),
-                    ms(),
-                ))
+                warn!(error = %e, board = id, "a board's filter wasn't read");
+                (None, Some(format!("Board {id}'s filter couldn't be read")))
             }
         };
         Ok(ToolResult::success(
             json!({
                 "boards": boards,
+                "truncated": truncated,
                 "board": board,
-                "order_by": order_by_clause(&jql),
+                "order_by": order_by,
                 "rank_field": rank_field,
+                "note": note,
             }),
             ms(),
         ))
@@ -3988,6 +3999,16 @@ mod tests {
             order_by_clause("summary ~ \"é\" ORDER BY duedate").as_deref(),
             Some("duedate")
         );
+        assert_eq!(
+            order_by_clause(r#"summary ~ "a \" order by b" ORDER BY created DESC"#).as_deref(),
+            Some("created DESC")
+        );
+        assert_eq!(
+            order_by_clause("summary ~ 'order by x' ORDER BY updated").as_deref(),
+            Some("updated")
+        );
+        let long = format!("project = ENG ORDER BY {}", "x".repeat(900));
+        assert_eq!(order_by_clause(&long).map(|c| c.len()), Some(500));
     }
 
     /// The project's one board is read through to its filter's ORDER BY
@@ -4025,6 +4046,18 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("GET"))
+            .and(path("/rest/agile/1.0/board/9/configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": 9, "filter": { "id": 10050 }, "ranking": { "rankCustomFieldId": 10019 }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/filter/10050"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
             .and(path("/rest/api/3/filter/10040"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "10040",
@@ -4048,6 +4081,26 @@ mod tests {
         assert!(r.output["board"].is_null());
         assert!(r.output["order_by"].is_null());
         assert_eq!(r.output["boards"].as_array().map(Vec::len), Some(2));
+        assert!(r.output["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("several boards"));
+        let r = tool
+            .execute(json!({ "project_key": "OPS", "board_id": 9 }))
+            .await
+            .unwrap();
+        assert!(r.success, "{:?}", r.error);
+        assert_eq!(r.output["board"]["name"], "B");
+        assert!(
+            r.output["order_by"].is_null(),
+            "its filter couldn't be read"
+        );
+        assert_eq!(r.output["rank_field"], "customfield_10019");
+        let r = tool
+            .execute(json!({ "project_key": "OPS", "board_id": 77 }))
+            .await
+            .unwrap();
+        assert!(r.output["board"].is_null());
         let r = tool
             .execute(json!({ "project_key": "ENG\" OR 1=1" }))
             .await
