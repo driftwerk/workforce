@@ -81,6 +81,11 @@ impl AgentTurnRig {
         }
     }
 
+    /// Whether the rig seats Codex turns: on the hub's coding worker only.
+    pub(crate) fn has_codex_worker(&self) -> bool {
+        self.codex_worker.is_some()
+    }
+
     /// Run the rig's turns on `cli` on the scripted CLI at `program`.
     #[cfg(test)]
     pub(crate) fn with_program(mut self, cli: CliKind, program: PathBuf) -> Self {
