@@ -913,10 +913,15 @@ impl Desk {
         budget: &mut Budget,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<Sync, DeskError> {
+        // A Jira ordering is derived with the site's fields (its Rank
+        // field, its priorities): fields read since are read with again.
+        let fields_since = |o: &board::SourceOrder| {
+            s.system == System::Jira && s.fields.as_ref().is_some_and(|f| f.read_at > o.read_at)
+        };
         let fresh = s
             .ordering
             .as_ref()
-            .is_some_and(|o| crate::board_sync::ordering_fresh(o, now));
+            .is_some_and(|o| crate::board_sync::ordering_fresh(o, now) && !fields_since(o));
         if fresh || budget.take().is_err() {
             return Ok(s);
         }
@@ -931,12 +936,23 @@ impl Desk {
             },
             Err(e) => {
                 tracing::info!(board = %id, error = %e, "the board's order there wasn't read");
-                match s.ordering.clone() {
-                    Some(was) => board::SourceOrder {
+                // A hub without the tool, or that won't let the sync call
+                // it, can't say: said so, asked again on the cadence. Any
+                // other failure is passing: what was read stands, and it is
+                // asked again soon.
+                let lasting = matches!(e, RemoteError::Missing(_) | RemoteError::NotAllowed(_));
+                let soon = Some(now + crate::board_sync::ORDERING_RETRY);
+                match (s.ordering.clone(), lasting) {
+                    (_, true) => crate::board_sync::ordering_unknown(s.system, now),
+                    (Some(was), false) => board::SourceOrder {
                         read_at: now,
+                        retry_at: soon,
                         ..was
                     },
-                    None => crate::board_sync::ordering_unknown(s.system, now),
+                    (None, false) => board::SourceOrder {
+                        retry_at: soon,
+                        ..crate::board_sync::ordering_unknown(s.system, now)
+                    },
                 }
             }
         };
@@ -970,7 +986,14 @@ impl Desk {
             return Ok(false);
         }
         let tickets = self.0.store.board_tickets(b.id).await.map_err(internal)?;
-        Ok(crate::board_sync::places_missing(&tickets, s.link))
+        if crate::board_sync::places_missing(&tickets, s.link) {
+            return Ok(true);
+        }
+        // Their places are there: not looked at again until the next read.
+        let now = crate::crew::now();
+        self.change_sync(b.id, |s| s.places_swept_at = Some(now))
+            .await?;
+        Ok(false)
     }
 
     /// The issues `s`'s filter matches since `since` (all, without), oldest

@@ -732,10 +732,27 @@ pub fn ordering_args(s: &crate::board::Sync) -> Value {
     }
 }
 
+/// How soon an ordering whose read failed for a passing reason (the hub
+/// offline, slowed down) is asked for again.
+pub const ORDERING_RETRY: Duration = Duration::minutes(15);
+
+/// Someone else's name (a board's, a filter's field) as an ordering says
+/// it: one line, no control characters, at most `max` characters.
+fn plain_name(text: &str, max: usize) -> String {
+    let clean: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    crate::crew::one_line(clean.trim(), max)
+}
+
 /// Whether `o`, read at its `read_at`, is still good at `now`: read again
 /// on the fields' cadence.
 pub fn ordering_fresh(o: &crate::board::SourceOrder, now: DateTime<Utc>) -> bool {
-    now - o.read_at < FIELDS_FRESH
+    match o.retry_at {
+        Some(at) => now < at,
+        None => now - o.read_at < FIELDS_FRESH,
+    }
 }
 
 /// What a board sorts by where its hub couldn't say how the board there is
@@ -750,6 +767,7 @@ pub fn ordering_unknown(system: System, now: DateTime<Utc>) -> crate::board::Sou
             fallback_words(system)
         )),
         read_at: now,
+        retry_at: None,
     }
 }
 
@@ -808,6 +826,7 @@ pub fn linear_ordering(answer: &Value, now: DateTime<Utc>) -> crate::board::Sour
         from: None,
         note: Some(note),
         read_at: now,
+        retry_at: None,
     };
     let Some((v, from)) = picked else {
         return manual(match personal || custom {
@@ -838,6 +857,7 @@ pub fn linear_ordering(answer: &Value, now: DateTime<Utc>) -> crate::board::Sour
         from: Some(from.into()),
         note: None,
         read_at: now,
+        retry_at: None,
     }
 }
 
@@ -951,9 +971,13 @@ pub fn jira_ordering(
         from: None,
         note: Some(note),
         read_at: now,
+        retry_at: None,
     };
     let Some(board) = answer["board"].is_object().then(|| {
-        short(&answer["board"]["name"], 60).unwrap_or_else(|| format!("{project}'s board"))
+        short(&answer["board"]["name"], 60)
+            .map(|n| plain_name(&n, 60))
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| format!("{project}'s board"))
     }) else {
         let n = answer["boards"].as_array().map_or(0, Vec::len);
         return rank(match n {
@@ -979,7 +1003,7 @@ pub fn jira_ordering(
             if by.is_empty() {
                 return rank(format!(
                     "Jira orders {board} by {}, which Desk can't follow yet, so this follows Jira's Rank.",
-                    crate::crew::one_line(&name, 40)
+                    plain_name(&name, 40)
                 ));
             }
             break;
@@ -1008,6 +1032,7 @@ pub fn jira_ordering(
         from: Some(format!("{board}'s filter")),
         note: None,
         read_at: now,
+        retry_at: None,
     }
 }
 

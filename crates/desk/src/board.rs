@@ -515,7 +515,12 @@ pub struct SourceOrder {
     /// columns then sort by the manual order or Rank.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// When it was last asked for.
     pub read_at: DateTime<Utc>,
+    /// A read that failed for a passing reason is asked for again then,
+    /// sooner than the fields' cadence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_at: Option<DateTime<Utc>>,
 }
 
 /// An issue a pull couldn't take in, and when it is tried again.

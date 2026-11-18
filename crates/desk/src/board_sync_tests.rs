@@ -2156,6 +2156,7 @@ fn a_drop_moves_its_issue_only_while_the_board_there_is_ordered_by_hand() {
             from: None,
             note: None,
             read_at: now,
+            retry_at: None,
         });
         assert_eq!(s.moves_by_hand(), hand, "{:?}", s.ordering);
     }
