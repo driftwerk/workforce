@@ -5689,6 +5689,13 @@ rules:
                     tracing::info!("Session label tool registered on all agents");
                 }
 
+                // Desk themes on every agent built at boot, as the live-spawn
+                // path does for one spawned later: on every hub, Desk sessions
+                // on or not.
+                for agent_svc in registry_for_slack.all_services() {
+                    workforce_hub::desk_themes::register(&agent_svc);
+                }
+
                 // Build the hub-wide knowledge maintenance runner first so
                 // it can be wired into `projects.index`. Reuses the default
                 // agent's `KnowledgeService`; the runner enumerates

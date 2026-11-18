@@ -11,9 +11,15 @@
 //! 2. The person's Desk, signed in here as them, asks for their calls
 //!    (`GET /api/me/desk-theme-jobs`, held open until one comes) and
 //!    answers each (`POST /api/me/desk-theme-jobs/{id}`).
-//! 3. What Desk answered is the tool's result. No answer in time: the call
-//!    is dropped, never done later, and the agent is told Desk didn't
-//!    answer.
+//! 3. What Desk answered is the tool's result. Not taken in time, or the
+//!    turn stopped: the call is dropped, never done later, and the agent
+//!    is told Desk didn't answer. Taken and not answered: it waits
+//!    [`TAKEN_GRACE`] more, then the agent is told Desk may have saved it.
+//!
+//! The calls wait in this hub's memory: a hub run as several instances
+//! hands a call only to a Desk asking the instance the turn is on. A call
+//! handed to a Desk whose ask has just broken off is lost, and the agent is
+//! told as above.
 //!
 //! - `theme.current` reads the theme the person has on, every colour of
 //!   it, and the themes they have.
@@ -25,7 +31,9 @@
 //! (`CURRENT_USER_ID`), and a proposal is made in their conversation only.
 //! Only that person's Desk is handed it or may answer it. The hub reads
 //! nothing of what is asked beyond its size: Desk checks every colour and
-//! name, and writes only theme proposals, only in its themes folder.
+//! name, and writes only theme proposals, only in its themes folder. A turn
+//! run as the person unattended (a schedule, a workflow) may propose too:
+//! nothing is applied, so the person still decides.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, OnceLock};
@@ -45,22 +53,25 @@ use tokio::sync::{oneshot, Notify};
 use uuid::Uuid;
 use workforce_agent::tools::{Tool, ToolResult};
 
-use crate::gateway::GatewayState;
+use crate::gateway::{resolve_caller_context, AuthFailure, GatewayState};
 
 /// The tools, the one that changes nothing first.
 pub const NAMES: [&str; 3] = ["theme.current", "theme.propose", "theme.revise"];
 
-/// How long a call waits for the person's Desk to answer.
+/// How long a call waits for the person's Desk to take it and answer.
 pub const ANSWER_WITHIN: Duration = Duration::from_secs(20);
+/// How much longer a call Desk has taken waits for its answer: Desk may be
+/// saving it.
+pub const TAKEN_GRACE: Duration = Duration::from_secs(10);
 /// The longest Desk's ask for calls is held open.
 const HOLD_MOST: Duration = Duration::from_secs(25);
 /// The most calls waiting for one person's Desk at once.
 const MOST_QUEUED: usize = 8;
 /// The largest call carried: a theme is a few dozen colours.
 const MOST_INPUT: usize = 16 * 1024;
-/// The largest answer taken from Desk: a theme's every colour, and the
-/// names of the person's themes.
-pub const MOST_ANSWER: usize = 256 * 1024;
+/// The largest answer taken from Desk, and handed to the model: a theme's
+/// every colour, and the names of the person's themes.
+pub const MOST_ANSWER: usize = 64 * 1024;
 
 pub const JOBS_PATH: &str = "/api/me/desk-theme-jobs";
 pub const ANSWER_PATH: &str = "/api/me/desk-theme-jobs/{id}";
@@ -92,6 +103,8 @@ pub struct Answer {
 struct Waiting {
     person: String,
     tx: oneshot::Sender<Answer>,
+    /// Handed to the person's Desk.
+    taken: bool,
 }
 
 #[derive(Default)]
@@ -136,21 +149,42 @@ impl Jobs {
                 Waiting {
                     person: person.to_string(),
                     tx,
+                    taken: false,
                 },
             );
         }
+        // However this ends (answered, timed out, or the turn stopped and
+        // this was dropped), the call goes: never done later.
+        let _forget = Forget {
+            jobs: self,
+            person,
+            id,
+        };
         self.queued.notify_waiters();
-        let answer = tokio::time::timeout(within, rx).await;
-        // Never done later: a call not answered in time goes.
-        self.forget(person, id);
+        tokio::pin!(rx);
+        let answer = match tokio::time::timeout(within, &mut rx).await {
+            Ok(a) => Some(a),
+            // Desk took it and may be saving it: a little longer.
+            Err(_) if self.taken(id) => tokio::time::timeout(TAKEN_GRACE, &mut rx).await.ok(),
+            Err(_) => None,
+        };
         match answer {
-            Ok(Ok(answer)) => Ok(answer),
+            Some(Ok(answer)) => Ok(answer),
+            _ if self.taken(id) => Err(
+                "Desk took this but didn't answer in time; it may have saved it. Call theme.current to see \
+                 the person's proposals before trying again."
+                    .into(),
+            ),
             _ => Err(
                 "Desk didn't answer. The person's Desk has to be open and signed in to this hub: \
                  ask them to open it, then try again."
                     .into(),
             ),
         }
+    }
+
+    fn taken(&self, id: Uuid) -> bool {
+        self.inner.lock().waiting.get(&id).is_some_and(|w| w.taken)
     }
 
     fn forget(&self, person: &str, id: Uuid) {
@@ -166,12 +200,18 @@ impl Jobs {
 
     /// `person`'s calls not yet handed to their Desk, handed now.
     pub fn take(&self, person: &str) -> Vec<Job> {
-        self.inner
-            .lock()
+        let mut inner = self.inner.lock();
+        let jobs: Vec<Job> = inner
             .queued
             .remove(person)
             .map(Vec::from)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        for j in &jobs {
+            if let Some(w) = inner.waiting.get_mut(&j.id) {
+                w.taken = true;
+            }
+        }
+        jobs
     }
 
     /// `person`'s calls, waiting `hold` at most for one to come.
@@ -204,6 +244,19 @@ impl Jobs {
             return false;
         };
         w.tx.send(answer).is_ok()
+    }
+}
+
+/// Forgets a call when its ask ends, however it ends.
+struct Forget<'a> {
+    jobs: &'a Jobs,
+    person: &'a str,
+    id: Uuid,
+}
+
+impl Drop for Forget<'_> {
+    fn drop(&mut self) {
+        self.jobs.forget(self.person, self.id);
     }
 }
 
@@ -252,22 +305,28 @@ the other and moves any that read too faintly, and says which it moved. Set any 
 yourself under `colors` (theme.current lists them all, by name). If the person shared an image (a \
 screenshot, a brand palette, a photo), pick the colours from it. It is saved as a proposal: \
 nothing changes until the person keeps it, on the card Desk shows them in this conversation. \
-Tell them in a sentence what you made, and what Desk moved, if anything.";
+Optionally set `density` and `corners`, else the person's own are kept, and `reason`: what they \
+asked for, in their words, shown on the card. Tell them in a sentence what you made, and what Desk \
+moved, if anything.";
 
 const REVISE: &str = "Change a theme proposal, or one of the person's own themes, from what they \
 said about it: give its id (from theme.propose, or theme.current's list) and only what changes. A \
 colour under `colors` set to null goes back to what Desk works out. Desk checks how it reads \
-again, and saves the change as a proposal beside the theme: a theme of theirs is never changed \
-until they keep it. Desk's built-in themes can't be changed: propose a new one from their \
-colours (theme.current) instead.";
+again. Revising a proposal replaces it; revising one of their themes saves the change as a \
+proposal beside it, and their theme is never changed until they keep it. Desk's built-in themes \
+can't be revised (that fails): propose a new one from their colours (theme.current) instead.";
 
 const CURRENT: &str = "The theme the person has on in Desk: its id, name, whether it is dark, its \
 base colours, every colour Desk draws with by name (the terminal's included), and the themes and \
-proposals they have. Start a theme from it, or change one, by name.";
+proposals they have. It takes nothing. Start a theme from it, or change one, by name.";
 
-fn hex() -> Value {
-    json!({ "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" })
+fn hex(what: &str) -> Value {
+    json!({ "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$", "description": what })
 }
+
+const BACKGROUND: &str = "The background, like \"#13201A\"";
+const SIGNAL: &str = "The accent: buttons, the cursor, what is chosen";
+const TEXT: &str = "The text; left out, Desk picks one that reads on the background";
 
 fn colors(nullable: bool) -> Value {
     json!({
@@ -308,9 +367,9 @@ impl Tool for ThemeTool {
                 "properties": {
                     "name": { "type": "string", "maxLength": 48 },
                     "dark": { "type": "boolean", "description": "true for a dark theme, false for a light one" },
-                    "background": hex(),
-                    "signal": hex(),
-                    "text": hex(),
+                    "background": hex(BACKGROUND),
+                    "signal": hex(SIGNAL),
+                    "text": hex(TEXT),
                     "colors": colors(false),
                     "density": shape["density"],
                     "corners": shape["corners"],
@@ -324,9 +383,9 @@ impl Tool for ThemeTool {
                     "theme": { "type": "string", "description": "The proposal's or theme's id" },
                     "name": { "type": "string", "maxLength": 48 },
                     "dark": { "type": "boolean" },
-                    "background": hex(),
-                    "signal": hex(),
-                    "text": { "type": ["string", "null"], "description": "A colour, or null for Desk's own" },
+                    "background": hex(BACKGROUND),
+                    "signal": hex(SIGNAL),
+                    "text": { "type": ["string", "null"], "description": "The text colour, or null for one Desk picks" },
                     "colors": colors(true),
                     "density": shape["density"],
                     "corners": shape["corners"],
@@ -344,17 +403,19 @@ impl Tool for ThemeTool {
     }
 
     fn soft_deadline(&self) -> Option<Duration> {
-        Some(ANSWER_WITHIN + Duration::from_secs(10))
+        Some(ANSWER_WITHIN + TAKEN_GRACE + Duration::from_secs(10))
     }
 
     async fn execute(&self, input: Value) -> eyre::Result<ToolResult> {
         use workforce_agent::runner::{CURRENT_SESSION_ID, CURRENT_USER_ID};
         let started = Instant::now();
         let ms = || started.elapsed().as_millis() as u64;
+        // The person's identity, whose own Desk signs in as them: a turn of
+        // someone known only by a platform's id has no Desk to ask.
         let Some(person) = CURRENT_USER_ID
             .try_with(|u| u.clone())
             .ok()
-            .filter(|u| !u.is_empty())
+            .filter(|u| Uuid::parse_str(u).is_ok())
         else {
             return Ok(ToolResult::failure(
                 "Themes are made for a person, in their conversation with you.",
@@ -409,7 +470,6 @@ pub fn router(state: Arc<GatewayState>) -> Router {
 
 #[derive(Deserialize)]
 struct JobsQuery {
-    token: Option<String>,
     /// How long to hold the ask open for a call, in seconds.
     wait: Option<u64>,
 }
@@ -418,21 +478,56 @@ fn refused(status: StatusCode, e: &str) -> Response {
     (status, Json(json!({ "error": e }))).into_response()
 }
 
-/// The person asking, by their own sign-in or a device paired with them:
-/// never the hub's own token, which is no one's.
-async fn person(
-    state: &GatewayState,
-    headers: &HeaderMap,
-    token: Option<&str>,
-) -> Result<String, Response> {
-    let caller = crate::gateway::resolve_caller_context(state, headers, token).await;
-    if caller.auth_failure.is_some() {
-        return Err(refused(StatusCode::UNAUTHORIZED, "not allowed"));
+/// The person asking, by their own Desk: their own sign-in, or a desktop
+/// device paired with this hub and linked to them; never a phone's or any
+/// other device's token, nor the hub's own. They are active here.
+async fn person(state: &GatewayState, headers: &HeaderMap) -> Result<String, Response> {
+    // The header only: a token in the address would be in access logs.
+    let caller = resolve_caller_context(state, headers, None).await;
+    match caller.auth_failure {
+        Some(AuthFailure::InvalidCredentials) => {
+            return Err(refused(StatusCode::UNAUTHORIZED, "not allowed"))
+        }
+        Some(AuthFailure::StoreError) => {
+            return Err(refused(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the hub could not check that token",
+            ))
+        }
+        None => {}
     }
-    caller
-        .identity_id
-        .filter(|p| !p.is_empty())
-        .ok_or_else(|| refused(StatusCode::UNAUTHORIZED, "Sign in as yourself"))
+    let Some(person) = caller.identity_id else {
+        return Err(refused(
+            StatusCode::UNAUTHORIZED,
+            "A theme call is a person's: ask as yourself, not as the hub",
+        ));
+    };
+    let store = state.identity_store.as_ref();
+    if let Some(device) = caller.device_id.as_deref() {
+        let at_desk = store.is_some_and(|store| {
+            crate::device_link::is_desktop_device(store.as_ref(), device)
+                && crate::device_link::identity_for_device(store.as_ref(), device).as_deref()
+                    == Some(person.as_str())
+        });
+        if !at_desk {
+            return Err(refused(
+                StatusCode::FORBIDDEN,
+                "Only your Desk on a computer takes theme calls: not a phone or other device",
+            ));
+        }
+    }
+    let active = Uuid::parse_str(&person).ok().is_some_and(|id| {
+        store
+            .and_then(|s| s.get_by_id(id).ok().flatten())
+            .is_some_and(|i| i.status == workforce_identity::types::IdentityStatus::Active)
+    });
+    if !active {
+        return Err(refused(
+            StatusCode::FORBIDDEN,
+            "You aren't active on this hub",
+        ));
+    }
+    Ok(person)
 }
 
 async fn jobs_route(
@@ -440,7 +535,7 @@ async fn jobs_route(
     h: HeaderMap,
     Query(q): Query<JobsQuery>,
 ) -> Response {
-    let person = match person(&state, &h, q.token.as_deref()).await {
+    let person = match person(&state, &h).await {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -448,21 +543,22 @@ async fn jobs_route(
     Json(json!({ "jobs": jobs().next(&person, hold).await })).into_response()
 }
 
-#[derive(Deserialize)]
-struct AnswerQuery {
-    token: Option<String>,
-}
-
 async fn answer_route(
     State(state): State<Arc<GatewayState>>,
     h: HeaderMap,
-    Query(q): Query<AnswerQuery>,
-    Path(id): Path<Uuid>,
-    Json(answer): Json<Answer>,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
 ) -> Response {
-    let person = match person(&state, &h, q.token.as_deref()).await {
+    // Who is asking first: nothing of the body is read for anyone else.
+    let person = match person(&state, &h).await {
         Ok(p) => p,
         Err(r) => return r,
+    };
+    let Ok(id) = Uuid::parse_str(&id) else {
+        return refused(StatusCode::NOT_FOUND, "There is no such request.");
+    };
+    let Ok(answer) = serde_json::from_slice::<Answer>(&body) else {
+        return refused(StatusCode::BAD_REQUEST, "An answer is {ok, body}.");
     };
     if jobs().answer(&person, id, answer) {
         StatusCode::NO_CONTENT.into_response()
@@ -553,6 +649,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_call_whose_turn_stopped_is_dropped_never_done_later() {
+        let q = Arc::new(Jobs::default());
+        let asking = tokio::spawn({
+            let q = Arc::clone(&q);
+            async move { q.ask("kim", job("propose"), Duration::from_secs(60)).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        asking.abort();
+        let _ = asking.await;
+        assert!(q.take("kim").is_empty());
+        assert!(q.inner.lock().waiting.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_call_desk_took_waits_a_little_longer_and_says_it_may_be_saved() {
+        let q = Arc::new(Jobs::default());
+        let asking = tokio::spawn({
+            let q = Arc::clone(&q);
+            async move { q.ask("kim", job("propose"), Duration::from_secs(20)).await }
+        });
+        tokio::task::yield_now().await;
+        let handed = q.take("kim");
+        assert_eq!(handed.len(), 1);
+        // Past the first wait, inside the grace: still answered.
+        tokio::time::sleep(Duration::from_secs(25)).await;
+        assert!(q.answer(
+            "kim",
+            handed[0].id,
+            Answer {
+                ok: true,
+                body: json!({ "id": "moss" })
+            }
+        ));
+        assert_eq!(asking.await.unwrap().unwrap().body["id"], "moss");
+        // Taken and never answered: it may have been saved.
+        let asking = tokio::spawn({
+            let q = Arc::clone(&q);
+            async move { q.ask("kim", job("propose"), Duration::from_secs(20)).await }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(q.take("kim").len(), 1);
+        let e = asking.await.unwrap().unwrap_err();
+        assert!(e.contains("may have saved it"), "{e}");
+    }
+
+    #[tokio::test]
     async fn a_desk_waiting_with_nothing_queued_is_answered_empty() {
         let q = Jobs::default();
         assert!(q.next("kim", Duration::from_millis(10)).await.is_empty());
@@ -585,6 +727,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_turn_of_someone_without_an_identity_is_refused_at_once() {
+        use workforce_agent::runner::{CURRENT_SESSION_ID, CURRENT_USER_ID};
+        let tool = ThemeTool::all("atlas")
+            .into_iter()
+            .find(|t| t.name == "theme.current")
+            .unwrap();
+        let r = CURRENT_USER_ID
+            .scope(
+                "slack-U123".into(),
+                CURRENT_SESSION_ID.scope("s1".into(), tool.execute(json!({}))),
+            )
+            .await
+            .unwrap();
+        assert!(!r.success);
+        assert!(jobs().take("slack-U123").is_empty());
+    }
+
+    #[tokio::test]
     async fn a_proposal_outside_a_conversation_is_refused() {
         use workforce_agent::runner::CURRENT_USER_ID;
         let tool = ThemeTool::all("atlas")
@@ -592,17 +752,207 @@ mod tests {
             .find(|t| t.name == "theme.propose")
             .unwrap();
         let r = CURRENT_USER_ID
-            .scope("kim".into(), tool.execute(json!({ "name": "Moss" })))
+            .scope(
+                "6f1c2a3b-4d5e-4f60-8a1b-2c3d4e5f6a7b".into(),
+                tool.execute(json!({ "name": "Moss" })),
+            )
             .await
             .unwrap();
         assert!(!r.success);
-        assert!(jobs().take("kim").is_empty());
+        assert!(jobs()
+            .take("6f1c2a3b-4d5e-4f60-8a1b-2c3d4e5f6a7b")
+            .is_empty());
     }
 
     #[test]
     fn the_tools_change_nothing_on_this_computer() {
         for t in ThemeTool::all("atlas") {
             assert_eq!(t.effect(&json!({})), workforce_core::computer::Effect::None);
+        }
+    }
+
+    mod routes {
+        use super::*;
+        use crate::remote_mcp::testing::{
+            fixture_with_devices, issue, pair_device, pair_device_as, TokenShape,
+        };
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+        use workforce_identity::store::IdentityStore;
+        use workforce_identity::types::{Identity, IdentityRole, IdentityStatus};
+
+        struct Hub {
+            app: Router,
+            state: Arc<GatewayState>,
+            jwt: crate::jwt::JwtConfig,
+            ann: Identity,
+            ann_desk: String,
+            ann_phone: String,
+            ann_mcp: String,
+            bob_desk: String,
+        }
+
+        fn hub() -> Hub {
+            let (fx, devices) = fixture_with_devices(false);
+            let mut ann = Identity::new("Ann", IdentityRole::Member);
+            let mut bob = Identity::new("Bob", IdentityRole::Member);
+            fx.identities.create(&ann).unwrap();
+            fx.identities.create(&bob).unwrap();
+            let (_, ann_desk) = pair_device(&fx, &devices, &mut ann, "Ann's Mac");
+            let (_, ann_phone) = pair_device_as(&fx, &devices, &mut ann, "Ann's phone", "ios");
+            let (_, bob_desk) = pair_device(&fx, &devices, &mut bob, "Bob's Mac");
+            let ann_mcp = issue(&fx, &ann, TokenShape::default());
+            let jwt =
+                crate::jwt::JwtConfig::new("a-test-secret-of-at-least-32-bytes!!".into(), 3600)
+                    .unwrap();
+            let state = Arc::new(GatewayState {
+                jwt_config: Some(jwt.clone()),
+                ..Arc::try_unwrap(fx.state)
+                    .ok()
+                    .expect("the fixture's only handle")
+            });
+            Hub {
+                app: router(Arc::clone(&state)),
+                state,
+                jwt,
+                ann,
+                ann_desk,
+                ann_phone,
+                ann_mcp,
+                bob_desk,
+            }
+        }
+
+        impl Hub {
+            async fn ask(
+                &self,
+                method: &str,
+                uri: &str,
+                bearer: Option<&str>,
+                body: &str,
+            ) -> StatusCode {
+                let mut req = Request::builder().method(method).uri(uri);
+                if let Some(b) = bearer {
+                    req = req.header("authorization", format!("Bearer {b}"));
+                }
+                let req = req
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap();
+                self.app.clone().oneshot(req).await.unwrap().status()
+            }
+
+            fn sign_in(&self, who: &Identity) -> String {
+                crate::jwt::generate_token_with_identity(
+                    &self.jwt,
+                    &who.display_name,
+                    who.role,
+                    Some(who.id.to_string()),
+                )
+                .unwrap()
+            }
+        }
+
+        const ANSWER: &str = r#"{"ok":true,"body":{}}"#;
+
+        #[tokio::test]
+        async fn only_the_persons_own_desk_or_sign_in_takes_and_answers_calls() {
+            let hub = hub();
+            let take = format!("{JOBS_PATH}?wait=0");
+            let answer = format!("{JOBS_PATH}/{}", Uuid::new_v4());
+            let sign_in = hub.sign_in(&hub.ann);
+            for (who, bearer) in [
+                ("Ann's Desk", hub.ann_desk.as_str()),
+                ("Ann's sign-in", sign_in.as_str()),
+            ] {
+                assert_eq!(
+                    hub.ask("GET", &take, Some(bearer), "").await,
+                    StatusCode::OK,
+                    "{who}"
+                );
+                assert_eq!(
+                    hub.ask("POST", &answer, Some(bearer), ANSWER).await,
+                    StatusCode::NOT_FOUND,
+                    "{who}"
+                );
+            }
+            let refused = [
+                ("no one", None),
+                ("the hub's own token", Some(hub.state.auth_token.as_str())),
+                ("Ann's phone", Some(hub.ann_phone.as_str())),
+                ("Ann's remote MCP token", Some(hub.ann_mcp.as_str())),
+                ("an unknown token", Some("wfp_not-a-device")),
+            ];
+            for (who, bearer) in refused {
+                let s = hub.ask("GET", &take, bearer, "").await;
+                assert!(
+                    matches!(s, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN),
+                    "{who} takes: {s}"
+                );
+                // Refused before the body is read: junk is no 400.
+                let s = hub.ask("POST", &answer, bearer, "junk").await;
+                assert!(
+                    matches!(s, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN),
+                    "{who} answers: {s}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn another_persons_call_is_never_theirs_to_take_or_answer() {
+            let hub = hub();
+            let ann = hub.ann.id.to_string();
+            let q = jobs();
+            let asking = tokio::spawn(async move {
+                jobs()
+                    .ask(&ann, job("propose"), Duration::from_secs(5))
+                    .await
+            });
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let id = q.inner.lock().queued.get(&hub.ann.id.to_string()).unwrap()[0].id;
+            let bob = Some(hub.bob_desk.as_str());
+            assert_eq!(
+                hub.ask("POST", &format!("{JOBS_PATH}/{id}"), bob, ANSWER)
+                    .await,
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(
+                hub.ask(
+                    "POST",
+                    &format!("{JOBS_PATH}/{id}"),
+                    Some(hub.ann_desk.as_str()),
+                    ANSWER
+                )
+                .await,
+                StatusCode::NO_CONTENT
+            );
+            assert!(asking.await.unwrap().unwrap().ok);
+        }
+
+        #[tokio::test]
+        async fn someone_suspended_takes_nothing() {
+            let hub = hub();
+            let mut ann = hub.ann.clone();
+            ann.status = IdentityStatus::Suspended;
+            hub.state
+                .identity_store
+                .as_ref()
+                .unwrap()
+                .update(&ann)
+                .unwrap();
+            let s = hub
+                .ask(
+                    "GET",
+                    &format!("{JOBS_PATH}?wait=0"),
+                    Some(hub.ann_desk.as_str()),
+                    "",
+                )
+                .await;
+            assert!(
+                matches!(s, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN),
+                "{s}"
+            );
         }
     }
 }
