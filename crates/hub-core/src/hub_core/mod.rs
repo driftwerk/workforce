@@ -33,6 +33,7 @@ pub mod node_relay;
 pub mod origins;
 pub mod owners;
 pub mod permissions_audit;
+pub mod personal_routes;
 pub mod pipelines;
 pub mod playbooks;
 pub mod pools;

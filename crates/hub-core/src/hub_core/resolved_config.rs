@@ -125,6 +125,11 @@ pub struct ResolvedConfig {
     /// `config.toml` edit takes effect on the next call — hence NOT in
     /// `structural_diff`.
     pub logins: LoginPolicy,
+    /// The agent's own `[llm.personal_routes]` (workspace field over agent
+    /// section), which only narrows the install's switch. Read on each
+    /// route decision, so an opt-out takes effect on the next call — hence
+    /// NOT in `structural_diff`.
+    pub personal_routes: Option<workforce_common::personal_route::AgentPersonalRoutes>,
     /// `[llm.retry]` watchdog windows, resolved per-agent (workspace → agent
     /// section → global). Read by each one-shot subscription completion to
     /// finish under the chain's request cap — hence NOT in `structural_diff`.
@@ -139,6 +144,26 @@ pub struct ResolvedConfig {
     /// settings report names which values it set from what the runtime
     /// loaded, never from a later state of the file.
     pub workspace: Option<AgentWorkspaceConfig>,
+}
+
+/// An agent's `[llm.personal_routes]`, each field of its `config.toml`
+/// over its `workforce.toml` section's.
+fn agent_personal_routes(
+    workspace: Option<&workforce_common::settings::AgentLlmConfig>,
+    section: Option<&workforce_common::settings::AgentLlmConfig>,
+) -> Option<workforce_common::personal_route::AgentPersonalRoutes> {
+    let own = workspace.and_then(|llm| llm.personal_routes.as_ref());
+    let section = section.and_then(|llm| llm.personal_routes.as_ref());
+    (own.is_some() || section.is_some()).then(|| {
+        workforce_common::personal_route::AgentPersonalRoutes {
+            enabled: own
+                .and_then(|o| o.enabled)
+                .or_else(|| section.and_then(|s| s.enabled)),
+            allow: own
+                .and_then(|o| o.allow.clone())
+                .or_else(|| section.and_then(|s| s.allow.clone())),
+        }
+    })
 }
 
 impl ResolvedConfig {
@@ -306,6 +331,7 @@ impl ResolvedConfig {
                 .and_then(AgentWorkspaceConfig::video_frames)
                 .cloned(),
             logins: llm.logins,
+            personal_routes: agent_personal_routes(workspace_llm, agent_llm),
             llm_timeouts,
             tiers,
             environments: crate::hub_core::environments::ResolvedEnvironments::resolve(
@@ -589,6 +615,7 @@ mod tests {
             handoff: None,
             video_frames: None,
             logins: LoginPolicy::default(),
+            personal_routes: None,
             llm_timeouts: LlmTimeouts::default(),
             tiers: TierRegistry::new(None),
             environments: Default::default(),
@@ -640,6 +667,44 @@ mod tests {
                 .map(String::as_str),
             Some("anthropic:powerful")
         );
+    }
+
+    #[test]
+    fn an_agents_personal_routes_merge_field_by_field_and_never_reach_the_install_switch() {
+        use workforce_common::personal_route::{AgentPersonalRoutes, PersonalRouteKind};
+        let global: WorkforceConfig = toml::from_str(
+            "[llm.personal_routes]\nenabled = true\n\
+             [[agents]]\nid = \"quill\"\n\
+             [agents.llm.personal_routes]\nallow = [\"claude-code\"]\n",
+        )
+        .unwrap();
+        assert!(global.llm.personal_routes.enabled);
+        let section = &global.agents[0];
+        let ws: AgentWorkspaceConfig =
+            toml::from_str("[llm.personal_routes]\nenabled = false\n").unwrap();
+        let cfg = ResolvedConfig::resolve(Some(section), Some(&ws), &global, "anthropic", None);
+        assert_eq!(
+            cfg.personal_routes,
+            Some(AgentPersonalRoutes {
+                enabled: Some(false),
+                allow: Some(vec![PersonalRouteKind::ClaudeCode]),
+            })
+        );
+        assert!(
+            !global
+                .llm
+                .personal_routes
+                .for_agent(cfg.personal_routes.as_ref())
+                .enabled,
+            "the agent's own file opts it out"
+        );
+        let merged = crate::serve::merged_effective_llm(Some(section), Some(&ws), &global.llm);
+        assert_eq!(
+            merged.personal_routes, global.llm.personal_routes,
+            "an agent's [llm] never replaces the install's switch"
+        );
+        let none = ResolvedConfig::resolve(None, None, &global, "anthropic", None);
+        assert_eq!(none.personal_routes, None);
     }
 
     fn on_claude_code(llm: workforce_common::settings::AgentLlmConfig) -> ResolvedConfig {

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::hub_core::logins::chatgpt_backend::ChatGptBackend;
 use crate::hub_core::logins::device_login::{DeviceAuthClient, DeviceLogins};
+use crate::hub_core::personal_routes::PersonalRoutes;
 use crate::hub_core::pools::SubscriptionPools;
 use crate::vault::Vault;
 use workforce_agent::llm::provider::ProviderKind;
@@ -846,6 +847,7 @@ pub struct SharedSubscriptions {
     completions_dir: Arc<Path>,
     codex: Arc<CodingCodexConfig>,
     device_logins: DeviceLogins,
+    personal_routes: PersonalRoutes,
 }
 
 impl SharedSubscriptions {
@@ -863,6 +865,7 @@ impl SharedSubscriptions {
                 global_vault.cloned(),
                 DeviceAuthClient::new(reqwest::Client::new()),
             ),
+            personal_routes: PersonalRoutes::new(config.llm.personal_routes.clone()),
         }
     }
 
@@ -881,6 +884,12 @@ impl SharedSubscriptions {
 
     pub fn chatgpt(&self) -> &ChatGptBackend {
         &self.chatgpt
+    }
+
+    /// The hub's `[llm.personal_routes]` switch, live, and where people's
+    /// own route settings are kept.
+    pub fn personal_routes(&self) -> &PersonalRoutes {
+        &self.personal_routes
     }
 
     pub fn pools(&self) -> &SubscriptionPools {

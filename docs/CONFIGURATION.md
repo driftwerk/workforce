@@ -430,6 +430,18 @@ shared_serves = "anyone"                                                # defaul
 
 See `end-user-docs/concepts/subscriptions.mdx`.
 
+**People's own routes (`[llm.personal_routes]`):** whether a person may run everything billable to them on their own subscription instead of the hub's model route. Off by default. Set in `workforce.toml` (read at start) or the config overlay (applied live, no restart).
+
+```toml
+[llm.personal_routes]
+enabled = false
+allow = ["claude-code", "codex", "devin"]   # the kinds people may pick
+```
+
+An agent can only narrow it, in its workspace `config.toml` or under `[agents.llm.personal_routes]`: `enabled = false` opts the agent out (a customer-facing agent, say), and `allow` keeps only the kinds both lists name. An agent can never switch it on when the install leaves it off.
+
+Each person chooses in two places, and the narrower one wins: for every agent (`GET`/`PUT /api/me/llm-route`, `{"route": {"kind": "claude-code", "fallback": "wait"}}`) and for one agent (`GET`/`PUT /api/me/agents/{id}/llm-route`, a route or `"hub"`). `fallback` is `wait` (the call stops and says why) or `hub` (that call runs on the hub's route). A route can only be chosen with a working login of its kind of the person's own; `null` clears a setting. The settings and an audit row for each change are kept in Postgres (`person_settings` schema). Only `claude-code` can be chosen so far.
+
 ### `[subscription]` — Subscription Install Settings
 
 Install-wide, in `workforce.toml`; read at boot.

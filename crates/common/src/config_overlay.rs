@@ -43,6 +43,9 @@ pub const OVERLAYABLE_PREFIXES: &[&str] = &[
     "llm.routing",
     "llm.model_preferences",
     "llm.equivalences",
+    // Whether people may run their work on their own subscriptions, read
+    // live.
+    "llm.personal_routes",
     "mcp.enabled",
     "environments",
     "games",
@@ -461,7 +464,8 @@ mod tests {
         let ok = t("[[agents]]\nid = \"maple\"\nname = \"Maple\"\n\
                     [llm.routing]\nenabled = true\n\
                     [llm.model_preferences]\ncoding = \"opus\"\n\
-                    [llm.equivalences]\nfast = [\"a\", \"b\"]\n");
+                    [llm.equivalences]\nfast = [\"a\", \"b\"]\n\
+                    [llm.personal_routes]\nenabled = true\nallow = [\"claude-code\"]\n");
         assert!(offending_paths(&ok).is_empty());
         let removes: toml::Table = t("agents_remove = [\"old\"]\n");
         assert!(offending_paths(&removes).is_empty());

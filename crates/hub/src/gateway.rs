@@ -1069,6 +1069,8 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route("/api/me/secret", post(crate::api_handlers::my_settings::set_user_secret).delete(crate::api_handlers::my_settings::delete_user_secret))
         .route("/api/me/vault/move", post(crate::api_handlers::my_settings::move_user_vault))
         .route("/api/me/vault/{*path}", post(crate::api_handlers::my_settings::set_user_vault).delete(crate::api_handlers::my_settings::delete_user_vault))
+        .route("/api/me/llm-route", get(crate::api_handlers::llm_route::get_my_route).put(crate::api_handlers::llm_route::put_my_route))
+        .route("/api/me/agents/{id}/llm-route", get(crate::api_handlers::llm_route::get_my_agent_route).put(crate::api_handlers::llm_route::put_my_agent_route))
         .route("/api/me/subscriptions", get(crate::api_handlers::subscriptions::my_subscriptions))
         .route("/api/me/subscriptions/{kind}/login", post(crate::api_handlers::subscriptions::save_login).delete(crate::api_handlers::subscriptions::remove_login))
         .route("/api/me/subscriptions/chatgpt/device", post(crate::api_handlers::subscriptions::start_device_login).get(crate::api_handlers::subscriptions::current_device_login))
