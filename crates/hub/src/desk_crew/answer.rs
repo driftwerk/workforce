@@ -314,8 +314,17 @@ impl CrewHub {
                 () = cancel.cancelled() => return,
                 a = async {
                     let _slot = slot.acquire().await;
-                    // On the picture as it is as the call begins.
-                    crew.on_picture(crew.answer_question(&view, &question, &boss)).await
+                    // On the picture as it is as the call begins, with
+                    // nothing else of the boss's deciding at once: a boss
+                    // busy past the wait looks again later.
+                    crew.mind_within(
+                        &boss,
+                        "answering a session's question",
+                        super::mind::FOCUSED_WAIT,
+                        crew.on_picture(crew.answer_question(&view, &question, &boss)),
+                    )
+                    .await
+                    .unwrap_or(Answered::Later)
                 } => a,
             };
             if let Answered::Later = answered {

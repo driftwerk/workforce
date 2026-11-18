@@ -112,6 +112,8 @@ impl CrewHub {
         // the answer. The person's next connect rolls a stale one.
         let session = service.sessions.get_or_create(channel, owner, agent_id)?;
         let sid = session.id.clone();
+        // Started holding the boss's mind: its tools hold it too.
+        let _under = self.turn_under_mind(agent_id, &sid);
         if hop > 0 {
             self.hops.lock().insert(sid.clone(), hop);
         }
@@ -364,6 +366,7 @@ impl CrewHub {
             listed.insert(new.to_string(), l);
         }
         drop(listed);
+        self.mind_turn_rolled(old, new);
         // What it decides on goes with it.
         self.picture_turn_rolled(old, new);
     }

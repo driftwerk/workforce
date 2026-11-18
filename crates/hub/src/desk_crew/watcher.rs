@@ -863,7 +863,7 @@ impl CrewHub {
         listed: Option<Vec<MentionedApproval>>,
         quiet: bool,
     ) -> Option<String> {
-        let mut record = CheckIn {
+        let record = CheckIn {
             id: crew::new_id(),
             at: crew::now(),
             agent_id: service.agent_id.as_str().to_string(),
@@ -874,6 +874,28 @@ impl CrewHub {
         if let Err(e) = self.desk.store().put_check_in(&record).await {
             tracing::warn!(error = %e, "recording a check-in failed");
         }
+        let id = service.agent_id.as_str().to_string();
+        // Under its mind ([`super::mind`]); the wake loop's check-ins hold
+        // it already.
+        self.with_mind(
+            &id,
+            "a check-in",
+            self.check_in_held(service, owner, prompt, hop, listed, quiet, record),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn check_in_held(
+        &self,
+        service: &Arc<AgentService>,
+        owner: &str,
+        prompt: &str,
+        hop: i16,
+        listed: Option<Vec<MentionedApproval>>,
+        quiet: bool,
+        mut record: CheckIn,
+    ) -> Option<String> {
         let id = service.agent_id.as_str().to_string();
         self.wake_hop.lock().insert(id.clone(), hop);
         let ran = match quiet {
@@ -1198,6 +1220,11 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
             if !due || w.firing.is_some() || w.pending.is_empty() {
                 continue;
             }
+            // Its mind is busy, or the person's own turn runs in its DM:
+            // what it found keeps gathering for its next look.
+            if !crew.mind_free(&id) {
+                continue;
+            }
             if w.held_until.is_some_and(|until| Utc::now() < until) {
                 continue;
             }
@@ -1275,7 +1302,11 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 })
                 .collect();
             w.firing = Some(tokio::spawn(async move {
-                if !crew.wake(service, o, triggers).await && !again.is_empty() {
+                // Its prompt is written once it holds its mind.
+                let woke = crew
+                    .with_mind(&id, "a check-in", crew.wake(service, o, triggers))
+                    .await;
+                if !woke && !again.is_empty() {
                     let _ = retry.send((id, again));
                 }
             }));

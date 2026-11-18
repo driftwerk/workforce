@@ -395,6 +395,29 @@ impl CrewHub {
         messages: Vec<LineMessage>,
         ended: Vec<String>,
     ) {
+        // Its boss decides it with nothing else of its own deciding at
+        // once, its prompt and picture read once it holds its mind
+        // ([`super::mind`]).
+        match self.line_boss(session) {
+            Some(boss) => {
+                self.with_mind(
+                    &boss,
+                    "a session's line",
+                    self.answer_line_now(session, messages, ended),
+                )
+                .await
+            }
+            None => self.answer_line_now(session, messages, ended).await,
+        }
+    }
+
+    /// The boss that answers `session`'s line now, if one does.
+    fn line_boss(&self, session: Uuid) -> Option<String> {
+        self.overseer_of_session(session)
+            .map(|(s, _)| s.agent_id.as_str().to_string())
+    }
+
+    async fn answer_line_now(&self, session: Uuid, messages: Vec<LineMessage>, ended: Vec<String>) {
         // Taken back from its boss, it is the person's: what it tells Desk
         // is kept (its thread, the picture) and no boss's turn is spent on
         // it; what it asks goes to the person.
@@ -801,8 +824,10 @@ impl Gathered {
 
 /// Turns sessions' messages to the overseer, and the turn ends of the
 /// sessions it runs, into its line turns: each session's gathered for
-/// [`GATHER`], one turn at a time per session. It takes sessions on as
-/// they appear, when it is set to.
+/// [`GATHER`], one line turn at a time per boss ([`super::mind`]): while
+/// its mind is held, or the person's own turn runs in its DM, what its
+/// sessions say keeps gathering, and the session that has waited longest
+/// goes first. It takes sessions on as they appear, when it is set to.
 pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     let (_, mut events) = crew.desk.subscribe();
     let mut gathering: HashMap<Uuid, Gathered> = HashMap::new();
@@ -815,7 +840,8 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
             },
         );
     }
-    let mut running: HashMap<Uuid, tokio::task::JoinHandle<()>> = HashMap::new();
+    // Each line turn running, by session, with the boss it is for.
+    let mut running: HashMap<Uuid, (tokio::task::JoinHandle<()>, Option<String>)> = HashMap::new();
     let mut rework = crew.rework.subscribe();
     let mut tick = tokio::time::interval(Duration::from_millis(500));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -902,13 +928,22 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
             let crew = Arc::clone(&crew);
             taking_on = Some(tokio::spawn(async move { crew.take_on_all().await }));
         }
-        running.retain(|_, h| !h.is_finished());
-        let due: Vec<Uuid> = gathering
+        running.retain(|_, (h, _)| !h.is_finished());
+        let mut due: Vec<(Uuid, Instant)> = gathering
             .iter()
             .filter(|(s, g)| g.since.elapsed() >= GATHER && !running.contains_key(s))
-            .map(|(s, _)| *s)
+            .map(|(s, g)| (*s, g.since))
             .collect();
-        for session in due {
+        // The longest waiting first: each boss starts one at a time.
+        due.sort_by_key(|(_, since)| *since);
+        let mut busy: HashSet<String> = running.values().filter_map(|(_, b)| b.clone()).collect();
+        for (session, _) in due {
+            let boss = crew.line_boss(session);
+            if let Some(b) = &boss {
+                if busy.contains(b) || !crew.mind_free(b) {
+                    continue;
+                }
+            }
             let Some(Gathered {
                 messages,
                 mut ended,
@@ -956,15 +991,21 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 }
             }
             ended.extend(asks.iter().map(|(_, line)| line.clone()));
+            if let Some(b) = &boss {
+                busy.insert(b.clone());
+            }
             let crew = Arc::clone(&crew);
             running.insert(
                 session,
-                tokio::spawn(async move {
-                    crew.answer_line(session, messages, ended).await;
-                    // What its turn was given and left open is the
-                    // person's: never given to it again by itself.
-                    crew.left_open(session, &asks).await;
-                }),
+                (
+                    tokio::spawn(async move {
+                        crew.answer_line(session, messages, ended).await;
+                        // What its turn was given and left open is the
+                        // person's: never given to it again by itself.
+                        crew.left_open(session, &asks).await;
+                    }),
+                    boss,
+                ),
             );
         }
     }

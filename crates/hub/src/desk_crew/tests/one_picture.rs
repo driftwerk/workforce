@@ -21,7 +21,8 @@ use super::super::actions::{Action, Target};
 use super::super::picture::stale;
 use super::*;
 
-const ACT: &str = "[oversight]\nenabled = true\nlevel = \"act\"\nact = { nudge = true }\n";
+pub(super) const ACT: &str =
+    "[oversight]\nenabled = true\nlevel = \"act\"\nact = { nudge = true }\n";
 
 fn nudge(to: uuid::Uuid, message: &str) -> Action {
     Action::Nudge {
@@ -42,7 +43,7 @@ async fn in_turn<F: Future>(sid: &str, f: F) -> F::Output {
 /// What the boss's line to `s` carries, oldest first. Desk's own note
 /// when a boss takes it on ("I'm running this session…", noted, never
 /// sent) isn't anything the boss told it.
-async fn told(d: &Desk, s: uuid::Uuid) -> Vec<String> {
+pub(super) async fn told(d: &Desk, s: uuid::Uuid) -> Vec<String> {
     d.line_thread(s, None, None)
         .await
         .unwrap()
@@ -342,7 +343,12 @@ async fn while_the_person_drives_a_session_the_boss_sends_it_nothing_and_resumes
 /// call decides on what it was given as it began, and answers after
 /// `delay`. `body` is the whole response: a tool call (streamed) or a
 /// focused call's text.
-async fn slow_once(llm: &wiremock::MockServer, marker: &str, delay: Duration, answer: Answer) {
+pub(super) async fn slow_once(
+    llm: &wiremock::MockServer,
+    marker: &str,
+    delay: Duration,
+    answer: Answer,
+) {
     use wiremock::matchers::{body_partial_json, body_string_contains, method, path};
     use wiremock::{Mock, ResponseTemplate};
     let chunk = |body: Value| format!("data: {body}\n\n");
@@ -386,13 +392,13 @@ async fn slow_once(llm: &wiremock::MockServer, marker: &str, delay: Duration, an
     m.up_to_n_times(1).with_priority(1).mount(llm).await;
 }
 
-enum Answer {
+pub(super) enum Answer {
     Tool(&'static str, Value),
     Text(&'static str),
 }
 
 /// The bodies of every model request carrying `marker`.
-async fn asked_with(llm: &wiremock::MockServer, marker: &str) -> Vec<String> {
+pub(super) async fn asked_with(llm: &wiremock::MockServer, marker: &str) -> Vec<String> {
     llm.received_requests()
         .await
         .unwrap_or_default()

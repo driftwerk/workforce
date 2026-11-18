@@ -199,6 +199,22 @@ impl CrewHub {
                 "The boss it goes to doesn't oversee it now, so the note wasn't sent.".into(),
             );
         };
+        // What it does on the note it decides with nothing else of its own
+        // deciding at once ([`super::mind`]).
+        let boss = service.agent_id.as_str().to_string();
+        self.with_mind(
+            &boss,
+            "a handover's note",
+            self.deliver_handover_now(h, service),
+        )
+        .await
+    }
+
+    async fn deliver_handover_now(
+        &self,
+        h: &Handover,
+        service: Arc<crate::serve::AgentService>,
+    ) -> Result<(), String> {
         let Some(owner) = self.person(Some(&service)) else {
             return Err("There's no one on Desk to deliver the note for.".into());
         };

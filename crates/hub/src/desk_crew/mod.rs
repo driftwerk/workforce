@@ -46,6 +46,7 @@ mod idle;
 mod items;
 mod line;
 pub(crate) mod machine_grants;
+mod mind;
 mod observe;
 mod own_settings;
 mod picture;
@@ -282,6 +283,9 @@ pub struct CrewHub {
     /// When Desk's native side last asked for calls: while it hasn't
     /// lately, nothing is queued and a machine is said not reached at once.
     relay_polled: Mutex<Option<std::time::Instant>>,
+    /// Each boss's mind: its own deciding, one stretch at a time
+    /// ([`mind`]).
+    minds: mind::Minds,
 }
 
 static CREWS: Mutex<Vec<Weak<CrewHub>>> = Mutex::new(Vec::new());
@@ -697,6 +701,7 @@ impl CrewHub {
             relay_queued: tokio::sync::Notify::new(),
             relay_wait: Mutex::new(Duration::from_secs(30)),
             relay_polled: Mutex::new(None),
+            minds: mind::Minds::default(),
         });
         {
             let mut crews = CREWS.lock();

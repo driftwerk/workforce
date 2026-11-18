@@ -38,6 +38,9 @@ pub(super) struct Track {
     manager_session: Option<String>,
     /// The picture's key for this turn (`super::picture`): ended with it.
     deciding: Option<String>,
+    /// The person's own turn in the boss's DM, counted while it runs: no
+    /// crew turn of the boss's starts meanwhile ([`super::mind`]).
+    _person: Option<super::mind::PersonTurn>,
     /// The room the turn was asked in (or answers to), and the message it
     /// answers, stamped on each of its events.
     place: Option<Place>,
@@ -93,7 +96,10 @@ impl CrewHub {
             // The reply is running before anything waiting on the person
             // looks again, so nothing posts into the middle of it.
             self.manager_turns.lock().insert(sid.clone(), crew::now());
-            if !message.starts_with(CHECK_IN) && !self.relayed_turns.lock().contains(&sid) {
+            let theirs =
+                !message.starts_with(CHECK_IN) && !self.relayed_turns.lock().contains(&sid);
+            let person = theirs.then(|| self.person_turn_began(&agent_id));
+            if theirs {
                 // Sent: no longer typing it, and here.
                 self.dm_sent(&agent_id);
                 // Messages queued into one turn are all its asks.
@@ -112,6 +118,7 @@ impl CrewHub {
                 hop,
                 manager_session: Some(sid),
                 deciding,
+                _person: person,
                 place,
                 message: asked,
                 done: false,
@@ -155,6 +162,7 @@ impl CrewHub {
             hop,
             manager_session: None,
             deciding,
+            _person: None,
             place,
             message: asked,
             done: false,
