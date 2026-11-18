@@ -4533,6 +4533,61 @@ async fn the_overseer_starts_real_sessions_it_runs_up_to_its_limit() {
     .await;
 }
 
+/// A session the boss starts runs on the person's default engine and model
+/// (`[oversight.work]`), unless the person asked for another model.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_the_boss_starts_runs_the_persons_default_engine_and_model() {
+    use super::actions::Action;
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _llm) = agent(dir.path(), "desk", "ok").await;
+        write_config(
+            &overseer,
+            "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = true\n[oversight.work]\nengine = \"claude\"\nmodel = \"opus\"\nparallel = 12\n",
+        );
+        let state = hub(std::slice::from_ref(&overseer));
+        let d = desk_running(
+            pool,
+            dir.path(),
+            Default::default(),
+            installed_cli(dir.path()),
+            not_installed(dir.path()),
+        )
+        .await;
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("Desk to read its engines", async || {
+            let e = d.engines();
+            e.iter()
+                .any(|v| v.engine == Engine::Claude && v.installed == Some(true))
+                .then_some(())
+        })
+        .await;
+        let start = |name: &str, model: Option<&str>| {
+            let mut i = json!({"folder": dir.path().to_string_lossy(), "goal": "Fix the flaky test", "name": name, "new": true});
+            if let Some(m) = model {
+                i["model"] = json!(m);
+            }
+            Action::parse("crew.start_session", &i).unwrap()
+        };
+        let started = |name: &str| d.list().into_iter().find(|v| v.name == name).unwrap();
+
+        // Nothing said: the person's default engine and model.
+        let by = crew.by_overseer("Fix it").unwrap();
+        crew.perform(&start("plain", None), by).await.unwrap();
+        let plain = started("plain");
+        assert_eq!(plain.engine, Engine::Claude);
+        assert_eq!(plain.model.as_deref(), Some("opus"));
+
+        // The person asked for another model: that one.
+        let by = crew.by_overseer("Sam asked for Sonnet").unwrap();
+        crew.perform(&start("asked", Some("sonnet")), by)
+            .await
+            .unwrap();
+        assert_eq!(started("asked").model.as_deref(), Some("sonnet"));
+    })
+    .await;
+}
+
 /// An agent with no name of its own is never shown by its id: an overseer
 /// is "Boss", any other "Agent".
 #[tokio::test]

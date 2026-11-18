@@ -946,6 +946,7 @@ async fn a_plan_at_its_warning_stops_starting_until_the_person_says_continue_and
             to: super::super::actions::Handout::NewSession {
                 folder: dir.path().to_string_lossy().into_owned(),
                 engine: Some(Engine::Claude),
+                model: None,
             },
             planned: true,
         };

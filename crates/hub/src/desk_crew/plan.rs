@@ -213,10 +213,10 @@ fn ticket_schema() -> Value {
         "key": { "type": "string", "description": "A ticket of the plan's, by its key, like ACM-12 (crew.plan_update)" },
         "title": { "type": "string" },
         "body": { "type": "string", "description": "What the session is to do: its first prompt reads it" },
-        "engine": { "type": "string", "description": "claude or codex; your default engine when not said" },
+        "engine": { "type": "string", "description": "claude or codex, only when the person named one for it; the person's default engine when not said, so omit it otherwise" },
         "folder": { "type": "string", "description": "Absolute path of the project folder it works in, on the computer it runs on: on a machine, that machine's own path (as crew.overview shows its sessions' folders)" },
         "machine": machine_schema("Where this ticket runs"),
-        "model": { "type": "string", "description": "The model its session runs, as its engine names it (opus, sonnet, gpt-5.5); the plan's model, else the engine's own, when not said. \"\" is the engine's own" },
+        "model": { "type": "string", "description": "The model its session runs, as its engine names it (opus, sonnet, gpt-5.5); only when the person named one; the plan's model, else the person's default model on their default engine, else the engine's own, when not said. \"\" is the engine's own" },
         "view": { "type": "string", "enum": ["terminal"] },
         "needs": { "type": "array", "items": { "type": "integer", "minimum": 0 },
             "description": "The places (from 0) in this list of the tickets it needs done first" }
@@ -394,6 +394,29 @@ fn fill_where(
         }
         if t.model.is_none() {
             t.model = model.map(str::to_string);
+        }
+    }
+}
+
+/// Each ticket of `tickets` that says no model and runs on the person's
+/// default engine (`[oversight.work] engine`, said or not) runs its default
+/// model too: every one, or (`only_new`) those the plan doesn't have yet.
+fn fill_model(
+    tickets: &mut [DraftTicket],
+    work: &workforce_common::oversight::Work,
+    only_new: bool,
+) {
+    let Some(model) = work.model.as_deref() else {
+        return;
+    };
+    let default = Engine::parse(work.engine.trim()).ok();
+    for t in tickets.iter_mut().filter(|t| !only_new || t.id.is_none()) {
+        let on_default = t
+            .engine
+            .as_deref()
+            .is_none_or(|e| Engine::parse(e.trim()).ok() == default);
+        if t.model.is_none() && on_default {
+            t.model = Some(model.to_string());
         }
     }
 }
@@ -652,6 +675,7 @@ impl CrewHub {
             str_of(input, "model"),
             false,
         );
+        fill_model(&mut tickets, &o.work, false);
         let new = NewPlan {
             draft: Draft {
                 goal: goal.to_string(),
@@ -757,6 +781,7 @@ impl CrewHub {
                 );
                 let group = self.group_machine(detail.summary.plan.group.as_deref());
                 fill_where(&mut t, group.as_deref(), None, true);
+                fill_model(&mut t, &o.work, true);
                 Some(t)
             }
             None => None,
@@ -1420,6 +1445,8 @@ impl CrewHub {
                 to: Handout::NewSession {
                     folder: s.folder.clone(),
                     engine: Some(s.engine),
+                    // The ticket's own, once the hand-out reads its plan.
+                    model: None,
                 },
                 planned: true,
             };
@@ -1866,6 +1893,43 @@ pub(super) async fn plan_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_ticket_on_the_persons_default_engine_runs_their_default_model() {
+        let ticket = |engine: Option<&str>, model: Option<&str>| DraftTicket {
+            id: None,
+            title: "t".into(),
+            body: String::new(),
+            engine: engine.map(str::to_string),
+            folder: "/work".into(),
+            view: None,
+            needs: vec![],
+            machine: None,
+            model: model.map(str::to_string),
+        };
+        let mut work = workforce_common::oversight::Oversight::default().work;
+        work.engine = "codex".into();
+        work.model = Some("gpt-6.1-sol".into());
+        let mut tickets = vec![
+            ticket(None, None),
+            ticket(Some("codex"), None),
+            ticket(Some("claude"), None),
+            ticket(None, Some("")),
+            ticket(None, Some("gpt-6-sol")),
+        ];
+        fill_model(&mut tickets, &work, false);
+        let models: Vec<_> = tickets.iter().map(|t| t.model.as_deref()).collect();
+        assert_eq!(
+            models,
+            [
+                Some("gpt-6.1-sol"),
+                Some("gpt-6.1-sol"),
+                None,
+                Some(""),
+                Some("gpt-6-sol")
+            ]
+        );
+    }
 
     #[test]
     fn failures_count_on_until_where_it_runs_or_the_plans_scope_changes() {

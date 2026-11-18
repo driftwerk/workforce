@@ -1102,6 +1102,7 @@ impl CrewHub {
             goal,
             name,
             engine,
+            model,
             view,
             worktree,
             ..
@@ -1163,7 +1164,9 @@ impl CrewHub {
                     approvals: None,
                     approve_for_me: false,
                     fast: false,
-                    model: None,
+                    // Only what the person asked for: a served boss's
+                    // default is its engine's own.
+                    model: model.clone(),
                     account: None,
                     env: Default::default(),
                     group: (g.group != workforce_desk::UNGROUPED).then(|| g.group.clone()),

@@ -1118,13 +1118,16 @@ async fn stream_pty(socket: WebSocket, pty: Arc<crate::pty::Pty>, kind: &'static
 /// it comes from), `keep-tickets` (a board with tickets of its own links
 /// keeping them), `session-model` (a new session runs the model it is
 /// given, and says it), `ticket-start-on` (a ticket's new session takes a
-/// model, and a ticket is given to a session started on a machine).
+/// model, and a ticket is given to a session started on a machine),
+/// `boss-session-model` (`[oversight.work] model`: the sessions a boss
+/// starts run the person's default model as well as their default engine).
 pub const FEATURES: &[&str] = &[
     "fresh-worktree",
     "folder-remotes",
     "keep-tickets",
     "session-model",
     "ticket-start-on",
+    "boss-session-model",
 ];
 
 async fn features(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
