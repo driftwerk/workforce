@@ -43,6 +43,7 @@ pub const READ_TOOLS: &[&str] = &[
     "jira.search_users",
     "jira.myself",
     "jira.list_boards",
+    "jira.board_order",
     "jira.list_sprints",
 ];
 
@@ -170,6 +171,7 @@ impl JiraSkill {
             Arc::new(tools::JiraDevStatusTool::with_instances(i(), p())),
             Arc::new(tools::JiraListRemoteLinksTool::with_instances(i(), p())),
             Arc::new(tools::JiraListBoardsTool::with_instances(i(), p())),
+            Arc::new(tools::JiraBoardOrderTool::with_instances(i(), p())),
             Arc::new(tools::JiraListSprintsTool::with_instances(i(), p())),
             Arc::new(tools::JiraAddWorklogTool::with_instances(i(), p())),
             Arc::new(tools::JiraApiTool::with_instances(i(), p())),
@@ -201,6 +203,7 @@ impl JiraSkill {
             "jira.dev_status",
             "jira.list_remote_links",
             "jira.list_boards",
+            "jira.board_order",
             "jira.list_sprints",
             "jira.add_worklog",
             "jira.api",
@@ -510,6 +513,19 @@ impl JiraSkill {
                     }),
                 ),
                 mk_tool(
+                    "jira.board_order",
+                    "How a Jira project's board orders its issues: its filter's ORDER BY and its Rank field. Read-only",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "workspace": { "type": "string" },
+                            "project_key": { "type": "string" },
+                            "board_id": { "type": "integer" }
+                        },
+                        "required": ["project_key"]
+                    }),
+                ),
+                mk_tool(
                     "jira.list_sprints",
                     "List sprints on a Jira board",
                     serde_json::json!({
@@ -579,6 +595,7 @@ impl JiraSkill {
                 allow("jira.dev_status"),
                 allow("jira.list_remote_links"),
                 allow("jira.list_boards"),
+                allow("jira.board_order"),
                 allow("jira.list_sprints"),
                 allow("jira.add_worklog"),
                 allow("jira.api"),

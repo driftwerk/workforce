@@ -490,6 +490,7 @@ fn list_query(params: &str, limit: u64, page: &str, filter_clause: &str, rich: b
                     priority
                     priorityLabel
                     sortOrder
+                    prioritySortOrder
                     state {{
                         id
                         name
@@ -640,6 +641,7 @@ impl Tool for LinearIssueGetTool {
                     priority
                     priorityLabel
                     sortOrder
+                    prioritySortOrder
                     state {
                         id
                         name
@@ -2490,6 +2492,186 @@ impl Tool for LinearViewerTool {
                     start.elapsed().as_millis() as u64,
                 ))
             }
+        }
+    }
+}
+
+// ── linear.view_ordering ───────────────────────────────────────────────
+
+/// How a Linear view orders its issues: the display settings Linear lets a
+/// key read for it. A custom view says its own (the workspace's default,
+/// your own, and what applies to you); a team's or project's view says
+/// only your own settings for that kind of view, not scoped to the team or
+/// project, which is all Linear's API reads.
+pub struct LinearViewOrderingTool {
+    clients: Arc<LiveInstances<LinearClient>>,
+    default_workspace: String,
+    prefix_map: Arc<HashMap<String, String>>,
+}
+
+impl LinearViewOrderingTool {
+    pub fn new(
+        clients: Arc<LiveInstances<LinearClient>>,
+        default_workspace: String,
+        prefix_map: Arc<HashMap<String, String>>,
+    ) -> Self {
+        Self {
+            clients,
+            default_workspace,
+            prefix_map,
+        }
+    }
+}
+
+/// The view types a team's or project's issues show in, as Linear's
+/// `ViewType` names them: the only ones asked for.
+const ORDERING_VIEW_TYPES: &[&str] = &[
+    "allIssues",
+    "activeIssues",
+    "backlog",
+    "board",
+    "cycle",
+    "myIssues",
+    "project",
+    "label",
+    "triage",
+];
+
+/// A view's ordering as its display settings say it: absent ones null.
+fn ordering_of(p: &Value) -> Value {
+    let say = |k: &str| match &p[k] {
+        Value::String(s) if !s.is_empty() && s.len() <= 60 => Value::String(s.clone()),
+        _ => Value::Null,
+    };
+    serde_json::json!({
+        "ordering": say("viewOrdering"),
+        "direction": say("viewOrderingDirection"),
+        "layout": say("layout"),
+    })
+}
+
+/// A stored preferences record's ordering; null when there is none.
+fn stored_ordering(v: &Value) -> Value {
+    match v.get("preferences") {
+        Some(p) if p.is_object() => ordering_of(p),
+        _ => Value::Null,
+    }
+}
+
+#[async_trait]
+impl Tool for LinearViewOrderingTool {
+    fn name(&self) -> &str {
+        "linear.view_ordering"
+    }
+
+    fn description(&self) -> &str {
+        "How a Linear view orders its issues (manual, priority, dateCreated, dateUpdated, dueDate …) and in which direction: a custom view's workspace default, your own setting and the one in force for you; for a team's or project's view (view_type), your own setting for that kind of view, which is all Linear lets a key read. Read-only."
+    }
+
+    fn input_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "workspace": {
+                    "type": "string",
+                    "description": workspace_description(&self.clients, &self.default_workspace)
+                },
+                "custom_view_id": {
+                    "type": "string",
+                    "description": "A custom view's id or slug"
+                },
+                "view_type": {
+                    "type": "string",
+                    "enum": ORDERING_VIEW_TYPES,
+                    "description": "The kind of team or project view, without custom_view_id. Default allIssues"
+                }
+            },
+            "required": []
+        })
+    }
+
+    async fn execute(&self, input: Value) -> Result<ToolResult> {
+        let start = std::time::Instant::now();
+        let ms = || start.elapsed().as_millis() as u64;
+        let client = match resolve_client(
+            &self.clients,
+            &self.default_workspace,
+            &self.prefix_map,
+            &input,
+        ) {
+            Ok(c) => c,
+            Err(e) => return Ok(ToolResult::failure(format!("{e}"), ms())),
+        };
+        // A shared key's own settings are whoever owns the key's.
+        let personal = client.key_is_personal();
+        const PREFS: &str = "preferences { viewOrdering viewOrderingDirection layout }";
+        if let Some(view) = input["custom_view_id"].as_str().filter(|v| !v.is_empty()) {
+            if view.len() > 64 || !view.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+                return Ok(ToolResult::failure("Not a Linear view id", ms()));
+            }
+            let query = format!(
+                "query($id: String!) {{ customView(id: $id) {{ id name \
+                 organizationViewPreferences {{ {PREFS} }} \
+                 userViewPreferences {{ {PREFS} }} \
+                 viewPreferencesValues {{ viewOrdering viewOrderingDirection layout }} }} }}"
+            );
+            return match client
+                .query(&query, serde_json::json!({ "id": view }))
+                .await
+            {
+                Ok(data) => {
+                    let v = &data["customView"];
+                    let effective = match &v["viewPreferencesValues"] {
+                        p if p.is_object() => ordering_of(p),
+                        _ => Value::Null,
+                    };
+                    Ok(ToolResult::success(
+                        serde_json::json!({
+                            "custom_view": { "id": v["id"], "name": v["name"] },
+                            "organization": stored_ordering(&v["organizationViewPreferences"]),
+                            "user": stored_ordering(&v["userViewPreferences"]),
+                            "effective": effective,
+                            "personal": personal,
+                        }),
+                        ms(),
+                    ))
+                }
+                Err(e) => Ok(ToolResult::from_report(
+                    &e.wrap_err("Failed to read the Linear view's ordering"),
+                    ms(),
+                )),
+            };
+        }
+        let view_type = input["view_type"].as_str().unwrap_or("allIssues");
+        if !ORDERING_VIEW_TYPES.contains(&view_type) {
+            return Ok(ToolResult::failure(
+                format!("view_type is one of {}", ORDERING_VIEW_TYPES.join(", ")),
+                ms(),
+            ));
+        }
+        let query = format!(
+            "query($viewType: ViewType!) {{ userViewPreferences(viewType: $viewType) {{ {PREFS} }} }}"
+        );
+        match client
+            .query(&query, serde_json::json!({ "viewType": view_type }))
+            .await
+        {
+            Ok(data) => Ok(ToolResult::success(
+                serde_json::json!({
+                    "view_type": view_type,
+                    "user": stored_ordering(&data["userViewPreferences"]),
+                    // Linear's API doesn't read a team's or project's own
+                    // settings, nor the workspace's for them.
+                    "organization": null,
+                    "effective": null,
+                    "personal": personal,
+                }),
+                ms(),
+            )),
+            Err(e) => Ok(ToolResult::from_report(
+                &e.wrap_err("Failed to read the Linear view's ordering"),
+                ms(),
+            )),
         }
     }
 }
@@ -4945,6 +5127,72 @@ mod tests {
             .await
             .unwrap();
         assert!(!unnamed.success, "never without its issue");
+    }
+
+    /// A custom view says its workspace default, your own and the one in
+    /// force; a team's view only your own for its kind, and nothing goes
+    /// into the query but a view id or a known view type.
+    #[tokio::test]
+    async fn view_ordering_reads_what_linear_lets_a_key_read() {
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("customView(id: $id)"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "customView": {
+                    "id": "v1", "name": "Mantis backlog",
+                    "organizationViewPreferences": { "preferences": { "viewOrdering": "priority", "layout": "list" } },
+                    "userViewPreferences": null,
+                    "viewPreferencesValues": { "viewOrdering": "priority", "viewOrderingDirection": null, "layout": "list" }
+                } }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("userViewPreferences(viewType: $viewType)"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "userViewPreferences": { "preferences": {
+                    "viewOrdering": "dateCreated", "viewOrderingDirection": "desc", "layout": "board"
+                } } }
+            })))
+            .mount(&server)
+            .await;
+        let clients: HashMap<String, Arc<LinearClient>> = [(
+            "main".to_string(),
+            Arc::new(LinearClient::new("key", &server.uri()).unwrap()),
+        )]
+        .into();
+        let tool = LinearViewOrderingTool::new(
+            Arc::new(LiveInstances::from(clients)),
+            "main".into(),
+            Arc::default(),
+        );
+        let r = tool
+            .execute(serde_json::json!({ "custom_view_id": "v1" }))
+            .await
+            .unwrap();
+        assert!(r.success, "{:?}", r.error);
+        assert_eq!(r.output["custom_view"]["name"], "Mantis backlog");
+        assert_eq!(r.output["organization"]["ordering"], "priority");
+        assert!(r.output["user"].is_null());
+        assert_eq!(r.output["effective"]["ordering"], "priority");
+        let r = tool
+            .execute(serde_json::json!({ "view_type": "backlog" }))
+            .await
+            .unwrap();
+        assert!(r.success, "{:?}", r.error);
+        assert_eq!(r.output["view_type"], "backlog");
+        assert_eq!(r.output["user"]["ordering"], "dateCreated");
+        assert_eq!(r.output["user"]["direction"], "desc");
+        assert!(r.output["organization"].is_null());
+        for bad in [
+            serde_json::json!({ "view_type": "allIssues) { x }" }),
+            serde_json::json!({ "custom_view_id": "v1\") { x }" }),
+        ] {
+            let r = tool.execute(bad.clone()).await.unwrap();
+            assert!(!r.success, "{bad}");
+        }
     }
 
     /// Linear's key goes only to Linear's own uploads: any other address is

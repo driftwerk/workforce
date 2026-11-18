@@ -43,6 +43,7 @@ pub const READ_TOOLS: &[&str] = &[
     "linear.labels_list",
     "linear.members_list",
     "linear.viewer",
+    "linear.view_ordering",
     "linear.upload_read",
     "linear.document_get",
     "linear.document_list",
@@ -287,6 +288,11 @@ impl LinearSkill {
                 self.default_workspace.clone(),
                 Arc::clone(pm),
             )),
+            Arc::new(tools::LinearViewOrderingTool::new(
+                Arc::clone(&self.clients),
+                self.default_workspace.clone(),
+                Arc::clone(pm),
+            )),
             Arc::new(tools::LinearUploadReadTool::new(
                 Arc::clone(&self.clients),
                 self.default_workspace.clone(),
@@ -347,6 +353,7 @@ impl LinearSkill {
             "linear.labels_list",
             "linear.members_list",
             "linear.viewer",
+            "linear.view_ordering",
             "linear.upload_read",
             "linear.document_get",
             "linear.document_list",
@@ -618,6 +625,19 @@ impl LinearSkill {
                     }),
                 },
                 SkillTool {
+                    name: "linear.view_ordering".to_string(),
+                    description: "How a Linear view orders its issues: a custom view's, or your own setting for a kind of team view. Read-only"
+                        .to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "custom_view_id": { "type": "string" },
+                            "view_type": { "type": "string" },
+                            "workspace": { "type": "string" }
+                        }
+                    }),
+                },
+                SkillTool {
                     name: "linear.upload_read".to_string(),
                     description:
                         "Desk's board sync reads a file uploaded to Linear, a base64 chunk at a time"
@@ -795,6 +815,10 @@ impl LinearSkill {
                 },
                 SkillPolicy {
                     tool: "linear.viewer".to_string(),
+                    action: "allow".to_string(),
+                },
+                SkillPolicy {
+                    tool: "linear.view_ordering".to_string(),
                     action: "allow".to_string(),
                 },
                 SkillPolicy {
