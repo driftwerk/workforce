@@ -778,7 +778,7 @@ async fn a_handed_message_that_comes_back_after_a_release_is_withdrawn() {
             .unwrap();
         let back =
             d.0.store
-                .line_requeue(None, Utc::now() + chrono::Duration::seconds(1))
+                .line_requeue(None, Some(Utc::now() + chrono::Duration::seconds(1)))
                 .await
                 .unwrap();
         assert_eq!(back.len(), 1);

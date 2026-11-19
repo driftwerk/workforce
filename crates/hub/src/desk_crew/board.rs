@@ -69,11 +69,23 @@ fn column(v: &TicketView) -> Option<Column> {
     }
 }
 
-/// Who has a ticket, with the id the overseer addresses them by.
-fn holder(v: &TicketView) -> String {
+/// What a ticket in Doing whose session no longer runs says it has: never
+/// "in progress" (VEL-1, 19 Nov).
+pub(crate) const NO_SESSION: &str = "in Doing, no session";
+
+/// Who has a ticket, with the id the overseer addresses them by. A session
+/// that `live` says no longer runs doesn't have it: a ticket in Doing says
+/// it has no session.
+fn holder(v: &TicketView, live: &dyn Fn(&str) -> bool) -> String {
     match &v.ticket.assignee {
         None => String::new(),
         Some(a) => match a.kind {
+            PartyKind::Session if !live(&a.id) && v.ticket.state == TicketState::Doing => {
+                format!("{NO_SESSION} ({} was session {})", a.name, a.id)
+            }
+            PartyKind::Session if !live(&a.id) => {
+                format!("{} (session {}, no longer running)", a.name, a.id)
+            }
             PartyKind::Session => format!("{} (session {})", a.name, a.id),
             PartyKind::Agent => format!("{} (agent {})", a.name, a.id),
             _ => a.name.clone(),
@@ -86,7 +98,11 @@ fn holder(v: &TicketView) -> String {
 /// What a ticket waits on that another scope holds now reads as.
 const ELSEWHERE: &str = "a ticket now in another group";
 
-fn table(views: &[&TicketView], waits: &HashMap<Uuid, String>) -> String {
+fn table(
+    views: &[&TicketView],
+    waits: &HashMap<Uuid, String>,
+    live: &dyn Fn(&str) -> bool,
+) -> String {
     let mut rows: Vec<(Column, &TicketView)> = views
         .iter()
         .filter_map(|v| column(v).map(|c| (c, *v)))
@@ -112,7 +128,7 @@ fn table(views: &[&TicketView], waits: &HashMap<Uuid, String>) -> String {
             v.key.as_deref().unwrap_or("-"),
             cell(&v.ticket.said_title()),
             c.word(),
-            cell(&holder(v)),
+            cell(&holder(v, live)),
             cell(&waiting),
         ));
     }
@@ -146,6 +162,20 @@ impl CrewHub {
                 Ok(json!({ "plan": super::plan::plan_out_with(&p, &briefs) }))
             }
             _ => Err(self.not_ours(&b.oversight.scope)),
+        }
+    }
+
+    /// Whether session `id` (as a ticket's assignee names it) runs here
+    /// now: live and not closed. A session on a machine isn't seen here:
+    /// it is taken to run.
+    pub(crate) fn session_runs(&self, id: &str) -> bool {
+        let Ok(id) = id.parse::<Uuid>() else {
+            return true;
+        };
+        match self.desk.view(id) {
+            Ok(v) => v.live && v.state != workforce_desk::model::SessionState::Closed,
+            Err(workforce_desk::DeskError::NotFound) => false,
+            Err(_) => true,
         }
     }
 
@@ -206,7 +236,7 @@ impl CrewHub {
             out.push_str(&format!(
                 "Board “{}”:\n{}\n",
                 cell(&name),
-                table(&on, &waits)
+                table(&on, &waits, &|id| self.session_runs(id))
             ));
         }
         if out.is_empty() {
@@ -323,6 +353,7 @@ impl CrewHub {
                 hop: 0,
                 about: None,
                 group: b.group.clone(),
+                handed: None,
             }));
         }
         out

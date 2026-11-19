@@ -12,7 +12,7 @@ use crate::store::DeskStore;
 /// How long a row is kept in Postgres at all.
 const KEPT_IN_STORE: chrono::TimeDelta = chrono::TimeDelta::days(30);
 
-const COLUMNS: &str = "seq, at, what, boss, session, sessions, text, turn";
+const COLUMNS: &str = "seq, at, what, boss, session, sessions, text, turn, message";
 
 fn happened(r: &Row) -> Result<Happened> {
     let what: String = r.try_get(2)?;
@@ -26,6 +26,7 @@ fn happened(r: &Row) -> Result<Happened> {
         sessions: r.try_get(5)?,
         text: r.try_get(6)?,
         turn: r.try_get(7)?,
+        message: r.try_get(8)?,
     })
 }
 
@@ -36,7 +37,7 @@ impl DeskStore {
         client
             .execute(
                 &format!(
-                    "INSERT INTO picture_events ({COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                    "INSERT INTO picture_events ({COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
                      ON CONFLICT (seq) DO NOTHING"
                 ),
                 &[
@@ -48,6 +49,7 @@ impl DeskStore {
                     &h.sessions,
                     &h.text,
                     &h.turn,
+                    &h.message,
                 ],
             )
             .await?;
@@ -123,6 +125,7 @@ mod tests {
                 sessions: vec![],
                 text: "an old word".into(),
                 turn: None,
+                message: None,
             };
             for h in [&a, &b, &old, &a] {
                 store.picture_put(h).await.unwrap();

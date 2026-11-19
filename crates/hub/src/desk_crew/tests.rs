@@ -1864,6 +1864,7 @@ mod groups;
 
 mod handovers;
 
+mod plan_watch;
 mod plans;
 
 mod act_fully;
@@ -1891,10 +1892,13 @@ mod one_picture;
 mod preferences;
 mod promises;
 mod repeats;
+mod silent_waits;
 mod updates;
 mod urgent;
 
 mod away;
+
+mod boss_waits;
 
 mod remote_asks;
 mod remote_decide;

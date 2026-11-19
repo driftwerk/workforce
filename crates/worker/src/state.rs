@@ -35,9 +35,38 @@ pub struct Scope {
     /// Whether the scope mounts the dataset durable jobs write to.
     #[serde(default)]
     pub jobs: bool,
+    /// Whether the scope gives way, once idle, to a prepare that finds the
+    /// worker full: an agent turn's workspace, whose keyed home outlives it.
+    #[serde(default)]
+    pub yields_when_idle: bool,
+    /// Who the scope is for, when its prepare queued: what the worker's
+    /// fair share counts.
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 impl Scope {
+    /// What is left of a scope whose build failed and whose container or
+    /// work could not be taken down: enough to take them down later.
+    pub fn unbuilt(id: ScopeId, container: ContainerId, dataset: Dataset) -> Self {
+        let now = Utc::now();
+        Self {
+            id,
+            container,
+            dataset,
+            repos: BTreeMap::new(),
+            setup: Vec::new(),
+            created_at: now,
+            last_seen: now,
+            ttl_secs: 0,
+            home: None,
+            bench: false,
+            jobs: false,
+            yields_when_idle: false,
+            owner: None,
+        }
+    }
+
     pub fn expired_at(&self, now: DateTime<Utc>) -> bool {
         expired(self.last_seen, self.ttl_secs, now)
     }
@@ -244,7 +273,7 @@ fn read_json<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
     }
 }
 
-fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     create_parent(path)?;
     let mut temp =
         tempfile::NamedTempFile::new_in(path.parent().unwrap_or_else(|| Path::new(".")))?;
@@ -280,6 +309,8 @@ mod tests {
             home: None,
             bench: false,
             jobs: true,
+            yields_when_idle: false,
+            owner: None,
         }
     }
 

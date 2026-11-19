@@ -392,6 +392,18 @@ impl DeskStore {
         rows.iter().map(|r| Ok(r.try_get(0)?)).collect()
     }
 
+    /// Whether `boss` ever had an item keyed `key`, closed or not.
+    pub async fn item_ever_keyed(&self, boss: &str, key: &str) -> Result<bool> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .query_opt(
+                "SELECT 1 FROM boss_open_items WHERE boss = $1 AND dedupe_key = $2 LIMIT 1",
+                &[&boss, &key],
+            )
+            .await?
+            .is_some())
+    }
+
     /// The item not closed for the session question `message`, if one.
     pub async fn item_of_line(&self, message: Uuid) -> Result<Option<OpenItem>> {
         let client = self.pool().get().await?;
