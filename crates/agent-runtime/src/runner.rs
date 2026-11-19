@@ -950,7 +950,9 @@ impl SessionContext {
             }
         };
         let inner = with_desk(desk, inner);
-        let inner = workforce_common::work_use::within_opt(work, inner);
+        // Boxed, as the layers above: each nests the whole future once more.
+        let inner: std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + '_>> =
+            Box::pin(workforce_common::work_use::within_opt(work, inner));
         let inner = async {
             match last_user_comm {
                 Some(clock) => LAST_USER_COMM.scope(clock, inner).await,

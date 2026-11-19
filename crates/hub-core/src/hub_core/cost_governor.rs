@@ -712,7 +712,9 @@ pub fn default_policies(budget: &BudgetConfig) -> Vec<workforce_policy::rules::P
     use workforce_policy::rules::{
         ConditionOperator, PolicyRule, PolicyScope, RuleAction, RuleCondition,
     };
-    if !budget.enabled {
+    // The plan guard asks the same way: raising a job's plan limit or
+    // turning back on one it stopped is the person's click.
+    if !budget.enabled && !budget.plan.enabled {
         return Vec::new();
     }
     vec![PolicyRule {
@@ -948,7 +950,7 @@ mod tests {
         let job = workforce_common::work_use::Work::job("a", "j1", "email check");
         let verdicts = workforce_common::work_use::within(job, async {
             let mut seen = Vec::new();
-            for _ in 0..200 {
+            for _ in 0..500 {
                 match g.admit_turn("a", Some("u")) {
                     Admission::Proceed => {}
                     other => seen.push(other),
@@ -963,7 +965,7 @@ mod tests {
             .count();
         assert_eq!(firsts, 1, "told once: {verdicts:?}");
         assert!(
-            matches!(&verdicts[0], Admission::Stopped { why, .. } if why.starts_with("Your 'email check' job began 120 turns in the last hour")),
+            matches!(&verdicts[0], Admission::Stopped { why, .. } if why.starts_with("Your 'email check' job began 360 turns in the last hour")),
             "{verdicts:?}"
         );
         assert!(verdicts[1..]

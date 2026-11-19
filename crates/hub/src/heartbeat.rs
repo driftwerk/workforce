@@ -224,7 +224,7 @@ impl HeartbeatRunner {
         let model = crate::turn_loop::heavy_model(&self.service);
         let work = workforce_common::work_use::Work::heartbeat(
             self.service.agent_id.as_str(),
-            &self.service.agent_id.to_string(),
+            &crate::desk_crew::name_of(&self.service),
         );
         let run = workforce_agent::runner::with_desk(
             desk,

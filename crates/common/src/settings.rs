@@ -8873,11 +8873,12 @@ pub struct PlanGuardConfig {
     /// ...or begun at least this many turns in the last hour, whatever its
     /// share. 0 = no turn floor.
     pub runaway_turns_per_hour: u32,
-    /// Most model rounds one background run takes before it is cut off,
-    /// where the job sets none of its own. 0 = no cap.
+    /// Most model rounds a scheduled job's run on a plan takes, its own
+    /// setting included (never raised). 0 = no cap.
     pub run_max_rounds: u32,
-    /// Most minutes one background run takes before it is stopped. 0 = no
-    /// cap.
+    /// Most minutes a scheduled job's run on a plan takes before it is cut
+    /// off; a job keeping its own session is bound by its rounds instead.
+    /// 0 = no cap.
     pub run_max_minutes: u32,
     /// The share of the plan's longest window background work used in a day
     /// from which the boss's update says so.

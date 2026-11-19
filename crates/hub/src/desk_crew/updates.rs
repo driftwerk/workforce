@@ -1092,18 +1092,25 @@ impl CrewHub {
         }
         // What background work used of the person's plans, when a notable
         // share: said in words, worth knowing.
-        // Since the last roundup, at most a day: the person's own plans'
-        // use alone, said once.
+        // Since the last roundup, at most a day, said once: what the person
+        // paid for, and what this boss's agent ran on the hub's own logins
+        // (an install pool, the agent's own), never another person's.
         let notable = service.config.budget.plan.notable_daily_percent;
         let store = Arc::clone(&service.telemetry_store);
         let from = since.max(now - Duration::hours(24));
-        let payer = owner.to_string();
-        let rows =
-            tokio::task::spawn_blocking(move || store.work_use_rows(from, now, Some(&payer), None))
+        let rows: Vec<_> =
+            tokio::task::spawn_blocking(move || store.work_use_rows(from, now, None, None))
                 .await
                 .ok()
                 .and_then(Result::ok)
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|r| match r.payer.as_deref() {
+                    Some(p) if p == owner => true,
+                    Some(p) if p.parse::<Uuid>().is_ok() => false,
+                    _ => r.agent_id == boss,
+                })
+                .collect();
         let at = from.with_timezone(&self.desk.timezone()).format("%H:%M");
         if let Some(headline) = background_plan_use(rows, notable, &format!("since {at}")) {
             lines.push((

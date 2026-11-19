@@ -636,8 +636,13 @@ fn runaway(cfg: &PlanGuardConfig, work: &Work, rate: &Rate, limit: Option<f64>) 
             share(rate.hour_share)
         ));
     }
-    // Turns are its measure only where the person set no share an hour.
+    // Turns are its measure only where the person set no share an hour;
+    // new work is held to a higher floor, as for its share.
     let floor = u64::from(cfg.runaway_turns_per_hour);
+    let floor = match rate.usual_turns <= 0.0 {
+        true => (floor as f64 * NEW_WORK_FLOOR) as u64,
+        false => floor,
+    };
     let by_turns = limit.is_none()
         && floor > 0
         && rate.hour_turns >= floor
@@ -1006,7 +1011,7 @@ mod tests {
         assert!(runaway(&cfg(), &new, &first(9.0), None).is_some());
         // A limit the person set replaces the turns floor too.
         let mut busy = vec![];
-        for _ in 0..200 {
+        for _ in 0..400 {
             busy.push(WorkUseRow::turn(&new, Some("p"), t));
         }
         let busy = rate_of(&busy, None, now);
@@ -1087,7 +1092,7 @@ mod tests {
             Arc::new(workforce_common::persistence::SqliteStore::in_memory().unwrap());
         guard.keep_in(Arc::clone(&store));
         let job = Work::job("atlas", "j1", "email check");
-        for _ in 0..130 {
+        for _ in 0..370 {
             guard.began(&job, Some("p"));
         }
         let now = Utc::now();

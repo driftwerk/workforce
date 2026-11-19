@@ -1207,12 +1207,15 @@ impl MonitorEngine {
             // stop that turns it off tells. Turned back on, it starts afresh.
             ActionOutcome::Runaway(why) => {
                 let _ = self.store.fail(key, &format!("skipped: {why}"), true).await;
+                // Released once it is off: turned back on, it starts afresh.
+                // Not turned off (already off, or the flip failed), the
+                // guard's own hold stays.
                 if self.stop(mon, "plan_runaway").await {
                     let work = self.work_of(mon);
                     let notice = format!("{why} {}", crate::plan_guard::stopped_choices(&work));
                     self.tell_owner(mon, "plan_runaway", &notice).await;
+                    crate::plan_guard::PlanGuard::global().release(&work_key(mon));
                 }
-                crate::plan_guard::PlanGuard::global().release(&work_key(mon));
                 false
             }
         }

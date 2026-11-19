@@ -627,13 +627,16 @@ window resets.
 
 A runaway is judged against what the work uses in an hour it runs in, so a
 job that runs once a day is held to its own run. Work with no history yet is
-a runaway only past three times `runaway_min_percent` in an hour (or
-`runaway_turns_per_hour` turns). A runaway job or monitor is turned off and
+a runaway only past three times `runaway_min_percent` in an hour, or three
+times `runaway_turns_per_hour` turns. A runaway job or monitor is turned off and
 its owner told once, in words, with what it used and how that compares to
 its usual; turning it back on resumes it, and the scheduler's
 `plan_limit_percent_per_hour` (asked of the person) sets the share an hour
 it may use instead. The run caps apply to job runs on a plan only, and never
-raise a job's own rounds. Readings are kept in memory per hub instance; with
+raise a job's own rounds; a job keeping its own session is bound by its
+rounds, never cut off mid-turn. A boss's own check-ins and wake-ups are
+guarded; what the person set going (a handover, a plan, a session's line)
+never is. Readings are kept in memory per hub instance; with
 no reading yet, nothing waits.
 
 ### `[gateway]` — WebSocket + REST Gateway

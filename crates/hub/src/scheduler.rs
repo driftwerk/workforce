@@ -2126,7 +2126,13 @@ impl Scheduler {
                     false => *max_rounds,
                 };
                 let max_rounds = &max_rounds;
-                let run_minutes = if capped { caps.run_max_minutes } else { 0 };
+                // A job keeping its own session is never cut off mid-turn,
+                // which would leave its conversation half written: its
+                // rounds bound it.
+                let run_minutes = match capped && session.is_none() {
+                    true => caps.run_max_minutes,
+                    false => 0,
+                };
 
                 // Always deliver to DM via open_conversation for reliability.
                 // Resolve DM channel up front so we can pass it to process_message.
@@ -3884,9 +3890,9 @@ mod tests {
             .await
             .unwrap();
         let job = sched.get_job(&id).await.unwrap();
-        // It began 130 turns in the last hour, from nothing before.
+        // It began 370 turns in the last hour, from nothing before.
         let work = job.work(service.agent_id.as_str());
-        for _ in 0..130 {
+        for _ in 0..370 {
             store
                 .record_work_use(&workforce_common::work_use::WorkUseRow::turn(
                     &work,
@@ -3900,7 +3906,7 @@ mod tests {
         assert!(first.success, "{first:?}");
         assert!(
             first.output.contains(
-                "skipped: stopped by the plan guard: Your 'email check' job began 130 turns \
+                "skipped: stopped by the plan guard: Your 'email check' job began 370 turns \
                  in the last hour. I've paused it."
             ),
             "{}",

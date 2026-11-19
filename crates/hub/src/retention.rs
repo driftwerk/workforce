@@ -260,6 +260,7 @@ mod tests {
             [
                 ("task telemetry", 0),
                 ("cost records", 0),
+                ("background work's use", 35),
                 ("resolved approvals", 30)
             ]
         );

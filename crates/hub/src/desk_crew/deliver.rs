@@ -182,20 +182,23 @@ impl CrewHub {
         // line) is background work: the plan guard holds it while the
         // person's plan is nearly full. One that answers the person's own
         // words is theirs, and never waits on it.
-        let work = (!persons).then(|| {
+        // Only the boss's own wake: its DM's turns and quiet check-ins with
+        // no word of the person's. What the person set going (a handover
+        // they sent, a plan, a session's line) is theirs, never held.
+        let own_wake = in_dm || channel.starts_with(&format!("{DESK_CHANNEL}:checkin:"));
+        let work = (!persons && own_wake).then(|| {
             workforce_common::work_use::Work::boss(agent_id, owner, &super::name_of(service))
         });
         // Held by the plan guard: not run, and nothing posted. The next
         // wake-up or check-in comes as it would; a runaway is told once.
         if let Some(work) = &work {
-            if let Some(why) = self
-                .held_by_plan(service, owner, work, model.as_deref())
-                .await
+            if let Some(why) =
+                Box::pin(self.held_by_plan(service, owner, work, model.as_deref())).await
             {
                 return Err(eyre::eyre!(why));
             }
         }
-        let progress = workforce_common::work_use::within_opt(
+        let progress = Box::pin(workforce_common::work_use::within_opt(
             work,
             workforce_agent::runner::with_desk(
                 Some(scope),
@@ -226,7 +229,7 @@ impl CrewHub {
                     None,
                 ),
             ),
-        )
+        ))
         .await?;
         let session_id = progress.session_id.clone();
         let tx = if session_id == sid {
@@ -275,8 +278,12 @@ impl CrewHub {
         model: Option<&str>,
     ) -> Option<String> {
         use crate::cost_governor::{Admission, OnPlan};
+        // On the plan the turn runs on: the owner's.
+        let person = owner.parse::<uuid::Uuid>().ok();
         let admitted = workforce_common::work_use::within(work.clone(), async {
-            let login = crate::turn_loop::plan_login(service, model).await;
+            let login =
+                crate::user_config::billed_to(person, crate::turn_loop::plan_login(service, model))
+                    .await;
             service.cost_governor.preflight_on(
                 service.agent_id.as_str(),
                 Some(owner),

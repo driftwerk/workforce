@@ -2026,7 +2026,7 @@ async fn ticketless_spend_goes_to_one_plan_by_each_hand_out() {
         ] {
             c.execute(
                 "INSERT INTO ledger (engine, key, session, at, input, usd, priced, billing) \
-                 VALUES ('claude', $1, $2, $3, 10, $4, 'reported', 'plan')",
+                 VALUES ('claude', $1, $2, $3, 10, $4, 'reported', 'key')",
                 &[&Uuid::new_v4().to_string(), &s, &at, &usd],
             )
             .await

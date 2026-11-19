@@ -3135,7 +3135,8 @@ pub(crate) async fn route_login(
         || service.current_default_model.read().clone(),
         str::to_string,
     );
-    let route = turn_chain(service, &spec)
+    // Boxed: the turn's own future holds this one, and the chain is deep.
+    let route = Box::pin(turn_chain(service, &spec))
         .await
         .kinds()
         .first()
