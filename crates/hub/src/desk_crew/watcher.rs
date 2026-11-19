@@ -102,6 +102,10 @@ pub(super) struct Trigger {
     /// with its refused next step (`super::idle`): said over once the
     /// check-in given it ran.
     pub handed: Option<uuid::Uuid>,
+    /// Desk's own look, not something that happened: a reminder of what
+    /// still waits, the regular sweep, a check-in tried again. At Act fully
+    /// it never lifts a turn the person stopped.
+    pub routine: bool,
 }
 
 impl Trigger {
@@ -114,6 +118,7 @@ impl Trigger {
             about: None,
             group: None,
             handed: None,
+            routine: false,
         }
     }
 }
@@ -489,6 +494,7 @@ impl CrewHub {
             about,
             group: event.group.clone(),
             handed: None,
+            routine: false,
         })
     }
 
@@ -617,6 +623,7 @@ impl CrewHub {
                             about: Some(about),
                             group: item.group_id.clone(),
                             handed: None,
+                            routine: false,
                         },
                     )
                 }
@@ -650,6 +657,7 @@ impl CrewHub {
                             about: None,
                             group: item.group_id.clone(),
                             handed: None,
+                            routine: false,
                         },
                     )
                 }
@@ -1215,7 +1223,10 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                     let at = crew.thresholds(&id, o, &mut noted).await;
                     let w = waking.entry(id.clone()).or_default();
                     w.noted = noted;
-                    found.extend(at.into_iter().map(|t| (id.clone(), t)));
+                    found.extend(at.into_iter().map(|mut t| {
+                        t.routine = true;
+                        (id.clone(), t)
+                    }));
                     // Unbound, it sweeps its scope every few minutes while
                     // there is anything in it, whatever else woke it.
                     let every = crew.timing.minute * UNBOUND_SWEEP_MINUTES;
@@ -1234,6 +1245,7 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                             about: None,
                             group: None,
                             handed: None,
+                            routine: true,
                         }));
                     }
                 }
@@ -1349,6 +1361,7 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 .filter(|t| !t.line.starts_with(RETRIED))
                 .map(|t| Trigger {
                     line: format!("{RETRIED}{}", t.line),
+                    routine: true,
                     ..t.clone()
                 })
                 .collect();
@@ -1470,6 +1483,7 @@ mod budget_tests {
             about: Some(about.into()),
             group: None,
             handed: None,
+            routine: false,
         }
     }
 

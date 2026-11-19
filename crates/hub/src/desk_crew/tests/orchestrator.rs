@@ -403,11 +403,9 @@ async fn a_plan_of_chained_tickets_runs_to_its_end_with_no_word_from_the_person(
             0,
             "nor its notices"
         );
-        // Only this hub's own boss runs on notices: never one served from
-        // another hub's grant, nor one relayed from its home.
+        // This hub's own boss at Act fully runs on notices (who else never
+        // does is `orchestrator`'s unit test).
         assert!(crew.orchestrates("desk"));
-        assert!(!crew.orchestrates("acme-hub/desk"));
-        assert!(!crew.orchestrates(&format!("{}/desk", workforce_desk::grant::HOME_HUB)));
         let asked: Vec<_> = d
             .store()
             .items_not_closed(Some("desk"))

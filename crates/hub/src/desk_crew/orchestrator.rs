@@ -45,6 +45,10 @@ const MAX_HELD: usize = 200;
 /// counts it as it counts a wake-up.
 pub(crate) const NOTICES_KIND: &str = "notices";
 
+/// How many runs in a row may find a boss not overseeing (a config
+/// reloading) before its notices are let go, a crew minute apart.
+const MAX_MISSES: u32 = 5;
+
 /// The longest a notices turn runs before it is let go as failed, in the
 /// crew's minutes: its notices are tried again, and the sweep comes back.
 const TURN_MINUTES: u32 = 30;
@@ -97,9 +101,9 @@ pub(super) struct Notice {
     pub hop: i16,
     /// The requests it names, beside it as a wake-up's are.
     pub approvals: Vec<MentionedApproval>,
-    /// The regular sweep's, not something that happened: it never lifts a
-    /// turn the person stopped.
-    pub sweep: bool,
+    /// Desk's own look (a reminder, the sweep, a check-in tried again), not
+    /// something that happened: it never lifts a turn the person stopped.
+    pub routine: bool,
 }
 
 impl Notice {
@@ -111,14 +115,14 @@ impl Notice {
             again: false,
             hop: 0,
             approvals: Vec::new(),
-            sweep: false,
+            routine: false,
         }
     }
 
     /// What the wake loop found, `t`, as a notice.
     pub(super) fn of(t: Trigger) -> Self {
         Self {
-            sweep: t.line == SWEEP,
+            routine: t.routine || t.line == SWEEP,
             hop: t.hop,
             approvals: t.approvals,
             ..Self::new(t.line)
@@ -130,6 +134,7 @@ impl Notice {
         Trigger {
             hop: self.hop,
             approvals: self.approvals,
+            routine: self.routine,
             ..Trigger::line(self.text)
         }
     }
@@ -139,7 +144,8 @@ impl Notice {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Hold {
     /// The person stopped its last turn: they wait for something new to
-    /// happen (never the sweep), and are never tried again by themselves.
+    /// happen (never Desk's own look), and are never tried again by
+    /// themselves.
     Stopped,
     /// Not before then: a failed turn, Desk's breaker, a spent ceiling.
     Until(Instant),
@@ -162,6 +168,8 @@ struct Queue {
     folded: usize,
     /// The spent ceiling the person was told of, so it is said once.
     told_paused: Option<DateTime<Utc>>,
+    /// Runs in a row that found its boss not overseeing.
+    misses: u32,
 }
 
 impl Queue {
@@ -174,8 +182,8 @@ impl Queue {
                 self.folded += 1;
             }
         }
-        // Something new to act on lifts a Stop; the sweep doesn't.
-        if !notice.sweep && self.hold == Some(Hold::Stopped) {
+        // Something new to act on lifts a Stop; Desk's own look doesn't.
+        if !notice.routine && self.hold == Some(Hold::Stopped) {
             self.hold = None;
         }
         self.pending.push_back(notice);
@@ -198,8 +206,7 @@ impl CrewHub {
         {
             return false;
         }
-        !workforce_desk::grant::is_served(boss)
-            && !super::relayed_decide::relayed_party(boss)
+        local_boss(boss)
             && self
                 .overseer_named(boss)
                 .is_some_and(|(s, o)| self.unbound_given(s.agent_id.as_str(), &o))
@@ -308,11 +315,31 @@ impl CrewHub {
                 )
             };
             let Some((service, o)) = self.overseer_named(boss) else {
-                // No one is left to tell: its watches' ends are kept as told.
+                // Gone for a moment (a config reloading) or for good: held
+                // a while, then, with no one left to tell, let go and its
+                // watches' ends kept as told.
+                let misses = {
+                    let mut all = self.notices.0.lock();
+                    let q = all.entry(key.clone()).or_default();
+                    q.misses += 1;
+                    q.misses
+                };
+                if misses < MAX_MISSES && self.state.registry.get(boss).is_some() {
+                    self.hold_back(
+                        &key,
+                        batch,
+                        Some(Hold::Until(Instant::now() + self.timing.minute)),
+                    );
+                    return;
+                }
                 tracing::info!(%boss, held = batch.len(), "notices for a boss that no longer oversees are let go");
                 self.delivered(&batch).await;
                 continue;
             };
+            {
+                let mut all = self.notices.0.lock();
+                all.entry(key.clone()).or_default().misses = 0;
+            }
             // Act fully ended, or isn't in force (yet: today's spend is
             // read after a restart): the wake loop takes them the old way,
             // as a check-in, with all it holds a check-in to. A watch's end
@@ -368,18 +395,29 @@ impl CrewHub {
             let hop = batch.iter().map(|n| n.hop).max().unwrap_or(0);
             let approvals: Vec<MentionedApproval> =
                 batch.iter().flat_map(|n| n.approvals.clone()).collect();
-            let ran = match tokio::time::timeout(
-                self.timing.minute * TURN_MINUTES,
-                self.notices_turn(&service, person, &prompt, hop, approvals),
-            )
-            .await
-            {
-                Ok(ran) => ran,
-                Err(_) => {
-                    self.wake_hop.lock().remove(boss);
-                    Err(Ran::Failed(format!(
-                        "it ran past {TURN_MINUTES} minutes and was let go"
-                    )))
+            let turn = self.notices_turn(&service, person, &prompt, hop, approvals);
+            tokio::pin!(turn);
+            let ran = tokio::select! {
+                ran = &mut turn => ran,
+                () = tokio::time::sleep(self.timing.minute * TURN_MINUTES) => {
+                    // Stopped as the person's Stop stops it, and waited for
+                    // to its end, never left running beside the next.
+                    let live = match service.sessions.find(&check_in_channel(boss), person) {
+                        Ok(Some(s)) => service
+                            .live_turns
+                            .apply(&s.id, crate::hub_core::live_turns::Control::Cancel)
+                            .await,
+                        _ => crate::hub_core::live_turns::Applied::NotLive,
+                    };
+                    let ran = turn.await;
+                    match live {
+                        // Not running yet (waiting on its mind): what it
+                        // came to stands.
+                        crate::hub_core::live_turns::Applied::NotLive => ran,
+                        _ => Err(Ran::Failed(format!(
+                            "it ran past {TURN_MINUTES} minutes and was stopped"
+                        ))),
+                    }
                 }
             };
             match ran {
@@ -395,9 +433,21 @@ impl CrewHub {
                     // The person's Stop: kept for what happens next, never
                     // tried again by itself, and not a failure.
                     tracing::info!(%boss, held = batch.len(), "the boss's notices turn was stopped; its notices wait for what comes next");
-                    {
+                    // What happened while it ran is new: that goes now.
+                    let fresh = {
                         let mut all = self.notices.0.lock();
-                        all.entry(key.clone()).or_default().failures = 0;
+                        let q = all.entry(key.clone()).or_default();
+                        q.failures = 0;
+                        let fresh = q.pending.iter().any(|n| !n.routine);
+                        if fresh {
+                            for n in batch.iter().rev() {
+                                q.pending.push_front(n.clone());
+                            }
+                        }
+                        fresh
+                    };
+                    if fresh {
+                        continue;
                     }
                     self.hold_back(&key, batch, Some(Hold::Stopped));
                     return;
@@ -589,6 +639,13 @@ impl CrewHub {
     }
 }
 
+/// Whether `boss` is this hub's own: never one served from another hub's
+/// grant, nor one relayed from its home, whose crew calls are decided where
+/// their sessions are.
+fn local_boss(boss: &str) -> bool {
+    !workforce_desk::grant::is_served(boss) && !super::relayed_decide::relayed_party(boss)
+}
+
 /// Whether a runner takes `q` now: notices wait, none runs, and nothing
 /// holds them. Taken, it is marked running.
 fn claim(q: &mut Queue) -> bool {
@@ -693,9 +750,12 @@ mod tests {
         q.hold = Some(Hold::Stopped);
         assert!(!claim(&mut q), "held by the person's Stop");
         let mut sweep = Notice::new(SWEEP);
-        sweep.sweep = true;
+        sweep.routine = true;
         q.push(sweep);
-        assert!(!claim(&mut q), "the sweep doesn't lift it");
+        let mut reminder = Notice::new("web has waited on you for 30 min");
+        reminder.routine = true;
+        q.push(reminder);
+        assert!(!claim(&mut q), "neither the sweep nor a reminder lifts it");
         q.push(Notice::new("a session finished its turn"));
         assert!(claim(&mut q), "something new does");
     }
@@ -727,9 +787,22 @@ mod tests {
         let n = Notice::of(t);
         assert_eq!(n.hop, 3);
         assert_eq!(n.approvals.len(), 1);
-        assert!(!n.sweep);
+        assert!(!n.routine);
         let back = n.into_trigger();
         assert_eq!((back.hop, back.approvals.len()), (3, 1));
-        assert!(Notice::of(Trigger::line(SWEEP.into())).sweep);
+        assert!(Notice::of(Trigger::line(SWEEP.into())).routine);
+        let mut reminder = Trigger::line("web has waited on you".into());
+        reminder.routine = true;
+        assert!(Notice::of(reminder).into_trigger().routine);
+    }
+
+    #[test]
+    fn only_this_hubs_own_boss_can_run_on_notices() {
+        assert!(local_boss("desk"));
+        assert!(!local_boss("acme-hub/desk"), "served from a grant");
+        assert!(
+            !local_boss(&format!("{}/desk", workforce_desk::grant::HOME_HUB)),
+            "relayed from its home"
+        );
     }
 }
