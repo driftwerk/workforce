@@ -1611,9 +1611,14 @@ pub(super) async fn updates_loop(crew: Arc<CrewHub>, cancel: CancellationToken) 
                 // A boss newly at Act fully asks the person's directives.
                 crew.look_at_directives().await;
                 crew.look_at_updates_apart();
+                // What monitors saw, held by the cadence, once it may go.
+                crew.release_monitor_holds().await;
             }
             // The person paused typing, came back, or wrote: look now.
-            () = crew.update_poke.notified() => crew.look_at_updates_apart(),
+            () = crew.update_poke.notified() => {
+                crew.look_at_updates_apart();
+                crew.release_monitor_holds().await;
+            }
         }
     }
 }

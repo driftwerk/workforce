@@ -578,6 +578,16 @@ impl Tool for EmailInboxTool {
             }
         }
 
+        // An inbox that couldn't be read is a failure, not an empty one: the
+        // account asked for, every account when none was, or none to read.
+        // Otherwise a watcher on it (a monitor) sees nothing new, forever.
+        if let Some(failed) = unread_inbox(account_filter, &account_names, &errors) {
+            return Ok(ToolResult::failure(
+                failed,
+                start.elapsed().as_millis() as u64,
+            ));
+        }
+
         // Messages come back in ascending UID order; reverse for newest first
         all_messages.reverse();
         all_messages.truncate(limit);
@@ -593,6 +603,42 @@ impl Tool for EmailInboxTool {
             output,
             start.elapsed().as_millis() as u64,
         ))
+    }
+}
+
+/// Why `email.inbox` read nothing it was asked to, when it didn't: the
+/// account it named failed, every account failed, or there is none.
+fn unread_inbox(
+    named: Option<&str>,
+    accounts: &[String],
+    errors: &[serde_json::Value],
+) -> Option<String> {
+    let said = || {
+        errors
+            .iter()
+            .map(|e| {
+                format!(
+                    "{}: {}",
+                    e["account"].as_str().unwrap_or("?"),
+                    e["error"].as_str().unwrap_or("failed")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    if accounts.is_empty() {
+        return Some(
+            "No email account is set up (in Desk: Settings → Connections → Email)".to_string(),
+        );
+    }
+    match named {
+        Some(name) if !errors.is_empty() => {
+            Some(format!("Couldn't read the inbox of {name}: {}", said()))
+        }
+        None if errors.len() >= accounts.len() => {
+            Some(format!("Couldn't read any inbox: {}", said()))
+        }
+        _ => None,
     }
 }
 
@@ -4323,6 +4369,37 @@ impl Tool for EmailRulesTool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_inbox_that_could_not_be_read_is_a_failure_not_an_empty_one() {
+        use super::unread_inbox;
+        let accounts = ["default".to_string(), "work".to_string()];
+        let broke = serde_json::json!({"account": "work", "error": "login refused"});
+        assert_eq!(unread_inbox(None, &accounts, &[]), None);
+        assert_eq!(
+            unread_inbox(None, &accounts, std::slice::from_ref(&broke)),
+            None,
+            "one of two read"
+        );
+        assert_eq!(
+            unread_inbox(
+                Some("work"),
+                &["work".to_string()],
+                std::slice::from_ref(&broke)
+            ),
+            Some("Couldn't read the inbox of work: work: login refused".to_string())
+        );
+        let both = [
+            serde_json::json!({"account": "default", "error": "timed out"}),
+            broke,
+        ];
+        assert!(unread_inbox(None, &accounts, &both)
+            .unwrap()
+            .starts_with("Couldn't read any inbox"));
+        assert!(unread_inbox(None, &[], &[])
+            .unwrap()
+            .contains("No email account"));
+    }
+
     use super::*;
 
     #[test]

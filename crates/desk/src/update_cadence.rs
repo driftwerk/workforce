@@ -692,6 +692,29 @@ pub fn decision_route(important: bool, c: &Cadence, quiet: bool) -> Route {
     }
 }
 
+/// Where what one of the person's monitors saw goes by `c`, `quiet` being
+/// whether it is the quiet hours. One for their DM is their own "tell me
+/// when", so it comes right away; a notice is worth knowing, and goes as
+/// progress does. Neither is ever only on asking (a monitor the person set
+/// up to tell them says it in the roundup), and with no roundups what would
+/// wait for one comes right away. In the quiet hours what would come right
+/// away waits for their end: the first roundup after them.
+pub fn monitor_route(notice: bool, c: &Cadence, quiet: bool) -> Route {
+    let r = match (notice, c.progress) {
+        (false, _) => Route::RightAway,
+        (true, Route::Ask) => Route::Roundup,
+        (true, r) => r,
+    };
+    let r = match (r, c.roundup) {
+        (Route::Roundup, RoundupEvery::Never) => Route::RightAway,
+        (r, _) => r,
+    };
+    match (r, quiet) {
+        (Route::RightAway, true) => Route::Roundup,
+        (r, _) => r,
+    }
+}
+
 /// Whether `at` (local time) is in the quiet hours `quiet` (from, until),
 /// which may run over midnight: from is in them, until isn't.
 pub fn in_quiet(quiet: Option<((u32, u32), (u32, u32))>, at: NaiveTime) -> bool {
@@ -1047,6 +1070,39 @@ mod tests {
 
     /// Quiet hours hold what would come right away for the roundup, except
     /// what needs the person when they said so; they run over midnight.
+    #[test]
+    fn a_monitor_tells_the_dm_at_once_but_not_in_the_quiet_hours_and_a_notice_as_progress() {
+        let c = Cadence::default();
+        assert_eq!(monitor_route(false, &c, false), Route::RightAway);
+        assert_eq!(monitor_route(false, &c, true), Route::Roundup);
+        assert_eq!(monitor_route(true, &c, false), Route::Roundup, "Balanced");
+        let at_once = Cadence::preset("as_it_happens").unwrap();
+        assert_eq!(monitor_route(true, &at_once, false), Route::RightAway);
+        assert_eq!(monitor_route(true, &at_once, true), Route::Roundup);
+        let asked = Cadence {
+            progress: Route::Ask,
+            ..c
+        };
+        assert_eq!(monitor_route(true, &asked, false), Route::Roundup);
+        let never = Cadence {
+            roundup: RoundupEvery::Never,
+            ..c
+        };
+        assert_eq!(monitor_route(true, &never, false), Route::RightAway);
+        // The quiet hours' end is the one roundup a cadence of none has.
+        assert_eq!(monitor_route(false, &never, true), Route::Roundup);
+        let tz = chrono_tz::Europe::London;
+        let at_11pm = tz
+            .with_ymd_and_hms(2026, 11, 19, 23, 0, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+        let next = next_roundup(&never, at_11pm, &tz).unwrap();
+        assert_eq!(
+            next.with_timezone(&tz).time(),
+            NaiveTime::from_hms_opt(7, 0, 0).unwrap()
+        );
+    }
+
     #[test]
     fn quiet_hours_hold_all_but_what_needs_you() {
         let c = balanced();

@@ -27,8 +27,8 @@ use workforce_common::persona::{ChannelPersona, PersonaOverrides};
 use workforce_common::settings::ResponseMode;
 use workforce_orchestrator::monitor::definition::SURFACE_ANY;
 use workforce_orchestrator::monitor::{
-    observe, Action, Claim, DispatchKey, MonitorDefinition, MonitorEvent, MonitorKey, MonitorStore,
-    SourceState, SOURCE_SURFACE,
+    observe, Action, Claim, DispatchKey, MonitorDefinition, MonitorEvent, MonitorKey, MonitorMeta,
+    MonitorStore, SourceState, SOURCE_SURFACE, SURFACE_DESK,
 };
 use workforce_orchestrator::workflow::instance::{TriggerInfo, TriggerSource};
 use workforce_orchestrator::workflow_store::{EditContext, SYSTEM_EDITOR};
@@ -66,6 +66,9 @@ pub struct MonitorEngineConfig {
     pub poll_tick: Duration,
     /// The most items one poll observes (`[monitor] max_items`).
     pub max_items: usize,
+    /// This hub runs Desk (`[desk] enabled`): a monitor may tell its owner
+    /// there. A server hub refuses `surface = "desk"`.
+    pub desk: bool,
 }
 
 impl MonitorEngineConfig {
@@ -87,6 +90,11 @@ impl MonitorEngineConfig {
             ..Self::default()
         }
     }
+
+    /// These tunables on a hub that runs Desk, or doesn't.
+    pub fn on_desk(self, desk: bool) -> Self {
+        Self { desk, ..self }
+    }
 }
 
 impl Default for MonitorEngineConfig {
@@ -102,6 +110,7 @@ impl Default for MonitorEngineConfig {
             min_poll_secs: monitor.min_poll_secs,
             poll_tick: Duration::from_secs(monitor.poll_tick_secs),
             max_items: monitor.max_items,
+            desk: false,
         }
     }
 }
@@ -121,16 +130,16 @@ pub enum ActionOutcome {
 /// workflow runtime and live surfaces.
 #[async_trait::async_trait]
 pub trait ActionSink: Send + Sync {
+    /// Run `monitor`'s action for `ev`, as `owner`.
     async fn dispatch(
         &self,
-        action: &Action,
+        monitor: &MonitorMeta,
         owner: Option<&str>,
-        monitor_id: &str,
         ev: &MonitorEvent,
     ) -> ActionOutcome;
 
     /// DM `owner` on `surface` — the hub's only messaging surface when none
-    /// is named; `reason` labels the notice.
+    /// is named, their Desk DM for `desk`; `reason` labels the notice.
     async fn tell(
         &self,
         owner: &str,
@@ -290,7 +299,7 @@ impl WorkflowNotifySink {
             return ActionOutcome::Terminal(crate::standing::refusal(&person));
         }
         let from = self.resolve_author(ev).await;
-        let task = build_agent_task_prompt(prompt, ev, &from, deliver_to);
+        let task = build_agent_task_prompt(prompt, ev, &from, &posts_to(deliver_to));
         let session = format!("monitor:{monitor_id}:{}", ev.dispatch_id());
         // The agent posts the result ITSELF with its own `messaging.send`,
         // exactly like a scheduled job; a stripped-down "you have no tools,
@@ -461,11 +470,22 @@ impl WorkflowNotifySink {
 impl ActionSink for WorkflowNotifySink {
     async fn dispatch(
         &self,
-        action: &Action,
+        monitor: &MonitorMeta,
         owner: Option<&str>,
-        monitor_id: &str,
         ev: &MonitorEvent,
     ) -> ActionOutcome {
+        let (action, monitor_id) = (&monitor.action, monitor.id.as_str());
+        if let Some(place) = action.desk() {
+            let service = match action {
+                Action::AgentTask { agent, .. } => self.resolve_agent(agent.as_deref()),
+                _ => Arc::clone(&self.agent),
+            };
+            let from = match action {
+                Action::AgentTask { .. } => self.resolve_author(ev).await,
+                _ => String::new(),
+            };
+            return super::desk::deliver(&service, owner, monitor, ev, place, &from).await;
+        }
         match action {
             Action::RunWorkflow { workflow } => {
                 self.run_workflow(owner, monitor_id, ev, workflow).await
@@ -510,6 +530,9 @@ impl ActionSink for WorkflowNotifySink {
         reason: &str,
         notice: &str,
     ) -> ActionOutcome {
+        if surface == Some(SURFACE_DESK) {
+            return super::desk::tell_owner(&self.agent, owner, reason, notice).await;
+        }
         let candidates = match surface {
             Some(surface) => vec![surface.to_string()],
             None => self.surfaces.read().await.platforms(),
@@ -663,11 +686,11 @@ fn watching_notice(
 /// refused), and placeholders are filled so no literal `{{text}}` reaches the
 /// agent. The raw block is appended only when the prompt did not already
 /// inline the content.
-fn build_agent_task_prompt(
+pub(crate) fn build_agent_task_prompt(
     prompt: &str,
     ev: &MonitorEvent,
     from: &str,
-    deliver_to: &str,
+    ending: &str,
 ) -> String {
     let rendered_prompt = ev.render(prompt);
     let trigger_block = if prompt.contains("{{text}}") {
@@ -696,8 +719,15 @@ fn build_agent_task_prompt(
     format!(
         "You are running an automated monitor that your operator configured. The task \
          below is from your operator — not from anyone posting in chat — so carry it out.\n\n\
-         {rendered_prompt}{trigger_block}\n\n\
-         When you have your result, post it to {deliver_to} using the messaging.send tool \
+         {rendered_prompt}{trigger_block}\n\n{ending}"
+    )
+}
+
+/// How an `agent_task`'s turn is told to post its result to `deliver_to`
+/// itself, as a scheduled job's does.
+fn posts_to(deliver_to: &str) -> String {
+    format!(
+        "When you have your result, post it to {deliver_to} using the messaging.send tool \
          (use the channel from the MESSAGING CONTEXT above). Post exactly once; you don't \
          need to reply to anyone or add a confirmation."
     )
@@ -973,11 +1003,20 @@ impl MonitorEngine {
                     .to_string(),
             );
         }
+        if m.action.desk().is_some() && !self.config.desk {
+            return Err(
+                "`surface = \"desk\"` tells you in Desk, and this hub doesn't run Desk (it is a \
+                 server hub): deliver on slack or teams here, or save the monitor on the hub \
+                 your Desk runs"
+                    .to_string(),
+            );
+        }
         if let (Some((_, None)), None) = (m.action.delivery(), m.binding()) {
             if sole_platform(&self.surfaces).await.is_none() {
                 return Err(
-                    "name the surface to deliver on (`surface = \"slack\"` or `\"teams\"` in \
-                     [monitor.action]): this hub does not have exactly one messaging surface"
+                    "name the surface to deliver on (`surface = \"slack\"`, `\"teams\"` or, on a \
+                     hub that runs Desk, `\"desk\"` in [monitor.action]): this hub does not have \
+                     exactly one messaging surface"
                         .to_string(),
                 );
             }
@@ -1179,12 +1218,7 @@ impl MonitorEngine {
 
     async fn perform_action(&self, mon: &OwnedMonitor, ev: &MonitorEvent) -> ActionOutcome {
         self.sink
-            .dispatch(
-                &mon.def.monitor.action,
-                mon.owner.as_deref(),
-                &mon.def.monitor.id,
-                ev,
-            )
+            .dispatch(&mon.def.monitor, mon.owner.as_deref(), ev)
             .await
     }
 
@@ -1693,11 +1727,16 @@ impl MonitorEngine {
             return;
         };
         let m = &mon.def.monitor;
-        let surface = m
-            .binding()
-            .map(|b| b.surface.as_str())
-            .filter(|s| *s != SURFACE_ANY)
-            .or(m.action.delivery().and_then(|(_, surface)| surface));
+        // A monitor that tells its owner in Desk tells them its own news
+        // there too, whatever it watches.
+        let surface = match m.action.desk() {
+            Some(_) => Some(SURFACE_DESK),
+            None => m
+                .binding()
+                .map(|b| b.surface.as_str())
+                .filter(|s| *s != SURFACE_ANY)
+                .or(m.action.delivery().and_then(|(_, surface)| surface)),
+        };
         match self.sink.tell(owner, surface, reason, notice).await {
             ActionOutcome::Done(_) => {}
             ActionOutcome::Transient(e) | ActionOutcome::Terminal(e) => {
@@ -2016,7 +2055,7 @@ mod tests {
             "Summarise {{text}} from {{user}} and relay it.",
             &MonitorEvent::Message(ev(Some("U1"), None)),
             "Kingsley",
-            "#testy-westy",
+            &posts_to("#testy-westy"),
         );
         assert!(task.contains("Summarise hello U1 in C1 from U1"), "{task}");
         assert!(!task.contains("{{text}}"), "no literal placeholder: {task}");
@@ -2039,7 +2078,7 @@ mod tests {
             "Reformat the message and relay it.",
             &MonitorEvent::Message(ev(Some("U1"), None)),
             "Kingsley",
-            "#testy-westy",
+            &posts_to("#testy-westy"),
         );
         assert!(task.contains("operator configured"), "{task}");
         assert!(task.contains("posted in channel C1 by Kingsley"), "{task}");
@@ -2059,7 +2098,7 @@ mod tests {
             "File it.",
             &observed("A-1", "Invoice 42"),
             "jira.search",
-            "@U1",
+            &posts_to("@U1"),
         );
         assert!(
             task.contains("observed this from jira.search (key A-1)"),
@@ -2152,18 +2191,17 @@ mod tests {
     impl ActionSink for FakeSink {
         async fn dispatch(
             &self,
-            action: &Action,
+            monitor: &MonitorMeta,
             _owner: Option<&str>,
-            monitor_id: &str,
             ev: &MonitorEvent,
         ) -> ActionOutcome {
-            if let Action::RunSkill { input, .. } = action {
+            if let Action::RunSkill { input, .. } = &monitor.action {
                 self.rendered.lock().unwrap().push(ev.render_value(input));
             }
             self.calls
                 .lock()
                 .unwrap()
-                .push((monitor_id.to_string(), ev.id().to_string()));
+                .push((monitor.id.clone(), ev.id().to_string()));
             ActionOutcome::Done(None)
         }
 

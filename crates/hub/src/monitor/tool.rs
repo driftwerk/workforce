@@ -214,13 +214,16 @@ impl Tool for MonitorTool {
 
     fn description(&self) -> &str {
         "Author durable monitors: list, get, schema, validate, save, set_enabled, delete. A monitor \
-         watches a chat channel, or polls anything a tool reads (a Gmail search, a Jira query, a \
-         GitHub run, a web page through http.request, a Metabase card, a WASM skill), and runs an \
-         action — a workflow, a skill tool, a notification, or an agent turn — for each matching \
-         message or each new/changed observation. Code decides what fires; a model is asked only \
-         by an optional [monitor.decide] yes/no or an agent_task. Survives restarts and catches up. \
-         A channel monitor's bot must be a member of the channel; save and set_enabled report the \
-         channel read or the first poll. Call action='schema' first for the TOML format."
+         watches a chat channel, or polls anything a tool reads (the person's email inbox, a Gmail \
+         search, a Jira query, a GitHub run, a web page through http.request, a Metabase card, a \
+         WASM skill), and runs an action — a workflow, a skill tool, a notification, or an agent \
+         turn — for each matching message or each new/changed observation. Code decides what \
+         fires; a model is asked only by an optional [monitor.decide] yes/no or an agent_task. \
+         Survives restarts and catches up. On a hub that runs Desk, a notify or agent_task with \
+         surface = \"desk\" tells the person in their Desk DM with you (\"tell me here\"), by their \
+         quiet hours and roundup. A channel monitor's bot must be a member of the channel; save \
+         and set_enabled report the channel read or the first poll. Call action='schema' first \
+         for the TOML format."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -448,6 +451,16 @@ impl MonitorTool {
         let Some(toml_content) = input.toml_content.filter(|s| !s.is_empty()) else {
             return Ok(missing("toml_content", "the monitor TOML to save.", start));
         };
+        let parsed = MonitorDefinition::from_toml(&toml_content).ok();
+        // A monitor that tells someone in Desk is theirs: it reads their
+        // accounts and tells them in their DM. Unnamed, it is the caller's
+        // own, an administrator's too (the person at a Desk is the hub's).
+        let requested = requested.or_else(|| {
+            parsed
+                .as_ref()
+                .filter(|def| def.monitor.action.desk().is_some())
+                .and_then(|_| current_turn_user())
+        });
         // The rule places the save: the named owner's row when the caller may
         // write it, else an administrator on the system row, a member on their
         // own, an unbound turn nowhere.
@@ -463,7 +476,6 @@ impl MonitorTool {
                 ));
             }
         };
-        let parsed = MonitorDefinition::from_toml(&toml_content).ok();
         let previous = self
             .runtime
             .stored_definition(&id, grant.owner.as_deref())
@@ -771,12 +783,45 @@ input = { gmail_id = "{{id}}", subject = "{{json:/snippet}}" }
 # prompt = "Summarise this and tell the user what changed."
 # deliver_to = "@U123"             # channel id or @user DM
 # surface = "slack"                # as for notify
+# --- tell the person in Desk (only on a hub that runs Desk; a server hub refuses it) ---
+# type = "notify"                  # or agent_task, whose answer is what they read
+# surface = "desk"
+# target = "dm"                    # "dm" (default: their DM with you) | "notice" (worth knowing, not for them to act on)
+# template = "New invoice from {{json:/sender}}: {{json:/subject}}"
+# It comes right away, but waits through their quiet hours, for their roundup (a notice, as
+# progress does) and while they're away from the DM, then comes as one message.
 # --- make an agent converse in the channel (channel monitors only) ---
 # type = "persona"
 # agent = "lynx"
 # prompt = "You are the release triage assistant for this channel. ..."
 # mode = "all"                     # all | mention_only | quiet
 ```
+
+## Watching the person's email, told in Desk
+"Monitor my emails for invoices and tell me here": a source on their own inbox
+(`email.inbox`; `connections.list` names their email connections, the first is
+"default"; one they haven't connected yet they connect in Settings → Connections →
+Email), told in Desk. Name the account: uids are only unique within one.
+
+```toml
+[monitor]
+id = "invoice-emails"
+name = "Invoice emails"
+[monitor.source]
+tool = "email.inbox"
+input = { account = "default", limit = 20 }
+every_secs = 300
+items = "/messages"
+item_id = "/uid"
+[monitor.decide]                   # or a [monitor.condition] on /subject for a fixed word
+question = "Is this email an invoice or a bill asking to be paid?"
+[monitor.action]
+type = "notify"
+surface = "desk"
+template = "Invoice email from {{json:/sender}}: {{json:/subject}}"
+```
+A Google account connected in Connections reads the same way through
+`google.gmail.search` (items = "/messages", the default item_id "/id").
 
 Placeholders in templates, prompts and run_skill inputs: {{text}} {{id}} {{channel}}
 {{user}} {{ts}} {{value}} {{previous}} and {{json:/a/b}} (a pointer into the message

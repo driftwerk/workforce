@@ -48,6 +48,7 @@ mod items;
 mod line;
 pub(crate) mod machine_grants;
 mod mind;
+pub(crate) mod monitors;
 mod observe;
 mod own_settings;
 mod picture;

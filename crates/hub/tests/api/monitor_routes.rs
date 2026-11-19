@@ -29,7 +29,7 @@ use workforce_identity::sqlite::SqliteIdentityStore;
 use workforce_identity::store::IdentityStore;
 use workforce_identity::types::{Identity, IdentityRole};
 use workforce_orchestrator::monitor::{
-    Action, MonitorDefinition, MonitorEvent, MonitorKey, MonitorStore,
+    MonitorDefinition, MonitorEvent, MonitorKey, MonitorMeta, MonitorStore,
 };
 use workforce_orchestrator::workflow_store::{
     EditContext, RunAsWrite, WorkflowStore, KIND_MONITOR,
@@ -111,13 +111,7 @@ struct RecordingSink {
 
 #[async_trait]
 impl ActionSink for RecordingSink {
-    async fn dispatch(
-        &self,
-        _: &Action,
-        _: Option<&str>,
-        _: &str,
-        ev: &MonitorEvent,
-    ) -> ActionOutcome {
+    async fn dispatch(&self, _: &MonitorMeta, _: Option<&str>, ev: &MonitorEvent) -> ActionOutcome {
         self.fired.lock().unwrap().push(ev.id().to_string());
         ActionOutcome::Done(None)
     }

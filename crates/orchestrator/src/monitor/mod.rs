@@ -12,8 +12,8 @@ pub mod store;
 
 pub use condition::CompiledCondition;
 pub use definition::{
-    Action, Binding, CompiledFilter, Condition, ConditionKind, Decide, Filter, MonitorDefinition,
-    MonitorMeta, Source,
+    Action, Binding, CompiledFilter, Condition, ConditionKind, Decide, DeskDelivery, Filter,
+    MonitorDefinition, MonitorMeta, Source, SURFACE_DESK,
 };
 pub use event::{MonitorEvent, Observation, SOURCE_SURFACE, VALUE_KEY};
 pub use observe::{observe, ObservedState, Outcome};

@@ -112,7 +112,8 @@ pub(crate) async fn wire(
                     Arc::clone(&service.surface_registry),
                     sink,
                     engine_agent,
-                    super::MonitorEngineConfig::from_settings(&config.monitor),
+                    super::MonitorEngineConfig::from_settings(&config.monitor)
+                        .on_desk(config.desk.enabled),
                 )
                 .with_invoker(invoker)
                 .with_decide(Arc::new(super::DecisionGate::new(
