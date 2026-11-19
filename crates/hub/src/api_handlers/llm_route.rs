@@ -377,6 +377,42 @@ fn agent_options(
     )
 }
 
+/// What `person`'s own conversations with `service` run on, when that is
+/// their own route, as an agent listing shows it to them; `None` is the
+/// hub's route. The route is the one a turn of theirs takes
+/// ([`crate::personal_route::RouteDecider::chosen_for`]), its model the
+/// one a chat turn on the agent's default model runs.
+pub(crate) async fn shown_route(
+    service: &AgentService,
+    person: Uuid,
+) -> Option<workforce_gateway_client::PersonalRouteInfo> {
+    let chosen = crate::personal_route::RouteDecider::of(service)
+        .chosen_for(person)
+        .await?;
+    let spec = service.current_default_model.read().clone();
+    let model = crate::personal_route::personal_model(
+        &service.tier_registry(),
+        &service.tier_key.read().clone(),
+        &spec,
+        chosen.cli,
+        &chosen.route,
+        workforce_common::personal_route::RouteWork::Conversation,
+    );
+    let kind = chosen.route.kind;
+    Some(workforce_gateway_client::PersonalRouteInfo {
+        kind: kind.as_str().to_string(),
+        title: kind.title().to_string(),
+        model,
+        fallback: chosen.route.fallback.as_str().to_string(),
+        connected: has_own_login(
+            kind,
+            &service.logins.vaults(),
+            &[CredentialTier::AgentUser, CredentialTier::GlobalUser],
+            person,
+        ),
+    })
+}
+
 /// The tiers models are named by for every agent: the host agent's.
 fn hub_tiers(state: &GatewayState) -> TierRegistry {
     state

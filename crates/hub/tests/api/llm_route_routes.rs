@@ -62,10 +62,16 @@ impl Hub {
             .shared()
             .personal_routes()
             .attach_store(Arc::clone(&store) as Arc<dyn PersonRouteStore>);
+        // Built as the agent it's listed as, so a turn's settings and the
+        // routes' are keyed alike.
+        let scout = workforce_common::settings::AgentConfig {
+            id: "scout".into(),
+            ..Default::default()
+        };
         let service = AgentService::build_for_agent(
             config,
             None,
-            None,
+            Some(&scout),
             None,
             Arc::new(LockManager::new()),
             None,
@@ -453,4 +459,74 @@ async fn her_routes_models_are_kept_and_a_retired_one_is_refused_in_plain_words(
     let unknown = json!({ "kind": "codex", "fallback": "wait", "model_preferences": { "coding": "gpt-6-sol" } });
     let (status, _) = hub.put(&hub.alice, "/api/me/llm-route", unknown).await;
     assert_eq!(status, StatusCode::CONFLICT);
+}
+
+/// The agent `scout` as `/api/agents` lists it.
+fn scout(listing: &Value) -> &Value {
+    listing["agents"]
+        .as_array()
+        .unwrap_or_else(|| panic!("agents listed: {listing}"))
+        .iter()
+        .find(|agent| agent["id"] == "scout")
+        .unwrap_or_else(|| panic!("scout listed: {listing}"))
+}
+
+#[tokio::test]
+async fn the_agent_list_says_what_each_persons_own_conversations_run_on() {
+    let hub = Hub::on().await;
+    let (status, before) = hub.get(&hub.alice, "/api/agents").await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+    assert!(
+        scout(&before).get("personal_route").is_none(),
+        "the hub's route: {before}"
+    );
+
+    hub.claude_login(&hub.alice);
+    hub.put(&hub.alice, "/api/me/llm-route", claude("wait"))
+        .await;
+    let (_, listing) = hub.get(&hub.alice, "/api/agents").await;
+    let agent = scout(&listing);
+    let route = &agent["personal_route"];
+    assert_eq!(route["kind"], "claude-code", "{listing}");
+    assert_eq!(route["title"], "Claude");
+    assert_eq!(route["fallback"], "wait");
+    assert_eq!(route["connected"], true);
+    assert!(
+        route["model"].as_str().is_some_and(|m| !m.is_empty()),
+        "{listing}"
+    );
+    assert_eq!(
+        (&agent["provider"], &agent["model"]),
+        (&scout(&before)["provider"], &scout(&before)["model"]),
+        "the hub's own route is still said as it was"
+    );
+
+    let (_, theirs) = hub.get(&hub.bob, "/api/agents").await;
+    assert!(
+        scout(&theirs).get("personal_route").is_none(),
+        "Bob's turns stay on the hub's route: {theirs}"
+    );
+
+    let path = "/api/me/agents/scout/llm-route";
+    let (status, body) = hub.put(&hub.alice, path, json!("hub")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, listing) = hub.get(&hub.alice, "/api/agents").await;
+    assert!(
+        scout(&listing).get("personal_route").is_none(),
+        "this agent stays on the hub's route: {listing}"
+    );
+
+    hub.put(&hub.alice, path, claude("hub")).await;
+    let (_, listing) = hub.get(&hub.alice, "/api/agents").await;
+    assert_eq!(scout(&listing)["personal_route"]["fallback"], "hub");
+
+    hub.agent_routes(AgentPersonalRoutes {
+        enabled: Some(false),
+        allow: None,
+    });
+    let (_, listing) = hub.get(&hub.alice, "/api/agents").await;
+    assert!(
+        scout(&listing).get("personal_route").is_none(),
+        "the agent opted out: {listing}"
+    );
 }

@@ -974,3 +974,110 @@ async fn her_background_calls_run_the_light_and_heavy_codex_models_she_chose() {
     );
     assert_eq!(hub.chatgpt_requests().await, 0);
 }
+
+/// What `person`'s own conversations with the agent are shown to run on.
+async fn shown(hub: &Hub, person: &str) -> Option<workforce_gateway_client::PersonalRouteInfo> {
+    crate::api_handlers::llm_route::shown_route(&hub.service, person.parse().unwrap()).await
+}
+
+#[tokio::test]
+async fn her_desk_chat_turn_runs_on_her_claude_login_at_the_model_she_is_shown() {
+    let (hub, store) = routed().await;
+    let token = hub.claude_login(ALICE);
+    shared_claude_login(&hub);
+    let mut route = claude(RouteFallback::Wait);
+    route
+        .model_preferences
+        .insert("conversation".into(), "claude-chat-test".into());
+    choose(&hub, &store, ALICE, Some(route)).await;
+    hub.claude.reply(None, &answer("Claude answers."));
+
+    let shown = shown(&hub, ALICE).await.expect("her own route is shown");
+    let (_, result) = crate::serve::chat_turn(hub.stream_at(
+        ("desk", None, None),
+        ALICE,
+        "hello there",
+        None,
+        None,
+    ))
+    .await;
+
+    result.unwrap();
+    let calls = hub.claude.calls();
+    assert_eq!(calls.len(), 1, "the turn ran on Claude Code");
+    assert_eq!(calls[0].token, token, "her own login, not the shared one");
+    assert_eq!(calls[0].flag("--model"), Some("claude-chat-test"));
+    assert_eq!(
+        shown.model, "claude-chat-test",
+        "what she's shown is what ran"
+    );
+    assert_eq!(shown.kind, "claude-code");
+    assert_eq!(shown.title, "Claude");
+    assert_eq!(shown.fallback, "wait");
+    assert!(shown.connected);
+    assert_eq!(
+        hub.chatgpt_requests().await,
+        0,
+        "never the agent's own route"
+    );
+}
+
+#[tokio::test]
+async fn with_no_model_chosen_she_is_shown_the_claude_model_her_turn_runs() {
+    let (hub, store) = routed().await;
+    hub.claude_login(ALICE);
+    choose(&hub, &store, ALICE, Some(claude(RouteFallback::Hub))).await;
+    hub.claude.reply(None, &answer("Claude answers."));
+
+    let shown = shown(&hub, ALICE).await.expect("her own route is shown");
+    let (_, result) = crate::serve::chat_turn(hub.stream_at(
+        ("desk", None, None),
+        ALICE,
+        "hello there",
+        None,
+        None,
+    ))
+    .await;
+
+    result.unwrap();
+    let calls = hub.claude.calls();
+    assert_eq!(calls[0].flag("--model"), Some(shown.model.as_str()));
+    assert_eq!(shown.fallback, "hub");
+}
+
+#[tokio::test]
+async fn only_a_person_whose_turns_take_their_own_route_is_shown_one() {
+    let (hub, store) = routed().await;
+    assert_eq!(shown(&hub, ALICE).await, None, "the hub's route");
+
+    choose(&hub, &store, ALICE, Some(claude(RouteFallback::Wait))).await;
+    let without_login = shown(&hub, ALICE).await.expect("her route");
+    assert!(
+        !without_login.connected,
+        "a turn of hers waits until she connects her own login"
+    );
+    assert_eq!(shown(&hub, BOB).await, None, "Bob's is his own");
+
+    choose_here(&hub, &store, ALICE, AgentRoute::Hub).await;
+    assert_eq!(
+        shown(&hub, ALICE).await,
+        None,
+        "this agent stays on the hub's"
+    );
+
+    choose_here(
+        &hub,
+        &store,
+        ALICE,
+        AgentRoute::Personal(claude(RouteFallback::Hub)),
+    )
+    .await;
+    let routes = hub.service.subscriptions().personal_routes();
+    routes.set_switch(PersonalRoutesConfig::default());
+    assert_eq!(shown(&hub, ALICE).await, None, "the hub's switch is off");
+    routes.set_switch(PersonalRoutesConfig {
+        enabled: true,
+        allow: vec![PersonalRouteKind::Codex],
+    });
+    assert_eq!(shown(&hub, ALICE).await, None, "Claude isn't offered");
+}
