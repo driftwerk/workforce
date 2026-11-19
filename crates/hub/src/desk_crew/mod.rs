@@ -1464,9 +1464,17 @@ impl Crew for CrewHub {
         let mut by = By::you();
         by.suggestion_id = Some(suggestion.id.clone());
         // An interrupt suggested for a stand-down not read in time: of that
-        // turn alone, while it is unread.
+        // turn alone, while it is unread. One whose mark can't be read is
+        // set aside, never taken as an interrupt of whatever turn runs now.
+        let only_turn = match urgent::only_turn_of(&suggestion.action["input"]) {
+            Ok(only) => only,
+            Err(urgent::Unreadable) => {
+                self.set_aside_unreadable(suggestion).await;
+                return Err(urgent::UNREADABLE.into());
+            }
+        };
         let order = assignments::Order {
-            only_turn: urgent::only_turn_of(&suggestion.action["input"]),
+            only_turn,
             ..Default::default()
         };
         Box::pin(self.me().perform_with(&action, by, &order))

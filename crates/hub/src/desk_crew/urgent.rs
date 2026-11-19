@@ -46,13 +46,36 @@ pub(crate) fn told(name: &str, rushed: Option<Rushed>) -> Option<String> {
 
 /// The stand-down an interrupt is for, as a suggestion to interrupt
 /// carries it: the person's yes interrupts that turn alone, while the row
-/// is unread ([`workforce_desk::Desk::interrupt_turn`]).
-pub(crate) fn only_turn_of(input: &serde_json::Value) -> Option<(Uuid, TurnMark)> {
-    let s = input.get(workforce_desk::line::STAND_DOWN_KEY)?;
-    let row = s.get("row")?.as_str()?.parse().ok()?;
-    let turn = serde_json::from_value(s.get("turn")?.clone()).ok()?;
-    Some((row, turn))
+/// is unread ([`workforce_desk::Desk::interrupt_turn`]). `None` for an
+/// interrupt suggested for no stand-down. A mark there that can't be read
+/// (only Desk writes it, so it is damaged) is [`Unreadable`]: its yes
+/// interrupts nothing, rather than whatever turn runs by then.
+pub(crate) fn only_turn_of(
+    input: &serde_json::Value,
+) -> Result<Option<(Uuid, TurnMark)>, Unreadable> {
+    let Some(s) = input.get(workforce_desk::line::STAND_DOWN_KEY) else {
+        return Ok(None);
+    };
+    let row = s
+        .get("row")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|r| r.parse().ok())
+        .ok_or(Unreadable)?;
+    let turn = s
+        .get("turn")
+        .and_then(|t| serde_json::from_value(t.clone()).ok())
+        .ok_or(Unreadable)?;
+    Ok(Some((row, turn)))
 }
+
+/// A suggestion to interrupt whose stand-down mark can't be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Unreadable;
+
+/// What the person is told of a yes to a suggestion whose stand-down mark
+/// can't be read: nothing was interrupted, and it is set aside.
+pub(crate) const UNREADABLE: &str = "This suggestion to interrupt can't say which turn it was for, \
+     so nothing was interrupted and it was set aside. Interrupt the session yourself if it still needs it.";
 
 impl CrewHub {
     /// `boss`'s escalating stand-down (line row `row`) wasn't read by
@@ -100,6 +123,28 @@ impl CrewHub {
             Gate::No(why) => Err(why.into_owned()),
             Gate::Refuse => Err("the boss only watches".into()),
         }
+    }
+
+    /// The person said yes to `s`, a suggestion to interrupt whose
+    /// stand-down mark can't be read ([`Unreadable`]): it is set aside, only
+    /// while still open, and said so, so it isn't asked again.
+    pub(crate) async fn set_aside_unreadable(&self, s: &crew::Suggestion) {
+        tracing::warn!(suggestion = %s.id, "a suggestion to interrupt has a stand-down mark that can't be read: set aside, nothing interrupted");
+        match self.desk.store().suggestion_dismiss_open(&s.id).await {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(e) => {
+                tracing::warn!(suggestion = %s.id, error = %e, "a suggestion to interrupt with an unreadable mark couldn't be set aside");
+                return;
+            }
+        }
+        let mut by = crew::By::desk("It couldn't say which turn it was for.");
+        by.suggestion_id = Some(s.id.clone());
+        self.desk.note(by.event(
+            crew::Kind::Dismissed,
+            s.subject.clone(),
+            format!("set aside the suggestion: {}", s.text),
+        ));
     }
 
     /// The suggestion `s` to interrupt `session` for its stand-down `row`

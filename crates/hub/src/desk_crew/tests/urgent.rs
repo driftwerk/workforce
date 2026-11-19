@@ -551,7 +551,9 @@ async fn a_suggested_interrupt_said_yes_to_in_its_turn_interrupts_it() {
         })
         .await;
         assert_eq!(
-            super::super::urgent::only_turn_of(&suggested.action["input"]).map(|(r, _)| r),
+            super::super::urgent::only_turn_of(&suggested.action["input"])
+                .unwrap()
+                .map(|(r, _)| r),
             Some(row),
             "it reads back its stand-down"
         );
@@ -566,4 +568,78 @@ async fn a_suggested_interrupt_said_yes_to_in_its_turn_interrupts_it() {
         went_in(&d, row).await;
     })
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_yes_to_an_interrupt_whose_mark_cant_be_read_is_refused_and_set_aside() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (overseer, crew, d, _llm) = overseeing(&base, pool, "ok", NO_INTERRUPT, &[]).await;
+        eventually("the overseer's tools", async || {
+            overseer.tools.has("crew.nudge").then_some(())
+        })
+        .await;
+        d.set_steer_wait(Duration::from_millis(300));
+        let (s, _) = working(&d, &base, "release-prep").await;
+        let row = stand_down(&d, &crew, s, Urgency::Escalate).await;
+        let mut suggested = eventually("the interrupt, suggested", async || {
+            d.store()
+                .suggestions(10)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|g| g.text == "Interrupt release-prep")
+        })
+        .await;
+        // Its mark damaged where it is kept: the turn no longer reads.
+        suggested.action["input"]["stand_down"]["turn"] = json!("its last one");
+        d.store().put_suggestion(&suggested).await.unwrap();
+        // The person's yes, while the turn still runs and the row is unread:
+        // refused in plain words, never a plain interrupt. (Desk's route
+        // answers a refusal without keeping the suggestion it read, so the
+        // setting aside below stands.)
+        let accepted = workforce_desk::crew::Crew::accept(&*crew, &suggested).await;
+        assert_eq!(accepted, Err(super::super::urgent::UNREADABLE.to_string()));
+        assert_eq!(d.view(s).unwrap().state, SessionState::Working);
+        assert_eq!(
+            d.store().line_message(row).await.unwrap().unwrap().delivery,
+            Delivery::Queued,
+            "its stand-down still waits for the turn"
+        );
+        // And set aside, so it isn't asked again.
+        let now = d.store().suggestion(&suggested.id).await.unwrap().unwrap();
+        assert_eq!(now.state, SuggestionState::Dismissed);
+    })
+    .await;
+}
+
+#[test]
+fn a_suggested_interrupts_stand_down_mark_is_read_whole_or_refused() {
+    use super::super::urgent::{only_turn_of, Unreadable};
+    let row = uuid::Uuid::new_v4();
+    let turn = json!({"run": uuid::Uuid::new_v4(), "ends": 2, "turns": 5});
+    // No mark: an interrupt of whatever turn runs.
+    assert_eq!(only_turn_of(&json!({"session_id": "x"})), Ok(None));
+    // A whole mark: that turn alone.
+    let whole = json!({"stand_down": {"row": row.to_string(), "turn": turn}});
+    assert_eq!(
+        only_turn_of(&whole),
+        Ok(Some((row, serde_json::from_value(turn.clone()).unwrap())))
+    );
+    // A mark there that doesn't read: refused, never taken as no mark.
+    for bad in [
+        json!({"stand_down": null}),
+        json!({"stand_down": "yes"}),
+        json!({"stand_down": {}}),
+        json!({"stand_down": {"row": row.to_string()}}),
+        json!({"stand_down": {"turn": turn}}),
+        json!({"stand_down": {"row": 7, "turn": turn}}),
+        json!({"stand_down": {"row": "not a row", "turn": turn}}),
+        json!({"stand_down": {"row": row.to_string(), "turn": "its last"}}),
+        json!({"stand_down": {"row": row.to_string(), "turn": {"run": "x"}}}),
+        json!({"stand_down": {"row": row.to_string(), "turn": null}}),
+    ] {
+        assert_eq!(only_turn_of(&bad), Err(Unreadable), "{bad}");
+    }
 }
