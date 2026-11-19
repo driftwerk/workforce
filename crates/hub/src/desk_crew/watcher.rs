@@ -406,8 +406,22 @@ impl CrewHub {
         overseer: &str,
         o: &Oversight,
     ) -> Option<Trigger> {
-        if matches!(event.actor.kind, PartyKind::Manager | PartyKind::You) || event.hop >= MAX_HOPS
-        {
+        // A restart that stopped work a session had running (its CI
+        // watchers, its sub-agents), whoever did it but this boss: the boss
+        // sees it re-checks that work.
+        let stopped = matches!(event.kind, Kind::Restarted | Kind::Resumed)
+            && event
+                .detail
+                .as_ref()
+                .and_then(|d| d.get("stopped"))
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|n| n > 0);
+        let quiet = match event.actor.kind {
+            PartyKind::Manager => !stopped || event.actor.id == overseer,
+            PartyKind::You => !stopped,
+            _ => false,
+        };
+        if quiet || event.hop >= MAX_HOPS {
             return None;
         }
         let subject = event.subject.as_ref()?;
@@ -447,6 +461,7 @@ impl CrewHub {
             return None;
         }
         let wanted = match event.kind {
+            _ if stopped => runs() || o.wake.on_failure || unbound,
             Kind::Finished | Kind::Question => o.wake.on_finish || unbound,
             Kind::Failed | Kind::Limit => o.wake.on_failure || unbound,
             // Unbound, what waits on an answer wakes it at once, unless it
@@ -487,8 +502,16 @@ impl CrewHub {
                 question_key(&subject.id, "asked", asked)
             })
         });
+        let line = match stopped {
+            true => format!(
+                "{} {}. Make sure it restarts what it still needs of that work, and that what \
+                 waited on it (CI, a review, an answer) still happens; it was told to check.",
+                event.actor.name, event.text
+            ),
+            false => format!("{} {}", who(subject), event.text),
+        };
         wanted.then(|| Trigger {
-            line: format!("{} {}", who(subject), event.text),
+            line,
             approvals: Vec::new(),
             hop: event.hop,
             about,

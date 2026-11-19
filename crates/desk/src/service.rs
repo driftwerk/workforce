@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::adopt::{self, External, HubInternal};
 use crate::asking::{self, Asked, Call, Denied, Reading};
-use crate::background::{Background, TaskKind};
+use crate::background::{Background, CutOff, Reported, TaskKind};
 use crate::claude::{self, Hook};
 use crate::codex::{self, AppServer, CodexEvent, Seen};
 use crate::crew::{self, By, Event, Kind, Party};
@@ -764,6 +764,15 @@ struct State {
     /// Sessions moving to another account once their turn ends (`None`:
     /// the CLI's own sign-in).
     switches: HashMap<Uuid, Option<Uuid>>,
+    /// Who asked for each switch in `switches`: who it is said to be by
+    /// when it is carried out later, never the person unless they asked.
+    switch_by: HashMap<Uuid, By>,
+    /// What each session's process had running when it ended, and when:
+    /// told to it, by name where known, when it runs again.
+    cut_off: HashMap<Uuid, (DateTime<Utc>, CutOff)>,
+    /// Sessions run again after a restart that stopped work of theirs,
+    /// until the turn that looks at it ends: what they are on now.
+    restarted: HashMap<Uuid, crate::model::Restarted>,
     /// What Desk last read of each account's plan (`None`: the CLI's own
     /// sign-in).
     standing: HashMap<Option<Uuid>, crate::engine_accounts::Standing>,
@@ -1213,6 +1222,20 @@ fn asked_at_end(denials: &[Denied], reply: Option<&str>) -> (Option<Asked>, bool
         Some(Reading::Unsure) => (None, true),
         Some(Reading::Done) | None => (None, false),
     }
+}
+
+/// `e`, a session's resume or restart, with what it stopped of the work
+/// the session had running (`stopped`), which it was told of.
+fn with_stopped(e: Event, stopped: Option<u32>) -> Event {
+    let Some(n) = stopped.filter(|n| *n > 0) else {
+        return e;
+    };
+    let text = format!(
+        "{}, which stopped {} it had running; Desk told it to check them",
+        e.text,
+        background_tasks(n)
+    );
+    Event { text, ..e }.detail(serde_json::json!({ "stopped": n }))
 }
 
 /// "1 background task", "2 background tasks".
@@ -2227,6 +2250,7 @@ impl Desk {
         view.group = Self::group_ref(&state.layout, &groups::session_item(r.id));
         (view.account, view.switching_to) = Self::account_refs(state, r);
         view.background = live.and_then(|l| l.background.view());
+        view.restarted = state.restarted.get(&r.id).copied();
         view.fixed_ground = live.and_then(|l| l.fixed_ground);
         view.interrupted = live.is_some_and(|l| l.interrupted);
         view.reading = live.is_some_and(|l| l.reading.is_some());
@@ -2258,7 +2282,7 @@ impl Desk {
             let ids: Vec<Uuid> = st.relogged.iter().copied().collect();
             self.keep_state(identities::RELOGGED, serde_json::json!(ids));
         }
-        let view = Self::view_of(st, &r);
+        let mut view = Self::view_of(st, &r);
         if before.as_ref().is_none_or(|b| b.state != view.state) {
             st.state_since.insert(r.id, view.updated_at);
         }
@@ -2339,8 +2363,15 @@ impl Desk {
         let verdict_pending = reported
             && matches!(&view.failure, Some(crate::limit::TurnFailure::Failed(e)) if e == "rate_limit")
             && st.verdict_pending.contains(&id);
+        // Its first turn after a restart that stopped work of its own ends:
+        // it has looked at that, and is what it says now.
+        let rechecked = turn_over && st.restarted.remove(&id).is_some();
+        // A switch that waited for the work it left running: that ended.
+        let drained = transitions
+            .iter()
+            .any(|t| matches!(t, Transition::Background { from, count: 0 } if *from > 0));
         // Carried out by the one driver of this session's switches.
-        if turn_over && !verdict_pending && st.switches.contains_key(&id) {
+        if (turn_over || drained) && !verdict_pending && st.switches.contains_key(&id) {
             let desk = self.clone();
             tokio::spawn(async move {
                 if let Err(e) = desk.drive_switch(id, None).await {
@@ -2351,6 +2382,9 @@ impl Desk {
         let _ = self.0.persist.send(Persist::Put(Box::new(r)));
         if noticed {
             let _ = self.0.persist.send(Persist::Attention(id, view.updated_at));
+        }
+        if rechecked {
+            view.restarted = None;
         }
         let _ = self.0.events.send(DeskEvent::Session {
             session: Box::new(view),
@@ -3645,8 +3679,66 @@ impl Desk {
             Some(m) => self.0.state.lock().modes_carried.insert(id, m),
             None => self.0.state.lock().modes_carried.remove(&id),
         };
-        let launched = self.launch(&r, afresh.is_none(), prompt.as_deref()).await;
+        // What its last process had running was stopped with it: the first
+        // thing it is told is that, by name where Desk knows them. Never
+        // past a hold of Desk's breaker, which only the person lifts: kept
+        // for the run after.
+        let cut = self.0.state.lock().cut_off.remove(&id);
+        let held = self.breaker_refuses_prompt(id, None).is_err();
+        let (cut, kept) = match (cut, held) {
+            (Some(c), true) => (None, Some(c)),
+            (c, _) => (c, None),
+        };
+        let now = Utc::now();
+        let note = cut.as_ref().map(|(_, c)| {
+            c.note(
+                &now.with_timezone(&self.timezone())
+                    .format("%H:%M")
+                    .to_string(),
+            )
+        });
+        let told = match (&note, &prompt) {
+            (Some(n), Some(p)) => Some(format!("{n}\n\n{p}")),
+            (Some(n), None) => Some(n.clone()),
+            (None, p) => p.clone(),
+        };
+        let launched = self.launch(&r, afresh.is_none(), told.as_deref()).await;
         self.0.state.lock().modes_carried.remove(&id);
+        {
+            let mut st = self.0.state.lock();
+            match &launched {
+                Ok(()) => {
+                    if let Some(kept) = kept {
+                        st.cut_off.insert(id, kept);
+                    }
+                    // Run again, a resumed CLI's word on what it ran before
+                    // is never taken for what it runs now.
+                    if let Some(l) = st.live.get_mut(&id).filter(|l| l.background.count() == 0) {
+                        l.background = Background::after_restart(cut.as_ref().map(|(_, c)| c));
+                    }
+                    match &cut {
+                        Some((_, c)) => {
+                            st.restarted.insert(
+                                id,
+                                crate::model::Restarted {
+                                    at: now,
+                                    stopped: u32::try_from(c.count).unwrap_or(u32::MAX),
+                                },
+                            );
+                        }
+                        None => {
+                            st.restarted.remove(&id);
+                        }
+                    }
+                }
+                // Not run: what it had is still to be told.
+                Err(_) => {
+                    if let Some(c) = cut.clone().or(kept) {
+                        st.cut_off.insert(id, c);
+                    }
+                }
+            }
+        }
         if let (Ok(()), Some(why)) = (&launched, &afresh) {
             if let Ok(view) = self.view(id) {
                 self.note(Event::new(
@@ -3659,7 +3751,7 @@ impl Desk {
         }
         if launched.is_ok() {
             self.breaker_launched(id);
-            if let Some(p) = &prompt {
+            if let Some(p) = &told {
                 // Its first prompt is the resumer's, never the terminal's.
                 self.breaker_typed(id, p, None);
             }
@@ -3673,12 +3765,32 @@ impl Desk {
             return Err(e);
         }
         let view = self.view(id)?;
-        if let Some(by) = by {
-            let text = match &prompt {
-                Some(p) => format!("resumed {} with “{}”", view.label(), crew::one_line(p, 100)),
-                None => format!("resumed {}", view.label()),
-            };
-            self.note(by.event(Kind::Resumed, Some(Party::session(&view)), text));
+        let stopped = view.restarted.map(|r| r.stopped);
+        // [`Self::restart`] says it, as its restart.
+        let restarting = by.is_none() && carrier.is_some();
+        match (by, stopped) {
+            (Some(by), _) => {
+                let text = match &prompt {
+                    Some(p) => {
+                        format!("resumed {} with “{}”", view.label(), crew::one_line(p, 100))
+                    }
+                    None => format!("resumed {}", view.label()),
+                };
+                let e = by.event(Kind::Resumed, Some(Party::session(&view)), text);
+                self.note(with_stopped(e, stopped));
+            }
+            // Run again by no one named (the hub's own restore): what it had
+            // running and was told is said all the same.
+            (None, Some(n)) if !restarting => {
+                let e = Event::new(
+                    Kind::Resumed,
+                    Party::desk(),
+                    Some(Party::session(&view)),
+                    format!("resumed {}", view.label()),
+                );
+                self.note(with_stopped(e, Some(n)));
+            }
+            (None, _) => {}
         }
         Ok(view)
     }
@@ -3758,7 +3870,8 @@ impl Desk {
             ),
             None => format!("restarted {}", view.label()),
         };
-        self.note(by.event(Kind::Restarted, Some(Party::session(&view)), text));
+        let e = by.event(Kind::Restarted, Some(Party::session(&view)), text);
+        self.note(with_stopped(e, view.restarted.map(|r| r.stopped)));
         Ok(view)
     }
 
@@ -5518,7 +5631,15 @@ impl Desk {
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
-        let live = self.0.state.lock().live.remove(&id);
+        let live = {
+            let mut st = self.0.state.lock();
+            let live = st.live.remove(&id);
+            // What it had running is stopped with it: told when it runs again.
+            if let Some(cut) = live.as_ref().and_then(|l| l.background.cut_off()) {
+                st.cut_off.insert(id, (Utc::now(), cut));
+            }
+            live
+        };
         let Some(live) = live else {
             // Forgotten while it ran: its files go now that it has ended.
             if engine == Engine::Devin && !self.0.state.lock().records.contains_key(&id) {
@@ -6340,7 +6461,7 @@ impl Desk {
         id: Uuid,
         transcript: Option<String>,
         reply: Option<String>,
-        background: Option<Vec<(String, TaskKind)>>,
+        background: Option<Vec<Reported>>,
         failure: Option<crate::limit::TurnFailure>,
     ) {
         let failed = failure.is_some();
