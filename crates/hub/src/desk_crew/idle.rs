@@ -22,10 +22,18 @@
 //!   Undo) and Stop. Lower levels never come here.
 //! - A call that fails or runs past [`WITHIN`] is tried once more; then the
 //!   turn's end goes to the boss's full turn, as before the fast call.
+//! - A next step Desk refuses for what the boss can fix (its job unsaid or
+//!   unclear, one another session holds) goes to its full turn, told why:
+//!   it can declare the job, which this call can't. The fast call never
+//!   takes a job over: `Declared::Unsaid` keeps only the one `replaces`
+//!   names, and a session's last job is no evidence its next step is that
+//!   job. The person never reads a refusal meant for the boss: one only
+//!   they can resolve, or the full turn's step refused too, reaches them
+//!   once, in plain words ([`Refusal::for_person`]).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use tokio::sync::broadcast::error::RecvError;
@@ -37,6 +45,7 @@ use workforce_desk::model::{DeskEvent, SessionState, SessionView};
 
 use super::actions::{Action, Target};
 use super::decide::{MARK, WITHIN};
+use super::refusal::{Refusal, Refused};
 use super::{name_of, CrewHub};
 
 /// How often every finished session is looked at again.
@@ -52,6 +61,10 @@ const RECENT_MINUTES: i64 = 30;
 /// to the session may be.
 const SHOWN: usize = 200;
 const MESSAGE_MAX: usize = 600;
+
+/// How long a refused next step handed to the full turn is followed, at
+/// most.
+const HANDED_KEPT: Duration = Duration::from_secs(60 * 60);
 
 const SYSTEM: &str = "You are the boss of coding sessions you oversee for the person, at Act fully: \
 a session finished its turn without asking anything, and you decide, now, as the person would, what \
@@ -130,6 +143,21 @@ pub(super) fn next(text: &str) -> Option<Next> {
 /// A finished turn: which session, and how many prompts it had.
 type Key = (Uuid, u64);
 
+/// A session's turn end handed to its boss's full turn because the fast
+/// call's next step was refused for what the boss can fix: followed until
+/// a step of the boss's for it goes, the session moves on, or the full
+/// turn's is refused too (then the person is told, once).
+#[derive(Debug, Clone)]
+pub(super) struct Handed {
+    boss: String,
+    prompts: u64,
+    /// The fast call's step, as the person is shown it.
+    step: String,
+    /// A step of the boss's for it refused since, of this kind.
+    again: Option<Refusal>,
+    at: Instant,
+}
+
 /// What the loop keeps between looks.
 #[derive(Default)]
 struct Seen {
@@ -172,6 +200,13 @@ pub(super) async fn idle_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
         crew.note_unbound(&seen);
         for id in sessions {
             crew.look_at_finished(id, &seen, &cancel, &mut slots);
+        }
+        for (boss, view, h, kind) in crew.refused_again() {
+            let crew = Arc::clone(&crew);
+            tokio::spawn(async move {
+                tracing::info!(session = %view.id, %boss, ?kind, "a boss's full turn couldn't send a refused next step either: the person is told");
+                crew.tell_person_refused(&boss, &view, &h.step, kind).await;
+            });
         }
         // Only what still waits is remembered.
         let mut s = seen.lock();
@@ -465,40 +500,179 @@ impl CrewHub {
                 };
                 let action = Action::Nudge {
                     to: Target::Session(view.id),
-                    message: text,
+                    message: text.clone(),
                     reply_to: None,
                 };
-                match self.perform(&action, By::manager(boss, &name, &why)).await {
+                // As it says it: the fast call declares no job.
+                let order = super::assignments::Order::default();
+                match Box::pin(self.perform_judged(&action, By::manager(boss, &name, &why), &order))
+                    .await
+                {
                     Ok(done) => {
                         tracing::info!(session = %view.id, %boss, %done, "the boss told a finished session its next step");
                     }
-                    // The picture moved while it decided: it decides again
-                    // on it at the next look (a sweep later).
-                    Err(refused) if super::picture::stale(&refused) => return Judged::Later,
-                    Err(refused) => {
-                        tracing::warn!(session = %view.id, %boss, %refused, "a boss's next step for a session was refused");
-                        self.record_turn_left(
-                            boss,
-                            view,
-                            &format!("Desk refused its next step: {refused}"),
-                        )
-                        .await;
-                        self.tell_dm(
-                            boss,
-                            &format!("{label} finished its turn. I told it what's next, but Desk refused it: {refused}"),
-                        )
-                        .await;
-                    }
+                    Err(r) => return self.next_step_refused(boss, view, &text, r, seen).await,
                 }
             }
         }
         Judged::Done
     }
 
+    /// What became of the fast call's next step `step` for `view`, refused
+    /// as `r`.
+    async fn next_step_refused(
+        &self,
+        boss: &str,
+        view: &SessionView,
+        step: &str,
+        r: Refused,
+        seen: &parking_lot::Mutex<Seen>,
+    ) -> Judged {
+        match r.kind {
+            // The picture moved while it decided: it decides again on it at
+            // the next look (a sweep later).
+            Refusal::Stale => Judged::Later,
+            // The person took it back meanwhile: theirs, nothing said.
+            Refusal::TakenBack => {
+                tracing::info!(session = %view.id, %boss, "a boss's next step for a session the person took back wasn't sent");
+                Judged::Done
+            }
+            // Its full turn can say what this call couldn't (its job): it
+            // takes the turn's end, told why the step wasn't sent.
+            kind if kind.boss_fixes() => {
+                tracing::info!(session = %view.id, %boss, ?kind, refused = %r, "a boss's next step for a session was refused for what it can fix: its full turn takes it");
+                self.refused_steps.lock().insert(
+                    view.id,
+                    Handed {
+                        boss: boss.to_string(),
+                        prompts: view.prompts,
+                        step: step.to_string(),
+                        again: None,
+                        at: Instant::now(),
+                    },
+                );
+                let told = format!(
+                    " · Your quick look gave it its next step, “{}”, but Desk didn't send it: {} Send it as Desk asks (declare its job), or whatever fits now. If you can't, leave it: Desk tells the person.",
+                    workforce_desk::crew::one_line(step, 300),
+                    r.why
+                );
+                self.hand_to_work_told(view, seen, Some(&told));
+                Judged::Done
+            }
+            kind => {
+                tracing::warn!(session = %view.id, %boss, ?kind, refused = %r, "a boss's next step for a session was refused");
+                self.tell_person_refused(boss, view, step, kind).await;
+                Judged::Done
+            }
+        }
+    }
+
+    /// Tells the person, in `boss`'s DM, that `view`'s next step `step`
+    /// wasn't sent, refused as `kind`, in plain words; recorded as left
+    /// to them.
+    async fn tell_person_refused(&self, boss: &str, view: &SessionView, step: &str, kind: Refusal) {
+        let why = kind.for_person();
+        let step = workforce_desk::crew::one_line(step, SHOWN);
+        self.record_turn_left(
+            boss,
+            view,
+            &format!("its next step (“{step}”) wasn't sent: {why}"),
+        )
+        .await;
+        self.tell_dm(
+            boss,
+            &format!(
+                "{} finished its turn, and I couldn't give it its next step (“{step}”): {why}. What should it do next?",
+                view.label()
+            ),
+        )
+        .await;
+    }
+
+    /// A boss's step for session `s` went, or was refused: what follows a
+    /// refused next step its full turn has ([`Handed`]). One that went, or
+    /// a session gone on, ends it; one refused for more than a moved
+    /// picture is told to the person once its turn is over.
+    pub(super) fn step_went(&self, boss: &str, s: Uuid, went: Result<(), &Refused>) {
+        if !self.refused_steps.lock().contains_key(&s) {
+            return;
+        }
+        let prompts = self.desk.view(s).ok().map(|v| v.prompts);
+        let mut steps = self.refused_steps.lock();
+        let Some(h) = steps.get_mut(&s) else {
+            return;
+        };
+        if h.boss != boss {
+            return;
+        }
+        match went {
+            Ok(()) => {
+                steps.remove(&s);
+            }
+            Err(_) if prompts != Some(h.prompts) => {
+                steps.remove(&s);
+            }
+            Err(r) if matches!(r.kind, Refusal::Stale) => {}
+            Err(r) => h.again = Some(r.kind),
+        }
+    }
+
+    /// The refused next steps whose full turn's step was refused too, and
+    /// is over: each the person's now, said once. Those whose session went
+    /// on, or that are old, are let go.
+    fn refused_again(&self) -> Vec<(String, SessionView, Handed, Refusal)> {
+        let handed: Vec<(Uuid, Handed)> = {
+            let steps = self.refused_steps.lock();
+            if steps.is_empty() {
+                return Vec::new();
+            }
+            steps.iter().map(|(s, h)| (*s, h.clone())).collect()
+        };
+        let mut due = Vec::new();
+        let mut done = Vec::new();
+        for (s, h) in handed {
+            let view = self.desk.view(s).ok().filter(|v| {
+                v.state == SessionState::Done && v.prompts == h.prompts && v.pending.is_none()
+            });
+            let Some(view) = view else {
+                done.push((s, h.at));
+                continue;
+            };
+            if h.at.elapsed() >= HANDED_KEPT {
+                done.push((s, h.at));
+                continue;
+            }
+            // Its turn is over once nothing holds or waits for its mind.
+            if let Some(kind) = h.again.filter(|_| self.mind_free(&h.boss)) {
+                done.push((s, h.at));
+                due.push((h.boss.clone(), view, h, kind));
+            }
+        }
+        let mut steps = self.refused_steps.lock();
+        for (s, at) in done {
+            // Only the one looked at: one handed since stands.
+            if steps.get(&s).is_some_and(|h| h.at == at) {
+                steps.remove(&s);
+            }
+        }
+        due
+    }
+
     /// Hands `view`'s turn's end to its boss's full turn, as Desk said it
     /// (or as it stands, when that was missed).
     fn hand_to_work(&self, view: &SessionView, seen: &parking_lot::Mutex<Seen>) {
-        let event = seen
+        self.hand_to_work_told(view, seen, None);
+    }
+
+    /// [`Self::hand_to_work`], with `told` added to what its full turn reads
+    /// of it.
+    fn hand_to_work_told(
+        &self,
+        view: &SessionView,
+        seen: &parking_lot::Mutex<Seen>,
+        told: Option<&str>,
+    ) {
+        let mut event = seen
             .lock()
             .ends
             .remove(&view.id)
@@ -513,6 +687,9 @@ impl CrewHub {
                 e.group = view.group.as_ref().map(|g| g.id.clone());
                 e
             });
+        if let Some(told) = told {
+            event.text.push_str(told);
+        }
         self.to_work.lock().insert((view.id, view.prompts));
         // No loop listening is a hub shutting down.
         let _ = self.rework.send(event);
