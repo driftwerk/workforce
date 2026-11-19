@@ -105,6 +105,10 @@ impl TurnRoute {
     }
 }
 
+/// The least an agent turn's scope stays up once its turn is over, whatever
+/// `agent_turn_idle_secs` says: a quick reply finds it warm.
+const AGENT_TURN_IDLE_FLOOR_SECS: u64 = 60;
+
 /// Wire what runs `service`'s turns on CLI routes: workspaces from the
 /// coding executor, transcripts rotated as `/cc`'s are. Wired whatever
 /// logins exist today, since a turn resolves its payer's login itself.
@@ -128,7 +132,12 @@ pub fn wire(
             codex_worker,
             crate::cli_session::RotationPolicy::of(&service.config.claude_chat),
             std::time::Duration::from_secs(coding.executor.scope_ttl_secs),
-            std::time::Duration::from_secs(coding.executor.agent_turn_idle_secs),
+            std::time::Duration::from_secs(
+                coding
+                    .executor
+                    .agent_turn_idle_secs
+                    .max(AGENT_TURN_IDLE_FLOOR_SECS),
+            ),
         ))),
         Err(e) => tracing::error!(
             agent = %service.agent_id,
@@ -466,10 +475,25 @@ fn whose(plan: (CliKind, bool)) -> String {
     }
 }
 
-/// What the person hears when no route served and one of them found the
-/// coding worker full: why, and what to do. A person whose route waits
-/// rather than fall back is told they can let it.
-fn worker_full_notice(misses: &[RouteMiss], personal_only: bool) -> Option<String> {
+/// What the person hears when no route served because the coding worker was
+/// full: why, and what to do. A person whose route waits rather than fall
+/// back is told they can let it. Only for a person in the loop
+/// (`interactive`): a job or trigger fails with its misses instead, so it is
+/// retried or alerted on. And only when the worker is all that stood in the
+/// way, every other miss a login one: a route that failed for some other
+/// reason is not hidden behind a full worker.
+fn worker_full_notice(
+    misses: &[RouteMiss],
+    personal_only: bool,
+    interactive: bool,
+) -> Option<String> {
+    if !interactive
+        || !misses
+            .iter()
+            .all(|miss| miss.worker_full || names_a_login(&miss.reason))
+    {
+        return None;
+    }
     let plan = misses.iter().find(|miss| miss.worker_full)?.plan?;
     let advice = match personal_only {
         true => "Try again in a minute, or switch this agent to the hub's models.",
@@ -482,49 +506,74 @@ fn worker_full_notice(misses: &[RouteMiss], personal_only: bool) -> Option<Strin
 }
 
 /// The line a served turn ends with when the person's own route could not
-/// take it and the hub's routes did: brief, and only what they need to know.
-/// The agent's own failover stays as quiet as it always was.
-fn fallback_note(misses: &[RouteMiss]) -> Option<String> {
+/// take it for want of a workspace on a full coding worker and another
+/// route did (`by`, as the person reads it): brief, and only what they need
+/// to know. Every other hand-over (no login of hers, her plan at its limit,
+/// the agent's own failover) stays as quiet as it always was, so a standing
+/// setup never closes each answer with the same line.
+fn fallback_note(misses: &[RouteMiss], by: &str) -> Option<String> {
     let miss = misses
         .iter()
-        .find(|miss| miss.plan.is_some_and(|(_, personal)| personal))?;
+        .find(|miss| miss.worker_full && miss.plan.is_some_and(|(_, personal)| personal))?;
     let plan = whose(miss.plan?);
-    let why = match miss.worker_full {
-        true => " (the coding worker was full)",
-        false => "",
-    };
     Some(format!(
-        "\n\n_{plan} couldn't take this{why}, so the hub's models answered._"
+        "\n\n_{plan} couldn't take this right now (the coding worker was full), so {by} answered._"
     ))
 }
 
-/// `result` closed by `note`, streamed to whoever watches the turn as the
-/// last part of its answer, so what is on screen and what is kept are the
-/// same words.
-async fn noted(
-    mut result: RunResult,
-    note: Option<String>,
+/// Stream `note` to whoever watches the turn as the last part of its answer,
+/// before the answer is given whole, so what is on screen and what is kept
+/// are the same words and nothing follows the turn's `Done`.
+async fn stream_note(note: &str, progress: &mpsc::Sender<ProgressEvent>) {
+    for event in [
+        ProgressEvent::StreamStart,
+        ProgressEvent::StreamDelta {
+            text: note.to_string(),
+        },
+        ProgressEvent::StreamEnd,
+    ] {
+        let _ = progress.send(event).await;
+    }
+}
+
+/// A progress channel for a runner route whose answer closes with `note`:
+/// everything the runner says passes through, its whole answer with the
+/// note streamed just before and appended, so the note lands before `Done`.
+/// Await the handle once the runner is over, before anything else is said.
+fn noting(
+    note: Option<&str>,
     progress: Option<&mpsc::Sender<ProgressEvent>>,
-) -> RunResult {
-    let Some(note) = note else {
-        return result;
+) -> (
+    Option<mpsc::Sender<ProgressEvent>>,
+    Option<tokio::task::JoinHandle<()>>,
+) {
+    let (Some(note), Some(progress)) = (note, progress) else {
+        return (progress.cloned(), None);
     };
-    if let Some(progress) = progress {
-        for event in [
-            ProgressEvent::StreamStart,
-            ProgressEvent::StreamDelta { text: note.clone() },
-            ProgressEvent::StreamEnd,
-        ] {
+    let (tx, mut rx) = mpsc::channel(64);
+    let (note, progress) = (note.to_string(), progress.clone());
+    let forward = tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            let event = match event {
+                ProgressEvent::Response { text } => {
+                    stream_note(&note, &progress).await;
+                    ProgressEvent::Response {
+                        text: format!("{text}{note}"),
+                    }
+                }
+                event => event,
+            };
             let _ = progress.send(event).await;
         }
-    }
-    result.response.push_str(&note);
-    result
+    });
+    (Some(tx), Some(forward))
 }
 
 /// No route served, and `text` says why: the turn's answer, given to
 /// whoever watches it as a finished one, so every surface replaces its
-/// status line with it.
+/// status line with it. A bare `Response` is enough: the notice comes only
+/// after every route missed before any output (a miss after output is an
+/// error, not a miss), so no surface has a streamed answer to keep.
 async fn notice(text: String, progress: Option<&mpsc::Sender<ProgressEvent>>) -> ChainOutcome {
     if let Some(progress) = progress {
         for event in [
@@ -675,19 +724,25 @@ impl TurnChain {
                         true => runner,
                         false => runner.without_silent_retry(),
                     };
-                    match Box::pin(run_runner(
+                    let note = fallback_note(&misses, "the hub's models");
+                    let (watched, forward) = noting(note.as_deref(), progress.as_ref());
+                    let ran = Box::pin(run_runner(
                         &runner,
                         task.clone(),
                         prior.clone(),
-                        progress.clone(),
+                        watched,
                         Some(cancel.clone()),
                         inbox,
                     ))
-                    .await
-                    {
-                        Ok(result) => {
-                            let result =
-                                noted(result, fallback_note(&misses), progress.as_ref()).await;
+                    .await;
+                    if let Some(forward) = forward {
+                        let _ = forward.await;
+                    }
+                    match ran {
+                        Ok(mut result) => {
+                            if let Some(note) = &note {
+                                result.response.push_str(note);
+                            }
                             return Ok(ChainOutcome::Served {
                                 result: Box::new(result),
                                 route: RouteTag::Runner,
@@ -744,10 +799,21 @@ impl TurnChain {
                         .await?;
                         match attempt {
                             CliAttempt::Served(served) => {
+                                let note = fallback_note(
+                                    &misses,
+                                    &match personal {
+                                        true => format!("your {} plan", plan_name(*cli)),
+                                        false => format!("this agent's {} plan", plan_name(*cli)),
+                                    },
+                                )
+                                .unwrap_or_default();
                                 if let Some(progress) = &progress {
+                                    if !note.is_empty() {
+                                        stream_note(&note, progress).await;
+                                    }
                                     let _ = progress
                                         .send(ProgressEvent::Response {
-                                            text: served.text.clone(),
+                                            text: format!("{}{note}", served.text),
                                         })
                                         .await;
                                     let _ = progress
@@ -759,12 +825,9 @@ impl TurnChain {
                                         .await;
                                 }
                                 let slot = served.slot.clone();
-                                let result = noted(
-                                    served.into_result(seeds.invocations.clone()),
-                                    fallback_note(&misses),
-                                    progress.as_ref(),
-                                )
-                                .await;
+                                let mut result =
+                                    served.into_result(seeds.invocations.clone());
+                                result.response.push_str(&note);
                                 return Ok(ChainOutcome::Served {
                                     result: Box::new(result),
                                     route: RouteTag::Cli { cli: *cli, slot },
@@ -810,7 +873,7 @@ impl TurnChain {
         if let Some(connect) = connect {
             return Ok(connect.notice(progress.as_ref()).await);
         }
-        match worker_full_notice(&misses, self.personal_only()) {
+        match worker_full_notice(&misses, self.personal_only(), interactive) {
             Some(text) => {
                 tracing::warn!(agent = %service.agent_id, misses = %describe(&misses), "no route could serve the turn: the coding worker is full; the person is told");
                 Ok(notice(text, progress.as_ref()).await)
