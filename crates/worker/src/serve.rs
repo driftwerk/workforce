@@ -50,6 +50,7 @@ pub async fn serve(config: WorkerConfig) -> Result<()> {
     };
     let worker = worker(config).await?;
     worker.reconcile().await?;
+    worker.publish_load();
     worker.resume_jobs().await?;
     info!(
         scopes = worker.scopes().len(),

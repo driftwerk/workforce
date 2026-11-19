@@ -293,10 +293,22 @@ async fn take_back(
 ) -> Response {
     guarded!(s, h, q.token.as_deref());
     s.desk
-        .line_edit(id, None)
+        .line_take_back(id)
         .await
         .map(|()| StatusCode::NO_CONTENT)
         .into_response()
+}
+
+/// The person's Send now for a message waiting for its session's turn to
+/// end: into that turn.
+async fn send_now(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    guarded!(s, h, q.token.as_deref());
+    s.desk.line_send_now(id).await.map(Json).into_response()
 }
 
 async fn answer(
@@ -346,5 +358,6 @@ pub(crate) fn api_routes(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
         .route("/api/desk/line/{id}", patch(edit).delete(take_back))
         .route("/api/desk/line/{id}/answer", post(answer))
         .route("/api/desk/line/{id}/dismiss", post(dismiss))
+        .route("/api/desk/line/{id}/now", post(send_now))
         .with_state(Arc::new(Api { desk, auth }))
 }

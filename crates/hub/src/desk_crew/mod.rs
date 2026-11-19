@@ -53,9 +53,11 @@ mod observe;
 mod own_settings;
 mod picture;
 mod plan;
+mod plan_watch;
 mod preferences;
 mod read_only;
 mod reading;
+mod refusal;
 pub(crate) mod relay;
 pub(crate) mod relayed_decide;
 pub(crate) mod remote_asks;
@@ -67,6 +69,7 @@ mod spend;
 mod tools;
 mod updates;
 mod urgent;
+mod waiting;
 pub(crate) use updates::HubWriter;
 mod watcher;
 mod work;
@@ -194,6 +197,9 @@ pub struct CrewHub {
     to_work: Mutex<std::collections::HashSet<(uuid::Uuid, u64)>>,
     /// Those turn ends, said again to the loops that wake a full turn.
     rework: tokio::sync::broadcast::Sender<workforce_desk::crew::Event>,
+    /// The turn ends handed to the full turn because the fast call's next
+    /// step was refused for what the boss can fix, by session (`idle`).
+    refused_steps: Mutex<HashMap<uuid::Uuid, idle::Handed>>,
     /// The words of sessions' questions on Desk's line the overseer may
     /// answer, by message: an answer is gated by what was asked as well as
     /// by what it says. One not known here is the person's.
@@ -269,6 +275,8 @@ pub struct CrewHub {
     /// The plan tickets whose session failed to start: each is tried again
     /// after a wait that doubles.
     plan_failed: Mutex<HashMap<uuid::Uuid, plan::Failed>>,
+    /// What the plan watchdog did, once each ([`plan_watch`]).
+    plan_watch: Mutex<plan_watch::Watch>,
     /// What failed to start, for its plan's next turn.
     plan_failures: Mutex<Vec<(uuid::Uuid, String)>>,
     /// The plan tickets waiting on something under way (a clone) to start,
@@ -680,6 +688,7 @@ impl CrewHub {
             poke: tokio::sync::Notify::new(),
             to_work: Mutex::default(),
             rework: tokio::sync::broadcast::channel(64).0,
+            refused_steps: Mutex::default(),
             questions: Mutex::default(),
             acted: Mutex::default(),
             asked_person: Mutex::default(),
@@ -708,6 +717,7 @@ impl CrewHub {
             work: Mutex::default(),
             starting: tokio::sync::Mutex::new(()),
             plan_failed: Mutex::default(),
+            plan_watch: Mutex::default(),
             plan_failures: Mutex::default(),
             plan_waiting: Mutex::default(),
             machine_seen: Mutex::default(),

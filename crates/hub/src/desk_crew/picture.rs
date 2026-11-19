@@ -23,7 +23,8 @@
 //! [`REPEAT_WINDOW`] and since then nothing touching the session was
 //! written to the picture, its account says nothing done, and it hasn't
 //! stopped with nothing of its own running (a turn that ends while its
-//! watcher runs is not news).
+//! watcher runs is not news). One that holds the session for the boss's
+//! answer never stands against the answer.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -344,6 +345,18 @@ impl CrewHub {
         }
         let since = self.desk.picture_since(boss, s, current.seq, None);
         if !since.is_empty() || self.session_did_since(s, current.at).await {
+            return Ok(None);
+        }
+        // One that holds it for the boss's answer ("change nothing until I
+        // answer") isn't carried out by a later word: that is the answer.
+        // The same words again are still a repeat.
+        let Action::Nudge { message, .. } = action else {
+            return Ok(None);
+        };
+        if workforce_desk::line::holds(&current.text)
+            && workforce_desk::open_item::normalised(message)
+                != workforce_desk::open_item::normalised(&current.text)
+        {
             return Ok(None);
         }
         tracing::info!(session = %s, %boss, "a boss's message repeating what the session is carrying out wasn't sent");

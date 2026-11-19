@@ -49,6 +49,7 @@ use workforce_desk::open_item::{NewItem, OpenKind};
 
 use super::actions::{Action, Handout, Target as To, STATUS_QUESTION};
 use super::picture::Deciding;
+use super::refusal::{Refusal, Refused};
 use super::CrewHub;
 
 /// The boss's tool that closes one of its assignments.
@@ -282,17 +283,20 @@ fn job_of(
     said: &Declared,
     repo: Option<&str>,
     old: Option<&Assignment>,
-) -> Result<Option<Job>, String> {
+) -> Result<Option<Job>, Refused> {
+    let unclear = |why: String| Refused::new(Refusal::JobUnclear, why);
     match said {
-        Declared::Malformed(why) => Err(why.clone()),
+        Declared::Malformed(why) => Err(unclear(why.clone())),
         Declared::Job { kind, target, key } => {
             let Some(target) = target.as_deref().or(repo) else {
-                return Err(format!(
+                return Err(unclear(format!(
                     "Not sent: say which repository the job is in, as {JOB_EXAMPLE}: Desk doesn't know this session's."
-                ));
+                )));
             };
             Job::new(kind, target, key).map(Some).ok_or_else(|| {
-                format!("Not sent: a job says its kind, target and key, as {JOB_EXAMPLE}.")
+                unclear(format!(
+                    "Not sent: a job says its kind, target and key, as {JOB_EXAMPLE}."
+                ))
             })
         }
         Declared::NoJob => Ok(None),
@@ -302,9 +306,12 @@ fn job_of(
 
 /// The refusal of an order that looks like it can't be taken back but
 /// declares no job.
-fn no_job() -> String {
-    format!(
-        "Not sent: this looks like it starts something that can't be taken back, and it says no job, so Desk can't keep a second session from being given it. Send it again with the job it is, as {JOB_EXAMPLE} (the key is the release's, PR's or migration's own id)."
+fn no_job() -> Refused {
+    Refused::new(
+        Refusal::NoJob,
+        format!(
+            "Not sent: this looks like it starts something that can't be taken back, and it says no job, so Desk can't keep a second session from being given it. Send it again with the job it is, as {JOB_EXAMPLE} (the key is the release's, PR's or migration's own id)."
+        ),
     )
 }
 
@@ -603,7 +610,7 @@ impl CrewHub {
         action: &Action,
         by: &By,
         order: &Order,
-    ) -> Result<Before, String> {
+    ) -> Result<Before, Refused> {
         if by.party.kind != PartyKind::Manager || order.unrecorded {
             return Ok(Before::Not);
         }
@@ -623,7 +630,7 @@ impl CrewHub {
             Holder::New => None,
         };
         if let Some(why) = replaces_refused(order, s.is_none()) {
-            return Err(why);
+            return Err(Refused::new(Refusal::JobUnclear, why));
         }
         let repo = match s {
             Some(s) => self.place_of(s).await.0,
@@ -631,7 +638,10 @@ impl CrewHub {
         };
         let internal = |e: eyre::Report| {
             tracing::warn!(error = %format!("{e:#}"), "a boss's assignment couldn't be kept");
-            "Not sent: Desk couldn't record who holds this job just now, so it sent nothing. Try again in a moment.".to_string()
+            Refused::new(
+                Refusal::Unrecorded,
+                "Not sent: Desk couldn't record who holds this job just now, so it sent nothing. Try again in a moment.",
+            )
         };
         let old = match order.replaces.as_deref() {
             None => None,
@@ -642,7 +652,7 @@ impl CrewHub {
                     .await
                     .map_err(internal)?
                     .ok_or_else(|| {
-                        format!("Not sent: {named} isn't one of your open assignments; crew.assignments lists them.")
+                        Refused::new(Refusal::JobUnclear, format!("Not sent: {named} isn't one of your open assignments; crew.assignments lists them."))
                     })?,
             ),
         };
@@ -654,7 +664,7 @@ impl CrewHub {
             }
             if order.job == Declared::Unsaid {
                 if let Some(why) = self.looks_held(boss, s.map(|s| (s, None)), &text).await {
-                    return Err(why);
+                    return Err(Refused::new(Refusal::JobHeld, why));
                 }
             }
             return Ok(Before::Not);
@@ -700,7 +710,7 @@ impl CrewHub {
                 let why = self.refusal(rule, &holder, &a);
                 tracing::info!(%session, %boss, holder = %holder.id, ?rule, "a boss's order for a job another assignment holds wasn't sent");
                 self.note_assignment(Kind::AssignmentRefused, &by.party, &a, why.clone());
-                return Err(why);
+                return Err(Refused::new(Refusal::JobHeld, why));
             }
             Reserved::Kept { superseded, .. } => superseded,
         };
@@ -722,7 +732,10 @@ impl CrewHub {
                 }
                 let mut held = was.clone();
                 held.delivered_at = held.delivered_at.or(Some(Utc::now()));
-                return Err(self.refusal(Rule::SameSession, &held, &a));
+                return Err(Refused::new(
+                    Refusal::JobHeld,
+                    self.refusal(Rule::SameSession, &held, &a),
+                ));
             }
         }
         let Some(old) = moving else {
@@ -734,7 +747,8 @@ impl CrewHub {
         };
         let held = self
             .move_from(by, &old, &a, &name, kept_form(action))
-            .await?;
+            .await
+            .map_err(|why| Refused::new(Refusal::JobHeld, why))?;
         if let Some(said) = held {
             self.note_assignment(Kind::AssignmentHeld, &by.party, &a, said.clone());
             return Ok(Before::Held(said));
@@ -1046,7 +1060,7 @@ impl CrewHub {
         let r = assignment::read(text, order.irreversible);
         let Some(job) = job else {
             if r.irreversible {
-                return Err(no_job());
+                return Err(no_job().into());
             }
             if order.job == Declared::Unsaid {
                 if let Some(why) = self.looks_held(boss, Some((id, Some(machine))), text).await {
@@ -1349,6 +1363,7 @@ impl CrewHub {
             hop: 0,
             about: Some(format!("assignment:{session}")),
             group,
+            handed: None,
         };
         let crew = Arc::clone(self);
         tokio::spawn(async move {
@@ -2029,9 +2044,16 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(job.as_key(), "mantis-crm/monorepo/release/4");
-        assert!(job_of(&said, None, None)
-            .unwrap_err()
-            .contains("which repository"));
+        let unknown = job_of(&said, None, None).unwrap_err();
+        assert_eq!(unknown.kind, Refusal::JobUnclear);
+        assert!(unknown.why.contains("which repository"), "{unknown}");
+        let malformed = job_of(
+            &Declared::Malformed("Not sent: a job says…".into()),
+            None,
+            None,
+        );
+        assert_eq!(malformed.unwrap_err().kind, Refusal::JobUnclear);
+        assert_eq!(no_job().kind, Refusal::NoJob);
         assert_eq!(job_of(&Declared::NoJob, None, None), Ok(None));
         assert_eq!(job_of(&Declared::Unsaid, None, None), Ok(None));
         let mut old = Assignment::new("desk", Uuid::new_v4(), "Start release 4.");

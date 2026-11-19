@@ -1546,6 +1546,20 @@ enum WorkerCommand {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Inside a scope: hold each service's address and start the service on
+    /// its first connection, then splice every connection through to it.
+    Activate {
+        /// Run as `START NAME`; brings the service up on its backend address
+        /// and returns once it is ready.
+        #[arg(long)]
+        start: PathBuf,
+        /// Created once every address is held.
+        #[arg(long)]
+        ready: Option<PathBuf>,
+        /// `NAME=FRONT=BACK`, each address `tcp:<ip>:<port>` or `unix:/<path>`.
+        #[arg(required = true)]
+        services: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -10273,6 +10287,17 @@ rules:
                     if checks.iter().any(|check| !check.ok) {
                         std::process::exit(1);
                     }
+                }
+                WorkerCommand::Activate {
+                    start,
+                    ready,
+                    services,
+                } => {
+                    let activations = services
+                        .iter()
+                        .map(|service| service.parse())
+                        .collect::<eyre::Result<Vec<_>>>()?;
+                    workforce_worker::activate::activate(start, ready, activations).await?;
                 }
             }
         }

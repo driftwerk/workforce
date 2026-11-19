@@ -872,10 +872,7 @@ async fn a_stand_down_handed_to_the_plugin_is_unread_for_its_interrupt_and_its_s
             .unwrap();
         assert_eq!(unread_settled(&d, s, mark, m.id).await, (true, false));
         // The plugin drops it (the person interrupted): queued again, unread.
-        d.0.store
-            .line_requeue(Some(m.id), chrono::Utc::now())
-            .await
-            .unwrap();
+        d.0.store.line_requeue(Some(m.id), None).await.unwrap();
         assert_eq!(row(&d, m.id).await.delivery, Delivery::Queued);
         assert_eq!(unread_settled(&d, s, mark, m.id).await, (true, false));
         // A hook taking it: neither. It doesn't escalate while the take
@@ -927,7 +924,12 @@ async fn an_urgent_row_left_from_an_earlier_turn_isnt_held_for_a_later_one() {
         post(&d, s, prompt()).await;
         post(&d, s, tool("cargo build")).await;
         assert_eq!(row(&d, m.id).await.delivery, Delivery::Queued);
-        // Nothing steers it in this turn: it is any message's.
+        // Nothing steers it in this turn: it is any message's, kept
+        // through the turn and handed at its end.
+        post(&d, s, done()).await;
+        assert_eq!(row(&d, m.id).await.delivery, Delivery::Queued);
+        assert!(d.line_next(s, Duration::from_millis(200)).await.is_none());
+        post(&d, s, stop()).await;
         let next = d
             .line_next(s, Duration::from_secs(2))
             .await

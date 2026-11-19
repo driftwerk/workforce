@@ -31,6 +31,10 @@ use crate::plan::{
 use crate::plan_store::{Adopt, BeginStart, Runs, Starting};
 use workforce_core::budget::{BudgetScope, Standing};
 
+/// What a ticket's session is told when a session worked on it before
+/// and let it go (its session ended or went away while it was in Doing).
+pub(crate) const AGAIN_NOTE: &str = "\n\nThis ticket was started before and its session ended. Check what is already done first (its folder, branch, commits and pull requests) and carry on from there; don't redo it.";
+
 /// What the desk keeps of plans in memory: the ones waiting on the person,
 /// for the Floor, which is read without waiting on Postgres.
 #[derive(Default)]
@@ -2759,8 +2763,9 @@ impl Desk {
             });
         }
         let prompt = format!(
-            "{}\n\n{}",
+            "{}{}\n\n{}",
             board::handed_text(&key, t, &needs),
+            self.again_note(t).await,
             machine_note(&key, machine)
         );
         let mut body = serde_json::json!({
@@ -2840,6 +2845,20 @@ impl Desk {
         }
     }
 
+    /// What a ticket started again is told after its handing text: a
+    /// session worked on it before, so what is already done is checked
+    /// first. Empty for a first start.
+    async fn again_note(&self, t: &Ticket) -> &'static str {
+        match self.store().ticket_worked_before(t.id).await {
+            Ok(true) => AGAIN_NOTE,
+            Ok(false) => "",
+            Err(e) => {
+                tracing::info!(ticket = %t.id, error = %format!("{e:#}"), "whether a ticket was worked on before couldn't be read");
+                ""
+            }
+        }
+    }
+
     /// The session for `t`, started as `session`.
     #[allow(clippy::too_many_arguments)]
     async fn plan_spawn(
@@ -2886,7 +2905,11 @@ impl Desk {
             cwd,
             goal: board::goal_of(&key, t),
             worktree: branch,
-            prompt: Some(board::handed_text(&key, t, &needs)),
+            prompt: Some(format!(
+                "{}{}",
+                board::handed_text(&key, t, &needs),
+                self.again_note(t).await
+            )),
             approvals: None,
             approve_for_me: false,
             // As its boss runs: an agent's `[llm] fast`.

@@ -349,6 +349,7 @@ mod tests {
             tokens: &tokens,
             home: HomeSpec::Ephemeral,
             primary: None,
+            idle_release: None,
         };
 
         let transcript = launcher.ensure(&spec(uuid)).await.unwrap();
@@ -387,6 +388,7 @@ mod tests {
             tokens: &tokens,
             home: HomeSpec::Ephemeral,
             primary: None,
+            idle_release: None,
         };
         let sandbox = launcher.ensure(&spec).await.unwrap();
         assert!(sandbox.fresh());
@@ -464,6 +466,7 @@ mod tests {
             tokens: &tokens,
             home: HomeSpec::Ephemeral,
             primary: None,
+            idle_release: None,
         };
 
         assert!(!launcher.exists("agent", "bench", "scope-1").await);

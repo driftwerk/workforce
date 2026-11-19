@@ -6438,6 +6438,7 @@ impl WorkflowRuntime {
                 tokens: &tokens,
                 home: HomeSpec::Ephemeral,
                 primary: project.repos.first().map(|repo| repo.alias.as_str()),
+                idle_release: None,
             })
             .await
     }

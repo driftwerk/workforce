@@ -160,8 +160,8 @@ impl Desk {
     }
 
     /// Session `id` wrote to its boss, or asked something.
-    pub(super) fn picture_session_said(&self, id: Uuid, what: What, text: &str) {
-        self.picture_note(Note::new(what, text).session(id));
+    pub(super) fn picture_session_said(&self, id: Uuid, what: What, text: &str, message: Uuid) {
+        self.picture_note(Note::new(what, text).session(id).message(message));
     }
 }
 

@@ -10413,6 +10413,14 @@ pub struct ExecutorConfig {
     /// Each round renews it. Default: two hours.
     #[serde(default = "default_scope_ttl_secs")]
     pub scope_ttl_secs: u64,
+    /// How long an agent turn's remote scope stays up once its turn has
+    /// ended, so a quick reply finds it warm; past it the worker releases
+    /// the scope and keeps only its home (files and the CLI's resume state)
+    /// for `scope_ttl_secs`, so the next message reseats and resumes. A
+    /// scope with a turn in flight is never released. At least a minute is
+    /// kept, so a quick reply never starts cold. Default: five minutes.
+    #[serde(default = "default_agent_turn_idle_secs")]
+    pub agent_turn_idle_secs: u64,
 }
 
 impl Default for ExecutorConfig {
@@ -10420,12 +10428,17 @@ impl Default for ExecutorConfig {
         Self {
             kind: ExecutorKind::Local,
             scope_ttl_secs: default_scope_ttl_secs(),
+            agent_turn_idle_secs: default_agent_turn_idle_secs(),
         }
     }
 }
 
 fn default_scope_ttl_secs() -> u64 {
     2 * 60 * 60
+}
+
+fn default_agent_turn_idle_secs() -> u64 {
+    5 * 60
 }
 
 /// How the bot decides which messages to respond to in channels.
@@ -12819,6 +12832,7 @@ oauth_system_prefix = ""
         let coding_exec = ExecutorConfig {
             kind: ExecutorKind::Remote,
             scope_ttl_secs: 99,
+            agent_turn_idle_secs: 9,
         };
         let inherit: ClaudeChatConfig = toml::from_str("").unwrap();
         assert_eq!(inherit.effective_executor(&coding_exec), coding_exec);

@@ -73,11 +73,16 @@ fn bad_since(said: &str) -> String {
 }
 
 /// What a found ticket says to the boss.
-fn row(f: &Found) -> Value {
+fn row(f: &Found, live: &dyn Fn(&str) -> bool) -> Value {
     let t = &f.view.ticket;
     let e = t.external.as_ref();
     let held = match (&t.assignee, &f.plan) {
         (Some(a), _) if a.kind == PartyKind::You => "the person has it".to_string(),
+        (Some(a), _)
+            if a.kind == PartyKind::Session && t.state == TicketState::Doing && !live(&a.id) =>
+        {
+            format!("{} ({} was its session)", super::board::NO_SESSION, a.name)
+        }
         (Some(a), _) => format!("{} has it", a.name),
         (None, Some((_, goal))) => format!("in the plan “{}”", crew::one_line(goal, 60)),
         (None, None) if !matches!(t.state, TicketState::Backlog | TicketState::Todo) => {
@@ -166,7 +171,10 @@ impl CrewHub {
                     "The boards could not be read just now.".to_string()
                 }
             })?;
-        let rows: Vec<Value> = found.iter().map(row).collect();
+        let rows: Vec<Value> = found
+            .iter()
+            .map(|f| row(f, &|id| self.session_runs(id)))
+            .collect();
         let free = rows
             .iter()
             .filter(|r| r["can_take_on"] == json!(true))
