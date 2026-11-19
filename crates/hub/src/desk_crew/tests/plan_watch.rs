@@ -63,8 +63,21 @@ async fn running(d: &Desk, folder: &Path, n: usize) -> (uuid::Uuid, Vec<SessionV
         .unwrap();
     let id = p.summary.plan.id;
     d.approve_plan(id, 1, &By::you()).await.unwrap();
-    let sessions = eventually("its sessions", async || {
-        let s = started(d);
+    // Each ticket given its session, and those sessions: a start retried
+    // under load may have made a spare one, which no ticket has.
+    let sessions = eventually("its tickets given their sessions", async || {
+        let held: Vec<uuid::Uuid> = d
+            .plan(id)
+            .await
+            .ok()?
+            .tickets
+            .iter()
+            .filter_map(|t| t.ticket.ticket.session())
+            .collect();
+        let s: Vec<SessionView> = started(d)
+            .into_iter()
+            .filter(|v| held.contains(&v.id))
+            .collect();
         (s.len() == n).then_some(s)
     })
     .await;
@@ -298,6 +311,20 @@ async fn a_session_waiting_on_ci_is_told_when_it_lands_once_a_head_and_outcome()
         .await;
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert_eq!(told("is green").await, 1, "once");
+
+        // A new head goes red: said too, with how many failed.
+        crew.pull_seen(
+            REPO,
+            191,
+            Pull {
+                head: Some("e1f2a3b4c5d6".into()),
+                ..open("failure", 2)
+            },
+        );
+        eventually("it told red", async || {
+            (told("CI on #191's head e1f2a3b is red (2 failed checks)").await == 1).then_some(())
+        })
+        .await;
     })
     .await;
 }
@@ -308,16 +335,57 @@ async fn a_ticket_in_doing_whose_session_is_gone_starts_again_told_to_check_what
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
         let (_overseer, state, d, _llm) = hub_with(&base, pool, &watching()).await;
-        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
-        let (id, sessions) = running(&d, &base, 1).await;
-        let first = sessions[0].id;
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        let (id, _) = running(&d, &base, 1).await;
+        // The session its ticket has (a start retried under load may have
+        // made another first).
+        let first = eventually("its ticket given its session", async || {
+            ticket(&d, id, "DES-1").await.ticket.ticket.session()
+        })
+        .await;
+        let before: Vec<uuid::Uuid> = started(&d).iter().map(|v| v.id).collect();
         // VEL-1: its session went away with the ticket still in Doing.
         d.end(first, Some(boss_by())).await.unwrap();
         d.remove_closed(first).await.unwrap();
-        // Ending it let the ticket go: in Doing, no one on it, until the
-        // watchdog puts it back.
+        // Ending it let the ticket go: in Doing, no one on it. Putting a
+        // ticket that ran back in the queue is the person's call at Act:
+        // suggested to them, once.
+        let open = || async {
+            d.store()
+                .suggestions(50)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|s| s.state == workforce_desk::crew::SuggestionState::Open)
+                .filter(|s| s.text.contains("DES-1"))
+                .collect::<Vec<_>>()
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        eventually("putting it back suggested", async || {
+            // Looked at now, not when the items' minute comes round.
+            crew.look_at_items().await;
+            (!open().await.is_empty()).then_some(())
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(open().await.len(), 1, "once");
+        let t = ticket(&d, id, "DES-1").await;
+        assert_eq!(
+            t.ticket.ticket.state,
+            TicketState::Doing,
+            "not moved under them"
+        );
+        assert!(
+            started(&d).iter().all(|v| before.contains(&v.id)),
+            "nothing started by itself"
+        );
+
+        // The person puts it back: the plan starts it again.
+        d.move_ticket(t.ticket.ticket.id, to(TicketState::Todo), &By::you())
+            .await
+            .unwrap();
         let again = eventually("it started again", async || {
-            started(&d).into_iter().find(|v| v.id != first)
+            started(&d).into_iter().find(|v| !before.contains(&v.id))
         })
         .await;
         assert!(
@@ -327,9 +395,13 @@ async fn a_ticket_in_doing_whose_session_is_gone_starts_again_told_to_check_what
             "{:?}",
             again.last_prompt
         );
-        let t = ticket(&d, id, "DES-1").await;
-        assert_eq!(t.ticket.ticket.state, TicketState::Doing);
-        assert_eq!(t.ticket.ticket.session(), Some(again.id));
+        eventually("it given its new session", async || {
+            let t = ticket(&d, id, "DES-1").await;
+            (t.ticket.ticket.state == TicketState::Doing
+                && t.ticket.ticket.session() == Some(again.id))
+            .then_some(())
+        })
+        .await;
     })
     .await;
 }

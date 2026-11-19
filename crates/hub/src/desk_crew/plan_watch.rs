@@ -38,11 +38,11 @@ use uuid::Uuid;
 use workforce_common::oversight::{Level, Oversight};
 use workforce_desk::board::TicketState;
 use workforce_desk::charge::How;
-use workforce_desk::model::SessionState;
+use workforce_desk::model::{Origin, SessionState};
 use workforce_desk::open_item::{NewItem, OpenKind};
 use workforce_desk::open_item_store::Opened;
 use workforce_desk::plan::PlanState;
-use workforce_desk::{DeskError, Move, PlanDetail, PlanTicketView};
+use workforce_desk::{DeskError, PlanDetail, PlanTicketView};
 
 use super::actions::{Action, Gate, Target};
 use super::closing::Pull;
@@ -106,6 +106,9 @@ pub(crate) fn stands(
             false => Stands::Fine,
         },
         SessionState::Stopped | SessionState::Closed => Stands::Fine,
+        // Only one Desk runs, not one in another terminal: that is where
+        // it goes on.
+        _ if v.origin != Origin::Desk || v.terminal_id.is_some() => Stands::Fine,
         SessionState::Interrupted if state == TicketState::Doing && rested => Stands::Down(session),
         _ if !v.live && state == TicketState::Doing && rested => Stands::Down(session),
         SessionState::Done | SessionState::Idle if v.live => Stands::Rests(session),
@@ -208,7 +211,15 @@ impl CrewHub {
     /// its boss runs is its own unless the person was given it.
     fn bosss_ticket(&self, boss: &str, session: Uuid, gone: bool) -> bool {
         match self.desk.charge_of(session) {
-            Some(c) => c.live() && c.boss == boss && matches!(c.how, How::Started | How::Handed),
+            // Gone, its charge ended with it: still the boss's, unless the
+            // person took it back.
+            Some(c) => {
+                c.boss == boss
+                    && matches!(c.how, How::Started | How::Handed)
+                    && (c.live()
+                        || gone
+                            && c.released_by != Some(workforce_desk::charge::ReleasedBy::Person))
+            }
             None => gone,
         }
     }
@@ -223,8 +234,10 @@ impl CrewHub {
         for t in &p.tickets {
             let ticket = &t.ticket.ticket;
             let key = t.ticket.key.clone().unwrap_or_else(|| "a ticket".into());
+            // One on a machine is the machine's to say: in Doing, it may be
+            // at work there.
             if t.machine.is_some() || t.starting {
-                busy |= t.starting;
+                busy |= t.starting || ticket.state == TicketState::Doing;
                 continue;
             }
             if ticket.state == TicketState::Todo && t.ticket.ready {
@@ -238,8 +251,8 @@ impl CrewHub {
                 if ticket.state == TicketState::Doing && ticket.assignee.is_none() {
                     stuck.push(format!("{key} is in Doing with no session"));
                     if now - ticket.state_at >= grace {
-                        let once = format!("{}:{}", ticket.state_at.timestamp_millis(), "none");
-                        self.put_back(service, o, t, &key, &once).await;
+                        let once = format!("{}:none", ticket.state_at.timestamp_millis());
+                        self.put_back(service, o, &key, &once).await;
                     }
                 }
                 continue;
@@ -253,6 +266,15 @@ impl CrewHub {
                 .as_ref()
                 .map_or(ticket.state_at, |v| v.updated_at.max(ticket.state_at));
             let rested = now - since >= grace;
+            // At work, whoever runs it: the plan moves.
+            if view.as_ref().is_some_and(|v| {
+                matches!(
+                    v.state,
+                    SessionState::Working | SessionState::Starting | SessionState::Blocked
+                )
+            }) {
+                busy = true;
+            }
             let ours = self.bosss_ticket(boss, session, view.is_none());
             let runs = view
                 .as_ref()
@@ -265,7 +287,7 @@ impl CrewHub {
                 Stands::Fine => {}
                 Stands::Gone(s) => {
                     stuck.push(format!("{key} is in Doing, its session gone"));
-                    self.put_back(service, o, t, &key, &s.to_string()).await;
+                    self.put_back(service, o, &key, &s.to_string()).await;
                 }
                 Stands::Down(_) => {
                     stuck.push(format!("{key} is in Doing, its session not running"));
@@ -294,34 +316,55 @@ impl CrewHub {
         self.say_stall(boss, o, p, busy, &stuck, now).await;
     }
 
-    /// Ticket `t` is in Doing with its session gone (`which`: it, or when
-    /// the ticket was let go): its boss puts it back in To do, so the plan
-    /// starts it again.
-    async fn put_back(
-        &self,
-        service: &Arc<AgentService>,
-        o: &Oversight,
-        t: &PlanTicketView,
-        key: &str,
-        which: &str,
-    ) {
-        let once = format!("back:{}:{which}", t.ticket.ticket.id);
-        if !self.plan_watch.lock().done.insert(once) {
+    /// Ticket `key` is in Doing with its session gone (`which`: it, or
+    /// when the ticket was let go): its boss puts it back in To do, so the
+    /// plan starts it again, as its own `crew.move_ticket` ([`CrewHub::gate`]:
+    /// a planned ticket that ran goes back in the queue by the person, so
+    /// below Act fully it is suggested to them). Once each.
+    async fn put_back(&self, service: &Arc<AgentService>, o: &Oversight, key: &str, which: &str) {
+        let boss = service.agent_id.as_str();
+        let once = format!("back:{key}:{which}");
+        if self.plan_watch.lock().done.contains(&once) {
+            return;
+        }
+        let input = serde_json::json!({
+            "ticket": key,
+            "state": "todo",
+            "reason": format!("{key} is in Doing with no session: back in To do, its plan starts it again."),
+        });
+        let mut action = match Action::parse("crew.move_ticket", &input) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::info!(%key, error = %e, "a ticket with no session couldn't be put back");
+                return;
+            }
+        };
+        if let Err(e) = self.resolve_ticket(&mut action, None, Some(boss)).await {
+            tracing::info!(%key, error = %e, "a ticket with no session couldn't be found to put back");
             return;
         }
         let why = format!("{key}'s session is gone while it was in Doing: it starts again.");
-        let by = self.by_at_level(self.by_boss(service, &why), o);
-        let mv = Move {
-            state: TicketState::Todo,
-            before: None,
-            after: None,
+        let by = self.by_boss(service, &why);
+        let went = match self.gate(&action, o) {
+            Gate::Run => {
+                let by = self.by_at_level(by, o);
+                self.perform(&action, by)
+                    .await
+                    .map(|done| tracing::info!(%key, %which, %done, "a ticket whose session was gone went back to To do"))
+            }
+            Gate::Suggest(_) => self
+                .suggest("crew.move_ticket", &input, &action, &by)
+                .await
+                .map(|_| tracing::info!(%key, "putting back a ticket whose session was gone was suggested")),
+            Gate::No(why) => Err(why.into_owned()),
+            Gate::Refuse => return,
         };
-        match self.desk.move_ticket(t.ticket.ticket.id, mv, &by).await {
-            Ok(_) => {
-                tracing::info!(ticket = %t.ticket.ticket.id, %which, "a ticket whose session was gone went back to To do")
+        match went {
+            Ok(()) => {
+                self.plan_watch.lock().done.insert(once);
             }
             Err(e) => {
-                tracing::info!(ticket = %t.ticket.ticket.id, error = %e, "a ticket whose session was gone couldn't go back to To do")
+                tracing::info!(%key, error = %e, "a ticket whose session was gone couldn't be put back")
             }
         }
     }
@@ -335,7 +378,9 @@ impl CrewHub {
         key: &str,
         v: &workforce_desk::model::SessionView,
     ) {
-        let once = format!("resume:{}:{}", v.id, v.prompts);
+        // Once each time it went down: a session not running counts no
+        // prompts, so when it last changed says which time.
+        let once = format!("resume:{}:{}", v.id, v.updated_at.timestamp_millis());
         if !self.plan_watch.lock().done.insert(once) {
             return;
         }
@@ -425,13 +470,28 @@ impl CrewHub {
         match landed(&pulls) {
             None => {}
             Some(Landed::Checks { n, head, failed }) => {
+                // In Review it waits on its review, not CI; with work of its
+                // own running, or a wait given to the person, it isn't told.
+                if t.ticket.ticket.state != TicketState::Doing || v.background.is_some() {
+                    return;
+                }
                 let once = format!("ci:{}:{head}:{}", v.id, failed > 0);
                 if self.plan_watch.lock().done.contains(&once) {
                     return;
                 }
+                match self
+                    .desk
+                    .store()
+                    .items_not_closed(Some(service.agent_id.as_str()))
+                    .await
+                {
+                    Ok(items) if items.iter().any(|i| i.session == Some(v.id)) => return,
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
                 let message = match failed {
                     0 => format!(
-                        "Desk checked GitHub: CI on #{n}'s head {} is green. Carry on with what you said you'd do once it was.",
+                        "Desk checked GitHub: CI on #{n}'s head {} is green. That is CI's result only; carry on with your ticket as it stands.",
                         short(&head)
                     ),
                     f => format!(
@@ -449,15 +509,14 @@ impl CrewHub {
                 if self.gate(&action, o) != Gate::Run {
                     // The boss is told instead, as for the merged.
                     if self.plan_watch.lock().done.insert(once) {
-                        self.plan_turn(
+                        self.wake_plan(
                             p.summary.plan.id,
-                            vec![format!(
+                            format!(
                                 "{key}'s session finished its turn waiting on CI; CI on #{n}'s head {} is now {}. Tell it with crew.nudge.",
                                 short(&head),
                                 if failed == 0 { "green" } else { "red" }
-                            )],
-                        )
-                        .await;
+                            ),
+                        );
                     }
                     return;
                 }
@@ -503,9 +562,18 @@ impl CrewHub {
                     said.join(", "),
                     t.ticket.ticket.state.title()
                 );
-                self.plan_turn(p.summary.plan.id, vec![line]).await;
+                self.wake_plan(p.summary.plan.id, line);
             }
         }
+    }
+
+    /// Wakes plan `id`'s boss with `line`, on its own task: its turn
+    /// never holds up the minute's other looks.
+    fn wake_plan(&self, id: Uuid, line: String) {
+        let Some(crew) = self.me.upgrade() else {
+            return;
+        };
+        tokio::spawn(async move { crew.plan_turn(id, vec![line]).await });
     }
 
     /// Tells the person, once a stall, that plan `p` hasn't moved in

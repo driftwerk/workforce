@@ -2655,8 +2655,6 @@ impl Desk {
         }
     }
 
-    /// The session for `t`, started as `session`.
-    #[allow(clippy::too_many_arguments)]
     /// What a ticket started again is told after its handing text: a
     /// session worked on it before, so what is already done is checked
     /// first. Empty for a first start.
@@ -2671,6 +2669,8 @@ impl Desk {
         }
     }
 
+    /// The session for `t`, started as `session`.
+    #[allow(clippy::too_many_arguments)]
     async fn plan_spawn(
         &self,
         p: &Plan,
