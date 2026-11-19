@@ -99,3 +99,33 @@ async fn the_same_instruction_to_a_session_is_sent_once() {
     })
     .await;
 }
+
+/// At Act fully only budget, audit and Stop hold the boss back: its word
+/// goes each time it gives it, and none of it is held as a repeat.
+#[tokio::test(flavor = "multi_thread")]
+async fn at_act_fully_the_same_instruction_goes_each_time() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let full = "[oversight]\nenabled = true\nlevel = \"full\"\n";
+        let (_overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", full, &[]).await;
+        eventually("Desk to know it is unbound", async || {
+            d.boss_unbound("desk").then_some(())
+        })
+        .await;
+        let s = new_session(&d, dir.path(), "acme-web").await;
+        let nudge = Action::Nudge {
+            to: Target::Session(s.id),
+            message: "Rebase onto main and push.".into(),
+            reply_to: None,
+        };
+        for _ in 0..3 {
+            let said = crew
+                .perform(&nudge, crew.by_overseer("It stopped moving.").unwrap())
+                .await
+                .unwrap();
+            assert!(said.starts_with("told acme-web"), "{said}");
+            assert!(!said.contains("already"), "{said}");
+        }
+    })
+    .await;
+}

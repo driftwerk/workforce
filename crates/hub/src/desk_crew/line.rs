@@ -74,12 +74,13 @@ pub(crate) fn settle(reply: Result<&str, ()>, still_open: usize) -> Vec<Settle> 
 }
 
 /// Why a question goes to the person without the overseer taking a turn,
-/// if it does.
-pub(crate) fn straight_to_person(o: &Oversight, hop: i16) -> Option<&'static str> {
+/// if it does. An `unbound` boss takes its sessions' questions whatever
+/// `wake.on_message` says: at Act fully only budget, audit and Stop hold it.
+pub(crate) fn straight_to_person(o: &Oversight, hop: i16, unbound: bool) -> Option<&'static str> {
     if o.level == Level::Watch {
         return Some("Desk only watches, so this came to you.");
     }
-    if !o.wake.on_message {
+    if !o.wake.on_message && !unbound {
         return Some("Desk is set to give you sessions' questions.");
     }
     if hop >= MAX_HOPS {
@@ -509,7 +510,7 @@ impl CrewHub {
             .cloned()
             .collect();
         let hop = messages.iter().map(|m| m.hop).max().unwrap_or(0);
-        if let Some(why) = straight_to_person(&o, hop) {
+        if let Some(why) = straight_to_person(&o, hop, self.unbound(&o)) {
             self.all_to_person(session, &asks, why).await;
             if ended.is_empty() {
                 return false;
@@ -1063,17 +1064,21 @@ mod tests {
             level: Level::Act,
             ..Oversight::default()
         };
-        assert_eq!(straight_to_person(&o, 1), None);
-        assert!(straight_to_person(&o, MAX_HOPS).is_some());
+        assert_eq!(straight_to_person(&o, 1, false), None);
+        assert!(straight_to_person(&o, MAX_HOPS, false).is_some());
         o.wake.on_message = false;
         assert_eq!(
-            straight_to_person(&o, 1),
+            straight_to_person(&o, 1, false),
             Some("Desk is set to give you sessions' questions.")
         );
+        // Unbound, the boss takes them whatever the switch says; a chain
+        // handed on too long still goes to the person.
+        assert_eq!(straight_to_person(&o, 1, true), None);
+        assert!(straight_to_person(&o, MAX_HOPS, true).is_some());
         o.wake.on_message = true;
         o.level = Level::Watch;
         assert_eq!(
-            straight_to_person(&o, 1),
+            straight_to_person(&o, 1, false),
             Some("Desk only watches, so this came to you.")
         );
     }

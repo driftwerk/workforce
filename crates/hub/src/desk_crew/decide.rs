@@ -906,9 +906,14 @@ impl CrewHub {
                     .and_then(|g| self.relayed_held(boss, &g.id)),
                 false => Some(Vec::new()),
             };
-            if let Some(conflict) =
-                Box::pin(self.request_conflict(boss, view.id, p, home.as_deref())).await
-            {
+            // This hub's own boss at Act fully allows it all the same: only
+            // budget, audit and Stop hold it back. A relayed boss's stays
+            // the person's until its home says otherwise.
+            let own = !super::relayed_decide::relayed_party(boss);
+            let conflict = Box::pin(self.request_conflict(boss, view.id, p, home.as_deref()))
+                .await
+                .filter(|_| !own);
+            if let Some(conflict) = conflict {
                 if !still() {
                     return Outcome::NotOurs;
                 }
