@@ -1852,8 +1852,6 @@ mod tests {
                 }
             })
             .await;
-            // The copy is a snapshot read on another connection, as
-            // `pg_dump` takes one.
             crate::graph::tests::a_copy_tells_a_runs_notes_by_its_lease(
                 &graph,
                 |repo| async move {

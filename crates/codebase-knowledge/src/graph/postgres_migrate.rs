@@ -905,8 +905,6 @@ mod tests {
                 .note_vectors_pending(&["vellev", "weaviate"], "r", &["src/v.rs".to_string()])
                 .await
                 .unwrap();
-            // A mark above every note left: the counter is carried, not
-            // started again from the notes.
             let cleared = vec!["src/x.rs".to_string()];
             let last = store
                 .note_vectors_pending(&["vellev"], "r", &cleared)
@@ -945,7 +943,6 @@ mod tests {
                     .unwrap(),
                 [("src/v.rs".to_string(), v), ("src/w.rs".to_string(), w)]
             );
-            // Carried again, it does not go back from a mark taken since.
             assert_eq!(
                 dest.note_vectors_pending(&["vellev"], "r", &["src/y.rs".to_string()])
                     .await

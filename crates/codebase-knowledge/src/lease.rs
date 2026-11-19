@@ -120,26 +120,18 @@ pub(crate) const LEASE_COLUMNS: &str = "repo_id, worker_id, target_commit, phase
 /// backend's placeholder for a parameter: 1 the repo, 2 the worker, 3 the
 /// target commit, 4 the phase, 5 now, 6 the cutoff.
 pub(crate) fn acquire_lease_sql(param: impl Fn(usize) -> String) -> String {
-    let taken = [
-        "worker_id",
-        "target_commit",
-        "phase",
-        "acquired_at_ms",
-        "last_heartbeat_at_ms",
-        "entities_total",
-        "entities_processed",
-        "summaries_total",
-        "summaries_processed",
-        "noted_from",
-    ]
-    .map(|column| {
-        format!(
-            "{column} = CASE WHEN index_lease.last_heartbeat_at_ms < {cutoff} \
+    let taken = LEASE_COLUMNS
+        .split(", ")
+        .filter(|column| *column != "repo_id")
+        .map(|column| {
+            format!(
+                "{column} = CASE WHEN index_lease.last_heartbeat_at_ms < {cutoff} \
              THEN excluded.{column} ELSE index_lease.{column} END",
-            cutoff = param(6)
-        )
-    })
-    .join(", ");
+                cutoff = param(6)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         "INSERT INTO index_lease ({LEASE_COLUMNS}) \
          VALUES ({repo}, {worker}, {target}, {phase}, {now}, {now}, NULL, NULL, NULL, NULL, \
