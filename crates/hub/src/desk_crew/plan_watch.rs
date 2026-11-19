@@ -252,7 +252,7 @@ impl CrewHub {
                     stuck.push(format!("{key} is in Doing with no session"));
                     if now - ticket.state_at >= grace {
                         let once = format!("{}:none", ticket.state_at.timestamp_millis());
-                        self.put_back(service, o, &key, &once).await;
+                        self.put_back(service, o, t, &key, &once).await;
                     }
                 }
                 continue;
@@ -287,7 +287,7 @@ impl CrewHub {
                 Stands::Fine => {}
                 Stands::Gone(s) => {
                     stuck.push(format!("{key} is in Doing, its session gone"));
-                    self.put_back(service, o, &key, &s.to_string()).await;
+                    self.put_back(service, o, t, &key, &s.to_string()).await;
                 }
                 Stands::Down(_) => {
                     stuck.push(format!("{key} is in Doing, its session not running"));
@@ -321,14 +321,23 @@ impl CrewHub {
     /// plan starts it again, as its own `crew.move_ticket` ([`CrewHub::gate`]:
     /// a planned ticket that ran goes back in the queue by the person, so
     /// below Act fully it is suggested to them). Once each.
-    async fn put_back(&self, service: &Arc<AgentService>, o: &Oversight, key: &str, which: &str) {
+    async fn put_back(
+        &self,
+        service: &Arc<AgentService>,
+        o: &Oversight,
+        t: &PlanTicketView,
+        key: &str,
+        which: &str,
+    ) {
         let boss = service.agent_id.as_str();
         let once = format!("back:{key}:{which}");
-        if self.plan_watch.lock().done.contains(&once) {
+        // Claimed before anything is awaited: two looks never both act.
+        if !self.plan_watch.lock().done.insert(once.clone()) {
             return;
         }
         let input = serde_json::json!({
             "ticket": key,
+            "ticket_id": t.ticket.ticket.id.to_string(),
             "state": "todo",
             "reason": format!("{key} is in Doing with no session: back in To do, its plan starts it again."),
         });
@@ -336,11 +345,13 @@ impl CrewHub {
             Ok(a) => a,
             Err(e) => {
                 tracing::info!(%key, error = %e, "a ticket with no session couldn't be put back");
+                self.plan_watch.lock().done.remove(&once);
                 return;
             }
         };
         if let Err(e) = self.resolve_ticket(&mut action, None, Some(boss)).await {
             tracing::info!(%key, error = %e, "a ticket with no session couldn't be found to put back");
+            self.plan_watch.lock().done.remove(&once);
             return;
         }
         let why = format!("{key}'s session is gone while it was in Doing: it starts again.");
@@ -359,13 +370,9 @@ impl CrewHub {
             Gate::No(why) => Err(why.into_owned()),
             Gate::Refuse => return,
         };
-        match went {
-            Ok(()) => {
-                self.plan_watch.lock().done.insert(once);
-            }
-            Err(e) => {
-                tracing::info!(%key, error = %e, "a ticket whose session was gone couldn't be put back")
-            }
+        if let Err(e) = went {
+            tracing::info!(%key, error = %e, "a ticket whose session was gone couldn't be put back");
+            self.plan_watch.lock().done.remove(&once);
         }
     }
 
@@ -479,15 +486,28 @@ impl CrewHub {
                 if self.plan_watch.lock().done.contains(&once) {
                     return;
                 }
+                // What it waits on the person for (a wait or a question
+                // given to them) is theirs to settle, not CI's line.
                 match self
                     .desk
                     .store()
                     .items_not_closed(Some(service.agent_id.as_str()))
                     .await
                 {
-                    Ok(items) if items.iter().any(|i| i.session == Some(v.id)) => return,
+                    Ok(items)
+                        if items.iter().any(|i| {
+                            i.session == Some(v.id)
+                                && (super::waiting::is_waiting(&i.dedupe_key)
+                                    || matches!(i.kind, OpenKind::Ask | OpenKind::Confirm))
+                        }) =>
+                    {
+                        return
+                    }
                     Ok(_) => {}
                     Err(_) => return,
+                }
+                if !self.plan_watch.lock().done.insert(once.clone()) {
+                    return;
                 }
                 let message = match failed {
                     0 => format!(
@@ -508,7 +528,7 @@ impl CrewHub {
                 let why = format!("{key}'s session waits on CI, which finished.");
                 if self.gate(&action, o) != Gate::Run {
                     // The boss is told instead, as for the merged.
-                    if self.plan_watch.lock().done.insert(once) {
+                    {
                         self.wake_plan(
                             p.summary.plan.id,
                             format!(
@@ -523,11 +543,11 @@ impl CrewHub {
                 let by = self.by_at_level(self.by_boss(service, &why), o);
                 match self.perform(&action, by).await {
                     Ok(_) => {
-                        self.plan_watch.lock().done.insert(once);
                         tracing::info!(session = %v.id, n, "a session waiting on CI was told it finished");
                     }
                     Err(e) => {
-                        tracing::info!(session = %v.id, error = %e, "a session waiting on CI couldn't be told")
+                        tracing::info!(session = %v.id, error = %e, "a session waiting on CI couldn't be told");
+                        self.plan_watch.lock().done.remove(&once);
                     }
                 }
             }
