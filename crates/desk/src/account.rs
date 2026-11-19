@@ -38,6 +38,21 @@ pub const MID_TURN_EVERY: Duration = Duration::from_secs(5 * 60);
 /// How old an account of a working session may be before a read refreshes
 /// it, and the least time between two such refreshes.
 pub const FRESH_FOR: Duration = Duration::from_secs(2 * 60);
+
+/// Why an account can't be relied on as it stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Staleness {
+    /// The session did more since: this many minutes after the account
+    /// was written its turn ended (`turn`), or words went in or out on its
+    /// line.
+    Behind { minutes: i64, turn: bool },
+    /// Past the time it said it would be out of date by: none says so yet
+    /// (a writer may set `stale_after`), so this is for when one does.
+    Expired,
+    /// Written plainly from the session's last words, not by a model,
+    /// and the session has worked since.
+    Plain,
+}
 /// A turn whose replies say less than this, with no steps, is said plainly.
 pub const SHORT_REPLY: usize = 300;
 /// How far back from the newest exchange read the cursor keeps keys.
@@ -238,6 +253,39 @@ impl Account {
     /// Its age at `now`.
     pub fn age(&self, now: DateTime<Utc>) -> chrono::Duration {
         now - self.written_at
+    }
+
+    /// How far it can be relied on at `now` for a session that is
+    /// `working`, whose newest write was plain (`last_plain`: not a
+    /// model's), whose last turn end it hasn't caught up with was at
+    /// `ended`, and on whose line words last went in or out (a boss's, the
+    /// person's, its own) at `line`: None while it can.
+    pub fn staleness(
+        &self,
+        now: DateTime<Utc>,
+        working: bool,
+        last_plain: bool,
+        ended: Option<DateTime<Utc>>,
+        line: Option<DateTime<Utc>>,
+    ) -> Option<Staleness> {
+        let after = |at: Option<DateTime<Utc>>| at.filter(|a| *a > self.written_at);
+        // The later of the two says how far behind it is.
+        let behind = match (after(ended), after(line)) {
+            (Some(e), Some(l)) if l > e => Some((l, false)),
+            (Some(e), _) => Some((e, true)),
+            (None, Some(l)) => Some((l, false)),
+            (None, None) => None,
+        };
+        if let Some((at, turn)) = behind {
+            return Some(Staleness::Behind {
+                minutes: (at - self.written_at).num_minutes().max(1),
+                turn,
+            });
+        }
+        if self.stale_after.is_some_and(|s| now >= s) {
+            return Some(Staleness::Expired);
+        }
+        (last_plain && working).then_some(Staleness::Plain)
     }
 
     /// Whether it is out of date at `now` for a session that is `working`:

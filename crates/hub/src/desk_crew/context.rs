@@ -10,11 +10,22 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 use workforce_common::channels::DESK_CHANNEL;
-use workforce_desk::account::Account;
+use workforce_desk::account::{Account, Staleness};
 use workforce_desk::model::SessionState;
 
 use super::watcher::reported;
 use crate::serve::AgentService;
+
+/// What every boss turn is told of the summaries it reads.
+pub(super) const CHECK_FIRST: &str = "Desk marks a summary STALE, with why, when it can't be relied on. Never tell anyone that something has or hasn't happened (a run started, a PR merged, a release went out) on the strength of a STALE summary: check it first (crew.account, crew.ask_session, or your GitHub tools) and say where you checked.";
+
+/// The same, for a focused call (a decision, an answer, an idle step),
+/// which has no tools to check with.
+pub(super) const CHECK_FIRST_FOCUSED: &str = "Desk marks a summary STALE, with why, when it can't be relied on. You can't check anything in this call: never decide or say that something has or hasn't happened (a run started, a PR merged, a release went out) on the strength of a STALE summary; leave it to the person, or to your full turn, saying it is stale.";
+
+/// Opens a focused call's brief on a spent day: as [`super::picture::NOTES_SPENT`],
+/// with nothing to check with.
+pub(super) const NOTES_SPENT_FOCUSED: &str = "Sessions' summaries are written plainly from their last words for the rest of today: the day's metered cheap calls are spent. Take every summary as possibly out of date.";
 
 /// The block's most, about 3k tokens.
 pub(super) const CAP_CHARS: usize = 12_000;
@@ -37,6 +48,8 @@ pub(super) struct Entry {
     /// Its last turn failed.
     pub failed: bool,
     pub account: Option<Account>,
+    /// Why its account can't be relied on as it stands, if so.
+    pub stale: Option<Staleness>,
 }
 
 /// One of the boss's own DM posts.
@@ -65,6 +78,31 @@ fn clip(s: &str, max: usize) -> String {
     }
 }
 
+/// When an account was written and how old it is, and, stale, why it
+/// can't be relied on: "STALE: summary 19:48 (34 min ago), its turn ended
+/// 27 min after it". What to do about it is said once, in
+/// [`CHECK_FIRST`].
+pub(super) fn as_of(a: &Account, stale: Option<Staleness>, tz: chrono_tz::Tz) -> String {
+    let at = a.written_at.with_timezone(&tz).format("%H:%M");
+    let ago = (workforce_desk::crew::now() - a.written_at)
+        .num_minutes()
+        .max(0);
+    let why = match stale {
+        None => return format!("summary {at} ({ago} min ago)"),
+        Some(Staleness::Behind {
+            minutes,
+            turn: true,
+        }) => format!("its turn ended {minutes} min after it"),
+        Some(Staleness::Behind {
+            minutes,
+            turn: false,
+        }) => format!("its line moved {minutes} min after it"),
+        Some(Staleness::Expired) => "past its expiry".to_string(),
+        Some(Staleness::Plain) => "written plainly, worked since".to_string(),
+    };
+    format!("STALE: summary {at} ({ago} min ago), {why}")
+}
+
 fn line(e: &Entry, short: bool, tz: chrono_tz::Tz) -> String {
     let state = match e.failed {
         true => format!("{}, its last turn failed", e.state.as_str()),
@@ -72,10 +110,10 @@ fn line(e: &Entry, short: bool, tz: chrono_tz::Tz) -> String {
     };
     let head = match &e.account {
         Some(a) => format!(
-            "- {} ({state}, session_id {}, as of {})",
+            "- {} ({state}, session_id {}, {})",
             e.name,
             e.id,
-            a.written_at.with_timezone(&tz).format("%H:%M")
+            as_of(a, e.stale, tz)
         ),
         None => format!("- {} ({state}, session_id {})", e.name, e.id),
     };
@@ -122,9 +160,9 @@ pub(super) fn body(
             head.push('\n');
         }
         head.push_str(&format!(
-            "The session this turn is about, {} (as of {}):\n{}\n",
+            "The session this turn is about, {} ({}):\n{}\n",
             a.0.name,
-            a.1.written_at.with_timezone(&tz).format("%H:%M"),
+            as_of(a.1, a.0.stale, tz),
             render.trim_end()
         ));
         headed = Some(a.0.id);
@@ -208,6 +246,20 @@ pub(crate) async fn block(service: &AgentService, channel: &str, owner: &str) ->
             Vec::new()
         }
     };
+    let working = |s: SessionState| {
+        matches!(
+            s,
+            SessionState::Working | SessionState::Blocked | SessionState::Asking
+        )
+    };
+    let read: Vec<(&Account, bool)> = accounts
+        .iter()
+        .filter_map(|a| {
+            let v = views.iter().find(|v| v.id == a.session)?;
+            Some((a, working(v.state)))
+        })
+        .collect();
+    let stale = crew.desk.accounts_staleness(&read);
     let entries: Vec<Entry> = views
         .iter()
         .map(|v| Entry {
@@ -216,6 +268,7 @@ pub(crate) async fn block(service: &AgentService, channel: &str, owner: &str) ->
             state: v.state,
             failed: v.failure.is_some(),
             account: accounts.iter().find(|a| a.session == v.id).cloned(),
+            stale: stale.get(&v.id).copied(),
         })
         .collect();
     let posts = recent_posts(&boss, owner);
@@ -263,9 +316,14 @@ pub(crate) async fn block(service: &AgentService, channel: &str, owner: &str) ->
         crew.desk.timezone(),
     )?;
     let how = how.map(|h| format!("\n\n{h}")).unwrap_or_default();
+    // Summaries said plainly read like fresh ones: the block opens with it.
+    let spent = match crew.desk.cheap_ceiling_hit_today() {
+        true => format!("\n{}", super::picture::NOTES_SPENT),
+        false => String::new(),
+    };
     Some(format!(
         "What Desk keeps of your crew now, the same in every turn of yours (read crew.account \
-         before you say anything specific of one session):\n{}{how}",
+         before you say anything specific of one session). {CHECK_FIRST}{spent}\n{}{how}",
         reported(&body, "Desk's notes on your crew")
     ))
 }
@@ -319,6 +377,7 @@ mod tests {
             state,
             failed: false,
             account: Some(a),
+            stale: None,
         }
     }
 
@@ -410,6 +469,123 @@ mod tests {
         assert!(
             text.contains("- other-0 "),
             "the others still have room: {text}"
+        );
+    }
+
+    #[test]
+    fn a_stale_summary_is_flagged_with_why_and_a_fresh_one_is_not() {
+        let tz = chrono_tz::Europe::London;
+        let mut e = entry("payments", SessionState::Idle, "Ship release 4");
+        let at = e
+            .account
+            .as_ref()
+            .unwrap()
+            .written_at
+            .with_timezone(&tz)
+            .format("%H:%M")
+            .to_string();
+        let fresh = line(&e, false, tz);
+        assert!(
+            fresh.contains(&format!("summary {at} (0 min ago)")) && !fresh.contains("STALE"),
+            "{fresh}"
+        );
+        e.stale = Some(Staleness::Behind {
+            minutes: 27,
+            turn: true,
+        });
+        let said = line(&e, false, tz);
+        assert!(
+            said.contains(&format!(
+                "STALE: summary {at} (0 min ago), its turn ended 27 min after it"
+            )),
+            "{said}"
+        );
+        e.stale = Some(Staleness::Behind {
+            minutes: 3,
+            turn: false,
+        });
+        assert!(line(&e, false, tz).contains("its line moved 3 min after it"));
+        e.stale = Some(Staleness::Plain);
+        assert!(
+            line(&e, true, tz).contains("written plainly, worked since"),
+            "short lines keep it"
+        );
+        // The session the turn is about says it too.
+        e.stale = Some(Staleness::Expired);
+        let id = e.id;
+        let b = body(&[e], Some(id), &[], None, tz).unwrap();
+        assert!(b.contains("past its expiry"), "{b}");
+    }
+
+    #[test]
+    fn an_account_is_stale_once_its_session_did_more_or_its_time_passed() {
+        let now = Utc::now();
+        let min = chrono::Duration::minutes;
+        let mut a = Account::new(Uuid::new_v4(), "", now - min(30));
+        a.by_model = true;
+        assert_eq!(
+            a.staleness(now, false, !a.by_model, None, None),
+            None,
+            "idle and nothing since"
+        );
+        assert_eq!(
+            a.staleness(now, true, !a.by_model, None, None),
+            None,
+            "a model's, nothing since"
+        );
+        assert_eq!(
+            a.staleness(now, false, !a.by_model, Some(now - min(3)), None),
+            Some(Staleness::Behind {
+                minutes: 27,
+                turn: true
+            })
+        );
+        assert_eq!(
+            a.staleness(now, false, !a.by_model, None, Some(now - min(10))),
+            Some(Staleness::Behind {
+                minutes: 20,
+                turn: false
+            })
+        );
+        // The later of the two says how far behind.
+        assert_eq!(
+            a.staleness(
+                now,
+                false,
+                !a.by_model,
+                Some(now - min(25)),
+                Some(now - min(10))
+            ),
+            Some(Staleness::Behind {
+                minutes: 20,
+                turn: false
+            })
+        );
+        // What it already caught up with doesn't count.
+        assert_eq!(
+            a.staleness(
+                now,
+                false,
+                !a.by_model,
+                Some(now - min(40)),
+                Some(now - min(31))
+            ),
+            None
+        );
+        a.by_model = false;
+        assert_eq!(
+            a.staleness(now, false, !a.by_model, None, None),
+            None,
+            "plain, but nothing since"
+        );
+        assert_eq!(
+            a.staleness(now, true, !a.by_model, None, None),
+            Some(Staleness::Plain)
+        );
+        a.stale_after = Some(now - min(1));
+        assert_eq!(
+            a.staleness(now, false, !a.by_model, None, None),
+            Some(Staleness::Expired)
         );
     }
 }
