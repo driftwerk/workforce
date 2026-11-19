@@ -143,7 +143,7 @@ impl CrewHub {
         let boss = b.service.agent_id.as_str();
         let plain = |e: MachineRefused| {
             match e {
-            MachineRefused::Refused(why) if why.contains("404") || why.contains("not found") => {
+            MachineRefused::Refused(why) if why.contains("is older") || why.contains("(404)") => {
                 "That machine's Desk is older and can't answer this yet: the person updates Desk there.".to_string()
             }
             e => e.to_string(),
@@ -155,8 +155,12 @@ impl CrewHub {
                     .machine_ask(ANY_MACHINE, boss, "desk.machines", json!({}))
                     .await
                     .map_err(plain)?;
+                let listed = got
+                    .get("machines")
+                    .cloned()
+                    .unwrap_or(Value::Array(Vec::new()));
                 Ok(json!({
-                    "machines": got.get("machines").cloned().unwrap_or(Value::Array(Vec::new())),
+                    "machines": reported(&listed.to_string(), "the person's machines"),
                     "note": "Name a machine by its name here in crew.machine_folders and a plan ticket's machine.",
                 }))
             }
@@ -243,9 +247,12 @@ impl CrewHub {
                 e.reason = Some(reason.to_string());
                 self.desk.note(e);
                 let got = got.map_err(plain)?;
-                Ok(
-                    json!({ "machine": machine, "made": got.get("path").cloned().unwrap_or(json!(path)) }),
-                )
+                let made = got
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&path)
+                    .to_string();
+                Ok(json!({ "machine": machine, "made": reported(&made, "the folder made") }))
             }
         }
     }

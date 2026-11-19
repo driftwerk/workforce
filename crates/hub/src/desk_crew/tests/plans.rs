@@ -672,6 +672,27 @@ async fn a_boss_moves_a_ticket_by_its_repository_and_its_machine_tools_say_what_
         assert_eq!(t.machine.as_deref(), Some("devbox"));
         assert_eq!(t.repo.as_deref(), Some("github.com/driftwerk/vellev"));
         assert_eq!(t.folder.as_deref(), Some(""), "the Mac's folder isn't devbox's");
+        // Its repository alone, changed: saved where it starts from.
+        let r = overseer
+            .tools
+            .get("crew.plan_update")
+            .unwrap()
+            .execute(json!({ "plan_id": id, "why": "The other repository.",
+                "tickets_edit": [{ "key": key, "repo": "driftwerk/workforce" }] }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        let p = d.plan(id.parse().unwrap()).await.unwrap();
+        assert_eq!(
+            p.tickets[0].repo.as_deref(),
+            Some("github.com/driftwerk/workforce")
+        );
+        let runs = d.store().plan_runs(id.parse().unwrap()).await.unwrap();
+        assert_eq!(
+            runs[0].1.repo.as_deref(),
+            Some("github.com/driftwerk/workforce"),
+            "the row a start reads"
+        );
 
         let said = |r: workforce_agent::tools::ToolResult| format!("{r:?}");
         let folders = overseer.tools.get("crew.machine_folders").unwrap();

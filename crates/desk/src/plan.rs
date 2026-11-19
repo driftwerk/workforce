@@ -1209,18 +1209,22 @@ pub fn next_starts(
     ready.sort_by(|a, b| a.rank.total_cmp(&b.rank));
     // A folder is in use on its own computer: the same path on a machine is
     // another folder. A repository is one checkout on each computer, so two
-    // tickets of it there share a folder.
-    let place = |t: &PlanTicket| -> Option<String> {
-        match (t.repo.as_deref(), t.folder.as_deref()) {
-            (Some(r), _) => Some(format!("repo:{r}")),
-            (None, Some(f)) if !f.is_empty() => Some(f.to_string()),
-            _ => None,
+    // tickets of it there share a folder; so do a ticket of its folder and
+    // one of its repository whose found checkout it is.
+    let places = |t: &PlanTicket| -> Vec<String> {
+        let mut at = Vec::new();
+        if let Some(r) = t.repo.as_deref() {
+            at.push(format!("repo:{r}"));
         }
+        if let Some(f) = t.folder.as_deref().filter(|f| !f.is_empty()) {
+            at.push(f.trim_end_matches('/').to_string());
+        }
+        at
     };
     let mut in_use: HashSet<(Option<&str>, String)> = tickets
         .iter()
         .filter(|t| t.state == TicketState::Doing || t.starting)
-        .filter_map(|t| place(t).map(|f| (t.machine.as_deref(), f)))
+        .flat_map(|t| places(t).into_iter().map(|f| (t.machine.as_deref(), f)))
         .collect();
     let mut busy = busy;
     let mut out = Vec::new();
@@ -1228,15 +1232,20 @@ pub fn next_starts(
         if busy >= cap {
             break;
         }
-        let (Some(engine), Some(at)) = (t.engine, place(t)) else {
+        let at = places(t);
+        let Some(engine) = t.engine.filter(|_| !at.is_empty()) else {
             continue;
         };
+        let mut shared = false;
+        for f in at {
+            shared |= !in_use.insert((t.machine.as_deref(), f));
+        }
         out.push(Start {
             ticket: t.id,
             engine,
             folder: t.folder.clone().unwrap_or_default(),
             view: t.view,
-            worktree: !in_use.insert((t.machine.as_deref(), at)),
+            worktree: shared,
             repo: t.repo.clone(),
         });
         busy += 1;

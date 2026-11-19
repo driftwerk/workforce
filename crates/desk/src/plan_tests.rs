@@ -1297,6 +1297,18 @@ fn a_ticket_of_a_repository_starts_with_its_checkout_found_there() {
         [false, true],
         "one checkout of it on devbox: the second gets a copy"
     );
+    // A ticket of the folder alone, working in the checkout a ticket of
+    // its repository found there: the same folder.
+    let mut doing = ticket(3, TicketState::Doing, &[]);
+    doing.folder = Some("/home/dev/projects/driftwerk/vellev/".into());
+    doing.machine = Some("devbox".into());
+    let mut c = ticket(4, TicketState::Todo, &[]);
+    c.folder = Some("/home/dev/projects/driftwerk/vellev".into());
+    c.repo = Some("github.com/driftwerk/vellev".into());
+    c.machine = Some("devbox".into());
+    let starts = next_starts(&p, &[doing, c], 1, 4, None);
+    assert_eq!(starts.len(), 1);
+    assert!(starts[0].worktree, "its folder is in use");
 }
 
 #[test]

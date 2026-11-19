@@ -568,7 +568,8 @@ impl CrewHub {
                 let home = self.desk.home_folder()?.canonicalize().ok()?;
                 let dir = std::path::PathBuf::from(folder);
                 tokio::task::spawn_blocking(move || {
-                    let inside = |p: &std::path::Path| p.starts_with(&home);
+                    // Never the home's own repository (its dotfiles).
+                    let inside = |p: &std::path::Path| p.starts_with(&home) && p != home;
                     workforce_desk::folders::remote_of(&dir, true, &inside)
                 })
                 .await
@@ -1724,6 +1725,27 @@ impl CrewHub {
                         }
                     }
                 }
+                // A ticket waiting on its clone holds no slot: it is asked
+                // after on its own, and starts with the rest once ready.
+                // One that left To do, or this plan, waits no more.
+                let waiting: Vec<Uuid> = {
+                    let mut w = self.plan_waiting.lock();
+                    w.retain(|id, (plan, _)| {
+                        *plan != p.id
+                            || tickets
+                                .iter()
+                                .any(|t| t.id == *id && t.state == TicketState::Todo && !t.assigned)
+                    });
+                    w.iter()
+                        .filter(|(_, (plan, _))| *plan == p.id)
+                        .map(|(id, _)| *id)
+                        .collect()
+                };
+                for t in &mut rows {
+                    if waiting.contains(&t.id) {
+                        t.starting = true;
+                    }
+                }
                 let busy = self.desk.charges_busy(&boss.id)
                     + self.desk.starts_under_way(&boss.id).await
                     + self.machine_busy(&boss.id);
@@ -1757,22 +1779,32 @@ impl CrewHub {
                         // Under way (a clone): not a failure; its boss is
                         // told once what it waits on.
                         Err(workforce_desk::StartRefused::Waits(why)) => {
-                            let tell = self
-                                .plan_waiting
-                                .lock()
-                                .insert(s.ticket, why.clone())
-                                .as_ref()
-                                != Some(&why);
-                            if tell {
-                                self.plan_failures.lock().push((p.id, why));
-                            }
+                            self.plan_waits(p.id, s.ticket, why);
                         }
                         Err(workforce_desk::StartRefused::Failed(e)) => {
+                            self.plan_waiting.lock().remove(&s.ticket);
                             tracing::info!(plan = %p.id, ticket = %s.ticket, error = %e, "a plan's ticket didn't start");
                             let Some(t) = tickets.iter().find(|t| t.id == s.ticket) else {
                                 continue;
                             };
                             self.start_failed(&p, t, scope, &plain(e)).await;
+                        }
+                    }
+                }
+                for id in waiting {
+                    match self.desk.plan_prepare(&p, id, &boss).await {
+                        // Ready: it starts with the rest, next pass.
+                        Ok(()) | Err(workforce_desk::StartRefused::Skipped(_)) => {
+                            self.plan_waiting.lock().remove(&id);
+                        }
+                        Err(workforce_desk::StartRefused::Waits(why)) => {
+                            self.plan_waits(p.id, id, why);
+                        }
+                        Err(workforce_desk::StartRefused::Failed(e)) => {
+                            self.plan_waiting.lock().remove(&id);
+                            if let Some(t) = tickets.iter().find(|t| t.id == id) {
+                                self.start_failed(&p, t, scope, &plain(e)).await;
+                            }
                         }
                     }
                 }
@@ -1782,6 +1814,19 @@ impl CrewHub {
                     .await
             }
             Level::Watch => {}
+        }
+    }
+
+    /// `ticket` of plan `plan` waits on its clone: its boss is told what it
+    /// waits on once, and again only when that changes.
+    fn plan_waits(&self, plan: Uuid, ticket: Uuid, why: String) {
+        let tell = self
+            .plan_waiting
+            .lock()
+            .insert(ticket, (plan, why.clone()))
+            .is_none_or(|(_, was)| was != why);
+        if tell {
+            self.plan_failures.lock().push((plan, why));
         }
     }
 

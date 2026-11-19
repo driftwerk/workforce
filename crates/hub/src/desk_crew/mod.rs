@@ -273,7 +273,7 @@ pub struct CrewHub {
     plan_failures: Mutex<Vec<(uuid::Uuid, String)>>,
     /// The plan tickets waiting on something under way (a clone) to start,
     /// with what they wait on: their boss is told once.
-    plan_waiting: Mutex<HashMap<uuid::Uuid, String>>,
+    plan_waiting: Mutex<HashMap<uuid::Uuid, (uuid::Uuid, String)>>,
     /// Plans' sessions on the person's machines, as last read there, by
     /// `<machine>/<id>`; and when each machine was last read.
     machine_seen: Mutex<HashMap<String, plan::MachineSeen>>,
