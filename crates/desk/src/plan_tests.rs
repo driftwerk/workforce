@@ -1062,3 +1062,132 @@ fn the_same_folder_on_another_computer_needs_no_copy_of_its_own() {
     let copies: Vec<bool> = starts.iter().map(|s| s.worktree).collect();
     assert_eq!(copies, [false, false, true], "only the second on devbox");
 }
+
+fn edit(n: u128) -> TicketEdit {
+    TicketEdit {
+        id: u(n),
+        key: Some(format!("VEL-{n}")),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn an_edit_by_key_changes_only_what_it_says() {
+    let mut a = planned(1, "Add the cache", &[]);
+    a.body = "Cache the index in memory; keep it under 50 MB.".into();
+    a.model = Some("opus".into());
+    let mut b = planned(2, "Use the cache", &[1]);
+    b.body = "Read through the cache.".into();
+    let before = Snapshot {
+        goal: "Faster reads".into(),
+        tickets: vec![a.clone(), b.clone()],
+        parallel: Some(2),
+        budget: None,
+    };
+    let after = edited(
+        &before,
+        &[TicketEdit {
+            machine: Some("devbox".into()),
+            folder: Some("/home/dev/projects/driftwerk/vellev".into()),
+            ..edit(2)
+        }],
+    )
+    .unwrap();
+    assert_eq!(after.tickets[0], a, "a ticket not edited is as it was");
+    let moved = &after.tickets[1];
+    assert_eq!(moved.machine.as_deref(), Some("devbox"));
+    assert_eq!(moved.folder, "/home/dev/projects/driftwerk/vellev");
+    assert_eq!(moved.title, b.title, "its title is kept");
+    assert_eq!(moved.body, b.body, "its brief is kept");
+    assert_eq!(moved.needs, b.needs, "its needs are kept");
+    assert_eq!(after.parallel, Some(2));
+    assert_eq!(after.goal, before.goal);
+
+    // Its model is kept while its engine is, and goes with an engine change.
+    let same = edited(
+        &before,
+        &[TicketEdit {
+            folder: Some("/srv/v".into()),
+            ..edit(1)
+        }],
+    )
+    .unwrap();
+    assert_eq!(same.tickets[0].model.as_deref(), Some("opus"));
+    let codex = edited(
+        &before,
+        &[TicketEdit {
+            engine: Some("codex".into()),
+            ..edit(1)
+        }],
+    )
+    .unwrap();
+    assert_eq!(codex.tickets[0].engine, Engine::Codex);
+    assert_eq!(codex.tickets[0].model, None);
+
+    // Back to this computer by its word.
+    let mut on = before.clone();
+    on.tickets[1].machine = Some("devbox".into());
+    let home = edited(
+        &on,
+        &[TicketEdit {
+            machine: Some("local".into()),
+            folder: Some("/work/acme-web".into()),
+            ..edit(2)
+        }],
+    )
+    .unwrap();
+    assert_eq!(home.tickets[1].machine, None);
+}
+
+#[test]
+fn an_edit_is_refused_by_the_key_it_names() {
+    let mut taken = planned(3, "MAN-465", &[]);
+    taken.adopted = true;
+    let before = Snapshot {
+        goal: "Faster reads".into(),
+        tickets: vec![planned(1, "Add the cache", &[]), taken],
+        ..Default::default()
+    };
+    let said = |edits: &[TicketEdit]| plain(&edited(&before, edits).unwrap_err());
+    assert!(said(&[TicketEdit {
+        folder: Some("/x".into()),
+        ..edit(9)
+    }])
+    .contains("VEL-9 isn't one of the plan's tickets"),);
+    let twice = said(&[
+        TicketEdit {
+            folder: Some("/x".into()),
+            ..edit(1)
+        },
+        TicketEdit {
+            folder: Some("/y".into()),
+            ..edit(1)
+        },
+    ]);
+    assert!(twice.contains("VEL-1 is edited twice"), "{twice}");
+    let words = said(&[TicketEdit {
+        body: Some("new".into()),
+        ..edit(3)
+    }]);
+    assert!(
+        words.contains("VEL-3 is taken on from its board"),
+        "{words}"
+    );
+    let away = said(&[TicketEdit {
+        machine: Some("devbox".into()),
+        ..edit(1)
+    }]);
+    assert!(
+        away.contains("VEL-1 moves to devbox: say its folder there too"),
+        "{away}"
+    );
+    // The same machine again needs no folder.
+    assert!(edited(
+        &before,
+        &[TicketEdit {
+            machine: Some("local".into()),
+            ..edit(1)
+        }]
+    )
+    .is_ok());
+}

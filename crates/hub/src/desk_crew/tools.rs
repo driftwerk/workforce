@@ -437,7 +437,7 @@ impl CrewTool {
                 crew.decisions_tool(b.service.agent_id.as_str(), input)
                     .await
             }
-            super::board::NAME => crew.board(seen).await,
+            super::board::NAME => crew.board_tool(b, input).await,
             super::find::NAME => crew.find_tickets_tool(b, input).await,
             super::items::ASK
             | super::items::CLOSE

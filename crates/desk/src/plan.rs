@@ -398,6 +398,210 @@ pub struct DraftTicket {
     pub model: Option<String>,
 }
 
+/// One ticket the plan has, changed in place: only what it says changes,
+/// and its title, description, needs and history are kept. Each field reads
+/// as [`DraftTicket`]'s does: `machine` [`THIS_COMPUTER`] (or `""`) is this
+/// computer, `model` `""` its engine's own, and a model is kept only while
+/// its engine is.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TicketEdit {
+    pub id: Uuid,
+    /// How it was named (its key, like VEL-2), for the words read back.
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub engine: Option<String>,
+    #[serde(default)]
+    pub folder: Option<String>,
+    #[serde(default)]
+    pub view: Option<String>,
+    #[serde(default)]
+    pub machine: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+impl TicketEdit {
+    /// What it is called in the words read back: its key, else its id.
+    pub fn name(&self) -> String {
+        self.key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map_or_else(|| self.id.to_string(), str::to_string)
+    }
+
+    /// Whether it says where, or how, the ticket's session runs.
+    pub fn moves(&self) -> bool {
+        self.engine.is_some()
+            || self.folder.is_some()
+            || self.view.is_some()
+            || self.machine.is_some()
+            || self.model.is_some()
+    }
+
+    /// Whether it changes where, or how, `was` runs: a field it gives that
+    /// says what `was` says already changes nothing.
+    pub fn moves_from(&self, was: &Planned) -> bool {
+        let differs = |said: &Option<String>, now: Option<&str>| {
+            said.as_deref()
+                .map(str::trim)
+                .is_some_and(|s| s != now.unwrap_or_default())
+        };
+        let machine = self.machine.as_deref().map(str::trim).is_some_and(|m| {
+            let m = (!m.is_empty() && !m.eq_ignore_ascii_case(THIS_COMPUTER)).then_some(m);
+            match (m, was.machine.as_deref()) {
+                (None, None) => false,
+                (Some(a), Some(b)) => !a.eq_ignore_ascii_case(b),
+                _ => true,
+            }
+        });
+        // An engine left empty is the default one, Claude.
+        let engine = self.engine.as_deref().map(str::trim).is_some_and(|e| {
+            let e = if e.is_empty() {
+                Engine::Claude.as_str()
+            } else {
+                e
+            };
+            !e.eq_ignore_ascii_case(was.engine.as_str())
+        });
+        let view = self.view.as_deref().map(str::trim).is_some_and(|v| {
+            !v.eq_ignore_ascii_case(was.view.map(|w| w.as_str()).unwrap_or_default())
+        });
+        machine
+            || engine
+            || differs(&self.folder, Some(&was.folder))
+            || view
+            || differs(&self.model, was.model.as_deref())
+    }
+}
+
+/// `before` with `edits` made, each to the ticket of it its id names; the
+/// rest as they are. What an edit says is read as a whole list's ticket is
+/// ([`snapshot_with`]), so the same problems refuse it, each named by its
+/// key: a ticket it doesn't have, one edited twice, words given to one
+/// taken on from its board, and a move to another machine that doesn't say
+/// its folder there.
+pub fn edited(before: &Snapshot, edits: &[TicketEdit]) -> Result<Snapshot, Vec<Problem>> {
+    let mut problems = Vec::new();
+    let mut seen = HashSet::new();
+    let place: HashMap<Uuid, usize> = before
+        .tickets
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.id, i))
+        .collect();
+    let mut draft = Draft {
+        goal: before.goal.clone(),
+        tickets: before
+            .tickets
+            .iter()
+            .map(|t| DraftTicket {
+                id: Some(t.id),
+                adopt: None,
+                title: t.title.clone(),
+                body: t.body.clone(),
+                engine: Some(t.engine.as_str().to_string()),
+                folder: t.folder.clone(),
+                view: t.view.map(|v| v.as_str().to_string()),
+                needs: t
+                    .needs
+                    .iter()
+                    .filter_map(|n| place.get(n).copied())
+                    .collect(),
+                machine: Some(
+                    t.machine
+                        .clone()
+                        .unwrap_or_else(|| THIS_COMPUTER.to_string()),
+                ),
+                model: None,
+            })
+            .collect(),
+    };
+    for e in edits {
+        let key = e.name();
+        let Some(&i) = place.get(&e.id) else {
+            problems.push(Problem::NotInPlan { key });
+            continue;
+        };
+        if !seen.insert(e.id) {
+            problems.push(Problem::EditedTwice { key });
+            continue;
+        }
+        let was = &before.tickets[i];
+        let t = &mut draft.tickets[i];
+        if was.adopted && (e.title.is_some() || e.body.is_some()) {
+            problems.push(Problem::AdoptedWords { key: key.clone() });
+        }
+        if let Some(title) = &e.title {
+            t.title.clone_from(title);
+        }
+        if let Some(body) = &e.body {
+            t.body.clone_from(body);
+        }
+        if let Some(engine) = &e.engine {
+            t.engine = Some(engine.clone());
+        }
+        if let Some(view) = &e.view {
+            t.view = Some(view.clone());
+        }
+        if let Some(model) = &e.model {
+            t.model = Some(model.clone());
+        }
+        if let Some(folder) = &e.folder {
+            t.folder.clone_from(folder);
+        }
+        if let Some(machine) = &e.machine {
+            let to = machine.trim();
+            let now = match to.is_empty() || to.eq_ignore_ascii_case(THIS_COMPUTER) {
+                true => None,
+                false => Some(to),
+            };
+            // The machine it runs on already, however it is spelled.
+            let same = match (now, was.machine.as_deref()) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                _ => false,
+            };
+            if same {
+                t.machine = Some(
+                    was.machine
+                        .clone()
+                        .unwrap_or_else(|| THIS_COMPUTER.to_string()),
+                );
+                continue;
+            }
+            if e.folder.is_none() {
+                problems.push(Problem::MovedWithoutFolder {
+                    key: key.clone(),
+                    machine: now.unwrap_or("this computer").to_string(),
+                });
+            }
+            t.machine = Some(machine.clone());
+        }
+    }
+    if !problems.is_empty() {
+        return Err(problems);
+    }
+    // Each model the plan has is kept, as a whole list keeps it, unless an
+    // edit says another: `None` keeps it only while its engine is the same.
+    let mut next = snapshot_with(
+        &draft,
+        Some(before),
+        Engine::Claude,
+        &HashMap::new(),
+        &mut Uuid::new_v4,
+    )?;
+    next.parallel = before.parallel;
+    next.budget.clone_from(&before.budget);
+    Ok(next)
+}
+
 /// What is wrong with a plan, in the words the person and the boss read.
 /// `ticket` is its place in the list, from 1.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -462,6 +666,18 @@ pub enum Problem {
     Started { title: String },
     #[error("{0}")]
     Budget(String),
+    #[error("{key} isn't one of the plan's tickets.")]
+    NotInPlan { key: String },
+    #[error("{key} is edited twice; say each ticket once.")]
+    EditedTwice { key: String },
+    #[error("{key} is taken on from its board: its title and description are its board's, so leave title and body out.")]
+    AdoptedWords { key: String },
+    #[error(
+        "{key} moves to {machine}: say its folder there too, as an absolute path on {machine}."
+    )]
+    MovedWithoutFolder { key: String, machine: String },
+    #[error("{key} has started (it is in {column}), so where it runs can't change: leave it out, or once it is done add a ticket for what is left.")]
+    StartedEdit { key: String, column: &'static str },
 }
 
 /// The problems as one message.
