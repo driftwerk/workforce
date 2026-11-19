@@ -364,6 +364,21 @@ impl CrewHub {
             }
             s.judged.insert(key);
         }
+        // Running as an orchestrator, the boss hears of it in its own
+        // conversation and acts there, with its tools: no focused call.
+        if self.orchestrates(&boss) {
+            if let Some(person) = self
+                .overseer_named(&boss)
+                .and_then(|(service, _)| self.person(Some(&service)))
+            {
+                let crew = Arc::clone(self);
+                tokio::spawn(async move {
+                    let text = crew.turn_end_notice(&view).await;
+                    crew.notify(&boss, &person, super::orchestrator::Notice::new(text));
+                });
+                return;
+            }
+        }
         let crew = Arc::clone(self);
         let seen = Arc::clone(seen);
         let cancel = cancel.clone();

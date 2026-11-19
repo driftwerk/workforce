@@ -9,6 +9,11 @@
 pub(crate) struct Refused {
     pub kind: Refusal,
     pub why: String,
+    /// A guard's judgement of the order alone (no job said, one that looks
+    /// held, a job said wrongly), made before anything was kept: at Act
+    /// fully it goes all the same. What Desk failed to keep, or an order of
+    /// the same job already gone in, is never lifted.
+    pub guard: bool,
 }
 
 /// What kind of refusal it was.
@@ -63,6 +68,16 @@ impl Refused {
         Self {
             kind,
             why: why.into(),
+            guard: false,
+        }
+    }
+
+    /// A guard's refusal of the order alone, before anything was kept
+    /// ([`Self::guard`]).
+    pub(crate) fn guard(kind: Refusal, why: impl Into<String>) -> Self {
+        Self {
+            guard: true,
+            ..Self::new(kind, why)
         }
     }
 
