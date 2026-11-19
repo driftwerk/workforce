@@ -524,7 +524,7 @@ impl CrewHub {
         let what = format!("left what {} does next to you", view.label());
         let mut d = BossDecision::new(boss, Need::TurnEnd, &what, why, How::Escalated);
         d.session = Some(view.id);
-        self.record(&d).await;
+        self.record(&mut d).await;
     }
 }
 

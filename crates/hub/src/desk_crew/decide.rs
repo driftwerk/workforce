@@ -1099,7 +1099,7 @@ impl CrewHub {
         let mut d = BossDecision::new(boss, Need::Approval, &what, why, How::Escalated);
         d.need_ref = Some(p.id.to_string());
         d.session = Some(view.id);
-        self.record(&d).await;
+        self.record(&mut d).await;
     }
 
     /// Says `text` in `boss`'s DM, as a notice.

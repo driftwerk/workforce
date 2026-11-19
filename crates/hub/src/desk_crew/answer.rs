@@ -804,7 +804,7 @@ impl CrewHub {
         );
         let mut d = BossDecision::new(boss, Need::Question, &what, why, How::Escalated);
         d.session = Some(view.id);
-        self.record(&d).await;
+        self.record(&mut d).await;
     }
 }
 

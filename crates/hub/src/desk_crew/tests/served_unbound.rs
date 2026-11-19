@@ -86,6 +86,23 @@ async fn decide_frame(rx: &mut tokio::sync::mpsc::Receiver<Value>) -> Value {
     }
 }
 
+/// The boss's decision `which` picks, once it is kept.
+async fn decided(
+    d: &Desk,
+    which: impl Fn(&workforce_desk::decision::BossDecision) -> bool,
+) -> workforce_desk::decision::BossDecision {
+    let which = &which;
+    eventually("the boss's decision, kept", async || {
+        d.store()
+            .decisions_since(BOSS, chrono::DateTime::UNIX_EPOCH, 50)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(which)
+    })
+    .await
+}
+
 fn answer(frame: &Value, text: &str) -> Value {
     json!({"type": "decided", "linkId": frame["linkId"], "decideId": frame["decideId"], "text": text})
 }
@@ -209,23 +226,12 @@ async fn a_remote_boss_at_act_fully_decides_each_request_on_its_own_hub_and_noth
             .await;
         assert_eq!(r.status, ServedStatus::Refused, "{:?}", r.body);
         assert!(d.view(started).unwrap().pending.is_some_and(|p| p.id == a0));
-        eventually("left to the person", async || {
-            d.view(started)
-                .unwrap()
-                .waits_on_you
-                .is_some()
-                .then_some(())
-        })
-        .await;
-        let rows = d
-            .store()
-            .decisions_since(BOSS, chrono::DateTime::UNIX_EPOCH, 50)
-            .await
-            .unwrap();
-        let left = rows
-            .iter()
-            .find(|r| r.need_ref == Some(a0.to_string()))
-            .unwrap_or_else(|| panic!("{rows:?}"));
+        // Its decision call fails and the request is left to the person,
+        // said in a row: waited on as such. The session reads as waiting on
+        // the person sooner (its badge says the boss isn't connected), so
+        // that says nothing of the row.
+        let left = decided(&d, |r| r.need_ref == Some(a0.to_string())).await;
+        assert!(d.view(started).unwrap().waits_on_you.is_some());
         assert_eq!(left.how, How::Escalated);
         assert!(left.why.contains("isn't connected"), "{}", left.why);
         assert!(
@@ -257,15 +263,11 @@ async fn a_remote_boss_at_act_fully_decides_each_request_on_its_own_hub_and_noth
             answered["hookSpecificOutput"]["decision"]["behavior"], "allow",
             "{answered}"
         );
-        let rows = d
-            .store()
-            .decisions_since(BOSS, chrono::DateTime::UNIX_EPOCH, 50)
-            .await
-            .unwrap();
-        let row = rows
-            .iter()
-            .find(|r| r.need == Need::Approval && r.need_ref == Some(a1.to_string()))
-            .unwrap_or_else(|| panic!("{rows:?}"));
+        // Kept once done: the session may hear its answer first.
+        let row = decided(&d, |r| {
+            r.need == Need::Approval && r.need_ref == Some(a1.to_string())
+        })
+        .await;
         assert!(row.what.contains("allan on driftwerk"), "{}", row.what);
         assert!(row.why.contains("the fix is ready to ship"), "{}", row.why);
         assert_eq!(row.session, Some(started));
