@@ -415,7 +415,15 @@ impl CrewHub {
         while self.minds.person_running(boss) && since.elapsed() < PERSON_YIELD {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        if self.minds.person_running(boss) {
+        // Any of their turns still running, however old: `person_running`
+        // no longer counts one past the yield.
+        let still = self
+            .minds
+            .person
+            .lock()
+            .get(boss)
+            .is_some_and(|t| !t.is_empty());
+        if still {
             tracing::warn!(
                 %boss,
                 waited_secs = PERSON_YIELD.as_secs(),

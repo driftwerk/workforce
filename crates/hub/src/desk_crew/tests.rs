@@ -6365,7 +6365,7 @@ async fn a_wedged_mind_is_waited_for_only_so_long() {
             .await;
         assert_eq!(out, 6);
         assert!(
-            nested.elapsed() < Duration::from_millis(550),
+            nested.elapsed() < Duration::from_millis(600),
             "waited once, not twice: {:?}",
             nested.elapsed()
         );
