@@ -299,39 +299,25 @@ impl ConfigTool {
         self.save(read.as_deref(), &doc.to_string()).await
     }
 
-    /// Tells the person, in this agent's Desk conversation, what it just
-    /// let itself reach.
+    /// Tells the person what it just let itself reach: in the conversation
+    /// they asked in, else in this agent's Desk DM
+    /// ([`crate::desk_surface::notice`]).
     async fn tell_the_person(&self, widened: &[String]) {
         tracing::info!(agent = %self.service.agent_id, widened = ?widened, "an agent widened its own connectors");
-        #[cfg(feature = "postgres")]
-        {
-            use workforce_common::channels::desk::{DeliveryKind, DeskPlace, DeskTarget};
-            let Some(person) = crate::user_config::current_identity_id() else {
-                return;
-            };
-            if !self.service.config.desk.enabled {
-                return;
-            }
-            let text = format!(
-                "I changed my own connectors, so I reach more now: {}. Change it back in my Connectors.",
-                widened.join("; ")
-            );
-            let target = DeskTarget::of_turn(
-                &DeskPlace::Dm { thread: None },
-                workforce_common::channels::DESK_CHANNEL,
-                None,
-                false,
-            );
-            if let Err(e) = crate::desk_surface::deliver(
-                &*self.service,
-                &person,
-                &target,
-                crate::desk_surface::Delivery::text(DeliveryKind::Notice, text),
-            )
-            .await
-            {
-                tracing::warn!(error = %format!("{e:#}"), "telling the person an agent widened its connectors failed");
-            }
+        let Some(person) = crate::user_config::current_identity_id() else {
+            return;
+        };
+        let text = format!(
+            "I changed my own connectors, so I reach more now: {}. Change it back in my Connectors.",
+            widened.join("; ")
+        );
+        // A hub with no Desk has no DM to fall back on.
+        if !self.service.config.desk.enabled {
+            crate::desk_surface::in_conversation(&self.service, &person, &text).await;
+            return;
+        }
+        if let Err(e) = crate::desk_surface::notice(&self.service, &person, text).await {
+            tracing::warn!(error = %format!("{e:#}"), "telling the person an agent widened its connectors failed");
         }
     }
 

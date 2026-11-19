@@ -25,8 +25,6 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use workforce_agent::llm::types::{ContentBlock, LlmMessage};
 use workforce_agent::runner::with_served_log;
-use workforce_common::channels::desk::{DeliveryKind, DeskPlace, DeskTarget};
-use workforce_common::channels::DESK_CHANNEL;
 use workforce_common::cost::{CostEntry, TokenCounts};
 use workforce_common::oversight::Level;
 use workforce_common::subscription::Origin;
@@ -1102,7 +1100,9 @@ impl CrewHub {
         self.record(&mut d).await;
     }
 
-    /// Says `text` in `boss`'s DM, as a notice.
+    /// Says `text` in `boss`'s DM, as a notice; in the person's conversation
+    /// with `boss` off Desk instead, when a turn of theirs there is what
+    /// says it ([`crate::desk_surface::notice`]).
     pub(super) async fn tell_dm(&self, boss: &str, text: &str) {
         // A boss on another hub: its conversation is there, where what it
         // leaves to the person goes up as an ask ([`Self::left_by_served`]).
@@ -1117,16 +1117,7 @@ impl CrewHub {
         let Some(owner) = self.person(Some(&service)) else {
             return;
         };
-        let target =
-            DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
-        if let Err(e) = crate::desk_surface::deliver(
-            &service,
-            &owner,
-            &target,
-            crate::desk_surface::Delivery::text(DeliveryKind::Notice, text.to_string()),
-        )
-        .await
-        {
+        if let Err(e) = crate::desk_surface::notice(&service, &owner, text.to_string()).await {
             tracing::warn!(%boss, error = %e, "saying a waiting request in the DM failed");
         }
     }

@@ -192,7 +192,7 @@ impl Hub {
 
     /// A streamed turn from `user` on `channel`, in the Slack channel and
     /// thread given.
-    async fn stream_at(
+    pub(crate) async fn stream_at(
         &self,
         place: (&str, Option<&str>, Option<&str>),
         user: &str,
