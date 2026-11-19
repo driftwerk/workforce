@@ -595,6 +595,9 @@ impl CrewHub {
             about: Some(about),
             group,
             handed: None,
+            // Desk's own look at what still waits: never past the
+            // person's Stop.
+            routine: true,
         };
         let crew = self.me();
         let boss = boss.to_string();
