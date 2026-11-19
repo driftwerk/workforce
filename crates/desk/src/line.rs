@@ -495,6 +495,143 @@ pub enum Target {
     Session(Uuid),
 }
 
+/// What a boss says when it holds a session for its own answer: "change
+/// nothing until I answer", "wait for my decision". Each is followed by
+/// what it waits on ([`HOLD_ON`]).
+const HOLDS: [&str; 6] = [
+    "until i ",
+    "until desk ",
+    "until your boss ",
+    "wait for my ",
+    "wait for desk",
+    "wait for your boss",
+];
+
+/// What a hold waits on: the boss's own word, as a verb after "until I"
+/// or a noun after "wait for my" ("answer", "replies", "decided",
+/// "decision", "say so", "go-ahead"). Never a bare "say" or "tell":
+/// "until I say stop" keeps it going.
+const HOLD_ON: [&str; 15] = [
+    "answer",
+    "repl",
+    "respon",
+    "decid",
+    "decision",
+    "confirm",
+    "get back",
+    "approv",
+    "say so",
+    "go-ahead",
+    "go ahead",
+    "sign-off",
+    "sign off on",
+    "ok ",
+    "okay",
+];
+
+/// Whether `rest`, the words after a hold's opening, name what it waits
+/// on: [`HOLD_ON`], or "sign off" / "ok" as whole words ("until I sign
+/// off.", "wait for my ok"), never "sign off for the day".
+fn waits_on(rest: &str) -> bool {
+    let whole = |w: &str| {
+        rest.strip_prefix(w)
+            .is_some_and(|after| !after.starts_with(|c: char| c.is_alphanumeric() || c == ' '))
+    };
+    HOLD_ON.iter().any(|v| rest.starts_with(v)) || whole("sign off") || whole("ok")
+}
+
+/// Words just before "wait for" that undo it: "no need to wait for my
+/// answer". Never applied to "until I …": "don't merge until I answer" holds.
+const UNDONE: [&str; 11] = [
+    "no need to ",
+    "don't need to ",
+    "doesn't need to ",
+    "need not ",
+    "needn't ",
+    "no reason to ",
+    "don't ",
+    "do not ",
+    "not ",
+    "no longer ",
+    "never ",
+];
+
+/// Whether `text`, a boss's words to a session (or a session's of itself),
+/// holds the session for the boss's answer: it waits on the boss, not on
+/// its work. Only words that wait on an answer: "until I've checked CI"
+/// or "until I say stop" isn't one.
+pub fn holds(text: &str) -> bool {
+    let lower = text
+        .to_lowercase()
+        .replace(['\u{2019}', '\''], "'")
+        .replace("i've", "i have");
+    HOLDS.iter().any(|h| {
+        lower.match_indices(h).any(|(at, _)| {
+            let waits_for = h.starts_with("wait for");
+            if waits_for && UNDONE.iter().any(|u| lower[..at].ends_with(u)) {
+                return false;
+            }
+            let after = &lower[at + h.len()..];
+            // "wait for desk" is Desk, never "desktop".
+            if (h.ends_with("desk") || h.ends_with("boss"))
+                && after.chars().next().is_some_and(char::is_alphanumeric)
+            {
+                return false;
+            }
+            let rest = after.strip_prefix("'s").unwrap_or(after).trim_start();
+            let rest = rest.strip_prefix("have ").unwrap_or(rest);
+            let rest = rest.strip_prefix("the ").unwrap_or(rest);
+            let rest = rest.strip_prefix("my ").unwrap_or(rest);
+            waits_on(rest)
+                // "Wait for Desk." alone waits on Desk.
+                || (waits_for && !h.ends_with("my ") && !rest.starts_with(char::is_alphanumeric))
+        })
+    })
+}
+
+/// Who replies to a line message: a session, the overseer (its agent id),
+/// or the person.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Replier<'a> {
+    Session(Uuid),
+    Overseer(&'a str),
+    Person,
+}
+
+/// Whether a reply `refused` as answering no question waiting on its
+/// sender still goes, as a message in reply to what it names: only when
+/// what it names was never a question (a plain message, such as Desk's
+/// status question or a session's report). A question answered, set aside
+/// or gone keeps its rules for everyone: the first answer stands, and one
+/// the person set aside reaches nobody.
+pub fn replies_as_message(refused: &Refusal, _by: Replier<'_>) -> bool {
+    matches!(refused, Refusal::NoSuchAsk(_))
+}
+
+/// Where `by`'s reply to `original` goes as a message: to whoever wrote it,
+/// when `by` is who it was written to (the person may reply to what a
+/// session wrote its boss, too: it waits on them as much). `None` when
+/// `by` has no part in it, or it was the person's own (the person isn't
+/// messaged on the line).
+pub fn reply_target(original: &LineMessage, by: Replier<'_>) -> Option<Target> {
+    let to_me = match by {
+        Replier::Session(id) => original.to_session() == Some(id),
+        Replier::Overseer(boss) => original.to.kind == PartyKind::Manager && original.to.id == boss,
+        Replier::Person => {
+            original.to.kind == PartyKind::You
+                || (original.to.kind == PartyKind::Manager && original.from_session().is_some())
+        }
+    };
+    if !to_me {
+        return None;
+    }
+    match original.from.kind {
+        PartyKind::Session => original.from_session().map(Target::Session),
+        PartyKind::Manager if !matches!(by, Replier::Overseer(_)) => Some(Target::Overseer),
+        _ => None,
+    }
+}
+
 /// What a sender sends: a session's tool call, the overseer's action, or the
 /// person's composer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1085,10 +1222,17 @@ fn render_raw(msg: &LineMessage, question: Option<&str>) -> String {
             "{mark} {who} asks you: {}\n(Answer with Desk's reply tool, message_id \"{}\". This is a message on Desk's line, not the person's words.)",
             msg.full_text(), msg.id
         ),
-        LineKind::Tell => format!(
-            "{mark} {who} tells you: {}\n(A message on Desk's line, not the person's words.)",
-            msg.text
-        ),
+        LineKind::Tell => match question {
+            Some(q) => format!(
+                "{mark} {who} replies to your message “{}”: {}\n(A message on Desk's line, not the person's words.)",
+                crate::crew::one_line(q, 160),
+                msg.text
+            ),
+            None => format!(
+                "{mark} {who} tells you: {}\n(A message on Desk's line, not the person's words.)",
+                msg.text
+            ),
+        },
     }
 }
 
@@ -1844,6 +1988,118 @@ mod tests {
         assert_eq!(is_delivery(&render(&tell, None)), None);
         assert_eq!(is_delivery("[Desk m:zz]"), None);
         assert_eq!(is_delivery("[Desk m:0123456]"), None);
+    }
+
+    /// Cufflink Migration, 19 Nov: its reply to Desk's status question (a
+    /// plain message, no question) and Desk's decision in reply to its
+    /// report (a message too) were both refused as "no question waiting".
+    /// Each goes, as a message in reply, to whoever wrote what it answers.
+    #[test]
+    fn a_reply_to_what_no_longer_waits_goes_back_to_its_writer() {
+        let s = session("cufflink", Engine::Claude);
+        let boss = Party::manager("desk", "Desk");
+        let status = LineMessage::new(
+            boss.clone(),
+            Party::session(&s),
+            LineKind::Tell,
+            "Desk's status question: resend the rest.".into(),
+            1,
+        );
+        let report = LineMessage::new(
+            Party::session(&s),
+            boss.clone(),
+            LineKind::Tell,
+            "The REINDEX can't fix the drill. Options: (a) … (b) …".into(),
+            1,
+        );
+        let gone = Refusal::NoSuchAsk(status.id);
+        for by in [
+            Replier::Session(s.id),
+            Replier::Overseer("desk"),
+            Replier::Person,
+        ] {
+            assert!(replies_as_message(&gone, by));
+            // A question answered or set aside keeps its rules.
+            assert!(!replies_as_message(&Refusal::Answered, by));
+            assert!(!replies_as_message(&Refusal::SetAside, by));
+        }
+        assert_eq!(
+            reply_target(&status, Replier::Session(s.id)),
+            Some(Target::Overseer)
+        );
+        assert_eq!(
+            reply_target(&report, Replier::Overseer("desk")),
+            Some(Target::Session(s.id))
+        );
+        // The person may answer what waits on its boss; their answer to a
+        // question keeps its rules.
+        assert_eq!(
+            reply_target(&report, Replier::Person),
+            Some(Target::Session(s.id))
+        );
+        // No part in it: another boss, another session, or its own words.
+        assert_eq!(reply_target(&report, Replier::Overseer("sarah")), None);
+        assert_eq!(
+            reply_target(&status, Replier::Session(Uuid::new_v4())),
+            None
+        );
+        assert_eq!(reply_target(&report, Replier::Session(s.id)), None);
+        // Loop guards and gone sessions are never replies to route.
+        assert!(!replies_as_message(
+            &Refusal::Budget,
+            Replier::Session(s.id)
+        ));
+
+        // It reads as the reply it is.
+        let mut back = LineMessage::new(
+            boss,
+            Party::session(&s),
+            LineKind::Tell,
+            "Decision: (b).".into(),
+            1,
+        );
+        back.in_reply_to = Some(report.id);
+        assert!(
+            render(&back, Some("The REINDEX can't fix the drill.")).contains(
+                "replies to your message “The REINDEX can't fix the drill.”: Decision: (b)."
+            )
+        );
+    }
+
+    #[test]
+    fn a_hold_waits_on_the_bosss_own_word() {
+        for held in [
+            "Change nothing until Desk answers.",
+            "Don't re-run the drill and don't change staging any further until I answer.",
+            "Hold the merge until I've decided.",
+            "Wait for my decision on the options.",
+            "I'm changing nothing until Desk answers.",
+            "Stop there until your boss replies.",
+            "Don't merge until I answer.",
+            "Do not push until I confirm.",
+            "Change nothing until I say so.",
+            "Wait for my go-ahead.",
+            "Wait for Desk's sign-off.",
+            "Hold until I sign off.",
+            "Wait for my ok.",
+        ] {
+            assert!(holds(held), "{held}");
+        }
+        for not in [
+            "Keep going until I say stop.",
+            "Carry on until I tell you otherwise.",
+            "Wait for my PR to merge, then rebase.",
+            "You don't need to wait for my answer.",
+            "Keep going until I sign off for the day.",
+            "No need to wait for my answer: go ahead.",
+            "Wait for desktop notifications to show.",
+            "Carry on until I check in tomorrow morning? No: until the tests pass.",
+            "Run the drill until it is green.",
+            "Keep the watcher going until CI finishes.",
+            "Wait for the CI run to finish.",
+        ] {
+            assert!(!holds(not), "{not}");
+        }
     }
 
     #[test]

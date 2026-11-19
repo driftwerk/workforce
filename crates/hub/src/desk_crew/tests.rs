@@ -1896,6 +1896,8 @@ mod urgent;
 
 mod away;
 
+mod boss_waits;
+
 mod remote_asks;
 mod remote_decide;
 mod served;

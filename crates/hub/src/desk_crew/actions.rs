@@ -226,7 +226,9 @@ fn id(raw: Option<&str>, what: &str) -> Result<Uuid, String> {
 }
 
 /// How Desk's status question to a session begins.
-pub(crate) const STATUS_QUESTION: &str = "Desk's status question, for the person (answer it in a line or two, then carry on with your work as you were):";
+/// It asks for words only: what the session does stays what its last
+/// instructions say (a hold its boss gave it holds), never "carry on".
+pub(crate) const STATUS_QUESTION: &str = "Desk's status question, for the person (answer it in a line or two with Desk's reply tool; it changes nothing about what you do, so keep to your last instructions):";
 
 fn text(raw: Option<String>, what: &str) -> Result<String, String> {
     raw.map(|t| t.trim().to_string())
@@ -1368,6 +1370,58 @@ impl CrewHub {
     /// words. A boss's is recorded in its decision log as it is done, with
     /// how it is undone; an answer to a session's question is said in its
     /// DM from that row. Recording never stops the action.
+    /// `action` as it is sent: a reply to what is no question (a session's
+    /// report, or Desk's status question) is a message like any other, so
+    /// every gate of one applies to it; and one citing what isn't on the
+    /// named session's line is refused, never sent to another through it.
+    pub(crate) async fn as_sent(&self, action: &Action) -> Result<Action, String> {
+        let Action::Nudge {
+            to: Target::Session(s),
+            message,
+            reply_to: Some(id),
+        } = action
+        else {
+            return Ok(action.clone());
+        };
+        let cited = self
+            .desk
+            .store()
+            .line_message(*id)
+            .await
+            .map_err(|e| format!("Desk couldn't read that message: {e}"))?;
+        let on_its_line = |m: &workforce_desk::line::LineMessage| {
+            m.from_session() == Some(*s) || m.to_session() == Some(*s)
+        };
+        match cited.filter(on_its_line) {
+            None => Err(format!(
+                "Not sent: message {id} isn't on {}'s line. Answer a question with the id the question came with.",
+                self.session_name(*s)
+            )),
+            // A question the person set aside reaches the session no more.
+            Some(m) if m.asked == Some(workforce_desk::line::Asked::Dismissed) => Err(format!(
+                "Not sent: the person set that question of {}'s aside. Tell them what you'd do instead.",
+                self.session_name(*s)
+            )),
+            // A question still waiting is answered.
+            Some(m)
+                if m.kind == workforce_desk::line::LineKind::Ask
+                    && matches!(
+                        m.asked,
+                        Some(workforce_desk::line::Asked::Open | workforce_desk::line::Asked::Escalated)
+                    ) =>
+            {
+                Ok(action.clone())
+            }
+            // Anything else (a report, Desk's status question, a question
+            // answered or gone ahead since) is replied to with a message.
+            Some(_) => Ok(Action::Nudge {
+                to: Target::Session(*s),
+                message: message.clone(),
+                reply_to: None,
+            }),
+        }
+    }
+
     pub(crate) async fn perform(&self, action: &Action, by: By) -> Result<String, String> {
         // Boxed: its future is large, and is awaited from deep in a turn.
         Box::pin(self.perform_with(action, by, &super::assignments::Order::default())).await
@@ -1430,6 +1484,16 @@ impl CrewHub {
                 }
             }
         };
+        let sent = match self.as_sent(action).await {
+            Ok(sent) => sent,
+            Err(e) => {
+                unheld(&e).await;
+                return Err(e);
+            }
+        };
+        if &sent != action {
+            return Box::pin(self.perform_with(&sent, by, order)).await;
+        }
         // R5: a boss allows no irreversible request on a job another
         // session holds, as irreversible, whichever path it came by.
         if let (crew::PartyKind::Manager, Action::Approve { session, approval }) =
