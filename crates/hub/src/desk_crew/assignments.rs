@@ -174,11 +174,14 @@ impl Order {
 }
 
 /// The properties a crew tool that hands out work takes for its order.
-pub(crate) fn order_properties(with_job: bool) -> Value {
+/// `urgent` only where it is steered in: a line message (crew.nudge).
+pub(crate) fn order_properties(with_job: bool, urgent: bool) -> Value {
     let mut p = json!({
-        "urgent": { "type": "boolean", "description": super::urgent::description() },
         "replaces": { "type": "string", "description": "The assignment (a:… from crew.assignments) this takes over, with its job: its holder is told to stand down first, and this waits until it answers when it may have started" }
     });
+    if urgent {
+        p["urgent"] = json!({ "type": "boolean", "description": super::urgent::description() });
+    }
     if with_job {
         p["job"] = json!({
             "type": ["object", "string"],

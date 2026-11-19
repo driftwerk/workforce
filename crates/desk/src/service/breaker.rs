@@ -85,6 +85,9 @@ pub(crate) struct LiveBreaker {
     /// The turn Esc ended, while Desk still reads it as working (Claude
     /// Code reports no turn's end after Esc): what it held is let go.
     pub(super) stopped: Option<crate::line::TurnMark>,
+    /// A boss's rows kept as urgent in this run, and the turn each was sent
+    /// in: reserved for that turn alone ([`Desk::steer_reserved`]).
+    pub(super) rushed: std::collections::HashMap<Uuid, crate::line::TurnMark>,
     /// What Desk typed into it and has yet to hear submitted, and whether
     /// the person sent it: the rest of what it is prompted with is typed
     /// in its terminal.

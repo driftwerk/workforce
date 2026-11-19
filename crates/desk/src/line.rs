@@ -111,7 +111,7 @@ pub fn in_turn(state: SessionState) -> bool {
 
 /// Which turn of a session's run something was sent in: an escalation
 /// interrupts that turn alone, never one begun since.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TurnMark {
     pub(crate) ends: u64,
     pub(crate) turns: u64,

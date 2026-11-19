@@ -326,6 +326,21 @@ impl DeskStore {
         Ok(())
     }
 
+    /// Dismisses suggestion `id` only while it is still open: whether it
+    /// was. An answer the person gave meanwhile stands.
+    pub async fn suggestion_dismiss_open(&self, id: &str) -> Result<bool> {
+        let client = self.pool().get().await?;
+        let n = client
+            .execute(
+                "UPDATE suggestions SET state = 'dismissed', updated_at = now() \
+                 WHERE id = $1 AND state = 'open'",
+                &[&id],
+            )
+            .await
+            .context("dismissing a suggestion")?;
+        Ok(n == 1)
+    }
+
     pub async fn suggestion(&self, id: &str) -> Result<Option<Suggestion>> {
         let client = self.pool().get().await?;
         client

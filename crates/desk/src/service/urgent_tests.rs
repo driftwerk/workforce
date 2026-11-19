@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 use workforce_postgres::test_support::with_test_pool;
 
+use super::breaker::Steer;
 use super::line::Sender;
 use super::tests::{desk, new_session, post};
 use super::{Desk, Rules};
@@ -161,6 +162,9 @@ async fn a_call_that_finds_its_row_gone_in_another_way_says_nothing_of_it() {
         assert!(inbox.to_string().contains("staging DB"), "{inbox}");
         assert_eq!(row(&d, m.id).await.delivery, Delivery::Delivered);
         assert_eq!(post(&d, s, done()).await, json!({}), "never twice");
+        // Nothing is left marked as being taken: an escalation isn't
+        // refused on it later.
+        assert!(d.0.state.lock().live[&s].breaker.taking.is_empty());
     })
     .await;
 }
@@ -735,6 +739,111 @@ async fn a_plugin_already_waiting_hears_what_a_turn_held_as_soon_as_it_ends() {
             "tool_input": {"command": "gh run watch"}, "error": "Interrupted",
             "is_interrupt": true});
         assert_eq!(handed_after(&d, u, esc, fast).await, Some(m.id));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_call_taken_as_its_turn_ended_keeps_the_breakers_warning_and_puts_the_order_back() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = working(&d, dir.path()).await;
+        let (m, _) = urgent(&d, s, "Use the staging DB.", Urgency::Order).await;
+        post(&d, s, stop()).await;
+        // A call's result answered after the turn ended, both still queued.
+        {
+            let mut st = d.0.state.lock();
+            let b = &mut st.live.get_mut(&s).unwrap().breaker;
+            b.steers.push_back(Steer::Breaker(
+                crate::breaker::Reason::Budget(Uuid::new_v4()),
+                "You are near your budget.".into(),
+            ));
+            b.steers.push_back(Steer::Line { row: m.id });
+        }
+        let said = d.steers_take(s, "PostToolUse", true).await;
+        let text = said
+            .as_ref()
+            .and_then(context)
+            .expect("the warning is said");
+        assert!(text.contains("near your budget"), "{text}");
+        assert!(!text.contains("staging DB"), "{text}");
+        let back = until_delivery(&d, m.id, |m| m != Delivery::Delivered).await;
+        assert_eq!(back, Delivery::Queued, "back for the idle");
+        assert!(d.0.state.lock().live[&s].breaker.taking.is_empty());
+    })
+    .await;
+}
+
+async fn until_delivery(d: &Desk, id: Uuid, ok: impl Fn(Delivery) -> bool) -> Delivery {
+    for _ in 0..200 {
+        let m = row(d, id).await;
+        if ok(m.delivery) {
+            return m.delivery;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    row(d, id).await.delivery
+}
+
+#[tokio::test]
+async fn an_interrupt_for_a_stand_down_being_read_or_read_is_refused_and_holds_nothing() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = working(&d, dir.path()).await;
+        let mark = d.turn_mark(s).unwrap();
+        let (m, _) = urgent(&d, s, "Stand down from a:2.", Urgency::Escalate).await;
+        // A hook is taking it now.
+        d.0.state
+            .lock()
+            .live
+            .get_mut(&s)
+            .unwrap()
+            .breaker
+            .taking
+            .insert(m.id);
+        assert!(d.interrupt_turn(s, mark, m.id, None).await.is_err());
+        d.0.state
+            .lock()
+            .live
+            .get_mut(&s)
+            .unwrap()
+            .breaker
+            .taking
+            .clear();
+        // Read: refused too, and nothing is left held from hooks.
+        d.0.store
+            .line_take(m.id, Delivery::Delivered)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(d.interrupt_turn(s, mark, m.id, None).await.is_err());
+        assert!(d.0.state.lock().live[&s].breaker.escalating.is_empty());
+        assert_eq!(d.view(s).unwrap().state, SessionState::Working);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_urgent_row_left_from_an_earlier_turn_isnt_held_for_a_later_one() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = working(&d, dir.path()).await;
+        let (m, _) = urgent(&d, s, "Use the staging DB.", Urgency::Order).await;
+        // Its turn ends with it unread (a gate held it at the idle, say),
+        // and another begins.
+        post(&d, s, stop()).await;
+        post(&d, s, prompt()).await;
+        post(&d, s, tool("cargo build")).await;
+        assert_eq!(row(&d, m.id).await.delivery, Delivery::Queued);
+        // Nothing steers it in this turn: it is any message's.
+        let next = d
+            .line_next(s, Duration::from_secs(2))
+            .await
+            .expect("not held for this turn");
+        assert_eq!(next["id"], json!(m.id));
     })
     .await;
 }

@@ -183,6 +183,13 @@ impl Desk {
             false => None,
         };
         m.urgency = Some(urgency);
+        // Reserved for this turn from before it is kept: the plugin, woken
+        // by its announcement, finds it held.
+        if let Some(mark) = mark {
+            if let Some(l) = self.0.state.lock().live.get_mut(&v.id) {
+                l.breaker.rushed.insert(m.id, mark);
+            }
+        }
         let rushed = match how {
             Ok(Some(MidTurn::Hook)) => Rushed::Steered,
             Ok(Some(MidTurn::TurnSteer)) => Rushed::SaidIn,
@@ -271,16 +278,40 @@ impl Desk {
         }
     }
 
-    /// Whether `m` waits for `id`'s running turn: kept as urgent, while the
-    /// session is in a turn. The pump and the plugin leave it meanwhile;
-    /// the turn's next tool call takes it, or its end lets it go.
+    /// Whether `m` waits for `id`'s running turn: kept as urgent for it.
+    /// The pump and the plugin leave it meanwhile; the turn's next tool call
+    /// takes it, or its end lets it go. Only a row this turn holds: one in
+    /// its steer queue, being taken or escalated, sent in this turn, or left
+    /// by a restart for it. An older urgent row (one a gate held at an
+    /// idle) is any message's, in any later turn.
     pub(super) fn steer_reserved(&self, id: Uuid, m: &LineMessage) -> bool {
         if m.urgency.is_none() {
             return false;
         }
+        let left = self
+            .0
+            .rush
+            .unarmed
+            .lock()
+            .get(&id)
+            .is_some_and(|rows| rows.iter().any(|u| u.row == m.id));
         let st = self.0.state.lock();
-        let mark = Self::mark_in(&st, id);
-        mark.is_some() && st.live.get(&id).and_then(|l| l.breaker.stopped) != mark
+        let Some(mark) = Self::mark_in(&st, id) else {
+            return false;
+        };
+        let Some(l) = st.live.get(&id) else {
+            return false;
+        };
+        let b = &l.breaker;
+        if b.stopped == Some(mark) {
+            return false;
+        }
+        left || b.rushed.get(&m.id) == Some(&mark)
+            || b.taking.contains(&m.id)
+            || b.escalating.contains(&m.id)
+            || b.steers
+                .iter()
+                .any(|s| matches!(s, Steer::Line { row } if *row == m.id))
     }
 
     /// Esc ended `id`'s turn: what waited for its next call goes in at the
@@ -322,13 +353,20 @@ impl Desk {
             b.steers = kept;
             (taken, mark)
         };
-        let lines = steers.iter().any(|s| matches!(s, Steer::Line { .. }));
+        let drained: Vec<Uuid> = steers
+            .iter()
+            .filter_map(|s| match s {
+                Steer::Line { row } => Some(*row),
+                Steer::Breaker(..) => None,
+            })
+            .collect();
+        let mut warned = Vec::new();
         let mut said = Vec::new();
         let mut read = Vec::new();
         let mut back = Vec::new();
         for s in steers {
             match s {
-                Steer::Breaker(_, text) => said.push(text),
+                Steer::Breaker(_, text) => warned.push(text),
                 Steer::Line { row } => match self.rush_take(id, row).await {
                     Ok(Took::Read(text)) => {
                         said.push(text);
@@ -348,6 +386,8 @@ impl Desk {
         if over && !read.is_empty() {
             // Taken as its turn ended: that result may never reach the
             // session. Back in the queue, for the idle.
+            // The breaker's warning stands: it was always said with the
+            // call that took it.
             for row in std::mem::take(&mut read) {
                 let _ = self.0.store.line_untake(row, &id.to_string()).await;
             }
@@ -356,7 +396,7 @@ impl Desk {
         {
             let mut st = self.0.state.lock();
             if let Some(l) = st.live.get_mut(&id) {
-                for row in read.iter().chain(&back) {
+                for row in &drained {
                     l.breaker.taking.remove(row);
                 }
                 if !over {
@@ -366,11 +406,12 @@ impl Desk {
                 }
             }
         }
-        if over && lines {
+        if over && !drained.is_empty() {
             // What it took or held back goes in at the idle.
             self.steers_released(id);
         }
-        (!said.is_empty()).then(|| crate::claude::context(event, &said.join("\n\n")))
+        warned.extend(said);
+        (!warned.is_empty()).then(|| crate::claude::context(event, &warned.join("\n\n")))
     }
 
     /// Takes the boss's `row` into `id`'s turn.
@@ -404,9 +445,12 @@ impl Desk {
     pub(super) fn steers_released(&self, id: Uuid) {
         let rows: Vec<Uuid> = {
             let mut st = self.0.state.lock();
+            let mark = Self::mark_in(&st, id);
             let Some(l) = st.live.get_mut(&id) else {
                 return;
             };
+            // What was reserved for a turn that is over is no longer.
+            l.breaker.rushed.retain(|_, m| Some(*m) == mark);
             let mut rows = Vec::new();
             l.breaker.steers.retain(|s| match s {
                 Steer::Line { row } => {
@@ -567,10 +611,7 @@ impl Desk {
     /// hook is taking it now. What an escalation, and a suggestion to
     /// interrupt, hold on.
     pub async fn steer_unread(&self, id: Uuid, mark: TurnMark, row: Uuid) -> bool {
-        let unread = match self.0.store.line_message(row).await {
-            Ok(Some(m)) => matches!(m.delivery, line::Delivery::Queued | line::Delivery::Handed),
-            _ => false,
-        };
+        let unread = self.row_unread(row).await;
         let st = self.0.state.lock();
         unread
             && Self::mark_in(&st, id) == Some(mark)
@@ -641,9 +682,8 @@ impl Desk {
         by: Option<By>,
     ) -> Result<SessionView, DeskError> {
         let moved = || DeskError::Conflict("it read its stand-down, or that turn is over".into());
-        if !self.steer_unread(id, mark, row).await {
-            return Err(moved());
-        }
+        // Held from hooks first, then read: a hook that takes it after this
+        // finds it held, and one that took it before shows in the row.
         {
             let mut st = self.0.state.lock();
             if Self::mark_in(&st, id) != Some(mark) {
@@ -655,10 +695,21 @@ impl Desk {
             }
             l.breaker.escalating.insert(row);
         }
-        let done = self.interrupt_when(id, by, Some(mark));
+        let done = match self.row_unread(row).await {
+            true => self.interrupt_when(id, by, Some(mark)),
+            false => Err(moved()),
+        };
         if let Some(l) = self.0.state.lock().live.get_mut(&id) {
             l.breaker.escalating.remove(&row);
         }
         done
+    }
+
+    /// Whether `row` is still queued, or handed to Desk's plugin unread.
+    async fn row_unread(&self, row: Uuid) -> bool {
+        matches!(
+            self.0.store.line_message(row).await,
+            Ok(Some(m)) if matches!(m.delivery, line::Delivery::Queued | line::Delivery::Handed)
+        )
     }
 }

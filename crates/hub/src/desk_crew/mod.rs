@@ -1463,7 +1463,15 @@ impl Crew for CrewHub {
         let action = actions::Action::from_suggestion(&suggestion.action)?;
         let mut by = By::you();
         by.suggestion_id = Some(suggestion.id.clone());
-        self.me().perform(&action, by).await.map(drop)
+        // An interrupt suggested for a stand-down not read in time: of that
+        // turn alone, while it is unread.
+        let order = assignments::Order {
+            only_turn: urgent::only_turn_of(&suggestion.action["input"]),
+            ..Default::default()
+        };
+        Box::pin(self.me().perform_with(&action, by, &order))
+            .await
+            .map(drop)
     }
 
     /// The needs of `person`, else of the person whose Desk this is, as the

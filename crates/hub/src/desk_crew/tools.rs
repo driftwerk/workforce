@@ -969,7 +969,7 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
                 "reply_to": { "type": "string", "description": "The message id of the session's question this answers" }
             }))
             .into_iter()
-            .chain(props(super::assignments::order_properties(true)))
+            .chain(props(super::assignments::order_properties(true, true)))
             .collect(),
             &["message"],
         ),
@@ -1000,7 +1000,7 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
                 "prompt": { "type": "string" }
             }))
             .into_iter()
-            .chain(props(super::assignments::order_properties(true)))
+            .chain(props(super::assignments::order_properties(true, false)))
             .collect(),
             &["session_id"],
         ),
@@ -1033,7 +1033,7 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
                     "new": { "type": "boolean", "description": "true only when the person asked for a new session: none already there gets the work" }
                 }))
                 .into_iter()
-                .chain(props(super::assignments::order_properties(true)))
+                .chain(props(super::assignments::order_properties(true, false)))
                 .collect(),
                 &["folder", "goal"],
             )
@@ -1063,7 +1063,7 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
                     }
                 }))
                 .into_iter()
-                .chain(props(super::assignments::order_properties(true)))
+                .chain(props(super::assignments::order_properties(true, false)))
                 .collect(),
                 &["ticket", "to"],
             )

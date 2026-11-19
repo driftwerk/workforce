@@ -76,6 +76,19 @@ async fn an_urgent_nudge_is_read_with_the_next_tool_call_and_the_boss_is_told_ho
             assert!(said.contains(words), "{words}: {said}");
         }
         assert!(!said.contains("a stop"), "{said}");
+        // Only where it is steered in.
+        for tool in [
+            "crew.resume",
+            "crew.restart",
+            "crew.start_session",
+            "crew.assign_ticket",
+        ] {
+            let schema = super::super::tools::schema(tool, Vec::new);
+            assert!(
+                schema["properties"].get("urgent").is_none(),
+                "{tool}: {schema}"
+            );
+        }
         let (s, url) = working(&d, &base, "release-prep").await;
         let out = nudge(
             &overseer,
@@ -449,6 +462,68 @@ async fn a_relayed_urgent_nudge_keeps_its_urgency_as_the_machine_performs_it() {
                 .is_some_and(|t| t.contains("Don't dispatch release 4")),
             "{took}"
         );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_suggested_interrupt_said_yes_to_after_its_turn_ended_interrupts_nothing() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (overseer, crew, d, _llm) = overseeing(&base, pool, "ok", NO_INTERRUPT, &[]).await;
+        eventually("the overseer's tools", async || {
+            overseer.tools.has("crew.nudge").then_some(())
+        })
+        .await;
+        d.set_steer_wait(Duration::from_millis(300));
+        let (s, url) = working(&d, &base, "release-prep").await;
+        let row = stand_down(&d, &crew, s, Urgency::Escalate).await;
+        let suggested = eventually("the interrupt, suggested", async || {
+            d.store()
+                .suggestions(10)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|g| g.text == "Interrupt release-prep")
+        })
+        .await;
+        assert_eq!(
+            suggested.action["input"]["stand_down"]["row"],
+            json!(row.to_string()),
+            "bound to its stand-down"
+        );
+        // Its turn ends, and the next begins on a long tool.
+        hook(
+            &url,
+            json!({"hook_event_name": "Stop", "last_assistant_message": "Done."}),
+        )
+        .await;
+        hook(
+            &url,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "now the docs"}),
+        )
+        .await;
+        hook(
+            &url,
+            json!({"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                "tool_input": {"command": "cargo build"}}),
+        )
+        .await;
+        eventually("working again", async || {
+            (d.view(s).unwrap().state == SessionState::Working).then_some(())
+        })
+        .await;
+        // The person's yes, late: nothing is interrupted.
+        let accepted = workforce_desk::crew::Crew::accept(&*crew, &suggested).await;
+        assert!(accepted.is_err(), "{accepted:?}");
+        assert_eq!(d.view(s).unwrap().state, SessionState::Working);
+        // And it was withdrawn for them, once the turn ended.
+        eventually("the suggestion withdrawn", async || {
+            let now = d.store().suggestion(&suggested.id).await.unwrap()?;
+            (now.state == SuggestionState::Dismissed).then_some(())
+        })
+        .await;
     })
     .await;
 }
