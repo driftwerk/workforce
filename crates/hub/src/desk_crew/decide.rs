@@ -897,6 +897,30 @@ impl CrewHub {
                     .into(),
             );
         }
+        // An irreversible request on a job another session holds, as
+        // irreversible: never the boss's to allow (R5), the person's.
+        if matches!(verdict, Verdict::Allow(_)) {
+            // A boss relayed from the home: its jobs come with each answer.
+            let home = match super::relayed_decide::relayed_party(boss) {
+                true => view
+                    .group
+                    .as_ref()
+                    .and_then(|g| self.relayed_held(boss, &g.id)),
+                false => Some(Vec::new()),
+            };
+            if let Some(conflict) =
+                Box::pin(self.request_conflict(boss, view.id, p, home.as_deref())).await
+            {
+                if !still() {
+                    return Outcome::NotOurs;
+                }
+                self.desk.let_go(view.id, p.id);
+                self.record_left(boss, view, p, &conflict).await;
+                return Outcome::Waits(format!(
+                    "I'd have allowed it, but {conflict}; it's yours to answer"
+                ));
+            }
+        }
         let by = By::manager(boss, &name, &why);
         let deciding = self.deciding(boss);
         let performed = self.perform(&action, by.clone()).await;

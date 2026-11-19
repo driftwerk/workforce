@@ -206,6 +206,24 @@ impl CrewHub {
         }
     }
 
+    /// [`Self::perform_in`], with what the boss's tool said of its order.
+    pub(super) async fn perform_in_with(
+        &self,
+        d: Option<Deciding>,
+        action: &Action,
+        by: workforce_desk::crew::By,
+        order: &super::assignments::Order,
+    ) -> Result<String, String> {
+        match d {
+            Some(d) => {
+                DECIDING
+                    .scope(d, Box::pin(self.perform_with(action, by, order)))
+                    .await
+            }
+            None => Box::pin(self.perform_with(action, by, order)).await,
+        }
+    }
+
     /// Session `s`'s lane, held: whatever goes to it waits its turn.
     pub(super) async fn lane(&self, s: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
         let lane = {

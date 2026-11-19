@@ -29,6 +29,7 @@ use crate::serve::AgentService;
 
 mod actions;
 mod answer;
+mod assignments;
 mod away;
 mod board;
 mod cadence_tool;
@@ -748,6 +749,10 @@ impl CrewHub {
         tokio::spawn(plan::plan_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(items::items_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(updates::updates_loop(Arc::clone(&crew), cancel.clone()));
+        tokio::spawn(assignments::assignments_loop(
+            Arc::clone(&crew),
+            cancel.clone(),
+        ));
         tokio::spawn(line::line_loop(Arc::clone(&crew), cancel));
         crew
     }

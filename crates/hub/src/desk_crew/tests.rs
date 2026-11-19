@@ -1873,6 +1873,7 @@ mod act_fully_budget;
 mod decides_at_once;
 
 mod answers_questions;
+mod assignments;
 
 mod terminal_asks;
 
@@ -4933,6 +4934,69 @@ mod board {
     /// words and leaves the ticket as it was. Existing sessions take
     /// tickets whatever the slots.
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_ticket_handed_to_a_new_session_with_its_job_is_held_by_that_session() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (overseer, _llm) = agent(dir.path(), "desk", "ok").await;
+            write_config(
+                &overseer,
+                "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = true\n[oversight.work]\nparallel = 2\n",
+            );
+            let state = hub(std::slice::from_ref(&overseer));
+            let d = desk_running(
+                pool,
+                dir.path(),
+                Default::default(),
+                installed_cli(dir.path()),
+                not_installed(dir.path()),
+            )
+            .await;
+            let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+            d.change_layout(|l| {
+                l.create(
+                    "g-acme",
+                    "Acme",
+                    &[workforce_desk::local_agent_item("desk")],
+                    None,
+                )
+            })
+            .await
+            .unwrap();
+            let b = acme(&d).await;
+            ticket(&d, b, "Run the ledger migration", TicketState::Todo, &[]).await;
+            eventually("the overseer's tools and engines", async || {
+                let e = d.engines();
+                let installed = e
+                    .iter()
+                    .find(|v| v.engine == Engine::Claude)
+                    .and_then(|v| v.installed);
+                (overseer.tools.has("crew.assign_ticket") && installed == Some(true)).then_some(())
+            })
+            .await;
+            let assign = overseer.tools.get("crew.assign_ticket").unwrap();
+            let r = assign
+                .execute(json!({"ticket": "ACM-1",
+                    "to": {"newSession": {"folder": dir.path().to_string_lossy()}},
+                    "job": {"kind": "migration", "target": "acme/web", "key": "ledger"},
+                    "reason": "It is next."}))
+                .await
+                .unwrap();
+            assert!(r.success, "{r:?}");
+            let started = d
+                .list()
+                .into_iter()
+                .find(|v| v.name == "ACM-1")
+                .expect("a session named for the ticket");
+            let held = d.store().assignments_of("desk", true).await.unwrap();
+            assert_eq!(held.len(), 1, "{held:?}");
+            assert_eq!(held[0].session, started.id, "the session it started holds it");
+            assert_eq!(held[0].state, workforce_desk::assignment::AssignmentState::Open);
+            assert_eq!(held[0].job_key.as_deref(), Some("acme/web/migration/ledger"));
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn assigning_to_a_new_session_counts_against_parallel_and_is_charged() {
         use workforce_desk::charge::How;
         with_test_pool(workforce_desk::store::build_pool, |pool| async move {
@@ -6053,7 +6117,10 @@ async fn work_a_session_cant_take_starts_a_session_instead() {
         )
         .unwrap();
         let by = crew.by_overseer("Sam asked").unwrap();
-        let (done, gave) = crew.give_or_start(&nudge, &start, gone, by).await.unwrap();
+        let (done, gave) = crew
+            .give_or_start(&nudge, &start, gone, by, &Default::default())
+            .await
+            .unwrap();
         assert!(!gave);
         assert!(done.starts_with("started "), "{done}");
         assert_eq!(d.list().len(), before + 1);

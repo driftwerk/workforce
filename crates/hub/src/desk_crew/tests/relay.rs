@@ -611,3 +611,135 @@ async fn nothing_is_said_of_machine_grants_before_the_bosses_are_read() {
     })
     .await;
 }
+
+/// At home: a job held by a session here or on a machine is one job, an
+/// approval relayed to the machine carries the jobs held here, and a
+/// relayed order is never settled as unsent for carrying no line message.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_held_here_or_on_a_machine_is_one_job_and_an_approval_there_carries_the_jobs() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let raw = pool.clone();
+        let dir = tempfile::tempdir().unwrap();
+        let nudges = "[oversight]\nenabled = true\ngroup = \"acme\"\nlevel = \"act\"\n[oversight.act]\nnudge = true\nanswer_sessions = true\n";
+        let (sarah, crew, d, _llm) = overseeing(dir.path(), pool, "ok", nudges, &[]).await;
+        d.picture_load().await;
+        let local = new_session(&d, dir.path(), "acme-api").await;
+        let remote = uuid::Uuid::new_v4();
+        d.change_layout(|l| {
+            l.create(
+                "acme",
+                "Acme",
+                &[
+                    format!("session:devbox/{remote}"),
+                    workforce_desk::session_item(local.id),
+                ],
+                None,
+            )
+        })
+        .await
+        .unwrap();
+        eventually("Sarah's tools", async || sarah.tools.get("crew.nudge").map(drop)).await;
+        let tool = |name: &str| sarah.tools.get(name).unwrap();
+        let seen: Arc<parking_lot::Mutex<Vec<RelayCall>>> = Arc::default();
+        let poller = {
+            let (crew, seen) = (Arc::clone(&crew), Arc::clone(&seen));
+            tokio::spawn(async move {
+                loop {
+                    for c in crew.relay_take(Duration::from_millis(200)).await {
+                        seen.lock().push(c.clone());
+                        crew.relay_answer(
+                            c.id,
+                            RelayAnswer {
+                                status: ServedStatus::Ok,
+                                body: json!({"done": "told it"}),
+                            },
+                        );
+                    }
+                }
+            })
+        };
+        eventually("Desk polling", async || crew.relay_polled.lock().is_some().then_some(()))
+            .await;
+        let release = |key: &str| json!({ "kind": "release", "target": "acme/api", "key": key });
+        let nudge = |to: String, message: &str, key: &str| {
+            json!({"session_id": to, "message": message, "reason": "Sam's order.",
+                   "job": release(key), "irreversible": true})
+        };
+
+        // Held here: the machine's session isn't given it, and nothing goes.
+        let r = tool("crew.nudge")
+            .execute(nudge(local.id.to_string(), "Dispatch release 4 now.", "release-4"))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        let r = tool("crew.nudge")
+            .execute(nudge(format!("devbox/{remote}"), "Start release 4 now.", "4"))
+            .await
+            .unwrap();
+        let why = r.error.unwrap_or_default();
+        assert!(why.starts_with("Not sent: acme-api holds this job"), "{why}");
+        assert!(seen.lock().iter().all(|c| c.tool != "crew.nudge"));
+
+        // Held on the machine: not given here.
+        let r = tool("crew.nudge")
+            .execute(nudge(format!("devbox/{remote}"), "Dispatch release 5 now.", "5"))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        let sent = seen.lock().iter().rfind(|c| c.tool == "crew.nudge").cloned().unwrap();
+        assert!(sent.input.get("job").is_none(), "its order stays at home: {}", sent.input);
+        let r = tool("crew.nudge")
+            .execute(nudge(local.id.to_string(), "Start release 5 now.", "r5"))
+            .await
+            .unwrap();
+        let why = r.error.unwrap_or_default();
+        assert!(why.starts_with("Not sent: devbox's session"), "{why}");
+
+        // An approval there carries the jobs held here and there.
+        let r = tool("crew.approve")
+            .execute(json!({"session_id": format!("devbox/{remote}"),
+                            "approval_id": uuid::Uuid::new_v4().to_string(), "reason": "Ok."}))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        let sent = seen.lock().iter().rfind(|c| c.tool == "crew.approve").cloned().unwrap();
+        let held: Vec<String> = sent.input["held_jobs"]
+            .as_array()
+            .expect("the jobs held here")
+            .iter()
+            .filter_map(|a| a["jobKey"].as_str().map(str::to_string))
+            .collect();
+        assert!(held.contains(&"acme/api/release/4".to_string()), "{held:?}");
+        assert!(held.contains(&"acme/api/release/5".to_string()), "{held:?}");
+        poller.abort();
+
+        // Left being sent: kept, as it carries no line message here.
+        let machine = d
+            .store()
+            .assignments_of("desk", true)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|a| a.machine.is_some())
+            .unwrap();
+        raw.get()
+            .await
+            .unwrap()
+            .execute(
+                "UPDATE boss_assignments SET state = 'sending', sent_at = now() - interval '10 minutes' WHERE id = $1",
+                &[&machine.id],
+            )
+            .await
+            .unwrap();
+        eventually("the relayed order to be settled", async || {
+            let a = d.store().assignment(machine.id).await.unwrap().unwrap();
+            (a.state != workforce_desk::assignment::AssignmentState::Sending).then_some(a.state)
+        })
+        .await;
+        assert_eq!(
+            d.store().assignment(machine.id).await.unwrap().unwrap().state,
+            workforce_desk::assignment::AssignmentState::Open
+        );
+    })
+    .await;
+}
