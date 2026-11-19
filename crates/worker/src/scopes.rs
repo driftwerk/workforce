@@ -246,6 +246,14 @@ impl Worker {
     }
 
     pub async fn prepare(&self, request: PrepareRequest) -> Result<ServerFrame> {
+        if !valid_scope_id(&request.scope) {
+            bail!("scope id {:?} is not a dataset-safe name", request.scope);
+        }
+        if let HomeSpec::Keyed { key, .. } = &request.home {
+            if !valid_home_key(key) {
+                bail!("home key {key:?} is not a dataset-safe name");
+            }
+        }
         if let Some(owner) = &request.queue {
             if !valid_owner(owner) {
                 bail!("queue owner {owner:?} is not a short printable name");
@@ -257,30 +265,29 @@ impl Worker {
                 if ahead > 0 {
                     return Ok(ServerFrame::Queued { ahead });
                 }
+                // The head waits on the seating under way, however long it
+                // takes, without losing its place meanwhile.
+                self.queue.lock().seating(&request.scope);
             }
         }
+        // Seated, found, refused, failed or dropped while it waited for the
+        // lock: whatever it was, unless it is told to wait on, it holds no
+        // place up.
+        let mut place = Place {
+            queue: &self.queue,
+            scope: &request.scope,
+            kept: false,
+        };
         let answer = {
             let _one_at_a_time = self.prepares.lock().await;
             self.prepare_one(&request).await
         };
-        // Seated, found, refused or failed: whatever it was, it no longer
-        // waits, so it holds no place up.
-        if !matches!(answer, Ok(ServerFrame::Queued { .. })) {
-            self.queue.lock().leave(&request.scope);
-        }
+        place.kept = matches!(answer, Ok(ServerFrame::Queued { .. }));
         answer
     }
 
     /// [`Self::prepare`] for its turn, while no other prepare runs.
     async fn prepare_one(&self, request: &PrepareRequest) -> Result<ServerFrame> {
-        if !valid_scope_id(&request.scope) {
-            bail!("scope id {:?} is not a dataset-safe name", request.scope);
-        }
-        if let HomeSpec::Keyed { key, .. } = &request.home {
-            if !valid_home_key(key) {
-                bail!("home key {key:?} is not a dataset-safe name");
-            }
-        }
         // A conversation back while its last scope's teardown is still
         // owed: that teardown comes first, as the new scope takes the same
         // id, dataset and home.
@@ -313,9 +320,11 @@ impl Worker {
                     return Ok(ServerFrame::Queued { ahead });
                 }
             }
-            // A prepare that did not ask to queue never takes a seat from
-            // those waiting for one.
-            None if self.queued() > 0 => return Ok(refused(RefusalReason::AtCapacity)),
+            // A prepare that did not ask to queue never takes a seat one
+            // waiting needs, and takes any seat beyond theirs.
+            None if self.room_beside_waiters().is_err() => {
+                return Ok(refused(RefusalReason::AtCapacity))
+            }
             None => {}
         }
         // A queued prepare at the head waits on for a seat rather than being
@@ -1005,6 +1014,18 @@ impl Worker {
 
     /// Whether one more scope may be seated now: the one test admission
     /// asks, before and after an idle scope gives way.
+    /// Whether a prepare outside the queue may be seated beside all those
+    /// waiting in it, each counted as one more scope; with nobody waiting,
+    /// what [`Self::room_for_another`] says.
+    fn room_beside_waiters(&self) -> Result<(), RefusalReason> {
+        let waiting = self.queued();
+        let held = self.scopes.lock().len() + self.leftovers.lock().len() + waiting;
+        match waiting > 0 && held as u32 >= self.config.max_scopes {
+            true => Err(RefusalReason::AtCapacity),
+            false => Ok(()),
+        }
+    }
+
     fn room_for_another(&self) -> Result<(), RefusalReason> {
         let held = self.scopes.lock().len() + self.leftovers.lock().len();
         match held as u32 >= self.config.max_scopes {
@@ -1278,6 +1299,22 @@ fn prepared(scope: &Scope, reused: bool, home_reused: bool) -> Prepared {
         reused,
         home_reused,
         jobs: scope.jobs,
+    }
+}
+
+/// A prepare's place in the queue, given up when the prepare ends without
+/// being told to wait on, however it ends.
+struct Place<'a> {
+    queue: &'a Mutex<Queue>,
+    scope: &'a ScopeId,
+    kept: bool,
+}
+
+impl Drop for Place<'_> {
+    fn drop(&mut self) {
+        if !self.kept {
+            self.queue.lock().leave(self.scope);
+        }
     }
 }
 
@@ -2051,6 +2088,45 @@ mod tests {
             refused(RefusalReason::AtCapacity)
         );
         assert!(seated(&w.prepare(queued("b", "person-b")).await.unwrap()));
+    }
+
+    #[tokio::test]
+    async fn a_prepare_that_did_not_queue_takes_a_seat_beyond_those_waiting() {
+        let h = Harness::with(|config| config.max_scopes = 3).await;
+        let w = &h.worker;
+        for id in ["coding-1", "coding-2", "coding-3"] {
+            w.prepare(spec(id, &[])).await.unwrap();
+        }
+        assert_eq!(w.prepare(queued("b", "person-b")).await.unwrap(), place(0));
+        w.release(&ScopeId::new("coding-1")).await.unwrap();
+        w.release(&ScopeId::new("coding-2")).await.unwrap();
+        assert!(
+            seated(&w.prepare(spec("coding-4", &[])).await.unwrap()),
+            "one seat for the waiter, one to spare"
+        );
+        assert!(seated(&w.prepare(queued("b", "person-b")).await.unwrap()));
+    }
+
+    #[tokio::test]
+    async fn a_head_dropped_while_waiting_for_the_lock_gives_its_place_up() {
+        let h = Harness::new().await;
+        let w = &h.worker;
+        w.prepare(spec("coding-1", &[])).await.unwrap();
+        w.prepare(spec("coding-2", &[])).await.unwrap();
+        assert_eq!(w.prepare(queued("b", "person-b")).await.unwrap(), place(0));
+        {
+            let _seating = w.prepares.lock().await;
+            let dropped = tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                w.prepare(queued("b", "person-b")),
+            )
+            .await;
+            assert!(
+                dropped.is_err(),
+                "it waited on the seating, then its caller left"
+            );
+        }
+        assert_eq!(w.queued(), 0, "nothing is left holding the head");
     }
 
     #[tokio::test]

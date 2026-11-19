@@ -19,6 +19,9 @@ struct Waiter {
     since: DateTime<Utc>,
     /// When it last asked; a place not asked for within [`QUEUE_HOLD`] goes.
     asked: DateTime<Utc>,
+    /// At the head and waiting on a seating under way: its place stays
+    /// however long that takes, until it asks again or leaves.
+    seating: bool,
 }
 
 #[derive(Debug, Default)]
@@ -43,17 +46,19 @@ impl Queue {
     ) -> u32 {
         let hold = chrono::Duration::from_std(QUEUE_HOLD).unwrap_or_default();
         self.waiters
-            .retain(|waiter| waiter.asked + hold > now || waiter.scope == *scope);
+            .retain(|waiter| waiter.seating || waiter.asked + hold > now || waiter.scope == *scope);
         match self.waiters.iter_mut().find(|w| w.scope == *scope) {
             Some(waiter) => {
                 waiter.asked = now;
                 waiter.owner = owner.to_string();
+                waiter.seating = false;
             }
             None => self.waiters.push(Waiter {
                 scope: scope.clone(),
                 owner: owner.to_string(),
                 since: now,
                 asked: now,
+                seating: false,
             }),
         }
         let order = |waiter: &Waiter| {
@@ -69,6 +74,13 @@ impl Queue {
         self.waiters.iter().filter(|w| order(w) < mine).count() as u32
     }
 
+    /// `scope`, at the head, goes on to wait for the seating under way.
+    pub(crate) fn seating(&mut self, scope: &ScopeId) {
+        if let Some(waiter) = self.waiters.iter_mut().find(|w| w.scope == *scope) {
+            waiter.seating = true;
+        }
+    }
+
     /// `scope` is seated, or no longer waiting: it gives up its place.
     pub(crate) fn leave(&mut self, scope: &ScopeId) {
         self.waiters.retain(|waiter| waiter.scope != *scope);
@@ -79,7 +91,7 @@ impl Queue {
         let hold = chrono::Duration::from_std(QUEUE_HOLD).unwrap_or_default();
         self.waiters
             .iter()
-            .filter(|waiter| waiter.asked + hold > now)
+            .filter(|waiter| waiter.seating || waiter.asked + hold > now)
             .count()
     }
 }
@@ -174,6 +186,23 @@ mod tests {
             );
             assert_eq!(queue.place(&id("first"), "person-one", now, held, 2), 0);
         }
+    }
+
+    #[test]
+    fn the_head_waiting_on_a_long_seating_keeps_its_place() {
+        let mut queue = Queue::default();
+        let now = Utc::now();
+        let none = |_: &str| 0;
+        queue.place(&id("head"), "person-a", now, none, 1);
+        queue.seating(&id("head"));
+        let much_later = now + chrono::Duration::from_std(QUEUE_HOLD * 4).unwrap();
+        assert_eq!(queue.place(&id("b"), "person-b", much_later, none, 1), 1);
+        assert_eq!(queue.waiting(much_later), 2);
+        assert_eq!(
+            queue.place(&id("head"), "person-a", much_later, none, 1),
+            0,
+            "first still, once it gets its turn"
+        );
     }
 
     #[test]
