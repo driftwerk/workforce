@@ -18,7 +18,7 @@ use eyre::Result;
 use serde_json::{json, Map, Value};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
-use vellev_client::api::{Change, Nearest, Page};
+use vellev_client::api::{Change, Content, Nearest, Page};
 use vellev_client::{Client, Tenant};
 use vellev_core::{Collection, CollectionName, DataType, ObjectId, Property};
 use vellev_index::filter::Filter;
@@ -290,10 +290,7 @@ impl VellevCodeVectorStore {
                 .run(|| {
                     let deletes = batch
                         .iter()
-                        .map(|id| Change::Delete {
-                            collection: collection.name().clone(),
-                            id: *id,
-                        })
+                        .map(|id| Change::delete(collection.name().clone(), *id))
                         .collect();
                     async move { self.writes.apply(deletes).await }
                 })
@@ -446,15 +443,14 @@ fn search_filter(repo_id: Option<&str>, kind: Option<EntityKind>) -> Option<Filt
 }
 
 fn upsert(records: &str, id: ObjectId, properties: Value) -> Result<Change> {
-    Ok(Change::Upsert {
-        collection: CollectionName::new(records)?,
+    Ok(Change::upsert(
+        CollectionName::new(records)?,
         id,
-        properties: match properties {
+        Content::new(match properties {
             Value::Object(properties) => properties,
             _ => Map::new(),
-        },
-        vector: None,
-    })
+        }),
+    ))
 }
 
 #[async_trait]
@@ -539,14 +535,8 @@ impl CodeVectorStore for VellevCodeVectorStore {
             .entities
             .run(|| {
                 self.cap.ask(limit, |limit| {
-                    let nearest = Nearest {
-                        vector: None,
-                        text: Some(query.as_str().to_string()),
-                        limit,
-                        filter: filter.clone(),
-                        oversample: None,
-                        vectors: false,
-                    };
+                    let nearest = Nearest::to_text(query.as_str(), limit);
+                    let nearest = filter.clone().into_iter().fold(nearest, Nearest::filter);
                     async move { self.entities.collection().nearest(&nearest).await }
                 })
             })
@@ -705,12 +695,8 @@ impl CodeVectorStore for VellevCodeVectorStore {
         let listed = collection
             .run(|| {
                 self.cap.ask(limit, |limit| {
-                    let page = Page {
-                        filter: Some(filter.clone()),
-                        after,
-                        limit,
-                        vectors: false,
-                    };
+                    let page = Page::new(limit).filter(filter.clone());
+                    let page = after.into_iter().fold(page, Page::after);
                     async move { collection.collection().list(&page).await }
                 })
             })

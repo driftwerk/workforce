@@ -17,7 +17,7 @@ use eyre::{eyre, Result};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
-use vellev_client::api::{Change, Page};
+use vellev_client::api::{Change, Content, Page};
 use vellev_client::Tenant;
 use vellev_core::{Collection, CollectionName, DataType, Embedding, ObjectId, Property};
 
@@ -360,14 +360,17 @@ pub async fn equivalence(
         for batch in written.chunks(32) {
             let changes = batch
                 .iter()
-                .map(|(id, text)| Change::Upsert {
-                    collection: probe.name.clone(),
-                    id: *id,
-                    properties: json!({ "text": text })
-                        .as_object()
-                        .cloned()
-                        .unwrap_or_default(),
-                    vector: None,
+                .map(|(id, text)| {
+                    Change::upsert(
+                        probe.name.clone(),
+                        *id,
+                        Content::new(
+                            json!({ "text": text })
+                                .as_object()
+                                .cloned()
+                                .unwrap_or_default(),
+                        ),
+                    )
                 })
                 .collect();
             tenants.writes.apply(changes).await?;
@@ -375,12 +378,9 @@ pub async fn equivalence(
         let mut by_node = std::collections::HashMap::new();
         let mut after = None;
         loop {
-            let page = Page {
-                filter: None,
-                after,
-                limit: 200,
-                vectors: true,
-            };
+            let page = after
+                .into_iter()
+                .fold(Page::new(200).vectors(true), Page::after);
             let listed = records.list(&page).await?;
             for object in listed.objects {
                 by_node.insert(object.id, object.vector.unwrap_or_default());
