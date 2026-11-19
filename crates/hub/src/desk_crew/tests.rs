@@ -6295,7 +6295,7 @@ async fn a_wedged_mind_is_waited_for_only_so_long() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let d = desk(pool, dir.path()).await;
-        let crew = CrewHub::start(hub(&[]), d, FAST, CancellationToken::new());
+        let crew = CrewHub::start(hub(&[]), d.clone(), FAST, CancellationToken::new());
         crew.set_mind_wait_max(Duration::from_millis(300));
         let c = Arc::clone(&crew);
         let _wedged = tokio::spawn(async move {
@@ -6307,6 +6307,68 @@ async fn a_wedged_mind_is_waited_for_only_so_long() {
         let out = crew.with_mind("desk", "a check-in", async { 3 }).await;
         assert_eq!(out, 3, "it went on without the mind");
         assert!(started.elapsed() >= Duration::from_millis(300));
+        // Said where the person looks, not only in the log, by the boss.
+        let told = eventually("the bound on the Floor", async || {
+            let page = d.activity(Filter::Manager, None, 10).await.unwrap();
+            page.events.into_iter().find(|e| e.kind == Kind::Quiet)
+        })
+        .await;
+        assert_eq!(told.actor.id, "desk");
+        assert!(
+            told.text.contains("stopped waiting for a wedged turn")
+                && told.text.contains("started a check-in alongside it"),
+            "{}",
+            told.text
+        );
+        // How many are said, once all noted before a marker are written:
+        // the activity is written in the order noted.
+        let said = async |marker: &str| {
+            d.note(workforce_desk::crew::Event::new(
+                Kind::Summary,
+                workforce_desk::crew::Party::desk(),
+                None,
+                marker,
+            ));
+            eventually("the marker", async || {
+                let page = d.activity(Filter::All, None, 50).await.unwrap();
+                page.events
+                    .iter()
+                    .any(|e| e.text == marker)
+                    .then(|| page.events.iter().filter(|e| e.kind == Kind::Quiet).count())
+            })
+            .await
+        };
+        // A second waiter on the same busy stretch isn't said again.
+        assert_eq!(crew.with_mind("desk", "a plan", async { 4 }).await, 4);
+        assert_eq!(said("m1").await, 1, "once a stretch");
+        // A new busy stretch is.
+        _wedged.abort();
+        eventually("freed", async || {
+            crew.mind_holder("desk").is_none().then_some(())
+        })
+        .await;
+        let c = Arc::clone(&crew);
+        let _again = tokio::spawn(async move {
+            c.with_mind("desk", "another wedged turn", std::future::pending::<()>())
+                .await
+        });
+        eventually("held again", async || crew.mind_holder("desk").map(|_| ())).await;
+        assert_eq!(crew.with_mind("desk", "an update", async { 5 }).await, 5);
+        assert_eq!(said("m2").await, 2, "said again for a new stretch");
+        // What it starts runs as part of it: a nested step never waits the
+        // whole bound again.
+        let nested = std::time::Instant::now();
+        let out = crew
+            .with_mind("desk", "a turn", async {
+                crew.with_mind("desk", "its tool", async { 6 }).await
+            })
+            .await;
+        assert_eq!(out, 6);
+        assert!(
+            nested.elapsed() < Duration::from_millis(600),
+            "waited once, not twice: {:?}",
+            nested.elapsed()
+        );
         // Held back while busy, started once it has waited its while.
         let now = std::time::Instant::now();
         assert!(!crew.mind_may_start("desk", now));

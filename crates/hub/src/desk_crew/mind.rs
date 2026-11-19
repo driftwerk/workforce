@@ -74,6 +74,9 @@ pub(super) struct Minds {
     marks: AtomicU64,
     /// [`WAIT_MAX`], shorter in tests.
     wait_max: parking_lot::Mutex<Duration>,
+    /// The stretch each boss's bound was last said for, by when it began:
+    /// what waits on one wedged stretch is said once, not once a waiter.
+    told: parking_lot::Mutex<HashMap<String, Instant>>,
 }
 
 impl Default for Minds {
@@ -86,6 +89,7 @@ impl Default for Minds {
             person: Default::default(),
             marks: AtomicU64::new(0),
             wait_max: parking_lot::Mutex::new(WAIT_MAX),
+            told: Default::default(),
         }
     }
 }
@@ -191,8 +195,57 @@ impl Drop for HoldingMark<'_> {
 }
 
 impl CrewHub {
+    /// Says, in the activity and so on the Floor, that `what` waited `wait`
+    /// for `boss` while `holder` kept it busy, and started anyway: two of
+    /// its turns may now overlap, which the person should know of. Once a
+    /// busy stretch, however many wait on it: whether it was said.
+    pub(super) fn mind_bound_hit(
+        &self,
+        boss: &str,
+        what: &str,
+        wait: Duration,
+        holder: Option<&Holding>,
+    ) -> bool {
+        if let Some(h) = holder {
+            let mut told = self.minds.told.lock();
+            if told.get(boss) == Some(&h.since) {
+                return false;
+            }
+            told.insert(boss.to_string(), h.since);
+        }
+        let mins = |d: Duration| (d.as_secs() / 60).max(1);
+        let text = match holder {
+            Some(h) => format!(
+                "stopped waiting for {} (busy {} min) after {} min and started {what} alongside it; the two may overlap, so check what each told the crew",
+                h.what,
+                mins(h.since.elapsed()),
+                mins(wait)
+            ),
+            None => format!(
+                "waited {} min to start {what} and started it anyway; it may overlap another of its turns, so check what each told the crew",
+                mins(wait)
+            ),
+        };
+        let name = self
+            .state
+            .registry
+            .get(boss)
+            .map(|s| super::name_of(&s))
+            .unwrap_or_else(|| boss.to_string());
+        let me = workforce_desk::crew::Party::manager(boss, &name);
+        self.desk.note(workforce_desk::crew::Event::new(
+            workforce_desk::crew::Kind::Quiet,
+            me,
+            None,
+            text,
+        ));
+        true
+    }
+
     /// Runs `f` holding `boss`'s mind, doing `what`, waiting for it as long
-    /// as [`WAIT_MAX`]; past that `f` runs without it, said.
+    /// as [`WAIT_MAX`]; past that `f` runs without it, said. What `f`
+    /// starts runs as part of it (a nested step, its turn's tools): it
+    /// never waits the whole bound again behind the same busy stretch.
     ///
     /// `f` is boxed as it is handed over: the turns it wraps are large, and
     /// the future returned holds only the box, so wrapping a step never
@@ -210,6 +263,15 @@ impl CrewHub {
                 Ok(out) => out,
                 Err(f) => {
                     let holder = self.mind_holder(boss);
+                    // Freed just as the wait ran out: taken after all.
+                    let f = match holder {
+                        Some(_) => f,
+                        None => match self.mind_held(boss, what, Duration::ZERO, f).await {
+                            Ok(out) => return out,
+                            Err(f) => f,
+                        },
+                    };
+                    let holder = holder.or_else(|| self.mind_holder(boss));
                     tracing::warn!(
                         %boss,
                         %what,
@@ -218,7 +280,8 @@ impl CrewHub {
                         held_secs = ?holder.as_ref().map(|h| h.since.elapsed().as_secs()),
                         "a boss's mind stayed held too long; this goes on without it"
                     );
-                    f.await
+                    self.mind_bound_hit(boss, what, wait, holder.as_ref());
+                    HELD.scope(boss.to_string(), f).await
                 }
             }
         }
@@ -351,6 +414,21 @@ impl CrewHub {
         let since = Instant::now();
         while self.minds.person_running(boss) && since.elapsed() < PERSON_YIELD {
             tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        // Any of their turns still running, however old: `person_running`
+        // no longer counts one past the yield.
+        let still = self
+            .minds
+            .person
+            .lock()
+            .get(boss)
+            .is_some_and(|t| !t.is_empty());
+        if still {
+            tracing::warn!(
+                %boss,
+                waited_secs = PERSON_YIELD.as_secs(),
+                "crew work yielded to the person's own turn as long as it does; it goes on beside it"
+            );
         }
     }
 
