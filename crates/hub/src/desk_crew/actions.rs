@@ -1597,8 +1597,10 @@ impl CrewHub {
             }
             // Unbound, a job the guard would hold back goes unrecorded:
             // who holds a job is still kept wherever one is declared, and
-            // only what it would have refused goes without a record.
-            Err(why) if unbound => {
+            // only what it would have refused goes without a record. What
+            // Desk failed to keep, or the same job's order already gone in
+            // meanwhile, still holds it back.
+            Err(why) if unbound && why.guard => {
                 tracing::info!(boss = %by.party.id, kind = ?why.kind, "an unbound boss's order the job guard would refuse goes all the same");
                 notes.push(why.why.clone());
                 None
@@ -2877,14 +2879,18 @@ impl CrewHub {
             let unbound = self.by_unbound(&by);
             let mut sent = self.sent.lock();
             // Unbound, messaging the crew isn't counted against the
-            // person's silence: it is how the boss keeps work moving.
-            if !unbound && sent.len() >= super::TURN_BUDGET {
-                return Err(format!(
-                    "Loop guard: you have messaged the crew {} times since the person last spoke; tell the person instead.",
-                    super::TURN_BUDGET
-                ));
+            // person's silence (nor kept, to count against a bound boss's):
+            // it is how the boss keeps work moving. MAX_HOPS above still
+            // ends a chain handed on too long.
+            if !unbound {
+                if sent.len() >= super::TURN_BUDGET {
+                    return Err(format!(
+                        "Loop guard: you have messaged the crew {} times since the person last spoke; tell the person instead.",
+                        super::TURN_BUDGET
+                    ));
+                }
+                sent.push(chrono::Utc::now());
             }
-            sent.push(chrono::Utc::now());
         }
         let owner = self
             .person(Some(&service))
