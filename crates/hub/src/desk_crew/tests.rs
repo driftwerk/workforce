@@ -1905,6 +1905,7 @@ mod preferences;
 mod promises;
 mod repeats;
 mod silent_waits;
+mod tickets;
 mod updates;
 mod urgent;
 

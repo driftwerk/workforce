@@ -813,6 +813,69 @@ async fn a_ticket_follows_its_sessions_pull_request_forward() {
     .await;
 }
 
+/// Words added to a description go after what it says when they are
+/// saved, a blank line between; its title and the rest stay as they are.
+#[tokio::test]
+async fn words_added_to_a_description_keep_what_it_said() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = board(&d, "Acme").await;
+        let t = ticket(&d, b.id, "Fix the login", TicketState::Todo).await;
+        let you = By::you();
+        let edit = |p: TicketPatch| d.edit_ticket(t.ticket.id, p, &you);
+        edit(TicketPatch {
+            body: Some("It fails on Safari only.".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let v = edit(TicketPatch {
+            append: Some("  Design approved by the person on 11/19.  ".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            v.ticket.body,
+            "It fails on Safari only.\n\nDesign approved by the person on 11/19."
+        );
+        assert_eq!(v.ticket.title, "Fix the login");
+        assert_eq!(v.ticket.state, TicketState::Todo);
+        for wrong in [
+            TicketPatch {
+                body: Some("x".into()),
+                append: Some("y".into()),
+                ..Default::default()
+            },
+            TicketPatch {
+                append: Some("   ".into()),
+                ..Default::default()
+            },
+            TicketPatch {
+                append: Some("y".repeat(crate::board::BODY_MAX)),
+                ..Default::default()
+            },
+        ] {
+            assert!(matches!(edit(wrong).await, Err(DeskError::Invalid(_))));
+        }
+        let kept = d.ticket(t.ticket.id).await.unwrap();
+        assert_eq!(
+            kept.ticket.body, v.ticket.body,
+            "a refused change changes nothing"
+        );
+        let page = d.ticket_history(t.ticket.id, None, 10).await.unwrap();
+        assert!(
+            page.events
+                .iter()
+                .any(|e| e.text == "added to its description on ACM-1"),
+            "{:?}",
+            page.events.iter().map(|e| &e.text).collect::<Vec<_>>()
+        );
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn a_snoozed_ticket_wakes_when_it_changes_and_a_pin_changes_nothing() {
     with_test_pool(build_pool, |pool| async move {
