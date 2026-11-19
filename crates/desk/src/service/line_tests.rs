@@ -1086,6 +1086,14 @@ async fn a_held_session_takes_only_the_persons_messages_and_a_delivery_never_let
         )
         .await;
         assert_eq!(d.breaker_needs().len(), 1, "still held");
+        // That prompt's turn ends (Desk keeps what waits through a turn).
+        hook(
+            &d,
+            id,
+            json!({"hook_event_name": "Stop", "last_assistant_message": "Noted."}),
+        )
+        .await;
+        assert_eq!(d.breaker_needs().len(), 1, "held still");
         let mine = d
             .line_post(id, "stop and summarise".into(), When::Queue)
             .await
@@ -2101,6 +2109,270 @@ async fn a_bosss_urgent_order_is_said_into_a_codex_turn_marked_and_a_refusal_put
             .await,
             Err(LineError::Refused(Refusal::NotYours))
         ));
+    })
+    .await;
+}
+
+/// A Claude Code session in a turn (a prompt in, a tool running), Desk's
+/// plugin heard from in it.
+async fn in_a_turn(d: &Desk, dir: &Path) -> Uuid {
+    let s = new_session(d, dir).await;
+    idle(d, s.id).await;
+    hook(
+        d,
+        s.id,
+        json!({"hook_event_name": "UserPromptSubmit", "prompt": "migrate the ledger"}),
+    )
+    .await;
+    hook(
+        d,
+        s.id,
+        json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "cargo test"}}),
+    )
+    .await;
+    assert_eq!(d.view(s.id).unwrap().state, SessionState::Working);
+    s.id
+}
+
+/// Every hand-off older than its wait put back, as the pump's tick does
+/// once two minutes have gone by.
+async fn hand_offs_gone_stale(d: &Desk) {
+    d.line_requeue_stale(chrono::Utc::now() + chrono::Duration::seconds(1))
+        .await;
+}
+
+#[tokio::test]
+async fn a_message_sent_mid_turn_is_kept_by_desk_and_handed_to_the_plugin_once_at_the_idle() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = in_a_turn(&d, dir.path()).await;
+        let by = By::manager("sarah", "Sarah", "It should check the totals.");
+        let m = d
+            .line_send(Sender::Overseer(by), tell(s, "Check the ledger totals."))
+            .await
+            .unwrap();
+        // Mid-turn the plugin isn't handed it: Desk keeps it, saying why.
+        assert!(d.line_next(s, Duration::from_millis(200)).await.is_none());
+        assert_eq!(row(&d, m.id).await.delivery, Delivery::Queued);
+        let thread = d.line_thread(s, None, None).await.unwrap();
+        let shown = thread.iter().find(|r| r.id == m.id).unwrap();
+        assert_eq!(shown.waiting, Some(Wait::Working));
+        // However long the turn runs, nothing is handed twice.
+        hand_offs_gone_stale(&d).await;
+        assert!(d.line_next(s, Duration::from_millis(200)).await.is_none());
+        // The turn's end wakes the plugin's wait, and it is handed once.
+        let waiting = tokio::spawn({
+            let d = d.clone();
+            async move { d.line_next(s, Duration::from_secs(5)).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        hook(
+            &d,
+            s,
+            json!({"hook_event_name": "Stop", "last_assistant_message": "Done."}),
+        )
+        .await;
+        let next = waiting.await.unwrap().expect("handed at the idle");
+        assert_eq!(next["id"], json!(m.id));
+        assert!(d.line_next(s, Duration::from_millis(200)).await.is_none());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_hand_off_claude_code_queues_behind_a_turn_is_never_handed_again_in_it() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        let m = d
+            .line_post(s.id, "then open the PR".into(), When::Queue)
+            .await
+            .unwrap();
+        // Handed at the idle; the person starts a turn before it goes in,
+        // so Claude Code queues it behind theirs.
+        let next = d.line_next(s.id, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(next["id"], json!(m.id));
+        hook(
+            &d,
+            s.id,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "fix the build first"}),
+        )
+        .await;
+        assert_eq!(d.view(s.id).unwrap().state, SessionState::Working);
+        // Past the hand-off's wait, the plugin is still there: Claude
+        // Code still holds it, and it isn't handed again.
+        d.line_next(s.id, Duration::from_millis(50)).await;
+        hand_offs_gone_stale(&d).await;
+        assert_eq!(row(&d, m.id).await.delivery, Delivery::Handed);
+        assert!(d
+            .line_next(s.id, Duration::from_millis(200))
+            .await
+            .is_none());
+        // At an idle it never said went in, it was lost: it goes again.
+        hook(
+            &d,
+            s.id,
+            json!({"hook_event_name": "Stop", "last_assistant_message": "Fixed."}),
+        )
+        .await;
+        hand_offs_gone_stale(&d).await;
+        assert_eq!(row(&d, m.id).await.delivery, Delivery::Queued);
+        let again = d.line_next(s.id, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(again["id"], json!(m.id));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_persons_send_now_puts_a_bosss_waiting_message_into_the_running_turn() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = in_a_turn(&d, dir.path()).await;
+        let by = By::manager("sarah", "Sarah", "It should check the totals.");
+        let m = d
+            .line_send(Sender::Overseer(by), tell(s, "Check the ledger totals."))
+            .await
+            .unwrap();
+        let shown = |thread: Vec<LineMessage>| thread.into_iter().find(|r| r.id == m.id).unwrap();
+        let waiting = shown(d.line_thread(s, None, None).await.unwrap());
+        assert_eq!(waiting.waiting, Some(Wait::Working));
+        assert_eq!(
+            waiting.actions,
+            vec![LineAction::SendNow, LineAction::Withdraw],
+            "a boss's words are never the person's to change"
+        );
+        let sent = d.line_send_now(m.id).await.unwrap();
+        assert_eq!(sent.waiting, Some(Wait::NextCall));
+        let steered = shown(d.line_thread(s, None, None).await.unwrap());
+        assert_eq!(steered.waiting, Some(Wait::NextCall));
+        assert_eq!(steered.actions, vec![LineAction::Withdraw]);
+        assert!(matches!(
+            d.line_send_now(m.id).await,
+            Err(LineError::Desk(DeskError::Conflict(_)))
+        ));
+        // Its next tool call's result carries it, once.
+        let said = hook(
+            &d,
+            s,
+            json!({"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": "cargo test"}}),
+        )
+        .await;
+        let text = said
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(Value::as_str)
+            .expect("beside the call's result");
+        assert!(text.contains("Check the ledger totals."), "{text}");
+        assert!(text.contains(&line::marker(m.id)), "{text}");
+        assert_eq!(row(&d, m.id).await.delivery, Delivery::Delivered);
+        // Not one of the boss's urgent orders.
+        assert_eq!(
+            d.0.store
+                .line_urgent_since(&s.to_string(), chrono::Utc::now() - chrono::Duration::hours(1))
+                .await
+                .unwrap(),
+            0
+        );
+        // Gone in: nothing to send now.
+        assert!(shown(d.line_thread(s, None, None).await.unwrap())
+            .actions
+            .is_empty());
+        assert!(matches!(
+            d.line_send_now(m.id).await,
+            Err(LineError::Desk(DeskError::Conflict(_)))
+        ));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_person_takes_back_a_waiting_message_and_a_bosss_hears_it_never_went_in() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = in_a_turn(&d, dir.path()).await;
+        // Theirs first: a boss's sent after the person's own words isn't
+        // overtaken by them.
+        let mine = d
+            .line_post(s, "and the refunds".into(), When::Queue)
+            .await
+            .unwrap();
+        let by = By::manager("sarah", "Sarah", "It should check the totals.");
+        let boss = d
+            .line_send(Sender::Overseer(by), tell(s, "Check the ledger totals."))
+            .await
+            .unwrap();
+        let thread = d.line_thread(s, None, None).await.unwrap();
+        let actions = |id: Uuid| thread.iter().find(|r| r.id == id).unwrap().actions.clone();
+        assert_eq!(
+            actions(mine.id),
+            vec![LineAction::SendNow, LineAction::Edit, LineAction::Withdraw]
+        );
+        d.line_take_back(boss.id).await.unwrap();
+        assert_eq!(row(&d, boss.id).await.delivery, Delivery::Withdrawn);
+        let heard = d.picture_recent("sarah", s, 10);
+        assert!(
+            heard
+                .iter()
+                .any(|h| h.what == crate::picture::What::TakenBack
+                    && h.text == "Check the ledger totals."),
+            "{heard:?}"
+        );
+        assert!(matches!(
+            d.line_take_back(boss.id).await,
+            Err(DeskError::Conflict(_))
+        ));
+        // The person's own is gone, as ever.
+        d.line_take_back(mine.id).await.unwrap();
+        assert!(d.0.store.line_message(mine.id).await.unwrap().is_none());
+        // Neither goes in at the idle.
+        hook(
+            &d,
+            s,
+            json!({"hook_event_name": "Stop", "last_assistant_message": "Done."}),
+        )
+        .await;
+        assert!(d.line_next(s, Duration::from_millis(300)).await.is_none());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_turn_esc_ended_as_it_wrote_lets_what_desk_kept_go_once_it_is_at_its_prompt() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = in_a_turn(&d, dir.path()).await;
+        hook(
+            &d,
+            s,
+            json!({"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": "cargo test"}}),
+        )
+        .await;
+        let by = By::manager("sarah", "Sarah", "It should check the totals.");
+        let m = d
+            .line_send(Sender::Overseer(by), tell(s, "Check the ledger totals."))
+            .await
+            .unwrap();
+        // Esc as it writes fires no hook: Desk still reads it as working.
+        assert!(d.line_next(s, Duration::from_millis(200)).await.is_none());
+        let waiting = tokio::spawn({
+            let d = d.clone();
+            async move { d.line_next(s, Duration::from_secs(5)).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Claude Code says it sits at its prompt: the plugin is woken.
+        hook(
+            &d,
+            s,
+            json!({"hook_event_name": "Notification", "notification_type": "idle_prompt", "message": "waiting"}),
+        )
+        .await;
+        let next = waiting.await.unwrap().expect("handed at its prompt");
+        assert_eq!(next["id"], json!(m.id));
     })
     .await;
 }

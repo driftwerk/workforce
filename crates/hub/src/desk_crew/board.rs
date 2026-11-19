@@ -288,6 +288,7 @@ impl CrewHub {
                 hop: 0,
                 about: None,
                 group: b.group.clone(),
+                handed: None,
             }));
         }
         out

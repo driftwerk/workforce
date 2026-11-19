@@ -1891,10 +1891,13 @@ mod one_picture;
 mod preferences;
 mod promises;
 mod repeats;
+mod silent_waits;
 mod updates;
 mod urgent;
 
 mod away;
+
+mod boss_waits;
 
 mod remote_asks;
 mod remote_decide;

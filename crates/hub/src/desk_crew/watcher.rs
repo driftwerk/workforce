@@ -98,6 +98,10 @@ pub(super) struct Trigger {
     /// The sidebar group of what it is about: the overseer whose scope sees
     /// that is the one it wakes.
     pub group: Option<String>,
+    /// The session whose turn end the fast call handed to the full turn
+    /// with its refused next step (`super::idle`): said over once the
+    /// check-in given it ran.
+    pub handed: Option<uuid::Uuid>,
 }
 
 /// What an Act-level check-in is asked while the composer writes the
@@ -483,6 +487,7 @@ impl CrewHub {
             hop: event.hop,
             about,
             group: event.group.clone(),
+            handed: None,
         })
     }
 
@@ -610,6 +615,7 @@ impl CrewHub {
                             hop: 0,
                             about: Some(about),
                             group: item.group_id.clone(),
+                            handed: None,
                         },
                     )
                 }
@@ -642,6 +648,7 @@ impl CrewHub {
                             hop: 0,
                             about: None,
                             group: item.group_id.clone(),
+                            handed: None,
                         },
                     )
                 }
@@ -1175,6 +1182,7 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                     if let Some(mut t) = crew.trigger_for(&event, s.agent_id.as_str(), &o) {
                         if let Some(session) = finished_session(&event) {
                             t.line = crew.with_doing(session, t.line).await;
+                            t.handed = Some(session);
                         }
                         found.push((s.agent_id.as_str().to_string(), t));
                     }
@@ -1221,6 +1229,7 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                             hop: 0,
                             about: None,
                             group: None,
+                            handed: None,
                         }));
                     }
                 }
@@ -1339,12 +1348,19 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                     ..t.clone()
                 })
                 .collect();
+            let handed: Vec<uuid::Uuid> = triggers.iter().filter_map(|t| t.handed).collect();
             w.firing = Some(tokio::spawn(async move {
                 // Its prompt is written once it holds its mind.
                 let woke = crew
                     .with_mind(&id, "a check-in", crew.wake(service, o, triggers))
                     .await;
-                if !woke && !again.is_empty() {
+                if woke {
+                    // A refused next step handed to it was its to take
+                    // (`super::idle`).
+                    for s in handed {
+                        crew.full_turn_over(&id, s);
+                    }
+                } else if !again.is_empty() {
                     let _ = retry.send((id, again));
                 }
             }));
@@ -1449,6 +1465,7 @@ mod budget_tests {
             hop: 0,
             about: Some(about.into()),
             group: None,
+            handed: None,
         }
     }
 

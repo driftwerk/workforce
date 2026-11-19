@@ -52,6 +52,7 @@ fn message(row: &Row) -> Result<LineMessage> {
             .try_get::<_, Option<&str>>("urgency")?
             .map(Urgency::parse)
             .transpose()?,
+        actions: Vec::new(),
     };
     m.shape();
     Ok(m)
@@ -359,20 +360,40 @@ impl DeskStore {
             .transpose()
     }
 
-    /// Puts handed rows back in the queue: one the plugin dropped (`id`),
-    /// or every one handed longer ago than `before` (a plugin that died
-    /// between taking and submitting it).
+    /// The rows handed to Desk's plugin before `before` that it hasn't said
+    /// went in, oldest first.
+    pub async fn line_handed_before(&self, before: DateTime<Utc>) -> Result<Vec<LineMessage>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                &format!(
+                    "SELECT {COLUMNS} FROM line_messages \
+                     WHERE delivery = 'handed' AND handed_at < $1 ORDER BY at, id"
+                ),
+                &[&before],
+            )
+            .await?
+            .iter()
+            .map(message)
+            .collect()
+    }
+
+    /// Puts handed rows back in the queue: one the plugin dropped (`id`, no
+    /// `before`), or those handed before `before` (a plugin that died
+    /// between taking and submitting one): one handed again since is left
+    /// as it is.
     pub async fn line_requeue(
         &self,
         id: Option<Uuid>,
-        before: DateTime<Utc>,
+        before: Option<DateTime<Utc>>,
     ) -> Result<Vec<LineMessage>> {
         let client = self.pool().get().await?;
         client
             .query(
                 &format!(
                     "UPDATE line_messages SET delivery = 'queued', handed_at = NULL, updated_at = now() \
-                     WHERE delivery = 'handed' AND (id = $1 OR ($1 IS NULL AND handed_at < $2)) \
+                     WHERE delivery = 'handed' AND ($1::uuid IS NULL OR id = $1) \
+                     AND ($2::timestamptz IS NULL OR handed_at < $2) \
                      RETURNING {COLUMNS}"
                 ),
                 &[&id, &before],
@@ -801,17 +822,17 @@ mod tests {
                 s.line_take(m.id, Delivery::Handed).await.unwrap().is_none(),
                 "taken once"
             );
-            let back = s.line_requeue(Some(m.id), Utc::now()).await.unwrap();
+            let back = s.line_requeue(Some(m.id), None).await.unwrap();
             assert_eq!(back.len(), 1);
             assert_eq!(back[0].delivery, Delivery::Queued);
             s.line_take(m.id, Delivery::Handed).await.unwrap().unwrap();
             assert!(s
-                .line_requeue(None, Utc::now() - chrono::Duration::minutes(2))
+                .line_requeue(None, Some(Utc::now() - chrono::Duration::minutes(2)))
                 .await
                 .unwrap()
                 .is_empty());
             assert_eq!(
-                s.line_requeue(None, Utc::now() + chrono::Duration::seconds(1))
+                s.line_requeue(None, Some(Utc::now() + chrono::Duration::seconds(1)))
                     .await
                     .unwrap()
                     .len(),

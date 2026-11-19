@@ -929,6 +929,15 @@ impl CrewHub {
                 Ok(json!({ "events": reported(&lines.join("\n"), "the group's activity here") }))
             }
             "crew.history" => {
+                if let Some(message) = input["message_id"].as_str() {
+                    return super::tools::line_message_read(self, message, |s| {
+                        match self.in_grant(g, s) {
+                            true => Ok(()),
+                            false => Err(self.not_in_grant(g)),
+                        }
+                    })
+                    .await;
+                }
                 let id: Uuid = input["session_id"]
                     .as_str()
                     .and_then(|s| s.parse().ok())
@@ -1032,6 +1041,8 @@ impl CrewHub {
                 return Err("You don't run that session.".into());
             }
         }
+        // A reply to what is no question is gated as the message it is.
+        let action = self.as_sent(&action).await?;
         self.know_question(&action).await;
         // A session the person took back: not done, nor suggested.
         if let Some(why) = self.left_alone(&action) {
