@@ -626,7 +626,11 @@ impl CrewTool {
                 }
                 o.insert(
                     "need_ids".into(),
-                    json!(new.need_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>()),
+                    json!(new
+                        .need_ids
+                        .iter()
+                        .map(|i| i.to_string())
+                        .collect::<Vec<_>>()),
                 );
             }
             (Action::ChangeTicket { change, .. }, Some(o)) => match &**change {
