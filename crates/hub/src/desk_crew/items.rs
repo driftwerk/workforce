@@ -48,6 +48,7 @@ use workforce_desk::open_item_store::Opened;
 use workforce_desk::Speaker;
 
 use super::tools::Bound;
+use super::waiting;
 use super::CrewHub;
 
 pub const ASK: &str = "crew.ask_person";
@@ -947,6 +948,12 @@ impl CrewHub {
         match (text("answer"), text("why")) {
             // A session's question: the person's answer goes on to it, as
             // theirs, and that closes the item.
+            (Some(answer), _) if waiting::is_waiting(&item.dedupe_key) => {
+                self.answer_wait(&item, answer).await?;
+                Ok(json!(
+                    "Their answer went to the session, and the item is closed."
+                ))
+            }
             (Some(answer), _) if item.line_message.is_some() => {
                 let ask = item.line_message.unwrap_or_default();
                 self.desk
@@ -1026,6 +1033,10 @@ impl CrewHub {
         };
         for i in open {
             let Some(s) = i.session else { continue };
+            // What a session waits on closes, and is said, on its own look.
+            if waiting::is_waiting(&i.dedupe_key) {
+                continue;
+            }
             if !matches!(i.kind, OpenKind::Ask | OpenKind::Confirm) || !i.said() {
                 continue;
             }
@@ -1164,6 +1175,13 @@ impl CrewHub {
             .ok_or(ItemRefused::NotFound)?;
         if item.state == OpenState::Closed {
             return Err(ItemRefused::Closed);
+        }
+        // What a session waits on: the answer goes to it, and closes it.
+        if waiting::is_waiting(&item.dedupe_key) {
+            self.answer_wait(&item, answer)
+                .await
+                .map_err(ItemRefused::Cant)?;
+            return Ok("Sent.".into());
         }
         if let Some(ask) = item.line_message {
             self.desk
@@ -1478,6 +1496,11 @@ impl CrewHub {
                 i.raised_at.is_none_or(|at| now - at >= MARK_FOR) && now - i.changed_at >= MARK_FOR;
             return old.then(|| (ClosedBy::Boss, "Told of over a day ago.".into()));
         }
+        // What a session waits on its boss for closes on what settles it
+        // where it waits, whatever its question's kind.
+        if waiting::is_waiting(&i.dedupe_key) {
+            return self.waiting_past(i).await;
+        }
         // Parked, it waits for the person to answer or drop it: never
         // closed under them.
         if i.state == OpenState::Parked {
@@ -1595,6 +1618,11 @@ impl CrewHub {
                         // ended, nothing changed for days): nothing is said,
                         // and their own words are never said back to them.
                         (OpenKind::Promise | OpenKind::Order, _) => {}
+                        // What a session waited on, settled elsewhere: one
+                        // line, which says how.
+                        _ if waiting::is_waiting(&closed.dedupe_key) && closed.said() => {
+                            self.say(&closed.boss, why.clone()).await;
+                        }
                         // A session's question shows its own end where it is.
                         _ if closed.said()
                             && closed.line_message.is_none()
@@ -1648,7 +1676,10 @@ impl CrewHub {
         let minute = chrono::Duration::from_std(self.timing.minute).unwrap_or_default();
         let first = minute * FIRST_RESTATE.num_minutes() as i32;
         let remind = minute * o.wake.remind_minutes as i32;
-        let due: Vec<&OpenItem> = items.iter().filter(|i| i.due(now, first, remind)).collect();
+        let due: Vec<&OpenItem> = items
+            .iter()
+            .filter(|i| !waiting::is_waiting(&i.dedupe_key) && i.due(now, first, remind))
+            .collect();
         restatements(&due, now)
     }
 
@@ -1662,7 +1693,9 @@ impl CrewHub {
                 continue;
             };
             // With the composer on, what is due goes in the boss's update.
-            if o.wake.remind_minutes == 0 || o.updates.enabled {
+            // What a session waits on is reminded on its own cadence.
+            if o.wake.remind_minutes == 0 || o.updates.enabled || waiting::is_waiting(&i.dedupe_key)
+            {
                 continue;
             }
             let remind = minute * o.wake.remind_minutes as i32;
@@ -1757,7 +1790,9 @@ impl CrewHub {
             Err(_) => return,
         };
         self.resurface(&items).await;
+        self.remind_waiting(&items).await;
         self.post_held_questions().await;
+        self.look_for_silent_waits().await;
     }
 }
 

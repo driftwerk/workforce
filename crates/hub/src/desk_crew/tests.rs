@@ -1891,6 +1891,7 @@ mod one_picture;
 mod preferences;
 mod promises;
 mod repeats;
+mod silent_waits;
 mod updates;
 mod urgent;
 
