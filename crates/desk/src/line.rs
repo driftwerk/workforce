@@ -509,13 +509,16 @@ const HOLDS: [&str; 6] = [
 
 /// What a hold waits on: the boss's own word, as a verb after "until I"
 /// or a noun after "wait for my" ("answer", "replies", "decided",
-/// "decision"). Never "say" or "tell": "until I say stop" keeps it going.
-const HOLD_ON: [&str; 8] = [
-    "answer", "repl", "respon", "decid", "decision", "confirm", "get back", "approv",
+/// "decision", "say so", "go-ahead"). Never a bare "say" or "tell":
+/// "until I say stop" keeps it going.
+const HOLD_ON: [&str; 13] = [
+    "answer", "repl", "respon", "decid", "decision", "confirm", "get back", "approv", "say so",
+    "go-ahead", "go ahead", "sign", "ok",
 ];
 
-/// Words before a hold that undo it: "no need to wait for my answer".
-const UNDONE: [&str; 5] = ["no need to ", "don't ", "do not ", "no longer ", "without "];
+/// Words just before "wait for" that undo it: "no need to wait for my
+/// answer". Never applied to "until I …": "don't merge until I answer" holds.
+const UNDONE: [&str; 5] = ["no need to ", "don't ", "do not ", "no longer ", "never "];
 
 /// Whether `text`, a boss's words to a session (or a session's of itself),
 /// holds the session for the boss's answer: it waits on the boss, not on
@@ -528,29 +531,24 @@ pub fn holds(text: &str) -> bool {
         .replace("i've", "i have");
     HOLDS.iter().any(|h| {
         lower.match_indices(h).any(|(at, _)| {
-            let before = &lower[lower[..at]
-                .char_indices()
-                .rev()
-                .nth(15)
-                .map_or(0, |(i, _)| i)..at];
-            if UNDONE.iter().any(|u| before.contains(u)) {
+            let waits_for = h.starts_with("wait for");
+            if waits_for && UNDONE.iter().any(|u| lower[..at].ends_with(u)) {
                 return false;
             }
-            let rest = lower[at + h.len()..].trim_start_matches(['\'', 's', ' ']);
+            let after = &lower[at + h.len()..];
+            // "wait for desk" is Desk, never "desktop".
+            if (h.ends_with("desk") || h.ends_with("boss"))
+                && after.chars().next().is_some_and(char::is_alphanumeric)
+            {
+                return false;
+            }
+            let rest = after.strip_prefix("'s").unwrap_or(after).trim_start();
             let rest = rest.strip_prefix("have ").unwrap_or(rest);
             let rest = rest.strip_prefix("the ").unwrap_or(rest);
-            // "wait for desk" is Desk, never "desktop".
-            if h.ends_with("desk") || h.ends_with("boss") {
-                let next = lower[at + h.len()..].chars().next();
-                if next.is_some_and(char::is_alphanumeric) {
-                    return false;
-                }
-                return h.starts_with("wait for")
-                    && (rest.is_empty()
-                        || HOLD_ON.iter().any(|v| rest.starts_with(v))
-                        || !rest.starts_with(char::is_alphanumeric));
-            }
+            let rest = rest.strip_prefix("my ").unwrap_or(rest);
             HOLD_ON.iter().any(|v| rest.starts_with(v))
+                // "Wait for Desk." alone waits on Desk.
+                || (waits_for && !h.ends_with("my ") && !rest.starts_with(char::is_alphanumeric))
         })
     })
 }
@@ -2041,6 +2039,11 @@ mod tests {
             "Wait for my decision on the options.",
             "I'm changing nothing until Desk answers.",
             "Stop there until your boss replies.",
+            "Don't merge until I answer.",
+            "Do not push until I confirm.",
+            "Change nothing until I say so.",
+            "Wait for my go-ahead.",
+            "Wait for Desk's sign-off.",
         ] {
             assert!(holds(held), "{held}");
         }

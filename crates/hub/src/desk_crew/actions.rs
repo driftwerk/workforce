@@ -1396,12 +1396,28 @@ impl CrewHub {
                 "Not sent: message {id} isn't on {}'s line. Answer a question with the id the question came with.",
                 self.session_name(*s)
             )),
-            Some(m) if m.kind != workforce_desk::line::LineKind::Ask => Ok(Action::Nudge {
+            // A question the person set aside reaches the session no more.
+            Some(m) if m.asked == Some(workforce_desk::line::Asked::Dismissed) => Err(format!(
+                "Not sent: the person set that question of {}'s aside. Tell them what you'd do instead.",
+                self.session_name(*s)
+            )),
+            // A question still waiting is answered.
+            Some(m)
+                if m.kind == workforce_desk::line::LineKind::Ask
+                    && matches!(
+                        m.asked,
+                        Some(workforce_desk::line::Asked::Open | workforce_desk::line::Asked::Escalated)
+                    ) =>
+            {
+                Ok(action.clone())
+            }
+            // Anything else (a report, Desk's status question, a question
+            // answered or gone ahead since) is replied to with a message.
+            Some(_) => Ok(Action::Nudge {
                 to: Target::Session(*s),
                 message: message.clone(),
                 reply_to: None,
             }),
-            Some(_) => Ok(action.clone()),
         }
     }
 
@@ -1437,7 +1453,13 @@ impl CrewHub {
                 }
             }
         };
-        let sent = self.as_sent(action).await?;
+        let sent = match self.as_sent(action).await {
+            Ok(sent) => sent,
+            Err(e) => {
+                unheld(&e).await;
+                return Err(e);
+            }
+        };
         if &sent != action {
             return Box::pin(self.perform_with(&sent, by, order)).await;
         }
