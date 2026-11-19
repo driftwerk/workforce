@@ -74,6 +74,9 @@ pub(super) struct Minds {
     marks: AtomicU64,
     /// [`WAIT_MAX`], shorter in tests.
     wait_max: parking_lot::Mutex<Duration>,
+    /// The stretch each boss's bound was last said for, by when it began:
+    /// what waits on one wedged stretch is said once, not once a waiter.
+    told: parking_lot::Mutex<HashMap<String, Instant>>,
 }
 
 impl Default for Minds {
@@ -86,6 +89,7 @@ impl Default for Minds {
             person: Default::default(),
             marks: AtomicU64::new(0),
             wait_max: parking_lot::Mutex::new(WAIT_MAX),
+            told: Default::default(),
         }
     }
 }
@@ -191,6 +195,46 @@ impl Drop for HoldingMark<'_> {
 }
 
 impl CrewHub {
+    /// Says, in the activity and so on the Floor, that `what` waited `wait`
+    /// for `boss`'s mind, held by `holder`, and goes on without it: two of
+    /// its stretches may now overlap, which the person should know of.
+    /// Once a held stretch, however many wait on it.
+    fn mind_bound_hit(&self, boss: &str, what: &str, wait: Duration, holder: Option<&Holding>) {
+        if let Some(h) = holder {
+            let mut told = self.minds.told.lock();
+            if told.get(boss) == Some(&h.since) {
+                return;
+            }
+            told.insert(boss.to_string(), h.since);
+        }
+        let mins = |d: Duration| (d.as_secs() / 60).max(1);
+        let held = match holder {
+            Some(h) => format!(
+                " while {} held it for {} min",
+                h.what,
+                mins(h.since.elapsed())
+            ),
+            None => String::new(),
+        };
+        let text = format!(
+            "went on without its one mind: {what} waited {} min{held}, so two of its turns may overlap; check what each told the crew",
+            mins(wait)
+        );
+        let name = self
+            .state
+            .registry
+            .get(boss)
+            .map(|s| super::name_of(&s))
+            .unwrap_or_else(|| boss.to_string());
+        let me = workforce_desk::crew::Party::manager(boss, &name);
+        self.desk.note(workforce_desk::crew::Event::new(
+            workforce_desk::crew::Kind::Quiet,
+            me,
+            None,
+            text,
+        ));
+    }
+
     /// Runs `f` holding `boss`'s mind, doing `what`, waiting for it as long
     /// as [`WAIT_MAX`]; past that `f` runs without it, said.
     ///
@@ -218,6 +262,7 @@ impl CrewHub {
                         held_secs = ?holder.as_ref().map(|h| h.since.elapsed().as_secs()),
                         "a boss's mind stayed held too long; this goes on without it"
                     );
+                    self.mind_bound_hit(boss, what, wait, holder.as_ref());
                     f.await
                 }
             }

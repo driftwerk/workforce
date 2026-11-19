@@ -6295,7 +6295,7 @@ async fn a_wedged_mind_is_waited_for_only_so_long() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let d = desk(pool, dir.path()).await;
-        let crew = CrewHub::start(hub(&[]), d, FAST, CancellationToken::new());
+        let crew = CrewHub::start(hub(&[]), d.clone(), FAST, CancellationToken::new());
         crew.set_mind_wait_max(Duration::from_millis(300));
         let c = Arc::clone(&crew);
         let _wedged = tokio::spawn(async move {
@@ -6307,6 +6307,27 @@ async fn a_wedged_mind_is_waited_for_only_so_long() {
         let out = crew.with_mind("desk", "a check-in", async { 3 }).await;
         assert_eq!(out, 3, "it went on without the mind");
         assert!(started.elapsed() >= Duration::from_millis(300));
+        // Said where the person looks, not only in the log.
+        let told = eventually("the bound on the Floor", async || {
+            let page = d.activity(Filter::Manager, None, 10).await.unwrap();
+            page.events.into_iter().find(|e| e.kind == Kind::Quiet)
+        })
+        .await;
+        assert!(
+            told.text.contains("went on without its one mind")
+                && told.text.contains("a check-in")
+                && told.text.contains("a wedged turn held it"),
+            "{}",
+            told.text
+        );
+        // A second waiter on the same wedged stretch isn't said again.
+        assert_eq!(crew.with_mind("desk", "a plan", async { 4 }).await, 4);
+        let page = d.activity(Filter::Manager, None, 10).await.unwrap();
+        assert_eq!(
+            page.events.iter().filter(|e| e.kind == Kind::Quiet).count(),
+            1,
+            "once a stretch"
+        );
         // Held back while busy, started once it has waited its while.
         let now = std::time::Instant::now();
         assert!(!crew.mind_may_start("desk", now));
