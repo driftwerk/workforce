@@ -36,6 +36,9 @@ pub(super) struct Track {
     /// The overseer's own turn in its DM: not activity, but what its
     /// answer mentions is kept.
     manager_session: Option<String>,
+    /// Another agent's reply in its DM, by session: kept in `dm_turns`
+    /// while it runs.
+    dm_session: Option<String>,
     /// The picture's key for this turn (`super::picture`): ended with it.
     deciding: Option<String>,
     /// The person's own turn in the boss's DM, counted while it runs: no
@@ -117,6 +120,7 @@ impl CrewHub {
                 task: None,
                 hop,
                 manager_session: Some(sid),
+                dm_session: None,
                 deciding,
                 _person: person,
                 place,
@@ -126,6 +130,14 @@ impl CrewHub {
         }
         if message.starts_with(CHECK_IN) {
             return None;
+        }
+        // Its reply in the DM is running: what it would post there on its
+        // own waits, so nothing lands in the middle of it.
+        let dm_session = session_id
+            .filter(|_| channel == DESK_CHANNEL)
+            .map(str::to_string);
+        if let Some(sid) = &dm_session {
+            self.dm_turns.lock().insert(sid.clone());
         }
         let task = line(message);
         let key = uuid::Uuid::new_v4().to_string();
@@ -161,6 +173,7 @@ impl CrewHub {
             task,
             hop,
             manager_session: None,
+            dm_session,
             deciding,
             _person: None,
             place,
@@ -209,6 +222,11 @@ impl Track {
             return;
         }
         crew.running.lock().remove(&self.key);
+        if let Some(sid) = self.dm_session.take() {
+            crew.dm_turns.lock().remove(&sid);
+            // What waited on this reply may go now.
+            crew.update_poke.notify_one();
+        }
         let (ended, answer, question) =
             crew::outcome_of(outcome.as_deref().map_err(String::as_str));
         let text = match (ended, &answer, &question) {
@@ -246,6 +264,10 @@ impl Drop for Track {
             return;
         }
         self.crew.running.lock().remove(&self.key);
+        if let Some(sid) = &self.dm_session {
+            self.crew.dm_turns.lock().remove(sid);
+            self.crew.update_poke.notify_one();
+        }
         self.crew.desk.note(
             Event::new(
                 Kind::Stopped,

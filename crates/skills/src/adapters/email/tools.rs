@@ -633,7 +633,8 @@ fn unread_inbox(
     }
     match named {
         Some(name) if !errors.is_empty() => {
-            Some(format!("Couldn't read the inbox of {name}: {}", said()))
+            let why = errors[0]["error"].as_str().unwrap_or("failed");
+            Some(format!("Couldn't read the inbox of {name}: {why}"))
         }
         None if errors.len() >= accounts.len() => {
             Some(format!("Couldn't read any inbox: {}", said()))
@@ -4386,7 +4387,7 @@ mod tests {
                 &["work".to_string()],
                 std::slice::from_ref(&broke)
             ),
-            Some("Couldn't read the inbox of work: work: login refused".to_string())
+            Some("Couldn't read the inbox of work: login refused".to_string())
         );
         let both = [
             serde_json::json!({"account": "default", "error": "timed out"}),

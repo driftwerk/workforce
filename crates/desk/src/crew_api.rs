@@ -347,9 +347,9 @@ async fn item_done(
     item_result(s.crew.done_item(id).await)
 }
 
-/// The person is typing in the boss `agent`'s DM: Desk sends it every few
-/// seconds while the composer has keystrokes, and the boss's posts wait
-/// for a pause.
+/// The person is typing in `agent`'s DM: Desk sends it every few seconds
+/// while the composer has keystrokes, and what the agent posts on its own
+/// (a boss's updates, what monitors saw) waits for a pause.
 async fn dm_typing(
     State(s): S,
     h: HeaderMap,
@@ -361,7 +361,10 @@ async fn dm_typing(
     }
     match s.crew.dm_typing(&agent) {
         true => StatusCode::NO_CONTENT.into_response(),
-        false => error(StatusCode::NOT_FOUND, "There is no boss by that name here."),
+        false => error(
+            StatusCode::NOT_FOUND,
+            "There is no agent by that name here.",
+        ),
     }
 }
 

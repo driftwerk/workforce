@@ -139,11 +139,14 @@ pub trait ActionSink: Send + Sync {
     ) -> ActionOutcome;
 
     /// DM `owner` on `surface` — the hub's only messaging surface when none
-    /// is named, their Desk DM for `desk`; `reason` labels the notice.
+    /// is named, their Desk DM with `agent` (the monitor's: its
+    /// `agent_task`'s, else this engine's) for `desk`; `reason` labels the
+    /// notice.
     async fn tell(
         &self,
         owner: &str,
         surface: Option<&str>,
+        agent: Option<&str>,
         reason: &str,
         notice: &str,
     ) -> ActionOutcome;
@@ -156,6 +159,8 @@ pub struct WorkflowNotifySink {
     surfaces: Arc<RwLock<SurfaceRegistry>>,
     agent: Arc<crate::serve::AgentService>,
     invoker: Arc<dyn ToolInvoke>,
+    /// The hub runs Desk.
+    desk: bool,
 }
 
 /// The one platform a hub with exactly one messaging surface delivers on.
@@ -179,7 +184,15 @@ impl WorkflowNotifySink {
             surfaces,
             agent,
             invoker,
+            desk: false,
         }
+    }
+
+    /// On a hub that runs Desk (`[desk] enabled`): a `surface = "desk"`
+    /// delivery waits for Desk to start rather than ending, refused.
+    pub fn on_desk(mut self, desk: bool) -> Self {
+        self.desk = desk;
+        self
     }
 
     /// The agent that runs an `agent_task` — the named one (resolved via the
@@ -484,7 +497,8 @@ impl ActionSink for WorkflowNotifySink {
                 Action::AgentTask { .. } => self.resolve_author(ev).await,
                 _ => String::new(),
             };
-            return super::desk::deliver(&service, owner, monitor, ev, place, &from).await;
+            return super::desk::deliver(&service, self.desk, owner, monitor, ev, place, &from)
+                .await;
         }
         match action {
             Action::RunWorkflow { workflow } => {
@@ -527,11 +541,13 @@ impl ActionSink for WorkflowNotifySink {
         &self,
         owner: &str,
         surface: Option<&str>,
+        agent: Option<&str>,
         reason: &str,
         notice: &str,
     ) -> ActionOutcome {
         if surface == Some(SURFACE_DESK) {
-            return super::desk::tell_owner(&self.agent, owner, reason, notice).await;
+            let service = self.resolve_agent(agent);
+            return super::desk::tell_owner(&service, self.desk, owner, reason, notice).await;
         }
         let candidates = match surface {
             Some(surface) => vec![surface.to_string()],
@@ -1004,12 +1020,7 @@ impl MonitorEngine {
             );
         }
         if m.action.desk().is_some() && !self.config.desk {
-            return Err(
-                "`surface = \"desk\"` tells you in Desk, and this hub doesn't run Desk (it is a \
-                 server hub): deliver on slack or teams here, or save the monitor on the hub \
-                 your Desk runs"
-                    .to_string(),
-            );
+            return Err(super::desk::NOT_ON_DESK.to_string());
         }
         if let (Some((_, None)), None) = (m.action.delivery(), m.binding()) {
             if sole_platform(&self.surfaces).await.is_none() {
@@ -1737,7 +1748,12 @@ impl MonitorEngine {
                 .filter(|s| *s != SURFACE_ANY)
                 .or(m.action.delivery().and_then(|(_, surface)| surface)),
         };
-        match self.sink.tell(owner, surface, reason, notice).await {
+        // Its findings' agent, whose DM its own news goes to as well.
+        let agent = match &m.action {
+            Action::AgentTask { agent, .. } => agent.as_deref(),
+            _ => None,
+        };
+        match self.sink.tell(owner, surface, agent, reason, notice).await {
             ActionOutcome::Done(_) => {}
             ActionOutcome::Transient(e) | ActionOutcome::Terminal(e) => {
                 warn!(monitor = %id, %owner, reason, error = %e, "monitor owner DM failed: {notice}")
@@ -2209,6 +2225,7 @@ mod tests {
             &self,
             owner: &str,
             _surface: Option<&str>,
+            _agent: Option<&str>,
             reason: &str,
             notice: &str,
         ) -> ActionOutcome {

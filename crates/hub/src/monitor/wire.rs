@@ -99,12 +99,15 @@ pub(crate) async fn wire(
                     Arc::clone(service),
                     Some(Arc::clone(adapter_loader)),
                 ));
-            let sink: Arc<dyn super::ActionSink> = Arc::new(super::WorkflowNotifySink::new(
-                wf_runtime,
-                Arc::clone(&service.surface_registry),
-                Arc::clone(service),
-                Arc::clone(&invoker),
-            ));
+            let sink: Arc<dyn super::ActionSink> = Arc::new(
+                super::WorkflowNotifySink::new(
+                    wf_runtime,
+                    Arc::clone(&service.surface_registry),
+                    Arc::clone(service),
+                    Arc::clone(&invoker),
+                )
+                .on_desk(config.desk.enabled),
+            );
             let engine = Arc::new(
                 super::MonitorEngine::new(
                     Arc::clone(&monitor_runtime),

@@ -81,7 +81,7 @@ async fn an_update_waits_for_a_pause_and_never_past_the_cap() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
-        assert!(!crew.typing_in("nobody"), "no boss by that name");
+        assert!(!crew.typing_in("nobody"), "no agent by that name");
         begun(&crew).await;
         let s = new_session(&d, dir.path(), "acme-web").await;
 

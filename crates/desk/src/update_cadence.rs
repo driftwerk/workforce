@@ -1068,8 +1068,8 @@ mod tests {
         assert_eq!(route(EventKind::NeedsYou, &custom, false), Route::RightAway);
     }
 
-    /// Quiet hours hold what would come right away for the roundup, except
-    /// what needs the person when they said so; they run over midnight.
+    /// A monitor's finding for the DM comes at once, out of the quiet
+    /// hours; a notice goes as progress does.
     #[test]
     fn a_monitor_tells_the_dm_at_once_but_not_in_the_quiet_hours_and_a_notice_as_progress() {
         let c = Cadence::default();
@@ -1103,6 +1103,8 @@ mod tests {
         );
     }
 
+    /// Quiet hours hold what would come right away for the roundup, except
+    /// what needs the person when they said so; they run over midnight.
     #[test]
     fn quiet_hours_hold_all_but_what_needs_you() {
         let c = balanced();

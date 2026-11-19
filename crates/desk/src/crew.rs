@@ -880,8 +880,8 @@ pub trait Crew: Send + Sync {
     ) -> Option<serde_json::Value> {
         None
     }
-    /// The person is typing in the boss `agent`'s DM: what it would post
-    /// waits for a pause. False when `agent` is no boss here.
+    /// The person is typing in `agent`'s DM: what it would post on its own
+    /// waits for a pause. False when there is no agent by that name here.
     fn dm_typing(&self, _agent: &str) -> bool {
         false
     }

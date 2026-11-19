@@ -786,7 +786,8 @@ input = { gmail_id = "{{id}}", subject = "{{json:/snippet}}" }
 # --- tell the person in Desk (only on a hub that runs Desk; a server hub refuses it) ---
 # type = "notify"                  # or agent_task, whose answer is what they read
 # surface = "desk"
-# target = "dm"                    # "dm" (default: their DM with you) | "notice" (worth knowing, not for them to act on)
+# target = "dm"                    # "dm" (default: their DM with you) | "notice" (worth knowing, not for them to act on);
+#                                  # an agent_task says it as deliver_to = "dm" | "notice"
 # template = "New invoice from {{json:/sender}}: {{json:/subject}}"
 # It comes right away, but waits through their quiet hours, for their roundup (a notice, as
 # progress does) and while they're away from the DM, then comes as one message.

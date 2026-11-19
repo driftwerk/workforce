@@ -116,7 +116,14 @@ impl ActionSink for RecordingSink {
         ActionOutcome::Done(None)
     }
 
-    async fn tell(&self, _: &str, _: Option<&str>, _: &str, _: &str) -> ActionOutcome {
+    async fn tell(
+        &self,
+        _: &str,
+        _: Option<&str>,
+        _: Option<&str>,
+        _: &str,
+        _: &str,
+    ) -> ActionOutcome {
         ActionOutcome::Done(None)
     }
 }

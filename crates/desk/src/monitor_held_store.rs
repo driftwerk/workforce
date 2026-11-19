@@ -18,8 +18,8 @@ pub enum HeldFor {
     Roundup,
     /// The person is away from the DM: until they are back.
     Away,
-    /// The person is typing in the DM, or the agent's reply there is being
-    /// written: until that is done.
+    /// The person is typing in the DM, the agent's reply there is being
+    /// written, or older findings for it wait: until that is done.
     Typing,
 }
 
@@ -46,6 +46,8 @@ impl HeldFor {
 /// One finding held for the person.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HeldFinding {
+    /// [`HeldFinding::id_of`] its dispatch: one row however often it is
+    /// held.
     pub id: Uuid,
     /// The agent whose DM it is told in.
     pub agent: String,
@@ -61,6 +63,22 @@ pub struct HeldFinding {
     /// Told no sooner than this, and only once the person is back.
     pub release_at: DateTime<Utc>,
 }
+
+impl HeldFinding {
+    /// The row a finding is kept as, from what makes it one (its monitor,
+    /// the person, the event it saw): a dispatch run again holds it again
+    /// as the same row, not a second one.
+    pub fn id_of(key: &str) -> Uuid {
+        Uuid::new_v5(
+            &Uuid::NAMESPACE_OID,
+            format!("monitor_held\n{key}").as_bytes(),
+        )
+    }
+}
+
+/// The most of one DM's due findings read at a look: the rest come at the
+/// next one.
+const DUE_PER_DM: i64 = 200;
 
 const COLUMNS: &str =
     "id, agent, owner, monitor_id, monitor_name, place, text, reason, held_at, release_at";
@@ -110,22 +128,51 @@ impl DeskStore {
         Ok(())
     }
 
-    /// Everything held whose time has come by `now` and that no one is
-    /// telling, oldest first.
+    /// What is held whose time has come by `now`, oldest first: the oldest
+    /// [`DUE_PER_DM`] of each DM and place, so one busy monitor keeps no
+    /// other DM waiting, and none of a DM whose findings are being told, so
+    /// what came since goes after them, not beside them.
     pub async fn monitor_held_due(&self, now: DateTime<Utc>) -> Result<Vec<HeldFinding>> {
         let client = self.pool().get().await?;
         let rows = client
             .query(
                 &format!(
-                    "SELECT {COLUMNS} FROM monitor_held WHERE release_at <= $1 \
-                     AND (claimed_until IS NULL OR claimed_until < now()) \
-                     ORDER BY held_at LIMIT 500"
+                    "SELECT {COLUMNS} FROM ( \
+                       SELECT *, row_number() OVER ( \
+                         PARTITION BY agent, owner, place ORDER BY held_at, id) AS nth \
+                       FROM monitor_held m WHERE release_at <= $1 \
+                       AND (claimed_until IS NULL OR claimed_until < now()) \
+                       AND NOT EXISTS (SELECT 1 FROM monitor_held t WHERE t.agent = m.agent \
+                         AND t.owner = m.owner AND t.place = m.place \
+                         AND t.claimed_until >= now())) due \
+                     WHERE nth <= $2 ORDER BY held_at, id"
                 ),
-                &[&now],
+                &[&now, &DUE_PER_DM],
             )
             .await
             .context("reading what monitors saw")?;
         rows.iter().map(held_of).collect()
+    }
+
+    /// Whether anything is held for `owner`'s DM with `agent` (as a notice
+    /// or not) whose time has come by `now`: what comes now goes after it.
+    pub async fn monitor_held_waiting(
+        &self,
+        agent: &str,
+        owner: &str,
+        notice: bool,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let client = self.pool().get().await?;
+        let place = if notice { "notice" } else { "dm" };
+        let row = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM monitor_held WHERE agent = $1 AND owner = $2 \
+                 AND place = $3 AND release_at <= $4)",
+                &[&agent, &owner, &place, &now],
+            )
+            .await?;
+        Ok(row.try_get(0)?)
     }
 
     /// Everything held for `agent`'s DM, due or not, oldest first.
@@ -189,7 +236,7 @@ mod tests {
 
     fn held(agent: &str, release_at: DateTime<Utc>, text: &str) -> HeldFinding {
         HeldFinding {
-            id: Uuid::new_v4(),
+            id: HeldFinding::id_of(&format!("invoices\nperson-1\n{agent}\n{text}")),
             agent: agent.into(),
             owner: "person-1".into(),
             monitor_id: "invoices".into(),
@@ -220,8 +267,24 @@ mod tests {
             );
             store.monitor_hold(&due).await.unwrap();
             store.monitor_hold(&later).await.unwrap();
-            // Held again (a retried dispatch): still one.
-            store.monitor_hold(&due).await.unwrap();
+            // Held again (a retried dispatch, a moment later): still one.
+            let again = HeldFinding {
+                held_at: due.held_at + chrono::Duration::seconds(5),
+                ..due.clone()
+            };
+            store.monitor_hold(&again).await.unwrap();
+            assert!(store
+                .monitor_held_waiting("scout", "person-1", false, now)
+                .await
+                .unwrap());
+            assert!(!store
+                .monitor_held_waiting("scout", "person-1", true, now)
+                .await
+                .unwrap());
+            assert!(!store
+                .monitor_held_waiting("lynx", "person-1", false, now)
+                .await
+                .unwrap());
 
             assert_eq!(
                 store.monitor_held_due(now).await.unwrap(),
@@ -238,12 +301,42 @@ mod tests {
                 "taken once"
             );
             assert!(store.monitor_held_due(now).await.unwrap().is_empty());
+            // Come since, while the first is being told: after it.
+            let since = held(
+                "scout",
+                now - chrono::Duration::seconds(1),
+                "Invoice from Initech",
+            );
+            store.monitor_hold(&since).await.unwrap();
+            assert!(store.monitor_held_due(now).await.unwrap().is_empty());
+            store.monitor_held_done(&[since.id]).await.unwrap();
             store.monitor_held_untake(&[due.id]).await.unwrap();
             assert_eq!(store.monitor_held_due(now).await.unwrap().len(), 1);
 
             store.monitor_held_done(&[due.id]).await.unwrap();
             assert!(store.monitor_held_due(now).await.unwrap().is_empty());
             assert_eq!(store.monitor_held_for("scout").await.unwrap(), vec![later]);
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_busy_dm_keeps_no_other_waiting() {
+        with_test_pool(crate::store::build_pool, |pool| async move {
+            let store = DeskStore::with_pool(pool).await.unwrap();
+            let now = Utc::now();
+            let due = now - chrono::Duration::minutes(1);
+            for n in 0..DUE_PER_DM + 5 {
+                store
+                    .monitor_hold(&held("scout", due, &format!("invoice {n}")))
+                    .await
+                    .unwrap();
+            }
+            let other = held("lynx", due, "Invoice from Initech");
+            store.monitor_hold(&other).await.unwrap();
+            let read = store.monitor_held_due(now).await.unwrap();
+            assert_eq!(read.len() as i64, DUE_PER_DM + 1);
+            assert!(read.contains(&other), "the quiet DM is read too");
         })
         .await;
     }

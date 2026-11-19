@@ -5,6 +5,8 @@
 //! - **Only on a hub that runs Desk.** A save on a server hub is refused
 //!   ([`super::engine::MonitorEngine::preflight`]); one that reaches a
 //!   dispatch anyway (a TOML file on disk) fails it for good, saying why.
+//!   On a hub that runs Desk, a dispatch before Desk has started (the
+//!   catch-up at boot) waits for it.
 //! - **The person's cadence decides when.** What the monitor saw is handed
 //!   to the crew ([`crate::desk_crew::CrewHub::monitor_told`]), which tells
 //!   it now, or holds it for the quiet hours, the roundup, or the person's
@@ -20,6 +22,9 @@ use workforce_orchestrator::monitor::{Action, DeskDelivery, MonitorEvent, Monito
 use super::engine::ActionOutcome;
 use crate::serve::AgentService;
 
+/// Why a Desk delivery waits on a hub that runs Desk.
+const DESK_STARTING: &str = "Desk hasn't started on this hub yet";
+
 /// Why a Desk delivery can't be made on this hub.
 pub(crate) const NOT_ON_DESK: &str = "this monitor tells you in Desk (`surface = \"desk\"`), and \
      this hub doesn't run Desk: deliver on slack or teams here, or save it on the hub your Desk runs";
@@ -32,17 +37,36 @@ pub(crate) const TELLS_DESK: &str = "Your answer is what the person reads: it is
 /// What one of the person's monitors saw, to tell them in Desk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Finding {
+    /// What makes it one (the monitor, the person, the event): held again
+    /// on a dispatch run again, it is still one.
+    pub key: String,
     pub monitor_id: String,
     pub monitor_name: String,
     pub place: DeskDelivery,
     pub text: String,
 }
 
+/// The crew to tell, with the agent as its hub serves it now; else how the
+/// dispatch ends: waiting for Desk to start on a hub that runs it
+/// (`desk_on`), refused on one that doesn't.
+#[cfg(feature = "postgres")]
+fn crew_of(
+    service: &AgentService,
+    desk_on: bool,
+) -> Result<(Arc<crate::desk_crew::CrewHub>, Arc<AgentService>), ActionOutcome> {
+    crate::desk_crew::for_agent(service).ok_or_else(|| match desk_on {
+        true => ActionOutcome::Transient(DESK_STARTING.to_string()),
+        false => ActionOutcome::Terminal(NOT_ON_DESK.to_string()),
+    })
+}
+
 /// Tell `owner` (else the person whose Desk this is) what `monitor` saw in
 /// `ev`, at `place` in their Desk DM with `service`'s agent. `from` is who
-/// the event came from, as an `agent_task`'s turn is told.
+/// the event came from, as an `agent_task`'s turn is told. `desk_on`: the
+/// hub runs Desk.
 pub(crate) async fn deliver(
     service: &Arc<AgentService>,
+    desk_on: bool,
     owner: Option<&str>,
     monitor: &MonitorMeta,
     ev: &MonitorEvent,
@@ -51,9 +75,11 @@ pub(crate) async fn deliver(
 ) -> ActionOutcome {
     #[cfg(feature = "postgres")]
     {
-        let Some(crew) = crate::desk_crew::for_service(service) else {
-            return ActionOutcome::Terminal(NOT_ON_DESK.to_string());
+        let (crew, service) = match crew_of(service, desk_on) {
+            Ok(found) => found,
+            Err(outcome) => return outcome,
         };
+        let service = &service;
         let Some(owner) = owner
             .map(str::to_string)
             .or_else(|| crew.person(Some(service)))
@@ -81,11 +107,14 @@ pub(crate) async fn deliver(
             return ActionOutcome::Done(None);
         }
         let finding = Finding {
+            key: key_of(monitor, &owner, ev),
             monitor_id: monitor.id.clone(),
             monitor_name: monitor.name.clone(),
             place,
             text,
         };
+        // Not told nor kept (Postgres is down): the dispatch is tried again,
+        // an agent_task's turn with it, rather than its finding lost.
         match crew.monitor_told(service, &owner, finding).await {
             Ok(_) => ActionOutcome::Done(None),
             Err(e) => ActionOutcome::Transient(format!("telling Desk: {e:#}")),
@@ -93,9 +122,15 @@ pub(crate) async fn deliver(
     }
     #[cfg(not(feature = "postgres"))]
     {
-        let _ = (service, owner, monitor, ev, place, from);
+        let _ = (service, desk_on, owner, monitor, ev, place, from);
         ActionOutcome::Terminal(NOT_ON_DESK.to_string())
     }
+}
+
+/// What makes `ev`'s finding one, for `owner`.
+#[cfg(feature = "postgres")]
+fn key_of(monitor: &MonitorMeta, owner: &str, ev: &MonitorEvent) -> String {
+    format!("{}\n{owner}\n{}", monitor.id, ev.dispatch_id())
 }
 
 /// The `agent_task` turn for `ev`, as `owner`: its answer, or how the
@@ -141,6 +176,7 @@ async fn turn(
         Ok(crate::serve::TurnOutcome::Stopped(stop)) => {
             if let Some(notice) = stop.notice() {
                 let told = Finding {
+                    key: format!("{}\nstopped", key_of(monitor, owner, ev)),
                     monitor_id: monitor.id.clone(),
                     monitor_name: monitor.name.clone(),
                     place: DeskDelivery::Notice,
@@ -164,16 +200,23 @@ async fn turn(
 /// cadence.
 pub(crate) async fn tell_owner(
     service: &Arc<AgentService>,
+    desk_on: bool,
     owner: &str,
     reason: &str,
     notice: &str,
 ) -> ActionOutcome {
     #[cfg(feature = "postgres")]
     {
-        let Some(crew) = crate::desk_crew::for_service(service) else {
-            return ActionOutcome::Terminal(format!("{reason}: {NOT_ON_DESK}"));
+        let (crew, service) = match crew_of(service, desk_on) {
+            Ok(found) => found,
+            Err(ActionOutcome::Transient(e) | ActionOutcome::Terminal(e)) => {
+                return ActionOutcome::Terminal(format!("{reason}: {e}"))
+            }
+            Err(done) => return done,
         };
+        let service = &service;
         let finding = Finding {
+            key: format!("{reason}\n{owner}\n{notice}"),
             monitor_id: reason.to_string(),
             monitor_name: "Your monitors".to_string(),
             place: DeskDelivery::Notice,
@@ -186,7 +229,7 @@ pub(crate) async fn tell_owner(
     }
     #[cfg(not(feature = "postgres"))]
     {
-        let _ = (service, owner, notice);
+        let _ = (service, desk_on, owner, notice);
         ActionOutcome::Terminal(format!("{reason}: {NOT_ON_DESK}"))
     }
 }

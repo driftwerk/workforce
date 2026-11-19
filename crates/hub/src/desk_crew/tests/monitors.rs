@@ -29,6 +29,7 @@ fn told(
 
 fn finding(place: DeskDelivery, text: &str) -> Finding {
     Finding {
+        key: format!("invoice-emails\n{PERSON}\n{text}"),
         monitor_id: "invoice-emails".into(),
         monitor_name: "Invoice emails".into(),
         place,
@@ -171,8 +172,8 @@ async fn away_from_the_dm_what_monitors_saw_gathers_into_one_message_for_their_r
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let (_overseer, scout, crew, d) = scout_under(dir.path(), pool, |_| String::new()).await;
-        // Read up to a minute ago, and Scout posted since: unread past the
-        // five minutes (500 ms here) that make them away.
+        // Read up to now: what Scout posts next is unread, and past the
+        // five minutes (500 ms here) that makes them away.
         let read = chrono::Utc::now();
         crew.test_reads.lock().insert("scout".into(), read);
         crew.monitor_told(&scout, PERSON, finding(DeskDelivery::Dm, "First invoice"))
@@ -234,6 +235,135 @@ async fn away_from_the_dm_what_monitors_saw_gathers_into_one_message_for_their_r
     .await;
 }
 
+/// What Scout, which oversees nothing, would say on its own waits while the
+/// person types to it and while its reply in the DM is being written, as a
+/// boss's updates do; it goes when they pause, or the reply ends.
+#[tokio::test(flavor = "multi_thread")]
+async fn typing_or_a_reply_being_written_holds_a_finding_in_any_agents_dm() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, scout, crew, _d) = scout_under(dir.path(), pool, |_| String::new()).await;
+        // A first finding makes the DM.
+        crew.monitor_told(&scout, PERSON, finding(DeskDelivery::Dm, "First invoice"))
+            .await
+            .unwrap();
+
+        assert!(crew.typing_in("scout"), "any agent's DM is typed in");
+        let held = crew
+            .monitor_told(&scout, PERSON, finding(DeskDelivery::Dm, "While typing"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                held,
+                MonitorTold::Held {
+                    why: HeldFor::Typing,
+                    ..
+                }
+            ),
+            "{held:?}"
+        );
+        let said = eventually("told after the pause", async || {
+            told(&scout, DeliveryKind::Monitor).into_iter().nth(1)
+        })
+        .await;
+        assert_eq!(said.content, "While typing");
+
+        // Scout's reply in the DM is being written.
+        let sid = scout
+            .sessions
+            .find(DESK_CHANNEL, PERSON)
+            .unwrap()
+            .expect("the DM")
+            .id;
+        crew.dm_turns.lock().insert(sid.clone());
+        let held = crew
+            .monitor_told(&scout, PERSON, finding(DeskDelivery::Dm, "Mid-reply"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                held,
+                MonitorTold::Held {
+                    why: HeldFor::Typing,
+                    ..
+                }
+            ),
+            "{held:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            told(&scout, DeliveryKind::Monitor).len(),
+            2,
+            "not into the reply"
+        );
+        crew.dm_turns.lock().remove(&sid);
+        crew.update_poke.notify_one();
+        let said = eventually("told once the reply ended", async || {
+            told(&scout, DeliveryKind::Monitor).into_iter().nth(2)
+        })
+        .await;
+        assert_eq!(said.content, "Mid-reply");
+    })
+    .await;
+}
+
+/// What comes while older findings wait to be told for the DM goes after
+/// them, in one message, not ahead of them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_finding_waits_behind_older_ones_for_the_same_dm() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, scout, crew, d) = scout_under(dir.path(), pool, |_| String::new()).await;
+        let older = workforce_desk::monitor_held_store::HeldFinding {
+            id: uuid::Uuid::new_v4(),
+            agent: "scout".into(),
+            owner: PERSON.into(),
+            monitor_id: "invoice-emails".into(),
+            monitor_name: "Invoice emails".into(),
+            notice: false,
+            text: "Older invoice".into(),
+            reason: HeldFor::Away,
+            held_at: chrono::Utc::now() - chrono::Duration::minutes(5),
+            release_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+        };
+        d.store().monitor_hold(&older).await.unwrap();
+        // Being told (taken) by a look that hasn't finished.
+        d.store().monitor_held_take(&[older.id]).await.unwrap();
+        let held = crew
+            .monitor_told(&scout, PERSON, finding(DeskDelivery::Dm, "Newer invoice"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                held,
+                MonitorTold::Held {
+                    why: HeldFor::Typing,
+                    ..
+                }
+            ),
+            "{held:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            told(&scout, DeliveryKind::Monitor).is_empty(),
+            "not ahead of the older"
+        );
+
+        d.store().monitor_held_untake(&[older.id]).await.unwrap();
+        let said = eventually("both, in order", async || {
+            told(&scout, DeliveryKind::Monitor).into_iter().next()
+        })
+        .await;
+        let (o, n) = (
+            said.content.find("Older invoice").expect("older"),
+            said.content.find("Newer invoice").expect("newer"),
+        );
+        assert!(o < n, "{}", said.content);
+    })
+    .await;
+}
+
 /// A monitor's meta from `action` (TOML), watching a source.
 fn meta(action: &str) -> MonitorMeta {
     MonitorDefinition::from_toml(&format!(
@@ -261,11 +391,21 @@ async fn a_hub_that_runs_no_desk_refuses_to_tell_anyone_there() {
         item: json!({"uid": 7, "subject": "Invoice"}),
     });
     let outcome =
-        crate::monitor::desk::deliver(&lone, Some(PERSON), &m, &ev, DeskDelivery::Dm, "").await;
+        crate::monitor::desk::deliver(&lone, false, Some(PERSON), &m, &ev, DeskDelivery::Dm, "")
+            .await;
     let crate::monitor::ActionOutcome::Terminal(why) = outcome else {
         panic!("a dispatch with no Desk to tell ends for good");
     };
     assert!(why.contains("doesn't run Desk"), "{why}");
+    // A hub that runs Desk, before it has started (the catch-up at boot):
+    // tried again, not lost.
+    let early =
+        crate::monitor::desk::deliver(&lone, true, Some(PERSON), &m, &ev, DeskDelivery::Dm, "")
+            .await;
+    let crate::monitor::ActionOutcome::Transient(why) = early else {
+        panic!("a dispatch before Desk starts is tried again");
+    };
+    assert!(why.contains("hasn't started"), "{why}");
 }
 
 /// `email.inbox` over a fake mailbox: each read answers what is in it now,
@@ -315,17 +455,18 @@ impl crate::monitor::ActionSink for DeskSink {
         ev: &MonitorEvent,
     ) -> crate::monitor::ActionOutcome {
         let place = monitor.action.desk().expect("a Desk monitor");
-        crate::monitor::desk::deliver(&self.0, owner, monitor, ev, place, "the inbox").await
+        crate::monitor::desk::deliver(&self.0, true, owner, monitor, ev, place, "the inbox").await
     }
 
     async fn tell(
         &self,
         owner: &str,
         _surface: Option<&str>,
+        _agent: Option<&str>,
         reason: &str,
         notice: &str,
     ) -> crate::monitor::ActionOutcome {
-        crate::monitor::desk::tell_owner(&self.0, owner, reason, notice).await
+        crate::monitor::desk::tell_owner(&self.0, true, owner, reason, notice).await
     }
 }
 
@@ -484,6 +625,7 @@ async fn an_agent_tasks_answer_is_what_desk_is_told() {
         });
         let outcome = crate::monitor::desk::deliver(
             &scout,
+            true,
             Some(PERSON),
             &m,
             &ev,

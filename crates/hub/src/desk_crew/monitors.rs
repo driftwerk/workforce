@@ -9,22 +9,26 @@
 //!   comes right away; a notice goes as progress does (the roundup, in
 //!   Balanced). In the quiet hours either waits for the first roundup
 //!   after them ([`cadence::monitor_route`]).
-//! - **Away and typing.** What would come right away waits while the person
-//!   is away from the DM (its posts unread `away_after_minutes`, as a
-//!   boss's are judged), while they type there, or while the agent's reply
-//!   there is being written; it goes once they are back.
+//! - **Away, typing, in order.** What would come right away waits while the
+//!   person is away from the DM (its posts unread `away_after_minutes`, as
+//!   a boss's are judged), while they type there, while the agent's reply
+//!   there is being written, and behind what already waits for that DM; it
+//!   goes once they are back.
 //! - **Held is kept.** What waits is kept in Postgres (`monitor_held`)
-//!   before the dispatch is done, so a restart loses none of it. When its
-//!   time comes, everything due for one DM goes as one message: one finding
-//!   in its own words, several under a line saying why they waited.
+//!   before the dispatch is done, so a restart loses none of it, as one row
+//!   however often its dispatch runs. When its time comes, everything due
+//!   for one DM goes as one message: one finding in its own words, several
+//!   under a line saying why they waited (the first [`SHOWN`] in full, the
+//!   rest counted).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use uuid::Uuid;
 use workforce_common::channels::desk::{DeliveryKind, DeskPlace, DeskTarget, DESK_CHANNEL};
 use workforce_common::oversight::{Oversight, Route};
+use workforce_desk::crew::Crew as _;
 use workforce_desk::monitor_held_store::{HeldFinding, HeldFor};
 use workforce_desk::update_cadence as cadence;
 use workforce_orchestrator::monitor::DeskDelivery;
@@ -33,7 +37,13 @@ use super::CrewHub;
 use crate::desk_surface::{Delivered, Delivery};
 use crate::monitor::desk::Finding;
 use crate::serve::AgentService;
-use workforce_desk::crew::Crew as _;
+
+/// The most findings one held message shows in full; the rest are counted.
+pub(crate) const SHOWN: usize = 20;
+
+/// How long what was held for an agent the hub no longer serves is kept,
+/// in case it comes back (a reload, a config being fixed).
+const GONE_AFTER: Duration = Duration::days(7);
 
 /// How a monitor's finding was told.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,19 +86,33 @@ impl CrewHub {
         let now = Utc::now();
         let notice = finding.place == DeskDelivery::Notice;
         let quiet = cadence::quiet_now(&c, now, &tz);
+        let store = self.desk.store();
         let (why, until) = match cadence::monitor_route(notice, &c, quiet) {
             Route::RightAway => {
                 let dm = self.dm_look(service, owner, &o);
                 if dm.away.is_some() {
                     (HeldFor::Away, now)
-                } else if self.update_held(agent, dm.session.as_deref()) {
+                } else if self.dm_held(agent, dm.session.as_deref())
+                    || store
+                        .monitor_held_waiting(agent, owner, notice, now)
+                        .await?
+                {
                     (HeldFor::Typing, now)
                 } else {
-                    let told = self
-                        .tell_monitor(service, owner, notice, finding.text)
-                        .await?;
-                    tracing::info!(agent, monitor = %finding.monitor_id, "a monitor told the person in Desk");
-                    return Ok(MonitorTold::Now(told));
+                    match self
+                        .tell_monitor(service, owner, notice, finding.text.clone())
+                        .await
+                    {
+                        Ok(told) => {
+                            tracing::info!(agent, monitor = %finding.monitor_id, "a monitor told the person in Desk");
+                            return Ok(MonitorTold::Now(told));
+                        }
+                        // Kept to be told at the next look instead.
+                        Err(e) => {
+                            tracing::warn!(agent, monitor = %finding.monitor_id, error = %format!("{e:#}"), "telling the person what a monitor saw failed: kept for the next look");
+                            (HeldFor::Typing, now)
+                        }
+                    }
                 }
             }
             Route::Roundup | Route::Ask => (
@@ -100,10 +124,9 @@ impl CrewHub {
                 cadence::next_roundup(&c, now, &tz).unwrap_or(now),
             ),
         };
-        self.desk
-            .store()
+        store
             .monitor_hold(&HeldFinding {
-                id: Uuid::new_v4(),
+                id: HeldFinding::id_of(&format!("{agent}\n{}", finding.key)),
                 agent: agent.to_string(),
                 owner: owner.to_string(),
                 monitor_id: finding.monitor_id.clone(),
@@ -116,9 +139,9 @@ impl CrewHub {
             })
             .await?;
         tracing::info!(agent, monitor = %finding.monitor_id, why = why.as_str(), %until, "a monitor's finding is held for the person");
-        // Typing or a reply being written ends within minutes: looked at
-        // again as the updates are.
         if why == HeldFor::Typing {
+            // A pause in their typing lets it go before the next minute's
+            // look; a reply ending, or older findings told, pokes as well.
             self.poke_at_release(agent);
         }
         Ok(MonitorTold::Held { until, why })
@@ -163,17 +186,24 @@ impl CrewHub {
         let tz = self.timezone();
         for ((agent, owner, notice), held) in by_dm {
             let Some(service) = self.state.registry.get(&agent) else {
-                // Its agent is gone, and its DM with it.
-                tracing::warn!(%agent, n = held.len(), "what monitors saw for an agent that is gone was forgotten");
-                let ids: Vec<Uuid> = held.iter().map(|h| h.id).collect();
-                if let Err(e) = store.monitor_held_done(&ids).await {
-                    tracing::warn!(error = %format!("{e:#}"), "forgetting what monitors saw failed");
+                // Its agent isn't served now: kept a while, in case it
+                // comes back, then forgotten with its DM.
+                let gone: Vec<Uuid> = held
+                    .iter()
+                    .filter(|h| h.held_at < now - GONE_AFTER)
+                    .map(|h| h.id)
+                    .collect();
+                if !gone.is_empty() {
+                    tracing::warn!(%agent, n = gone.len(), "what monitors saw for an agent that is gone was forgotten");
+                    if let Err(e) = store.monitor_held_done(&gone).await {
+                        tracing::warn!(error = %format!("{e:#}"), "forgetting what monitors saw failed");
+                    }
                 }
                 continue;
             };
             let o = self.monitor_oversight(&service);
             let dm = self.dm_look(&service, &owner, &o);
-            if dm.away.is_some() || self.update_held(&agent, dm.session.as_deref()) {
+            if dm.away.is_some() || self.dm_held(&agent, dm.session.as_deref()) {
                 continue;
             }
             let ids: Vec<Uuid> = held.iter().map(|h| h.id).collect();
@@ -190,7 +220,7 @@ impl CrewHub {
                 continue;
             }
             match self
-                .tell_monitor(&service, &owner, notice, held_text(&held, &tz))
+                .tell_monitor(&service, &owner, notice, held_text(&held, now, &tz))
                 .await
             {
                 Ok(_) => {
@@ -212,12 +242,25 @@ impl CrewHub {
 
 /// What one message says of `held`, oldest first: one finding in its own
 /// words, noting what held it; several under a line saying why they
-/// waited, each with its monitor and when it was seen (local time in `tz`).
-pub(crate) fn held_text<Tz: chrono::TimeZone>(held: &[HeldFinding], tz: &Tz) -> String
+/// waited, each with its monitor and when it was seen (local time in `tz`,
+/// with the day when it wasn't `now`'s), the first [`SHOWN`] in full and
+/// the rest counted by monitor.
+pub(crate) fn held_text<Tz: chrono::TimeZone>(
+    held: &[HeldFinding],
+    now: DateTime<Utc>,
+    tz: &Tz,
+) -> String
 where
     Tz::Offset: std::fmt::Display,
 {
-    let at = |h: &HeldFinding| h.held_at.with_timezone(tz).format("%H:%M").to_string();
+    let today = now.with_timezone(tz).date_naive();
+    let at = |h: &HeldFinding| {
+        let local = h.held_at.with_timezone(tz);
+        match local.date_naive() == today {
+            true => local.format("%H:%M").to_string(),
+            false => local.format("%a %H:%M").to_string(),
+        }
+    };
     let why = held
         .iter()
         .map(|h| h.reason)
@@ -248,19 +291,31 @@ where
         HeldFor::Roundup => "Since the last roundup, your monitors saw:",
         HeldFor::Typing => "Your monitors saw:",
     };
-    let items: Vec<String> = held
+    let mut parts: Vec<String> = held
         .iter()
+        .take(SHOWN)
         .map(|h| format!("**{}** · {}\n{}", h.monitor_name, at(h), h.text))
         .collect();
-    format!("{lead}\n\n{}", items.join("\n\n"))
+    let mut more: BTreeMap<&str, usize> = BTreeMap::new();
+    for h in held.iter().skip(SHOWN) {
+        *more.entry(h.monitor_name.as_str()).or_default() += 1;
+    }
+    if !more.is_empty() {
+        let counted: Vec<String> = more
+            .iter()
+            .map(|(name, n)| format!("{n} more from {name}"))
+            .collect();
+        parts.push(format!("…and {}.", counted.join(", ")));
+    }
+    format!("{lead}\n\n{}", parts.join("\n\n"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
-    fn held(name: &str, text: &str, reason: HeldFor, hour: u32) -> HeldFinding {
-        use chrono::TimeZone;
+    fn held(name: &str, text: &str, reason: HeldFor, day: u32, hour: u32) -> HeldFinding {
         HeldFinding {
             id: Uuid::new_v4(),
             agent: "scout".into(),
@@ -270,41 +325,66 @@ mod tests {
             notice: false,
             text: text.into(),
             reason,
-            held_at: Utc.with_ymd_and_hms(2026, 11, 19, hour, 5, 0).unwrap(),
+            held_at: Utc.with_ymd_and_hms(2026, 11, day, hour, 5, 0).unwrap(),
             release_at: Utc::now(),
         }
+    }
+
+    /// Thursday 19 November 2026, 09:00 UTC.
+    fn now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 11, 19, 9, 0, 0).unwrap()
     }
 
     #[test]
     fn one_held_finding_is_its_own_words_with_why_it_waited() {
         let tz = chrono_tz::UTC;
-        let one = held("Invoices", "Acme sent invoice 42.", HeldFor::Quiet, 23);
+        let one = held("Invoices", "Acme sent invoice 42.", HeldFor::Away, 19, 7);
         assert_eq!(
-            held_text(std::slice::from_ref(&one), &tz),
-            "Acme sent invoice 42.\n\n_Invoices saw this at 23:05, held for the quiet hours._"
+            held_text(std::slice::from_ref(&one), now(), &tz),
+            "Acme sent invoice 42.\n\n_Invoices saw this at 07:05, while you were away._"
         );
         let typing = HeldFinding {
             reason: HeldFor::Typing,
             ..one
         };
-        assert_eq!(held_text(&[typing], &tz), "Acme sent invoice 42.");
+        assert_eq!(held_text(&[typing], now(), &tz), "Acme sent invoice 42.");
     }
 
     #[test]
-    fn several_go_as_one_message_under_why_they_waited() {
+    fn several_go_as_one_message_under_why_they_waited_with_the_day_when_not_today() {
         let tz = chrono_tz::UTC;
         let text = held_text(
             &[
-                held("Invoices", "Acme sent invoice 42.", HeldFor::Quiet, 23),
-                held("Invoices", "Globex sent invoice 7.", HeldFor::Away, 6),
+                held("Invoices", "Acme sent invoice 42.", HeldFor::Quiet, 18, 23),
+                held("Invoices", "Globex sent invoice 7.", HeldFor::Away, 19, 6),
             ],
+            now(),
             &tz,
         );
         assert_eq!(
             text,
             "While you were away, your monitors saw:\n\n\
-             **Invoices** · 23:05\nAcme sent invoice 42.\n\n\
+             **Invoices** · Wed 23:05\nAcme sent invoice 42.\n\n\
              **Invoices** · 06:05\nGlobex sent invoice 7."
+        );
+    }
+
+    #[test]
+    fn past_the_first_twenty_the_rest_are_counted_by_monitor() {
+        let tz = chrono_tz::UTC;
+        let mut many: Vec<HeldFinding> = (0..SHOWN)
+            .map(|n| held("Invoices", &format!("invoice {n}"), HeldFor::Away, 19, 1))
+            .collect();
+        many.extend((0..3).map(|n| held("Invoices", &format!("late {n}"), HeldFor::Away, 19, 2)));
+        many.push(held("Refunds", "refund", HeldFor::Away, 19, 3));
+        let text = held_text(&many, now(), &tz);
+        assert!(
+            text.contains("invoice 19") && !text.contains("late 0"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("…and 3 more from Invoices, 1 more from Refunds."),
+            "{text}"
         );
     }
 }
