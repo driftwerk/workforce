@@ -82,25 +82,37 @@ pub(crate) fn held_for<'a>(open: &'a [OpenItem], s: Uuid, work: &Work) -> Vec<&'
     }
     open.iter()
         .filter(|i| i.kind == OpenKind::Order && i.state != OpenState::Closed)
-        .filter(|i| write::asks_for_word(&i.text) || !standing(&i.text))
+        .filter(|i| answers(&i.text))
         .filter(|i| i.linked().contains(&s) || keys.iter().any(|k| names(&i.text, k)))
         .collect()
 }
 
+/// Words an answer to something asked is given in: "yes", "go with option
+/// B", "approved", beside what asks ([`write::asks_for_word`]).
+const ANSWER_WORDS: &[&str] = &[
+    "yes", "ok", "okay", "agreed", "go with", "option", "chose", "choose", "pick", "take the",
+    "ship it", "go ahead",
+];
+
+/// Whether an order answers something asked ("ok yes to all to approve the
+/// design", "go with option B"), not a standing instruction ("Keep the old
+/// index until Friday") or more work ("also add tests for the importer").
+fn answers(text: &str) -> bool {
+    let l = text.to_lowercase();
+    !standing(text) && (write::asks_for_word(text) || ANSWER_WORDS.iter().any(|w| names(&l, w)))
+}
+
 /// Whether an order is a standing instruction ("Keep the old index until
-/// Friday", "Don't touch staging"), not an answer to something asked.
+/// Friday", "Note: don't deploy"), not an answer to something asked.
 fn standing(text: &str) -> bool {
     let l = text.to_lowercase().replace('\u{2019}', "'");
-    let first = l
-        .split([':', '\n'])
-        .map(str::trim)
-        .find(|p| !p.is_empty() && !write::is_id(p))
-        .unwrap_or_default();
-    [
+    let rules = [
         "keep ", "don't ", "do not ", "never ", "always ", "stop ", "leave ",
-    ]
-    .iter()
-    .any(|w| first.starts_with(w))
+    ];
+    l.split([':', '\n', '.', ';'])
+        .map(str::trim)
+        .filter(|p| !p.is_empty() && !write::is_id(p))
+        .any(|p| rules.iter().any(|w| p.starts_with(w)))
         || names(&l, "until")
 }
 
@@ -143,7 +155,7 @@ fn given(
     // Still on its way: going now, not given.
     if mine
         .iter()
-        .any(|m| ours(m) && m.delivery != Delivery::Delivered)
+        .any(|m| ours(m) && matches!(m.delivery, Delivery::Queued | Delivery::Handed))
     {
         return Some(Given::Going);
     }
@@ -156,7 +168,8 @@ fn given(
 
 /// How what a boss holds already went to a session.
 enum Given {
-    /// Queued on its line, not yet read.
+    /// Queued on its line for the running session, not yet read (one held
+    /// for a session not running isn't on its way).
     Going,
     /// It reached the session then.
     At(DateTime<Utc>),
@@ -275,6 +288,15 @@ mod tests {
         let kept = order("Keep the old index until Friday", vec![s]);
         let plain = order("VEL-22: go with option B, the 60 minute window", vec![]);
         assert_eq!(held_for(std::slice::from_ref(&plain), s, &work).len(), 1);
+        for not in [
+            "VEL-22: also add tests for the importer",
+            "VEL-22. Note: don't deploy it",
+        ] {
+            assert!(
+                held_for(&[order(not, vec![s])], s, &work).is_empty(),
+                "{not}"
+            );
+        }
         let open = vec![answers.clone(), other, linked.clone(), kept];
         let held: Vec<Uuid> = held_for(&open, s, &work).iter().map(|i| i.id).collect();
         assert_eq!(held, vec![answers.id, linked.id]);

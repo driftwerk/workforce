@@ -57,6 +57,10 @@ pub(crate) const RECHECK: &str = "recheck:";
 /// handed again, in minutes.
 const HANDED_AGAIN: i32 = 60;
 
+/// What a re-check after the person's answer is kept with (its
+/// `done_when`): looked at for the session still stuck, not for one wait.
+const SETTLED: &str = "after the person's answer";
+
 /// The fewest minutes before a re-check.
 const RECHECK_MINUTES: u32 = 15;
 
@@ -76,7 +80,7 @@ pub(crate) fn recheck_of(key: &str) -> Option<(Uuid, DateTime<Utc>)> {
 
 /// Whether `waiting_on` names the boss (Desk, or its name): its own to
 /// answer.
-fn names_boss(waiting_on: &str, boss_name: &str) -> bool {
+pub(super) fn names_boss(waiting_on: &str, boss_name: &str) -> bool {
     let l = waiting_on.to_lowercase();
     let word = |w: &str| {
         let w = w.to_lowercase();
@@ -88,7 +92,7 @@ fn names_boss(waiting_on: &str, boss_name: &str) -> bool {
 }
 
 /// Whether `waiting_on` names the person: "you", "the owner", "Kingsley".
-fn names_person(waiting_on: &str, person: Option<&str>) -> bool {
+pub(super) fn names_person(waiting_on: &str, person: Option<&str>) -> bool {
     let l = waiting_on.to_lowercase();
     let words: Vec<&str> = l.split(|c: char| !c.is_alphanumeric()).collect();
     ["you", "your", "owner", "person", "user"]
@@ -183,12 +187,7 @@ impl CrewHub {
             // 1. The person's word the session says is missing, which the
             // boss holds: given, and said so. Never for what it says it
             // waits on outside the crew ("awaiting the reviewer").
-            let outside = changed
-                .and_then(|c| c.waiting_on.as_deref())
-                .is_some_and(|w| {
-                    !names_person(w, self.person(None).as_deref())
-                        && !names_boss(w, &self.boss_name_of(boss))
-                });
+            let outside = changed.is_some_and(|c| self.waits_outside(boss, c));
             if let Some(held) = b.held.get(&sid).filter(|h| !h.is_empty()) {
                 if !outside && write::says_missing(&all) {
                     if let Some(m) = self
@@ -230,16 +229,19 @@ impl CrewHub {
         use super::held::Held;
         let s = view.id;
         let mut sent = false;
+        let mut going = false;
         let mut given: Option<DateTime<Utc>> = None;
         let mut not: Option<String> = None;
         for i in held {
             match self.deliver_held(boss, s, i, since).await {
-                Held::Sent | Held::Going => sent = true,
+                Held::Sent => sent = true,
+                Held::Going => going = true,
                 Held::Given(at) => given = given.max(Some(at)),
                 Held::Suggested(why) | Held::Refused(why) => not = Some(why),
             }
         }
-        if sent {
+        // On its way to the session: said so only where the boss acts.
+        if sent || (going && acts) {
             return Some(Mover::Boss {
                 doing: "I'm passing them to its session now.".into(),
             });
@@ -278,7 +280,7 @@ impl CrewHub {
             "{} says your word is missing; you gave it as: {words} Answer here and it goes to its session",
             work.in_words()
         );
-        self.person_moves(boss, o, view, &question, all, since, now)
+        self.person_moves(boss, o, view, &question, all, since, acts, now)
             .await
     }
 
@@ -294,6 +296,7 @@ impl CrewHub {
         question: &str,
         words: &str,
         since: DateTime<Utc>,
+        acts: bool,
         now: DateTime<Utc>,
     ) -> Option<Mover> {
         use super::waiting::Stall;
@@ -305,10 +308,32 @@ impl CrewHub {
                 question: asked(&i),
                 item: i.id,
             }),
+            // Answered since it last said where it is: the boss sees it
+            // acts on their answer, or, where it doesn't act, looks again.
             Stall::Settled(at) => {
                 let at = at.with_timezone(&self.desk.timezone()).format("%H:%M");
+                if acts {
+                    let handed = self.hand_stall(
+                        boss,
+                        view.id,
+                        format!(
+                            "The person answered what {} waited on at {at}, and your update still \
+                             reads it as stuck. Make sure their answer reached it and it acts on \
+                             it now (crew.nudge); if it needs more of them, ask with \
+                             crew.ask_person.",
+                            view.label()
+                        ),
+                    );
+                    return Some(Mover::Boss {
+                        doing: self.doing(
+                            handed,
+                            &format!("You answered at {at}; I'm seeing its session acts on it now."),
+                            &format!("You answered at {at}; I've been seeing its session acts on it since"),
+                        ),
+                    });
+                }
                 let on = format!("its session to act on your answer from {at}");
-                let due = self.keep_recheck(boss, o, view, &on, now).await?;
+                let due = self.keep_recheck(boss, o, view, &on, true, now).await?;
                 Some(Mover::Outside { on, check_at: due })
             }
             Stall::Failed => None,
@@ -418,7 +443,7 @@ impl CrewHub {
                 ),
             };
             if let Some(m) = self
-                .person_moves(boss, o, view, &question, &words, since, now)
+                .person_moves(boss, o, view, &question, &words, since, acts, now)
                 .await
             {
                 return Some(m);
@@ -426,7 +451,7 @@ impl CrewHub {
         }
         // 7. Outside the crew: looked at again, and when.
         if let Some(w) = waiting_on.filter(|_| !theirs) {
-            if let Some(due) = self.keep_recheck(boss, o, view, w, now).await {
+            if let Some(due) = self.keep_recheck(boss, o, view, w, false, now).await {
                 return Some(Mover::Outside {
                     on: w.to_string(),
                     check_at: due,
@@ -442,7 +467,16 @@ impl CrewHub {
                 workforce_desk::crew::one_line(all, 200)
             );
             return self
-                .person_moves(boss, o, view, &question, &words_of(changed), since, now)
+                .person_moves(
+                    boss,
+                    o,
+                    view,
+                    &question,
+                    &words_of(changed),
+                    since,
+                    false,
+                    now,
+                )
                 .await;
         }
         let handed = self.hand_stall(
@@ -478,8 +512,17 @@ impl CrewHub {
         }
     }
 
+    /// Whether `c` says it waits on something outside the crew: neither the
+    /// person nor its boss ("CI", "the reviewer's approval").
+    pub(super) fn waits_outside(&self, boss: &str, c: &Changed) -> bool {
+        c.waiting_on.as_deref().is_some_and(|w| {
+            !names_person(w, self.person(None).as_deref())
+                && !names_boss(w, &self.boss_name_of(boss))
+        })
+    }
+
     /// What the person calls boss `boss`.
-    fn boss_name_of(&self, boss: &str) -> String {
+    pub(super) fn boss_name_of(&self, boss: &str) -> String {
         self.overseer_named(boss)
             .map(|(s, _)| super::name_of(&s))
             .unwrap_or_else(|| "Desk".into())
@@ -546,14 +589,18 @@ impl CrewHub {
         o: &Oversight,
         view: &workforce_desk::model::SessionView,
         on: &str,
+        settled: bool,
         now: DateTime<Utc>,
     ) -> Option<DateTime<Utc>> {
         let store = self.desk.store();
         let open = store.items_not_closed(Some(boss)).await.ok()?;
         let prefix = format!("{RECHECK}{}:", view.id);
+        let on = workforce_desk::crew::one_line(on, 200);
+        // The one kept for the same wait: never another's time.
         if let Some(due) = open
             .iter()
             .filter(|i| i.dedupe_key.starts_with(&prefix))
+            .filter(|i| i.holding_up.as_deref() == Some(on.as_str()))
             .filter_map(|i| recheck_of(&i.dedupe_key).map(|(_, d)| d))
             .filter(|d| *d > now)
             .min()
@@ -564,7 +611,6 @@ impl CrewHub {
         let after = o.updates.every_minutes.max(RECHECK_MINUTES);
         let due = now + minute * after as i32;
         let tz = self.desk.timezone();
-        let on = workforce_desk::crew::one_line(on, 200);
         let mut new = NewItem::ask(
             boss,
             OpenKind::Promise,
@@ -579,6 +625,7 @@ impl CrewHub {
         new.said = false;
         new.sessions = vec![view.id];
         new.holding_up = Some(on);
+        new.done_when = settled.then(|| SETTLED.to_string());
         match store.item_open(&new).await {
             Ok(Opened::New(_) | Opened::Again(_)) => Some(due),
             Err(e) => {
@@ -611,7 +658,20 @@ impl CrewHub {
                 continue;
             }
             let on = i.holding_up.clone().unwrap_or_default();
+            let settled = i.done_when.as_deref() == Some(SETTLED);
             let still = match self.desk.session_accounts_of(&[s]).await {
+                // After the person's answer: while it still waits or says
+                // it is stuck.
+                Ok(a) if settled => a.iter().any(|a| {
+                    a.waiting_on
+                        .as_deref()
+                        .is_some_and(|w| !w.trim().is_empty())
+                        || a.done.last().is_some_and(|d| {
+                            write::says_stall(&d.text)
+                                || write::says_missing(&d.text)
+                                || write::asks_for_word(&d.text)
+                        })
+                }),
                 Ok(a) => a.iter().any(|a| {
                     a.waiting_on.as_deref().map(str::trim).is_some_and(|w| {
                         !w.is_empty() && workforce_desk::crew::one_line(w, 200) == on

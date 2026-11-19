@@ -404,14 +404,16 @@ impl DeskStore {
             .is_some())
     }
 
-    /// When the person last settled `boss`'s item keyed `key` (closed it by
-    /// their answer), if they did.
+    /// When the person last settled `boss`'s item keyed `key` (answered it,
+    /// or settled it in its session; never dropped or set aside), if they
+    /// did.
     pub async fn item_last_settled(&self, boss: &str, key: &str) -> Result<Option<DateTime<Utc>>> {
         let client = self.pool().get().await?;
         Ok(client
             .query_opt(
                 "SELECT max(closed_at) FROM boss_open_items \
-                 WHERE boss = $1 AND dedupe_key = $2 AND state = 'closed' AND closed_by = 'person'",
+                 WHERE boss = $1 AND dedupe_key = $2 AND state = 'closed' AND closed_by = 'person' \
+                 AND (closed_why LIKE 'You answered%' OR closed_why LIKE 'You settled%')",
                 &[&boss, &key],
             )
             .await?

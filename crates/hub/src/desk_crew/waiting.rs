@@ -732,9 +732,10 @@ impl CrewHub {
                 .filter(|d| d.at > i.opened_at)
                 .map(|d| d.text.as_str())
                 .collect();
-            let still = newer
-                .iter()
-                .any(|t| write::says_stall(t) || write::says_missing(t) || write::asks_for_word(t));
+            // What it says now: its newest line since.
+            let still = newer.last().is_some_and(|t| {
+                write::says_stall(t) || write::says_missing(t) || write::asks_for_word(t)
+            });
             let on_boss = self
                 .desk
                 .line_thread(s, None, Some(30))

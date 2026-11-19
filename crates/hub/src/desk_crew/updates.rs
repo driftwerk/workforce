@@ -402,8 +402,11 @@ impl CrewHub {
         };
         let gap = self.answer_gap(o);
         let all_open: Vec<OpenItem> = store.items_not_closed(Some(boss)).await.unwrap_or_default();
+        // What it holds of the person's word, for each session that waits
+        // on it: never one that says it waits outside the crew.
         let held: HashMap<Uuid, Vec<OpenItem>> = sessions
             .iter()
+            .filter(|s| !self.waits_outside(boss, s))
             .map(|s| {
                 let h: Vec<OpenItem> = super::held::held_for(&all_open, s.id, &s.work)
                     .into_iter()
