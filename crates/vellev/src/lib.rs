@@ -90,11 +90,9 @@ pub fn connect(url: &str, api_key: &str, tenant: &str) -> Result<Tenants> {
 
 /// As [`connect`], with `timeouts`.
 pub fn connect_with(url: &str, api_key: &str, tenant: &str, timeouts: Timeouts) -> Result<Tenants> {
-    let options = Options {
-        timeout: timeouts.read,
-        attempts: timeouts.attempts.max(1),
-        ..Options::default()
-    };
+    let options = Options::default()
+        .timeout(timeouts.read)
+        .attempts(timeouts.attempts.max(1));
     let client = Client::connect(&[url], api_key, options)?;
     let tenant = TenantId::new(tenant)?;
     Ok(Tenants {
@@ -203,15 +201,11 @@ pub mod testing {
                         .cloned()
                         .unwrap_or_default(),
                     vector: None,
+                    only_if_version: None,
                 })
                 .collect();
             self.tenants.writes.apply(changes).await?;
-            let page = Page {
-                filter: None,
-                after: None,
-                limit: 1000,
-                vectors: true,
-            };
+            let page = Page::new(1000).vectors(true);
             let listed = records.list(&page).await?;
             records.drop().await?;
             let made: std::collections::HashMap<_, _> = listed
@@ -1018,14 +1012,7 @@ mod node_tests {
             return;
         };
         let ensured = Ensured::new(node.tenant(), notes(), "put it right");
-        let oversize = Nearest {
-            vector: Some(vec![1.0, 0.0]),
-            text: None,
-            limit: 100_000,
-            filter: None,
-            oversample: None,
-            vectors: false,
-        };
+        let oversize = Nearest::to_vector(vec![1.0, 0.0], 100_000);
         let refused = ensured
             .run(|| ensured.collection().nearest(&oversize))
             .await
@@ -1259,13 +1246,13 @@ mod node_tests {
         let plain = Ensured::new(node.tenant(), wanted.clone(), "put it right");
         let records = plain.records().await.unwrap();
         assert_eq!(identity(&records.schema().await.unwrap().unwrap()), None);
-        let content = vellev_client::api::Content {
-            properties: serde_json::json!({ "owner": "kept" })
+        let content = vellev_client::api::Content::new(
+            serde_json::json!({ "owner": "kept" })
                 .as_object()
                 .cloned()
                 .unwrap(),
-            vector: Some(vec![1.0, 0.0]),
-        };
+        )
+        .vector(vec![1.0, 0.0]);
         let id = vellev_core::ObjectId(uuid::Uuid::new_v4());
         records.put(id, &content).await.unwrap();
 
@@ -1314,6 +1301,7 @@ mod node_tests {
                 .cloned()
                 .unwrap(),
             vector: None,
+            only_if_version: None,
         }
     }
 
@@ -1408,12 +1396,7 @@ mod node_tests {
         assert_eq!(applied, 5);
         tenants.writes.apply(vec![line(6, "six")]).await.unwrap();
 
-        let page = vellev_client::api::Page {
-            filter: None,
-            after: None,
-            limit: 100,
-            vectors: true,
-        };
+        let page = vellev_client::api::Page::new(100).vectors(true);
         let listed = tenants
             .reads
             .collection(&wanted.name)

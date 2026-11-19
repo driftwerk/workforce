@@ -76,12 +76,7 @@ async fn by_id(
     loop {
         let listed = cap
             .ask(usize::MAX, |limit| {
-                let page = Page {
-                    filter: Some(filter.clone()),
-                    after: None,
-                    limit,
-                    vectors: false,
-                };
+                let page = Page::new(limit).filter(filter.clone());
                 async move { records.list(&page).await }
             })
             .await?;
@@ -102,6 +97,7 @@ async fn by_id(
             .map(|object| Change::Delete {
                 collection: collection.clone(),
                 id: object.id,
+                only_if_version: None,
             })
             .collect();
         let written = writes.apply(by_id).await?;
@@ -122,6 +118,7 @@ async fn one(writes: &Tenant, collection: &CollectionName, filter: &Filter) -> R
     let delete = Change::DeleteWhere {
         collection: collection.clone(),
         filter: filter.clone(),
+        limit: None,
     };
     let written = writes.apply(vec![delete]).await?;
     match written.outcomes.first() {
@@ -181,6 +178,7 @@ mod tests {
                         .cloned()
                         .unwrap(),
                     vector: Some(vec![1.0, 0.0]),
+                    only_if_version: None,
                 })
                 .collect();
             tenants.writes.apply(changes).await.unwrap();

@@ -126,14 +126,7 @@ pub async fn probe_model(tenant: &Tenant, records: &Records, wanted: &Collection
     if wanted.embedding.provider == EmbeddingProvider::None {
         return Ok(());
     }
-    let probe = Nearest {
-        vector: None,
-        text: Some("model probe".to_string()),
-        limit: 1,
-        filter: None,
-        oversample: None,
-        vectors: false,
-    };
+    let probe = Nearest::to_text("model probe", 1);
     match records.nearest(&probe).await {
         Ok(_) => Ok(()),
         Err(e) if matches!(e.code(), Some(Code::Unavailable | Code::Invalid)) => {

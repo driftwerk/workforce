@@ -96,12 +96,8 @@ pub async fn unmatched(
     loop {
         let listed = cap
             .ask(usize::MAX, |limit| {
-                let page = Page {
-                    filter: Some(filter.clone()),
-                    after,
-                    limit,
-                    vectors: false,
-                };
+                let page = Page::new(limit).filter(filter.clone());
+                let page = after.into_iter().fold(page, Page::after);
                 async move { records.list(&page).await }
             })
             .await?;
@@ -177,6 +173,7 @@ mod tests {
                 .cloned()
                 .unwrap(),
             vector: None,
+            only_if_version: None,
         };
         let page: Vec<(String, String)> = (0..300)
             .map(|n| (format!("k{n:03}"), format!("h{n}")))

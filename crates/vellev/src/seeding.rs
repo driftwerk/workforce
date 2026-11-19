@@ -368,6 +368,7 @@ pub async fn equivalence(
                         .cloned()
                         .unwrap_or_default(),
                     vector: None,
+                    only_if_version: None,
                 })
                 .collect();
             tenants.writes.apply(changes).await?;
@@ -375,12 +376,9 @@ pub async fn equivalence(
         let mut by_node = std::collections::HashMap::new();
         let mut after = None;
         loop {
-            let page = Page {
-                filter: None,
-                after,
-                limit: 200,
-                vectors: true,
-            };
+            let page = after
+                .into_iter()
+                .fold(Page::new(200).vectors(true), Page::after);
             let listed = records.list(&page).await?;
             for object in listed.objects {
                 by_node.insert(object.id, object.vector.unwrap_or_default());

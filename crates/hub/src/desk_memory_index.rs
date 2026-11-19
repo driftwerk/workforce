@@ -195,6 +195,7 @@ impl MemoryIndex for VellevDeskIndex {
                 id: object_id(&p.key),
                 properties: properties(p),
                 vector: None,
+                only_if_version: None,
             })
             .collect();
         let writes = &self.tenants.writes;
@@ -257,17 +258,15 @@ impl MemoryIndex for VellevDeskIndex {
     async fn canary(&self) -> Result<()> {
         let e = self.ensured(CANARY).await?;
         let id = object_id("canary#0");
-        let content = vellev_client::api::Content {
-            properties:
-                json!({ "key": "canary#0", "hash": "", "ref": uuid::Uuid::nil().to_string(),
+        let content = vellev_client::api::Content::new(
+            json!({ "key": "canary#0", "hash": "", "ref": uuid::Uuid::nil().to_string(),
                 "n": 0, "kind": "exchange", "session": uuid::Uuid::nil().to_string(), "project": "",
                 "at": chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
                 "valid": true, "text": "Desk Memory checks it can write." })
-                .as_object()
-                .cloned()
-                .unwrap_or_default(),
-            vector: None,
-        };
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+        );
         let writes = self.tenants.writes.collection(e.name());
         e.run(|| writes.put(id, &content)).await?;
         e.run(|| e.collection().delete(id)).await?;
@@ -318,12 +317,7 @@ impl MemoryIndex for VellevDeskIndex {
         let listed = e
             .run(|| {
                 self.cap.ask(limit, |limit| {
-                    let page = Page {
-                        filter: None,
-                        after,
-                        limit,
-                        vectors: false,
-                    };
+                    let page = after.into_iter().fold(Page::new(limit), Page::after);
                     async move { e.collection().list(&page).await }
                 })
             })
@@ -364,21 +358,9 @@ impl MemoryIndex for VellevDeskIndex {
         let found = e
             .run(|| {
                 self.cap.ask(wanted, |limit| {
-                    let hybrid = Hybrid {
-                        text: q.text.clone(),
-                        vector: None,
-                        alpha: None,
-                        fusion: Default::default(),
-                        properties: vec![Weighted {
-                            property: "text".into(),
-                            weight: 1.0,
-                        }],
-                        limit,
-                        candidates: None,
-                        filter: filter.clone(),
-                        oversample: None,
-                        vectors: false,
-                    };
+                    let hybrid = Hybrid::new(q.text.clone(), limit)
+                        .properties(vec![Weighted::new("text", 1.0)]);
+                    let hybrid = filter.clone().into_iter().fold(hybrid, Hybrid::filter);
                     async move {
                         workforce_common::shadow::index_call(e.collection().hybrid(&hybrid)).await
                     }

@@ -293,6 +293,7 @@ impl VellevCodeVectorStore {
                         .map(|id| Change::Delete {
                             collection: collection.name().clone(),
                             id: *id,
+                            only_if_version: None,
                         })
                         .collect();
                     async move { self.writes.apply(deletes).await }
@@ -454,6 +455,7 @@ fn upsert(records: &str, id: ObjectId, properties: Value) -> Result<Change> {
             _ => Map::new(),
         },
         vector: None,
+        only_if_version: None,
     })
 }
 
@@ -539,14 +541,8 @@ impl CodeVectorStore for VellevCodeVectorStore {
             .entities
             .run(|| {
                 self.cap.ask(limit, |limit| {
-                    let nearest = Nearest {
-                        vector: None,
-                        text: Some(query.as_str().to_string()),
-                        limit,
-                        filter: filter.clone(),
-                        oversample: None,
-                        vectors: false,
-                    };
+                    let nearest = Nearest::to_text(query.as_str(), limit);
+                    let nearest = filter.clone().into_iter().fold(nearest, Nearest::filter);
                     async move { self.entities.collection().nearest(&nearest).await }
                 })
             })
@@ -705,12 +701,8 @@ impl CodeVectorStore for VellevCodeVectorStore {
         let listed = collection
             .run(|| {
                 self.cap.ask(limit, |limit| {
-                    let page = Page {
-                        filter: Some(filter.clone()),
-                        after,
-                        limit,
-                        vectors: false,
-                    };
+                    let page = Page::new(limit).filter(filter.clone());
+                    let page = after.into_iter().fold(page, Page::after);
                     async move { collection.collection().list(&page).await }
                 })
             })
