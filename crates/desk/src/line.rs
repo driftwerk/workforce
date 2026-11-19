@@ -529,6 +529,17 @@ const HOLD_ON: [&str; 15] = [
     "okay",
 ];
 
+/// Whether `rest`, the words after a hold's opening, name what it waits
+/// on: [`HOLD_ON`], or "sign off" / "ok" as whole words ("until I sign
+/// off.", "wait for my ok"), never "sign off for the day".
+fn waits_on(rest: &str) -> bool {
+    let whole = |w: &str| {
+        rest.strip_prefix(w)
+            .is_some_and(|after| !after.starts_with(|c: char| c.is_alphanumeric() || c == ' '))
+    };
+    HOLD_ON.iter().any(|v| rest.starts_with(v)) || whole("sign off") || whole("ok")
+}
+
 /// Words just before "wait for" that undo it: "no need to wait for my
 /// answer". Never applied to "until I …": "don't merge until I answer" holds.
 const UNDONE: [&str; 11] = [
@@ -571,7 +582,7 @@ pub fn holds(text: &str) -> bool {
             let rest = rest.strip_prefix("have ").unwrap_or(rest);
             let rest = rest.strip_prefix("the ").unwrap_or(rest);
             let rest = rest.strip_prefix("my ").unwrap_or(rest);
-            HOLD_ON.iter().any(|v| rest.starts_with(v))
+            waits_on(rest)
                 // "Wait for Desk." alone waits on Desk.
                 || (waits_for && !h.ends_with("my ") && !rest.starts_with(char::is_alphanumeric))
         })
@@ -2069,6 +2080,8 @@ mod tests {
             "Change nothing until I say so.",
             "Wait for my go-ahead.",
             "Wait for Desk's sign-off.",
+            "Hold until I sign off.",
+            "Wait for my ok.",
         ] {
             assert!(holds(held), "{held}");
         }
