@@ -19,6 +19,7 @@ pub mod refresh;
 pub mod scopes;
 pub mod serve;
 pub mod state;
+pub mod weight;
 
 #[cfg(test)]
 pub(crate) mod fakes;

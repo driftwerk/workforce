@@ -23,7 +23,12 @@ pub struct WorkerConfig {
     pub toolbox_image_file: PathBuf,
     #[serde(default)]
     pub registry_mirror: Option<String>,
+    /// The most full scopes (those checking repos out) at once.
     pub max_scopes: u32,
+    /// The most light scopes (those with no repos: agent turns) at once; 0,
+    /// the default, counts them against `max_scopes` as full ones are.
+    #[serde(default)]
+    pub max_light_scopes: u32,
     pub pool_free_floor_gib: u64,
     pub scope_memory_gib: u32,
     pub scope_cpus: u32,
@@ -85,6 +90,11 @@ pub struct GoldenConfig {
     /// Paths on `branch` whose change makes the golden stale.
     #[serde(default)]
     pub watch: Vec<String>,
+    /// The services a scope checking this repo out starts with it, by name
+    /// (`mysql`, `postgres`, `redis`, `ministack`); unset, every configured
+    /// one. The others start on first use where the toolbox can.
+    #[serde(default)]
+    pub services: Option<Vec<String>>,
 }
 
 /// A stateless service toolbox-init can start on loopback.
@@ -346,7 +356,29 @@ impl WorkerConfig {
                 "[[worker.golden]] {name:?} watches lockfiles, which needs [worker.secrets] github_token"
             );
         }
+        let configured = self.service_names();
+        if let Some(service) = golden
+            .services
+            .iter()
+            .flatten()
+            .find(|service| !configured.contains(&service.as_str()))
+        {
+            bail!(
+                "[[worker.golden]] {name:?} services names {service:?}, which is not a configured service (configured: {})",
+                configured.join(", ")
+            );
+        }
         Ok(())
+    }
+
+    /// Every service a scope may run, as toolbox-init names them: the
+    /// databases, then the stateless services.
+    pub fn service_names(&self) -> Vec<&'static str> {
+        self.database
+            .iter()
+            .map(|database| database.kind.service())
+            .chain(self.services.iter().map(|service| service.name()))
+            .collect()
     }
 
     pub fn listen_addr(&self) -> SocketAddr {
@@ -396,6 +428,7 @@ pub(crate) mod tests {
             toolbox_image_file: "/etc/workforce/toolbox-image".into(),
             registry_mirror: Some("http://host.docker.internal:5000".into()),
             max_scopes: 2,
+            max_light_scopes: 0,
             pool_free_floor_gib: 1,
             scope_memory_gib: 8,
             scope_cpus: 4,
@@ -412,6 +445,7 @@ pub(crate) mod tests {
                 secrets: vec!["RAILS_MASTER_KEY".into()],
                 env: BTreeMap::from([("TZ".into(), "Europe/London".into())]),
                 watch: vec!["Gemfile.lock".into()],
+                services: None,
             }],
             database: vec![
                 DatabaseConfig {
@@ -584,6 +618,23 @@ pub(crate) mod tests {
             .to_string()
             .contains("needs [worker.secrets] github_token"));
         config.golden[0].watch.clear();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn a_golden_may_name_only_configured_services() {
+        let mut config = sample();
+        config.golden[0].services = Some(vec!["mysql".into(), "postgres".into()]);
+        assert!(config.validate().is_ok());
+        config.golden[0].services = Some(Vec::new());
+        assert!(config.validate().is_ok());
+        config.golden[0].services = Some(vec!["redis".into()]);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("\"redis\"") && error.contains("mysql, postgres"),
+            "{error}"
+        );
+        config.services = vec![Service::Redis];
         assert!(config.validate().is_ok());
     }
 

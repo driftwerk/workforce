@@ -24,6 +24,7 @@ use crate::ports::{
     REPO_ENV_PREFIX,
 };
 use crate::state::{Home, JobRecord, Scope, State, Store};
+use crate::weight::{ServicePlan, Weight};
 
 /// Label every scope container carries, valued with its scope id.
 pub const SCOPE_LABEL: &str = "workforce.scope";
@@ -39,7 +40,9 @@ pub const AGENT_GID: u32 = 1000;
 pub use workforce_agent::tools::exec_runner::SCOPE_MCP_CONFIG_PATH as MCP_CONFIG_PATH;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
-const READY_POLL: Duration = Duration::from_secs(1);
+/// A light scope's init is ready almost at once, so its seat is the
+/// container's start plus at most one of these.
+const READY_POLL: Duration = Duration::from_millis(250);
 const CHOWN_TIMEOUT_SECS: u64 = 60;
 const GIT_TIMEOUT_SECS: u64 = 600;
 const SETUP_TIMEOUT_SECS: u64 = 1800;
@@ -269,6 +272,12 @@ impl Worker {
         let mut started: Option<ContainerId> = None;
         match self.materialise(&request, &root, &mut started).await {
             Ok((scope, home_reused)) => {
+                info!(
+                    scope = %scope.id,
+                    weight = Weight::of(&request.repos).name(),
+                    home_reused,
+                    "prepared"
+                );
                 let frame = ServerFrame::Prepared(prepared(&scope, false, home_reused));
                 self.scopes.lock().insert(scope.id.clone(), scope);
                 self.save()?;
@@ -369,7 +378,7 @@ impl Worker {
 
         let env: Vec<(String, String)> = base_env(&self.config)
             .into_iter()
-            .chain([("TOOLBOX_SERVICES".to_string(), scope_services(&self.config))])
+            .chain(ServicePlan::of(&self.config, &request.repos).env())
             .chain(scope_env)
             .chain(request.env.iter().cloned())
             .collect();
@@ -1049,17 +1058,6 @@ pub(crate) fn base_env(config: &WorkerConfig) -> Vec<(String, String)> {
                 .map(|mirror| ("TOOLBOX_REGISTRY_MIRROR".to_string(), mirror.clone())),
         )
         .collect()
-}
-
-/// Every service a scope starts: its databases, then the stateless services.
-pub(crate) fn scope_services(config: &WorkerConfig) -> String {
-    config
-        .database
-        .iter()
-        .map(|database| database.kind.service())
-        .chain(config.services.iter().map(|service| service.name()))
-        .collect::<Vec<_>>()
-        .join(",")
 }
 
 /// A repo's settings as `TOOLBOX_REPO_ENV_<ALIAS>`, the alias upper-cased
@@ -1924,6 +1922,7 @@ mod tests {
             secrets: Vec::new(),
             env: BTreeMap::new(),
             watch: Vec::new(),
+            services: None,
         }
     }
 
@@ -2000,14 +1999,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scope_services_are_the_databases_and_the_configured_services() {
+    async fn a_coding_scope_starts_every_service_and_a_turn_scope_starts_none_at_seat() {
         let h = Harness::with(|config| config.services = vec![Service::Redis, Service::Ministack])
             .await;
-        h.worker.prepare(spec("s1", &[])).await.unwrap();
+        h.worker
+            .prepare(spec("coding", &[("rails", "acme/rails")]))
+            .await
+            .unwrap();
+        h.worker
+            .prepare(keyed("turn", "thread", 3600))
+            .await
+            .unwrap_or_else(|e| panic!("{e:#}"));
+        let runs = h.containers.runs();
         assert_eq!(
-            env_of(&h.containers.runs()[0], "TOOLBOX_SERVICES"),
+            env_of(&runs[0], "TOOLBOX_SERVICES"),
             ["mysql,postgres,redis,ministack"]
         );
+        assert!(env_of(&runs[0], "TOOLBOX_LAZY_SERVICES").is_empty());
+        assert!(env_of(&runs[0], "TOOLBOX_DOCKER").is_empty());
+        assert_eq!(env_of(&runs[1], "TOOLBOX_SERVICES"), ["none"]);
+        assert_eq!(
+            env_of(&runs[1], "TOOLBOX_LAZY_SERVICES"),
+            ["mysql,postgres,redis,ministack"]
+        );
+        assert_eq!(env_of(&runs[1], "TOOLBOX_DOCKER"), ["lazy"]);
+        // Its databases are still cloned and mounted, so a service it starts
+        // on first use finds the seeded golden, and the cap is a full one's.
+        assert!(h.zfs.exists_sync("tank/work/turn/mysql"));
+        assert!(runs[1]
+            .mounts
+            .iter()
+            .any(|m| m.container == "/var/lib/toolbox/mysql"));
+        assert_eq!(runs[1].memory_gib, runs[0].memory_gib);
     }
 
     #[tokio::test]

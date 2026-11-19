@@ -593,6 +593,7 @@ mod tests {
             secrets: Vec::new(),
             env: BTreeMap::new(),
             watch: vec!["gradle/libs.versions.toml".into()],
+            services: None,
         });
     }
 
