@@ -19,8 +19,8 @@ use serde_json::{json, Map, Value};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 use vellev_client::api::{
-    Change, Changes, Found, Hybrid, Keyword, Nearest, OnlyIf, Outcome, Page, Results, Stored,
-    Weighted, Written,
+    Change, Changes, Content, Found, Hybrid, Keyword, Nearest, OnlyIf, Outcome, Page, Results,
+    Stored, Weighted, Written,
 };
 use vellev_client::{Records, Tenant};
 use vellev_core::{
@@ -446,14 +446,13 @@ impl VellevStore {
         properties: Map<String, Value>,
         only_if: Option<OnlyIf>,
     ) -> Change {
-        Change::Patch {
-            collection: self.collection.clone(),
+        Change::patch(
+            self.collection.clone(),
             id,
-            properties,
-            vector: None,
-            only_if,
-            only_if_version: None,
-        }
+            only_if
+                .into_iter()
+                .fold(Changes::new(properties), Changes::only_if),
+        )
     }
 
     /// The hub-vectored candidates for `query`, scored by the certainty of
@@ -693,13 +692,14 @@ impl VellevStore {
                 } else {
                     embedded.next().flatten()
                 };
-                Change::Upsert {
-                    collection: self.collection.clone(),
-                    id: *id,
-                    properties: declared(&object["properties"]),
-                    vector,
-                    only_if_version: None,
-                }
+                Change::upsert(
+                    self.collection.clone(),
+                    *id,
+                    vector.into_iter().fold(
+                        Content::new(declared(&object["properties"])),
+                        Content::vector,
+                    ),
+                )
             })
             .collect();
         self.writes
@@ -1175,13 +1175,13 @@ impl MemoryStore for VellevStore {
         // The node embeds the memory within the request unless the hub did.
         self.answered(
             self.writes
-                .apply(vec![Change::Upsert {
-                    collection: self.collection.clone(),
+                .apply(vec![Change::upsert(
+                    self.collection.clone(),
                     id,
-                    properties,
-                    vector,
-                    only_if_version: None,
-                }])
+                    vector
+                        .into_iter()
+                        .fold(Content::new(properties), Content::vector),
+                )])
                 .await,
         )
         .await?;

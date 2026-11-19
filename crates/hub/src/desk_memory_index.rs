@@ -16,7 +16,7 @@ use eyre::{eyre, Result};
 use serde_json::{json, Map, Value};
 use tokio::sync::Mutex;
 use tracing::info;
-use vellev_client::api::{Change, Hybrid, Page, Weighted};
+use vellev_client::api::{Change, Content, Hybrid, Page, Weighted};
 use vellev_core::{CollectionName, DataType, ObjectId, Property};
 use workforce_desk::memory::index::{Differing, IndexHit, IndexQuery, KeyPage, MemoryIndex};
 use workforce_desk::memory::passage::{is_ours, Passage, PassageKind, Purge};
@@ -190,12 +190,12 @@ impl MemoryIndex for VellevDeskIndex {
         let e = self.ensured(name).await?;
         let changes: Vec<Change> = passages
             .iter()
-            .map(|p| Change::Upsert {
-                collection: e.name().clone(),
-                id: object_id(&p.key),
-                properties: properties(p),
-                vector: None,
-                only_if_version: None,
+            .map(|p| {
+                Change::upsert(
+                    e.name().clone(),
+                    object_id(&p.key),
+                    Content::new(properties(p)),
+                )
             })
             .collect();
         let writes = &self.tenants.writes;

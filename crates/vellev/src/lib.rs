@@ -176,7 +176,7 @@ pub mod testing {
         }
 
         async fn documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-            use vellev_client::api::{Change, Page};
+            use vellev_client::api::{Change, Content, Page};
             self.asked
                 .fetch_add(texts.len(), std::sync::atomic::Ordering::SeqCst);
             let scratch = collection(
@@ -193,15 +193,17 @@ pub mod testing {
             let changes = ids
                 .iter()
                 .zip(texts)
-                .map(|(id, text)| Change::Upsert {
-                    collection: scratch.name.clone(),
-                    id: *id,
-                    properties: serde_json::json!({ "text": format!("{}{text}", self.prefix) })
-                        .as_object()
-                        .cloned()
-                        .unwrap_or_default(),
-                    vector: None,
-                    only_if_version: None,
+                .map(|(id, text)| {
+                    Change::upsert(
+                        scratch.name.clone(),
+                        *id,
+                        Content::new(
+                            serde_json::json!({ "text": format!("{}{text}", self.prefix) })
+                                .as_object()
+                                .cloned()
+                                .unwrap_or_default(),
+                        ),
+                    )
                 })
                 .collect();
             self.tenants.writes.apply(changes).await?;
@@ -870,8 +872,8 @@ mod tests {
                 "{said}"
             );
         }
-        // Another refusal with a code this client does not know is not it.
-        let other = std::sync::Arc::new(Fake::answering(500, "model_unavailable", "odd"));
+        // A refusal with another code is not it.
+        let other = std::sync::Arc::new(Fake::answering(409, "conflict", "odd"));
         let tenant = other.serve().await;
         let answered = tenant
             .collection(&wanted.name)
@@ -1293,16 +1295,16 @@ mod node_tests {
     }
 
     fn line(id: u128, text: &str) -> vellev_client::api::Change {
-        vellev_client::api::Change::Upsert {
-            collection: lines().name,
-            id: vellev_core::ObjectId(uuid::Uuid::from_u128(id)),
-            properties: serde_json::json!({ "owner": "o", "text": text })
-                .as_object()
-                .cloned()
-                .unwrap(),
-            vector: None,
-            only_if_version: None,
-        }
+        vellev_client::api::Change::upsert(
+            lines().name,
+            vellev_core::ObjectId(uuid::Uuid::from_u128(id)),
+            vellev_client::api::Content::new(
+                serde_json::json!({ "owner": "o", "text": text })
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            ),
+        )
     }
 
     /// An embedder that takes a while, and counts how many requests it has

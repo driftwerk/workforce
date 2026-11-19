@@ -17,7 +17,7 @@ use eyre::{eyre, Result};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
-use vellev_client::api::{Change, Page};
+use vellev_client::api::{Change, Content, Page};
 use vellev_client::Tenant;
 use vellev_core::{Collection, CollectionName, DataType, Embedding, ObjectId, Property};
 
@@ -360,15 +360,17 @@ pub async fn equivalence(
         for batch in written.chunks(32) {
             let changes = batch
                 .iter()
-                .map(|(id, text)| Change::Upsert {
-                    collection: probe.name.clone(),
-                    id: *id,
-                    properties: json!({ "text": text })
-                        .as_object()
-                        .cloned()
-                        .unwrap_or_default(),
-                    vector: None,
-                    only_if_version: None,
+                .map(|(id, text)| {
+                    Change::upsert(
+                        probe.name.clone(),
+                        *id,
+                        Content::new(
+                            json!({ "text": text })
+                                .as_object()
+                                .cloned()
+                                .unwrap_or_default(),
+                        ),
+                    )
                 })
                 .collect();
             tenants.writes.apply(changes).await?;

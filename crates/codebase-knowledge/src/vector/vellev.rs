@@ -18,7 +18,7 @@ use eyre::Result;
 use serde_json::{json, Map, Value};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
-use vellev_client::api::{Change, Nearest, Page};
+use vellev_client::api::{Change, Content, Nearest, Page};
 use vellev_client::{Client, Tenant};
 use vellev_core::{Collection, CollectionName, DataType, ObjectId, Property};
 use vellev_index::filter::Filter;
@@ -290,11 +290,7 @@ impl VellevCodeVectorStore {
                 .run(|| {
                     let deletes = batch
                         .iter()
-                        .map(|id| Change::Delete {
-                            collection: collection.name().clone(),
-                            id: *id,
-                            only_if_version: None,
-                        })
+                        .map(|id| Change::delete(collection.name().clone(), *id))
                         .collect();
                     async move { self.writes.apply(deletes).await }
                 })
@@ -447,16 +443,14 @@ fn search_filter(repo_id: Option<&str>, kind: Option<EntityKind>) -> Option<Filt
 }
 
 fn upsert(records: &str, id: ObjectId, properties: Value) -> Result<Change> {
-    Ok(Change::Upsert {
-        collection: CollectionName::new(records)?,
+    Ok(Change::upsert(
+        CollectionName::new(records)?,
         id,
-        properties: match properties {
+        Content::new(match properties {
             Value::Object(properties) => properties,
             _ => Map::new(),
-        },
-        vector: None,
-        only_if_version: None,
-    })
+        }),
+    ))
 }
 
 #[async_trait]
