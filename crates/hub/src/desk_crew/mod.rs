@@ -64,6 +64,7 @@ pub(crate) mod shared_budget;
 mod spend;
 mod tools;
 mod updates;
+mod urgent;
 pub(crate) use updates::HubWriter;
 mod watcher;
 mod work;
@@ -1441,6 +1442,15 @@ impl Crew for CrewHub {
             .and_then(|m| m.and_local_timezone(tz).earliest())
             .map(|m| m.with_timezone(&Utc))
             .unwrap_or_else(|| Utc::now() - chrono::Duration::hours(24))
+    }
+
+    async fn steer_overdue(
+        &self,
+        boss: &str,
+        session: uuid::Uuid,
+        row: uuid::Uuid,
+    ) -> Result<String, String> {
+        self.steer_overdue_now(boss, session, row).await
     }
 
     async fn accept(&self, suggestion: &Suggestion) -> Result<(), String> {

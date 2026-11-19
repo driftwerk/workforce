@@ -2029,3 +2029,78 @@ async fn a_chain_handed_on_too_far_is_a_need_and_a_restart_closes_its_item() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn a_bosss_urgent_order_is_said_into_a_codex_turn_marked_and_a_refusal_puts_it_back() {
+    use crate::codex::tests::{next_sent, say};
+    use crate::line::{Rushed, Urgency};
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, id, mut ws) = codex_working(pool, dir.path(), true).await;
+        let by = By::manager("sarah", "Sarah", "It must hear this now.");
+        let (m, rushed) = d
+            .line_send_with(
+                Sender::Overseer(by.clone()),
+                tell(id, "Stand down: don't dispatch release 4."),
+                Some(Urgency::Order),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rushed, Some(Rushed::SaidIn));
+        let steer = next_sent(&mut ws, |v| v["method"] == "turn/steer").await;
+        assert_eq!(steer["params"]["expectedTurnId"], "u1");
+        let text = steer["params"]["input"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            text.starts_with(&line::marker(m.id)),
+            "marked, to be answered: {text}"
+        );
+        assert!(text.contains("don't dispatch release 4"), "{text}");
+        assert_eq!(row(&d, m.id).await.delivery, Delivery::Delivered);
+        // Codex says it back as the turn's input: Desk's words, not the
+        // person's.
+        say(
+            &mut ws,
+            json!({"method": "item/started", "params": {"threadId": "t1",
+            "item": {"type": "userMessage", "content": [{"type": "text", "text": text}]}}}),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(d.person_spoke_at(id), None);
+        // Refused (the turn had ended): back in the queue, for the idle.
+        say(
+            &mut ws,
+            json!({"id": 5, "error": {"code": -32600, "message": "no active turn"}}),
+        )
+        .await;
+        until_async(|| {
+            let d = d.clone();
+            async move { row(&d, m.id).await.delivery == Delivery::Queued }
+        })
+        .await;
+        // The person's own Send now still steers as before.
+        let now = d
+            .line_post(id, "skip the slow tests".into(), When::Now)
+            .await
+            .unwrap();
+        let steer = next_sent(&mut ws, |v| v["method"] == "turn/steer").await;
+        assert_eq!(steer["params"]["input"][0]["text"], "skip the slow tests");
+        assert_eq!(row(&d, now.id).await.delivery, Delivery::Delivered);
+        // And a boss is never typed in: Send now isn't its.
+        assert!(matches!(
+            d.line_send(
+                Sender::Overseer(by),
+                Send::Tell {
+                    to: Target::Session(id),
+                    text: "now".into(),
+                    when: When::Now
+                },
+            )
+            .await,
+            Err(LineError::Refused(Refusal::NotYours))
+        ));
+    })
+    .await;
+}

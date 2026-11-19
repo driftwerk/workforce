@@ -9,11 +9,11 @@ use tokio_postgres::Row;
 use uuid::Uuid;
 
 use crate::crew::Party;
-use crate::line::{Asked, Delivery, LineKind, LineMessage};
+use crate::line::{Asked, Delivery, LineKind, LineMessage, Urgency};
 use crate::store::DeskStore;
 
 const COLUMNS: &str = "id, at, sender, recipient, kind, text, in_reply_to, hop, delivery, \
-    asked, escalation, group_id, delivered_at, updated_at, chose, about, why, details";
+    asked, escalation, group_id, delivered_at, updated_at, chose, about, why, details, urgency";
 
 /// A question waiting on the person: asked of them, or given to them by
 /// the overseer (as [`crate::service`]'s `needs_you` reads a row).
@@ -48,6 +48,10 @@ fn message(row: &Row) -> Result<LineMessage> {
         delivered_at: row.try_get("delivered_at")?,
         updated_at: row.try_get("updated_at")?,
         waiting: None,
+        urgency: row
+            .try_get::<_, Option<&str>>("urgency")?
+            .map(Urgency::parse)
+            .transpose()?,
     };
     m.shape();
     Ok(m)
@@ -69,7 +73,7 @@ impl DeskStore {
             .execute(
                 &format!(
                     "INSERT INTO line_messages ({COLUMNS}) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) \
                      ON CONFLICT (id) DO UPDATE SET recipient = EXCLUDED.recipient, \
                      text = EXCLUDED.text, delivery = EXCLUDED.delivery, \
                      asked = EXCLUDED.asked, escalation = EXCLUDED.escalation, \
@@ -97,6 +101,7 @@ impl DeskStore {
                     &m.about,
                     &m.why,
                     &m.details,
+                    &m.urgency.map(Urgency::as_str),
                 ],
             )
             .await?;
@@ -542,6 +547,39 @@ impl DeskStore {
     /// Puts a row delivered to `session` back in its queue, as it was
     /// before: one statement, so a row that moved on meanwhile is left as
     /// it is. The row as it now is, or `None` when it didn't move.
+    /// How many urgent orders (stand-downs aside) went to `session` since
+    /// `since`: what [`crate::line::URGENT_PER_SESSION`] holds.
+    pub async fn line_urgent_since(&self, session: &str, since: DateTime<Utc>) -> Result<i64> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .query_one(
+                "SELECT count(*) FROM line_messages \
+                 WHERE urgency = 'order' AND recipient ->> 'kind' = 'session' \
+                 AND recipient ->> 'id' = $1 AND at > $2",
+                &[&session, &since],
+            )
+            .await?
+            .get(0))
+    }
+
+    /// Every urgent message still queued for a session, oldest first: what
+    /// a restart before its steer was taken steers again.
+    pub async fn line_urgent_queued(&self) -> Result<Vec<LineMessage>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                &format!(
+                    "SELECT {COLUMNS} FROM line_messages WHERE urgency IS NOT NULL \
+                     AND delivery = 'queued' AND recipient ->> 'kind' = 'session' ORDER BY at"
+                ),
+                &[],
+            )
+            .await?
+            .iter()
+            .map(message)
+            .collect()
+    }
+
     pub async fn line_untake(&self, id: Uuid, session: &str) -> Result<Option<LineMessage>> {
         let client = self.pool().get().await?;
         client
@@ -612,7 +650,7 @@ impl DeskStore {
         tx.execute(
             &format!(
                 "INSERT INTO line_messages ({COLUMNS}) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)"
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)"
             ),
             &[
                 &answer.id,
@@ -637,6 +675,7 @@ impl DeskStore {
                 &answer.about,
                 &answer.why,
                 &answer.details,
+                &answer.urgency.map(Urgency::as_str),
             ],
         )
         .await?;

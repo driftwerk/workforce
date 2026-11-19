@@ -128,6 +128,9 @@ mod scopes_tests;
 mod terminals;
 mod transition;
 mod unread;
+mod urgent;
+#[cfg(test)]
+mod urgent_tests;
 
 use transition::Transition;
 
@@ -1047,6 +1050,8 @@ struct Inner {
     /// Held while a session's line messages are delivered: one typed in
     /// at a time.
     line_pump: tokio::sync::Mutex<()>,
+    /// A boss's urgent words to working sessions ([`urgent`]).
+    rush: urgent::Rush,
     /// What answers sessions' MCP requests on their lines.
     line_mcp: std::sync::OnceLock<Arc<dyn line::SessionMcp>>,
     /// The crew whose overseer answers sessions on their lines.
@@ -1832,6 +1837,7 @@ impl Desk {
             served_full: Mutex::new(None),
             budget_tz: Mutex::new(None),
             line_pump: tokio::sync::Mutex::new(()),
+            rush: Default::default(),
             line_mcp: std::sync::OnceLock::new(),
             line_crew: Mutex::new(None),
             boss_bounds: Mutex::new(None),
@@ -1895,6 +1901,8 @@ impl Desk {
         }
         desk.handoffs_recover().await;
         desk.carry_asks(kept_asks, open_waits);
+        // Steered again into the turns still running, once each is heard.
+        desk.rush_load().await;
 
         let hooks = crate::api::hook_router(desk.clone());
         let shutdown = cancel.clone();
@@ -4416,6 +4424,9 @@ impl Desk {
                 };
             }
         });
+        // The turn is over: what waited for its next tool call goes in at
+        // the idle.
+        self.steers_released(id);
         let view = self.view(id)?;
         if let Some(by) = by {
             self.note(by.event(
@@ -5719,17 +5730,10 @@ impl Desk {
             (None, false, Some(charge::ServedCheck::Ask(why))) => claude::ask_call(&why),
             (None, false, None) => empty(),
         };
-        // A steer waiting for this tool call's result goes with it.
-        let steer = |desk: &Desk, event: &str| {
-            let text = desk
-                .0
-                .state
-                .lock()
-                .live
-                .get_mut(&id)
-                .and_then(Desk::take_steer)?;
-            Some(claude::context(event, &text))
-        };
+        // A tool hook heard: what is said beside a call's result reaches it.
+        if matches!(hook, Hook::ToolStart { .. } | Hook::ToolEnd { .. }) {
+            self.steer_heard(id);
+        }
         if let Some(agent) = &inside {
             let (idle, held) = {
                 let mut st = self.0.state.lock();
@@ -6024,7 +6028,8 @@ impl Desk {
                     (false, false) => "PostToolUse",
                     _ => "PostToolUseFailure",
                 };
-                if let Some(said) = steer(self, event) {
+                // What waits for this tool call's result goes with it.
+                if let Some(said) = self.steers_take(id, event, inside.is_none()).await {
                     return said;
                 }
             }
@@ -7178,6 +7183,7 @@ impl Desk {
             }
             match &event {
                 CodexEvent::Tool(t) => {
+                    self.steer_heard(id);
                     // Codex takes no answer before a call: a turn its breaker
                     // holds (one the person didn't start) is told why and
                     // ended at its first call.

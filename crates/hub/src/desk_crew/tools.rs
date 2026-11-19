@@ -599,7 +599,8 @@ impl CrewTool {
                 let by = crew.by_at_level(by, oversight);
                 let actor = by.party.clone();
                 let Some((start, name)) = reused else {
-                    let done = crew.perform(&action, by).await?;
+                    let urgency = super::urgent::of(input);
+                    let done = super::urgent::sent(urgency, crew.perform(&action, by)).await?;
                     return Ok(json!({ "done": done }));
                 };
                 let Action::Nudge { to: Target::Session(s), .. } = &action else {
@@ -834,7 +835,7 @@ pub(crate) fn describe(name: &str) -> &'static str {
             "crew.account" => "What one session (session_id) is for, who asked, its plan, what it has done (with its PRs, tickets, commits and deploys), what it is doing now, what it waits on, what comes next and the choices it made: its running account, brought up to date first when it is stale, with the time it is as of. Read it before you say anything of a session. With question, also the answer its own recent conversation gives to something the account doesn't say (which key, which file, what error).",
             "crew.ask_session" => "Ask a session (session_id) a question about its work, as Desk's status question on its line, without derailing it: one that is working gets it once its turn ends, never typed in over what it is doing. Use it only when crew.account, with a question, can't answer; then answer the person now from what you have and say you asked.",
             "crew.history" => "The recent messages of one agent's Desk DM with the person (agent_id), or one session's last prompt, reply, pending request and terminal (session_id).",
-            "crew.nudge" => "Send a short message to an agent's DM (agent_id) or to a session on its Desk line (session_id): a check-in, a hint, a correction. A session gets it once its turn ends (crew.interrupt stops a turn now). With reply_to (a question's message id), it is your answer to what that session asked you.",
+            "crew.nudge" => "Send a short message to an agent's DM (agent_id) or to a session on its Desk line (session_id): a check-in, a hint, a correction. A session gets it once its turn ends, or, with urgent, with its next tool call's result (crew.interrupt stops a turn now). With reply_to (a question's message id), it is your answer to what that session asked you.",
             "crew.escalate" => "Give a question a session asked you on its Desk line to the person (message_id): say why in reason, offer answers in options, and draft one in draft if you can. Use it for anything that pushes, deletes, deploys, spends, sends to people or changes scope, and whenever you are unsure; at Act fully, only for what the person's own orders and preferences don't cover (they are the rule, both ways).",
             "crew.approve" => "Allow a session's pending request (session_id, approval_id from crew.overview).",
             "crew.deny" => "Deny a session's pending request (session_id, approval_id from crew.overview).",
@@ -917,7 +918,8 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
                 "agent_id": { "type": "string" },
                 "session_id": session_schema(),
                 "message": { "type": "string" },
-                "reply_to": { "type": "string", "description": "The message id of the session's question this answers" }
+                "reply_to": { "type": "string", "description": "The message id of the session's question this answers" },
+                "urgent": { "type": "boolean", "description": super::urgent::URGENT_DESCRIPTION }
             })),
             &["message"],
         ),

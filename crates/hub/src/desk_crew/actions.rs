@@ -1623,20 +1623,27 @@ impl CrewHub {
                         Ok(format!("answered {name}"))
                     }
                     // On its line: it gets it once its turn ends, never typed
-                    // in over what it is doing (Interrupt is for that).
+                    // in over what it is doing (Interrupt is for that); a
+                    // boss's urgent one, with its next tool call's result.
                     None => {
-                        let told = d
-                            .line_send(
+                        let urgency = super::urgent::current()
+                            .filter(|_| matches!(sender, workforce_desk::LineSender::Overseer(_)));
+                        let (told, rushed) = d
+                            .line_send_with(
                                 sender,
                                 workforce_desk::line::Send::Tell {
                                     to: workforce_desk::line::Target::Session(*s),
                                     text: message.clone(),
                                     when: workforce_desk::line::When::Queue,
                                 },
+                                urgency,
                             )
                             .await
                             .map_err(line)?;
                         done.line = Some((told.id, told.delivery));
+                        if let Some(said) = super::urgent::told(&name, rushed) {
+                            return Ok(said);
+                        }
                         if d.wheel_of(*s).is_some_and(|w| w.person()) {
                             return Ok(format!(
                                 "told {name}; the person is driving it, so your message waits until they stop giving it input for a little while or hand it back"

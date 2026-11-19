@@ -65,15 +65,31 @@ pub(super) struct PlanFacts {
 #[derive(Debug, Default)]
 pub(crate) struct LiveBreaker {
     /// Turns begun while it ran here (a prompt, or its own waking).
-    turns: u64,
+    pub(super) turns: u64,
     /// BreakerOf from the turn after this one.
     hold_after: Option<u64>,
-    /// A steer waiting for its next tool call to be delivered with.
-    steer: Option<(Reason, String)>,
+    /// What waits for its next tool call, to be delivered with its
+    /// result, in the order it came: the breaker's own warning (one at a
+    /// time, the latest), and a boss's urgent line messages ([`Steer`]).
+    pub(super) steers: std::collections::VecDeque<Steer>,
+    /// A tool hook of Desk's was heard from it in this run (for Codex, a
+    /// tool event from its app-server): words beside a call's result reach
+    /// it.
+    pub(super) heard: bool,
     /// What Desk typed into it and has yet to hear submitted, and whether
     /// the person sent it: the rest of what it is prompted with is typed
     /// in its terminal.
     typed: std::collections::VecDeque<(String, bool)>,
+}
+
+/// One thing waiting for a running turn's next tool call.
+#[derive(Debug, Clone)]
+pub(crate) enum Steer {
+    /// The breaker's warning.
+    Breaker(Reason, String),
+    /// A boss's urgent line message, by its row: its text is read from the
+    /// row as it is taken, and only a row still queued is taken.
+    Line { row: Uuid },
 }
 
 /// How many of Desk's own prompts are remembered until heard.
@@ -736,7 +752,13 @@ impl Desk {
         match engine {
             // Devin reads words beside a call's result as Claude Code does
             // (`additionalContext`, [`crate::devin::answer`]).
-            Some(Engine::Claude | Engine::Devin) => l.breaker.steer = Some((reason, text)),
+            // The latest warning stands for the earlier, in its place.
+            Some(Engine::Claude | Engine::Devin) => {
+                l.breaker
+                    .steers
+                    .retain(|s| !matches!(s, Steer::Breaker(..)));
+                l.breaker.steers.push_back(Steer::Breaker(reason, text));
+            }
             Some(Engine::Codex) => {
                 if let Some(link) = &l._codex {
                     let _ = link.steers.send(text);
@@ -827,19 +849,31 @@ impl Desk {
         }
     }
 
-    /// A steer waiting to be delivered with `id`'s tool call result.
-    pub(super) fn take_steer(l: &mut Live) -> Option<String> {
-        l.breaker.steer.take().map(|(_, text)| text)
+    /// What waits to be delivered with `id`'s tool call result, taken:
+    /// everything, on the main thread's call (`main`); on a sub-agent's,
+    /// the breaker's warning only, as its result is the sub-agent's to
+    /// read and a boss's words are for the session.
+    pub(super) fn take_steers(l: &mut Live, main: bool) -> Vec<Steer> {
+        if main {
+            return l.breaker.steers.drain(..).collect();
+        }
+        let (taken, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut l.breaker.steers)
+            .into_iter()
+            .partition(|s| matches!(s, Steer::Breaker(..)));
+        l.breaker.steers = kept.into();
+        taken
     }
 
     /// `id`'s turn ended: what it was told it has heard. A budget's steer
     /// not yet delivered waits for its next turn; a loop's is over with it.
+    /// A boss's message that wasn't taken goes in at the idle instead.
     pub(super) fn breaker_settled(&self, id: Uuid) {
         if let Some(l) = self.0.state.lock().live.get_mut(&id) {
-            if matches!(l.breaker.steer, Some((Reason::Loop | Reason::Errors, _))) {
-                l.breaker.steer = None;
-            }
+            l.breaker
+                .steers
+                .retain(|s| !matches!(s, Steer::Breaker(Reason::Loop | Reason::Errors, _)));
         }
+        self.steers_released(id);
         if self
             .0
             .breakers
