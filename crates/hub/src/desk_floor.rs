@@ -597,6 +597,7 @@ pub fn router(state: Arc<GatewayState>, sources: Option<Sources>) -> Router {
         .route("/api/desk/floor", get(floor_view))
         .route("/api/desk/needs/decide", post(decide))
         .route("/api/desk/usage", get(usage))
+        .route("/api/desk/usage/work", get(work_usage))
         .with_state(Arc::new(Routes { state, sources }))
 }
 
@@ -1137,9 +1138,169 @@ async fn usage(State(r): S, headers: HeaderMap, Query(q): Query<TokenQuery>) -> 
     .into_response()
 }
 
+/// What one unit of background work used over a day and a week.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkUsage {
+    pub work: String,
+    pub label: String,
+    pub agent_id: String,
+    pub kind: workforce_common::work_use::WorkKind,
+    pub day: WorkSpan,
+    pub week: WorkSpan,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkSpan {
+    pub turns: u64,
+    pub tokens: u64,
+    pub shares: Vec<workforce_common::work_use::WorkShare>,
+}
+
+impl From<workforce_common::work_use::WorkUse> for WorkSpan {
+    fn from(u: workforce_common::work_use::WorkUse) -> Self {
+        Self {
+            turns: u.turns,
+            tokens: u.tokens,
+            shares: u.shares,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkUsageView {
+    pub as_of: DateTime<Utc>,
+    pub works: Vec<WorkUsage>,
+}
+
+/// Each unit of background work's use, the day's and the week's, from a
+/// week of `rows`: the most of its plan's longest window first.
+pub fn work_usage_of(
+    rows: Vec<workforce_common::work_use::WorkUseRow>,
+    now: DateTime<Utc>,
+) -> WorkUsageView {
+    use workforce_common::work_use::{fold, Work};
+    let day_from = now - Duration::hours(24);
+    let day: Vec<_> = rows.iter().filter(|r| r.at >= day_from).cloned().collect();
+    let day = fold(day);
+    let mut works: Vec<WorkUsage> = fold(rows)
+        .into_iter()
+        .map(|week| {
+            let today = day.iter().find(|d| d.work == week.work).cloned();
+            let kind = Work {
+                key: week.work.clone(),
+                label: String::new(),
+                agent_id: String::new(),
+                allowed: Default::default(),
+            }
+            .kind();
+            WorkUsage {
+                work: week.work.clone(),
+                label: week.label.clone(),
+                agent_id: week.agent_id.clone(),
+                kind,
+                day: today.map(WorkSpan::from).unwrap_or_default(),
+                week: WorkSpan::from(week),
+            }
+        })
+        .collect();
+    let longest = |w: &WorkUsage| {
+        w.week
+            .shares
+            .iter()
+            .max_by_key(|s| s.window_minutes)
+            .map_or(0.0, |s| s.share)
+    };
+    works.sort_by(|a, b| {
+        longest(b)
+            .total_cmp(&longest(a))
+            .then(b.week.turns.cmp(&a.week.turns))
+    });
+    WorkUsageView { as_of: now, works }
+}
+
+/// What the person's background work used of their plans: on their own hub
+/// all of it, on a shared hub what was billed to them.
+async fn work_usage(State(r): S, headers: HeaderMap, Query(q): Query<TokenQuery>) -> Response {
+    let (caller, _) = match reader(&r, &headers, q.token.as_deref()).await {
+        Ok(found) => found,
+        Err(refused) => return refused,
+    };
+    let Some(store) = r.state.telemetry_store.clone() else {
+        return Json(work_usage_of(Vec::new(), Utc::now())).into_response();
+    };
+    let now = Utc::now();
+    let payer = (!caller.personal).then(|| caller.id.clone());
+    let read = tokio::task::spawn_blocking(move || {
+        store.work_use_rows(now - Duration::days(7), now, payer.as_deref(), None)
+    })
+    .await;
+    match read {
+        Ok(Ok(rows)) => Json(work_usage_of(rows, now)).into_response(),
+        Ok(Err(e)) => failed(e),
+        Err(e) => failed(eyre::eyre!("{e}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_works_day_and_week_are_said_the_most_used_first() {
+        use workforce_common::work_use::{Work, WorkKind, WorkUseRow};
+        let now = DateTime::parse_from_rfc3339("2026-11-19T10:00:00Z")
+            .unwrap()
+            .to_utc();
+        let email = Work::job("atlas", "j1", "email check");
+        let boss = Work::boss("atlas", "Atlas");
+        let rows = vec![
+            WorkUseRow::share(
+                &email,
+                Some("p"),
+                "claude",
+                10_080,
+                3.0,
+                now - Duration::days(3),
+            ),
+            WorkUseRow::share(
+                &email,
+                Some("p"),
+                "claude",
+                10_080,
+                1.0,
+                now - Duration::hours(2),
+            ),
+            WorkUseRow::turn(&email, Some("p"), now - Duration::hours(2)),
+            WorkUseRow::share(
+                &boss,
+                Some("p"),
+                "claude",
+                10_080,
+                0.5,
+                now - Duration::hours(1),
+            ),
+        ];
+        let view = work_usage_of(rows, now);
+        assert_eq!(view.works.len(), 2);
+        let first = &view.works[0];
+        assert_eq!(
+            (first.label.as_str(), first.kind),
+            ("email check", WorkKind::Job)
+        );
+        assert_eq!(first.week.shares[0].share, 4.0);
+        assert_eq!(first.day.shares[0].share, 1.0);
+        assert_eq!((first.day.turns, first.week.turns), (1, 1));
+        assert_eq!(view.works[1].kind, WorkKind::Boss);
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(
+            json["works"][0]["day"]["shares"][0]["windowMinutes"],
+            10_080
+        );
+        assert_eq!(json["works"][1]["kind"], "boss");
+    }
 
     fn origin<'a>(channel: &'a str, user: &'a str, message: &'a str) -> Origin<'a> {
         Origin {

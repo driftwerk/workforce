@@ -781,6 +781,8 @@ pub(super) async fn build_inner(
         permission_evaluator,
         ..
     } = skills;
+    // What background work uses of a plan is kept with the cost ledger.
+    crate::plan_guard::PlanGuard::global().keep_in(Arc::clone(&telemetry_store));
     let scheduler = scheduler.map(|scheduler| scheduler as Arc<dyn crate::hosts::SchedulerHost>);
     let JobRunning {
         active_runners: active_runners_for_jobs,

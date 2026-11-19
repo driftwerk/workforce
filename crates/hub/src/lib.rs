@@ -65,6 +65,7 @@ pub mod cost_analytics_tools;
 pub mod tool_session;
 pub use hub_core::cost_forecast;
 pub use hub_core::cost_governor;
+pub use hub_core::plan_guard;
 pub mod credentials;
 pub mod daily_briefing;
 pub mod decide;

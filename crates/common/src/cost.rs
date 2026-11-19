@@ -442,6 +442,7 @@ impl CostTracker {
         if !persisted {
             return;
         }
+        self.record_work_tokens(&record);
         if record
             .ledger_key
             .as_ref()
@@ -450,6 +451,23 @@ impl CostTracker {
             return;
         }
         self.records.write().push(UsageRecord::from(record));
+    }
+
+    /// Counts a call's tokens toward the background work it was made for,
+    /// when it was made for some ([`crate::work_use`]).
+    fn record_work_tokens(&self, record: &CostRecord) {
+        let (Some(store), Some(work)) = (&self.store, crate::work_use::current()) else {
+            return;
+        };
+        let tokens = record.input_tokens
+            + record.output_tokens
+            + record.cache_creation_input_tokens
+            + record.cache_read_input_tokens;
+        let payer = record.payer.as_deref().or(record.identity_id.as_deref());
+        let row = crate::work_use::WorkUseRow::tokens(&work, payer, tokens, chrono::Utc::now());
+        if let Err(e) = store.record_work_use(&row) {
+            tracing::warn!(error = %e, work = %work.key, "Failed to keep a background work's tokens");
+        }
     }
 
     /// Calculate cost for a given model and token breakdown.

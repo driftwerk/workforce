@@ -3068,10 +3068,14 @@ pub(crate) async fn admit_turn_or_deny(
     }
     let identity = crate::user_config::current_billing_identity_id()
         .or_else(|| identity.map(str::to_string).filter(|s| !s.is_empty()));
-    match service
-        .cost_governor
-        .admit_turn(service.agent_id.as_str(), identity.as_deref())
-    {
+    let login = plan_login(service, None).await;
+    match service.cost_governor.admit_turn_on(
+        service.agent_id.as_str(),
+        identity.as_deref(),
+        crate::cost_governor::OnPlan {
+            login: login.as_ref(),
+        },
+    ) {
         crate::cost_governor::Admission::Proceed => None,
         crate::cost_governor::Admission::Warn(notice) => {
             tracing::warn!(agent = %service.agent_id, %notice, "LLM budget soft warning");
@@ -3096,7 +3100,46 @@ pub(crate) async fn admit_turn_or_deny(
             tracing::info!(agent = %service.agent_id, %reason, "LLM turn held by the person's budget on Desk");
             Some(reason)
         }
+        crate::cost_governor::Admission::Stopped { why: reason, .. } => {
+            tracing::warn!(agent = %service.agent_id, %reason, "Background turn stopped as a runaway");
+            Some(reason)
+        }
+        crate::cost_governor::Admission::Waits(reason) => {
+            tracing::info!(agent = %service.agent_id, %reason, "Background turn waits on the person's plan");
+            Some(reason)
+        }
     }
+}
+
+/// The plan login background work's next turn on `model` (the agent's own
+/// when unset) would run on: the first route of its chain, when that is a
+/// subscription. `None` for the person's own turns, which the plan guard
+/// never reads, and where the turn would not run on a plan.
+pub(crate) async fn plan_login(
+    service: &AgentService,
+    model: Option<&str>,
+) -> Option<crate::hub_core::logins::resolve::Login> {
+    workforce_common::work_use::current()?;
+    route_login(service, model).await
+}
+
+/// The plan login a turn on `model` (the agent's own when unset) would run
+/// on: the first route of its chain, when that is a subscription.
+pub(crate) async fn route_login(
+    service: &AgentService,
+    model: Option<&str>,
+) -> Option<crate::hub_core::logins::resolve::Login> {
+    let spec = model.map_or_else(
+        || service.current_default_model.read().clone(),
+        str::to_string,
+    );
+    let route = turn_chain(service, &spec)
+        .await
+        .kinds()
+        .first()
+        .copied()?
+        .subscription_route()?;
+    service.logins.resolve(route.kind()).ok()
 }
 
 /// Process an incoming message and return the response.
@@ -5480,6 +5523,8 @@ pub(crate) async fn stream_admitted(
     // don't cross a bare spawn) so the skill sink can resolve declared
     // secrets. Absent for every non-workflow turn — then a no-op.
     let secret_policy_for_task = workforce_common::secret_policy::capture();
+    // The background work the turn is for, so its calls are counted toward it.
+    let work_for_task = workforce_common::work_use::current();
     // The turn's environment scope (session `cmd: env use` override, else
     // the global default) expanded into the three task-locals the tool
     // filter + skill/MCP guards read. NOT propagated into `run_isolated`
@@ -5551,7 +5596,7 @@ pub(crate) async fn stream_admitted(
                 session_key_for_task,
                 CURRENT_SESSION_ID.scope(
                     session_id_for_task,
-                    CURRENT_USER_ID.scope(user_id_for_task, ACTIVE_ENVIRONMENT.scope(active_environment_for_task, ACTIVE_SKILL_INSTANCES.scope(active_skill_instances_for_task, ACTIVE_MCP_ENVS.scope(active_mcp_envs_for_task, SESSION_TOOLS.scope(session_tools_for_task, workforce_common::secret_policy::scope_if_present(secret_policy_for_task, async move {
+                    CURRENT_USER_ID.scope(user_id_for_task, ACTIVE_ENVIRONMENT.scope(active_environment_for_task, ACTIVE_SKILL_INSTANCES.scope(active_skill_instances_for_task, ACTIVE_MCP_ENVS.scope(active_mcp_envs_for_task, SESSION_TOOLS.scope(session_tools_for_task, workforce_common::secret_policy::scope_if_present(secret_policy_for_task, workforce_common::work_use::within_if_present(work_for_task, async move {
                 // Hold (and background-renew) the fleet-wide turn claim
                 // until every exit path of this task has run.
                 let _turn_claim = turn_claim;
@@ -6047,7 +6092,7 @@ pub(crate) async fn stream_admitted(
                 }
 
                 Ok(result)
-            })))))),
+            }))))))),
         ),
     ),
         ),

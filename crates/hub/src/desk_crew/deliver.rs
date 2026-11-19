@@ -152,6 +152,10 @@ impl CrewHub {
         // another.
         let _under = self.turn_under_mind(agent_id, &sid);
         // Gone with the turn, however it ends, as the person's own are.
+        let persons = theirs.is_some()
+            || author
+                .as_ref()
+                .is_some_and(|a| a.kind == workforce_desk::conversations::SpeakerKind::You);
         let _theirs = theirs.map(|words| Theirs::keep(&self.person_turns, &sid, words));
         // The crew's own wake-up, by name, for as long as its turn runs:
         // named only once the turn is the crew's (a session busy with the
@@ -174,33 +178,42 @@ impl CrewHub {
             None => crate::turn_loop::heavy_model(service),
             Some(_) => None,
         };
-        let progress = workforce_agent::runner::with_desk(
-            Some(scope),
-            service.process_message_with_progress(
-                channel,
-                owner,
-                None,
-                prompt,
-                relay.as_deref(),
-                Some(&sid),
-                None,
-                None,
-                None,
-                None,
-                Some(inbox),
-                None,
-                None,
-                None,
-                model.as_deref(),
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(TrustLevel::Paired),
-                Some(live.cancel_token()),
-                None,
-                None,
+        // The boss's own turn (a check-in, a notice, a wake-up, a session's
+        // line) is background work: the plan guard holds it while the
+        // person's plan is nearly full. One that answers the person's own
+        // words is theirs, and never waits on it.
+        let work = (!persons)
+            .then(|| workforce_common::work_use::Work::boss(agent_id, &super::name_of(service)));
+        let progress = workforce_common::work_use::within_opt(
+            work,
+            workforce_agent::runner::with_desk(
+                Some(scope),
+                service.process_message_with_progress(
+                    channel,
+                    owner,
+                    None,
+                    prompt,
+                    relay.as_deref(),
+                    Some(&sid),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(inbox),
+                    None,
+                    None,
+                    None,
+                    model.as_deref(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(TrustLevel::Paired),
+                    Some(live.cancel_token()),
+                    None,
+                    None,
+                ),
             ),
         )
         .await?;

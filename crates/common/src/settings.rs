@@ -8844,6 +8844,70 @@ pub struct BudgetConfig {
     /// allowlist (config-file-only by construction).
     #[serde(default)]
     pub agents: HashMap<String, AgentBudgetOverride>,
+    /// `[budget.plan]`: what holds background work on a subscription. The
+    /// dollar ceilings above count money only, so a turn on a person's
+    /// Claude or ChatGPT plan is never stopped by them; this is its budget.
+    /// Not gated by `enabled`.
+    #[serde(default)]
+    pub plan: PlanGuardConfig,
+}
+
+/// `[budget.plan]`: the plan-usage guard. Background work (scheduled jobs,
+/// monitors, a boss's own turns, heartbeats) waits while any window its
+/// plan reports is at `pause_at_percent` or more, and goes on once it is
+/// under again or the window resets. The person's own turns never wait on
+/// it. A unit of background work using far more of the plan than it
+/// usually does is stopped, and its owner told once.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlanGuardConfig {
+    pub enabled: bool,
+    /// Background work waits from this share of any reported window, 1-100.
+    pub pause_at_percent: f64,
+    /// A unit of work using this many times its usual hourly share of the
+    /// plan (or turns) is a runaway.
+    pub runaway_multiple: f64,
+    /// ...and only once it has used at least this many points of the plan's
+    /// longest window in the last hour: below it, nothing is a runaway.
+    pub runaway_min_percent: f64,
+    /// ...or begun at least this many turns in the last hour, whatever its
+    /// share. 0 = no turn floor.
+    pub runaway_turns_per_hour: u32,
+    /// Most model rounds one background run takes before it is cut off,
+    /// where the job sets none of its own. 0 = no cap.
+    pub run_max_rounds: u32,
+    /// Most minutes one background run takes before it is stopped. 0 = no
+    /// cap.
+    pub run_max_minutes: u32,
+    /// The share of the plan's longest window background work used in a day
+    /// from which the boss's update says so.
+    pub notable_daily_percent: f64,
+}
+
+impl Default for PlanGuardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            pause_at_percent: 80.0,
+            runaway_multiple: 10.0,
+            runaway_min_percent: 3.0,
+            runaway_turns_per_hour: 120,
+            run_max_rounds: 60,
+            run_max_minutes: 30,
+            notable_daily_percent: 5.0,
+        }
+    }
+}
+
+impl PlanGuardConfig {
+    /// The threshold as a share of a window, clamped to 1-100.
+    pub fn pause_at(&self) -> f64 {
+        if self.pause_at_percent.is_finite() {
+            self.pause_at_percent.clamp(1.0, 100.0)
+        } else {
+            80.0
+        }
+    }
 }
 
 /// Per-agent `[budget.agents.<id>]` tightening. Absent fields inherit the
@@ -8958,6 +9022,7 @@ impl Default for BudgetConfig {
             soft_warn_ratio: default_budget_soft_warn_ratio(),
             exempt_identities: default_budget_exempt_identities(),
             agents: HashMap::new(),
+            plan: PlanGuardConfig::default(),
         }
     }
 }

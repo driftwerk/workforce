@@ -1090,6 +1090,33 @@ impl CrewHub {
                 },
             ));
         }
+        // What background work used of the person's plans, when a notable
+        // share: said in words, worth knowing.
+        let notable = service.config.budget.plan.notable_daily_percent;
+        let store = Arc::clone(&service.telemetry_store);
+        let rows = tokio::task::spawn_blocking(move || {
+            store.work_use_rows(now - Duration::hours(24), now, None, None)
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+        if let Some(headline) = background_plan_use(rows, notable) {
+            lines.push((
+                SectionKey::WorthKnowing,
+                Said {
+                    kind: EventKind::Problem,
+                    headline,
+                    body: String::new(),
+                    ids: vec![],
+                    not_checked: None,
+                    session: None,
+                    did: vec![],
+                    at: None,
+                    decisions: None,
+                },
+            ));
+        }
         let runs = told
             .routine
             .iter()
@@ -1569,6 +1596,74 @@ impl CrewHub {
 }
 
 /// What a check-in's prompt names a handed update by.
+/// The roundup's line on the last day's background work, when it used at
+/// least `notable` points of a plan's longest window: how much in all, and
+/// the most of it, by name. `None` under that.
+fn background_plan_use(
+    rows: Vec<workforce_common::work_use::WorkUseRow>,
+    notable: f64,
+) -> Option<String> {
+    use crate::plan_guard::{plan_words, window_words};
+    let works = workforce_common::work_use::fold(rows);
+    // By plan and window, the longest each plan reported.
+    let mut totals: Vec<(String, u32, f64)> = Vec::new();
+    for w in &works {
+        for s in &w.shares {
+            match totals
+                .iter_mut()
+                .find(|t| t.0 == s.plan && t.1 == s.window_minutes)
+            {
+                Some(t) => t.2 += s.share,
+                None => totals.push((s.plan.clone(), s.window_minutes, s.share)),
+            }
+        }
+    }
+    let (plan, minutes, total) = totals
+        .iter()
+        .filter(|t| !totals.iter().any(|o| o.0 == t.0 && o.1 > t.1))
+        .max_by(|a, b| a.2.total_cmp(&b.2))
+        .cloned()?;
+    if total < notable.max(0.1) {
+        return None;
+    }
+    let mut most: Vec<(&str, f64)> = works
+        .iter()
+        .filter_map(|w| {
+            w.shares
+                .iter()
+                .find(|s| s.plan == plan && s.window_minutes == minutes)
+                .map(|s| (w.label.as_str(), s.share))
+        })
+        .filter(|(_, share)| *share >= 0.5)
+        .collect();
+    most.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let named = most
+        .iter()
+        .take(3)
+        .map(|(label, share)| format!("'{label}' {share:.0}%"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let plan = match plan.as_str() {
+        "claude" => plan_words(workforce_common::usage::PlanKind::Claude),
+        "chatgpt" => plan_words(workforce_common::usage::PlanKind::Chatgpt),
+        _ => "",
+    };
+    let mut line = format!(
+        "Background work used about {total:.0}% of your {} {plan}plan in the last day",
+        window_words(minutes),
+        plan = if plan.is_empty() {
+            String::new()
+        } else {
+            format!("{plan} ")
+        },
+    );
+    if !named.is_empty() {
+        line.push_str(&format!(", most of it {named}"));
+    }
+    line.push('.');
+    Some(line)
+}
+
 fn marker(p: &Pending) -> String {
     format!("update {}", p.id)
 }
@@ -1615,5 +1710,32 @@ pub(super) async fn updates_loop(crew: Arc<CrewHub>, cancel: CancellationToken) 
             // The person paused typing, came back, or wrote: look now.
             () = crew.update_poke.notified() => crew.look_at_updates_apart(),
         }
+    }
+}
+
+#[cfg(test)]
+mod plan_use_tests {
+    use super::background_plan_use;
+    use workforce_common::work_use::{Work, WorkUseRow};
+
+    #[test]
+    fn the_roundup_names_background_works_plan_use_only_when_notable() {
+        let now = chrono::Utc::now();
+        let email = Work::job("atlas", "j1", "email check");
+        let boss = Work::boss("atlas", "Atlas");
+        let quiet = vec![WorkUseRow::share(&email, None, "claude", 10_080, 2.0, now)];
+        assert_eq!(background_plan_use(quiet, 5.0), None);
+        let rows = vec![
+            WorkUseRow::share(&email, None, "claude", 10_080, 6.0, now),
+            WorkUseRow::share(&email, None, "claude", 300, 40.0, now),
+            WorkUseRow::share(&boss, None, "claude", 10_080, 1.2, now),
+        ];
+        assert_eq!(
+            background_plan_use(rows, 5.0).as_deref(),
+            Some(
+                "Background work used about 7% of your weekly Claude plan in the last day, \
+                 most of it 'email check' 6%, 'Atlas's own turns' 1%."
+            )
+        );
     }
 }

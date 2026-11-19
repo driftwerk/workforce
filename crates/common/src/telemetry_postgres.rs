@@ -2681,10 +2681,11 @@ impl TelemetryStore for PostgresTelemetryStore {
                 .query(
                     "SELECT agent_id, COALESCE(SUM(cost_usd), 0)::float8,
                        COALESCE(SUM(input_tokens + output_tokens + cache_creation_input_tokens
-                         + cache_read_input_tokens), 0)::int8
+                         + cache_read_input_tokens), 0)::int8,
+                       COALESCE(SUM(CASE WHEN billing = $3 THEN cost_usd ELSE 0 END), 0)::float8
                      FROM cost_records WHERE timestamp >= $1 AND timestamp <= $2
                      GROUP BY agent_id",
-                    &[&from, &to],
+                    &[&from, &to, &Billing::Metered.as_str()],
                 )
                 .await?;
             Ok(rows
@@ -2693,9 +2694,85 @@ impl TelemetryStore for PostgresTelemetryStore {
                     agent_id: r.get(0),
                     cost_usd: r.get(1),
                     tokens: u64::try_from(r.get::<_, i64>(2)).unwrap_or(0),
+                    metered_usd: r.get(3),
                 })
                 .collect())
         })
+    }
+
+    fn record_work_use(&self, row: &crate::work_use::WorkUseRow) -> Result<()> {
+        self.block_on(async move {
+            let conn = self.pool.get().await?;
+            conn.execute(
+                "INSERT INTO work_use (at, work, label, agent_id, payer, plan, window_minutes, share, turns, tokens)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                &[
+                    &row.at,
+                    &row.work,
+                    &row.label,
+                    &row.agent_id,
+                    &row.payer,
+                    &row.plan,
+                    &row.window_minutes.map(i32::try_from).transpose().ok().flatten(),
+                    &row.share,
+                    &i32::try_from(row.turns).unwrap_or(i32::MAX),
+                    &i64::try_from(row.tokens).unwrap_or(i64::MAX),
+                ],
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn work_use_rows(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        payer: Option<&str>,
+        work: Option<&str>,
+    ) -> Result<Vec<crate::work_use::WorkUseRow>> {
+        let (payer, work) = (payer.map(str::to_string), work.map(str::to_string));
+        self.block_on(async move {
+            let conn = self.pool.get().await?;
+            let rows = conn
+                .query(
+                    "SELECT at, work, label, agent_id, payer, plan, window_minutes, share, turns, tokens
+                     FROM work_use
+                     WHERE at >= $1 AND at <= $2
+                       AND ($3::text IS NULL OR payer = $3)
+                       AND ($4::text IS NULL OR work = $4)
+                     ORDER BY at",
+                    &[&from, &to, &payer, &work],
+                )
+                .await?;
+            Ok(rows
+                .into_iter()
+                .map(|r| crate::work_use::WorkUseRow {
+                    at: r.get(0),
+                    work: r.get(1),
+                    label: r.get(2),
+                    agent_id: r.get(3),
+                    payer: r.get(4),
+                    plan: r.get(5),
+                    window_minutes: r
+                        .get::<_, Option<i32>>(6)
+                        .and_then(|m| u32::try_from(m).ok()),
+                    share: r.get(7),
+                    turns: u32::try_from(r.get::<_, i32>(8)).unwrap_or(0),
+                    tokens: u64::try_from(r.get::<_, i64>(9)).unwrap_or(0),
+                })
+                .collect())
+        })
+    }
+
+    fn prune_work_use(&self, before: DateTime<Utc>) -> Result<usize> {
+        self.prune(
+            "DELETE FROM work_use WHERE id IN (
+                 SELECT id FROM work_use WHERE at < $1
+                 ORDER BY at LIMIT $2 FOR UPDATE SKIP LOCKED)",
+            before,
+            None,
+        )
     }
 
     fn metered_spend(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Vec<MeteredSpend>> {

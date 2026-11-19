@@ -1439,7 +1439,7 @@ async fn the_breaker_holding_the_plans_group_holds_its_starts() {
                         priced: Priced::Reported,
                         billing: None,
                     },
-                    billing: Billing::Plan,
+                    billing: Billing::Key,
                     account: None,
                 }],
             )
@@ -1702,7 +1702,7 @@ async fn spent_at(d: &Desk, session: Uuid, usd: f64, at: chrono::DateTime<chrono
                     priced: Priced::Reported,
                     billing: None,
                 },
-                billing: Billing::Plan,
+                billing: Billing::Key,
                 account: None,
             }],
         )

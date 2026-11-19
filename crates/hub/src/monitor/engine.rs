@@ -289,6 +289,36 @@ impl WorkflowNotifySink {
         if let Some(person) = owner.and_then(|owner| svc.suspended(owner)) {
             return ActionOutcome::Terminal(crate::standing::refusal(&person));
         }
+        // The person's plan nearly full: the event waits, retried as any
+        // passing failure is. A runaway is stopped, its owner told once.
+        let payer = svc.background_payer(Some(owner.unwrap_or("monitor")));
+        let billed = payer.map(|p| p.to_string());
+        let admitted = crate::user_config::billed_to(payer, async {
+            let on_plan = crate::turn_loop::plan_login(&svc, None).await;
+            svc.cost_governor.preflight_on(
+                svc.agent_id.as_str(),
+                billed.as_deref(),
+                crate::cost_governor::OnPlan {
+                    login: on_plan.as_ref(),
+                },
+            )
+        })
+        .await;
+        match admitted {
+            crate::cost_governor::Admission::Waits(why) => return ActionOutcome::Transient(why),
+            crate::cost_governor::Admission::Stopped { why, first } => {
+                if let (true, Some(owner), Some(work)) =
+                    (first, owner, workforce_common::work_use::current())
+                {
+                    let notice = format!("{why} {}", crate::plan_guard::stopped_choices(&work));
+                    let _ = self
+                        .tell(owner, named_surface, "plan_runaway", &notice)
+                        .await;
+                }
+                return ActionOutcome::Terminal(why);
+            }
+            _ => {}
+        }
         let from = self.resolve_author(ev).await;
         let task = build_agent_task_prompt(prompt, ev, &from, deliver_to);
         let session = format!("monitor:{monitor_id}:{}", ev.dispatch_id());
@@ -315,7 +345,6 @@ impl WorkflowNotifySink {
             owner,
             crate::serve::RunAuthor::Other,
         );
-        let payer = svc.background_payer(Some(owner.unwrap_or("monitor")));
         match crate::user_config::billed_to(payer, run).await {
             // Told where the monitor delivers, as the agent would have
             // posted its result; retrying would be refused the same way.
@@ -1178,14 +1207,26 @@ impl MonitorEngine {
     }
 
     async fn perform_action(&self, mon: &OwnedMonitor, ev: &MonitorEvent) -> ActionOutcome {
-        self.sink
-            .dispatch(
-                &mon.def.monitor.action,
-                mon.owner.as_deref(),
-                &mon.def.monitor.id,
-                ev,
-            )
-            .await
+        let dispatch = self.sink.dispatch(
+            &mon.def.monitor.action,
+            mon.owner.as_deref(),
+            &mon.def.monitor.id,
+            ev,
+        );
+        // A monitor's agent task is background work: the plan guard holds
+        // it while the person's plan is nearly full, and counts what it uses
+        // toward the monitor.
+        match &mon.def.monitor.action {
+            Action::AgentTask { agent, .. } => {
+                let work = workforce_common::work_use::Work::monitor(
+                    agent.as_deref().unwrap_or(&self.agent.id),
+                    &mon.def.monitor.id,
+                    &mon.def.monitor.name,
+                );
+                workforce_common::work_use::within(work, dispatch).await
+            }
+            _ => dispatch.await,
+        }
     }
 
     /// Disable a monitor by the hub's own hand, through the one flip path, so

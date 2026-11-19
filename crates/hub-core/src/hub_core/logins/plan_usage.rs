@@ -26,6 +26,11 @@ impl Login {
         if windows.is_empty() {
             return;
         }
+        crate::hub_core::plan_guard::PlanGuard::global().observe(
+            self,
+            &windows,
+            chrono::Utc::now(),
+        );
         if let Some(observer) = OBSERVER.read().clone() {
             observer.observe(self, plan, windows);
         }
