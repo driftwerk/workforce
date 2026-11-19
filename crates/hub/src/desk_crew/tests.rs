@@ -5917,6 +5917,39 @@ fn at_act_and_above_the_dm_hint_starts_the_work_in_a_session() {
     for level in [Level::Watch, Level::Suggest] {
         assert!(!CrewHub::dm_hint(level, &o, false).contains("start it now"));
     }
+    // Where it doesn't start the sessions (Suggest, or "Hand out work"
+    // off) it is still told its way, by the name the setting shows; at
+    // Watch it does nothing of its own.
+    for style in WorkStyle::ALL {
+        let o = Oversight {
+            work: Work {
+                style,
+                ..o.work.clone()
+            },
+            ..o.clone()
+        };
+        let off = Oversight {
+            act: Act {
+                hand_out_work: false,
+                ..o.act
+            },
+            ..o.clone()
+        };
+        let named = format!("setting is {}", style.title());
+        for hint in [
+            CrewHub::dm_hint(Level::Suggest, &o, false),
+            CrewHub::dm_hint(Level::Act, &off, false),
+            CrewHub::dm_hint(Level::Act, &o, false),
+        ] {
+            assert!(hint.contains(&named), "{style:?}: {hint}");
+        }
+        assert!(!CrewHub::dm_hint(Level::Watch, &o, false).contains("How it works"));
+    }
+    let hint = CrewHub::dm_hint(Level::Suggest, &prefer, false);
+    assert!(
+        hint.contains("you run yourself") && hint.contains("ssh"),
+        "{hint}"
+    );
 }
 
 /// The person's own turns in the overseer's DM carry its level and the

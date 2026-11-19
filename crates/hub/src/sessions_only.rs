@@ -16,9 +16,15 @@
 //!
 //! **Prefer sessions** refuses the coding tools' working calls and the file
 //! writes inside code alike, but lets commands run: ssh, gh, reading logs,
-//! a quick check. What a command may do is judged as it is for any agent
-//! (its approvals, exec containment); the person's directives say what is
-//! theirs. **Do it myself** refuses nothing.
+//! a quick check. A command that is itself coding work is refused as one:
+//! a build, a test or a package install (`cargo build`, `npm test`,
+//! `make`), a change made with git (`git commit`, `git apply`), an edit in
+//! place (`sed -i`), or a write, move or delete (`>`, `tee`, `rm`, `mv`,
+//! `cp`) of a path inside code. A command run on another machine over ssh
+//! is that machine's ops, and runs. What a command may do is judged beyond
+//! this as it is for any agent (its approvals, exec containment); the
+//! person's directives say what is theirs. **Do it myself** refuses
+//! nothing.
 //!
 //! What a call does decides as much as what its tool is called: any tool
 //! whose call runs a command is a command, and any whose call writes,
@@ -106,13 +112,6 @@ fn oversight_of(workspace: &Path) -> Oversight {
         .unwrap_or_default()
 }
 
-/// Whether the agent whose workspace is `workspace` sends its coding work
-/// to real sessions: it oversees the crew at a level that starts sessions
-/// (Watch starts none), working only in sessions or preferring them.
-pub fn always_sessions(workspace: &Path) -> bool {
-    refusal_for(&oversight_of(workspace), Doing::Code).is_some()
-}
-
 /// What a call doing `doing` is told, for the agent whose workspace is
 /// `workspace`: `None` when its style lets it run. The refusal names the
 /// setting, the option that would let it, and whether the session it is
@@ -146,7 +145,8 @@ pub fn refusal_for(o: &Oversight, doing: Doing) -> Option<String> {
 enum Held {
     /// `code.*`, `coding.*`: refused unless the call only reads.
     Coding,
-    /// `exec.*`: always refused.
+    /// `exec.*`: refused when only in sessions; preferring sessions, when
+    /// the command is coding work ([`Bounds::command_is_code`]).
     Shell,
     /// A file write, edit or delete: refused where it touches code.
     Files,
@@ -168,8 +168,8 @@ impl Held {
     }
 }
 
-/// Whether `name` is a tool held to the switch: a coding tool, a shell, or
-/// a file write.
+/// Whether `name` is a tool held to the boss's style: a coding tool, a
+/// shell, or a file write.
 pub fn is_held(name: &str) -> bool {
     Held::of(name).is_some()
 }
@@ -258,7 +258,13 @@ impl Bounds {
             // A coding tool's build or test is coding work, never a check.
             (Some(Held::Coding), Effect::None | Effect::Read { .. }) => None,
             (Some(Held::Coding), _) => Some(Doing::Code),
-            (Some(Held::Shell), _) | (_, Effect::Exec { .. }) => Some(Doing::Command),
+            (_, Effect::Exec { command, cwd }) => {
+                Some(match self.command_is_code(command, cwd.as_deref()) {
+                    true => Doing::Code,
+                    false => Doing::Command,
+                })
+            }
+            (Some(Held::Shell), _) => Some(Doing::Command),
             (_, Effect::None | Effect::Read { .. }) => None,
             (_, Effect::Write { paths } | Effect::Delete { paths }) => {
                 touches(&paths.iter().collect::<Vec<_>>()).then_some(Doing::Code)
@@ -270,6 +276,117 @@ impl Bounds {
             (None, Effect::Session { .. } | Effect::Connector { .. } | Effect::Unknown) => None,
         }?;
         refusal_for(&o, doing).map(Cow::Owned)
+    }
+}
+
+impl Bounds {
+    /// Whether the shell command `command`, run in `cwd` (the workspace
+    /// when not said), is coding work rather than a check: a build, test
+    /// or install, a change made with git, an edit in place, or a write,
+    /// move or delete of a path inside code. Read word by word from each of
+    /// its steps (split at `;`, `&&`, `||`, `|` and new lines); a command
+    /// run over ssh is another machine's and is never read.
+    fn command_is_code(&self, command: &str, cwd: Option<&Path>) -> bool {
+        let first = command.split_whitespace().next().unwrap_or_default();
+        if matches!(first.rsplit('/').next(), Some("ssh" | "mosh")) {
+            return false;
+        }
+        let here = cwd.unwrap_or(&self.workspace);
+        let at = |word: &str| {
+            let word = word.trim_matches(|c| c == '"' || c == '\'');
+            !word.is_empty() && !word.starts_with('-') && self.touches_code(&here.join(word))
+        };
+        command
+            .split(['\n', ';', '|', '&'])
+            .map(str::split_whitespace)
+            .any(|words| {
+                let words: Vec<&str> = words
+                    // An env assignment or sudo before the command itself.
+                    .skip_while(|w| (w.contains('=') && !w.starts_with('-')) || *w == "sudo")
+                    .collect();
+                // A write by redirect, anywhere in the step.
+                let redirected = words
+                    .windows(2)
+                    .any(|w| matches!(w[0], ">" | ">>") && at(w[1]))
+                    || words.iter().any(|w| {
+                        w.strip_prefix(">>")
+                            .or_else(|| w.strip_prefix('>'))
+                            .is_some_and(|t| !t.is_empty() && !t.starts_with('&') && at(t))
+                    });
+                let program = words
+                    .first()
+                    .map(|w| w.rsplit('/').next().unwrap_or(w))
+                    .unwrap_or_default();
+                let sub = words.get(1).copied().unwrap_or_default();
+                redirected
+                    || match program {
+                        "git" => matches!(
+                            sub,
+                            "commit"
+                                | "push"
+                                | "apply"
+                                | "am"
+                                | "rebase"
+                                | "reset"
+                                | "checkout"
+                                | "switch"
+                                | "restore"
+                                | "merge"
+                                | "cherry-pick"
+                                | "revert"
+                                | "stash"
+                                | "clean"
+                                | "add"
+                                | "rm"
+                                | "mv"
+                        ),
+                        "cargo" => matches!(
+                            sub,
+                            "build"
+                                | "b"
+                                | "test"
+                                | "t"
+                                | "run"
+                                | "r"
+                                | "check"
+                                | "c"
+                                | "clippy"
+                                | "fmt"
+                                | "install"
+                                | "add"
+                                | "remove"
+                                | "update"
+                                | "fix"
+                                | "bench"
+                                | "nextest"
+                        ),
+                        "npm" | "pnpm" | "yarn" | "bun" => matches!(
+                            sub,
+                            "run"
+                                | "build"
+                                | "test"
+                                | "t"
+                                | "install"
+                                | "i"
+                                | "ci"
+                                | "add"
+                                | "remove"
+                                | "exec"
+                                | "dlx"
+                                | "x"
+                        ),
+                        "go" => matches!(
+                            sub,
+                            "build" | "test" | "run" | "generate" | "install" | "get" | "mod"
+                        ),
+                        "make" | "cmake" | "ninja" | "bazel" | "gradle" | "mvn" | "npx" | "tsc"
+                        | "pytest" | "patch" | "pip" | "pip3" | "uv" | "poetry" => true,
+                        "sed" | "perl" => words.iter().any(|w| w.starts_with("-i")),
+                        "tee" | "rm" | "mv" | "cp" | "touch" | "mkdir" | "ln" | "truncate"
+                        | "chmod" | "rmdir" | "install" => words[1..].iter().any(|w| at(w)),
+                        _ => false,
+                    }
+            })
     }
 }
 
@@ -325,7 +442,7 @@ fn desk_session_folders() -> Vec<PathBuf> {
 }
 
 /// Hold every tool `tools` has and is given later — and every copy of it
-/// takes — to the switch within `bounds`: MCP, WASM and skill tools as much
+/// takes — to its style within `bounds`: MCP, WASM and skill tools as much
 /// as the hub's own, since what a call does decides.
 pub fn hold(tools: &workforce_agent::tools::registry::ToolRegistry, bounds: &Bounds) {
     let bounds = bounds.clone();
@@ -341,7 +458,7 @@ pub struct SessionsOnly {
 }
 
 impl SessionsOnly {
-    /// `tool`, held to the switch within `bounds`.
+    /// `tool`, held to the boss's style within `bounds`.
     pub fn wrap(tool: Arc<dyn Tool>, bounds: &Bounds) -> Arc<dyn Tool> {
         Arc::new(Self {
             held: Held::of(tool.name()),
@@ -470,10 +587,12 @@ mod tests {
             paths: paths(input),
         }
     }
-    fn exec(_: &serde_json::Value) -> Effect {
+    /// A command as its input says it (`cargo test` when not said), run
+    /// where `workdir` says.
+    fn exec(input: &serde_json::Value) -> Effect {
         Effect::Exec {
-            command: "cargo test".into(),
-            cwd: None,
+            command: input["command"].as_str().unwrap_or("cargo test").into(),
+            cwd: input["workdir"].as_str().map(PathBuf::from),
         }
     }
     fn session(_: &serde_json::Value) -> Effect {
@@ -575,7 +694,7 @@ mod tests {
         serde_json::Value,
     );
 
-    /// Every held tool's working call: refused while the switch is on.
+    /// Every held tool's working call: refused only in sessions.
     fn working_calls(at: &Place) -> Vec<Call> {
         vec![
             ("coding.session", session, json!({"task": "fix it"})),
@@ -686,11 +805,49 @@ mod tests {
                 "{name} {input} refused"
             );
         }
-        let changes: Vec<Call> = working_calls(&at)
+        // Reads and ops over a repo run, and a command on another machine.
+        let repo = at.path("repo");
+        for command in [
+            "git log -5",
+            "git status && git diff",
+            "cat src/lib.rs | grep fn > /tmp/fns.txt",
+            "ssh devbox 'cd ~/src/vellev && cargo build && make install'",
+            "gh pr checks 12 2>&1",
+        ] {
+            let input = json!({"command": command, "workdir": repo});
+            assert!(at.runs("exec.run", exec, input).await, "{command} refused");
+        }
+        let mut changes: Vec<Call> = working_calls(&at)
             .into_iter()
             .filter(|(name, ..)| !name.starts_with("exec."))
             .collect();
         assert!(changes.len() > 10);
+        // A command that is itself coding work goes to a session too: a
+        // build or test, a change made with git, an edit in place, or a
+        // write, move or delete inside code.
+        for command in [
+            "cargo build --release",
+            "npm run build",
+            "git commit -am 'fix'",
+            "FOO=1 sudo make",
+            "sed -i 's/a/b/' src/lib.rs",
+            "echo x > src/lib.rs",
+            "echo x >>src/lib.rs",
+            "cat a | tee src/new.rs",
+            "rm -rf src",
+            "cd /x && git apply p.diff",
+        ] {
+            changes.push((
+                "exec.run",
+                exec,
+                json!({"command": command, "workdir": repo}),
+            ));
+        }
+        changes.push((
+            "mcp__ops__shell",
+            exec,
+            json!({"command": "cp /tmp/a.rs src/a.rs", "workdir": repo}),
+        ));
         for (name, effect, input) in changes {
             let r = at.tool(name, effect).execute(input.clone()).await.unwrap();
             assert!(!r.success, "{name} {input} ran");

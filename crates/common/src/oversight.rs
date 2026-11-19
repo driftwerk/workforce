@@ -344,6 +344,9 @@ fn model_name_ok(m: &str) -> bool {
 /// [`Self::Direct`]. `style` wins when both are there, and Desk writes
 /// both, so a hub that doesn't know `style` reads Prefer sessions as the
 /// stricter Only in sessions.
+/// What a `style` that is none of the three is told.
+const WRONG_STYLE: &str = "How it works must be \"sessions_only\" (Only in sessions), \"prefer_sessions\" (Prefer sessions) or \"direct\" (Do it myself).";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkStyle {
@@ -1116,23 +1119,19 @@ impl Oversight {
             root.and_then(|t| t.get("updates")),
             "how it keeps you posted",
         )?;
-        // `style`, else the switch it replaced: on is only in sessions.
+        // `style`, else the switch it replaced: on is only in sessions. The
+        // switch is read either way, so a wrong one is said even beside a
+        // style (Desk writes both, for hubs from before `style`).
+        let sessions = switch(
+            work,
+            "prefer_sessions",
+            d.work.style.sessions_for_code(),
+            "always using real sessions",
+        )?;
         let style = match work.and_then(|t| t.get("style")) {
-            Some(Value::String(s)) if WorkStyle::parse(s).is_some() => {
-                WorkStyle::parse(s).unwrap_or_default()
-            }
-            Some(_) => {
-                return Err("How it works must be \"sessions_only\" (Only in sessions), \"prefer_sessions\" (Prefer sessions) or \"direct\" (Do it myself).".into())
-            }
-            None => match switch(
-                work,
-                "prefer_sessions",
-                d.work.style.sessions_for_code(),
-                "always using real sessions",
-            )? {
-                true => WorkStyle::SessionsOnly,
-                false => WorkStyle::Direct,
-            },
+            Some(v) => v.as_str().and_then(WorkStyle::parse).ok_or(WRONG_STYLE)?,
+            None if sessions => WorkStyle::SessionsOnly,
+            None => WorkStyle::Direct,
         };
         let take_on = match work.and_then(|t| t.get("take_on")) {
             None => d.work.take_on,
@@ -2027,6 +2026,26 @@ mod tests {
                 assert!(!e.contains(key), "{source} → {e} names {key}");
             }
         }
+    }
+
+    #[test]
+    fn a_wrong_way_of_working_names_the_three_it_may_be() {
+        for source in [
+            "[oversight]\nwork = { style = \"sometimes\" }\n",
+            "[oversight]\nwork = { style = true }\n",
+        ] {
+            assert_eq!(parse(source).unwrap_err(), WRONG_STYLE, "{source}");
+        }
+        // Each is named as Desk shows it.
+        for style in WorkStyle::ALL {
+            assert!(WRONG_STYLE.contains(style.title()), "{style:?}");
+            assert!(WRONG_STYLE.contains(style.as_str()), "{style:?}");
+        }
+        assert_eq!(
+            parse("[oversight]\nwork = { style = \"direct\", prefer_sessions = \"yes\" }\n")
+                .unwrap_err(),
+            "Whether always using real sessions is on or off must be true or false."
+        );
     }
 
     #[test]

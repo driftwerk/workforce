@@ -250,6 +250,11 @@ pub(super) const START_THE_CODE_WORK: &str = "Your “How it works” setting is
 /// What a boss that does the work itself is told of sessions.
 pub(super) const DO_IT_YOURSELF: &str = "Your “How it works” setting is Do it myself: do the work the person asks for yourself with your own tools, or start a real session for it (crew.start_session, crew.assign_ticket for a board ticket) when it is long or they'd want to watch it; a destructive or irreversible step follows the person's directives.";
 
+/// What a boss is told of its own work where starting sessions isn't its
+/// to do (at Suggest, or with “Hand out work” off), by its style.
+pub(super) const OWN_WORK_SESSIONS_ONLY: &str = "Your “How it works” setting is Only in sessions: commands, builds and code changes go to a session, never here; you read, search and keep notes yourself.";
+pub(super) const OWN_WORK_PREFER: &str = "Your “How it works” setting is Prefer sessions: code changes, builds and long tasks go to a session; checks, lookups and ops (ssh to one of their machines, gh, reading files and logs, a quick command) you run yourself.";
+
 /// What every DM turn of a boss is told before it speaks of a session.
 pub(super) const CHECK_FIRST: &str = "Before you say anything about a session, read its account with crew.account; never guess. Answer as Done / Now / Next / Waiting on, from the account, and say how fresh it is if it's over a few minutes old.";
 
@@ -718,9 +723,11 @@ impl CrewHub {
         };
         // At Act and above, work the person asks for starts its session
         // here and now, wherever starting one is the boss's to do.
-        let says = match level.acts() && o.act.hand_out_work {
-            true => format!("{says} {}", Self::style_line(o)),
-            false => says.to_string(),
+        // Below that, it still knows what of its own work it does here.
+        let says = match (level, level.acts() && o.act.hand_out_work) {
+            (_, true) => format!("{says} {}", Self::style_line(o)),
+            (Level::Watch, false) => says.to_string(),
+            (_, false) => format!("{says} {}", Self::own_work_line(o)),
         };
         let says = match level {
             Level::Full => format!("{says} {STANDING_RULE}"),
@@ -746,6 +753,16 @@ impl CrewHub {
         match o.work.style {
             WorkStyle::SessionsOnly => START_THE_WORK,
             WorkStyle::PreferSessions => START_THE_CODE_WORK,
+            WorkStyle::Direct => DO_IT_YOURSELF,
+        }
+    }
+
+    /// What of its own work a boss does here, where it doesn't start the
+    /// sessions itself.
+    pub(super) fn own_work_line(o: &Oversight) -> &'static str {
+        match o.work.style {
+            WorkStyle::SessionsOnly => OWN_WORK_SESSIONS_ONLY,
+            WorkStyle::PreferSessions => OWN_WORK_PREFER,
             WorkStyle::Direct => DO_IT_YOURSELF,
         }
     }

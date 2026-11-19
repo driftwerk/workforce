@@ -2696,8 +2696,8 @@ fn register_code_tools(
         tools,
         ..
     } = toolbox;
-    // Register native coding tools, each held to "always work in real
-    // sessions" (`crate::sessions_only`).
+    // Register native coding tools, each held to the boss's "How it works"
+    // style (`crate::sessions_only`).
     let bounds = crate::sessions_only::Bounds::of_agent(workspace, tool_paths[1..].to_vec());
     // Every tool the agent has, and every one it gets later (MCP, WASM,
     // skills, coding sessions), and every copy a turn or worker runs on.
