@@ -935,6 +935,72 @@ async fn only_what_the_settings_ask_wakes_the_overseer_and_never_its_own_doing()
     .await;
 }
 
+/// A restart that stopped work a session had running (19 Nov, 18:32:
+/// Desk moved seven sessions off a full account, and their CI watchers and
+/// sub-agents stopped) wakes the boss, whoever did it but itself; one that
+/// stopped nothing is no news.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_that_stopped_work_wakes_the_boss() {
+    use workforce_desk::crew::{By, Event, Party};
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, crew, _, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nwake = { on_failure = true }\n",
+            &[],
+        )
+        .await;
+        let (_, o) = crew.overseer_service().unwrap();
+        let web = session_party("acme-web");
+        let restarted = |by: By, stopped: Option<u32>| {
+            let e = by.event(
+                Kind::Restarted,
+                Some(web.clone()),
+                "restarted acme-web".to_string(),
+            );
+            match stopped {
+                Some(n) => e.detail(json!({ "stopped": n })),
+                None => e,
+            }
+        };
+        let moved = By::desk("Work reached its plan's limit");
+        let t = crew
+            .trigger_for(&restarted(moved.clone(), Some(6)), "desk", &o)
+            .expect("Desk's restart stopped its work");
+        assert!(
+            t.line.contains("restarts what it still needs"),
+            "{}",
+            t.line
+        );
+        assert!(
+            crew.trigger_for(&restarted(By::you(), Some(2)), "desk", &o)
+                .is_some(),
+            "the person's too"
+        );
+        assert!(
+            crew.trigger_for(&restarted(moved, None), "desk", &o)
+                .is_none(),
+            "nothing stopped"
+        );
+        let by_it = By::manager("desk", "Desk", "");
+        assert!(
+            crew.trigger_for(&restarted(by_it, Some(1)), "desk", &o)
+                .is_none(),
+            "its own"
+        );
+        let plain = Event::new(
+            Kind::Restarted,
+            Party::you(),
+            Some(web.clone()),
+            "restarted acme-web",
+        );
+        assert!(crew.trigger_for(&plain, "desk", &o).is_none());
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn what_happens_together_is_one_check_in_and_the_day_has_a_cap() {
     use workforce_desk::crew::Event;
@@ -1906,6 +1972,7 @@ mod promises;
 mod repeats;
 mod silent_waits;
 mod stalls;
+mod tickets;
 mod updates;
 mod urgent;
 

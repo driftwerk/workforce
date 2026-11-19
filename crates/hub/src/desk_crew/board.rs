@@ -25,7 +25,7 @@ pub const DESCRIPTION: &str = "The board's tickets that matter now, by board: th
 with everything they need done), the ones being done, and the blocked ones (to do, waiting on \
 tickets that aren't done), each with its key (like ACM-12), who has it (with their session or agent \
 id) and what it waits on. Hand a ready ticket out with crew.assign_ticket and move one with \
-crew.move_ticket, both by its key. With plan_id, one plan's tickets instead, in its order: each \
+crew.move_ticket, both by its key; read one in full with crew.ticket. With plan_id, one plan's tickets instead, in its order: each \
 with its key, column, needs and where it runs (machine, folder, engine, model), and with briefs \
 (true, or a list of keys) what each says, so you can read a ticket back before you change it.";
 

@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::asking::{Call, Denied};
-use crate::background::TaskKind;
+use crate::background::{Reported, TaskKind};
 use crate::pty::Spawn;
 
 /// What to run: a new conversation with an id Desk chose, or one to resume.
@@ -314,6 +314,10 @@ struct BackgroundTask {
     #[serde(rename = "type")]
     kind: String,
     status: String,
+    /// A sub-agent's: what it was given to do.
+    description: Option<String>,
+    /// A shell's: what it runs.
+    command: Option<String>,
 }
 
 /// The prompts Claude Code submits itself when background work it started
@@ -387,7 +391,7 @@ pub enum Hook {
         transcript: Option<String>,
         reply: Option<String>,
         /// What it left running, when the CLI says.
-        background: Option<Vec<(String, TaskKind)>>,
+        background: Option<Vec<Reported>>,
     },
     /// Its turn ended on an API error (`StopFailure`): the plan's limit,
     /// or another failure, as [`crate::limit::of_stop_failure`] reads it.
@@ -398,7 +402,7 @@ pub enum Hook {
         reply: Option<String>,
         failure: crate::limit::TurnFailure,
         /// What it left running, when the CLI says (2.1.319's doesn't).
-        background: Option<Vec<(String, TaskKind)>>,
+        background: Option<Vec<Reported>>,
     },
     /// It was signed in again inside (`/login`, `auth_success`): it runs on
     /// the CLI's own sign-in from now on.
@@ -551,7 +555,7 @@ pub fn parse_hook(body: &[u8]) -> eyre::Result<Hook> {
 }
 
 /// The tasks of a turn's end that still run.
-fn running_tasks(tasks: Vec<BackgroundTask>) -> Vec<(String, TaskKind)> {
+fn running_tasks(tasks: Vec<BackgroundTask>) -> Vec<Reported> {
     tasks
         .into_iter()
         .filter(|t| t.status == "running")
@@ -560,7 +564,11 @@ fn running_tasks(tasks: Vec<BackgroundTask>) -> Vec<(String, TaskKind)> {
                 "shell" => TaskKind::Shell,
                 _ => TaskKind::Agent,
             };
-            (t.id, kind)
+            Reported {
+                id: t.id,
+                kind,
+                label: t.description.or(t.command),
+            }
         })
         .collect()
 }
@@ -1236,8 +1244,16 @@ pub(crate) mod tests {
                 transcript: None,
                 reply: Some("launched".into()),
                 background: Some(vec![
-                    ("a471".into(), TaskKind::Agent),
-                    ("baoj".into(), TaskKind::Shell)
+                    Reported {
+                        id: "a471".into(),
+                        kind: TaskKind::Agent,
+                        label: Some("Run sleep".into())
+                    },
+                    Reported {
+                        id: "baoj".into(),
+                        kind: TaskKind::Shell,
+                        label: Some("sleep 30".into())
+                    }
                 ])
             }
         );

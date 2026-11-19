@@ -68,6 +68,7 @@ pub(crate) mod served;
 pub(crate) mod shared_budget;
 mod spend;
 mod stalls;
+mod tickets;
 mod tools;
 mod updates;
 mod urgent;
