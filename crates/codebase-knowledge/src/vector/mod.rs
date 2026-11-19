@@ -30,6 +30,9 @@ const CODE_SUMMARY_COLLECTION: &str = "CodeSummary";
 /// covers up to 160k objects per drain call.
 const MAX_BATCH_DELETE_PASSES: usize = 16;
 
+/// Entities or summaries compared with the store at a time.
+pub(crate) const VERIFY_PAGE: usize = 100;
+
 /// Outcome of a (potentially multi-pass) batch delete.
 #[derive(Debug, Default, Clone, Copy, Serialize)]
 pub struct DeleteOutcome {

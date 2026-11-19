@@ -32,10 +32,9 @@ use super::health::{InsertErrorSink, InsertErrorSlot};
 use super::{
     entity_text, search_result, search_text, summary_text, vectorizable, CodeVectorStore,
     DeleteOutcome, Differing, VectorCodeEntity, VectorCodeSummary, VectorSearchResult,
-    CODE_ENTITY_COLLECTION, CODE_SUMMARY_COLLECTION,
+    CODE_ENTITY_COLLECTION, CODE_SUMMARY_COLLECTION, VERIFY_PAGE,
 };
 use crate::graph::entities::EntityKind;
-use crate::indexer::fill::VERIFY_PAGE;
 
 /// Records per delete, or per patch of their fills, each one atomic step.
 const INDEX_BATCH: usize = 50;
@@ -664,9 +663,6 @@ impl CodeVectorStore for VellevCodeVectorStore {
         self.insert_errors.set(sink);
     }
 
-    /// Every whole write has the node embed again, so what it holds as it
-    /// is, but for its fill, is not written whole: its fill alone is
-    /// patched.
     async fn index_entities(&self, entities: &[VectorCodeEntity]) -> Result<usize> {
         let entities: Vec<&VectorCodeEntity> =
             vectorizable(entities, entity_text, "code_index_entities", "entities")
@@ -1641,6 +1637,44 @@ mod tests {
         assert_eq!(store.write(&[&unwritten], &gone).await.unwrap(), 1);
         assert_eq!(held_as_wanted(vec![after, unwritten]).await, (0, 2));
         assert!(heard.0.lock().unwrap().is_empty(), "nothing told");
+    }
+
+    /// A patch the node fails for any other reason than a lost race is
+    /// the batch's failure, told to the insert-error sink, not written
+    /// whole instead.
+    #[tokio::test]
+    async fn a_patch_the_node_fails_reaches_the_insert_error_sink() {
+        use axum::response::IntoResponse;
+        let held = entity_collection().unwrap();
+        let app = axum::Router::new().fallback(
+            move |method: axum::http::Method, uri: axum::http::Uri| {
+                let held = held.clone();
+                async move {
+                    let path = uri.path();
+                    if path.ends_with("/collections") {
+                        return axum::Json(json!({ "collections": [] })).into_response();
+                    }
+                    if method != axum::http::Method::POST {
+                        return axum::Json(held).into_response();
+                    }
+                    if path.ends_with("/count") {
+                        return axum::Json(json!({ "count": 1 })).into_response();
+                    }
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let store = VellevCodeVectorStore::new(&url, "key", "workforce").unwrap();
+        let heard = Arc::new(Heard::default());
+        store.set_insert_error_sink(Arc::clone(&heard) as Arc<dyn InsertErrorSink>);
+        let held = entity("r", "e", "f", "Function", "does a thing");
+        assert!(store.index_entities(&[held]).await.is_err());
+        let heard = heard.0.lock().unwrap();
+        assert_eq!(heard.len(), 1, "{heard:?}");
+        assert!(heard[0].contains("entities"), "{heard:?}");
     }
 
     /// A `CodeEntity` made before the slim shape, keeping more than it

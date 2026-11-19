@@ -28,7 +28,7 @@ use tracing::{info, warn};
 use crate::graph::entities::EntityId;
 use crate::graph::vectors::{FillStage, StoredSummary, VectorFill};
 use crate::graph::CodeGraph;
-use crate::vector::{CodeVectorStore, VectorCodeEntity, VectorCodeSummary};
+use crate::vector::{CodeVectorStore, VectorCodeEntity, VectorCodeSummary, VERIFY_PAGE};
 use workforce_common::vectorizable::VectorizableText;
 
 /// Entities or summaries per page of a fill.
@@ -44,9 +44,6 @@ const CHECK_LIMIT: usize = 100_000;
 
 /// Files put right per call of [`VectorFiller::settle_pending`].
 const PENDING_PAGE: usize = 200;
-
-/// Entities or summaries compared with the store at a time.
-pub const VERIFY_PAGE: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VerifyStage {

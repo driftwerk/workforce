@@ -261,6 +261,14 @@ mod tests {
             .unwrap();
         assert!(unscoped.is_empty());
     }
+}
+
+#[cfg(test)]
+mod fake_node_tests {
+    use vellev_core::CollectionName;
+
+    use super::*;
+    use crate::connect;
 
     /// Where nothing is held under the wanted keys, every one differs, and
     /// that is told by the two counts alone.
@@ -276,9 +284,7 @@ mod tests {
                 axum::Json(serde_json::json!({ "count": 0 })).into_response()
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = crate::serve(app).await;
         let records = connect(&url, "key", "harbor")
             .unwrap()
             .reads

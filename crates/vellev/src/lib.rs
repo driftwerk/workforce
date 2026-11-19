@@ -340,6 +340,14 @@ pub mod testing {
 }
 
 #[cfg(test)]
+pub(crate) async fn serve(app: axum::Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    url
+}
+
+#[cfg(test)]
 mod tests {
     use vellev_core::DataType;
 
@@ -526,9 +534,7 @@ mod tests {
                         .into_response()
                 }
             });
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!("http://{}", listener.local_addr().unwrap());
-            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let url = crate::serve(app).await;
             connect(&url, "key", "harbor").unwrap().reads
         }
     }
@@ -579,9 +585,7 @@ mod tests {
                 )
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = crate::serve(app).await;
         let timeouts = Timeouts {
             read: Duration::from_secs(5),
             write: Duration::from_secs(5),
@@ -742,9 +746,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(600)).await;
             axum::Json(serde_json::json!({ "incarnation": 1, "position": 1, "outcomes": [] }))
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = crate::serve(app).await;
         let timeouts = Timeouts {
             read: Duration::from_millis(200),
             write: Duration::from_secs(2),
