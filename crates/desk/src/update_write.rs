@@ -211,6 +211,9 @@ pub enum Mover {
     /// Something outside the crew: what, and when the boss looks again
     /// (kept, and looked at then).
     Outside { on: String, check_at: DateTime<Utc> },
+    /// The person set its card aside then: it stays as it is until they
+    /// take it up, and nobody is asked or woken for it meanwhile.
+    SetAside { at: DateTime<Utc> },
 }
 
 impl Mover {
@@ -227,6 +230,10 @@ impl Mover {
                 "Waiting on {}; I'll check again at {}",
                 lowered(on.trim().trim_end_matches('.')),
                 check_at.with_timezone(tz).format("%H:%M")
+            )),
+            Self::SetAside { at } => sentence(&format!(
+                "You set it aside at {}, so it stays as it is until you take it up",
+                at.with_timezone(tz).format("%H:%M")
             )),
         }
     }
@@ -1397,6 +1404,17 @@ mod tests {
             "{}",
             out.body
         );
+
+        // Set aside by the person: theirs, said when, nobody woken.
+        let aside = moved(stall.clone(), Mover::SetAside { at }, &w, &tz);
+        assert!(
+            aside.body.starts_with(
+                "You set it aside at 15:20, so it stays as it is until you take it up."
+            ),
+            "{}",
+            aside.body
+        );
+        assert!(!unowned(&aside, &[]), "{aside:?}");
 
         // However long the rest, who moves it is never cut.
         let mut long = stall.clone();

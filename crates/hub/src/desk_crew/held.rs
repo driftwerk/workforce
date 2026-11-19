@@ -57,9 +57,12 @@ pub(crate) enum Held {
     Sent,
     /// Sent before, still queued on its line: on its way.
     Going,
-    /// Left on its line for a session not running (now or before): it
-    /// reaches it when it runs again.
-    Parked,
+    /// Left on its line for a session not running (now or before), and
+    /// the session started again through the gate to read it.
+    Resumed,
+    /// Left on its line for a session not running, which the boss may not
+    /// start again (why): the person's to resume.
+    Parked(String),
     /// It reached the session already, at this time (it, or the boss's own
     /// word after the session said it waits).
     Given(DateTime<Utc>),
@@ -109,14 +112,32 @@ fn answers(text: &str) -> bool {
 /// Friday", "Note: don't deploy"), not an answer to something asked: its
 /// first words (past an id or a "Note:") say a rule.
 fn standing(text: &str) -> bool {
-    let l = text.to_lowercase().replace('\u{2019}', "'");
+    let l = text.replace('\u{2019}', "'");
     let rules = [
-        "keep ", "don't ", "do not ", "never ", "always ", "stop ", "leave ",
+        "keep ",
+        "don't ",
+        "do not ",
+        "never ",
+        "always ",
+        "stop ",
+        "leave ",
+        "wait until ",
+        "hold off ",
+        "hold the ",
+        "hold it ",
     ];
     l.split([':', '\n', '.', ';'])
         .map(str::trim)
-        .find(|p| !p.is_empty() && !write::is_id(p) && !matches!(*p, "note" | "fyi" | "ps"))
-        .is_some_and(|p| rules.iter().any(|w| p.starts_with(w)))
+        // An id is read as written ("VEL-22"); the rest in lower case.
+        .find(|p| {
+            !p.is_empty()
+                && !write::is_id(p)
+                && !matches!(p.to_lowercase().as_str(), "note" | "fyi" | "ps")
+        })
+        .is_some_and(|p| {
+            let p = p.to_lowercase();
+            rules.iter().any(|w| p.starts_with(w))
+        })
 }
 
 /// What the session is sent of `item`: the person's word, said as the
@@ -201,7 +222,7 @@ impl CrewHub {
         };
         match given(&thread, boss, s, item, since) {
             Some(Given::Going) => return Held::Going,
-            Some(Given::Parked) => return Held::Parked,
+            Some(Given::Parked) => return self.resume_for_held(boss, s).await,
             Some(Given::At(at)) => return Held::Given(at),
             None => {}
         }
@@ -230,10 +251,49 @@ impl CrewHub {
             return Held::Refused(why);
         }
         tracing::info!(session = %s, item = %item.id, "the person's word a boss held went to the session waiting on it");
-        // A session not running has it when it runs again.
+        // A session not running has it when it runs again: started again.
         match self.desk.view(s) {
-            Ok(v) if !v.live => Held::Parked,
+            Ok(v) if !v.live => self.resume_for_held(boss, s).await,
             _ => Held::Sent,
+        }
+    }
+
+    /// Starts session `s` again, through the gate any resume of `boss`'s
+    /// goes through, to read the person's word left on its line for it:
+    /// [`Held::Resumed`], or [`Held::Parked`] with why it is the person's.
+    async fn resume_for_held(&self, boss: &str, s: Uuid) -> Held {
+        // Running (or started) already: it reads them in Desk's next pass.
+        if self.desk.view(s).is_ok_and(|v| v.live) {
+            return Held::Going;
+        }
+        let Some((service, o)) = self.overseer_named(boss) else {
+            return Held::Parked("its boss isn't running here".into());
+        };
+        let action = Action::Resume {
+            session: s,
+            prompt: None,
+        };
+        match self.gate(&action, &o) {
+            Gate::Run => {}
+            Gate::Suggest(why) | Gate::No(why) => return Held::Parked(why.into_owned()),
+            Gate::Refuse => return Held::Parked("it only watches".into()),
+        }
+        let by = self.by_at_level(
+            self.by_boss(
+                &service,
+                "The person's word waits on its line and it isn't running: started again to read it.",
+            ),
+            &o,
+        );
+        match self.perform(&action, by).await {
+            Ok(_) => {
+                tracing::info!(session = %s, "a session the person's word waited for was started again");
+                Held::Resumed
+            }
+            // Started meanwhile, or still starting: on its way.
+            Err(_) if self.desk.view(s).is_ok_and(|v| v.live) => Held::Resumed,
+            Err(why) if why.contains("may still be starting") => Held::Resumed,
+            Err(why) => Held::Parked(why),
         }
     }
 }
@@ -311,6 +371,8 @@ mod tests {
             "VEL-22: also add tests for the importer",
             "VEL-22. Note: don't deploy it",
             "VEL-22: pick up the importer tests too",
+            "VEL-22: wait until Friday, then ship it",
+            "VEL-22: hold the release until the approval lands",
         ] {
             assert!(
                 held_for(&[order(not, vec![s])], s, &work).is_empty(),

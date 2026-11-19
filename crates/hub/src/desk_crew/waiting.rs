@@ -128,7 +128,7 @@ pub(super) enum Stall {
     Settled(DateTime<Utc>),
     /// They dropped it or set it aside then, after the session last said
     /// where it is: not asked again until it says more.
-    SetAside,
+    SetAside(DateTime<Utc>),
     /// It couldn't be read or kept.
     Failed,
 }
@@ -561,9 +561,9 @@ impl CrewHub {
         let mut given = false;
         for i in held {
             match self.deliver_held(boss, view.id, i, since).await {
-                Held::Sent | Held::Going | Held::Parked => given = true,
+                Held::Sent | Held::Going | Held::Resumed => given = true,
                 Held::Given(at) => given |= at > since,
-                Held::Suggested(why) | Held::Refused(why) => {
+                Held::Suggested(why) | Held::Refused(why) | Held::Parked(why) => {
                     tracing::info!(session = %view.id, item = %i.id, %why, "the person's word a boss holds couldn't go to the session waiting on it")
                 }
             }
@@ -601,13 +601,12 @@ impl CrewHub {
             match store.item_last_by_person(boss, &key).await {
                 // Answered, or settled in the session: theirs is done.
                 Ok(Some((at, why)))
-                    if at >= since
-                        && (why.starts_with("You answered") || why.starts_with("You settled")) =>
+                    if at >= since && workforce_desk::open_item::settled_why(&why) =>
                 {
                     return Stall::Settled(at)
                 }
                 // Dropped or set aside: not asked again until it says more.
-                Ok(Some((at, _))) if at >= since => return Stall::SetAside,
+                Ok(Some((at, _))) if at >= since => return Stall::SetAside(at),
                 Ok(_) => {}
                 Err(e) => {
                     tracing::info!(error = %e, "whether a stall was settled couldn't be read");

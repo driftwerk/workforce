@@ -230,22 +230,25 @@ impl CrewHub {
         let s = view.id;
         let mut sent = false;
         let mut going = false;
-        let mut parked = false;
+        let mut resumed = false;
+        let mut parked: Option<String> = None;
         let mut given: Option<DateTime<Utc>> = None;
         let mut not: Option<String> = None;
         for i in held {
             match self.deliver_held(boss, s, i, since).await {
                 Held::Sent => sent = true,
                 Held::Going => going = true,
-                Held::Parked => parked = true,
+                Held::Resumed => resumed = true,
+                Held::Parked(why) => parked = Some(why),
                 Held::Given(at) => given = given.max(Some(at)),
                 Held::Suggested(why) | Held::Refused(why) => not = Some(why),
             }
         }
-        // Left for it while it isn't running: it has them when it runs.
-        if parked && acts && !sent {
+        // Left for it while it isn't running, and started again to read them.
+        if resumed && !sent && not.is_none() {
             return Some(Mover::Boss {
-                doing: "I've left them on its line; they reach it as soon as it runs again.".into(),
+                doing: "I've left them on its line and started its session again to read them."
+                    .into(),
             });
         }
         // On its way to the session: said so only where the boss acts.
@@ -275,6 +278,18 @@ impl CrewHub {
                     ),
                 },
             });
+        }
+        // On its line, but stopped, and not the boss's to start again: the
+        // person's to resume.
+        if let Some(why) = parked.filter(|_| !sent && not.is_none()) {
+            tracing::info!(session = %s, %why, "the person's word waits on a stopped session's line: theirs to resume");
+            let question = format!(
+                "{} has stopped, and the answers you gave wait on its line. Resume it and it reads them",
+                work.in_words()
+            );
+            return self
+                .person_moves(boss, o, view, &question, all, since, acts, now)
+                .await;
         }
         // Not the boss's to send (it suggests, it's held, a gate): the
         // person's, with what the boss holds to answer it.
@@ -344,8 +359,10 @@ impl CrewHub {
                 let due = self.keep_recheck(boss, o, view, &on, true, now).await?;
                 Some(Mover::Outside { on, check_at: due })
             }
-            // Set aside by the person, or not kept: left as written.
-            Stall::SetAside | Stall::Failed => None,
+            // Set aside by the person: theirs, and nobody is woken for it.
+            Stall::SetAside(at) => Some(Mover::SetAside { at }),
+            // Not kept: left as written.
+            Stall::Failed => None,
         }
     }
 
@@ -616,19 +633,6 @@ impl CrewHub {
         {
             return Some(due);
         }
-        // One re-check a session: what it waited on before is this now.
-        for old in open
-            .iter()
-            .filter(|i| i.dedupe_key.starts_with(&prefix))
-            .filter(|i| i.holding_up.as_deref() != Some(on.as_str()))
-        {
-            if let Err(e) = store
-                .item_close(old.id, ClosedBy::Boss, "It waits on something newer.")
-                .await
-            {
-                tracing::warn!(error = %e, "closing an older re-check failed");
-            }
-        }
         let minute = Duration::from_std(self.timing.minute).unwrap_or_default();
         let after = o.updates.every_minutes.max(RECHECK_MINUTES);
         let due = now + minute * after as i32;
@@ -646,10 +650,26 @@ impl CrewHub {
         new.dedupe_key = recheck_key(view.id, due);
         new.said = false;
         new.sessions = vec![view.id];
-        new.holding_up = Some(on);
+        new.holding_up = Some(on.clone());
         new.done_when = settled.then(|| SETTLED.to_string());
         match store.item_open(&new).await {
-            Ok(Opened::New(_) | Opened::Again(_)) => Some(due),
+            Ok(Opened::New(_) | Opened::Again(_)) => {
+                // One re-check a session: what it waited on before is this
+                // now (closed once this one is kept, never before).
+                for old in open
+                    .iter()
+                    .filter(|i| i.dedupe_key.starts_with(&prefix))
+                    .filter(|i| i.holding_up.as_deref() != Some(on.as_str()))
+                {
+                    if let Err(e) = store
+                        .item_close(old.id, ClosedBy::Boss, "It waits on something newer.")
+                        .await
+                    {
+                        tracing::warn!(error = %e, "closing an older re-check failed");
+                    }
+                }
+                Some(due)
+            }
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "keeping a re-check failed");
                 None
@@ -688,7 +708,7 @@ impl CrewHub {
                     a.waiting_on
                         .as_deref()
                         .is_some_and(|w| !w.trim().is_empty())
-                        || a.done.last().is_some_and(|d| {
+                        || a.done.iter().max_by_key(|d| d.at).is_some_and(|d| {
                             write::says_stall(&d.text)
                                 || write::says_missing(&d.text)
                                 || write::asks_for_word(&d.text)
@@ -708,15 +728,25 @@ impl CrewHub {
             if !still || !live {
                 continue;
             }
-            let line = match settled {
-                true => format!(
+            let acts = self
+                .overseer_named(&i.boss)
+                .is_some_and(|(_, o)| self.level_now(&i.boss, &o).0.acts());
+            let line = match (settled, acts) {
+                (true, true) => format!(
                     "You told the person you'd look again at {at} at whether {} acted on their \
                      answer to what it waited on. It still says it waits or is stuck: make sure \
                      their answer reached it and it acts on it now (crew.nudge), or ask them what \
                      more it needs with crew.ask_person.",
                     self.session_name(s)
                 ),
-                false => format!(
+                (true, false) => format!(
+                    "You told the person you'd look again at {at} at whether {} acted on their \
+                     answer to what it waited on. It still says it waits or is stuck: suggest to \
+                     the person what moves it, or ask them what more it needs with \
+                     crew.ask_person.",
+                    self.session_name(s)
+                ),
+                (false, _) => format!(
                     "You told the person you'd check again at {at} on {}, which waits on {on}. \
                      Check it now: if it moved, carry on; if not, do what moves it, or say when \
                      you'll look next.",

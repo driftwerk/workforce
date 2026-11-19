@@ -446,3 +446,94 @@ async fn a_boss_that_may_not_message_leaves_the_held_answers_to_the_person() {
     })
     .await;
 }
+
+/// What the boss holds for a stopped session waits on its line, and a boss
+/// not let to start sessions again leaves that to the person: theirs, as
+/// an item saying it has stopped, never that the answers reach it by
+/// themselves.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_session_the_boss_may_not_start_is_the_persons_to_resume() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let no_resume = "[oversight]\nenabled = true\nlevel = \"act\"\n\
+                         act = { nudge = true, resume_restart = false }\n\
+                         wake = { waiting_remind_minutes = [10, 10, 10] }\n";
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", no_resume, &[]).await;
+        crew.set_update_writer(Arc::new(NoAnswers));
+        crew.look_at_updates().await;
+        let answers = "VEL-22's section 7 design questions: Kingsley, 19 Nov 11:57: \"ok yes to all to approve the design\".";
+        d.store()
+            .item_open(&NewItem::order("desk", answers, vec![], None))
+            .await
+            .unwrap();
+        let s = new_session(&d, dir.path(), "VEL-22").await;
+        d.stop(s.id, None).unwrap();
+        eventually("it to stop", async || {
+            (!d.view(s.id).unwrap().live).then_some(())
+        })
+        .await;
+        account(
+            &d,
+            s.id,
+            "Carry out the track 2 Workforce PRs",
+            &["Found no recorded answers to the section 7 questions; blocked."],
+            None,
+        )
+        .await;
+        let u = update(&overseer, &d, 0).await;
+        let item = item_of(&u, s.id);
+        assert!(
+            matches!(&item.moves, Some(Mover::Person { question, .. }) if question.contains("has stopped")),
+            "{item:?}"
+        );
+        assert!(item.body.starts_with("Yours:"), "{item:?}");
+        assert!(!write::says_missing(&item.headline), "{item:?}");
+        assert!(!d.view(s.id).unwrap().live, "not started again by the boss");
+    })
+    .await;
+}
+
+/// A stall's card the person set aside is left with them: not asked again
+/// until the session says more. One they answered, wherever ("They
+/// answered: …" from their boss too), is settled, never read as set aside.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stall_set_aside_is_left_and_one_answered_anywhere_is_settled() {
+    use super::super::waiting::Stall;
+    use workforce_desk::open_item::ClosedBy;
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        let s = new_session(&d, dir.path(), "cutover").await;
+        let since = chrono::Utc::now();
+        let ask = "The cutover waits on your decision on its window";
+        let Stall::Item(i) = crew.give_stall_to_person("desk", &s, ask, "", since).await else {
+            panic!("its item");
+        };
+        d.store()
+            .item_close(i.id, ClosedBy::Person, "You dropped it.")
+            .await
+            .unwrap();
+        assert!(matches!(
+            crew.give_stall_to_person("desk", &s, ask, "", since).await,
+            Stall::SetAside(_)
+        ));
+        // Said more since: theirs again, and answered through their boss.
+        let since = chrono::Utc::now();
+        let Stall::Item(i) = crew.give_stall_to_person("desk", &s, ask, "", since).await else {
+            panic!("asked again");
+        };
+        d.store()
+            .item_close(
+                i.id,
+                ClosedBy::Person,
+                "They answered: take the 60 minute window",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            crew.give_stall_to_person("desk", &s, ask, "", since).await,
+            Stall::Settled(_)
+        ));
+    })
+    .await;
+}
