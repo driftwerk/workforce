@@ -284,7 +284,7 @@ fn job_of(
     repo: Option<&str>,
     old: Option<&Assignment>,
 ) -> Result<Option<Job>, Refused> {
-    let unclear = |why: String| Refused::new(Refusal::JobUnclear, why);
+    let unclear = |why: String| Refused::guard(Refusal::JobUnclear, why);
     match said {
         Declared::Malformed(why) => Err(unclear(why.clone())),
         Declared::Job { kind, target, key } => {
@@ -307,7 +307,7 @@ fn job_of(
 /// The refusal of an order that looks like it can't be taken back but
 /// declares no job.
 fn no_job() -> Refused {
-    Refused::new(
+    Refused::guard(
         Refusal::NoJob,
         format!(
             "Not sent: this looks like it starts something that can't be taken back, and it says no job, so Desk can't keep a second session from being given it. Send it again with the job it is, as {JOB_EXAMPLE} (the key is the release's, PR's or migration's own id)."
@@ -630,7 +630,7 @@ impl CrewHub {
             Holder::New => None,
         };
         if let Some(why) = replaces_refused(order, s.is_none()) {
-            return Err(Refused::new(Refusal::JobUnclear, why));
+            return Err(Refused::guard(Refusal::JobUnclear, why));
         }
         let repo = match s {
             Some(s) => self.place_of(s).await.0,
@@ -652,7 +652,7 @@ impl CrewHub {
                     .await
                     .map_err(internal)?
                     .ok_or_else(|| {
-                        Refused::new(Refusal::JobUnclear, format!("Not sent: {named} isn't one of your open assignments; crew.assignments lists them."))
+                        Refused::guard(Refusal::JobUnclear, format!("Not sent: {named} isn't one of your open assignments; crew.assignments lists them."))
                     })?,
             ),
         };
@@ -664,7 +664,7 @@ impl CrewHub {
             }
             if order.job == Declared::Unsaid {
                 if let Some(why) = self.looks_held(boss, s.map(|s| (s, None)), &text).await {
-                    return Err(Refused::new(Refusal::JobHeld, why));
+                    return Err(Refused::guard(Refusal::JobHeld, why));
                 }
             }
             return Ok(Before::Not);
@@ -710,7 +710,7 @@ impl CrewHub {
                 let why = self.refusal(rule, &holder, &a);
                 tracing::info!(%session, %boss, holder = %holder.id, ?rule, "a boss's order for a job another assignment holds wasn't sent");
                 self.note_assignment(Kind::AssignmentRefused, &by.party, &a, why.clone());
-                return Err(Refused::new(Refusal::JobHeld, why));
+                return Err(Refused::guard(Refusal::JobHeld, why));
             }
             Reserved::Kept { superseded, .. } => superseded,
         };
@@ -2052,8 +2052,14 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(malformed.unwrap_err().kind, Refusal::JobUnclear);
+        let malformed = malformed.unwrap_err();
+        assert_eq!(malformed.kind, Refusal::JobUnclear);
+        // A guard's judgement of the order alone: what Act fully lifts.
+        assert!(malformed.guard);
         assert_eq!(no_job().kind, Refusal::NoJob);
+        assert!(no_job().guard);
+        // What Desk failed to keep never is.
+        assert!(!Refused::new(Refusal::Unrecorded, "Not sent: …").guard);
         assert_eq!(job_of(&Declared::NoJob, None, None), Ok(None));
         assert_eq!(job_of(&Declared::Unsaid, None, None), Ok(None));
         let mut old = Assignment::new("desk", Uuid::new_v4(), "Start release 4.");
