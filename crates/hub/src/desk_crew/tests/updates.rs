@@ -1007,17 +1007,22 @@ async fn an_update_reads_the_decisions_only_once_those_timed_before_it_are_writt
         // A decision still being written: an update waits for it before it
         // reads, as it would otherwise move its mark past it unsaid.
         let writing = crew.keeping.0.read().await;
-        let settled = {
+        let read = {
             let crew = Arc::clone(&crew);
-            tokio::spawn(async move { crew.decisions_settled().await })
+            tokio::spawn(async move {
+                let (service, o) = crew.overseer_service().unwrap();
+                let now = chrono::Utc::now();
+                let state = crew.desk.store().update_state("desk", now).await.unwrap();
+                crew.batch(&service, &o, &state, now, None).await;
+            })
         };
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
-            !settled.is_finished(),
+            !read.is_finished(),
             "read while a decision timed before it was still being written"
         );
         drop(writing);
-        tokio::time::timeout(Duration::from_secs(5), settled)
+        tokio::time::timeout(Duration::from_secs(10), read)
             .await
             .expect("read once it is written")
             .unwrap();
