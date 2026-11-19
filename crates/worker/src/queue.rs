@@ -81,6 +81,15 @@ impl Queue {
         }
     }
 
+    /// `scope` was told to wait on at `now`: it no longer waits on a
+    /// seating, and keeps its place while it asks again within the hold.
+    pub(crate) fn asked(&mut self, scope: &ScopeId, now: DateTime<Utc>) {
+        if let Some(waiter) = self.waiters.iter_mut().find(|w| w.scope == *scope) {
+            waiter.seating = false;
+            waiter.asked = now;
+        }
+    }
+
     /// `scope` is seated, or no longer waiting: it gives up its place.
     pub(crate) fn leave(&mut self, scope: &ScopeId) {
         self.waiters.retain(|waiter| waiter.scope != *scope);

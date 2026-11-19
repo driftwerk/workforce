@@ -81,6 +81,8 @@ pub struct Worker {
     /// capacity, as they may still hold the host, until a sweep takes them
     /// down.
     leftovers: Mutex<Vec<Scope>>,
+    /// The scopes whose teardown is under way right now.
+    tearing: Mutex<HashSet<ScopeId>>,
     pub(crate) jobs: Mutex<BTreeMap<JobId, JobRecord>>,
     pub(crate) live: Mutex<HashMap<JobId, LiveJob>>,
     pub(crate) starts: tokio::sync::Mutex<()>,
@@ -139,6 +141,7 @@ impl Worker {
             prepares: tokio::sync::Mutex::new(()),
             queue: Mutex::new(Queue::default()),
             leftovers: Mutex::new(Vec::new()),
+            tearing: Mutex::new(HashSet::new()),
             jobs: Mutex::new(jobs),
             live: Mutex::new(HashMap::new()),
             starts: tokio::sync::Mutex::new(()),
@@ -283,6 +286,10 @@ impl Worker {
             self.prepare_one(&request).await
         };
         place.kept = matches!(answer, Ok(ServerFrame::Queued { .. }));
+        if place.kept {
+            // Told to wait on: it asks again like any waiter, from now.
+            self.queue.lock().asked(&request.scope, Utc::now());
+        }
         answer
     }
 
@@ -291,15 +298,19 @@ impl Worker {
         // A conversation back while its last scope's teardown is still
         // owed: that teardown comes first, as the new scope takes the same
         // id, dataset and home.
-        if let Some(at) = self.leftover_at(&request.scope) {
-            let leftover = self.leftovers.lock().remove(at);
-            if let Err(error) = self.dismantle(&leftover).await {
-                warn!(scope = %leftover.id, %error, "taking down a scope that gave way failed again; its conversation waits");
-                self.leftovers.lock().push(leftover);
-                return Ok(match request.queue {
-                    Some(_) => ServerFrame::Queued { ahead: 0 },
-                    None => refused(RefusalReason::AtCapacity),
-                });
+        // Waited out rather than refused when it queued, keeping its place.
+        let owed = || match request.queue {
+            Some(_) => ServerFrame::Queued { ahead: 0 },
+            None => refused(RefusalReason::AtCapacity),
+        };
+        // One being taken down right now (a release) is waited out.
+        if self.tearing.lock().contains(&request.scope) {
+            return Ok(owed());
+        }
+        if let Some(leftover) = self.leftover(&request.scope) {
+            if let Err(error) = self.take_down(leftover).await {
+                warn!(scope = %request.scope, %error, "taking down a scope that gave way failed again; its conversation waits");
+                return Ok(owed());
             }
         }
         self.classify(request);
@@ -931,23 +942,38 @@ impl Worker {
     pub async fn release(&self, scope: &ScopeId) -> Result<ServerFrame> {
         let removed = self.scopes.lock().remove(scope);
         if let Some(removed) = removed {
-            if let Err(error) = self.dismantle(&removed).await {
-                // Out of the map, but maybe not off the host: counted, and
-                // taken down again by the sweep.
-                self.leftovers.lock().push(removed);
-                return Err(error);
-            }
+            self.take_down(removed).await?;
             info!(scope = %scope, "released");
         }
         Ok(ServerFrame::Done(ExecSummary::exited(0)))
     }
 
-    /// Where `scope` is among the leftovers, when its teardown is owed.
-    fn leftover_at(&self, scope: &ScopeId) -> Option<usize> {
+    /// `scope` among the leftovers, when its teardown is owed.
+    fn leftover(&self, scope: &ScopeId) -> Option<Scope> {
         self.leftovers
             .lock()
             .iter()
-            .position(|left| left.id == *scope)
+            .find(|left| left.id == *scope)
+            .cloned()
+    }
+
+    /// Take down a scope out of the map. Until that is done it stays among
+    /// the leftovers, counted against capacity and owed by the sweep, so a
+    /// teardown that fails, or is dropped part way, never leaves the host
+    /// holding a scope nothing counts; and while it runs its id is marked,
+    /// so no prepare seats the same id over it.
+    async fn take_down(&self, scope: Scope) -> Result<()> {
+        let id = scope.id.clone();
+        {
+            let mut leftovers = self.leftovers.lock();
+            if !leftovers.iter().any(|left| left.id == id) {
+                leftovers.push(scope.clone());
+            }
+        }
+        let _tearing = Tearing::mark(&self.tearing, &id);
+        self.dismantle(&scope).await?;
+        self.leftovers.lock().retain(|left| left.id != id);
+        Ok(())
     }
 
     /// Take down a scope already taken out of the map: its jobs, container
@@ -1012,8 +1038,6 @@ impl Worker {
         self.queue.lock().waiting(Utc::now())
     }
 
-    /// Whether one more scope may be seated now: the one test admission
-    /// asks, before and after an idle scope gives way.
     /// Whether a prepare outside the queue may be seated beside all those
     /// waiting in it, each counted as one more scope; with nobody waiting,
     /// what [`Self::room_for_another`] says.
@@ -1026,6 +1050,8 @@ impl Worker {
         }
     }
 
+    /// Whether one more scope may be seated now: the one test admission
+    /// asks, before and after an idle scope gives way.
     fn room_for_another(&self) -> Result<(), RefusalReason> {
         let held = self.scopes.lock().len() + self.leftovers.lock().len();
         match held as u32 >= self.config.max_scopes {
@@ -1080,11 +1106,12 @@ impl Worker {
     /// seated over what may still be on the host.
     async fn give_way(&self, idle: Scope, to: &ScopeId) -> bool {
         let idle_secs = (Utc::now() - idle.last_seen).num_seconds();
-        match self.dismantle(&idle).await {
+        let (id, home) = (idle.id.clone(), idle.home.clone());
+        match self.take_down(idle).await {
             Ok(()) => {
                 info!(
-                    scope = %idle.id,
-                    home = idle.home.as_deref().unwrap_or("none"),
+                    scope = %id,
+                    home = home.as_deref().unwrap_or("none"),
                     idle_secs,
                     to = %to,
                     "an idle scope gave way to a new one on a full worker"
@@ -1093,12 +1120,11 @@ impl Worker {
             }
             Err(error) => {
                 warn!(
-                    scope = %idle.id,
+                    scope = %id,
                     to = %to,
                     %error,
                     "an idle scope gave way, but taking it down failed; it still counts against capacity until a sweep takes it down"
                 );
-                self.leftovers.lock().push(idle);
                 false
             }
         }
@@ -1122,25 +1148,18 @@ impl Worker {
                 warn!(scope = %scope, %error, "releasing an idle scope failed; the next sweep tries again");
             }
         }
-        {
-            // Under the prepare lock, so no prepare seats while a leftover
-            // is between the list and the host, and none seats its id anew.
+        if !self.leftovers.lock().is_empty() {
+            // Under the prepare lock, so no prepare seats the same id anew
+            // meanwhile; one a release is taking down now is left to it.
             let _one_at_a_time = self.prepares.lock().await;
-            let owed: Vec<ScopeId> = self.leftovers.lock().iter().map(|l| l.id.clone()).collect();
-            for id in owed {
-                let Some(at) = self.leftover_at(&id) else {
+            let owed: Vec<Scope> = self.leftovers.lock().clone();
+            for leftover in owed {
+                if self.tearing.lock().contains(&leftover.id) {
                     continue;
-                };
-                let leftover = self.leftovers.lock()[at].clone();
-                match self.dismantle(&leftover).await {
-                    Ok(()) => {
-                        if let Some(at) = self.leftover_at(&id) {
-                            self.leftovers.lock().remove(at);
-                        }
-                    }
-                    Err(error) => {
-                        warn!(scope = %id, %error, "taking down a scope that gave way failed again")
-                    }
+                }
+                let id = leftover.id.clone();
+                if let Err(error) = self.take_down(leftover).await {
+                    warn!(scope = %id, %error, "taking down a scope that gave way failed again");
                 }
             }
         }
@@ -1315,6 +1334,29 @@ impl Drop for Place<'_> {
         if !self.kept {
             self.queue.lock().leave(self.scope);
         }
+    }
+}
+
+/// Marks a scope's teardown under way for as long as it lives, however the
+/// teardown ends.
+struct Tearing<'a> {
+    tearing: &'a Mutex<HashSet<ScopeId>>,
+    id: ScopeId,
+}
+
+impl<'a> Tearing<'a> {
+    fn mark(tearing: &'a Mutex<HashSet<ScopeId>>, id: &ScopeId) -> Self {
+        tearing.lock().insert(id.clone());
+        Self {
+            tearing,
+            id: id.clone(),
+        }
+    }
+}
+
+impl Drop for Tearing<'_> {
+    fn drop(&mut self) {
+        self.tearing.lock().remove(&self.id);
     }
 }
 
@@ -2442,6 +2484,24 @@ mod tests {
             "and no later sweep takes down the new one"
         );
         assert_eq!(h.worker.health().await.unwrap().scopes, 2);
+    }
+
+    #[tokio::test]
+    async fn a_release_that_fails_to_come_down_still_holds_its_seat() {
+        let h = Harness::new().await;
+        h.worker.prepare(spec("coding-1", &[])).await.unwrap();
+        h.worker.prepare(spec("coding-2", &[])).await.unwrap();
+        h.zfs.fail_next_destroy();
+        assert!(h.worker.release(&ScopeId::new("coding-1")).await.is_err());
+        assert_eq!(
+            h.worker.prepare(spec("coding-3", &[])).await.unwrap(),
+            refused(RefusalReason::AtCapacity),
+            "what is left still counts"
+        );
+        h.worker.sweep(Utc::now()).await.unwrap();
+        assert!(h.worker.leftovers.lock().is_empty());
+        assert!(h.worker.tearing.lock().is_empty());
+        assert!(h.worker.prepare(spec("coding-3", &[])).await.is_ok());
     }
 
     #[tokio::test]
