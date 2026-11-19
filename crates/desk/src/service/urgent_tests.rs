@@ -918,10 +918,9 @@ async fn a_suggested_interrupt_from_before_a_restart_interrupts_nothing_and_isnt
         tokio::time::sleep(Duration::from_millis(100)).await;
         let now = suggested(&d).await;
         assert_eq!(now.len(), 1, "never doubled");
-        let turn: line::TurnMark = serde_json::from_value(
-            now[0].action["input"][line::STAND_DOWN_KEY]["turn"].clone(),
-        )
-        .unwrap();
+        let turn: line::TurnMark =
+            serde_json::from_value(now[0].action["input"][line::STAND_DOWN_KEY]["turn"].clone())
+                .unwrap();
         assert_eq!(turn, after);
     })
     .await;
