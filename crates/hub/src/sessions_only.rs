@@ -40,6 +40,8 @@
 //! ([`SessionsOnly`]), so every path a call takes — a turn, a worker
 //! sub-agent's snapshot, a CLI turn's gated MCP — meets it.
 
+mod command;
+
 use std::borrow::Cow;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -211,14 +213,19 @@ impl Bounds {
     /// tree (other than one the workspace itself sits in), a code root, or
     /// a Desk session's folder. Links are followed first.
     fn touches_code(&self, path: &Path) -> bool {
+        let roots: Vec<PathBuf> = (self.code)()
+            .iter()
+            .map(|root| folded_buf(resolved(root)))
+            .collect();
+        self.touches_code_in(path, &roots)
+    }
+
+    /// [`Self::touches_code`] with the code roots read, resolved and folded.
+    fn touches_code_in(&self, path: &Path, roots: &[PathBuf]) -> bool {
         let path = resolved(path);
         let workspace = resolved(&self.workspace);
         let folded = folded(&path);
-        if (self.code)()
-            .iter()
-            .map(|root| folded_buf(resolved(root)))
-            .any(|root| folded.starts_with(&root))
-        {
+        if roots.iter().any(|root| folded.starts_with(root)) {
             return true;
         }
         // A repo of its own inside the workspace counts; a repo the
@@ -281,112 +288,19 @@ impl Bounds {
 
 impl Bounds {
     /// Whether the shell command `command`, run in `cwd` (the workspace
-    /// when not said), is coding work rather than a check: a build, test
-    /// or install, a change made with git, an edit in place, or a write,
-    /// move or delete of a path inside code. Read word by word from each of
-    /// its steps (split at `;`, `&&`, `||`, `|` and new lines); a command
-    /// run over ssh is another machine's and is never read.
+    /// when not said, a relative one from it), is coding work rather than a
+    /// check ([`command::is_code`]). The code roots are read once for it.
     fn command_is_code(&self, command: &str, cwd: Option<&Path>) -> bool {
-        let first = command.split_whitespace().next().unwrap_or_default();
-        if matches!(first.rsplit('/').next(), Some("ssh" | "mosh")) {
-            return false;
-        }
-        let here = cwd.unwrap_or(&self.workspace);
-        let at = |word: &str| {
-            let word = word.trim_matches(|c| c == '"' || c == '\'');
-            !word.is_empty() && !word.starts_with('-') && self.touches_code(&here.join(word))
+        let here = match cwd {
+            Some(c) if c.is_absolute() => c.to_path_buf(),
+            Some(c) => self.workspace.join(c),
+            None => self.workspace.clone(),
         };
-        command
-            .split(['\n', ';', '|', '&'])
-            .map(str::split_whitespace)
-            .any(|words| {
-                let words: Vec<&str> = words
-                    // An env assignment or sudo before the command itself.
-                    .skip_while(|w| (w.contains('=') && !w.starts_with('-')) || *w == "sudo")
-                    .collect();
-                // A write by redirect, anywhere in the step.
-                let redirected = words
-                    .windows(2)
-                    .any(|w| matches!(w[0], ">" | ">>") && at(w[1]))
-                    || words.iter().any(|w| {
-                        w.strip_prefix(">>")
-                            .or_else(|| w.strip_prefix('>'))
-                            .is_some_and(|t| !t.is_empty() && !t.starts_with('&') && at(t))
-                    });
-                let program = words
-                    .first()
-                    .map(|w| w.rsplit('/').next().unwrap_or(w))
-                    .unwrap_or_default();
-                let sub = words.get(1).copied().unwrap_or_default();
-                redirected
-                    || match program {
-                        "git" => matches!(
-                            sub,
-                            "commit"
-                                | "push"
-                                | "apply"
-                                | "am"
-                                | "rebase"
-                                | "reset"
-                                | "checkout"
-                                | "switch"
-                                | "restore"
-                                | "merge"
-                                | "cherry-pick"
-                                | "revert"
-                                | "stash"
-                                | "clean"
-                                | "add"
-                                | "rm"
-                                | "mv"
-                        ),
-                        "cargo" => matches!(
-                            sub,
-                            "build"
-                                | "b"
-                                | "test"
-                                | "t"
-                                | "run"
-                                | "r"
-                                | "check"
-                                | "c"
-                                | "clippy"
-                                | "fmt"
-                                | "install"
-                                | "add"
-                                | "remove"
-                                | "update"
-                                | "fix"
-                                | "bench"
-                                | "nextest"
-                        ),
-                        "npm" | "pnpm" | "yarn" | "bun" => matches!(
-                            sub,
-                            "run"
-                                | "build"
-                                | "test"
-                                | "t"
-                                | "install"
-                                | "i"
-                                | "ci"
-                                | "add"
-                                | "remove"
-                                | "exec"
-                                | "dlx"
-                                | "x"
-                        ),
-                        "go" => matches!(
-                            sub,
-                            "build" | "test" | "run" | "generate" | "install" | "get" | "mod"
-                        ),
-                        "make" | "cmake" | "ninja" | "bazel" | "gradle" | "mvn" | "npx" | "tsc"
-                        | "pytest" | "patch" | "pip" | "pip3" | "uv" | "poetry" => true,
-                        "sed" | "perl" => words.iter().any(|w| w.starts_with("-i")),
-                        "tee" | "rm" | "mv" | "cp" | "touch" | "mkdir" | "ln" | "truncate"
-                        | "chmod" | "rmdir" | "install" => words[1..].iter().any(|w| at(w)),
-                        _ => false,
-                    }
-            })
+        let roots: Vec<PathBuf> = (self.code)()
+            .iter()
+            .map(|root| folded_buf(resolved(root)))
+            .collect();
+        command::is_code(command, &here, &|p: &Path| self.touches_code_in(p, &roots))
     }
 }
 
@@ -835,7 +749,7 @@ mod tests {
             "echo x >>src/lib.rs",
             "cat a | tee src/new.rs",
             "rm -rf src",
-            "cd /x && git apply p.diff",
+            "cd src && git apply p.diff",
         ] {
             changes.push((
                 "exec.run",

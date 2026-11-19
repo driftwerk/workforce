@@ -344,9 +344,6 @@ fn model_name_ok(m: &str) -> bool {
 /// [`Self::Direct`]. `style` wins when both are there, and Desk writes
 /// both, so a hub that doesn't know `style` reads Prefer sessions as the
 /// stricter Only in sessions.
-/// What a `style` that is none of the three is told.
-const WRONG_STYLE: &str = "How it works must be \"sessions_only\" (Only in sessions), \"prefer_sessions\" (Prefer sessions) or \"direct\" (Do it myself).";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkStyle {
@@ -363,6 +360,9 @@ pub enum WorkStyle {
     /// Do it myself: no session preference.
     Direct,
 }
+
+/// What a `style` that is none of the three is told.
+const WRONG_STYLE: &str = "How it works must be \"sessions_only\" (Only in sessions), \"prefer_sessions\" (Prefer sessions) or \"direct\" (Do it myself).";
 
 impl WorkStyle {
     pub const ALL: [Self; 3] = [Self::SessionsOnly, Self::PreferSessions, Self::Direct];
