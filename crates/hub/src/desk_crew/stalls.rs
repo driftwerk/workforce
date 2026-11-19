@@ -230,15 +230,23 @@ impl CrewHub {
         let s = view.id;
         let mut sent = false;
         let mut going = false;
+        let mut parked = false;
         let mut given: Option<DateTime<Utc>> = None;
         let mut not: Option<String> = None;
         for i in held {
             match self.deliver_held(boss, s, i, since).await {
                 Held::Sent => sent = true,
                 Held::Going => going = true,
+                Held::Parked => parked = true,
                 Held::Given(at) => given = given.max(Some(at)),
                 Held::Suggested(why) | Held::Refused(why) => not = Some(why),
             }
+        }
+        // Left for it while it isn't running: it has them when it runs.
+        if parked && acts && !sent {
+            return Some(Mover::Boss {
+                doing: "I've left them on its line; they reach it as soon as it runs again.".into(),
+            });
         }
         // On its way to the session: said so only where the boss acts.
         if sent || (going && acts) {
@@ -336,7 +344,8 @@ impl CrewHub {
                 let due = self.keep_recheck(boss, o, view, &on, true, now).await?;
                 Some(Mover::Outside { on, check_at: due })
             }
-            Stall::Failed => None,
+            // Set aside by the person, or not kept: left as written.
+            Stall::SetAside | Stall::Failed => None,
         }
     }
 
@@ -607,6 +616,19 @@ impl CrewHub {
         {
             return Some(due);
         }
+        // One re-check a session: what it waited on before is this now.
+        for old in open
+            .iter()
+            .filter(|i| i.dedupe_key.starts_with(&prefix))
+            .filter(|i| i.holding_up.as_deref() != Some(on.as_str()))
+        {
+            if let Err(e) = store
+                .item_close(old.id, ClosedBy::Boss, "It waits on something newer.")
+                .await
+            {
+                tracing::warn!(error = %e, "closing an older re-check failed");
+            }
+        }
         let minute = Duration::from_std(self.timing.minute).unwrap_or_default();
         let after = o.updates.every_minutes.max(RECHECK_MINUTES);
         let due = now + minute * after as i32;
@@ -679,24 +701,29 @@ impl CrewHub {
                 }),
                 Err(_) => true,
             };
-            let live = self
-                .desk
-                .view(s)
-                .is_ok_and(|v| v.state != SessionState::Closed);
+            // Working on it now (after the person's answer): it moved.
+            let live = self.desk.view(s).is_ok_and(|v| {
+                v.state != SessionState::Closed && !(settled && v.state == SessionState::Working)
+            });
             if !still || !live {
                 continue;
             }
-            self.wake_on(
-                &i.boss,
-                s,
-                format!(
+            let line = match settled {
+                true => format!(
+                    "You told the person you'd look again at {at} at whether {} acted on their \
+                     answer to what it waited on. It still says it waits or is stuck: make sure \
+                     their answer reached it and it acts on it now (crew.nudge), or ask them what \
+                     more it needs with crew.ask_person.",
+                    self.session_name(s)
+                ),
+                false => format!(
                     "You told the person you'd check again at {at} on {}, which waits on {on}. \
                      Check it now: if it moved, carry on; if not, do what moves it, or say when \
                      you'll look next.",
                     self.session_name(s)
                 ),
-                format!("recheck:{s}"),
-            );
+            };
+            self.wake_on(&i.boss, s, line, format!("recheck:{s}"));
         }
     }
 }

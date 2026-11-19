@@ -404,20 +404,23 @@ impl DeskStore {
             .is_some())
     }
 
-    /// When the person last settled `boss`'s item keyed `key` (answered it,
-    /// or settled it in its session; never dropped or set aside), if they
-    /// did.
-    pub async fn item_last_settled(&self, boss: &str, key: &str) -> Result<Option<DateTime<Utc>>> {
+    /// When the person last closed `boss`'s item keyed `key`, and why
+    /// ("You answered: …", "You dropped it."), if they did.
+    pub async fn item_last_by_person(
+        &self,
+        boss: &str,
+        key: &str,
+    ) -> Result<Option<(DateTime<Utc>, String)>> {
         let client = self.pool().get().await?;
         Ok(client
             .query_opt(
-                "SELECT max(closed_at) FROM boss_open_items \
+                "SELECT closed_at, coalesce(closed_why, '') FROM boss_open_items \
                  WHERE boss = $1 AND dedupe_key = $2 AND state = 'closed' AND closed_by = 'person' \
-                 AND (closed_why LIKE 'You answered%' OR closed_why LIKE 'You settled%')",
+                 AND closed_at IS NOT NULL ORDER BY closed_at DESC LIMIT 1",
                 &[&boss, &key],
             )
             .await?
-            .and_then(|r| r.get::<_, Option<DateTime<Utc>>>(0)))
+            .map(|r| (r.get::<_, DateTime<Utc>>(0), r.get::<_, String>(1))))
     }
 
     /// The item not closed for the session question `message`, if one.

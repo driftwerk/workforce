@@ -57,6 +57,9 @@ pub(crate) enum Held {
     Sent,
     /// Sent before, still queued on its line: on its way.
     Going,
+    /// Left on its line for a session not running (now or before): it
+    /// reaches it when it runs again.
+    Parked,
     /// It reached the session already, at this time (it, or the boss's own
     /// word after the session said it waits).
     Given(DateTime<Utc>),
@@ -90,8 +93,8 @@ pub(crate) fn held_for<'a>(open: &'a [OpenItem], s: Uuid, work: &Work) -> Vec<&'
 /// Words an answer to something asked is given in: "yes", "go with option
 /// B", "approved", beside what asks ([`write::asks_for_word`]).
 const ANSWER_WORDS: &[&str] = &[
-    "yes", "ok", "okay", "agreed", "go with", "option", "chose", "choose", "pick", "take the",
-    "ship it", "go ahead",
+    "yes", "ok", "okay", "agreed", "go with", "option", "chose", "choose", "take the", "ship it",
+    "go ahead",
 ];
 
 /// Whether an order answers something asked ("ok yes to all to approve the
@@ -103,7 +106,8 @@ fn answers(text: &str) -> bool {
 }
 
 /// Whether an order is a standing instruction ("Keep the old index until
-/// Friday", "Note: don't deploy"), not an answer to something asked.
+/// Friday", "Note: don't deploy"), not an answer to something asked: its
+/// first words (past an id or a "Note:") say a rule.
 fn standing(text: &str) -> bool {
     let l = text.to_lowercase().replace('\u{2019}', "'");
     let rules = [
@@ -111,9 +115,8 @@ fn standing(text: &str) -> bool {
     ];
     l.split([':', '\n', '.', ';'])
         .map(str::trim)
-        .filter(|p| !p.is_empty() && !write::is_id(p))
-        .any(|p| rules.iter().any(|w| p.starts_with(w)))
-        || names(&l, "until")
+        .find(|p| !p.is_empty() && !write::is_id(p) && !matches!(*p, "note" | "fyi" | "ps"))
+        .is_some_and(|p| rules.iter().any(|w| p.starts_with(w)))
 }
 
 /// What the session is sent of `item`: the person's word, said as the
@@ -159,6 +162,10 @@ fn given(
     {
         return Some(Given::Going);
     }
+    // Left for a session not running: it goes when it runs, never again.
+    if mine.iter().any(|m| ours(m) && m.delivery == Delivery::Held) {
+        return Some(Given::Parked);
+    }
     mine.iter()
         .filter(|m| m.delivery == Delivery::Delivered && (ours(m) || reached(m) > since))
         .map(|m| reached(m))
@@ -171,6 +178,8 @@ enum Given {
     /// Queued on its line for the running session, not yet read (one held
     /// for a session not running isn't on its way).
     Going,
+    /// Left on its line for a session not running: it goes when it runs.
+    Parked,
     /// It reached the session then.
     At(DateTime<Utc>),
 }
@@ -192,6 +201,7 @@ impl CrewHub {
         };
         match given(&thread, boss, s, item, since) {
             Some(Given::Going) => return Held::Going,
+            Some(Given::Parked) => return Held::Parked,
             Some(Given::At(at)) => return Held::Given(at),
             None => {}
         }
@@ -220,7 +230,11 @@ impl CrewHub {
             return Held::Refused(why);
         }
         tracing::info!(session = %s, item = %item.id, "the person's word a boss held went to the session waiting on it");
-        Held::Sent
+        // A session not running has it when it runs again.
+        match self.desk.view(s) {
+            Ok(v) if !v.live => Held::Parked,
+            _ => Held::Sent,
+        }
     }
 }
 
@@ -288,9 +302,15 @@ mod tests {
         let kept = order("Keep the old index until Friday", vec![s]);
         let plain = order("VEL-22: go with option B, the 60 minute window", vec![]);
         assert_eq!(held_for(std::slice::from_ref(&plain), s, &work).len(), 1);
+        let both = order(
+            "VEL-22: go with option B. Keep the 60 minute window",
+            vec![],
+        );
+        assert_eq!(held_for(std::slice::from_ref(&both), s, &work).len(), 1);
         for not in [
             "VEL-22: also add tests for the importer",
             "VEL-22. Note: don't deploy it",
+            "VEL-22: pick up the importer tests too",
         ] {
             assert!(
                 held_for(&[order(not, vec![s])], s, &work).is_empty(),

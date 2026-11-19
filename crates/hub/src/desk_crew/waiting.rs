@@ -126,6 +126,9 @@ pub(super) enum Stall {
     Item(Box<OpenItem>),
     /// They answered it then, after the session last said where it is.
     Settled(DateTime<Utc>),
+    /// They dropped it or set it aside then, after the session last said
+    /// where it is: not asked again until it says more.
+    SetAside,
     /// It couldn't be read or kept.
     Failed,
 }
@@ -558,7 +561,7 @@ impl CrewHub {
         let mut given = false;
         for i in held {
             match self.deliver_held(boss, view.id, i, since).await {
-                Held::Sent | Held::Going => given = true,
+                Held::Sent | Held::Going | Held::Parked => given = true,
                 Held::Given(at) => given |= at > since,
                 Held::Suggested(why) | Held::Refused(why) => {
                     tracing::info!(session = %view.id, item = %i.id, %why, "the person's word a boss holds couldn't go to the session waiting on it")
@@ -595,8 +598,16 @@ impl CrewHub {
         };
         let was = open.into_iter().find(|i| i.dedupe_key == key);
         if was.is_none() {
-            match store.item_last_settled(boss, &key).await {
-                Ok(Some(at)) if at >= since => return Stall::Settled(at),
+            match store.item_last_by_person(boss, &key).await {
+                // Answered, or settled in the session: theirs is done.
+                Ok(Some((at, why)))
+                    if at >= since
+                        && (why.starts_with("You answered") || why.starts_with("You settled")) =>
+                {
+                    return Stall::Settled(at)
+                }
+                // Dropped or set aside: not asked again until it says more.
+                Ok(Some((at, _))) if at >= since => return Stall::SetAside,
                 Ok(_) => {}
                 Err(e) => {
                     tracing::info!(error = %e, "whether a stall was settled couldn't be read");
@@ -726,15 +737,13 @@ impl CrewHub {
                 .is_some_and(|w| !w.trim().is_empty());
             // Only what it said since the card opened shows it went on: a
             // line that waits on no one, and nothing it says waits.
-            let newer: Vec<&str> = a
-                .done
-                .iter()
-                .filter(|d| d.at > i.opened_at)
-                .map(|d| d.text.as_str())
-                .collect();
-            // What it says now: its newest line since.
-            let still = newer.last().is_some_and(|t| {
-                write::says_stall(t) || write::says_missing(t) || write::asks_for_word(t)
+            let newer: Vec<&workforce_desk::account::Done> =
+                a.done.iter().filter(|d| d.at > i.opened_at).collect();
+            // What it says now: its newest line since, by when it was said.
+            let still = newer.iter().max_by_key(|d| d.at).is_some_and(|d| {
+                write::says_stall(&d.text)
+                    || write::says_missing(&d.text)
+                    || write::asks_for_word(&d.text)
             });
             let on_boss = self
                 .desk
