@@ -629,7 +629,12 @@ impl Desk {
     /// Whether `row` (to `id`) is still unread in turn `mark`: that turn
     /// runs, the row is still queued or handed to Desk's plugin, and no
     /// hook is taking it now. What an escalation, and a suggestion to
-    /// interrupt, hold on.
+    /// interrupt, hold on. A handed row is unread: the plugin holds it for
+    /// the session's idle, and may drop it back to the queue
+    /// ([`Self::row_unread`], as [`Self::steer_settled`] reads it too). A
+    /// row a hook is taking is the one difference from that: not unread
+    /// here, so nothing interrupts the call reading it, and not settled
+    /// there, as the take may put it back.
     pub async fn steer_unread(&self, id: Uuid, mark: TurnMark, row: Uuid) -> bool {
         let unread = self.row_unread(row).await;
         let st = self.0.state.lock();
@@ -692,16 +697,14 @@ impl Desk {
 
     /// Whether a suggestion to interrupt `id`'s turn `mark` for its
     /// stand-down `row` is over: that turn ended, or the row went in (taken
-    /// and delivered, handed to Desk's plugin, or withdrawn). A row a hook
-    /// is taking isn't yet: the take may put it back.
+    /// and delivered, or withdrawn). Unread as [`Self::steer_unread`] reads
+    /// it ([`Self::row_unread`]): a row handed to Desk's plugin isn't in
+    /// the session yet and may come back to the queue, so the person's yes
+    /// would still interrupt for it, and the suggestion stands. A row a hook
+    /// is taking isn't over either, though it isn't unread there: the take
+    /// may put it back.
     pub async fn steer_settled(&self, id: Uuid, mark: TurnMark, row: Uuid) -> bool {
-        if self.turn_mark(id) != Some(mark) {
-            return true;
-        }
-        !matches!(
-            self.0.store.line_message(row).await,
-            Ok(Some(m)) if m.delivery == line::Delivery::Queued
-        )
+        self.turn_mark(id) != Some(mark) || !self.row_unread(row).await
     }
 
     /// Interrupts `id`'s turn `mark` as [`Self::interrupt`] does, for its

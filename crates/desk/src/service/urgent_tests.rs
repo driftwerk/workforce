@@ -843,6 +843,77 @@ async fn an_interrupt_for_a_stand_down_being_read_or_read_is_refused_and_holds_n
     .await;
 }
 
+/// Whether `row` reads as unread in `s`'s turn `mark`, and whether a
+/// suggestion to interrupt that turn for it is over.
+async fn unread_settled(d: &Desk, s: Uuid, mark: line::TurnMark, row: Uuid) -> (bool, bool) {
+    (
+        d.steer_unread(s, mark, row).await,
+        d.steer_settled(s, mark, row).await,
+    )
+}
+
+#[tokio::test]
+async fn a_stand_down_handed_to_the_plugin_is_unread_for_its_interrupt_and_its_suggestion_alike() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = working(&d, dir.path()).await;
+        let mark = d.turn_mark(s).unwrap();
+        let (m, _) = urgent(&d, s, "Stand down from a:2.", Urgency::Escalate).await;
+        // Queued in its turn: unread, so it escalates, and its suggestion
+        // stands.
+        assert_eq!(unread_settled(&d, s, mark, m.id).await, (true, false));
+        // Handed to Desk's plugin, which holds it for the session's idle:
+        // still unread, both ways.
+        d.0.store
+            .line_take(m.id, Delivery::Handed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unread_settled(&d, s, mark, m.id).await, (true, false));
+        // The plugin drops it (the person interrupted): queued again, unread.
+        d.0.store
+            .line_requeue(Some(m.id), chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(row(&d, m.id).await.delivery, Delivery::Queued);
+        assert_eq!(unread_settled(&d, s, mark, m.id).await, (true, false));
+        // A hook taking it: neither. It doesn't escalate while the take
+        // runs, nor is its suggestion over, as the take may put it back.
+        d.0.state
+            .lock()
+            .live
+            .get_mut(&s)
+            .unwrap()
+            .breaker
+            .taking
+            .insert(m.id);
+        assert_eq!(unread_settled(&d, s, mark, m.id).await, (false, false));
+        d.0.state
+            .lock()
+            .live
+            .get_mut(&s)
+            .unwrap()
+            .breaker
+            .taking
+            .clear();
+        // Handed again, and the plugin says the session has it: read.
+        d.0.store
+            .line_take(m.id, Delivery::Handed)
+            .await
+            .unwrap()
+            .unwrap();
+        d.0.store.line_ack(m.id).await.unwrap().unwrap();
+        assert_eq!(unread_settled(&d, s, mark, m.id).await, (false, true));
+        // Another, unread as its turn ends: over, and nothing to escalate.
+        let (n, _) = urgent(&d, s, "Stand down from b:3.", Urgency::Escalate).await;
+        assert_eq!(unread_settled(&d, s, mark, n.id).await, (true, false));
+        post(&d, s, stop()).await;
+        assert_eq!(unread_settled(&d, s, mark, n.id).await, (false, true));
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn an_urgent_row_left_from_an_earlier_turn_isnt_held_for_a_later_one() {
     with_test_pool(build_pool, |pool| async move {
