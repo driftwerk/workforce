@@ -24,6 +24,14 @@ pub struct WorkerConfig {
     #[serde(default)]
     pub registry_mirror: Option<String>,
     pub max_scopes: u32,
+    /// Whether a scope starts at seat only the services it needs: none for a
+    /// scope with no repos, a golden's `services` for one with repos. The
+    /// rest are left to start on first use, which needs a toolbox image whose
+    /// toolbox-init reads `TOOLBOX_LAZY_SERVICES`; turn this on only once the
+    /// deployed image does. Off, the default, every scope starts every
+    /// service, as before.
+    #[serde(default)]
+    pub lazy_services: bool,
     pub pool_free_floor_gib: u64,
     pub scope_memory_gib: u32,
     pub scope_cpus: u32,
@@ -85,6 +93,13 @@ pub struct GoldenConfig {
     /// Paths on `branch` whose change makes the golden stale.
     #[serde(default)]
     pub watch: Vec<String>,
+    /// With `lazy_services`, the services a scope checking this repo out
+    /// starts with it, by name (`mysql`, `postgres`, `redis`, `ministack`);
+    /// unset, every configured one. The others start on first use. It must
+    /// cover what `install` and a repo's setup need at seat, as they run
+    /// before anything else in the scope.
+    #[serde(default)]
+    pub services: Option<Vec<String>>,
 }
 
 /// A stateless service toolbox-init can start on loopback.
@@ -346,7 +361,29 @@ impl WorkerConfig {
                 "[[worker.golden]] {name:?} watches lockfiles, which needs [worker.secrets] github_token"
             );
         }
+        let configured = self.service_names();
+        if let Some(service) = golden
+            .services
+            .iter()
+            .flatten()
+            .find(|service| !configured.contains(&service.as_str()))
+        {
+            bail!(
+                "[[worker.golden]] {name:?} services names {service:?}, which is not a configured service (configured: {})",
+                configured.join(", ")
+            );
+        }
         Ok(())
+    }
+
+    /// Every service a scope may run, as toolbox-init names them: the
+    /// databases, then the stateless services.
+    pub fn service_names(&self) -> Vec<&'static str> {
+        self.database
+            .iter()
+            .map(|database| database.kind.service())
+            .chain(self.services.iter().map(|service| service.name()))
+            .collect()
     }
 
     pub fn listen_addr(&self) -> SocketAddr {
@@ -396,6 +433,7 @@ pub(crate) mod tests {
             toolbox_image_file: "/etc/workforce/toolbox-image".into(),
             registry_mirror: Some("http://host.docker.internal:5000".into()),
             max_scopes: 2,
+            lazy_services: true,
             pool_free_floor_gib: 1,
             scope_memory_gib: 8,
             scope_cpus: 4,
@@ -412,6 +450,7 @@ pub(crate) mod tests {
                 secrets: vec!["RAILS_MASTER_KEY".into()],
                 env: BTreeMap::from([("TZ".into(), "Europe/London".into())]),
                 watch: vec!["Gemfile.lock".into()],
+                services: None,
             }],
             database: vec![
                 DatabaseConfig {
@@ -588,6 +627,23 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_golden_may_name_only_configured_services() {
+        let mut config = sample();
+        config.golden[0].services = Some(vec!["mysql".into(), "postgres".into()]);
+        assert!(config.validate().is_ok());
+        config.golden[0].services = Some(Vec::new());
+        assert!(config.validate().is_ok());
+        config.golden[0].services = Some(vec!["redis".into()]);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("\"redis\"") && error.contains("mysql, postgres"),
+            "{error}"
+        );
+        config.services = vec![Service::Redis];
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
     fn services_are_redis_or_ministack_each_at_most_once() {
         let mut config = sample();
         config.services = vec![Service::Redis, Service::Ministack];
@@ -669,6 +725,37 @@ scope_cpus = 4
 snapshot_retention_days = 7
 backup_pool = "backup"
 "#;
+
+    #[test]
+    fn lazy_services_and_a_goldens_services_load_and_an_older_file_has_neither() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("worker.toml");
+        std::fs::write(
+            &path,
+            format!("{MINIMAL}backup_bucket_prefix = \"s3://b/golden\"\n"),
+        )
+        .unwrap();
+        let older = WorkerConfig::load(&path).unwrap();
+        assert!(!older.lazy_services, "off unless asked for");
+
+        let newer = MINIMAL.replace(
+            "[worker]\n",
+            "[worker]\nlazy_services = true\nservices = [\"redis\"]\n",
+        );
+        std::fs::write(
+            &path,
+            format!(
+                "{newer}backup_bucket_prefix = \"s3://b/golden\"\n\
+                 [[worker.golden]]\nname = \"web\"\nslug = \"acme/web\"\nbranch = \"main\"\nservices = []\n\
+                 [[worker.golden]]\nname = \"api\"\nslug = \"acme/api\"\nbranch = \"main\"\nservices = [\"redis\"]\n"
+            ),
+        )
+        .unwrap();
+        let newer = WorkerConfig::load(&path).unwrap_or_else(|e| panic!("{e:#}"));
+        assert!(newer.lazy_services);
+        assert_eq!(newer.golden[0].services, Some(Vec::new()));
+        assert_eq!(newer.golden[1].services, Some(vec!["redis".to_string()]));
+    }
 
     #[test]
     fn load_anchors_relative_paths_to_the_file() {
