@@ -1415,7 +1415,12 @@ impl CrewHub {
                     &by.party.id,
                     *session,
                     &p,
-                    &order.held_elsewhere,
+                    // Relayed from the home: its jobs came with it, or
+                    // the request is the person's.
+                    match order.unrecorded {
+                        true => order.held_elsewhere.as_deref(),
+                        false => Some(&[]),
+                    },
                 ))
                 .await
                 {
@@ -1429,6 +1434,7 @@ impl CrewHub {
         // whichever path its action came by.
         if by.party.kind == crew::PartyKind::Manager {
             if let Some(why) = self.left_alone(action) {
+                unheld(&why).await;
                 return Err(why);
             }
         }
@@ -1903,7 +1909,7 @@ impl CrewHub {
                 Ok(format!("restarted {}", v.label()))
             }
             Action::StartSession { .. } => self.start_session(action, by, done).await,
-            Action::AssignTicket { .. } => self.assign_ticket(action, by).await,
+            Action::AssignTicket { .. } => Box::pin(self.assign_ticket(action, by, done)).await,
             Action::MoveTicket {
                 ticket, id, state, ..
             } => {
@@ -2478,7 +2484,12 @@ impl CrewHub {
     /// started for it, as `by`. One that is started is the overseer's to
     /// run from the start: it counts against `[oversight.work] parallel`
     /// as any start does, and is in the overseer's charge and group.
-    async fn assign_ticket(&self, action: &Action, by: By) -> Result<String, String> {
+    async fn assign_ticket(
+        &self,
+        action: &Action,
+        by: By,
+        done: &mut Done,
+    ) -> Result<String, String> {
         let Action::AssignTicket {
             ticket: key,
             id,
@@ -2579,6 +2590,10 @@ impl CrewHub {
             }
         };
         let who = given.ticket.assignee;
+        // The session it started, for the assignment it holds.
+        if let (Handout::NewSession { .. }, Some(a)) = (to, who.as_ref()) {
+            done.started = a.id.parse().ok();
+        }
         let name = who.as_ref().map_or("no one", |a| a.name.as_str());
         Ok(match (to, who.as_ref()) {
             (Handout::NewSession { .. }, Some(a)) => format!(

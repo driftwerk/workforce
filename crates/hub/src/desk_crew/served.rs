@@ -1072,8 +1072,24 @@ impl CrewHub {
             Gate::Suggest(why) => Ok(self.served_suggestion(&action, &why)),
             Gate::Run => {
                 let done = match &action {
+                    // Recorded as any order (its goal, its declared job),
+                    // with the session it started.
                     Action::StartSession { .. } => {
-                        self.served_start(&action, g, o, boss, by).await?
+                        let reserved =
+                            match Box::pin(self.assign_before(&action, &by, &order)).await? {
+                                super::assignments::Before::Send(r) => Some(r),
+                                super::assignments::Before::Not => None,
+                                super::assignments::Before::Held(said) => {
+                                    return Ok((ServedStatus::Ok, json!({ "done": said })))
+                                }
+                            };
+                        let who = by.clone();
+                        let started = self.served_start(&action, g, o, boss, by).await;
+                        if let Some(r) = &reserved {
+                            let id = started.as_ref().ok().map(|(_, id)| *id);
+                            Box::pin(self.assign_after(r, &who, None, id, started.is_ok())).await;
+                        }
+                        started?.0
                     }
                     _ => Box::pin(self.perform_with(&action, by, &order)).await?,
                 };
@@ -1104,7 +1120,7 @@ impl CrewHub {
         o: &Oversight,
         boss: &str,
         by: By,
-    ) -> Result<String, String> {
+    ) -> Result<(String, Uuid), String> {
         let Action::StartSession {
             folder,
             goal,
@@ -1199,7 +1215,10 @@ impl CrewHub {
                 }
                 other => other.to_string(),
             })?;
-        Ok(format!("started {} ({}); you run it", v.label(), v.id))
+        Ok((
+            format!("started {} ({}); you run it", v.label(), v.id),
+            v.id,
+        ))
     }
 }
 

@@ -120,6 +120,10 @@ pub(crate) struct Outbox {
     taken: HashSet<Uuid>,
     /// When the Mac sent the latest take heard for each (its `sentAt`).
     latest: HashMap<Key, i64>,
+    /// The irreversible jobs the home said its boss holds, with its latest
+    /// answer for each (none when it didn't say): what a request here is
+    /// compared with before it is allowed (R5).
+    held: HashMap<Key, Option<Vec<workforce_desk::assignment::Assignment>>>,
 }
 
 impl Outbox {
@@ -177,6 +181,22 @@ fn key_of(boss: &BossRef, group: &str) -> Option<Key> {
 // ── The machine's side ──────────────────────────────────────────────────
 
 impl CrewHub {
+    /// The irreversible jobs the home said, with its latest answer, that
+    /// `party` (`home/<agent>`) holds, for `group`'s requests: none when it
+    /// didn't say.
+    pub(crate) fn relayed_held(
+        &self,
+        party: &str,
+        group: &str,
+    ) -> Option<Vec<workforce_desk::assignment::Assignment>> {
+        self.relayed
+            .lock()
+            .held
+            .get(&(party.to_string(), group.to_string()))
+            .cloned()
+            .flatten()
+    }
+
     /// Whether the home said, lately, that Act fully is in force for
     /// `party` (`home/<agent>`) in `group`.
     pub(crate) fn home_holds_full(&self, party: &str, group: &str) -> bool {
@@ -443,8 +463,12 @@ impl CrewHub {
             Ok(t) => workforce_desk::sees::capped(t, 500),
             Err(f) => f.why.clone(),
         };
+        let held = input
+            .get("heldJobs")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
         let taken = id.and_then(|id| {
             let mut out = self.relayed.lock();
+            out.held.insert(key.clone(), held);
             let ours =
                 out.waiting.get(&id).is_some_and(|(k, _)| *k == key) && out.taken.contains(&id);
             if !ours {
@@ -811,11 +835,17 @@ async fn decide_one(
         }
         d => d,
     };
-    let input = match decided {
+    let mut input = match decided {
         Ok(text) => json!({"decideId": id,
                            "text": text.chars().take(MAX_ANSWER).collect::<String>()}),
         Err((code, why)) => json!({"decideId": id, "error": why, "code": code.as_str()}),
     };
+    // The jobs the boss holds here, for the machine to compare the request
+    // with (R5); none said when they couldn't be read, and the machine then
+    // leaves an irreversible one to the person.
+    if let Ok(held) = crew.held_irreversible(&agent).await {
+        input["heldJobs"] = json!(held);
+    }
     tracing::info!(%machine, %group, %agent, ok = input.get("text").is_some(), "a relayed boss decided a machine's request");
     let ceiling = crew.ceiling_now(&agent, &o);
     if let Err(why) = crew

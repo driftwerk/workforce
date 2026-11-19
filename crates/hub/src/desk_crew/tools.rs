@@ -794,7 +794,14 @@ impl CrewTool {
             super::assignments::relayed_input(&sent, assigned.as_ref().and_then(|a| a.guard));
         // The machine compares a request with the jobs kept here (R5).
         if name == "crew.approve" {
-            sent[super::assignments::HELD_JOBS] = json!(crew.held_irreversible(agent).await);
+            match crew.held_irreversible(agent).await {
+                Ok(held) => sent[super::assignments::HELD_JOBS] = json!(held),
+                Err(why) => {
+                    return Some(Err(format!(
+                        "Not allowed: {why}, so this can't be checked against them. It's the person's to answer."
+                    )))
+                }
+            }
         }
         let relayed = crew.relay(machine, g, name, sent, agent, &ceiling).await;
         if let Some(a) = assigned.map(|a| a.id) {

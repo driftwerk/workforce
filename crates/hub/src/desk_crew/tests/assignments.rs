@@ -969,62 +969,86 @@ async fn a_stand_down_answer_missed_on_the_bus_is_read_from_the_line() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn what_a_dropped_send_left_reserved_is_settled_within_minutes() {
+async fn what_a_dropped_send_left_reserved_is_settled_by_how_it_was_sent() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let raw = pool.clone();
         let dir = tempfile::tempdir().unwrap();
         let (_overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
         d.picture_load().await;
+        let by = || crew.by_overseer("Sam ordered the releases.").unwrap();
         let s = session_in(&d, dir.path(), "harbor", "harbor-release-3").await;
         let t = session_in(&d, dir.path(), "harbor", "harbor-docs").await;
         let u = session_in(&d, dir.path(), "harbor", "harbor-web").await;
-        let reserve = async |session: uuid::Uuid, text: &str, key: &str, tool: Option<&str>| {
-            let mut a = workforce_desk::assignment::Assignment::new("desk", session, text);
-            let job = workforce_desk::assignment::Job::new("release", HARBOR, key).unwrap();
-            a.job_key = Some(job.as_key());
-            a.job = Some(job.said());
-            a.claims = true;
-            a.action = tool.map(|t| json!({ "tool": t, "input": {} }));
-            d.store().assignment_reserve(&a, None).await.unwrap();
-            a.id
+        // Each reserved and sent as the boss's tools do: two messages on
+        // their lines, and a resume, which carries none.
+        crew.perform_with(&nudge(s.id, "Start release 6."), by(), &release("6"))
+            .await
+            .unwrap();
+        crew.perform_with(&nudge(t.id, "Start release 7."), by(), &release("7"))
+            .await
+            .unwrap();
+        let resume = Action::Resume {
+            session: u.id,
+            prompt: Some("Pick up release 8 where you left it.".into()),
         };
-        // Its send dropped before it was kept: one never sent, one whose
-        // message went, and a ticket, which carries none.
-        let unsent = reserve(s.id, "Start release 6.", "6", None).await;
-        let went = reserve(t.id, "Start release 7.", "7", None).await;
-        d.line_send(
-            LineSender::Overseer(crew.by_overseer("Release 7.").unwrap()),
-            Send::Ask {
-                to: LineTarget::Session(t.id),
-                text: "Start release 7.".into(),
-                wait: Duration::ZERO,
-                chose: None,
-                parts: Default::default(),
-            },
+        let _ = crew.perform_with(&resume, by(), &release("8")).await;
+        let (went, lost, resumed) = (held_by(&d, s.id).await, held_by(&d, t.id).await, {
+            d.store()
+                .assignments_of("desk", false)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|a| a.session == u.id)
+                .expect("the resume's assignment")
+        });
+        assert_eq!(resumed.action.as_ref().unwrap()["tool"], "crew.resume");
+        // Both messages delivered first, so nothing writes their lines again.
+        goes_in(&d, s.id).await;
+        goes_in(&d, t.id).await;
+        // Each send dropped before its end was kept, as a future dropped
+        // midway leaves it; one message never reached its line.
+        let db = raw.get().await.unwrap();
+        db.execute(
+            "UPDATE boss_assignments SET state = 'sending', closed_at = NULL, closed_by = NULL, \
+             closed_why = NULL, line_message = NULL, sent_at = now() - interval '10 minutes' \
+             WHERE id = ANY($1)",
+            &[&vec![went.id, lost.id, resumed.id]],
         )
         .await
         .unwrap();
-        let ticket = reserve(
-            u.id,
-            "Ticket DW-1 is yours to work on.",
-            "8",
-            Some("crew.assign_ticket"),
+        db.execute(
+            "UPDATE line_messages SET at = now() - interval '9 minutes' WHERE id = $1",
+            &[&went.line_message.unwrap()],
         )
-        .await;
+        .await
+        .unwrap();
+        db.execute(
+            "DELETE FROM line_messages WHERE id = $1",
+            &[&lost.line_message.unwrap()],
+        )
+        .await
+        .unwrap();
         let state = async |id| d.store().assignment(id).await.unwrap().unwrap();
         eventually("the dropped sends to be settled", async || {
-            (state(unsent).await.state == AssignmentState::Failed).then_some(())
+            (state(lost.id).await.state != AssignmentState::Sending).then_some(())
         })
         .await;
-        let w = state(went).await;
-        assert_eq!(w.state, AssignmentState::Open);
-        assert!(w.line_message.is_some());
-        assert_eq!(
-            state(ticket).await.state,
-            AssignmentState::Open,
-            "never dropped for not being seen"
-        );
+        let l = state(lost.id).await;
+        assert_eq!(l.state, AssignmentState::Failed, "{l:?}");
+        // Settled as gone (and, unreported ten minutes on, lapsed by the
+        // look after): never as unsent.
+        let gone = [AssignmentState::Open, AssignmentState::Lapsed];
+        let w = state(went.id).await;
+        assert!(gone.contains(&w.state), "{:?}", w.state);
+        assert_eq!(w.line_message, went.line_message);
+        let r = state(resumed.id).await.state;
+        assert!(gone.contains(&r), "a resume carries no line message: {r:?}");
         // Its send ending late still keeps what happened.
-        let late = d.store().assignment_sent(unsent, None, true).await.unwrap();
+        let late = d
+            .store()
+            .assignment_sent(lost.id, None, true)
+            .await
+            .unwrap();
         assert_eq!(late.map(|a| a.state), Some(AssignmentState::Open));
     })
     .await;
@@ -1098,6 +1122,83 @@ async fn a_stand_down_while_the_person_drives_is_theirs_and_goes_once_they_close
             (!told(&d, new.id).await.is_empty()).then_some(())
         })
         .await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_order_goes_when_the_person_closes_its_unanswered_stand_down() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        d.picture_load().await;
+        let old = session_in(&d, dir.path(), "harbor", "harbor-release-3").await;
+        let new = session_in(&d, dir.path(), "harbor", "harbor-auth-reset").await;
+        let held = moved_and_held(&crew, &d, old.id, new.id).await;
+        let item = eventually("the person asked to check its old holder", async || {
+            d.store()
+                .items_not_closed(Some("desk"))
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|i| i.text.contains("hasn't answered its stand-down"))
+        })
+        .await;
+        assert!(item.text.contains(&short(held.id)), "{}", item.text);
+        assert!(told(&d, new.id).await.is_empty(), "held until then");
+        d.store()
+            .item_close(
+                item.id,
+                workforce_desk::open_item::ClosedBy::Person,
+                "checked",
+            )
+            .await
+            .unwrap();
+        eventually("the held order to go out", async || {
+            (!told(&d, new.id).await.is_empty()).then_some(())
+        })
+        .await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn replaces_with_no_job_is_refused_before_anything_is_held_or_stood_down() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        d.picture_load().await;
+        let by = || crew.by_overseer("Sam moved release 4.").unwrap();
+        let old = session_in(&d, dir.path(), "harbor", "harbor-release-3").await;
+        let new = session_in(&d, dir.path(), "harbor", "harbor-auth-reset").await;
+        crew.perform_with(&nudge(old.id, OWN_4), by(), &release("4"))
+            .await
+            .unwrap();
+        goes_in(&d, old.id).await;
+        let was = held_by(&d, old.id).await;
+        let moving = Order {
+            job: Declared::NoJob,
+            replaces: Some(short(was.id)),
+            ..Default::default()
+        };
+        let why = crew
+            .perform_with(&nudge(new.id, "Fix the login copy."), by(), &moving)
+            .await
+            .unwrap_err();
+        assert!(why.contains("job: \"none\""), "{why}");
+        assert!(told(&d, new.id).await.is_empty());
+        assert!(
+            !told(&d, old.id)
+                .await
+                .iter()
+                .any(|m| m.text.starts_with("Stand down")),
+            "no stand-down went"
+        );
+        assert_eq!(
+            d.store().assignments_of("desk", true).await.unwrap().len(),
+            1
+        );
+        assert_eq!(held_by(&d, old.id).await.state, AssignmentState::Open);
     })
     .await;
 }

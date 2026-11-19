@@ -540,14 +540,19 @@ pub fn targets(text: &str) -> Vec<Target> {
 /// The verbs that start, on their own, what can't be taken back.
 const ACTS: &[&str] = &[
     "release", "deploy", "promote", "dispatch", "publish", "tag", "merge", "rollback", "delete",
-    "drop", "migrate", "redeploy", "rerun",
+    "drop", "migrate", "redeploy",
 ];
 
 /// The verbs that start what can't be taken back when what follows is a
 /// release, a deploy, a promote or a workflow ("start release 4").
 const STARTS: &[&str] = &[
-    "start", "kick", "trigger", "launch", "ship", "cut", "begin", "fire", "run", "roll",
+    "start", "kick", "trigger", "launch", "ship", "cut", "begin", "fire", "run", "roll", "proceed",
 ];
+
+/// The verbs that act on what can't be taken back only when what they
+/// act on is named right after them ("tag v1.4.0", "delete release 4");
+/// "tag me", "delete the comment on #711" act on nothing that ships.
+const ON_ITS_OBJECT: &[&str] = &["tag", "delete"];
 
 /// What, after one of [`STARTS`], makes it irreversible.
 const UNDONE: &[&str] = &[
@@ -597,6 +602,11 @@ const NOUN_AFTER: &[&str] = &[
     "branch",
     "log",
     "logs",
+    "id",
+    "ids",
+    "url",
+    "link",
+    "number",
     "key",
     "keys",
     "is",
@@ -665,11 +675,16 @@ fn next_but_one_pronoun(ws: &[Word], i: usize) -> bool {
         .is_some_and(|n| n.clause == ws[i].clause && PRONOUNS.contains(&n.text.as_str()))
 }
 
-/// Whether sentence `sentence` of `ws` is a dry run (`--dry-run`, "a dry
-/// run of it"), which takes nothing irreversible; "dry run off", or "as
-/// dry run 4438…" (one done before) isn't.
-fn dry(ws: &[Word], sentence: usize) -> bool {
-    let words: Vec<&Word> = ws.iter().filter(|w| w.sentence == sentence).collect();
+/// Whether what is asked from clause `clause` of sentence `sentence` on
+/// is a dry run (`--dry-run`, "a dry run of it"), which takes nothing
+/// irreversible; "dry run off", or "as dry run 4438…" (one done before)
+/// isn't, and neither is a dry run said before it ("The dry run passed,
+/// so dispatch release 4").
+fn dry(ws: &[Word], sentence: usize, clause: usize) -> bool {
+    let words: Vec<&Word> = ws
+        .iter()
+        .filter(|w| w.sentence == sentence && w.clause >= clause)
+        .collect();
     words.iter().enumerate().any(|(k, w)| {
         let t = w.text.as_str();
         if t.contains("dry-run=false") || t.contains("dry_run=false") {
@@ -698,7 +713,8 @@ fn dry(ws: &[Word], sentence: usize) -> bool {
 fn acts(ws: &[Word], has_target: bool) -> Vec<usize> {
     // A merge acts on a PR or a commit, never only on an environment
     // ("merge main into dev").
-    let names_more_than_a_place = targets_at(ws)
+    let targets = targets_at(ws);
+    let names_more_than_a_place = targets
         .iter()
         .any(|(_, t)| t.kind != TargetKind::Environment);
     let mut out = Vec::new();
@@ -714,19 +730,7 @@ fn acts(ws: &[Word], has_target: bool) -> Vec<usize> {
             .get(i + 1)
             .filter(|n| n.clause == w.clause)
             .map(|n| n.text.as_str());
-        let after_next = ws
-            .get(i + 2)
-            .filter(|n| n.clause == w.clause)
-            .map(|n| n.text.as_str());
-        // "own release 4", "Release 4 can start": a number right after
-        // names the thing; first in its clause and going on ("Release 4
-        // now.", "Deploy 4 to prod") it is what to do. "merge #711" acts.
-        let numbered = matches!(t, "release" | "promote" | "deploy")
-            && next.is_some_and(numberish)
-            && (prev.is_some() || after_next.is_some_and(|n| NOUN_AFTER.contains(&n)));
-        let noun = numbered
-            || prev.is_some_and(|p| DETERMINERS.contains(&p))
-            || next.is_some_and(|n| NOUN_AFTER.contains(&n));
+        let noun = noun_at(ws, i);
         let force = t == "force-push"
             || t == "--force"
             || (t == "force" && next.is_some_and(|n| n.starts_with("push")));
@@ -735,7 +739,21 @@ fn acts(ws: &[Word], has_target: bool) -> Vec<usize> {
         let command = (t == "publish" && prev.is_some_and(|p| PUBLISHERS.contains(&p)))
             || (t == "apply" && prev == Some("terraform"))
             || (t == "release" && prev == Some("gh") && next == Some("create"))
-            || t.ends_with("/dispatches");
+            || t.ends_with("/dispatches")
+            // A tag pushed: `git push origin v1.4.0`, `git push --tags`.
+            || (t == "push"
+                && prev == Some("git")
+                && ws[i + 1..]
+                    .iter()
+                    .take(5)
+                    .take_while(|n| n.sentence == w.sentence)
+                    .any(|n| n.text == "--tags" || version_tag(&n.text)));
+        // What it acts on, right after it ("tag v1.4.0", "delete the
+        // release 4 tag"): a target, at most a word on.
+        let object_named = targets
+            .iter()
+            .any(|(at, t)| t.kind != TargetKind::Environment && (*at == i + 1 || *at == i + 2))
+            || ws.get(i + 1).is_some_and(|n| version_tag(&n.text));
         let undone_follows = || {
             ws[i + 1..]
                 .iter()
@@ -755,15 +773,63 @@ fn acts(ws: &[Word], has_target: bool) -> Vec<usize> {
             || (roll_back && (has_target || next_but_one_pronoun(ws, i)))
             || (ACTS.contains(&t)
                 && !noun
+                && (!ON_ITS_OBJECT.contains(&t) || object_named || pronoun)
                 && ((has_target && (t != "merge" || names_more_than_a_place))
                     || pronoun
                     || undone_follows()))
             || (STARTS.contains(&t) && undone_follows());
-        if fires && !negated(ws, i) && !dry(ws, w.sentence) {
+        if fires && !negated(ws, i) && !dry(ws, w.sentence, w.clause) {
             out.push(i);
         }
     }
     out
+}
+
+/// Whether the verb-like word at `i` is a noun there: "own release 4",
+/// "Release 4 can start" (a number right after names the thing; first in
+/// its clause and going on, "Release 4 now.", "Deploy 4 to prod", it is
+/// what to do), "a merge", "release notes".
+fn noun_at(ws: &[Word], i: usize) -> bool {
+    let w = &ws[i];
+    let t = w.text.as_str();
+    let prev = i
+        .checked_sub(1)
+        .map(|p| &ws[p])
+        .filter(|p| p.clause == w.clause)
+        .map(|p| p.text.as_str())
+        .filter(|p| *p != "please");
+    let next = ws
+        .get(i + 1)
+        .filter(|n| n.clause == w.clause)
+        .map(|n| n.text.as_str());
+    let after_next = ws
+        .get(i + 2)
+        .filter(|n| n.clause == w.clause)
+        .map(|n| n.text.as_str());
+    let numbered = matches!(t, "release" | "promote" | "deploy")
+        && next.is_some_and(numberish)
+        && (prev.is_some() || after_next.is_some_and(|n| NOUN_AFTER.contains(&n)));
+    numbered
+        || prev.is_some_and(|p| DETERMINERS.contains(&p))
+        || next.is_some_and(|n| NOUN_AFTER.contains(&n))
+}
+
+/// Whether `w` is a version tag: `v1.4.0`, `v2.0`.
+fn version_tag(w: &str) -> bool {
+    w.strip_prefix('v')
+        .is_some_and(|rest| rest.contains('.') && version(rest).is_some())
+}
+
+/// Whether `text` asks for anything to be done at all with a verb that
+/// starts work that can't be taken back (release, deploy, dispatch,
+/// start, run, proceed…), said or not, named or not: what a word on a
+/// job a session already holds must not, to be only a word on it.
+pub fn asks_an_act(text: &str) -> bool {
+    let ws = words(text);
+    (0..ws.len()).any(|i| {
+        let t = ws[i].text.as_str();
+        (ACTS.contains(&t) || STARTS.contains(&t)) && !noun_at(&ws, i) && !negated(&ws, i)
+    })
 }
 
 /// Whether `text` asks for something that can't be taken back: one of
@@ -1037,7 +1103,11 @@ pub fn rule(new: &Assignment, live: &[Live], replacing: Option<Uuid>) -> Ruling 
             match (a.state, a.irreversible && l.delivered, new.irreversible) {
                 (AssignmentState::Held, ..) => refuse(Rule::Held, a.id, &mut refused),
                 (_, true, true) => refuse(Rule::SameSession, a.id, &mut refused),
-                (_, true, false) => follow_up = true,
+                // A word on it, asking nothing to be done: a follow-up.
+                // Anything that asks for an act may start it again,
+                // however the words read.
+                (_, true, false) if !asks_an_act(&new.text) => follow_up = true,
+                (_, true, false) => refuse(Rule::SameSession, a.id, &mut refused),
                 _ => supersede.push(a.id),
             }
             continue;
@@ -1209,6 +1279,34 @@ mod tests {
     }
 
     #[test]
+    fn what_the_second_review_found_reads_as_it_should() {
+        for text in [
+            "The dry run passed, so dispatch release 4.",
+            "Proceed with release 4.",
+            "git push origin v1.4.0",
+            "Tag v1.4.0 and push it.",
+            "Delete release 4 from GitHub.",
+        ] {
+            assert!(irreversible(text), "irreversible: {text}");
+        }
+        for text in [
+            "Review #711 and tag me when done.",
+            "Rerun the failed CI job on #711.",
+            "Delete the comment on #711.",
+            "Dispatch the promote for release 4 with --dry-run.",
+        ] {
+            assert!(!irreversible(text), "not irreversible: {text}");
+        }
+        assert!(asks_an_act("Go ahead and proceed."));
+        assert!(!asks_an_act(
+            "When release 3 finishes, send Desk its run id."
+        ));
+        assert!(!asks_an_act(
+            "Send Desk the release 3 run id when you have it."
+        ));
+    }
+
+    #[test]
     fn a_declared_job_is_one_key_however_it_is_written() {
         let key =
             |kind: &str, target: &str, key: &str| Job::new(kind, target, key).unwrap().as_key();
@@ -1325,6 +1423,22 @@ mod tests {
                 follow_up: true
             }
         );
+        // Anything asking for an act again, however its words read, is
+        // refused: it may start it twice.
+        let proceed = live(
+            a,
+            "Go on with it now, as agreed: proceed.",
+            Some("3"),
+            false,
+        )
+        .a;
+        assert!(matches!(
+            rule(&proceed, &first, None),
+            Ruling::Refused {
+                rule: Rule::SameSession,
+                ..
+            }
+        ));
         // An order that declares no job is never compared.
         let mention = live(b, "Write the release notes for release 4.", None, false).a;
         assert!(matches!(rule(&mention, &held, None), Ruling::Send { .. }));

@@ -22,6 +22,11 @@ const COLUMNS: &str = "a.id, a.boss, a.session, a.machine, a.line_message, a.tex
 /// The live assignments, each with whether its line message went in.
 const LIVE: &str = "('sending', 'open', 'held')";
 
+/// Why a send that ended after it was settled as failed holds nothing:
+/// another order took its job meanwhile.
+pub const TAKEN_MEANWHILE: &str =
+    "it went after it was settled, and another order holds its job now";
+
 /// When the line message carrying it went in, if it did: as the line
 /// row says (taken by the session's hook counts).
 const WENT_IN: &str = "CASE WHEN l.delivery IN ('delivered', 'handed') \
@@ -263,6 +268,23 @@ impl DeskStore {
             .collect()
     }
 
+    /// Every live assignment of `boss`'s, oldest first, however many: what
+    /// the rules and the backstop compare with.
+    pub async fn assignments_live_of(&self, boss: &str) -> Result<Vec<Assignment>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                &select(&format!(
+                    "WHERE a.boss = $1 AND a.state IN {LIVE} ORDER BY a.sent_at"
+                )),
+                &[&boss],
+            )
+            .await?
+            .iter()
+            .map(assignment)
+            .collect()
+    }
+
     /// Every live assignment of every boss, oldest first.
     pub async fn assignments_live(&self) -> Result<Vec<Assignment>> {
         let client = self.pool().get().await?;
@@ -291,7 +313,7 @@ impl DeskStore {
             true => ("open", None),
             false => ("failed", Some("it wasn't sent")),
         };
-        client
+        let kept = client
             .query_opt(
                 &format!(
                     "UPDATE boss_assignments a SET state = $2, line_message = COALESCE($3, line_message), \
@@ -303,14 +325,33 @@ impl DeskStore {
                 ),
                 &[&id, &state, &line_message, &why],
             )
-            .await?
-            .as_ref()
-            .map(assignment)
-            .transpose()
+            .await;
+        match kept {
+            Ok(row) => row.as_ref().map(assignment).transpose(),
+            // Settled as failed, then sent after all, while another order
+            // took its job: it stays failed, said so, and the caller tells
+            // the boss and the person it went without holding the job.
+            Err(e) if e.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) => {
+                client
+                    .query_opt(
+                        &format!(
+                            "UPDATE boss_assignments a SET line_message = COALESCE($2, line_message), \
+                             closed_why = $3 WHERE id = $1 RETURNING {COLUMNS}, NULL::timestamptz"
+                        ),
+                        &[&id, &line_message, &TAKEN_MEANWHILE],
+                    )
+                    .await?
+                    .as_ref()
+                    .map(assignment)
+                    .transpose()
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// An order superseded by one that then couldn't go (its line message
     /// had gone in meanwhile) stands again.
+    #[cfg(test)]
     pub async fn assignment_reopen(&self, id: Uuid) -> Result<()> {
         let client = self.pool().get().await?;
         client
@@ -429,7 +470,8 @@ impl DeskStore {
         client
             .query_opt(
                 &format!(
-                    "UPDATE boss_assignments a SET state = 'sending', answer = COALESCE($2, answer) \
+                    "UPDATE boss_assignments a SET state = 'sending', sent_at = now(), \
+                     answer = COALESCE($2, answer) \
                      WHERE id = $1 AND state = 'held' RETURNING {COLUMNS}, NULL::timestamptz"
                 ),
                 &[&id, &answer],
@@ -496,7 +538,7 @@ impl DeskStore {
         .await?;
         tx.execute(
             "UPDATE boss_assignments SET state = 'failed', closed_at = now(), closed_by = 'desk', \
-             closed_why = 'its earlier order went in meanwhile' WHERE id = $1",
+             closed_why = 'its earlier order went in meanwhile' WHERE id = $1 AND state = 'sending'",
             &[&new],
         )
         .await?;
@@ -649,12 +691,14 @@ impl DeskStore {
     }
 
     /// What was still being sent before `before` is settled: after a
-    /// restart, or a send whose end was never kept. A message whose line
-    /// row is there (its boss's, to its session, starting with its words,
-    /// sent after it) is `open`, one with none `failed`; a ticket, resume,
-    /// restart or start carries no line message, so it is kept `open`:
-    /// it holds its job until it is closed, never dropped for not being
-    /// seen. Each as it now is.
+    /// restart, or a send whose end was never kept. A local message (its
+    /// `action` says `crew.nudge`) whose line row is there (its boss's, to
+    /// its session, starting with its words, sent after it) is `open`, one
+    /// with none `failed`. Anything else (a ticket, resume, restart, start,
+    /// an order relayed to a machine, or one that doesn't say how it was
+    /// sent) carries no line message here, so it is kept `open`: it holds
+    /// its job until it is closed, never dropped for not being seen. Each
+    /// as it now is.
     pub async fn assignments_reconcile(&self, before: DateTime<Utc>) -> Result<Vec<Assignment>> {
         let client = self.pool().get().await?;
         let rows = client
@@ -666,7 +710,7 @@ impl DeskStore {
                          WHERE l.sender ->> 'id' = a.boss AND l.recipient ->> 'id' = a.session::text \
                          AND starts_with(l.text, a.text) AND l.at >= a.sent_at - interval '1 second' \
                          ORDER BY l.at LIMIT 1) AS line, \
-                         COALESCE(a.action ->> 'tool', 'crew.nudge') = 'crew.nudge' AS by_line \
+                         COALESCE(a.machine IS NULL AND a.action ->> 'tool' = 'crew.nudge', false) AS by_line \
                        FROM boss_assignments a WHERE a.state = 'sending' AND a.sent_at < $1) \
                      UPDATE boss_assignments a SET \
                        state = CASE WHEN f.line IS NULL AND f.by_line THEN 'failed' ELSE 'open' END, \
@@ -707,6 +751,8 @@ mod tests {
         a.irreversible = r.irreversible;
         a.claims = a.job_key.is_some();
         a.repo = Some("acme/harbor".into());
+        // Sent as a message on its line, as the hub records it.
+        a.action = Some(serde_json::json!({ "tool": "crew.nudge", "input": {} }));
         a
     }
 
