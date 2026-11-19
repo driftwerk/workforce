@@ -5,7 +5,8 @@
 //!   message to this agent in a Slack thread or DM (Teams, once it runs
 //!   turns, the same way) started the turn the notice comes from, it is
 //!   posted in that conversation, beside the turn's answer, through the
-//!   surface the agent posts there by: a short line.
+//!   surface the agent posts there by: a short line. In a shared channel
+//!   it is seen by whoever sees the turn's answer, as the answer is.
 //! - **It is not also put in the Desk DM.** Desk counts a conversation's
 //!   unread by time against the person's one read point
 //!   ([`crate::desk_reads::unread_of`]), so no single message can be posted
@@ -56,8 +57,11 @@ impl Conversation {
     /// channel or thread (`slack:<workspace>:<channel>[:<thread>]`), the
     /// thread its answer goes to (`channel`, `thread`: the turn's own) where
     /// its key names none; a Teams conversation (`teams:<conversation>`).
-    /// None for any other key: Desk's, the web app's, a job's, a slash
-    /// command's.
+    /// Only when the turn's own `channel`, which only that surface's
+    /// dispatch sets, is the one the key names: a key is what a client may
+    /// name (the web app's chat takes any), the channel is where the
+    /// message came from. None for any other key: Desk's, the web app's, a
+    /// job's, a slash command's.
     pub(crate) fn of_turn(key: &str, channel: Option<&str>, thread: Option<&str>) -> Option<Self> {
         let (platform, rest) = key.split_once(':')?;
         match platform {
@@ -65,12 +69,13 @@ impl Conversation {
                 let mut parts = rest.splitn(3, ':');
                 let workspace = parts.next().filter(|w| !w.is_empty())?;
                 let in_key = parts.next().filter(|c| !c.is_empty())?;
+                if channel != Some(in_key) {
+                    return None;
+                }
                 let thread = match parts.next() {
                     Some(t) if is_slack_ts(t) => Some(t.to_string()),
                     Some(_) => return None,
-                    None => thread
-                        .filter(|t| is_slack_ts(t) && channel == Some(in_key))
-                        .map(str::to_string),
+                    None => thread.filter(|t| is_slack_ts(t)).map(str::to_string),
                 };
                 Some(Self {
                     platform: platform.to_string(),
@@ -79,12 +84,14 @@ impl Conversation {
                     thread,
                 })
             }
-            "teams" if !rest.is_empty() => Some(Self {
-                platform: platform.to_string(),
-                workspace: None,
-                channel: key.to_string(),
-                thread: None,
-            }),
+            "teams" if !rest.is_empty() && (channel == Some(rest) || channel == Some(key)) => {
+                Some(Self {
+                    platform: platform.to_string(),
+                    workspace: None,
+                    channel: key.to_string(),
+                    thread: None,
+                })
+            }
             _ => None,
         }
     }

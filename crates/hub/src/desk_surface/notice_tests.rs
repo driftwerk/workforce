@@ -29,22 +29,35 @@ fn a_turn_s_conversation_is_the_one_its_session_key_names() {
         Some(slack("T1", "D1", Some("1700.1")))
     );
     assert_eq!(
-        Conversation::of_turn("slack:T1:C1", Some("C2"), Some("1700.1")),
-        Some(slack("T1", "C1", None)),
-        "another channel's thread is not this conversation's"
-    );
-    assert_eq!(
-        Conversation::of_turn("slack:T1:C1", None, None),
+        Conversation::of_turn("slack:T1:C1", Some("C1"), None),
         Some(slack("T1", "C1", None))
     );
+    // A key the turn's own channel doesn't name is only what a client
+    // named it (the web app's chat, a socket frame): no Slack conversation.
+    for (key, channel) in [
+        ("slack:T1:C1", Some("C2")),
+        ("slack:T1:C1", None),
+        ("slack:T1:C9:1700.1", None),
+        ("slack:T1:C9:1700.1", Some("C1")),
+    ] {
+        assert_eq!(
+            Conversation::of_turn(key, channel, Some("1700.1")),
+            None,
+            "{key} {channel:?}"
+        );
+    }
     assert_eq!(
-        Conversation::of_turn("teams:19:abc@thread.v2", None, None),
+        Conversation::of_turn("teams:19:abc@thread.v2", Some("19:abc@thread.v2"), None),
         Some(Conversation {
             platform: "teams".into(),
             workspace: None,
             channel: "teams:19:abc@thread.v2".into(),
             thread: None,
         })
+    );
+    assert_eq!(
+        Conversation::of_turn("teams:19:abc@thread.v2", None, None),
+        None
     );
     for none in [
         "desk",
@@ -112,13 +125,22 @@ async fn scout(
     dir: &std::path::Path,
     surface: Option<Arc<Posts>>,
 ) -> (Arc<AgentService>, wiremock::MockServer) {
+    scout_on(dir, surface, true).await
+}
+
+/// [`scout`], on a hub that runs Desk when `desk`.
+async fn scout_on(
+    dir: &std::path::Path,
+    surface: Option<Arc<Posts>>,
+    desk: bool,
+) -> (Arc<AgentService>, wiremock::MockServer) {
     use crate::serve::Compose as _;
     let (config, server) = crate::serve::testing::mock_llm_config(&dir.join("scout"), |c| {
         c.agents = vec![workforce_common::settings::AgentConfig {
             id: "scout".into(),
             ..Default::default()
         }];
-        c.desk.enabled = true;
+        c.desk.enabled = desk;
     })
     .await;
     let service = AgentService::from_config(config, None).await.unwrap();
@@ -280,7 +302,14 @@ async fn a_notice_no_slack_turn_of_its_person_is_behind_goes_to_the_desk_dm() {
     let person = uuid::Uuid::new_v4().to_string();
     let scheduled = SessionContext {
         automated_origin: Some("scheduler".into()),
-        chat: false,
+        ..in_slack(&person)
+    };
+    // The web app's chat, naming a Slack session's key: no Slack channel
+    // is the turn's.
+    let named_by_a_client = SessionContext {
+        channel_id: None,
+        thread_id: None,
+        workspace_id: None,
         ..in_slack(&person)
     };
     let not_a_chat = SessionContext {
@@ -292,7 +321,7 @@ async fn a_notice_no_slack_turn_of_its_person_is_behind_goes_to_the_desk_dm() {
         ..in_slack(&person)
     };
     let mut unread = dm_unread(&scout, &person);
-    for turn in [scheduled, not_a_chat, another_agent_s] {
+    for turn in [scheduled, named_by_a_client, not_a_chat, another_agent_s] {
         let told = turn
             .scope(notice(&scout, &person, "a note".to_string()))
             .await
@@ -310,4 +339,37 @@ async fn a_notice_no_slack_turn_of_its_person_is_behind_goes_to_the_desk_dm() {
     assert_eq!(told, Told::InDeskDm);
     assert_eq!(dm_unread(&scout, &theirs), 1);
     assert!(posts.sent.lock().is_empty());
+}
+
+/// A hub with no Desk still says it in the Slack conversation, and says
+/// nothing anywhere for a turn with no conversation off Desk.
+#[tokio::test(flavor = "multi_thread")]
+async fn without_desk_a_slack_turn_s_notice_is_still_told_in_slack() {
+    let dir = tempfile::tempdir().unwrap();
+    let posts = Arc::new(Posts::default());
+    let (scout, _llm) = scout_on(dir.path(), Some(Arc::clone(&posts)), false).await;
+    let person = uuid::Uuid::new_v4().to_string();
+
+    in_slack(&person).scope(widen(&scout)).await;
+    let elsewhere = SessionContext {
+        key: Some("web:chat".into()),
+        channel_id: None,
+        thread_id: None,
+        workspace_id: None,
+        ..in_slack(&person)
+    };
+    elsewhere.scope(widen_back_and_again(&scout)).await;
+
+    assert_eq!(posts.sent.lock().len(), 1);
+    assert_eq!(dm_unread(&scout, &person), 0);
+}
+
+/// Narrows the agent's connectors back, then widens them again.
+async fn widen_back_and_again(service: &Arc<AgentService>) {
+    let tool = crate::config_tool::ConfigTool::new(Arc::clone(service), None);
+    let back =
+        serde_json::json!({"action": "set", "key": "skills.read_only", "value": ["jira:globex"]});
+    tool.effect(&back);
+    assert!(tool.execute(back).await.unwrap().success);
+    widen(service).await;
 }
