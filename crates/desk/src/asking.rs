@@ -104,6 +104,13 @@ impl Denied {
     pub fn name(&self) -> &str {
         self.tool.split('(').next().unwrap_or(&self.tool).trim()
     }
+
+    /// Whether it refused one of Desk's own line tools: the line's rule,
+    /// whose words the session read in the call's result and went on
+    /// from. It stops no turn and asks the person nothing.
+    pub fn of_line_tool(&self) -> bool {
+        crate::claude::is_line_tool(&self.call.tool)
+    }
 }
 
 /// Whether a refusal's reason is the classifier's verdict: not one it gave
@@ -234,6 +241,11 @@ pub fn denials_in<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<Denied> {
                         .get(id)
                         .map(|(n, i)| (n.as_str(), Some(i)))
                         .unwrap_or(("a tool", None));
+                    // Desk's own line tool, turned down by the line's own
+                    // rule: no refusal the turn stops on.
+                    if crate::claude::is_line_tool(name) {
+                        continue;
+                    }
                     out.push(Denied::new(
                         name,
                         input,
@@ -618,6 +630,36 @@ mod tests {
             asked.why,
             "auto mode refused Bash ([Credential Exploration])"
         );
+    }
+
+    /// Cufflink Migration, 19 Nov: Desk's line refused its reply (the line's
+    /// own rule, which Claude Code marks as a permission rule's refusal),
+    /// and the turn ended there on its own words. Nothing was stopped, and
+    /// nothing waits on the person to allow.
+    #[test]
+    fn a_desk_line_tool_turned_down_by_the_line_is_no_refusal() {
+        let lines = turn(&[
+            prompt("Desk asks you: resend the rest in short form."),
+            tool_use(
+                "t1",
+                "mcp__desk__reply",
+                json!({ "message_id": "4288d9ac", "text": "The short form, resent." }),
+            ),
+            result(
+                "t1",
+                "<tool_use_error>There is no question 4288d9ac waiting on you.</tool_use_error>",
+                Some("permission-rule"),
+            ),
+            reply("I've resent Desk the reply, and I'm changing nothing until Desk answers."),
+        ]);
+        assert!(denials_in(lines.lines()).is_empty());
+        let hooked = Denied::from_hook(
+            "mcp__desk__reply",
+            Some(&json!({ "message_id": "4288d9ac" })),
+            "",
+        );
+        assert!(hooked.of_line_tool());
+        assert!(!Denied::from_hook("Bash", Some(&json!({ "command": "ls" })), "").of_line_tool());
     }
 
     #[test]

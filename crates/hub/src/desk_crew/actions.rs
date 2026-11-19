@@ -225,7 +225,9 @@ fn id(raw: Option<&str>, what: &str) -> Result<Uuid, String> {
 }
 
 /// How Desk's status question to a session begins.
-pub(crate) const STATUS_QUESTION: &str = "Desk's status question, for the person (answer it in a line or two, then carry on with your work as you were):";
+/// It asks for words only: what the session does stays what its last
+/// instructions say (a hold its boss gave it holds), never "carry on".
+pub(crate) const STATUS_QUESTION: &str = "Desk's status question, for the person (answer it in a line or two with Desk's reply tool; it changes nothing about what you do, so keep to your last instructions):";
 
 fn text(raw: Option<String>, what: &str) -> Result<String, String> {
     raw.map(|t| t.trim().to_string())
@@ -1731,7 +1733,20 @@ impl CrewHub {
                             .await
                             .map_err(line)?;
                         done.line = Some((answer.id, answer.delivery));
-                        Ok(format!("answered {name}"))
+                        // What it replied to was no question waiting on the
+                        // boss (a report, or one answered since): its words
+                        // still go, as a message in reply.
+                        Ok(match answer.kind {
+                            workforce_desk::line::LineKind::Answer => format!("answered {name}"),
+                            _ => match answer.delivery {
+                                workforce_desk::line::Delivery::Delivered => {
+                                    format!("told {name}, in reply to its message")
+                                }
+                                _ => format!(
+                                    "told {name}, in reply to its message; it gets it once its turn ends"
+                                ),
+                            },
+                        })
                     }
                     // On its line: it gets it once its turn ends, never typed
                     // in over what it is doing (Interrupt is for that); a

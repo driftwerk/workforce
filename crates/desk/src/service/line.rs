@@ -97,6 +97,17 @@ pub enum Sender {
     Overseer(By),
 }
 
+impl Sender {
+    /// Who replies, as [`line::reply_target`] judges a reply.
+    fn replier(&self) -> line::Replier<'_> {
+        match self {
+            Self::Session(id) => line::Replier::Session(*id),
+            Self::Person => line::Replier::Person,
+            Self::Overseer(b) => line::Replier::Overseer(&b.party.id),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LineError {
     /// The line's rules refused it; the words are the sender's to read.
@@ -621,6 +632,18 @@ impl Desk {
         send: Send,
         urgency: Option<line::Urgency>,
     ) -> Result<(LineMessage, Option<line::Rushed>), LineError> {
+        self.line_send_threaded(from, send, urgency, None).await
+    }
+
+    /// [`Self::line_send_with`], as a reply to the line message
+    /// `in_reply_to` when one is given: it says what it replies to.
+    async fn line_send_threaded(
+        &self,
+        from: Sender,
+        send: Send,
+        urgency: Option<line::Urgency>,
+        in_reply_to: Option<Uuid>,
+    ) -> Result<(LineMessage, Option<line::Rushed>), LineError> {
         if urgency.is_some() && !matches!(from, Sender::Overseer(_)) {
             return Err(Refusal::NotYours.into());
         }
@@ -736,6 +759,7 @@ impl Desk {
             }
         };
         let mut m = LineMessage::new(party, recipient, kind, text, hop);
+        m.in_reply_to = in_reply_to;
         // The person's and the overseer's to a session are its group's.
         m.group = group.or_else(|| self.line_group(&m));
         if let Send::Ask { chose, parts, .. } = &hop_send {
@@ -810,7 +834,7 @@ impl Desk {
                     LineKind::Ask => crate::picture::What::SessionAsked,
                     _ => crate::picture::What::SessionReported,
                 };
-                self.picture_session_said(*id, what, &m.text);
+                self.picture_session_said(*id, what, &m.text, m.id);
             }
             Sender::Person => {
                 if let Some(v) = &recipient {
@@ -911,7 +935,58 @@ impl Desk {
 
     /// Answers the question `ask` as `by`: the first answer stands. The
     /// person may answer any question asked on Desk.
+    ///
+    /// A reply is never refused into the void: one to a line message that
+    /// is no question waiting on `by` (a plain message, or a question
+    /// answered, set aside or gone ahead since) goes to whoever wrote it,
+    /// as a message saying what it replies to ([`Self::line_reply_told`]).
+    /// The person's own answers keep their question's rules.
     pub async fn line_answer(
+        &self,
+        ask: Uuid,
+        by: Sender,
+        text: String,
+    ) -> Result<LineMessage, LineError> {
+        match self.line_answer_ask(ask, by.clone(), text.clone()).await {
+            Err(LineError::Refused(r)) if line::replies_as_message(&r, by.replier()) => {
+                self.line_reply_told(ask, by, text, r).await
+            }
+            answered => answered,
+        }
+    }
+
+    /// `by`'s reply to the line message `to`, that answered no question
+    /// waiting on it (`refused`, said again when it can't go either): a
+    /// message to the one who wrote `to`, in reply to it, under the line's
+    /// rules for any other message between them.
+    async fn line_reply_told(
+        &self,
+        to: Uuid,
+        by: Sender,
+        text: String,
+        refused: Refusal,
+    ) -> Result<LineMessage, LineError> {
+        let Some(original) = self.0.store.line_message(to).await? else {
+            return Err(refused.into());
+        };
+        let Some(target) = line::reply_target(&original, by.replier()) else {
+            return Err(refused.into());
+        };
+        tracing::info!(message = %to, kind = original.kind.as_str(), "a reply to what no longer waits on its sender goes as a message in reply to it");
+        let send = Send::Tell {
+            to: target,
+            text,
+            when: When::Queue,
+        };
+        // Boxed: a send of a reply comes back here.
+        Ok(
+            Box::pin(self.line_send_threaded(by, send, None, Some(original.id)))
+                .await?
+                .0,
+        )
+    }
+
+    async fn line_answer_ask(
         &self,
         ask: Uuid,
         by: Sender,

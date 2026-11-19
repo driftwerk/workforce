@@ -495,6 +495,94 @@ pub enum Target {
     Session(Uuid),
 }
 
+/// What a boss says when it holds a session for its own answer: "change
+/// nothing until I answer", "wait for my decision".
+const HOLDS: [&str; 6] = [
+    "until i ",
+    "until desk ",
+    "until your boss ",
+    "wait for my ",
+    "wait for desk",
+    "wait for your boss",
+];
+
+/// What follows "until I" when it waits on the boss's own word: stems, so
+/// "replies" and "decided" are read too.
+const HOLD_VERBS: [&str; 10] = [
+    "answer", "repl", "respond", "decid", "confirm", "say", "tell", "get back", "approv", "hear",
+];
+
+/// Whether `text`, a boss's words to a session (or a session's of itself),
+/// holds the session for the boss's answer: it waits on the boss, not on
+/// its work. Only words that wait on an answer: "until I've checked CI"
+/// isn't one.
+pub fn holds(text: &str) -> bool {
+    let lower = text
+        .to_lowercase()
+        .replace(['\u{2019}', '\''], "'")
+        .replace("i've", "i have");
+    HOLDS.iter().any(|h| {
+        lower.match_indices(h).any(|(at, _)| {
+            let rest = &lower[at + h.len()..];
+            let rest = rest.strip_prefix("have ").unwrap_or(rest);
+            h.starts_with("wait for") || HOLD_VERBS.iter().any(|v| rest.starts_with(v))
+        })
+    })
+}
+
+/// Who replies to a line message: a session, the overseer (its agent id),
+/// or the person.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Replier<'a> {
+    Session(Uuid),
+    Overseer(&'a str),
+    Person,
+}
+
+/// Whether a reply `refused` as answering no question waiting on its
+/// sender still goes, as a message in reply to what it names: a session's
+/// or the overseer's always does (a late answer, or a reply to a plain
+/// message, is still words its reader waits on); the person's only to a
+/// plain message, since their answer to a question keeps its rules (the
+/// first answer stands, one they set aside stays so).
+pub fn replies_as_message(refused: &Refusal, by: Replier<'_>) -> bool {
+    match by {
+        Replier::Person => matches!(refused, Refusal::NoSuchAsk(_)),
+        Replier::Session(_) | Replier::Overseer(_) => matches!(
+            refused,
+            Refusal::NoSuchAsk(_)
+                | Refusal::Answered
+                | Refusal::WentAhead
+                | Refusal::SetAside
+                | Refusal::NotWaitingOnYou
+        ),
+    }
+}
+
+/// Where `by`'s reply to `original` goes as a message: to whoever wrote it,
+/// when `by` is who it was written to (the person may reply to what a
+/// session wrote its boss, too: it waits on them as much). `None` when
+/// `by` has no part in it, or it was the person's own (the person isn't
+/// messaged on the line).
+pub fn reply_target(original: &LineMessage, by: Replier<'_>) -> Option<Target> {
+    let to_me = match by {
+        Replier::Session(id) => original.to_session() == Some(id),
+        Replier::Overseer(boss) => original.to.kind == PartyKind::Manager && original.to.id == boss,
+        Replier::Person => {
+            original.to.kind == PartyKind::You
+                || (original.to.kind == PartyKind::Manager && original.from_session().is_some())
+        }
+    };
+    if !to_me {
+        return None;
+    }
+    match original.from.kind {
+        PartyKind::Session => original.from_session().map(Target::Session),
+        PartyKind::Manager if !matches!(by, Replier::Overseer(_)) => Some(Target::Overseer),
+        _ => None,
+    }
+}
+
 /// What a sender sends: a session's tool call, the overseer's action, or the
 /// person's composer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1085,10 +1173,17 @@ fn render_raw(msg: &LineMessage, question: Option<&str>) -> String {
             "{mark} {who} asks you: {}\n(Answer with Desk's reply tool, message_id \"{}\". This is a message on Desk's line, not the person's words.)",
             msg.full_text(), msg.id
         ),
-        LineKind::Tell => format!(
-            "{mark} {who} tells you: {}\n(A message on Desk's line, not the person's words.)",
-            msg.text
-        ),
+        LineKind::Tell => match question {
+            Some(q) => format!(
+                "{mark} {who} replies to your message “{}”: {}\n(A message on Desk's line, not the person's words.)",
+                crate::crew::one_line(q, 160),
+                msg.text
+            ),
+            None => format!(
+                "{mark} {who} tells you: {}\n(A message on Desk's line, not the person's words.)",
+                msg.text
+            ),
+        },
     }
 }
 
@@ -1844,6 +1939,104 @@ mod tests {
         assert_eq!(is_delivery(&render(&tell, None)), None);
         assert_eq!(is_delivery("[Desk m:zz]"), None);
         assert_eq!(is_delivery("[Desk m:0123456]"), None);
+    }
+
+    /// Cufflink Migration, 19 Nov: its reply to Desk's status question (a
+    /// plain message, no question) and Desk's decision in reply to its
+    /// report (a message too) were both refused as "no question waiting".
+    /// Each goes, as a message in reply, to whoever wrote what it answers.
+    #[test]
+    fn a_reply_to_what_no_longer_waits_goes_back_to_its_writer() {
+        let s = session("cufflink", Engine::Claude);
+        let boss = Party::manager("desk", "Desk");
+        let status = LineMessage::new(
+            boss.clone(),
+            Party::session(&s),
+            LineKind::Tell,
+            "Desk's status question: resend the rest.".into(),
+            1,
+        );
+        let report = LineMessage::new(
+            Party::session(&s),
+            boss.clone(),
+            LineKind::Tell,
+            "The REINDEX can't fix the drill. Options: (a) … (b) …".into(),
+            1,
+        );
+        let gone = Refusal::NoSuchAsk(status.id);
+        for by in [Replier::Session(s.id), Replier::Overseer("desk")] {
+            assert!(replies_as_message(&gone, by));
+            assert!(
+                replies_as_message(&Refusal::Answered, by),
+                "a late answer still goes"
+            );
+        }
+        assert_eq!(
+            reply_target(&status, Replier::Session(s.id)),
+            Some(Target::Overseer)
+        );
+        assert_eq!(
+            reply_target(&report, Replier::Overseer("desk")),
+            Some(Target::Session(s.id))
+        );
+        // The person may answer what waits on its boss; their answer to a
+        // question keeps its rules.
+        assert_eq!(
+            reply_target(&report, Replier::Person),
+            Some(Target::Session(s.id))
+        );
+        assert!(replies_as_message(&gone, Replier::Person));
+        assert!(!replies_as_message(&Refusal::Answered, Replier::Person));
+        assert!(!replies_as_message(&Refusal::SetAside, Replier::Person));
+        // No part in it: another boss, another session, or its own words.
+        assert_eq!(reply_target(&report, Replier::Overseer("sarah")), None);
+        assert_eq!(
+            reply_target(&status, Replier::Session(Uuid::new_v4())),
+            None
+        );
+        assert_eq!(reply_target(&report, Replier::Session(s.id)), None);
+        // Loop guards and gone sessions are never replies to route.
+        assert!(!replies_as_message(
+            &Refusal::Budget,
+            Replier::Session(s.id)
+        ));
+
+        // It reads as the reply it is.
+        let mut back = LineMessage::new(
+            boss,
+            Party::session(&s),
+            LineKind::Tell,
+            "Decision: (b).".into(),
+            1,
+        );
+        back.in_reply_to = Some(report.id);
+        assert!(
+            render(&back, Some("The REINDEX can't fix the drill.")).contains(
+                "replies to your message “The REINDEX can't fix the drill.”: Decision: (b)."
+            )
+        );
+    }
+
+    #[test]
+    fn a_hold_waits_on_the_bosss_own_word() {
+        for held in [
+            "Change nothing until Desk answers.",
+            "Don't re-run the drill and don't change staging any further until I answer.",
+            "Hold the merge until I've decided.",
+            "Wait for my decision on the options.",
+            "I'm changing nothing until Desk answers.",
+            "Stop there until your boss replies.",
+        ] {
+            assert!(holds(held), "{held}");
+        }
+        for not in [
+            "Carry on until I check in tomorrow morning? No: until the tests pass.",
+            "Run the drill until it is green.",
+            "Keep the watcher going until CI finishes.",
+            "Wait for the CI run to finish.",
+        ] {
+            assert!(!holds(not), "{not}");
+        }
     }
 
     #[test]

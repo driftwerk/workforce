@@ -5865,8 +5865,9 @@ impl Desk {
                         }
                     });
                 }
-                // A sub-agent's refusal is its own to work around.
-                if inside.is_none() {
+                // A sub-agent's refusal is its own to work around; one of
+                // Desk's line tools' is the line's own rule, said to it.
+                if inside.is_none() && !denied.of_line_tool() {
                     if let Some(l) = self.0.state.lock().live.get_mut(&id) {
                         l.denials.push(denied);
                     }

@@ -131,7 +131,13 @@ pub struct Happened {
     /// The boss's turn that made it (an instruction): that turn's own
     /// sends never make its picture stale.
     pub turn: Option<String>,
+    /// The line message it is (what a session wrote its boss): where it
+    /// is read whole when its row is cut short.
+    pub message: Option<Uuid>,
 }
+
+/// The most of a row's text said on its line to a boss.
+pub const SAID_MAX: usize = 600;
 
 impl Happened {
     /// Whether this row touches `session` for `boss`.
@@ -151,11 +157,19 @@ impl Happened {
     pub fn said(&self, tz: chrono_tz::Tz) -> String {
         let at = self.at.with_timezone(&tz).format("%H:%M:%S");
         // All of it, on one line: a later sentence ("…must not write its
-        // own") is often the one that matters.
-        let text = crate::crew::clip(
-            &self.text.split_whitespace().collect::<Vec<_>>().join(" "),
-            600,
-        );
+        // own") is often the one that matters. Cut short, it says so, and
+        // where the whole of it is read: a boss never takes the cut for
+        // the session's own words breaking off.
+        let flat = self.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let shown = crate::crew::clip(&flat, SAID_MAX);
+        let cut = shown.chars().count() < flat.chars().count() || self.text.ends_with('…');
+        let text = match (cut, self.message) {
+            (false, _) => shown,
+            (true, Some(m)) => format!(
+                "{shown} [Desk cut this short here, not the session: read it whole with crew.history, message_id \"{m}\"]"
+            ),
+            (true, None) => format!("{shown} [Desk cut this short here, not its writer]"),
+        };
         match self.what {
             What::PersonSaid if self.session.is_some() => {
                 format!("{at} the person, in the session: “{text}”")
@@ -184,6 +198,7 @@ pub struct Note {
     pub sessions: Vec<Uuid>,
     pub text: String,
     pub turn: Option<String>,
+    pub message: Option<Uuid>,
 }
 
 impl Note {
@@ -212,6 +227,11 @@ impl Note {
 
     pub fn turn(mut self, turn: Option<String>) -> Self {
         self.turn = turn;
+        self
+    }
+
+    pub fn message(mut self, message: Uuid) -> Self {
+        self.message = Some(message);
         self
     }
 }
@@ -245,6 +265,7 @@ impl Picture {
             sessions: note.sessions,
             text: crate::crew::clip(note.text.trim(), TEXT_MAX),
             turn: note.turn,
+            message: note.message,
         };
         self.rows.push_back(row.clone());
         self.trim(at);
@@ -495,6 +516,7 @@ mod tests {
             sessions: vec![],
             text: format!("fact {seq}"),
             turn: None,
+            message: None,
         };
         let mut p = Picture::default();
         assert!(!p.loaded());
@@ -509,6 +531,47 @@ mod tests {
         assert_eq!(r.unwrap().seq, 11);
         let all: Vec<u64> = p.recent("boss", s, 10).iter().map(|r| r.seq).collect();
         assert_eq!(all, vec![3, 7, 10, 11]);
+    }
+
+    /// Cufflink Migration, 19 Nov: a 2,541-character report reached the
+    /// boss cut after "because back branches…", read as the session's own
+    /// words breaking off. Cut short, a row says so, and where it is whole.
+    #[test]
+    fn a_row_cut_short_says_so_and_where_it_is_whole() {
+        let s = Uuid::new_v4();
+        let m = Uuid::new_v4();
+        let long = format!("Both need your decision. {}", "word ".repeat(400));
+        let mut p = Picture::default();
+        let row = p
+            .push(
+                Note::new(What::SessionReported, &long)
+                    .session(s)
+                    .message(m),
+                Utc::now(),
+            )
+            .unwrap();
+        assert_eq!(row.message, Some(m));
+        let said = row.said(chrono_tz::UTC);
+        assert!(
+            said.contains(&format!(
+                "read it whole with crew.history, message_id \"{m}\""
+            )),
+            "{said}"
+        );
+        assert!(
+            said.contains("Desk cut this short here, not the session"),
+            "{said}"
+        );
+        // Whole, it says nothing of it.
+        let short = p
+            .push(
+                Note::new(What::SessionReported, "Done.")
+                    .session(s)
+                    .message(m),
+                Utc::now(),
+            )
+            .unwrap();
+        assert!(!short.said(chrono_tz::UTC).contains("cut"));
     }
 
     #[test]

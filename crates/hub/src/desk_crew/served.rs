@@ -929,6 +929,15 @@ impl CrewHub {
                 Ok(json!({ "events": reported(&lines.join("\n"), "the group's activity here") }))
             }
             "crew.history" => {
+                if let Some(message) = input["message_id"].as_str() {
+                    return super::tools::line_message_read(self, message, |s| {
+                        match self.in_grant(g, s) {
+                            true => Ok(()),
+                            false => Err(self.not_in_grant(g)),
+                        }
+                    })
+                    .await;
+                }
                 let id: Uuid = input["session_id"]
                     .as_str()
                     .and_then(|s| s.parse().ok())

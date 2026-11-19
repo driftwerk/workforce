@@ -667,9 +667,10 @@ impl CrewHub {
         let lines: Vec<String> = messages
             .iter()
             .map(|m| {
-                let kind = match m.kind {
-                    LineKind::Ask => "asks",
-                    LineKind::Tell | LineKind::Answer => "tells you",
+                let kind = match (m.kind, m.in_reply_to) {
+                    (LineKind::Ask, _) => "asks".to_string(),
+                    (LineKind::Tell, Some(to)) => format!("replies to your message {to}"),
+                    (LineKind::Tell | LineKind::Answer, _) => "tells you".to_string(),
                 };
                 format!("- message {} ({kind}): {}", m.id, m.full_text())
             })
