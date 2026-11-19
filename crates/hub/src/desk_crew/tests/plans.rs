@@ -2051,15 +2051,19 @@ async fn a_boss_runs_a_check_on_a_machine_and_what_no_boss_does_is_the_persons()
 
         // Desk carrying calls: a machine that runs what's read, needs the
         // person for a project's tests, and loses the answer to a delete.
-        *crew.relay_wait.lock() = Duration::from_millis(400);
+        *crew.relay_wait.lock() = Duration::from_secs(5);
         let sent: Arc<parking_lot::Mutex<Vec<Value>>> = Arc::default();
         let _poller = {
             let (crew, sent) = (Arc::clone(&crew), Arc::clone(&sent));
             tokio::spawn(async move {
                 loop {
                     for c in crew.relay_take(Duration::from_millis(100)).await {
-                        assert_eq!(c.tool, "desk.run");
-                        sent.lock().push(c.input.clone());
+                        // Any other tool is said in what was sent, for the
+                        // test to fail on.
+                        sent.lock().push(match c.tool.as_str() {
+                            "desk.run" => c.input.clone(),
+                            other => json!({ "tool": other }),
+                        });
                         let command = c.input["command"].as_str().unwrap_or_default().to_string();
                         let body = match (command.as_str(), c.input["by_person"].as_bool()) {
                             (c, _) if c.starts_with("rm ") => continue,
@@ -2104,8 +2108,10 @@ async fn a_boss_runs_a_check_on_a_machine_and_what_no_boss_does_is_the_persons()
         let theirs = sent.lock().last().cloned().unwrap();
         assert_eq!(theirs["by_person"], true);
         assert_eq!(theirs["judged"], false);
+        assert!(sent.lock().iter().all(|s| s.get("tool").is_none()), "{:?}", sent.lock());
         // Its answer lost: the boss is told it may have run; the person's
         // yes to the delete is done with, never left to be run again.
+        *crew.relay_wait.lock() = Duration::from_millis(400);
         let r = run
             .execute(json!({ "machine": "devbox", "command": "rm -f ~/x", "reason": "Tidy." }))
             .await

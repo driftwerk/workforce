@@ -63,8 +63,8 @@ its own git and gh; cwd, where it runs: inside its home, as ~/x, an absolute pat
 to the home (the home when not said); timeout_secs, how long it may run: 1 to 15 (10 when not \
 said), then it and all it started are stopped. No input; at most 32 KB of its output and of its \
 errors come back. Desk judges it there as it judges a session's request, with no folder of its \
-own: it reads anywhere but where secrets are kept and writes nowhere, nor runs a script or a \
-build. What it won't allow becomes a suggestion the person runs or dismisses; at Act fully, one of \
+own: it reads anywhere but where secrets are kept and writes nowhere (but git fetch, which \
+updates what it knows of the remotes), nor runs a script, a build or tests. What it won't allow becomes a suggestion the person runs or dismisses; at Act fully, one of \
 the person's preferences can allow it (say which in preference). What no boss does is the \
 person's at every level. Use it to check what is there (git remote -v, ls, git status, gh repo \
 view), not to do the work: that is a session's. Say why.";
@@ -181,7 +181,11 @@ pub(crate) const UNKNOWN: &str = "unknown";
 /// `command` as a code span, all of it ([`shown`]): its fence longer than
 /// any run of backticks in it, so none of it reads as outside the span.
 pub(crate) fn code(command: &str) -> String {
-    let shown = shown(command);
+    code_of(&shown(command))
+}
+
+/// `shown`, already [`shown`], as a code span ([`code`]).
+fn code_of(shown: &str) -> String {
     let mut longest = 0;
     let mut run = 0;
     for c in shown.chars() {
@@ -370,19 +374,23 @@ impl CrewHub {
                 Some("ran") => ("ran", ran_line(g)),
                 Some("needs_person") => ("didn't run", ran_line(g)),
                 Some("refused") => ("couldn't run", ran_line(g)),
-                _ => ("may have run", ran_line(g)),
+                _ => (
+                    "may have run",
+                    crew::one_line(g["why"].as_str().unwrap_or("no answer came back"), 200),
+                ),
             },
             Err(MachineRefused::Unreached(e)) => ("couldn't send", crew::one_line(e, 200)),
             Err(e) => ("couldn't run", crew::one_line(&e.to_string(), 200)),
         };
-        let span = code(command);
-        let clipped = span.chars().count() > 300;
+        // Clipped before it is fenced, so its fence is always whole.
+        let said_as = shown(command);
+        let clipped = said_as.chars().count() > 300;
         let mut e = by.event(
             Kind::OnMachine,
             None,
             format!(
                 "{verb} {}{} {} {machine}{}: {}",
-                crew::clip(&span, 300),
+                code_of(&crew::clip(&said_as, 300)),
                 if clipped {
                     " (all of it in the detail)"
                 } else {
