@@ -533,6 +533,9 @@ impl CrewTool {
         if let Some(o) = kept.as_object_mut() {
             o.remove("ticket_id");
             o.remove("board_id");
+            o.remove("needs_id");
+            o.remove("need_ids");
+            o.remove("brief_was");
             // What it applies is checked below and cited, never read as
             // part of the action or kept with a suggestion.
             for f in super::preferences::ACT_FIELDS {
@@ -577,11 +580,33 @@ impl CrewTool {
             o.insert("ticket_id".into(), json!(id.to_string()));
             o.insert("ticket".into(), json!(key));
         }
-        // A new ticket's board, as resolved: the suggestion makes it there.
-        if let (Action::CreateTicket { new }, Some(o)) = (&action, kept.as_object_mut()) {
-            if let Some(b) = new.board_id {
-                o.insert("board_id".into(), json!(b.to_string()));
+        // What a ticket change names, as resolved: the suggestion acts on
+        // those, and on the brief it saw.
+        match (&action, kept.as_object_mut()) {
+            (Action::CreateTicket { new }, Some(o)) => {
+                if let Some(b) = new.board_id {
+                    o.insert("board_id".into(), json!(b.to_string()));
+                }
+                o.insert(
+                    "need_ids".into(),
+                    json!(new.need_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>()),
+                );
             }
+            (Action::ChangeTicket { change, .. }, Some(o)) => match &**change {
+                super::tickets::TicketChange::Need {
+                    other,
+                    other_id: Some(n),
+                    ..
+                } => {
+                    o.insert("needs_id".into(), json!(n.to_string()));
+                    o.insert("needs".into(), json!(other));
+                }
+                super::tickets::TicketChange::Edit { was: Some(w), .. } => {
+                    o.insert("brief_was".into(), json!(w));
+                }
+                _ => {}
+            },
+            _ => {}
         }
         let oversight = &b.oversight;
         // Always working in real sessions, a start goes to the session it

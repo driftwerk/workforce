@@ -148,15 +148,10 @@ async fn a_boss_reads_edits_comments_links_moves_and_makes_tickets() {
             .as_str()
             .unwrap()
             .contains("Approved on 11/19."));
-        let history: Vec<&str> = read["history"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|e| e["did"].as_str())
-            .collect();
+        let history = read["history"].as_str().unwrap();
         assert!(
-            history.contains(&"added to its description on VEL-1"),
-            "{history:?}"
+            history.contains("added to its description on VEL-1"),
+            "{history}"
         );
 
         // Each is the boss's doing, with its reason.
@@ -300,6 +295,88 @@ async fn at_suggest_an_edit_waits_on_its_card() {
         let t = now(&d, "VEL-1").await;
         assert_eq!(t.ticket.body, "Sketch the cache.\n\nApproved.");
         assert_eq!(t.ticket.title, "Design the recall cache");
+    })
+    .await;
+}
+
+/// A brief in full suggested at Suggest replaces only the brief it saw:
+/// changed since, the yes is refused and nothing is written over.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_suggested_brief_never_writes_over_one_changed_since() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", SUGGEST, &[]).await;
+        let b = board(&d, "Vellev").await;
+        let t = ticket(&d, b, "Design the recall cache", "Sketch the cache.").await;
+        eventually("the boss's ticket tools", async || {
+            overseer.tools.has("crew.edit_ticket").then_some(())
+        })
+        .await;
+        let r = overseer
+            .tools
+            .get("crew.edit_ticket")
+            .unwrap()
+            .execute(json!({"ticket": "VEL-1", "body": "Use a ring buffer.", "reason": "Simpler."}))
+            .await
+            .unwrap();
+        assert!(r.output["suggested"].is_string(), "{r:?}");
+        d.edit_ticket(
+            t.ticket.id,
+            workforce_desk::TicketPatch {
+                body: Some("Sketch the cache; keep it under 50 MB.".into()),
+                ..Default::default()
+            },
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        let kept = d.store().suggestions(10).await.unwrap().remove(0);
+        let refused = crew.accept(&kept).await.unwrap_err();
+        assert!(refused.contains("brief changed since"), "{refused}");
+        assert_eq!(
+            now(&d, "VEL-1").await.ticket.body,
+            "Sketch the cache; keep it under 50 MB."
+        );
+    })
+    .await;
+}
+
+/// A board synced with Linear changes through Linear's tools: each ticket
+/// tool refuses it, naming them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_synced_boards_tickets_change_through_its_own_tools() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        let b = board(&d, "Vellev").await;
+        ticket(&d, b, "Design the recall cache", "").await;
+        let sync: workforce_desk::board::Sync = serde_json::from_value(json!({
+            "link": uuid::Uuid::new_v4(), "system": "linear", "target": "ENG",
+            "via": {"kind": "thisHub"}, "person": "you", "filter": {"kind": "assignedToMe"}, "states": {},
+        }))
+        .unwrap();
+        d.store()
+            .change_board_sync(b, move |_, prefix| Ok((Some(sync), prefix)))
+            .await
+            .unwrap();
+        eventually("the boss's ticket tools", async || {
+            overseer.tools.has("crew.edit_ticket").then_some(())
+        })
+        .await;
+        for (tool, input) in [
+            ("crew.edit_ticket", json!({"ticket": "VEL-1", "title": "x", "reason": "x"})),
+            ("crew.comment_ticket", json!({"ticket": "VEL-1", "comment": "x", "reason": "x"})),
+            ("crew.delete_ticket", json!({"ticket": "VEL-1", "reason": "x"})),
+            ("crew.create_ticket", json!({"board": "Vellev", "title": "x", "reason": "x"})),
+        ] {
+            let r = overseer.tools.get(tool).unwrap().execute(input).await.unwrap();
+            assert!(!r.success, "{tool}: {r:?}");
+            assert!(
+                r.error.as_deref().unwrap_or_default().contains("Linear"),
+                "{tool}: {r:?}"
+            );
+        }
+        assert_eq!(now(&d, "VEL-1").await.ticket.title, "Design the recall cache");
     })
     .await;
 }

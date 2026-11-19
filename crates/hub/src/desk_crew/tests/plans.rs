@@ -1930,6 +1930,7 @@ async fn editing_a_plans_ticket_goes_through_its_plan() {
             .unwrap()
             .execute(json!({ "goal": "Faster reads", "tickets": [
                 { "title": "Add the cache", "body": "Cache the index.", "folder": folder },
+                { "title": "Use the cache", "folder": folder },
             ] }))
             .await
             .unwrap();
@@ -1966,6 +1967,24 @@ async fn editing_a_plans_ticket_goes_through_its_plan() {
         assert!(read.success, "{read:?}");
         assert_eq!(read.output["plan"]["machine"], "devbox", "{read:?}");
         assert_eq!(read.output["plan"]["yours"], true);
+        // Its brief as the plan says it now: applied, or waiting, with what
+        // was added after what it said.
+        let p = d.plan(id).await.unwrap();
+        let said = read.output["plan"]["brief_waiting"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| p.tickets[0].ticket.ticket.body.clone());
+        assert!(said.contains("Cache the index.\n\nKeep it under 50 MB."), "{said}");
+        // What a plan's tickets need, and taking one out, are the plan's.
+        let other = plan["tickets"][1]["key"].as_str().unwrap().to_string();
+        for (tool, input, says) in [
+            ("crew.link_ticket", json!({ "ticket": other, "needs": key, "reason": "x" }), "crew.plan_update"),
+            ("crew.delete_ticket", json!({ "ticket": key, "reason": "x" }), "through the plan"),
+        ] {
+            let r = overseer.tools.get(tool).unwrap().execute(input).await.unwrap();
+            assert!(!r.success, "{tool}: {r:?}");
+            assert!(r.error.as_deref().unwrap_or_default().contains(says), "{tool}: {r:?}");
+        }
     })
     .await;
 }
