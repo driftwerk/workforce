@@ -2185,3 +2185,67 @@ async fn a_plan_isnt_moved_while_a_ticket_starts_or_one_is_filed_elsewhere() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn a_found_checkout_is_found_again_each_start_and_one_gone_is_never_kept() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let home = home.canonicalize().unwrap();
+        let checkout = |at: &Path| {
+            std::fs::create_dir_all(at.join(".git")).unwrap();
+            std::fs::write(
+                at.join(".git/config"),
+                "[remote \"origin\"]\n\turl = git@github.com:driftwerk/vellev.git\n",
+            )
+            .unwrap();
+        };
+        let first = home.join("work/vellev");
+        checkout(&first);
+        crate::store::DeskStore::migrate(&pool).await.unwrap();
+        let mut opts = super::super::tests::options(dir.path());
+        opts.env
+            .insert("HOME".into(), home.to_string_lossy().into_owned());
+        let d = Desk::start(
+            crate::store::DeskStore::from_pool(pool),
+            opts,
+            Default::default(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let mut plan = new_plan(dir.path(), &[("Add the cache", &[])]);
+        plan.draft.tickets[0].folder = String::new();
+        plan.draft.tickets[0].repo = Some("driftwerk/vellev".into());
+        let p = d.propose_plan(plan, &sarah(), &by_sarah()).await.unwrap();
+        let id = p.summary.plan.id;
+        let ran = d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let t = ran.tickets[0].ticket.ticket.id;
+        let folder = |d: &Desk| {
+            let d = d.clone();
+            async move {
+                d.0.store
+                    .plan_runs(id)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|(i, _)| *i == t)
+                    .and_then(|(_, r)| r.folder)
+            }
+        };
+        let plan = &ran.summary.plan;
+        d.plan_prepare(plan, t, &sarah()).await.unwrap();
+        assert_eq!(folder(&d).await, Some(first.to_string_lossy().into_owned()));
+        // Gone, and another checkout of it there: that one is found.
+        std::fs::remove_dir_all(&first).unwrap();
+        let second = home.join("code/vellev");
+        checkout(&second);
+        d.plan_prepare(plan, t, &sarah()).await.unwrap();
+        assert_eq!(
+            folder(&d).await,
+            Some(second.to_string_lossy().into_owned())
+        );
+    })
+    .await;
+}

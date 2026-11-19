@@ -445,6 +445,8 @@ async fn clone_into(repo: &Repo, dest: &Path, home: &Path) -> Result<(), String>
         return Err("git isn't installed here".into());
     }
     let mut why = String::new();
+    // The session each try runs in, so all it started ends with it.
+    let running = std::sync::atomic::AtomicI32::new(0);
     let run = async {
         for (prog, args) in &tries {
             let _ = tokio::fs::remove_dir_all(&part).await;
@@ -474,13 +476,23 @@ async fn clone_into(repo: &Repo, dest: &Path, home: &Path) -> Result<(), String>
                     Ok(())
                 });
             }
-            let out = match cmd.output().await {
+            let child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => {
+                    why = format!("it couldn't run: {e}");
+                    continue;
+                }
+            };
+            let pid = child.id().and_then(|p| i32::try_from(p).ok()).unwrap_or(0);
+            running.store(pid, std::sync::atomic::Ordering::SeqCst);
+            let out = match child.wait_with_output().await {
                 Ok(o) => o,
                 Err(e) => {
                     why = format!("it couldn't run: {e}");
                     continue;
                 }
             };
+            running.store(0, std::sync::atomic::Ordering::SeqCst);
             if out.status.success() {
                 return Ok(());
             }
@@ -493,10 +505,19 @@ async fn clone_into(repo: &Repo, dest: &Path, home: &Path) -> Result<(), String>
     };
     let ended = match tokio::time::timeout(CLONE_FOR, run).await {
         Ok(r) => r,
-        Err(_) => Err(format!(
-            "cloning {repo} took longer than {} minutes",
-            CLONE_FOR.as_secs() / 60
-        )),
+        Err(_) => {
+            let pid = running.load(std::sync::atomic::Ordering::SeqCst);
+            if pid > 0 {
+                // SAFETY: killpg only signals the session its clone made.
+                unsafe {
+                    libc::killpg(pid, libc::SIGKILL);
+                }
+            }
+            Err(format!(
+                "cloning {repo} took longer than {} minutes",
+                CLONE_FOR.as_secs() / 60
+            ))
+        }
     };
     if let Err(why) = ended {
         let _ = tokio::fs::remove_dir_all(&part).await;

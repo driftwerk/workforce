@@ -2342,6 +2342,17 @@ impl Desk {
         };
         let key = self.key_of(t).await?;
         let folder = runs.folder.clone().filter(|f| !f.trim().is_empty());
+        // A folder the plan says is the person's: used, or refused. One a
+        // start found (the plan leaves it for its repository to say) is
+        // found again each start, so one gone since is never kept.
+        let chosen = self
+            .newest(p)
+            .await
+            .ok()
+            .and_then(|s| s.ticket(t.id).map(|w| !w.folder.trim().is_empty()))
+            .unwrap_or(true);
+        let found = folder.clone().filter(|_| !chosen);
+        let folder = folder.filter(|_| chosen);
         let got = match runs.machine.as_deref() {
             None => {
                 let d = self.clone();
@@ -2385,7 +2396,11 @@ impl Desk {
                 .collect()
         };
         match got {
-            crate::repos::Got::Ready { path } if Some(&path) == folder.as_ref() => Ok(false),
+            crate::repos::Got::Ready { path }
+                if Some(&path) == folder.as_ref() || Some(&path) == found.as_ref() =>
+            {
+                Ok(false)
+            }
             crate::repos::Got::Ready { path } => {
                 if !path.starts_with('/') || path.chars().any(char::is_control) {
                     return Err(StartRefused::Failed(DeskError::Invalid(format!(
