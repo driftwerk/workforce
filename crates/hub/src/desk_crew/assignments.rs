@@ -132,9 +132,13 @@ pub(crate) struct Order {
     pub job: Declared,
     /// The boss says it can't be taken back, whatever the words say.
     pub irreversible: bool,
-    /// Kept for its delivery: an urgent order is steered in by a later
-    /// change (§4); for now it is queued as any other.
+    /// It can't wait for the session's turn to end: steered into the
+    /// running turn (§4, [`super::urgent`]).
     pub urgent: bool,
+    /// An interrupt for a stand-down not read in time: of the turn it was
+    /// sent in alone, and only while it is still unread (the stand-down's
+    /// row, and that turn).
+    pub only_turn: Option<(Uuid, workforce_desk::line::TurnMark)>,
     /// The assignment it takes over from, as the boss names it (`a:…`).
     pub replaces: Option<String>,
     /// Kept at the home, not here: a call the home relayed.
@@ -172,7 +176,7 @@ impl Order {
 /// The properties a crew tool that hands out work takes for its order.
 pub(crate) fn order_properties(with_job: bool) -> Value {
     let mut p = json!({
-        "urgent": { "type": "boolean", "description": "It can't wait for the session's turn to end (a correction, a stop)" },
+        "urgent": { "type": "boolean", "description": super::urgent::description() },
         "replaces": { "type": "string", "description": "The assignment (a:… from crew.assignments) this takes over, with its job: its holder is told to stand down first, and this waits until it answers when it may have started" }
     });
     if with_job {
@@ -312,13 +316,14 @@ enum StoodDown {
     Unsent,
 }
 
-/// `input`, a crew call for a machine, without the fields its order says
-/// here (kept at the home, never relayed), with `guard` said after what it
-/// says.
+/// `input`, a crew call for a machine, without the fields of its job
+/// (kept at the home, never relayed; its urgency goes with it), with
+/// `guard` said after what it says.
 pub(super) fn relayed_input(input: &Value, guard: Option<&str>) -> Value {
     let mut sent = input.clone();
     if let Some(o) = sent.as_object_mut() {
-        for f in ["job", "irreversible", "urgent", "replaces"] {
+        // Its urgency goes with it: the machine steers it in.
+        for f in ["job", "irreversible", "replaces"] {
             o.remove(f);
         }
         if let Some(guard) = guard {
@@ -845,9 +850,10 @@ impl CrewHub {
     }
 
     /// Tells `old`'s holder to stand down from it: `new` is moved to
-    /// `name`. The one place a stand-down is sent, so the urgent delivery
-    /// to come (§4) takes it from here; for now it is a line message, queued
-    /// as any other, that asks for an answer. While the person drives the
+    /// `name`. The one place a stand-down is sent: a line message that asks
+    /// for an answer, steered into the old holder's running turn (§4), and,
+    /// for a job that can't be undone, its turn interrupted when it isn't
+    /// read in time. While the person drives the
     /// old holder (or took it back), or it is on a machine, it goes to the
     /// person instead, never into the session.
     async fn stand_down(
@@ -883,9 +889,16 @@ impl CrewHub {
             .await;
             return StoodDown::Person;
         }
+        // Urgent (§4), never counted against the urgent limit; one of a
+        // job that can't be undone interrupts a turn that doesn't read it
+        // in time.
+        let urgency = match old.irreversible {
+            true => workforce_desk::line::Urgency::Escalate,
+            false => workforce_desk::line::Urgency::StandDown,
+        };
         let sent = self
             .desk
-            .line_send(
+            .line_send_with(
                 workforce_desk::LineSender::Overseer(by.clone()),
                 workforce_desk::line::Send::Ask {
                     to: workforce_desk::line::Target::Session(old.session),
@@ -894,10 +907,11 @@ impl CrewHub {
                     chose: None,
                     parts: Default::default(),
                 },
+                Some(urgency),
             )
             .await;
         match sent {
-            Ok(m) => {
+            Ok((m, _)) => {
                 tracing::info!(session = %old.session, old = %old.id, "a session was told to stand down from a job moved on");
                 self.picture_instruction(&old.boss, old.session, &text, self.current_turn());
                 StoodDown::Asked(m.id)
@@ -1294,6 +1308,7 @@ impl CrewHub {
         };
         let order = Order {
             released: Some(id),
+            urgent: a.urgent,
             ..Default::default()
         };
         match self.perform_in_with(Some(d), &action, by, &order).await {
@@ -1954,6 +1969,20 @@ mod tests {
             "a message after it isn't an answer"
         );
         assert!(!answers(&msg("Ack m:00000000", None), sd));
+    }
+
+    #[test]
+    fn a_relayed_order_keeps_its_urgency_and_leaves_its_job_at_home() {
+        let sent = relayed_input(
+            &json!({ "session_id": "s", "message": "Stop.", "urgent": true,
+                "job": { "kind": "release", "key": "4" }, "irreversible": true,
+                "replaces": "a:3f2a1b2c" }),
+            None,
+        );
+        assert_eq!(sent["urgent"], json!(true));
+        assert!(sent.get("job").is_none() && sent.get("irreversible").is_none());
+        assert!(sent.get("replaces").is_none());
+        assert!(Order::of(&sent).urgent, "the machine steers it in");
     }
 
     #[test]

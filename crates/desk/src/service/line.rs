@@ -772,15 +772,19 @@ impl Desk {
         }
         // How a boss's urgent words reach it, decided and counted before
         // they are kept (the count's lock held until they are).
-        let (rushed, _counted) = match (urgency, &recipient) {
-            (Some(u), Some(v)) => {
-                let (r, guard) = self.rush_plan(v, &mut m, u).await?;
-                (Some(r), guard)
-            }
-            _ => (None, None),
+        let plan = match (urgency, &recipient) {
+            (Some(u), Some(v)) => Some(self.rush_plan(v, &mut m, u).await?),
+            _ => None,
         };
         self.0.store.put_line(&m).await?;
-        drop(_counted);
+        let (rushed, mark) = match plan {
+            Some(p) => {
+                // Kept: the next urgent send to it counts this one.
+                drop(p.counted);
+                (Some(p.rushed), p.mark)
+            }
+            None => (None, None),
+        };
         // A session's question is waited on from the moment it is told of:
         // whoever takes it up (the overseer giving it to the person) finds
         // its call still waiting, not gone ahead.
@@ -825,7 +829,9 @@ impl Desk {
         self.line_announce(&m);
         if let Some(v) = recipient {
             match (rushed, &from) {
-                (Some(r), Sender::Overseer(by)) => self.rush_deliver(&mut m, v.id, r, by).await?,
+                (Some(r), Sender::Overseer(by)) => {
+                    self.rush_deliver(&mut m, v.id, r, mark, by).await?
+                }
                 _ => match steering {
                     Steering::Queue => self.line_pump_later(v.id),
                     Steering::PasteNow | Steering::TurnSteer => {
@@ -894,6 +900,7 @@ impl Desk {
             Ok(None) => {}
             Ok(Some(m)) => {
                 self.line_announce(&m);
+                self.rush_refused(id, &m);
                 self.line_pump_later(id);
             }
             Err(e) => {
@@ -1556,7 +1563,7 @@ impl Desk {
         for m in inbox {
             if self.waited_on(&m)
                 || self.line_gate(&view, &m).is_some()
-                || self.steer_reserved(caller, m.id)
+                || self.steer_reserved(caller, &m)
             {
                 continue;
             }
@@ -1653,8 +1660,7 @@ impl Desk {
         let mut typed_in = false;
         for mut m in inbox {
             // One its running turn's next tool call takes is left to it.
-            if m.delivery == Delivery::Handed || self.waited_on(&m) || self.steer_reserved(id, m.id)
-            {
+            if m.delivery == Delivery::Handed || self.waited_on(&m) || self.steer_reserved(id, &m) {
                 continue;
             }
             // Decided before the person's own words there: never typed in.
@@ -1809,6 +1815,7 @@ impl Desk {
     /// and whoever asked it is told.
     pub(super) async fn line_forgotten(&self, gone: &SessionView) {
         let id = gone.id;
+        self.rush_forget(id);
         let asks = match self.0.store.line_open_asks(None).await {
             Ok(asks) => asks,
             Err(e) => {

@@ -6,7 +6,10 @@
 //! through the boss's own `crew.interrupt` gate, and a plain urgent order
 //! never does.
 
+use super::super::actions::{Action, Target as ActionTarget};
+use super::super::assignments::{Declared, Order};
 use super::*;
+use workforce_desk::assignment::short;
 use workforce_desk::line::{Delivery, Send, Target, Urgency, When};
 use workforce_desk::model::SessionState;
 
@@ -60,12 +63,19 @@ async fn an_urgent_nudge_is_read_with_the_next_tool_call_and_the_boss_is_told_ho
         })
         .await;
         let schema = super::super::tools::schema("crew.nudge", Vec::new);
-        assert!(
-            schema["properties"]["urgent"]["description"]
-                .as_str()
-                .is_some_and(|d| d.contains("mid-turn")),
-            "{schema}"
-        );
+        let said = schema["properties"]["urgent"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        for words in [
+            "mid-turn",
+            "gh run watch",
+            "crew.interrupt",
+            "At most 3 urgent orders per session in 10 minutes",
+            "Ignored with reply_to",
+        ] {
+            assert!(said.contains(words), "{words}: {said}");
+        }
+        assert!(!said.contains("a stop"), "{said}");
         let (s, url) = working(&d, &base, "release-prep").await;
         let out = nudge(
             &overseer,
@@ -203,8 +213,8 @@ async fn a_stand_down_not_read_in_time_is_an_interrupt_through_the_bosss_gate() 
             SessionState::Working,
             "never escalated"
         );
-        let m = d.store().line_message(row).await.unwrap().unwrap();
-        assert_ne!(m.delivery, Delivery::Refused);
+        // The stand-down goes in at the idle after.
+        went_in(&d, row).await;
     })
     .await;
 }
@@ -233,7 +243,8 @@ async fn a_boss_not_let_to_interrupt_has_the_interrupt_suggested_and_the_turn_ru
         .await;
         assert_eq!(suggested.state, SuggestionState::Open);
         assert_eq!(d.view(s).unwrap().state, SessionState::Working);
-        // Its next call still reads it.
+        // Its next call still reads it, and the suggestion is withdrawn:
+        // the person's yes would interrupt what it does next.
         let said = hook(&url, done()).await;
         assert!(
             said["hookSpecificOutput"]["additionalContext"]
@@ -241,6 +252,157 @@ async fn a_boss_not_let_to_interrupt_has_the_interrupt_suggested_and_the_turn_ru
                 .is_some_and(|t| t.contains("Stand down from a:3f2a")),
             "{said}"
         );
+        eventually("the suggestion withdrawn", async || {
+            let now = d.store().suggestion(&suggested.id).await.unwrap()?;
+            (now.state == SuggestionState::Dismissed).then_some(())
+        })
+        .await;
+    })
+    .await;
+}
+
+/// The line row `row` goes in at its session's idle (typed in: no plugin
+/// waits on these sessions' lines).
+async fn went_in(d: &Desk, row: uuid::Uuid) {
+    eventually("in at the idle", async || {
+        let m = d.store().line_message(row).await.unwrap()?;
+        matches!(m.delivery, Delivery::Delivered | Delivery::Handed).then_some(())
+    })
+    .await;
+}
+
+/// The boss's urgent order holding Harbor's release `key`, a job that
+/// can't be undone.
+fn release(key: &str) -> Order {
+    Order {
+        job: Declared::Job {
+            kind: "release".into(),
+            target: Some("harbor/monorepo".into()),
+            key: key.into(),
+        },
+        irreversible: true,
+        urgent: true,
+        ..Default::default()
+    }
+}
+
+fn nudge_action(to: uuid::Uuid, message: &str) -> Action {
+    Action::Nudge {
+        to: ActionTarget::Session(to),
+        message: message.into(),
+        reply_to: None,
+    }
+}
+
+async fn held(d: &Desk, s: uuid::Uuid) -> workforce_desk::assignment::Assignment {
+    d.store()
+        .assignments_of("desk", true)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|a| a.session == s)
+        .expect("an assignment of its")
+}
+
+/// Release `key` is ordered to `old` (working, its hook at `url`), urgently,
+/// and its next call reads it; moving it to `new` holds `new`'s order and
+/// sends `old` its stand-down: that row.
+async fn moved(
+    crew: &Arc<CrewHub>,
+    d: &Desk,
+    key: &str,
+    (old, url): (uuid::Uuid, &str),
+    new: uuid::Uuid,
+) -> uuid::Uuid {
+    let by = || crew.by_overseer("Sam moved the release.").unwrap();
+    let said = crew
+        .perform_with(
+            &nudge_action(old, &format!("You own release {key}: dispatch it.")),
+            by(),
+            &release(key),
+        )
+        .await
+        .unwrap();
+    assert!(said.contains("next tool call"), "{said}");
+    let took = hook(url, done()).await;
+    assert!(
+        took["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .is_some_and(|t| t.contains(&format!("release {key}"))),
+        "{took}"
+    );
+    // The hook's take is when the order went in.
+    let went = eventually("its order went in", async || {
+        let a = held(d, old).await;
+        a.delivered_at.map(|_| a)
+    })
+    .await;
+    // The session is on its next tool call.
+    hook(
+        url,
+        json!({"hook_event_name": "PreToolUse", "tool_name": "Bash",
+            "tool_input": {"command": "gh run watch 4412"}}),
+    )
+    .await;
+    let moving = Order {
+        replaces: Some(short(went.id)),
+        ..Default::default()
+    };
+    let said = crew
+        .perform_with(
+            &nudge_action(new, &format!("Start release {key}.")),
+            by(),
+            &moving,
+        )
+        .await
+        .unwrap();
+    assert!(said.starts_with("held a:"), "{said}");
+    held(d, new).await.stand_down.expect("the old holder told")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn moving_an_irreversible_job_off_a_busy_session_steers_its_stand_down_then_interrupts() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (overseer, crew, d, _llm) = overseeing(&base, pool, "ok", LETS, &[]).await;
+        eventually("the overseer's tools", async || {
+            overseer.tools.has("crew.interrupt").then_some(())
+        })
+        .await;
+        d.picture_load().await;
+        d.set_steer_wait(Duration::from_millis(400));
+
+        // Read in time: its next call carries it; nothing is interrupted.
+        let (old, url) = working(&d, &base, "harbor-release-3").await;
+        let new = new_session(&d, &base, "harbor-auth-reset").await;
+        let row = moved(&crew, &d, "4", (old, &url), new.id).await;
+        let m = d.store().line_message(row).await.unwrap().unwrap();
+        assert_eq!(
+            (m.delivery, m.urgency),
+            (Delivery::Queued, Some(Urgency::Escalate))
+        );
+        let said = hook(&url, done()).await;
+        assert!(
+            said["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .is_some_and(|t| t.contains("Stand down from")),
+            "{said}"
+        );
+        let m = d.store().line_message(row).await.unwrap().unwrap();
+        assert_eq!(m.delivery, Delivery::Delivered);
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert_eq!(d.view(old).unwrap().state, SessionState::Working);
+
+        // Unread, its tool running on: interrupted, then in at the idle.
+        let (busy, url) = working(&d, &base, "harbor-release-5").await;
+        let other = new_session(&d, &base, "harbor-docs").await;
+        let row = moved(&crew, &d, "5", (busy, &url), other.id).await;
+        eventually("its turn interrupted", async || {
+            (d.view(busy).unwrap().state == SessionState::Done).then_some(())
+        })
+        .await;
+        went_in(&d, row).await;
     })
     .await;
 }

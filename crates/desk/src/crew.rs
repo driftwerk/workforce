@@ -780,14 +780,16 @@ pub trait Crew: Send + Sync {
         )))
     }
     /// The boss `boss`'s escalating stand-down (line message `row`) wasn't
-    /// read by `session` within the steer wait ([`crate::line::STEER_WAIT`]):
-    /// the boss interrupts its turn, as `crew.interrupt` would, through the
-    /// same gate. What was done, or why it wasn't, in plain words.
+    /// read by `session` within the steer wait ([`crate::line::STEER_WAIT`])
+    /// in the turn `turn` it was sent in: the boss interrupts that turn
+    /// ([`crate::Desk::interrupt_turn`]), as `crew.interrupt` would, through
+    /// the same gate. What was done, or why it wasn't, in plain words.
     async fn steer_overdue(
         &self,
         _boss: &str,
         _session: uuid::Uuid,
         _row: uuid::Uuid,
+        _turn: crate::line::TurnMark,
     ) -> Result<String, String> {
         Err("no boss here interrupts sessions".into())
     }

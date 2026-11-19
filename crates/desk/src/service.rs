@@ -4361,6 +4361,17 @@ impl Desk {
     /// does, for Claude Code and Codex alike. Its process (and a tracked
     /// one's shell) goes on. Not working, it does nothing.
     pub fn interrupt(&self, id: Uuid, by: Option<By>) -> Result<SessionView, DeskError> {
+        self.interrupt_when(id, by, None)
+    }
+
+    /// [`Self::interrupt`], only while `id` is in the turn `mark` (when
+    /// given), checked as the keys are sent: never a turn begun since.
+    pub(super) fn interrupt_when(
+        &self,
+        id: Uuid,
+        by: Option<By>,
+        mark: Option<crate::line::TurnMark>,
+    ) -> Result<SessionView, DeskError> {
         self.boss_holds(id, by.as_ref())?;
         // Esc on a dialog is the person's, or the boss's whose Act fully
         // answers the session while the person isn't in control of it: no
@@ -4381,6 +4392,9 @@ impl Desk {
                 .live
                 .get(&id)
                 .ok_or_else(|| DeskError::Conflict("session is not running".into()))?;
+            if mark.is_some_and(|m| Self::mark_in(&st, id) != Some(m)) {
+                return Err(DeskError::Conflict("that turn is over".into()));
+            }
             let record = st.records.get(&id);
             let keys = record.and_then(|r| engine::interrupt_keys(r.engine));
             let working = record.map(|r| r.state) == Some(SessionState::Working);
@@ -5732,7 +5746,7 @@ impl Desk {
         };
         // A tool hook heard: what is said beside a call's result reaches it.
         if matches!(hook, Hook::ToolStart { .. } | Hook::ToolEnd { .. }) {
-            self.steer_heard(id);
+            self.steer_heard(id).await;
         }
         if let Some(agent) = &inside {
             let (idle, held) = {
@@ -5978,6 +5992,10 @@ impl Desk {
                 if let Some(failed) = &failed {
                     self.breaker_failed(id, failed);
                 }
+                // Esc ended the main thread's turn (in a dialog or not): what
+                // waited for its next call goes in at the idle, never into a
+                // call the person stopped.
+                let esc = interrupt && inside.is_none();
                 let skip = self.0.state.lock().live.get(&id).is_some_and(|l| {
                     // Another call ended (one run beside it, or another
                     // thread's): what was asked waits on, but not past Esc,
@@ -5989,6 +6007,9 @@ impl Desk {
                         || (interrupt && l.pending.is_none())
                 });
                 if skip {
+                    if esc {
+                        self.steers_released(id);
+                    }
                     return answer();
                 }
                 self.change(id, |r, l| {
@@ -6023,14 +6044,19 @@ impl Desk {
                         }
                     }
                 });
+                if esc {
+                    self.steers_released(id);
+                }
                 self.spend_read_while_working(id);
                 let event = match (failed.is_some(), interrupt) {
                     (false, false) => "PostToolUse",
                     _ => "PostToolUseFailure",
                 };
                 // What waits for this tool call's result goes with it.
-                if let Some(said) = self.steers_take(id, event, inside.is_none()).await {
-                    return said;
+                if !esc {
+                    if let Some(said) = self.steers_take(id, event, inside.is_none()).await {
+                        return said;
+                    }
                 }
             }
             Hook::NeedsInput(message) => self.change(id, |r, l| {
@@ -7183,7 +7209,7 @@ impl Desk {
             }
             match &event {
                 CodexEvent::Tool(t) => {
-                    self.steer_heard(id);
+                    self.steer_heard(id).await;
                     // Codex takes no answer before a call: a turn its breaker
                     // holds (one the person didn't start) is told why and
                     // ended at its first call.

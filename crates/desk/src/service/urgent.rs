@@ -8,19 +8,23 @@
 //!   it. Codex takes them with `turn/steer`, as the person's Send now does.
 //! - A row is delivered once: whoever moves it from `queued` (the hook, the
 //!   idle pump, the plugin, the session's inbox) delivers it, and every
-//!   other path finds it moved. While the session works, the pump and the
-//!   plugin leave a row the queue holds for the hook alone; once it doesn't
-//!   (its turn ended, it was interrupted), the row goes out at idle.
+//!   other path finds it moved. While its session is in a turn, the pump
+//!   and the plugin leave a row kept as urgent ([`Desk::steer_reserved`],
+//!   read from the row itself, so it holds from the moment it is kept and
+//!   across a restart); once the turn is over, the row goes out at idle.
 //! - A session that can't take words mid-turn gets them at its turn's end,
 //!   and the sender is told so.
-//! - A stand-down that escalates, not read within the steer wait, has its
-//!   turn interrupted through the boss's own gate ([`crate::crew::Crew::steer_overdue`]).
+//! - A stand-down that escalates, not read within the steer wait in the
+//!   turn it was sent in, has that turn interrupted through the boss's own
+//!   gate ([`crate::crew::Crew::steer_overdue`], [`Desk::interrupt_turn`]):
+//!   never a turn begun since.
 //! - At most [`line::URGENT_PER_SESSION`] urgent orders per session in
 //!   [`line::URGENT_WINDOW`]; stand-downs aren't counted.
-//! - After a restart, what was queued urgently is steered again from the
-//!   session's first tool call heard.
+//! - After a restart, what was queued urgently is held for its session's
+//!   running turn, an escalating stand-down is timed again at once, and the
+//!   rest is steered again from the session's first tool call heard.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -30,11 +34,11 @@ use uuid::Uuid;
 
 use super::breaker::Steer;
 use super::line::LineError;
-use super::Desk;
+use super::{Desk, DeskError};
 use crate::crew::{By, Event, Kind, Party, PartyKind};
 use crate::engine::Engine;
-use crate::line::{self, LineMessage, MidTurn, Rushed, Urgency};
-use crate::model::{SessionState, SessionView};
+use crate::line::{self, LineMessage, MidTurn, Rushed, TurnMark, Urgency};
+use crate::model::SessionView;
 
 /// What the desk keeps for urgent delivery.
 pub(crate) struct Rush {
@@ -45,7 +49,15 @@ pub(crate) struct Rush {
     write: tokio::sync::Mutex<()>,
     /// What a restart found queued urgently, by session: steered again once
     /// the session's first tool call is heard in this run.
-    unarmed: parking_lot::Mutex<HashMap<Uuid, Vec<(Uuid, Urgency)>>>,
+    unarmed: parking_lot::Mutex<HashMap<Uuid, Vec<Unarmed>>>,
+}
+
+/// A row a restart found queued urgently.
+#[derive(Debug, Clone, Copy)]
+struct Unarmed {
+    row: Uuid,
+    /// Its escalation was timed again at the restart already.
+    armed: bool,
 }
 
 impl Default for Rush {
@@ -56,6 +68,26 @@ impl Default for Rush {
             unarmed: parking_lot::Mutex::default(),
         }
     }
+}
+
+/// How an urgent send is to go, decided before its row is kept.
+pub(super) struct Plan<'a> {
+    pub(super) rushed: Rushed,
+    /// The turn it was sent in, while the session was in one.
+    pub(super) mark: Option<TurnMark>,
+    /// The limit's count is held until the row is kept.
+    pub(super) counted: Option<tokio::sync::MutexGuard<'a, ()>>,
+}
+
+/// What a hook made of one of the boss's rows it took from the queue.
+enum Took {
+    /// Delivered: its words, as the session reads them.
+    Read(String),
+    /// Held from the session now (its gate, a wait on it): back in the
+    /// queue for a later call, or the turn's end.
+    Back,
+    /// Gone in another way, or never to go in.
+    Gone,
 }
 
 impl Desk {
@@ -73,29 +105,50 @@ impl Desk {
             .store(wait.as_millis() as u64, Ordering::Relaxed);
     }
 
+    /// The turn `id` is in now, while it is in one.
+    pub fn turn_mark(&self, id: Uuid) -> Option<TurnMark> {
+        let st = self.0.state.lock();
+        Self::mark_in(&st, id)
+    }
+
+    pub(super) fn mark_in(st: &super::State, id: Uuid) -> Option<TurnMark> {
+        let state = st.records.get(&id)?.state;
+        let l = st.live.get(&id)?;
+        line::in_turn(state).then_some(TurnMark {
+            ends: l.ends,
+            turns: l.breaker.turns,
+        })
+    }
+
     /// How a boss's urgent `m` would reach `v` now, decided before `m` is
-    /// kept: the limit is counted under a lock the caller holds (the guard
-    /// returned) until `m` is written, and `m` carries its urgency only
-    /// when it is to go into the running turn, or wait for its end as
-    /// urgent.
+    /// kept: the limit is counted under a lock held (the plan's `counted`)
+    /// until `m` is written, and `m` carries its urgency only when it is to
+    /// go into the running turn, or wait for its end as urgent.
     pub(super) async fn rush_plan(
         &self,
         v: &SessionView,
         m: &mut LineMessage,
         urgency: Urgency,
-    ) -> Result<(Rushed, Option<tokio::sync::MutexGuard<'_, ()>>), LineError> {
-        let (engine, heard, dialog, link) = {
+    ) -> Result<Plan<'_>, LineError> {
+        let (engine, heard, dialog, link, mark) = {
             let st = self.0.state.lock();
             let engine = st.records.get(&v.id).map(|r| r.engine);
+            let mark = Self::mark_in(&st, v.id);
             match st.live.get(&v.id) {
                 Some(l) => (
                     engine,
                     l.breaker.heard,
                     l.pending.is_some(),
                     l._codex.is_some(),
+                    mark,
                 ),
-                None => (engine, false, false, false),
+                None => (engine, false, false, false, None),
             }
+        };
+        let plan = |rushed| Plan {
+            rushed,
+            mark,
+            counted: None,
         };
         let heard = match engine {
             Some(Engine::Codex) => link,
@@ -106,13 +159,13 @@ impl Desk {
             None => Ok(None),
         };
         if matches!(how, Ok(None)) || !v.live {
-            return Ok((Rushed::NotWorking, None));
+            return Ok(plan(Rushed::NotWorking));
         }
         // What holds the boss's words from it at idle holds them now too.
         if let Some(wait) = self.line_gate(v, m) {
-            return Ok((Rushed::Held(wait), None));
+            return Ok(plan(Rushed::Held(wait)));
         }
-        let guard = match urgency.counts() {
+        let counted = match urgency.counts() {
             true => {
                 let guard = self.0.rush.write.lock().await;
                 let since = Utc::now()
@@ -123,7 +176,7 @@ impl Desk {
                     .line_urgent_since(&v.id.to_string(), since)
                     .await?;
                 if sent >= line::URGENT_PER_SESSION {
-                    return Ok((Rushed::TooMany, None));
+                    return Ok(plan(Rushed::TooMany));
                 }
                 Some(guard)
             }
@@ -136,16 +189,22 @@ impl Desk {
             Err(why) => Rushed::CantSteer(why),
             Ok(None) => Rushed::NotWorking,
         };
-        Ok((rushed, guard))
+        Ok(Plan {
+            rushed,
+            mark,
+            counted,
+        })
     }
 
     /// Sends the kept urgent `m` on to session `id` as `rushed` planned, as
-    /// `by`. What can't go into the running turn goes as any message.
+    /// `by`, sent in turn `mark` (an escalating stand-down is timed in it).
+    /// What can't go into the running turn goes as any message.
     pub(super) async fn rush_deliver(
         &self,
         m: &mut LineMessage,
         id: Uuid,
         rushed: Rushed,
+        mark: Option<TurnMark>,
         by: &By,
     ) -> Result<(), LineError> {
         let urgency = m.urgency;
@@ -162,17 +221,17 @@ impl Desk {
                 self.line_pump_later(id)
             }
         }
-        if urgency.is_some_and(Urgency::escalates)
-            && matches!(rushed, Rushed::Steered | Rushed::CantSteer(_))
-        {
-            self.rush_arm(id, m.id);
+        if let (true, Some(mark)) = (urgency.is_some_and(Urgency::escalates), mark) {
+            if matches!(rushed, Rushed::Steered | Rushed::CantSteer(_)) {
+                self.rush_arm(id, m.id, mark);
+            }
         }
         Ok(())
     }
 
     /// Says a boss's `m` into Codex session `id`'s running turn, marked so
     /// it can be answered: delivered as it is said, and back in the queue if
-    /// Codex refuses it.
+    /// Codex refuses it ([`Self::rush_refused`]).
     async fn rush_codex(&self, id: Uuid, m: &mut LineMessage, by: &By) -> Result<(), LineError> {
         let Some(taken) = self
             .0
@@ -201,61 +260,116 @@ impl Desk {
         Ok(())
     }
 
-    /// Whether `row` waits for `id`'s next tool call: the pump and the
-    /// plugin leave it while the session works.
-    pub(super) fn steer_reserved(&self, id: Uuid, row: Uuid) -> bool {
-        let st = self.0.state.lock();
-        let working = st.records.get(&id).map(|r| r.state) == Some(SessionState::Working);
-        working
-            && st.live.get(&id).is_some_and(|l| {
-                l.breaker
-                    .steers
-                    .iter()
-                    .any(|s| matches!(s, Steer::Line { row: r } if *r == row))
-            })
+    /// Codex refused `m`, back in the queue: an escalating stand-down is
+    /// timed in the turn still running, as one queued for a hook is.
+    pub(super) fn rush_refused(&self, id: Uuid, m: &LineMessage) {
+        if !m.urgency.is_some_and(Urgency::escalates) {
+            return;
+        }
+        if let Some(mark) = self.turn_mark(id) {
+            self.rush_arm(id, m.id, mark);
+        }
+    }
+
+    /// Whether `m` waits for `id`'s running turn: kept as urgent, while the
+    /// session is in a turn. The pump and the plugin leave it meanwhile;
+    /// the turn's next tool call takes it, or its end lets it go.
+    pub(super) fn steer_reserved(&self, id: Uuid, m: &LineMessage) -> bool {
+        m.urgency.is_some()
+            && self
+                .0
+                .state
+                .lock()
+                .records
+                .get(&id)
+                .is_some_and(|r| line::in_turn(r.state))
     }
 
     /// What goes with `id`'s tool call result (hook `event`): the breaker's
     /// warning, and, on the main thread's call (`main`), the boss's urgent
     /// messages still queued, each taken as it is delivered. None when
-    /// nothing is.
+    /// nothing is. A row taken as the turn ended or was interrupted is put
+    /// back for the idle: that call's result may never be read.
     pub(super) async fn steers_take(&self, id: Uuid, event: &str, main: bool) -> Option<Value> {
-        let steers = {
+        let (steers, mark) = {
             let mut st = self.0.state.lock();
-            let l = st.live.get_mut(&id)?;
-            Desk::take_steers(l, main)
+            let mark = Self::mark_in(&st, id);
+            let b = &mut st.live.get_mut(&id)?.breaker;
+            let mut taken = Vec::new();
+            let mut kept = VecDeque::new();
+            for s in b.steers.drain(..) {
+                match &s {
+                    Steer::Breaker(..) => taken.push(s),
+                    Steer::Line { row } if main && !b.escalating.contains(row) => {
+                        b.taking.insert(*row);
+                        taken.push(s);
+                    }
+                    Steer::Line { .. } => kept.push_back(s),
+                }
+            }
+            b.steers = kept;
+            (taken, mark)
         };
         let mut said = Vec::new();
+        let mut read = Vec::new();
+        let mut back = Vec::new();
         for s in steers {
             match s {
                 Steer::Breaker(_, text) => said.push(text),
                 Steer::Line { row } => match self.rush_take(id, row).await {
-                    Ok(Some(text)) => said.push(text),
-                    Ok(None) => {}
+                    Ok(Took::Read(text)) => {
+                        said.push(text);
+                        read.push(row);
+                    }
+                    Ok(Took::Back) => back.push(row),
+                    Ok(Took::Gone) => {}
                     Err(e) => {
-                        // Left queued: it goes in at the idle.
+                        // Left queued: a later call, or the idle, takes it.
                         tracing::warn!(session = %id, %row, error = %e, "an urgent line message couldn't be taken into a turn");
+                        back.push(row);
                     }
                 },
+            }
+        }
+        let over = mark.is_none() || self.turn_mark(id) != mark;
+        if over && !read.is_empty() {
+            // Taken as its turn ended: that result may never reach the
+            // session. Back in the queue, for the idle.
+            for row in std::mem::take(&mut read) {
+                if let Ok(Some(m)) = self.0.store.line_untake(row, &id.to_string()).await {
+                    self.line_announce(&m);
+                }
+            }
+            said.clear();
+            self.line_pump_later(id);
+        }
+        {
+            let mut st = self.0.state.lock();
+            if let Some(l) = st.live.get_mut(&id) {
+                for row in read.iter().chain(&back) {
+                    l.breaker.taking.remove(row);
+                }
+                if !over {
+                    for row in back.into_iter().rev() {
+                        l.breaker.steers.push_front(Steer::Line { row });
+                    }
+                }
             }
         }
         (!said.is_empty()).then(|| crate::claude::context(event, &said.join("\n\n")))
     }
 
-    /// Takes the boss's `row` into `id`'s turn: its words as the session
-    /// reads them, or none when it went in another way, or something holds
-    /// it now (it waits at the idle).
-    async fn rush_take(&self, id: Uuid, row: Uuid) -> Result<Option<String>, LineError> {
+    /// Takes the boss's `row` into `id`'s turn.
+    async fn rush_take(&self, id: Uuid, row: Uuid) -> Result<Took, LineError> {
         let Some(m) = self.0.store.line_message(row).await? else {
-            return Ok(None);
+            return Ok(Took::Gone);
         };
+        if !m.waits() || self.line_overtaken(&m).await {
+            return Ok(Took::Gone);
+        }
         let view = self.view(id)?;
-        if !m.waits()
-            || self.waited_on(&m)
-            || self.line_gate(&view, &m).is_some()
-            || self.line_overtaken(&m).await
-        {
-            return Ok(None);
+        if self.waited_on(&m) || self.line_gate(&view, &m).is_some() {
+            return Ok(Took::Back);
         }
         let Some(taken) = self
             .0
@@ -263,11 +377,11 @@ impl Desk {
             .line_take(row, line::Delivery::Delivered)
             .await?
         else {
-            return Ok(None);
+            return Ok(Took::Gone);
         };
         self.line_delivered_into(id, &taken);
         tracing::info!(session = %id, %row, "an urgent line message was read mid-turn");
-        Ok(Some(self.rendered(&taken).await))
+        Ok(Took::Read(self.rendered(&taken).await))
     }
 
     /// `id`'s boss messages waiting for its next tool call no longer do (its
@@ -307,8 +421,9 @@ impl Desk {
 
     /// A tool call of `id`'s was heard: words beside a call's result reach
     /// it. The first in this run steers again what a restart left queued
-    /// urgently for it.
-    pub(super) fn steer_heard(&self, id: Uuid) {
+    /// urgently for it, before the hook answers, so that call's result can
+    /// carry it.
+    pub(super) async fn steer_heard(&self, id: Uuid) {
         let first = {
             let mut st = self.0.state.lock();
             match st.live.get_mut(&id) {
@@ -322,13 +437,16 @@ impl Desk {
         let Some(rows) = self.0.rush.unarmed.lock().remove(&id) else {
             return;
         };
-        let desk = self.clone();
-        tokio::spawn(async move { desk.rush_rearm(id, rows).await });
+        self.rush_rearm(id, rows).await;
     }
 
     /// What waits on the lines urgently, after a restart: read once the
-    /// sessions that still run were taken back, and steered again from
-    /// each one's first tool call heard ([`Self::steer_heard`]).
+    /// sessions that still run were taken back. The plugin and the pump
+    /// leave each row for its session's running turn (it is kept as urgent);
+    /// an escalating stand-down to a session in a turn is timed again now,
+    /// as a session inside a long tool says nothing until it returns; the
+    /// rest are steered again from each session's first tool call heard
+    /// ([`Self::steer_heard`]).
     pub(super) async fn rush_load(&self) {
         let rows = match self.0.store.line_urgent_queued().await {
             Ok(rows) => rows,
@@ -337,18 +455,35 @@ impl Desk {
                 return;
             }
         };
-        let mut unarmed = self.0.rush.unarmed.lock();
         for m in rows {
-            if let (Some(to), Some(u)) = (m.to_session(), m.urgency) {
-                unarmed.entry(to).or_default().push((m.id, u));
+            let (Some(to), Some(u)) = (m.to_session(), m.urgency) else {
+                continue;
+            };
+            let mark = self.turn_mark(to);
+            let armed = u.escalates() && mark.is_some();
+            if let (true, Some(mark)) = (armed, mark) {
+                tracing::info!(session = %to, row = %m.id, "an escalating stand-down a restart left queued is timed again");
+                self.rush_arm(to, m.id, mark);
             }
+            self.0
+                .rush
+                .unarmed
+                .lock()
+                .entry(to)
+                .or_default()
+                .push(Unarmed { row: m.id, armed });
         }
+    }
+
+    /// `id` is gone: nothing a restart left for it is steered again.
+    pub(super) fn rush_forget(&self, id: Uuid) {
+        self.0.rush.unarmed.lock().remove(&id);
     }
 
     /// Steers `rows` (queued urgently before a restart) into `id`'s running
     /// turn again, when it still works and can take them.
-    async fn rush_rearm(&self, id: Uuid, rows: Vec<(Uuid, Urgency)>) {
-        for (row, urgency) in rows {
+    async fn rush_rearm(&self, id: Uuid, rows: Vec<Unarmed>) {
+        for Unarmed { row, armed } in rows {
             let Ok(view) = self.view(id) else { return };
             let Ok(Some(mut m)) = self.0.store.line_message(row).await else {
                 continue;
@@ -363,75 +498,79 @@ impl Desk {
                 hop: m.hop,
                 preference: None,
             };
-            let (engine, dialog) = {
+            let (engine, dialog, mark) = {
                 let st = self.0.state.lock();
                 (
                     st.records.get(&id).map(|r| r.engine),
                     st.live.get(&id).is_some_and(|l| l.pending.is_some()),
+                    Self::mark_in(&st, id),
                 )
             };
             let how = engine.map(|e| line::mid_turn(e, view.state, true, dialog));
             let rushed = match how {
                 Some(Ok(Some(MidTurn::Hook))) => Rushed::Steered,
                 Some(Ok(Some(MidTurn::TurnSteer))) => Rushed::SaidIn,
-                Some(Err(why)) => Rushed::CantSteer(why),
+                // Timed already if it escalates; the turn's end takes it.
+                Some(Err(_)) => continue,
                 _ => continue,
             };
             if self.line_gate(&view, &m).is_some() {
                 continue;
             }
-            tracing::info!(session = %id, %row, ?urgency, "an urgent line message a restart left queued is steered again");
-            if let Err(e) = self.rush_deliver(&mut m, id, rushed, &by).await {
+            tracing::info!(session = %id, %row, "an urgent line message a restart left queued is steered again");
+            let mark = if armed { None } else { mark };
+            if let Err(e) = self.rush_deliver(&mut m, id, rushed, mark, &by).await {
                 tracing::warn!(session = %id, %row, error = %e, "couldn't steer an urgent line message again");
             }
         }
     }
 
     /// In the steer wait, looks again whether `id` read the escalating
-    /// stand-down `row`.
-    fn rush_arm(&self, id: Uuid, row: Uuid) {
-        let at = {
-            let st = self.0.state.lock();
-            st.live.get(&id).map(|l| (l.ends, l.breaker.turns))
-        };
-        let Some(at) = at else { return };
+    /// stand-down `row` in the turn `mark` it was sent in.
+    fn rush_arm(&self, id: Uuid, row: Uuid, mark: TurnMark) {
         let desk = self.clone();
         let wait = self.steer_wait();
         tokio::spawn(async move {
             tokio::time::sleep(wait).await;
-            desk.rush_overdue(id, row, at).await;
+            desk.rush_overdue(id, row, mark).await;
         });
     }
 
-    /// The escalating stand-down `row` wasn't read by `id` in the turn it
-    /// was sent in (`at`: its turn counts then): its boss interrupts that
-    /// turn, through its own gate, and it goes in at the idle that follows.
-    async fn rush_overdue(&self, id: Uuid, row: Uuid, at: (u64, u64)) {
-        let same_turn = {
-            let st = self.0.state.lock();
-            let working = st.records.get(&id).is_some_and(|r| {
-                matches!(
-                    r.state,
-                    SessionState::Working | SessionState::Blocked | SessionState::Asking
-                )
-            });
-            working
-                && st
-                    .live
-                    .get(&id)
-                    .is_some_and(|l| (l.ends, l.breaker.turns) == at)
+    /// Whether `row` (to `id`) is still unread in turn `mark`: that turn
+    /// runs, the row is still queued or handed to Desk's plugin, and no
+    /// hook is taking it now. What an escalation, and a suggestion to
+    /// interrupt, hold on.
+    pub async fn steer_unread(&self, id: Uuid, mark: TurnMark, row: Uuid) -> bool {
+        let unread = match self.0.store.line_message(row).await {
+            Ok(Some(m)) => matches!(m.delivery, line::Delivery::Queued | line::Delivery::Handed),
+            _ => false,
         };
-        if !same_turn {
+        let st = self.0.state.lock();
+        unread
+            && Self::mark_in(&st, id) == Some(mark)
+            && st
+                .live
+                .get(&id)
+                .is_some_and(|l| !l.breaker.taking.contains(&row))
+    }
+
+    /// The escalating stand-down `row` wasn't read by `id` in the turn it
+    /// was sent in (`mark`): its boss interrupts that turn, through its own
+    /// gate, and it goes in at the idle that follows. Not while the boss's
+    /// words are held from it (the person drives it, its breaker paused it,
+    /// its mode is ending): those are theirs.
+    async fn rush_overdue(&self, id: Uuid, row: Uuid, mark: TurnMark) {
+        if !self.steer_unread(id, mark, row).await {
             return;
         }
-        let m = match self.0.store.line_message(row).await {
-            Ok(Some(m)) => m,
-            _ => return,
+        let (Ok(Some(m)), Ok(view)) = (self.0.store.line_message(row).await, self.view(id)) else {
+            return;
         };
-        // Read, withdrawn, or handed on: nothing to do.
-        if !matches!(m.delivery, line::Delivery::Queued | line::Delivery::Handed)
-            || m.from.kind != PartyKind::Manager
-        {
+        if m.from.kind != PartyKind::Manager {
+            return;
+        }
+        if let Some(wait) = self.line_gate(&view, &m) {
+            tracing::info!(session = %id, %row, ?wait, "a stand-down wasn't read in time, but the boss's words are held from the session: no interrupt");
             return;
         }
         let crew = self
@@ -440,32 +579,60 @@ impl Desk {
             .lock()
             .as_ref()
             .and_then(std::sync::Weak::upgrade);
-        let name = self
-            .view(id)
-            .map(|v| v.label().to_string())
-            .unwrap_or_default();
-        let wait = self.steer_wait().as_secs();
         let Some(crew) = crew else {
             tracing::warn!(session = %id, %row, "a stand-down wasn't read in time and no boss is here to interrupt its turn");
             return;
         };
-        match crew.steer_overdue(&m.from.id, id, row).await {
+        match crew.steer_overdue(&m.from.id, id, row, mark).await {
             Ok(done) => {
                 tracing::info!(session = %id, %row, %done, "a stand-down wasn't read in time: its turn was interrupted");
-                self.steers_released(id);
             }
             Err(why) => {
                 tracing::info!(session = %id, %row, %why, "a stand-down wasn't read in time, and its turn wasn't interrupted");
-                let to = self.view(id).ok().map(|v| Party::session(&v));
+                let wait = self.steer_wait().as_secs();
                 self.note(Event::new(
                     Kind::Steered,
                     m.from.clone(),
-                    to,
+                    Some(Party::session(&view)),
                     format!(
-                        "{name} hasn't read its stand-down in {wait}s, and it wasn't interrupted: {why}. It gets it once its turn ends"
+                        "{} hasn't read its stand-down in {wait}s, and it wasn't interrupted: {why}. It gets it once its turn ends",
+                        view.label()
                     ),
                 ));
             }
         }
+    }
+
+    /// Interrupts `id`'s turn `mark` as [`Self::interrupt`] does, for its
+    /// unread escalating stand-down `row`, and only then: refused when that
+    /// turn is over, or the row was read or is being read. No hook takes
+    /// the row while the interrupt goes in; it goes in at the idle after.
+    pub async fn interrupt_turn(
+        &self,
+        id: Uuid,
+        mark: TurnMark,
+        row: Uuid,
+        by: Option<By>,
+    ) -> Result<SessionView, DeskError> {
+        let moved = || DeskError::Conflict("it read its stand-down, or that turn is over".into());
+        if !self.steer_unread(id, mark, row).await {
+            return Err(moved());
+        }
+        {
+            let mut st = self.0.state.lock();
+            if Self::mark_in(&st, id) != Some(mark) {
+                return Err(moved());
+            }
+            let l = st.live.get_mut(&id).ok_or_else(moved)?;
+            if l.breaker.taking.contains(&row) {
+                return Err(moved());
+            }
+            l.breaker.escalating.insert(row);
+        }
+        let done = self.interrupt_when(id, by, Some(mark));
+        if let Some(l) = self.0.state.lock().live.get_mut(&id) {
+            l.breaker.escalating.remove(&row);
+        }
+        done
     }
 }

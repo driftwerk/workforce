@@ -18,7 +18,7 @@ use workforce_core::budget::{
     self, Budget, BudgetScope, OnExceed, Period, Pool, Standing, Status, Subject, Unit, WARN_AT,
 };
 
-use super::{session_item, Desk, DeskError, Live};
+use super::{session_item, Desk, DeskError};
 use crate::breaker::{self as pure, Level, Reason, Signal, Step, Whose};
 use crate::budget_store::{SessionSpend, Used};
 use crate::crew::{By, Event, Kind, Party, PartyKind};
@@ -76,6 +76,12 @@ pub(crate) struct LiveBreaker {
     /// tool event from its app-server): words beside a call's result reach
     /// it.
     pub(super) heard: bool,
+    /// A boss's rows a hook took from the queue and is delivering now: no
+    /// escalation interrupts the turn over them.
+    pub(super) taking: std::collections::HashSet<Uuid>,
+    /// A boss's rows whose escalation is interrupting the turn now: no hook
+    /// takes them meanwhile; they go in at the idle after.
+    pub(super) escalating: std::collections::HashSet<Uuid>,
     /// What Desk typed into it and has yet to hear submitted, and whether
     /// the person sent it: the rest of what it is prompted with is typed
     /// in its terminal.
@@ -752,7 +758,8 @@ impl Desk {
         match engine {
             // Devin reads words beside a call's result as Claude Code does
             // (`additionalContext`, [`crate::devin::answer`]).
-            // The latest warning stands for the earlier, in its place.
+            // The latest warning stands for the earlier one, at the back
+            // of the queue: it is what the breaker says now.
             Some(Engine::Claude | Engine::Devin) => {
                 l.breaker
                     .steers
@@ -847,21 +854,6 @@ impl Desk {
                 None,
             );
         }
-    }
-
-    /// What waits to be delivered with `id`'s tool call result, taken:
-    /// everything, on the main thread's call (`main`); on a sub-agent's,
-    /// the breaker's warning only, as its result is the sub-agent's to
-    /// read and a boss's words are for the session.
-    pub(super) fn take_steers(l: &mut Live, main: bool) -> Vec<Steer> {
-        if main {
-            return l.breaker.steers.drain(..).collect();
-        }
-        let (taken, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut l.breaker.steers)
-            .into_iter()
-            .partition(|s| matches!(s, Steer::Breaker(..)));
-        l.breaker.steers = kept.into();
-        taken
     }
 
     /// `id`'s turn ended: what it was told it has heard. A budget's steer

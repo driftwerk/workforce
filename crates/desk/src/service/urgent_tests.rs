@@ -57,17 +57,6 @@ async fn row(d: &Desk, id: Uuid) -> LineMessage {
     d.0.store.line_message(id).await.unwrap().unwrap()
 }
 
-async fn until_row(d: &Desk, id: Uuid, ok: impl Fn(&LineMessage) -> bool) -> LineMessage {
-    for _ in 0..300 {
-        let m = row(d, id).await;
-        if ok(&m) {
-            return m;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("the row never got there: {:?}", row(d, id).await.delivery);
-}
-
 /// A Claude Code session at work on a tool call, its hooks heard, Desk's
 /// plugin waiting on its line.
 async fn working(d: &Desk, dir: &std::path::Path) -> Uuid {
@@ -384,17 +373,26 @@ struct Interrupting {
 
 #[async_trait::async_trait]
 impl Crew for Interrupting {
-    async fn steer_overdue(&self, boss: &str, session: Uuid, row: Uuid) -> Result<String, String> {
+    async fn steer_overdue(
+        &self,
+        boss: &str,
+        session: Uuid,
+        row: Uuid,
+        turn: crate::line::TurnMark,
+    ) -> Result<String, String> {
         self.asked.lock().push((boss.to_string(), session, row));
         if !self.let_it {
             return Err("the person hasn't let you interrupt sessions".into());
         }
         let d = self.desk.lock().clone().unwrap();
         let v = d
-            .interrupt(
+            .interrupt_turn(
                 session,
+                turn,
+                row,
                 Some(By::manager(boss, "Sarah", "Its stand-down wasn't read.")),
             )
+            .await
             .map_err(|e| e.to_string())?;
         Ok(format!("interrupted {}", v.label()))
     }
@@ -525,57 +523,173 @@ async fn a_boss_not_let_to_interrupt_leaves_the_stand_down_for_the_turns_end_and
     .await;
 }
 
+/// As a restart finds `s`: its turn still runs, its steer queue and what
+/// was heard of it gone with the last hub; then what is queued urgently is
+/// read back.
+async fn restarted(d: &Desk, s: Uuid) {
+    {
+        let mut st = d.0.state.lock();
+        let l = st.live.get_mut(&s).unwrap();
+        l.breaker.steers.clear();
+        l.breaker.heard = false;
+    }
+    d.rush_load().await;
+}
+
 #[tokio::test]
-async fn an_urgent_order_a_restart_left_queued_is_steered_again_from_the_first_call_heard() {
+async fn an_urgent_order_a_restart_left_queued_is_held_for_the_turn_and_read_with_its_first_call() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let d = desk(pool, dir.path()).await;
         let s = working(&d, dir.path()).await;
         let (m, _) = urgent(&d, s, "Don't merge PR 711.", Urgency::Order).await;
-        let (quiet, _) = d
-            .line_send_with(Sender::Overseer(boss()), tell(s, "Then the docs."), None)
-            .await
-            .unwrap();
-        // As a restart finds it: the turn still runs, its steer queue and
-        // what was heard of it gone with the last hub.
-        {
-            let mut st = d.0.state.lock();
-            let l = st.live.get_mut(&s).unwrap();
-            l.breaker.steers.clear();
-            l.breaker.heard = false;
-        }
-        d.rush_load().await;
-        assert_eq!(
-            post(&d, s, done()).await,
-            json!({}),
-            "nothing until a call is heard"
-        );
-        // Its first call heard steers it again; the plain message waits.
-        post(&d, s, tool("ls")).await;
-        let said = until_said(&d, s).await;
-        assert!(said.contains("Don't merge PR 711"), "{said}");
-        assert!(!said.contains("Then the docs"), "{said}");
+        restarted(&d, s).await;
+        // Desk's plugin, waiting on the line before any hook is heard, is
+        // never handed it while the turn runs.
+        assert!(d.line_next(s, Duration::from_millis(300)).await.is_none());
+        assert_eq!(row(&d, m.id).await.delivery, Delivery::Queued);
+        // The first call heard carries it.
+        let said = post(&d, s, done()).await;
+        let text = context(&said).expect("with the first call's result");
+        assert!(text.contains("Don't merge PR 711"), "{text}");
         assert_eq!(row(&d, m.id).await.delivery, Delivery::Delivered);
-        assert_eq!(row(&d, quiet.id).await.delivery, Delivery::Queued);
-        let _ = until_row(&d, quiet.id, |q| q.delivery == Delivery::Queued).await;
+        assert_eq!(context(&post(&d, s, done()).await), None, "once");
     })
     .await;
 }
 
-/// The words the next tool call result carries, once the re-steer is in.
-async fn until_said(d: &Desk, s: Uuid) -> String {
-    for _ in 0..100 {
-        let queued =
-            d.0.state
-                .lock()
-                .live
-                .get(&s)
-                .is_some_and(|l| !l.breaker.steers.is_empty());
-        if queued {
-            let said = post(d, s, done()).await;
-            return context(&said).unwrap_or_default().to_string();
+#[tokio::test]
+async fn an_escalating_stand_down_a_restart_left_inside_a_long_tool_is_timed_again_at_once() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let crew = interrupting(&d, true);
+        let s = working(&d, dir.path()).await;
+        // Sent before the restart, its wait the last hub's.
+        let (hard, _) = urgent(&d, s, "Stand down from a:2.", Urgency::Escalate).await;
+        d.set_steer_wait(Duration::from_millis(300));
+        restarted(&d, s).await;
+        // Inside `gh run watch`, no hook is heard: the plugin leaves it,
+        // and the wait runs out all the same.
+        assert!(d.line_next(s, Duration::from_millis(100)).await.is_none());
+        for _ in 0..100 {
+            if !crew.asked.lock().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("never steered again");
+        assert_eq!(
+            crew.asked.lock().clone(),
+            vec![("sarah".to_string(), s, hard.id)]
+        );
+        assert_eq!(d.view(s).unwrap().state, SessionState::Done, "interrupted");
+        let next = d
+            .line_next(s, Duration::from_secs(5))
+            .await
+            .expect("at the idle");
+        assert_eq!(next["id"], json!(hard.id));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn desks_plugin_waiting_as_an_urgent_order_is_kept_is_never_handed_it_mid_turn() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = working(&d, dir.path()).await;
+        let waiting = tokio::spawn({
+            let d = d.clone();
+            async move { d.line_next(s, Duration::from_millis(600)).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (m, rushed) = urgent(&d, s, "Use the staging DB.", Urgency::Order).await;
+        assert_eq!(rushed, Rushed::Steered);
+        assert!(waiting.await.unwrap().is_none(), "left for the hook");
+        assert_eq!(row(&d, m.id).await.delivery, Delivery::Queued);
+        let said = post(&d, s, done()).await;
+        assert!(context(&said).is_some_and(|t| t.contains("staging DB")));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn four_urgent_orders_sent_at_once_pass_the_limit_three_times() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = working(&d, dir.path()).await;
+        let (a, b, c, e) = tokio::join!(
+            urgent(&d, s, "A.", Urgency::Order),
+            urgent(&d, s, "B.", Urgency::Order),
+            urgent(&d, s, "C.", Urgency::Order),
+            urgent(&d, s, "D.", Urgency::Order),
+        );
+        let rushed = [a.1, b.1, c.1, e.1];
+        let steered = rushed.iter().filter(|r| **r == Rushed::Steered).count();
+        let queued = rushed.iter().filter(|r| **r == Rushed::TooMany).count();
+        assert_eq!((steered, queued), (3, 1), "{rushed:?}");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_stand_down_whose_turn_ended_never_interrupts_the_turn_after() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        d.set_steer_wait(Duration::from_millis(400));
+        let crew = interrupting(&d, true);
+        let s = working(&d, dir.path()).await;
+        let sent_in = d.turn_mark(s).expect("in a turn");
+        let (hard, _) = urgent(&d, s, "Stand down from a:2.", Urgency::Escalate).await;
+        // Its turn ends, and a new prompt starts a long tool, all within the
+        // wait.
+        post(&d, s, stop()).await;
+        post(&d, s, prompt()).await;
+        post(&d, s, tool("cargo build --release")).await;
+        assert_eq!(d.view(s).unwrap().state, SessionState::Working);
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(crew.asked.lock().is_empty(), "{:?}", crew.asked.lock());
+        assert_eq!(d.view(s).unwrap().state, SessionState::Working);
+        // An interrupt for it, late, is refused: that turn is over.
+        assert!(d.interrupt_turn(s, sent_in, hard.id, None).await.is_err());
+        assert_eq!(d.view(s).unwrap().state, SessionState::Working);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn esc_in_a_dialog_leaves_the_bosss_order_for_the_idle_not_the_stopped_call() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = working(&d, dir.path()).await;
+        let (m, _) = urgent(&d, s, "Use the staging DB.", Urgency::Order).await;
+        post(
+            &d,
+            s,
+            json!({"hook_event_name": "Notification", "message": "Claude needs your permission"}),
+        )
+        .await;
+        assert_eq!(d.view(s).unwrap().state, SessionState::Blocked);
+        let stopped = post(
+            &d,
+            s,
+            json!({"hook_event_name": "PostToolUseFailure", "tool_name": "Bash",
+                "tool_input": {"command": "gh run watch"}, "error": "Interrupted",
+                "is_interrupt": true}),
+        )
+        .await;
+        assert!(
+            !context(&stopped).is_some_and(|t| t.contains("staging DB")),
+            "{stopped}"
+        );
+        let next = d
+            .line_next(s, Duration::from_secs(5))
+            .await
+            .expect("at the idle");
+        assert_eq!(next["id"], json!(m.id));
+    })
+    .await;
 }

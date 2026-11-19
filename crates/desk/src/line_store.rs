@@ -544,9 +544,6 @@ impl DeskStore {
             .transpose()
     }
 
-    /// Puts a row delivered to `session` back in its queue, as it was
-    /// before: one statement, so a row that moved on meanwhile is left as
-    /// it is. The row as it now is, or `None` when it didn't move.
     /// How many urgent orders (stand-downs aside) went to `session` since
     /// `since`: what [`crate::line::URGENT_PER_SESSION`] holds.
     pub async fn line_urgent_since(&self, session: &str, since: DateTime<Utc>) -> Result<i64> {
@@ -580,6 +577,9 @@ impl DeskStore {
             .collect()
     }
 
+    /// Puts a row delivered to `session` back in its queue, as it was
+    /// before: one statement, so a row that moved on meanwhile is left as
+    /// it is. The row as it now is, or `None` when it didn't move.
     pub async fn line_untake(&self, id: Uuid, session: &str) -> Result<Option<LineMessage>> {
         let client = self.pool().get().await?;
         client

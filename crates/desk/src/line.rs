@@ -102,6 +102,21 @@ pub const STEER_WAIT: Duration = Duration::from_secs(60);
 pub const URGENT_PER_SESSION: i64 = 3;
 pub const URGENT_WINDOW: Duration = Duration::from_secs(10 * 60);
 
+/// Whether a session in `state` is inside a turn: working, or blocked on a
+/// dialog its turn raised. What waits for that turn's next tool call is
+/// left to it meanwhile, and a stand-down's escalation interrupts only it.
+pub fn in_turn(state: SessionState) -> bool {
+    matches!(state, SessionState::Working | SessionState::Blocked)
+}
+
+/// Which turn of a session's run something was sent in: an escalation
+/// interrupts that turn alone, never one begun since.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnMark {
+    pub(crate) ends: u64,
+    pub(crate) turns: u64,
+}
+
 /// How a session that is working takes words mid-turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MidTurn {

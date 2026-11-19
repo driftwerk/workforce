@@ -1454,8 +1454,9 @@ impl Crew for CrewHub {
         boss: &str,
         session: uuid::Uuid,
         row: uuid::Uuid,
+        turn: workforce_desk::line::TurnMark,
     ) -> Result<String, String> {
-        self.steer_overdue_now(boss, session, row).await
+        self.steer_overdue_now(boss, session, row, turn).await
     }
 
     async fn accept(&self, suggestion: &Suggestion) -> Result<(), String> {
