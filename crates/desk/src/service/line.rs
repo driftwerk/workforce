@@ -1634,7 +1634,7 @@ impl Desk {
             }
             // Still handed from then: one dropped and handed again since
             // is the new hand-off's.
-            match self.0.store.line_requeue(Some(m.id), before).await {
+            match self.0.store.line_requeue(Some(m.id), Some(before)).await {
                 Ok(back) => self.line_requeued(back).await,
                 Err(e) => {
                     tracing::warn!(id = %m.id, error = %e, "couldn't requeue a stale line hand-off")
@@ -1658,7 +1658,7 @@ impl Desk {
                 self.line_delivered_into(caller, &m);
             }
         } else {
-            let back = self.0.store.line_requeue(Some(m.id), Utc::now()).await?;
+            let back = self.0.store.line_requeue(Some(m.id), None).await?;
             self.line_requeued(back).await;
         }
         Ok(())

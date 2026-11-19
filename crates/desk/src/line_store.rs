@@ -378,21 +378,22 @@ impl DeskStore {
             .collect()
     }
 
-    /// Puts handed rows back in the queue, handed before `before`: one the
-    /// plugin dropped (`id`, with `before` now), or every one (a plugin that
-    /// died between taking and submitting it). A row handed again since
-    /// `before` is left as it is.
+    /// Puts handed rows back in the queue: one the plugin dropped (`id`, no
+    /// `before`), or those handed before `before` (a plugin that died
+    /// between taking and submitting one): one handed again since is left
+    /// as it is.
     pub async fn line_requeue(
         &self,
         id: Option<Uuid>,
-        before: DateTime<Utc>,
+        before: Option<DateTime<Utc>>,
     ) -> Result<Vec<LineMessage>> {
         let client = self.pool().get().await?;
         client
             .query(
                 &format!(
                     "UPDATE line_messages SET delivery = 'queued', handed_at = NULL, updated_at = now() \
-                     WHERE delivery = 'handed' AND ($1::uuid IS NULL OR id = $1) AND handed_at < $2 \
+                     WHERE delivery = 'handed' AND ($1::uuid IS NULL OR id = $1) \
+                     AND ($2::timestamptz IS NULL OR handed_at < $2) \
                      RETURNING {COLUMNS}"
                 ),
                 &[&id, &before],
@@ -821,17 +822,17 @@ mod tests {
                 s.line_take(m.id, Delivery::Handed).await.unwrap().is_none(),
                 "taken once"
             );
-            let back = s.line_requeue(Some(m.id), Utc::now()).await.unwrap();
+            let back = s.line_requeue(Some(m.id), None).await.unwrap();
             assert_eq!(back.len(), 1);
             assert_eq!(back[0].delivery, Delivery::Queued);
             s.line_take(m.id, Delivery::Handed).await.unwrap().unwrap();
             assert!(s
-                .line_requeue(None, Utc::now() - chrono::Duration::minutes(2))
+                .line_requeue(None, Some(Utc::now() - chrono::Duration::minutes(2)))
                 .await
                 .unwrap()
                 .is_empty());
             assert_eq!(
-                s.line_requeue(None, Utc::now() + chrono::Duration::seconds(1))
+                s.line_requeue(None, Some(Utc::now() + chrono::Duration::seconds(1)))
                     .await
                     .unwrap()
                     .len(),
