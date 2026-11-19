@@ -65,6 +65,9 @@ pub enum What {
     /// A boss's message waiting to go into `session` was withdrawn unsent:
     /// the person's own words there came after it.
     Withdrawn,
+    /// A boss's message waiting to go into `session` was taken back unsent
+    /// by the person.
+    TakenBack,
 }
 
 impl What {
@@ -78,7 +81,7 @@ impl What {
             | What::SessionAsked
             | What::HandedBack
             | What::PersonAnswered => true,
-            What::Fact | What::Order | What::Withdrawn => false,
+            What::Fact | What::Order | What::Withdrawn | What::TakenBack => false,
         }
     }
 
@@ -93,6 +96,7 @@ impl What {
             What::HandedBack => "handed_back",
             What::PersonAnswered => "person_answered",
             What::Withdrawn => "withdrawn",
+            What::TakenBack => "taken_back",
         }
     }
 
@@ -107,6 +111,7 @@ impl What {
             "handed_back" => What::HandedBack,
             "person_answered" => What::PersonAnswered,
             "withdrawn" => What::Withdrawn,
+            "taken_back" => What::TakenBack,
             _ => return None,
         })
     }
@@ -188,6 +193,9 @@ impl Happened {
             What::PersonAnswered => format!("{at} the person answered its question: “{text}”"),
             What::Withdrawn => format!(
                 "{at} your message “{text}” was withdrawn unsent: the person's own words in the session came after it"
+            ),
+            What::TakenBack => format!(
+                "{at} the person took back your message “{text}” before it went in: it was never delivered"
             ),
         }
     }
@@ -405,8 +413,10 @@ impl Picture {
             .iter()
             .rev()
             .find(|r| {
-                matches!(r.what, What::Instruction | What::Withdrawn)
-                    && r.session == Some(session)
+                matches!(
+                    r.what,
+                    What::Instruction | What::Withdrawn | What::TakenBack
+                ) && r.session == Some(session)
                     && r.boss.as_deref() == Some(boss)
             })
             .filter(|r| r.what == What::Instruction)
