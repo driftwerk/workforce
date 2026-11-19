@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,6 +17,7 @@ use workforce_agent::tools::exec_runner::{
     SetupReport, WorkerHealth,
 };
 
+use crate::admission::{self, Census, HostLoad, Load, ProcLoad, Reading, Shortfall};
 use crate::bridge::Bridge;
 use crate::config::{dataset_safe, GoldenConfig, WorkerConfig, HOME_GOLDEN};
 use crate::jobs::{LiveJob, JOBS_ROOT};
@@ -24,7 +26,8 @@ use crate::ports::{
     REPO_ENV_PREFIX,
 };
 use crate::queue::{share_of, Queue};
-use crate::state::{Home, JobRecord, Scope, State, Store};
+use crate::state::{write_json, Home, JobRecord, Scope, State, Store};
+use crate::weight::{ServicePlan, Weight};
 
 /// Label every scope container carries, valued with its scope id.
 pub const SCOPE_LABEL: &str = "workforce.scope";
@@ -40,7 +43,12 @@ pub const AGENT_GID: u32 = 1000;
 pub use workforce_agent::tools::exec_runner::SCOPE_MCP_CONFIG_PATH as MCP_CONFIG_PATH;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
-const READY_POLL: Duration = Duration::from_secs(1);
+/// The first pause between readiness checks: a light scope's init is ready
+/// almost at once, so its seat is the container's start plus about this.
+/// Pauses double up to [`READY_POLL_MAX`], so a full scope's long start
+/// costs few checks.
+const READY_POLL: Duration = Duration::from_millis(250);
+const READY_POLL_MAX: Duration = Duration::from_secs(1);
 const CHOWN_TIMEOUT_SECS: u64 = 60;
 const GIT_TIMEOUT_SECS: u64 = 600;
 const SETUP_TIMEOUT_SECS: u64 = 1800;
@@ -86,6 +94,13 @@ pub struct Worker {
     pub(crate) jobs: Mutex<BTreeMap<JobId, JobRecord>>,
     pub(crate) live: Mutex<HashMap<JobId, LiveJob>>,
     pub(crate) starts: tokio::sync::Mutex<()>,
+    load: Arc<dyn HostLoad>,
+    /// Scopes being built, by weight: counted by admission as if seated.
+    building: Mutex<HashMap<ScopeId, Building>>,
+    scope_locks: KeyedLocks,
+    home_locks: KeyedLocks,
+    /// Prepares refused for room since the daemon started.
+    refusals: AtomicU64,
 }
 
 impl Worker {
@@ -145,7 +160,67 @@ impl Worker {
             jobs: Mutex::new(jobs),
             live: Mutex::new(HashMap::new()),
             starts: tokio::sync::Mutex::new(()),
+            load: Arc::new(ProcLoad),
+            building: Mutex::new(HashMap::new()),
+            scope_locks: KeyedLocks::default(),
+            home_locks: KeyedLocks::default(),
+            refusals: AtomicU64::new(0),
         })
+    }
+
+    /// The same worker reading the host's load from `load`.
+    pub fn with_load(self, load: Arc<dyn HostLoad>) -> Self {
+        Self { load, ..self }
+    }
+
+    /// Every scope admission counts: those seated, by the repos they hold,
+    /// and those being built.
+    fn census(&self) -> Census {
+        let mut census = Census::default();
+        for scope in self.scopes.lock().values() {
+            census.add(Weight::of_held(&scope.repos));
+        }
+        // What is left of a failed teardown still holds its seat.
+        for left in self.leftovers.lock().iter() {
+            census.add(Weight::of_held(&left.repos));
+        }
+        for building in self.building.lock().values() {
+            census.add(building.weight);
+        }
+        census
+    }
+
+    /// The host's load now, or `None`, logged, when it cannot be read: the
+    /// ceilings still hold, so a broken `/proc` never stops every seat.
+    fn reading(&self) -> Option<Reading> {
+        self.load
+            .read()
+            .inspect_err(|error| warn!(%error, "reading the host's load for admission"))
+            .ok()
+    }
+
+    /// Whether one more scope of `weight` fits now: the predicate every
+    /// seat, and anything that frees one, asks.
+    pub fn room_for(&self, weight: Weight) -> std::result::Result<(), Shortfall> {
+        let reading = self.config.admission.as_ref().and_then(|_| self.reading());
+        admission::decide(&self.config, &self.census(), weight, reading.as_ref())
+    }
+
+    /// Write what the host's metrics publish; a failure is logged, never
+    /// the caller's.
+    pub(crate) fn publish_load(&self) {
+        // Unlogged: a host without PSI or admission reports no reading
+        // rather than warning on every publish.
+        let load = Load::of(
+            &self.config,
+            &self.census(),
+            self.load.read().ok().as_ref(),
+            self.refusals.load(Ordering::Relaxed),
+            Utc::now(),
+        );
+        if let Err(error) = write_json(&admission::load_path(&self.config), &load) {
+            warn!(%error, "writing the worker's load");
+        }
     }
 
     pub fn config(&self) -> &WorkerConfig {
@@ -248,6 +323,14 @@ impl Worker {
         })
     }
 
+    /// Seat a scope, or hand back the one already seated under its id.
+    ///
+    /// Only the decision is taken one prepare at a time: whether the scope
+    /// exists, whether there is room for it, and its seat counted while it is
+    /// built. Building it (its container, checkouts and setup, which can take
+    /// half an hour) runs beside other prepares, under a lock of its own
+    /// scope and home, so a coding session's setup never holds up a turn's
+    /// seat and no scope or home is ever built twice at once.
     pub async fn prepare(&self, request: PrepareRequest) -> Result<ServerFrame> {
         if !valid_scope_id(&request.scope) {
             bail!("scope id {:?} is not a dataset-safe name", request.scope);
@@ -256,6 +339,12 @@ impl Worker {
             if !valid_home_key(key) {
                 bail!("home key {key:?} is not a dataset-safe name");
             }
+        }
+        // Before any place is held, so a bad request is said at once rather
+        // than once a seat is free, and gives up any place it held.
+        if let Err(reason) = validate_overrides(&request.env) {
+            self.queue.lock().leave(&request.scope);
+            bail!(reason);
         }
         if let Some(owner) = &request.queue {
             if !valid_owner(owner) {
@@ -281,10 +370,7 @@ impl Worker {
             scope: &request.scope,
             kept: false,
         };
-        let answer = {
-            let _one_at_a_time = self.prepares.lock().await;
-            self.prepare_one(&request).await
-        };
+        let answer = self.prepare_one(&request).await;
         place.kept = matches!(answer, Ok(ServerFrame::Queued { .. }));
         if place.kept {
             // Told to wait on: it asks again like any waiter, from now.
@@ -293,9 +379,12 @@ impl Worker {
         answer
     }
 
-    /// [`Self::prepare`] for its turn, while no other prepare runs.
+    /// [`Self::prepare`], once its place in the queue is settled.
     async fn prepare_one(&self, request: &PrepareRequest) -> Result<ServerFrame> {
+        let _same_scope = self.scope_locks.lock(request.scope.as_str()).await;
         self.classify(request);
+        // A scope already seated is handed back without waiting on another
+        // scope's build of the same home.
         if let Some(existing) = self.touch(&request.scope) {
             let home_reused = existing.home.is_some();
             return Ok(ServerFrame::Prepared(prepared(
@@ -304,90 +393,158 @@ impl Worker {
                 home_reused,
             )));
         }
-        // Not in the map: a conversation back while its last scope's
-        // teardown is under way (waited out) or still owed (done first), as
-        // the new scope takes the same id, dataset and home. Asked after the
-        // map, so a release moving it out meanwhile is seen here. Waited out
-        // in the queue, keeping a place there, when it queued.
-        let owed = || match &request.queue {
-            Some(owner) => ServerFrame::Queued {
-                ahead: self.queue_place(&request.scope, owner),
-            },
-            None => refused(RefusalReason::AtCapacity),
+        let _same_home = match &request.home {
+            HomeSpec::Keyed { key, .. } => Some(self.home_locks.lock(key).await),
+            HomeSpec::Ephemeral => None,
         };
-        match self.claim(&request.scope) {
-            Claim::Absent => {}
-            Claim::Busy => return Ok(owed()),
-            Claim::Owed(leftover) => {
-                if let Err(error) = self.take_down(*leftover).await {
-                    warn!(scope = %request.scope, %error, "taking down a scope that gave way failed again; its conversation waits");
-                    return Ok(owed());
+        let weight = Weight::of(&request.repos);
+        let _seat = {
+            let _one_at_a_time = self.prepares.lock().await;
+            if let Some(existing) = self.touch(&request.scope) {
+                let home_reused = existing.home.is_some();
+                return Ok(ServerFrame::Prepared(prepared(
+                    &existing,
+                    true,
+                    home_reused,
+                )));
+            }
+            // Not in the map: a conversation back while its last scope's
+            // teardown is under way (waited out) or still owed (done
+            // first), as the new scope takes the same id, dataset and home.
+            // Asked after the map, so a release moving it out meanwhile is
+            // seen here. Waited out in the queue, keeping a place there, when
+            // it queued.
+            let owed = || match &request.queue {
+                Some(owner) => ServerFrame::Queued {
+                    ahead: self.queue_place(&request.scope, owner),
+                },
+                None => refused(RefusalReason::AtCapacity),
+            };
+            match self.claim(&request.scope) {
+                Claim::Absent => {}
+                Claim::Busy => return Ok(owed()),
+                Claim::Owed(leftover) => {
+                    if let Err(error) = self.take_down(*leftover).await {
+                        warn!(scope = %request.scope, %error, "taking down a scope that gave way failed again; its conversation waits");
+                        return Ok(owed());
+                    }
                 }
             }
-        }
-        match &request.queue {
-            // Asked again under the lock, as a seating may have changed the
-            // order since.
-            Some(owner) => {
-                let ahead = self.queue_place(&request.scope, owner);
-                if ahead > 0 {
-                    return Ok(ServerFrame::Queued { ahead });
+            match &request.queue {
+                // Asked again under the lock, as a seating may have changed
+                // the order since.
+                Some(owner) => {
+                    let ahead = self.queue_place(&request.scope, owner);
+                    if ahead > 0 {
+                        return Ok(ServerFrame::Queued { ahead });
+                    }
+                }
+                // A prepare that did not ask to queue never takes a seat one
+                // waiting needs, and takes any seat beyond theirs.
+                None => {
+                    if let Err(shortfall) = self.room_beside_waiters(weight) {
+                        return Ok(self.no_room(&request.scope, weight, shortfall));
+                    }
                 }
             }
-            // A prepare that did not ask to queue never takes a seat one
-            // waiting needs, and takes any seat beyond theirs.
-            None if self.room_beside_waiters().is_err() => {
-                return Ok(refused(RefusalReason::AtCapacity))
-            }
-            None => {}
-        }
-        // A queued prepare at the head waits on for a seat rather than being
-        // refused, keeping its place; anything else refuses it at once.
-        let wait_or = |reason| match (&request.queue, reason) {
-            (Some(_), RefusalReason::AtCapacity) => ServerFrame::Queued { ahead: 0 },
-            (_, reason) => refused(reason),
-        };
-        validate_overrides(&request.env).map_err(|reason| eyre::eyre!(reason))?;
-        if self.zfs.free_bytes(&self.config.pool).await? < self.config.pool_free_floor_bytes() {
-            // A refresh pruning at the same moment can take a snapshot out
-            // from under this; whatever was freed still counts below.
-            if let Err(error) = crate::refresh::reclaim(self).await {
-                warn!(%error, "reclaiming pool space before a prepare failed");
+            // A queued prepare at the head waits on for a seat rather than
+            // being refused, keeping its place; anything else is refused.
+            let full = |shortfall| match &request.queue {
+                Some(_) => {
+                    info!(scope = %request.scope, %shortfall, "no room yet for the head of the queue");
+                    ServerFrame::Queued { ahead: 0 }
+                }
+                None => self.no_room(&request.scope, weight, shortfall),
+            };
+            // With no room and no idle scope whose going would make some,
+            // answered before anything slower is asked.
+            let short = self.room_for(weight).err();
+            if let Some(shortfall) = short {
+                if self.idle_yielder(Utc::now(), weight, shortfall).is_none() {
+                    return Ok(full(shortfall));
+                }
             }
             if self.zfs.free_bytes(&self.config.pool).await? < self.config.pool_free_floor_bytes() {
-                return Ok(refused(RefusalReason::PoolFull));
-            }
-        }
-        // Last of the checks, so a prepare refused for anything else never
-        // takes down a conversation's workspace for nothing. Short of pool
-        // space it is refused before one could give way: a turn's work
-        // clone is small, and its home, the large part, stays anyway.
-        if self.room_for_another().is_err() {
-            if let Some(idle) = self.take_idle_yielder(Utc::now()) {
-                if !self.give_way(idle, &request.scope).await {
-                    return Ok(wait_or(RefusalReason::AtCapacity));
+                // A refresh pruning at the same moment can take a snapshot out
+                // from under this; whatever was freed still counts below.
+                if let Err(error) = crate::refresh::reclaim(self).await {
+                    warn!(%error, "reclaiming pool space before a prepare failed");
+                }
+                if self.zfs.free_bytes(&self.config.pool).await?
+                    < self.config.pool_free_floor_bytes()
+                {
+                    return Ok(refused(RefusalReason::PoolFull));
                 }
             }
-            if let Err(reason) = self.room_for_another() {
-                return Ok(wait_or(reason));
+            // Last of the checks, so a prepare refused for anything else
+            // never takes down a conversation's workspace for nothing. Short
+            // of pool space it is refused before one could give way: a
+            // turn's work clone is small, and its home, the large part,
+            // stays anyway.
+            if let Err(shortfall) = self.room_for(weight) {
+                if let Some(idle) = self.take_idle_yielder(Utc::now(), weight, shortfall) {
+                    if !self.give_way(idle, &request.scope).await {
+                        return Ok(full(shortfall));
+                    }
+                }
+                if let Err(shortfall) = self.room_for(weight) {
+                    return Ok(full(shortfall));
+                }
             }
-        }
+            let home = match &request.home {
+                HomeSpec::Keyed { key, .. } => Some(key.clone()),
+                HomeSpec::Ephemeral => None,
+            };
+            // Seated, and counted as building: the next in line is the head.
+            self.queue.lock().leave(&request.scope);
+            Seat::hold(self, &request.scope, weight, home)
+        };
 
         let root = self.work_dataset(&request.scope);
         let mut started: Option<ContainerId> = None;
         match self.materialise(request, &root, &mut started).await {
             Ok((scope, home_reused)) => {
+                info!(
+                    scope = %scope.id,
+                    weight = Weight::of(&request.repos).name(),
+                    home_reused,
+                    "prepared"
+                );
                 let frame = ServerFrame::Prepared(prepared(&scope, false, home_reused));
-                self.scopes.lock().insert(scope.id.clone(), scope);
+                {
+                    // Seated and no longer being built in one step, so no
+                    // decision counts it twice.
+                    let mut scopes = self.scopes.lock();
+                    self.building.lock().remove(&scope.id);
+                    scopes.insert(scope.id.clone(), scope);
+                }
                 self.save()?;
+                self.publish_load();
                 Ok(frame)
             }
             Err(error) => {
-                if let Some(container) = started {
-                    let _ = self.containers.stop(&container).await;
+                let mut cleared = true;
+                if let Some(container) = &started {
+                    if let Err(e) = self.containers.stop(container).await {
+                        warn!(scope = %request.scope, error = %e, "removing a failed scope's container");
+                        cleared = false;
+                    }
                 }
-                if self.zfs.exists(&root).await.unwrap_or(false) {
-                    let _ = self.zfs.destroy(&root).await;
+                if self.zfs.exists(&root).await.unwrap_or(true) {
+                    if let Err(e) = self.zfs.destroy(&root).await {
+                        warn!(scope = %request.scope, error = %e, "destroying a failed scope's work");
+                        cleared = false;
+                    }
+                }
+                if !cleared {
+                    // Owed, and counted, until the sweep takes it down.
+                    let container =
+                        started.unwrap_or_else(|| ContainerId(container_name(&request.scope)));
+                    self.leftovers.lock().push(Scope::unbuilt(
+                        request.scope.clone(),
+                        container,
+                        root,
+                    ));
                 }
                 Err(error)
             }
@@ -477,7 +634,7 @@ impl Worker {
 
         let env: Vec<(String, String)> = base_env(&self.config)
             .into_iter()
-            .chain([("TOOLBOX_SERVICES".to_string(), scope_services(&self.config))])
+            .chain(ServicePlan::of(&self.config, &request.repos).env())
             .chain(scope_env)
             .chain(request.env.iter().cloned())
             .collect();
@@ -684,6 +841,7 @@ impl Worker {
 
     pub(crate) async fn await_ready(&self, container: &ContainerId) -> Result<()> {
         let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+        let mut pause = READY_POLL;
         while !self.containers.ready(container).await? {
             if tokio::time::Instant::now() >= deadline {
                 bail!(
@@ -691,7 +849,8 @@ impl Worker {
                     READY_TIMEOUT.as_secs()
                 );
             }
-            tokio::time::sleep(READY_POLL).await;
+            tokio::time::sleep(pause).await;
+            pause = (pause * 2).min(READY_POLL_MAX);
         }
         Ok(())
     }
@@ -947,6 +1106,7 @@ impl Worker {
         if let Some(removed) = removed {
             self.take_down(removed).await?;
             info!(scope = %scope, "released");
+            self.publish_load();
         }
         Ok(ServerFrame::Done(ExecSummary::exited(0)))
     }
@@ -1023,11 +1183,14 @@ impl Worker {
     /// prepares go first, counting the scopes each owner holds against its
     /// share of the worker.
     ///
-    /// The share and what an owner holds are counted in scopes, as the
-    /// worker's capacity is; a capacity measured otherwise redefines both
-    /// here, beside its capacity test.
+    /// The share and what an owner holds are counted in seats of the
+    /// ceiling queued turns, which are light, are seated under.
     fn queue_place(&self, scope: &ScopeId, owner: &str) -> u32 {
-        let share = share_of(self.config.fair_share, self.config.max_scopes);
+        let seats = match self.config.max_light_scopes {
+            0 => self.config.max_scopes,
+            light => light,
+        };
+        let share = share_of(self.config.fair_share, seats);
         let scopes = self.scopes.lock();
         let held = |owner: &str| {
             scopes
@@ -1055,25 +1218,46 @@ impl Worker {
         self.queue.lock().waiting(Utc::now())
     }
 
-    /// Whether a prepare outside the queue may be seated beside all those
-    /// waiting in it, each counted as one more scope; with nobody waiting,
-    /// what [`Self::room_for_another`] says.
-    fn room_beside_waiters(&self) -> Result<(), RefusalReason> {
+    /// Whether a prepare outside the queue of `weight` would still fit once
+    /// every turn waiting in it, each a light scope, were seated; with
+    /// nobody waiting, it is let through to the usual test.
+    fn room_beside_waiters(&self, weight: Weight) -> std::result::Result<(), Shortfall> {
         let waiting = self.queued();
-        let held = self.scopes.lock().len() + self.leftovers.lock().len() + waiting;
-        match waiting > 0 && held as u32 >= self.config.max_scopes {
-            true => Err(RefusalReason::AtCapacity),
-            false => Ok(()),
+        if waiting == 0 {
+            return Ok(());
         }
+        let mut census = self.census();
+        for _ in 0..waiting {
+            census.add(Weight::Light);
+        }
+        let reading = self.config.admission.as_ref().and_then(|_| self.reading());
+        admission::decide(&self.config, &census, weight, reading.as_ref())
     }
 
-    /// Whether one more scope may be seated now: the one test admission
-    /// asks, before and after an idle scope gives way.
-    fn room_for_another(&self) -> Result<(), RefusalReason> {
-        let held = self.scopes.lock().len() + self.leftovers.lock().len();
-        match held as u32 >= self.config.max_scopes {
-            true => Err(RefusalReason::AtCapacity),
-            false => Ok(()),
+    /// A prepare of `weight` refused for want of room: counted, logged and
+    /// published as every such refusal is.
+    fn no_room(&self, scope: &ScopeId, weight: Weight, shortfall: Shortfall) -> ServerFrame {
+        self.refusals.fetch_add(1, Ordering::Relaxed);
+        info!(
+            scope = %scope,
+            weight = weight.name(),
+            %shortfall,
+            "no room for a scope"
+        );
+        self.publish_load();
+        refused(RefusalReason::AtCapacity)
+    }
+
+    /// Whether `idle` going would answer `shortfall` for a scope of
+    /// `weight`: a seat of the ceiling the newcomer counts against, or the
+    /// memory every scope reserves. An idle scope frees no CPU.
+    fn going_would_help(&self, idle: &Scope, weight: Weight, shortfall: Shortfall) -> bool {
+        match shortfall {
+            Shortfall::Ceiling { .. } => {
+                self.config.max_light_scopes == 0 || Weight::of_held(&idle.repos) == weight
+            }
+            Shortfall::Committed { .. } | Shortfall::Available { .. } => true,
+            Shortfall::Cpu { .. } => false,
         }
     }
 
@@ -1098,20 +1282,53 @@ impl Worker {
     /// it gone. A finished job nobody collected holds its scope here though
     /// the sweep, at the scope's lifetime, drops it: giving way comes early,
     /// and its result may yet be asked for.
-    fn take_idle_yielder(&self, now: DateTime<Utc>) -> Option<Scope> {
-        let grace = chrono::Duration::from_std(YIELD_IDLE_GRACE).unwrap_or_default();
+    /// Only one whose going would answer `shortfall` for a scope of
+    /// `weight` is taken.
+    fn take_idle_yielder(
+        &self,
+        now: DateTime<Utc>,
+        weight: Weight,
+        shortfall: Shortfall,
+    ) -> Option<Scope> {
         let running = self.running.lock();
         let mut scopes = self.scopes.lock();
         let jobs = self.jobs.lock();
-        let idle = scopes
+        let idle = self.yielder_among(&running, &scopes, &jobs, now, weight, shortfall)?;
+        self.retire(&mut scopes, &idle)
+    }
+
+    /// The scope [`Self::take_idle_yielder`] would take now, left in place.
+    fn idle_yielder(
+        &self,
+        now: DateTime<Utc>,
+        weight: Weight,
+        shortfall: Shortfall,
+    ) -> Option<ScopeId> {
+        let running = self.running.lock();
+        let scopes = self.scopes.lock();
+        let jobs = self.jobs.lock();
+        self.yielder_among(&running, &scopes, &jobs, now, weight, shortfall)
+    }
+
+    fn yielder_among(
+        &self,
+        running: &HashMap<ScopeId, HashSet<String>>,
+        scopes: &BTreeMap<ScopeId, Scope>,
+        jobs: &BTreeMap<JobId, JobRecord>,
+        now: DateTime<Utc>,
+        weight: Weight,
+        shortfall: Shortfall,
+    ) -> Option<ScopeId> {
+        let grace = chrono::Duration::from_std(YIELD_IDLE_GRACE).unwrap_or_default();
+        scopes
             .values()
             .filter(|scope| scope.yields_when_idle)
             .filter(|scope| scope.last_seen + grace <= now)
             .filter(|scope| running.get(&scope.id).is_none_or(HashSet::is_empty))
             .filter(|scope| !jobs.values().any(|job| job.scope == scope.id))
+            .filter(|scope| self.going_would_help(scope, weight, shortfall))
             .min_by_key(|scope| scope.last_seen)
-            .map(|scope| scope.id.clone())?;
-        self.retire(&mut scopes, &idle)
+            .map(|scope| scope.id.clone())
     }
 
     /// Release an idle scope taken by [`Self::take_idle_yielder`] so `to`
@@ -1181,6 +1398,7 @@ impl Worker {
         }
         self.sweep_jobs(now)?;
         self.sweep_homes(now).await?;
+        self.publish_load();
         Ok(idle)
     }
 
@@ -1188,7 +1406,12 @@ impl Worker {
     pub async fn sweep_homes(&self, now: DateTime<Utc>) -> Result<Vec<String>> {
         let expired: Vec<Home> = {
             let scopes = self.scopes.lock();
-            let in_use: HashSet<&str> = scopes.values().filter_map(|s| s.home.as_deref()).collect();
+            let building = self.building.lock();
+            let in_use: HashSet<&str> = scopes
+                .values()
+                .filter_map(|s| s.home.as_deref())
+                .chain(building.values().filter_map(|b| b.home.as_deref()))
+                .collect();
             self.homes
                 .lock()
                 .values()
@@ -1237,7 +1460,10 @@ impl Worker {
                 ),
                 None => {
                     warn!(scope = %scope.id, "scope has no container; forgetting it");
-                    self.release(&scope.id).await?;
+                    if let Err(error) = self.release(&scope.id).await {
+                        // Owed now: the sweep takes it down.
+                        warn!(scope = %scope.id, %error, "taking down a scope with no container failed");
+                    }
                 }
             }
         }
@@ -1252,10 +1478,18 @@ impl Worker {
                 let _ = self.containers.stop(container).await;
             }
         }
+        // A scope whose teardown is owed keeps its work until the sweep.
+        let owed: Vec<String> = self
+            .leftovers
+            .lock()
+            .iter()
+            .map(|s| s.id.as_str().to_string())
+            .collect();
         let known: HashSet<String> = self
             .scopes()
             .into_iter()
             .map(|s| s.id.as_str().to_string())
+            .chain(owed)
             .collect();
         for dataset in self.zfs.children(&self.pool().child("work")).await? {
             if !known.contains(dataset.name()) {
@@ -1302,13 +1536,94 @@ impl Worker {
             // What is left of a failed teardown still holds its seat.
             scopes: scopes + self.leftovers.lock().len() as u32,
             homes: self.homes.lock().len() as u32,
-            capacity: self.config.max_scopes,
+            capacity: self.config.max_scopes + self.config.max_light_scopes,
             pool_free_bytes,
             goldens,
             version: env!("CARGO_PKG_VERSION").to_string(),
             jobs: self.running_jobs(),
             queued: self.queued() as u32,
         })
+    }
+}
+
+/// What a scope being built holds: its weight, for admission, and its keyed
+/// home, which no sweep may take while the build is under way.
+#[derive(Debug, Clone)]
+struct Building {
+    weight: Weight,
+    home: Option<String>,
+}
+
+/// A scope's seat while it is built: counted by admission until the built
+/// scope takes its place in the map, or until dropped when the build fails.
+struct Seat<'a> {
+    worker: &'a Worker,
+    scope: ScopeId,
+}
+
+impl<'a> Seat<'a> {
+    fn hold(worker: &'a Worker, scope: &ScopeId, weight: Weight, home: Option<String>) -> Self {
+        worker
+            .building
+            .lock()
+            .insert(scope.clone(), Building { weight, home });
+        Self {
+            worker,
+            scope: scope.clone(),
+        }
+    }
+}
+
+impl Drop for Seat<'_> {
+    fn drop(&mut self) {
+        self.worker.building.lock().remove(&self.scope);
+    }
+}
+
+/// One async lock per key, made on first use and dropped with its last
+/// holder or waiter.
+#[derive(Default)]
+struct KeyedLocks(Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>);
+
+struct KeyedGuard<'a> {
+    locks: &'a KeyedLocks,
+    key: String,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl KeyedLocks {
+    async fn lock(&self, key: &str) -> KeyedGuard<'_> {
+        let lock = {
+            let mut locks = self.0.lock();
+            // A waiter cancelled after the holder let go leaves its key with
+            // only the map's reference: nobody holds or awaits it.
+            locks.retain(|held, lock| held == key || Arc::strong_count(lock) > 1);
+            Arc::clone(locks.entry(key.to_string()).or_default())
+        };
+        KeyedGuard {
+            locks: self,
+            key: key.to_string(),
+            guard: Some(lock.lock_owned().await),
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.lock().len()
+    }
+}
+
+impl Drop for KeyedGuard<'_> {
+    fn drop(&mut self) {
+        let mut locks = self.locks.0.lock();
+        drop(self.guard.take());
+        // The map's own reference is the last: nobody holds or awaits it.
+        if locks
+            .get(&self.key)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
+            locks.remove(&self.key);
+        }
     }
 }
 
@@ -1401,17 +1716,6 @@ pub(crate) fn base_env(config: &WorkerConfig) -> Vec<(String, String)> {
                 .map(|mirror| ("TOOLBOX_REGISTRY_MIRROR".to_string(), mirror.clone())),
         )
         .collect()
-}
-
-/// Every service a scope starts: its databases, then the stateless services.
-pub(crate) fn scope_services(config: &WorkerConfig) -> String {
-    config
-        .database
-        .iter()
-        .map(|database| database.kind.service())
-        .chain(config.services.iter().map(|service| service.name()))
-        .collect::<Vec<_>>()
-        .join(",")
 }
 
 /// A repo's settings as `TOOLBOX_REPO_ENV_<ALIAS>`, the alias upper-cased
@@ -1752,6 +2056,192 @@ mod tests {
         );
         assert!(!h.zfs.exists_sync("tank/work/c"));
         assert_eq!(h.containers.runs().len(), 2);
+    }
+
+    fn at_capacity() -> ServerFrame {
+        ServerFrame::Refused {
+            reason: RefusalReason::AtCapacity,
+        }
+    }
+
+    #[tokio::test]
+    async fn light_and_full_scopes_each_have_a_ceiling_of_their_own() {
+        let h = Harness::with(|config| config.max_light_scopes = 3).await;
+        h.worker
+            .prepare(spec("c1", &[("rails", "acme/rails")]))
+            .await
+            .unwrap();
+        h.worker
+            .prepare(spec("c2", &[("rails", "acme/rails")]))
+            .await
+            .unwrap();
+        assert_eq!(
+            h.worker
+                .prepare(spec("c3", &[("rails", "acme/rails")]))
+                .await
+                .unwrap(),
+            at_capacity()
+        );
+        for turn in ["t1", "t2", "t3"] {
+            let frame = h.worker.prepare(keyed(turn, turn, 60)).await.unwrap();
+            assert!(matches!(frame, ServerFrame::Prepared(_)), "{frame:?}");
+        }
+        assert_eq!(
+            h.worker.prepare(keyed("t4", "t4", 60)).await.unwrap(),
+            at_capacity()
+        );
+        let load: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(admission::load_path(h.worker.config())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(load["full"], 2);
+        assert_eq!(load["light"], 3);
+        assert_eq!(load["light_seats_free"], 0);
+        assert_eq!(load["refusals"], 2);
+    }
+
+    #[tokio::test]
+    async fn the_hosts_memory_refuses_a_seat_the_ceilings_would_allow() {
+        let h = Harness::with(|config| {
+            config.max_light_scopes = 10;
+            config.admission = Some(crate::config::AdmissionConfig {
+                full_reserve_gib: 3,
+                light_reserve_gib: 1,
+                memory_floor_gib: 6,
+                cpu_pressure_max: Some(80.0),
+            });
+        })
+        .await;
+        let tight = Reading {
+            memory_total_bytes: 64 << 30,
+            memory_available_bytes: (6 << 30) + (1 << 29),
+            cpu_pressure: Some(1.0),
+        };
+        h.load.set(Some(tight));
+        assert_eq!(
+            h.worker.prepare(keyed("t1", "t1", 60)).await.unwrap(),
+            at_capacity()
+        );
+        assert!(!h.zfs.exists_sync("tank/work/t1"));
+        h.load.set(None);
+        assert!(
+            matches!(
+                h.worker.prepare(keyed("t1", "t1", 60)).await.unwrap(),
+                ServerFrame::Prepared(_)
+            ),
+            "an unreadable host leaves the ceilings to decide"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scope_being_built_holds_its_seat_and_does_not_hold_up_another() {
+        let h = Harness::with(|config| {
+            config.max_scopes = 1;
+            config.max_light_scopes = 5;
+        })
+        .await;
+        let coding = container_name(&ScopeId::new("coding"));
+        h.containers.mark_unready(&coding);
+        let worker = Arc::clone(&h.worker);
+        let building = tokio::spawn(async move {
+            worker
+                .prepare(spec("coding", &[("rails", "acme/rails")]))
+                .await
+        });
+        while h.containers.runs().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let turn = tokio::time::timeout(
+            Duration::from_secs(5),
+            h.worker.prepare(keyed("turn", "thread", 60)),
+        )
+        .await
+        .expect("a turn is seated while a coding scope is still being built")
+        .unwrap();
+        assert!(matches!(turn, ServerFrame::Prepared(_)), "{turn:?}");
+        assert_eq!(
+            h.worker
+                .prepare(spec("coding-2", &[("rails", "acme/rails")]))
+                .await
+                .unwrap(),
+            at_capacity(),
+            "the scope being built holds the only full seat"
+        );
+
+        // The same scope asked for again waits for the one being built and
+        // is handed it, built once.
+        let worker = Arc::clone(&h.worker);
+        let again = tokio::spawn(async move {
+            worker
+                .prepare(spec("coding", &[("rails", "acme/rails")]))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!again.is_finished());
+        h.containers.mark_ready(&coding);
+        let ServerFrame::Prepared(first) = building.await.unwrap().unwrap() else {
+            panic!("the coding scope is built")
+        };
+        let ServerFrame::Prepared(second) = again.await.unwrap().unwrap() else {
+            panic!("the second ask is handed the same scope")
+        };
+        assert!(!first.reused && second.reused);
+        assert_eq!(
+            h.containers
+                .runs()
+                .iter()
+                .filter(|run| run.name == coding)
+                .count(),
+            1
+        );
+        assert!(h.worker.building.lock().is_empty());
+        assert_eq!(h.worker.scope_locks.len(), 0);
+        assert_eq!(h.worker.home_locks.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_home_being_built_into_a_scope_is_never_swept_from_under_it() {
+        let h = Harness::new().await;
+        let turn = container_name(&ScopeId::new("turn"));
+        h.containers.mark_unready(&turn);
+        let worker = Arc::clone(&h.worker);
+        let building =
+            tokio::spawn(async move { worker.prepare(keyed("turn", "thread", 0)).await });
+        while h.containers.runs().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let much_later = Utc::now() + chrono::Duration::days(1);
+        assert!(h.worker.sweep_homes(much_later).await.unwrap().is_empty());
+        assert!(h.zfs.exists_sync("tank/homes/thread"));
+        h.containers.mark_ready(&turn);
+        assert!(matches!(
+            building.await.unwrap().unwrap(),
+            ServerFrame::Prepared(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_failed_build_gives_its_seat_back() {
+        let h = Harness::new().await;
+        h.containers.fail_next_run();
+        assert!(h.worker.prepare(spec("a", &[])).await.is_err());
+        assert!(h.worker.building.lock().is_empty());
+        h.worker.prepare(spec("a", &[])).await.unwrap();
+        h.worker.prepare(spec("b", &[])).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_build_whose_work_cannot_be_destroyed_is_owed_and_counted() {
+        let h = Harness::new().await;
+        h.containers.fail_next_run();
+        h.zfs.fail_next_destroy();
+        assert!(h.worker.prepare(spec("a", &[])).await.is_err());
+        assert_eq!(h.worker.leftovers.lock().len(), 1);
+        assert_eq!(h.worker.health().await.unwrap().scopes, 1);
+        h.worker.sweep(Utc::now()).await.unwrap();
+        assert!(h.worker.leftovers.lock().is_empty());
+        assert!(!h.zfs.exists_sync("tank/work/a"));
     }
 
     #[tokio::test]
@@ -2241,6 +2731,38 @@ mod tests {
 
     fn idle_past_grace() -> chrono::Duration {
         chrono::Duration::from_std(YIELD_IDLE_GRACE).unwrap() + chrono::Duration::seconds(1)
+    }
+
+    #[tokio::test]
+    async fn a_coding_session_short_of_its_own_seats_takes_no_turn_down() {
+        let h = Harness::with(|config| {
+            config.max_scopes = 1;
+            config.max_light_scopes = 1;
+        })
+        .await;
+        h.worker
+            .prepare(spec("coding-1", &[("app", "main")]))
+            .await
+            .unwrap();
+        h.worker.prepare(turn("idle", "thread-1")).await.unwrap();
+        age(&h.worker, "idle", idle_past_grace());
+        assert_eq!(
+            h.worker
+                .prepare(spec("coding-2", &[("app", "main")]))
+                .await
+                .unwrap(),
+            refused(RefusalReason::AtCapacity),
+            "a light seat freed makes no room for a full scope"
+        );
+        assert!(h.worker.scope(&ScopeId::new("idle")).is_some());
+        assert!(matches!(
+            h.worker.prepare(turn("new", "thread-2")).await.unwrap(),
+            ServerFrame::Prepared(_)
+        ));
+        assert!(
+            h.worker.scope(&ScopeId::new("idle")).is_none(),
+            "but one for a turn"
+        );
     }
 
     #[tokio::test]
@@ -2798,6 +3320,7 @@ mod tests {
             secrets: Vec::new(),
             env: BTreeMap::new(),
             watch: Vec::new(),
+            services: None,
         }
     }
 
@@ -2874,14 +3397,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scope_services_are_the_databases_and_the_configured_services() {
+    async fn a_coding_scope_starts_every_service_and_a_turn_scope_starts_none_at_seat() {
         let h = Harness::with(|config| config.services = vec![Service::Redis, Service::Ministack])
             .await;
-        h.worker.prepare(spec("s1", &[])).await.unwrap();
+        h.worker
+            .prepare(spec("coding", &[("rails", "acme/rails")]))
+            .await
+            .unwrap();
+        h.worker
+            .prepare(keyed("turn", "thread", 3600))
+            .await
+            .unwrap_or_else(|e| panic!("{e:#}"));
+        let runs = h.containers.runs();
         assert_eq!(
-            env_of(&h.containers.runs()[0], "TOOLBOX_SERVICES"),
+            env_of(&runs[0], "TOOLBOX_SERVICES"),
             ["mysql,postgres,redis,ministack"]
         );
+        assert!(env_of(&runs[0], "TOOLBOX_LAZY_SERVICES").is_empty());
+        assert!(env_of(&runs[0], "TOOLBOX_DOCKER").is_empty());
+        assert_eq!(env_of(&runs[1], "TOOLBOX_SERVICES"), ["none"]);
+        assert_eq!(
+            env_of(&runs[1], "TOOLBOX_LAZY_SERVICES"),
+            ["mysql,postgres,redis,ministack"]
+        );
+        assert_eq!(env_of(&runs[1], "TOOLBOX_DOCKER"), ["lazy"]);
+        // Its databases are still cloned and mounted, so a service it starts
+        // on first use finds the seeded golden, and the cap is a full one's.
+        assert!(h.zfs.exists_sync("tank/work/turn/mysql"));
+        assert!(runs[1]
+            .mounts
+            .iter()
+            .any(|m| m.container == "/var/lib/toolbox/mysql"));
+        assert_eq!(runs[1].memory_gib, runs[0].memory_gib);
     }
 
     #[tokio::test]
