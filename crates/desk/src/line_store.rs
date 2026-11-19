@@ -577,6 +577,25 @@ impl DeskStore {
             .collect()
     }
 
+    /// The urgent messages still queued for `session`, oldest first: what
+    /// its running turn held, let go when the turn ends.
+    pub async fn line_urgent_queued_to(&self, session: &str) -> Result<Vec<LineMessage>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                &format!(
+                    "SELECT {COLUMNS} FROM line_messages WHERE urgency IS NOT NULL \
+                     AND delivery = 'queued' AND recipient ->> 'kind' = 'session' \
+                     AND recipient ->> 'id' = $1 ORDER BY at"
+                ),
+                &[&session],
+            )
+            .await?
+            .iter()
+            .map(message)
+            .collect()
+    }
+
     /// Puts a row delivered to `session` back in its queue, as it was
     /// before: one statement, so a row that moved on meanwhile is left as
     /// it is. The row as it now is, or `None` when it didn't move.

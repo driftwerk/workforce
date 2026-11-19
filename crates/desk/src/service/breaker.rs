@@ -82,6 +82,9 @@ pub(crate) struct LiveBreaker {
     /// A boss's rows whose escalation is interrupting the turn now: no hook
     /// takes them meanwhile; they go in at the idle after.
     pub(super) escalating: std::collections::HashSet<Uuid>,
+    /// The turn Esc ended, while Desk still reads it as working (Claude
+    /// Code reports no turn's end after Esc): what it held is let go.
+    pub(super) stopped: Option<crate::line::TurnMark>,
     /// What Desk typed into it and has yet to hear submitted, and whether
     /// the person sent it: the rest of what it is prompted with is typed
     /// in its terminal.

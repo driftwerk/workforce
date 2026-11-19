@@ -693,3 +693,48 @@ async fn esc_in_a_dialog_leaves_the_bosss_order_for_the_idle_not_the_stopped_cal
     })
     .await;
 }
+
+/// What Desk's plugin, already waiting on `s`'s line, is handed within
+/// `within` of `end` (the turn's end, as a hook reports it).
+async fn handed_after(d: &Desk, s: Uuid, end: Value, within: Duration) -> Option<Uuid> {
+    let waiting = tokio::spawn({
+        let d = d.clone();
+        async move { d.line_next(s, Duration::from_secs(10)).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!waiting.is_finished(), "nothing mid-turn");
+    post(d, s, end).await;
+    let next = tokio::time::timeout(within, waiting).await.ok()?.unwrap()?;
+    serde_json::from_value(next["id"].clone()).ok()
+}
+
+#[tokio::test]
+async fn a_plugin_already_waiting_hears_what_a_turn_held_as_soon_as_it_ends() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        // One that couldn't be steered: no hook heard yet.
+        let s = new_session(&d, dir.path()).await;
+        d.plugin_heard_from(s.id);
+        post(&d, s.id, prompt()).await;
+        let (m, rushed) = urgent(&d, s.id, "Stop.", Urgency::Order).await;
+        assert_eq!(rushed, Rushed::CantSteer(Unsteerable::NoHooks));
+        let fast = Duration::from_millis(1500);
+        assert_eq!(handed_after(&d, s.id, stop(), fast).await, Some(m.id));
+
+        // One a restart left, at the turn's end.
+        let t = working(&d, dir.path()).await;
+        let (m, _) = urgent(&d, t, "Don't merge PR 711.", Urgency::Order).await;
+        restarted(&d, t).await;
+        assert_eq!(handed_after(&d, t, stop(), fast).await, Some(m.id));
+
+        // One the queue held, at Esc.
+        let u = working(&d, dir.path()).await;
+        let (m, _) = urgent(&d, u, "Use the staging DB.", Urgency::Order).await;
+        let esc = json!({"hook_event_name": "PostToolUseFailure", "tool_name": "Bash",
+            "tool_input": {"command": "gh run watch"}, "error": "Interrupted",
+            "is_interrupt": true});
+        assert_eq!(handed_after(&d, u, esc, fast).await, Some(m.id));
+    })
+    .await;
+}

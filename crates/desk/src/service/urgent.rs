@@ -275,14 +275,26 @@ impl Desk {
     /// session is in a turn. The pump and the plugin leave it meanwhile;
     /// the turn's next tool call takes it, or its end lets it go.
     pub(super) fn steer_reserved(&self, id: Uuid, m: &LineMessage) -> bool {
-        m.urgency.is_some()
-            && self
-                .0
-                .state
-                .lock()
-                .records
-                .get(&id)
-                .is_some_and(|r| line::in_turn(r.state))
+        if m.urgency.is_none() {
+            return false;
+        }
+        let st = self.0.state.lock();
+        let mark = Self::mark_in(&st, id);
+        mark.is_some() && st.live.get(&id).and_then(|l| l.breaker.stopped) != mark
+    }
+
+    /// Esc ended `id`'s turn: what waited for its next call goes in at the
+    /// idle, never into a call the person stopped, even while Desk still
+    /// reads the session as working.
+    pub(super) fn steers_stopped(&self, id: Uuid) {
+        {
+            let mut st = self.0.state.lock();
+            let mark = Self::mark_in(&st, id);
+            if let Some(l) = st.live.get_mut(&id) {
+                l.breaker.stopped = mark;
+            }
+        }
+        self.steers_released(id);
     }
 
     /// What goes with `id`'s tool call result (hook `event`): the breaker's
@@ -310,6 +322,7 @@ impl Desk {
             b.steers = kept;
             (taken, mark)
         };
+        let lines = steers.iter().any(|s| matches!(s, Steer::Line { .. }));
         let mut said = Vec::new();
         let mut read = Vec::new();
         let mut back = Vec::new();
@@ -336,12 +349,9 @@ impl Desk {
             // Taken as its turn ended: that result may never reach the
             // session. Back in the queue, for the idle.
             for row in std::mem::take(&mut read) {
-                if let Ok(Some(m)) = self.0.store.line_untake(row, &id.to_string()).await {
-                    self.line_announce(&m);
-                }
+                let _ = self.0.store.line_untake(row, &id.to_string()).await;
             }
             said.clear();
-            self.line_pump_later(id);
         }
         {
             let mut st = self.0.state.lock();
@@ -355,6 +365,10 @@ impl Desk {
                     }
                 }
             }
+        }
+        if over && lines {
+            // What it took or held back goes in at the idle.
+            self.steers_released(id);
         }
         (!said.is_empty()).then(|| crate::claude::context(event, &said.join("\n\n")))
     }
@@ -403,11 +417,23 @@ impl Desk {
             });
             rows
         };
-        if rows.is_empty() {
-            return;
-        }
+        // What else waits urgently for it was reserved for the turn too
+        // (one that couldn't be steered, one a restart left): a plugin
+        // already waiting on the line hears it now, not at its next look.
         let desk = self.clone();
         tokio::spawn(async move {
+            let mut rows = rows;
+            match desk.0.store.line_urgent_queued_to(&id.to_string()).await {
+                Ok(more) => rows.extend(more.into_iter().map(|m| m.id)),
+                Err(e) => {
+                    tracing::warn!(session = %id, error = %e, "couldn't read what waits urgently for a turn that ended");
+                }
+            }
+            let mut seen = std::collections::HashSet::new();
+            rows.retain(|r| seen.insert(*r));
+            if rows.is_empty() {
+                return;
+            }
             for row in rows {
                 if let Ok(Some(m)) = desk.0.store.line_message(row).await {
                     if m.waits() {

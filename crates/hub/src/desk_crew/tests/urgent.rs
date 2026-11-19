@@ -406,3 +406,49 @@ async fn moving_an_irreversible_job_off_a_busy_session_steers_its_stand_down_the
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relayed_urgent_nudge_keeps_its_urgency_as_the_machine_performs_it() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (_overseer, crew, d, _llm) = overseeing(&base, pool, "ok", LETS, &[]).await;
+        let (s, url) = working(&d, &base, "acme-api").await;
+        // As the home relays it (its job fields stay home), and as the
+        // machine's served path performs it: its order read from the input,
+        // as a boss (a manager's words; the grant's checks are relay.rs's).
+        let input = super::super::assignments::relayed_input(
+            &json!({"session_id": s.to_string(), "message": "Don't dispatch release 4.",
+                    "urgent": true, "job": {"kind": "release", "key": "4"},
+                    "reason": "It moved to another session."}),
+            None,
+        );
+        let mut order = Order::of(&input);
+        order.unrecorded = true;
+        let by = crew.by_overseer("It moved.").unwrap();
+        let said = crew
+            .perform_with(&nudge_action(s, "Don't dispatch release 4."), by, &order)
+            .await
+            .unwrap();
+        assert_eq!(
+            said, "told acme-api; it reads it with its next tool call's result",
+            "{said}"
+        );
+        let row = d
+            .line_thread(s, None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.text.contains("release 4"))
+            .expect("on its line");
+        assert_eq!(row.urgency, Some(Urgency::Order));
+        let took = hook(&url, done()).await;
+        assert!(
+            took["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .is_some_and(|t| t.contains("Don't dispatch release 4")),
+            "{took}"
+        );
+    })
+    .await;
+}

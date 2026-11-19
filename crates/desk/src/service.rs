@@ -6008,7 +6008,7 @@ impl Desk {
                 });
                 if skip {
                     if esc {
-                        self.steers_released(id);
+                        self.steers_stopped(id);
                     }
                     return answer();
                 }
