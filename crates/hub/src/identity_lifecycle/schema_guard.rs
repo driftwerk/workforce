@@ -268,6 +268,14 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
     ),
     (
         "desk",
+        "boss_watches",
+        "person",
+        NotPersonal(
+            "`you`, the one person of the Desk whose own hub this is, whose boss's waits these are; told ones go within days",
+        ),
+    ),
+    (
+        "desk",
         "session_accounts",
         "owner",
         NotPersonal("`you`, the one person of the Desk whose own hub this is"),

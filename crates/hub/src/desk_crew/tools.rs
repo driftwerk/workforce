@@ -27,7 +27,7 @@ use super::CrewHub;
 
 /// Every `crew.*` tool: the ones it has at every level first (its reads,
 /// and what it asks of the person, which is never gated).
-pub const READ: [&str; 21] = [
+pub const READ: [&str; 23] = [
     "crew.overview",
     "crew.activity",
     "crew.account",
@@ -49,6 +49,8 @@ pub const READ: [&str; 21] = [
     super::github::BRANCH,
     super::github::CI,
     super::assignments::LIST,
+    super::watches::WATCH,
+    super::watches::WATCHES,
 ];
 pub const ACT: [&str; 24] = [
     "crew.nudge",
@@ -437,7 +439,7 @@ impl CrewTool {
                 crew.decisions_tool(b.service.agent_id.as_str(), input)
                     .await
             }
-            super::board::NAME => crew.board(seen).await,
+            super::board::NAME => crew.board_tool(b, input).await,
             super::find::NAME => crew.find_tickets_tool(b, input).await,
             super::items::ASK
             | super::items::CLOSE
@@ -460,6 +462,9 @@ impl CrewTool {
                     input,
                 )
                 .await
+            }
+            super::watches::WATCH | super::watches::WATCHES => {
+                crew.watch_tool(self.name, b, input).await
             }
             _ => Err("not a reading tool".into()),
         }
@@ -607,7 +612,7 @@ impl CrewTool {
             o.insert("ticket".into(), json!(key));
         }
         let oversight = &b.oversight;
-        // Always working in real sessions, a start goes to the session it
+        // Working in real sessions, a start goes to the session it
         // already runs for it when one fits, as the start would have run:
         // told the goal, not a new one.
         let reused = crew
@@ -906,6 +911,8 @@ pub(crate) fn describe(name: &str) -> &'static str {
             super::own_settings::NAME => super::own_settings::DESCRIPTION,
             super::assignments::CLOSE => super::assignments::CLOSE_DESCRIPTION,
             super::assignments::LIST => super::assignments::LIST_DESCRIPTION,
+            super::watches::WATCH => super::watches::WATCH_DESCRIPTION,
+            super::watches::WATCHES => super::watches::WATCHES_DESCRIPTION,
             "crew.activity" => "What happened on the crew, newest first: turns started and finished, questions, requests, failures, and what you and the person did. Filter to one agent or session with subject_id.",
             "crew.account" => "What one session (session_id) is for, who asked, its plan, what it has done (with its PRs, tickets, commits and deploys), what it is doing now, what it waits on, what comes next and the choices it made: its running account, brought up to date first when it is stale, with the time it is as of. Read it before you say anything of a session. With question, also the answer its own recent conversation gives to something the account doesn't say (which key, which file, what error).",
             "crew.ask_session" => "Ask a session (session_id) a question about its work, as Desk's status question on its line, without derailing it: one that is working gets it once its turn ends, never typed in over what it is doing. Use it only when crew.account, with a question, can't answer; then answer the person now from what you have and say you asked. It asks for words only and never changes what the session does: to have it wait, hold or change course, tell it so with crew.nudge.",
@@ -919,7 +926,7 @@ pub(crate) fn describe(name: &str) -> &'static str {
             "crew.interrupt" => "End the turn a working session is on, as Esc in its terminal: it, and the terminal it runs in, keep running, and the shell stays the person's. Works for sessions started in a Desk terminal too.",
             "crew.resume" => "Resume a stopped session, optionally with a prompt. A session in another terminal can only be resumed once it has ended there.",
             "crew.restart" => "Stop a session and resume it with a new prompt, e.g. to get it unstuck.",
-            "crew.start_session" => "Start a real, visible session (Claude Code, Codex) in a project folder with a goal: it shows on the person's Floor and sidebar, they can watch it, type into it and take it over, and you run it from the start (its turn ends wake you). It runs on the person's default engine and model: omit engine and model unless the person named one for this work, in this conversation or its ticket; never pick one yourself. worktree names a new branch to work on in a worktree of its own. You run at most your limit of sessions starting or working at once (crew.overview's slots). When you always work in real sessions, a session already there in that folder (or another worktree of its repository) that's idle or on this goal gets the work instead, and you're told which; pass new: true only when the person asked for a new session.",
+            "crew.start_session" => "Start a real, visible session (Claude Code, Codex) in a project folder with a goal: it shows on the person's Floor and sidebar, they can watch it, type into it and take it over, and you run it from the start (its turn ends wake you). It runs on the person's default engine and model: omit engine and model unless the person named one for this work, in this conversation or its ticket; never pick one yourself. worktree names a new branch to work on in a worktree of its own. You run at most your limit of sessions starting or working at once (crew.overview's slots). When you work in real sessions (Only in sessions or Prefer sessions), a session already there in that folder (or another worktree of its repository) that's idle or on this goal gets the work instead, and you're told which; pass new: true only when the person asked for a new session.",
             "crew.assign" => "Hand a task to one of the crew's agents, in its DM.",
             "crew.assign_ticket" => "Hand a ticket on the board (ticket, its key like ACM-12) to a session (to: { \"session\": id }), an agent (to: { \"agent\": id }) or a new session started for it, which you run (to: { \"newSession\": { \"folder\": path, \"engine\": optional } }). The ticket moves to Doing and its holder is told. Only a ready ticket can be handed out (crew.board); a new session counts against your limit of sessions at once. Handing out work is for what the person has let you hand out.",
             "crew.move_ticket" => "Move a ticket on the board (ticket, its key like ACM-12) to a column (state): backlog, todo, doing, review or done. Dropping a ticket is always the person's call, so it becomes a suggestion for them.",
@@ -951,6 +958,7 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
             super::github::schema(name)
         }
         super::decisions::NAME => super::decisions::schema(),
+        super::watches::WATCH | super::watches::WATCHES => super::watches::schema(name),
         super::items::ASK
         | super::items::CLOSE
         | super::items::OPEN

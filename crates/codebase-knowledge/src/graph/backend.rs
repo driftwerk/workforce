@@ -175,8 +175,10 @@ pub trait CodeGraphBackend: Send + Sync {
 
     // ─── Index state ───────────────────────────────────────────────
 
+    /// Forgets `backend`'s fill of the repo; other backends' are kept.
     async fn update_index_state_full(
         &self,
+        backend: &str,
         repo_id: &str,
         commit: &str,
         total_entities: usize,
@@ -191,6 +193,7 @@ pub trait CodeGraphBackend: Send + Sync {
         total_relationships: usize,
     ) -> Result<()>;
 
+    /// The repo's state once a full index has written it.
     async fn get_index_state(&self, repo_id: &str) -> Result<Option<IndexState>>;
 
     async fn set_indexing_in_progress(&self, repo_id: &str, in_progress: bool) -> Result<()>;
@@ -251,16 +254,20 @@ pub trait CodeGraphBackend: Send + Sync {
     async fn clear_vector_fill(&self, backend: &str, repo_id: &str) -> Result<()>;
 
     /// Note that the vectors of `files` may be behind the graph in each of
-    /// `backends`.
+    /// `backends`, under one mark, which is returned: the graph's counter
+    /// of notes, taken once by the call. Marks are taken in the order their
+    /// notes are committed, so a consistent copy of the graph holds every
+    /// note at or below the counter it holds. Nothing is noted, and no mark
+    /// taken, for no files or no backends: 0 is returned.
     async fn note_vectors_pending(
         &self,
         backends: &[&str],
         repo_id: &str,
         files: &[String],
-    ) -> Result<()>;
+    ) -> Result<i64>;
 
     /// Up to `limit` of a repo's files noted as pending, with each note's
-    /// sequence, in path order.
+    /// mark, in path order.
     async fn vectors_pending(
         &self,
         backend: &str,
@@ -271,13 +278,13 @@ pub trait CodeGraphBackend: Send + Sync {
     /// How many of a repo's files are noted as pending.
     async fn count_vectors_pending(&self, backend: &str, repo_id: &str) -> Result<usize>;
 
-    /// Take a file off the pending list, if its note is still the one
-    /// with `seq`: one noted again since stays.
+    /// Take `files` off the pending list, each whose note is still the one
+    /// with the mark `seq`: one noted again since stays.
     async fn clear_vectors_pending(
         &self,
         backend: &str,
         repo_id: &str,
-        file_path: &str,
+        files: &[String],
         seq: i64,
     ) -> Result<()>;
 
@@ -303,10 +310,13 @@ pub trait CodeGraphBackend: Send + Sync {
     // restarts; a worker that dies leaves a stale heartbeat behind, and
     // the next acquirer steals it.
 
-    /// Try to acquire the lease for `repo_id`. Steals stale leases
-    /// (heartbeat older than [`crate::lease::STALE_THRESHOLD`]),
-    /// otherwise returns [`AcquireOutcome::Held`] when a fresh lease
-    /// already exists.
+    /// Try to acquire the lease for `repo_id`, in one statement. Steals
+    /// stale leases (heartbeat older than
+    /// [`crate::lease::STALE_THRESHOLD`]), otherwise returns
+    /// [`AcquireOutcome::Held`] when a fresh lease already exists. A lease
+    /// taken records the graph's mark of notes as it was taken
+    /// ([`IndexLease::noted_from`]). `worker_id` is the run's own: each
+    /// acquisition is to have one.
     async fn acquire_lease(
         &self,
         repo_id: &str,
@@ -351,10 +361,17 @@ pub trait CodeGraphBackend: Send + Sync {
     /// summaries, file_index, and index_state. Returns the number of
     /// entities deleted. Keeps the `repositories` row so a follow-up
     /// `register_repo` can reuse it for a clean re-index.
-    /// The files noted pending for the backends in `keep_pending` stay
-    /// noted: a standby is told of what a full index changes by what it
-    /// notes, and must not lose what was noted before.
-    async fn delete_repo_data(&self, repo_id: &str, keep_pending: &[&str]) -> Result<usize>;
+    /// The vector state of the backends in `keep`, their fills and the
+    /// files noted pending for them, is kept: a standby is told of what a
+    /// full index changes by what it notes, and must not lose what was
+    /// noted before. With `keep_complete_in`, what the repo's vectors were
+    /// complete in is kept too, in a state row no full index has written.
+    async fn delete_repo_data(
+        &self,
+        repo_id: &str,
+        keep: &[&str],
+        keep_complete_in: bool,
+    ) -> Result<usize>;
 
     /// Like [`Self::delete_repo_data`] but also drops the `repositories`
     /// row itself. Use when fully removing a repo (e.g. cascade from

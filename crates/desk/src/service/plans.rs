@@ -26,10 +26,14 @@ use crate::floor::{Answer, DecideRef, Need, NeedKind, Place, Who};
 use crate::model::{DeskEvent, NewSession, SessionState, SessionView};
 use crate::plan::{
     self, Change, Draft, DraftTicket, Paused, Plan, PlanBudget, PlanState, PlanTicket, Planned,
-    Problem, Progress, Revision, Snapshot, Start,
+    Problem, Progress, Revision, Snapshot, Start, TicketEdit,
 };
 use crate::plan_store::{Adopt, BeginStart, Runs, Starting};
 use workforce_core::budget::{BudgetScope, Standing};
+
+/// What a ticket's session is told when a session worked on it before
+/// and let it go (its session ended or went away while it was in Doing).
+pub(crate) const AGAIN_NOTE: &str = "\n\nThis ticket was started before and its session ended. Check what is already done first (its folder, branch, commits and pull requests) and carry on from there; don't redo it.";
 
 /// What the desk keeps of plans in memory: the ones waiting on the person,
 /// for the Floor, which is read without waiting on Postgres.
@@ -128,6 +132,10 @@ pub struct PlanEdit {
     /// Every ticket the plan is to have, in order; none leaves them.
     #[serde(default)]
     pub tickets: Option<Vec<DraftTicket>>,
+    /// Tickets the plan has, each changed in place by its id: only what an
+    /// edit says changes ([`plan::edited`]). Not with `tickets`.
+    #[serde(default)]
+    pub ticket_edits: Option<Vec<TicketEdit>>,
     /// What it may spend; `null` takes its budget off.
     #[serde(default, deserialize_with = "crate::model::present")]
     pub budget: Option<Option<PlanBudget>>,
@@ -221,6 +229,17 @@ fn stale_plan(p: &Plan, boss: &str) -> DeskError {
 
 fn problems(p: Vec<Problem>) -> DeskError {
     DeskError::Invalid(plan::plain(&p))
+}
+
+/// The tickets of `rows` that have started: past To do, or someone has
+/// them, or a session is being started for them.
+fn started_of(rows: &[PlanTicket]) -> HashSet<Uuid> {
+    rows.iter()
+        .filter(|t| {
+            t.assigned || t.starting || !matches!(t.state, TicketState::Backlog | TicketState::Todo)
+        })
+        .map(|t| t.id)
+        .collect()
 }
 
 /// The branch a ticket's own worktree is on.
@@ -1502,20 +1521,9 @@ impl Desk {
 
     // ── Changing ────────────────────────────────────────────────────────
 
-    /// The tickets of `p` that have started: past To do, or someone has
-    /// them, or a session is being started for them.
+    /// The tickets of `p` that have started ([`started_of`]).
     async fn started(&self, p: &Plan) -> Result<HashSet<Uuid>, DeskError> {
-        Ok(self
-            .plan_tickets(p.id)
-            .await?
-            .into_iter()
-            .filter(|t| {
-                t.assigned
-                    || t.starting
-                    || !matches!(t.state, TicketState::Backlog | TicketState::Todo)
-            })
-            .map(|t| t.id)
-            .collect())
+        Ok(started_of(&self.plan_tickets(p.id).await?))
     }
 
     /// Changes plan `id` as `by` asks. The person's change applies at once;
@@ -1559,8 +1567,47 @@ impl Desk {
         }
         let newest = self.newest(&p).await?;
         let applied = self.applied(&p).await?;
-        let mut next = match &edit.tickets {
-            Some(tickets) => {
+        let rows = self.plan_tickets(p.id).await?;
+        let started = started_of(&rows);
+        let mut next = match (&edit.tickets, &edit.ticket_edits) {
+            (Some(_), Some(_)) => {
+                return Err(DeskError::Invalid(
+                    "Say every ticket the plan is to have, or the ones to change, not both.".into(),
+                ))
+            }
+            (None, Some(edits)) => {
+                // Where a started ticket runs is refused by its key, before
+                // anything else is read of the edit.
+                let moved: Vec<Problem> = edits
+                    .iter()
+                    .filter(|e| started.contains(&e.id))
+                    .filter(|e| {
+                        newest
+                            .ticket(e.id)
+                            .map_or(e.moves(), |was| e.moves_from(was))
+                    })
+                    .filter_map(|e| {
+                        let t = rows.iter().find(|t| t.id == e.id)?;
+                        let column = match (t.state, t.starting) {
+                            (TicketState::Backlog | TicketState::Todo, true) => "Doing, starting",
+                            (s, _) => s.title(),
+                        };
+                        Some(Problem::StartedEdit {
+                            key: e
+                                .key
+                                .clone()
+                                .or_else(|| t.key.clone())
+                                .unwrap_or_else(|| e.name()),
+                            column,
+                        })
+                    })
+                    .collect();
+                if !moved.is_empty() {
+                    return Err(DeskError::Conflict(plan::plain(&moved)));
+                }
+                plan::edited(&newest, edits).map_err(problems)?
+            }
+            (Some(tickets), None) => {
                 let taking = self
                     .adoptable(tickets, Some(&newest), p.group.as_deref(), Some(p.id))
                     .await?;
@@ -1586,7 +1633,7 @@ impl Desk {
                 }
                 next
             }
-            None => newest.clone(),
+            (None, None) => newest.clone(),
         };
         if let Some(goal) = &edit.goal {
             next.goal = goal.trim().to_string();
@@ -1598,7 +1645,6 @@ impl Desk {
             next.budget = b;
         }
         plan::validate(&next, &self.engines(), &|f| Path::new(f).is_dir()).map_err(problems)?;
-        let started = self.started(&p).await?;
         let change = plan::plan_change(&applied, &next, &started)
             .map_err(|e| DeskError::Conflict(e.to_string()))?;
         if change.is_none() && next == newest {
@@ -2569,8 +2615,9 @@ impl Desk {
             });
         }
         let prompt = format!(
-            "{}\n\n{}",
+            "{}{}\n\n{}",
             board::handed_text(&key, t, &needs),
+            self.again_note(t).await,
             machine_note(&key, machine)
         );
         let mut body = serde_json::json!({
@@ -2650,6 +2697,20 @@ impl Desk {
         }
     }
 
+    /// What a ticket started again is told after its handing text: a
+    /// session worked on it before, so what is already done is checked
+    /// first. Empty for a first start.
+    async fn again_note(&self, t: &Ticket) -> &'static str {
+        match self.store().ticket_worked_before(t.id).await {
+            Ok(true) => AGAIN_NOTE,
+            Ok(false) => "",
+            Err(e) => {
+                tracing::info!(ticket = %t.id, error = %format!("{e:#}"), "whether a ticket was worked on before couldn't be read");
+                ""
+            }
+        }
+    }
+
     /// The session for `t`, started as `session`.
     #[allow(clippy::too_many_arguments)]
     async fn plan_spawn(
@@ -2696,7 +2757,11 @@ impl Desk {
             cwd,
             goal: board::goal_of(&key, t),
             worktree: branch,
-            prompt: Some(board::handed_text(&key, t, &needs)),
+            prompt: Some(format!(
+                "{}{}",
+                board::handed_text(&key, t, &needs),
+                self.again_note(t).await
+            )),
             approvals: None,
             approve_for_me: false,
             // As its boss runs: an agent's `[llm] fast`.

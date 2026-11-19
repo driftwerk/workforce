@@ -90,11 +90,9 @@ pub fn connect(url: &str, api_key: &str, tenant: &str) -> Result<Tenants> {
 
 /// As [`connect`], with `timeouts`.
 pub fn connect_with(url: &str, api_key: &str, tenant: &str, timeouts: Timeouts) -> Result<Tenants> {
-    let options = Options {
-        timeout: timeouts.read,
-        attempts: timeouts.attempts.max(1),
-        ..Options::default()
-    };
+    let options = Options::default()
+        .timeout(timeouts.read)
+        .attempts(timeouts.attempts.max(1));
     let client = Client::connect(&[url], api_key, options)?;
     let tenant = TenantId::new(tenant)?;
     Ok(Tenants {
@@ -137,7 +135,10 @@ pub fn is_conflict(error: &vellev_client::Error) -> bool {
 }
 
 /// A real node for tests: `VELLEV_TEST_URL` and `VELLEV_TEST_KEY` name it,
-/// and `VELLEV_TEST_LOCAL_EMBED=1` says it runs the local model.
+/// and `VELLEV_TEST_LOCAL_EMBED=1` says it runs the local model. It must be
+/// a throwaway node run with `VELLEV_MAX_FORMAT=2`, as CI runs one, never
+/// one holding data you keep: the code tests make collections only format 2
+/// holds, and a node's format, once raised, is never lowered.
 #[cfg(feature = "testing")]
 pub mod testing {
     use super::*;
@@ -178,7 +179,7 @@ pub mod testing {
         }
 
         async fn documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-            use vellev_client::api::{Change, Page};
+            use vellev_client::api::{Change, Content, Page};
             self.asked
                 .fetch_add(texts.len(), std::sync::atomic::Ordering::SeqCst);
             let scratch = collection(
@@ -195,23 +196,21 @@ pub mod testing {
             let changes = ids
                 .iter()
                 .zip(texts)
-                .map(|(id, text)| Change::Upsert {
-                    collection: scratch.name.clone(),
-                    id: *id,
-                    properties: serde_json::json!({ "text": format!("{}{text}", self.prefix) })
-                        .as_object()
-                        .cloned()
-                        .unwrap_or_default(),
-                    vector: None,
+                .map(|(id, text)| {
+                    Change::upsert(
+                        scratch.name.clone(),
+                        *id,
+                        Content::new(
+                            serde_json::json!({ "text": format!("{}{text}", self.prefix) })
+                                .as_object()
+                                .cloned()
+                                .unwrap_or_default(),
+                        ),
+                    )
                 })
                 .collect();
             self.tenants.writes.apply(changes).await?;
-            let page = Page {
-                filter: None,
-                after: None,
-                limit: 1000,
-                vectors: true,
-            };
+            let page = Page::new(1000).vectors(true);
             let listed = records.list(&page).await?;
             records.drop().await?;
             let made: std::collections::HashMap<_, _> = listed
@@ -338,6 +337,14 @@ pub mod testing {
             }
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn serve(app: axum::Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    url
 }
 
 #[cfg(test)]
@@ -527,9 +534,7 @@ mod tests {
                         .into_response()
                 }
             });
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!("http://{}", listener.local_addr().unwrap());
-            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let url = crate::serve(app).await;
             connect(&url, "key", "harbor").unwrap().reads
         }
     }
@@ -580,9 +585,7 @@ mod tests {
                 )
             }
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = crate::serve(app).await;
         let timeouts = Timeouts {
             read: Duration::from_secs(5),
             write: Duration::from_secs(5),
@@ -743,9 +746,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(600)).await;
             axum::Json(serde_json::json!({ "incarnation": 1, "position": 1, "outcomes": [] }))
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = crate::serve(app).await;
         let timeouts = Timeouts {
             read: Duration::from_millis(200),
             write: Duration::from_secs(2),
@@ -876,8 +877,8 @@ mod tests {
                 "{said}"
             );
         }
-        // Another refusal with a code this client does not know is not it.
-        let other = std::sync::Arc::new(Fake::answering(500, "model_unavailable", "odd"));
+        // A refusal with another code is not it.
+        let other = std::sync::Arc::new(Fake::answering(409, "conflict", "odd"));
         let tenant = other.serve().await;
         let answered = tenant
             .collection(&wanted.name)
@@ -1018,14 +1019,7 @@ mod node_tests {
             return;
         };
         let ensured = Ensured::new(node.tenant(), notes(), "put it right");
-        let oversize = Nearest {
-            vector: Some(vec![1.0, 0.0]),
-            text: None,
-            limit: 100_000,
-            filter: None,
-            oversample: None,
-            vectors: false,
-        };
+        let oversize = Nearest::to_vector(vec![1.0, 0.0], 100_000);
         let refused = ensured
             .run(|| ensured.collection().nearest(&oversize))
             .await
@@ -1259,13 +1253,13 @@ mod node_tests {
         let plain = Ensured::new(node.tenant(), wanted.clone(), "put it right");
         let records = plain.records().await.unwrap();
         assert_eq!(identity(&records.schema().await.unwrap().unwrap()), None);
-        let content = vellev_client::api::Content {
-            properties: serde_json::json!({ "owner": "kept" })
+        let content = vellev_client::api::Content::new(
+            serde_json::json!({ "owner": "kept" })
                 .as_object()
                 .cloned()
                 .unwrap(),
-            vector: Some(vec![1.0, 0.0]),
-        };
+        )
+        .vector(vec![1.0, 0.0]);
         let id = vellev_core::ObjectId(uuid::Uuid::new_v4());
         records.put(id, &content).await.unwrap();
 
@@ -1306,15 +1300,16 @@ mod node_tests {
     }
 
     fn line(id: u128, text: &str) -> vellev_client::api::Change {
-        vellev_client::api::Change::Upsert {
-            collection: lines().name,
-            id: vellev_core::ObjectId(uuid::Uuid::from_u128(id)),
-            properties: serde_json::json!({ "owner": "o", "text": text })
-                .as_object()
-                .cloned()
-                .unwrap(),
-            vector: None,
-        }
+        vellev_client::api::Change::upsert(
+            lines().name,
+            vellev_core::ObjectId(uuid::Uuid::from_u128(id)),
+            vellev_client::api::Content::new(
+                serde_json::json!({ "owner": "o", "text": text })
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            ),
+        )
     }
 
     /// An embedder that takes a while, and counts how many requests it has
@@ -1408,12 +1403,7 @@ mod node_tests {
         assert_eq!(applied, 5);
         tenants.writes.apply(vec![line(6, "six")]).await.unwrap();
 
-        let page = vellev_client::api::Page {
-            filter: None,
-            after: None,
-            limit: 100,
-            vectors: true,
-        };
+        let page = vellev_client::api::Page::new(100).vectors(true);
         let listed = tenants
             .reads
             .collection(&wanted.name)

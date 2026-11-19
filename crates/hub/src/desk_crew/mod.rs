@@ -50,9 +50,11 @@ mod line;
 pub(crate) mod machine_grants;
 mod mind;
 mod observe;
+mod orchestrator;
 mod own_settings;
 mod picture;
 mod plan;
+mod plan_watch;
 mod preferences;
 mod read_only;
 mod reading;
@@ -70,6 +72,7 @@ mod tools;
 mod updates;
 mod urgent;
 mod waiting;
+mod watches;
 pub(crate) use updates::HubWriter;
 mod watcher;
 mod work;
@@ -278,6 +281,8 @@ pub struct CrewHub {
     /// The plan tickets whose session failed to start: each is tried again
     /// after a wait that doubles.
     plan_failed: Mutex<HashMap<uuid::Uuid, plan::Failed>>,
+    /// What the plan watchdog did, once each ([`plan_watch`]).
+    plan_watch: Mutex<plan_watch::Watch>,
     /// What failed to start, for its plan's next turn.
     plan_failures: Mutex<Vec<(uuid::Uuid, String)>>,
     /// Plans' sessions on the person's machines, as last read there, by
@@ -302,6 +307,25 @@ pub struct CrewHub {
     /// Each boss's mind: its own deciding, one stretch at a time
     /// ([`mind`]).
     minds: mind::Minds,
+    /// Each oversight conversation's notices at Act fully, by boss and
+    /// person ([`orchestrator`]).
+    notices: orchestrator::Notices,
+    /// The ended watches told to a conversation and not yet marked told
+    /// ([`watches`]): told once, until a turn has them.
+    watches_in_flight: Mutex<std::collections::HashSet<uuid::Uuid>>,
+    /// What each watch's last read said as it ended, for its notice.
+    watch_reads: Mutex<HashMap<uuid::Uuid, Option<serde_json::Value>>>,
+    /// Notices handed back to the wake loop when their boss no longer runs
+    /// on them, and its end of that, taken once it starts.
+    #[allow(clippy::type_complexity)]
+    wake_back: (
+        tokio::sync::mpsc::UnboundedSender<(String, Vec<watcher::Trigger>)>,
+        Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<(String, Vec<watcher::Trigger>)>>>,
+    ),
+    /// A test's own: its boss judges turn ends with the focused call, as a
+    /// boss the loop doesn't run for does.
+    #[cfg(test)]
+    focused_turn_ends: std::sync::atomic::AtomicBool,
     /// The day the person was offered a card to raise the day's spent
     /// metered cheap calls ([`own_settings`]).
     notes_offered: Mutex<Option<chrono::NaiveDate>>,
@@ -716,6 +740,7 @@ impl CrewHub {
             work: Mutex::default(),
             starting: tokio::sync::Mutex::new(()),
             plan_failed: Mutex::default(),
+            plan_watch: Mutex::default(),
             plan_failures: Mutex::default(),
             machine_seen: Mutex::default(),
             machine_read: Mutex::default(),
@@ -726,6 +751,15 @@ impl CrewHub {
             relay_wait: Mutex::new(Duration::from_secs(30)),
             relay_polled: Mutex::new(None),
             minds: mind::Minds::default(),
+            notices: orchestrator::Notices::default(),
+            watches_in_flight: Mutex::default(),
+            watch_reads: Mutex::default(),
+            wake_back: {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                (tx, Mutex::new(Some(rx)))
+            },
+            #[cfg(test)]
+            focused_turn_ends: std::sync::atomic::AtomicBool::new(false),
             notes_offered: Mutex::new(None),
             notes_looked: Mutex::new(None),
         });
@@ -763,6 +797,7 @@ impl CrewHub {
         tokio::spawn(relayed_decide::pump_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(answer::answer_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(idle::idle_loop(Arc::clone(&crew), cancel.clone()));
+        tokio::spawn(watches::watch_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(closing::closing_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(plan::plan_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(items::items_loop(Arc::clone(&crew), cancel.clone()));

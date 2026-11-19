@@ -1496,6 +1496,11 @@ impl CrewHub {
             // step is said once, by the call that took it.
             return Box::pin(self.perform_typed(&sent, by, order)).await;
         }
+        // At Act fully (in force) only budget, audit and Stop hold a boss
+        // back: what a guard below would refuse goes all the same, and the
+        // boss is told what it would have said, as a note in its result.
+        let unbound = self.by_unbound(&by);
+        let mut notes: Vec<String> = Vec::new();
         // R5: a boss allows no irreversible request on a job another
         // session holds, as irreversible, whichever path it came by.
         if let (crew::PartyKind::Manager, Action::Approve { session, approval }) =
@@ -1521,9 +1526,12 @@ impl CrewHub {
                 ))
                 .await
                 {
-                    return Err(Refused::other(format!(
-                        "Not allowed: {conflict}. It's the person's to answer."
-                    )));
+                    if !unbound {
+                        return Err(Refused::other(format!(
+                            "Not allowed: {conflict}. It's the person's to answer."
+                        )));
+                    }
+                    notes.push(format!("{conflict}; allowed all the same at Act fully"));
                 }
             }
         }
@@ -1543,7 +1551,7 @@ impl CrewHub {
             None => None,
         };
         if let Some(s) = lane {
-            match self.check_at_send(action, &by.party.id, s).await {
+            match self.check_at_send(action, &by.party.id, s, unbound).await {
                 Ok(Some(said)) => {
                     unheld(&said).await;
                     return Ok(said);
@@ -1556,8 +1564,10 @@ impl CrewHub {
             }
         }
         // The same instruction to the same session again, soon after: said
-        // once, no second message on its line, no second decision.
+        // once, no second message on its line, no second decision. Unbound,
+        // the boss's word goes as it gives it.
         let told = match self.tell_once(action, &by) {
+            _ if unbound => None,
             Ok(told) => told,
             Err(at) => {
                 unheld("it was said already").await;
@@ -1584,6 +1594,16 @@ impl CrewHub {
                     self.untell(t);
                 }
                 return Ok(said);
+            }
+            // Unbound, a job the guard would hold back goes unrecorded:
+            // who holds a job is still kept wherever one is declared, and
+            // only what it would have refused goes without a record. What
+            // Desk failed to keep, or the same job's order already gone in
+            // meanwhile, still holds it back.
+            Err(why) if unbound && why.guard => {
+                tracing::info!(boss = %by.party.id, kind = ?why.kind, "an unbound boss's order the job guard would refuse goes all the same");
+                notes.push(why.why.clone());
+                None
             }
             Err(why) => {
                 if let Some(t) = told {
@@ -1699,7 +1719,7 @@ impl CrewHub {
                 self.post_decision(&d).await;
             }
         }
-        Ok(said)
+        Ok(with_notes(said, &notes))
     }
 
     /// Keeps that a boss (`by`) tells `action`'s session this on its line
@@ -2228,7 +2248,7 @@ impl CrewHub {
         ))
     }
 
-    /// With "always work in real sessions", the session this overseer
+    /// Working in real sessions (only, or preferring them), the session this overseer
     /// already runs to give a start's work to instead of starting another:
     /// `action` becomes a nudge to it with the goal, and the session is
     /// claimed so another start doesn't pile onto it. Only when the start
@@ -2252,7 +2272,7 @@ impl CrewHub {
         else {
             return None;
         };
-        if !o.work.prefer_sessions || self.gate(action, o) != Gate::Run {
+        if !o.work.style.sessions_for_code() || self.gate(action, o) != Gate::Run {
             return None;
         }
         let engine = self.engine_or_default(*engine, o).ok()?;
@@ -2856,14 +2876,21 @@ impl CrewHub {
                     super::MAX_HOPS
                 ));
             }
+            let unbound = self.by_unbound(&by);
             let mut sent = self.sent.lock();
-            if sent.len() >= super::TURN_BUDGET {
-                return Err(format!(
-                    "Loop guard: you have messaged the crew {} times since the person last spoke; tell the person instead.",
-                    super::TURN_BUDGET
-                ));
+            // Unbound, messaging the crew isn't counted against the
+            // person's silence (nor kept, to count against a bound boss's):
+            // it is how the boss keeps work moving. MAX_HOPS above still
+            // ends a chain handed on too long.
+            if !unbound {
+                if sent.len() >= super::TURN_BUDGET {
+                    return Err(format!(
+                        "Loop guard: you have messaged the crew {} times since the person last spoke; tell the person instead.",
+                        super::TURN_BUDGET
+                    ));
+                }
+                sent.push(chrono::Utc::now());
             }
-            sent.push(chrono::Utc::now());
         }
         let owner = self
             .person(Some(&service))
@@ -3010,6 +3037,27 @@ pub(crate) fn same_place_key(folder: &str) -> String {
 
 /// How long the same instruction to a session isn't sent again.
 const TOLD_AGAIN: chrono::TimeDelta = chrono::TimeDelta::minutes(20);
+
+/// `said`, with what a guard would have refused an unbound boss said after
+/// it, each as a note: done all the same, and why it might not have been.
+fn with_notes(said: String, notes: &[String]) -> String {
+    if notes.is_empty() {
+        return said;
+    }
+    let notes: Vec<String> = notes
+        .iter()
+        .map(|n| {
+            // What a refusal opens with isn't so: it went.
+            let n = n.trim();
+            let n = ["Not sent: ", "Not allowed: ", "not sent: "]
+                .iter()
+                .find_map(|p| n.strip_prefix(p))
+                .unwrap_or(n);
+            format!("note (done at Act fully all the same): {n}")
+        })
+        .collect();
+    format!("{}\n{}", said.trim_end(), notes.join("\n"))
+}
 
 /// The session `action` tells something on its line, and what, in plain
 /// form (case, spacing and the closing stop aside), when a boss (`by`)

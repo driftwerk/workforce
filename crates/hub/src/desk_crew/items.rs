@@ -1795,6 +1795,7 @@ impl CrewHub {
         self.look_at_rechecks(&items).await;
         self.post_held_questions().await;
         self.look_for_silent_waits().await;
+        self.look_at_plans().await;
     }
 }
 

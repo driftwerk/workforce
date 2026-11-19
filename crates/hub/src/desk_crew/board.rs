@@ -15,7 +15,7 @@ use workforce_desk::crew::{self, PartyKind};
 use workforce_desk::scope::Seen;
 use workforce_desk::{TicketQuery, TicketView};
 
-use super::tools::cell;
+use super::tools::{cell, Bound};
 use super::watcher::{reported, Trigger};
 use super::CrewHub;
 
@@ -25,10 +25,16 @@ pub const DESCRIPTION: &str = "The board's tickets that matter now, by board: th
 with everything they need done), the ones being done, and the blocked ones (to do, waiting on \
 tickets that aren't done), each with its key (like ACM-12), who has it (with their session or agent \
 id) and what it waits on. Hand a ready ticket out with crew.assign_ticket and move one with \
-crew.move_ticket, both by its key.";
+crew.move_ticket, both by its key. With plan_id, one plan's tickets instead, in its order: each \
+with its key, column, needs and where it runs (machine, folder, engine, model), and with briefs \
+(true, or a list of keys) what each says, so you can read a ticket back before you change it.";
 
 pub fn schema() -> Value {
-    json!({ "type": "object", "properties": {} })
+    json!({ "type": "object", "properties": {
+        "plan_id": { "type": "string", "description": "One plan's tickets instead of the board (its plan_id, from plans here)" },
+        "briefs": { "type": ["boolean", "array"], "items": { "type": "string" },
+            "description": "With plan_id: true for every ticket's brief, or the keys of the ones to read" }
+    } })
 }
 
 /// Which of the board's lists a ticket is on.
@@ -63,11 +69,23 @@ fn column(v: &TicketView) -> Option<Column> {
     }
 }
 
-/// Who has a ticket, with the id the overseer addresses them by.
-fn holder(v: &TicketView) -> String {
+/// What a ticket in Doing whose session no longer runs says it has: never
+/// "in progress" (VEL-1, 19 Nov).
+pub(crate) const NO_SESSION: &str = "in Doing, no session";
+
+/// Who has a ticket, with the id the overseer addresses them by. A session
+/// that `live` says no longer runs doesn't have it: a ticket in Doing says
+/// it has no session.
+fn holder(v: &TicketView, live: &dyn Fn(&str) -> bool) -> String {
     match &v.ticket.assignee {
         None => String::new(),
         Some(a) => match a.kind {
+            PartyKind::Session if !live(&a.id) && v.ticket.state == TicketState::Doing => {
+                format!("{NO_SESSION} ({} was session {})", a.name, a.id)
+            }
+            PartyKind::Session if !live(&a.id) => {
+                format!("{} (session {}, no longer running)", a.name, a.id)
+            }
             PartyKind::Session => format!("{} (session {})", a.name, a.id),
             PartyKind::Agent => format!("{} (agent {})", a.name, a.id),
             _ => a.name.clone(),
@@ -80,7 +98,11 @@ fn holder(v: &TicketView) -> String {
 /// What a ticket waits on that another scope holds now reads as.
 const ELSEWHERE: &str = "a ticket now in another group";
 
-fn table(views: &[&TicketView], waits: &HashMap<Uuid, String>) -> String {
+fn table(
+    views: &[&TicketView],
+    waits: &HashMap<Uuid, String>,
+    live: &dyn Fn(&str) -> bool,
+) -> String {
     let mut rows: Vec<(Column, &TicketView)> = views
         .iter()
         .filter_map(|v| column(v).map(|c| (c, *v)))
@@ -106,7 +128,7 @@ fn table(views: &[&TicketView], waits: &HashMap<Uuid, String>) -> String {
             v.key.as_deref().unwrap_or("-"),
             cell(&v.ticket.said_title()),
             c.word(),
-            cell(&holder(v)),
+            cell(&holder(v, live)),
             cell(&waiting),
         ));
     }
@@ -114,6 +136,49 @@ fn table(views: &[&TicketView], waits: &HashMap<Uuid, String>) -> String {
 }
 
 impl CrewHub {
+    /// `crew.board`, for the boss `b`: the board, or with `plan_id` one
+    /// plan in its sight read back, briefs too when asked.
+    pub(super) async fn board_tool(&self, b: &Bound, input: &Value) -> Result<Value, String> {
+        let Some(raw) = input
+            .get("plan_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        else {
+            if input
+                .get("briefs")
+                .is_some_and(|v| !v.is_null() && *v != Value::Bool(false))
+            {
+                return Err("Briefs are read for one plan: give its plan_id with briefs.".into());
+            }
+            return self.board(&b.seen).await;
+        };
+        let briefs = super::plan::briefs_of(input)?;
+        let id: Uuid = raw
+            .parse()
+            .map_err(|_| "That isn't a plan_id from crew.board's plans.".to_string())?;
+        match self.desk.plan(id).await {
+            Ok(p) if b.seen.sees(p.summary.plan.group.as_deref()) => {
+                Ok(json!({ "plan": super::plan::plan_out_with(&p, &briefs) }))
+            }
+            _ => Err(self.not_ours(&b.oversight.scope)),
+        }
+    }
+
+    /// Whether session `id` (as a ticket's assignee names it) runs here
+    /// now: live and not closed. A session on a machine isn't seen here:
+    /// it is taken to run.
+    pub(crate) fn session_runs(&self, id: &str) -> bool {
+        let Ok(id) = id.parse::<Uuid>() else {
+            return true;
+        };
+        match self.desk.view(id) {
+            Ok(v) => v.live && v.state != workforce_desk::model::SessionState::Closed,
+            Err(workforce_desk::DeskError::NotFound) => false,
+            Err(_) => true,
+        }
+    }
+
     /// `crew.board`: what is ready, being done and blocked, board by board,
     /// of the boards `seen` sees. What a ticket waits on is named only when
     /// it is on one of those boards too.
@@ -171,7 +236,7 @@ impl CrewHub {
             out.push_str(&format!(
                 "Board “{}”:\n{}\n",
                 cell(&name),
-                table(&on, &waits)
+                table(&on, &waits, &|id| self.session_runs(id))
             ));
         }
         if out.is_empty() {
@@ -289,6 +354,7 @@ impl CrewHub {
                 about: None,
                 group: b.group.clone(),
                 handed: None,
+                routine: false,
             }));
         }
         out

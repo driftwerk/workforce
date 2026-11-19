@@ -269,11 +269,14 @@ impl CrewHub {
     /// picture as it is now, in `s`'s lane: `Err` (starting [`STALE`]) when
     /// the picture moved since the turn decided it, `Ok(Some)` when it
     /// repeats the session's current instruction, `Ok(None)` to send it.
+    /// An `unbound` boss's word is never held as a repeat: only the
+    /// person's wheel and a moved picture are said to it.
     pub(super) async fn check_at_send(
         &self,
         action: &Action,
         boss: &str,
         s: Uuid,
+        unbound: bool,
     ) -> Result<Option<String>, String> {
         let tz = self.desk.timezone();
         let name = self.session_name(s);
@@ -331,6 +334,9 @@ impl CrewHub {
         let Action::Nudge { reply_to: None, .. } = action else {
             return Ok(None);
         };
+        if unbound {
+            return Ok(None);
+        }
         let Some(current) = self.desk.picture_last_instruction(boss, s) else {
             return Ok(None);
         };

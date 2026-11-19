@@ -204,14 +204,17 @@ impl Tool for SubAgentTool {
 }
 
 impl SubAgentTool {
-    /// Why `profile` may not run for this agent: it always works in real
-    /// sessions ([`crate::sessions_only`]), and the sub-agent would do work
-    /// rather than look things up.
-    fn prefers_sessions(&self, profile: AgentProfile) -> Option<&'static str> {
+    /// Why `profile` may not run for this agent: its style sends work to
+    /// real sessions ([`crate::sessions_only`]), and the sub-agent would do
+    /// work rather than look things up.
+    fn prefers_sessions(&self, profile: AgentProfile) -> Option<String> {
         if profile == AgentProfile::Worker {
             return None;
         }
-        crate::sessions_only::always_sessions_refusal(&self.service.workspace)
+        crate::sessions_only::always_sessions_refusal(
+            &self.service.workspace,
+            crate::sessions_only::Doing::Helper,
+        )
     }
 
     async fn handle_spawn(&self, input: SubAgentInput, start: Instant) -> Result<ToolResult> {
@@ -575,6 +578,7 @@ mod tests {
                 .or(r.output.as_str().map(str::to_string))
                 .unwrap_or_default()
         };
+        let refused = |said: &str| said.starts_with("Desk's “How it works” setting");
         let config = |toml: &str| {
             workforce_common::settings::AgentWorkspaceConfig::write(&service.workspace, toml)
                 .unwrap()
@@ -584,26 +588,32 @@ mod tests {
         // goes as far as the runner).
         for p in [None, Some("full"), Some("worker")] {
             let r = tool.execute(spawn(p)).await.unwrap();
-            assert_ne!(said(r), crate::sessions_only::ALWAYS_SESSIONS, "{p:?}");
+            assert!(!refused(&said(r)), "{p:?}");
         }
         config("[oversight]\nenabled = true\nlevel = \"act\"\n");
         for p in [None, Some("full")] {
             let r = tool.execute(spawn(p)).await.unwrap();
             assert!(!r.success);
-            assert_eq!(said(r), crate::sessions_only::ALWAYS_SESSIONS, "{p:?}");
+            assert!(refused(&said(r)), "{p:?}");
         }
         let r = tool.execute(spawn(Some("worker"))).await.unwrap();
-        assert_ne!(said(r), crate::sessions_only::ALWAYS_SESSIONS);
+        assert!(!refused(&said(r)));
         // Watching only, it has no sessions to start instead.
         config("[oversight]\nenabled = true\nlevel = \"watch\"\n");
         for p in [None, Some("full"), Some("worker")] {
             let r = tool.execute(spawn(p)).await.unwrap();
-            assert_ne!(said(r), crate::sessions_only::ALWAYS_SESSIONS, "{p:?}");
+            assert!(!refused(&said(r)), "{p:?}");
+        }
+        // Preferring sessions, a helper doing work still goes to one.
+        config("[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.work]\nstyle = \"prefer_sessions\"\n");
+        for p in [None, Some("full")] {
+            let r = tool.execute(spawn(p)).await.unwrap();
+            assert!(refused(&said(r)), "{p:?}");
         }
         config("[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.work]\nprefer_sessions = false\n");
         for p in [None, Some("full"), Some("worker")] {
             let r = tool.execute(spawn(p)).await.unwrap();
-            assert_ne!(said(r), crate::sessions_only::ALWAYS_SESSIONS, "{p:?}");
+            assert!(!refused(&said(r)), "{p:?}");
         }
     }
 

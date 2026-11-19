@@ -14,7 +14,7 @@ use vellev_client::{Records, Tenant};
 use vellev_core::{Collection, CollectionName, DataType, EmbeddingProvider, Property};
 
 use crate::shape::{checked, Refused};
-use crate::signals::{model_unavailable, no_tenant};
+use crate::signals::no_tenant;
 use crate::LOCAL_MODEL;
 
 /// How long a collection found unusable stays so before it is looked at
@@ -84,15 +84,16 @@ pub enum Asked<'a> {
 /// to act, otherwise as it is. This is the one place a node's answer is
 /// classified. A tenant the key does not reach is to it one that does not
 /// exist, so either is `NoTenant`; it is told by what was asked, never by
-/// the message. A node that cannot run a collection's model at all (see
-/// [`model_unavailable`]) is named with [`LOCAL_MODEL`], the one model a
-/// workforce collection has a node embed with.
+/// the message. A node that cannot run a collection's model at all (its
+/// `model_unavailable`, until it or the collection is set up otherwise) is
+/// named with [`LOCAL_MODEL`], the one model a workforce collection has a
+/// node embed with.
 pub fn failure(error: vellev_client::Error, tenant: &Tenant, asked: Asked) -> Report {
     let tenant = tenant.id().to_string();
     let message = error.to_string();
     let unusable = match (error.code(), asked) {
         (_, Asked::Collection(collection) | Asked::Request(collection))
-            if model_unavailable(&error) =>
+            if error.is_model_unavailable() =>
         {
             Unusable::Model {
                 tenant,
@@ -126,14 +127,7 @@ pub async fn probe_model(tenant: &Tenant, records: &Records, wanted: &Collection
     if wanted.embedding.provider == EmbeddingProvider::None {
         return Ok(());
     }
-    let probe = Nearest {
-        vector: None,
-        text: Some("model probe".to_string()),
-        limit: 1,
-        filter: None,
-        oversample: None,
-        vectors: false,
-    };
+    let probe = Nearest::to_text("model probe", 1);
     match records.nearest(&probe).await {
         Ok(_) => Ok(()),
         Err(e) if matches!(e.code(), Some(Code::Unavailable | Code::Invalid)) => {
@@ -178,11 +172,13 @@ pub fn identity(found: &Collection) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Create `wanted` in `tenant`, or add what an existing collection lacks and
-/// check the rest; returns whether it was created. The tenant is never
-/// created: one that is missing is [`Unusable::NoTenant`], for an operator
-/// to create deliberately. A collection of the wrong shape is
-/// [`Unusable::Refused`], with `remedy` (see [`crate::mismatches`]).
+/// Create `wanted` in `tenant`, or check an existing collection and add the
+/// stored properties it lacks; returns whether it was created. The tenant
+/// is never created: one that is missing is [`Unusable::NoTenant`], for an
+/// operator to create deliberately. A collection of the wrong shape, as it
+/// would be with those properties added, is [`Unusable::Refused`], with
+/// `remedy` (see [`crate::mismatches`]), and is left as it was found: a
+/// property that is embedded but not stored cannot be added to it.
 pub async fn ensure(
     tenant: &Tenant,
     records: &Records,
@@ -229,26 +225,22 @@ async fn ensure_as(
         }
     };
     let adopted = (identified && identity(&found).is_none()).then(incarnation);
-    let missing: Vec<&Property> = wanted
+    let missing: Vec<Property> = wanted
         .properties
         .iter()
-        .filter(|p| found.property(&p.name).is_none())
+        .filter(|p| p.stored && found.property(&p.name).is_none())
         .chain(&adopted)
+        .cloned()
         .collect();
+    let widened = Collection {
+        properties: found.properties.iter().chain(&missing).cloned().collect(),
+        ..found
+    };
+    checked(&widened, wanted, remedy).map_err(as_unusable)?;
     for property in &missing {
         info!(collection = %wanted.name, property = %property.name, "Adding property to vellev collection");
         records.add_property(property).await.map_err(failed)?;
     }
-    let found = if missing.is_empty() {
-        found
-    } else {
-        records
-            .schema()
-            .await
-            .map_err(failed)?
-            .ok_or_else(|| eyre!("vellev collection '{}' vanished", wanted.name))?
-    };
-    checked(&found, wanted, remedy).map_err(as_unusable)?;
     Ok(false)
 }
 
@@ -586,5 +578,124 @@ impl Ensured {
     /// Whether the collection was created since this was last asked.
     pub fn take_created(&self) -> bool {
         self.known.created.swap(false, Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use axum::response::IntoResponse;
+    use vellev_core::Embedding;
+
+    use super::*;
+    use crate::{collection, connect, local_embedding};
+
+    /// A node holding `found`, recording every request, that adds a
+    /// property it is asked to.
+    async fn holding(found: Collection) -> (Tenant, Arc<Mutex<Vec<String>>>) {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let (held, seen) = (Arc::new(Mutex::new(found)), Arc::clone(&asked));
+        let app = axum::Router::new().fallback(
+            move |method: axum::http::Method, uri: axum::http::Uri, body: String| {
+                let (held, seen) = (Arc::clone(&held), Arc::clone(&seen));
+                async move {
+                    let path = uri.path().to_string();
+                    seen.lock().unwrap().push(format!("{method} {path}"));
+                    if path.ends_with("/collections") {
+                        return axum::Json(serde_json::json!({ "collections": [] }))
+                            .into_response();
+                    }
+                    if path.ends_with("/properties") {
+                        let property: Property = serde_json::from_str(&body).unwrap();
+                        held.lock().unwrap().properties.push(property);
+                        return axum::Json(serde_json::json!({
+                            "incarnation": 1,
+                            "position": 1,
+                            "outcomes": [{ "outcome": "applied" }]
+                        }))
+                        .into_response();
+                    }
+                    axum::Json(held.lock().unwrap().clone()).into_response()
+                }
+            },
+        );
+        let url = crate::serve(app).await;
+        (connect(&url, "key", "harbor").unwrap().reads, asked)
+    }
+
+    fn notes(properties: Vec<Property>, embedding: Embedding) -> Collection {
+        collection(CollectionName::new("Notes").unwrap(), properties, embedding)
+    }
+
+    /// A found collection lacking a property it is embedded on, which
+    /// cannot be added, is refused saying so, and nothing is added to it;
+    /// one that lacks only what is stored has that added.
+    #[tokio::test]
+    async fn only_what_is_stored_is_added_and_only_to_a_collection_that_then_fits() {
+        let wanted = notes(
+            vec![
+                Property::new("body", DataType::Text).unstored(),
+                Property::new("owner", DataType::Text),
+            ],
+            local_embedding(&["body"]),
+        );
+        let imported = notes(
+            Vec::new(),
+            Embedding {
+                provider: EmbeddingProvider::None,
+                model: "none".into(),
+                dimensions: 768,
+                query_prefix: None,
+                document_prefix: None,
+                properties: Vec::new(),
+            },
+        );
+        let (tenant, asked) = holding(imported.clone()).await;
+        let refused = ensure(
+            &tenant,
+            &tenant.collection(&wanted.name),
+            &wanted,
+            "remake it",
+        )
+        .await
+        .unwrap_err();
+        match refused.downcast_ref::<Unusable>() {
+            Some(Unusable::Refused(refused)) => assert!(
+                refused
+                    .problems
+                    .contains(&"property 'body' is missing".to_string()),
+                "{refused:?}"
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        let asked = asked.lock().unwrap().clone();
+        assert!(
+            !asked.iter().any(|request| request.ends_with("/properties")),
+            "not widened: {asked:?}"
+        );
+
+        let lacking_owner = notes(wanted.properties[..1].to_vec(), wanted.embedding.clone());
+        let (tenant, asked) = holding(lacking_owner).await;
+        let created = ensure(
+            &tenant,
+            &tenant.collection(&wanted.name),
+            &wanted,
+            "remake it",
+        )
+        .await
+        .unwrap();
+        assert!(!created);
+        let added: Vec<String> = asked
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.ends_with("/properties"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            added,
+            ["POST /v1/tenants/harbor/collections/Notes/properties"]
+        );
     }
 }

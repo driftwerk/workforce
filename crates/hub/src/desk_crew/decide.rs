@@ -906,9 +906,18 @@ impl CrewHub {
                     .and_then(|g| self.relayed_held(boss, &g.id)),
                 false => Some(Vec::new()),
             };
-            if let Some(conflict) =
-                Box::pin(self.request_conflict(boss, view.id, p, home.as_deref())).await
-            {
+            // This hub's own boss at Act fully in force allows it all the
+            // same: only budget, audit and Stop hold it back. As Desk sends
+            // it (`perform`), so it is judged here: a boss served from a
+            // grant or relayed from a home is never one of this hub's
+            // overseers, and its stays the person's.
+            let lifted = self
+                .overseer_named(boss)
+                .is_some_and(|(s, o)| self.unbound_given(s.agent_id.as_str(), &o));
+            let conflict = Box::pin(self.request_conflict(boss, view.id, p, home.as_deref()))
+                .await
+                .filter(|_| !lifted);
+            if let Some(conflict) = conflict {
                 if !still() {
                     return Outcome::NotOurs;
                 }
