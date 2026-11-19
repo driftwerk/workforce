@@ -1564,40 +1564,89 @@ async fn a_spent_day_is_said_only_while_metered_and_holds_across_a_restart() {
     .await;
 }
 
+/// The staleness of `a` alone, with its session `working` or not.
+fn stale_of(d: &Desk, a: &Account, working: bool) -> Option<crate::account::Staleness> {
+    d.accounts_staleness(&[(a, working)])
+        .get(&a.session)
+        .copied()
+}
+
 #[tokio::test]
 async fn a_boss_reads_an_account_as_stale_once_its_session_did_more_since() {
+    use crate::account::Staleness;
+    use crate::picture::{Note, What};
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let fake = Fake::answering(&[ANSWER]);
+        let fake = Fake::answering(&[ANSWER, ANSWER]);
         let (d, id, _cancel) = start(&pool, dir.path(), &fake).await;
         let mut a = Account::new(id, "", Utc::now() - chrono::Duration::minutes(20));
         a.by_model = true;
-        assert_eq!(d.account_staleness("boss", id, &a), None, "nothing since");
+        assert_eq!(stale_of(&d, &a, false), None, "nothing since");
+        // What only touches it for being in the boss's scope isn't its
+        // activity: the person's words in the boss's DM, an order or a
+        // fact that names no session, a message withdrawn unsent.
+        d.picture_note(Note::new(What::PersonSaid, "How are we doing?").boss("boss"));
+        d.picture_note(Note::new(What::Order, "No releases after 18:00."));
+        d.picture_note(Note::new(What::Fact, "Sam owns the fix.").boss("boss"));
+        d.picture_note(
+            Note::new(What::Withdrawn, "Rebase.")
+                .boss("boss")
+                .session(id),
+        );
+        assert_eq!(stale_of(&d, &a, true), None, "nothing happened in it");
         // The boss told it something on its line after it was written.
         d.picture_note(
-            crate::picture::Note::new(crate::picture::What::Instruction, "Run release 4.")
+            Note::new(What::Instruction, "Run release 4.")
                 .boss("boss")
                 .session(id),
         );
         assert!(
             matches!(
-                d.account_staleness("boss", id, &a),
-                Some(crate::account::Staleness::Behind { minutes }) if minutes >= 19
+                stale_of(&d, &a, false),
+                Some(Staleness::Behind { minutes, turn: false }) if minutes >= 19
             ),
             "{:?}",
-            d.account_staleness("boss", id, &a)
+            stale_of(&d, &a, false)
         );
         // Written after it: relied on again.
         a.written_at = Utc::now() + chrono::Duration::seconds(1);
-        assert_eq!(d.account_staleness("boss", id, &a), None);
-        // A turn ended it hasn't caught up with.
-        d.0.accounts
-            .ended
-            .lock()
-            .insert(id, Utc::now() + chrono::Duration::minutes(5));
+        assert_eq!(stale_of(&d, &a, false), None);
+        // A plain one, while its session works.
+        a.by_model = false;
+        assert_eq!(stale_of(&d, &a, true), Some(Staleness::Plain));
+        assert_eq!(stale_of(&d, &a, false), None);
+        a.by_model = true;
+        // Written after its line moved; then a turn ended that it hasn't
+        // caught up with, until the refresh that turn end starts reads it.
+        a.written_at = Utc::now();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(stale_of(&d, &a, false), None);
+        let store = DeskStore::from_pool(pool.clone());
+        harvested(
+            &store,
+            id,
+            &[exchange("x1", 10, &"I found the bug. ".repeat(40), 3)],
+        )
+        .await;
+        d.account_turn_ended(id);
+        assert!(
+            matches!(
+                stale_of(&d, &a, false),
+                Some(Staleness::Behind { turn: true, .. })
+            ) || !d.0.accounts.ended.lock().contains_key(&id),
+            "behind until caught up"
+        );
+        let started = std::time::Instant::now();
+        while d.0.accounts.ended.lock().contains_key(&id) {
+            assert!(started.elapsed() < Duration::from_secs(10), "caught up");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(stale_of(&d, &a, false), None, "caught up: relied on again");
+        // One it hasn't caught up with, set as a turn end leaves it.
+        d.0.accounts.ended.lock().insert(id, Utc::now());
         assert!(matches!(
-            d.account_staleness("boss", id, &a),
-            Some(crate::account::Staleness::Behind { .. })
+            stale_of(&d, &a, false),
+            Some(Staleness::Behind { turn: true, .. })
         ));
     })
     .await;

@@ -369,25 +369,38 @@ impl Desk {
         Ok(AccountAnswer::Answered(self.account_redacted_text(answer)))
     }
 
-    /// How far `a`, session `id`'s account, can be relied on now as
-    /// `boss`'s turn reads it: stale once a turn ended that it hasn't
-    /// caught up with, or anything touched the session on `boss`'s
-    /// picture (its line, the person's words) after it was written. None
-    /// while it can. Read without waiting on the store.
-    pub fn account_staleness(
+    /// How far each of `accounts` (with whether its session works now)
+    /// can be relied on as a boss's turn reads them: stale once a turn
+    /// ended that it hasn't caught up with, or words went in or out on its
+    /// session's line after it was written, and so on
+    /// ([`Account::staleness`]). Only the stale ones are given. Read
+    /// without waiting on the store, each lock taken once.
+    pub fn accounts_staleness(
         &self,
-        boss: &str,
-        id: Uuid,
-        a: &Account,
-    ) -> Option<account::Staleness> {
-        let working = self.view(id).is_ok_and(|v| {
-            use crate::model::SessionState as S;
-            matches!(v.state, S::Working | S::Blocked | S::Asking)
-        });
-        let ended = self.0.accounts.ended.lock().get(&id).copied();
-        let touched = self.picture_recent(boss, id, 1).first().map(|h| h.at);
-        let activity = ended.max(touched);
-        a.staleness(crate::crew::now(), working, activity)
+        accounts: &[(&Account, bool)],
+    ) -> HashMap<Uuid, account::Staleness> {
+        let ids: Vec<Uuid> = accounts.iter().map(|(a, _)| a.session).collect();
+        let line = self.0.picture.lock().last_activity(&ids);
+        let ended: HashMap<Uuid, DateTime<Utc>> = {
+            let ended = self.0.accounts.ended.lock();
+            ids.iter()
+                .filter_map(|id| ended.get(id).map(|e| (*id, *e)))
+                .collect()
+        };
+        let now = crate::crew::now();
+        accounts
+            .iter()
+            .filter_map(|(a, working)| {
+                let id = a.session;
+                a.staleness(
+                    now,
+                    *working,
+                    ended.get(&id).copied(),
+                    line.get(&id).copied(),
+                )
+                .map(|s| (id, s))
+            })
+            .collect()
     }
 
     /// A turn of session `id` ended and the harvest read it: its account
@@ -766,26 +779,31 @@ impl Desk {
             .await?;
         // A question's own share spent leaves accounts written as before.
         if !taken && kind != CheapKind::Question {
-            let first = self.0.accounts.ceiling_hit.lock().replace(day) != Some(day);
-            if first {
-                tracing::warn!(
-                    cap = limits.cheap_calls_per_day,
-                    "the day's metered cheap calls are spent: sessions' accounts are said plainly until tomorrow"
-                );
-                // On the Floor, as it happens: summaries read plainly from
-                // now on.
-                self.note(crate::crew::Event::new(
-                    crate::crew::Kind::Limit,
-                    crate::crew::Party::desk(),
-                    None,
-                    format!(
-                        "today's {} metered cheap calls are spent: sessions' summaries are written plainly from their last words until tomorrow",
-                        limits.cheap_calls_per_day
-                    ),
-                ));
-            }
+            self.ceiling_hit(day, limits.cheap_calls_per_day);
         }
         Ok(taken)
+    }
+
+    /// The day's metered cheap calls, `cap` of them, are spent on `day`:
+    /// marked, and said in the log and on the Floor the first time. Once a
+    /// day while the hub runs; a restart on a spent day says it once more,
+    /// which is the truth again.
+    fn ceiling_hit(&self, day: NaiveDate, cap: u32) {
+        if self.0.accounts.ceiling_hit.lock().replace(day) == Some(day) {
+            return;
+        }
+        tracing::warn!(
+            cap,
+            "the day's metered cheap calls are spent: sessions' accounts are said plainly until tomorrow"
+        );
+        self.note(crate::crew::Event::new(
+            crate::crew::Kind::Limit,
+            crate::crew::Party::desk(),
+            None,
+            format!(
+                "today's {cap} metered cheap calls are spent: sessions' summaries are written plainly from their last words until tomorrow"
+            ),
+        ));
     }
 
     /// Gives back a call of `kind` paid by `billing` that no model took.
@@ -864,7 +882,7 @@ impl Desk {
                 .await
                 .is_ok_and(|n| n >= i64::from(cap));
         if spent {
-            *self.0.accounts.ceiling_hit.lock() = Some(day);
+            self.ceiling_hit(day, cap);
         }
         spent || self.cheap_ceiling_hit_today()
     }

@@ -42,10 +42,12 @@ pub const FRESH_FOR: Duration = Duration::from_secs(2 * 60);
 /// Why an account can't be relied on as it stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Staleness {
-    /// The session did more since: its last turn ended this many minutes
-    /// after the account was written.
-    Behind { minutes: i64 },
-    /// Past the time it said it would be out of date by.
+    /// The session did more since: this many minutes after the account
+    /// was written its turn ended (`turn`), or words went in or out on its
+    /// line.
+    Behind { minutes: i64, turn: bool },
+    /// Past the time it said it would be out of date by: none says so yet
+    /// (a writer may set `stale_after`), so this is for when one does.
     Expired,
     /// Written plainly from the session's last words, not by a model,
     /// and the session has worked since.
@@ -254,18 +256,28 @@ impl Account {
     }
 
     /// How far it can be relied on at `now` for a session that is
-    /// `working`, whose last activity it hasn't caught up with (a turn's
-    /// end, a message on its line, the person's words in it) was at
-    /// `activity`: None while it can.
+    /// `working`, whose last turn end it hasn't caught up with was at
+    /// `ended`, and on whose line words last went in or out (a boss's, the
+    /// person's, its own) at `line`: None while it can.
     pub fn staleness(
         &self,
         now: DateTime<Utc>,
         working: bool,
-        activity: Option<DateTime<Utc>>,
+        ended: Option<DateTime<Utc>>,
+        line: Option<DateTime<Utc>>,
     ) -> Option<Staleness> {
-        if let Some(a) = activity.filter(|a| *a > self.written_at) {
+        let after = |at: Option<DateTime<Utc>>| at.filter(|a| *a > self.written_at);
+        // The later of the two says how far behind it is.
+        let behind = match (after(ended), after(line)) {
+            (Some(e), Some(l)) if l > e => Some((l, false)),
+            (Some(e), _) => Some((e, true)),
+            (None, Some(l)) => Some((l, false)),
+            (None, None) => None,
+        };
+        if let Some((at, turn)) = behind {
             return Some(Staleness::Behind {
-                minutes: (a - self.written_at).num_minutes().max(1),
+                minutes: (at - self.written_at).num_minutes().max(1),
+                turn,
             });
         }
         if self.stale_after.is_some_and(|s| now >= s) {

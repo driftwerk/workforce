@@ -20,7 +20,7 @@
 //! This module decides; [`crate::service`]'s `picture` keeps the feed and
 //! `picture_store` writes it to Postgres (`picture_events`).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -68,6 +68,20 @@ pub enum What {
 }
 
 impl What {
+    /// Whether a row of this kind about a session is something happening
+    /// in it, which its account may not have caught up with.
+    pub fn is_activity(self) -> bool {
+        match self {
+            What::PersonSaid
+            | What::Instruction
+            | What::SessionReported
+            | What::SessionAsked
+            | What::HandedBack
+            | What::PersonAnswered => true,
+            What::Fact | What::Order | What::Withdrawn => false,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             What::PersonSaid => "person_said",
@@ -309,6 +323,28 @@ impl Picture {
             .cloned()
             .collect();
         out.reverse();
+        out
+    }
+
+    /// When each of `sessions` last had something happen in it: words that
+    /// reached it on its line (a boss's, the person's) or that it wrote
+    /// there, its handing back. What only touches it because it is in a
+    /// boss's scope (the boss's DM, a fact or order naming no session) and
+    /// a message withdrawn unsent don't count. One pass, newest first,
+    /// done once every session is found.
+    pub fn last_activity(&self, sessions: &[Uuid]) -> HashMap<Uuid, DateTime<Utc>> {
+        let mut out = HashMap::new();
+        for r in self.rows.iter().rev() {
+            if out.len() == sessions.len() {
+                break;
+            }
+            let Some(s) = r.session.filter(|s| sessions.contains(s)) else {
+                continue;
+            };
+            if r.what.is_activity() {
+                out.entry(s).or_insert(r.at);
+            }
+        }
         out
     }
 
