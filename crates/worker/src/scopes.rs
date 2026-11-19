@@ -254,19 +254,6 @@ impl Worker {
                 bail!("home key {key:?} is not a dataset-safe name");
             }
         }
-        // A conversation back while its last scope's teardown is still
-        // owed: that teardown comes first, as the new scope takes the same
-        // id, dataset and home.
-        // One being taken down right now (a release) is waited out.
-        if self.tearing.lock().contains(&request.scope) {
-            return Ok(refused(RefusalReason::AtCapacity));
-        }
-        if let Some(leftover) = self.leftover(&request.scope) {
-            if let Err(error) = self.take_down(leftover).await {
-                warn!(scope = %request.scope, %error, "taking down a scope that gave way failed again; its conversation waits");
-                return Ok(refused(RefusalReason::AtCapacity));
-            }
-        }
         self.classify(&request);
         if let Some(existing) = self.touch(&request.scope) {
             let home_reused = existing.home.is_some();
@@ -275,6 +262,20 @@ impl Worker {
                 true,
                 home_reused,
             )));
+        }
+        // Not in the map: a conversation back while its last scope's
+        // teardown is under way (waited out) or still owed (done first), as
+        // the new scope takes the same id, dataset and home. Asked after the
+        // map, so a release moving it out meanwhile is seen here.
+        match self.claim(&request.scope) {
+            Claim::Absent => {}
+            Claim::Busy => return Ok(refused(RefusalReason::AtCapacity)),
+            Claim::Owed(leftover) => {
+                if let Err(error) = self.take_down(leftover).await {
+                    warn!(scope = %request.scope, %error, "taking down a scope that gave way failed again; its conversation waits");
+                    return Ok(refused(RefusalReason::AtCapacity));
+                }
+            }
         }
         validate_overrides(&request.env).map_err(|reason| eyre::eyre!(reason))?;
         if self.zfs.free_bytes(&self.config.pool).await? < self.config.pool_free_floor_bytes() {
@@ -871,7 +872,7 @@ impl Worker {
     }
 
     pub async fn release(&self, scope: &ScopeId) -> Result<ServerFrame> {
-        let removed = self.scopes.lock().remove(scope);
+        let removed = self.retire(&mut self.scopes.lock(), scope);
         if let Some(removed) = removed {
             self.take_down(removed).await?;
             info!(scope = %scope, "released");
@@ -879,31 +880,46 @@ impl Worker {
         Ok(ServerFrame::Done(ExecSummary::exited(0)))
     }
 
-    /// `scope` among the leftovers, when its teardown is owed.
-    fn leftover(&self, scope: &ScopeId) -> Option<Scope> {
-        self.leftovers
-            .lock()
-            .iter()
-            .find(|left| left.id == *scope)
-            .cloned()
+    /// Move `scope` out of the map, held as `scopes`, to be taken down:
+    /// in one step it is listed among the leftovers, still counted, and
+    /// marked as being torn down, so no prepare finds it in neither place.
+    /// Locks in order: scopes, leftovers, tearing.
+    fn retire(&self, scopes: &mut BTreeMap<ScopeId, Scope>, scope: &ScopeId) -> Option<Scope> {
+        let removed = scopes.remove(scope)?;
+        self.leftovers.lock().push(removed.clone());
+        self.tearing.lock().insert(scope.clone());
+        Some(removed)
     }
 
-    /// Take down a scope out of the map. Until that is done it stays among
-    /// the leftovers, counted against capacity and owed by the sweep, so a
-    /// teardown that fails, or is dropped part way, never leaves the host
-    /// holding a scope nothing counts; and while it runs its id is marked,
-    /// so no prepare seats the same id over it.
-    async fn take_down(&self, scope: Scope) -> Result<()> {
-        let id = scope.id.clone();
-        {
-            let mut leftovers = self.leftovers.lock();
-            if !leftovers.iter().any(|left| left.id == id) {
-                leftovers.push(scope.clone());
-            }
+    /// Claim `scope`'s owed teardown, when it has one nobody is doing now.
+    fn claim(&self, scope: &ScopeId) -> Claim {
+        let _scopes = self.scopes.lock();
+        let leftovers = self.leftovers.lock();
+        let mut tearing = self.tearing.lock();
+        if tearing.contains(scope) {
+            return Claim::Busy;
         }
-        let _tearing = Tearing::mark(&self.tearing, &id);
+        match leftovers.iter().find(|left| left.id == *scope) {
+            Some(left) => {
+                tearing.insert(scope.clone());
+                Claim::Owed(left.clone())
+            }
+            None => Claim::Absent,
+        }
+    }
+
+    /// Take down a scope retired or claimed for it. Until that is done it
+    /// stays among the leftovers, counted against capacity and owed by the
+    /// sweep, so a teardown that fails, or is dropped part way, never
+    /// leaves the host holding a scope nothing counts; its id stays marked
+    /// as torn down until this ends, however it ends.
+    async fn take_down(&self, scope: Scope) -> Result<()> {
+        let _tearing = Tearing {
+            tearing: &self.tearing,
+            id: scope.id.clone(),
+        };
         self.dismantle(&scope).await?;
-        self.leftovers.lock().retain(|left| left.id != id);
+        self.leftovers.lock().retain(|left| left.id != scope.id);
         Ok(())
     }
 
@@ -924,9 +940,8 @@ impl Worker {
             }
             self.save()?;
         }
-        if let Err(e) = self.containers.stop(&removed.container).await {
-            warn!(scope = %scope, error = %e, "stopping a released scope's container");
-        }
+        // A container that may still run keeps the scope owed.
+        self.containers.stop(&removed.container).await?;
         if self.zfs.exists(&removed.dataset).await? {
             self.zfs.destroy(&removed.dataset).await?;
         }
@@ -977,7 +992,7 @@ impl Worker {
             .filter(|scope| !jobs.values().any(|job| job.scope == scope.id))
             .min_by_key(|scope| scope.last_seen)
             .map(|scope| scope.id.clone())?;
-        scopes.remove(&idle)
+        self.retire(&mut scopes, &idle)
     }
 
     /// Release an idle scope taken by [`Self::take_idle_yielder`] so `to`
@@ -1035,12 +1050,11 @@ impl Worker {
             // Under the prepare lock, so no prepare seats the same id anew
             // meanwhile; one a release is taking down now is left to it.
             let _one_at_a_time = self.prepares.lock().await;
-            let owed: Vec<Scope> = self.leftovers.lock().clone();
-            for leftover in owed {
-                if self.tearing.lock().contains(&leftover.id) {
+            let owed: Vec<ScopeId> = self.leftovers.lock().iter().map(|l| l.id.clone()).collect();
+            for id in owed {
+                let Claim::Owed(leftover) = self.claim(&id) else {
                     continue;
-                }
-                let id = leftover.id.clone();
+                };
                 if let Err(error) = self.take_down(leftover).await {
                     warn!(scope = %id, %error, "taking down a scope that gave way failed again");
                 }
@@ -1203,21 +1217,20 @@ fn prepared(scope: &Scope, reused: bool, home_reused: bool) -> Prepared {
     }
 }
 
-/// Marks a scope's teardown under way for as long as it lives, however the
-/// teardown ends.
+/// What [`Worker::claim`] found of a scope out of the map.
+enum Claim {
+    /// Nothing is owed for it.
+    Absent,
+    /// It is being taken down now.
+    Busy,
+    /// Its teardown is owed and now claimed by the caller.
+    Owed(Scope),
+}
+
+/// Unmarks a scope's teardown as under way when it ends, however it ends.
 struct Tearing<'a> {
     tearing: &'a Mutex<HashSet<ScopeId>>,
     id: ScopeId,
-}
-
-impl<'a> Tearing<'a> {
-    fn mark(tearing: &'a Mutex<HashSet<ScopeId>>, id: &ScopeId) -> Self {
-        tearing.lock().insert(id.clone());
-        Self {
-            tearing,
-            id: id.clone(),
-        }
-    }
 }
 
 impl Drop for Tearing<'_> {
@@ -2149,6 +2162,27 @@ mod tests {
             "and no later sweep takes down the new one"
         );
         assert_eq!(h.worker.health().await.unwrap().scopes, 2);
+    }
+
+    #[tokio::test]
+    async fn a_prepare_for_a_scope_being_taken_down_waits_it_out() {
+        let h = Harness::new().await;
+        let w = &h.worker;
+        w.prepare(turn("going", "thread-1")).await.unwrap();
+        let id = ScopeId::new("going");
+        // As a release does, before its teardown's first await.
+        let going = w.retire(&mut w.scopes.lock(), &id).unwrap();
+        assert_eq!(
+            w.prepare(turn("going", "thread-1")).await.unwrap(),
+            refused(RefusalReason::AtCapacity),
+            "not seated anew over a teardown under way"
+        );
+        assert_eq!(w.health().await.unwrap().scopes, 1, "and still counted");
+        w.take_down(going).await.unwrap();
+        assert!(matches!(
+            w.prepare(turn("going", "thread-1")).await.unwrap(),
+            ServerFrame::Prepared(_)
+        ));
     }
 
     #[tokio::test]
