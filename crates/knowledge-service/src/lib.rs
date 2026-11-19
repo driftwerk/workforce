@@ -3836,10 +3836,12 @@ mod tests {
         let Some((memories, code)) = two_tenants().await else {
             return;
         };
+        let dir = tempfile::tempdir().unwrap();
         let vellev = with_code_in(&memories, &code.tenant);
-        let (first_dir, second_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let (first, service) = filled_by_config(first_dir.path(), &vellev).await;
-        let (second, _other) = filled_by_config(second_dir.path(), &vellev).await;
+        let (first, service) = filled_by_config(dir.path(), &vellev).await;
+        let second = another_repo(&service, dir.path(), "other", 3).await;
+        let pass = service.backfill_vectors().await.unwrap();
+        assert_eq!(pass.filled, std::slice::from_ref(&second));
         let store = service.vector_store().clone().unwrap();
         let summary = |repo: &str| workforce_codebase_knowledge::vector::VectorCodeSummary {
             entity_id: "src/config.rs".into(),

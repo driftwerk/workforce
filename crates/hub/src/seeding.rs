@@ -975,7 +975,10 @@ mod tests {
             .await
             .unwrap_err();
         let refused = format!("{refused:#}");
-        assert!(refused.contains("768 dimensions"), "{refused}");
+        assert!(
+            refused.contains("does not embed as the node does"),
+            "{refused}"
+        );
         assert_eq!(store.entity_count(&repo).await.unwrap(), 0);
 
         let otherwise = Arc::new(ByNode {
