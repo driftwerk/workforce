@@ -4570,6 +4570,7 @@ impl Desk {
             return self.view(id);
         };
         pty.write(keys)?;
+        let mut interrupted = false;
         // Claude Code runs no hook for an interrupted turn, nor for a
         // dialog Esc turned down: that wait is over, and what queues
         // behind it shows next (its own notice, for one its terminal asks).
@@ -4579,6 +4580,7 @@ impl Desk {
                 r.state = SessionState::Done;
                 l.current_tool = None;
                 l.interrupted = true;
+                interrupted = true;
             } else if r.state == SessionState::Blocked
                 && l.pending.as_ref().is_some_and(|p| !p.answerable)
             {
@@ -4589,6 +4591,10 @@ impl Desk {
                 };
             }
         });
+        // Its turn ended, interrupted: a restart's note it carried was read.
+        if interrupted {
+            self.0.state.lock().restarted.remove(&id);
+        }
         // The turn is over: what waited for its next tool call goes in at
         // the idle.
         self.steers_released(id);
@@ -4725,6 +4731,7 @@ impl Desk {
             r.state = SessionState::Done;
             r.asked = None;
         });
+        self.tell_kept_cut_off(id);
         let view = self.view(id)?;
         if let Some(by) = by {
             self.note(by.event(
@@ -6728,10 +6735,9 @@ impl Desk {
             // Between turns, asking no one (nor being read for whether it
             // asks), and not stopped on a limit: typed in, it would answer
             // that, or fail at once.
-            let between = st
-                .records
-                .get(&id)
-                .is_some_and(|r| r.state == SessionState::Done && r.asked.is_none());
+            let between = st.records.get(&id).is_some_and(|r| {
+                matches!(r.state, SessionState::Done | SessionState::Idle) && r.asked.is_none()
+            });
             let read = st.live.get(&id).is_some_and(|l| l.reading.is_none());
             if !between || !read || st.turn_failures.contains_key(&id) {
                 return;
@@ -7108,6 +7114,8 @@ impl Desk {
                     r.asked = Some(Asked::read_by_model(&reply));
                 }
             });
+            // Read as asking nothing: what a restart stopped goes in now.
+            desk.tell_kept_cut_off(id);
         });
     }
 

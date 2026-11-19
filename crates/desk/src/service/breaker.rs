@@ -1510,11 +1510,15 @@ impl Desk {
 
     /// The person lets `subject` go on (Continue).
     pub fn breaker_continue(&self, subject: &str, by: By) -> Result<BreakerView, DeskError> {
-        BreakerOf::parse(subject).ok_or(DeskError::NotFound)?;
+        let of = BreakerOf::parse(subject).ok_or(DeskError::NotFound)?;
         if self.held(subject).is_none() {
             return Err(DeskError::Conflict("it isn't paused".into()));
         }
         self.breaker_signal(subject, Signal::Continue, Some(&by));
+        // What a restart stopped, kept from it while it was held.
+        if let BreakerOf::Session(id) = of {
+            self.tell_kept_cut_off(id);
+        }
         self.breaker(subject).ok_or(DeskError::NotFound)
     }
 
