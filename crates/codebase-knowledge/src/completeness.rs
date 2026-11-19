@@ -148,6 +148,7 @@ mod tests {
             entities_processed: Some(100),
             summaries_total: Some(50),
             summaries_processed: Some(20),
+            noted_from: 0,
         }
     }
 

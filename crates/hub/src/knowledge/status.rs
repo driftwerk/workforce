@@ -311,6 +311,7 @@ mod tests {
             entities_processed: None,
             summaries_total: None,
             summaries_processed: None,
+            noted_from: 0,
         }
     }
 
