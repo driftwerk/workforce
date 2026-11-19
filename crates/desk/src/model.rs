@@ -232,6 +232,10 @@ pub struct SessionView {
     pub group: Option<GroupRef>,
     /// Work it started that still runs: while it is done, it waits on it.
     pub background: Option<crate::floor::Background>,
+    /// Run again after a restart that stopped work it had running, until
+    /// the turn that looks at what was stopped ends.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restarted: Option<Restarted>,
     /// While it is asking: what, and why Desk read it so.
     pub asked: Option<crate::asking::Asked>,
     /// How many prompts the person has given it while it ran here, so the
@@ -259,6 +263,13 @@ pub struct SessionView {
     /// boss runs it. Its badge says "Waiting on you" while it is set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waits_on_you: Option<String>,
+    /// The boss that has it now, by name: it runs it, has the wheel, and
+    /// nothing it waits on is the person's (`waits_on_you` none). While it
+    /// is set, nothing of it calls for the person's attention (badges,
+    /// counts, the Floor, notifications, "waiting on you"): the boss deals
+    /// with it, and what it gives the person comes as its own card.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boss_has: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -272,6 +283,26 @@ impl SessionView {
             (SessionState::Done, Some(b)) => b.count,
             _ => 0,
         }
+    }
+}
+
+/// A session restarted with work of its own running, which the restart
+/// stopped: when, and how much. It is told, and re-checks it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Restarted {
+    pub at: DateTime<Utc>,
+    /// How many background tasks and subagents were stopped.
+    pub stopped: u32,
+}
+
+impl Restarted {
+    /// "restarted 18:32, re-checking its work": what it is on, in `tz`.
+    pub fn words(&self, tz: &chrono_tz::Tz) -> String {
+        format!(
+            "restarted {}, re-checking its work",
+            self.at.with_timezone(tz).format("%H:%M")
+        )
     }
 }
 
@@ -340,12 +371,14 @@ impl SessionView {
             display_name: r.display_name.clone(),
             group: None,
             background: None,
+            restarted: None,
             asked: r.asked.clone().filter(|_| r.state == SessionState::Asking),
             prompts: 0,
             interrupted: false,
             reading: false,
             mode: None,
             waits_on_you: None,
+            boss_has: None,
             failure: None,
             created_at: r.created_at,
             updated_at: r.updated_at,

@@ -1436,7 +1436,12 @@ async fn an_account_at_its_limit_asks_to_switch_all_and_asks_back_once_it_resets
         // Switch all: the one stopped on its limit carries on, the idle one
         // restarts, both on Personal.
         let done = d
-            .switch_all(Engine::Claude, Some(work), Some(personal))
+            .switch_all(
+                Engine::Claude,
+                Some(work),
+                Some(personal),
+                crate::crew::By::you(),
+            )
             .await
             .unwrap();
         assert_eq!(done.now.len(), 2, "{done:?}");
@@ -1487,9 +1492,14 @@ async fn an_account_at_its_limit_asks_to_switch_all_and_asks_back_once_it_resets
             "{need:?}"
         );
         assert_eq!(d.view(a).unwrap().account.map(|x| x.id), Some(personal));
-        d.switch_all(Engine::Claude, Some(personal), Some(work))
-            .await
-            .unwrap();
+        d.switch_all(
+            Engine::Claude,
+            Some(personal),
+            Some(work),
+            crate::crew::By::you(),
+        )
+        .await
+        .unwrap();
         assert!(d.account_needs().is_empty());
     })
     .await;
@@ -2067,7 +2077,12 @@ async fn switch_all_and_auto_switch_never_pick_an_account_whose_sign_in_cant_be_
         keys.delete(personal).unwrap();
         // Switch all to it: refused before any session is stopped.
         let refused = d
-            .switch_all(Engine::Claude, Some(work), Some(personal))
+            .switch_all(
+                Engine::Claude,
+                Some(work),
+                Some(personal),
+                crate::crew::By::you(),
+            )
             .await
             .unwrap_err();
         assert!(refused.to_string().contains("no longer in"), "{refused}");
@@ -2858,9 +2873,14 @@ async fn a_reading_of_another_account_never_ends_one_being_full_and_a_move_off_i
         }
         // Moved off it, twice over: one move, one need.
         for _ in 0..2 {
-            d.switch_all(Engine::Claude, Some(work), Some(personal))
-                .await
-                .unwrap();
+            d.switch_all(
+                Engine::Claude,
+                Some(work),
+                Some(personal),
+                crate::crew::By::you(),
+            )
+            .await
+            .unwrap();
         }
         assert_eq!(d.0.state.lock().moved_off.len(), 1);
         until(|| d.view(a).ok().filter(|v| v.live).map(drop)).await;
@@ -2926,9 +2946,14 @@ async fn standing_and_moves_off_outlive_a_restart() {
         let (work, personal, a, _) = two_on_work(&d, dir.path()).await;
         stops_on_its_limit(&d, a);
         until(|| d.account_needs().into_iter().next()).await;
-        d.switch_all(Engine::Claude, Some(work), Some(personal))
-            .await
-            .unwrap();
+        d.switch_all(
+            Engine::Claude,
+            Some(work),
+            Some(personal),
+            crate::crew::By::you(),
+        )
+        .await
+        .unwrap();
         let kept = d.0.state.lock().standing[&Some(work)].clone();
         // Written once it changes.
         let mut written = false;
@@ -4734,6 +4759,147 @@ async fn a_refusal_told_before_a_restart_is_not_told_again() {
         let again = refused(&d);
         assert_eq!(again.len(), 1);
         assert_ne!(again, first);
+    })
+    .await;
+}
+
+/// 19 Nov, 18:32: an account reached its limit and Desk moved its
+/// sessions, restarting seven within twenty seconds, each recorded as the
+/// person's, which stopped their CI watchers and sub-agents; they then sat
+/// idle, still said to wait on them. A move waits for work still running;
+/// it is said to be by whoever asked; and a session restarted over work it
+/// had running is told what stopped, first, and never counts it again.
+#[tokio::test]
+async fn a_move_waits_for_running_work_and_a_restart_tells_what_it_stopped() {
+    use crate::background::{Background, Reported, TaskKind};
+    use crate::crew::{By, Kind, PartyKind};
+    use crate::model::DeskEvent;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = Arc::new(MemoryKeys::default());
+        let d = desk(pool, account_options(dir.path(), keys)).await;
+        let work = paste(&d, "Work", GOOD, true).await;
+        let personal = paste(&d, "Personal", OTHER, false).await;
+        let mut events = d.0.events.subscribe();
+        let s = d.create(session(dir.path(), None), None).await.unwrap();
+        started(dir.path(), s.id, 0).await;
+        let agent = |id: &str, label: &str| Reported {
+            id: id.into(),
+            kind: TaskKind::Agent,
+            label: Some(label.into()),
+        };
+        // Interrupted, two sub-agents it started still run.
+        let (a1, a2) = (
+            agent("a1", "Watch CI on #450"),
+            agent("a2", "Review the diff"),
+        );
+        d.change(s.id, |r, l| {
+            r.state = SessionState::Interrupted;
+            let l = l.expect("it runs");
+            l.background = Background::default().reported(Some(vec![a1, a2]), chrono::Utc::now());
+        });
+        assert_eq!(d.view(s.id).unwrap().background.map(|b| b.count), Some(2));
+
+        // Desk moves it off a full account: not while that runs.
+        let moved = By::desk("Work reached its plan's limit");
+        let v = d
+            .switch_account(s.id, Some(personal), Some(moved))
+            .await
+            .unwrap();
+        assert!(v.live, "not restarted over its work");
+        assert_eq!(v.account.as_ref().map(|a| a.id), Some(work));
+        assert_eq!(v.switching_to.as_ref().map(|a| a.id), Some(personal));
+        // Its work ends: it moves now, as Desk's doing.
+        d.change(s.id, |_, l| {
+            let l = l.expect("it runs");
+            let now = chrono::Utc::now();
+            l.background = std::mem::take(&mut l.background)
+                .ended("a1", now)
+                .ended("a2", now);
+        });
+        let (env, args) = started(dir.path(), s.id, 1).await;
+        assert_eq!(env["TOKEN_ON_FD"], OTHER);
+        assert!(
+            !args.contains("was restarted"),
+            "nothing ran to be stopped: {args}"
+        );
+
+        // The person restarts it over a sub-agent still running: it is told
+        // first, by name, and counts nothing it ran before.
+        for _ in 0..200 {
+            if d.view(s.id).unwrap().live {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let a3 = agent("a3", "Watch CI on #451");
+        d.change(s.id, |r, l| {
+            r.state = SessionState::Done;
+            let l = l.expect("it runs");
+            l.background = Background::default().reported(Some(vec![a3]), chrono::Utc::now());
+        });
+        d.restart(s.id, None, By::you()).await.unwrap();
+        let (_, args) = started(dir.path(), s.id, 2).await;
+        assert!(args.contains("This session was restarted at"), "{args}");
+        assert!(args.contains("the subagent “Watch CI on #451”"), "{args}");
+        let v = d.view(s.id).unwrap();
+        assert_eq!(v.background, None, "nothing it ran before");
+        assert_eq!(v.restarted.map(|r| r.stopped), Some(1));
+        // The note is not what it was last asked.
+        let last = d.record(s.id).unwrap().last_prompt;
+        d.prompted(
+            s.id,
+            "This session was restarted at 18:32. Background tasks and subagents started before \
+             then were stopped. Check what each was doing, and restart any you still need."
+                .into(),
+            false,
+        );
+        assert_eq!(d.record(s.id).unwrap().last_prompt, last);
+        // The resumed CLI still reports it at its turn's end, which a new
+        // sub-agent of its own keeps open: what was stopped is not counted,
+        // what runs now is, and the turn that looked at it is over.
+        d.change(s.id, |_, l| {
+            let l = l.expect("it runs");
+            l.background = std::mem::take(&mut l.background).started(
+                "a4",
+                TaskKind::Agent,
+                chrono::Utc::now(),
+            );
+        });
+        d.turn_ended(
+            s.id,
+            None,
+            Some("Restarted the CI watch.".into()),
+            Some(vec![
+                agent("a3", "Watch CI on #451"),
+                agent("a4", "Watch CI again"),
+            ]),
+            None,
+        )
+        .await;
+        let v = d.view(s.id).unwrap();
+        assert_eq!((v.waiting_on(), v.restarted), (1, None));
+
+        // Who did each: Desk's move, the person's restart, never the other.
+        let mut restarts = Vec::new();
+        while let Ok(e) = events.try_recv() {
+            if let DeskEvent::Activity { event } = e {
+                if event.kind == Kind::Restarted {
+                    restarts.push(event);
+                }
+            }
+        }
+        let by: Vec<PartyKind> = restarts.iter().map(|e| e.actor.kind).collect();
+        assert_eq!(by, vec![PartyKind::Desk, PartyKind::You], "{restarts:?}");
+        assert!(
+            restarts[1].text.contains("stopped 1 background task"),
+            "{}",
+            restarts[1].text
+        );
+        assert_eq!(
+            restarts[1].detail.as_ref().and_then(|d| d.get("stopped")),
+            Some(&serde_json::json!(1))
+        );
     })
     .await;
 }

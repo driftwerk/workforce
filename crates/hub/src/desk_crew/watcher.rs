@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
 use workforce_common::channels::DESK_CHANNEL;
-use workforce_common::oversight::{Level, Oversight, Scope};
+use workforce_common::oversight::{Level, Oversight, Scope, WorkStyle};
 use workforce_desk::crew::Crew as _;
 use workforce_desk::crew::{
     self, Event, ItemKind, ItemState, Kind, MentionedApproval, Party, PartyKind,
@@ -102,6 +102,25 @@ pub(super) struct Trigger {
     /// with its refused next step (`super::idle`): said over once the
     /// check-in given it ran.
     pub handed: Option<uuid::Uuid>,
+    /// Desk's own look, not something that happened: a reminder of what
+    /// still waits, the regular sweep, a check-in tried again. At Act fully
+    /// it never lifts a turn the person stopped.
+    pub routine: bool,
+}
+
+impl Trigger {
+    /// Only `line`: what happened, with nothing beside it.
+    pub(super) fn line(line: String) -> Self {
+        Self {
+            line,
+            approvals: Vec::new(),
+            hop: 0,
+            about: None,
+            group: None,
+            handed: None,
+            routine: false,
+        }
+    }
 }
 
 /// What an Act-level check-in is asked while the composer writes the
@@ -244,7 +263,20 @@ pub(crate) const STANDING_RULE: &str = "The person's instructions are the rule, 
 /// What a boss that starts sessions does with work the person asks it
 /// for in its DM: starts the session itself, at once, in the folder the
 /// work obviously belongs in, and answers a question itself.
-pub(super) const START_THE_WORK: &str = "Work the person asks for (a code change, a fix, an investigation in a repo, a ticket) goes to a real session: start it now with crew.start_session (crew.assign_ticket for a board ticket), never offer or suggest one and never do the work here, then say which session has it and in which folder. Pick the folder yourself: a session linked to the ticket or its PR's repo, else the folder of the person's latest session (crew.overview), else the only one; ask only when you can't tell. A question (\"what tickets do I have?\") you answer here with your tools.";
+pub(super) const START_THE_WORK: &str = "Your “How it works” setting is Only in sessions. Work the person asks for (a code change, a fix, an investigation in a repo, a ticket) goes to a real session: start it now with crew.start_session (crew.assign_ticket for a board ticket), never offer or suggest one and never do the work here, then say which session has it and in which folder. Pick the folder yourself: a session linked to the ticket or its PR's repo, else the folder of the person's latest session (crew.overview), else the only one; ask only when you can't tell. A question (\"what tickets do I have?\") you answer here with your tools.";
+
+/// [`START_THE_WORK`] for a boss that prefers sessions: code changes and
+/// long tasks start their session, and checks, lookups and ops it runs
+/// itself.
+pub(super) const START_THE_CODE_WORK: &str = "Your “How it works” setting is Prefer sessions. Code changes and long tasks the person asks for (a fix, a feature, a refactor, a ticket) go to a real session: start it now with crew.start_session (crew.assign_ticket for a board ticket), never offer or suggest one and never change code here, then say which session has it and in which folder. Pick the folder yourself: a session linked to the ticket or its PR's repo, else the folder of the person's latest session (crew.overview), else the only one; ask only when you can't tell. Checks, lookups and ops (ssh to one of their machines, gh, reading files and logs, a quick command) you run yourself with your own tools, at once, and answer from what they show; a destructive or irreversible step follows the person's directives. A question (\"what tickets do I have?\") you answer here with your tools.";
+
+/// What a boss that does the work itself is told of sessions.
+pub(super) const DO_IT_YOURSELF: &str = "Your “How it works” setting is Do it myself: do the work the person asks for yourself with your own tools, or start a real session for it (crew.start_session, crew.assign_ticket for a board ticket) when it is long or they'd want to watch it; a destructive or irreversible step follows the person's directives.";
+
+/// What a boss is told of its own work where starting sessions isn't its
+/// to do (at Suggest, or with “Hand out work” off), by its style.
+pub(super) const OWN_WORK_SESSIONS_ONLY: &str = "Your “How it works” setting is Only in sessions: commands, builds and code changes go to a session (crew.start_session, which may only suggest one), never here; you read, search and keep notes yourself.";
+pub(super) const OWN_WORK_PREFER: &str = "Your “How it works” setting is Prefer sessions: code changes, builds and long tasks go to a session (crew.start_session, which may only suggest one); checks, lookups and ops (ssh to one of their machines, gh, reading files and logs, a quick command) you run yourself.";
 
 /// What every DM turn of a boss is told before it speaks of a session.
 pub(super) const CHECK_FIRST: &str = "Before you say anything about a session, read its account with crew.account; never guess. Answer as Done / Now / Next / Waiting on, from the account, and say how fresh it is if it's over a few minutes old.";
@@ -387,8 +419,22 @@ impl CrewHub {
         overseer: &str,
         o: &Oversight,
     ) -> Option<Trigger> {
-        if matches!(event.actor.kind, PartyKind::Manager | PartyKind::You) || event.hop >= MAX_HOPS
-        {
+        // A restart that stopped work a session had running (its CI
+        // watchers, its sub-agents), whoever did it but this boss: the boss
+        // sees it re-checks that work.
+        let stopped = matches!(event.kind, Kind::Restarted | Kind::Resumed)
+            && event
+                .detail
+                .as_ref()
+                .and_then(|d| d.get("stopped"))
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|n| n > 0);
+        let quiet = match event.actor.kind {
+            PartyKind::Manager => !stopped || event.actor.id == overseer,
+            PartyKind::You => !stopped,
+            _ => false,
+        };
+        if quiet || event.hop >= MAX_HOPS {
             return None;
         }
         let subject = event.subject.as_ref()?;
@@ -428,6 +474,7 @@ impl CrewHub {
             return None;
         }
         let wanted = match event.kind {
+            _ if stopped => runs() || o.wake.on_failure || unbound,
             Kind::Finished | Kind::Question => o.wake.on_finish || unbound,
             Kind::Failed | Kind::Limit => o.wake.on_failure || unbound,
             // Unbound, what waits on an answer wakes it at once, unless it
@@ -468,13 +515,27 @@ impl CrewHub {
                 question_key(&subject.id, "asked", asked)
             })
         });
+        let line = match stopped {
+            true => format!(
+                "{} {}. Make sure it restarts what it still needs of that work, and that what \
+                 waited on it (CI, a review, an answer) still happens; it was told to check.",
+                match event.actor.kind {
+                    // Said to the boss, "You" would be it.
+                    PartyKind::You => "The person",
+                    _ => event.actor.name.as_str(),
+                },
+                event.text
+            ),
+            false => format!("{} {}", who(subject), event.text),
+        };
         wanted.then(|| Trigger {
-            line: format!("{} {}", who(subject), event.text),
+            line,
             approvals: Vec::new(),
             hop: event.hop,
             about,
             group: event.group.clone(),
             handed: None,
+            routine: false,
         })
     }
 
@@ -603,6 +664,7 @@ impl CrewHub {
                             about: Some(about),
                             group: item.group_id.clone(),
                             handed: None,
+                            routine: false,
                         },
                     )
                 }
@@ -636,6 +698,7 @@ impl CrewHub {
                             about: None,
                             group: item.group_id.clone(),
                             handed: None,
+                            routine: false,
                         },
                     )
                 }
@@ -707,7 +770,8 @@ impl CrewHub {
     pub(super) fn dm_hint(level: Level, o: &Oversight, unbound: bool) -> String {
         let says = match level {
             _ if unbound => {
-                return format!("You oversee the crew, unbound: do everything yourself with the crew.* tools. {START_THE_WORK} {STANDING_RULE} {PLAN_DRAFT} {CHECK_FIRST} {CHECK_GITHUB}");
+                let work = Self::style_line(o);
+                return format!("You oversee the crew, unbound: do everything yourself with the crew.* tools. {work} {STANDING_RULE} {PLAN_DRAFT} {CHECK_FIRST} {CHECK_GITHUB}");
             }
             Level::Watch => "at Watch: don't act; say what you would do.",
             Level::Suggest => "at Suggest: your crew.* actions become suggestions the person accepts.",
@@ -716,9 +780,11 @@ impl CrewHub {
         };
         // At Act and above, work the person asks for starts its session
         // here and now, wherever starting one is the boss's to do.
-        let says = match level.acts() && o.act.hand_out_work && o.work.prefer_sessions {
-            true => format!("{says} {START_THE_WORK}"),
-            false => says.to_string(),
+        // Below that, it still knows what of its own work it does here.
+        let says = match (level, level.acts() && o.act.hand_out_work) {
+            (_, true) => format!("{says} {}", Self::style_line(o)),
+            (Level::Watch, false) => says.to_string(),
+            (_, false) => format!("{says} {}", Self::own_work_line(o)),
         };
         let says = match level {
             Level::Full => format!("{says} {STANDING_RULE}"),
@@ -736,6 +802,26 @@ impl CrewHub {
             false => String::new(),
         };
         format!("You oversee the crew {says}{off} {CHECK_FIRST} {CHECK_GITHUB}")
+    }
+
+    /// What a boss that starts sessions does with the work the person asks
+    /// for, as its “How it works” setting says.
+    pub(super) fn style_line(o: &Oversight) -> &'static str {
+        match o.work.style {
+            WorkStyle::SessionsOnly => START_THE_WORK,
+            WorkStyle::PreferSessions => START_THE_CODE_WORK,
+            WorkStyle::Direct => DO_IT_YOURSELF,
+        }
+    }
+
+    /// What of its own work a boss does here, where it doesn't start the
+    /// sessions itself.
+    pub(super) fn own_work_line(o: &Oversight) -> &'static str {
+        match o.work.style {
+            WorkStyle::SessionsOnly => OWN_WORK_SESSIONS_ONLY,
+            WorkStyle::PreferSessions => OWN_WORK_PREFER,
+            WorkStyle::Direct => DO_IT_YOURSELF,
+        }
     }
 
     fn level_words(level: Level) -> &'static str {
@@ -760,6 +846,20 @@ impl CrewHub {
             tracing::info!("the overseer has no Desk conversation to check in on yet");
             return false;
         };
+        // At Act fully what it found is a notice in its own running
+        // conversation (`super::orchestrator`), acted on there at once.
+        if self.orchestrates(service.agent_id.as_str()) {
+            if let Some(crew) = self.me.upgrade() {
+                for t in triggers {
+                    crew.notify(
+                        service.agent_id.as_str(),
+                        &owner,
+                        super::orchestrator::Notice::of(t),
+                    );
+                }
+                return true;
+            }
+        }
         let lines: Vec<String> = triggers.iter().map(|t| format!("- {}", t.line)).collect();
         let (level, why) = self.level_now(service.agent_id.as_str(), &o);
         let hint = match self.unbound_given(service.agent_id.as_str(), &o) {
@@ -1050,7 +1150,7 @@ impl CrewHub {
 
     /// Tells the person, where they look, that the overseer holds its
     /// check-ins until `until`, and why.
-    fn paused(&self, service: &AgentService, until: DateTime<Utc>, daily: bool) {
+    pub(super) fn paused(&self, service: &AgentService, until: DateTime<Utc>, daily: bool) {
         let why = if daily { "daily" } else { "hourly" };
         let text = format!(
             "paused check-ins until {}: {why} limit reached",
@@ -1111,6 +1211,10 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     // A check-in whose turn didn't run comes back here, to be tried again
     // once: none is dropped without a word.
     let (retry, mut retried) = tokio::sync::mpsc::unbounded_channel::<(String, Vec<Trigger>)>();
+    // What a boss's notices hand back when it no longer runs on them (Act
+    // fully ended, or isn't in force yet): checked in on here, the old way.
+    let (_unused, none_back) = tokio::sync::mpsc::unbounded_channel();
+    let mut handed_back = crew.wake_back.1.lock().take().unwrap_or(none_back);
     // The ready tickets nobody has, so that one that becomes so wakes it.
     let mut ready_seen = HashMap::new();
     let mut ready_dirty = false;
@@ -1152,6 +1256,11 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                     }
                 }
             }
+            Some((id, back)) = handed_back.recv() => {
+                let w = waking.entry(id).or_default();
+                w.window.get_or_insert_with(Instant::now);
+                hold(&mut w.pending, back);
+            }
             Some((id, again)) = retried.recv() => {
                 tracing::warn!(agent = %id, held = again.len(), "the overseer's check-in didn't run; trying it again");
                 // Held again as it was: what it asks was raised already.
@@ -1178,12 +1287,18 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                     let at = crew.thresholds(&id, o, &mut noted).await;
                     let w = waking.entry(id.clone()).or_default();
                     w.noted = noted;
-                    found.extend(at.into_iter().map(|t| (id.clone(), t)));
+                    found.extend(at.into_iter().map(|mut t| {
+                        t.routine = true;
+                        (id.clone(), t)
+                    }));
                     // Unbound, it sweeps its scope every few minutes while
                     // there is anything in it, whatever else woke it.
                     let every = crew.timing.minute * UNBOUND_SWEEP_MINUTES;
                     let due = w.swept.is_none_or(|at| at.elapsed() >= every);
-                    if due && crew.unbound(o) && crew.has_work(&id, o).await {
+                    // Running on notices, it is swept only once they have
+                    // been quiet a while: the net under them.
+                    let noticed = crew.orchestrates(&id) && crew.noticed_lately(&id);
+                    if due && !noticed && crew.unbound(o) && crew.has_work(&id, o).await {
                         if let Some(w) = waking.get_mut(&id) {
                             w.swept = Some(Instant::now());
                         }
@@ -1194,6 +1309,7 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                             about: None,
                             group: None,
                             handed: None,
+                            routine: true,
                         }));
                     }
                 }
@@ -1309,6 +1425,7 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 .filter(|t| !t.line.starts_with(RETRIED))
                 .map(|t| Trigger {
                     line: format!("{RETRIED}{}", t.line),
+                    routine: true,
                     ..t.clone()
                 })
                 .collect();
@@ -1430,6 +1547,7 @@ mod budget_tests {
             about: Some(about.into()),
             group: None,
             handed: None,
+            routine: false,
         }
     }
 

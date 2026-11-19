@@ -21,6 +21,7 @@ pub mod board_sync_store;
 pub mod boss_ask;
 pub mod boss_ask_store;
 pub mod boss_shell;
+pub mod boss_watch;
 pub mod breaker;
 pub mod budget_store;
 pub mod charge;

@@ -8,7 +8,7 @@ pub struct Schema;
 /// Current schema version. Bump whenever a `V_N` step is added below
 /// and the corresponding `ALTER`/`CREATE` is appended to
 /// [`Schema::migrate`].
-const CURRENT_VERSION: i64 = 6;
+const CURRENT_VERSION: i64 = 7;
 
 impl Schema {
     /// Create or migrate the schema to the latest version. Idempotent.
@@ -54,6 +54,9 @@ impl Schema {
         }
         if version < 6 {
             apply_v6(conn).context("apply schema v6 (vector state kept per backend)")?;
+        }
+        if version < 7 {
+            apply_v7(conn).context("apply schema v7 (vector_note_mark, index_lease.noted_from)")?;
         }
         conn.execute(
             "INSERT OR IGNORE INTO graph_identity (only_one, id) VALUES (1, ?1)",
@@ -149,6 +152,36 @@ fn apply_v6(conn: &Connection) -> Result<()> {
     }
     Ok(())
 }
+
+/// The counter pending notes take their marks from, and the mark each
+/// lease was taken at: as Postgres's V008 has them. Guarded, as in
+/// [`apply_v2`].
+fn apply_v7(conn: &Connection) -> Result<()> {
+    conn.execute_batch(SCHEMA_V7)?;
+    let has_column: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('index_lease') WHERE name = 'noted_from'")?
+        .exists([])?;
+    if !has_column {
+        conn.execute_batch(
+            "ALTER TABLE index_lease ADD COLUMN noted_from INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    Ok(())
+}
+
+/// A pending note's `seq` is the mark it was made under: the counter's
+/// `last` as one call to note files took it, one above the call before's.
+/// Seeded at the highest `seq` noted already, so that every note made
+/// before is at or below every mark taken after.
+const SCHEMA_V7: &str = r#"
+CREATE TABLE IF NOT EXISTS vector_note_mark (
+    only_one INTEGER PRIMARY KEY CHECK (only_one = 1),
+    last     INTEGER NOT NULL
+);
+
+INSERT OR IGNORE INTO vector_note_mark (only_one, last)
+SELECT 1, COALESCE(max(seq), 0) FROM vector_pending;
+"#;
 
 /// Which code graph this is: as Postgres's V006 has it.
 const SCHEMA_V5: &str = r#"
@@ -492,6 +525,75 @@ mod tests {
             .query_row("SELECT count(*) FROM vector_pending", [], |r| r.get(0))
             .unwrap();
         assert_eq!(rows, 2);
+    }
+
+    /// A graph as v6 left it keeps every pending note and lease as they
+    /// were; its leases are as if taken at mark 0, and the counter of marks
+    /// starts at the highest note. Migrating again, as after an older
+    /// binary set the version back, changes nothing, a mark taken since
+    /// included.
+    #[test]
+    fn v7_starts_the_marks_above_every_note_and_keeps_notes_and_leases() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        apply_v2(&conn).unwrap();
+        apply_v3(&conn).unwrap();
+        conn.execute_batch(SCHEMA_V4).unwrap();
+        conn.execute_batch(SCHEMA_V5).unwrap();
+        apply_v6(&conn).unwrap();
+        conn.execute_batch(
+            "PRAGMA user_version = 6;
+             INSERT INTO repositories (id, name, root_path, created_at)
+             VALUES ('r', 'r', '/r', '2026-01-01');
+             INSERT INTO vector_pending (backend, repo_id, file_path, seq)
+             VALUES ('vellev', 'r', 'src/a.rs', 3), ('weaviate', 'r', 'src/b.rs', 7);
+             INSERT INTO index_lease (repo_id, worker_id, phase, acquired_at_ms, last_heartbeat_at_ms)
+             VALUES ('r', 'w', 'parsing', 10, 20);",
+        )
+        .unwrap();
+        let last = |conn: &Connection| -> i64 {
+            conn.query_row("SELECT last FROM vector_note_mark", [], |r| r.get(0))
+                .unwrap()
+        };
+        for expected_last in [7, 9] {
+            Schema::migrate(&conn).unwrap();
+            let pending: Vec<(String, String, i64)> = conn
+                .prepare("SELECT backend, file_path, seq FROM vector_pending ORDER BY file_path")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(
+                pending,
+                [
+                    ("vellev".into(), "src/a.rs".into(), 3),
+                    ("weaviate".into(), "src/b.rs".into(), 7)
+                ]
+            );
+            let lease: (String, String, i64, i64, i64) = conn
+                .query_row(
+                    "SELECT worker_id, phase, acquired_at_ms, last_heartbeat_at_ms, noted_from
+                     FROM index_lease WHERE repo_id = 'r'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .unwrap();
+            assert_eq!(lease, ("w".into(), "parsing".into(), 10, 20, 0));
+            assert_eq!(last(&conn), expected_last);
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, CURRENT_VERSION);
+            conn.execute_batch(
+                "UPDATE vector_note_mark SET last = 9;
+                 PRAGMA user_version = 6;",
+            )
+            .unwrap();
+        }
+        assert!(conn
+            .execute_batch("INSERT INTO vector_note_mark (only_one, last) VALUES (2, 0)")
+            .is_err());
     }
 
     /// The index fills page by is no part of the migration, which a hub

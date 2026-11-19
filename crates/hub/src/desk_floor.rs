@@ -552,9 +552,20 @@ fn needs_of(
     turns: &[Turn],
     now: DateTime<Utc>,
 ) -> eyre::Result<Vec<Need>> {
+    // What a session its boss has waits on goes to that boss first, never
+    // to the person: only what the boss gives them is theirs.
+    let desk = (sources.desk)();
+    let boss_has = |n: &Need| {
+        n.who.kind == workforce_desk::crew::PartyKind::Session
+            && (n.id.starts_with("wait:") || n.id.starts_with("question:"))
+            && desk
+                .as_ref()
+                .is_some_and(|d| n.who.id.parse::<Uuid>().is_ok_and(|s| d.boss_has_it(s)))
+    };
     Ok(floor::longest_waiting(
         floor::open_needs(turns)
             .into_iter()
+            .filter(|n| !boss_has(n))
             .chain(routed_needs(state, caller, now)?)
             .chain(config_needs(state, caller))
             .chain(breaker_needs(sources, caller))

@@ -6,13 +6,17 @@
 //! with the ball in its boss's court is looked at: its newest word to the
 //! boss is newer than anything the boss got to it, and it lays out a
 //! choice, asks, or says it holds; or the boss's newest word to it holds it
-//! for an answer. Within [`Wake::waiting_after_minutes`] the boss answers
-//! (its answer reaching the session ends it), or the person is given the
-//! choice as an open item: what waits, its options, the recommendation,
-//! that it is theirs to decide, answered from its buttons straight to the
-//! session. A boss's hold says it won't answer now: the person is given it
-//! at once. A question asked on the line (an ask) has its own way to the
-//! person, escalated or lapsed, and isn't looked at here.
+//! for an answer. The boss has a fair chance to answer first
+//! ([`FAIR_CHANCE_MINUTES`], or [`Wake::waiting_after_minutes`] if longer;
+//! only the latter where it can't act), and nothing is given the person
+//! while its turn is working: no pop-up the boss then settles. Past that the
+//! person is given the choice as an open item: what waits, its options, the
+//! recommendation, that it is theirs to decide, answered from its buttons
+//! straight to the session. A boss's hold that says it is the person's
+//! ("until the person decides") is given them at once. What waits on the
+//! person's word the boss already holds goes to the session instead
+//! ([`super::held`]). A question asked on the line (an ask) has its own way
+//! to the person, escalated or lapsed, and isn't looked at here.
 //!
 //! - **Reminded until answered**, on `waiting_remind_minutes` (10, 30, then
 //!   hourly by default), each saying how long it has waited; never in the
@@ -73,6 +77,32 @@ const GOES_ON: [&str; 7] = [
     "deployed",
 ];
 
+/// How long a boss that can act has to answer what a session waits on
+/// before the person is given it, at the least, in minutes: a fair chance,
+/// so nothing pops up for the person only to be settled by the boss
+/// moments later.
+pub(crate) const FAIR_CHANCE_MINUTES: u32 = 10;
+
+/// Words a boss's hold says what waits is the person's with.
+const PERSONS: [&str; 10] = [
+    "the person",
+    "person's",
+    "the owner",
+    "owner's",
+    "until they",
+    "their call",
+    "their decision",
+    "they decide",
+    "they answer",
+    "is yours",
+];
+
+/// Whether a boss's hold says what it holds for is the person's.
+fn persons_hold(text: &str) -> bool {
+    let lower = text.to_lowercase().replace('\u{2019}', "'");
+    PERSONS.iter().any(|p| says(&lower, p))
+}
+
 /// Whether `key` is a waiting item's.
 pub(crate) fn is_waiting(key: &str) -> bool {
     key.starts_with(KEY)
@@ -82,6 +112,25 @@ pub(crate) fn is_waiting(key: &str) -> bool {
 /// session's word, or the boss's hold).
 fn key(s: Uuid, m: Uuid) -> String {
     format!("{KEY}{s}:{m}")
+}
+
+/// The key of session `s`'s stall given to the person ([`CrewHub::give_stall_to_person`]):
+/// one a session, its words kept current.
+pub(crate) fn stall_key(s: Uuid) -> String {
+    format!("{KEY}{s}:stall")
+}
+
+/// What became of a stall given to the person.
+pub(super) enum Stall {
+    /// Their item for it, open.
+    Item(Box<OpenItem>),
+    /// They answered it then, after the session last said where it is.
+    Settled(DateTime<Utc>),
+    /// They dropped it or set it aside then, after the session last said
+    /// where it is: not asked again until it says more.
+    SetAside(DateTime<Utc>),
+    /// It couldn't be read or kept.
+    Failed,
 }
 
 /// The session a waiting key is about.
@@ -204,15 +253,15 @@ fn waited(since: DateTime<Utc>, now: DateTime<Utc>) -> String {
 }
 
 /// What waits on the boss, of one session: since when, and the message.
-struct Waiting {
+pub(super) struct Waiting {
     since: DateTime<Utc>,
     message: Uuid,
     /// The session's own words, when it said them (not only the boss's
     /// hold).
     said: Option<LineMessage>,
-    /// Its boss's newest word to it holds it for an answer: the boss has
-    /// said it won't answer now, so the person is told at once.
-    held: bool,
+    /// Its boss's newest word to it holds it for an answer, and that hold says what it waits on is the person's: they are told at
+    /// once.
+    persons: bool,
 }
 
 /// Whether `m` is the boss's word to `s`, as the session got it.
@@ -234,10 +283,11 @@ fn reached(m: &LineMessage) -> DateTime<Utc> {
 }
 
 /// Of `thread` (oldest first), what of session `s` waits on `boss`.
-fn waiting_in(thread: &[LineMessage], boss: &str, s: Uuid) -> Option<Waiting> {
+pub(super) fn waiting_in(thread: &[LineMessage], boss: &str, s: Uuid) -> Option<Waiting> {
     let ours = thread.iter().rfind(|m| bosss_word(m, boss, s));
     let theirs = thread.iter().rfind(|m| to_boss(m, boss, s));
     let held = ours.is_some_and(|o| workforce_desk::line::holds(&o.text));
+    let persons = held && ours.is_some_and(|o| persons_hold(&o.text));
     match (theirs, ours) {
         // Its word is the newest: the ball is in the boss's court when it
         // waits on an answer.
@@ -256,7 +306,7 @@ fn waiting_in(thread: &[LineMessage], boss: &str, s: Uuid) -> Option<Waiting> {
                 since: began.map_or(t.at, reached),
                 message: began.map_or(t.id, |o| o.id),
                 said: Some(t.clone()),
-                held,
+                persons,
             })
         }
         // The boss's hold is the newest, and the session stopped on it.
@@ -264,7 +314,7 @@ fn waiting_in(thread: &[LineMessage], boss: &str, s: Uuid) -> Option<Waiting> {
             since: reached(o),
             message: o.id,
             said: theirs.filter(|t| t.at < reached(o)).cloned(),
-            held,
+            persons,
         }),
         _ => None,
     }
@@ -308,14 +358,17 @@ impl CrewHub {
             .unwrap_or_else(|| "Desk".into())
     }
 
-    /// The bound before what waits on a boss is the person's.
-    fn waiting_bound(&self, o: &Oversight) -> chrono::Duration {
-        chrono::Duration::from_std(
-            self.timing
-                .minute
-                .mul_f64(f64::from(o.wake.waiting_after_minutes)),
-        )
-        .unwrap_or_default()
+    /// The bound before what waits on boss `boss` is the person's: its
+    /// own (`waiting_after_minutes`) where it can't act on it, else at
+    /// least a fair chance ([`FAIR_CHANCE_MINUTES`]) to.
+    fn waiting_bound(&self, boss: &str, o: &Oversight) -> chrono::Duration {
+        let acts = self.level_now(boss, o).0.acts() && o.act.nudge;
+        let minutes = match acts {
+            true => o.wake.waiting_after_minutes.max(FAIR_CHANCE_MINUTES),
+            false => o.wake.waiting_after_minutes,
+        };
+        chrono::Duration::from_std(self.timing.minute.mul_f64(f64::from(minutes)))
+            .unwrap_or_default()
     }
 
     /// Whether `view` stands stopped on its boss: live, its turn over,
@@ -354,7 +407,12 @@ impl CrewHub {
             let Some(w) = waiting_in(&thread, &boss, view.id) else {
                 continue;
             };
-            if !w.held && now - w.since < self.waiting_bound(&o) {
+            // Its boss's hold that says it is the person's goes to them at
+            // once; anything else waits while the boss's turn is working,
+            // and for the boss's fair chance to answer it.
+            if !w.persons
+                && (!self.mind_free(&boss) || now - w.since < self.waiting_bound(&boss, &o))
+            {
                 continue;
             }
             // The person took part in it since: theirs, not a silent wait.
@@ -401,12 +459,14 @@ impl CrewHub {
             }
         };
         let theirs = open.iter().any(|i| {
-            !is_waiting(&i.dedupe_key)
-                && (line.is_some() && i.line_message == line
-                    || matches!(i.kind, OpenKind::Ask | OpenKind::Confirm)
-                        && i.said()
-                        && i.opened_at >= w.since
-                        && i.session == Some(view.id))
+            // This wait given to them already as its stall: one card a wait.
+            i.dedupe_key == stall_key(view.id) && i.opened_at >= w.since
+                || !is_waiting(&i.dedupe_key)
+                    && (line.is_some() && i.line_message == line
+                        || matches!(i.kind, OpenKind::Ask | OpenKind::Confirm)
+                            && i.said()
+                            && i.opened_at >= w.since
+                            && i.session == Some(view.id))
         });
         if theirs {
             return;
@@ -417,6 +477,13 @@ impl CrewHub {
             .as_ref()
             .map(|m| workforce_desk::line::without_marks(&m.text))
             .unwrap_or_default();
+        // What it says is missing is the person's word the boss already
+        // holds: given to it now, never asked of the person again. A hold
+        // of the boss's that says it is the person's is theirs, and words
+        // given before this wait began didn't settle it: theirs too.
+        if !w.persons && self.held_given(boss, view, &open, &words, w.since).await {
+            return;
+        }
         let question = crew::question_in(&words)
             .or_else(|| {
                 words
@@ -472,6 +539,116 @@ impl CrewHub {
         tracing::info!(session = %view.id, item = %opened.id, "a session waited on its boss past the bound: given to the person");
         self.post_item(boss, &opened, super::items::needs_you(&opened), Vec::new())
             .await;
+    }
+
+    /// Whether session `view`, saying since `since` that `words` are
+    /// missing, waits on the person's word that `boss` holds (`open`, its
+    /// open items), and it was sent to it now, or reached it after `since`.
+    async fn held_given(
+        &self,
+        boss: &str,
+        view: &SessionView,
+        open: &[OpenItem],
+        words: &str,
+        since: DateTime<Utc>,
+    ) -> bool {
+        use super::held::Held;
+        if !workforce_desk::update_write::says_missing(words) {
+            return false;
+        }
+        let work = self.work_of(view, None, &[], None).await;
+        let held = super::held::held_for(open, view.id, &work);
+        let mut given = false;
+        for i in held {
+            match self.deliver_held(boss, view.id, i, since).await {
+                Held::Sent | Held::Going | Held::Resumed => given = true,
+                Held::Given(at) => given |= at > since,
+                Held::Suggested(why) | Held::Refused(why) | Held::Parked(why) => {
+                    tracing::info!(session = %view.id, item = %i.id, %why, "the person's word a boss holds couldn't go to the session waiting on it")
+                }
+            }
+        }
+        given
+    }
+
+    /// Gives the person what only they can settle of session `view`'s
+    /// stall: `question`, as the waiting item a silent wait is, answered from
+    /// its card straight to the session and reminded until it is; `words`
+    /// the session's own, behind "more". One a session: the one open is
+    /// kept current and handed back; settled when the person answered one
+    /// after the session last said where it is (`since`): nothing new to
+    /// ask.
+    pub(super) async fn give_stall_to_person(
+        &self,
+        boss: &str,
+        view: &SessionView,
+        question: &str,
+        words: &str,
+        since: DateTime<Utc>,
+    ) -> Stall {
+        let store = self.desk.store();
+        let question = crew::one_line(question, 300);
+        let key = stall_key(view.id);
+        let open = match store.items_not_closed(Some(boss)).await {
+            Ok(open) => open,
+            Err(e) => {
+                tracing::info!(error = %e, "a boss's open items couldn't be read for a stall");
+                return Stall::Failed;
+            }
+        };
+        let was = open.into_iter().find(|i| i.dedupe_key == key);
+        if was.is_none() {
+            match store.item_last_by_person(boss, &key).await {
+                // Answered, or settled in the session: theirs is done.
+                Ok(Some((at, why)))
+                    if at >= since && workforce_desk::open_item::settled_why(&why) =>
+                {
+                    return Stall::Settled(at)
+                }
+                // Dropped or set aside: not asked again until it says more.
+                Ok(Some((at, _))) if at >= since => return Stall::SetAside(at),
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::info!(error = %e, "whether a stall was settled couldn't be read");
+                    return Stall::Failed;
+                }
+            }
+        }
+        let name = view.label().to_string();
+        let mut text = question.clone();
+        if !words.trim().is_empty() {
+            text.push_str("\n\n");
+            text.push_str(&crew::clip(words.trim(), KEPT_CHARS));
+        }
+        // Said as it was: kept current, not said again.
+        if let Some(i) = was.as_ref().filter(|i| i.text == text) {
+            return Stall::Item(Box::new(i.clone()));
+        }
+        let mut new = NewItem::ask(boss, OpenKind::Ask, Some(view.id), &text);
+        new.dedupe_key = key;
+        // Its words kept current: the open one's text replaced, not said
+        // again (only a new one is posted).
+        new.said = true;
+        new.options = options_in(words);
+        new.recommendation = recommendation_in(words);
+        new.layout.question = Some(question);
+        new.layout.recommended = new.recommendation.clone();
+        new.holding_up = Some(format!("{name} changes nothing until it is answered"));
+        new.cant_decide = Some(format!(
+            "Only you can settle what {name} waits on, so it's yours to decide"
+        ));
+        let opened = match store.item_open(&new).await {
+            Ok(Opened::New(i)) if was.is_none() => i,
+            Ok(Opened::New(i) | Opened::Again(i)) => return Stall::Item(Box::new(i)),
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "keeping a session's stall for the person failed");
+                return Stall::Failed;
+            }
+        };
+        tracing::info!(session = %view.id, item = %opened.id, "a stall only the person can settle: given to them");
+        self.post_item(boss, &opened, super::items::needs_you(&opened), Vec::new())
+            .await;
+        Stall::Item(Box::new(opened))
     }
 
     /// The person's `answer` to waiting item `i`: to its session, in reply
@@ -545,6 +722,40 @@ impl CrewHub {
                     at(t)
                 ),
             ));
+        }
+        // A stall given to them is settled by their answer, or by its
+        // session no longer saying it waits: never by its going on as it
+        // was, or the boss's other words.
+        if i.dedupe_key == stall_key(s) {
+            use workforce_desk::update_write as write;
+            let accounts = self.desk.session_accounts_of(&[s]).await.ok()?;
+            let a = accounts.into_iter().next()?;
+            let waits = a
+                .waiting_on
+                .as_deref()
+                .is_some_and(|w| !w.trim().is_empty());
+            // Only what it said since the card opened shows it went on: a
+            // line that waits on no one, and nothing it says waits.
+            let newer: Vec<&workforce_desk::account::Done> =
+                a.done.iter().filter(|d| d.at > i.opened_at).collect();
+            // What it says now: its newest line since, by when it was said.
+            let still = newer.iter().max_by_key(|d| d.at).is_some_and(|d| {
+                write::says_stall(&d.text)
+                    || write::says_missing(&d.text)
+                    || write::asks_for_word(&d.text)
+            });
+            let on_boss = self
+                .desk
+                .line_thread(s, None, Some(30))
+                .await
+                .ok()
+                .is_some_and(|t| waiting_in(&t, &i.boss, s).is_some());
+            return (!newer.is_empty() && !waits && !still && !on_boss).then(|| {
+                (
+                    ClosedBy::Session,
+                    format!("{name} went on; I've closed the question."),
+                )
+            });
         }
         let thread = self.desk.line_thread(s, None, Some(LOOK_BACK)).await.ok()?;
         if let Some(m) = thread.iter().rfind(|m| {
