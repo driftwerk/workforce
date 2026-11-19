@@ -1159,20 +1159,27 @@ impl CrewHub {
         // What background work used of the person's plans, when a notable
         // share: said in words, worth knowing.
         // Since the last roundup, at most a day, said once: what the person
-        // paid for, and what this boss and its crew ran on the hub's own
-        // logins (an install pool, an agent's own), never another person's.
-        // Each read is narrowed in the store, by payer or by agent.
+        // paid for, and, on the hub they hold, what this boss and its crew
+        // ran on its own logins (an install pool, an agent's own). Never
+        // another person's: on a shared hub those logins carry other
+        // people's jobs too, so only the person's own are read. Each read is
+        // narrowed in the store, by payer or by agent.
         let notable = service.config.budget.plan.notable_daily_percent;
         let store = Arc::clone(&service.telemetry_store);
         let from = since.max(now - Duration::hours(24));
         let seen = self.desk.seen_by(&o.scope);
-        let mut crew: Vec<String> = vec![boss.to_string()];
-        crew.extend(
-            self.services()
-                .iter()
-                .map(|s| s.agent_id.as_str().to_string())
-                .filter(|id| id != boss && self.agent_in(id, &seen)),
-        );
+        let holds =
+            crate::desk_floor::holds_the_hub(self.state.identity_store.as_ref(), true, Some(owner));
+        let mut crew: Vec<String> = Vec::new();
+        if holds {
+            crew.push(boss.to_string());
+            crew.extend(
+                self.services()
+                    .iter()
+                    .map(|s| s.agent_id.as_str().to_string())
+                    .filter(|id| id != boss && self.agent_in(id, &seen)),
+            );
+        }
         let person = owner.to_string();
         let rows: Vec<_> = tokio::task::spawn_blocking(move || {
             let mut rows = store
@@ -1687,16 +1694,16 @@ impl CrewHub {
     }
 }
 
-/// The roundup's line on background work's use of the person's plans
-/// (`when`: "since 09:00"), when it used at least `notable` points of a
-/// plan's longest window: how much in all, and the most of it, by name.
-/// `None` under that.
 /// Whether `payer` is a person (a user id), not one of the hub's own
 /// logins (an install pool, an agent's or a team's).
 fn is_person(payer: &str) -> bool {
     payer.parse::<Uuid>().is_ok()
 }
 
+/// The roundup's line on background work's use of the person's plans
+/// (`when`: "since 09:00"), when it used at least `notable` points of a
+/// plan's longest window: how much in all, and the most of it, by name.
+/// `None` under that.
 fn background_plan_use(
     rows: Vec<workforce_common::work_use::WorkUseRow>,
     notable: f64,
