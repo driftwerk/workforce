@@ -468,18 +468,30 @@ jobs:
             sleep 1
           done
           if [ "${ready:-}" != 1 ]; then docker logs vellev | tail -n 100; exit 1; fi
-          # Embed once so the model download isn't charged to a test's timeout.
+          # Embed once so the model download isn't charged to a test's timeout,
+          # into a collection that does not store what it embeds: the node
+          # raises its format to 2 in the background, after it is ready, and
+          # until then refuses such a collection naming VELLEV_MAX_FORMAT.
           call() { curl -sS -H "authorization: Bearer $VELLEV_TEST_KEY" -H 'content-type: application/json' "$@"; }
           probe="$VELLEV_TEST_URL/v1/tenants/ci-probe"
           call -f -X PUT "$probe"
-          call -f -X PUT "$probe/collections/Probe" -d '{"name":"Probe","properties":[{"name":"text","data_type":"text"}],"embedding":{"provider":"local","model":"BAAI/bge-base-en-v1.5","dimensions":768,"properties":["text"]}}'
           for _ in $(seq 1 90); do
-            code=$(call -o /dev/null -w '%{http_code}' -X PUT "$probe/collections/Probe/objects/00000000-0000-0000-0000-000000000001" -d '{"properties":{"text":"warm up"}}')
-            [ "$code" = 200 ] && embeds=1 && break
+            if [ "${created:-}" != 1 ]; then
+              answer=$(call -w '\n%{http_code}' -X PUT "$probe/collections/Probe" -d '{"name":"Probe","properties":[{"name":"text","data_type":"text","stored":false,"filterable":false}],"embedding":{"provider":"local","model":"BAAI/bge-base-en-v1.5","dimensions":768,"properties":["text"]}}')
+              case "${answer##*$'\n'}" in
+                2??) created=1 ;;
+                400) grep -q VELLEV_MAX_FORMAT <<<"$answer" || break ;;
+                *) break ;;
+              esac
+            fi
+            if [ "${created:-}" = 1 ]; then
+              code=$(call -o /dev/null -w '%{http_code}' -X PUT "$probe/collections/Probe/objects/00000000-0000-0000-0000-000000000001" -d '{"properties":{"text":"warm up"}}')
+              [ "$code" = 200 ] && embeds=1 && break
+            fi
             sleep 10
           done
           call -X DELETE "$probe" || true
-          if [ "${embeds:-}" != 1 ]; then docker logs vellev | tail -n 100; exit 1; fi
+          if [ "${embeds:-}" != 1 ]; then echo "${answer:-}"; docker logs vellev | tail -n 100; exit 1; fi
       # A Weaviate, for the memory shadow's end-to-end test, which moves
       # memories from one. Its release binary, pinned by sha256 (see
       # WEAVIATE_SHA256). The collection memories are moved from names the

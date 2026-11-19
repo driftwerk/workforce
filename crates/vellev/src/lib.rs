@@ -135,7 +135,10 @@ pub fn is_conflict(error: &vellev_client::Error) -> bool {
 }
 
 /// A real node for tests: `VELLEV_TEST_URL` and `VELLEV_TEST_KEY` name it,
-/// and `VELLEV_TEST_LOCAL_EMBED=1` says it runs the local model.
+/// and `VELLEV_TEST_LOCAL_EMBED=1` says it runs the local model. It must be
+/// a throwaway node run with `VELLEV_MAX_FORMAT=2`, as CI runs one, never
+/// one holding data you keep: the code tests make collections only format 2
+/// holds, and a node's format, once raised, is never lowered.
 #[cfg(feature = "testing")]
 pub mod testing {
     use super::*;
