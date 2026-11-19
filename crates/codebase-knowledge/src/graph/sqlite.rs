@@ -873,7 +873,7 @@ impl CodeGraphBackend for SqliteCodeGraphBackend {
         let result = conn.query_row(
             "SELECT repo_id, last_commit, last_full_index_at, last_incremental_at,
                     total_entities, total_relationships, indexing_in_progress
-             FROM index_state WHERE repo_id = ?1",
+             FROM index_state WHERE repo_id = ?1 AND last_full_index_at IS NOT NULL",
             rusqlite::params![repo_id],
             |row| {
                 Ok(IndexState {
@@ -1040,7 +1040,12 @@ impl CodeGraphBackend for SqliteCodeGraphBackend {
         Ok(count as u64)
     }
 
-    async fn delete_repo_data(&self, repo_id: &str, keep: &[&str]) -> Result<usize> {
+    async fn delete_repo_data(
+        &self,
+        repo_id: &str,
+        keep: &[&str],
+        keep_complete_in: bool,
+    ) -> Result<usize> {
         let conn = self.conn.lock().await;
         let tx = conn.unchecked_transaction()?;
 
@@ -1067,7 +1072,14 @@ impl CodeGraphBackend for SqliteCodeGraphBackend {
         )?;
 
         tx.execute(
-            "DELETE FROM index_state WHERE repo_id = ?1",
+            if keep_complete_in {
+                "UPDATE index_state
+                 SET last_commit = NULL, last_full_index_at = NULL, last_incremental_at = NULL,
+                     total_entities = 0, total_relationships = 0, indexing_in_progress = 0
+                 WHERE repo_id = ?1"
+            } else {
+                "DELETE FROM index_state WHERE repo_id = ?1"
+            },
             rusqlite::params![repo_id],
         )?;
         let kept = serde_json::to_string(keep)?;

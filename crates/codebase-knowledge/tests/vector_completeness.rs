@@ -994,6 +994,12 @@ async fn an_index_run_on_another_store_notes_its_files_for_the_standby() {
         expected.sort();
         expected.dedup();
         assert_eq!(repo.pending().await, expected);
+        assert!(repo.complete().await, "but for the files noted");
+        assert_eq!(repo.filler().settle_pending(REPO).await.unwrap(), 0);
+        assert!(
+            repo.agrees().await,
+            "what it held of the files gone is gone"
+        );
     }
 }
 
@@ -1024,6 +1030,44 @@ async fn a_full_index_forgets_completeness_nothing_kept() {
             repo.graph.vectors_complete_in(REPO).await.unwrap(),
             None,
             "{active}"
+        );
+    }
+}
+
+/// A full index that fails once the repo is purged leaves what the
+/// standby's vectors were complete in for the next one to carry; with no
+/// standby, nothing is left.
+#[tokio::test]
+async fn a_full_index_that_fails_leaves_the_standbys_completeness() {
+    for standby in [Some("vellev"), None] {
+        let repo = Repo::filled().await;
+        let complete_in = repo.graph.vectors_complete_in(REPO).await.unwrap();
+        assert!(complete_in.is_some());
+        let expected = complete_in.filter(|_| standby.is_some());
+        let graph = keyed(&repo, "weaviate", standby);
+        let pipeline = |config| {
+            IndexingPipeline::with_vector_store(config, Arc::clone(&graph), Arc::new(Untracked))
+        };
+        let mut gone = repo.config();
+        gone.crawler.root = repo.dir.path().join("gone");
+        assert!(pipeline(gone)
+            .run_full_index(RunOptions::default())
+            .await
+            .is_err());
+        assert!(repo.graph.get_index_state(REPO).await.unwrap().is_none());
+        assert_eq!(
+            repo.graph.vectors_complete_in(REPO).await.unwrap(),
+            expected,
+            "{standby:?}"
+        );
+        pipeline(repo.config())
+            .run_full_index(RunOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.graph.vectors_complete_in(REPO).await.unwrap(),
+            expected,
+            "{standby:?}"
         );
     }
 }

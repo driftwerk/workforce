@@ -16,7 +16,7 @@ use tracing::{info, warn};
 
 use crate::graph::entities::{CodeEntity, EntityId, EntityKind};
 use crate::graph::relationships::Relationship;
-use crate::graph::{CodeGraph, VectorKeys};
+use crate::graph::CodeGraph;
 use crate::lease::{IndexPhase, LeaseContext, LeaseProgress};
 use crate::vector::{CodeVectorStore, VectorCodeEntity, VectorCodeSummary};
 use crawler::{CrawledFile, CrawlerConfig, FileCrawler};
@@ -274,7 +274,10 @@ pub struct IndexingPipeline {
 }
 
 enum Carried {
-    Active(String),
+    Active {
+        whole_in: String,
+        store: Arc<dyn CodeVectorStore>,
+    },
     Standby(String),
 }
 
@@ -502,28 +505,29 @@ impl IndexingPipeline {
         // here makes it the repo as it is. With vellev the standby, what its
         // vectors were complete in is kept, and its fill: it was told of
         // every file the repo had and has, and holds the rest as it did.
-        match (carried, self.tracked_store()) {
-            (Some(Carried::Active(whole_in)), Some(vs)) => {
-                let filler = fill::VectorFiller::new(self.graph.clone(), vs.clone());
-                match vs.identity(true).await {
-                    Ok(held) if held == whole_in => {
-                        self.graph
-                            .set_vectors_complete_in(&self.config.repo_id, Some(&whole_in))
-                            .await?;
-                        filler.begin(&self.config.repo_id, true).await?;
-                    }
-                    _ => warn!(
+        let restored = match carried {
+            Some(Carried::Active { whole_in, store }) => match store.identity(true).await {
+                Ok(held) if held == whole_in => Some((whole_in, Some(store))),
+                _ => {
+                    warn!(
                         repo_id = %self.config.repo_id,
                         "the collection the repo's vectors were complete in could not be found again; they are filled from the graph before they are searched"
-                    ),
+                    );
+                    None
                 }
-            }
-            (Some(Carried::Standby(whole_in)), _) => {
-                self.graph
-                    .set_vectors_complete_in(&self.config.repo_id, Some(&whole_in))
+            },
+            Some(Carried::Standby(whole_in)) => Some((whole_in, None)),
+            None => None,
+        };
+        if let Some((whole_in, store)) = restored {
+            self.graph
+                .set_vectors_complete_in(&self.config.repo_id, Some(&whole_in))
+                .await?;
+            if let Some(store) = store {
+                fill::VectorFiller::new(self.graph.clone(), store)
+                    .begin(&self.config.repo_id, true)
                     .await?;
             }
-            _ => {}
         }
 
         if let Err(e) = self.graph.checkpoint().await {
@@ -977,20 +981,21 @@ impl IndexingPipeline {
     }
 
     async fn completeness_to_carry(&self) -> Result<Option<Carried>> {
-        let recorded = || self.graph.vectors_complete_in(&self.config.repo_id);
-        Ok(
-            match (self.tracked_store(), self.graph.vector_keys().standby()) {
-                (Some(vs), _) => {
-                    let held = vs.identity(false).await.ok();
-                    recorded()
-                        .await?
-                        .filter(|recorded| Some(recorded) == held.as_ref())
-                        .map(Carried::Active)
-                }
-                (None, Some(VectorKeys::VELLEV)) => recorded().await?.map(Carried::Standby),
-                _ => None,
-            },
-        )
+        let recorded = self.graph.vectors_complete_in(&self.config.repo_id).await?;
+        Ok(match self.tracked_store() {
+            Some(store) => {
+                let held = store.identity(false).await.ok();
+                recorded
+                    .filter(|recorded| Some(recorded) == held.as_ref())
+                    .map(|whole_in| Carried::Active {
+                        whole_in,
+                        store: Arc::clone(store),
+                    })
+            }
+            None => recorded
+                .filter(|_| self.graph.vector_keys().standby_tracks_completeness())
+                .map(Carried::Standby),
+        })
     }
 
     /// Whether this run's store is the one the repo's vectors are kept
