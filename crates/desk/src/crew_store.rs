@@ -674,7 +674,9 @@ impl DeskStore {
         Ok(row.try_get("n")?)
     }
 
-    /// When each of `agent_id`'s wake-ups since `since` was, earliest first.
+    /// When each of `agent_id`'s wake-ups since `since` was, earliest first:
+    /// its check-ins on what happened, and at Act fully its notices turns
+    /// (one ceiling for both, the stop against a runaway loop).
     pub async fn wakes_since(
         &self,
         agent_id: &str,
@@ -683,7 +685,7 @@ impl DeskStore {
         let client = self.pool().get().await?;
         let rows = client
             .query(
-                "SELECT at FROM check_ins WHERE kind = 'wake' AND agent_id = $1 AND at >= $2 \
+                "SELECT at FROM check_ins WHERE kind IN ('wake', 'notices') AND agent_id = $1 AND at >= $2 \
                  ORDER BY at",
                 &[&agent_id, &since],
             )
@@ -920,6 +922,18 @@ mod tests {
                 .unwrap()
                 .is_empty());
             assert_eq!(store.wakes_since("desk", hour_ago).await.unwrap(), [c.at]);
+            // A notices turn at Act fully counts against the same ceiling.
+            let n = CheckIn {
+                id: crate::crew::new_id(),
+                at: crate::crew::now(),
+                kind: "notices".into(),
+                ..c.clone()
+            };
+            store.put_check_in(&n).await.unwrap();
+            assert_eq!(
+                store.wakes_since("desk", hour_ago).await.unwrap(),
+                [c.at, n.at]
+            );
         })
         .await;
     }

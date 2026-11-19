@@ -27,7 +27,7 @@ use super::CrewHub;
 
 /// Every `crew.*` tool: the ones it has at every level first (its reads,
 /// and what it asks of the person, which is never gated).
-pub const READ: [&str; 22] = [
+pub const READ: [&str; 24] = [
     "crew.overview",
     "crew.activity",
     "crew.account",
@@ -50,6 +50,8 @@ pub const READ: [&str; 22] = [
     super::github::BRANCH,
     super::github::CI,
     super::assignments::LIST,
+    super::watches::WATCH,
+    super::watches::WATCHES,
 ];
 pub const ACT: [&str; 29] = [
     "crew.nudge",
@@ -467,6 +469,9 @@ impl CrewTool {
                     input,
                 )
                 .await
+            }
+            super::watches::WATCH | super::watches::WATCHES => {
+                crew.watch_tool(self.name, b, input).await
             }
             _ => Err("not a reading tool".into()),
         }
@@ -955,6 +960,8 @@ pub(crate) fn describe(name: &str) -> &'static str {
             super::own_settings::NAME => super::own_settings::DESCRIPTION,
             super::assignments::CLOSE => super::assignments::CLOSE_DESCRIPTION,
             super::assignments::LIST => super::assignments::LIST_DESCRIPTION,
+            super::watches::WATCH => super::watches::WATCH_DESCRIPTION,
+            super::watches::WATCHES => super::watches::WATCHES_DESCRIPTION,
             "crew.activity" => "What happened on the crew, newest first: turns started and finished, questions, requests, failures, and what you and the person did. Filter to one agent or session with subject_id.",
             "crew.account" => "What one session (session_id) is for, who asked, its plan, what it has done (with its PRs, tickets, commits and deploys), what it is doing now, what it waits on, what comes next and the choices it made: its running account, brought up to date first when it is stale, with the time it is as of. Read it before you say anything of a session. With question, also the answer its own recent conversation gives to something the account doesn't say (which key, which file, what error).",
             "crew.ask_session" => "Ask a session (session_id) a question about its work, as Desk's status question on its line, without derailing it: one that is working gets it once its turn ends, never typed in over what it is doing. Use it only when crew.account, with a question, can't answer; then answer the person now from what you have and say you asked. It asks for words only and never changes what the session does: to have it wait, hold or change course, tell it so with crew.nudge.",
@@ -1000,6 +1007,7 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
             super::github::schema(name)
         }
         super::decisions::NAME => super::decisions::schema(),
+        super::watches::WATCH | super::watches::WATCHES => super::watches::schema(name),
         super::items::ASK
         | super::items::CLOSE
         | super::items::OPEN

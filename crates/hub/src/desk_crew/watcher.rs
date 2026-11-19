@@ -102,6 +102,25 @@ pub(super) struct Trigger {
     /// with its refused next step (`super::idle`): said over once the
     /// check-in given it ran.
     pub handed: Option<uuid::Uuid>,
+    /// Desk's own look, not something that happened: a reminder of what
+    /// still waits, the regular sweep, a check-in tried again. At Act fully
+    /// it never lifts a turn the person stopped.
+    pub routine: bool,
+}
+
+impl Trigger {
+    /// Only `line`: what happened, with nothing beside it.
+    pub(super) fn line(line: String) -> Self {
+        Self {
+            line,
+            approvals: Vec::new(),
+            hop: 0,
+            about: None,
+            group: None,
+            handed: None,
+            routine: false,
+        }
+    }
 }
 
 /// What an Act-level check-in is asked while the composer writes the
@@ -475,6 +494,7 @@ impl CrewHub {
             about,
             group: event.group.clone(),
             handed: None,
+            routine: false,
         })
     }
 
@@ -603,6 +623,7 @@ impl CrewHub {
                             about: Some(about),
                             group: item.group_id.clone(),
                             handed: None,
+                            routine: false,
                         },
                     )
                 }
@@ -636,6 +657,7 @@ impl CrewHub {
                             about: None,
                             group: item.group_id.clone(),
                             handed: None,
+                            routine: false,
                         },
                     )
                 }
@@ -760,6 +782,20 @@ impl CrewHub {
             tracing::info!("the overseer has no Desk conversation to check in on yet");
             return false;
         };
+        // At Act fully what it found is a notice in its own running
+        // conversation (`super::orchestrator`), acted on there at once.
+        if self.orchestrates(service.agent_id.as_str()) {
+            if let Some(crew) = self.me.upgrade() {
+                for t in triggers {
+                    crew.notify(
+                        service.agent_id.as_str(),
+                        &owner,
+                        super::orchestrator::Notice::of(t),
+                    );
+                }
+                return true;
+            }
+        }
         let lines: Vec<String> = triggers.iter().map(|t| format!("- {}", t.line)).collect();
         let (level, why) = self.level_now(service.agent_id.as_str(), &o);
         let hint = match self.unbound_given(service.agent_id.as_str(), &o) {
@@ -1050,7 +1086,7 @@ impl CrewHub {
 
     /// Tells the person, where they look, that the overseer holds its
     /// check-ins until `until`, and why.
-    fn paused(&self, service: &AgentService, until: DateTime<Utc>, daily: bool) {
+    pub(super) fn paused(&self, service: &AgentService, until: DateTime<Utc>, daily: bool) {
         let why = if daily { "daily" } else { "hourly" };
         let text = format!(
             "paused check-ins until {}: {why} limit reached",
@@ -1111,6 +1147,10 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     // A check-in whose turn didn't run comes back here, to be tried again
     // once: none is dropped without a word.
     let (retry, mut retried) = tokio::sync::mpsc::unbounded_channel::<(String, Vec<Trigger>)>();
+    // What a boss's notices hand back when it no longer runs on them (Act
+    // fully ended, or isn't in force yet): checked in on here, the old way.
+    let (_unused, none_back) = tokio::sync::mpsc::unbounded_channel();
+    let mut handed_back = crew.wake_back.1.lock().take().unwrap_or(none_back);
     // The ready tickets nobody has, so that one that becomes so wakes it.
     let mut ready_seen = HashMap::new();
     let mut ready_dirty = false;
@@ -1152,6 +1192,11 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                     }
                 }
             }
+            Some((id, back)) = handed_back.recv() => {
+                let w = waking.entry(id).or_default();
+                w.window.get_or_insert_with(Instant::now);
+                hold(&mut w.pending, back);
+            }
             Some((id, again)) = retried.recv() => {
                 tracing::warn!(agent = %id, held = again.len(), "the overseer's check-in didn't run; trying it again");
                 // Held again as it was: what it asks was raised already.
@@ -1178,12 +1223,18 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                     let at = crew.thresholds(&id, o, &mut noted).await;
                     let w = waking.entry(id.clone()).or_default();
                     w.noted = noted;
-                    found.extend(at.into_iter().map(|t| (id.clone(), t)));
+                    found.extend(at.into_iter().map(|mut t| {
+                        t.routine = true;
+                        (id.clone(), t)
+                    }));
                     // Unbound, it sweeps its scope every few minutes while
                     // there is anything in it, whatever else woke it.
                     let every = crew.timing.minute * UNBOUND_SWEEP_MINUTES;
                     let due = w.swept.is_none_or(|at| at.elapsed() >= every);
-                    if due && crew.unbound(o) && crew.has_work(&id, o).await {
+                    // Running on notices, it is swept only once they have
+                    // been quiet a while: the net under them.
+                    let noticed = crew.orchestrates(&id) && crew.noticed_lately(&id);
+                    if due && !noticed && crew.unbound(o) && crew.has_work(&id, o).await {
                         if let Some(w) = waking.get_mut(&id) {
                             w.swept = Some(Instant::now());
                         }
@@ -1194,6 +1245,7 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                             about: None,
                             group: None,
                             handed: None,
+                            routine: true,
                         }));
                     }
                 }
@@ -1309,6 +1361,7 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 .filter(|t| !t.line.starts_with(RETRIED))
                 .map(|t| Trigger {
                     line: format!("{RETRIED}{}", t.line),
+                    routine: true,
                     ..t.clone()
                 })
                 .collect();
@@ -1430,6 +1483,7 @@ mod budget_tests {
             about: Some(about.into()),
             group: None,
             handed: None,
+            routine: false,
         }
     }
 
