@@ -10411,7 +10411,8 @@ pub struct ExecutorConfig {
     /// ended, so a quick reply finds it warm; past it the worker releases
     /// the scope and keeps only its home (files and the CLI's resume state)
     /// for `scope_ttl_secs`, so the next message reseats and resumes. A
-    /// scope with a turn in flight is never released. Default: five minutes.
+    /// scope with a turn in flight is never released. At least a minute is
+    /// kept, so a quick reply never starts cold. Default: five minutes.
     #[serde(default = "default_agent_turn_idle_secs")]
     pub agent_turn_idle_secs: u64,
 }
