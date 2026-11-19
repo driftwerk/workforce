@@ -266,7 +266,7 @@ mod tests {
         );
         assert_eq!(
             windows(None).len(),
-            2,
+            3,
             "no approvals store, nothing to prune"
         );
     }
@@ -293,7 +293,7 @@ mod tests {
                         .collect::<Vec<_>>()
                 };
                 assert_eq!(
-                    windows(Some(Arc::clone(&shadow)))[2..],
+                    windows(Some(Arc::clone(&shadow)))[3..],
                     [
                         ("shadow comparisons", 14),
                         ("shadow verdicts", 180),
@@ -302,7 +302,7 @@ mod tests {
                         ("shadow known items", 180)
                     ]
                 );
-                assert_eq!(windows(None).len(), 2, "nothing shadowed, nothing to prune");
+                assert_eq!(windows(None).len(), 3, "nothing shadowed, nothing to prune");
 
                 let conn = pool.get().await.unwrap();
                 let old = Utc::now() - chrono::Duration::days(20);

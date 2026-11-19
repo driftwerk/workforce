@@ -2730,8 +2730,10 @@ impl TelemetryStore for PostgresTelemetryStore {
         to: DateTime<Utc>,
         payer: Option<&str>,
         work: Option<&str>,
+        agent: Option<&str>,
     ) -> Result<Vec<crate::work_use::WorkUseRow>> {
         let (payer, work) = (payer.map(str::to_string), work.map(str::to_string));
+        let agent = agent.map(str::to_string);
         self.block_on(async move {
             let conn = self.pool.get().await?;
             let rows = conn
@@ -2741,8 +2743,9 @@ impl TelemetryStore for PostgresTelemetryStore {
                      WHERE at >= $1 AND at <= $2
                        AND ($3::text IS NULL OR payer = $3)
                        AND ($4::text IS NULL OR work = $4)
+                       AND ($5::text IS NULL OR agent_id = $5)
                      ORDER BY at",
-                    &[&from, &to, &payer, &work],
+                    &[&from, &to, &payer, &work, &agent],
                 )
                 .await?;
             Ok(rows

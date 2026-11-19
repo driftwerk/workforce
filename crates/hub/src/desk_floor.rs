@@ -1245,7 +1245,7 @@ async fn work_usage(State(r): S, headers: HeaderMap, Query(q): Query<TokenQuery>
     let now = Utc::now();
     let payer = (!caller.personal).then(|| caller.id.clone());
     let read = tokio::task::spawn_blocking(move || {
-        store.work_use_rows(now - Duration::days(7), now, payer.as_deref(), None)
+        store.work_use_rows(now - Duration::days(7), now, payer.as_deref(), None, None)
     })
     .await;
     match read {

@@ -345,13 +345,15 @@ pub trait TelemetryStore: Send + Sync + 'static {
     /// Keep one row of what background work used ([`crate::work_use`]).
     fn record_work_use(&self, row: &crate::work_use::WorkUseRow) -> Result<()>;
     /// What background work used from `from` to `to`: of `payer`'s plans
-    /// alone when one is named, of `work` alone when it is named.
+    /// alone when one is named, of `work` alone, and of `agent`'s alone,
+    /// when named.
     fn work_use_rows(
         &self,
         from: DateTime<Utc>,
         to: DateTime<Utc>,
         payer: Option<&str>,
         work: Option<&str>,
+        agent: Option<&str>,
     ) -> Result<Vec<crate::work_use::WorkUseRow>>;
     /// What background work used from `from` to `to`, summed in the store
     /// by work and plan window: of `work` alone, of `agent`'s alone, of
@@ -1299,8 +1301,9 @@ impl TelemetryStore for SqliteStore {
         to: DateTime<Utc>,
         payer: Option<&str>,
         work: Option<&str>,
+        agent: Option<&str>,
     ) -> Result<Vec<crate::work_use::WorkUseRow>> {
-        SqliteStore::work_use_rows(self, from, to, payer, work)
+        SqliteStore::work_use_rows(self, from, to, payer, work, agent)
     }
     fn work_use_sums(
         &self,

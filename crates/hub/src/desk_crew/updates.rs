@@ -1159,24 +1159,38 @@ impl CrewHub {
         // What background work used of the person's plans, when a notable
         // share: said in words, worth knowing.
         // Since the last roundup, at most a day, said once: what the person
-        // paid for, and what this boss's agent ran on the hub's own logins
-        // (an install pool, the agent's own), never another person's.
+        // paid for, and what this boss and its crew ran on the hub's own
+        // logins (an install pool, an agent's own), never another person's.
+        // Each read is narrowed in the store, by payer or by agent.
         let notable = service.config.budget.plan.notable_daily_percent;
         let store = Arc::clone(&service.telemetry_store);
         let from = since.max(now - Duration::hours(24));
-        let rows: Vec<_> =
-            tokio::task::spawn_blocking(move || store.work_use_rows(from, now, None, None))
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|r| match r.payer.as_deref() {
-                    Some(p) if p == owner => true,
-                    Some(p) if p.parse::<Uuid>().is_ok() => false,
-                    _ => r.agent_id == boss,
-                })
-                .collect();
+        let seen = self.desk.seen_by(&o.scope);
+        let mut crew: Vec<String> = vec![boss.to_string()];
+        crew.extend(
+            self.services()
+                .iter()
+                .map(|s| s.agent_id.as_str().to_string())
+                .filter(|id| id != boss && self.agent_in(id, &seen)),
+        );
+        let person = owner.to_string();
+        let rows: Vec<_> = tokio::task::spawn_blocking(move || {
+            let mut rows = store
+                .work_use_rows(from, now, Some(&person), None, None)
+                .unwrap_or_default();
+            for agent in &crew {
+                rows.extend(
+                    store
+                        .work_use_rows(from, now, None, None, Some(agent))
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|r| !r.payer.as_deref().is_some_and(is_person)),
+                );
+            }
+            rows
+        })
+        .await
+        .unwrap_or_default();
         let at = from.with_timezone(&self.desk.timezone()).format("%H:%M");
         if let Some(headline) = background_plan_use(rows, notable, &format!("since {at}")) {
             lines.push((
@@ -1191,6 +1205,7 @@ impl CrewHub {
                     did: vec![],
                     at: None,
                     decisions: None,
+                    moves: None,
                 },
             ));
         }
@@ -1676,6 +1691,12 @@ impl CrewHub {
 /// (`when`: "since 09:00"), when it used at least `notable` points of a
 /// plan's longest window: how much in all, and the most of it, by name.
 /// `None` under that.
+/// Whether `payer` is a person (a user id), not one of the hub's own
+/// logins (an install pool, an agent's or a team's).
+fn is_person(payer: &str) -> bool {
+    payer.parse::<Uuid>().is_ok()
+}
+
 fn background_plan_use(
     rows: Vec<workforce_common::work_use::WorkUseRow>,
     notable: f64,

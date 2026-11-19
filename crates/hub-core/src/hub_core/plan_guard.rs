@@ -956,7 +956,13 @@ mod tests {
         }));
         guard.served(&l, "p1");
         let rows = store
-            .work_use_rows(at("2026-01-01T00:00:00Z"), Utc::now(), None, Some(&job.key))
+            .work_use_rows(
+                at("2026-01-01T00:00:00Z"),
+                Utc::now(),
+                None,
+                Some(&job.key),
+                None,
+            )
             .unwrap();
         let used = work_use::fold(rows);
         assert_eq!(used[0].longest_share().unwrap().share, 2.5);

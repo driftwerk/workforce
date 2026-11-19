@@ -1139,6 +1139,7 @@ impl SqliteStore {
         to: DateTime<Utc>,
         payer: Option<&str>,
         work: Option<&str>,
+        agent: Option<&str>,
     ) -> Result<Vec<crate::work_use::WorkUseRow>> {
         let conn = self
             .conn
@@ -1148,11 +1149,12 @@ impl SqliteStore {
             "SELECT at, work, label, agent_id, payer, plan, window_minutes, share, turns, tokens
              FROM work_use
              WHERE at >= ?1 AND at <= ?2 AND (?3 IS NULL OR payer = ?3) AND (?4 IS NULL OR work = ?4)
+               AND (?5 IS NULL OR agent_id = ?5)
              ORDER BY at",
         )?;
         let rows = stmt
             .query_map(
-                params![from.to_rfc3339(), to.to_rfc3339(), payer, work],
+                params![from.to_rfc3339(), to.to_rfc3339(), payer, work, agent],
                 |row| {
                     let at: String = row.get(0)?;
                     Ok(crate::work_use::WorkUseRow {
