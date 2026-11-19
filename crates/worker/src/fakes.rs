@@ -38,9 +38,15 @@ pub struct FakeZfs {
     free: AtomicI64,
     clock: AtomicI64,
     root: PathBuf,
+    fail_destroy: AtomicBool,
 }
 
 impl FakeZfs {
+    /// Fail the next dataset destroy, as a busy dataset does.
+    pub fn fail_next_destroy(&self) {
+        self.fail_destroy.store(true, Ordering::SeqCst);
+    }
+
     /// A pool whose datasets mount under `root`, so what a test writes to a
     /// host path is really written.
     pub fn rooted(root: PathBuf) -> Self {
@@ -49,6 +55,7 @@ impl FakeZfs {
             free: AtomicI64::new(100 << 30),
             clock: AtomicI64::new(1_700_000_000),
             root,
+            fail_destroy: AtomicBool::new(false),
         };
         for dataset in [
             "tank",
@@ -240,6 +247,9 @@ impl Zfs for FakeZfs {
     }
 
     async fn destroy(&self, dataset: &Dataset) -> Result<()> {
+        if self.fail_destroy.swap(false, Ordering::SeqCst) {
+            bail!("cannot destroy '{dataset}': dataset is busy");
+        }
         let mut state = self.state.lock();
         let prefix = format!("{}/", dataset.0);
         if !state
@@ -400,6 +410,10 @@ impl FakeContainers {
 
     pub fn mark_unready(&self, name: &str) {
         self.state.lock().unready.insert(name.to_string());
+    }
+
+    pub fn mark_ready(&self, name: &str) {
+        self.state.lock().unready.remove(name);
     }
 
     pub fn add_stray(&self, name: &str, label: &str, value: &str) {
@@ -611,8 +625,34 @@ impl Repos for FakeRepos {
     }
 }
 
+/// A host whose load a test sets: plenty of memory and idle CPUs unless
+/// told otherwise.
+pub struct FakeLoad(Mutex<Option<crate::admission::Reading>>);
+
+impl FakeLoad {
+    pub fn new() -> Self {
+        Self(Mutex::new(Some(crate::admission::Reading {
+            memory_total_bytes: 64 << 30,
+            memory_available_bytes: 60 << 30,
+            cpu_pressure: Some(0.0),
+        })))
+    }
+
+    /// `None` makes the host unreadable.
+    pub fn set(&self, reading: Option<crate::admission::Reading>) {
+        *self.0.lock() = reading;
+    }
+}
+
+impl crate::admission::HostLoad for FakeLoad {
+    fn read(&self) -> Result<crate::admission::Reading> {
+        (*self.0.lock()).ok_or_else(|| eyre::eyre!("no /proc here"))
+    }
+}
+
 pub struct Harness {
     pub worker: Arc<Worker>,
+    pub load: Arc<FakeLoad>,
     config: Arc<WorkerConfig>,
     pub zfs: Arc<FakeZfs>,
     pub containers: Arc<FakeContainers>,
@@ -641,9 +681,11 @@ impl Harness {
         let containers = Arc::new(FakeContainers::new());
         let cloud = Arc::new(FakeCloud::new());
         let repos = Arc::new(FakeRepos::new());
-        let worker = worker_over(&config, &zfs, &containers, &cloud, &repos).await;
+        let load = Arc::new(FakeLoad::new());
+        let worker = worker_over(&config, &zfs, &containers, &cloud, &repos, &load).await;
         Self {
             worker,
+            load,
             config,
             zfs,
             containers,
@@ -661,6 +703,7 @@ impl Harness {
             &self.containers,
             &self.cloud,
             &self.repos,
+            &self.load,
         )
         .await
     }
@@ -672,6 +715,7 @@ async fn worker_over(
     containers: &Arc<FakeContainers>,
     cloud: &Arc<FakeCloud>,
     repos: &Arc<FakeRepos>,
+    load: &Arc<FakeLoad>,
 ) -> Arc<Worker> {
     let worker = Worker::new(
         Arc::clone(config),
@@ -681,6 +725,7 @@ async fn worker_over(
         Arc::clone(repos) as Arc<dyn Repos>,
     )
     .await
-    .unwrap();
+    .unwrap()
+    .with_load(Arc::clone(load) as Arc<dyn crate::admission::HostLoad>);
     Arc::new(worker)
 }

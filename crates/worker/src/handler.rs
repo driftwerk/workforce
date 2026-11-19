@@ -30,6 +30,7 @@ impl JobHandler for WorkerHandler {
             Request::Health => Ok(ServerFrame::Healthy(self.worker.health().await?)),
             Request::Run(run) => self.worker.run(run, Arc::new(link)).await,
             Request::Forget { job } => self.worker.forget(&job),
+            Request::Leave { scope } => Ok(self.worker.leave_queue(&scope)),
             Request::Interactive(_) => Ok(ServerFrame::Refused {
                 reason: RefusalReason::ProtocolMismatch,
             }),

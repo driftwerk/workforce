@@ -20,8 +20,8 @@ use super::{Desk, DeskError};
 use crate::crew::{self, By, Event, Kind, Party, PartyKind};
 use crate::engine::{Deliver, Steer};
 use crate::line::{
-    self, Asked, Call, Delivery, LineKind, LineMessage, LineRun, Reach, Refusal, Send, Steering,
-    Target, Wait, When,
+    self, Asked, Call, Delivery, LineAction, LineKind, LineMessage, LineRun, Reach, Refusal, Send,
+    Steering, Target, Wait, When,
 };
 use crate::line_store::NotAnswered;
 use crate::model::{DeskEvent, Origin, SessionState, SessionView};
@@ -95,6 +95,17 @@ pub enum Sender {
     Person,
     /// The overseer, through its crew tools.
     Overseer(By),
+}
+
+impl Sender {
+    /// Who replies, as [`line::reply_target`] judges a reply.
+    fn replier(&self) -> line::Replier<'_> {
+        match self {
+            Self::Session(id) => line::Replier::Session(*id),
+            Self::Person => line::Replier::Person,
+            Self::Overseer(b) => line::Replier::Overseer(&b.party.id),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -621,6 +632,18 @@ impl Desk {
         send: Send,
         urgency: Option<line::Urgency>,
     ) -> Result<(LineMessage, Option<line::Rushed>), LineError> {
+        self.line_send_threaded(from, send, urgency, None).await
+    }
+
+    /// [`Self::line_send_with`], as a reply to the line message
+    /// `in_reply_to` when one is given: it says what it replies to.
+    async fn line_send_threaded(
+        &self,
+        from: Sender,
+        send: Send,
+        urgency: Option<line::Urgency>,
+        in_reply_to: Option<Uuid>,
+    ) -> Result<(LineMessage, Option<line::Rushed>), LineError> {
         if urgency.is_some() && !matches!(from, Sender::Overseer(_)) {
             return Err(Refusal::NotYours.into());
         }
@@ -736,6 +759,7 @@ impl Desk {
             }
         };
         let mut m = LineMessage::new(party, recipient, kind, text, hop);
+        m.in_reply_to = in_reply_to;
         // The person's and the overseer's to a session are its group's.
         m.group = group.or_else(|| self.line_group(&m));
         if let Send::Ask { chose, parts, .. } = &hop_send {
@@ -810,7 +834,7 @@ impl Desk {
                     LineKind::Ask => crate::picture::What::SessionAsked,
                     _ => crate::picture::What::SessionReported,
                 };
-                self.picture_session_said(*id, what, &m.text);
+                self.picture_session_said(*id, what, &m.text, m.id);
             }
             Sender::Person => {
                 if let Some(v) = &recipient {
@@ -911,7 +935,65 @@ impl Desk {
 
     /// Answers the question `ask` as `by`: the first answer stands. The
     /// person may answer any question asked on Desk.
+    ///
+    /// A reply is never refused into the void: one to a line message that
+    /// is no question waiting on `by` (a plain message, or a question
+    /// answered, set aside or gone ahead since) goes to whoever wrote it,
+    /// as a message saying what it replies to ([`Self::line_reply_told`]).
+    /// The person's own answers keep their question's rules.
     pub async fn line_answer(
+        &self,
+        ask: Uuid,
+        by: Sender,
+        text: String,
+    ) -> Result<LineMessage, LineError> {
+        match self.line_answer_ask(ask, by.clone(), text.clone()).await {
+            Err(LineError::Refused(r)) if line::replies_as_message(&r, by.replier()) => {
+                self.line_reply_told(ask, by, text, r).await
+            }
+            answered => answered,
+        }
+    }
+
+    /// `by`'s reply to the line message `to`, that answered no question
+    /// waiting on it (`refused`, said again when it can't go either): a
+    /// message to the one who wrote `to`, in reply to it, under the line's
+    /// rules for any other message between them.
+    async fn line_reply_told(
+        &self,
+        to: Uuid,
+        by: Sender,
+        text: String,
+        refused: Refusal,
+    ) -> Result<LineMessage, LineError> {
+        // A question keeps its rules: only a plain message is replied to so.
+        let Some(original) = self
+            .0
+            .store
+            .line_message(to)
+            .await?
+            .filter(|m| m.kind != LineKind::Ask)
+        else {
+            return Err(refused.into());
+        };
+        let Some(target) = line::reply_target(&original, by.replier()) else {
+            return Err(refused.into());
+        };
+        tracing::info!(message = %to, kind = original.kind.as_str(), "a reply to what no longer waits on its sender goes as a message in reply to it");
+        let send = Send::Tell {
+            to: target,
+            text,
+            when: When::Queue,
+        };
+        // Boxed: a send of a reply comes back here.
+        Ok(
+            Box::pin(self.line_send_threaded(by, send, None, Some(original.id)))
+                .await?
+                .0,
+        )
+    }
+
+    async fn line_answer_ask(
         &self,
         ask: Uuid,
         by: Sender,
@@ -1512,6 +1594,13 @@ impl Desk {
                     {
                         break
                     }
+                    // Its turn ended: what Desk kept through it is handed
+                    // now, not at the plugin's next look.
+                    Ok(Ok(DeskEvent::Session { session }))
+                        if session.id == caller && !line::in_turn(session.state) =>
+                    {
+                        break
+                    }
                     Ok(Err(broadcast::error::RecvError::Lagged(_))) => break,
                     Ok(Ok(_)) => {}
                 }
@@ -1545,14 +1634,37 @@ impl Desk {
         (view.state == SessionState::Asking).then_some(Wait::Asking)
     }
 
+    /// Desk's plugin in `id`, waiting on its line, looks again now: a turn
+    /// Desk kept its messages through ended without a state of its own to
+    /// say so (Esc).
+    pub(super) fn line_wake(&self, id: Uuid) {
+        let desk = self.clone();
+        tokio::spawn(async move {
+            if let Ok(inbox) = desk.0.store.line_inbox(&id.to_string()).await {
+                if let Some(m) = inbox.iter().find(|m| m.delivery == Delivery::Queued) {
+                    desk.line_announce(m);
+                }
+            }
+        });
+    }
+
+    /// Whether `view` is inside a turn Desk keeps its line's messages
+    /// through, Desk's plugin handed none until it ends: running, working
+    /// or on a dialog, and not a turn Esc ended (which Desk may still read
+    /// as working, no Stop following it).
+    pub(super) fn in_a_turn(&self, view: &SessionView) -> bool {
+        view.live && line::in_turn(view.state) && !self.esc_ended(view.id)
+    }
+
     /// Who a message is typed in for: the person's own, as theirs.
-    fn typed_by(m: &LineMessage) -> Option<By> {
+    pub(super) fn typed_by(m: &LineMessage) -> Option<By> {
         (m.from.kind == PartyKind::You).then(By::you)
     }
 
     async fn line_next_now(&self, caller: Uuid) -> Result<Option<Value>, LineError> {
         let view = self.view(caller)?;
-        if !view.live {
+        // Inside a turn Desk keeps what waits (see [`line::deliverable`]).
+        if !view.live || self.in_a_turn(&view) {
             return Ok(None);
         }
         let inbox = self.0.store.line_inbox(&caller.to_string()).await?;
@@ -1581,6 +1693,38 @@ impl Desk {
         Ok(None)
     }
 
+    /// Hand-offs Desk's plugin never said went in, handed before `before`
+    /// ([`HANDED_FOR`] ago), back in the queue (the plugin died between
+    /// taking and submitting one). Not one to a session still in a turn:
+    /// Claude Code holds it behind that turn and submits it as the turn
+    /// ends, so handed again it would go in twice.
+    pub(super) async fn line_requeue_stale(&self, before: DateTime<Utc>) {
+        let stale = match self.0.store.line_handed_before(before).await {
+            Ok(stale) => stale,
+            Err(e) => {
+                tracing::warn!(error = %e, "couldn't read stale line hand-offs");
+                return;
+            }
+        };
+        for m in stale {
+            let held = m
+                .to_session()
+                .and_then(|s| self.view(s).ok())
+                .is_some_and(|v| self.in_a_turn(&v));
+            if held {
+                continue;
+            }
+            // Still handed from then: one dropped and handed again since
+            // is the new hand-off's.
+            match self.0.store.line_requeue(Some(m.id), Some(before)).await {
+                Ok(back) => self.line_requeued(back).await,
+                Err(e) => {
+                    tracing::warn!(id = %m.id, error = %e, "couldn't requeue a stale line hand-off")
+                }
+            }
+        }
+    }
+
     /// Desk's plugin says what became of a message it was handed: in the
     /// session (`ok`), or dropped (the person interrupted), to go again.
     pub async fn line_ack(&self, caller: Uuid, id: Uuid, ok: bool) -> Result<(), LineError> {
@@ -1596,7 +1740,7 @@ impl Desk {
                 self.line_delivered_into(caller, &m);
             }
         } else {
-            let back = self.0.store.line_requeue(Some(m.id), Utc::now()).await?;
+            let back = self.0.store.line_requeue(Some(m.id), None).await?;
             self.line_requeued(back).await;
         }
         Ok(())
@@ -1771,10 +1915,7 @@ impl Desk {
             tokio::select! {
                 _ = self.0.cancel.cancelled() => return,
                 _ = tick.tick() => {
-                    match self.0.store.line_requeue(None, Utc::now() - HANDED_FOR).await {
-                        Ok(back) => self.line_requeued(back).await,
-                        Err(e) => tracing::warn!(error = %e, "couldn't requeue stale line hand-offs"),
-                    }
+                    self.line_requeue_stale(Utc::now() - HANDED_FOR).await;
                     self.line_pump_pending().await;
                     self.line_sweep_waits().await;
                 }
@@ -1902,15 +2043,18 @@ impl Desk {
         for m in rows.iter_mut().filter(|m| m.to_session() == Some(id)) {
             m.waiting = match m.delivery {
                 Delivery::Held => Some(Wait::Stopped),
+                Delivery::Queued if self.steered(id, m.id) => Some(Wait::NextCall),
                 Delivery::Queued => match line::deliverable(&view, typed, plugin) {
-                    Err(why) => Some(why),
-                    Ok(_) if self.line_gate(&view, m).is_some() => self.line_gate(&view, m),
-                    Ok(Deliver::Submit)
-                        if matches!(view.state, SessionState::Working | SessionState::Blocked) =>
+                    // A turn Esc ended: the plugin takes it now.
+                    Err(Wait::Working)
+                        if plugin
+                            && view.caps.line == Deliver::Submit
+                            && !self.in_a_turn(&view) =>
                     {
-                        Some(Wait::Working)
+                        self.line_gate(&view, m)
                     }
-                    Ok(_) => None,
+                    Err(why) => Some(why),
+                    Ok(_) => self.line_gate(&view, m),
                 },
                 Delivery::Handed
                 | Delivery::Delivered
@@ -1918,8 +2062,69 @@ impl Desk {
                 | Delivery::Withdrawn
                 | Delivery::Noted => None,
             };
+            m.actions = self.line_actions(&view, m);
         }
         Ok(rows)
+    }
+
+    /// What the person can do now with `m`, to `view`, while it waits.
+    fn line_actions(&self, view: &SessionView, m: &LineMessage) -> Vec<LineAction> {
+        if !matches!(m.delivery, Delivery::Queued | Delivery::Held) {
+            return Vec::new();
+        }
+        let mut can = Vec::new();
+        if self.send_now_how(view, m).is_ok() {
+            can.push(LineAction::SendNow);
+        }
+        let theirs = m.from.kind == PartyKind::You;
+        if theirs {
+            can.push(LineAction::Edit);
+        }
+        if theirs || Self::boss_word(m) {
+            can.push(LineAction::Withdraw);
+        }
+        can
+    }
+
+    /// Whether `m` is a boss's tell or answer, which the person may take
+    /// back unsent ([`Self::line_take_back`]).
+    fn boss_word(m: &LineMessage) -> bool {
+        m.from.kind == PartyKind::Manager && matches!(m.kind, LineKind::Tell | LineKind::Answer)
+    }
+
+    /// The person takes back `id`, waiting to go into a session: their own
+    /// is gone, as if never sent; a boss's tell or answer is withdrawn
+    /// unsent, kept on the line, and its boss's picture says the person
+    /// took it back (an answer's question comes back to them).
+    pub async fn line_take_back(&self, id: Uuid) -> Result<(), DeskError> {
+        let m = self
+            .0
+            .store
+            .line_message(id)
+            .await?
+            .ok_or(DeskError::NotFound)?;
+        if m.from.kind == PartyKind::You {
+            return self.line_edit(id, None).await;
+        }
+        let Some(session) = m.to_session().filter(|_| Self::boss_word(&m)) else {
+            return Err(DeskError::Conflict(
+                "Only your own messages and a boss's can be taken back.".into(),
+            ));
+        };
+        match self.line_withdraw(id).await? {
+            Some((withdrawn, _)) => {
+                self.picture_note(
+                    crate::picture::Note::new(
+                        crate::picture::What::TakenBack,
+                        withdrawn.text.clone(),
+                    )
+                    .boss(&withdrawn.from.id)
+                    .session(session),
+                );
+                Ok(())
+            }
+            None => Err(DeskError::Conflict("It's already on its way.".into())),
+        }
     }
 
     /// The person writes to a session from Desk: queued for its next idle,

@@ -13,7 +13,7 @@
 //! max_checkins_per_hour = 6
 //! max_checkins_per_day = 100
 //! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = true, interrupt = false, message_agents = false, message_terminal_sessions = false, answer_sessions = true, hand_off = false, set_mode = false }
-//! work = { prefer_sessions = true, parallel = 4, take_on = "handed", engine = "claude", model = "", max_turns_per_hour = 60, close_finished = true }
+//! work = { prefer_sessions = true, parallel = 4, take_on = "handed", engine = "claude", model = "", max_turns_per_hour = 60, close_finished = true, watch = true, orphan_grace_minutes = 5, stall_minutes = 30 }
 //! full = { repos = ["acme/acme-web", "~/dev/globex-api"], workflows = ["deploy.yml", "promote.yml"], budget_usd_per_day = 25 }
 //! updates = { cheap_calls_per_day = 500, account_questions_per_day = 60, close_from_accounts = false, enabled = true, every_minutes = 3, max_wait_minutes = 10, away_after_minutes = 15 }
 //! ```
@@ -86,7 +86,12 @@
 //! handed to it, are closed once their work is done (their PR merged,
 //! their ticket finished, the session said so, or a day idle with nothing
 //! open), never with uncommitted or unpushed work, nor while the person
-//! is in one: below where it acts, it suggests it.
+//! is in one: below where it acts, it suggests it. With `watch` (on
+//! unless said) it watches every plan it runs each minute
+//! (`desk_crew::plan_watch`): a ticket in Doing whose session went away
+//! for `orphan_grace_minutes` is started again, a session that ended its
+//! turn waiting on CI or a merge is told when it lands, and the person is
+//! told once when no ticket has moved for `stall_minutes`.
 //!
 //! A session asks the overseer on Desk's line: with `on_message` it gets a
 //! turn of its own for that, else every question goes straight to the
@@ -186,6 +191,14 @@ pub struct Wake {
     /// that session's questions theirs: the boss says nothing of them
     /// until then.
     pub answer_after_minutes: u32,
+    /// How long a session stopped on its boss (its choice laid out, a
+    /// question, a hold) waits for the boss's answer before the person is
+    /// given it; 0 never.
+    pub waiting_after_minutes: u32,
+    /// How long after the person was given what a session waits on it is
+    /// said again, then after each reminder; the last repeats until it is
+    /// answered. All 0 is never.
+    pub waiting_remind_minutes: [u32; 3],
 }
 
 /// The local times of the morning and evening summaries, `None` when off.
@@ -357,6 +370,14 @@ pub struct Work {
     /// It closes the sessions it runs once their work is done
     /// (`desk_crew::closing`).
     pub close_finished: bool,
+    /// It watches the plans it runs (`desk_crew::plan_watch`).
+    pub watch: bool,
+    /// How long a ticket in Doing may be without its session before it is
+    /// started again.
+    pub orphan_grace_minutes: u32,
+    /// How long a plan may go without a ticket moving, while one is ready
+    /// or in Doing, before the person is told.
+    pub stall_minutes: u32,
 }
 
 /// The cheap model's day for the boss's reading (`[oversight.updates]`).
@@ -648,6 +669,12 @@ pub const MAX_HOLD_MINUTES: i64 = 60;
 /// How long, by default, the person's last input into a session keeps its
 /// questions theirs.
 pub const ANSWER_AFTER_MINUTES: u32 = 10;
+/// How long, by default, a session stopped on its boss waits for the
+/// boss's answer before the person is given it.
+pub const WAITING_AFTER_MINUTES: u32 = 2;
+/// The reminders, by default, of what a session waits on the person for:
+/// 10 minutes, 30 minutes, then hourly.
+pub const WAITING_REMIND_MINUTES: [u32; 3] = [10, 30, 60];
 
 impl Default for Oversight {
     fn default() -> Self {
@@ -670,6 +697,8 @@ impl Default for Oversight {
                 on_message: true,
                 hold_minutes: HOLD_MINUTES,
                 answer_after_minutes: ANSWER_AFTER_MINUTES,
+                waiting_after_minutes: WAITING_AFTER_MINUTES,
+                waiting_remind_minutes: WAITING_REMIND_MINUTES,
             },
             summaries: Summaries {
                 morning: Some((9, 0)),
@@ -699,6 +728,9 @@ impl Default for Oversight {
                 model: None,
                 max_turns_per_hour: 60,
                 close_finished: true,
+                watch: true,
+                orphan_grace_minutes: 5,
+                stall_minutes: 30,
             },
             full: Full::default(),
             updates: Updates {
@@ -748,6 +780,32 @@ fn whole(
         None => Ok(default),
         Some(Value::Integer(n)) if range.contains(n) => Ok(*n as u32),
         Some(_) => Err(problem.to_string()),
+    }
+}
+
+/// A list of one to three reminder gaps in minutes, 0 to a day each; the
+/// last repeats, so `[60]` is hourly.
+fn reminders(t: Option<&Table>, key: &str, default: [u32; 3]) -> Result<[u32; 3], String> {
+    let wrong = || {
+        format!(
+            "When it reminds you of what a session waits on must be a list of one to three whole numbers of minutes, each from 0 to {MAX_MINUTES} (a day)."
+        )
+    };
+    match t.and_then(|t| t.get(key)) {
+        None => Ok(default),
+        Some(Value::Array(items)) if (1..=3).contains(&items.len()) => {
+            let mut gaps = Vec::new();
+            for i in items {
+                match i.as_integer() {
+                    Some(n) if (0..=MAX_MINUTES).contains(&n) => gaps.push(n as u32),
+                    _ => return Err(wrong()),
+                }
+            }
+            let last = *gaps.last().unwrap_or(&0);
+            gaps.resize(3, last);
+            Ok([gaps[0], gaps[1], gaps[2]])
+        }
+        Some(_) => Err(wrong()),
     }
 }
 
@@ -1203,6 +1261,20 @@ impl Oversight {
                         "How long your typing in a session keeps its questions yours must be a whole number of minutes from 1 to {MAX_HOLD_MINUTES}."
                     ),
                 )?,
+                waiting_after_minutes: whole(
+                    wake,
+                    "waiting_after_minutes",
+                    d.wake.waiting_after_minutes,
+                    0..=MAX_HOLD_MINUTES,
+                    &format!(
+                        "How long a session waits on its boss before you're asked must be a whole number of minutes from 0 (never) to {MAX_HOLD_MINUTES}."
+                    ),
+                )?,
+                waiting_remind_minutes: reminders(
+                    wake,
+                    "waiting_remind_minutes",
+                    d.wake.waiting_remind_minutes,
+                )?,
             },
             summaries: Summaries {
                 morning: time(summaries, "morning", d.summaries.morning, "morning")?,
@@ -1316,6 +1388,30 @@ impl Oversight {
                     "close_finished",
                     d.work.close_finished,
                     "closing the sessions it started once they are finished",
+                )?,
+                watch: switch(
+                    work,
+                    "watch",
+                    d.work.watch,
+                    "watching the plans it runs",
+                )?,
+                orphan_grace_minutes: whole(
+                    work,
+                    "orphan_grace_minutes",
+                    d.work.orphan_grace_minutes,
+                    1..=MAX_MINUTES,
+                    &format!(
+                        "How long a ticket in Doing may be without its session must be a whole number of minutes from 1 to {MAX_MINUTES} (a day)."
+                    ),
+                )?,
+                stall_minutes: whole(
+                    work,
+                    "stall_minutes",
+                    d.work.stall_minutes,
+                    5..=MAX_MINUTES,
+                    &format!(
+                        "How long a plan may go without moving before you are told must be a whole number of minutes from 5 to {MAX_MINUTES} (a day)."
+                    ),
                 )?,
             },
             full,
@@ -1805,12 +1901,14 @@ mod tests {
             d.close_finished,
             "it closes its finished sessions unless told not to"
         );
+        assert!(d.watch, "it watches its plans unless told not to");
+        assert_eq!((d.orphan_grace_minutes, d.stall_minutes), (5, 30));
         let inline = parse(
-            "[oversight]\nwork = { prefer_sessions = false, parallel = 12, take_on = \"all\", engine = \"codex\", model = \"gpt-6.1-sol\", max_turns_per_hour = 1, close_finished = false }\n",
+            "[oversight]\nwork = { prefer_sessions = false, parallel = 12, take_on = \"all\", engine = \"codex\", model = \"gpt-6.1-sol\", max_turns_per_hour = 1, close_finished = false, watch = false, orphan_grace_minutes = 2, stall_minutes = 60 }\n",
         )
         .unwrap();
         let table = parse(
-            "[oversight]\n[oversight.work]\nprefer_sessions = false\nparallel = 12\ntake_on = \"all\"\nengine = \"codex\"\nmodel = \"gpt-6.1-sol\"\nmax_turns_per_hour = 1\nclose_finished = false\n",
+            "[oversight]\n[oversight.work]\nprefer_sessions = false\nparallel = 12\ntake_on = \"all\"\nengine = \"codex\"\nmodel = \"gpt-6.1-sol\"\nmax_turns_per_hour = 1\nclose_finished = false\nwatch = false\norphan_grace_minutes = 2\nstall_minutes = 60\n",
         )
         .unwrap();
         assert_eq!(inline, table);
@@ -1824,6 +1922,9 @@ mod tests {
                 model: Some("gpt-6.1-sol".into()),
                 max_turns_per_hour: 1,
                 close_finished: false,
+                watch: false,
+                orphan_grace_minutes: 2,
+                stall_minutes: 60,
             }
         );
     }
@@ -1883,6 +1984,18 @@ mod tests {
                 "[oversight]\nwork = { close_finished = \"yes\" }\n",
                 "Whether closing the sessions it started once they are finished is on or off must be true or false.",
             ),
+            (
+                "[oversight]\nwork = { watch = 1 }\n",
+                "Whether watching the plans it runs is on or off must be true or false.",
+            ),
+            (
+                "[oversight]\nwork = { orphan_grace_minutes = 0 }\n",
+                "How long a ticket in Doing may be without its session must be a whole number of minutes from 1 to 1440 (a day).",
+            ),
+            (
+                "[oversight]\nwork = { stall_minutes = 2 }\n",
+                "How long a plan may go without moving before you are told must be a whole number of minutes from 5 to 1440 (a day).",
+            ),
         ] {
             let e = parse(source).unwrap_err();
             assert_eq!(e, says, "{source}");
@@ -1931,6 +2044,14 @@ mod tests {
                 "[oversight]\nwake = { remind_minutes = 1441 }\n",
                 "a question it already raised",
             ),
+            (
+                "[oversight]\nwake = { waiting_remind_minutes = [10, 30, 60, 90] }\n",
+                "one to three whole numbers",
+            ),
+            (
+                "[oversight]\nwake = { waiting_after_minutes = 61 }\n",
+                "waits on its boss",
+            ),
             ("[oversight]\ntrack = true\n", "group of settings"),
             ("oversight = 3\n", "group of settings"),
         ] {
@@ -1950,6 +2071,24 @@ mod tests {
                 assert!(!e.contains(key), "{source} → {e} names {key}");
             }
         }
+    }
+
+    /// What a session waits on its boss for is the person's after two
+    /// minutes, reminded at 10, 30, then hourly; both are the person's to
+    /// set, and a shorter list repeats its last.
+    #[test]
+    fn a_wait_on_the_boss_is_the_persons_soon_and_reminded_as_set() {
+        let d = Oversight::default();
+        assert_eq!(d.wake.waiting_after_minutes, 2);
+        assert_eq!(d.wake.waiting_remind_minutes, [10, 30, 60]);
+        let o = parse(
+            "[oversight]\nwake = { waiting_after_minutes = 5, waiting_remind_minutes = [15, 120] }\n",
+        )
+        .unwrap();
+        assert_eq!(o.wake.waiting_after_minutes, 5);
+        assert_eq!(o.wake.waiting_remind_minutes, [15, 120, 120]);
+        let hourly = parse("[oversight]\nwake = { waiting_remind_minutes = [60] }\n").unwrap();
+        assert_eq!(hourly.wake.waiting_remind_minutes, [60, 60, 60]);
     }
 
     /// At Act it starts the sessions its work needs unless the person

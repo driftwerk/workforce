@@ -35,8 +35,8 @@ pub use process_group::GroupChild;
 pub use protocol::{
     CodexMcpConfig, CodexMcpServer, ExecRequest, ExecSummary, HomeSpec, InteractiveRequest, JobId,
     McpBinding, Offsets, PrepareRequest, Prepared, RefusalReason, RepoSpec, Request, RunRequest,
-    ScopeId, ServerFrame, Stream, WorkerHealth, MAX_FRAME_LEN, PROTOCOL_DURABLE_JOBS, SCOPE_BENCH,
-    SCOPE_HOME, SCOPE_MCP_CONFIG_PATH, SCOPE_WORK_ROOT,
+    ScopeId, ServerFrame, Stream, WorkerHealth, MAX_FRAME_LEN, PROTOCOL_DURABLE_JOBS, QUEUE_HOLD,
+    SCOPE_BENCH, SCOPE_HOME, SCOPE_MCP_CONFIG_PATH, SCOPE_WORK_ROOT,
 };
 pub use run_exec::{
     is_transient_error, run_exec, run_interactive, validate_workdir, EnvMode, MAX_OUTPUT_SIZE,

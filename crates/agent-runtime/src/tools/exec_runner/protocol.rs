@@ -15,7 +15,7 @@ use super::setup::SetupReport;
 /// may depend on. A request that needs one asserts the daemon announced at
 /// least this version, so a skewed pair fails loudly instead of running the
 /// command with the new fields silently dropped.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = PROTOCOL_FAIR_QUEUE;
 
 /// Revision that introduced the environment and stdin fields.
 const PROTOCOL_ENV_STDIN: u32 = 1;
@@ -42,6 +42,18 @@ const PROTOCOL_CODEX_APPROVALS: u32 = 5;
 /// Revision whose daemon runs an interactive command: one whose stdin the
 /// client streams for as long as it runs.
 const PROTOCOL_INTERACTIVE: u32 = 6;
+
+/// Revision whose daemon, when full, releases the least recently used idle
+/// scope prepared with `yields_when_idle` to seat a new one. Announced, never
+/// required: an older daemon only refuses at capacity, as before.
+pub const PROTOCOL_IDLE_YIELD: u32 = 7;
+
+/// Revision whose daemon keeps a fair queue for prepares that name a `queue`
+/// owner: one it cannot seat yet is answered [`ServerFrame::Queued`] with its
+/// place, kept while it asks again. Announced, never required: an older
+/// daemon drops the field and refuses at capacity, which the hub waits out
+/// as it always did.
+pub const PROTOCOL_FAIR_QUEUE: u32 = 8;
 
 /// Where a scope mounts its repositories and its home: the only roots a job's
 /// working directory and file paths may reach.
@@ -300,7 +312,23 @@ pub struct PrepareRequest {
     pub env: Vec<(String, String)>,
     #[serde(default)]
     pub home: HomeSpec,
+    /// Whether the scope may give way, once idle, to a prepare that finds the
+    /// worker full: an agent turn's workspace, whose keyed home outlives it.
+    /// A daemon before [`PROTOCOL_IDLE_YIELD`] drops the field and keeps the
+    /// scope for its lifetime, as it always did, so no prepare requires it.
+    #[serde(default)]
+    pub yields_when_idle: bool,
+    /// Who the scope is for (a person, or an agent working for nobody), when
+    /// the prepare would rather queue than be refused: a daemon at
+    /// [`PROTOCOL_FAIR_QUEUE`] that cannot seat it answers its place in a
+    /// queue that lets nobody hold more than a share of the worker while
+    /// others wait.
+    #[serde(default)]
+    pub queue: Option<String>,
 }
+
+/// How long a queued prepare keeps its place without asking again.
+pub const QUEUE_HOLD: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// What a worker reports once a scope is ready.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -362,6 +390,9 @@ pub struct WorkerHealth {
     /// Durable jobs still running.
     #[serde(default)]
     pub jobs: u32,
+    /// Prepares waiting in the queue for a seat.
+    #[serde(default)]
+    pub queued: u32,
 }
 
 impl WorkerHealth {
@@ -376,6 +407,7 @@ impl WorkerHealth {
             goldens: Vec::new(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             jobs: 0,
+            queued: 0,
         }
     }
 }
@@ -396,6 +428,11 @@ pub enum Request {
     Forget {
         job: JobId,
     },
+    /// A queued prepare for `scope` stopped waiting: its place goes to the
+    /// next in line at once, rather than once [`QUEUE_HOLD`] passes.
+    Leave {
+        scope: ScopeId,
+    },
 }
 
 impl Request {
@@ -415,6 +452,7 @@ impl Request {
                 .map_or(0, ExecRequest::required_protocol)
                 .max(PROTOCOL_DURABLE_JOBS),
             Self::Forget { .. } => PROTOCOL_DURABLE_JOBS,
+            Self::Leave { .. } => PROTOCOL_FAIR_QUEUE,
         }
     }
 
@@ -425,7 +463,9 @@ impl Request {
             Self::Interactive(req) => req.exec.timeout_secs,
             Self::Prepare(_) => PREPARE_TIMEOUT_SECS,
             Self::Run(run) => run.timeout_secs,
-            Self::Release { .. } | Self::Health | Self::Forget { .. } => CONTROL_TIMEOUT_SECS,
+            Self::Release { .. } | Self::Health | Self::Forget { .. } | Self::Leave { .. } => {
+                CONTROL_TIMEOUT_SECS
+            }
         }
     }
 }
@@ -492,6 +532,12 @@ pub enum ServerFrame {
     Done(ExecSummary),
     Refused {
         reason: RefusalReason,
+    },
+    /// A prepare naming a `queue` owner that cannot be seated yet: `ahead`
+    /// prepares go first. Its place is kept while it asks again within
+    /// [`QUEUE_HOLD`].
+    Queued {
+        ahead: u32,
     },
     /// The daemon could not carry out the request; asking again would fail
     /// the same way.
@@ -783,6 +829,8 @@ mod tests {
                 ttl_secs: 60,
                 env: Vec::new(),
                 home,
+                yields_when_idle: false,
+                queue: None,
             })
         };
         assert_eq!(prepare(HomeSpec::Ephemeral).required_protocol(), 2);
@@ -795,6 +843,33 @@ mod tests {
             3,
             "a daemon that would mount a throwaway home instead is refused"
         );
+        let yielding = Request::Prepare(PrepareRequest {
+            scope: ScopeId::new("s"),
+            repos: Vec::new(),
+            ttl_secs: 60,
+            env: Vec::new(),
+            home: HomeSpec::Keyed {
+                key: "thread".into(),
+                ttl_secs: 60,
+            },
+            yields_when_idle: true,
+            queue: Some("person-1".into()),
+        });
+        assert_eq!(
+            yielding.required_protocol(),
+            3,
+            "a daemon that can neither yield idle scopes nor queue still seats the prepare"
+        );
+    }
+
+    #[test]
+    fn a_prepare_from_an_older_hub_never_gives_way() {
+        let older = r#"{"kind":"prepare","scope":"s","repos":[],"ttl_secs":60,"env":[],
+            "home":{"kind":"keyed","key":"thread","ttl_secs":60}}"#;
+        let Request::Prepare(prepare) = serde_json::from_str::<Request>(older).unwrap() else {
+            panic!("a prepare");
+        };
+        assert!(!prepare.yields_when_idle);
     }
 
     #[test]
@@ -845,6 +920,7 @@ mod tests {
             ServerFrame::Refused {
                 reason: RefusalReason::AtCapacity,
             },
+            ServerFrame::Queued { ahead: 2 },
         ] {
             let json = serde_json::to_string(&frame).unwrap();
             let back: ServerFrame = serde_json::from_str(&json).unwrap();
@@ -871,8 +947,13 @@ mod tests {
                     key: "thread-1".into(),
                     ttl_secs: 604_800,
                 },
+                yields_when_idle: true,
+                queue: Some("person-1".into()),
             }))),
             ClientFrame::Request(Box::new(Request::Release {
+                scope: ScopeId::new("s"),
+            })),
+            ClientFrame::Request(Box::new(Request::Leave {
                 scope: ScopeId::new("s"),
             })),
             ClientFrame::Request(Box::new(Request::Health)),

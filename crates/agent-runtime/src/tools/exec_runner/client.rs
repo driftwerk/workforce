@@ -110,6 +110,8 @@ pub enum Outcome {
     Prepared(Prepared),
     Healthy(WorkerHealth),
     Refused(RefusalReason),
+    /// A queued prepare not seated yet, with how many go first.
+    Queued(u32),
 }
 
 impl Outcome {
@@ -119,6 +121,7 @@ impl Outcome {
             Self::Prepared(_) => "a prepared scope",
             Self::Healthy(_) => "a health report",
             Self::Refused(_) => "a refusal",
+            Self::Queued(_) => "a place in the queue",
         }
     }
 }
@@ -511,6 +514,7 @@ async fn read_until_terminal(
                     ServerFrame::Prepared(prepared) => Outcome::Prepared(prepared),
                     ServerFrame::Healthy(health) => Outcome::Healthy(health),
                     ServerFrame::Refused { reason } => Outcome::Refused(reason),
+                    ServerFrame::Queued { ahead } => Outcome::Queued(ahead),
                     ServerFrame::Failed { message } => {
                         bail!("secure command runner failed the request: {message}")
                     }

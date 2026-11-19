@@ -9,6 +9,9 @@
 //! - Its next step needs the boss's own tools: its full turn takes it.
 //! - A call that fails is tried once more, then its full turn takes it.
 //! - While the person is in control of it, nothing is said.
+//! - A next step Desk refuses for what the boss can fix (no job said): its
+//!   full turn takes it, told why, and the person reads nothing of it; the
+//!   full turn's step refused too reaches them once, in plain words.
 
 use super::decides_at_once::{calls_about, decides, said, THEIRS};
 use super::*;
@@ -229,6 +232,190 @@ async fn act_fully_tells_a_finished_session_its_next_step_itself_and_never_while
             "tried twice"
         );
         assert_eq!(said(&overseer, &["billing", "couldn't decide"]), 0);
+    })
+    .await;
+}
+
+/// What the person reads of a refused next step, as the 07:43 and 07:56
+/// DMs said it: never a refusal meant for the boss.
+const RAW: [&str; 4] = ["Desk refused", "Not sent", "job:", "Send it again"];
+
+/// The boss's escalated rows about `id`: what it left to the person.
+async fn left_to_person(d: &Desk, since: chrono::DateTime<chrono::Utc>, id: uuid::Uuid) -> usize {
+    d.store()
+        .decisions_since("desk", since, 50)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.session == Some(id) && r.how == workforce_desk::decision::How::Escalated)
+        .count()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_next_step_refused_for_its_job_goes_to_the_full_turn_told_why_and_never_to_the_person() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (overseer, _crew, d, llm) = overseeing(&base, pool, "ok", &theirs(), &[]).await;
+        d.boss_bounds_with(workforce_desk::charge::Bounds {
+            home: base.clone(),
+            ..Default::default()
+        });
+        // Its next step looks like it can't be taken back, and the fast
+        // call can't say its job.
+        decides(
+            &llm,
+            "Built the release bundle",
+            "CONTINUE: Run the deploy.\nWHY: the bundle is built",
+        )
+        .await;
+        eventually("Desk to know it is unbound", async || {
+            d.boss_unbound("desk").then_some(())
+        })
+        .await;
+        let since = chrono::Utc::now();
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+
+        let s = new_session(&d, &base, "harbor").await;
+        let url = hook_url(&base, s.id).await;
+        ends(&url, "Built the release bundle.").await;
+        // Its full turn takes the turn's end, with why the step wasn't sent:
+        // it can declare the job.
+        let full = eventually("its full turn", async || {
+            woken(&llm, "Built the release bundle")
+                .await
+                .into_iter()
+                .next()
+        })
+        .await;
+        assert!(
+            full.contains("Run the deploy.")
+                && full.contains("didn't send it")
+                && full.contains("job"),
+            "told why: {full}"
+        );
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+        assert_eq!(
+            calls_about(&llm, "Built the release bundle").await.len(),
+            1,
+            "one fast call"
+        );
+        assert!(told(&d, s.id).await.is_empty(), "nothing sent to it");
+        for raw in RAW {
+            assert_eq!(
+                said(&overseer, &["harbor finished", raw]),
+                0,
+                "nothing of {raw:?} in the DM"
+            );
+        }
+        assert_eq!(
+            said(&overseer, &["harbor finished its turn"]),
+            0,
+            "nothing in the DM"
+        );
+        assert_eq!(
+            left_to_person(&d, since, s.id).await,
+            0,
+            "nothing left to the person"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_next_step_its_full_turn_cant_send_either_reaches_the_person_once_in_plain_words() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (overseer, _crew, d, llm) = overseeing(&base, pool, "ok", &theirs(), &[]).await;
+        d.boss_bounds_with(workforce_desk::charge::Bounds {
+            home: base.clone(),
+            ..Default::default()
+        });
+        decides(
+            &llm,
+            "Built the release bundle",
+            "CONTINUE: Run the deploy.\nWHY: the bundle is built",
+        )
+        .await;
+        eventually("Desk to know it is unbound", async || {
+            d.boss_unbound("desk").then_some(())
+        })
+        .await;
+        let since = chrono::Utc::now();
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+
+        let s = new_session(&d, &base, "harbor").await;
+        // Its full turn sends the same step, again with no job: refused too.
+        calls_tool_once(
+            &llm,
+            "didn't send it",
+            "crew_nudge",
+            json!({"session_id": s.id.to_string(), "message": "Run the deploy.", "reason": "The bundle is built."}),
+        )
+        .await;
+        let url = hook_url(&base, s.id).await;
+        ends(&url, "Built the release bundle.").await;
+        let plain = ["harbor finished its turn", "Run the deploy.", "What should it do next?"];
+        eventually("the person told once its full turn is over", async || {
+            (said(&overseer, &plain) == 1).then_some(())
+        })
+        .await;
+        // Once, however many sweeps; in plain words.
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+        assert_eq!(said(&overseer, &plain), 1, "said once");
+        assert_eq!(
+            said(&overseer, &["harbor finished its turn", "can't be taken back"]),
+            1,
+            "why, plainly"
+        );
+        for raw in RAW {
+            assert_eq!(said(&overseer, &["harbor finished its turn", raw]), 0, "nothing of {raw:?}");
+        }
+        assert!(told(&d, s.id).await.is_empty(), "nothing sent to it");
+        assert_eq!(calls_about(&llm, "Built the release bundle").await.len(), 1, "one fast call");
+        assert_eq!(left_to_person(&d, since, s.id).await, 1, "left to the person once");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_step_the_person_took_back_or_the_full_turn_chose_otherwise_is_never_told() {
+    use super::super::refusal::{Refusal, Refused};
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (overseer, crew, d, _llm) = overseeing(&base, pool, "ok", &theirs(), &[]).await;
+        let s = new_session(&d, &base, "harbor").await;
+        let view = d.view(s.id).unwrap();
+        let refused = |kind| Refused::new(kind, "Not sent: …");
+
+        // Its full turn's step refused as the person took it back: theirs,
+        // and nothing is followed.
+        crew.handed_refused("desk", &view, "Run the deploy.");
+        crew.step_went("desk", s.id, Err(&refused(Refusal::TakenBack)));
+        assert!(!crew.follows_refused(s.id), "theirs now");
+
+        // Another boss's refusal, or a moved picture, changes nothing; a
+        // step that went ends it.
+        crew.handed_refused("desk", &view, "Run the deploy.");
+        crew.step_went("sarah", s.id, Err(&refused(Refusal::NoJob)));
+        crew.step_went("desk", s.id, Err(&refused(Refusal::Stale)));
+        assert!(crew.follows_refused(s.id));
+        crew.step_went("desk", s.id, Ok(()));
+        assert!(!crew.follows_refused(s.id), "it went");
+
+        // Only a full turn given its turn's end is its; one of another
+        // boss's never.
+        crew.handed_refused("desk", &view, "Run the deploy.");
+        crew.full_turn_over("sarah", s.id);
+        assert_eq!(crew.refused_turn_over(s.id), Some(false));
+        crew.full_turn_over("desk", s.id);
+        assert_eq!(crew.refused_turn_over(s.id), Some(true));
+        // Over with nothing of its refused: it chose, and is let go untold.
+        assert!(crew.refused_again().is_empty());
+        assert!(!crew.follows_refused(s.id), "let go");
+        assert_eq!(said(&overseer, &["harbor finished its turn"]), 0);
     })
     .await;
 }

@@ -105,7 +105,8 @@ impl TurnChain {
         oversight: Oversight,
     ) -> AdvisorLoopOutcome {
         let mut misses = Vec::new();
-        for route in &self.routes {
+        let last = self.routes.len().saturating_sub(1);
+        for (at, route) in self.routes.iter().enumerate() {
             if request
                 .cancel
                 .as_ref()
@@ -141,6 +142,7 @@ impl TurnChain {
                             continue;
                         }
                     };
+                    let seat_wait = rig.seat_wait().of(at == last);
                     // Its login at its limit or turned away is skipped from
                     // then, so the route runs again on the payer's next login
                     // of the same plan, as a turn's own route does.
@@ -176,6 +178,7 @@ impl TurnChain {
                             progress: None,
                             cancel: request.cancel.clone().unwrap_or_default(),
                             timeout,
+                            seat_wait,
                         };
                         match super::personal_if(*personal, rig.run(service, turn, None, None))
                             .await
