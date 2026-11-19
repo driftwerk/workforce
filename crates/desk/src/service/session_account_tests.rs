@@ -1616,6 +1616,12 @@ async fn a_boss_reads_an_account_as_stale_once_its_session_did_more_since() {
         assert_eq!(stale_of(&d, &a, true), Some(Staleness::Plain));
         assert_eq!(stale_of(&d, &a, false), None);
         a.by_model = true;
+        // Once a model wrote it, `by_model` stays: a newest write that
+        // was plain still says so.
+        d.0.accounts.plain.lock().insert(id);
+        assert_eq!(stale_of(&d, &a, true), Some(Staleness::Plain));
+        d.0.accounts.plain.lock().remove(&id);
+        assert_eq!(stale_of(&d, &a, true), None);
         // Written after its line moved; then a turn ended that it hasn't
         // caught up with, until the refresh that turn end starts reads it.
         a.written_at = Utc::now();
@@ -1628,14 +1634,13 @@ async fn a_boss_reads_an_account_as_stale_once_its_session_did_more_since() {
             &[exchange("x1", 10, &"I found the bug. ".repeat(40), 3)],
         )
         .await;
+        // Seeded as the turn end does, before its refresh runs.
+        d.0.accounts.ended.lock().insert(id, Utc::now());
+        assert!(matches!(
+            stale_of(&d, &a, false),
+            Some(Staleness::Behind { turn: true, .. })
+        ));
         d.account_turn_ended(id);
-        assert!(
-            matches!(
-                stale_of(&d, &a, false),
-                Some(Staleness::Behind { turn: true, .. })
-            ) || !d.0.accounts.ended.lock().contains_key(&id),
-            "behind until caught up"
-        );
         let started = std::time::Instant::now();
         while d.0.accounts.ended.lock().contains_key(&id) {
             assert!(started.elapsed() < Duration::from_secs(10), "caught up");

@@ -73,6 +73,11 @@ pub(super) struct AccountRun {
     looked: Mutex<HashMap<Uuid, Instant>>,
     /// When each session's turn last ended.
     pub(super) ended: Mutex<HashMap<Uuid, DateTime<Utc>>>,
+    /// The sessions whose account was last written plainly, not by a
+    /// model: `by_model` stays true once a model wrote it (its words
+    /// aren't gone), so this says what the newest write was. Lost on a
+    /// restart, when the crew block's spent-ceiling notice still holds.
+    pub(super) plain: Mutex<HashSet<Uuid>>,
     /// When a reader last refreshed each session's account.
     read_refreshed: Mutex<HashMap<Uuid, Instant>>,
     /// Model calls made, for tests.
@@ -93,6 +98,7 @@ impl AccountRun {
             mid_turn: Mutex::default(),
             looked: Mutex::default(),
             ended: Mutex::default(),
+            plain: Mutex::default(),
             read_refreshed: Mutex::default(),
             calls: std::sync::atomic::AtomicUsize::new(0),
             shared_within: Mutex::new(super::memory_derive::CALL_WITHIN),
@@ -387,14 +393,23 @@ impl Desk {
                 .filter_map(|id| ended.get(id).map(|e| (*id, *e)))
                 .collect()
         };
+        let plain: HashSet<Uuid> = {
+            let plain = self.0.accounts.plain.lock();
+            ids.iter()
+                .filter(|id| plain.contains(id))
+                .copied()
+                .collect()
+        };
         let now = crate::crew::now();
         accounts
             .iter()
             .filter_map(|(a, working)| {
                 let id = a.session;
+                let last_plain = !a.by_model || plain.contains(&id);
                 a.staleness(
                     now,
                     *working,
+                    last_plain,
                     ended.get(&id).copied(),
                     line.get(&id).copied(),
                 )
@@ -608,8 +623,13 @@ impl Desk {
             fresh.cursor.tail = Some(t.clone());
             fresh.cursor.read_at = Some(at);
         }
-        // A plain write never says the model's words are gone.
+        // A plain write never says the model's words are gone; what the
+        // newest write was is kept beside it.
         fresh.by_model = said.by_model || kept.by_model;
+        match said.by_model {
+            true => self.0.accounts.plain.lock().remove(&id),
+            false => self.0.accounts.plain.lock().insert(id),
+        };
         fresh.stale_after = None;
         Ok(match self.0.store.session_account_put(&fresh).await? {
             Put::Kept(v) => Account {

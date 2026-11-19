@@ -256,13 +256,15 @@ impl Account {
     }
 
     /// How far it can be relied on at `now` for a session that is
-    /// `working`, whose last turn end it hasn't caught up with was at
+    /// `working`, whose newest write was plain (`last_plain`: not a
+    /// model's), whose last turn end it hasn't caught up with was at
     /// `ended`, and on whose line words last went in or out (a boss's, the
     /// person's, its own) at `line`: None while it can.
     pub fn staleness(
         &self,
         now: DateTime<Utc>,
         working: bool,
+        last_plain: bool,
         ended: Option<DateTime<Utc>>,
         line: Option<DateTime<Utc>>,
     ) -> Option<Staleness> {
@@ -283,7 +285,7 @@ impl Account {
         if self.stale_after.is_some_and(|s| now >= s) {
             return Some(Staleness::Expired);
         }
-        (!self.by_model && working).then_some(Staleness::Plain)
+        (last_plain && working).then_some(Staleness::Plain)
     }
 
     /// Whether it is out of date at `now` for a session that is `working`:

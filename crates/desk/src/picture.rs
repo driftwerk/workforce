@@ -333,12 +333,13 @@ impl Picture {
     /// a message withdrawn unsent don't count. One pass, newest first,
     /// done once every session is found.
     pub fn last_activity(&self, sessions: &[Uuid]) -> HashMap<Uuid, DateTime<Utc>> {
+        let wanted: std::collections::HashSet<&Uuid> = sessions.iter().collect();
         let mut out = HashMap::new();
         for r in self.rows.iter().rev() {
-            if out.len() == sessions.len() {
+            if out.len() == wanted.len() {
                 break;
             }
-            let Some(s) = r.session.filter(|s| sessions.contains(s)) else {
+            let Some(s) = r.session.filter(|s| wanted.contains(s)) else {
                 continue;
             };
             if r.what.is_activity() {

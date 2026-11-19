@@ -74,9 +74,11 @@ fn clip(s: &str, max: usize) -> String {
 /// can't be relied on: "STALE: summary 19:48 (34 min ago), its turn ended
 /// 27 min after it". What to do about it is said once, in
 /// [`CHECK_FIRST`].
-fn as_of(a: &Account, stale: Option<Staleness>, tz: chrono_tz::Tz) -> String {
+pub(super) fn as_of(a: &Account, stale: Option<Staleness>, tz: chrono_tz::Tz) -> String {
     let at = a.written_at.with_timezone(&tz).format("%H:%M");
-    let ago = (Utc::now() - a.written_at).num_minutes().max(0);
+    let ago = (workforce_desk::crew::now() - a.written_at)
+        .num_minutes()
+        .max(0);
     let why = match stale {
         None => return format!("summary {at} ({ago} min ago)"),
         Some(Staleness::Behind {
@@ -506,24 +508,24 @@ mod tests {
         let mut a = Account::new(Uuid::new_v4(), "", now - min(30));
         a.by_model = true;
         assert_eq!(
-            a.staleness(now, false, None, None),
+            a.staleness(now, false, !a.by_model, None, None),
             None,
             "idle and nothing since"
         );
         assert_eq!(
-            a.staleness(now, true, None, None),
+            a.staleness(now, true, !a.by_model, None, None),
             None,
             "a model's, nothing since"
         );
         assert_eq!(
-            a.staleness(now, false, Some(now - min(3)), None),
+            a.staleness(now, false, !a.by_model, Some(now - min(3)), None),
             Some(Staleness::Behind {
                 minutes: 27,
                 turn: true
             })
         );
         assert_eq!(
-            a.staleness(now, false, None, Some(now - min(10))),
+            a.staleness(now, false, !a.by_model, None, Some(now - min(10))),
             Some(Staleness::Behind {
                 minutes: 20,
                 turn: false
@@ -531,7 +533,13 @@ mod tests {
         );
         // The later of the two says how far behind.
         assert_eq!(
-            a.staleness(now, false, Some(now - min(25)), Some(now - min(10))),
+            a.staleness(
+                now,
+                false,
+                !a.by_model,
+                Some(now - min(25)),
+                Some(now - min(10))
+            ),
             Some(Staleness::Behind {
                 minutes: 20,
                 turn: false
@@ -539,19 +547,28 @@ mod tests {
         );
         // What it already caught up with doesn't count.
         assert_eq!(
-            a.staleness(now, false, Some(now - min(40)), Some(now - min(31))),
+            a.staleness(
+                now,
+                false,
+                !a.by_model,
+                Some(now - min(40)),
+                Some(now - min(31))
+            ),
             None
         );
         a.by_model = false;
         assert_eq!(
-            a.staleness(now, false, None, None),
+            a.staleness(now, false, !a.by_model, None, None),
             None,
             "plain, but nothing since"
         );
-        assert_eq!(a.staleness(now, true, None, None), Some(Staleness::Plain));
+        assert_eq!(
+            a.staleness(now, true, !a.by_model, None, None),
+            Some(Staleness::Plain)
+        );
         a.stale_after = Some(now - min(1));
         assert_eq!(
-            a.staleness(now, false, None, None),
+            a.staleness(now, false, !a.by_model, None, None),
             Some(Staleness::Expired)
         );
     }

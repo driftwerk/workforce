@@ -446,6 +446,12 @@ async fn the_persons_orders_decide_a_production_step_both_ways() {
                 "quoted as the person's own words: {}",
                 call[0]
             );
+            // Told, as every boss turn is, to check a STALE summary first.
+            assert!(
+                call[0].contains(super::super::context::CHECK_FIRST),
+                "{}",
+                call[0]
+            );
         })
         .await;
     }

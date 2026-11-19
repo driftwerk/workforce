@@ -933,12 +933,29 @@ impl CrewHub {
             .await
             .ok()
             .and_then(|a| a.into_iter().next());
+        // How far its summary can be relied on, as every boss turn reads
+        // it (`super::context`).
+        let working = matches!(
+            view.state,
+            workforce_desk::model::SessionState::Working
+                | workforce_desk::model::SessionState::Blocked
+                | workforce_desk::model::SessionState::Asking
+        );
+        let summary = account.as_ref().map(|a| {
+            let stale = self
+                .desk
+                .accounts_staleness(&[(a, working)])
+                .get(&a.session)
+                .copied();
+            super::context::as_of(a, stale, self.desk.timezone())
+        });
         let session = serde_json::json!({
             "name": view.label(),
             "engine": view.engine.title(),
             "folder": view.cwd,
             "goal": view.goal,
             "state": view.state,
+            "summary": summary,
             "purpose": account.as_ref().map(|a| &a.purpose),
             "now": account.as_ref().map(|a| &a.now),
             "next": account.as_ref().map(|a| &a.next),
@@ -970,7 +987,14 @@ impl CrewHub {
                 )
             })
             .unwrap_or_default();
-        (session, format!("{orders}{prefs}{picture}"))
+        // What it may not take a summary for, and whether summaries are
+        // written plainly today: as in every boss turn.
+        let spent = match self.desk.cheap_ceiling_hit_today() {
+            true => format!(" {}", super::picture::NOTES_SPENT),
+            false => String::new(),
+        };
+        let check = format!("\n\n{}{spent}", super::context::CHECK_FIRST);
+        (session, format!("{check}{orders}{prefs}{picture}"))
     }
 
     /// What `boss`'s model is given to decide `p`: the whole request, the
