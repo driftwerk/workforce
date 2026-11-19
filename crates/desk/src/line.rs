@@ -511,14 +511,39 @@ const HOLDS: [&str; 6] = [
 /// or a noun after "wait for my" ("answer", "replies", "decided",
 /// "decision", "say so", "go-ahead"). Never a bare "say" or "tell":
 /// "until I say stop" keeps it going.
-const HOLD_ON: [&str; 13] = [
-    "answer", "repl", "respon", "decid", "decision", "confirm", "get back", "approv", "say so",
-    "go-ahead", "go ahead", "sign", "ok",
+const HOLD_ON: [&str; 15] = [
+    "answer",
+    "repl",
+    "respon",
+    "decid",
+    "decision",
+    "confirm",
+    "get back",
+    "approv",
+    "say so",
+    "go-ahead",
+    "go ahead",
+    "sign-off",
+    "sign off on",
+    "ok ",
+    "okay",
 ];
 
 /// Words just before "wait for" that undo it: "no need to wait for my
 /// answer". Never applied to "until I …": "don't merge until I answer" holds.
-const UNDONE: [&str; 5] = ["no need to ", "don't ", "do not ", "no longer ", "never "];
+const UNDONE: [&str; 11] = [
+    "no need to ",
+    "don't need to ",
+    "doesn't need to ",
+    "need not ",
+    "needn't ",
+    "no reason to ",
+    "don't ",
+    "do not ",
+    "not ",
+    "no longer ",
+    "never ",
+];
 
 /// Whether `text`, a boss's words to a session (or a session's of itself),
 /// holds the session for the boss's answer: it waits on the boss, not on
@@ -2051,6 +2076,8 @@ mod tests {
             "Keep going until I say stop.",
             "Carry on until I tell you otherwise.",
             "Wait for my PR to merge, then rebase.",
+            "You don't need to wait for my answer.",
+            "Keep going until I sign off for the day.",
             "No need to wait for my answer: go ahead.",
             "Wait for desktop notifications to show.",
             "Carry on until I check in tomorrow morning? No: until the tests pass.",
