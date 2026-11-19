@@ -483,6 +483,14 @@ impl Desk {
             .chain(&done.next_start)
             .copied()
             .collect();
+        {
+            // Told only as it carries on now or after its turn: one that
+            // moves at its next start was told nothing it would hear.
+            let mut st = self.0.state.lock();
+            for id in &done.next_start {
+                st.switch_notes.remove(id);
+            }
+        }
         // Only those this move took: one already moving was told of then.
         let moved: Vec<Uuid> = moved.into_iter().filter(|id| moving.contains(id)).collect();
         {

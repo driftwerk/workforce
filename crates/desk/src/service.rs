@@ -4044,6 +4044,7 @@ impl Desk {
             st.cut_off.remove(&id);
             st.restarted.remove(&id);
             st.switch_by.remove(&id);
+            st.switch_notes.remove(&id);
             st.live.remove(&id)
         };
         if let Some(live) = &live {

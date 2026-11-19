@@ -1775,7 +1775,7 @@ impl Desk {
                 return self.view(id);
             };
             let r = self.record(id)?;
-            let (live, hit_limit, running) = {
+            let (live, hit_limit, running, kept_cut_off) = {
                 let st = self.0.state.lock();
                 let live = st.live.contains_key(&id);
                 // Work it started that still runs (CI watchers, sub-agents).
@@ -1791,7 +1791,9 @@ impl Desk {
                             .as_deref()
                             .is_some_and(|reply| crew::outcome_of(Ok(reply)).0 == Outcome::Limit),
                     };
-                (live, hit_limit, running)
+                // What it stopped, kept to be said as it carries on.
+                let kept_cut_off = st.cut_off.contains_key(&id);
+                (live, hit_limit, running, kept_cut_off)
             };
             if r.account == to && !hit_limit {
                 let mut st = self.0.state.lock();
@@ -1869,7 +1871,9 @@ impl Desk {
                     let prompt = match note {
                         // What it ran is named first, when Desk knew of it
                         // ([`crate::background::CutOff`]).
-                        Some(note) if running > 0 => format!("{note} Carry on."),
+                        Some(note) if running > 0 || kept_cut_off => {
+                            format!("{note} Carry on.")
+                        }
                         Some(note) => format!(
                             "{note} Anything you had running in the background (subagents, \
                              shells) stopped: check what each was doing, restart what you \
@@ -2136,7 +2140,9 @@ impl Desk {
             &standing,
             &on,
             &moved_off,
-            // The CLI's own sign-in, unless its probe didn't answer lately.
+            own_signed_in,
+            // A move goes to the CLI's own sign-in unless its probe didn't
+            // answer lately; what runs on it is moved off all the same.
             own_signed_in && !Self::unchecked_now(&st, None),
             // Never onto one the provider turns away until it is re-checked.
             &st.signed_in_accounts

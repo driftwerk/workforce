@@ -1155,7 +1155,8 @@ pub fn claude_probe_said(out: &str) -> Probe {
 
 /// The account needs, from what Desk read of each account's plan.
 /// `on` is the running sessions on each side; `own_signed_in` whether the
-/// CLI's own sign-in is a plan this computer can switch to.
+/// CLI's own sign-in is a plan this computer runs on (a side, from and to);
+/// `own_takes` whether a move may go to it now (its last check answered).
 pub fn needs(
     engine: Engine,
     accounts: &[Account],
@@ -1163,12 +1164,13 @@ pub fn needs(
     on: &std::collections::HashMap<Option<Uuid>, Vec<Uuid>>,
     moved_off: &[MovedOff],
     own_signed_in: bool,
+    own_takes: bool,
     usable: &std::collections::HashSet<Uuid>,
     used: &std::collections::HashMap<Option<Uuid>, f64>,
     now: DateTime<Utc>,
 ) -> Vec<AccountNeed> {
     // Only an account whose sign-in reads can be moved to.
-    let takes = |id: &Option<Uuid>| id.is_none_or(|id| usable.contains(&id));
+    let takes = |id: &Option<Uuid>| id.map_or(own_takes, |id| usable.contains(&id));
     let mut sides: Vec<Option<Uuid>> = accounts
         .iter()
         .filter(|a| a.engine == engine)
@@ -1774,6 +1776,7 @@ mod tests {
             &on,
             &[],
             false,
+            true,
             &usable,
             &Default::default(),
             at(200),
@@ -1795,6 +1798,7 @@ mod tests {
             &on,
             &[],
             false,
+            true,
             &usable,
             &used,
             at(200),
@@ -1812,6 +1816,7 @@ mod tests {
             &on,
             &[],
             false,
+            true,
             &usable,
             &used,
             at(200),
@@ -1846,6 +1851,7 @@ mod tests {
             &on,
             &[],
             false,
+            true,
             &all_usable,
             &Default::default(),
             at(200),
@@ -1874,6 +1880,7 @@ mod tests {
             &HashMap::new(),
             &[],
             false,
+            true,
             &all_usable,
             &Default::default(),
             at(200)
@@ -1894,6 +1901,7 @@ mod tests {
             &on,
             &[],
             false,
+            true,
             &all_usable,
             &Default::default(),
             at(200),
@@ -1916,6 +1924,7 @@ mod tests {
             &on_personal,
             &moved,
             false,
+            true,
             &all_usable,
             &Default::default(),
             at(1000),
@@ -1934,6 +1943,7 @@ mod tests {
             &own,
             &[],
             false,
+            true,
             &all_usable,
             &Default::default(),
             at(200)
@@ -1945,6 +1955,7 @@ mod tests {
             &full,
             &own,
             &[],
+            true,
             true,
             &all_usable,
             &Default::default(),
