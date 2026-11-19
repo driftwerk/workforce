@@ -163,18 +163,30 @@ fn rig_or_miss(service: &AgentService, route: &TurnRoute) -> Result<Arc<AgentTur
         .turn_rig
         .get::<AgentTurnRig>()
         .ok_or_else(|| route.miss("CLI turns are not wired on this hub"))?;
-    let personal_codex = matches!(
-        route,
+    match route {
         TurnRoute::Cli {
-            cli: CliKind::Codex,
+            cli,
             personal: true,
             ..
+        } if !seats_personal(&rig, *cli) => {
+            Err(route.miss(crate::personal_route::CODEX_NEEDS_WORKER))
         }
-    );
-    match personal_codex && !rig.has_codex_worker() {
-        true => Err(route.miss(crate::personal_route::CODEX_NEEDS_WORKER)),
-        false => Ok(rig),
+        _ => Ok(rig),
     }
+}
+
+/// Whether `rig` seats a person's own route on `cli`: Codex only on the
+/// hub's coding worker.
+fn seats_personal(rig: &AgentTurnRig, cli: CliKind) -> bool {
+    cli != CliKind::Codex || rig.has_codex_worker()
+}
+
+/// Why a person's own route on `cli` can't take `service`'s turns, in the
+/// words a turn misses with; `None` when it can. A hub whose CLI turns
+/// aren't wired is left to the turn to say.
+pub(crate) fn personal_refusal(service: &AgentService, cli: CliKind) -> Option<&'static str> {
+    let rig = service.turn_rig.get::<AgentTurnRig>()?;
+    (!seats_personal(&rig, cli)).then_some(crate::personal_route::CODEX_NEEDS_WORKER)
 }
 
 /// A turn's routes, in the order the chain is configured.
@@ -825,8 +837,7 @@ impl TurnChain {
                                         .await;
                                 }
                                 let slot = served.slot.clone();
-                                let mut result =
-                                    served.into_result(seeds.invocations.clone());
+                                let mut result = served.into_result(seeds.invocations.clone());
                                 result.response.push_str(&note);
                                 return Ok(ChainOutcome::Served {
                                     result: Box::new(result),

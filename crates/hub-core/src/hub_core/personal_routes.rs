@@ -94,6 +94,9 @@ pub struct PersonalRoutes {
     switch: Arc<parking_lot::RwLock<PersonalRoutesConfig>>,
     store: Arc<parking_lot::RwLock<Option<Arc<dyn PersonRouteStore>>>>,
     cache: Arc<parking_lot::Mutex<std::collections::HashMap<(Uuid, String), Cached>>>,
+    /// Bumped by every [`Self::forget`], so a read begun before a change
+    /// never puts what it read back into the cache after it.
+    changes: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl std::fmt::Debug for PersonalRoutes {
@@ -111,6 +114,7 @@ impl PersonalRoutes {
             switch: Arc::new(parking_lot::RwLock::new(switch)),
             store: Default::default(),
             cache: Default::default(),
+            changes: Default::default(),
         }
     }
 
@@ -160,16 +164,25 @@ impl PersonalRoutes {
                 return Ok(settings);
             }
         }
+        let begun = self.changes.load(std::sync::atomic::Ordering::Acquire);
         let settings = store.settings(person, Some(agent_id)).await?;
-        self.cache
-            .lock()
-            .insert(key, (std::time::Instant::now(), settings.clone()));
+        let mut cache = self.cache.lock();
+        if self.changes.load(std::sync::atomic::Ordering::Acquire) != begun {
+            return Ok(settings);
+        }
+        // What has gone stale is read again anyway: dropped, so the cache
+        // holds only who was asked about lately.
+        cache.retain(|_, (at, _)| at.elapsed() < SETTINGS_TTL);
+        cache.insert(key, (std::time::Instant::now(), settings.clone()));
         Ok(settings)
     }
 
     /// Drops what is cached of `person`'s settings, after they change.
     pub fn forget(&self, person: Uuid) {
-        self.cache.lock().retain(|(who, _), _| *who != person);
+        let mut cache = self.cache.lock();
+        self.changes
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        cache.retain(|(who, _), _| *who != person);
     }
 }
 

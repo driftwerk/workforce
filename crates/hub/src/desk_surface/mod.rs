@@ -9,6 +9,7 @@ mod deliver;
 pub(crate) mod edit;
 #[cfg(feature = "postgres")]
 pub(crate) mod link;
+mod notice;
 mod retarget;
 pub(crate) mod room_view;
 mod surface;
@@ -22,6 +23,7 @@ pub(crate) use context::{desk_context, person_name};
 pub(crate) use deliver::{
     deliver, deliver_as, deliver_file, resumed, save_on_head, Delivered, Delivery, Outbox,
 };
+pub(crate) use notice::{in_conversation, notice};
 pub(crate) use retarget::retarget;
 pub(crate) use surface::DeskSurface;
 

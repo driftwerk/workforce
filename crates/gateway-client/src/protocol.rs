@@ -793,6 +793,38 @@ pub struct AgentInfo {
     /// The picture shown for the agent, when it has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub picture: Option<PictureInfo>,
+    /// What the caller's own conversations with the agent run on, when that
+    /// is their own subscription rather than the hub's route that
+    /// `provider` and `model` name. Absent: the hub's route, or a hub from
+    /// before it said. Its model is the one a new conversation runs; a
+    /// session's own `cmd: model` or a spoken turn's voice model can differ.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub personal_route: Option<PersonalRouteInfo>,
+}
+
+/// A person's own route as an agent listing shows it to them: the
+/// subscription their conversations with the agent run on, the model, and
+/// what happens when it can't take a turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonalRouteInfo {
+    /// `claude-code` or `codex`.
+    pub kind: String,
+    /// How the subscription reads to a person: "Claude".
+    pub title: String,
+    /// The model their conversation turns run on.
+    pub model: String,
+    /// `wait`: a turn their login can't take stops and says why. `hub`: it
+    /// runs on the hub's route instead.
+    pub fallback: String,
+    /// Whether they hold a working login of their own for it now (one at
+    /// its usage limit counts). Without one, a turn waits or runs on the
+    /// hub's route, as `fallback` says.
+    pub connected: bool,
+    /// Why the route can't take the agent's turns here at all (a Codex
+    /// route on a hub without its coding worker), so they stop and say
+    /// this; none when it can.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
 }
 
 /// The picture an agent or a person is shown with: one chosen for them,
