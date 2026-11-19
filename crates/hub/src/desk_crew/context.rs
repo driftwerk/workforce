@@ -247,6 +247,14 @@ pub(crate) async fn block(service: &AgentService, channel: &str, owner: &str) ->
         (Some(open), Some(p)) => Some(format!("{}\n\n{}", open.trim_end(), p.trim_end())),
         (open, p) => open.or(p),
     };
+    // Who holds which job it gave out: never dropped for room either.
+    let open = match (
+        open,
+        Box::pin(crew.assignments_block(boss.agent_id.as_str())).await,
+    ) {
+        (Some(open), Some(a)) => Some(format!("{}\n\n{a}", open.trim_end())),
+        (open, a) => open.or(a),
+    };
     let body = body(
         &entries,
         about,

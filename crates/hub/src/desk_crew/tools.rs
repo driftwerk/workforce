@@ -27,7 +27,7 @@ use super::CrewHub;
 
 /// Every `crew.*` tool: the ones it has at every level first (its reads,
 /// and what it asks of the person, which is never gated).
-pub const READ: [&str; 20] = [
+pub const READ: [&str; 21] = [
     "crew.overview",
     "crew.activity",
     "crew.account",
@@ -48,8 +48,9 @@ pub const READ: [&str; 20] = [
     super::github::PR,
     super::github::BRANCH,
     super::github::CI,
+    super::assignments::LIST,
 ];
-pub const ACT: [&str; 23] = [
+pub const ACT: [&str; 24] = [
     "crew.nudge",
     "crew.ask_session",
     "crew.escalate",
@@ -73,6 +74,7 @@ pub const ACT: [&str; 23] = [
     "crew.handoff",
     "crew.set_mode",
     super::own_settings::NAME,
+    super::assignments::CLOSE,
 ];
 
 pub struct CrewTool {
@@ -389,6 +391,10 @@ impl CrewTool {
                 self.account(crew, id, input["question"].as_str()).await
             }
             super::spend::NAME => crew.spend(input, seen).await,
+            super::assignments::LIST => {
+                crew.assignments_tool(b.service.agent_id.as_str(), input)
+                    .await
+            }
             // Its own log only: nothing of another boss's is read.
             super::decisions::NAME => {
                 crew.decisions_tool(b.service.agent_id.as_str(), input)
@@ -598,16 +604,16 @@ impl CrewTool {
             Gate::Run => {
                 let by = crew.by_at_level(by, oversight);
                 let actor = by.party.clone();
+                let order = super::assignments::Order::of(input);
                 let Some((start, name)) = reused else {
-                    let urgency = super::urgent::of(input);
-                    let done = super::urgent::sent(urgency, crew.perform(&action, by)).await?;
+                    let done = Box::pin(crew.perform_with(&action, by, &order)).await?;
                     return Ok(json!({ "done": done }));
                 };
                 let Action::Nudge { to: Target::Session(s), .. } = &action else {
                     return Err("That isn't a session to give work to.".into());
                 };
                 let s = *s;
-                let (done, gave) = crew.give_or_start(&action, &start, s, by).await?;
+                let (done, gave) = Box::pin(crew.give_or_start(&action, &start, s, by, &order)).await?;
                 if !gave {
                     return Ok(json!({ "done": done }));
                 }
@@ -773,35 +779,64 @@ impl CrewTool {
             }
         }
         let agent = b.service.agent_id.as_str();
-        Some(
-            match crew.relay(machine, g, name, sent, agent, &ceiling).await {
-                Ok(a) => {
-                    let said = reported(
-                        &workforce_desk::sees::capped(
-                            &a.body.to_string(),
-                            workforce_desk::sees::MAX_CHARS,
-                        ),
-                        &format!("{machine}'s answer"),
-                    );
-                    let uncited = format!(
-                        "{machine} recorded this without your preference: if you tell the person, say \
-                         which preference you followed yourself."
-                    );
-                    match a.status {
-                        super::served::ServedStatus::Refused => Err(said),
-                        super::served::ServedStatus::Ok if cited => {
-                            Ok(json!({ "done": said, "note": uncited }))
-                        }
-                        super::served::ServedStatus::Ok => Ok(json!({ "done": said })),
-                        super::served::ServedStatus::Suggested => Ok(json!({
-                            "suggested": said,
-                            "note": format!("Not done: {machine} keeps it for the person to decide."),
-                        })),
-                    }
+        // Who holds which job is kept here, the boss's home, for its
+        // sessions here and on machines alike: reserved before it goes.
+        let assigned = match crew.assign_relayed(agent, machine, id, name, &sent).await {
+            Ok(a) => a,
+            Err(why) => return Some(Err(why)),
+        };
+        // Held for its old holder's stand-down: relayed once it answers.
+        if let Some(said) = assigned.as_ref().and_then(|a| a.held.clone()) {
+            return Some(Ok(json!({ "done": said })));
+        }
+        // Taken over: its new holder checks it hasn't been started.
+        let mut sent =
+            super::assignments::relayed_input(&sent, assigned.as_ref().and_then(|a| a.guard));
+        // The machine compares a request with the jobs kept here (R5).
+        if name == "crew.approve" {
+            match crew.held_irreversible(agent).await {
+                Ok(held) => sent[super::assignments::HELD_JOBS] = json!(held),
+                Err(why) => {
+                    return Some(Err(format!(
+                        "Not allowed: {why}, so this can't be checked against them. It's the person's to answer."
+                    )))
                 }
-                Err(why) => Err(why),
-            },
-        )
+            }
+        }
+        let relayed = crew.relay(machine, g, name, sent, agent, &ceiling).await;
+        if let Some(a) = assigned.map(|a| a.id) {
+            let ok = relayed
+                .as_ref()
+                .is_ok_and(|r| r.status == super::served::ServedStatus::Ok);
+            crew.assign_relayed_done(a, ok).await;
+        }
+        Some(match relayed {
+            Ok(a) => {
+                let said = reported(
+                    &workforce_desk::sees::capped(
+                        &a.body.to_string(),
+                        workforce_desk::sees::MAX_CHARS,
+                    ),
+                    &format!("{machine}'s answer"),
+                );
+                let uncited = format!(
+                    "{machine} recorded this without your preference: if you tell the person, say \
+                         which preference you followed yourself."
+                );
+                match a.status {
+                    super::served::ServedStatus::Refused => Err(said),
+                    super::served::ServedStatus::Ok if cited => {
+                        Ok(json!({ "done": said, "note": uncited }))
+                    }
+                    super::served::ServedStatus::Ok => Ok(json!({ "done": said })),
+                    super::served::ServedStatus::Suggested => Ok(json!({
+                        "suggested": said,
+                        "note": format!("Not done: {machine} keeps it for the person to decide."),
+                    })),
+                }
+            }
+            Err(why) => Err(why),
+        })
     }
 }
 
@@ -831,6 +866,8 @@ pub(crate) fn describe(name: &str) -> &'static str {
             super::plan::BOARD_CREATE => super::plan::BOARD_CREATE_DESCRIPTION,
             super::handover::NAME => super::handover::DESCRIPTION,
             super::own_settings::NAME => super::own_settings::DESCRIPTION,
+            super::assignments::CLOSE => super::assignments::CLOSE_DESCRIPTION,
+            super::assignments::LIST => super::assignments::LIST_DESCRIPTION,
             "crew.activity" => "What happened on the crew, newest first: turns started and finished, questions, requests, failures, and what you and the person did. Filter to one agent or session with subject_id.",
             "crew.account" => "What one session (session_id) is for, who asked, its plan, what it has done (with its PRs, tickets, commits and deploys), what it is doing now, what it waits on, what comes next and the choices it made: its running account, brought up to date first when it is stale, with the time it is as of. Read it before you say anything of a session. With question, also the answer its own recent conversation gives to something the account doesn't say (which key, which file, what error).",
             "crew.ask_session" => "Ask a session (session_id) a question about its work, as Desk's status question on its line, without derailing it: one that is working gets it once its turn ends, never typed in over what it is doing. Use it only when crew.account, with a question, can't answer; then answer the person now from what you have and say you asked.",
@@ -893,6 +930,17 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
         super::plan::BOARD_CREATE => super::plan::board_create_schema(),
         super::handover::NAME => super::handover::schema(),
         super::own_settings::NAME => super::own_settings::schema(),
+        super::assignments::LIST => json!({ "type": "object", "properties": {
+            "all": { "type": "boolean", "description": "true for the last day's closed ones too" }
+        }}),
+        super::assignments::CLOSE => act(
+            props(json!({
+                "id": { "type": "string", "description": "The assignment, as a:… from crew.assignments" },
+                "state": { "type": "string", "enum": ["done", "cancelled", "release"] },
+                "note": { "type": "string", "description": "Why, in a sentence the person reads" }
+            })),
+            &["id", "state", "note"],
+        ),
         "crew.activity" => json!({ "type": "object", "properties": {
             "subject_id": { "type": "string", "description": "An agent or session id" },
             "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
@@ -918,9 +966,11 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
                 "agent_id": { "type": "string" },
                 "session_id": session_schema(),
                 "message": { "type": "string" },
-                "reply_to": { "type": "string", "description": "The message id of the session's question this answers" },
-                "urgent": { "type": "boolean", "description": super::urgent::URGENT_DESCRIPTION }
-            })),
+                "reply_to": { "type": "string", "description": "The message id of the session's question this answers" }
+            }))
+            .into_iter()
+            .chain(props(super::assignments::order_properties(true)))
+            .collect(),
             &["message"],
         ),
         "crew.escalate" => act(
@@ -948,7 +998,10 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
             props(json!({
                 "session_id": session_schema(),
                 "prompt": { "type": "string" }
-            })),
+            }))
+            .into_iter()
+            .chain(props(super::assignments::order_properties(true)))
+            .collect(),
             &["session_id"],
         ),
         "crew.set_mode" => act(
@@ -978,7 +1031,10 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
                     "view": { "type": "string", "enum": ["terminal"], "description": "Where it runs (default terminal)" },
                     "worktree": { "type": "string", "description": "A new branch to work on, in a worktree of its own" },
                     "new": { "type": "boolean", "description": "true only when the person asked for a new session: none already there gets the work" }
-                })),
+                }))
+                .into_iter()
+                .chain(props(super::assignments::order_properties(true)))
+                .collect(),
                 &["folder", "goal"],
             )
         }
@@ -1005,7 +1061,10 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
                             }, "required": ["folder"] }
                         }
                     }
-                })),
+                }))
+                .into_iter()
+                .chain(props(super::assignments::order_properties(true)))
+                .collect(),
                 &["ticket", "to"],
             )
         }
@@ -1078,6 +1137,8 @@ impl Tool for CrewTool {
             crew.plan_tool(self.name, &bound, &input).await
         } else if self.name == super::handover::NAME {
             crew.handover_tool(&bound, &input).await
+        } else if self.name == super::assignments::CLOSE {
+            crew.assignment_tool(&bound, &input).await
         } else {
             self.act(&crew, &bound, &input).await
         };

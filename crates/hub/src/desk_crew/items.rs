@@ -712,8 +712,25 @@ impl CrewHub {
                 .map(|m| m.id.clone())
         });
         let new = NewItem::order(boss, text.trim(), sessions, message.as_deref());
-        if let Err(e) = self.order_open(new).await {
-            tracing::warn!(error = %format!("{e:#}"), "keeping the person's order failed");
+        match self.order_open(new).await {
+            // What the turn handed out serves it: the person's order is
+            // kept with the assignments it made.
+            Ok(opened) => {
+                let item = opened.item().id;
+                for turn in std::iter::once(sid).chain(rolled.as_deref()) {
+                    if let Err(e) = self
+                        .desk
+                        .store()
+                        .assignments_serve_item(boss, turn, started, item)
+                        .await
+                    {
+                        tracing::warn!(error = %format!("{e:#}"), "the person's order wasn't kept with its assignments");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "keeping the person's order failed");
+            }
         }
     }
 

@@ -164,6 +164,12 @@ kinds! {
     // A boss's ask the person settled in its session themselves: Desk
     // folds what still lists it (`detail`: itemId, by).
     Settled => "settled",
+    // A boss's assignment to a session (designs/boss-orders-and-serial-turns.md
+    // §3) closed, refused, or held until its old holder stands down. Its
+    // sending is `Assigned`.
+    AssignmentClosed => "assignment_closed",
+    AssignmentRefused => "assignment_refused",
+    AssignmentHeld => "assignment_held",
 }
 
 /// One thing that happened on the crew.

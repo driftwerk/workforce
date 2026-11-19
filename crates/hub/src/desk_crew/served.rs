@@ -430,7 +430,11 @@ impl CrewHub {
                 .await
                 .map(|v| (ServedStatus::Ok, v))
         } else {
-            self.served_act(tool, &call.input, &grant, &o, &boss).await
+            // A call the home relayed is kept as an assignment at the
+            // home; one of a boss served from its own hub, here.
+            let relayed = call.link_id.as_deref() == Some(super::relay::RELAY_LINK);
+            self.served_act(tool, &call.input, &grant, &o, &boss, relayed)
+                .await
         };
         // The boss answered a request itself: its ask to the person is
         // closed.
@@ -956,6 +960,7 @@ impl CrewHub {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn served_act(
         self: &Arc<Self>,
         tool: &'static str,
@@ -963,7 +968,10 @@ impl CrewHub {
         g: &Grant,
         o: &Oversight,
         boss: &str,
+        relayed: bool,
     ) -> Result<(ServedStatus, Value), String> {
+        let mut order = super::assignments::Order::of(input);
+        order.unrecorded = relayed;
         let reason = input["reason"]
             .as_str()
             .map(str::trim)
@@ -1064,10 +1072,26 @@ impl CrewHub {
             Gate::Suggest(why) => Ok(self.served_suggestion(&action, &why)),
             Gate::Run => {
                 let done = match &action {
+                    // Recorded as any order (its goal, its declared job),
+                    // with the session it started.
                     Action::StartSession { .. } => {
-                        self.served_start(&action, g, o, boss, by).await?
+                        let reserved =
+                            match Box::pin(self.assign_before(&action, &by, &order)).await? {
+                                super::assignments::Before::Send(r) => Some(r),
+                                super::assignments::Before::Not => None,
+                                super::assignments::Before::Held(said) => {
+                                    return Ok((ServedStatus::Ok, json!({ "done": said })))
+                                }
+                            };
+                        let who = by.clone();
+                        let started = self.served_start(&action, g, o, boss, by).await;
+                        if let Some(r) = &reserved {
+                            let id = started.as_ref().ok().map(|(_, id)| *id);
+                            Box::pin(self.assign_after(r, &who, None, id, started.is_ok())).await;
+                        }
+                        started?.0
                     }
-                    _ => self.perform(&action, by).await?,
+                    _ => Box::pin(self.perform_with(&action, by, &order)).await?,
                 };
                 Ok((ServedStatus::Ok, json!({ "done": done })))
             }
@@ -1096,7 +1120,7 @@ impl CrewHub {
         o: &Oversight,
         boss: &str,
         by: By,
-    ) -> Result<String, String> {
+    ) -> Result<(String, Uuid), String> {
         let Action::StartSession {
             folder,
             goal,
@@ -1191,7 +1215,10 @@ impl CrewHub {
                 }
                 other => other.to_string(),
             })?;
-        Ok(format!("started {} ({}); you run it", v.label(), v.id))
+        Ok((
+            format!("started {} ({}); you run it", v.label(), v.id),
+            v.id,
+        ))
     }
 }
 

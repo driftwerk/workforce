@@ -682,7 +682,8 @@ async fn a_running_session_goes_back_to_its_own_mode_when_unbound_ends() {
                 .tools
                 .get("crew.nudge")
                 .unwrap()
-                .execute(json!({"session_id": s.id.to_string(), "message": "Run the deploy", "reason": "Next."}))
+                .execute(json!({"session_id": s.id.to_string(), "message": "Run the deploy", "reason": "Next.",
+                    "job": { "kind": "deploy", "target": "acme/web", "key": s.id.to_string() }}))
                 .await
                 .unwrap();
             assert!(asked.output["done"].is_string(), "{ends:?}: {asked:?}");
