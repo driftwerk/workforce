@@ -90,6 +90,11 @@ pub struct NewTicket {
 pub struct TicketPatch {
     pub title: Option<String>,
     pub body: Option<String>,
+    /// Words added to the end of its description, after a blank line: the
+    /// description as it is when the change is saved, so nothing written
+    /// meanwhile is lost. Not with `body`.
+    #[serde(default)]
+    pub append: Option<String>,
     pub pinned: Option<bool>,
     /// Until when it is hidden from the board; `null` wakes it.
     #[serde(default, deserialize_with = "crate::model::present")]
@@ -798,11 +803,41 @@ impl Desk {
                 t.title = title;
             }
         }
-        if let Some(body) = patch.body.map(|s| s.trim().to_string()) {
-            if body != t.body {
-                said.push("edited its description".to_string());
+        match (patch.body, patch.append) {
+            (Some(_), Some(_)) => {
+                return Err(DeskError::Invalid(
+                    "Replace its description or add to it, not both.".into(),
+                ))
+            }
+            (Some(body), None) => {
+                let body = body.trim().to_string();
+                if body != t.body {
+                    said.push("edited its description".to_string());
+                    t.body = body;
+                }
+            }
+            (None, Some(more)) => {
+                let more = more.trim();
+                if more.is_empty() {
+                    return Err(DeskError::Invalid(
+                        "Say what to add to its description.".into(),
+                    ));
+                }
+                let body = match t.body.trim_end() {
+                    "" => more.to_string(),
+                    was => format!("{was}\n\n{more}"),
+                };
+                let n = body.chars().count();
+                if n > board::BODY_MAX {
+                    return Err(DeskError::Invalid(format!(
+                        "With that added, its description would be {n} characters; keep it to {}.",
+                        board::BODY_MAX
+                    )));
+                }
+                said.push("added to its description".to_string());
                 t.body = body;
             }
+            (None, None) => {}
         }
         if !said.is_empty() {
             t.updated_at = at;

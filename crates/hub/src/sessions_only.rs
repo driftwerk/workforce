@@ -1,9 +1,9 @@
-//! "Always work in real sessions": an agent that oversees the crew
-//! (`[oversight] enabled`, at a level that starts sessions) with
-//! `[oversight.work] prefer_sessions` does no coding work in-process, so the
-//! work always happens in a session the person can watch, type into and take
-//! over. While the switch is on, these calls are refused with a pointer to
-//! `crew.start_session`:
+//! How the boss works (`[oversight.work] style`, [`WorkStyle`]): an agent
+//! that oversees the crew (`[oversight] enabled`, at a level that starts
+//! sessions) does its work in real sessions the person can watch, type into
+//! and take over, as its style says.
+//!
+//! **Only in sessions** refuses, with a pointer to `crew.start_session`:
 //!
 //! - a coding tool's (`code.*`, `coding.*`) call that changes or runs
 //!   something: an edit, a build, a test, a commit, a coding session or
@@ -14,19 +14,35 @@
 //!   followed, inside a git work tree, a Desk session's folder, a project
 //!   checkout or the hub's worktrees.
 //!
+//! **Prefer sessions** refuses the coding tools' working calls and the file
+//! writes inside code alike, but lets commands run: ssh, gh, reading logs,
+//! a quick check. A command that is itself coding work is refused as one:
+//! a build, a test or a package install (`cargo build`, `npm test`,
+//! `make`), a change made with git (`git commit`, `git apply`), an edit in
+//! place (`sed -i`), or a write, move or delete (`>`, `tee`, `rm`, `mv`,
+//! `cp`) of a path inside code. A command run on another machine over ssh
+//! is that machine's ops, and runs. What a command may do is judged beyond
+//! this as it is for any agent (its approvals, exec containment); the
+//! person's directives say what is theirs. **Do it myself** refuses
+//! nothing.
+//!
 //! What a call does decides as much as what its tool is called: any tool
-//! whose call runs a command is refused, and any whose call writes, deletes
-//! or moves a path inside code (an MCP server's, a WASM skill's).
+//! whose call runs a command is a command, and any whose call writes,
+//! deletes or moves a path inside code (an MCP server's, a WASM skill's) is
+//! a change to code.
 //!
 //! What only reads still runs, and so do writes elsewhere in the agent's own
 //! workspace (its notes, memory and scratch files). Workflow coding steps and
 //! pilot rounds run their own CLIs, not these tools, and are not held.
 //!
-//! The switch is read from the agent's config at each call, so turning it on
-//! or off applies to the next call. It is enforced in the tool itself
+//! The style is read from the agent's config at each call, so changing it
+//! applies to the next call. It is enforced in the tool itself
 //! ([`SessionsOnly`]), so every path a call takes — a turn, a worker
 //! sub-agent's snapshot, a CLI turn's gated MCP — meets it.
 
+mod command;
+
+use std::borrow::Cow;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -34,38 +50,63 @@ use std::time::Instant;
 use async_trait::async_trait;
 use eyre::Result;
 use workforce_agent::tools::{SurfaceEffect, Tool, ToolDefinition, ToolResult};
+use workforce_common::oversight::{Level, Oversight, WorkStyle};
 use workforce_core::computer::Effect;
 
-/// [`ALWAYS_SESSIONS`], and what follows it when a session it starts is
-/// only a suggestion.
-macro_rules! always_sessions_then {
-    ($then:literal) => {
-        concat!(
-            "Desk is set to always work in real sessions: start one with crew.start_session so \
-             the person can watch it. Here only read-only lookups run: reads, search, notes in \
-             the agent's own workspace, and sub-agents with profile \"worker\".",
-            $then
-        )
-    };
+/// What a held call would do, for which style refuses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Doing {
+    /// It runs a command: a shell's, or any tool's that runs one.
+    Command,
+    /// It changes code, or is a coding tool's working call.
+    Code,
+    /// A sub-agent that would do work rather than look things up.
+    Helper,
 }
 
-/// Why a call is refused while the switch is on: the same words for every
-/// held tool and for a sub-agent that would do the work.
-pub const ALWAYS_SESSIONS: &str = always_sessions_then!("");
+/// The words a refusal starts with, for the style that refuses it.
+fn says(style: WorkStyle) -> &'static str {
+    match style {
+        WorkStyle::PreferSessions => {
+            "Desk's “How it works” setting for you is Prefer sessions: changing code and long \
+             tasks go to a real session the person can watch; start one with \
+             crew.start_session. Checks, lookups and ops you may still run yourself (ssh, gh, \
+             reading files and logs, a quick command), and sub-agents with profile \"worker\"."
+        }
+        _ => {
+            "Desk's “How it works” setting for you is Only in sessions: all work goes to a real \
+             session the person can watch; start one with crew.start_session. Here only \
+             read-only lookups run: reads, search, notes in the agent's own workspace, and \
+             sub-agents with profile \"worker\"."
+        }
+    }
+}
 
-/// [`ALWAYS_SESSIONS`] at Act while "Hand out work" is off: the session it
-/// would start is a suggestion until the person turns it on.
-pub const ALWAYS_SESSIONS_HAND_OUT_OFF: &str = always_sessions_then!(
-    " “Hand out work” is off, so the start is a suggestion; tell the person turning “Hand out \
-     work” on lets you start sessions."
-);
+/// The option that would let what is refused run, named for the person.
+fn allows(style: WorkStyle, doing: Doing) -> &'static str {
+    match (style, doing) {
+        (WorkStyle::SessionsOnly, Doing::Command) => {
+            " “Prefer sessions” would let you run checks, lookups and ops like this yourself; \
+             tell the person if that's what they want."
+        }
+        _ => " Only “Do it myself” would let you do this here; tell the person if that's what they want.",
+    }
+}
 
-/// [`ALWAYS_SESSIONS`] at Suggest: every session it would start is a
-/// suggestion.
-pub const ALWAYS_SESSIONS_SUGGEST: &str =
-    always_sessions_then!(" At Suggest, the start is a suggestion.");
+/// What follows when the session it is pointed to would only be
+/// suggested: at Suggest, or at Act with “Hand out work” off.
+fn then(o: &Oversight) -> &'static str {
+    match o.level {
+        Level::Suggest => " At Suggest, the start is a suggestion.",
+        Level::Act | Level::Full if !o.act.hand_out_work => {
+            " “Hand out work” is off, so the start is a suggestion; tell the person turning \
+             “Hand out work” on lets you start sessions."
+        }
+        _ => "",
+    }
+}
 
-fn oversight_of(workspace: &Path) -> workforce_common::oversight::Oversight {
+fn oversight_of(workspace: &Path) -> Oversight {
     workforce_common::settings::AgentWorkspaceConfig::load(workspace)
         .ok()
         .flatten()
@@ -73,31 +114,32 @@ fn oversight_of(workspace: &Path) -> workforce_common::oversight::Oversight {
         .unwrap_or_default()
 }
 
-/// Whether the agent whose workspace is `workspace` always works in real
-/// sessions: it oversees the crew at a level that starts sessions (Watch
-/// starts none) with `[oversight.work] prefer_sessions` on.
-pub fn always_sessions(workspace: &Path) -> bool {
-    refusal_for(&oversight_of(workspace)).is_some()
+/// What a call doing `doing` is told, for the agent whose workspace is
+/// `workspace`: `None` when its style lets it run. The refusal names the
+/// setting, the option that would let it, and whether the session it is
+/// pointed to would only be suggested.
+pub fn always_sessions_refusal(workspace: &Path, doing: Doing) -> Option<String> {
+    refusal_for(&oversight_of(workspace), doing)
 }
 
-/// What a call held to the switch is told, for the agent whose workspace
-/// is `workspace`: `None` unless it always works in real sessions, and
-/// whether the session it is pointed to would only be suggested.
-pub fn always_sessions_refusal(workspace: &Path) -> Option<&'static str> {
-    refusal_for(&oversight_of(workspace))
-}
-
-fn refusal_for(o: &workforce_common::oversight::Oversight) -> Option<&'static str> {
-    use workforce_common::oversight::Level;
-    if !o.enabled || !o.work.prefer_sessions {
+/// [`always_sessions_refusal`] for the oversight `o`.
+pub fn refusal_for(o: &Oversight, doing: Doing) -> Option<String> {
+    if !o.enabled || o.level == Level::Watch {
         return None;
     }
-    match o.level {
-        Level::Watch => None,
-        Level::Suggest => Some(ALWAYS_SESSIONS_SUGGEST),
-        Level::Act | Level::Full if !o.act.hand_out_work => Some(ALWAYS_SESSIONS_HAND_OUT_OFF),
-        Level::Act | Level::Full => Some(ALWAYS_SESSIONS),
-    }
+    let refused = match o.work.style {
+        WorkStyle::SessionsOnly => true,
+        WorkStyle::PreferSessions => doing != Doing::Command,
+        WorkStyle::Direct => false,
+    };
+    refused.then(|| {
+        format!(
+            "{}{}{}",
+            says(o.work.style),
+            allows(o.work.style, doing),
+            then(o)
+        )
+    })
 }
 
 /// What a held tool is, for what of its calls is refused.
@@ -105,7 +147,8 @@ fn refusal_for(o: &workforce_common::oversight::Oversight) -> Option<&'static st
 enum Held {
     /// `code.*`, `coding.*`: refused unless the call only reads.
     Coding,
-    /// `exec.*`: always refused.
+    /// `exec.*`: refused when only in sessions; preferring sessions, when
+    /// the command is coding work ([`Bounds::command_is_code`]).
     Shell,
     /// A file write, edit or delete: refused where it touches code.
     Files,
@@ -127,8 +170,8 @@ impl Held {
     }
 }
 
-/// Whether `name` is a tool held to the switch: a coding tool, a shell, or
-/// a file write.
+/// Whether `name` is a tool held to the boss's style: a coding tool, a
+/// shell, or a file write.
 pub fn is_held(name: &str) -> bool {
     Held::of(name).is_some()
 }
@@ -170,14 +213,19 @@ impl Bounds {
     /// tree (other than one the workspace itself sits in), a code root, or
     /// a Desk session's folder. Links are followed first.
     fn touches_code(&self, path: &Path) -> bool {
+        let roots: Vec<PathBuf> = (self.code)()
+            .iter()
+            .map(|root| folded_buf(resolved(root)))
+            .collect();
+        self.touches_code_in(path, &roots)
+    }
+
+    /// [`Self::touches_code`] with the code roots read, resolved and folded.
+    fn touches_code_in(&self, path: &Path, roots: &[PathBuf]) -> bool {
         let path = resolved(path);
         let workspace = resolved(&self.workspace);
         let folded = folded(&path);
-        if (self.code)()
-            .iter()
-            .map(|root| folded_buf(resolved(root)))
-            .any(|root| folded.starts_with(&root))
-        {
+        if roots.iter().any(|root| folded.starts_with(root)) {
             return true;
         }
         // A repo of its own inside the workspace counts; a repo the
@@ -190,10 +238,10 @@ impl Bounds {
 
     /// Why a call of a tool `held` names (none for any other tool) acting
     /// as `effect` may not run now. What a call does decides, whatever its
-    /// tool is called: a command it runs is refused, and so is a write,
-    /// delete or move that touches code. A tool named as held is refused
-    /// besides for what it can't say it only reads.
-    fn refusal(&self, held: Option<Held>, effect: &Effect) -> Option<&'static str> {
+    /// tool is called: a command it runs is a command, and a write, delete
+    /// or move that touches code a change to code. A coding tool is a
+    /// change to code besides for what it can't say it only reads.
+    fn refusal(&self, held: Option<Held>, effect: &Effect) -> Option<Cow<'static, str>> {
         // Most calls are none of this: say so before reading anything.
         let may_be = matches!(held, Some(Held::Shell))
             || match effect {
@@ -209,20 +257,50 @@ impl Bounds {
         if !may_be {
             return None;
         }
-        let refusal = always_sessions_refusal(&self.workspace)?;
+        let o = oversight_of(&self.workspace);
+        // Nothing to judge when its style refuses neither.
+        refusal_for(&o, Doing::Code)?;
         let touches = |paths: &[&PathBuf]| paths.iter().any(|p| self.touches_code(p));
-        let refused = match (held, effect) {
-            (Some(Held::Shell), _) | (_, Effect::Exec { .. }) => true,
-            (_, Effect::None | Effect::Read { .. }) => false,
-            (Some(Held::Coding), _) => true,
-            (_, Effect::Write { paths } | Effect::Delete { paths }) => {
-                touches(&paths.iter().collect::<Vec<_>>())
+        let doing = match (held, effect) {
+            // A coding tool's build or test is coding work, never a check.
+            (Some(Held::Coding), Effect::None | Effect::Read { .. }) => None,
+            (Some(Held::Coding), _) => Some(Doing::Code),
+            (_, Effect::Exec { command, cwd }) => {
+                Some(match self.command_is_code(command, cwd.as_deref()) {
+                    true => Doing::Code,
+                    false => Doing::Command,
+                })
             }
-            (_, Effect::Move { from, to }) => touches(&from.iter().chain([to]).collect::<Vec<_>>()),
-            (Some(Held::Files), _) => true,
-            (None, Effect::Session { .. } | Effect::Connector { .. } | Effect::Unknown) => false,
+            (Some(Held::Shell), _) => Some(Doing::Command),
+            (_, Effect::None | Effect::Read { .. }) => None,
+            (_, Effect::Write { paths } | Effect::Delete { paths }) => {
+                touches(&paths.iter().collect::<Vec<_>>()).then_some(Doing::Code)
+            }
+            (_, Effect::Move { from, to }) => {
+                touches(&from.iter().chain([to]).collect::<Vec<_>>()).then_some(Doing::Code)
+            }
+            (Some(Held::Files), _) => Some(Doing::Code),
+            (None, Effect::Session { .. } | Effect::Connector { .. } | Effect::Unknown) => None,
+        }?;
+        refusal_for(&o, doing).map(Cow::Owned)
+    }
+}
+
+impl Bounds {
+    /// Whether the shell command `command`, run in `cwd` (the workspace
+    /// when not said, a relative one from it), is coding work rather than a
+    /// check ([`command::is_code`]). The code roots are read once for it.
+    fn command_is_code(&self, command: &str, cwd: Option<&Path>) -> bool {
+        let here = match cwd {
+            Some(c) if c.is_absolute() => c.to_path_buf(),
+            Some(c) => self.workspace.join(c),
+            None => self.workspace.clone(),
         };
-        refused.then_some(refusal)
+        let roots: Vec<PathBuf> = (self.code)()
+            .iter()
+            .map(|root| folded_buf(resolved(root)))
+            .collect();
+        command::is_code(command, &here, &|p: &Path| self.touches_code_in(p, &roots))
     }
 }
 
@@ -278,7 +356,7 @@ fn desk_session_folders() -> Vec<PathBuf> {
 }
 
 /// Hold every tool `tools` has and is given later — and every copy of it
-/// takes — to the switch within `bounds`: MCP, WASM and skill tools as much
+/// takes — to its style within `bounds`: MCP, WASM and skill tools as much
 /// as the hub's own, since what a call does decides.
 pub fn hold(tools: &workforce_agent::tools::registry::ToolRegistry, bounds: &Bounds) {
     let bounds = bounds.clone();
@@ -294,7 +372,7 @@ pub struct SessionsOnly {
 }
 
 impl SessionsOnly {
-    /// `tool`, held to the switch within `bounds`.
+    /// `tool`, held to the boss's style within `bounds`.
     pub fn wrap(tool: Arc<dyn Tool>, bounds: &Bounds) -> Arc<dyn Tool> {
         Arc::new(Self {
             held: Held::of(tool.name()),
@@ -304,7 +382,7 @@ impl SessionsOnly {
     }
 
     /// Why the call with `input` may not run now, if it may not.
-    fn refusal(&self, input: &serde_json::Value) -> Option<&'static str> {
+    fn refusal(&self, input: &serde_json::Value) -> Option<Cow<'static, str>> {
         self.bounds.refusal(self.held, &self.inner.effect(input))
     }
 }
@@ -328,7 +406,7 @@ impl Tool for SessionsOnly {
         if let Some(why) = self.refusal(&input) {
             tracing::info!(
                 tool = self.inner.name(),
-                "coding work refused in-process: the agent always works in real sessions"
+                "work refused in-process: the agent's style sends it to real sessions"
             );
             return Ok(ToolResult::failure(why, start.elapsed().as_millis() as u64));
         }
@@ -423,10 +501,12 @@ mod tests {
             paths: paths(input),
         }
     }
-    fn exec(_: &serde_json::Value) -> Effect {
+    /// A command as its input says it (`cargo test` when not said), run
+    /// where `workdir` says.
+    fn exec(input: &serde_json::Value) -> Effect {
         Effect::Exec {
-            command: "cargo test".into(),
-            cwd: None,
+            command: input["command"].as_str().unwrap_or("cargo test").into(),
+            cwd: input["workdir"].as_str().map(PathBuf::from),
         }
     }
     fn session(_: &serde_json::Value) -> Effect {
@@ -449,6 +529,10 @@ mod tests {
 
     const ON: &str =
         "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.work]\nprefer_sessions = true\n";
+    const OFF: &str =
+        "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.work]\nprefer_sessions = false\n";
+    const PREFER: &str =
+        "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.work]\nstyle = \"prefer_sessions\"\n";
 
     /// An agent's workspace holding `config`, a git checkout, a hub
     /// worktrees folder and a Desk session folder beside it.
@@ -507,7 +591,11 @@ mod tests {
         ) -> bool {
             let result = self.tool(name, effect).execute(input).await.unwrap();
             if !result.success {
-                assert_eq!(result.error.as_deref(), Some(ALWAYS_SESSIONS), "{name}");
+                let said = result.error.as_deref().unwrap_or_default();
+                assert!(
+                    said.starts_with("Desk's “How it works” setting"),
+                    "{name}: {said}"
+                );
             }
             result.success
         }
@@ -520,7 +608,7 @@ mod tests {
         serde_json::Value,
     );
 
-    /// Every held tool's working call: refused while the switch is on.
+    /// Every held tool's working call: refused only in sessions.
     fn working_calls(at: &Place) -> Vec<Call> {
         vec![
             ("coding.session", session, json!({"task": "fix it"})),
@@ -601,10 +689,136 @@ mod tests {
         }
     }
 
+    /// Prefer sessions: a command runs (ssh, gh, a log read), while a
+    /// change to code and a coding tool's working call still go to a
+    /// session, each refusal naming the option that would let it.
+    #[tokio::test]
+    async fn preferring_sessions_runs_commands_and_still_sends_code_to_a_session() {
+        let at = Place::new(PREFER);
+        for (name, effect, input) in [
+            (
+                "exec.run",
+                exec as fn(&serde_json::Value) -> Effect,
+                json!({"command": "ssh devbox uptime"}),
+            ),
+            ("exec.run", read, json!({"path": at.path("agent/notes")})),
+            ("mcp__ops__shell", exec, json!({"command": "gh pr list"})),
+            (
+                "code.read",
+                read,
+                json!({"path": at.path("repo/src/lib.rs")}),
+            ),
+            (
+                "filesystem.write",
+                write,
+                json!({"path": at.path("agent/notes/a.md")}),
+            ),
+        ] {
+            assert!(
+                at.runs(name, effect, input.clone()).await,
+                "{name} {input} refused"
+            );
+        }
+        // Reads and ops over a repo run, and a command on another machine.
+        let repo = at.path("repo");
+        for command in [
+            "git log -5",
+            "git status && git diff",
+            "cat src/lib.rs | grep fn > /tmp/fns.txt",
+            "ssh devbox 'cd ~/src/vellev && cargo build && make install'",
+            "gh pr checks 12 2>&1",
+        ] {
+            let input = json!({"command": command, "workdir": repo});
+            assert!(at.runs("exec.run", exec, input).await, "{command} refused");
+        }
+        let mut changes: Vec<Call> = working_calls(&at)
+            .into_iter()
+            .filter(|(name, ..)| !name.starts_with("exec."))
+            .collect();
+        assert!(changes.len() > 10);
+        // A command that is itself coding work goes to a session too: a
+        // build or test, a change made with git, an edit in place, or a
+        // write, move or delete inside code.
+        for command in [
+            "cargo build --release",
+            "npm run build",
+            "git commit -am 'fix'",
+            "FOO=1 sudo make",
+            "sed -i 's/a/b/' src/lib.rs",
+            "echo x > src/lib.rs",
+            "echo x >>src/lib.rs",
+            "cat a | tee src/new.rs",
+            "rm -rf src",
+            "cd src && git apply p.diff",
+        ] {
+            changes.push((
+                "exec.run",
+                exec,
+                json!({"command": command, "workdir": repo}),
+            ));
+        }
+        changes.push((
+            "mcp__ops__shell",
+            exec,
+            json!({"command": "cp /tmp/a.rs src/a.rs", "workdir": repo}),
+        ));
+        for (name, effect, input) in changes {
+            let r = at.tool(name, effect).execute(input.clone()).await.unwrap();
+            assert!(!r.success, "{name} {input} ran");
+            let said = r.error.unwrap_or_default();
+            assert!(
+                said.contains("Prefer sessions") && said.contains("“Do it myself” would let you"),
+                "{name}: {said}"
+            );
+        }
+        // Only in sessions refuses the command, naming Prefer sessions.
+        at.set(ON);
+        let r = at
+            .tool("exec.run", exec)
+            .execute(json!({"command": "ssh devbox uptime"}))
+            .await
+            .unwrap();
+        let said = r.error.unwrap_or_default();
+        assert!(!r.success && said.contains("Only in sessions"), "{said}");
+        assert!(
+            said.contains("“Prefer sessions” would let you run"),
+            "{said}"
+        );
+    }
+
+    /// A config from before `style` keeps working as it did: its switch on
+    /// is Only in sessions, off is Do it myself; `style` wins over it.
+    #[tokio::test]
+    async fn an_old_config_works_as_it_did_and_style_wins_over_it() {
+        for (config, ssh_runs, edit_runs) in [
+            (ON, false, false),
+            (OFF, true, true),
+            ("[oversight]\nenabled = true\nlevel = \"act\"\n", false, false),
+            (
+                "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.work]\nprefer_sessions = true\nstyle = \"prefer_sessions\"\n",
+                true,
+                false,
+            ),
+            (
+                "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.work]\nprefer_sessions = true\nstyle = \"direct\"\n",
+                true,
+                true,
+            ),
+        ] {
+            let at = Place::new(config);
+            let ssh = at.runs("exec.run", exec, json!({"command": "ssh devbox"})).await;
+            let edit = at
+                .runs("code.edit", write, json!({"path": at.path("repo/src/lib.rs")}))
+                .await;
+            assert_eq!((ssh, edit), (ssh_runs, edit_runs), "{config}");
+        }
+    }
+
     #[tokio::test]
     async fn every_held_call_runs_with_the_switch_off_or_at_watch() {
         for config in [
-            "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.work]\nprefer_sessions = false\n",
+            OFF,
+            "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.work]\nstyle = \"direct\"\n",
             "[oversight]\nenabled = false\n[oversight.work]\nprefer_sessions = true\n",
             "[oversight]\nenabled = true\nlevel = \"watch\"\n[oversight.work]\nprefer_sessions = true\n",
             "",
@@ -705,34 +919,45 @@ mod tests {
         assert!(at.runs("memory.remember", unknown, json!({})).await);
     }
 
-    /// The refusal points to a session it starts, and says when that start
-    /// is only a suggestion and which switch would let it start it itself.
+    /// The refusal points to a session it starts, names the setting and
+    /// the option that would let the call, and says when that start is
+    /// only a suggestion and which switch would let it start it itself.
     #[test]
     fn the_refusal_says_when_the_session_it_points_to_is_only_suggested() {
-        let at = |config: &str| {
+        let at = |config: &str, doing: Doing| {
             let place = Place::new(config);
-            always_sessions_refusal(&place.bounds.workspace)
+            always_sessions_refusal(&place.bounds.workspace, doing)
         };
-        assert_eq!(
-            at(ON),
-            Some(ALWAYS_SESSIONS),
-            "Act starts sessions by default"
+        let act = at(ON, Doing::Code).expect("Act starts sessions by default");
+        assert!(act.contains("crew.start_session") && act.contains("Only in sessions"));
+        assert!(!act.contains("is a suggestion"), "{act}");
+        let off = at(
+            &format!("{ON}[oversight.act]\nhand_out_work = false\n"),
+            Doing::Code,
+        )
+        .unwrap();
+        assert!(off.contains(workforce_common::oversight::switch::HAND_OUT_WORK));
+        assert!(off.contains("the start is a suggestion"), "{off}");
+        let suggest = at(
+            "[oversight]\nenabled = true\nlevel = \"suggest\"\n",
+            Doing::Code,
+        )
+        .unwrap();
+        assert!(
+            suggest.ends_with("At Suggest, the start is a suggestion."),
+            "{suggest}"
         );
         assert_eq!(
-            at(&format!("{ON}[oversight.act]\nhand_out_work = false\n")),
-            Some(ALWAYS_SESSIONS_HAND_OUT_OFF)
-        );
-        assert!(ALWAYS_SESSIONS_HAND_OUT_OFF
-            .contains(workforce_common::oversight::switch::HAND_OUT_WORK));
-        assert_eq!(
-            at("[oversight]\nenabled = true\nlevel = \"suggest\"\n"),
-            Some(ALWAYS_SESSIONS_SUGGEST)
-        );
-        assert_eq!(at("[oversight]\nenabled = true\nlevel = \"watch\"\n"), None);
-        assert_eq!(
-            at("[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.work]\nprefer_sessions = false\n"),
+            at(
+                "[oversight]\nenabled = true\nlevel = \"watch\"\n",
+                Doing::Code
+            ),
             None
         );
+        assert_eq!(at(OFF, Doing::Code), None);
+        // A helper doing work goes to a session in both styles that prefer them.
+        assert!(at(PREFER, Doing::Helper).is_some());
+        assert_eq!(at(PREFER, Doing::Command), None);
     }
 
     #[tokio::test]

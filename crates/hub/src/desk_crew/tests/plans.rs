@@ -1914,3 +1914,82 @@ async fn a_boss_finds_tickets_and_plans_on_them_as_they_are() {
     })
     .await;
 }
+
+/// crew.edit_ticket on a ticket of the boss's own open plan changes it
+/// through the plan, as crew.plan_update's tickets_edit does: where it runs
+/// moves, words added keep what its brief said.
+#[tokio::test(flavor = "multi_thread")]
+async fn editing_a_plans_ticket_goes_through_its_plan() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
+        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("the ticket tools", async || {
+            overseer.tools.has("crew.edit_ticket").then_some(())
+        })
+        .await;
+        let folder = dir.path().to_string_lossy().into_owned();
+        let made = overseer
+            .tools
+            .get("crew.plan")
+            .unwrap()
+            .execute(json!({ "goal": "Faster reads", "tickets": [
+                { "title": "Add the cache", "body": "Cache the index.", "folder": folder },
+                { "title": "Use the cache", "folder": folder },
+            ] }))
+            .await
+            .unwrap();
+        let plan = &made.output["proposed"];
+        let id: uuid::Uuid = plan["plan_id"].as_str().unwrap().parse().unwrap();
+        let key = plan["tickets"][0]["key"].as_str().unwrap().to_string();
+        let edit = overseer.tools.get("crew.edit_ticket").unwrap();
+        let r = edit
+            .execute(json!({ "ticket": key, "machine": "devbox",
+                "folder": "/home/dev/projects/driftwerk/vellev", "reason": "The person wants it on devbox." }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert!(
+            r.output["note"].as_str().unwrap_or_default().contains("went through the plan"),
+            "{r:?}"
+        );
+        let p = d.plan(id).await.unwrap();
+        assert_eq!(p.tickets[0].machine.as_deref(), Some("devbox"));
+        assert_eq!(p.tickets[0].ticket.ticket.title, "Add the cache");
+        let r = edit
+            .execute(json!({ "ticket": key, "append": "Keep it under 50 MB.", "reason": "The person said." }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        // Read back as its plan says it now, applied or waiting for the person.
+        let read = overseer
+            .tools
+            .get("crew.ticket")
+            .unwrap()
+            .execute(json!({ "ticket": key }))
+            .await
+            .unwrap();
+        assert!(read.success, "{read:?}");
+        assert_eq!(read.output["plan"]["machine"], "devbox", "{read:?}");
+        assert_eq!(read.output["plan"]["yours"], true);
+        // Its brief as the plan says it now: applied, or waiting, with what
+        // was added after what it said.
+        let p = d.plan(id).await.unwrap();
+        let said = read.output["plan"]["brief_waiting"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| p.tickets[0].ticket.ticket.body.clone());
+        assert!(said.contains("Cache the index.\n\nKeep it under 50 MB."), "{said}");
+        // What a plan's tickets need, and taking one out, are the plan's.
+        let other = plan["tickets"][1]["key"].as_str().unwrap().to_string();
+        for (tool, input, says) in [
+            ("crew.link_ticket", json!({ "ticket": other, "needs": key, "reason": "x" }), "crew.plan_update"),
+            ("crew.delete_ticket", json!({ "ticket": key, "reason": "x" }), "through the plan"),
+        ] {
+            let r = overseer.tools.get(tool).unwrap().execute(input).await.unwrap();
+            assert!(!r.success, "{tool}: {r:?}");
+            assert!(r.error.as_deref().unwrap_or_default().contains(says), "{tool}: {r:?}");
+        }
+    })
+    .await;
+}

@@ -10,6 +10,7 @@
 //! vectors the node cannot embed queries to match: it is to be dropped,
 //! and a full re-index rebuilds it from the repositories.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,22 +19,24 @@ use eyre::Result;
 use serde_json::{json, Map, Value};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
-use vellev_client::api::{Change, Content, Nearest, Page};
+use vellev_client::api::{Change, Changes, Content, Nearest, OnlyIf, Page};
 use vellev_client::{Client, Tenant};
 use vellev_core::{Collection, CollectionName, DataType, ObjectId, Property};
 use vellev_index::filter::Filter;
 use workforce_vellev::seeding::{apply_embedded, Seeding};
-use workforce_vellev::{collection, local_embedding, Cap, Ensured, Unusable};
+use workforce_vellev::{
+    collection, failure, is_conflict, local_embedding, Asked, Cap, Ensured, Unusable,
+};
 
 use super::health::{InsertErrorSink, InsertErrorSlot};
 use super::{
     entity_text, search_result, search_text, summary_text, vectorizable, CodeVectorStore,
     DeleteOutcome, Differing, VectorCodeEntity, VectorCodeSummary, VectorSearchResult,
-    CODE_ENTITY_COLLECTION, CODE_SUMMARY_COLLECTION,
+    CODE_ENTITY_COLLECTION, CODE_SUMMARY_COLLECTION, VERIFY_PAGE,
 };
 use crate::graph::entities::EntityKind;
 
-/// Records per delete, each one atomic step.
+/// Records per delete, or per patch of their fills, each one atomic step.
 const INDEX_BATCH: usize = 50;
 
 /// Records per write the node embeds, one write at a time: the most a
@@ -58,6 +61,10 @@ const FILL: &str = "fill";
 /// records is compared with the store by one count.
 const HASH: &str = "textHash";
 
+/// The property that tells one entity of a repo from another, as the graph
+/// does.
+const ENTITY_KEY: &str = "entityId";
+
 /// The property that tells one summary of a repo from another.
 const SUMMARY_KEY: &str = "summaryKey";
 
@@ -75,6 +82,10 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 /// What to do about a code collection holding vectors the node cannot embed
 /// queries to match: code vectors are rebuilt from the repositories.
 const REINDEX: &str = "drop it, then run a full index of each repository (the knowledge tool's `trigger_full` action, or `POST /api/knowledge/index` with `{\"mode\": \"full\"}`), which rebuilds its vectors from the code";
+
+/// The objects of entities about to be written that the collection holds
+/// as they are, but for their fill.
+pub(crate) type Matched = HashSet<ObjectId>;
 
 /// The [`CodeVectorStore`] on vellev.
 pub struct VellevCodeVectorStore {
@@ -196,17 +207,20 @@ impl VellevCodeVectorStore {
         Ok((&self.tenants, entity_collection()?.embedding))
     }
 
+    /// `e`, an indexing of `what` that failed, as the sink hears of it.
+    fn told(&self, what: &str, e: eyre::Report) -> eyre::Report {
+        let message = format!("vellev batch index of {what} failed: {e}");
+        warn!(error = %e, what, "vellev batch insert failed");
+        self.insert_errors.notify(&message);
+        eyre::eyre!(message)
+    }
+
     /// Store `changes` into `collection`, a batch at a time; the sink hears
     /// of a batch that failed, or of a collection not to be written to, and
     /// the failure ends the indexing.
     async fn store(&self, what: &str, collection: &Ensured, changes: Vec<Change>) -> Result<usize> {
         self.owned().await?;
-        let told = |e: eyre::Report| {
-            let message = format!("vellev batch index of {what} failed: {e}");
-            warn!(error = %e, what, "vellev batch insert failed");
-            self.insert_errors.notify(&message);
-            eyre::eyre!(message)
-        };
+        let told = |e| self.told(what, e);
         if let Some(seeding) = &self.seeding {
             collection.records().await.map_err(told)?;
             let stored = apply_embedded(&self.writes, collection.wanted(), seeding, changes)
@@ -239,6 +253,105 @@ impl VellevCodeVectorStore {
         }
         info!(what, count = stored, "Batch indexed in vellev");
         Ok(stored)
+    }
+
+    /// Which of `entities` the collection holds as they are, but for their
+    /// fill: compared a repo at a time, [`VERIFY_PAGE`] at once, as a
+    /// verify compares them.
+    async fn compare(&self, entities: &[&VectorCodeEntity]) -> Result<Matched> {
+        let by_repo = entities.iter().fold(
+            HashMap::<&str, Vec<&VectorCodeEntity>>::new(),
+            |mut by_repo, entity| {
+                by_repo.entry(&entity.repo_id).or_default().push(entity);
+                by_repo
+            },
+        );
+        let mut matched = Matched::new();
+        for (repo_id, held) in by_repo {
+            for page in held.chunks(VERIFY_PAGE) {
+                let wanted = entity_keys(page.iter().copied());
+                let differing = self
+                    .differing(&self.entities, repo_id, ENTITY_KEY, &wanted)
+                    .await?;
+                let differing: HashSet<usize> = differing.places.into_iter().collect();
+                matched.extend(
+                    page.iter()
+                        .enumerate()
+                        .filter(|(at, _)| !differing.contains(at))
+                        .map(|(_, entity)| entity_id(entity)),
+                );
+            }
+        }
+        Ok(matched)
+    }
+
+    /// Write `entities`: those `matched` by a patch of their fill alone, the
+    /// rest whole, as are those of a patch the node refused. Returns how
+    /// many were written, each once.
+    pub(crate) async fn write(
+        &self,
+        entities: &[&VectorCodeEntity],
+        matched: &Matched,
+    ) -> Result<usize> {
+        let (whole, patched) = split(entities, matched);
+        let (refilled, refused) = self.refill(patched).await?;
+        let changes = whole
+            .into_iter()
+            .chain(refused)
+            .map(|entity| {
+                upsert(
+                    CODE_ENTITY_COLLECTION,
+                    entity_id(entity),
+                    Value::Object(entity_properties(entity)),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if changes.is_empty() {
+            return Ok(refilled);
+        }
+        Ok(refilled + self.store("entities", &self.entities, changes).await?)
+    }
+
+    /// Give `entities`, held as they are, their fill by patches that embed
+    /// nothing, each only if its object still holds the entity's hash.
+    /// Returns how many the node took, and those of each batch it refused,
+    /// an object of it having changed or gone meanwhile: nothing of such a
+    /// batch was written, and writing it whole is a write as any other.
+    async fn refill<'a>(
+        &self,
+        entities: Vec<&'a VectorCodeEntity>,
+    ) -> Result<(usize, Vec<&'a VectorCodeEntity>)> {
+        if entities.is_empty() {
+            return Ok((0, entities));
+        }
+        self.owned().await?;
+        let name = self.entities.name();
+        self.entities
+            .records()
+            .await
+            .map_err(|e| self.told("entities", e))?;
+        let mut refilled = 0;
+        let mut refused = Vec::new();
+        for batch in entities.chunks(INDEX_BATCH) {
+            let patches = batch
+                .iter()
+                .map(|entity| fill_patch(name, entity))
+                .collect();
+            match self.writes.apply(patches).await {
+                Ok(_) => refilled += batch.len(),
+                Err(e) if is_conflict(&e) || e.is_not_found() => refused.extend_from_slice(batch),
+                Err(e) => {
+                    let failed = failure(e, &self.writes, Asked::Request(name));
+                    return Err(self.told("entities", failed));
+                }
+            }
+        }
+        debug!(
+            refilled,
+            refused = refused.len(),
+            "Fills of entities held as they are patched in vellev"
+        );
+        Ok((refilled, refused))
     }
 
     /// The places in `wanted`, `(key, hash)` pairs of one repo, of those
@@ -321,31 +434,80 @@ impl VellevCodeVectorStore {
     }
 }
 
-/// `CodeEntity` as Weaviate has it, embedded by the node on its searchable
-/// content.
+/// `CodeEntity` as search, deletes and a fill's compare read it, embedded
+/// by the node on its searchable content, which it does not keep.
 fn entity_collection() -> Result<Collection> {
     Ok(collection(
         CollectionName::new(CODE_ENTITY_COLLECTION)?,
         [
-            searched("searchableContent"),
-            filtered("entityId"),
+            embedded("searchableContent"),
+            filtered(ENTITY_KEY),
             filtered("repoId"),
-            searched("qualifiedName"),
-            searched("name"),
+            kept("qualifiedName", DataType::Text),
             filtered("kind"),
             filtered("filePath"),
-            filtered("language"),
-            searched("signature"),
-            searched("docComment"),
-            searched("summary"),
-            Property::new("startLine", DataType::Int),
-            Property::new("endLine", DataType::Int),
+            kept("startLine", DataType::Int),
+            kept("endLine", DataType::Int),
             filtered(FILL),
             filtered(HASH),
         ]
         .into(),
         local_embedding(&["searchableContent"]),
     ))
+}
+
+/// The properties an entity is written with: [`entity_collection`]'s.
+fn entity_properties(entity: &VectorCodeEntity) -> Map<String, Value> {
+    [
+        ("searchableContent", json!(entity.searchable_content)),
+        (ENTITY_KEY, json!(entity.entity_id)),
+        ("repoId", json!(entity.repo_id)),
+        ("qualifiedName", json!(entity.qualified_name)),
+        ("kind", json!(entity.kind)),
+        ("filePath", json!(entity.file_path)),
+        ("startLine", json!(entity.start_line)),
+        ("endLine", json!(entity.end_line)),
+        (FILL, json!(entity.generation)),
+        (HASH, json!(entity.record_hash())),
+    ]
+    .into_iter()
+    .map(|(name, value)| (name.to_string(), value))
+    .collect()
+}
+
+/// What an entity is compared with the store by: its key and its hash.
+fn entity_keys<'a>(
+    entities: impl IntoIterator<Item = &'a VectorCodeEntity>,
+) -> Vec<(String, String)> {
+    entities
+        .into_iter()
+        .map(|entity| (entity.entity_id.clone(), entity.record_hash()))
+        .collect()
+}
+
+/// `entities` as those to write whole and those `matched`, to patch, each
+/// part in their order.
+fn split<'a>(
+    entities: &[&'a VectorCodeEntity],
+    matched: &Matched,
+) -> (Vec<&'a VectorCodeEntity>, Vec<&'a VectorCodeEntity>) {
+    entities
+        .iter()
+        .copied()
+        .partition(|entity| !matched.contains(&entity_id(entity)))
+}
+
+/// A patch of `entity`'s fill alone, only if its object holds its hash.
+fn fill_patch(collection: &CollectionName, entity: &VectorCodeEntity) -> Change {
+    Change::patch(
+        collection.clone(),
+        entity_id(entity),
+        Changes::new(Map::from_iter([(
+            FILL.to_string(),
+            json!(entity.generation),
+        )]))
+        .only_if(OnlyIf::new(HASH, json!(entity.record_hash()))),
+    )
 }
 
 /// `CodeSummary` as Weaviate has it, embedded by the node on its text.
@@ -379,6 +541,17 @@ fn searched(name: &str) -> Property {
 /// Text matched whole.
 fn filtered(name: &str) -> Property {
     Property::new(name, DataType::Text)
+}
+
+fn embedded(name: &str) -> Property {
+    Property::new(name, DataType::Text).unstored()
+}
+
+fn kept(name: &str, data_type: DataType) -> Property {
+    Property {
+        filterable: false,
+        ..Property::new(name, data_type)
+    }
 }
 
 /// The object id of a record, the same however often it is indexed, so
@@ -491,33 +664,16 @@ impl CodeVectorStore for VellevCodeVectorStore {
     }
 
     async fn index_entities(&self, entities: &[VectorCodeEntity]) -> Result<usize> {
-        let changes = vectorizable(entities, entity_text, "code_index_entities", "entities")
-            .into_iter()
-            .map(|(entity, searchable)| {
-                upsert(
-                    CODE_ENTITY_COLLECTION,
-                    entity_id(entity),
-                    json!({
-                        "searchableContent": searchable,
-                        "entityId": entity.entity_id,
-                        "repoId": entity.repo_id,
-                        "qualifiedName": entity.qualified_name,
-                        "name": entity.name,
-                        "kind": entity.kind,
-                        "filePath": entity.file_path,
-                        "language": entity.language,
-                        "signature": entity.signature,
-                        "docComment": entity.doc_comment,
-                        "summary": entity.summary,
-                        "startLine": entity.start_line,
-                        "endLine": entity.end_line,
-                        FILL: entity.generation,
-                        HASH: entity.record_hash(),
-                    }),
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.store("entities", &self.entities, changes).await
+        let entities: Vec<&VectorCodeEntity> =
+            vectorizable(entities, entity_text, "code_index_entities", "entities")
+                .into_iter()
+                .map(|(entity, _)| entity)
+                .collect();
+        let matched = self
+            .compare(&entities)
+            .await
+            .map_err(|e| self.told("entities", e))?;
+        self.write(&entities, &matched).await
     }
 
     async fn search_entities(
@@ -655,11 +811,7 @@ impl CodeVectorStore for VellevCodeVectorStore {
         repo_id: &str,
         entities: &[VectorCodeEntity],
     ) -> Result<Differing> {
-        let wanted: Vec<(String, String)> = entities
-            .iter()
-            .map(|entity| (entity.entity_id.clone(), entity.record_hash()))
-            .collect();
-        self.differing(&self.entities, repo_id, "entityId", &wanted)
+        self.differing(&self.entities, repo_id, ENTITY_KEY, &entity_keys(entities))
             .await
     }
 
@@ -685,7 +837,7 @@ impl CodeVectorStore for VellevCodeVectorStore {
     ) -> Result<(Vec<(String, String)>, Option<String>)> {
         let (collection, key) = match summaries {
             true => (&self.summaries, SUMMARY_KEY),
-            false => (&self.entities, "entityId"),
+            false => (&self.entities, ENTITY_KEY),
         };
         let after = match after {
             Some(after) => Some(ObjectId(after.parse()?)),
@@ -766,9 +918,143 @@ impl CodeVectorStore for VellevCodeVectorStore {
 
 #[cfg(test)]
 mod tests {
-    use workforce_vellev::testing::Node;
+    use workforce_vellev::testing::{ByNode, Node};
 
     use super::*;
+
+    /// `CodeEntity` as the hub made it before the slim shape: every
+    /// property stored, those since left out among them, and its text
+    /// indexed for keywords.
+    fn pre_w4_entity_collection() -> Collection {
+        collection(
+            CollectionName::new(CODE_ENTITY_COLLECTION).unwrap(),
+            vec![
+                searched("searchableContent"),
+                filtered("entityId"),
+                filtered("repoId"),
+                searched("qualifiedName"),
+                searched("name"),
+                filtered("kind"),
+                filtered("filePath"),
+                filtered("language"),
+                searched("signature"),
+                searched("docComment"),
+                searched("summary"),
+                Property::new("startLine", DataType::Int),
+                Property::new("endLine", DataType::Int),
+                filtered(FILL),
+                filtered(HASH),
+            ],
+            local_embedding(&["searchableContent"]),
+        )
+    }
+
+    /// Vectors copied from Weaviate, which the node cannot embed queries
+    /// to match.
+    fn copied_from_weaviate() -> Collection {
+        Collection {
+            embedding: vellev_core::Embedding {
+                provider: vellev_core::EmbeddingProvider::None,
+                model: "weaviate:text2vec-transformers".into(),
+                dimensions: 384,
+                query_prefix: None,
+                document_prefix: None,
+                properties: Vec::new(),
+            },
+            ..pre_w4_entity_collection()
+        }
+    }
+
+    /// An insert-error sink that keeps what it hears.
+    #[derive(Default)]
+    struct Heard(std::sync::Mutex<Vec<String>>);
+
+    impl InsertErrorSink for Heard {
+        fn record(&self, message: String) {
+            self.0.lock().unwrap().push(message);
+        }
+    }
+
+    /// The properties of every entity of `repo_id` the store holds.
+    async fn held(store: &VellevCodeVectorStore, repo_id: &str) -> Vec<Map<String, Value>> {
+        let page = Page::new(100).filter(of_repo(repo_id));
+        let listed = store.entities.collection().list(&page).await.unwrap();
+        listed.objects.into_iter().map(|o| o.properties).collect()
+    }
+
+    /// An entity with a signature, a doc comment and a summary, all in
+    /// what is embedded.
+    fn documented(repo: &str, id: &str, said: &str) -> VectorCodeEntity {
+        let (signature, doc) = (format!("pub fn {id}(path: &str)"), format!("{said}."));
+        VectorCodeEntity {
+            signature: signature.clone(),
+            doc_comment: doc.clone(),
+            summary: said.to_string(),
+            searchable_content: format!("crate::{id} {signature} {doc} {said}"),
+            start_line: 3,
+            end_line: 12,
+            ..entity(repo, id, &format!("src/{id}.rs"), "Function", "")
+        }
+    }
+
+    #[test]
+    fn the_entity_collection_keeps_only_what_is_read_and_embeds_what_it_does_not_keep() {
+        let made = entity_collection().unwrap();
+        made.validate().unwrap();
+        let unstored: Vec<&str> = made
+            .properties
+            .iter()
+            .filter(|p| !p.stored)
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(unstored, ["searchableContent"]);
+        assert_eq!(made.embedding.properties, ["searchableContent"]);
+        assert!(made.properties.iter().all(|p| !p.searchable));
+        let mut filterable: Vec<&str> = made
+            .properties
+            .iter()
+            .filter(|p| p.filterable)
+            .map(|p| p.name.as_str())
+            .collect();
+        filterable.sort_unstable();
+        assert_eq!(
+            filterable,
+            ["entityId", "filePath", "fill", "kind", "repoId", "textHash"]
+        );
+    }
+
+    #[test]
+    fn an_entity_is_written_with_exactly_the_collections_properties() {
+        let written: HashSet<String> = entity_properties(&documented("r", "e", "Does it"))
+            .keys()
+            .cloned()
+            .collect();
+        let shaped: HashSet<String> = entity_collection()
+            .unwrap()
+            .properties
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(written, shaped);
+    }
+
+    #[test]
+    fn a_write_is_split_into_whole_and_patched_each_in_order() {
+        let entities: Vec<VectorCodeEntity> = (0..4)
+            .map(|n| entity("r", &format!("e{n}"), "f.rs", "Function", "does a thing"))
+            .collect();
+        let all: Vec<&VectorCodeEntity> = entities.iter().collect();
+        let split_by = |matched: &[usize]| {
+            let matched: Matched = matched.iter().map(|&at| entity_id(all[at])).collect();
+            split(&all, &matched)
+        };
+        assert_eq!(split_by(&[]), (all.clone(), vec![]));
+        assert_eq!(split_by(&[0, 1, 2, 3]), (vec![], all.clone()));
+        assert_eq!(
+            split_by(&[3, 1]),
+            (vec![all[0], all[2]], vec![all[1], all[3]])
+        );
+    }
 
     #[test]
     fn record_ids_are_stable_and_distinct() {
@@ -1132,6 +1418,328 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((found.places, found.held), (vec![0], 2));
+
+        // A doc comment changed, which is kept only in the hash: that
+        // place, and not the other.
+        let mail = [
+            documented("docs", "send", "Sends one message"),
+            documented("docs", "bounce", "Bounces one message"),
+        ];
+        store.index_entities(&mail).await.unwrap();
+        let redocumented = [
+            mail[0].clone(),
+            VectorCodeEntity {
+                doc_comment: "Bounces it twice.".into(),
+                ..mail[1].clone()
+            },
+        ];
+        let found = store
+            .differing_entities("docs", &redocumented)
+            .await
+            .unwrap();
+        assert_eq!((found.places, found.held), (vec![1], 2));
+    }
+
+    /// The node holds `CodeEntity` as wanted: its searchable content
+    /// embedded and not kept, nothing indexed for keywords, and nothing
+    /// kept that nothing reads.
+    #[tokio::test]
+    async fn the_slim_collection_is_made_as_wanted() {
+        let Some(node) = Node::embedding().await else {
+            return;
+        };
+        let store = VellevCodeVectorStore::new(&node.url, &node.key, &node.tenant).unwrap();
+        store.ensure_collections().await.unwrap();
+        let made = store.entities.collection().schema().await.unwrap().unwrap();
+        assert!(!made.property("searchableContent").unwrap().stored);
+        assert!(made
+            .embedding
+            .properties
+            .contains(&"searchableContent".to_string()));
+        assert!(made.properties.iter().all(|p| !p.searchable), "{made:?}");
+        let mut names: Vec<&str> = made
+            .properties
+            .iter()
+            .map(|p| p.name.as_str())
+            .filter(|name| !name.starts_with("incarnation_"))
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "endLine",
+                "entityId",
+                "filePath",
+                "fill",
+                "kind",
+                "qualifiedName",
+                "repoId",
+                "searchableContent",
+                "startLine",
+                "textHash"
+            ]
+        );
+    }
+
+    /// What is embedded is not kept, nor what nothing reads, whoever makes
+    /// the vectors; and a search by the text finds the entity with all a
+    /// result says of it.
+    #[tokio::test]
+    async fn the_text_is_embedded_not_kept() {
+        let Some(node) = Node::embedding().await else {
+            return;
+        };
+        let plain = VellevCodeVectorStore::new(&node.url, &node.key, &node.tenant).unwrap();
+        let seeded = VellevCodeVectorStore::new(&node.url, &node.key, &node.tenant)
+            .unwrap()
+            .seeded_by(Seeding::new(Arc::new(ByNode::of(&node)), 8, 1));
+        for (store, repo) in [(&plain, "plain"), (&seeded, "seeded")] {
+            let one = documented(repo, "parse_config", "Reads the TOML configuration file");
+            assert_eq!(
+                store
+                    .index_entities(std::slice::from_ref(&one))
+                    .await
+                    .unwrap(),
+                1
+            );
+            let held = held(store, repo).await;
+            assert_eq!(held.len(), 1, "{repo}");
+            for left_out in [
+                "searchableContent",
+                "name",
+                "language",
+                "signature",
+                "docComment",
+                "summary",
+            ] {
+                assert!(!held[0].contains_key(left_out), "{repo}: {left_out} kept");
+            }
+            let found = store
+                .search_entities(&one.searchable_content, Some(repo), None, 5)
+                .await
+                .unwrap();
+            let hit = found.first().expect("found by its text");
+            assert_eq!(
+                (
+                    hit.entity_id.as_str(),
+                    hit.repo_id.as_str(),
+                    hit.qualified_name.as_str(),
+                    hit.kind.as_str(),
+                    hit.file_path.as_str(),
+                    hit.start_line,
+                    hit.end_line
+                ),
+                (
+                    "parse_config",
+                    repo,
+                    "crate::parse_config",
+                    "Function",
+                    "src/parse_config.rs",
+                    3,
+                    12
+                )
+            );
+        }
+    }
+
+    /// Writing again what the store holds, under a new fill as a fill
+    /// does, has nothing embedded: only the fill changes. What has changed
+    /// is embedded, and only that.
+    #[tokio::test]
+    async fn a_refill_embeds_nothing_that_is_unchanged() {
+        let Some(node) = Node::embedding().await else {
+            return;
+        };
+        let by = Arc::new(ByNode::of(&node));
+        let store = VellevCodeVectorStore::new(&node.url, &node.key, &node.tenant)
+            .unwrap()
+            .seeded_by(Seeding::new(by.clone(), 8, 2));
+        let embedded = || by.asked.load(std::sync::atomic::Ordering::SeqCst);
+        let first: Vec<VectorCodeEntity> = ["parse", "send", "render"]
+            .iter()
+            .map(|id| {
+                documented("repo", id, &format!("{id}s what it is given")).of_generation("one")
+            })
+            .collect();
+        assert_eq!(store.index_entities(&first).await.unwrap(), 3);
+        assert_eq!(embedded(), 3);
+
+        let again: Vec<VectorCodeEntity> = first
+            .iter()
+            .cloned()
+            .map(|entity| entity.of_generation("two"))
+            .collect();
+        assert_eq!(store.index_entities(&again).await.unwrap(), 3);
+        assert_eq!(embedded(), 3, "nothing embedded again");
+        let fills: Vec<Value> = held(&store, "repo")
+            .await
+            .into_iter()
+            .map(|properties| properties[FILL].clone())
+            .collect();
+        assert_eq!(fills, [json!("two"), json!("two"), json!("two")]);
+        let found = store
+            .search_entities(&again[1].searchable_content, Some("repo"), None, 3)
+            .await
+            .unwrap();
+        assert_eq!(found[0].entity_id, "send");
+
+        let mut changed = again.clone();
+        changed[1] = VectorCodeEntity {
+            doc_comment: "Sends it twice.".into(),
+            searchable_content: format!("{} Sends it twice.", again[1].searchable_content),
+            ..again[1].clone()
+        };
+        assert_eq!(store.index_entities(&changed).await.unwrap(), 3);
+        assert_eq!(embedded(), 4, "the changed one alone");
+        let agreed = store.differing_entities("repo", &changed).await.unwrap();
+        assert_eq!((agreed.places.len(), agreed.held), (0, 3));
+    }
+
+    /// A patch whose object changed or went meanwhile is refused, and its
+    /// entity is written whole instead, as if it had not been held: no
+    /// failure is told of.
+    #[tokio::test]
+    async fn a_patch_that_loses_a_race_is_written_whole_unreported() {
+        let Some(node) = Node::embedding().await else {
+            return;
+        };
+        let store = VellevCodeVectorStore::new(&node.url, &node.key, &node.tenant).unwrap();
+        let heard = Arc::new(Heard::default());
+        store.set_insert_error_sink(Arc::clone(&heard) as Arc<dyn InsertErrorSink>);
+        let before = documented("repo", "send", "Sends one message").of_generation("one");
+        assert_eq!(
+            store
+                .index_entities(std::slice::from_ref(&before))
+                .await
+                .unwrap(),
+            1
+        );
+        let after = VectorCodeEntity {
+            doc_comment: "Sends one message, and bounces.".into(),
+            searchable_content: format!("{} And bounces.", before.searchable_content),
+            ..before.clone()
+        }
+        .of_generation("two");
+        assert_eq!(entity_id(&after), entity_id(&before), "the same object");
+        let held_as_wanted = |entities: Vec<VectorCodeEntity>| {
+            let store = &store;
+            async move {
+                let agreed = store.differing_entities("repo", &entities).await.unwrap();
+                (agreed.places.len(), agreed.held)
+            }
+        };
+        let changed = Matched::from([entity_id(&after)]);
+        assert_eq!(store.write(&[&after], &changed).await.unwrap(), 1);
+        assert_eq!(held_as_wanted(vec![after.clone()]).await, (0, 1));
+
+        let unwritten = documented("repo", "bounce", "Bounces one message");
+        let gone = Matched::from([entity_id(&unwritten)]);
+        assert_eq!(store.write(&[&unwritten], &gone).await.unwrap(), 1);
+        assert_eq!(held_as_wanted(vec![after, unwritten]).await, (0, 2));
+        assert!(heard.0.lock().unwrap().is_empty(), "nothing told");
+    }
+
+    /// A patch the node fails for any other reason than a lost race is
+    /// the batch's failure, told to the insert-error sink, not written
+    /// whole instead.
+    #[tokio::test]
+    async fn a_patch_the_node_fails_reaches_the_insert_error_sink() {
+        use axum::response::IntoResponse;
+        let mut held = entity_collection().unwrap();
+        held.properties.push(Property {
+            filterable: false,
+            ..Property::new("incarnation_0", DataType::Bool)
+        });
+        let changes: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+        let sent = Arc::clone(&changes);
+        let app = axum::Router::new().fallback(
+            move |method: axum::http::Method, uri: axum::http::Uri, body: axum::body::Bytes| {
+                let (held, sent) = (held.clone(), Arc::clone(&sent));
+                async move {
+                    let path = uri.path();
+                    if path.ends_with("/collections") {
+                        return axum::Json(json!({ "collections": [] })).into_response();
+                    }
+                    if method != axum::http::Method::POST {
+                        return axum::Json(held).into_response();
+                    }
+                    if path.ends_with("/count") {
+                        return axum::Json(json!({ "count": 1 })).into_response();
+                    }
+                    if path.ends_with("/nearest") {
+                        return axum::Json(json!({ "results": [] })).into_response();
+                    }
+                    if let Ok(body) = serde_json::from_slice(&body) {
+                        sent.lock().unwrap().push(body);
+                    }
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let store = VellevCodeVectorStore::new(&url, "key", "workforce").unwrap();
+        let heard = Arc::new(Heard::default());
+        store.set_insert_error_sink(Arc::clone(&heard) as Arc<dyn InsertErrorSink>);
+        let held = entity("r", "e", "f", "Function", "does a thing");
+        assert!(store.index_entities(&[held]).await.is_err());
+        let heard = heard.0.lock().unwrap();
+        assert_eq!(heard.len(), 1, "{heard:?}");
+        assert!(heard[0].contains("entities"), "{heard:?}");
+        let ops: Vec<Value> = changes
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|batch| batch["changes"].as_array().cloned().unwrap_or_default())
+            .collect();
+        assert!(
+            !ops.is_empty() && ops.iter().all(|op| op["op"] == "patch"),
+            "patched, never written whole: {ops:?}"
+        );
+    }
+
+    /// A `CodeEntity` made before the slim shape, keeping more than it
+    /// needs, is used as it is: written to, searched and compared, and
+    /// its fills patched.
+    #[tokio::test]
+    async fn a_collection_made_before_the_slim_shape_is_still_used() {
+        let Some(node) = Node::embedding().await else {
+            return;
+        };
+        let earlier = pre_w4_entity_collection();
+        let tenant = node.tenant();
+        tenant
+            .collection(&earlier.name)
+            .create(&earlier)
+            .await
+            .unwrap();
+        let store = VellevCodeVectorStore::new(&node.url, &node.key, &node.tenant).unwrap();
+        store.ensure_collections().await.unwrap();
+        let entities = [
+            documented("repo", "parse_config", "Reads the TOML configuration file"),
+            documented("repo", "send_email", "Delivers a message over SMTP"),
+        ];
+        assert_eq!(store.index_entities(&entities).await.unwrap(), 2);
+        let found = store
+            .search_entities("reading the configuration", Some("repo"), None, 5)
+            .await
+            .unwrap();
+        assert_eq!(found[0].entity_id, "parse_config");
+        let agreed = store.differing_entities("repo", &entities).await.unwrap();
+        assert_eq!((agreed.places.len(), agreed.held), (0, 2));
+        let refilled: Vec<VectorCodeEntity> = entities
+            .iter()
+            .cloned()
+            .map(|entity| entity.of_generation("two"))
+            .collect();
+        assert_eq!(store.index_entities(&refilled).await.unwrap(), 2);
+        let fills: Vec<Value> = held(&store, "repo")
+            .await
+            .into_iter()
+            .map(|properties| properties[FILL].clone())
+            .collect();
+        assert_eq!(fills, [json!("two"), json!("two")]);
     }
 
     /// Needs a node that runs the local model.
@@ -1270,15 +1878,7 @@ mod tests {
             return;
         };
         let tenant = node.tenant();
-        let mut imported = entity_collection().unwrap();
-        imported.embedding = vellev_core::Embedding {
-            provider: vellev_core::EmbeddingProvider::None,
-            model: "weaviate:text2vec-transformers".into(),
-            dimensions: 384,
-            query_prefix: None,
-            document_prefix: None,
-            properties: Vec::new(),
-        };
+        let imported = copied_from_weaviate();
         tenant
             .collection(&imported.name)
             .create(&imported)
@@ -1365,15 +1965,7 @@ mod tests {
         // Of another model's vectors, as one copied from Weaviate is: a
         // node will not make a collection of its own model with the wrong
         // number of dimensions (from 0.2 it checks them).
-        let mut wrong = entity_collection().unwrap();
-        wrong.embedding = vellev_core::Embedding {
-            provider: vellev_core::EmbeddingProvider::None,
-            model: "weaviate:text2vec-transformers".into(),
-            dimensions: 384,
-            query_prefix: None,
-            document_prefix: None,
-            properties: Vec::new(),
-        };
+        let wrong = copied_from_weaviate();
         tenant.collection(&wrong.name).create(&wrong).await.unwrap();
         let store = VellevCodeVectorStore::new(&node.url, &node.key, &node.tenant).unwrap();
         assert!(store.health_check().await.is_err());
@@ -1457,16 +2049,51 @@ mod tests {
         assert_eq!(NODE_EMBEDS_AT_ONCE, 16);
     }
 
+    /// A cluster that writes format 1 cannot hold the slim collection,
+    /// and says so: that is what the store reports, and its readiness
+    /// check fails with it, rather than as a node not there.
+    #[tokio::test]
+    async fn a_cluster_writing_format_1_refuses_the_collection_plainly() {
+        use axum::response::IntoResponse;
+        const REFUSED: &str = "CodeEntity has a property it does not store, which only format 2 can hold, and the cluster writes format 1: it rises to 2 once every node reads format 2 and one is let raise it (VELLEV_MAX_FORMAT=2)";
+        let app = axum::Router::new().fallback(
+            |method: axum::http::Method, uri: axum::http::Uri| async move {
+                let answer = |status: u16, code: &str, message: &str| {
+                    (
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        axum::Json(json!({ "error": { "code": code, "message": message } })),
+                    )
+                        .into_response()
+                };
+                let path = uri.path();
+                if path.ends_with("/collections") || path.ends_with("/health/ready") {
+                    return axum::Json(json!({ "collections": [] })).into_response();
+                }
+                if method == axum::http::Method::GET {
+                    return answer(404, "not_found", "no such collection");
+                }
+                answer(400, "invalid", REFUSED)
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let store = VellevCodeVectorStore::new(&url, "key", "workforce").unwrap();
+        let refused = store.ensure_collections().await.unwrap_err();
+        match refused.downcast_ref::<Unusable>() {
+            Some(Unusable::Invalid { message, .. }) => {
+                assert!(message.contains(REFUSED), "{message}")
+            }
+            other => panic!("expected the node's refusal, got {other:?}"),
+        }
+        let unhealthy = store.health_check().await.unwrap_err().to_string();
+        assert!(unhealthy.contains("VELLEV_MAX_FORMAT=2"), "{unhealthy}");
+    }
+
     #[tokio::test]
     async fn a_failed_batch_reaches_the_insert_error_sink() {
-        struct Heard(std::sync::Mutex<Vec<String>>);
-        impl InsertErrorSink for Heard {
-            fn record(&self, message: String) {
-                self.0.lock().unwrap().push(message);
-            }
-        }
         let store = VellevCodeVectorStore::new("http://127.0.0.1:1", "key", "workforce").unwrap();
-        let heard = Arc::new(Heard(Default::default()));
+        let heard = Arc::new(Heard::default());
         store.set_insert_error_sink(Arc::clone(&heard) as Arc<dyn InsertErrorSink>);
         let content = "parse_config reads the configuration";
         assert!(store

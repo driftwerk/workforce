@@ -96,6 +96,7 @@ impl Run<'_> {
             did,
             at: self.rows.first().map(|d| d.at),
             decisions: None,
+            moves: None,
         }
     }
 }
@@ -407,6 +408,7 @@ impl Entry<'_> {
             did,
             at: self.rows.last().map(|d| d.at),
             decisions: Some(n),
+            moves: None,
         }
     }
 }

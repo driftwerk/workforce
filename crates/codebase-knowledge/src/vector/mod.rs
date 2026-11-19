@@ -30,6 +30,9 @@ const CODE_SUMMARY_COLLECTION: &str = "CodeSummary";
 /// covers up to 160k objects per drain call.
 const MAX_BATCH_DELETE_PASSES: usize = 16;
 
+/// Entities or summaries compared with the store at a time.
+pub(crate) const VERIFY_PAGE: usize = 100;
+
 /// Outcome of a (potentially multi-pass) batch delete.
 #[derive(Debug, Default, Clone, Copy, Serialize)]
 pub struct DeleteOutcome {
@@ -74,7 +77,7 @@ pub struct VectorCodeEntity {
     pub signature: String,
     pub doc_comment: String,
     pub summary: String,
-    /// Combined searchable content: name + signature + doc_comment + summary
+    /// Combined searchable content: qualified_name + signature + doc_comment + summary
     pub searchable_content: String,
     pub start_line: u32,
     pub end_line: u32,
@@ -93,7 +96,7 @@ fn hash_of(parts: &[&str]) -> String {
 }
 
 impl VectorCodeEntity {
-    /// A hash of everything a store keeps of this entity but its fill
+    /// A hash of everything written of this entity but its fill
     /// generation: the text that is embedded, and where the entity is.
     /// Two records of one entity hash alike exactly when a store holding
     /// one holds the other.

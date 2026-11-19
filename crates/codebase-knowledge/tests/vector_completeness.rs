@@ -1113,7 +1113,7 @@ async fn the_files_whose_summaries_a_run_makes_are_noted_for_the_standby() {
             {
                 graph
                     .backend()
-                    .clear_vectors_pending(standby, REPO, &file, seq)
+                    .clear_vectors_pending(standby, REPO, std::slice::from_ref(&file), seq)
                     .await
                     .unwrap();
             }
@@ -1135,17 +1135,16 @@ async fn the_files_whose_summaries_a_run_makes_are_noted_for_the_standby() {
         forget().await;
 
         // Summaries of the files no run changed, made as the summary phase
-        // is resumed: noted, file by file.
+        // is resumed: noted, file by file. `mail.rs`'s, fresh already and
+        // noted as they were made, are not noted again.
         let made = summarising()
             .run_summaries_only(RunOptions::default())
             .await
             .unwrap();
         assert!(made.summaries_generated > 0, "{in_use}: {made:?}");
-        // `mail.rs`'s summaries, fresh already, are written again too (a
-        // resumed phase heals ones never stored), and so noted again.
         assert_eq!(
             noted().await,
-            ["src/config.rs", "src/mail.rs", "src/many.rs"],
+            ["src/config.rs", "src/many.rs"],
             "{in_use}: the files outside any change"
         );
     }
@@ -1186,7 +1185,100 @@ async fn a_run_on_the_tracked_store_leaves_the_standbys_notes() {
         .vectors_pending("weaviate", REPO, 10)
         .await
         .unwrap();
-    assert_eq!(standby, [("src/mail.rs".to_string(), 1)]);
+    let standby: Vec<&str> = standby.iter().map(|(file, _)| file.as_str()).collect();
+    assert_eq!(standby, ["src/mail.rs"]);
+}
+
+/// A run on the tracked store with a standby notes every file it changes
+/// in both under one mark, and takes off its own by that mark once its
+/// store has them: none is left pending in the store in use.
+#[tokio::test]
+async fn a_clean_run_takes_off_its_own_notes_by_their_mark() {
+    let repo = Repo::filled().await;
+    let with_standby = keyed(&repo, "vellev", Some("weaviate"));
+    let pipeline =
+        IndexingPipeline::with_vector_store(repo.config(), Arc::clone(&with_standby), repo.store());
+    repo.change_mail();
+    write(repo.dir.path(), "post.rs", MAIL_RS);
+    std::fs::remove_file(repo.dir.path().join("src/config.rs")).unwrap();
+    commit(repo.dir.path());
+    repo.incremental(&pipeline, 2).await;
+    assert!(repo.pending().await.is_empty());
+    assert!(repo.complete().await && repo.agrees().await);
+    let standby = with_standby
+        .backend()
+        .vectors_pending("weaviate", REPO, 10)
+        .await
+        .unwrap();
+    let files: Vec<&str> = standby.iter().map(|(file, _)| file.as_str()).collect();
+    assert_eq!(files, ["src/config.rs", "src/mail.rs", "src/post.rs"]);
+    assert!(
+        standby.iter().all(|(_, mark)| *mark == standby[0].1),
+        "one mark: {standby:?}"
+    );
+}
+
+/// With no vector store at all, the files of the summaries a run makes
+/// are noted for the standby still.
+#[tokio::test]
+async fn the_files_summarised_with_no_vector_store_are_noted_for_the_standby() {
+    let repo = Repo::new();
+    let graph = keyed(&repo, "weaviate", Some("vellev"));
+    IndexingPipeline::new(repo.config(), Arc::clone(&graph))
+        .run_full_index(RunOptions::default())
+        .await
+        .unwrap();
+    let noted = || async {
+        let noted = graph.backend().vectors_pending("vellev", REPO, 100).await;
+        noted.unwrap()
+    };
+    for (file, mark) in noted().await {
+        graph
+            .backend()
+            .clear_vectors_pending("vellev", REPO, &[file], mark)
+            .await
+            .unwrap();
+    }
+    let made = IndexingPipeline::new(repo.config(), Arc::clone(&graph))
+        .with_summary_generator(SummaryGenerator::new(Box::new(Terse), 64))
+        .run_summaries_only(RunOptions::default())
+        .await
+        .unwrap();
+    assert!(made.summaries_generated > 0, "{made:?}");
+    let files: Vec<String> = noted().await.into_iter().map(|(file, _)| file).collect();
+    assert_eq!(files, ["src/config.rs", "src/mail.rs", "src/many.rs"]);
+}
+
+/// A run whose summaries cannot be noted for the standby fails, and writes
+/// none: a summary written unnoted would never reach the standby.
+#[tokio::test]
+async fn a_run_whose_summaries_cannot_be_noted_fails() {
+    let repo = Repo::new();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("codegraph.db");
+    let graph = Arc::new(
+        CodeGraph::open(&path)
+            .unwrap()
+            .keyed(VectorKeys::new("weaviate", Some("vellev")).unwrap()),
+    );
+    IndexingPipeline::new(repo.config(), Arc::clone(&graph))
+        .run_full_index(RunOptions::default())
+        .await
+        .unwrap();
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER refused BEFORE UPDATE ON vector_note_mark
+             BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+        )
+        .unwrap();
+    let run = IndexingPipeline::new(repo.config(), Arc::clone(&graph))
+        .with_summary_generator(SummaryGenerator::new(Box::new(Terse), 64))
+        .run_summaries_only(RunOptions::default())
+        .await;
+    let error = format!("{:#}", run.expect_err("the note failed"));
+    assert!(error.contains("refused"), "{error}");
+    assert_eq!(graph.count_summaries_present(REPO).await.unwrap(), 0);
 }
 
 /// A store that keeps no track of a repo no store keeps track of notes
