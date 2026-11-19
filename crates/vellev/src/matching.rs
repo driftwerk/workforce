@@ -57,7 +57,7 @@ fn within(scope: Option<&Filter>, any: Vec<Filter>) -> Filter {
 /// How `wanted`, a page of `(key, hash)` pairs with no key twice, differs
 /// from what `records` holds within `scope`: by the properties named `key`
 /// and `hash`, both filterable. Nothing is listed unless something
-/// differs.
+/// differs and something is held.
 pub async fn unmatched(
     records: &Records,
     scope: Option<&Filter>,
@@ -83,6 +83,12 @@ pub async fn unmatched(
     );
     if held_exactly == wanted.len() as u64 && held_at_all == held_exactly {
         return Ok(held(held_at_all));
+    }
+    if held_at_all == 0 {
+        return Ok(Unmatched {
+            differing: wanted.iter().map(|(k, _)| k.clone()).collect(),
+            ..Unmatched::default()
+        });
     }
     // Which: only this page's keys are listed.
     let by_key: HashMap<&str, &str> = wanted
@@ -254,5 +260,48 @@ mod tests {
             .await
             .unwrap();
         assert!(unscoped.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod fake_node_tests {
+    use vellev_core::CollectionName;
+
+    use super::*;
+    use crate::connect;
+
+    /// Where nothing is held under the wanted keys, every one differs, and
+    /// that is told by the two counts alone.
+    #[tokio::test]
+    async fn nothing_held_is_told_without_a_listing() {
+        use axum::response::IntoResponse;
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = std::sync::Arc::clone(&asked);
+        let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let seen = std::sync::Arc::clone(&seen);
+            async move {
+                seen.lock().unwrap().push(uri.path().to_string());
+                axum::Json(serde_json::json!({ "count": 0 })).into_response()
+            }
+        });
+        let url = crate::serve(app).await;
+        let records = connect(&url, "key", "harbor")
+            .unwrap()
+            .reads
+            .collection(&CollectionName::new("Held").unwrap());
+        let wanted: Vec<(String, String)> =
+            (0..3).map(|n| (format!("k{n}"), format!("h{n}"))).collect();
+        let found = unmatched(&records, None, ("key", "hash"), &wanted, &Cap::default())
+            .await
+            .unwrap();
+        assert_eq!(found.differing, ["k0", "k1", "k2"]);
+        assert!(found.stale.is_empty());
+        assert_eq!(found.held, 0);
+        let asked = asked.lock().unwrap();
+        assert_eq!(asked.len(), 2, "{asked:?}");
+        assert!(
+            asked.iter().all(|path| path.ends_with("/count")),
+            "{asked:?}"
+        );
     }
 }
