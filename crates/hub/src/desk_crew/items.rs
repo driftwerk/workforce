@@ -1793,6 +1793,7 @@ impl CrewHub {
         self.remind_waiting(&items).await;
         self.post_held_questions().await;
         self.look_for_silent_waits().await;
+        self.look_at_plans().await;
     }
 }
 

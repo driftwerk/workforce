@@ -14,7 +14,7 @@ use vellev_client::{Records, Tenant};
 use vellev_core::{Collection, CollectionName, DataType, EmbeddingProvider, Property};
 
 use crate::shape::{checked, Refused};
-use crate::signals::{model_unavailable, no_tenant};
+use crate::signals::no_tenant;
 use crate::LOCAL_MODEL;
 
 /// How long a collection found unusable stays so before it is looked at
@@ -84,15 +84,16 @@ pub enum Asked<'a> {
 /// to act, otherwise as it is. This is the one place a node's answer is
 /// classified. A tenant the key does not reach is to it one that does not
 /// exist, so either is `NoTenant`; it is told by what was asked, never by
-/// the message. A node that cannot run a collection's model at all (see
-/// [`model_unavailable`]) is named with [`LOCAL_MODEL`], the one model a
-/// workforce collection has a node embed with.
+/// the message. A node that cannot run a collection's model at all (its
+/// `model_unavailable`, until it or the collection is set up otherwise) is
+/// named with [`LOCAL_MODEL`], the one model a workforce collection has a
+/// node embed with.
 pub fn failure(error: vellev_client::Error, tenant: &Tenant, asked: Asked) -> Report {
     let tenant = tenant.id().to_string();
     let message = error.to_string();
     let unusable = match (error.code(), asked) {
         (_, Asked::Collection(collection) | Asked::Request(collection))
-            if model_unavailable(&error) =>
+            if error.is_model_unavailable() =>
         {
             Unusable::Model {
                 tenant,
@@ -126,14 +127,7 @@ pub async fn probe_model(tenant: &Tenant, records: &Records, wanted: &Collection
     if wanted.embedding.provider == EmbeddingProvider::None {
         return Ok(());
     }
-    let probe = Nearest {
-        vector: None,
-        text: Some("model probe".to_string()),
-        limit: 1,
-        filter: None,
-        oversample: None,
-        vectors: false,
-    };
+    let probe = Nearest::to_text("model probe", 1);
     match records.nearest(&probe).await {
         Ok(_) => Ok(()),
         Err(e) if matches!(e.code(), Some(Code::Unavailable | Code::Invalid)) => {

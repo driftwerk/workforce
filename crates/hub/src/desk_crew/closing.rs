@@ -61,8 +61,9 @@ const HANDS_OFF_HOURS: i64 = 2;
 /// of its boss's, asked for or not: they are in it.
 const PERSON_NOW_MINUTES: i64 = 15;
 /// How long an open pull request's state is believed before it is read
-/// again: GitHub's rate limit is everyone's.
-const PULL_AGAIN: Duration = Duration::from_secs(15 * 60);
+/// again: GitHub's rate limit is everyone's, but a session waiting on its
+/// CI is told within minutes ([`super::plan_watch`]).
+const PULL_AGAIN: Duration = Duration::from_secs(5 * 60);
 /// How long a git command in a session's folder may take.
 const GIT_WITHIN: Duration = Duration::from_secs(10);
 /// The most pull requests one session's account names that are read.
@@ -109,11 +110,18 @@ pub(crate) enum Folder {
 }
 
 /// A pull request as GitHub last said.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Pull {
     pub open: bool,
     pub merged: bool,
     pub head: Option<String>,
+    /// Its checks on its head overall: `success`, `failure`, `pending`,
+    /// or none when none reported or they couldn't be read.
+    pub checks: Option<String>,
+    /// How many of its checks failed.
+    pub failed: u64,
+    /// When it merged, as GitHub says.
+    pub merged_at: Option<String>,
 }
 
 /// What the closer keeps between looks.
@@ -763,7 +771,7 @@ impl CrewHub {
 
     /// The pull requests `v`'s account names, each as GitHub says now
     /// (none where it couldn't be read).
-    async fn pulls_of(
+    pub(super) async fn pulls_of(
         &self,
         service: &Arc<AgentService>,
         v: &SessionView,
@@ -796,6 +804,15 @@ impl CrewHub {
             out.push((n, self.pull(service, &repo, n).await));
         }
         out
+    }
+
+    /// Takes `p` as what GitHub says of pull request `n` of `repo` now.
+    #[cfg(test)]
+    pub(crate) fn pull_seen(&self, repo: &str, n: u64, p: Pull) {
+        self.closing
+            .lock()
+            .pulls
+            .insert((repo.to_string(), n), (p, Instant::now()));
     }
 
     /// Pull request `n` of `repo` as GitHub says, read as the person: a
@@ -831,6 +848,9 @@ impl CrewHub {
             open: got["state"] == "open",
             merged: got["merged"] == true,
             head: got["head_sha"].as_str().map(str::to_string),
+            checks: got["checks"]["overall"].as_str().map(str::to_string),
+            failed: got["checks"]["failure"].as_u64().unwrap_or(0),
+            merged_at: got["merged_at"].as_str().map(str::to_string),
         };
         self.closing
             .lock()
@@ -867,6 +887,7 @@ mod tests {
             open,
             merged,
             head: Some("abc".into()),
+            ..Default::default()
         })
     }
 

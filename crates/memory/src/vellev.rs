@@ -19,8 +19,8 @@ use serde_json::{json, Map, Value};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 use vellev_client::api::{
-    Change, Changes, Found, Hybrid, Keyword, Nearest, OnlyIf, Outcome, Page, Results, Stored,
-    Weighted, Written,
+    Change, Changes, Content, Found, Hybrid, Keyword, Nearest, OnlyIf, Outcome, Page, Results,
+    Stored, Weighted, Written,
 };
 use vellev_client::{Records, Tenant};
 use vellev_core::{
@@ -381,12 +381,8 @@ impl VellevStore {
                 .answered(
                     self.cap
                         .ask(wanted, |limit| {
-                            let page = Page {
-                                filter: Some(filter.clone()),
-                                after,
-                                limit,
-                                vectors,
-                            };
+                            let page = Page::new(limit).filter(filter.clone()).vectors(vectors);
+                            let page = after.into_iter().fold(page, Page::after);
                             async move { self.records.list(&page).await }
                         })
                         .await,
@@ -450,13 +446,13 @@ impl VellevStore {
         properties: Map<String, Value>,
         only_if: Option<OnlyIf>,
     ) -> Change {
-        Change::Patch {
-            collection: self.collection.clone(),
+        Change::patch(
+            self.collection.clone(),
             id,
-            properties,
-            vector: None,
-            only_if,
-        }
+            only_if
+                .into_iter()
+                .fold(Changes::new(properties), Changes::only_if),
+        )
     }
 
     /// The hub-vectored candidates for `query`, scored by the certainty of
@@ -556,13 +552,9 @@ impl VellevStore {
                 self.answered(
                     self.cap
                         .ask(limit, |limit| {
-                            let keyword = Keyword {
-                                text: query.to_string(),
-                                properties: content_only(),
-                                limit,
-                                filter: Some(where_filter.clone()),
-                                vectors: false,
-                            };
+                            let keyword = Keyword::new(query.to_string(), limit)
+                                .properties(content_only())
+                                .filter(where_filter.clone());
                             async move { index_call(self.records.keyword(&keyword)).await }
                         })
                         .await,
@@ -614,14 +606,8 @@ impl VellevStore {
                     .answered(
                         self.cap
                             .ask(limit, |limit| {
-                                let nearest = Nearest {
-                                    vector: None,
-                                    text: Some(query.to_string()),
-                                    limit,
-                                    filter: Some(where_filter.clone()),
-                                    oversample: None,
-                                    vectors: false,
-                                };
+                                let nearest = Nearest::to_text(query.to_string(), limit)
+                                    .filter(where_filter.clone());
                                 async move { index_call(self.records.nearest(&nearest)).await }
                             })
                             .await,
@@ -658,18 +644,14 @@ impl VellevStore {
     ) -> vellev_client::Result<Results> {
         self.cap
             .ask(limit, |limit| {
-                let hybrid = Hybrid {
-                    text: query.to_string(),
-                    vectors: vector.is_some(),
-                    vector: vector.map(<[f32]>::to_vec),
-                    alpha: Some(alpha),
-                    fusion: Default::default(),
-                    properties: content_only(),
-                    limit,
-                    candidates: None,
-                    filter: Some(where_filter.clone()),
-                    oversample: None,
-                };
+                let hybrid = Hybrid::new(query.to_string(), limit)
+                    .vectors(vector.is_some())
+                    .alpha(alpha)
+                    .properties(content_only())
+                    .filter(where_filter.clone());
+                let hybrid = vector
+                    .into_iter()
+                    .fold(hybrid, |hybrid, vector| hybrid.vector(vector.to_vec()));
                 async move { index_call(self.records.hybrid(&hybrid)).await }
             })
             .await
@@ -710,12 +692,14 @@ impl VellevStore {
                 } else {
                     embedded.next().flatten()
                 };
-                Change::Upsert {
-                    collection: self.collection.clone(),
-                    id: *id,
-                    properties: declared(&object["properties"]),
-                    vector,
-                }
+                Change::upsert(
+                    self.collection.clone(),
+                    *id,
+                    vector.into_iter().fold(
+                        Content::new(declared(&object["properties"])),
+                        Content::vector,
+                    ),
+                )
             })
             .collect();
         self.writes
@@ -1018,11 +1002,7 @@ impl MemoryAdmin for VellevStore {
             self.records
                 .patch(
                     object_id(id)?,
-                    &Changes {
-                        properties: props([("tags", json!(tags))]),
-                        vector: None,
-                        only_if: None,
-                    },
+                    &Changes::new(props([("tags", json!(tags))])),
                 )
                 .await,
         )
@@ -1046,20 +1026,15 @@ impl SyncSource for VellevStore {
     /// One page of the collection as Weaviate-shaped raw objects; vellev
     /// lists a collection in id order.
     async fn export_page(&self, after: Option<&str>, with_vectors: bool) -> Result<Vec<Value>> {
-        let page = self
-            .answered(
-                self.records
-                    .list(&Page {
-                        filter: None,
-                        after: after.map(object_id).transpose()?,
-                        // Exactly a page: a shorter one is taken as the last, so a
-                        // node that gives fewer fails the export rather than ending it.
-                        limit: u32::try_from(EXPORT_PAGE)?,
-                        vectors: with_vectors,
-                    })
-                    .await,
-            )
-            .await?;
+        // Exactly a page: a shorter one is taken as the last, so a
+        // node that gives fewer fails the export rather than ending it.
+        let page = Page::new(u32::try_from(EXPORT_PAGE)?).vectors(with_vectors);
+        let page = after
+            .map(object_id)
+            .transpose()?
+            .into_iter()
+            .fold(page, Page::after);
+        let page = self.answered(self.records.list(&page).await).await?;
         Ok(page
             .objects
             .into_iter()
@@ -1115,11 +1090,7 @@ impl SyncTarget for VellevStore {
     /// Merge `properties` into an object, keeping its vector; an object
     /// gone already is left gone.
     async fn patch(&self, id: &str, properties: Value) -> Result<()> {
-        let changes = Changes {
-            properties: declared(&properties),
-            vector: None,
-            only_if: None,
-        };
+        let changes = Changes::new(declared(&properties));
         match self.records.patch(object_id(id)?, &changes).await {
             Err(e) if !e.is_not_found() => Err(self.failed(e)),
             _ => Ok(()),
@@ -1204,12 +1175,13 @@ impl MemoryStore for VellevStore {
         // The node embeds the memory within the request unless the hub did.
         self.answered(
             self.writes
-                .apply(vec![Change::Upsert {
-                    collection: self.collection.clone(),
+                .apply(vec![Change::upsert(
+                    self.collection.clone(),
                     id,
-                    properties,
-                    vector,
-                }])
+                    vector
+                        .into_iter()
+                        .fold(Content::new(properties), Content::vector),
+                )])
                 .await,
         )
         .await?;
@@ -1253,12 +1225,10 @@ impl MemoryStore for VellevStore {
         let page = self
             .answered(
                 self.records
-                    .list(&Page {
-                        filter: Some(Filter::And(vec![by_memory_id(id), eq("deleted", false)])),
-                        after: None,
-                        limit: 1,
-                        vectors: false,
-                    })
+                    .list(
+                        &Page::new(1)
+                            .filter(Filter::And(vec![by_memory_id(id), eq("deleted", false)])),
+                    )
                     .await,
             )
             .await?;
@@ -2724,13 +2694,10 @@ pub(crate) mod node_tests {
         switches
             .put(
                 ObjectId(workforce_vellev::marker_id("Memories")),
-                &vellev_client::api::Content {
-                    properties: props([
-                        ("collection", json!("Memories")),
-                        ("switchedAt", json!("2026-07-05T09:30:00.1Z")),
-                    ]),
-                    vector: None,
-                },
+                &vellev_client::api::Content::new(props([
+                    ("collection", json!("Memories")),
+                    ("switchedAt", json!("2026-07-05T09:30:00.1Z")),
+                ])),
             )
             .await
             .unwrap();

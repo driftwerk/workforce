@@ -13,7 +13,7 @@
 //! max_checkins_per_hour = 6
 //! max_checkins_per_day = 100
 //! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = true, interrupt = false, message_agents = false, message_terminal_sessions = false, answer_sessions = true, hand_off = false, set_mode = false }
-//! work = { style = "sessions_only", parallel = 4, take_on = "handed", engine = "claude", model = "", max_turns_per_hour = 60, close_finished = true }
+//! work = { style = "sessions_only", parallel = 4, take_on = "handed", engine = "claude", model = "", max_turns_per_hour = 60, close_finished = true, watch = true, orphan_grace_minutes = 5, stall_minutes = 30 }
 //! full = { repos = ["acme/acme-web", "~/dev/globex-api"], workflows = ["deploy.yml", "promote.yml"], budget_usd_per_day = 25 }
 //! updates = { cheap_calls_per_day = 500, account_questions_per_day = 60, close_from_accounts = false, enabled = true, every_minutes = 3, max_wait_minutes = 10, away_after_minutes = 15 }
 //! ```
@@ -86,7 +86,12 @@
 //! handed to it, are closed once their work is done (their PR merged,
 //! their ticket finished, the session said so, or a day idle with nothing
 //! open), never with uncommitted or unpushed work, nor while the person
-//! is in one: below where it acts, it suggests it.
+//! is in one: below where it acts, it suggests it. With `watch` (on
+//! unless said) it watches every plan it runs each minute
+//! (`desk_crew::plan_watch`): a ticket in Doing whose session went away
+//! for `orphan_grace_minutes` is started again, a session that ended its
+//! turn waiting on CI or a merge is told when it lands, and the person is
+//! told once when no ticket has moved for `stall_minutes`.
 //!
 //! A session asks the overseer on Desk's line: with `on_message` it gets a
 //! turn of its own for that, else every question goes straight to the
@@ -427,6 +432,14 @@ pub struct Work {
     /// It closes the sessions it runs once their work is done
     /// (`desk_crew::closing`).
     pub close_finished: bool,
+    /// It watches the plans it runs (`desk_crew::plan_watch`).
+    pub watch: bool,
+    /// How long a ticket in Doing may be without its session before it is
+    /// started again.
+    pub orphan_grace_minutes: u32,
+    /// How long a plan may go without a ticket moving, while one is ready
+    /// or in Doing, before the person is told.
+    pub stall_minutes: u32,
 }
 
 /// The cheap model's day for the boss's reading (`[oversight.updates]`).
@@ -777,6 +790,9 @@ impl Default for Oversight {
                 model: None,
                 max_turns_per_hour: 60,
                 close_finished: true,
+                watch: true,
+                orphan_grace_minutes: 5,
+                stall_minutes: 30,
             },
             full: Full::default(),
             updates: Updates {
@@ -1444,6 +1460,30 @@ impl Oversight {
                     d.work.close_finished,
                     "closing the sessions it started once they are finished",
                 )?,
+                watch: switch(
+                    work,
+                    "watch",
+                    d.work.watch,
+                    "watching the plans it runs",
+                )?,
+                orphan_grace_minutes: whole(
+                    work,
+                    "orphan_grace_minutes",
+                    d.work.orphan_grace_minutes,
+                    1..=MAX_MINUTES,
+                    &format!(
+                        "How long a ticket in Doing may be without its session must be a whole number of minutes from 1 to {MAX_MINUTES} (a day)."
+                    ),
+                )?,
+                stall_minutes: whole(
+                    work,
+                    "stall_minutes",
+                    d.work.stall_minutes,
+                    5..=MAX_MINUTES,
+                    &format!(
+                        "How long a plan may go without moving before you are told must be a whole number of minutes from 5 to {MAX_MINUTES} (a day)."
+                    ),
+                )?,
             },
             full,
             updates: Updates {
@@ -1932,12 +1972,14 @@ mod tests {
             d.close_finished,
             "it closes its finished sessions unless told not to"
         );
+        assert!(d.watch, "it watches its plans unless told not to");
+        assert_eq!((d.orphan_grace_minutes, d.stall_minutes), (5, 30));
         let inline = parse(
-            "[oversight]\nwork = { prefer_sessions = false, parallel = 12, take_on = \"all\", engine = \"codex\", model = \"gpt-6.1-sol\", max_turns_per_hour = 1, close_finished = false }\n",
+            "[oversight]\nwork = { prefer_sessions = false, parallel = 12, take_on = \"all\", engine = \"codex\", model = \"gpt-6.1-sol\", max_turns_per_hour = 1, close_finished = false, watch = false, orphan_grace_minutes = 2, stall_minutes = 60 }\n",
         )
         .unwrap();
         let table = parse(
-            "[oversight]\n[oversight.work]\nprefer_sessions = false\nparallel = 12\ntake_on = \"all\"\nengine = \"codex\"\nmodel = \"gpt-6.1-sol\"\nmax_turns_per_hour = 1\nclose_finished = false\n",
+            "[oversight]\n[oversight.work]\nprefer_sessions = false\nparallel = 12\ntake_on = \"all\"\nengine = \"codex\"\nmodel = \"gpt-6.1-sol\"\nmax_turns_per_hour = 1\nclose_finished = false\nwatch = false\norphan_grace_minutes = 2\nstall_minutes = 60\n",
         )
         .unwrap();
         assert_eq!(inline, table);
@@ -1951,6 +1993,9 @@ mod tests {
                 model: Some("gpt-6.1-sol".into()),
                 max_turns_per_hour: 1,
                 close_finished: false,
+                watch: false,
+                orphan_grace_minutes: 2,
+                stall_minutes: 60,
             }
         );
     }
@@ -2067,6 +2112,18 @@ mod tests {
             (
                 "[oversight]\nwork = { close_finished = \"yes\" }\n",
                 "Whether closing the sessions it started once they are finished is on or off must be true or false.",
+            ),
+            (
+                "[oversight]\nwork = { watch = 1 }\n",
+                "Whether watching the plans it runs is on or off must be true or false.",
+            ),
+            (
+                "[oversight]\nwork = { orphan_grace_minutes = 0 }\n",
+                "How long a ticket in Doing may be without its session must be a whole number of minutes from 1 to 1440 (a day).",
+            ),
+            (
+                "[oversight]\nwork = { stall_minutes = 2 }\n",
+                "How long a plan may go without moving before you are told must be a whole number of minutes from 5 to 1440 (a day).",
             ),
         ] {
             let e = parse(source).unwrap_err();

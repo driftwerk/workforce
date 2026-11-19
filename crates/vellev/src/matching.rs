@@ -96,12 +96,8 @@ pub async fn unmatched(
     loop {
         let listed = cap
             .ask(usize::MAX, |limit| {
-                let page = Page {
-                    filter: Some(filter.clone()),
-                    after,
-                    limit,
-                    vectors: false,
-                };
+                let page = Page::new(limit).filter(filter.clone());
+                let page = after.into_iter().fold(page, Page::after);
                 async move { records.list(&page).await }
             })
             .await?;
@@ -134,7 +130,7 @@ pub async fn unmatched(
 
 #[cfg(all(test, feature = "testing"))]
 mod tests {
-    use vellev_client::api::Change;
+    use vellev_client::api::{Change, Content};
     use vellev_core::{CollectionName, DataType, Property};
 
     use super::*;
@@ -169,14 +165,17 @@ mod tests {
         );
         let records = tenants.reads.collection(&held.name);
         records.create(&held).await.unwrap();
-        let put = |id: u128, repo: &str, key: &str, hash: &str| Change::Upsert {
-            collection: held.name.clone(),
-            id: ObjectId(uuid::Uuid::from_u128(id)),
-            properties: serde_json::json!({ "repo": repo, "key": key, "hash": hash })
-                .as_object()
-                .cloned()
-                .unwrap(),
-            vector: None,
+        let put = |id: u128, repo: &str, key: &str, hash: &str| {
+            Change::upsert(
+                held.name.clone(),
+                ObjectId(uuid::Uuid::from_u128(id)),
+                Content::new(
+                    serde_json::json!({ "repo": repo, "key": key, "hash": hash })
+                        .as_object()
+                        .cloned()
+                        .unwrap(),
+                ),
+            )
         };
         let page: Vec<(String, String)> = (0..300)
             .map(|n| (format!("k{n:03}"), format!("h{n}")))
