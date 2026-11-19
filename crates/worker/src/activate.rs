@@ -11,8 +11,9 @@
 //! A start that fails closes the connections waiting on it and is tried
 //! again by the next connection after [`RETRY_AFTER`], so a transient
 //! failure does not stick and a broken service is not restarted in a loop.
-//! A started service found unreachable is started again by the next
-//! connection, so the start command must be idempotent.
+//! A started service found unreachable is started again for the connection
+//! that found it, so the start command must be idempotent. A stop (SIGTERM)
+//! ends every start in flight, whole, before the activator exits.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -33,6 +34,9 @@ const START_TIMEOUT: Duration = Duration::from_secs(300);
 /// How long a started service's backend may refuse connections, as one does
 /// for a moment after its readiness check passed.
 const CONNECT_PATIENCE: Duration = Duration::from_secs(10);
+/// How long a service that was running may refuse before it is taken for
+/// gone and started again.
+const CONNECT_PATIENCE_RUNNING: Duration = Duration::from_secs(1);
 const CONNECT_RETRY: Duration = Duration::from_millis(100);
 
 /// Where a listener is held or a backend reached.
@@ -102,28 +106,45 @@ impl std::str::FromStr for Activation {
     }
 }
 
-/// What a service's start has come to.
+/// What a service's start has come to. Each success has a generation, so a
+/// connection that found the service gone forgets only the start it was
+/// served by, never a newer one another connection already made.
 enum Started {
     Not,
-    Yes,
+    Yes(u64),
     Failed(Instant),
 }
+
+/// The process groups of the starts running now, for a stop to end.
+type Starts = Arc<std::sync::Mutex<std::collections::HashSet<i32>>>;
 
 /// One service's start, run at most once at a time and kept once it
 /// succeeds.
 struct Service {
     activation: Activation,
     start: PathBuf,
-    state: Mutex<Started>,
+    state: Mutex<(Started, u64)>,
+    starts: Starts,
+}
+
+/// A started service's generation, and whether this call started it.
+struct Ensured {
+    generation: u64,
+    fresh: bool,
 }
 
 impl Service {
     /// Start the service unless it is started; waiters on a start in flight
     /// share its outcome.
-    async fn ensure(&self) -> Result<()> {
+    async fn ensure(&self) -> Result<Ensured> {
         let mut state = self.state.lock().await;
-        match *state {
-            Started::Yes => return Ok(()),
+        match state.0 {
+            Started::Yes(generation) => {
+                return Ok(Ensured {
+                    generation,
+                    fresh: false,
+                })
+            }
             Started::Failed(at) if at.elapsed() < RETRY_AFTER => {
                 bail!(
                     "{} failed to start {}s ago",
@@ -134,53 +155,110 @@ impl Service {
             _ => {}
         }
         let began = Instant::now();
-        info!(service = %self.activation.name, "first use; starting");
-        match run_start(&self.start, &self.activation.name).await {
+        info!(service = %self.activation.name, "starting on first use");
+        match run_start(&self.start, &self.activation.name, &self.starts).await {
             Ok(()) => {
                 info!(service = %self.activation.name, secs = began.elapsed().as_secs(), "started");
-                *state = Started::Yes;
-                Ok(())
+                state.1 += 1;
+                state.0 = Started::Yes(state.1);
+                Ok(Ensured {
+                    generation: state.1,
+                    fresh: true,
+                })
             }
             Err(error) => {
-                *state = Started::Failed(Instant::now());
+                state.0 = Started::Failed(Instant::now());
                 Err(error)
             }
         }
     }
 
+    /// Forget the start of `generation`, when it is still the current one.
+    async fn forget(&self, generation: u64) {
+        let mut state = self.state.lock().await;
+        if matches!(state.0, Started::Yes(current) if current == generation) {
+            state.0 = Started::Not;
+        }
+    }
+
     /// Serve one connection to the held address: start the service, then
-    /// splice through to it.
+    /// splice through to it. A service found gone, or never up where it
+    /// said, is started again for this same connection; the start is
+    /// idempotent, so what is running is left alone.
     async fn serve<S>(&self, mut client: S)
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
         let name = &self.activation.name;
-        if let Err(error) = self.ensure().await {
-            warn!(service = %name, error = %format!("{error:#}"), "not started; closing the connection");
-            return;
-        }
-        let mut backend = match connect(&self.activation.back).await {
-            Ok(backend) => backend,
-            Err(error) => {
-                // It died since, or never came up where it said: the next
-                // connection runs the start again, which brings back what
-                // is not running and leaves what is.
-                warn!(service = %name, error = %format!("{error:#}"), "started but unreachable; starting it again on the next connection");
-                *self.state.lock().await = Started::Not;
-                return;
+        let mut restarted = false;
+        let mut backend = loop {
+            let ensured = match self.ensure().await {
+                Ok(ensured) => ensured,
+                Err(error) => {
+                    warn!(service = %name, error = %format!("{error:#}"), "not started; closing the connection");
+                    return;
+                }
+            };
+            // A service started just now may refuse for a moment; one that
+            // was running and refuses has gone.
+            let patience = match ensured.fresh {
+                true => CONNECT_PATIENCE,
+                false => CONNECT_PATIENCE_RUNNING,
+            };
+            match connect(&self.activation.back, patience).await {
+                Ok(backend) => break backend,
+                Err(error) if out_of_descriptors(&error) => {
+                    // The activator's own limit, not the service's death.
+                    warn!(service = %name, %error, "out of descriptors; closing the connection");
+                    return;
+                }
+                Err(error) => {
+                    self.forget(ensured.generation).await;
+                    if restarted {
+                        warn!(service = %name, %error, back = %self.activation.back, "unreachable after starting again; closing the connection");
+                        return;
+                    }
+                    warn!(service = %name, %error, back = %self.activation.back, "unreachable; starting it again");
+                    restarted = true;
+                }
             }
         };
         let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
     }
 }
 
+fn out_of_descriptors(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
+}
+
 /// Run `start NAME`, which must bring the service up and return once it is
-/// ready, within [`START_TIMEOUT`].
-async fn run_start(start: &std::path::Path, name: &str) -> Result<()> {
+/// ready, within [`START_TIMEOUT`]. It leads a process group of its own,
+/// which a timeout or a stop ends whole; anything it leaves running for
+/// good, as dockerd, must leave the group itself.
+async fn run_start(start: &std::path::Path, name: &str, starts: &Starts) -> Result<()> {
     let mut command = tokio::process::Command::new(start);
-    command.arg(name).kill_on_drop(true);
-    let output = tokio::time::timeout(START_TIMEOUT, command.output())
-        .await
+    command
+        .arg(name)
+        .process_group(0)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let child = command
+        .spawn()
+        .with_context(|| format!("running {} {name}", start.display()))?;
+    let group = child.id().and_then(|pid| i32::try_from(pid).ok());
+    if let Some(group) = group {
+        lock(starts).insert(group);
+    }
+    let outcome = tokio::time::timeout(START_TIMEOUT, child.wait_with_output()).await;
+    if let Some(group) = group {
+        lock(starts).remove(&group);
+        if outcome.is_err() {
+            kill_group(group);
+        }
+    }
+    let output = outcome
         .map_err(|_| {
             eyre!(
                 "{} {name} took over {}s",
@@ -191,14 +269,47 @@ async fn run_start(start: &std::path::Path, name: &str) -> Result<()> {
         .with_context(|| format!("running {} {name}", start.display()))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let lines: Vec<&str> = stderr.trim().lines().collect();
         bail!(
             "{} {name} failed ({}): {}",
             start.display(),
             output.status,
-            stderr.trim().lines().last().unwrap_or_default()
+            lines[lines.len().saturating_sub(5)..].join(" | ")
         );
     }
     Ok(())
+}
+
+fn lock(starts: &Starts) -> std::sync::MutexGuard<'_, std::collections::HashSet<i32>> {
+    starts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn kill_group(group: i32) {
+    // SAFETY: killpg only sends a signal; a group already gone is ESRCH.
+    unsafe {
+        libc::killpg(group, libc::SIGKILL);
+    }
+}
+
+/// Let the activator hold as many connections as the hard limit allows: a
+/// test suite opens hundreds, each two descriptors here.
+fn raise_descriptor_limit() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit and setrlimit read and write the struct passed.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 && limit.rlim_cur < limit.rlim_max
+        {
+            limit.rlim_cur = limit.rlim_max;
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                warn!("could not raise the descriptor limit");
+            }
+        }
+    }
 }
 
 /// A connection to a backend, either kind.
@@ -253,9 +364,9 @@ impl AsyncWrite for Backend {
     }
 }
 
-/// Connect to a started backend, waiting out a moment of refusals.
-async fn connect(back: &Address) -> Result<Backend> {
-    let deadline = Instant::now() + CONNECT_PATIENCE;
+/// Connect to a started backend, waiting out refusals for `patience`.
+async fn connect(back: &Address, patience: Duration) -> std::io::Result<Backend> {
+    let deadline = Instant::now() + patience;
     loop {
         let attempt = match back {
             Address::Tcp(addr) => TcpStream::connect(addr).await.map(Backend::Tcp),
@@ -263,10 +374,11 @@ async fn connect(back: &Address) -> Result<Backend> {
         };
         match attempt {
             Ok(backend) => return Ok(backend),
+            Err(error) if out_of_descriptors(&error) => return Err(error),
             Err(_) if Instant::now() + CONNECT_RETRY < deadline => {
                 tokio::time::sleep(CONNECT_RETRY).await
             }
-            Err(error) => return Err(error).with_context(|| format!("connecting to {back}")),
+            Err(error) => return Err(error),
         }
     }
 }
@@ -285,7 +397,11 @@ async fn hold(front: &Address) -> Result<Held> {
                 .with_context(|| format!("holding {front}"))?,
         )),
         Address::Unix(path) => {
-            // A socket left by a previous run of the scope's init.
+            // A socket left by a previous run of the scope's init, which
+            // nothing answers on; one something serves is not ours to take.
+            if UnixStream::connect(path).await.is_ok() {
+                bail!("{front} is already served by another process");
+            }
             match std::fs::remove_file(path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -321,6 +437,8 @@ pub async fn activate(
             bail!("{} is named twice", activation.name);
         }
     }
+    raise_descriptor_limit();
+    let starts: Starts = Arc::default();
     let mut held = Vec::with_capacity(activations.len());
     for activation in activations {
         let listener = hold(&activation.front).await?;
@@ -329,7 +447,8 @@ pub async fn activate(
             Arc::new(Service {
                 activation,
                 start: start.clone(),
-                state: Mutex::new(Started::Not),
+                state: Mutex::new((Started::Not, 0)),
+                starts: Arc::clone(&starts),
             }),
             listener,
         ));
@@ -340,7 +459,18 @@ pub async fn activate(
     let loops = held
         .into_iter()
         .map(|(service, listener)| accept_forever(service, listener));
-    futures::future::join_all(loops).await;
+    let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("listening for SIGTERM")?;
+    tokio::select! {
+        _ = futures::future::join_all(loops) => {}
+        _ = stop.recv() => {
+            let groups: Vec<i32> = lock(&starts).drain().collect();
+            for group in &groups {
+                kill_group(*group);
+            }
+            info!(starts_ended = groups.len(), "stopping");
+        }
+    }
     Ok(())
 }
 
@@ -450,7 +580,8 @@ mod tests {
     }
 
     async fn wait_for(path: &std::path::Path) {
-        for _ in 0..200 {
+        // Generous: a loaded runner may take seconds to spawn a script.
+        for _ in 0..3000 {
             if path.exists() {
                 return;
             }
@@ -543,7 +674,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_started_service_that_died_is_started_again_by_the_next_connection() {
+    async fn a_started_service_that_died_is_started_again_for_the_connection_that_found_it() {
         let dir = tempfile::tempdir().unwrap();
         let (front, back) = (free_port(), free_port());
         let start = start_script(dir.path(), "true");
@@ -559,15 +690,59 @@ mod tests {
 
         serving.abort();
         let _ = serving.await;
-        let mut gone = TcpStream::connect(("127.0.0.1", front)).await.unwrap();
-        let mut buf = [0u8; 1];
-        assert_eq!(gone.read(&mut buf).await.unwrap_or(0), 0);
-        assert_eq!(starts(dir.path()), ["db"]);
-
-        tokio::spawn(backend(format!("127.0.0.1:{back}")));
-        let back_again = TcpStream::connect(("127.0.0.1", front)).await.unwrap();
-        assert_eq!(round_trip(back_again, b"b").await, b"B");
+        // The service comes back only when it is started again, as the
+        // toolbox's start brings back a dead one.
+        let starts_file = dir.path().join("starts");
+        let back_addr = format!("127.0.0.1:{back}");
+        tokio::spawn(async move {
+            while std::fs::read_to_string(&starts_file)
+                .unwrap_or_default()
+                .lines()
+                .count()
+                < 2
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            backend(back_addr).await
+        });
+        let found_it_gone = TcpStream::connect(("127.0.0.1", front)).await.unwrap();
+        assert_eq!(round_trip(found_it_gone, b"b").await, b"B");
         assert_eq!(starts(dir.path()), ["db", "db"]);
+        let later = TcpStream::connect(("127.0.0.1", front)).await.unwrap();
+        assert_eq!(round_trip(later, b"c").await, b"C");
+        assert_eq!(starts(dir.path()), ["db", "db"], "kept once back");
+    }
+
+    #[tokio::test]
+    async fn a_socket_another_process_serves_is_never_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("docker.sock");
+        let _served = UnixListener::bind(&socket).unwrap();
+        let activation: Activation = format!("docker=unix:{}=tcp:127.0.0.1:1", socket.display())
+            .parse()
+            .unwrap();
+        let error = activate(start_script(dir.path(), "true"), None, vec![activation])
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("already served"), "{error:#}");
+        assert!(socket.exists());
+    }
+
+    #[tokio::test]
+    async fn a_start_that_fails_says_its_last_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = start_script(
+            dir.path(),
+            "echo one >&2; echo two >&2; echo 'docker: port is taken' >&2; echo three >&2; exit 3",
+        );
+        let error = run_start(&script, "db", &Starts::default())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("port is taken") && error.contains("three"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
