@@ -397,28 +397,31 @@ impl CrewHub {
                 batch.iter().flat_map(|n| n.approvals.clone()).collect();
             let turn = self.notices_turn(&service, person, &prompt, hop, approvals);
             tokio::pin!(turn);
-            let ran = tokio::select! {
-                ran = &mut turn => ran,
-                () = tokio::time::sleep(self.timing.minute * TURN_MINUTES) => {
-                    // Stopped as the person's Stop stops it, and waited for
-                    // to its end, never left running beside the next.
-                    let live = match service.sessions.find(&check_in_channel(boss), person) {
-                        Ok(Some(s)) => service
-                            .live_turns
-                            .apply(&s.id, crate::hub_core::live_turns::Control::Cancel)
-                            .await,
-                        _ => crate::hub_core::live_turns::Applied::NotLive,
-                    };
-                    let ran = turn.await;
-                    match live {
-                        // Not running yet (waiting on its mind): what it
-                        // came to stands.
-                        crate::hub_core::live_turns::Applied::NotLive => ran,
-                        _ => Err(Ran::Failed(format!(
-                            "it ran past {TURN_MINUTES} minutes and was stopped"
-                        ))),
+            // Past its time it is stopped as the person's Stop stops it and
+            // waited for to its end, never left running beside the next.
+            // Not running yet (waiting on its mind), it is looked at again
+            // after as long once more.
+            let mut stopped = false;
+            let ran = loop {
+                tokio::select! {
+                    ran = &mut turn => break ran,
+                    () = tokio::time::sleep(self.timing.minute * TURN_MINUTES), if !stopped => {
+                        use crate::hub_core::live_turns::{Applied, Control};
+                        let live = match service.sessions.find(&check_in_channel(boss), person) {
+                            Ok(Some(s)) => service.live_turns.apply(&s.id, Control::Cancel).await,
+                            _ => Applied::NotLive,
+                        };
+                        stopped = !matches!(live, Applied::NotLive);
                     }
                 }
+            };
+            // A turn that came through stands; one stopped for its time is a
+            // failure, never the person's Stop.
+            let ran = match ran {
+                Err(Ran::Stopped) if stopped => Err(Ran::Failed(format!(
+                    "it ran past {TURN_MINUTES} minutes and was stopped"
+                ))),
+                ran => ran,
             };
             match ran {
                 Ok(()) => {
