@@ -522,8 +522,12 @@ fn worker_full_notice(
 /// route did (`by`, as the person reads it): brief, and only what they need
 /// to know. Every other hand-over (no login of hers, her plan at its limit,
 /// the agent's own failover) stays as quiet as it always was, so a standing
-/// setup never closes each answer with the same line.
-fn fallback_note(misses: &[RouteMiss], by: &str) -> Option<String> {
+/// setup never closes each answer with the same line. Only a person in the
+/// loop (`interactive`) is told; a job's answer is its own.
+fn fallback_note(misses: &[RouteMiss], by: &str, interactive: bool) -> Option<String> {
+    if !interactive {
+        return None;
+    }
     let miss = misses
         .iter()
         .find(|miss| miss.worker_full && miss.plan.is_some_and(|(_, personal)| personal))?;
@@ -736,7 +740,7 @@ impl TurnChain {
                         true => runner,
                         false => runner.without_silent_retry(),
                     };
-                    let note = fallback_note(&misses, "the hub's models");
+                    let note = fallback_note(&misses, "the hub's models", interactive);
                     let (watched, forward) = noting(note.as_deref(), progress.as_ref());
                     let ran = Box::pin(run_runner(
                         &runner,
@@ -747,6 +751,9 @@ impl TurnChain {
                         inbox,
                     ))
                     .await;
+                    // Every sender the runner was given is dropped once it
+                    // returns (tools read the turn's progress sender inline,
+                    // never keeping it), so the forwarder ends here.
                     if let Some(forward) = forward {
                         let _ = forward.await;
                     }
@@ -817,6 +824,7 @@ impl TurnChain {
                                         true => format!("your {} plan", plan_name(*cli)),
                                         false => format!("this agent's {} plan", plan_name(*cli)),
                                     },
+                                    interactive,
                                 )
                                 .unwrap_or_default();
                                 if let Some(progress) = &progress {
