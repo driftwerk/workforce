@@ -63,6 +63,8 @@ pub struct AgentTurnRig {
     home_ttl: Duration,
     /// How long a turn waits for a workspace on a full coding worker.
     seat_wait: SeatWait,
+    /// How long a turn's scope stays up on a worker once the turn is over.
+    idle_release: Duration,
     #[cfg(test)]
     programs: std::collections::HashMap<CliKind, PathBuf>,
 }
@@ -103,6 +105,7 @@ impl AgentTurnRig {
         codex_worker: Option<Arc<dyn SandboxLauncher>>,
         rotation: RotationPolicy,
         home_ttl: Duration,
+        idle_release: Duration,
     ) -> Self {
         Self {
             launcher,
@@ -110,6 +113,7 @@ impl AgentTurnRig {
             rotation,
             home_ttl,
             seat_wait: SeatWait::default(),
+            idle_release,
             #[cfg(test)]
             programs: std::collections::HashMap::new(),
         }
@@ -511,9 +515,10 @@ impl AgentTurnRig {
                 key: scope.clone(),
                 ttl_secs: self.home_ttl.as_secs(),
             },
-            // Its transcript and bench live in the keyed home, so a full
-            // worker may take the scope back once the conversation is idle.
-            yields_when_idle: true,
+            // Its transcript and bench live in the keyed home, so the worker
+            // releases the scope once the conversation is idle, and sooner
+            // when it is full; the home stays for the next turn.
+            idle_release: Some(self.idle_release),
         })
         .seat(
             launcher.as_ref(),

@@ -246,7 +246,7 @@ impl Worker {
                 bail!("home key {key:?} is not a dataset-safe name");
             }
         }
-        self.classify(&request.scope, request.yields_when_idle);
+        self.classify(&request);
         if let Some(existing) = self.touch(&request.scope) {
             let home_reused = existing.home.is_some();
             return Ok(ServerFrame::Prepared(prepared(
@@ -255,11 +255,13 @@ impl Worker {
                 home_reused,
             )));
         }
-        if self.scopes.lock().len() as u32 >= self.config.max_scopes {
-            let Some(idle) = self.take_idle_yielder(Utc::now()) else {
-                return Ok(refused(RefusalReason::AtCapacity));
-            };
-            self.give_way(idle, &request.scope).await;
+        if self.room_for_another().is_err() {
+            if let Some(idle) = self.take_idle_yielder(Utc::now()) {
+                self.give_way(idle, &request.scope).await;
+            }
+            if let Err(reason) = self.room_for_another() {
+                return Ok(refused(reason));
+            }
         }
         if self.zfs.free_bytes(&self.config.pool).await? < self.config.pool_free_floor_bytes() {
             // A refresh pruning at the same moment can take a snapshot out
@@ -874,11 +876,22 @@ impl Worker {
         Ok(())
     }
 
-    /// Record what the hub says a scope is for, on a scope found again: a
-    /// scope made before its class was asked for learns it on its next use.
-    fn classify(&self, scope: &ScopeId, yields_when_idle: bool) {
-        if let Some(entry) = self.scopes.lock().get_mut(scope) {
-            entry.yields_when_idle = yields_when_idle;
+    /// Whether one more scope may be seated now: the one test admission
+    /// asks, before and after an idle scope gives way.
+    fn room_for_another(&self) -> Result<(), RefusalReason> {
+        match self.scopes.lock().len() as u32 >= self.config.max_scopes {
+            true => Err(RefusalReason::AtCapacity),
+            false => Ok(()),
+        }
+    }
+
+    /// Record what the hub now says of a scope found again: whether it may
+    /// give way, and how long it lives once idle. A scope made before the hub
+    /// asked for either learns it on its next use.
+    fn classify(&self, request: &PrepareRequest) {
+        if let Some(entry) = self.scopes.lock().get_mut(&request.scope) {
+            entry.yields_when_idle = request.yields_when_idle;
+            entry.ttl_secs = request.ttl_secs;
         }
     }
 
@@ -1905,6 +1918,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_idle_turn_scope_is_released_after_its_short_lifetime_and_its_home_is_kept() {
+        let h = Harness::new().await;
+        let mut request = turn("turn", "thread-1");
+        request.ttl_secs = 300;
+        h.worker.prepare(request).await.unwrap();
+        let later = Utc::now() + chrono::Duration::seconds(301);
+        h.worker
+            .running
+            .lock()
+            .entry(ScopeId::new("turn"))
+            .or_default()
+            .insert("round".into());
+        assert!(
+            h.worker.sweep(later).await.unwrap().is_empty(),
+            "a turn in flight keeps its scope however long it runs"
+        );
+        h.worker.running.lock().clear();
+        assert_eq!(
+            h.worker.sweep(later).await.unwrap(),
+            vec![ScopeId::new("turn")]
+        );
+        assert!(h.zfs.exists_sync("tank/homes/thread-1"));
+        assert!(h.worker.homes().iter().any(|home| home.key == "thread-1"));
+    }
+
+    #[tokio::test]
     async fn a_scope_found_again_learns_whether_it_may_give_way() {
         let h = Harness::new().await;
         h.worker
@@ -1917,14 +1956,15 @@ mod tests {
                 .unwrap()
                 .yields_when_idle
         );
-        h.worker.prepare(turn("turn", "thread-1")).await.unwrap();
+        let mut again = turn("turn", "thread-1");
+        again.ttl_secs = 300;
+        h.worker.prepare(again).await.unwrap();
+        let found = h.worker.scope(&ScopeId::new("turn")).unwrap();
         assert!(
-            h.worker
-                .scope(&ScopeId::new("turn"))
-                .unwrap()
-                .yields_when_idle,
+            found.yields_when_idle,
             "a scope made before the hub said so is classed on its next turn"
         );
+        assert_eq!(found.ttl_secs, 300, "and lives as long idle as it now asks");
     }
 
     fn age(worker: &Worker, scope: &str, by: chrono::Duration) {
