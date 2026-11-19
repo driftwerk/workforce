@@ -631,7 +631,7 @@ async fn switch_all(
 ) -> Response {
     guarded!(s, h, q);
     s.desk
-        .switch_all(b.engine, b.from, b.to)
+        .switch_all(b.engine, b.from, b.to, By::you())
         .await
         .map(Json)
         .into_response()

@@ -1546,10 +1546,16 @@ impl Desk {
         // Running sessions move to the default as a switch does: idle ones
         // now, working ones once their turn ends.
         for s in running {
-            self.0.state.lock().switches.insert(s, to);
+            // Desk moves them, for the account the person removed.
+            let by = By::desk(&format!("{} was removed", a.name));
+            {
+                let mut st = self.0.state.lock();
+                st.switches.insert(s, to);
+                st.switch_by.insert(s, by.clone());
+            }
             let desk = self.clone();
             tokio::spawn(async move {
-                if let Err(e) = desk.drive_switch(s, None).await {
+                if let Err(e) = desk.drive_switch(s, Some(by)).await {
                     tracing::warn!(session = %s, error = %e, "couldn't move a session off a removed account");
                 }
             });
@@ -1649,7 +1655,15 @@ impl Desk {
             let a = self.account(to)?;
             self.read_token(&a).await?;
         }
-        self.0.state.lock().switches.insert(id, to);
+        {
+            let mut st = self.0.state.lock();
+            st.switches.insert(id, to);
+            // Said to be by whoever asked for it, when it is carried out.
+            match &by {
+                Some(by) => st.switch_by.insert(id, by.clone()),
+                None => st.switch_by.remove(&id),
+            };
+        }
         self.drive_switch(id, by).await
     }
 
@@ -1673,15 +1687,21 @@ impl Desk {
     }
 
     async fn drive_switch_now(&self, id: Uuid, by: Option<By>) -> Result<SessionView, DeskError> {
-        let by = by.unwrap_or_else(By::you);
+        // Whoever asked for it, when it waited; Desk itself, never the
+        // person, when no one did.
+        let by = by
+            .or_else(|| self.0.state.lock().switch_by.get(&id).cloned())
+            .unwrap_or_else(|| By::desk("it moves to another account"));
         loop {
             let Some(to) = self.0.state.lock().switches.get(&id).copied() else {
                 return self.view(id);
             };
             let r = self.record(id)?;
-            let (live, hit_limit) = {
+            let (live, hit_limit, running) = {
                 let st = self.0.state.lock();
                 let live = st.live.contains_key(&id);
+                // Work it started that still runs (CI watchers, sub-agents).
+                let running = st.live.get(&id).map_or(0, |l| l.background.count());
                 // What Claude Code said of how its turn ended comes first;
                 // the reply's words only when it said nothing.
                 let hit_limit = matches!(r.state, SessionState::Done | SessionState::Idle)
@@ -1692,13 +1712,22 @@ impl Desk {
                             .as_deref()
                             .is_some_and(|reply| crew::outcome_of(Ok(reply)).0 == Outcome::Limit),
                     };
-                (live, hit_limit)
+                (live, hit_limit, running)
             };
             if r.account == to && !hit_limit {
-                self.0.state.lock().switches.remove(&id);
+                let mut st = self.0.state.lock();
+                st.switches.remove(&id);
+                st.switch_by.remove(&id);
+                drop(st);
                 return self.view(id);
             }
-            let when = accounts::switch_when(r.state, live, hit_limit);
+            let when = match accounts::switch_when(r.state, live, hit_limit) {
+                // A restart now would stop what it left running: it moves
+                // once that ends. On the old account's limit it can't go
+                // on, so it moves now, told what was stopped.
+                SwitchWhen::Now if running > 0 => SwitchWhen::AfterTurn,
+                when => when,
+            };
             if when == SwitchWhen::AfterTurn {
                 let view = self.view(id)?;
                 self.announce(DeskEvent::Session {
@@ -1714,7 +1743,10 @@ impl Desk {
                     Err(e) => Err(e),
                 };
                 if let Err(e) = read {
-                    self.0.state.lock().switches.remove(&id);
+                    let mut st = self.0.state.lock();
+                    st.switches.remove(&id);
+                    st.switch_by.remove(&id);
+                    drop(st);
                     if let Ok(view) = self.view(id) {
                         self.announce(DeskEvent::Session {
                             session: Box::new(view),
@@ -1724,7 +1756,11 @@ impl Desk {
                 }
             }
             let from = r.account;
-            self.0.state.lock().switches.remove(&id);
+            {
+                let mut st = self.0.state.lock();
+                st.switches.remove(&id);
+                st.switch_by.remove(&id);
+            }
             self.change(id, |r, _| r.account = to);
             {
                 // A removed account's name is kept only while something is on it.
@@ -2264,7 +2300,12 @@ impl Desk {
                     engine, from, to, ..
                 } = n
                 {
-                    match self.switch_all(*engine, from.id, to.id).await {
+                    // Desk's own move, as the person set it to: never theirs.
+                    let by = By::desk(&format!(
+                        "{} reached its plan's limit, so Desk moved its sessions to {}",
+                        from.name, to.name
+                    ));
+                    match self.switch_all(*engine, from.id, to.id, by).await {
                         Ok(done) => tracing::info!(
                             moved = done.now.len() + done.after_turn.len(),
                             "sessions moved off an account at its limit"
@@ -2295,6 +2336,7 @@ impl Desk {
         engine: Engine,
         from: Option<Uuid>,
         to: Option<Uuid>,
+        by: By,
     ) -> Result<SwitchedAll, DeskError> {
         if from == to {
             return Err(DeskError::Invalid("they are the same account".into()));
@@ -2332,7 +2374,7 @@ impl Desk {
                 done.in_terminals.push(id);
                 continue;
             }
-            match self.switch_account(id, to, None).await {
+            match self.switch_account(id, to, Some(by.clone())).await {
                 Ok(v) if v.switching_to.is_some() => done.after_turn.push(id),
                 Ok(_) if live => done.now.push(id),
                 Ok(_) => done.next_start.push(id),
