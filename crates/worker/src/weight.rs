@@ -93,7 +93,9 @@ impl ServicePlan {
     /// start on first use, and whether the scope's own Docker engine waits
     /// for first use too.
     pub fn env(&self) -> Vec<(String, String)> {
-        let eager = match self.eager.is_empty() {
+        // Only a plan that left services for later says "none": with nothing
+        // deferred the value is what it always was, empty included.
+        let eager = match self.eager.is_empty() && !self.lazy.is_empty() {
             true => NO_SERVICES.to_string(),
             false => self.eager.join(","),
         };
@@ -210,6 +212,23 @@ mod tests {
                     "TOOLBOX_SERVICES".to_string(),
                     "mysql,postgres,redis,ministack".to_string()
                 )]
+            );
+        }
+    }
+
+    #[test]
+    fn a_worker_with_no_services_configured_sends_what_it_always_did() {
+        for lazy_services in [false, true] {
+            let config = WorkerConfig {
+                lazy_services,
+                database: Vec::new(),
+                services: Vec::new(),
+                golden: Vec::new(),
+                ..sample()
+            };
+            assert_eq!(
+                ServicePlan::of(&config, &[]).env()[0],
+                ("TOOLBOX_SERVICES".to_string(), String::new())
             );
         }
     }
