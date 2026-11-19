@@ -22,7 +22,7 @@ You can connect to multiple Linear workspaces. Configure them in your skill's `c
 
 ## Available tools
 
-The Linear skill provides over 20 tools. Here are the key categories:
+The Linear skill provides over 25 tools. Here are the key categories:
 
 ### Issues & Comments
 - `linear.issue_list`: List issues with filters.
@@ -52,8 +52,11 @@ The Linear skill provides over 20 tools. Here are the key categories:
 - `linear.labels_list`: List issue labels.
 - `linear.members_list`: List workspace members.
 - `linear.view_ordering`: How a view orders its issues: a custom view's settings, or your own setting for a kind of team view (Linear's API reads no team's own settings).
+- `linear.workspaces`: List the workspaces you can use and which one is the default.
+- `linear.viewer`: Who the Linear key in use belongs to (id, name, email), and whether it is your own key or a shared one.
+- `linear.upload_read`: Read a file uploaded to Linear (from `https://uploads.linear.app/`) that an issue shows or lists, in chunks.
 
-All tools support an optional `workspace` parameter for multi-workspace setups.
+All tools except `linear.workspaces` support an optional `workspace` parameter for multi-workspace setups.
 
 ## Webhooks (Event sources)
 
