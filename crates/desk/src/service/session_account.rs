@@ -73,6 +73,11 @@ pub(super) struct AccountRun {
     looked: Mutex<HashMap<Uuid, Instant>>,
     /// When each session's turn last ended.
     pub(super) ended: Mutex<HashMap<Uuid, DateTime<Utc>>>,
+    /// The sessions whose account was last written plainly, not by a
+    /// model: `by_model` stays true once a model wrote it (its words
+    /// aren't gone), so this says what the newest write was. Lost on a
+    /// restart, when the crew block's spent-ceiling notice still holds.
+    pub(super) plain: Mutex<HashSet<Uuid>>,
     /// When a reader last refreshed each session's account.
     read_refreshed: Mutex<HashMap<Uuid, Instant>>,
     /// Model calls made, for tests.
@@ -93,6 +98,7 @@ impl AccountRun {
             mid_turn: Mutex::default(),
             looked: Mutex::default(),
             ended: Mutex::default(),
+            plain: Mutex::default(),
             read_refreshed: Mutex::default(),
             calls: std::sync::atomic::AtomicUsize::new(0),
             shared_within: Mutex::new(super::memory_derive::CALL_WITHIN),
@@ -369,6 +375,49 @@ impl Desk {
         Ok(AccountAnswer::Answered(self.account_redacted_text(answer)))
     }
 
+    /// How far each of `accounts` (with whether its session works now)
+    /// can be relied on as a boss's turn reads them: stale once a turn
+    /// ended that it hasn't caught up with, or words went in or out on its
+    /// session's line after it was written, and so on
+    /// ([`Account::staleness`]). Only the stale ones are given. Read
+    /// without waiting on the store, each lock taken once.
+    pub fn accounts_staleness(
+        &self,
+        accounts: &[(&Account, bool)],
+    ) -> HashMap<Uuid, account::Staleness> {
+        let ids: Vec<Uuid> = accounts.iter().map(|(a, _)| a.session).collect();
+        let line = self.0.picture.lock().last_activity(&ids);
+        let ended: HashMap<Uuid, DateTime<Utc>> = {
+            let ended = self.0.accounts.ended.lock();
+            ids.iter()
+                .filter_map(|id| ended.get(id).map(|e| (*id, *e)))
+                .collect()
+        };
+        let plain: HashSet<Uuid> = {
+            let plain = self.0.accounts.plain.lock();
+            ids.iter()
+                .filter(|id| plain.contains(id))
+                .copied()
+                .collect()
+        };
+        let now = crate::crew::now();
+        accounts
+            .iter()
+            .filter_map(|(a, working)| {
+                let id = a.session;
+                let last_plain = !a.by_model || plain.contains(&id);
+                a.staleness(
+                    now,
+                    *working,
+                    last_plain,
+                    ended.get(&id).copied(),
+                    line.get(&id).copied(),
+                )
+                .map(|s| (id, s))
+            })
+            .collect()
+    }
+
     /// A turn of session `id` ended and the harvest read it: its account
     /// is refreshed off the caller.
     pub(super) fn account_turn_ended(&self, id: Uuid) {
@@ -574,10 +623,12 @@ impl Desk {
             fresh.cursor.tail = Some(t.clone());
             fresh.cursor.read_at = Some(at);
         }
-        // A plain write never says the model's words are gone.
+        // A plain write never says the model's words are gone; what the
+        // newest write was is kept beside it.
         fresh.by_model = said.by_model || kept.by_model;
+        let plain = !said.by_model;
         fresh.stale_after = None;
-        Ok(match self.0.store.session_account_put(&fresh).await? {
+        let out = match self.0.store.session_account_put(&fresh).await? {
             Put::Kept(v) => Account {
                 version: v,
                 ..fresh
@@ -614,7 +665,13 @@ impl Desk {
                     }
                 }
             }
-        })
+        };
+        // Kept: what the newest write was, beside it.
+        match plain {
+            true => self.0.accounts.plain.lock().insert(id),
+            false => self.0.accounts.plain.lock().remove(&id),
+        };
+        Ok(out)
     }
 
     /// Hands the floor session `id`'s turn-end gist, said from `a`.
@@ -745,15 +802,31 @@ impl Desk {
             .await?;
         // A question's own share spent leaves accounts written as before.
         if !taken && kind != CheapKind::Question {
-            let first = self.0.accounts.ceiling_hit.lock().replace(day) != Some(day);
-            if first {
-                tracing::warn!(
-                    cap = limits.cheap_calls_per_day,
-                    "the day's metered cheap calls are spent: sessions' accounts are said plainly until tomorrow"
-                );
-            }
+            self.ceiling_hit(day, limits.cheap_calls_per_day);
         }
         Ok(taken)
+    }
+
+    /// The day's metered cheap calls, `cap` of them, are spent on `day`:
+    /// marked, and said in the log and on the Floor the first time. Once a
+    /// day while the hub runs; a restart on a spent day says it once more,
+    /// which is the truth again.
+    fn ceiling_hit(&self, day: NaiveDate, cap: u32) {
+        if self.0.accounts.ceiling_hit.lock().replace(day) == Some(day) {
+            return;
+        }
+        tracing::warn!(
+            cap,
+            "the day's metered cheap calls are spent: sessions' accounts are said plainly until tomorrow"
+        );
+        self.note(crate::crew::Event::new(
+            crate::crew::Kind::Limit,
+            crate::crew::Party::desk(),
+            None,
+            format!(
+                "today's {cap} metered cheap calls are spent: sessions' summaries are written plainly from their last words until tomorrow"
+            ),
+        ));
     }
 
     /// Gives back a call of `kind` paid by `billing` that no model took.
@@ -832,7 +905,7 @@ impl Desk {
                 .await
                 .is_ok_and(|n| n >= i64::from(cap));
         if spent {
-            *self.0.accounts.ceiling_hit.lock() = Some(day);
+            self.ceiling_hit(day, cap);
         }
         spent || self.cheap_ceiling_hit_today()
     }

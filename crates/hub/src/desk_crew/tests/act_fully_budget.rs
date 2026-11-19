@@ -311,6 +311,34 @@ async fn a_spent_metered_day_is_raised_from_its_card_and_held_at_once() {
         );
         assert_eq!(card.action["input"]["agent_id"], overseer.agent_id.as_str());
         assert!(d.cheap_ceiling_hit_today());
+        // On the Floor once, however many calls it refuses after.
+        assert!(!d
+            .update_take(workforce_desk::account::Billing::Metered)
+            .await
+            .unwrap());
+        let spent = |page: workforce_desk::crew::ActivityPage| {
+            page.events
+                .into_iter()
+                .filter(|e| {
+                    e.kind == workforce_desk::crew::Kind::Limit
+                        && e.text.contains("metered cheap calls are spent")
+                })
+                .count()
+        };
+        eventually("the spent day on the Floor", async || {
+            let page = d
+                .activity(workforce_desk::crew::Filter::All, None, 50)
+                .await
+                .unwrap();
+            (spent(page) > 0).then_some(())
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let page = d
+            .activity(workforce_desk::crew::Filter::All, None, 50)
+            .await
+            .unwrap();
+        assert_eq!(spent(page), 1, "said once");
         // Once a day, however often it is looked at.
         for _ in 0..2 {
             *crew.notes_looked.lock() = None;

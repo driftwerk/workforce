@@ -3723,6 +3723,12 @@ async fn every_turn_of_the_boss_is_given_the_same_block_and_its_posts_survive_a_
                 block.contains("<<<EXTERNAL_UNTRUSTED_CONTENT_"),
                 "{turn}: fenced as data"
             );
+            // Told to check a STALE summary first, outside the fence.
+            let check = block.find(super::context::CHECK_FIRST);
+            assert!(
+                check.is_some_and(|at| at < block.find("<<<EXTERNAL_UNTRUSTED_CONTENT_").unwrap()),
+                "{turn}: {block}"
+            );
         }
         assert!(
             on_line.contains("The session this turn is about, acme-web"),
