@@ -19,7 +19,7 @@ use workforce_agent::llm::provider::ProviderKind;
 use workforce_agent::llm::responses::ChatGptModel;
 use workforce_agent::llm::tiers::{ModelTier, TierRegistry};
 use workforce_common::personal_route::{
-    AgentRoute, PersonalRoute, PersonalRouteKind, PersonalRoutesConfig,
+    AgentRoute, PersonalRoute, PersonalRouteKind, PersonalRoutesConfig, RouteFallback,
 };
 use workforce_common::settings::ExecutorKind;
 use workforce_common::subscription::{AgentOwner, CredentialTier};
@@ -375,6 +375,62 @@ fn agent_options(
         has_worker(service),
         &service.tier_registry(),
     )
+}
+
+/// What `person`'s own conversations with `service` run on, when that is
+/// their own route, as an agent listing shows it to them; `None` is the
+/// hub's route. The route is the one a turn of theirs takes
+/// ([`crate::personal_route::RouteDecider::chosen_for`]), its model the
+/// one a new conversation's chat turn runs. A Codex route on a hub without
+/// its coding worker is the hub's route when it falls back to it, and said
+/// refused when it waits, as a turn finds it.
+pub(crate) async fn shown_route(
+    service: &AgentService,
+    person: Uuid,
+) -> Option<workforce_gateway_client::PersonalRouteInfo> {
+    let chosen = crate::personal_route::RouteDecider::of(service)
+        .chosen_for(person)
+        .await?;
+    let refused = crate::agent_turn::personal_refusal(service, chosen.cli);
+    if refused.is_some() && chosen.route.fallback == RouteFallback::Hub {
+        // Every turn of theirs runs on the hub's route instead.
+        return None;
+    }
+    // The model a new conversation's chat turn starts from: the agent's
+    // conversation model, else its default, as `resolve_chat_model` picks.
+    let fresh = workforce_common::session::Session::new(
+        "desk",
+        &person.to_string(),
+        service.agent_id.as_str(),
+    );
+    // Picked as a turn picks it, without the lines a turn's pick logs: a
+    // listing asks for every agent each time a client reads it.
+    let spec =
+        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+            service.resolve_model(&fresh, Some(crate::serve::CONVERSATION), None)
+        });
+    let model = crate::personal_route::personal_model(
+        &service.tier_registry(),
+        &service.tier_key.read().clone(),
+        &spec,
+        chosen.cli,
+        &chosen.route,
+        workforce_common::personal_route::RouteWork::Conversation,
+    );
+    let kind = chosen.route.kind;
+    Some(workforce_gateway_client::PersonalRouteInfo {
+        kind: kind.as_str().to_string(),
+        title: kind.title().to_string(),
+        model,
+        fallback: chosen.route.fallback.as_str().to_string(),
+        connected: has_own_login(
+            kind,
+            &service.logins.vaults(),
+            &[CredentialTier::AgentUser, CredentialTier::GlobalUser],
+            person,
+        ),
+        refused: refused.map(str::to_string),
+    })
 }
 
 /// The tiers models are named by for every agent: the host agent's.
