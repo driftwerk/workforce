@@ -194,6 +194,9 @@ struct WorkerFile {
     worker: WorkerConfig,
 }
 
+/// The most scopes one worker may be configured for, of both weights.
+pub const MAX_SCOPES_CEILING: u32 = 500;
+
 /// The dataset under the pool that holds the agent's home for every scope.
 pub const HOME_GOLDEN: &str = "home";
 
@@ -296,6 +299,11 @@ impl WorkerConfig {
             if value == 0 {
                 bail!("[worker] {key} must be at least 1");
             }
+        }
+        if self.max_scopes.saturating_add(self.max_light_scopes) > MAX_SCOPES_CEILING {
+            bail!(
+                "[worker] max_scopes and max_light_scopes together must be at most {MAX_SCOPES_CEILING}"
+            );
         }
         if let Some(admission) = &self.admission {
             if admission.full_reserve_gib == 0 || admission.light_reserve_gib == 0 {

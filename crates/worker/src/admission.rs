@@ -38,7 +38,13 @@ pub struct ProcLoad;
 impl HostLoad for ProcLoad {
     fn read(&self) -> Result<Reading> {
         let meminfo = std::fs::read_to_string("/proc/meminfo").context("reading /proc/meminfo")?;
-        let (memory_total_bytes, memory_available_bytes) = parse_meminfo(&meminfo)?;
+        let (memory_total_bytes, available) = parse_meminfo(&meminfo)?;
+        // The ZFS ARC gives memory back under pressure but is not counted in
+        // MemAvailable, so a warm cache would otherwise refuse seats.
+        let arc = std::fs::read_to_string(Path::new("/proc/spl/kstat/zfs/arcstats"))
+            .ok()
+            .map_or(0, |text| reclaimable_arc(&text));
+        let memory_available_bytes = available.saturating_add(arc).min(memory_total_bytes);
         let cpu_pressure = std::fs::read_to_string(Path::new("/proc/pressure/cpu"))
             .ok()
             .and_then(|text| parse_pressure(&text));
@@ -63,6 +69,23 @@ pub(crate) fn parse_meminfo(text: &str) -> Result<(u64, u64)> {
         Ok(kib * 1024)
     };
     Ok((field("MemTotal")?, field("MemAvailable")?))
+}
+
+/// What the ZFS ARC would give back: its `size` above its `c_min`, from
+/// `arcstats` (`name type data` lines); 0 when either is missing.
+pub(crate) fn reclaimable_arc(text: &str) -> u64 {
+    let field = |name: &str| {
+        text.lines().find_map(|line| {
+            let mut parts = line.split_whitespace();
+            (parts.next() == Some(name))
+                .then(|| parts.nth(1)?.parse::<u64>().ok())
+                .flatten()
+        })
+    };
+    match (field("size"), field("c_min")) {
+        (Some(size), Some(min)) => size.saturating_sub(min),
+        _ => 0,
+    }
 }
 
 /// `some avg10` from a PSI file.
@@ -401,6 +424,14 @@ mod tests {
             "measured: 9 GiB less 3 reserves leaves the 6 GiB floor"
         );
         assert_eq!(light_seats_free(&config, &census(0, 0), None), 10);
+    }
+
+    #[test]
+    fn the_reclaimable_arc_is_its_size_over_its_minimum() {
+        let arcstats = "13 1 0x01 123 33456 1234 5678\nname                            type data\nhits                            4    100\nc_min                           4    2000000000\nsize                            4    9000000000\n";
+        assert_eq!(reclaimable_arc(arcstats), 7_000_000_000);
+        assert_eq!(reclaimable_arc("size 4 10\n"), 0);
+        assert_eq!(reclaimable_arc("c_min 4 50\nsize 4 10\n"), 0);
     }
 
     #[test]

@@ -83,7 +83,7 @@ pub struct Worker {
     pub(crate) starts: tokio::sync::Mutex<()>,
     load: Arc<dyn HostLoad>,
     /// Scopes being built, by weight: counted by admission as if seated.
-    building: Mutex<HashMap<ScopeId, Weight>>,
+    building: Mutex<HashMap<ScopeId, Building>>,
     scope_locks: KeyedLocks,
     home_locks: KeyedLocks,
     /// Prepares refused for room since the daemon started.
@@ -164,8 +164,8 @@ impl Worker {
         for scope in self.scopes.lock().values() {
             census.add(Weight::of_held(&scope.repos));
         }
-        for weight in self.building.lock().values() {
-            census.add(*weight);
+        for building in self.building.lock().values() {
+            census.add(building.weight);
         }
         census
     }
@@ -189,10 +189,12 @@ impl Worker {
     /// Write what the host's metrics publish; a failure is logged, never
     /// the caller's.
     pub(crate) fn publish_load(&self) {
+        // Unlogged: a host without PSI or admission reports no reading
+        // rather than warning on every publish.
         let load = Load::of(
             &self.config,
             &self.census(),
-            self.reading().as_ref(),
+            self.load.read().ok().as_ref(),
             self.refusals.load(Ordering::Relaxed),
             Utc::now(),
         );
@@ -319,6 +321,16 @@ impl Worker {
             }
         }
         let _same_scope = self.scope_locks.lock(request.scope.as_str()).await;
+        // A scope already seated is handed back without waiting on another
+        // scope's build of the same home.
+        if let Some(existing) = self.touch(&request.scope) {
+            let home_reused = existing.home.is_some();
+            return Ok(ServerFrame::Prepared(prepared(
+                &existing,
+                true,
+                home_reused,
+            )));
+        }
         let _same_home = match &request.home {
             HomeSpec::Keyed { key, .. } => Some(self.home_locks.lock(key).await),
             HomeSpec::Ephemeral => None,
@@ -358,7 +370,11 @@ impl Worker {
                 }
             }
             validate_overrides(&request.env).map_err(|reason| eyre::eyre!(reason))?;
-            Seat::hold(self, &request.scope, weight)
+            let home = match &request.home {
+                HomeSpec::Keyed { key, .. } => Some(key.clone()),
+                HomeSpec::Ephemeral => None,
+            };
+            Seat::hold(self, &request.scope, weight, home)
         };
 
         let root = self.work_dataset(&request.scope);
@@ -372,7 +388,13 @@ impl Worker {
                     "prepared"
                 );
                 let frame = ServerFrame::Prepared(prepared(&scope, false, home_reused));
-                self.scopes.lock().insert(scope.id.clone(), scope);
+                {
+                    // Seated and no longer being built in one step, so no
+                    // decision counts it twice.
+                    let mut scopes = self.scopes.lock();
+                    self.building.lock().remove(&scope.id);
+                    scopes.insert(scope.id.clone(), scope);
+                }
                 self.save()?;
                 self.publish_load();
                 Ok(frame)
@@ -988,7 +1010,12 @@ impl Worker {
     pub async fn sweep_homes(&self, now: DateTime<Utc>) -> Result<Vec<String>> {
         let expired: Vec<Home> = {
             let scopes = self.scopes.lock();
-            let in_use: HashSet<&str> = scopes.values().filter_map(|s| s.home.as_deref()).collect();
+            let building = self.building.lock();
+            let in_use: HashSet<&str> = scopes
+                .values()
+                .filter_map(|s| s.home.as_deref())
+                .chain(building.values().filter_map(|b| b.home.as_deref()))
+                .collect();
             self.homes
                 .lock()
                 .values()
@@ -1101,7 +1128,7 @@ impl Worker {
         Ok(WorkerHealth {
             scopes,
             homes: self.homes.lock().len() as u32,
-            capacity: self.config.max_scopes,
+            capacity: self.config.max_scopes + self.config.max_light_scopes,
             pool_free_bytes,
             goldens,
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1110,16 +1137,27 @@ impl Worker {
     }
 }
 
-/// A scope's seat while it is built: counted by admission until dropped,
-/// by which time a built scope is in the map.
+/// What a scope being built holds: its weight, for admission, and its keyed
+/// home, which no sweep may take while the build is under way.
+#[derive(Debug, Clone)]
+struct Building {
+    weight: Weight,
+    home: Option<String>,
+}
+
+/// A scope's seat while it is built: counted by admission until the built
+/// scope takes its place in the map, or until dropped when the build fails.
 struct Seat<'a> {
     worker: &'a Worker,
     scope: ScopeId,
 }
 
 impl<'a> Seat<'a> {
-    fn hold(worker: &'a Worker, scope: &ScopeId, weight: Weight) -> Self {
-        worker.building.lock().insert(scope.clone(), weight);
+    fn hold(worker: &'a Worker, scope: &ScopeId, weight: Weight, home: Option<String>) -> Self {
+        worker
+            .building
+            .lock()
+            .insert(scope.clone(), Building { weight, home });
         Self {
             worker,
             scope: scope.clone(),
@@ -1146,7 +1184,13 @@ struct KeyedGuard<'a> {
 
 impl KeyedLocks {
     async fn lock(&self, key: &str) -> KeyedGuard<'_> {
-        let lock = Arc::clone(self.0.lock().entry(key.to_string()).or_default());
+        let lock = {
+            let mut locks = self.0.lock();
+            // A waiter cancelled after the holder let go leaves its key with
+            // only the map's reference: nobody holds or awaits it.
+            locks.retain(|held, lock| held == key || Arc::strong_count(lock) > 1);
+            Arc::clone(locks.entry(key.to_string()).or_default())
+        };
         KeyedGuard {
             locks: self,
             key: key.to_string(),
@@ -1700,6 +1744,27 @@ mod tests {
         assert!(h.worker.building.lock().is_empty());
         assert_eq!(h.worker.scope_locks.len(), 0);
         assert_eq!(h.worker.home_locks.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_home_being_built_into_a_scope_is_never_swept_from_under_it() {
+        let h = Harness::new().await;
+        let turn = container_name(&ScopeId::new("turn"));
+        h.containers.mark_unready(&turn);
+        let worker = Arc::clone(&h.worker);
+        let building =
+            tokio::spawn(async move { worker.prepare(keyed("turn", "thread", 0)).await });
+        while h.containers.runs().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let much_later = Utc::now() + chrono::Duration::days(1);
+        assert!(h.worker.sweep_homes(much_later).await.unwrap().is_empty());
+        assert!(h.zfs.exists_sync("tank/homes/thread"));
+        h.containers.mark_ready(&turn);
+        assert!(matches!(
+            building.await.unwrap().unwrap(),
+            ServerFrame::Prepared(_)
+        ));
     }
 
     #[tokio::test]
