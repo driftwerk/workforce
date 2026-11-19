@@ -1488,11 +1488,13 @@ impl CrewHub {
             Ok(sent) => sent,
             Err(e) => {
                 unheld(&e).await;
-                return Err(e);
+                return Err(Refused::other(e));
             }
         };
         if &sent != action {
-            return Box::pin(self.perform_with(&sent, by, order)).await;
+            // The body again, not `perform_judged`: what became of this
+            // step is said once, by the call that took it.
+            return Box::pin(self.perform_typed(&sent, by, order)).await;
         }
         // R5: a boss allows no irreversible request on a job another
         // session holds, as irreversible, whichever path it came by.
