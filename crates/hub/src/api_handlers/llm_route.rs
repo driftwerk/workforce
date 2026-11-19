@@ -403,7 +403,12 @@ pub(crate) async fn shown_route(
         &person.to_string(),
         service.agent_id.as_str(),
     );
-    let spec = service.resolve_model(&fresh, Some(crate::serve::CONVERSATION), None);
+    // Picked as a turn picks it, without the lines a turn's pick logs: a
+    // listing asks for every agent each time a client reads it.
+    let spec =
+        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+            service.resolve_model(&fresh, Some(crate::serve::CONVERSATION), None)
+        });
     let model = crate::personal_route::personal_model(
         &service.tier_registry(),
         &service.tier_key.read().clone(),
