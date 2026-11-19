@@ -23,7 +23,17 @@ pub struct WorkerConfig {
     pub toolbox_image_file: PathBuf,
     #[serde(default)]
     pub registry_mirror: Option<String>,
+    /// The most scopes at once; with `max_light_scopes`, the most full ones
+    /// (those checking repos out).
     pub max_scopes: u32,
+    /// The most light scopes (those with no repos: agent turns) at once; 0,
+    /// the default, counts them against `max_scopes` as full ones are.
+    #[serde(default)]
+    pub max_light_scopes: u32,
+    /// Admission by the host's memory and CPU headroom on top of the
+    /// ceilings; unset, the ceilings alone decide.
+    #[serde(default)]
+    pub admission: Option<AdmissionConfig>,
     /// Whether a scope starts at seat only the services it needs: none for a
     /// scope with no repos, a golden's `services` for one with repos. The
     /// rest are left to start on first use, which needs a toolbox image whose
@@ -63,6 +73,20 @@ pub struct WorkerConfig {
 
 fn default_max_golden_age_hours() -> u32 {
     36
+}
+
+/// `[worker.admission]`: what each scope is charged against the host's
+/// memory, the memory that must stay free, and the CPU pressure past which
+/// no scope is seated.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct AdmissionConfig {
+    pub full_reserve_gib: u32,
+    pub light_reserve_gib: u32,
+    pub memory_floor_gib: u32,
+    /// The highest PSI `cpu some avg10`, in percent, a new scope is seated
+    /// at; unset, CPU is not checked.
+    #[serde(default)]
+    pub cpu_pressure_max: Option<f64>,
 }
 
 /// Where secrets are read and bucket images stored: SSM and S3 through
@@ -273,6 +297,19 @@ impl WorkerConfig {
                 bail!("[worker] {key} must be at least 1");
             }
         }
+        if let Some(admission) = &self.admission {
+            if admission.full_reserve_gib == 0 || admission.light_reserve_gib == 0 {
+                bail!(
+                    "[worker.admission] full_reserve_gib and light_reserve_gib must be at least 1"
+                );
+            }
+            if admission
+                .cpu_pressure_max
+                .is_some_and(|max| !(0.0..=100.0).contains(&max))
+            {
+                bail!("[worker.admission] cpu_pressure_max is a percentage, 0 to 100");
+            }
+        }
         let mut services = std::collections::HashSet::new();
         if let Some(twice) = self.services.iter().find(|s| !services.insert(**s)) {
             bail!("[worker] services lists {:?} twice", twice.name());
@@ -433,6 +470,8 @@ pub(crate) mod tests {
             toolbox_image_file: "/etc/workforce/toolbox-image".into(),
             registry_mirror: Some("http://host.docker.internal:5000".into()),
             max_scopes: 2,
+            max_light_scopes: 0,
+            admission: None,
             lazy_services: true,
             pool_free_floor_gib: 1,
             scope_memory_gib: 8,
@@ -725,6 +764,48 @@ scope_cpus = 4
 snapshot_retention_days = 7
 backup_pool = "backup"
 "#;
+
+    #[test]
+    fn admission_loads_from_its_table_and_is_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("worker.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "{}backup_bucket_prefix = \"s3://b/golden\"\n\
+                 [worker.admission]\nfull_reserve_gib = 3\nlight_reserve_gib = 1\nmemory_floor_gib = 6\ncpu_pressure_max = 80\n",
+                MINIMAL.replace("[worker]\n", "[worker]\nmax_light_scopes = 40\n")
+            ),
+        )
+        .unwrap();
+        let config = WorkerConfig::load(&path).unwrap_or_else(|e| panic!("{e:#}"));
+        assert_eq!(config.max_light_scopes, 40);
+        assert_eq!(
+            config.admission,
+            Some(AdmissionConfig {
+                full_reserve_gib: 3,
+                light_reserve_gib: 1,
+                memory_floor_gib: 6,
+                cpu_pressure_max: Some(80.0),
+            })
+        );
+
+        let mut config = sample();
+        assert!(config.admission.is_none() && config.max_light_scopes == 0);
+        config.admission = Some(AdmissionConfig {
+            full_reserve_gib: 3,
+            light_reserve_gib: 0,
+            memory_floor_gib: 6,
+            cpu_pressure_max: None,
+        });
+        assert!(config.validate().is_err());
+        config.admission = Some(AdmissionConfig {
+            light_reserve_gib: 1,
+            cpu_pressure_max: Some(180.0),
+            ..config.admission.clone().unwrap()
+        });
+        assert!(config.validate().is_err());
+    }
 
     #[test]
     fn lazy_services_and_a_goldens_services_load_and_an_older_file_has_neither() {

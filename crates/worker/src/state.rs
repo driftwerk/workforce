@@ -244,7 +244,7 @@ fn read_json<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
     }
 }
 
-fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     create_parent(path)?;
     let mut temp =
         tempfile::NamedTempFile::new_in(path.parent().unwrap_or_else(|| Path::new(".")))?;

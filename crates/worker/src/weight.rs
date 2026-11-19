@@ -33,6 +33,15 @@ impl Weight {
         }
     }
 
+    /// The weight of a scope already prepared, from the repos it holds.
+    pub fn of_held<K, V>(repos: &std::collections::BTreeMap<K, V>) -> Self {
+        if repos.is_empty() {
+            Self::Light
+        } else {
+            Self::Full
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Self::Light => "light",
