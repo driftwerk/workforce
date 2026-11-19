@@ -782,8 +782,6 @@ fn spoken_duration(wait: Duration) -> String {
     }
 }
 
-/// Tell the turn's watcher what its `cli` is waiting for, when anyone
-/// watches it.
 /// What the status line says of a turn queued for the coding worker.
 fn queued_detail(ahead: u32) -> String {
     match ahead {
@@ -792,6 +790,8 @@ fn queued_detail(ahead: u32) -> String {
     }
 }
 
+/// Tell the turn's watcher what its `cli` is waiting for, when anyone
+/// watches it.
 async fn waiting(cli: CliKind, progress: Option<&mpsc::Sender<ProgressEvent>>, detail: &str) {
     if let Some(progress) = progress {
         let _ = progress

@@ -474,6 +474,16 @@ pub(crate) mod tests {
             .to_string()
             .contains("max_scopes"));
 
+        for share in [0.0, 1.5, f64::NAN] {
+            let mut config = sample();
+            config.fair_share = share;
+            assert!(config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("fair_share"));
+        }
+
         let mut config = sample();
         config.golden.push(config.golden[0].clone());
         assert!(config

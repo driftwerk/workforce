@@ -241,7 +241,33 @@ impl Worker {
     }
 
     pub async fn prepare(&self, request: PrepareRequest) -> Result<ServerFrame> {
-        let _one_at_a_time = self.prepares.lock().await;
+        if let Some(owner) = &request.queue {
+            if !valid_owner(owner) {
+                bail!("queue owner {owner:?} is not a short printable name");
+            }
+            // Answered without waiting on another prepare's seating, however
+            // long that takes, so a waiter's place stays fresh meanwhile.
+            if self.scope(&request.scope).is_none() {
+                let ahead = self.queue_place(&request.scope, owner);
+                if ahead > 0 {
+                    return Ok(ServerFrame::Queued { ahead });
+                }
+            }
+        }
+        let answer = {
+            let _one_at_a_time = self.prepares.lock().await;
+            self.prepare_one(&request).await
+        };
+        // Seated, found, refused or failed: whatever it was, it no longer
+        // waits, so it holds no place up.
+        if !matches!(answer, Ok(ServerFrame::Queued { .. })) {
+            self.queue.lock().leave(&request.scope);
+        }
+        answer
+    }
+
+    /// [`Self::prepare`] for its turn, while no other prepare runs.
+    async fn prepare_one(&self, request: &PrepareRequest) -> Result<ServerFrame> {
         if !valid_scope_id(&request.scope) {
             bail!("scope id {:?} is not a dataset-safe name", request.scope);
         }
@@ -250,7 +276,7 @@ impl Worker {
                 bail!("home key {key:?} is not a dataset-safe name");
             }
         }
-        self.classify(&request);
+        self.classify(request);
         if let Some(existing) = self.touch(&request.scope) {
             let home_reused = existing.home.is_some();
             return Ok(ServerFrame::Prepared(prepared(
@@ -259,20 +285,25 @@ impl Worker {
                 home_reused,
             )));
         }
-        if let Some(owner) = &request.queue {
-            if !valid_owner(owner) {
-                bail!("queue owner {owner:?} is not a short printable name");
+        match &request.queue {
+            // Asked again under the lock, as a seating may have changed the
+            // order since.
+            Some(owner) => {
+                let ahead = self.queue_place(&request.scope, owner);
+                if ahead > 0 {
+                    return Ok(ServerFrame::Queued { ahead });
+                }
             }
-            let ahead = self.queue_place(&request.scope, owner);
-            if ahead > 0 {
-                return Ok(ServerFrame::Queued { ahead });
-            }
+            // A prepare that did not ask to queue never takes a seat from
+            // those waiting for one.
+            None if self.queued() > 0 => return Ok(refused(RefusalReason::AtCapacity)),
+            None => {}
         }
-        // A queued prepare at the head waits on for room rather than being
-        // refused, keeping its place.
-        let wait_or = |reason| match request.queue {
-            Some(_) => ServerFrame::Queued { ahead: 0 },
-            None => refused(reason),
+        // A queued prepare at the head waits on for a seat rather than being
+        // refused, keeping its place; anything else refuses it at once.
+        let wait_or = |reason| match (&request.queue, reason) {
+            (Some(_), RefusalReason::AtCapacity) => ServerFrame::Queued { ahead: 0 },
+            (_, reason) => refused(reason),
         };
         validate_overrides(&request.env).map_err(|reason| eyre::eyre!(reason))?;
         if self.zfs.free_bytes(&self.config.pool).await? < self.config.pool_free_floor_bytes() {
@@ -282,7 +313,7 @@ impl Worker {
                 warn!(%error, "reclaiming pool space before a prepare failed");
             }
             if self.zfs.free_bytes(&self.config.pool).await? < self.config.pool_free_floor_bytes() {
-                return Ok(wait_or(RefusalReason::PoolFull));
+                return Ok(refused(RefusalReason::PoolFull));
             }
         }
         // Last of the checks, so a prepare refused for anything else never
@@ -297,11 +328,10 @@ impl Worker {
                 return Ok(wait_or(reason));
             }
         }
-        self.queue.lock().leave(&request.scope);
 
         let root = self.work_dataset(&request.scope);
         let mut started: Option<ContainerId> = None;
-        match self.materialise(&request, &root, &mut started).await {
+        match self.materialise(request, &root, &mut started).await {
             Ok((scope, home_reused)) => {
                 let frame = ServerFrame::Prepared(prepared(&scope, false, home_reused));
                 self.scopes.lock().insert(scope.id.clone(), scope);
@@ -906,6 +936,10 @@ impl Worker {
     /// Keep `scope`'s place in the queue for `owner` and say how many
     /// prepares go first, counting the scopes each owner holds against its
     /// share of the worker.
+    ///
+    /// The share and what an owner holds are counted in scopes, as the
+    /// worker's capacity is; a capacity measured otherwise redefines both
+    /// here, beside its capacity test.
     fn queue_place(&self, scope: &ScopeId, owner: &str) -> u32 {
         let share = share_of(self.config.fair_share, self.config.max_scopes);
         let scopes = self.scopes.lock();
@@ -932,7 +966,7 @@ impl Worker {
 
     /// How many prepares are waiting for a seat.
     pub(crate) fn queued(&self) -> usize {
-        self.queue.lock().len()
+        self.queue.lock().waiting(Utc::now())
     }
 
     /// Whether one more scope may be seated now: the one test admission
@@ -1910,6 +1944,70 @@ mod tests {
 
         w.leave_queue(&ScopeId::new("c"));
         assert_eq!(w.health().await.unwrap().queued, 0);
+    }
+
+    #[tokio::test]
+    async fn a_queued_prepare_that_fails_or_finds_no_disk_gives_its_place_up() {
+        let h = Harness::new().await;
+        let w = &h.worker;
+        w.prepare(spec("coding-1", &[])).await.unwrap();
+        w.prepare(spec("coding-2", &[])).await.unwrap();
+        assert_eq!(w.prepare(queued("b", "person-b")).await.unwrap(), place(0));
+        assert_eq!(w.prepare(queued("c", "person-c")).await.unwrap(), place(1));
+
+        let mut bad = queued("b", "person-b");
+        bad.env = vec![("not a name".into(), "x".into())];
+        assert!(w.prepare(bad).await.is_err());
+        assert_eq!(
+            w.prepare(queued("c", "person-c")).await.unwrap(),
+            place(0),
+            "the failed head holds nobody up"
+        );
+
+        w.release(&ScopeId::new("coding-1")).await.unwrap();
+        h.zfs.set_free_bytes(0);
+        assert_eq!(
+            w.prepare(queued("c", "person-c")).await.unwrap(),
+            refused(RefusalReason::PoolFull),
+            "no disk is said at once, not waited out as a full worker"
+        );
+        assert_eq!(w.queued(), 0);
+        assert!(w.prepare(queued("bad", "not printable")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_prepare_that_did_not_queue_never_takes_a_seat_from_one_waiting() {
+        let h = Harness::new().await;
+        let w = &h.worker;
+        w.prepare(spec("coding-1", &[])).await.unwrap();
+        w.prepare(spec("coding-2", &[])).await.unwrap();
+        assert_eq!(w.prepare(queued("b", "person-b")).await.unwrap(), place(0));
+        w.release(&ScopeId::new("coding-1")).await.unwrap();
+
+        assert_eq!(
+            w.prepare(spec("coding-3", &[])).await.unwrap(),
+            refused(RefusalReason::AtCapacity)
+        );
+        assert!(seated(&w.prepare(queued("b", "person-b")).await.unwrap()));
+    }
+
+    #[tokio::test]
+    async fn a_waiter_behind_the_head_is_answered_while_a_seating_is_under_way() {
+        let h = Harness::new().await;
+        let w = &h.worker;
+        w.prepare(spec("coding-1", &[])).await.unwrap();
+        w.prepare(spec("coding-2", &[])).await.unwrap();
+        assert_eq!(w.prepare(queued("b", "person-b")).await.unwrap(), place(0));
+        assert_eq!(w.prepare(queued("c", "person-c")).await.unwrap(), place(1));
+
+        let _seating = w.prepares.lock().await;
+        let asked = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            w.prepare(queued("c", "person-c")),
+        )
+        .await
+        .expect("answered without waiting on the seating");
+        assert_eq!(asked.unwrap(), place(1));
     }
 
     #[tokio::test]

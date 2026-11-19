@@ -120,6 +120,15 @@ where
         };
         let e = match attempt {
             Err(e) if worker_full(&e) => e,
+            Err(e) => {
+                // Failed after queueing: the place it held goes too.
+                if queued {
+                    launcher
+                        .leave_queue(spec.agent_id, &spec.project.name, spec.scope)
+                        .await;
+                }
+                return Err(e);
+            }
             outcome => return outcome,
         };
         let ahead = e.downcast_ref::<Queued>().map(|q| q.ahead);
@@ -719,6 +728,14 @@ mod tests {
         launcher: &Queueing,
         deadline: tokio::time::Instant,
     ) -> (Result<Arc<dyn CodingSandbox>>, Vec<Option<u32>>) {
+        queue_or_stop(launcher, deadline, None).await
+    }
+
+    async fn queue_or_stop(
+        launcher: &Queueing,
+        deadline: tokio::time::Instant,
+        cancel: Option<&CancellationToken>,
+    ) -> (Result<Arc<dyn CodingSandbox>>, Vec<Option<u32>>) {
         let project = Project::new("agent", "bench");
         let tokens = HashMap::new();
         let spec = WorkspaceSpec {
@@ -737,7 +754,7 @@ mod tests {
             &spec,
             Some("person-1"),
             deadline.into_std(),
-            None,
+            cancel,
             |ahead| async move { notices.borrow_mut().push(ahead) },
         )
         .await;
@@ -776,6 +793,21 @@ mod tests {
             1,
             "the next in line moves up at once"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_seat_given_up_by_its_caller_goes_to_the_next_in_line() {
+        let launcher = Queueing::new(&[3; 100]);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let (seated, _) = queue_or_stop(
+            &launcher,
+            tokio::time::Instant::now() + Duration::from_secs(3600),
+            Some(&cancel),
+        )
+        .await;
+        assert!(seated.is_err_and(|e| worker_full(&e)));
+        assert_eq!(launcher.left.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

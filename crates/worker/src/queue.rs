@@ -3,7 +3,9 @@
 //! than a share of the worker while others wait.
 //!
 //! The queue decides only the order. Whether anyone can be seated at all is
-//! the worker's capacity test, asked for the prepare at the head.
+//! the worker's capacity test, asked for the prepare at the head; a head
+//! that does not fit waits there, and those behind it wait too, so a large
+//! request is never starved by smaller ones slipping past.
 
 use chrono::{DateTime, Utc};
 use workforce_agent::tools::exec_runner::{ScopeId, QUEUE_HOLD};
@@ -29,8 +31,8 @@ impl Queue {
     /// none, and say how many prepares go first. Places not asked for within
     /// [`QUEUE_HOLD`] are dropped first. An owner holding `share` scopes or
     /// more (`held` says how many each holds now) goes behind every owner
-    /// holding fewer; among the rest, fewer held goes first, then whoever
-    /// asked first.
+    /// holding fewer; otherwise whoever asked first goes first, so a steady
+    /// stream of newcomers never overtakes anyone for good.
     pub(crate) fn place(
         &mut self,
         scope: &ScopeId,
@@ -56,7 +58,7 @@ impl Queue {
         }
         let order = |waiter: &Waiter| {
             let holds = held(&waiter.owner);
-            (holds >= share, holds, waiter.since, waiter.scope.clone())
+            (holds >= share, waiter.since, waiter.scope.clone())
         };
         let mine = self
             .waiters
@@ -72,9 +74,13 @@ impl Queue {
         self.waiters.retain(|waiter| waiter.scope != *scope);
     }
 
-    /// How many prepares hold a place.
-    pub(crate) fn len(&self) -> usize {
-        self.waiters.len()
+    /// How many prepares hold a place at `now`: asked for within the hold.
+    pub(crate) fn waiting(&self, now: DateTime<Utc>) -> usize {
+        let hold = chrono::Duration::from_std(QUEUE_HOLD).unwrap_or_default();
+        self.waiters
+            .iter()
+            .filter(|waiter| waiter.asked + hold > now)
+            .count()
     }
 }
 
@@ -108,7 +114,7 @@ mod tests {
         );
         queue.leave(&id("a"));
         assert_eq!(queue.place(&id("c"), "person-c", later, none, 1), 1);
-        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.waiting(later), 2);
     }
 
     #[test]
@@ -123,11 +129,11 @@ mod tests {
             0,
             "the prepare that stopped asking holds nobody up"
         );
-        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.waiting(later), 1);
     }
 
     #[test]
-    fn an_owner_at_its_share_waits_behind_owners_holding_less() {
+    fn an_owner_at_its_share_waits_behind_the_rest_who_go_in_the_order_they_asked() {
         let mut queue = Queue::default();
         let now = Utc::now();
         let held = |owner: &str| match owner {
@@ -141,15 +147,33 @@ mod tests {
         let latest = later + chrono::Duration::seconds(1);
         assert_eq!(
             queue.place(&id("none"), "person-none", latest, held, 2),
-            0,
-            "holding nothing goes before holding one, whoever asked first"
+            1,
+            "under the share, whoever asked first goes first"
         );
-        assert_eq!(queue.place(&id("some"), "person-some", latest, held, 2), 1);
         assert_eq!(
             queue.place(&id("busy"), "person-busy", latest, held, 2),
             2,
             "the owner at its share goes last though it asked first"
         );
+    }
+
+    #[test]
+    fn a_stream_of_newcomers_never_overtakes_who_asked_first() {
+        let mut queue = Queue::default();
+        let start = Utc::now();
+        let held = |owner: &str| u32::from(owner == "person-one");
+        queue.place(&id("first"), "person-one", start, held, 2);
+        for n in 1..20 {
+            let now = start + chrono::Duration::seconds(n);
+            queue.place(
+                &id(&format!("new-{n}")),
+                &format!("person-{n}"),
+                now,
+                held,
+                2,
+            );
+            assert_eq!(queue.place(&id("first"), "person-one", now, held, 2), 0);
+        }
     }
 
     #[test]
