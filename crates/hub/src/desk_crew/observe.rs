@@ -152,8 +152,11 @@ impl CrewHub {
             .map(str::to_string);
         if let Some(sid) = &dm_session {
             *self.dm_turns.lock().entry(sid.clone()).or_default() += 1;
-            // Sent: no longer typing it.
-            self.dm_sent(&agent_id);
+            // The person's own message: no longer typing it. A boss's relayed
+            // turn there isn't theirs, and leaves their typing as it is.
+            if !self.relayed_turns.lock().contains(sid) {
+                self.dm_sent(&agent_id);
+            }
         }
         let task = line(message);
         let key = uuid::Uuid::new_v4().to_string();

@@ -242,7 +242,9 @@ impl CrewHub {
                     match store.monitor_held_untake(&taken).await {
                         Ok(0) => {}
                         Ok(dropped) => {
-                            tracing::warn!(%agent, dropped, "what monitors saw couldn't be told after many tries and was dropped")
+                            let monitors: Vec<&str> =
+                                held.iter().map(|h| h.monitor_id.as_str()).collect();
+                            tracing::warn!(%agent, %owner, dropped, ?monitors, "what monitors saw couldn't be told after many tries and was dropped")
                         }
                         Err(e) => {
                             tracing::info!(error = %format!("{e:#}"), "letting what monitors saw go failed: taken again in a minute")
@@ -272,7 +274,8 @@ where
         let local = h.held_at.with_timezone(tz);
         let days = (today - local.date_naive()).num_days();
         match days {
-            0 => local.format("%H:%M").to_string(),
+            // Today, or (another hub's clock ahead) later.
+            ..=0 => local.format("%H:%M").to_string(),
             1..=6 => local.format("%a %H:%M").to_string(),
             _ => local.format("%a %-d %b %H:%M").to_string(),
         }

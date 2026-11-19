@@ -222,21 +222,24 @@ impl DeskStore {
     /// `ids` were taken but their telling failed: put off a minute more for
     /// each failure so far (what comes since for their DM isn't held behind
     /// them meanwhile), and dropped past [`ATTEMPTS`]. How many were dropped.
+    ///
+    /// The minute is the wall clock's, whatever the crew's minute is.
     pub async fn monitor_held_untake(&self, ids: &[Uuid]) -> Result<u64> {
-        let client = self.pool().get().await?;
-        client
+        let mut client = self.pool().get().await?;
+        let tx = client.transaction().await?;
+        let dropped = tx
             .execute(
-                "UPDATE monitor_held SET claimed_until = NULL, attempts = attempts + 1, \
-                 release_at = now() + (attempts + 1) * interval '1 minute' WHERE id = ANY($1)",
-                &[&ids],
-            )
-            .await?;
-        let dropped = client
-            .execute(
-                "DELETE FROM monitor_held WHERE id = ANY($1) AND attempts >= $2",
+                "DELETE FROM monitor_held WHERE id = ANY($1) AND attempts + 1 >= $2",
                 &[&ids, &ATTEMPTS],
             )
             .await?;
+        tx.execute(
+            "UPDATE monitor_held SET claimed_until = NULL, attempts = attempts + 1, \
+             release_at = now() + (attempts + 1) * interval '1 minute' WHERE id = ANY($1)",
+            &[&ids],
+        )
+        .await?;
+        tx.commit().await?;
         Ok(dropped)
     }
 }
