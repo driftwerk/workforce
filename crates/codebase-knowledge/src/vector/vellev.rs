@@ -1645,10 +1645,16 @@ mod tests {
     #[tokio::test]
     async fn a_patch_the_node_fails_reaches_the_insert_error_sink() {
         use axum::response::IntoResponse;
-        let held = entity_collection().unwrap();
+        let mut held = entity_collection().unwrap();
+        held.properties.push(Property {
+            filterable: false,
+            ..Property::new("incarnation_0", DataType::Bool)
+        });
+        let changes: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+        let sent = Arc::clone(&changes);
         let app = axum::Router::new().fallback(
-            move |method: axum::http::Method, uri: axum::http::Uri| {
-                let held = held.clone();
+            move |method: axum::http::Method, uri: axum::http::Uri, body: axum::body::Bytes| {
+                let (held, sent) = (held.clone(), Arc::clone(&sent));
                 async move {
                     let path = uri.path();
                     if path.ends_with("/collections") {
@@ -1659,6 +1665,12 @@ mod tests {
                     }
                     if path.ends_with("/count") {
                         return axum::Json(json!({ "count": 1 })).into_response();
+                    }
+                    if path.ends_with("/nearest") {
+                        return axum::Json(json!({ "results": [] })).into_response();
+                    }
+                    if let Ok(body) = serde_json::from_slice(&body) {
+                        sent.lock().unwrap().push(body);
                     }
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
                 }
@@ -1675,6 +1687,16 @@ mod tests {
         let heard = heard.0.lock().unwrap();
         assert_eq!(heard.len(), 1, "{heard:?}");
         assert!(heard[0].contains("entities"), "{heard:?}");
+        let ops: Vec<Value> = changes
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|batch| batch["changes"].as_array().cloned().unwrap_or_default())
+            .collect();
+        assert!(
+            !ops.is_empty() && ops.iter().all(|op| op["op"] == "patch"),
+            "patched, never written whole: {ops:?}"
+        );
     }
 
     /// A `CodeEntity` made before the slim shape, keeping more than it
