@@ -51,10 +51,18 @@ pub struct WorkerConfig {
     pub max_golden_age_hours: u32,
     #[serde(default)]
     pub secrets: SecretsConfig,
+    /// The share of `max_scopes` one person (or agent working for nobody)
+    /// may hold while others queue for a seat.
+    #[serde(default = "default_fair_share")]
+    pub fair_share: f64,
 }
 
 fn default_max_golden_age_hours() -> u32 {
     36
+}
+
+fn default_fair_share() -> f64 {
+    0.25
 }
 
 /// Where secrets are read and bucket images stored: SSM and S3 through
@@ -258,6 +266,9 @@ impl WorkerConfig {
                 bail!("[worker] {key} must be at least 1");
             }
         }
+        if !(self.fair_share > 0.0 && self.fair_share <= 1.0) {
+            bail!("[worker] fair_share must be above 0 and at most 1");
+        }
         let mut services = std::collections::HashSet::new();
         if let Some(twice) = self.services.iter().find(|s| !services.insert(**s)) {
             bail!("[worker] services lists {:?} twice", twice.name());
@@ -429,6 +440,7 @@ pub(crate) mod tests {
             ],
             services: Vec::new(),
             max_golden_age_hours: 36,
+            fair_share: 0.25,
             secrets: SecretsConfig {
                 github_token: Some("/workforce/prod/worker/github-read-token".into()),
                 env: BTreeMap::from([(

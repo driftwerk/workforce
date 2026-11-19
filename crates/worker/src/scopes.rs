@@ -23,6 +23,7 @@ use crate::ports::{
     Cloud, ContainerId, ContainerSpec, Containers, Dataset, ExecSpec, Mount, Repos, Snapshot, Zfs,
     REPO_ENV_PREFIX,
 };
+use crate::queue::{share_of, Queue};
 use crate::state::{Home, JobRecord, Scope, State, Store};
 
 /// Label every scope container carries, valued with its scope id.
@@ -74,6 +75,8 @@ pub struct Worker {
     homes: Mutex<BTreeMap<String, Home>>,
     running: Mutex<HashMap<ScopeId, HashSet<String>>>,
     prepares: tokio::sync::Mutex<()>,
+    /// The prepares waiting, by fair turn, for a seat on a full worker.
+    queue: Mutex<Queue>,
     pub(crate) jobs: Mutex<BTreeMap<JobId, JobRecord>>,
     pub(crate) live: Mutex<HashMap<JobId, LiveJob>>,
     pub(crate) starts: tokio::sync::Mutex<()>,
@@ -130,6 +133,7 @@ impl Worker {
             homes: Mutex::new(homes),
             running: Mutex::new(HashMap::new()),
             prepares: tokio::sync::Mutex::new(()),
+            queue: Mutex::new(Queue::default()),
             jobs: Mutex::new(jobs),
             live: Mutex::new(HashMap::new()),
             starts: tokio::sync::Mutex::new(()),
@@ -255,12 +259,27 @@ impl Worker {
                 home_reused,
             )));
         }
+        if let Some(owner) = &request.queue {
+            if !valid_owner(owner) {
+                bail!("queue owner {owner:?} is not a short printable name");
+            }
+            let ahead = self.queue_place(&request.scope, owner);
+            if ahead > 0 {
+                return Ok(ServerFrame::Queued { ahead });
+            }
+        }
+        // A queued prepare at the head waits on for room rather than being
+        // refused, keeping its place.
+        let wait_or = |reason| match request.queue {
+            Some(_) => ServerFrame::Queued { ahead: 0 },
+            None => refused(reason),
+        };
         if self.room_for_another().is_err() {
             if let Some(idle) = self.take_idle_yielder(Utc::now()) {
                 self.give_way(idle, &request.scope).await;
             }
             if let Err(reason) = self.room_for_another() {
-                return Ok(refused(reason));
+                return Ok(wait_or(reason));
             }
         }
         if self.zfs.free_bytes(&self.config.pool).await? < self.config.pool_free_floor_bytes() {
@@ -270,9 +289,10 @@ impl Worker {
                 warn!(%error, "reclaiming pool space before a prepare failed");
             }
             if self.zfs.free_bytes(&self.config.pool).await? < self.config.pool_free_floor_bytes() {
-                return Ok(refused(RefusalReason::PoolFull));
+                return Ok(wait_or(RefusalReason::PoolFull));
             }
         }
+        self.queue.lock().leave(&request.scope);
         validate_overrides(&request.env).map_err(|reason| eyre::eyre!(reason))?;
 
         let root = self.work_dataset(&request.scope);
@@ -427,6 +447,7 @@ impl Worker {
                 bench,
                 jobs: true,
                 yields_when_idle: request.yields_when_idle,
+                owner: request.queue.clone(),
             },
             home_reused,
         ))
@@ -876,6 +897,38 @@ impl Worker {
         Ok(())
     }
 
+    /// Keep `scope`'s place in the queue for `owner` and say how many
+    /// prepares go first, counting the scopes each owner holds against its
+    /// share of the worker.
+    fn queue_place(&self, scope: &ScopeId, owner: &str) -> u32 {
+        let share = share_of(self.config.fair_share, self.config.max_scopes);
+        let scopes = self.scopes.lock();
+        let held = |owner: &str| {
+            scopes
+                .values()
+                .filter(|scope| scope.owner.as_deref() == Some(owner))
+                .count() as u32
+        };
+        let ahead = self
+            .queue
+            .lock()
+            .place(scope, owner, Utc::now(), held, share);
+        tracing::debug!(scope = %scope, owner, ahead, "a prepare is queued for a seat on a full worker");
+        ahead
+    }
+
+    /// A queued prepare for `scope` stopped waiting: the next in line moves
+    /// up now.
+    pub(crate) fn leave_queue(&self, scope: &ScopeId) -> ServerFrame {
+        self.queue.lock().leave(scope);
+        ServerFrame::Done(ExecSummary::exited(0))
+    }
+
+    /// How many prepares are waiting for a seat.
+    pub(crate) fn queued(&self) -> usize {
+        self.queue.lock().len()
+    }
+
     /// Whether one more scope may be seated now: the one test admission
     /// asks, before and after an idle scope gives way.
     fn room_for_another(&self) -> Result<(), RefusalReason> {
@@ -1086,6 +1139,7 @@ impl Worker {
             goldens,
             version: env!("CARGO_PKG_VERSION").to_string(),
             jobs: self.running_jobs(),
+            queued: self.queued() as u32,
         })
     }
 }
@@ -1113,6 +1167,11 @@ fn prepared(scope: &Scope, reused: bool, home_reused: bool) -> Prepared {
         home_reused,
         jobs: scope.jobs,
     }
+}
+
+/// Whether `owner` is fit to key the queue by: short, and printable.
+fn valid_owner(owner: &str) -> bool {
+    !owner.is_empty() && owner.len() <= 128 && owner.chars().all(|c| c.is_ascii_graphic())
 }
 
 pub(crate) fn refused(reason: RefusalReason) -> ServerFrame {
@@ -1334,6 +1393,7 @@ mod tests {
             env: Vec::new(),
             home: HomeSpec::Ephemeral,
             yields_when_idle: false,
+            queue: None,
         }
     }
 
@@ -1776,6 +1836,98 @@ mod tests {
             yields_when_idle: true,
             ..keyed(scope, key, 3600)
         }
+    }
+
+    /// A turn's prepare that would rather queue, for `owner`.
+    fn queued(scope: &str, owner: &str) -> PrepareRequest {
+        PrepareRequest {
+            queue: Some(owner.into()),
+            ..turn(scope, scope)
+        }
+    }
+
+    fn place(ahead: u32) -> ServerFrame {
+        ServerFrame::Queued { ahead }
+    }
+
+    fn seated(frame: &ServerFrame) -> bool {
+        matches!(frame, ServerFrame::Prepared(_))
+    }
+
+    #[tokio::test]
+    async fn a_full_worker_queues_turns_in_order_and_seats_the_head_once_room_frees() {
+        let h = Harness::new().await;
+        h.worker.prepare(spec("coding-1", &[])).await.unwrap();
+        h.worker.prepare(spec("coding-2", &[])).await.unwrap();
+
+        let w = &h.worker;
+        assert_eq!(w.prepare(queued("b", "person-b")).await.unwrap(), place(0));
+        assert_eq!(w.prepare(queued("c", "person-c")).await.unwrap(), place(1));
+        assert_eq!(
+            w.prepare(queued("c", "person-c")).await.unwrap(),
+            place(1),
+            "asking again keeps the place"
+        );
+        assert_eq!(w.health().await.unwrap().queued, 2);
+
+        w.release(&ScopeId::new("coding-1")).await.unwrap();
+        assert_eq!(
+            w.prepare(queued("c", "person-c")).await.unwrap(),
+            place(1),
+            "a freed seat waits for the head of the queue"
+        );
+        assert!(seated(&w.prepare(queued("b", "person-b")).await.unwrap()));
+        assert_eq!(
+            w.scope(&ScopeId::new("b")).unwrap().owner.as_deref(),
+            Some("person-b")
+        );
+        assert_eq!(w.prepare(queued("c", "person-c")).await.unwrap(), place(0));
+        assert!(
+            seated(&w.prepare(queued("b", "person-b")).await.unwrap()),
+            "a seated turn found again never queues"
+        );
+        assert_eq!(
+            w.prepare(spec("another-coding", &[])).await.unwrap(),
+            refused(RefusalReason::AtCapacity),
+            "a prepare that did not ask to queue is refused, as before"
+        );
+
+        w.leave_queue(&ScopeId::new("c"));
+        assert_eq!(w.health().await.unwrap().queued, 0);
+    }
+
+    #[tokio::test]
+    async fn a_person_at_their_share_waits_behind_someone_holding_less() {
+        let h = Harness::with(|config| config.fair_share = 0.5).await;
+        let w = &h.worker;
+        assert!(seated(&w.prepare(queued("a-1", "person-a")).await.unwrap()));
+        w.prepare(spec("coding", &[])).await.unwrap();
+        w.running
+            .lock()
+            .entry(ScopeId::new("a-1"))
+            .or_default()
+            .insert("job".into());
+
+        assert_eq!(
+            w.prepare(queued("a-2", "person-a")).await.unwrap(),
+            place(0)
+        );
+        assert_eq!(
+            w.prepare(queued("b-1", "person-b")).await.unwrap(),
+            place(0),
+            "person-a holds their share, so person-b goes first"
+        );
+        assert_eq!(
+            w.prepare(queued("a-2", "person-a")).await.unwrap(),
+            place(1)
+        );
+
+        w.release(&ScopeId::new("coding")).await.unwrap();
+        assert!(seated(&w.prepare(queued("b-1", "person-b")).await.unwrap()));
+        assert_eq!(
+            w.prepare(queued("a-2", "person-a")).await.unwrap(),
+            place(0)
+        );
     }
 
     fn idle_past_grace() -> chrono::Duration {

@@ -2689,9 +2689,10 @@ impl ClaudeChatService {
         let seated = ensure_with_wait(
             self.launcher.as_ref(),
             &spec,
+            None,
             seating.deadline,
             Some(seating.cancel),
-            || self.show(state, surface, turn, turn_message_id, TurnStatus::Queued),
+            |_| self.show(state, surface, turn, turn_message_id, TurnStatus::Queued),
         )
         .await;
         match seated {

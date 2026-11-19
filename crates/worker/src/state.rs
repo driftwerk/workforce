@@ -39,6 +39,10 @@ pub struct Scope {
     /// worker full: an agent turn's workspace, whose keyed home outlives it.
     #[serde(default)]
     pub yields_when_idle: bool,
+    /// Who the scope is for, when its prepare queued: what the worker's
+    /// fair share counts.
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 impl Scope {
@@ -285,6 +289,7 @@ mod tests {
             bench: false,
             jobs: true,
             yields_when_idle: false,
+            owner: None,
         }
     }
 

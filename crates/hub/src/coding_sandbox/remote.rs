@@ -26,7 +26,7 @@ use workforce_agent::tools::exec_runner::{
 use workforce_projects::{Project, RepoSource};
 
 use super::{
-    head_utf8, sandbox_path, AtCapacity, CodingSandbox, DirEntry, EntryKind, McpSurface,
+    head_utf8, sandbox_path, AtCapacity, CodingSandbox, DirEntry, EntryKind, McpSurface, Queued,
     SandboxCommand, SandboxLauncher, WorkspaceSpec,
 };
 use crate::claude_code::RemotePlacement;
@@ -152,9 +152,14 @@ fn drained_sink() -> mpsc::Sender<ServerFrame> {
     tx
 }
 
-#[async_trait]
-impl SandboxLauncher for RemoteLauncher {
-    async fn ensure(&self, spec: &WorkspaceSpec<'_>) -> Result<Arc<dyn CodingSandbox>> {
+impl RemoteLauncher {
+    /// Prepare `spec`'s scope, queued for `queue` when the worker cannot seat
+    /// it yet.
+    async fn prepare(
+        &self,
+        spec: &WorkspaceSpec<'_>,
+        queue: Option<&str>,
+    ) -> Result<Arc<dyn CodingSandbox>> {
         let scope = remote_scope(spec.agent_id, &spec.project.name, spec.scope);
         let request = Request::Prepare(PrepareRequest {
             scope: scope.clone(),
@@ -165,10 +170,12 @@ impl SandboxLauncher for RemoteLauncher {
             env: Vec::new(),
             home: spec.home.clone(),
             yields_when_idle: spec.idle_release.is_some(),
+            queue: queue.map(str::to_string),
         });
         let prepared = match self.request(request).await? {
             Outcome::Prepared(prepared) => prepared,
             Outcome::Refused(RefusalReason::AtCapacity) => return Err(AtCapacity.into()),
+            Outcome::Queued(ahead) => return Err(Queued { ahead }.into()),
             Outcome::Refused(reason) => {
                 bail!("the coding worker refused to prepare a workspace: {reason}")
             }
@@ -199,6 +206,33 @@ impl SandboxLauncher for RemoteLauncher {
             hub_tools: self.mcp.hub_tools(),
             jobs: prepared.jobs,
         }))
+    }
+}
+
+#[async_trait]
+impl SandboxLauncher for RemoteLauncher {
+    async fn ensure(&self, spec: &WorkspaceSpec<'_>) -> Result<Arc<dyn CodingSandbox>> {
+        self.prepare(spec, None).await
+    }
+
+    async fn ensure_queued(
+        &self,
+        spec: &WorkspaceSpec<'_>,
+        owner: &str,
+    ) -> Result<Arc<dyn CodingSandbox>> {
+        self.prepare(spec, Some(owner)).await
+    }
+
+    async fn leave_queue(&self, agent_id: &str, project: &str, scope: &str) {
+        let scope = remote_scope(agent_id, project, scope);
+        if let Err(error) = self
+            .request(Request::Leave {
+                scope: scope.clone(),
+            })
+            .await
+        {
+            warn!(scope = %scope, error = %error, "giving up a place in the coding worker's queue; it lapses on its own");
+        }
     }
 
     /// The worker recreates a reclaimed scope on the next prepare; a transcript
@@ -572,6 +606,11 @@ mod tests {
             self.requests.lock().push(request.clone());
             Ok(match request {
                 Request::Prepare(prepare) => match self.refuse_prepare {
+                    // As the worker does: a queued prepare at capacity is
+                    // told its place instead.
+                    Some(RefusalReason::AtCapacity) if prepare.queue.is_some() => {
+                        ServerFrame::Queued { ahead: 1 }
+                    }
                     Some(reason) => ServerFrame::Refused { reason },
                     None => {
                         let reused = !self.prepared.lock().insert(prepare.scope.clone());
@@ -615,7 +654,7 @@ mod tests {
                         reason: RefusalReason::UnknownScope,
                     }
                 }
-                Request::Release { .. } => ServerFrame::Done(ExecSummary {
+                Request::Release { .. } | Request::Leave { .. } => ServerFrame::Done(ExecSummary {
                     exit_code: Some(0),
                     attempts: 1,
                     truncated: false,
@@ -1033,6 +1072,47 @@ mod tests {
             before,
             "refused before any request"
         );
+    }
+
+    #[tokio::test]
+    async fn a_queued_prepare_names_its_owner_hears_its_place_and_can_give_it_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let (endpoint, fake) = worker(dir.path(), Some(RefusalReason::AtCapacity)).await;
+        let launcher = RemoteLauncher::new(endpoint, 900, surface());
+        let project = Project::new("agent", "bench");
+        let tokens = HashMap::new();
+        let spec = WorkspaceSpec {
+            agent_id: "agent",
+            project: &project,
+            scope: "s",
+            tokens: &tokens,
+            home: HomeSpec::Ephemeral,
+            primary: None,
+            idle_release: None,
+        };
+        let err = launcher
+            .ensure_queued(&spec, "person-1")
+            .await
+            .err()
+            .expect("a full worker seats nothing");
+        assert_eq!(err.downcast_ref::<Queued>(), Some(&Queued { ahead: 1 }));
+        let err = launcher.ensure(&spec).await.err().expect("still full");
+        assert!(
+            err.downcast_ref::<AtCapacity>().is_some(),
+            "a prepare that did not ask to queue is refused"
+        );
+        launcher.leave_queue("agent", "bench", "s").await;
+
+        let requests = fake.requests.lock().clone();
+        let scope = remote_scope("agent", "bench", "s");
+        match requests.as_slice() {
+            [Request::Prepare(queued), Request::Prepare(plain), Request::Leave { scope: left }] => {
+                assert_eq!(queued.queue.as_deref(), Some("person-1"));
+                assert_eq!(plain.queue, None);
+                assert_eq!(*left, scope);
+            }
+            other => panic!("unexpected requests: {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -15,6 +15,7 @@ pub mod handler;
 pub mod host;
 pub mod jobs;
 pub mod ports;
+pub(crate) mod queue;
 pub mod refresh;
 pub mod scopes;
 pub mod serve;
