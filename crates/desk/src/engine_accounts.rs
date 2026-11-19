@@ -1828,6 +1828,59 @@ mod tests {
     }
 
     #[test]
+    fn the_computers_own_sign_in_whose_check_didnt_answer_is_moved_off_but_never_to() {
+        use std::collections::HashMap;
+        let at = |m: i64| chrono::DateTime::from_timestamp(m * 60, 0).unwrap();
+        let gmail = Account {
+            id: Uuid::new_v4(),
+            engine: Engine::Claude,
+            name: "Kingsley Gmail".into(),
+            is_default: true,
+            created_at: at(0),
+        };
+        let usable: std::collections::HashSet<Uuid> = [gmail.id].into();
+        let run = |from: Option<Uuid>, own_takes| {
+            let on = HashMap::from([(from, vec![Uuid::new_v4()])]);
+            let full = HashMap::from([(from, standing(&[(100.0, Some(900))], 100, None))]);
+            needs(
+                Engine::Claude,
+                std::slice::from_ref(&gmail),
+                &full,
+                &on,
+                &[],
+                true,
+                own_takes,
+                &usable,
+                &Default::default(),
+                at(200),
+            )
+        };
+        // At its limit, what runs on it still moves off, to the login.
+        let n = run(None, false);
+        let [AccountNeed::Limit { from, to, .. }] = &n[..] else {
+            panic!("{n:?}");
+        };
+        assert_eq!((from.id, to.id), (None, Some(gmail.id)));
+        // The login at its limit: never moved to the sign-in that didn't
+        // answer, so none has room.
+        let n = run(Some(gmail.id), false);
+        assert!(
+            n.iter().all(|n| !matches!(n, AccountNeed::Limit { .. })),
+            "{n:?}"
+        );
+        assert!(
+            n.iter().any(|n| matches!(n, AccountNeed::AllFull { .. })),
+            "{n:?}"
+        );
+        // Once it answers, it is.
+        let n = run(Some(gmail.id), true);
+        let [AccountNeed::Limit { to, .. }] = &n[..] else {
+            panic!("{n:?}");
+        };
+        assert_eq!(to.id, None);
+    }
+
+    #[test]
     fn a_full_account_asks_to_move_its_sessions_to_one_with_room_and_back_once_it_resets() {
         use std::collections::HashMap;
         let at = |m: i64| chrono::DateTime::from_timestamp(m * 60, 0).unwrap();
