@@ -1041,6 +1041,8 @@ impl CrewHub {
                 return Err("You don't run that session.".into());
             }
         }
+        // A reply to what is no question is gated as the message it is.
+        let action = self.as_sent(&action).await?;
         self.know_question(&action).await;
         // A session the person took back: not done, nor suggested.
         if let Some(why) = self.left_alone(&action) {
