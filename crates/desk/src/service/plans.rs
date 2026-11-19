@@ -2410,7 +2410,14 @@ impl Desk {
                 let saved = self
                     .0
                     .store
-                    .found_folder(t.id, &path, &repo.key(), runs.machine.as_deref(), t.version)
+                    .found_folder(
+                        t.id,
+                        &path,
+                        &repo.key(),
+                        runs.machine.as_deref(),
+                        runs.folder.as_deref(),
+                        t.version,
+                    )
                     .await
                     .map_err(internal)?;
                 if !saved {
