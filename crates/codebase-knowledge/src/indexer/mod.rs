@@ -324,7 +324,7 @@ impl IndexingPipeline {
         //    otherwise persist because `INSERT OR REPLACE` only overwrites
         //    rows with the same primary key.
         //    What the repo's vectors were recorded complete in goes with
-        //    it, so it is read first.
+        //    it unless the standby keeps it, so it is read first.
         let carried = self.completeness_to_carry().await?;
         // The standby is told of every file the repo had, before they go:
         // its notes outlast the purge (see `CodeGraph::delete_repo_data`),

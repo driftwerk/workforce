@@ -1191,7 +1191,7 @@ pub(crate) mod tests {
         let indexed = || async { store.get_index_state(REPO).await.unwrap().is_some() };
         let seeding = CodeGraph::from_backend(Arc::clone(store))
             .keyed(VectorKeys::new(weaviate, Some(vellev)).unwrap());
-        for (graph, kept) in [(&seeding, true), (&keyed, false)] {
+        for (graph, kept) in [(&keyed, false), (&seeding, true)] {
             seeding
                 .update_index_state_full(REPO, "c2", 0, 0)
                 .await
