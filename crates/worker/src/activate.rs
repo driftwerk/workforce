@@ -108,15 +108,23 @@ impl std::str::FromStr for Activation {
 
 /// What a service's start has come to. Each success has a generation, so a
 /// connection that found the service gone forgets only the start it was
-/// served by, never a newer one another connection already made.
+/// served by, never a newer one another connection already made; and the
+/// moment it came up, while which a refusal is the service settling.
 enum Started {
     Not,
-    Yes(u64),
+    Yes(u64, Instant),
     Failed(Instant),
 }
 
-/// The process groups of the starts running now, for a stop to end.
-type Starts = Arc<std::sync::Mutex<std::collections::HashSet<i32>>>;
+/// The process groups of the starts running now, for a stop to end, and
+/// whether the activator is stopping, after which nothing starts.
+#[derive(Default)]
+struct StartsInner {
+    stopping: bool,
+    groups: std::collections::HashSet<i32>,
+}
+
+type Starts = Arc<std::sync::Mutex<StartsInner>>;
 
 /// One service's start, run at most once at a time and kept once it
 /// succeeds.
@@ -127,10 +135,10 @@ struct Service {
     starts: Starts,
 }
 
-/// A started service's generation, and whether this call started it.
+/// A started service's generation, and when it came up.
 struct Ensured {
     generation: u64,
-    fresh: bool,
+    started_at: Instant,
 }
 
 impl Service {
@@ -139,10 +147,10 @@ impl Service {
     async fn ensure(&self) -> Result<Ensured> {
         let mut state = self.state.lock().await;
         match state.0 {
-            Started::Yes(generation) => {
+            Started::Yes(generation, started_at) => {
                 return Ok(Ensured {
                     generation,
-                    fresh: false,
+                    started_at,
                 })
             }
             Started::Failed(at) if at.elapsed() < RETRY_AFTER => {
@@ -160,10 +168,11 @@ impl Service {
             Ok(()) => {
                 info!(service = %self.activation.name, secs = began.elapsed().as_secs(), "started");
                 state.1 += 1;
-                state.0 = Started::Yes(state.1);
+                let started_at = Instant::now();
+                state.0 = Started::Yes(state.1, started_at);
                 Ok(Ensured {
                     generation: state.1,
-                    fresh: true,
+                    started_at,
                 })
             }
             Err(error) => {
@@ -176,7 +185,7 @@ impl Service {
     /// Forget the start of `generation`, when it is still the current one.
     async fn forget(&self, generation: u64) {
         let mut state = self.state.lock().await;
-        if matches!(state.0, Started::Yes(current) if current == generation) {
+        if matches!(state.0, Started::Yes(current, _) if current == generation) {
             state.0 = Started::Not;
         }
     }
@@ -199,9 +208,10 @@ impl Service {
                     return;
                 }
             };
-            // A service started just now may refuse for a moment; one that
-            // was running and refuses has gone.
-            let patience = match ensured.fresh {
+            // A service started just now may refuse for a moment, whichever
+            // connection started it; one that was running and refuses has
+            // gone.
+            let patience = match ensured.started_at.elapsed() < CONNECT_PATIENCE {
                 true => CONNECT_PATIENCE,
                 false => CONNECT_PATIENCE_RUNNING,
             };
@@ -233,8 +243,9 @@ fn out_of_descriptors(error: &std::io::Error) -> bool {
 
 /// Run `start NAME`, which must bring the service up and return once it is
 /// ready, within [`START_TIMEOUT`]. It leads a process group of its own,
-/// which a timeout or a stop ends whole; anything it leaves running for
-/// good, as dockerd, must leave the group itself.
+/// which a timeout, a stop or the activator's exit ends whole; anything it
+/// leaves running for good, as dockerd, must leave the group itself. Once
+/// the activator is stopping, nothing starts.
 async fn run_start(start: &std::path::Path, name: &str, starts: &Starts) -> Result<()> {
     let mut command = tokio::process::Command::new(start);
     command
@@ -244,20 +255,42 @@ async fn run_start(start: &std::path::Path, name: &str, starts: &Starts) -> Resu
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let child = command
-        .spawn()
-        .with_context(|| format!("running {} {name}", start.display()))?;
-    let group = child.id().and_then(|pid| i32::try_from(pid).ok());
-    if let Some(group) = group {
-        lock(starts).insert(group);
-    }
-    let outcome = tokio::time::timeout(START_TIMEOUT, child.wait_with_output()).await;
-    if let Some(group) = group {
-        lock(starts).remove(&group);
-        if outcome.is_err() {
-            kill_group(group);
+    if let Some(original) = ORIGINAL_NOFILE.get().copied() {
+        // SAFETY: setrlimit is async-signal-safe and touches only the
+        // child's own limit.
+        unsafe {
+            command.pre_exec(move || {
+                libc::setrlimit(libc::RLIMIT_NOFILE, &original);
+                Ok(())
+            });
         }
     }
+    // Spawned under the lock a stop takes, so a stop either sees the group
+    // or this sees the stop.
+    let (child, mut group) = {
+        let mut starts_now = lock(starts);
+        if starts_now.stopping {
+            bail!("stopping; {name} not started");
+        }
+        let child = command
+            .spawn()
+            .with_context(|| format!("running {} {name}", start.display()))?;
+        let group = child.id().and_then(|pid| i32::try_from(pid).ok());
+        if let Some(group) = group {
+            starts_now.groups.insert(group);
+        }
+        (
+            child,
+            Group {
+                id: group,
+                starts: Arc::clone(starts),
+                finished: false,
+            },
+        )
+    };
+    let outcome = tokio::time::timeout(START_TIMEOUT, child.wait_with_output()).await;
+    group.finished = outcome.is_ok();
+    drop(group);
     let output = outcome
         .map_err(|_| {
             eyre!(
@@ -280,10 +313,41 @@ async fn run_start(start: &std::path::Path, name: &str, starts: &Starts) -> Resu
     Ok(())
 }
 
-fn lock(starts: &Starts) -> std::sync::MutexGuard<'_, std::collections::HashSet<i32>> {
+/// A start's process group: forgotten when it ends, and killed whole when
+/// it did not finish (a timeout, or the start's future dropped as the
+/// activator exits).
+struct Group {
+    id: Option<i32>,
+    starts: Starts,
+    finished: bool,
+}
+
+impl Drop for Group {
+    fn drop(&mut self) {
+        if let Some(id) = self.id {
+            lock(&self.starts).groups.remove(&id);
+            if !self.finished {
+                kill_group(id);
+            }
+        }
+    }
+}
+
+fn lock(starts: &Starts) -> std::sync::MutexGuard<'_, StartsInner> {
     starts
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Stop starting anything, and kill every start in flight, whole.
+fn stop_starts(starts: &Starts) -> usize {
+    let mut starts_now = lock(starts);
+    starts_now.stopping = true;
+    let groups: Vec<i32> = starts_now.groups.drain().collect();
+    for group in &groups {
+        kill_group(*group);
+    }
+    groups.len()
 }
 
 fn kill_group(group: i32) {
@@ -292,6 +356,10 @@ fn kill_group(group: i32) {
         libc::killpg(group, libc::SIGKILL);
     }
 }
+
+/// The descriptor limit the activator was started with, which the starts it
+/// runs get back.
+static ORIGINAL_NOFILE: std::sync::OnceLock<libc::rlimit> = std::sync::OnceLock::new();
 
 /// Let the activator hold as many connections as the hard limit allows: a
 /// test suite opens hundreds, each two descriptors here.
@@ -304,8 +372,12 @@ fn raise_descriptor_limit() {
     unsafe {
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 && limit.rlim_cur < limit.rlim_max
         {
-            limit.rlim_cur = limit.rlim_max;
-            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+            let _ = ORIGINAL_NOFILE.set(limit);
+            let raised = libc::rlimit {
+                rlim_cur: limit.rlim_max,
+                rlim_max: limit.rlim_max,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &raised) != 0 {
                 warn!("could not raise the descriptor limit");
             }
         }
@@ -464,11 +536,8 @@ pub async fn activate(
     tokio::select! {
         _ = futures::future::join_all(loops) => {}
         _ = stop.recv() => {
-            let groups: Vec<i32> = lock(&starts).drain().collect();
-            for group in &groups {
-                kill_group(*group);
-            }
-            info!(starts_ended = groups.len(), "stopping");
+            let ended = stop_starts(&starts);
+            info!(starts_ended = ended, "stopping");
         }
     }
     Ok(())
@@ -729,18 +798,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stop_kills_a_start_in_flight_whole_and_starts_nothing_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let child_pid = dir.path().join("child");
+        let script = start_script(
+            dir.path(),
+            &format!("sleep 600 & echo $! >{}; wait", child_pid.display()),
+        );
+        let starts = Starts::default();
+        let running = tokio::spawn({
+            let (script, starts) = (script.clone(), Arc::clone(&starts));
+            async move { run_start(&script, "db", &starts).await }
+        });
+        while std::fs::read_to_string(&child_pid).map_or(true, |pid| pid.trim().is_empty()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let pid: i32 = std::fs::read_to_string(&child_pid)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(stop_starts(&starts), 1);
+        assert!(running.await.unwrap().is_err());
+        let mut gone = false;
+        for _ in 0..200 {
+            // Gone, or a zombie waiting for whoever adopted it to reap it.
+            let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit(')')
+                    .next()
+                    .is_some_and(|rest| rest.trim_start().starts_with('Z'))
+            });
+            // SAFETY: signal 0 only checks the process exists.
+            if zombie || unsafe { libc::kill(pid, 0) } != 0 {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(gone, "the start's own child was killed with it");
+        let refused = run_start(&script, "db", &starts).await.unwrap_err();
+        assert!(refused.to_string().contains("stopping"), "{refused}");
+    }
+
+    #[tokio::test]
     async fn a_start_that_fails_says_its_last_lines() {
         let dir = tempfile::tempdir().unwrap();
         let script = start_script(
             dir.path(),
-            "echo one >&2; echo two >&2; echo 'docker: port is taken' >&2; echo three >&2; exit 3",
+            "echo first >&2; echo one >&2; echo two >&2; echo 'docker: port is taken' >&2; echo three >&2; echo four >&2; echo five >&2; exit 3",
         );
         let error = run_start(&script, "db", &Starts::default())
             .await
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("port is taken") && error.contains("three"),
+            error.contains("port is taken") && error.contains("five") && !error.contains("first"),
             "{error}"
         );
     }
