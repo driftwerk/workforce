@@ -4609,3 +4609,79 @@ async fn a_silent_model_with_a_fallback_route_is_left_after_one_window() {
         started.elapsed()
     );
 }
+
+fn full_worker_miss(personal: bool) -> RouteMiss {
+    RouteMiss::new("claude-code".into(), "no workspace for the turn")
+        .worker_full()
+        .on_plan(CliKind::ClaudeCode, personal)
+}
+
+#[test]
+fn a_full_worker_is_said_only_to_a_person_and_only_when_it_was_all_that_stood_in_the_way() {
+    let full = [full_worker_miss(true)];
+    assert_eq!(
+        worker_full_notice(&full, true, true).as_deref(),
+        Some(
+            "Your Claude plan couldn't take this right now: the coding worker is full. \
+             Try again in a minute, or switch this agent to the hub's models."
+        )
+    );
+    assert_eq!(
+        worker_full_notice(&[full_worker_miss(false)], false, true).as_deref(),
+        Some("This agent's Claude plan couldn't take this right now: the coding worker is full. Try again in a minute.")
+    );
+    assert_eq!(
+        worker_full_notice(&full, true, false),
+        None,
+        "a job or trigger fails with its misses, so it is retried or alerted on"
+    );
+    let hub_down = [
+        full_worker_miss(true),
+        RouteMiss::new("gpt-5".into(), "the provider is unavailable"),
+    ];
+    assert_eq!(
+        worker_full_notice(&hub_down, false, true),
+        None,
+        "a route that failed for another reason is not hidden behind the worker"
+    );
+}
+
+#[tokio::test]
+async fn a_noted_runner_answer_closes_with_its_note_before_done() {
+    let (tx, mut rx) = mpsc::channel(16);
+    let (watched, forward) = noting(Some("\n\n_note_"), Some(&tx));
+    let watched = watched.unwrap();
+    for event in [
+        ProgressEvent::StreamStart,
+        ProgressEvent::StreamDelta {
+            text: "answer".into(),
+        },
+        ProgressEvent::StreamEnd,
+        ProgressEvent::Response {
+            text: "answer".into(),
+        },
+        done_of(&TokenUsage::default(), 1, 0),
+    ] {
+        watched.send(event).await.unwrap();
+    }
+    drop(watched);
+    forward.unwrap().await.unwrap();
+    drop(tx);
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    let note = events
+        .iter()
+        .position(|e| matches!(e, ProgressEvent::StreamDelta { text } if text == "\n\n_note_"))
+        .expect("the note is streamed");
+    let whole = events
+        .iter()
+        .position(|e| matches!(e, ProgressEvent::Response { text } if text == "answer\n\n_note_"))
+        .expect("and is part of the whole answer");
+    let done = events
+        .iter()
+        .position(|e| matches!(e, ProgressEvent::Done { .. }))
+        .expect("done");
+    assert!(note < whole && whole < done, "{events:?}");
+}
