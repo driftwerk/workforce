@@ -972,12 +972,7 @@ async fn a_restart_that_stopped_work_wakes_the_boss() {
                 .is_none(),
             "nothing stopped"
         );
-        let by_it = By {
-            party: Party::manager("desk", "Desk"),
-            reason: None,
-            suggestion_id: None,
-            hop: 0,
-        };
+        let by_it = By::manager("desk", "Desk", "");
         assert!(
             crew.trigger_for(&restarted(by_it, Some(1)), "desk", &o)
                 .is_none(),
