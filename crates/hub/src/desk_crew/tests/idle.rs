@@ -280,11 +280,20 @@ async fn a_next_step_that_says_no_job_goes_at_once_at_act_fully() {
         let s = new_session(&d, &base, "harbor").await;
         let url = hook_url(&base, s.id).await;
         ends(&url, "Built the release bundle.").await;
+        // On its line, wherever it is in going in.
         eventually("the step sent", async || {
-            told(&d, s.id)
+            d.line_thread(s.id, None, None)
                 .await
+                .unwrap_or_default()
                 .iter()
-                .any(|t| t.contains("Run the deploy."))
+                .any(|m| {
+                    m.text.contains("Run the deploy.")
+                        && !matches!(
+                            m.delivery,
+                            workforce_desk::line::Delivery::Withdrawn
+                                | workforce_desk::line::Delivery::Noted
+                        )
+                })
                 .then_some(())
         })
         .await;
