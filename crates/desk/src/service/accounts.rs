@@ -2132,7 +2132,8 @@ impl Desk {
             &standing,
             &on,
             &moved_off,
-            own_signed_in,
+            // The CLI's own sign-in, unless its probe didn't answer lately.
+            own_signed_in && !Self::unchecked_now(&st, None),
             // Never onto one the provider turns away until it is re-checked.
             &st.signed_in_accounts
                 .iter()
