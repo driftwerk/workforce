@@ -989,11 +989,12 @@ impl CrewHub {
             .unwrap_or_default();
         // What it may not take a summary for, and whether summaries are
         // written plainly today: as in every boss turn.
+        // This call has no tools: it is told so, never to check.
         let spent = match self.desk.cheap_ceiling_hit_today() {
-            true => format!(" {}", super::picture::NOTES_SPENT),
+            true => format!(" {}", super::context::NOTES_SPENT_FOCUSED),
             false => String::new(),
         };
-        let check = format!("\n\n{}{spent}", super::context::CHECK_FIRST);
+        let check = format!("\n\n{}{spent}", super::context::CHECK_FIRST_FOCUSED);
         (session, format!("{check}{orders}{prefs}{picture}"))
     }
 

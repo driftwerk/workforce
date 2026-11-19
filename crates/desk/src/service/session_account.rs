@@ -626,12 +626,9 @@ impl Desk {
         // A plain write never says the model's words are gone; what the
         // newest write was is kept beside it.
         fresh.by_model = said.by_model || kept.by_model;
-        match said.by_model {
-            true => self.0.accounts.plain.lock().remove(&id),
-            false => self.0.accounts.plain.lock().insert(id),
-        };
+        let plain = !said.by_model;
         fresh.stale_after = None;
-        Ok(match self.0.store.session_account_put(&fresh).await? {
+        let out = match self.0.store.session_account_put(&fresh).await? {
             Put::Kept(v) => Account {
                 version: v,
                 ..fresh
@@ -668,7 +665,13 @@ impl Desk {
                     }
                 }
             }
-        })
+        };
+        // Kept: what the newest write was, beside it.
+        match plain {
+            true => self.0.accounts.plain.lock().insert(id),
+            false => self.0.accounts.plain.lock().remove(&id),
+        };
+        Ok(out)
     }
 
     /// Hands the floor session `id`'s turn-end gist, said from `a`.

@@ -19,6 +19,14 @@ use crate::serve::AgentService;
 /// What every boss turn is told of the summaries it reads.
 pub(super) const CHECK_FIRST: &str = "Desk marks a summary STALE, with why, when it can't be relied on. Never tell anyone that something has or hasn't happened (a run started, a PR merged, a release went out) on the strength of a STALE summary: check it first (crew.account, crew.ask_session, or your GitHub tools) and say where you checked.";
 
+/// The same, for a focused call (a decision, an answer, an idle step),
+/// which has no tools to check with.
+pub(super) const CHECK_FIRST_FOCUSED: &str = "Desk marks a summary STALE, with why, when it can't be relied on. You can't check anything in this call: never decide or say that something has or hasn't happened (a run started, a PR merged, a release went out) on the strength of a STALE summary; leave it to the person, or to your full turn, saying it is stale.";
+
+/// Opens a focused call's brief on a spent day: as [`super::picture::NOTES_SPENT`],
+/// with nothing to check with.
+pub(super) const NOTES_SPENT_FOCUSED: &str = "Sessions' summaries are written plainly from their last words for the rest of today: the day's metered cheap calls are spent. Take every summary as possibly out of date.";
+
 /// The block's most, about 3k tokens.
 pub(super) const CAP_CHARS: usize = 12_000;
 /// A session's line, about 80 tokens.

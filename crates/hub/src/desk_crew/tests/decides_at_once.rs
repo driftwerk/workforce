@@ -448,7 +448,7 @@ async fn the_persons_orders_decide_a_production_step_both_ways() {
             );
             // Told, as every boss turn is, to check a STALE summary first.
             assert!(
-                call[0].contains(super::super::context::CHECK_FIRST),
+                call[0].contains(super::super::context::CHECK_FIRST_FOCUSED),
                 "{}",
                 call[0]
             );
