@@ -445,8 +445,7 @@ async fn clone_into(repo: &Repo, dest: &Path, home: &Path) -> Result<(), String>
         return Err("git isn't installed here".into());
     }
     let mut why = String::new();
-    // The session each try runs in, so all it started ends with it.
-    let running = std::sync::atomic::AtomicI32::new(0);
+    let until = tokio::time::Instant::now() + CLONE_FOR;
     let run = async {
         for (prog, args) in &tries {
             let _ = tokio::fs::remove_dir_all(&part).await;
@@ -476,49 +475,60 @@ async fn clone_into(repo: &Repo, dest: &Path, home: &Path) -> Result<(), String>
                     Ok(())
                 });
             }
-            let child = match cmd.spawn() {
+            let mut child = match cmd.spawn() {
                 Ok(c) => c,
                 Err(e) => {
                     why = format!("it couldn't run: {e}");
                     continue;
                 }
             };
-            let pid = child.id().and_then(|p| i32::try_from(p).ok()).unwrap_or(0);
-            running.store(pid, std::sync::atomic::Ordering::SeqCst);
-            let out = match child.wait_with_output().await {
-                Ok(o) => o,
-                Err(e) => {
-                    why = format!("it couldn't run: {e}");
-                    continue;
+            let pid = child.id().and_then(|p| i32::try_from(p).ok());
+            let mut err = child.stderr.take();
+            let said = tokio::spawn(async move {
+                let mut b = Vec::new();
+                if let Some(e) = err.as_mut() {
+                    let _ = tokio::io::AsyncReadExt::read_to_end(e, &mut b).await;
+                }
+                b
+            });
+            let status = tokio::select! {
+                s = child.wait() => s,
+                () = tokio::time::sleep_until(until) => {
+                    // Its whole session, while the clone is still unreaped:
+                    // what it started (ssh, git's helpers) ends with it.
+                    if let Some(pid) = pid {
+                        // SAFETY: killpg only signals the session it made.
+                        unsafe {
+                            libc::killpg(pid, libc::SIGKILL);
+                        }
+                    }
+                    let _ = child.wait().await;
+                    said.abort();
+                    return Err(format!(
+                        "cloning {repo} took longer than {} minutes",
+                        CLONE_FOR.as_secs() / 60
+                    ));
                 }
             };
-            running.store(0, std::sync::atomic::Ordering::SeqCst);
-            if out.status.success() {
-                return Ok(());
+            let stderr = tokio::time::timeout(Duration::from_secs(2), said)
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default();
+            match status {
+                Ok(s) if s.success() => return Ok(()),
+                Ok(_) => {
+                    why = format!(
+                        "cloning {repo} failed: {}",
+                        clone_failure(&String::from_utf8_lossy(&stderr))
+                    );
+                }
+                Err(e) => why = format!("it couldn't run: {e}"),
             }
-            why = format!(
-                "cloning {repo} failed: {}",
-                clone_failure(&String::from_utf8_lossy(&out.stderr))
-            );
         }
         Err(why.clone())
     };
-    let ended = match tokio::time::timeout(CLONE_FOR, run).await {
-        Ok(r) => r,
-        Err(_) => {
-            let pid = running.load(std::sync::atomic::Ordering::SeqCst);
-            if pid > 0 {
-                // SAFETY: killpg only signals the session its clone made.
-                unsafe {
-                    libc::killpg(pid, libc::SIGKILL);
-                }
-            }
-            Err(format!(
-                "cloning {repo} took longer than {} minutes",
-                CLONE_FOR.as_secs() / 60
-            ))
-        }
-    };
+    let ended = run.await;
     if let Err(why) = ended {
         let _ = tokio::fs::remove_dir_all(&part).await;
         return Err(why);

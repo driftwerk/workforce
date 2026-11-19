@@ -377,7 +377,7 @@ impl DeskStore {
 
     /// The checkout a start found for `ticket`'s repository saved as its
     /// folder, only while the ticket is as it was read (its `version`, its
-    /// `repo` and `machine`): whether it was. Nothing the person changed
+    /// `repo`, `machine` and folder `was`): whether it was. Nothing the person changed
     /// meanwhile is written over.
     pub async fn found_folder(
         &self,
@@ -385,14 +385,16 @@ impl DeskStore {
         folder: &str,
         repo: &str,
         machine: Option<&str>,
+        was: Option<&str>,
         version: i32,
     ) -> Result<bool> {
         let client = self.pool().get().await?;
         let n = client
             .execute(
                 "UPDATE tickets SET folder = $2, version = version + 1 \
-                 WHERE id = $1 AND repo = $3 AND machine IS NOT DISTINCT FROM $4 AND version = $5",
-                &[&ticket, &folder, &repo, &machine, &version],
+                 WHERE id = $1 AND repo = $3 AND machine IS NOT DISTINCT FROM $4 AND version = $5 \
+                 AND folder IS NOT DISTINCT FROM $6",
+                &[&ticket, &folder, &repo, &machine, &version, &was],
             )
             .await?;
         Ok(n == 1)
