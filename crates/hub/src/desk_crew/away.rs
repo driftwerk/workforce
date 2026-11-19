@@ -466,6 +466,12 @@ impl CrewHub {
             // absence.
             .unwrap_or_else(|| state.since.max(since - Duration::hours(24)));
         let b = self.batch(service, o, state, now, Some(read_post)).await;
+        // Written as any update is, before what waits is read: each stall
+        // owned, and what it gave the person listed with the rest.
+        let written = match b.sessions.is_empty() {
+            true => None,
+            false => Some(self.written(boss, owner, o, &b, now).await.0),
+        };
         let open = store.items_not_closed(Some(boss)).await.unwrap_or_default();
         let asks = |i: &&OpenItem| matches!(i.kind, OpenKind::Ask | OpenKind::Confirm);
         let gap = self.answer_gap(o);
@@ -499,8 +505,10 @@ impl CrewHub {
             }
             return Ok(());
         }
-        // Written as any update is: each stall owned, and its words so.
-        let (written, _, _) = self.written(boss, owner, o, &b, now).await;
+        let written = match written {
+            Some(w) => w,
+            None => self.written(boss, owner, o, &b, now).await.0,
+        };
         let (sessions, decisions) = (written.sessions, written.decisions);
         let full = self.level_now(boss, o).0 == workforce_common::oversight::Level::Full;
         let finished: Vec<(String, String)> = b

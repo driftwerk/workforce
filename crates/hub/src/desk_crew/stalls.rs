@@ -181,20 +181,32 @@ impl CrewHub {
                 .or(s.at)
                 .unwrap_or(now);
             // 1. The person's word the session says is missing, which the
-            // boss holds: given, and said so.
+            // boss holds: given, and said so. Never for what it says it
+            // waits on outside the crew ("awaiting the reviewer").
+            let outside = changed
+                .and_then(|c| c.waiting_on.as_deref())
+                .is_some_and(|w| {
+                    !names_person(w, self.person(None).as_deref())
+                        && !names_boss(w, &self.boss_name_of(boss))
+                });
             if let Some(held) = b.held.get(&sid).filter(|h| !h.is_empty()) {
-                if write::says_missing(&all) {
-                    let m = self
-                        .give_held(boss, &view, &work, held, &all, since, acts)
-                        .await;
-                    *s = write::held(s.clone(), &work, m, &tz);
+                if !outside && write::says_missing(&all) {
+                    if let Some(m) = self
+                        .give_held(boss, o, &view, &work, held, &all, since, acts, now)
+                        .await
+                    {
+                        *s = write::held(s.clone(), &work, m, &tz);
+                    }
                     continue;
                 }
             }
-            let m = self
+            // Unread or unkept (the store failed): left as written.
+            if let Some(m) = self
                 .mover_of(boss, o, b, &view, changed, &work, &all, since, acts, now)
-                .await;
-            *s = write::moved(s.clone(), m, &work, &tz);
+                .await
+            {
+                *s = write::moved(s.clone(), m, &work, &tz);
+            }
         }
     }
 
@@ -206,13 +218,15 @@ impl CrewHub {
     async fn give_held(
         &self,
         boss: &str,
+        o: &Oversight,
         view: &workforce_desk::model::SessionView,
         work: &Work,
         held: &[OpenItem],
         all: &str,
         since: DateTime<Utc>,
         acts: bool,
-    ) -> Mover {
+        now: DateTime<Utc>,
+    ) -> Option<Mover> {
         use super::held::Held;
         let s = view.id;
         let mut sent = false;
@@ -220,15 +234,15 @@ impl CrewHub {
         let mut not: Option<String> = None;
         for i in held {
             match self.deliver_held(boss, s, i, since).await {
-                Held::Sent => sent = true,
+                Held::Sent | Held::Going => sent = true,
                 Held::Given(at) => given = given.max(Some(at)),
                 Held::Suggested(why) | Held::Refused(why) => not = Some(why),
             }
         }
         if sent {
-            return Mover::Boss {
+            return Some(Mover::Boss {
                 doing: "I'm passing them to its session now.".into(),
-            };
+            });
         }
         let tz = self.desk.timezone();
         if let (Some(at), true) = (given, acts) {
@@ -240,7 +254,7 @@ impl CrewHub {
                 view.label(),
                 workforce_desk::crew::one_line(all, 300)
             );
-            return Mover::Boss {
+            return Some(Mover::Boss {
                 doing: match self.hand_stall(boss, s, line) {
                     Handed::Now => {
                         format!("I gave them to its session at {at}; it still waits, so I'm finding out why now.")
@@ -250,7 +264,7 @@ impl CrewHub {
                         t.with_timezone(&tz).format("%H:%M")
                     ),
                 },
-            };
+            });
         }
         // Not the boss's to send (it suggests, it's held, a gate): the
         // person's, with what the boss holds to answer it.
@@ -264,17 +278,40 @@ impl CrewHub {
             "{} says your word is missing; you gave it as: {words} Answer here and it goes to its session",
             work.in_words()
         );
+        self.person_moves(boss, o, view, &question, all, since, now)
+            .await
+    }
+
+    /// Who moves what only the person can settle (`question`, with the
+    /// session's `words`): them, with its card; their answer since, the
+    /// session acting on it, looked at again; none when it couldn't be kept.
+    #[allow(clippy::too_many_arguments)]
+    async fn person_moves(
+        &self,
+        boss: &str,
+        o: &Oversight,
+        view: &workforce_desk::model::SessionView,
+        question: &str,
+        words: &str,
+        since: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Option<Mover> {
+        use super::waiting::Stall;
         match self
-            .give_stall_to_person(boss, view, &question, all, since)
+            .give_stall_to_person(boss, view, question, words, since)
             .await
         {
-            Some(i) => Mover::Person {
+            Stall::Item(i) => Some(Mover::Person {
                 question: asked(&i),
                 item: i.id,
-            },
-            None => Mover::Boss {
-                doing: "you answered it since; I'm checking it reached its session".into(),
-            },
+            }),
+            Stall::Settled(at) => {
+                let at = at.with_timezone(&self.desk.timezone()).format("%H:%M");
+                let on = format!("its session to act on your answer from {at}");
+                let due = self.keep_recheck(boss, o, view, &on, now).await?;
+                Some(Mover::Outside { on, check_at: due })
+            }
+            Stall::Failed => None,
         }
     }
 
@@ -293,7 +330,7 @@ impl CrewHub {
         since: DateTime<Utc>,
         acts: bool,
         now: DateTime<Utc>,
-    ) -> Mover {
+    ) -> Option<Mover> {
         let sid = view.id;
         let waiting_on = changed.and_then(|c| c.waiting_on.as_deref());
         // 2. The person's already: their open question about it.
@@ -303,10 +340,10 @@ impl CrewHub {
                 && i.said()
                 && i.linked().contains(&sid)
         }) {
-            return Mover::Person {
+            return Some(Mover::Person {
                 question: asked(i),
                 item: i.id,
-            };
+            });
         }
         // 3. The boss did something about it since the session said so.
         if let Some(d) = b.decisions.iter().rev().find(|d| {
@@ -320,9 +357,9 @@ impl CrewHub {
                 .strip_prefix("I ")
                 .map(str::to_string)
                 .unwrap_or_else(|| write::lowered(brief));
-            return Mover::Boss {
+            return Some(Mover::Boss {
                 doing: format!("I {brief}"),
-            };
+            });
         }
         let boss_name = self.boss_name_of(boss);
         let on_boss = waiting_on.is_some_and(|w| names_boss(w, &boss_name))
@@ -330,12 +367,12 @@ impl CrewHub {
         // 4. Its session is on it, waiting on nothing.
         if view.live && view.state == SessionState::Working && waiting_on.is_none() && !on_boss {
             let doing = changed.map(|c| c.doing.trim()).unwrap_or_default();
-            return Mover::Boss {
+            return Some(Mover::Boss {
                 doing: match doing {
                     "" => "I have its session working on it now.".into(),
                     d => format!("I have its session on it now: {}", write::lowered(d)),
                 },
-            };
+            });
         }
         // 5. It waits on the boss: its full turn answers it.
         if on_boss && acts {
@@ -353,13 +390,13 @@ impl CrewHub {
                         .unwrap_or_default()
                 ),
             );
-            return Mover::Boss {
+            return Some(Mover::Boss {
                 doing: self.doing(
                     handed,
                     "I'm answering it now.",
                     "I've been answering it since",
                 ),
-            };
+            });
         }
         // 6. Only the person: their word, as an item with its answer.
         // What it says it waits on decides; its words only where it says
@@ -380,23 +417,20 @@ impl CrewHub {
                     workforce_desk::crew::one_line(&words, 200)
                 ),
             };
-            if let Some(i) = self
-                .give_stall_to_person(boss, view, &question, &words, since)
+            if let Some(m) = self
+                .person_moves(boss, o, view, &question, &words, since, now)
                 .await
             {
-                return Mover::Person {
-                    question: asked(&i),
-                    item: i.id,
-                };
+                return Some(m);
             }
         }
         // 7. Outside the crew: looked at again, and when.
         if let Some(w) = waiting_on.filter(|_| !theirs) {
             if let Some(due) = self.keep_recheck(boss, o, view, w, now).await {
-                return Mover::Outside {
+                return Some(Mover::Outside {
                     on: w.to_string(),
                     check_at: due,
-                };
+                });
             }
         }
         // 8. Nobody: the boss's full turn is handed it; where the boss
@@ -407,18 +441,9 @@ impl CrewHub {
                 work.in_words(),
                 workforce_desk::crew::one_line(all, 200)
             );
-            if let Some(i) = self
-                .give_stall_to_person(boss, view, &question, &words_of(changed), since)
-                .await
-            {
-                return Mover::Person {
-                    question: asked(&i),
-                    item: i.id,
-                };
-            }
-            return Mover::Boss {
-                doing: "you settled it since; its session carries on from your word".into(),
-            };
+            return self
+                .person_moves(boss, o, view, &question, &words_of(changed), since, now)
+                .await;
         }
         let handed = self.hand_stall(
             boss,
@@ -432,13 +457,13 @@ impl CrewHub {
                 workforce_desk::crew::one_line(all, 300)
             ),
         );
-        Mover::Boss {
+        Some(Mover::Boss {
             doing: self.doing(
                 handed,
                 "I'm looking at what unblocks it now.",
                 "I've been looking at what unblocks it since",
             ),
-        }
+        })
     }
 
     /// What the boss says it is doing about a stall it handed its full

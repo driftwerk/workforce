@@ -369,7 +369,17 @@ async fn an_outside_wait_in_words_of_approval_is_still_outside() {
         let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
         crew.set_update_writer(Arc::new(Down));
         crew.look_at_updates().await;
-        let s = new_session(&d, dir.path(), "release").await;
+        // An answer the boss holds for it is no answer to what it awaits.
+        d.store()
+            .item_open(&NewItem::order(
+                "desk",
+                "REL-7: the audit plan is approved.",
+                vec![],
+                None,
+            ))
+            .await
+            .unwrap();
+        let s = new_session(&d, dir.path(), "REL-7").await;
         account(
             &d,
             s.id,
@@ -388,6 +398,11 @@ async fn an_outside_wait_in_words_of_approval_is_still_outside() {
         assert!(
             !open.iter().any(|i| i.dedupe_key.starts_with("waiting:")),
             "no card for the person: {open:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            sent(&d, s.id).await.is_empty(),
+            "nothing passed off as its answer"
         );
     })
     .await;

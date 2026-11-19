@@ -55,6 +55,8 @@ fn names(text: &str, key: &str) -> bool {
 pub(crate) enum Held {
     /// Sent to the session now.
     Sent,
+    /// Sent before, still queued on its line: on its way.
+    Going,
     /// It reached the session already, at this time (it, or the boss's own
     /// word after the session said it waits).
     Given(DateTime<Utc>),
@@ -80,9 +82,26 @@ pub(crate) fn held_for<'a>(open: &'a [OpenItem], s: Uuid, work: &Work) -> Vec<&'
     }
     open.iter()
         .filter(|i| i.kind == OpenKind::Order && i.state != OpenState::Closed)
-        .filter(|i| write::asks_for_word(&i.text))
+        .filter(|i| write::asks_for_word(&i.text) || !standing(&i.text))
         .filter(|i| i.linked().contains(&s) || keys.iter().any(|k| names(&i.text, k)))
         .collect()
+}
+
+/// Whether an order is a standing instruction ("Keep the old index until
+/// Friday", "Don't touch staging"), not an answer to something asked.
+fn standing(text: &str) -> bool {
+    let l = text.to_lowercase().replace('\u{2019}', "'");
+    let first = l
+        .split([':', '\n'])
+        .map(str::trim)
+        .find(|p| !p.is_empty() && !write::is_id(p))
+        .unwrap_or_default();
+    [
+        "keep ", "don't ", "do not ", "never ", "always ", "stop ", "leave ",
+    ]
+    .iter()
+    .any(|w| first.starts_with(w))
+        || names(&l, "until")
 }
 
 /// What the session is sent of `item`: the person's word, said as the
@@ -105,29 +124,42 @@ fn bosss(m: &LineMessage, boss: &str, s: Uuid) -> bool {
         )
 }
 
-/// When the line `thread` already had what `item` holds, from `boss` to
-/// `s`: its message (sent, if not yet delivered), or any word of the
-/// boss's that reached the session after `since` (when it said it waits).
+/// Whether the line `thread` already has what `item` holds, from `boss` to
+/// `s`: its message, on its way or delivered, or any word of the boss's
+/// that reached the session after `since` (when it said it waits).
 fn given(
     thread: &[LineMessage],
     boss: &str,
     s: Uuid,
     item: &OpenItem,
     since: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
+) -> Option<Given> {
     // Its first words, its spacing aside.
     let flat = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
     let held: String = flat(&item.text).chars().take(80).collect();
     let reached = |m: &LineMessage| m.delivered_at.unwrap_or(m.at);
-    thread
+    let ours = |m: &&LineMessage| m.at >= item.opened_at && flat(&m.text).contains(&held);
+    let mine: Vec<&LineMessage> = thread.iter().filter(|m| bosss(m, boss, s)).collect();
+    // Still on its way: going now, not given.
+    if mine
         .iter()
-        .filter(|m| bosss(m, boss, s))
-        .filter(|m| {
-            (m.at >= item.opened_at && flat(&m.text).contains(&held))
-                || (m.delivery == Delivery::Delivered && reached(m) > since)
-        })
-        .map(reached)
+        .any(|m| ours(m) && m.delivery != Delivery::Delivered)
+    {
+        return Some(Given::Going);
+    }
+    mine.iter()
+        .filter(|m| m.delivery == Delivery::Delivered && (ours(m) || reached(m) > since))
+        .map(|m| reached(m))
         .max()
+        .map(Given::At)
+}
+
+/// How what a boss holds already went to a session.
+enum Given {
+    /// Queued on its line, not yet read.
+    Going,
+    /// It reached the session then.
+    At(DateTime<Utc>),
 }
 
 impl CrewHub {
@@ -145,8 +177,10 @@ impl CrewHub {
             Ok(t) => t,
             Err(e) => return Held::Refused(format!("Desk couldn't read its line: {e}")),
         };
-        if let Some(at) = given(&thread, boss, s, item, since) {
-            return Held::Given(at);
+        match given(&thread, boss, s, item, since) {
+            Some(Given::Going) => return Held::Going,
+            Some(Given::At(at)) => return Held::Given(at),
+            None => {}
         }
         let Some((service, o)) = self.overseer_named(boss) else {
             return Held::Refused("its boss isn't running here".into());
@@ -237,8 +271,10 @@ mod tests {
         );
         let other = order("VEL-221: the export questions are approved", vec![]);
         let linked = order("Approved: take the 60 minute cutover window", vec![s]);
-        // An order that answers nothing is no held answer.
+        // A standing instruction is no held answer; a plain answer is.
         let kept = order("Keep the old index until Friday", vec![s]);
+        let plain = order("VEL-22: go with option B, the 60 minute window", vec![]);
+        assert_eq!(held_for(std::slice::from_ref(&plain), s, &work).len(), 1);
         let open = vec![answers.clone(), other, linked.clone(), kept];
         let held: Vec<Uuid> = held_for(&open, s, &work).iter().map(|i| i.id).collect();
         assert_eq!(held, vec![answers.id, linked.id]);

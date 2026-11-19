@@ -120,6 +120,16 @@ pub(crate) fn stall_key(s: Uuid) -> String {
     format!("{KEY}{s}:stall")
 }
 
+/// What became of a stall given to the person.
+pub(super) enum Stall {
+    /// Their item for it, open.
+    Item(Box<OpenItem>),
+    /// They answered it then, after the session last said where it is.
+    Settled(DateTime<Utc>),
+    /// It couldn't be read or kept.
+    Failed,
+}
+
 /// The session a waiting key is about.
 fn session_of(key: &str) -> Option<Uuid> {
     key.strip_prefix(KEY)?.split(':').next()?.parse().ok()
@@ -446,8 +456,8 @@ impl CrewHub {
             }
         };
         let theirs = open.iter().any(|i| {
-            // A stall of it given to them already: one card a wait.
-            i.dedupe_key.starts_with(&stall_key(view.id))
+            // This wait given to them already as its stall: one card a wait.
+            i.dedupe_key == stall_key(view.id) && i.opened_at >= w.since
                 || !is_waiting(&i.dedupe_key)
                     && (line.is_some() && i.line_message == line
                         || matches!(i.kind, OpenKind::Ask | OpenKind::Confirm)
@@ -548,7 +558,7 @@ impl CrewHub {
         let mut given = false;
         for i in held {
             match self.deliver_held(boss, view.id, i, since).await {
-                Held::Sent => given = true,
+                Held::Sent | Held::Going => given = true,
                 Held::Given(at) => given |= at > since,
                 Held::Suggested(why) | Held::Refused(why) => {
                     tracing::info!(session = %view.id, item = %i.id, %why, "the person's word a boss holds couldn't go to the session waiting on it")
@@ -562,8 +572,9 @@ impl CrewHub {
     /// stall: `question`, as the waiting item a silent wait is, answered from
     /// its card straight to the session and reminded until it is; `words`
     /// the session's own, behind "more". One a session: the one open is
-    /// kept current and handed back. None when the person settled one after
-    /// the session last said where it is (`since`): nothing new to ask.
+    /// kept current and handed back; settled when the person answered one
+    /// after the session last said where it is (`since`): nothing new to
+    /// ask.
     pub(super) async fn give_stall_to_person(
         &self,
         boss: &str,
@@ -571,7 +582,7 @@ impl CrewHub {
         question: &str,
         words: &str,
         since: DateTime<Utc>,
-    ) -> Option<OpenItem> {
+    ) -> Stall {
         let store = self.desk.store();
         let question = crew::one_line(question, 300);
         let key = stall_key(view.id);
@@ -579,17 +590,17 @@ impl CrewHub {
             Ok(open) => open,
             Err(e) => {
                 tracing::info!(error = %e, "a boss's open items couldn't be read for a stall");
-                return None;
+                return Stall::Failed;
             }
         };
         let was = open.into_iter().find(|i| i.dedupe_key == key);
         if was.is_none() {
-            match store.item_last_closed(boss, &key).await {
-                Ok(Some(at)) if at >= since => return None,
+            match store.item_last_settled(boss, &key).await {
+                Ok(Some(at)) if at >= since => return Stall::Settled(at),
                 Ok(_) => {}
                 Err(e) => {
                     tracing::info!(error = %e, "whether a stall was settled couldn't be read");
-                    return None;
+                    return Stall::Failed;
                 }
             }
         }
@@ -600,12 +611,14 @@ impl CrewHub {
             text.push_str(&crew::clip(words.trim(), KEPT_CHARS));
         }
         // Said as it was: kept current, not said again.
-        if was.as_ref().is_some_and(|i| i.text == text) {
-            return was;
+        if let Some(i) = was.as_ref().filter(|i| i.text == text) {
+            return Stall::Item(Box::new(i.clone()));
         }
         let mut new = NewItem::ask(boss, OpenKind::Ask, Some(view.id), &text);
         new.dedupe_key = key;
-        new.said = was.is_none();
+        // Its words kept current: the open one's text replaced, not said
+        // again (only a new one is posted).
+        new.said = true;
         new.options = options_in(words);
         new.recommendation = recommendation_in(words);
         new.layout.question = Some(question);
@@ -615,17 +628,17 @@ impl CrewHub {
             "Only you can settle what {name} waits on, so it's yours to decide"
         ));
         let opened = match store.item_open(&new).await {
-            Ok(Opened::New(i)) => i,
-            Ok(Opened::Again(i)) => return Some(i),
+            Ok(Opened::New(i)) if was.is_none() => i,
+            Ok(Opened::New(i) | Opened::Again(i)) => return Stall::Item(Box::new(i)),
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "keeping a session's stall for the person failed");
-                return None;
+                return Stall::Failed;
             }
         };
         tracing::info!(session = %view.id, item = %opened.id, "a stall only the person can settle: given to them");
         self.post_item(boss, &opened, super::items::needs_you(&opened), Vec::new())
             .await;
-        Some(opened)
+        Stall::Item(Box::new(opened))
     }
 
     /// The person's `answer` to waiting item `i`: to its session, in reply
@@ -704,17 +717,31 @@ impl CrewHub {
         // session no longer saying it waits: never by its going on as it
         // was, or the boss's other words.
         if i.dedupe_key == stall_key(s) {
+            use workforce_desk::update_write as write;
             let accounts = self.desk.session_accounts_of(&[s]).await.ok()?;
             let a = accounts.into_iter().next()?;
             let waits = a
                 .waiting_on
                 .as_deref()
                 .is_some_and(|w| !w.trim().is_empty());
-            let says = a.done.last().is_some_and(|d| {
-                use workforce_desk::update_write as write;
-                write::says_stall(&d.text) || write::says_missing(&d.text)
-            });
-            return (!waits && !says).then(|| {
+            // Only what it said since the card opened shows it went on: a
+            // line that waits on no one, and nothing it says waits.
+            let newer: Vec<&str> = a
+                .done
+                .iter()
+                .filter(|d| d.at > i.opened_at)
+                .map(|d| d.text.as_str())
+                .collect();
+            let still = newer
+                .iter()
+                .any(|t| write::says_stall(t) || write::says_missing(t) || write::asks_for_word(t));
+            let on_boss = self
+                .desk
+                .line_thread(s, None, Some(30))
+                .await
+                .ok()
+                .is_some_and(|t| waiting_in(&t, &i.boss, s).is_some());
+            return (!newer.is_empty() && !waits && !still && !on_boss).then(|| {
                 (
                     ClosedBy::Session,
                     format!("{name} went on; I've closed the question."),

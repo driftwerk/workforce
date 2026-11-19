@@ -934,7 +934,7 @@ impl CrewHub {
         // questions are the person's.
         self.desk.set_unwoken(
             list.iter()
-                .filter(|(_, o)| !o.wake.on_finish)
+                .filter(|(s, o)| !o.wake.on_finish && !self.unbound_given(s.agent_id.as_str(), o))
                 .map(|(s, _)| {
                     (
                         s.agent_id.as_str().to_string(),
