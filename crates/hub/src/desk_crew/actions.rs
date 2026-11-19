@@ -2248,7 +2248,7 @@ impl CrewHub {
         ))
     }
 
-    /// With "always work in real sessions", the session this overseer
+    /// Working in real sessions (only, or preferring them), the session this overseer
     /// already runs to give a start's work to instead of starting another:
     /// `action` becomes a nudge to it with the goal, and the session is
     /// claimed so another start doesn't pile onto it. Only when the start
@@ -2272,7 +2272,7 @@ impl CrewHub {
         else {
             return None;
         };
-        if !o.work.prefer_sessions || self.gate(action, o) != Gate::Run {
+        if !o.work.style.sessions_for_code() || self.gate(action, o) != Gate::Run {
             return None;
         }
         let engine = self.engine_or_default(*engine, o).ok()?;

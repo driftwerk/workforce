@@ -5844,10 +5844,10 @@ fn the_act_hint_says_to_act_and_names_the_switches_that_are_off() {
 /// At Act, Act fully and unbound, work the person asks for in the DM
 /// starts its session there and then, in a folder the boss picks itself:
 /// never offered, never done in chat. A question is still answered. With
-/// "Hand out work" or "Always work in real sessions" off, it isn't told to.
+/// "Hand out work" off, or doing the work itself, it isn't told to.
 #[test]
 fn at_act_and_above_the_dm_hint_starts_the_work_in_a_session() {
-    use workforce_common::oversight::{Act, Level, Oversight, Work};
+    use workforce_common::oversight::{Act, Level, Oversight, Work, WorkStyle};
     let o = Oversight::default();
     for (level, unbound) in [
         (Level::Act, false),
@@ -5881,7 +5881,7 @@ fn at_act_and_above_the_dm_hint_starts_the_work_in_a_session() {
         },
         Oversight {
             work: Work {
-                prefer_sessions: false,
+                style: WorkStyle::Direct,
                 ..o.work.clone()
             },
             ..o.clone()
@@ -5890,9 +5890,83 @@ fn at_act_and_above_the_dm_hint_starts_the_work_in_a_session() {
         let hint = CrewHub::dm_hint(Level::Act, &o, false);
         assert!(!hint.contains("start it now"), "{hint}");
     }
+    // Each style is said by its name, and Prefer sessions runs its own
+    // checks and ops while code still goes to a session.
+    for (style, says) in [
+        (WorkStyle::SessionsOnly, "setting is Only in sessions"),
+        (WorkStyle::PreferSessions, "setting is Prefer sessions"),
+        (WorkStyle::Direct, "setting is Do it myself"),
+    ] {
+        let o = Oversight {
+            work: Work {
+                style,
+                ..o.work.clone()
+            },
+            ..o.clone()
+        };
+        for (level, unbound) in [(Level::Act, false), (Level::Full, true)] {
+            let hint = CrewHub::dm_hint(level, &o, unbound);
+            assert!(hint.contains(says), "{style:?}: {hint}");
+            assert_eq!(
+                hint.contains("never do the work here"),
+                style == WorkStyle::SessionsOnly,
+                "{style:?}: {hint}"
+            );
+        }
+    }
+    let prefer = Oversight {
+        work: Work {
+            style: WorkStyle::PreferSessions,
+            ..o.work.clone()
+        },
+        ..o.clone()
+    };
+    let hint = CrewHub::dm_hint(Level::Act, &prefer, false);
+    for says in [
+        "never change code here",
+        "ssh",
+        "gh",
+        "you run yourself",
+        "start it now with crew.start_session",
+    ] {
+        assert!(hint.contains(says), "{says:?} in {hint}");
+    }
     for level in [Level::Watch, Level::Suggest] {
         assert!(!CrewHub::dm_hint(level, &o, false).contains("start it now"));
     }
+    // Where it doesn't start the sessions (Suggest, or "Hand out work"
+    // off) it is still told its way, by the name the setting shows; at
+    // Watch it does nothing of its own.
+    for style in WorkStyle::ALL {
+        let o = Oversight {
+            work: Work {
+                style,
+                ..o.work.clone()
+            },
+            ..o.clone()
+        };
+        let off = Oversight {
+            act: Act {
+                hand_out_work: false,
+                ..o.act
+            },
+            ..o.clone()
+        };
+        let named = format!("setting is {}", style.title());
+        for hint in [
+            CrewHub::dm_hint(Level::Suggest, &o, false),
+            CrewHub::dm_hint(Level::Act, &off, false),
+            CrewHub::dm_hint(Level::Act, &o, false),
+        ] {
+            assert!(hint.contains(&named), "{style:?}: {hint}");
+        }
+        assert!(!CrewHub::dm_hint(Level::Watch, &o, false).contains("How it works"));
+    }
+    let hint = CrewHub::dm_hint(Level::Suggest, &prefer, false);
+    assert!(
+        hint.contains("you run yourself") && hint.contains("ssh"),
+        "{hint}"
+    );
 }
 
 /// The person's own turns in the overseer's DM carry its level and the

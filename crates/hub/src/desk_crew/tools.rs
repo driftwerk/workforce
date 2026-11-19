@@ -612,7 +612,7 @@ impl CrewTool {
             o.insert("ticket".into(), json!(key));
         }
         let oversight = &b.oversight;
-        // Always working in real sessions, a start goes to the session it
+        // Working in real sessions, a start goes to the session it
         // already runs for it when one fits, as the start would have run:
         // told the goal, not a new one.
         let reused = crew
@@ -926,7 +926,7 @@ pub(crate) fn describe(name: &str) -> &'static str {
             "crew.interrupt" => "End the turn a working session is on, as Esc in its terminal: it, and the terminal it runs in, keep running, and the shell stays the person's. Works for sessions started in a Desk terminal too.",
             "crew.resume" => "Resume a stopped session, optionally with a prompt. A session in another terminal can only be resumed once it has ended there.",
             "crew.restart" => "Stop a session and resume it with a new prompt, e.g. to get it unstuck.",
-            "crew.start_session" => "Start a real, visible session (Claude Code, Codex) in a project folder with a goal: it shows on the person's Floor and sidebar, they can watch it, type into it and take it over, and you run it from the start (its turn ends wake you). It runs on the person's default engine and model: omit engine and model unless the person named one for this work, in this conversation or its ticket; never pick one yourself. worktree names a new branch to work on in a worktree of its own. You run at most your limit of sessions starting or working at once (crew.overview's slots). When you always work in real sessions, a session already there in that folder (or another worktree of its repository) that's idle or on this goal gets the work instead, and you're told which; pass new: true only when the person asked for a new session.",
+            "crew.start_session" => "Start a real, visible session (Claude Code, Codex) in a project folder with a goal: it shows on the person's Floor and sidebar, they can watch it, type into it and take it over, and you run it from the start (its turn ends wake you). It runs on the person's default engine and model: omit engine and model unless the person named one for this work, in this conversation or its ticket; never pick one yourself. worktree names a new branch to work on in a worktree of its own. You run at most your limit of sessions starting or working at once (crew.overview's slots). When you work in real sessions (Only in sessions or Prefer sessions), a session already there in that folder (or another worktree of its repository) that's idle or on this goal gets the work instead, and you're told which; pass new: true only when the person asked for a new session.",
             "crew.assign" => "Hand a task to one of the crew's agents, in its DM.",
             "crew.assign_ticket" => "Hand a ticket on the board (ticket, its key like ACM-12) to a session (to: { \"session\": id }), an agent (to: { \"agent\": id }) or a new session started for it, which you run (to: { \"newSession\": { \"folder\": path, \"engine\": optional } }). The ticket moves to Doing and its holder is told. Only a ready ticket can be handed out (crew.board); a new session counts against your limit of sessions at once. Handing out work is for what the person has let you hand out.",
             "crew.move_ticket" => "Move a ticket on the board (ticket, its key like ACM-12) to a column (state): backlog, todo, doing, review or done. Dropping a ticket is always the person's call, so it becomes a suggestion for them.",

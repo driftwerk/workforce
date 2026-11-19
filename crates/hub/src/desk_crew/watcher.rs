@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
 use workforce_common::channels::DESK_CHANNEL;
-use workforce_common::oversight::{Level, Oversight, Scope};
+use workforce_common::oversight::{Level, Oversight, Scope, WorkStyle};
 use workforce_desk::crew::Crew as _;
 use workforce_desk::crew::{
     self, Event, ItemKind, ItemState, Kind, MentionedApproval, Party, PartyKind,
@@ -263,7 +263,20 @@ pub(crate) const STANDING_RULE: &str = "The person's instructions are the rule, 
 /// What a boss that starts sessions does with work the person asks it
 /// for in its DM: starts the session itself, at once, in the folder the
 /// work obviously belongs in, and answers a question itself.
-pub(super) const START_THE_WORK: &str = "Work the person asks for (a code change, a fix, an investigation in a repo, a ticket) goes to a real session: start it now with crew.start_session (crew.assign_ticket for a board ticket), never offer or suggest one and never do the work here, then say which session has it and in which folder. Pick the folder yourself: a session linked to the ticket or its PR's repo, else the folder of the person's latest session (crew.overview), else the only one; ask only when you can't tell. A question (\"what tickets do I have?\") you answer here with your tools.";
+pub(super) const START_THE_WORK: &str = "Your “How it works” setting is Only in sessions. Work the person asks for (a code change, a fix, an investigation in a repo, a ticket) goes to a real session: start it now with crew.start_session (crew.assign_ticket for a board ticket), never offer or suggest one and never do the work here, then say which session has it and in which folder. Pick the folder yourself: a session linked to the ticket or its PR's repo, else the folder of the person's latest session (crew.overview), else the only one; ask only when you can't tell. A question (\"what tickets do I have?\") you answer here with your tools.";
+
+/// [`START_THE_WORK`] for a boss that prefers sessions: code changes and
+/// long tasks start their session, and checks, lookups and ops it runs
+/// itself.
+pub(super) const START_THE_CODE_WORK: &str = "Your “How it works” setting is Prefer sessions. Code changes and long tasks the person asks for (a fix, a feature, a refactor, a ticket) go to a real session: start it now with crew.start_session (crew.assign_ticket for a board ticket), never offer or suggest one and never change code here, then say which session has it and in which folder. Pick the folder yourself: a session linked to the ticket or its PR's repo, else the folder of the person's latest session (crew.overview), else the only one; ask only when you can't tell. Checks, lookups and ops (ssh to one of their machines, gh, reading files and logs, a quick command) you run yourself with your own tools, at once, and answer from what they show; a destructive or irreversible step follows the person's directives. A question (\"what tickets do I have?\") you answer here with your tools.";
+
+/// What a boss that does the work itself is told of sessions.
+pub(super) const DO_IT_YOURSELF: &str = "Your “How it works” setting is Do it myself: do the work the person asks for yourself with your own tools, or start a real session for it (crew.start_session, crew.assign_ticket for a board ticket) when it is long or they'd want to watch it; a destructive or irreversible step follows the person's directives.";
+
+/// What a boss is told of its own work where starting sessions isn't its
+/// to do (at Suggest, or with “Hand out work” off), by its style.
+pub(super) const OWN_WORK_SESSIONS_ONLY: &str = "Your “How it works” setting is Only in sessions: commands, builds and code changes go to a session (crew.start_session, which may only suggest one), never here; you read, search and keep notes yourself.";
+pub(super) const OWN_WORK_PREFER: &str = "Your “How it works” setting is Prefer sessions: code changes, builds and long tasks go to a session (crew.start_session, which may only suggest one); checks, lookups and ops (ssh to one of their machines, gh, reading files and logs, a quick command) you run yourself.";
 
 /// What every DM turn of a boss is told before it speaks of a session.
 pub(super) const CHECK_FIRST: &str = "Before you say anything about a session, read its account with crew.account; never guess. Answer as Done / Now / Next / Waiting on, from the account, and say how fresh it is if it's over a few minutes old.";
@@ -729,7 +742,8 @@ impl CrewHub {
     pub(super) fn dm_hint(level: Level, o: &Oversight, unbound: bool) -> String {
         let says = match level {
             _ if unbound => {
-                return format!("You oversee the crew, unbound: do everything yourself with the crew.* tools. {START_THE_WORK} {STANDING_RULE} {PLAN_DRAFT} {CHECK_FIRST} {CHECK_GITHUB}");
+                let work = Self::style_line(o);
+                return format!("You oversee the crew, unbound: do everything yourself with the crew.* tools. {work} {STANDING_RULE} {PLAN_DRAFT} {CHECK_FIRST} {CHECK_GITHUB}");
             }
             Level::Watch => "at Watch: don't act; say what you would do.",
             Level::Suggest => "at Suggest: your crew.* actions become suggestions the person accepts.",
@@ -738,9 +752,11 @@ impl CrewHub {
         };
         // At Act and above, work the person asks for starts its session
         // here and now, wherever starting one is the boss's to do.
-        let says = match level.acts() && o.act.hand_out_work && o.work.prefer_sessions {
-            true => format!("{says} {START_THE_WORK}"),
-            false => says.to_string(),
+        // Below that, it still knows what of its own work it does here.
+        let says = match (level, level.acts() && o.act.hand_out_work) {
+            (_, true) => format!("{says} {}", Self::style_line(o)),
+            (Level::Watch, false) => says.to_string(),
+            (_, false) => format!("{says} {}", Self::own_work_line(o)),
         };
         let says = match level {
             Level::Full => format!("{says} {STANDING_RULE}"),
@@ -758,6 +774,26 @@ impl CrewHub {
             false => String::new(),
         };
         format!("You oversee the crew {says}{off} {CHECK_FIRST} {CHECK_GITHUB}")
+    }
+
+    /// What a boss that starts sessions does with the work the person asks
+    /// for, as its “How it works” setting says.
+    pub(super) fn style_line(o: &Oversight) -> &'static str {
+        match o.work.style {
+            WorkStyle::SessionsOnly => START_THE_WORK,
+            WorkStyle::PreferSessions => START_THE_CODE_WORK,
+            WorkStyle::Direct => DO_IT_YOURSELF,
+        }
+    }
+
+    /// What of its own work a boss does here, where it doesn't start the
+    /// sessions itself.
+    pub(super) fn own_work_line(o: &Oversight) -> &'static str {
+        match o.work.style {
+            WorkStyle::SessionsOnly => OWN_WORK_SESSIONS_ONLY,
+            WorkStyle::PreferSessions => OWN_WORK_PREFER,
+            WorkStyle::Direct => DO_IT_YOURSELF,
+        }
     }
 
     fn level_words(level: Level) -> &'static str {
