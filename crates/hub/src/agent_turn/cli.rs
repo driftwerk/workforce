@@ -458,6 +458,9 @@ impl AgentTurnRig {
                 key: scope.clone(),
                 ttl_secs: self.home_ttl.as_secs(),
             },
+            // Its transcript and bench live in the keyed home, so a full
+            // worker may take the scope back once the conversation is idle.
+            yields_when_idle: true,
         })
         .seat(
             launcher.as_ref(),

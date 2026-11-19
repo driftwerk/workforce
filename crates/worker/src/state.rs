@@ -35,6 +35,10 @@ pub struct Scope {
     /// Whether the scope mounts the dataset durable jobs write to.
     #[serde(default)]
     pub jobs: bool,
+    /// Whether the scope gives way, once idle, to a prepare that finds the
+    /// worker full: an agent turn's workspace, whose keyed home outlives it.
+    #[serde(default)]
+    pub yields_when_idle: bool,
 }
 
 impl Scope {
@@ -280,6 +284,7 @@ mod tests {
             home: None,
             bench: false,
             jobs: true,
+            yields_when_idle: false,
         }
     }
 

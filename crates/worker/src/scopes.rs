@@ -43,6 +43,10 @@ const READY_POLL: Duration = Duration::from_secs(1);
 const CHOWN_TIMEOUT_SECS: u64 = 60;
 const GIT_TIMEOUT_SECS: u64 = 600;
 const SETUP_TIMEOUT_SECS: u64 = 1800;
+/// How long a scope that may give way must have been untouched before a
+/// prepare on a full worker takes it: far longer than any gap between the
+/// commands of one turn, which touch their scope as they start and end.
+pub(crate) const YIELD_IDLE_GRACE: Duration = Duration::from_secs(120);
 
 /// Shared caches every scope mounts, as (dataset name, path in the scope).
 const CACHES: &[(&str, &str)] = &[
@@ -242,6 +246,7 @@ impl Worker {
                 bail!("home key {key:?} is not a dataset-safe name");
             }
         }
+        self.classify(&request.scope, request.yields_when_idle);
         if let Some(existing) = self.touch(&request.scope) {
             let home_reused = existing.home.is_some();
             return Ok(ServerFrame::Prepared(prepared(
@@ -251,7 +256,10 @@ impl Worker {
             )));
         }
         if self.scopes.lock().len() as u32 >= self.config.max_scopes {
-            return Ok(refused(RefusalReason::AtCapacity));
+            let Some(idle) = self.take_idle_yielder(Utc::now()) else {
+                return Ok(refused(RefusalReason::AtCapacity));
+            };
+            self.give_way(idle, &request.scope).await;
         }
         if self.zfs.free_bytes(&self.config.pool).await? < self.config.pool_free_floor_bytes() {
             // A refresh pruning at the same moment can take a snapshot out
@@ -416,6 +424,7 @@ impl Worker {
                 home: home_key,
                 bench,
                 jobs: true,
+                yields_when_idle: request.yields_when_idle,
             },
             home_reused,
         ))
@@ -835,25 +844,90 @@ impl Worker {
     pub async fn release(&self, scope: &ScopeId) -> Result<ServerFrame> {
         let removed = self.scopes.lock().remove(scope);
         if let Some(removed) = removed {
-            self.drop_jobs_of(scope);
-            self.save()?;
-            self.running.lock().remove(scope);
-            let _ = std::fs::remove_file(self.mcp_config_host_path(&removed));
-            if let Err(e) = self.containers.stop(&removed.container).await {
-                warn!(scope = %scope, error = %e, "stopping a released scope's container");
-            }
-            if self.zfs.exists(&removed.dataset).await? {
-                self.zfs.destroy(&removed.dataset).await?;
-            }
-            if let Some(key) = &removed.home {
-                if let Some(home) = self.homes.lock().get_mut(key) {
-                    home.last_used = Utc::now();
-                }
-                self.save()?;
-            }
+            self.dismantle(&removed).await?;
             info!(scope = %scope, "released");
         }
         Ok(ServerFrame::Done(ExecSummary::exited(0)))
+    }
+
+    /// Take down a scope already taken out of the map: its jobs, container
+    /// and work go, and its keyed home, which outlives it, counts as used
+    /// now so its lifetime starts again from here.
+    async fn dismantle(&self, removed: &Scope) -> Result<()> {
+        let scope = &removed.id;
+        self.drop_jobs_of(scope);
+        self.save()?;
+        self.running.lock().remove(scope);
+        let _ = std::fs::remove_file(self.mcp_config_host_path(removed));
+        if let Err(e) = self.containers.stop(&removed.container).await {
+            warn!(scope = %scope, error = %e, "stopping a released scope's container");
+        }
+        if self.zfs.exists(&removed.dataset).await? {
+            self.zfs.destroy(&removed.dataset).await?;
+        }
+        if let Some(key) = &removed.home {
+            if let Some(home) = self.homes.lock().get_mut(key) {
+                home.last_used = Utc::now();
+            }
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    /// Record what the hub says a scope is for, on a scope found again: a
+    /// scope made before its class was asked for learns it on its next use.
+    fn classify(&self, scope: &ScopeId, yields_when_idle: bool) {
+        if let Some(entry) = self.scopes.lock().get_mut(scope) {
+            entry.yields_when_idle = yields_when_idle;
+        }
+    }
+
+    /// Take out of the map the least recently used scope that may give way
+    /// and is idle at `now`: nothing running in it, no durable job of it
+    /// remembered, and untouched for [`YIELD_IDLE_GRACE`]. A turn between
+    /// two of its commands has touched its scope moments before, so the grace
+    /// keeps it; the check and the removal hold the same locks, so an exec
+    /// that touches the scope either does so first, and keeps it, or finds
+    /// it gone.
+    fn take_idle_yielder(&self, now: DateTime<Utc>) -> Option<Scope> {
+        let grace = chrono::Duration::from_std(YIELD_IDLE_GRACE).unwrap_or_default();
+        let running = self.running.lock();
+        let mut scopes = self.scopes.lock();
+        let jobs = self.jobs.lock();
+        let idle = scopes
+            .values()
+            .filter(|scope| scope.yields_when_idle)
+            .filter(|scope| scope.last_seen + grace <= now)
+            .filter(|scope| running.get(&scope.id).is_none_or(HashSet::is_empty))
+            .filter(|scope| !jobs.values().any(|job| job.scope == scope.id))
+            .min_by_key(|scope| scope.last_seen)
+            .map(|scope| scope.id.clone())?;
+        scopes.remove(&idle)
+    }
+
+    /// Release an idle scope taken by [`Self::take_idle_yielder`] so `to`
+    /// can be seated. Its keyed home stays, so its conversation's next turn
+    /// is seated over the same transcript and bench. A failure taking it
+    /// down is logged, not returned: it is out of the map already, its
+    /// container stopped or stopping, and the next reconcile clears what is
+    /// left.
+    async fn give_way(&self, idle: Scope, to: &ScopeId) {
+        let idle_secs = (Utc::now() - idle.last_seen).num_seconds();
+        match self.dismantle(&idle).await {
+            Ok(()) => info!(
+                scope = %idle.id,
+                home = idle.home.as_deref().unwrap_or("none"),
+                idle_secs,
+                to = %to,
+                "an idle scope gave way to a new one on a full worker"
+            ),
+            Err(error) => warn!(
+                scope = %idle.id,
+                to = %to,
+                %error,
+                "an idle scope gave way, but taking it down failed; reconcile clears what is left"
+            ),
+        }
     }
 
     /// Release every scope past its lifetime that has nothing running.
@@ -1246,6 +1320,7 @@ mod tests {
             ttl_secs: 60,
             env: Vec::new(),
             home: HomeSpec::Ephemeral,
+            yields_when_idle: false,
         }
     }
 
@@ -1679,6 +1754,177 @@ mod tests {
             .map(|s| s.id.as_str().to_string())
             .collect();
         assert_eq!(remaining, vec!["fresh"]);
+    }
+
+    /// An agent turn's scope: over its conversation's keyed home, and free
+    /// to give way once idle.
+    fn turn(scope: &str, key: &str) -> PrepareRequest {
+        PrepareRequest {
+            yields_when_idle: true,
+            ..keyed(scope, key, 3600)
+        }
+    }
+
+    fn idle_past_grace() -> chrono::Duration {
+        chrono::Duration::from_std(YIELD_IDLE_GRACE).unwrap() + chrono::Duration::seconds(1)
+    }
+
+    #[tokio::test]
+    async fn a_full_worker_seats_a_new_turn_by_yielding_the_idle_turn_scope_and_keeps_its_home() {
+        let h = Harness::new().await;
+        h.zfs.add_snapshot("tank/golden/home", "g");
+        h.worker.prepare(turn("turn-a", "thread-a")).await.unwrap();
+        h.worker.prepare(spec("coding", &[])).await.unwrap();
+        age(&h.worker, "turn-a", idle_past_grace());
+        age(&h.worker, "coding", idle_past_grace() * 10);
+
+        let ServerFrame::Prepared(seated) =
+            h.worker.prepare(turn("turn-b", "thread-b")).await.unwrap()
+        else {
+            panic!("a full worker with an idle turn scope seats the new turn")
+        };
+        assert!(!seated.reused);
+        assert_eq!(
+            scope_ids(&h.worker),
+            vec!["coding", "turn-b"],
+            "the idle turn scope gave way; the coding session's, idler still, did not"
+        );
+        assert!(!h.zfs.exists_sync("tank/work/turn-a"));
+        assert!(h
+            .containers
+            .stopped()
+            .iter()
+            .any(|c| c.0 == container_name(&ScopeId::new("turn-a"))));
+        assert!(
+            h.zfs.exists_sync("tank/homes/thread-a"),
+            "the yielded conversation keeps its home"
+        );
+        assert!(h
+            .worker
+            .homes()
+            .iter()
+            .any(|home| home.key == "thread-a" && !home.expired_at(Utc::now())));
+
+        // Its next turn finds the transcript and bench where it left them.
+        age(&h.worker, "turn-b", idle_past_grace());
+        let ServerFrame::Prepared(back) =
+            h.worker.prepare(turn("turn-a", "thread-a")).await.unwrap()
+        else {
+            panic!("the yielded conversation is seated again")
+        };
+        assert!(!back.reused && back.home_reused);
+        assert_eq!(back.workdir, BENCH_DIR);
+        assert_eq!(scope_ids(&h.worker), vec!["coding", "turn-a"]);
+        let run = h.containers.runs().pop().unwrap();
+        assert!(run
+            .mounts
+            .iter()
+            .any(|m| m.container == AGENT_HOME && m.host.ends_with("homes/thread-a")));
+    }
+
+    #[tokio::test]
+    async fn a_full_worker_with_only_busy_or_held_scopes_still_refuses() {
+        let h = Harness::new().await;
+        h.worker.prepare(turn("running", "thread-1")).await.unwrap();
+        h.worker.prepare(turn("recent", "thread-2")).await.unwrap();
+        age(&h.worker, "running", idle_past_grace());
+        h.worker
+            .running
+            .lock()
+            .entry(ScopeId::new("running"))
+            .or_default()
+            .insert("job".into());
+        let full = ServerFrame::Refused {
+            reason: RefusalReason::AtCapacity,
+        };
+        assert_eq!(
+            h.worker.prepare(turn("new", "thread-3")).await.unwrap(),
+            full,
+            "neither a scope with a command running nor one touched moments ago gives way"
+        );
+
+        h.worker.running.lock().clear();
+        age(&h.worker, "recent", idle_past_grace());
+        let now = Utc::now();
+        for id in ["running", "recent"] {
+            h.worker.jobs.lock().insert(
+                JobId::new(format!("job-{id}")),
+                JobRecord {
+                    id: JobId::new(format!("job-{id}")),
+                    scope: ScopeId::new(id),
+                    started_at: now,
+                    deadline: now,
+                    bridge: None,
+                    stopped: None,
+                    finished: (id == "recent").then(|| crate::state::Finished {
+                        at: now,
+                        summary: ExecSummary::exited(0),
+                    }),
+                },
+            );
+        }
+        assert_eq!(
+            h.worker.prepare(turn("new", "thread-3")).await.unwrap(),
+            full,
+            "a durable job, running or not yet collected, holds its scope"
+        );
+        assert_eq!(scope_ids(&h.worker), vec!["recent", "running"]);
+        assert!(!h.zfs.exists_sync("tank/work/new"));
+    }
+
+    #[tokio::test]
+    async fn a_coding_scope_never_gives_way_and_the_least_recently_used_turn_scope_does() {
+        let h = Harness::with(|config| config.max_scopes = 3).await;
+        h.worker.prepare(spec("coding", &[])).await.unwrap();
+        h.worker.prepare(turn("older", "thread-1")).await.unwrap();
+        h.worker.prepare(turn("newer", "thread-2")).await.unwrap();
+        age(&h.worker, "coding", idle_past_grace() * 30);
+        age(&h.worker, "older", idle_past_grace() * 3);
+        age(&h.worker, "newer", idle_past_grace() * 2);
+
+        assert!(matches!(
+            h.worker.prepare(spec("another-coding", &[])).await.unwrap(),
+            ServerFrame::Prepared(_)
+        ));
+        assert_eq!(
+            scope_ids(&h.worker),
+            vec!["another-coding", "coding", "newer"]
+        );
+
+        h.worker.release(&ScopeId::new("newer")).await.unwrap();
+        h.worker.prepare(spec("third", &[])).await.unwrap();
+        age(&h.worker, "another-coding", idle_past_grace() * 30);
+        age(&h.worker, "third", idle_past_grace() * 30);
+        assert_eq!(
+            h.worker.prepare(turn("turn", "thread-3")).await.unwrap(),
+            ServerFrame::Refused {
+                reason: RefusalReason::AtCapacity
+            },
+            "only agent-turn scopes give way, however idle the others"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scope_found_again_learns_whether_it_may_give_way() {
+        let h = Harness::new().await;
+        h.worker
+            .prepare(keyed("turn", "thread-1", 3600))
+            .await
+            .unwrap();
+        assert!(
+            !h.worker
+                .scope(&ScopeId::new("turn"))
+                .unwrap()
+                .yields_when_idle
+        );
+        h.worker.prepare(turn("turn", "thread-1")).await.unwrap();
+        assert!(
+            h.worker
+                .scope(&ScopeId::new("turn"))
+                .unwrap()
+                .yields_when_idle,
+            "a scope made before the hub said so is classed on its next turn"
+        );
     }
 
     fn age(worker: &Worker, scope: &str, by: chrono::Duration) {

@@ -162,6 +162,7 @@ impl SandboxLauncher for RemoteLauncher {
             ttl_secs: self.ttl_secs,
             env: Vec::new(),
             home: spec.home.clone(),
+            yields_when_idle: spec.yields_when_idle,
         });
         let prepared = match self.request(request).await? {
             Outcome::Prepared(prepared) => prepared,
@@ -764,6 +765,7 @@ mod tests {
                 ttl_secs: 3600,
             },
             primary: None,
+            yields_when_idle: scope == "thread-1",
         };
 
         assert!(launcher.ensure(&spec("thread-1")).await.unwrap().fresh());
@@ -778,6 +780,10 @@ mod tests {
         assert_ne!(first.scope, second.scope);
         assert_eq!(first.home, spec("").home);
         assert_eq!(second.home, spec("").home);
+        assert!(
+            first.yields_when_idle && !second.yields_when_idle,
+            "the worker is told which scopes may give way when idle"
+        );
     }
 
     #[tokio::test]
@@ -794,6 +800,7 @@ mod tests {
             tokens: &tokens,
             home: HomeSpec::Ephemeral,
             primary: None,
+            yields_when_idle: false,
         };
 
         let sandbox = launcher.ensure(&spec).await.unwrap();
@@ -846,6 +853,7 @@ mod tests {
             tokens: &tokens,
             home: HomeSpec::Ephemeral,
             primary,
+            yields_when_idle: false,
         };
 
         let started = launcher
@@ -921,6 +929,7 @@ mod tests {
                 tokens: &tokens,
                 home: HomeSpec::Ephemeral,
                 primary: None,
+                yields_when_idle: false,
             })
             .await
             .unwrap();
@@ -1034,6 +1043,7 @@ mod tests {
                 tokens: &tokens,
                 home: HomeSpec::Ephemeral,
                 primary: None,
+                yields_when_idle: false,
             })
             .await
             .err()
@@ -1066,6 +1076,7 @@ mod tests {
                 tokens: &tokens,
                 home: HomeSpec::Ephemeral,
                 primary: None,
+                yields_when_idle: false,
             })
             .await
             .err()
