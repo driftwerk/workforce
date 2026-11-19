@@ -872,7 +872,7 @@ pub(crate) fn describe(name: &str) -> &'static str {
             "crew.account" => "What one session (session_id) is for, who asked, its plan, what it has done (with its PRs, tickets, commits and deploys), what it is doing now, what it waits on, what comes next and the choices it made: its running account, brought up to date first when it is stale, with the time it is as of. Read it before you say anything of a session. With question, also the answer its own recent conversation gives to something the account doesn't say (which key, which file, what error).",
             "crew.ask_session" => "Ask a session (session_id) a question about its work, as Desk's status question on its line, without derailing it: one that is working gets it once its turn ends, never typed in over what it is doing. Use it only when crew.account, with a question, can't answer; then answer the person now from what you have and say you asked.",
             "crew.history" => "The recent messages of one agent's Desk DM with the person (agent_id), or one session's last prompt, reply, pending request and terminal (session_id).",
-            "crew.nudge" => "Send a short message to an agent's DM (agent_id) or to a session on its Desk line (session_id): a check-in, a hint, a correction. A session gets it once its turn ends (crew.interrupt stops a turn now). With reply_to (a question's message id), it is your answer to what that session asked you.",
+            "crew.nudge" => "Send a short message to an agent's DM (agent_id) or to a session on its Desk line (session_id): a check-in, a hint, a correction. A session gets it once its turn ends, or, with urgent, with its next tool call's result (crew.interrupt stops a turn now). With reply_to (a question's message id), it is your answer to what that session asked you.",
             "crew.escalate" => "Give a question a session asked you on its Desk line to the person (message_id): say why in reason, offer answers in options, and draft one in draft if you can. Use it for anything that pushes, deletes, deploys, spends, sends to people or changes scope, and whenever you are unsure; at Act fully, only for what the person's own orders and preferences don't cover (they are the rule, both ways).",
             "crew.approve" => "Allow a session's pending request (session_id, approval_id from crew.overview).",
             "crew.deny" => "Deny a session's pending request (session_id, approval_id from crew.overview).",
@@ -969,7 +969,7 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
                 "reply_to": { "type": "string", "description": "The message id of the session's question this answers" }
             }))
             .into_iter()
-            .chain(props(super::assignments::order_properties(true)))
+            .chain(props(super::assignments::order_properties(true, true)))
             .collect(),
             &["message"],
         ),
@@ -1000,7 +1000,7 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
                 "prompt": { "type": "string" }
             }))
             .into_iter()
-            .chain(props(super::assignments::order_properties(true)))
+            .chain(props(super::assignments::order_properties(true, false)))
             .collect(),
             &["session_id"],
         ),
@@ -1033,7 +1033,7 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
                     "new": { "type": "boolean", "description": "true only when the person asked for a new session: none already there gets the work" }
                 }))
                 .into_iter()
-                .chain(props(super::assignments::order_properties(true)))
+                .chain(props(super::assignments::order_properties(true, false)))
                 .collect(),
                 &["folder", "goal"],
             )
@@ -1063,7 +1063,7 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
                     }
                 }))
                 .into_iter()
-                .chain(props(super::assignments::order_properties(true)))
+                .chain(props(super::assignments::order_properties(true, false)))
                 .collect(),
                 &["ticket", "to"],
             )

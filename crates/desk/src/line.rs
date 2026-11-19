@@ -70,6 +70,155 @@ text_enum!(When {
     Now => "now",
 });
 
+text_enum!(Urgency {
+    // An urgent order: it can't wait for the session's turn to end.
+    // Counted against [`URGENT_PER_SESSION`].
+    Order => "order",
+    // A stand-down from a job moved to another session: urgent, never
+    // counted.
+    StandDown => "stand_down",
+    // A stand-down of an irreversible assignment: when it isn't read
+    // within [`STEER_WAIT`], the turn is interrupted.
+    Escalate => "escalate",
+});
+
+impl Urgency {
+    /// Whether it counts against [`URGENT_PER_SESSION`]: stand-downs don't.
+    pub fn counts(self) -> bool {
+        self == Self::Order
+    }
+
+    /// Whether a turn that hasn't read it in [`STEER_WAIT`] is interrupted.
+    pub fn escalates(self) -> bool {
+        self == Self::Escalate
+    }
+}
+
+/// How long an escalating stand-down waits to be read in a running turn
+/// before Desk interrupts the turn.
+pub const STEER_WAIT: Duration = Duration::from_secs(60);
+/// The most urgent orders (not stand-downs) one session is sent in
+/// [`URGENT_WINDOW`]: past that they queue.
+pub const URGENT_PER_SESSION: i64 = 3;
+pub const URGENT_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+/// Whether a session in `state` is inside a turn: working, or blocked on a
+/// dialog its turn raised. What waits for that turn's next tool call is
+/// left to it meanwhile, and a stand-down's escalation interrupts only it.
+pub fn in_turn(state: SessionState) -> bool {
+    matches!(state, SessionState::Working | SessionState::Blocked)
+}
+
+/// Which turn of a session's run something was sent in: an escalation
+/// interrupts that turn alone, never one begun since. `run` is the run's
+/// own: its counters start again with each Desk, so a mark from before a
+/// restart never matches a turn after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TurnMark {
+    pub(crate) run: uuid::Uuid,
+    pub(crate) ends: u64,
+    pub(crate) turns: u64,
+}
+
+/// Where a suggestion to interrupt for a stand-down not read in time keeps
+/// its stand-down's row and turn, in its `crew.interrupt` input.
+pub const STAND_DOWN_KEY: &str = "stand_down";
+
+/// How a session that is working takes words mid-turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MidTurn {
+    /// Beside its next tool call's result (Claude Code's and Devin's
+    /// `additionalContext`, from Desk's PostToolUse hook).
+    Hook,
+    /// Codex's `turn/steer`.
+    TurnSteer,
+}
+
+/// Why a working session can't take a boss's words mid-turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unsteerable {
+    /// Its engine has no way in.
+    Engine,
+    /// No Desk hook was heard from it in this run (nor a Codex link).
+    NoHooks,
+    /// It waits on a dialog: a permission, or a question.
+    Dialog,
+}
+
+/// What became of an urgent send, for the sender's words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rushed {
+    /// It waits beside its next tool call's result.
+    Steered,
+    /// Said into its running turn (Codex).
+    SaidIn,
+    /// It isn't working: it goes in as any message, now.
+    NotWorking,
+    /// Working, and it can't take words mid-turn: at its turn's end.
+    CantSteer(Unsteerable),
+    /// Something holds the boss's words from it now (`Wait`): it waits as
+    /// any message.
+    Held(Wait),
+    /// Past [`URGENT_PER_SESSION`]: queued as any message.
+    TooMany,
+}
+
+impl Rushed {
+    /// What the sender is told of it, after "told <name>; ": none when the
+    /// usual words for its delivery say it.
+    pub fn said(self) -> Option<String> {
+        Some(match self {
+            Self::Steered => "it reads it with its next tool call's result".into(),
+            Self::SaidIn => "it was said into its running turn".into(),
+            Self::CantSteer(_) => {
+                "it gets it once its turn ends: it can't take words mid-turn".into()
+            }
+            Self::TooMany => format!(
+                "it gets it once its turn ends: it was sent {URGENT_PER_SESSION} urgent orders in the last {} minutes, so this one queues",
+                URGENT_WINDOW.as_secs() / 60
+            ),
+            Self::NotWorking | Self::Held(_) => return None,
+        })
+    }
+}
+
+/// How a session of `engine` in `state` takes a boss's urgent words:
+/// `Ok(None)` when it isn't working (they go in now, as any message).
+/// `heard`: a tool hook of Desk's was heard from it in this run (for
+/// Codex, its app-server link is up); `dialog`: something waits on its
+/// dialog. A boss is never typed into a terminal: that is the person's.
+pub fn mid_turn(
+    engine: crate::engine::Engine,
+    state: SessionState,
+    heard: bool,
+    dialog: bool,
+) -> Result<Option<MidTurn>, Unsteerable> {
+    use crate::engine::Engine;
+    match state {
+        SessionState::Working if !dialog => {}
+        SessionState::Working | SessionState::Blocked | SessionState::Asking => {
+            return Err(Unsteerable::Dialog)
+        }
+        SessionState::Starting
+        | SessionState::Idle
+        | SessionState::Done
+        | SessionState::Interrupted
+        | SessionState::Stopped
+        | SessionState::Closed => return Ok(None),
+    }
+    let how = match engine {
+        Engine::Claude | Engine::Devin => MidTurn::Hook,
+        Engine::Codex => MidTurn::TurnSteer,
+        Engine::Gemini | Engine::Copilot | Engine::OpenCode | Engine::Cursor | Engine::Custom => {
+            return Err(Unsteerable::Engine)
+        }
+    };
+    match heard {
+        true => Ok(Some(how)),
+        false => Err(Unsteerable::NoHooks),
+    }
+}
+
 /// Why the overseer gave a question to the person, and what it offered.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -143,6 +292,10 @@ pub struct LineMessage {
     /// Why it waits, while it is queued or held (not stored).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waiting: Option<Wait>,
+    /// A boss's urgent message to a working session: steered into its
+    /// running turn rather than waiting for its end (§4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub urgency: Option<Urgency>,
 }
 
 impl LineMessage {
@@ -170,6 +323,7 @@ impl LineMessage {
             delivered_at: None,
             updated_at: at,
             waiting: None,
+            urgency: None,
         }
     }
 

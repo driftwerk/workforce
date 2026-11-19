@@ -779,6 +779,20 @@ pub trait Crew: Send + Sync {
             "{machine} can't be reached from this hub."
         )))
     }
+    /// The boss `boss`'s escalating stand-down (line message `row`) wasn't
+    /// read by `session` within the steer wait ([`crate::line::STEER_WAIT`])
+    /// in the turn `turn` it was sent in: the boss interrupts that turn
+    /// ([`crate::Desk::interrupt_turn`]), as `crew.interrupt` would, through
+    /// the same gate. What was done, or why it wasn't, in plain words.
+    async fn steer_overdue(
+        &self,
+        _boss: &str,
+        _session: uuid::Uuid,
+        _row: uuid::Uuid,
+        _turn: crate::line::TurnMark,
+    ) -> Result<String, String> {
+        Err("no boss here interrupts sessions".into())
+    }
     /// The agent overseeing the crew, if one does.
     fn overseer(&self) -> Option<Overseer>;
     /// The hub's agents, with the turn each is running.

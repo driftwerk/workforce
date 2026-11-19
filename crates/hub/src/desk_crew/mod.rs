@@ -65,6 +65,7 @@ pub(crate) mod shared_budget;
 mod spend;
 mod tools;
 mod updates;
+mod urgent;
 pub(crate) use updates::HubWriter;
 mod watcher;
 mod work;
@@ -1448,11 +1449,29 @@ impl Crew for CrewHub {
             .unwrap_or_else(|| Utc::now() - chrono::Duration::hours(24))
     }
 
+    async fn steer_overdue(
+        &self,
+        boss: &str,
+        session: uuid::Uuid,
+        row: uuid::Uuid,
+        turn: workforce_desk::line::TurnMark,
+    ) -> Result<String, String> {
+        self.steer_overdue_now(boss, session, row, turn).await
+    }
+
     async fn accept(&self, suggestion: &Suggestion) -> Result<(), String> {
         let action = actions::Action::from_suggestion(&suggestion.action)?;
         let mut by = By::you();
         by.suggestion_id = Some(suggestion.id.clone());
-        self.me().perform(&action, by).await.map(drop)
+        // An interrupt suggested for a stand-down not read in time: of that
+        // turn alone, while it is unread.
+        let order = assignments::Order {
+            only_turn: urgent::only_turn_of(&suggestion.action["input"]),
+            ..Default::default()
+        };
+        Box::pin(self.me().perform_with(&action, by, &order))
+            .await
+            .map(drop)
     }
 
     /// The needs of `person`, else of the person whose Desk this is, as the

@@ -1503,7 +1503,7 @@ impl CrewHub {
         let before = self.before(action);
         let who = by.clone();
         let mut done = Done::default();
-        let performed = self.perform_as(action, by, &mut done).await;
+        let performed = self.perform_as(action, by, &mut done, order).await;
         if let Some(r) = &reserved {
             Box::pin(self.assign_after(
                 r,
@@ -1665,7 +1665,13 @@ impl CrewHub {
 
     /// [`Self::perform`]'s work: what it left behind that an undo needs
     /// goes in `done`.
-    async fn perform_as(&self, action: &Action, by: By, done: &mut Done) -> Result<String, String> {
+    async fn perform_as(
+        &self,
+        action: &Action,
+        by: By,
+        done: &mut Done,
+        order: &super::assignments::Order,
+    ) -> Result<String, String> {
         let plain = |e: workforce_desk::DeskError| match e {
             workforce_desk::DeskError::NotFound => "That session isn’t there any more.".to_string(),
             workforce_desk::DeskError::Internal(e) => {
@@ -1728,20 +1734,26 @@ impl CrewHub {
                         Ok(format!("answered {name}"))
                     }
                     // On its line: it gets it once its turn ends, never typed
-                    // in over what it is doing (Interrupt is for that).
+                    // in over what it is doing (Interrupt is for that); a
+                    // boss's urgent one, with its next tool call's result.
                     None => {
-                        let told = d
-                            .line_send(
+                        let urgency = super::urgent::of(order, &sender);
+                        let (told, rushed) = d
+                            .line_send_with(
                                 sender,
                                 workforce_desk::line::Send::Tell {
                                     to: workforce_desk::line::Target::Session(*s),
                                     text: message.clone(),
                                     when: workforce_desk::line::When::Queue,
                                 },
+                                urgency,
                             )
                             .await
                             .map_err(line)?;
                         done.line = Some((told.id, told.delivery));
+                        if let Some(said) = super::urgent::told(&name, rushed) {
+                            return Ok(said);
+                        }
                         if d.wheel_of(*s).is_some_and(|w| w.person()) {
                             return Ok(format!(
                                 "told {name}; the person is driving it, so your message waits until they stop giving it input for a little while or hand it back"
@@ -1883,7 +1895,12 @@ impl CrewHub {
                 }
             }
             Action::Interrupt { session } => {
-                let v = d.interrupt(*session, Some(by)).map_err(plain)?;
+                let v = match order.only_turn {
+                    // For a stand-down not read in time: that turn alone.
+                    Some((row, turn)) => d.interrupt_turn(*session, turn, row, Some(by)).await,
+                    None => d.interrupt(*session, Some(by)),
+                }
+                .map_err(plain)?;
                 Ok(format!("interrupted {}", v.label()))
             }
             // Run on their own, so one that outlasts the wait still ends

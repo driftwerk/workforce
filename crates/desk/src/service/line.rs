@@ -607,9 +607,26 @@ impl Desk {
     /// Sends on a line, as `from`, under the line's rules; delivered once
     /// its recipient can take it.
     pub async fn line_send(&self, from: Sender, send: Send) -> Result<LineMessage, LineError> {
+        Ok(self.line_send_with(from, send, None).await?.0)
+    }
+
+    /// [`Self::line_send`], with how urgently: a boss's tell or ask with
+    /// `urgency` to a session that is working goes into its running turn
+    /// (design note §4), and what became of that is said. Urgency is a
+    /// boss's to give (the person's Send now is [`When::Now`]); from anyone
+    /// else, and for a reply, it is refused or unused.
+    pub async fn line_send_with(
+        &self,
+        from: Sender,
+        send: Send,
+        urgency: Option<line::Urgency>,
+    ) -> Result<(LineMessage, Option<line::Rushed>), LineError> {
+        if urgency.is_some() && !matches!(from, Sender::Overseer(_)) {
+            return Err(Refusal::NotYours.into());
+        }
         let hop_send = send.clone();
         let (to, text, kind, when) = match send {
-            Send::Reply { to, text } => return self.line_answer(to, from, text).await,
+            Send::Reply { to, text } => return Ok((self.line_answer(to, from, text).await?, None)),
             Send::Ask { to, text, .. } => (to, text, LineKind::Ask, When::Queue),
             Send::Tell { to, text, when } => (to, text, LineKind::Tell, when),
         };
@@ -753,7 +770,21 @@ impl Desk {
             Some(v) if !v.live => m.delivery = Delivery::Held,
             Some(_) => {}
         }
+        // How a boss's urgent words reach it, decided and counted before
+        // they are kept (the count's lock held until they are).
+        let plan = match (urgency, &recipient) {
+            (Some(u), Some(v)) => Some(self.rush_plan(v, &mut m, u).await?),
+            _ => None,
+        };
         self.0.store.put_line(&m).await?;
+        let (rushed, mark) = match plan {
+            Some(p) => {
+                // Kept: the next urgent send to it counts this one.
+                drop(p.counted);
+                (Some(p.rushed), p.mark)
+            }
+            None => (None, None),
+        };
         // A session's question is waited on from the moment it is told of:
         // whoever takes it up (the overseer giving it to the person) finds
         // its call still waiting, not gone ahead.
@@ -797,14 +828,19 @@ impl Desk {
         self.line_noted(&m);
         self.line_announce(&m);
         if let Some(v) = recipient {
-            match steering {
-                Steering::Queue => self.line_pump_later(v.id),
-                Steering::PasteNow | Steering::TurnSteer => {
-                    self.line_steer(&mut m, steering).await?
+            match (rushed, &from) {
+                (Some(r), Sender::Overseer(by)) => {
+                    self.rush_deliver(&mut m, v.id, r, mark, by).await?
                 }
+                _ => match steering {
+                    Steering::Queue => self.line_pump_later(v.id),
+                    Steering::PasteNow | Steering::TurnSteer => {
+                        self.line_steer(&mut m, steering).await?
+                    }
+                },
             }
         }
-        Ok(m)
+        Ok((m, rushed))
     }
 
     /// Says the person's `m` into its recipient's running turn now.
@@ -864,6 +900,7 @@ impl Desk {
             Ok(None) => {}
             Ok(Some(m)) => {
                 self.line_announce(&m);
+                self.rush_refused(id, &m);
                 self.line_pump_later(id);
             }
             Err(e) => {
@@ -1398,7 +1435,7 @@ impl Desk {
     }
 
     /// Whether the answer `m` is one a tool call still waits on.
-    fn waited_on(&self, m: &LineMessage) -> bool {
+    pub(super) fn waited_on(&self, m: &LineMessage) -> bool {
         let st = self.0.state.lock();
         m.in_reply_to
             .and_then(|a| st.lines.waiting.get(&a))
@@ -1431,7 +1468,7 @@ impl Desk {
         Ok(out)
     }
 
-    fn line_delivered_into(&self, id: Uuid, m: &LineMessage) {
+    pub(super) fn line_delivered_into(&self, id: Uuid, m: &LineMessage) {
         self.0
             .state
             .lock()
@@ -1444,7 +1481,7 @@ impl Desk {
     }
 
     /// What `m` reads as to its session.
-    async fn rendered(&self, m: &LineMessage) -> String {
+    pub(super) async fn rendered(&self, m: &LineMessage) -> String {
         let question = match m.in_reply_to {
             Some(ask) => self.0.store.line_message(ask).await.ok().flatten(),
             None => None,
@@ -1486,7 +1523,7 @@ impl Desk {
     /// a session Desk's breaker paused, or one asking the person something,
     /// takes only the person's own messages; one the person drives, none
     /// of its boss's.
-    fn line_gate(&self, view: &SessionView, m: &LineMessage) -> Option<Wait> {
+    pub(super) fn line_gate(&self, view: &SessionView, m: &LineMessage) -> Option<Wait> {
         if m.from.kind == PartyKind::You {
             return None;
         }
@@ -1524,7 +1561,10 @@ impl Desk {
             return Ok(None);
         }
         for m in inbox {
-            if self.waited_on(&m) || self.line_gate(&view, &m).is_some() {
+            if self.waited_on(&m)
+                || self.line_gate(&view, &m).is_some()
+                || self.steer_reserved(caller, &m)
+            {
                 continue;
             }
             // Decided before the person's own words there: never handed in.
@@ -1619,7 +1659,8 @@ impl Desk {
         let plugin = self.plugin_heard(id);
         let mut typed_in = false;
         for mut m in inbox {
-            if m.delivery == Delivery::Handed || self.waited_on(&m) {
+            // One its running turn's next tool call takes is left to it.
+            if m.delivery == Delivery::Handed || self.waited_on(&m) || self.steer_reserved(id, &m) {
                 continue;
             }
             // Decided before the person's own words there: never typed in.
@@ -1774,6 +1815,7 @@ impl Desk {
     /// and whoever asked it is told.
     pub(super) async fn line_forgotten(&self, gone: &SessionView) {
         let id = gone.id;
+        self.rush_forget(id);
         let asks = match self.0.store.line_open_asks(None).await {
             Ok(asks) => asks,
             Err(e) => {

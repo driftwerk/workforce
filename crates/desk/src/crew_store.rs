@@ -326,6 +326,41 @@ impl DeskStore {
         Ok(())
     }
 
+    /// Dismisses suggestion `id` only while it is still open: whether it
+    /// was. An answer the person gave meanwhile stands.
+    pub async fn suggestion_dismiss_open(&self, id: &str) -> Result<bool> {
+        let client = self.pool().get().await?;
+        let n = client
+            .execute(
+                "UPDATE suggestions SET state = 'dismissed', updated_at = now() \
+                 WHERE id = $1 AND state = 'open'",
+                &[&id],
+            )
+            .await
+            .context("dismissing a suggestion")?;
+        Ok(n == 1)
+    }
+
+    /// Dismisses every open suggestion to interrupt for a stand-down not
+    /// read in time ([`crate::line::STAND_DOWN_KEY`]): those a Desk before
+    /// this one made, bound to turns of runs that are over. Those it
+    /// dismissed.
+    pub async fn suggestions_stand_down_dismiss(&self) -> Result<Vec<Suggestion>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                "UPDATE suggestions SET state = 'dismissed', updated_at = now() \
+                 WHERE state = 'open' AND action ->> 'tool' = 'crew.interrupt' \
+                 AND action -> 'input' -> $1::text IS NOT NULL RETURNING *",
+                &[&crate::line::STAND_DOWN_KEY],
+            )
+            .await
+            .context("dismissing a restart's stand-down suggestions")?
+            .iter()
+            .map(suggestion)
+            .collect()
+    }
+
     pub async fn suggestion(&self, id: &str) -> Result<Option<Suggestion>> {
         let client = self.pool().get().await?;
         client

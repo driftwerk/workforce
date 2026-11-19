@@ -1892,6 +1892,7 @@ mod preferences;
 mod promises;
 mod repeats;
 mod updates;
+mod urgent;
 
 mod away;
 
