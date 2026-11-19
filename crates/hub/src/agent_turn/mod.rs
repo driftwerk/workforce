@@ -825,8 +825,7 @@ impl TurnChain {
                                         .await;
                                 }
                                 let slot = served.slot.clone();
-                                let mut result =
-                                    served.into_result(seeds.invocations.clone());
+                                let mut result = served.into_result(seeds.invocations.clone());
                                 result.response.push_str(&note);
                                 return Ok(ChainOutcome::Served {
                                     result: Box::new(result),
