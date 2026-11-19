@@ -461,6 +461,7 @@ jobs:
             -e VELLEV_CACHE_DIR=/data/cache \
             -e VELLEV_MODEL_DIR=/models \
             -e VELLEV_API_KEYS="$VELLEV_TEST_KEY" \
+            -e VELLEV_MAX_FORMAT=2 \
             -v "$RUNNER_TEMP/vellev-data:/data" \
             -v "$HOME/vellev-models:/models" \
             "$VELLEV_IMAGE" serve
