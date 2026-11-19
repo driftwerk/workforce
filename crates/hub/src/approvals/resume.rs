@@ -9,7 +9,9 @@
 
 use std::sync::Arc;
 
-use workforce_agent::runner::{with_desk, PreExecutedTool, CURRENT_CHANNEL_ID, CURRENT_PREEXECUTE};
+use workforce_agent::runner::{
+    with_desk, PreExecutedTool, CURRENT_CHANNEL_ID, CURRENT_PREEXECUTE, CURRENT_THREAD_ID,
+};
 use workforce_common::channels::OutboundMessage;
 
 use super::store::{ApprovalOutcome, PendingApproval};
@@ -51,6 +53,9 @@ pub async fn launch_resume(
     let svc = &svc;
     let directive = directive_for(row, outcome, resolver_display);
     let channel_id = row.channel_id.clone().unwrap_or_default();
+    // The thread its answer goes to, so what the turn says beside it (a
+    // notice) is said there too.
+    let thread_id = row.thread_ts.clone().unwrap_or_default();
     // A request made in a Desk conversation, or by a run made in one, is
     // resumed answering to it, unattended.
     let session = svc
@@ -100,7 +105,10 @@ pub async fn launch_resume(
                         desk,
                         CURRENT_CHANNEL_ID.scope(
                             channel_id.clone(),
-                            CURRENT_PREEXECUTE.scope(pre, run_turn(svc, row, &directive)),
+                            CURRENT_THREAD_ID.scope(
+                                thread_id.clone(),
+                                CURRENT_PREEXECUTE.scope(pre, run_turn(svc, row, &directive)),
+                            ),
                         ),
                     )
                     .await
@@ -108,8 +116,11 @@ pub async fn launch_resume(
                 ApprovalOutcome::Denied | ApprovalOutcome::Expired => {
                     with_desk(
                         desk,
-                        CURRENT_CHANNEL_ID
-                            .scope(channel_id.clone(), run_turn(svc, row, &directive)),
+                        CURRENT_CHANNEL_ID.scope(
+                            channel_id.clone(),
+                            CURRENT_THREAD_ID
+                                .scope(thread_id.clone(), run_turn(svc, row, &directive)),
+                        ),
                     )
                     .await
                 }

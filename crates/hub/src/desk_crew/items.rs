@@ -861,7 +861,9 @@ impl CrewHub {
         }
     }
 
-    /// Says `text` in `boss`'s DM, as a notice. Never one that says
+    /// Says `text` in `boss`'s DM, as a notice; in the person's conversation
+    /// with `boss` off Desk instead, when a turn of theirs there is what
+    /// says it ([`crate::desk_surface::notice`]). Never one that says
     /// nothing: blank, or only a session's marks.
     async fn say(&self, boss: &str, text: String) {
         let text = workforce_desk::line::without_marks(&text);
@@ -874,16 +876,7 @@ impl CrewHub {
         let Some(owner) = self.person(Some(&service)) else {
             return;
         };
-        let target =
-            DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
-        if let Err(e) = crate::desk_surface::deliver(
-            &service,
-            &owner,
-            &target,
-            crate::desk_surface::Delivery::text(DeliveryKind::Notice, text),
-        )
-        .await
-        {
+        if let Err(e) = crate::desk_surface::notice(&service, &owner, text).await {
             tracing::info!(error = %e, "a notice in the boss's DM failed");
         }
     }
@@ -1618,7 +1611,9 @@ impl CrewHub {
         }
     }
 
-    /// Says in `i`'s boss's DM that it no longer waits on the person.
+    /// Says in `i`'s boss's DM that it no longer waits on the person (in
+    /// their conversation with it off Desk instead, when a turn of theirs
+    /// there closed it: [`crate::desk_surface::notice`]).
     async fn say_closed(&self, i: &OpenItem, why: &str) {
         let Some((service, _)) = self.overseer_named(&i.boss) else {
             return;
@@ -1626,21 +1621,12 @@ impl CrewHub {
         let Some(owner) = self.person(Some(&service)) else {
             return;
         };
-        let target =
-            DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
         let text = format!(
             "No longer waiting on you: {} ({})",
             crew::one_line(&i.text, 300),
             why.trim_end_matches('.')
         );
-        if let Err(e) = crate::desk_surface::deliver(
-            &service,
-            &owner,
-            &target,
-            crate::desk_surface::Delivery::text(DeliveryKind::Notice, text),
-        )
-        .await
-        {
+        if let Err(e) = crate::desk_surface::notice(&service, &owner, text).await {
             tracing::info!(error = %e, "saying an open item closed failed");
         }
     }
