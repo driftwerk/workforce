@@ -172,7 +172,9 @@ jobs:
     needs: [changes]
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # A warm cache builds in about 30 minutes; a cold one (the cache is saved
+    # only from main, so after a red main or a lockfile change) takes over 60.
+    timeout-minutes: 100
     permissions:
       contents: read
     env:
