@@ -170,6 +170,12 @@ pub(crate) enum Action {
         session: Uuid,
         mode: Mode,
     },
+    /// Move a session to another of the person's logins of the same
+    /// provider: it starts again in place on it, its conversation kept.
+    SwitchLogin {
+        session: Uuid,
+        login: Uuid,
+    },
     /// Change the overseer `agent`'s own `[oversight]`: only ever a
     /// suggestion, which only the person can accept, as its own limits are
     /// never the overseer's to change.
@@ -216,6 +222,8 @@ struct Input {
     account: Option<String>,
     /// A permission mode, as Claude Code spells it.
     mode: Option<String>,
+    /// `crew.switch_login`'s login: its id (a name is resolved to it first).
+    login: Option<String>,
 }
 
 fn id(raw: Option<&str>, what: &str) -> Result<Uuid, String> {
@@ -452,6 +460,19 @@ impl Action {
                     })?)),
                 },
             },
+            "crew.switch_login" => Self::SwitchLogin {
+                session: session()?,
+                login: i
+                    .login
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .ok_or("Say which login: its name or id from crew.logins.")?
+                    .parse()
+                    .map_err(|_| {
+                        "That isn’t a login from crew.logins: give its name or id.".to_string()
+                    })?,
+            },
             "crew.set_mode" => Self::SetMode {
                 session: session()?,
                 mode: i.mode.as_deref().and_then(Mode::parse).ok_or(
@@ -531,6 +552,7 @@ impl Action {
             | Self::Release { .. }
             | Self::Handoff { .. }
             | Self::SetMode { .. }
+            | Self::SwitchLogin { .. }
             | Self::ChangeOversight { .. } => "",
         })
     }
@@ -891,6 +913,9 @@ impl CrewHub {
             // command; any other is an unbound overseer's alone.
             // Only a mode that asks gets here.
             Action::SetMode { .. } => (o.act.set_mode, Some(switch::SET_MODE)),
+            // Another of the person's own logins of the same provider: an
+            // ordinary move, its conversation kept.
+            Action::SwitchLogin { .. } => (true, None),
         };
         match (allowed, needs) {
             (true, _) => Gate::Run,
@@ -950,7 +975,8 @@ impl CrewHub {
             | Action::Resume { session: s, .. }
             | Action::Restart { session: s, .. }
             | Action::Handoff { session: s, .. }
-            | Action::SetMode { session: s, .. } => Some(*s),
+            | Action::SetMode { session: s, .. }
+            | Action::SwitchLogin { session: s, .. } => Some(*s),
             _ => None,
         }
     }
@@ -1012,6 +1038,8 @@ impl CrewHub {
                 "starting it again loads whatever settings it changed; that's the person's call"
                     .into(),
             )),
+            // Moving it to another login of the person's is ordinary.
+            Action::SwitchLogin { .. } => Some(Gate::Run),
             _ => None,
         }
     }
@@ -1093,6 +1121,9 @@ impl CrewHub {
             | Action::Handoff { .. }
             // Below unbound, only to a mode that still asks.
             | Action::SetMode { .. }
+            // The same session, on another login: what it does next waits
+            // as before.
+            | Action::SwitchLogin { .. }
             // Only ever a card the person approves.
             | Action::ChangeOversight { .. } => true,
             Action::Nudge {
@@ -1189,6 +1220,16 @@ impl CrewHub {
             .unwrap_or_else(|_| "that session".into())
     }
 
+    /// What the person calls one of their logins.
+    pub(super) fn login_name(&self, id: Uuid) -> String {
+        self.desk
+            .accounts()
+            .into_iter()
+            .find(|a| a.id == id)
+            .map(|a| a.name)
+            .unwrap_or_else(|| "that login".into())
+    }
+
     fn agent_name(&self, id: &str) -> String {
         self.party_of_agent(id)
             .map(|p| p.name)
@@ -1233,7 +1274,8 @@ impl CrewHub {
             | Action::TakeOn { session: s }
             | Action::Release { session: s }
             | Action::Handoff { session: s, .. }
-            | Action::SetMode { session: s, .. } => {
+            | Action::SetMode { session: s, .. }
+            | Action::SwitchLogin { session: s, .. } => {
                 self.desk.view(*s).ok().map(|v| Party::session(&v))
             }
         }
@@ -1352,6 +1394,11 @@ impl CrewHub {
                 "Put {} in {} mode",
                 self.session_name(*session),
                 mode.title()
+            ),
+            Action::SwitchLogin { session, login } => format!(
+                "Move {} to the login {}, its conversation kept",
+                self.session_name(*session),
+                self.login_name(*login)
             ),
             Action::ChangeOversight { agent, change } => {
                 let mut said = change.describe();
@@ -2120,6 +2167,24 @@ impl CrewHub {
                     engine.title(),
                     done.session.label()
                 ))
+            }
+            Action::SwitchLogin { session, login } => {
+                let name = self.session_name(*session);
+                let login_name = self.login_name(*login);
+                let v = d
+                    .switch_account(*session, Some(*login), Some(by.clone()))
+                    .await
+                    .map_err(|e| match e {
+                        workforce_desk::DeskError::Conflict(why)
+                        | workforce_desk::DeskError::Invalid(why) => why,
+                        e => plain(e),
+                    })?;
+                Ok(match v.switching_to {
+                    Some(_) => format!(
+                        "{name} moves to {login_name} once its turn and the work it left running end, its conversation kept"
+                    ),
+                    None => format!("moved {name} to {login_name}, its conversation kept"),
+                })
             }
             Action::SetMode { session, mode } => {
                 let set = d.set_mode(*session, *mode, by).await.map_err(|e| match e {

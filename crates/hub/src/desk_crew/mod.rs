@@ -46,6 +46,7 @@ mod handover;
 mod idle;
 mod items;
 mod line;
+mod logins;
 pub(crate) mod machine_grants;
 mod mind;
 mod observe;
@@ -791,6 +792,7 @@ impl CrewHub {
         tokio::spawn(relayed_decide::pump_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(answer::answer_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(idle::idle_loop(Arc::clone(&crew), cancel.clone()));
+        tokio::spawn(logins::logins_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(watches::watch_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(closing::closing_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(plan::plan_loop(Arc::clone(&crew), cancel.clone()));

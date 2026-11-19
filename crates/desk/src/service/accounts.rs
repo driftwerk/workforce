@@ -426,6 +426,27 @@ impl Desk {
         Self::standing_of(st, Self::canonical(st, side)).full(Utc::now())
     }
 
+    /// Whether the provider turned `account` away and it isn't due to be
+    /// tried again yet: no move or start goes onto it.
+    pub(super) fn refused_now(
+        st: &super::State,
+        account: Uuid,
+        now: chrono::DateTime<Utc>,
+    ) -> bool {
+        st.refused.get(&account).is_some_and(|r| r.recheck_at > now)
+    }
+
+    /// How far into its fullest plan window each side was as last read.
+    fn plans_used(
+        standing: &std::collections::HashMap<Option<Uuid>, accounts::Standing>,
+        now: chrono::DateTime<Utc>,
+    ) -> std::collections::HashMap<Option<Uuid>, f64> {
+        standing
+            .iter()
+            .filter_map(|(side, s)| Some((*side, s.plan_used(now)?)))
+            .collect()
+    }
+
     /// What a new session of `engine` naming no account starts on: the
     /// default (else the CLI's own sign-in), unless it is known to be full,
     /// then the next account with room, in the order a switch takes them.
@@ -442,7 +463,15 @@ impl Desk {
         if st.own_identity.is_some() && Self::own_account(st).is_none() && !sides.contains(&None) {
             sides.push(None);
         }
-        if let Some(side) = sides.iter().find(|s| Self::full_now(st, **s).is_none()) {
+        let now = Utc::now();
+        let room: Vec<Option<Uuid>> = sides
+            .iter()
+            .filter(|s| Self::full_now(st, **s).is_none())
+            .filter(|s| s.is_none_or(|id| !Self::refused_now(st, id, now)))
+            .copied()
+            .collect();
+        let used = Self::plans_used(&Self::effective_standing(st), now);
+        if let Some(side) = accounts::with_headroom(&room, &used).as_ref() {
             if *side != first {
                 tracing::info!(
                     engine = engine.as_str(),
@@ -702,29 +731,62 @@ impl Desk {
         self.ok_seen(&super::identities::Raw::Account(account), at);
     }
 
-    /// An account by the name the person or an agent gave it.
+    /// An account by the name the person or an agent gave it, or its id
+    /// ([`Desk::login_named`]).
     pub fn account_named(&self, engine: Engine, name: &str) -> Result<Uuid, DeskError> {
+        self.login_named(Some(engine), name)
+    }
+
+    /// One of the person's logins (engine accounts) by what someone called
+    /// it: its id, else its name, case aside, else the one name that
+    /// contains it ("Gmail" for "Kingsley Gmail"). Of `engine` alone when
+    /// given. Two that match are said, never guessed between.
+    pub fn login_named(&self, engine: Option<Engine>, said: &str) -> Result<Uuid, DeskError> {
+        let said = said.trim();
         let st = self.0.state.lock();
-        st.accounts
+        let of: Vec<&Account> = st
+            .accounts
             .iter()
-            .find(|a| a.engine == engine && a.name.eq_ignore_ascii_case(name.trim()))
-            .map(|a| a.id)
-            .ok_or_else(|| {
-                let names: Vec<&str> = st
-                    .accounts
-                    .iter()
-                    .filter(|a| a.engine == engine)
-                    .map(|a| a.name.as_str())
-                    .collect();
-                DeskError::Invalid(match names.is_empty() {
-                    true => format!("there are no {} accounts", engine.title()),
-                    false => format!(
-                        "there is no {} account called {name}; there are {}",
-                        engine.title(),
-                        names.join(", ")
-                    ),
-                })
-            })
+            .filter(|a| engine.is_none_or(|e| a.engine == e))
+            .collect();
+        let what = engine.map_or_else(|| "login".to_string(), |e| format!("{} login", e.title()));
+        if let Ok(id) = said.parse::<Uuid>() {
+            return of
+                .iter()
+                .find(|a| a.id == id)
+                .map(|a| a.id)
+                .ok_or_else(|| DeskError::Invalid(format!("no {what} has the id {id}")));
+        }
+        let lower = said.to_lowercase();
+        let exact: Vec<&&Account> = of
+            .iter()
+            .filter(|a| a.name.trim().to_lowercase() == lower)
+            .collect();
+        let found: Vec<&&Account> = match exact.len() {
+            0 if !lower.is_empty() => of
+                .iter()
+                .filter(|a| a.name.to_lowercase().contains(&lower))
+                .collect(),
+            _ => exact,
+        };
+        let named = |list: &[&&Account]| -> String {
+            list.iter()
+                .map(|a| format!("{} ({}, {})", a.name, a.engine.title(), a.id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        match found[..] {
+            [one] => Ok(one.id),
+            [] if of.is_empty() => Err(DeskError::Invalid(format!("there are no {what}s"))),
+            [] => Err(DeskError::Invalid(format!(
+                "there is no {what} called {said}; there are {}",
+                named(&of.iter().collect::<Vec<_>>())
+            ))),
+            _ => Err(DeskError::Invalid(format!(
+                "“{said}” could be {}: say which by its full name or id",
+                named(&found)
+            ))),
+        }
     }
 
     /// The token a session's account signs its CLI in with, read from the
@@ -1651,7 +1713,11 @@ impl Desk {
                     .into(),
             ));
         }
-        if let Some(to) = to {
+        // Never onto a login that can't serve: probed first. Staying on its
+        // own, its sign-in is still read.
+        if r.account != to {
+            self.verify_login(to).await?;
+        } else if let Some(to) = to {
             let a = self.account(to)?;
             self.read_token(&a).await?;
         }
@@ -1706,7 +1772,8 @@ impl Desk {
                 // the reply's words only when it said nothing.
                 let hit_limit = matches!(r.state, SessionState::Done | SessionState::Idle)
                     && match st.turn_failures.get(&id) {
-                        Some(f) => f.limit().is_some(),
+                        // Its login turned away, it can't go on there either.
+                        Some(f) => f.limit().is_some() || f.refused(),
                         None => r
                             .last_reply
                             .as_deref()
@@ -1756,11 +1823,13 @@ impl Desk {
                 }
             }
             let from = r.account;
-            {
+            // Why Desk moved it, when it did: told as it goes on.
+            let note = {
                 let mut st = self.0.state.lock();
                 st.switches.remove(&id);
                 st.switch_by.remove(&id);
-            }
+                st.switch_notes.remove(&id)
+            };
             self.change(id, |r, _| r.account = to);
             {
                 // A removed account's name is kept only while something is on it.
@@ -1779,8 +1848,18 @@ impl Desk {
                     self.restart(id, None, by.clone()).await?;
                 }
                 SwitchWhen::NowWithContinue => {
-                    self.restart(id, Some(accounts::CONTINUE.into()), by.clone())
-                        .await?;
+                    let prompt = match note {
+                        // What it ran is named first, when Desk knew of it
+                        // ([`crate::background::CutOff`]).
+                        Some(note) if running > 0 => format!("{note} Carry on."),
+                        Some(note) => format!(
+                            "{note} Anything you had running in the background (subagents, \
+                             shells) stopped: check what each was doing, restart what you \
+                             still need, then carry on."
+                        ),
+                        None => accounts::CONTINUE.into(),
+                    };
+                    self.restart(id, Some(prompt), by.clone()).await?;
                 }
             }
             // A switch asked for while it restarted: carried out next.
@@ -1940,20 +2019,27 @@ fn refused_needs(st: &super::State) -> Vec<accounts::AccountNeed> {
         .filter(|a| a.engine == Engine::Claude)
         .collect();
     ordered.sort_by_key(|a| !a.is_default);
+    let now = Utc::now();
+    let used = Desk::plans_used(&Desk::effective_standing(st), now);
     let mut out: Vec<accounts::AccountNeed> = st
         .refused
         .iter()
         .filter_map(|(id, refused)| {
             let account = st.accounts.iter().find(|a| a.id == *id)?;
-            let using = ordered
+            let room: Vec<Option<Uuid>> = ordered
                 .iter()
-                .find(|a| {
+                .filter(|a| {
                     a.id != *id
                         && st.signed_in_accounts.contains(&a.id)
                         && !st.sign_in_problems.contains_key(&a.id)
-                        && !st.refused.contains_key(&a.id)
+                        && !Desk::refused_now(st, a.id, now)
                         && Desk::full_now(st, Some(a.id)).is_none()
                 })
+                .map(|a| Some(a.id))
+                .collect();
+            let using = accounts::with_headroom(&room, &used)
+                .flatten()
+                .and_then(|to| ordered.iter().find(|a| a.id == to))
                 .map(|a| accounts::Side {
                     id: Some(a.id),
                     name: a.name.clone(),
@@ -2017,6 +2103,8 @@ impl Desk {
                 on.entry(side).or_default().push(r.id);
             }
         }
+        let now = Utc::now();
+        let used = Self::plans_used(&standing, now);
         let needs = accounts::needs(
             Engine::Claude,
             &st.accounts,
@@ -2024,12 +2112,15 @@ impl Desk {
             &on,
             &moved_off,
             own_signed_in,
+            // Never onto one the provider turns away until it is re-checked.
             &st.signed_in_accounts
                 .iter()
                 .filter(|id| !st.sign_in_problems.contains_key(id))
+                .filter(|id| !Self::refused_now(&st, **id, now))
                 .copied()
                 .collect(),
-            Utc::now(),
+            &used,
+            now,
         );
         let needs = Self::ask_which_sign_in(&st, own_on_plan, needs);
         let mut seen = std::collections::HashSet::new();
@@ -2295,33 +2386,14 @@ impl Desk {
         }
         self.keep_standing();
         if self.auto_switch() {
-            for n in &needs {
-                if let accounts::AccountNeed::Limit {
-                    engine, from, to, ..
-                } = n
-                {
-                    // Desk's own move, as the person set it to: never theirs.
-                    let by = By::desk(&format!(
-                        "{} reached its plan's limit, so Desk moved its sessions to {}",
-                        from.name, to.name
-                    ));
-                    match self.switch_all(*engine, from.id, to.id, by).await {
-                        Ok(done) => tracing::info!(
-                            moved = done.now.len() + done.after_turn.len(),
-                            "sessions moved off an account at its limit"
-                        ),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "couldn't move sessions off an account at its limit")
-                        }
-                    }
-                }
-            }
+            // Desk's own moves, as the person set it to: never theirs.
+            self.fail_over().await;
         }
         self.announce_accounts();
     }
 
     /// Every need, those put off too.
-    fn account_needs_all(&self) -> Vec<accounts::AccountNeed> {
+    pub(super) fn account_needs_all(&self) -> Vec<accounts::AccountNeed> {
         let put_off = std::mem::take(&mut self.0.state.lock().put_off);
         let needs = self.account_needs();
         self.0.state.lock().put_off = put_off;
@@ -2343,10 +2415,9 @@ impl Desk {
         }
         if let Some(to) = to {
             self.account_for(engine, Some(Some(to)))?;
-            // Its sign-in must read before any session is stopped.
-            let a = self.account(to)?;
-            self.read_token(&a).await?;
         }
+        // It must serve before any session is stopped: probed first.
+        self.verify_login(to).await?;
         let (ids, full) = {
             let st = self.0.state.lock();
             let ids: Vec<(Uuid, bool, bool)> = st

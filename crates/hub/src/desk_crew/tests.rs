@@ -989,6 +989,7 @@ async fn a_restart_that_stopped_work_wakes_the_boss() {
             reason: None,
             suggestion_id: None,
             hop: 0,
+            preference: None,
         };
         assert!(
             crew.trigger_for(&restarted(by_it, Some(1)), "desk", &o)
@@ -1970,6 +1971,7 @@ mod directives;
 mod items;
 mod learning;
 mod left_alone;
+mod logins;
 mod one_mind;
 mod one_picture;
 mod preferences;

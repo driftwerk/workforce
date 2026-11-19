@@ -27,8 +27,9 @@ use super::CrewHub;
 
 /// Every `crew.*` tool: the ones it has at every level first (its reads,
 /// and what it asks of the person, which is never gated).
-pub const READ: [&str; 23] = [
+pub const READ: [&str; 24] = [
     "crew.overview",
+    LOGINS,
     "crew.activity",
     "crew.account",
     super::decisions::NAME,
@@ -52,7 +53,7 @@ pub const READ: [&str; 23] = [
     super::watches::WATCH,
     super::watches::WATCHES,
 ];
-pub const ACT: [&str; 24] = [
+pub const ACT: [&str; 25] = [
     "crew.nudge",
     "crew.ask_session",
     "crew.escalate",
@@ -75,9 +76,15 @@ pub const ACT: [&str; 24] = [
     super::handover::NAME,
     "crew.handoff",
     "crew.set_mode",
+    SWITCH_LOGIN,
     super::own_settings::NAME,
     super::assignments::CLOSE,
 ];
+
+/// The person's logins (engine accounts), each with what runs on it.
+pub const LOGINS: &str = "crew.logins";
+/// Move a session to another of the person's logins.
+pub const SWITCH_LOGIN: &str = "crew.switch_login";
 
 pub struct CrewTool {
     name: &'static str,
@@ -246,10 +253,11 @@ fn row(i: &Item, charged: &Charged) -> String {
         format!("{} ({})", i.name, also.join(", "))
     };
     format!(
-        "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+        "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
         cell(&who),
         kind,
         i.id,
+        cell(i.login.as_deref().unwrap_or("")),
         state_word(i.state),
         cell(i.task.as_deref().unwrap_or("")),
         cell(&detail),
@@ -261,7 +269,7 @@ fn row(i: &Item, charged: &Charged) -> String {
 /// The overview as tables the overseer reads and can act from: one per
 /// sidebar group, in the person's order, then whatever is in none.
 fn table(items: &[Item], groups: &[String], charged: &Charged) -> String {
-    const HEAD: &str = "| Who | Kind | Id | State | Doing | Detail | Since | You run it |\n|---|---|---|---|---|---|---|---|\n";
+    const HEAD: &str = "| Who | Kind | Id | Login | State | Doing | Detail | Since | You run it |\n|---|---|---|---|---|---|---|---|---|\n";
     let mut out = String::new();
     let mut section = |title: Option<&str>, rows: Vec<&Item>| {
         if rows.is_empty() {
@@ -429,6 +437,7 @@ impl CrewTool {
                 crew.session_seen(id, seen)?;
                 self.account(crew, id, input["question"].as_str()).await
             }
+            LOGINS => Ok(crew.logins_seen(seen)),
             super::spend::NAME => crew.spend(input, seen).await,
             super::assignments::LIST => {
                 crew.assignments_tool(b.service.agent_id.as_str(), input)
@@ -575,6 +584,31 @@ impl CrewTool {
             // Whose settings are its own, never another's it names.
             if self.name == super::own_settings::NAME {
                 o.insert("agent_id".into(), json!(b.service.agent_id.as_str()));
+            }
+        }
+        // A login is named as the person calls it, or by its id: read here
+        // into its id, case aside, never guessed between two.
+        if let Some(o) = kept.as_object_mut() {
+            let field = match self.name {
+                SWITCH_LOGIN => Some("login"),
+                "crew.handoff" => Some("account"),
+                _ => None,
+            };
+            if let Some(field) = field {
+                let said = o
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && *s != "own")
+                    .map(str::to_string);
+                if let Some(said) = said {
+                    let id = crew.desk.login_named(None, &said).map_err(|e| match e {
+                        workforce_desk::DeskError::Invalid(why)
+                        | workforce_desk::DeskError::Conflict(why) => why,
+                        e => e.to_string(),
+                    })?;
+                    o.insert(field.into(), json!(id.to_string()));
+                }
             }
         }
         let mut action = Action::parse(self.name, &kept)?;
@@ -887,7 +921,7 @@ impl CrewTool {
 /// own words, the same whether its crew is here or on a linked engine.
 pub(crate) fn describe(name: &str) -> &'static str {
     match name {
-            "crew.overview" => "Everyone on the crew now: the person's agents and their Claude Code and Codex sessions, each with its state (needs you, working, quiet, done today, idle, failed, stopped), what it's doing, what it asks (with approval ids), since when, and whether you run it for the person (and whether they are driving it now). slots says how many of the sessions you run are starting or working, of the most you may run at once. For what sessions spent (tokens, cost), use crew.spend.",
+            "crew.overview" => "Everyone on the crew now: the person's agents and their Claude Code and Codex sessions, each with its state (needs you, working, quiet, done today, idle, failed, stopped), what it's doing, what it asks (with approval ids), since when, which of the person's logins it runs on (its Login), and whether you run it for the person (and whether they are driving it now). slots says how many of the sessions you run are starting or working, of the most you may run at once. For what sessions spent (tokens, cost), use crew.spend.",
             super::spend::NAME => super::spend::DESCRIPTION,
             super::github::PR | super::github::BRANCH | super::github::CI => {
                 super::github::describe(name)
@@ -932,8 +966,10 @@ pub(crate) fn describe(name: &str) -> &'static str {
             "crew.move_ticket" => "Move a ticket on the board (ticket, its key like ACM-12) to a column (state): backlog, todo, doing, review or done. Dropping a ticket is always the person's call, so it becomes a suggestion for them.",
             "crew.take_on" => "Run a session for the person (session_id): it wakes you each time its turn ends, so you can tell it the next step. You take it on yourself only when the person lets you take on every session; otherwise this offers it to them. The person can take over any time by typing in it; it is theirs while they are active there (a couple of minutes after their last input, unless they pin it), and your messages wait until then.",
             "crew.release" => "Let a session you run go (session_id): the person runs it on their own, and its turn ends no longer wake you. Say why in reason.",
+            LOGINS => "The person's logins for each engine (their Claude accounts, as Desk keeps them): each one's name, provider, id, whether it is the default, whether its sign-in can be used, how far into its plan's windows it was last read and when they reset, whether it is at its limit or turned away by the provider (and why, and until when), and which sessions run on it. Name a login by its name or id in crew.switch_login and crew.handoff.",
+            SWITCH_LOGIN => "Move a Desk session (session_id) to another of the person's logins of the same provider (login: its name or id from crew.logins), its conversation kept: Desk checks first that the login serves, then starts the session again in place on it (one whose turn stopped on its old login's limit is told why and carries on; one working moves once its turn and the work it left running end). Use it when a session's login is at its limit or turned away and Desk hasn't moved it already; Desk never moves a session to another provider's login. Say why in reason.",
             "crew.set_mode" => "Change a Desk session's permission mode (session_id, mode): default (manual: it asks), acceptEdits, plan, auto (it decides what is safe) or bypassPermissions (it asks for nothing). Desk starts it again in place in that mode, its conversation kept, and says the mode it now runs in. Set it between turns, never while it works or waits on an answer: auto before routine work, default before work that will need your judgement. auto and bypassPermissions are for an unbound overseer only, on a session it runs (take it on first), and end with unbound: once you aren't unbound or don't run it, it starts in its own mode again, as it does when the person resumes it. Below unbound, only default, acceptEdits and plan, where the person switched it on.",
-            "crew.handoff" => "Suggest the person continue a session's work in another engine (session_id; engine: claude or codex; account optional): Desk starts a session of that engine in the same folder and group with a brief of the work, and the two become one piece of work. It is only ever a suggestion the person accepts, because the brief goes to that engine's vendor, and only when they have switched it on for you.",
+            "crew.handoff" => "Suggest the person continue a session's work in another engine (session_id; engine: claude or codex; account optional: a login's name or id from crew.logins): Desk starts a session of that engine in the same folder and group with a brief of the work, and the two become one piece of work. It is only ever a suggestion the person accepts, because the brief goes to that engine's vendor, and only when they have switched it on for you.",
             _ => "",
         }
 }
@@ -1051,6 +1087,14 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
             .collect(),
             &["session_id"],
         ),
+        LOGINS => json!({ "type": "object", "properties": {} }),
+        SWITCH_LOGIN => act(
+            props(json!({
+                "session_id": session_schema(),
+                "login": { "type": "string", "description": "The login to move it to: its name (\"Kingsley Gmail\", case aside) or id, from crew.logins" }
+            })),
+            &["session_id", "login"],
+        ),
         "crew.set_mode" => act(
             props(json!({
                 "session_id": session_schema(),
@@ -1062,7 +1106,7 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
             props(json!({
                 "session_id": session_schema(),
                 "engine": { "type": "string", "enum": ["claude", "codex"], "description": "The engine to continue in" },
-                "account": { "type": "string", "description": "Optional: an account's id from crew.overview, or \"own\" for the engine's own sign-in on this computer; the engine's default when left out" }
+                "account": { "type": "string", "description": "Optional: a login's name or id from crew.logins, or \"own\" for the engine's own sign-in on this computer; the engine's default when left out" }
             })),
             &["session_id", "engine"],
         ),
@@ -1212,6 +1256,7 @@ mod tests {
             group_id: group.map(Into::into),
             engine: Some(Engine::Claude),
             origin: Some(Origin::Desk),
+            login: Some("Kingsley Gmail".into()),
             state: ItemState::Working,
             task: None,
             detail: None,
@@ -1248,5 +1293,11 @@ mod tests {
         assert!(t[rest..].contains("| auth-fix (in /Users/k/dev/monorepo) |"));
         assert!(t.contains("| yes · the person is driving |\n"), "{t}");
         assert!(t[rest..].trim_end().ends_with("|  |"), "{t}");
+        // Each session's login, by its name.
+        assert!(t.contains("| Login |"), "{t}");
+        assert!(
+            t.contains("| id-auth-fix | Kingsley Gmail | working |"),
+            "{t}"
+        );
     }
 }

@@ -770,7 +770,7 @@ impl Standing {
     }
 
     /// The last stop on the limit, while it still counts ([`Self::counts`]).
-    fn live_hit(&self) -> Option<DateTime<Utc>> {
+    pub fn live_hit(&self) -> Option<DateTime<Utc>> {
         self.hit_at.filter(|at| self.counts(*at))
     }
 }
@@ -787,6 +787,16 @@ impl Standing {
     /// inside: not said).
     pub fn full(&self, now: DateTime<Utc>) -> Option<Option<DateTime<Utc>>> {
         self.full_by(now).map(|f| f.until)
+    }
+
+    /// How far into its fullest plan window (5-hour or weekly) it was as
+    /// last read, in percent, for a window not yet reset: none read.
+    pub fn plan_used(&self, now: DateTime<Utc>) -> Option<f64> {
+        self.windows
+            .iter()
+            .filter(|w| w.minutes <= PLAN_WINDOW_MAX && w.resets_at.is_none_or(|r| r > now))
+            .map(|w| w.used_percent)
+            .reduce(f64::max)
     }
 
     /// The plan window the readings show at 100% and not yet reset,
@@ -1078,6 +1088,71 @@ pub fn side_key(id: Option<Uuid>) -> String {
     id.map_or_else(|| "own".to_string(), |id| id.simple().to_string())
 }
 
+/// How far into a plan window a login is, in percent, past which a move
+/// takes it last: the plan-usage guard's threshold, where background work
+/// on a login is paused. A login past it is still better than none.
+pub const HEADROOM_GUARD: f64 = 80.0;
+
+/// Of the logins with room (`room`, in the order a switch takes them), the
+/// one a move takes: the first under [`HEADROOM_GUARD`] in every plan
+/// window as last read (`used`; none read counts as under), else the first.
+pub fn with_headroom(
+    room: &[Option<Uuid>],
+    used: &std::collections::HashMap<Option<Uuid>, f64>,
+) -> Option<Option<Uuid>> {
+    room.iter()
+        .find(|side| used.get(side).is_none_or(|u| *u < HEADROOM_GUARD))
+        .or(room.first())
+        .copied()
+}
+
+/// What a one-word probe of a login said ([`claude_probe_said`]): whether
+/// it serves a call now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Probe {
+    /// It answered.
+    Serves,
+    /// It is at its plan's limit.
+    Full,
+    /// The provider refused the account itself, in plain words.
+    Refused(&'static str),
+    /// It didn't answer, and why.
+    Failed(String),
+}
+
+/// What `claude -p --output-format json` printed for a probe: its result's
+/// words decide, a limit or a refusal of the account named as such, any
+/// other error a failure, and an answer that it serves.
+pub fn claude_probe_said(out: &str) -> Probe {
+    #[derive(Deserialize)]
+    struct Said {
+        #[serde(default)]
+        is_error: bool,
+        #[serde(default)]
+        result: Option<String>,
+    }
+    let said: Option<Said> = out
+        .lines()
+        .rev()
+        .find_map(|l| serde_json::from_str(l.trim()).ok())
+        .or_else(|| serde_json::from_str(out.trim()).ok());
+    let (is_error, words) = match said {
+        Some(s) => (s.is_error, s.result.unwrap_or_default()),
+        None => (true, out.trim().to_string()),
+    };
+    if crate::limit::says_plan_limit(&words) {
+        return Probe::Full;
+    }
+    if let Some(why) = workforce_common::usage::claude_account_refusal(&words) {
+        return Probe::Refused(why);
+    }
+    match (is_error, words.trim()) {
+        (false, w) if !w.is_empty() => Probe::Serves,
+        (_, "") => Probe::Failed("Claude Code didn't answer".into()),
+        (_, w) => Probe::Failed(w.chars().take(200).collect()),
+    }
+}
+
 /// The account needs, from what Desk read of each account's plan.
 /// `on` is the running sessions on each side; `own_signed_in` whether the
 /// CLI's own sign-in is a plan this computer can switch to.
@@ -1089,6 +1164,7 @@ pub fn needs(
     moved_off: &[MovedOff],
     own_signed_in: bool,
     usable: &std::collections::HashSet<Uuid>,
+    used: &std::collections::HashMap<Option<Uuid>, f64>,
     now: DateTime<Utc>,
 ) -> Vec<AccountNeed> {
     // Only an account whose sign-in reads can be moved to.
@@ -1116,15 +1192,17 @@ pub fn needs(
         if sessions.is_empty() {
             continue;
         }
-        match sides
+        let room: Vec<Option<Uuid>> = sides
             .iter()
-            .find(|to| *to != from && full(to).is_none() && takes(to))
-        {
+            .filter(|to| *to != from && full(to).is_none() && takes(to))
+            .copied()
+            .collect();
+        match with_headroom(&room, used) {
             Some(to) => out.push(AccountNeed::Limit {
-                id: format!("limit:{}:{}", side_key(*from), side_key(*to)),
+                id: format!("limit:{}:{}", side_key(*from), side_key(to)),
                 engine,
                 from: Side::of(accounts, *from),
-                to: Side::of(accounts, *to),
+                to: Side::of(accounts, to),
                 sessions,
                 resets_at,
             }),
@@ -1164,6 +1242,44 @@ pub fn needs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_move_takes_the_first_login_under_the_guard_else_the_first_with_room() {
+        let (a, b, c) = (Some(Uuid::new_v4()), Some(Uuid::new_v4()), None);
+        let used: std::collections::HashMap<Option<Uuid>, f64> =
+            [(a, 91.0), (b, 40.0)].into_iter().collect();
+        assert_eq!(with_headroom(&[a, b, c], &used), Some(b));
+        // Never read: under it.
+        assert_eq!(with_headroom(&[a, c], &used), Some(c));
+        // Every one past it: still the first, better than none.
+        let past: std::collections::HashMap<Option<Uuid>, f64> =
+            [(a, 95.0), (b, 85.0)].into_iter().collect();
+        assert_eq!(with_headroom(&[a, b], &past), Some(a));
+        assert_eq!(with_headroom(&[], &past), None);
+    }
+
+    #[test]
+    fn a_probe_is_read_from_what_claude_code_printed() {
+        let ok = r#"{"type":"result","subtype":"success","is_error":false,"result":"OK"}"#;
+        assert_eq!(claude_probe_said(ok), Probe::Serves);
+        let refused = r#"{"type":"result","subtype":"success","is_error":true,"result":"Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access"}"#;
+        assert_eq!(
+            claude_probe_said(refused),
+            Probe::Refused("its organisation has turned off Claude Code access")
+        );
+        let full = r#"{"type":"result","is_error":true,"result":"You've hit your weekly limit · resets 4pm (Europe/London)"}"#;
+        assert_eq!(claude_probe_said(full), Probe::Full);
+        assert!(matches!(
+            claude_probe_said(r#"{"type":"result","is_error":true,"result":"API Error: 500"}"#),
+            Probe::Failed(_)
+        ));
+        assert!(matches!(claude_probe_said(""), Probe::Failed(_)));
+        // Plain words, as an older CLI may print them.
+        assert_eq!(
+            claude_probe_said("Your account is on hold"),
+            Probe::Refused("the account is on hold")
+        );
+    }
 
     #[test]
     fn only_a_claude_page_coming_back_to_a_localhost_callback_is_direct() {
@@ -1635,6 +1751,78 @@ mod tests {
     }
 
     #[test]
+    fn a_full_login_moves_only_to_one_of_its_own_provider_and_first_to_one_with_headroom() {
+        use std::collections::HashMap;
+        let at = |m: i64| chrono::DateTime::from_timestamp(m * 60, 0).unwrap();
+        let account = |name: &str, engine, is_default| Account {
+            id: Uuid::new_v4(),
+            engine,
+            name: name.into(),
+            is_default,
+            created_at: at(0),
+        };
+        let apple = account("Kingsley Apple", Engine::Claude, true);
+        let codex = account("Kingsley ChatGPT", Engine::Codex, false);
+        let on = HashMap::from([(Some(apple.id), vec![Uuid::new_v4()])]);
+        let full = HashMap::from([(Some(apple.id), standing(&[(100.0, Some(900))], 100, None))]);
+        let usable: std::collections::HashSet<Uuid> = [apple.id, codex.id].into();
+        // Another provider's login is never a move's.
+        let n = needs(
+            Engine::Claude,
+            &[apple.clone(), codex.clone()],
+            &full,
+            &on,
+            &[],
+            false,
+            &usable,
+            &Default::default(),
+            at(200),
+        );
+        assert!(
+            n.iter().all(|n| !matches!(n, AccountNeed::Limit { .. })),
+            "{n:?}"
+        );
+        // Of two of its own with room, the one under the guard, though the
+        // other comes first.
+        let busy = account("Kingsley Starmoire", Engine::Claude, false);
+        let gmail = account("Kingsley Gmail", Engine::Claude, false);
+        let usable: std::collections::HashSet<Uuid> = [apple.id, busy.id, gmail.id].into();
+        let used = HashMap::from([(Some(busy.id), 92.0), (Some(gmail.id), 30.0)]);
+        let n = needs(
+            Engine::Claude,
+            &[apple.clone(), busy.clone(), gmail.clone()],
+            &full,
+            &on,
+            &[],
+            false,
+            &usable,
+            &used,
+            at(200),
+        );
+        let [AccountNeed::Limit { to, .. }] = &n[..] else {
+            panic!("{n:?}");
+        };
+        assert_eq!(to.name, "Kingsley Gmail");
+        // One left out of `usable` (turned away) is never moved to.
+        let usable: std::collections::HashSet<Uuid> = [apple.id, busy.id].into();
+        let n = needs(
+            Engine::Claude,
+            &[apple, busy, gmail],
+            &full,
+            &on,
+            &[],
+            false,
+            &usable,
+            &used,
+            at(200),
+        );
+        let [AccountNeed::Limit { to, .. }] = &n[..] else {
+            panic!("{n:?}");
+        };
+        assert_eq!(to.name, "Kingsley Starmoire");
+    }
+
+    #[test]
     fn a_full_account_asks_to_move_its_sessions_to_one_with_room_and_back_once_it_resets() {
         use std::collections::HashMap;
         let at = |m: i64| chrono::DateTime::from_timestamp(m * 60, 0).unwrap();
@@ -1659,6 +1847,7 @@ mod tests {
             &[],
             false,
             &all_usable,
+            &Default::default(),
             at(200),
         );
         assert_eq!(n.len(), 1);
@@ -1686,6 +1875,7 @@ mod tests {
             &[],
             false,
             &all_usable,
+            &Default::default(),
             at(200)
         )
         .is_empty());
@@ -1705,6 +1895,7 @@ mod tests {
             &[],
             false,
             &all_usable,
+            &Default::default(),
             at(200),
         );
         assert!(
@@ -1726,6 +1917,7 @@ mod tests {
             &moved,
             false,
             &all_usable,
+            &Default::default(),
             at(1000),
         );
         assert!(
@@ -1743,6 +1935,7 @@ mod tests {
             &[],
             false,
             &all_usable,
+            &Default::default(),
             at(200)
         )
         .is_empty());
@@ -1754,6 +1947,7 @@ mod tests {
             &[],
             true,
             &all_usable,
+            &Default::default(),
             at(200),
         );
         assert!(
