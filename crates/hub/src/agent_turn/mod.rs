@@ -482,19 +482,18 @@ fn worker_full_notice(misses: &[RouteMiss], personal_only: bool) -> Option<Strin
 }
 
 /// The line a served turn ends with when the person's own route could not
-/// take it and the hub's routes did: brief, and only what they need to know.
-/// The agent's own failover stays as quiet as it always was.
+/// take it for want of a workspace on a full coding worker and the hub's
+/// routes did: brief, and only what they need to know. Every other hand-over
+/// (no login of hers, her plan at its limit, the agent's own failover) stays
+/// as quiet as it always was, so a standing setup never closes each answer
+/// with the same line.
 fn fallback_note(misses: &[RouteMiss]) -> Option<String> {
     let miss = misses
         .iter()
-        .find(|miss| miss.plan.is_some_and(|(_, personal)| personal))?;
+        .find(|miss| miss.worker_full && miss.plan.is_some_and(|(_, personal)| personal))?;
     let plan = whose(miss.plan?);
-    let why = match miss.worker_full {
-        true => " (the coding worker was full)",
-        false => "",
-    };
     Some(format!(
-        "\n\n_{plan} couldn't take this{why}, so the hub's models answered._"
+        "\n\n_{plan} couldn't take this right now (the coding worker was full), so the hub's models answered._"
     ))
 }
 

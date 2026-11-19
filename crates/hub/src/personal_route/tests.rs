@@ -78,12 +78,6 @@ async fn choose_here(hub: &Hub, store: &MemoryRouteStore, person: &str, route: A
     hub.service.subscriptions().personal_routes().forget(person);
 }
 
-/// The agent's answer, closed by the line saying her own `plan` couldn't
-/// take the turn and the hub's models answered it.
-fn fell_back(plan: &str) -> String {
-    format!("{SKY}\n\n_Your {plan} plan couldn't take this, so the hub's models answered._")
-}
-
 /// A Claude login the agent shares with everyone.
 fn shared_claude_login(hub: &Hub) {
     hub.service
@@ -242,10 +236,7 @@ async fn without_her_login_hub_falls_back_to_the_agents_route() {
     hub.chatgpt_login(ALICE).await;
     choose(&hub, &store, ALICE, Some(claude(RouteFallback::Hub))).await;
 
-    assert_eq!(
-        hub.ask(ALICE, "why is the sky blue?").await.unwrap(),
-        fell_back("Claude")
-    );
+    assert_eq!(hub.ask(ALICE, "why is the sky blue?").await.unwrap(), SKY);
     assert!(hub.claude.calls().is_empty(), "not on the shared login");
 }
 
@@ -402,10 +393,7 @@ async fn at_her_plans_limit_hub_answers_on_the_agents_route() {
     choose(&hub, &store, ALICE, Some(claude(RouteFallback::Hub))).await;
     hub.claude.reply(None, &rejected());
 
-    assert_eq!(
-        hub.ask(ALICE, "why is the sky blue?").await.unwrap(),
-        fell_back("Claude")
-    );
+    assert_eq!(hub.ask(ALICE, "why is the sky blue?").await.unwrap(), SKY);
     assert_eq!(hub.claude.calls().len(), 1);
     assert_eq!(hub.chatgpt_requests().await, 1);
 }
@@ -443,10 +431,7 @@ async fn hub_hands_over_a_failure_before_output_but_never_one_after() {
     );
 
     hub.claude.script(None, "exit 1\n");
-    assert_eq!(
-        hub.ask(ALICE, "why is the sky blue?").await.unwrap(),
-        fell_back("Claude")
-    );
+    assert_eq!(hub.ask(ALICE, "why is the sky blue?").await.unwrap(), SKY);
     assert_eq!(hub.claude.calls().len(), 2);
     assert_eq!(hub.chatgpt_requests().await, 1, "handed over before output");
 }
@@ -811,10 +796,7 @@ async fn off_the_worker_hub_runs_her_turn_on_the_agents_route() {
     hub.chatgpt_login(ALICE).await;
     choose(&hub, &store, ALICE, Some(codex(RouteFallback::Hub))).await;
 
-    assert_eq!(
-        hub.ask(ALICE, "why is the sky blue?").await.unwrap(),
-        fell_back("ChatGPT")
-    );
+    assert_eq!(hub.ask(ALICE, "why is the sky blue?").await.unwrap(), SKY);
     assert_eq!(hub.codex.runs(), 0);
 }
 
@@ -1074,8 +1056,8 @@ async fn on_a_full_worker_with_hub_her_turn_runs_on_the_hubs_models_and_says_so(
 
     let (events, run) = hub.stream(ALICE, "why is the sky blue?", None, None).await;
 
-    let note = "\n\n_Your Claude plan couldn't take this (the coding worker was full), \
-                so the hub's models answered._";
+    let note = "\n\n_Your Claude plan couldn't take this right now (the coding worker was \
+                full), so the hub's models answered._";
     assert_eq!(run.unwrap().response, format!("{SKY}{note}"));
     assert!(
         events
