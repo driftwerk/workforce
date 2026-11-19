@@ -509,14 +509,25 @@ impl Containers for HostContainers {
     async fn stop(&self, container: &ContainerId) -> Result<()> {
         // A graceful stop first; whatever it does, the forced removal below
         // is what says the container is gone.
-        if let Err(error) = run(
+        match run(
             "docker",
             &strings(["stop", "-t", &STOP_GRACE_SECS.to_string(), &container.0]),
             60,
         )
         .await
         {
-            tracing::warn!(container = %container.0, %error, "stopping a container failed; removing it by force");
+            Ok(stopped) if stopped.success() => {}
+            Ok(stopped) => tracing::warn!(
+                container = %container.0,
+                exit = stopped.exit_code(),
+                stderr = stopped.stderr.trim(),
+                "stopping a container failed; removing it by force"
+            ),
+            Err(error) => tracing::warn!(
+                container = %container.0,
+                %error,
+                "stopping a container failed; removing it by force"
+            ),
         }
         // `-v` takes the container's anonymous volumes with it; without it
         // each removed scope leaves the image's declared volumes behind.

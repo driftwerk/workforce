@@ -7,6 +7,7 @@
 //! with in-memory fakes; the real ports shell out through the execution core
 //! or call the GitHub API.
 
+pub mod admission;
 pub mod backup;
 pub mod bridge;
 pub mod config;
@@ -19,6 +20,7 @@ pub mod refresh;
 pub mod scopes;
 pub mod serve;
 pub mod state;
+pub mod weight;
 
 #[cfg(test)]
 pub(crate) mod fakes;

@@ -23,7 +23,25 @@ pub struct WorkerConfig {
     pub toolbox_image_file: PathBuf,
     #[serde(default)]
     pub registry_mirror: Option<String>,
+    /// The most scopes at once; with `max_light_scopes`, the most full ones
+    /// (those checking repos out).
     pub max_scopes: u32,
+    /// The most light scopes (those with no repos: agent turns) at once; 0,
+    /// the default, counts them against `max_scopes` as full ones are.
+    #[serde(default)]
+    pub max_light_scopes: u32,
+    /// Admission by the host's memory and CPU headroom on top of the
+    /// ceilings; unset, the ceilings alone decide.
+    #[serde(default)]
+    pub admission: Option<AdmissionConfig>,
+    /// Whether a scope starts at seat only the services it needs: none for a
+    /// scope with no repos, a golden's `services` for one with repos. The
+    /// rest are left to start on first use, which needs a toolbox image whose
+    /// toolbox-init reads `TOOLBOX_LAZY_SERVICES`; turn this on only once the
+    /// deployed image does. Off, the default, every scope starts every
+    /// service, as before.
+    #[serde(default)]
+    pub lazy_services: bool,
     pub pool_free_floor_gib: u64,
     pub scope_memory_gib: u32,
     pub scope_cpus: u32,
@@ -57,6 +75,20 @@ fn default_max_golden_age_hours() -> u32 {
     36
 }
 
+/// `[worker.admission]`: what each scope is charged against the host's
+/// memory, the memory that must stay free, and the CPU pressure past which
+/// no scope is seated.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct AdmissionConfig {
+    pub full_reserve_gib: u32,
+    pub light_reserve_gib: u32,
+    pub memory_floor_gib: u32,
+    /// The highest PSI `cpu some avg10`, in percent, a new scope is seated
+    /// at; unset, CPU is not checked.
+    #[serde(default)]
+    pub cpu_pressure_max: Option<f64>,
+}
+
 /// Where secrets are read and bucket images stored: SSM and S3 through
 /// `aws`, or Secret Manager and GCS through `gcloud`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -85,6 +117,13 @@ pub struct GoldenConfig {
     /// Paths on `branch` whose change makes the golden stale.
     #[serde(default)]
     pub watch: Vec<String>,
+    /// With `lazy_services`, the services a scope checking this repo out
+    /// starts with it, by name (`mysql`, `postgres`, `redis`, `ministack`);
+    /// unset, every configured one. The others start on first use. It must
+    /// cover what `install` and a repo's setup need at seat, as they run
+    /// before anything else in the scope.
+    #[serde(default)]
+    pub services: Option<Vec<String>>,
 }
 
 /// A stateless service toolbox-init can start on loopback.
@@ -154,6 +193,9 @@ pub struct SecretsConfig {
 struct WorkerFile {
     worker: WorkerConfig,
 }
+
+/// The most scopes one worker may be configured for, of both weights.
+pub const MAX_SCOPES_CEILING: u32 = 500;
 
 /// The dataset under the pool that holds the agent's home for every scope.
 pub const HOME_GOLDEN: &str = "home";
@@ -258,6 +300,24 @@ impl WorkerConfig {
                 bail!("[worker] {key} must be at least 1");
             }
         }
+        if self.max_scopes.saturating_add(self.max_light_scopes) > MAX_SCOPES_CEILING {
+            bail!(
+                "[worker] max_scopes and max_light_scopes together must be at most {MAX_SCOPES_CEILING}"
+            );
+        }
+        if let Some(admission) = &self.admission {
+            if admission.full_reserve_gib == 0 || admission.light_reserve_gib == 0 {
+                bail!(
+                    "[worker.admission] full_reserve_gib and light_reserve_gib must be at least 1"
+                );
+            }
+            if admission
+                .cpu_pressure_max
+                .is_some_and(|max| !(0.0..=100.0).contains(&max))
+            {
+                bail!("[worker.admission] cpu_pressure_max is a percentage, 0 to 100");
+            }
+        }
         let mut services = std::collections::HashSet::new();
         if let Some(twice) = self.services.iter().find(|s| !services.insert(**s)) {
             bail!("[worker] services lists {:?} twice", twice.name());
@@ -346,7 +406,29 @@ impl WorkerConfig {
                 "[[worker.golden]] {name:?} watches lockfiles, which needs [worker.secrets] github_token"
             );
         }
+        let configured = self.service_names();
+        if let Some(service) = golden
+            .services
+            .iter()
+            .flatten()
+            .find(|service| !configured.contains(&service.as_str()))
+        {
+            bail!(
+                "[[worker.golden]] {name:?} services names {service:?}, which is not a configured service (configured: {})",
+                configured.join(", ")
+            );
+        }
         Ok(())
+    }
+
+    /// Every service a scope may run, as toolbox-init names them: the
+    /// databases, then the stateless services.
+    pub fn service_names(&self) -> Vec<&'static str> {
+        self.database
+            .iter()
+            .map(|database| database.kind.service())
+            .chain(self.services.iter().map(|service| service.name()))
+            .collect()
     }
 
     pub fn listen_addr(&self) -> SocketAddr {
@@ -396,6 +478,9 @@ pub(crate) mod tests {
             toolbox_image_file: "/etc/workforce/toolbox-image".into(),
             registry_mirror: Some("http://host.docker.internal:5000".into()),
             max_scopes: 2,
+            max_light_scopes: 0,
+            admission: None,
+            lazy_services: true,
             pool_free_floor_gib: 1,
             scope_memory_gib: 8,
             scope_cpus: 4,
@@ -412,6 +497,7 @@ pub(crate) mod tests {
                 secrets: vec!["RAILS_MASTER_KEY".into()],
                 env: BTreeMap::from([("TZ".into(), "Europe/London".into())]),
                 watch: vec!["Gemfile.lock".into()],
+                services: None,
             }],
             database: vec![
                 DatabaseConfig {
@@ -588,6 +674,23 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_golden_may_name_only_configured_services() {
+        let mut config = sample();
+        config.golden[0].services = Some(vec!["mysql".into(), "postgres".into()]);
+        assert!(config.validate().is_ok());
+        config.golden[0].services = Some(Vec::new());
+        assert!(config.validate().is_ok());
+        config.golden[0].services = Some(vec!["redis".into()]);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("\"redis\"") && error.contains("mysql, postgres"),
+            "{error}"
+        );
+        config.services = vec![Service::Redis];
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
     fn services_are_redis_or_ministack_each_at_most_once() {
         let mut config = sample();
         config.services = vec![Service::Redis, Service::Ministack];
@@ -669,6 +772,79 @@ scope_cpus = 4
 snapshot_retention_days = 7
 backup_pool = "backup"
 "#;
+
+    #[test]
+    fn admission_loads_from_its_table_and_is_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("worker.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "{}backup_bucket_prefix = \"s3://b/golden\"\n\
+                 [worker.admission]\nfull_reserve_gib = 3\nlight_reserve_gib = 1\nmemory_floor_gib = 6\ncpu_pressure_max = 80\n",
+                MINIMAL.replace("[worker]\n", "[worker]\nmax_light_scopes = 40\n")
+            ),
+        )
+        .unwrap();
+        let config = WorkerConfig::load(&path).unwrap_or_else(|e| panic!("{e:#}"));
+        assert_eq!(config.max_light_scopes, 40);
+        assert_eq!(
+            config.admission,
+            Some(AdmissionConfig {
+                full_reserve_gib: 3,
+                light_reserve_gib: 1,
+                memory_floor_gib: 6,
+                cpu_pressure_max: Some(80.0),
+            })
+        );
+
+        let mut config = sample();
+        assert!(config.admission.is_none() && config.max_light_scopes == 0);
+        config.admission = Some(AdmissionConfig {
+            full_reserve_gib: 3,
+            light_reserve_gib: 0,
+            memory_floor_gib: 6,
+            cpu_pressure_max: None,
+        });
+        assert!(config.validate().is_err());
+        config.admission = Some(AdmissionConfig {
+            light_reserve_gib: 1,
+            cpu_pressure_max: Some(180.0),
+            ..config.admission.clone().unwrap()
+        });
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn lazy_services_and_a_goldens_services_load_and_an_older_file_has_neither() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("worker.toml");
+        std::fs::write(
+            &path,
+            format!("{MINIMAL}backup_bucket_prefix = \"s3://b/golden\"\n"),
+        )
+        .unwrap();
+        let older = WorkerConfig::load(&path).unwrap();
+        assert!(!older.lazy_services, "off unless asked for");
+
+        let newer = MINIMAL.replace(
+            "[worker]\n",
+            "[worker]\nlazy_services = true\nservices = [\"redis\"]\n",
+        );
+        std::fs::write(
+            &path,
+            format!(
+                "{newer}backup_bucket_prefix = \"s3://b/golden\"\n\
+                 [[worker.golden]]\nname = \"web\"\nslug = \"acme/web\"\nbranch = \"main\"\nservices = []\n\
+                 [[worker.golden]]\nname = \"api\"\nslug = \"acme/api\"\nbranch = \"main\"\nservices = [\"redis\"]\n"
+            ),
+        )
+        .unwrap();
+        let newer = WorkerConfig::load(&path).unwrap_or_else(|e| panic!("{e:#}"));
+        assert!(newer.lazy_services);
+        assert_eq!(newer.golden[0].services, Some(Vec::new()));
+        assert_eq!(newer.golden[1].services, Some(vec!["redis".to_string()]));
+    }
 
     #[test]
     fn load_anchors_relative_paths_to_the_file() {
