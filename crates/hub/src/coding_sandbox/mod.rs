@@ -84,12 +84,15 @@ pub async fn ensure_with_wait<F>(
 where
     F: std::future::Future<Output = ()>,
 {
+    // On the runtime's clock, as the pauses are, so a wait is measured the
+    // same way it sleeps.
+    let deadline = tokio::time::Instant::from_std(deadline);
     let mut pause = CAPACITY_WAIT_MIN;
     let mut waited = false;
     loop {
         match launcher.ensure(spec).await {
             Err(e) if e.downcast_ref::<AtCapacity>().is_some() => {
-                let left = deadline.saturating_duration_since(Instant::now());
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if left.is_zero() {
                     return Err(e);
                 }
@@ -513,7 +516,7 @@ mod tests {
 
     async fn wait_for_a_seat(
         refusals: usize,
-        deadline: Instant,
+        deadline: tokio::time::Instant,
         cancel: Option<&CancellationToken>,
     ) -> (Result<Arc<dyn CodingSandbox>>, usize) {
         let project = Project::new("agent", "bench");
@@ -530,31 +533,39 @@ mod tests {
         let launcher = Refusing(std::sync::atomic::AtomicUsize::new(refusals));
         let waits = std::cell::Cell::new(0);
         let notice = &waits;
-        let seated = ensure_with_wait(&launcher, &spec, deadline, cancel, || async move {
-            notice.set(notice.get() + 1)
-        })
+        let seated = ensure_with_wait(
+            &launcher,
+            &spec,
+            deadline.into_std(),
+            cancel,
+            || async move { notice.set(notice.get() + 1) },
+        )
         .await;
         (seated, waits.get())
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_worker_at_capacity_is_waited_out_with_one_notice() {
-        let (seated, waits) =
-            wait_for_a_seat(2, Instant::now() + Duration::from_secs(60), None).await;
+        let (seated, waits) = wait_for_a_seat(
+            2,
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            None,
+        )
+        .await;
         assert!(seated.is_ok());
         assert_eq!(waits, 1);
     }
 
     #[tokio::test(start_paused = true)]
     async fn the_wait_lasts_its_whole_bound_and_no_longer() {
-        let started = Instant::now();
+        let started = tokio::time::Instant::now();
         let (seated, _) =
             wait_for_a_seat(usize::MAX, started + Duration::from_secs(100), None).await;
         assert!(seated.is_err());
-        let waited = started.elapsed();
-        assert!(
-            waited >= Duration::from_secs(100) && waited < Duration::from_secs(101),
-            "the last pause is cut to the deadline, where it tries once more: {waited:?}"
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(100),
+            "the last pause is cut to the deadline, where it tries once more"
         );
         let (seated, waits) = wait_for_a_seat(5, started + Duration::from_secs(200), None).await;
         assert!(seated.is_ok(), "a seat freed inside the bound is taken");
@@ -563,8 +574,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn the_wait_ends_at_the_deadline_or_when_the_caller_stops() {
-        let (seated, waits) =
-            wait_for_a_seat(usize::MAX, Instant::now() + Duration::from_secs(3), None).await;
+        let (seated, waits) = wait_for_a_seat(
+            usize::MAX,
+            tokio::time::Instant::now() + Duration::from_secs(3),
+            None,
+        )
+        .await;
         assert!(seated.is_err_and(|e| e.downcast_ref::<AtCapacity>().is_some()));
         assert_eq!(waits, 1, "queued once, and tried again at the deadline");
 
@@ -572,7 +587,7 @@ mod tests {
         cancel.cancel();
         let (seated, waits) = wait_for_a_seat(
             usize::MAX,
-            Instant::now() + Duration::from_secs(3600),
+            tokio::time::Instant::now() + Duration::from_secs(3600),
             Some(&cancel),
         )
         .await;
