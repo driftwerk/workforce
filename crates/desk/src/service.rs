@@ -1233,6 +1233,11 @@ fn asked_at_end(denials: &[Denied], reply: Option<&str>) -> (Option<Asked>, bool
 
 /// `e`, a session's resume or restart, with what it stopped of the work
 /// the session had running (`stopped`), which it was told of.
+/// A prompt read back, without the note Desk put before it of a restart.
+fn asked_of(prompt: Option<String>) -> Option<String> {
+    prompt.and_then(|p| CutOff::asked(&p).map(str::to_string))
+}
+
 fn with_stopped(e: Event, stopped: Option<u32>) -> Event {
     let Some(n) = stopped.filter(|n| *n > 0) else {
         return e;
@@ -3702,7 +3707,10 @@ impl Desk {
         // past a hold of Desk's breaker, which only the person lifts: kept
         // for the run after.
         let cut = self.0.state.lock().cut_off.remove(&id);
-        let held = self.breaker_refuses_prompt(id, None).is_err();
+        // Past a hold by whoever resumes it: the person, at least.
+        let held = self
+            .breaker_refuses_prompt(id, by.as_ref().or(carrier))
+            .is_err();
         // A slash command runs only as the first thing typed: told after it.
         let command = prompt
             .as_deref()
@@ -3714,7 +3722,9 @@ impl Desk {
         let now = Utc::now();
         let note = cut.as_ref().map(|c| {
             c.note(
-                &now.with_timezone(&self.timezone())
+                &c.at
+                    .unwrap_or(now)
+                    .with_timezone(&self.timezone())
                     .format("%H:%M")
                     .to_string(),
             )
@@ -3743,7 +3753,7 @@ impl Desk {
                     match cut {
                         Some(c) => {
                             let on = crate::model::Restarted {
-                                at: now,
+                                at: c.at.unwrap_or(now),
                                 stopped: u32::try_from(c.count).unwrap_or(u32::MAX),
                             };
                             st.restarted.insert(id, (on, c));
@@ -5669,7 +5679,8 @@ impl Desk {
                 .flatten()
                 .reduce(CutOff::merged);
             if let Some(cut) = cut {
-                st.cut_off.insert(id, cut);
+                let at = cut.at.or(Some(Utc::now()));
+                st.cut_off.insert(id, CutOff { at, ..cut });
             }
             live
         };
@@ -6696,6 +6707,46 @@ impl Desk {
         // The turn's calls are in its transcript now.
         self.spend_read_ending(id);
         self.breaker_settled(id);
+        self.tell_kept_cut_off(id);
+    }
+
+    /// What a restart of `id` stopped and couldn't tell it first (a hold of
+    /// its breaker, a slash command typed first): told now, between turns,
+    /// once nothing holds it.
+    fn tell_kept_cut_off(&self, id: Uuid) {
+        let cut = {
+            let mut st = self.0.state.lock();
+            // Between turns, asking no one: typed in, it would answer that.
+            let between = st
+                .records
+                .get(&id)
+                .is_some_and(|r| r.state == SessionState::Done);
+            if !st.live.contains_key(&id) || !between {
+                return;
+            }
+            let Some(cut) = st.cut_off.remove(&id) else {
+                return;
+            };
+            cut
+        };
+        let stopped_at = cut.at.unwrap_or_else(Utc::now);
+        let at = stopped_at
+            .with_timezone(&self.timezone())
+            .format("%H:%M")
+            .to_string();
+        match self.type_prompt(id, &cut.note(&at), None) {
+            Ok(_) => {
+                let on = crate::model::Restarted {
+                    at: stopped_at,
+                    stopped: u32::try_from(cut.count).unwrap_or(u32::MAX),
+                };
+                self.0.state.lock().restarted.insert(id, (on, cut));
+            }
+            Err(e) => {
+                tracing::debug!(session = %id, error = %e, "what a restart stopped waits to be told");
+                self.0.state.lock().cut_off.insert(id, cut);
+            }
+        }
     }
 
     /// A switch of account session `id` waits on, carried out now.
@@ -7461,6 +7512,15 @@ impl Desk {
                 .and_then(|(_, t)| t.said.clone())
                 .filter(|_| reader.is_some());
             let mut read = None;
+            // Its first turn after a restart that stopped work of its own
+            // ended: it has looked at that.
+            if matches!(&event, CodexEvent::Idle)
+                && self
+                    .record(id)
+                    .is_ok_and(|r| r.state != SessionState::Starting)
+            {
+                self.0.state.lock().restarted.remove(&id);
+            }
             // A question its boss answers in the person's place, unless they
             // are in control of it.
             let for_boss = matches!(&event, CodexEvent::Question { asks: Some(_), .. })
@@ -7525,7 +7585,7 @@ impl Desk {
                         }
                         if let Some((path, t)) = tail {
                             r.transcript = Some(path.to_string_lossy().into_owned());
-                            r.last_prompt = t.last_prompt.or(r.last_prompt.take());
+                            r.last_prompt = asked_of(t.last_prompt).or(r.last_prompt.take());
                             r.last_reply = t.last_reply.or(r.last_reply.take());
                         }
                         r.asked = asked;
@@ -7539,7 +7599,7 @@ impl Desk {
                         }
                     }
                     CodexEvent::Prompt(p) => {
-                        r.last_prompt = Some(p);
+                        r.last_prompt = asked_of(Some(p)).or(r.last_prompt.take());
                         if let Some(l) = l.filter(|_| !delivery) {
                             l.prompts += 1;
                         }
@@ -7795,7 +7855,7 @@ impl Desk {
                             r.moved_to(ext.cwd.clone());
                             r.transcript = transcript.clone().or(r.transcript.take());
                             if let Some(t) = tail {
-                                r.last_prompt = t.last_prompt.or(r.last_prompt.take());
+                                r.last_prompt = asked_of(t.last_prompt).or(r.last_prompt.take());
                                 r.last_reply = t.last_reply.or(r.last_reply.take());
                             }
                         });

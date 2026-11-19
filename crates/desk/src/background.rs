@@ -56,6 +56,8 @@ pub struct CutOff {
     pub named: Vec<(TaskKind, String)>,
     /// How many were running, as far as Desk knew.
     pub count: usize,
+    /// When they were stopped, where Desk saw it.
+    pub at: Option<DateTime<Utc>>,
 }
 
 /// The longest a stopped piece's name is said.
@@ -74,12 +76,12 @@ impl CutOff {
                 self.named.push((kind, label));
             }
         }
+        // Shells only seen running have no ids: counted all the same.
+        let unnamed = other.count.saturating_sub(other.ids.len());
         let fresh = other.ids.difference(&self.ids).count();
         self.ids.extend(other.ids);
-        self.count += match fresh {
-            0 => 0,
-            _ => other.count.min(fresh).max(1),
-        };
+        self.count += fresh + unnamed;
+        self.at = self.at.max(other.at);
         self
     }
 
@@ -217,6 +219,7 @@ impl Background {
                 .filter(|(_, l)| !l.trim().is_empty())
                 .collect(),
             count,
+            at: None,
         })
     }
 
@@ -382,6 +385,16 @@ mod tests {
             ..CutOff::default()
         };
         assert!(!unnamed.note("09:05").contains("Desk knew of"));
+        // Stopped twice before it was told: each piece once, the shells
+        // only seen running too.
+        let named = CutOff {
+            ids: ["a1".to_string()].into(),
+            named: vec![(TaskKind::Agent, "Watch CI".into())],
+            count: 1,
+            ..CutOff::default()
+        };
+        let both = named.clone().merged(unnamed).merged(named);
+        assert_eq!((both.count, both.named.len()), (4, 1));
     }
 
     #[test]
