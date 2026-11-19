@@ -18,6 +18,11 @@ CREATE TABLE IF NOT EXISTS monitor_held (
     release_at   TIMESTAMPTZ NOT NULL,
     -- Taken to tell until then: a telling that fails or dies with the hub
     -- leaves it to be taken again after.
-    claimed_until TIMESTAMPTZ
+    claimed_until TIMESTAMPTZ,
+    -- Tellings that failed: each puts it off longer, and past a few it is
+    -- dropped, so one that can't be told holds up nothing for good.
+    attempts     INTEGER     NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS monitor_held_release ON monitor_held (release_at);
+-- One DM's findings: what waits for it, and what is being told there.
+CREATE INDEX IF NOT EXISTS monitor_held_dm ON monitor_held (agent, owner, place, release_at);

@@ -172,9 +172,10 @@ pub struct CrewHub {
     relayed: Mutex<relayed_decide::Outbox>,
     /// When the overseer's turns in its DM started, by session.
     manager_turns: Mutex<HashMap<String, DateTime<Utc>>>,
-    /// The DM sessions of other agents whose reply is being written: what
-    /// they would post on their own (what monitors saw) waits for it.
-    dm_turns: Mutex<HashSet<String>>,
+    /// The DM sessions of other agents whose reply is being written, with
+    /// how many turns run there: what they would post on their own (what
+    /// monitors saw) waits for them.
+    dm_turns: Mutex<HashMap<String, usize>>,
     /// Pending approvals a wake-up listed, by the overseer's DM session.
     listed: Mutex<HashMap<String, Vec<workforce_desk::crew::MentionedApproval>>>,
     /// When the overseer messaged other agents since the person last spoke.

@@ -56,6 +56,20 @@ fn line(text: &str) -> Option<String> {
 }
 
 impl CrewHub {
+    /// One of the turns running in another agent's DM `sid` ended: what
+    /// waited on the reply may go once none runs.
+    fn dm_turn_ended(&self, sid: &str) {
+        let mut turns = self.dm_turns.lock();
+        if let Some(n) = turns.get_mut(sid) {
+            *n -= 1;
+            if *n == 0 {
+                turns.remove(sid);
+            }
+        }
+        drop(turns);
+        self.update_poke.notify_one();
+    }
+
     /// Starts recording a turn of `service`'s, unless it is one the crew
     /// leaves out.
     pub(super) fn track(
@@ -137,7 +151,9 @@ impl CrewHub {
             .filter(|_| channel == DESK_CHANNEL)
             .map(str::to_string);
         if let Some(sid) = &dm_session {
-            self.dm_turns.lock().insert(sid.clone());
+            *self.dm_turns.lock().entry(sid.clone()).or_default() += 1;
+            // Sent: no longer typing it.
+            self.dm_sent(&agent_id);
         }
         let task = line(message);
         let key = uuid::Uuid::new_v4().to_string();
@@ -223,9 +239,7 @@ impl Track {
         }
         crew.running.lock().remove(&self.key);
         if let Some(sid) = self.dm_session.take() {
-            crew.dm_turns.lock().remove(&sid);
-            // What waited on this reply may go now.
-            crew.update_poke.notify_one();
+            crew.dm_turn_ended(&sid);
         }
         let (ended, answer, question) =
             crew::outcome_of(outcome.as_deref().map_err(String::as_str));
@@ -264,9 +278,8 @@ impl Drop for Track {
             return;
         }
         self.crew.running.lock().remove(&self.key);
-        if let Some(sid) = &self.dm_session {
-            self.crew.dm_turns.lock().remove(sid);
-            self.crew.update_poke.notify_one();
+        if let Some(sid) = self.dm_session.take() {
+            self.crew.dm_turn_ended(&sid);
         }
         self.crew.desk.note(
             Event::new(

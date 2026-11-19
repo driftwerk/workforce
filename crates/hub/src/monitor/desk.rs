@@ -197,7 +197,8 @@ async fn turn(
 
 /// Tell `owner` a monitor's own news (`reason`: it was disabled, it
 /// expired) as a notice in their Desk DM with `service`'s agent, by their
-/// cadence.
+/// cadence. Its news is told once, as on Slack or Teams: when Desk hasn't
+/// started yet it is logged, not kept (the monitor's state says the same).
 pub(crate) async fn tell_owner(
     service: &Arc<AgentService>,
     desk_on: bool,

@@ -80,6 +80,10 @@ impl HeldFinding {
 /// next one.
 const DUE_PER_DM: i64 = 200;
 
+/// The failed tellings after which a finding is dropped: put off a minute
+/// more after each, it has had about an hour.
+pub const ATTEMPTS: i32 = 10;
+
 const COLUMNS: &str =
     "id, agent, owner, monitor_id, monitor_name, place, text, reason, held_at, release_at";
 
@@ -215,16 +219,25 @@ impl DeskStore {
         Ok(())
     }
 
-    /// Lets `ids`, taken but not told, be taken again at once.
-    pub async fn monitor_held_untake(&self, ids: &[Uuid]) -> Result<()> {
+    /// `ids` were taken but their telling failed: put off a minute more for
+    /// each failure so far (what comes since for their DM isn't held behind
+    /// them meanwhile), and dropped past [`ATTEMPTS`]. How many were dropped.
+    pub async fn monitor_held_untake(&self, ids: &[Uuid]) -> Result<u64> {
         let client = self.pool().get().await?;
         client
             .execute(
-                "UPDATE monitor_held SET claimed_until = NULL WHERE id = ANY($1)",
+                "UPDATE monitor_held SET claimed_until = NULL, attempts = attempts + 1, \
+                 release_at = now() + (attempts + 1) * interval '1 minute' WHERE id = ANY($1)",
                 &[&ids],
             )
             .await?;
-        Ok(())
+        let dropped = client
+            .execute(
+                "DELETE FROM monitor_held WHERE id = ANY($1) AND attempts >= $2",
+                &[&ids, &ATTEMPTS],
+            )
+            .await?;
+        Ok(dropped)
     }
 }
 
@@ -310,7 +323,31 @@ mod tests {
             store.monitor_hold(&since).await.unwrap();
             assert!(store.monitor_held_due(now).await.unwrap().is_empty());
             store.monitor_held_done(&[since.id]).await.unwrap();
-            store.monitor_held_untake(&[due.id]).await.unwrap();
+            // Its telling failed: put off a minute, holding nothing up meanwhile.
+            assert_eq!(store.monitor_held_untake(&[due.id]).await.unwrap(), 0);
+            assert!(store.monitor_held_due(Utc::now()).await.unwrap().is_empty());
+            assert!(!store
+                .monitor_held_waiting("scout", "person-1", false, Utc::now())
+                .await
+                .unwrap());
+            let later_on = Utc::now() + chrono::Duration::minutes(2);
+            assert_eq!(store.monitor_held_due(later_on).await.unwrap().len(), 1);
+            // Failing every time, it is dropped in the end.
+            for _ in 1..ATTEMPTS - 1 {
+                store.monitor_held_take(&[due.id]).await.unwrap();
+                assert_eq!(store.monitor_held_untake(&[due.id]).await.unwrap(), 0);
+            }
+            store.monitor_held_take(&[due.id]).await.unwrap();
+            assert_eq!(
+                store.monitor_held_untake(&[due.id]).await.unwrap(),
+                1,
+                "dropped"
+            );
+            assert_eq!(
+                store.monitor_held_for("scout").await.unwrap(),
+                vec![later.clone()]
+            );
+            store.monitor_hold(&due).await.unwrap();
             assert_eq!(store.monitor_held_due(now).await.unwrap().len(), 1);
 
             store.monitor_held_done(&[due.id]).await.unwrap();

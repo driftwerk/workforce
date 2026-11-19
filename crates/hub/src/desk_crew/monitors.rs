@@ -140,16 +140,21 @@ impl CrewHub {
             .await?;
         tracing::info!(agent, monitor = %finding.monitor_id, why = why.as_str(), %until, "a monitor's finding is held for the person");
         if why == HeldFor::Typing {
-            // A pause in their typing lets it go before the next minute's
-            // look; a reply ending, or older findings told, pokes as well.
-            self.poke_at_release(agent);
+            match self.typing_release(agent) {
+                // A pause in their typing lets it go before the next
+                // minute's look.
+                Some(_) => self.poke_at_release(agent),
+                // Behind a reply (its end pokes), older findings (told, they
+                // poke) or a failed tell: looked at again now.
+                None => self.update_poke.notify_one(),
+            }
         }
         Ok(MonitorTold::Held { until, why })
     }
 
     /// Puts `text` in `owner`'s DM with `service`'s agent: a message for
     /// them, or a notice.
-    async fn tell_monitor(
+    pub(super) async fn tell_monitor(
         &self,
         service: &AgentService,
         owner: &str,
@@ -228,11 +233,20 @@ impl CrewHub {
                     if let Err(e) = store.monitor_held_done(&taken).await {
                         tracing::warn!(error = %format!("{e:#}"), "forgetting what monitors saw, told, failed: it may be told again");
                     }
+                    // What waited behind these may go now, not at the next
+                    // minute's look.
+                    self.update_poke.notify_one();
                 }
                 Err(e) => {
                     tracing::warn!(%agent, error = %format!("{e:#}"), "telling what monitors saw failed: tried again at the next look");
-                    if let Err(e) = store.monitor_held_untake(&taken).await {
-                        tracing::info!(error = %format!("{e:#}"), "letting what monitors saw go failed: taken again in a minute");
+                    match store.monitor_held_untake(&taken).await {
+                        Ok(0) => {}
+                        Ok(dropped) => {
+                            tracing::warn!(%agent, dropped, "what monitors saw couldn't be told after many tries and was dropped")
+                        }
+                        Err(e) => {
+                            tracing::info!(error = %format!("{e:#}"), "letting what monitors saw go failed: taken again in a minute")
+                        }
                     }
                 }
             }
@@ -243,8 +257,8 @@ impl CrewHub {
 /// What one message says of `held`, oldest first: one finding in its own
 /// words, noting what held it; several under a line saying why they
 /// waited, each with its monitor and when it was seen (local time in `tz`,
-/// with the day when it wasn't `now`'s), the first [`SHOWN`] in full and
-/// the rest counted by monitor.
+/// with the weekday when it wasn't `now`'s day, the date past six days),
+/// the first [`SHOWN`] in full and the rest counted by monitor.
 pub(crate) fn held_text<Tz: chrono::TimeZone>(
     held: &[HeldFinding],
     now: DateTime<Utc>,
@@ -256,9 +270,11 @@ where
     let today = now.with_timezone(tz).date_naive();
     let at = |h: &HeldFinding| {
         let local = h.held_at.with_timezone(tz);
-        match local.date_naive() == today {
-            true => local.format("%H:%M").to_string(),
-            false => local.format("%a %H:%M").to_string(),
+        let days = (today - local.date_naive()).num_days();
+        match days {
+            0 => local.format("%H:%M").to_string(),
+            1..=6 => local.format("%a %H:%M").to_string(),
+            _ => local.format("%a %-d %b %H:%M").to_string(),
         }
     };
     let why = held
@@ -366,6 +382,18 @@ mod tests {
             "While you were away, your monitors saw:\n\n\
              **Invoices** · Wed 23:05\nAcme sent invoice 42.\n\n\
              **Invoices** · 06:05\nGlobex sent invoice 7."
+        );
+        let week = held_text(
+            &[
+                held("Invoices", "Old.", HeldFor::Away, 12, 8),
+                held("Invoices", "New.", HeldFor::Away, 19, 8),
+            ],
+            now(),
+            &tz,
+        );
+        assert!(
+            week.contains("**Invoices** · Thu 12 Nov 08:05\nOld."),
+            "{week}"
         );
     }
 

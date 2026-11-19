@@ -276,7 +276,21 @@ async fn typing_or_a_reply_being_written_holds_a_finding_in_any_agents_dm() {
             .unwrap()
             .expect("the DM")
             .id;
-        crew.dm_turns.lock().insert(sid.clone());
+        // Their message begins Scout's reply, as the turn loop records it.
+        let turn = crew
+            .track(
+                &scout,
+                DESK_CHANNEL,
+                PERSON,
+                "What's due this week?",
+                Some(sid.as_str()),
+                (None, None),
+            )
+            .expect("a turn in Scout's DM is recorded");
+        assert!(
+            crew.dm_turns.lock().contains_key(&sid),
+            "its reply is being written"
+        );
         let held = crew
             .monitor_told(&scout, PERSON, finding(DeskDelivery::Dm, "Mid-reply"))
             .await
@@ -297,8 +311,9 @@ async fn typing_or_a_reply_being_written_holds_a_finding_in_any_agents_dm() {
             2,
             "not into the reply"
         );
-        crew.dm_turns.lock().remove(&sid);
-        crew.update_poke.notify_one();
+        // The reply ends (or the turn is dropped, as a stopped one is).
+        drop(turn);
+        assert!(!crew.dm_turns.lock().contains_key(&sid));
         let said = eventually("told once the reply ended", async || {
             told(&scout, DeliveryKind::Monitor).into_iter().nth(2)
         })
@@ -350,16 +365,21 @@ async fn a_new_finding_waits_behind_older_ones_for_the_same_dm() {
             "not ahead of the older"
         );
 
-        d.store().monitor_held_untake(&[older.id]).await.unwrap();
-        let said = eventually("both, in order", async || {
-            told(&scout, DeliveryKind::Monitor).into_iter().next()
+        // That look tells the older and is done: the newer goes after it.
+        crew.tell_monitor(&scout, PERSON, false, older.text.clone())
+            .await
+            .unwrap();
+        d.store().monitor_held_done(&[older.id]).await.unwrap();
+        crew.update_poke.notify_one();
+        let said = eventually("the newer, after", async || {
+            told(&scout, DeliveryKind::Monitor).into_iter().nth(1)
         })
         .await;
-        let (o, n) = (
-            said.content.find("Older invoice").expect("older"),
-            said.content.find("Newer invoice").expect("newer"),
+        let first = &told(&scout, DeliveryKind::Monitor)[0];
+        assert_eq!(
+            (first.content.as_str(), said.content.as_str()),
+            ("Older invoice", "Newer invoice")
         );
-        assert!(o < n, "{}", said.content);
     })
     .await;
 }

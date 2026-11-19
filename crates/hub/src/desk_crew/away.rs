@@ -370,7 +370,7 @@ impl CrewHub {
     /// of agents that oversee nothing.
     pub(super) fn dm_held(&self, agent: &str, session: Option<&str>) -> bool {
         self.update_held(agent, session)
-            || session.is_some_and(|sid| self.dm_turns.lock().contains(sid))
+            || session.is_some_and(|sid| self.dm_turns.lock().contains_key(sid))
     }
 
     /// How far `owner` has read `service`'s DM: their read point, or when
