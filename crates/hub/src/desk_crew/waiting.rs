@@ -58,15 +58,13 @@ const WAITS: [&str; 15] = [
     "until you decide",
     "until desk",
     "wait for your",
-    "until you",
-    "i'll wait",
+    "until you answer",
+    "until you confirm",
 ];
 
 /// Words of a session going on, or done: no wait however its boss held it.
-const GOES_ON: [&str; 9] = [
-    "done",
+const GOES_ON: [&str; 7] = [
     "merged",
-    "finished",
     "carrying on",
     "going ahead",
     "proceeding",
@@ -654,6 +652,12 @@ mod tests {
         assert!(waits_on_answer("I'll wait for your decision."));
         assert!(goes_on("Merged; carrying on with the docs."));
         assert!(!goes_on("Understood, holding."));
+        assert!(!goes_on(
+            "Holding. The REINDEX is done; nothing else changes."
+        ));
+        assert!(!waits_on_answer(
+            "Left the flag off until you need it. Done."
+        ));
         assert!(options_in("e.g. the staging host\ni.e. not production").is_empty());
         // What was done, listed, is no choice.
         let done = "Done.\n1. Updated the migration.\n2. Ran the tests.\nCI: green on all jobs.\nPR: opened #12.";
