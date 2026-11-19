@@ -112,7 +112,10 @@ impl CrewHub {
                 Handout::NewSession { .. } => Ok(()),
             },
             // Started in the overseer's own group; its ticket is read below.
-            Action::StartSession { .. } | Action::MoveTicket { .. } => Ok(()),
+            Action::StartSession { .. }
+            | Action::MoveTicket { .. }
+            | Action::ChangeTicket { .. }
+            | Action::CreateTicket { .. } => Ok(()),
             // Only ever its own settings ([`super::tools`] names it).
             Action::ChangeOversight { .. } => Ok(()),
         }

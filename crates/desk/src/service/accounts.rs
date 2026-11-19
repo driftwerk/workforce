@@ -1763,10 +1763,14 @@ impl Desk {
     async fn drive_switch_now(&self, id: Uuid, by: Option<By>) -> Result<SessionView, DeskError> {
         // Whoever asked for it, when it waited; Desk itself, never the
         // person, when no one did.
-        let by = by
-            .or_else(|| self.0.state.lock().switch_by.get(&id).cloned())
-            .unwrap_or_else(|| By::desk("it moves to another account"));
+        let mut asked = by;
         loop {
+            // Read each time: a switch asked for while one ran is its
+            // asker's.
+            let by = asked
+                .take()
+                .or_else(|| self.0.state.lock().switch_by.get(&id).cloned())
+                .unwrap_or_else(|| By::desk("it moves to another account"));
             let Some(to) = self.0.state.lock().switches.get(&id).copied() else {
                 return self.view(id);
             };
