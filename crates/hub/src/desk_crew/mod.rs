@@ -66,6 +66,7 @@ mod spend;
 mod tools;
 mod updates;
 mod urgent;
+mod waiting;
 pub(crate) use updates::HubWriter;
 mod watcher;
 mod work;

@@ -48,6 +48,7 @@ use workforce_desk::open_item_store::Opened;
 use workforce_desk::Speaker;
 
 use super::tools::Bound;
+use super::waiting;
 use super::CrewHub;
 
 pub const ASK: &str = "crew.ask_person";
@@ -1026,6 +1027,10 @@ impl CrewHub {
         };
         for i in open {
             let Some(s) = i.session else { continue };
+            // What a session waits on closes, and is said, on its own look.
+            if waiting::is_waiting(&i.dedupe_key) {
+                continue;
+            }
             if !matches!(i.kind, OpenKind::Ask | OpenKind::Confirm) || !i.said() {
                 continue;
             }
@@ -1175,6 +1180,16 @@ impl CrewHub {
                         ItemRefused::Cant(Self::item_err(eyre::eyre!("{e}")))
                     }
                 })?;
+            // What a session waited on is answered once it has the answer:
+            // nothing more is said of it.
+            if waiting::is_waiting(&item.dedupe_key) {
+                if let Err(e) = store
+                    .item_close(id, ClosedBy::Person, &format!("You answered: {answer}"))
+                    .await
+                {
+                    tracing::warn!(error = %e, "closing an answered wait failed");
+                }
+            }
             return Ok("Sent.".into());
         }
         let closed = store
@@ -1478,6 +1493,11 @@ impl CrewHub {
                 i.raised_at.is_none_or(|at| now - at >= MARK_FOR) && now - i.changed_at >= MARK_FOR;
             return old.then(|| (ClosedBy::Boss, "Told of over a day ago.".into()));
         }
+        // What a session waits on its boss for closes on what settles it
+        // where it waits, whatever its question's kind.
+        if waiting::is_waiting(&i.dedupe_key) {
+            return self.waiting_past(i).await;
+        }
         // Parked, it waits for the person to answer or drop it: never
         // closed under them.
         if i.state == OpenState::Parked {
@@ -1595,6 +1615,11 @@ impl CrewHub {
                         // ended, nothing changed for days): nothing is said,
                         // and their own words are never said back to them.
                         (OpenKind::Promise | OpenKind::Order, _) => {}
+                        // What a session waited on, settled elsewhere: one
+                        // line, which says how.
+                        _ if waiting::is_waiting(&closed.dedupe_key) && closed.said() => {
+                            self.say(&closed.boss, why.clone()).await;
+                        }
                         // A session's question shows its own end where it is.
                         _ if closed.said()
                             && closed.line_message.is_none()
@@ -1648,7 +1673,10 @@ impl CrewHub {
         let minute = chrono::Duration::from_std(self.timing.minute).unwrap_or_default();
         let first = minute * FIRST_RESTATE.num_minutes() as i32;
         let remind = minute * o.wake.remind_minutes as i32;
-        let due: Vec<&OpenItem> = items.iter().filter(|i| i.due(now, first, remind)).collect();
+        let due: Vec<&OpenItem> = items
+            .iter()
+            .filter(|i| !waiting::is_waiting(&i.dedupe_key) && i.due(now, first, remind))
+            .collect();
         restatements(&due, now)
     }
 
@@ -1662,7 +1690,9 @@ impl CrewHub {
                 continue;
             };
             // With the composer on, what is due goes in the boss's update.
-            if o.wake.remind_minutes == 0 || o.updates.enabled {
+            // What a session waits on is reminded on its own cadence.
+            if o.wake.remind_minutes == 0 || o.updates.enabled || waiting::is_waiting(&i.dedupe_key)
+            {
                 continue;
             }
             let remind = minute * o.wake.remind_minutes as i32;
@@ -1757,7 +1787,9 @@ impl CrewHub {
             Err(_) => return,
         };
         self.resurface(&items).await;
+        self.remind_waiting(&items).await;
         self.post_held_questions().await;
+        self.look_for_silent_waits().await;
     }
 }
 
