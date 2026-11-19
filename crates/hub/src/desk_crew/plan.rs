@@ -671,6 +671,7 @@ pub(crate) fn plan_out_with(p: &PlanDetail, briefs: &Briefs) -> Value {
     // the board's own while a revision waits for the person.
     let newest = p.revisions.last().map(|r| &r.snapshot);
     let waits = p.summary.plan.approved_revision != Some(p.summary.plan.revision);
+    let mut marked = false;
     if let Some(rows) = out["tickets"].as_array_mut() {
         for (row, t) in rows.iter_mut().zip(&p.tickets) {
             let id = t.ticket.ticket.id;
@@ -694,6 +695,7 @@ pub(crate) fn plan_out_with(p: &PlanDetail, briefs: &Briefs) -> Value {
                 .filter(|n| !n.adopted)
                 .map_or(t.ticket.ticket.body.as_str(), |n| n.body.as_str());
             let n = body.chars().count();
+            let changed = body != t.ticket.ticket.body.as_str();
             let body: std::borrow::Cow<'_, str> = match (n > left, briefs) {
                 // Alone, it is given as far as it fits.
                 (true, Briefs::Of(keys)) if keys.len() == 1 => {
@@ -708,8 +710,9 @@ pub(crate) fn plan_out_with(p: &PlanDetail, briefs: &Briefs) -> Value {
             };
             left = left.saturating_sub(body.chars().count());
             row["brief"] = json!(reported(&body, &format!("{key}'s brief")));
-            if waits && body != t.ticket.ticket.body.as_str() {
+            if waits && changed {
                 row["brief_waits"] = json!(true);
+                marked = true;
             }
         }
     }
@@ -727,7 +730,7 @@ pub(crate) fn plan_out_with(p: &PlanDetail, briefs: &Briefs) -> Value {
             shortened.join(", ")
         ));
     }
-    if waits {
+    if marked {
         notes.push("A brief marked brief_waits is as the plan's newest revision says it, which waits for the person to approve.".into());
     }
     if let Briefs::Of(keys) = briefs {
@@ -1139,7 +1142,7 @@ impl CrewHub {
         let ticket_edits = edits_of(input, &known, &kept)?;
         if ticket_edits.is_some() && input.get("tickets").is_some_and(|t| !t.is_null()) {
             return Err(
-                "Say every ticket (tickets) or the ones to change (tickets_edit), not both.".into(),
+                "Say every ticket the plan is to have (tickets) or the ones to change (tickets_edit), not both.".into(),
             );
         }
         let tickets = match input.get("tickets").filter(|t| !t.is_null()) {

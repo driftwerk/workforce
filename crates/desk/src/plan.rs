@@ -461,15 +461,22 @@ impl TicketEdit {
                 _ => true,
             }
         });
-        let engine = self
-            .engine
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|e| !e.eq_ignore_ascii_case(was.engine.as_str()));
+        // An engine left empty is the default one, Claude.
+        let engine = self.engine.as_deref().map(str::trim).is_some_and(|e| {
+            let e = if e.is_empty() {
+                Engine::Claude.as_str()
+            } else {
+                e
+            };
+            !e.eq_ignore_ascii_case(was.engine.as_str())
+        });
+        let view = self.view.as_deref().map(str::trim).is_some_and(|v| {
+            !v.eq_ignore_ascii_case(was.view.map(|w| w.as_str()).unwrap_or_default())
+        });
         machine
             || engine
             || differs(&self.folder, Some(&was.folder))
-            || differs(&self.view, was.view.map(|v| v.as_str()))
+            || view
             || differs(&self.model, was.model.as_deref())
     }
 }

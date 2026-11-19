@@ -1577,7 +1577,11 @@ impl Desk {
                 let moved: Vec<Problem> = edits
                     .iter()
                     .filter(|e| started.contains(&e.id))
-                    .filter(|e| newest.ticket(e.id).is_none_or(|was| e.moves_from(was)))
+                    .filter(|e| {
+                        newest
+                            .ticket(e.id)
+                            .map_or(e.moves(), |was| e.moves_from(was))
+                    })
                     .filter_map(|e| {
                         let t = rows.iter().find(|t| t.id == e.id)?;
                         let column = match (t.state, t.starting) {
