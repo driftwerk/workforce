@@ -35,6 +35,14 @@ pub(super) const WATCHES: &str = "crew.watches";
 /// After a failed read, how many crew minutes until the next.
 const BACKOFF_MINUTES: u32 = 5;
 
+/// Reads in a row that fail before a watch ends saying so (about half an
+/// hour of trying): a repository or number said wrongly never ends by
+/// itself.
+const MAX_FAILED_READS: i32 = 6;
+
+/// How long a watch whose end was told is kept, in days.
+const KEPT_TOLD_DAYS: i64 = 7;
+
 pub(super) const WATCH_DESCRIPTION: &str = "Start a background wait that wakes you when it \
     ends, as you'd run `gh run watch` in the background: a pull request (repo, number) until \
     its checks are done, or with until_merged until it merges or closes; a CI run (repo, \
@@ -174,6 +182,10 @@ impl CrewHub {
             let open = store.watches_open(boss, &person).await.map_err(internal)?;
             return Ok(json!({ "watches": open.iter().map(|w| said(w, tz)).collect::<Vec<_>>() }));
         }
+        // Its end is a notice in the conversation only Act fully runs.
+        if !self.orchestrates(boss) {
+            return Err("Background waits are for Act fully, where what ends reaches your own running conversation. Check it yourself instead (crew.github_pr, crew.github_ci).".into());
+        }
         let Asked {
             kind,
             repo,
@@ -223,7 +235,9 @@ impl CrewHub {
                 session,
                 plan,
                 due_at,
-                expires_at: now + chrono::Duration::hours(hours),
+                // A time is waited for however far off it was asked.
+                expires_at: (now + chrono::Duration::hours(hours))
+                    .max(due_at.map_or(now, |at| at + chrono::Duration::minutes(5))),
             })
             .await
             .map_err(internal)?;
@@ -287,13 +301,16 @@ impl CrewHub {
                 for w in open {
                     if let Some(outcome) = self.look_at_watch(&w, now).await {
                         match store.watch_end(w.id, &outcome.0).await {
-                            Ok(_) => {}
+                            // What it read, kept for the notice; told below.
+                            Ok(Some(_)) => {
+                                self.watch_reads.lock().insert(w.id, outcome.1);
+                            }
+                            // Ended meanwhile (the boss ended it).
+                            Ok(None) => {}
                             Err(e) => {
                                 tracing::warn!(error = %format!("{e:#}"), watch = %w.id, "an ended watch wasn't kept as ended")
                             }
                         }
-                        // What it read, kept for the notice; told below.
-                        self.watch_reads.lock().insert(w.id, outcome.1);
                     }
                 }
             }
@@ -390,6 +407,15 @@ impl CrewHub {
                 return Some(("GitHub isn't connected for the person, so it can't be watched: tell them \"Connect GitHub to let me check.\"".into(), None));
             }
             Err(e) => {
+                if w.failures + 1 >= MAX_FAILED_READS {
+                    return Some((
+                        format!(
+                            "GitHub couldn't be read for it {MAX_FAILED_READS} times in a row, so it stopped waiting (check the repository and number): {}",
+                            workforce_desk::crew::one_line(&e, 300)
+                        ),
+                        None,
+                    ));
+                }
                 tracing::info!(watch = %w.id, error = %e, "a watch's read failed; it backs off");
                 if let Err(e) = self.desk.store().watch_polled(w.id, true).await {
                     tracing::warn!(error = %format!("{e:#}"), "a watch's failed read wasn't noted");
@@ -448,12 +474,14 @@ pub(super) fn ended(w: &Watch, got: &Value) -> Option<String> {
     }
 }
 
-/// Whether a failed run's read shows a job that failed with no failed
-/// step: a runner lost, not the code.
+/// Whether a failed run's read shows that every job that failed did so
+/// with no failed step: runners lost, not the code, so rerunning the failed
+/// jobs is the fix. One real failure among them, and it isn't.
 fn lost_runner(got: &Value) -> bool {
     // The jobs are fenced as data for the boss; their shape is read here.
-    let named = got["named"].to_string();
-    named.contains("\\\"failed_steps\\\":[]") || named.contains("\"failed_steps\":[]")
+    let named = got["named"].to_string().replace("\\\"", "\"");
+    let failed = named.matches("\"failed_steps\":").count();
+    failed > 0 && named.matches("\"failed_steps\":[]").count() == failed
 }
 
 /// The notice of `w`'s end, with what was read.
@@ -505,6 +533,7 @@ impl CrewHub {
 pub(super) async fn watch_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     let mut tick = tokio::time::interval(crew.timing.minute);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut pruned: Option<std::time::Instant> = None;
     loop {
         tokio::select! {
             () = cancel.cancelled() => return,
@@ -512,6 +541,14 @@ pub(super) async fn watch_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
         }
         crew.poll_watches().await;
         crew.kick_notices();
+        // Once an hour, the watches told long ago are forgotten.
+        if pruned.is_none_or(|at| at.elapsed() >= crew.timing.minute * 60) {
+            pruned = Some(std::time::Instant::now());
+            let before = Utc::now() - chrono::Duration::days(KEPT_TOLD_DAYS);
+            if let Err(e) = crew.desk.store().watches_prune(before).await {
+                tracing::info!(error = %format!("{e:#}"), "the told watches weren't pruned");
+            }
+        }
     }
 }
 
@@ -587,6 +624,13 @@ mod tests {
         let real = json!({ "run": { "status": "completed", "conclusion": "failure" },
             "named": reported(&json!({ "failed_jobs": [{ "name": "test", "failed_steps": ["cargo test"] }] }).to_string(), "GitHub") });
         assert!(!ended(&run, &real).unwrap().contains("rerun"));
+        let mixed = json!({ "run": { "status": "completed", "conclusion": "failure" },
+            "named": reported(&json!({ "failed_jobs": [{ "name": "lint", "failed_steps": [] },
+                { "name": "test", "failed_steps": ["cargo test"] }] }).to_string(), "GitHub") });
+        assert!(
+            !ended(&run, &mixed).unwrap().contains("rerun"),
+            "one real failure"
+        );
     }
 
     #[test]

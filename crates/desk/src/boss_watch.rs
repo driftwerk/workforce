@@ -334,4 +334,129 @@ impl DeskStore {
             .await?;
         Ok(())
     }
+
+    /// Forgets the watches whose end was told before `before`: nothing reads
+    /// them again. How many.
+    pub async fn watches_prune(&self, before: DateTime<Utc>) -> Result<u64> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .execute(
+                "DELETE FROM boss_watches WHERE delivered_at IS NOT NULL AND delivered_at < $1",
+                &[&before],
+            )
+            .await?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::build_pool;
+    use workforce_postgres::test_support::with_test_pool;
+
+    fn pr(boss: &str, person: &str, number: i64) -> NewWatch {
+        NewWatch {
+            boss: boss.into(),
+            person: person.into(),
+            kind: WatchKind::Pr,
+            repo: Some("acme/web".into()),
+            number: Some(number),
+            run_id: None,
+            until_merged: false,
+            note: "merge when green".into(),
+            session: None,
+            plan: None,
+            due_at: None,
+            expires_at: Utc::now() + chrono::Duration::hours(DEFAULT_HOURS),
+        }
+    }
+
+    /// A watch is started once, at most [`MAX_OPEN`] for a boss and person,
+    /// ended once, told once, and forgotten once told long enough ago.
+    #[tokio::test]
+    async fn a_watch_is_kept_bounded_and_ended_and_told_once() {
+        with_test_pool(build_pool, |pool| async move {
+            DeskStore::migrate(&pool).await.unwrap();
+            let store = DeskStore::from_pool(pool);
+            let Opened::Started(first) = store.watch_open(&pr("desk", "sam", 5)).await.unwrap()
+            else {
+                panic!("started");
+            };
+            assert!(matches!(
+                store.watch_open(&pr("desk", "sam", 5)).await.unwrap(),
+                Opened::Already(w) if w.id == first.id
+            ));
+            for n in 6..(5 + MAX_OPEN as i64) {
+                assert!(matches!(
+                    store.watch_open(&pr("desk", "sam", n)).await.unwrap(),
+                    Opened::Started(_)
+                ));
+            }
+            assert!(matches!(
+                store.watch_open(&pr("desk", "sam", 99)).await.unwrap(),
+                Opened::Full(open) if open.len() == MAX_OPEN
+            ));
+            // Another person's are their own.
+            assert!(matches!(
+                store.watch_open(&pr("desk", "kim", 99)).await.unwrap(),
+                Opened::Started(_)
+            ));
+            assert_eq!(
+                store.watches_open("desk", "sam").await.unwrap().len(),
+                MAX_OPEN
+            );
+
+            // Failed reads count in a row; one that works starts again.
+            store.watch_polled(first.id, true).await.unwrap();
+            store.watch_polled(first.id, true).await.unwrap();
+            let failing = store.watches_open("desk", "sam").await.unwrap();
+            assert_eq!(
+                failing.iter().find(|w| w.id == first.id).unwrap().failures,
+                2
+            );
+            store.watch_polled(first.id, false).await.unwrap();
+
+            // Ended once; told once.
+            let ended = store
+                .watch_end(first.id, "its checks are done")
+                .await
+                .unwrap();
+            assert_eq!(
+                ended.unwrap().outcome.as_deref(),
+                Some("its checks are done")
+            );
+            assert!(store.watch_end(first.id, "again").await.unwrap().is_none());
+            let due = store.watches_undelivered().await.unwrap();
+            assert_eq!(due.iter().map(|w| w.id).collect::<Vec<_>>(), [first.id]);
+            store.watches_delivered(&[first.id]).await.unwrap();
+            assert!(store.watches_undelivered().await.unwrap().is_empty());
+
+            // Ended by the boss: told already.
+            let other = store.watches_open("desk", "sam").await.unwrap()[0].clone();
+            assert!(store.watch_cancel("desk", "sam", other.id).await.unwrap());
+            assert!(!store.watch_cancel("desk", "sam", other.id).await.unwrap());
+            assert!(
+                !store.watch_cancel("desk", "kim", other.id).await.unwrap(),
+                "only theirs"
+            );
+            assert!(store.watches_undelivered().await.unwrap().is_empty());
+
+            // Told a while ago: forgotten.
+            assert_eq!(
+                store
+                    .watches_prune(Utc::now() - chrono::Duration::days(1))
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                store
+                    .watches_prune(Utc::now() + chrono::Duration::seconds(1))
+                    .await
+                    .unwrap(),
+                2
+            );
+        })
+        .await;
+    }
 }

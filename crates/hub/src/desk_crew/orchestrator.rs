@@ -31,13 +31,23 @@ use uuid::Uuid;
 use workforce_desk::crew;
 use workforce_desk::CheckIn;
 
-use super::watcher::{check_in_channel, reported, Budget, Trigger};
+use workforce_desk::crew::MentionedApproval;
+
+use super::watcher::{check_in_channel, reported, Budget, Trigger, SWEEP};
 use super::{name_of, CrewHub, CHECK_IN};
 use crate::serve::AgentService;
 
 /// The most notices held for one conversation: past it the oldest are
 /// folded into one line.
 const MAX_HELD: usize = 200;
+
+/// What a notices turn is kept as among the boss's check-ins: the ceiling
+/// counts it as it counts a wake-up.
+pub(crate) const NOTICES_KIND: &str = "notices";
+
+/// The longest a notices turn runs before it is let go as failed, in the
+/// crew's minutes: its notices are tried again, and the sweep comes back.
+const TURN_MINUTES: u32 = 30;
 
 /// How long after a failed turn its notices are tried again, in the crew's
 /// minutes: once soon, then after a while.
@@ -82,6 +92,14 @@ pub(super) struct Notice {
     pub watch: Option<Uuid>,
     /// Told once already in a turn that didn't run.
     pub again: bool,
+    /// How many hand-offs it came by: the turn it is in is one more, so a
+    /// chain between the boss and an agent ends at `MAX_HOPS`.
+    pub hop: i16,
+    /// The requests it names, beside it as a wake-up's are.
+    pub approvals: Vec<MentionedApproval>,
+    /// The regular sweep's, not something that happened: it never lifts a
+    /// turn the person stopped.
+    pub sweep: bool,
 }
 
 impl Notice {
@@ -91,8 +109,40 @@ impl Notice {
             text: text.into(),
             watch: None,
             again: false,
+            hop: 0,
+            approvals: Vec::new(),
+            sweep: false,
         }
     }
+
+    /// What the wake loop found, `t`, as a notice.
+    pub(super) fn of(t: Trigger) -> Self {
+        Self {
+            sweep: t.line == SWEEP,
+            hop: t.hop,
+            approvals: t.approvals,
+            ..Self::new(t.line)
+        }
+    }
+
+    /// As the wake loop takes it, when it runs the old way.
+    fn into_trigger(self) -> Trigger {
+        Trigger {
+            hop: self.hop,
+            approvals: self.approvals,
+            ..Trigger::line(self.text)
+        }
+    }
+}
+
+/// Why a conversation's notices wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hold {
+    /// The person stopped its last turn: they wait for something new to
+    /// happen (never the sweep), and are never tried again by themselves.
+    Stopped,
+    /// Not before then: a failed turn, Desk's breaker, a spent ceiling.
+    Until(Instant),
 }
 
 /// One conversation's notices.
@@ -101,8 +151,8 @@ struct Queue {
     pending: VecDeque<Notice>,
     /// Its runner is on it.
     running: bool,
-    /// Not tried again before this (a failed turn, a spent ceiling).
-    not_before: Option<Instant>,
+    /// Why what waits doesn't go yet.
+    hold: Option<Hold>,
     /// Failed turns in a row.
     failures: u32,
     /// Its last turn that ran, and when it began: the person's DM words
@@ -110,6 +160,26 @@ struct Queue {
     last_turn: Option<(Instant, DateTime<Utc>)>,
     /// A notice folded away for room, counted.
     folded: usize,
+    /// The spent ceiling the person was told of, so it is said once.
+    told_paused: Option<DateTime<Utc>>,
+}
+
+impl Queue {
+    /// Adds `notice`. Past [`MAX_HELD`] the oldest plain one is folded away
+    /// for room: a watch's end never is, as nothing else tells it.
+    fn push(&mut self, notice: Notice) {
+        if self.pending.len() >= MAX_HELD {
+            if let Some(at) = self.pending.iter().position(|n| n.watch.is_none()) {
+                self.pending.remove(at);
+                self.folded += 1;
+            }
+        }
+        // Something new to act on lifts a Stop; the sweep doesn't.
+        if !notice.sweep && self.hold == Some(Hold::Stopped) {
+            self.hold = None;
+        }
+        self.pending.push_back(notice);
+    }
 }
 
 /// Every oversight conversation's notices, by (boss, person).
@@ -143,32 +213,27 @@ impl CrewHub {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Whether `boss`'s oversight conversation had a turn in the last
-    /// [`SWEEP_AFTER_QUIET_MINUTES`]: then a sweep has nothing to add.
+    /// Whether `boss`'s oversight conversation has had a turn in the last
+    /// [`SWEEP_AFTER_QUIET_MINUTES`], runs one, or was stopped by the
+    /// person: then a sweep has nothing to add.
     pub(super) fn noticed_lately(&self, boss: &str) -> bool {
         let quiet = self.timing.minute * SWEEP_AFTER_QUIET_MINUTES;
         self.notices.0.lock().iter().any(|((b, _), q)| {
-            b == boss && (q.running || q.last_turn.is_some_and(|(at, _)| at.elapsed() < quiet))
+            b == boss
+                && (q.running
+                    || q.hold == Some(Hold::Stopped)
+                    || q.last_turn.is_some_and(|(at, _)| at.elapsed() < quiet))
         })
     }
 
     /// Tells `boss`'s oversight conversation with `person` of `notice`; its
-    /// turn starts now unless one runs, or it is waiting to be tried again.
+    /// turn starts now unless one runs, or it is held.
     pub(super) fn notify(self: &Arc<Self>, boss: &str, person: &str, notice: Notice) {
         let key = (boss.to_string(), person.to_string());
         let start = {
             let mut all = self.notices.0.lock();
             let q = all.entry(key.clone()).or_default();
-            if q.pending.len() >= MAX_HELD {
-                q.pending.pop_front();
-                q.folded += 1;
-            }
-            q.pending.push_back(notice);
-            // Something new is new work: a turn the person stopped held its
-            // notices only until now.
-            if q.not_before.is_some() && q.failures == 0 {
-                q.not_before = None;
-            }
+            q.push(notice);
             claim(q)
         };
         if start {
@@ -181,7 +246,9 @@ impl CrewHub {
     pub(super) fn kick_notices(self: &Arc<Self>) {
         let due: Vec<(String, String)> = {
             let mut all = self.notices.0.lock();
-            all.retain(|_, q| !q.pending.is_empty() || q.running || q.last_turn.is_some());
+            all.retain(|_, q| {
+                !q.pending.is_empty() || q.running || q.last_turn.is_some() || q.hold.is_some()
+            });
             all.iter_mut()
                 .filter_map(|(k, q)| claim(q).then(|| k.clone()))
                 .collect()
@@ -191,16 +258,33 @@ impl CrewHub {
         }
     }
 
-    /// Puts `batch` back at the front of `key`'s queue, to go no sooner
-    /// than `after`, and lets its runner go.
-    fn hold_back(&self, key: &(String, String), batch: Vec<Notice>, after: Option<Duration>) {
+    /// Puts `batch` back at the front of `key`'s queue, held as `hold`, and
+    /// lets its runner go.
+    fn hold_back(&self, key: &(String, String), batch: Vec<Notice>, hold: Option<Hold>) {
         let mut all = self.notices.0.lock();
         let q = all.entry(key.clone()).or_default();
         for n in batch.into_iter().rev() {
             q.pending.push_front(n);
         }
         q.running = false;
-        q.not_before = after.map(|d| Instant::now() + d);
+        q.hold = hold;
+    }
+
+    /// The watches `batch` tells, kept as told: none is told again, here or
+    /// after a restart. Only once Desk has kept that are they let go here,
+    /// or the next look would tell them again.
+    async fn delivered(&self, batch: &[Notice]) {
+        let watches: Vec<Uuid> = batch.iter().filter_map(|n| n.watch).collect();
+        if watches.is_empty() {
+            return;
+        }
+        match self.desk.store().watches_delivered(&watches).await {
+            Ok(()) => self.watches_told(&watches),
+            // Kept in flight: not told again here; a restart may.
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "the told watches weren't marked told")
+            }
+        }
     }
 
     /// The runner of `key`'s conversation: a turn on what waits, again while
@@ -224,33 +308,56 @@ impl CrewHub {
                 )
             };
             let Some((service, o)) = self.overseer_named(boss) else {
+                // No one is left to tell: its watches' ends are kept as told.
                 tracing::info!(%boss, held = batch.len(), "notices for a boss that no longer oversees are let go");
-                self.hold_back(&key, Vec::new(), None);
-                return;
+                self.delivered(&batch).await;
+                continue;
             };
-            // Act fully ended, or isn't in force: the old way, as a check-in.
+            // Act fully ended, or isn't in force (yet: today's spend is
+            // read after a restart): the wake loop takes them the old way,
+            // as a check-in, with all it holds a check-in to. A watch's end
+            // handed on is kept as told there.
             if !self.orchestrates(boss) {
-                self.hold_back(&key, Vec::new(), None);
-                let triggers = batch.into_iter().map(|n| Trigger::line(n.text)).collect();
-                self.wake(service, o, triggers).await;
-                return;
+                self.delivered(&batch).await;
+                let triggers: Vec<Trigger> = batch.into_iter().map(Notice::into_trigger).collect();
+                if self.wake_back.0.send((boss.to_string(), triggers)).is_err() {
+                    tracing::warn!(%boss, "the wake loop is gone: notices for a boss not at Act fully were let go");
+                }
+                continue;
             }
             // Held by Desk's breaker: its notices wait for it to let go.
             if self.desk.agent_held(boss).is_some() {
-                self.hold_back(&key, batch, Some(self.timing.minute));
+                self.hold_back(
+                    &key,
+                    batch,
+                    Some(Hold::Until(Instant::now() + self.timing.minute)),
+                );
                 return;
             }
             match self.budget(boss, &o).await {
                 Ok(Budget::Open) => {}
                 Ok(Budget::Spent { until, daily }) => {
-                    self.paused(&service, until, daily);
+                    let tell = {
+                        let mut all = self.notices.0.lock();
+                        let q = all.entry(key.clone()).or_default();
+                        let tell = q.told_paused != Some(until);
+                        q.told_paused = Some(until);
+                        tell
+                    };
+                    if tell {
+                        self.paused(&service, until, daily);
+                    }
                     let wait = (until - Utc::now()).to_std().unwrap_or(self.timing.minute);
-                    self.hold_back(&key, batch, Some(wait));
+                    self.hold_back(&key, batch, Some(Hold::Until(Instant::now() + wait)));
                     return;
                 }
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), "counting the boss's turns failed");
-                    self.hold_back(&key, batch, Some(self.timing.minute));
+                    self.hold_back(
+                        &key,
+                        batch,
+                        Some(Hold::Until(Instant::now() + self.timing.minute)),
+                    );
                     return;
                 }
             }
@@ -258,22 +365,41 @@ impl CrewHub {
             let prompt = self
                 .notices_prompt(&service, &o, person, &batch, folded, since)
                 .await;
-            let watches: Vec<Uuid> = batch.iter().filter_map(|n| n.watch).collect();
-            match self.notices_turn(&service, person, &prompt).await {
+            let hop = batch.iter().map(|n| n.hop).max().unwrap_or(0);
+            let approvals: Vec<MentionedApproval> =
+                batch.iter().flat_map(|n| n.approvals.clone()).collect();
+            let ran = match tokio::time::timeout(
+                self.timing.minute * TURN_MINUTES,
+                self.notices_turn(&service, person, &prompt, hop, approvals),
+            )
+            .await
+            {
+                Ok(ran) => ran,
+                Err(_) => {
+                    self.wake_hop.lock().remove(boss);
+                    Err(Ran::Failed(format!(
+                        "it ran past {TURN_MINUTES} minutes and was let go"
+                    )))
+                }
+            };
+            match ran {
                 Ok(()) => {
-                    if let Err(e) = self.desk.store().watches_delivered(&watches).await {
-                        tracing::warn!(error = %format!("{e:#}"), "the told watches weren't marked told");
-                    }
-                    self.watches_told(&watches);
+                    self.delivered(&batch).await;
                     let mut all = self.notices.0.lock();
                     let q = all.entry(key.clone()).or_default();
                     q.failures = 0;
+                    q.told_paused = None;
                     q.last_turn = Some((Instant::now(), began));
                 }
                 Err(Ran::Stopped) => {
-                    // The person's Stop: kept, never tried again by itself.
+                    // The person's Stop: kept for what happens next, never
+                    // tried again by itself, and not a failure.
                     tracing::info!(%boss, held = batch.len(), "the boss's notices turn was stopped; its notices wait for what comes next");
-                    self.hold_back(&key, batch, Some(Duration::from_secs(365 * 24 * 3600)));
+                    {
+                        let mut all = self.notices.0.lock();
+                        all.entry(key.clone()).or_default().failures = 0;
+                    }
+                    self.hold_back(&key, batch, Some(Hold::Stopped));
                     return;
                 }
                 Err(Ran::Failed(e)) => {
@@ -295,7 +421,11 @@ impl CrewHub {
                         1 => RETRY_SOON_MINUTES,
                         _ => RETRY_LATER_MINUTES,
                     };
-                    self.hold_back(&key, again, Some(self.timing.minute * minutes));
+                    self.hold_back(
+                        &key,
+                        again,
+                        Some(Hold::Until(Instant::now() + self.timing.minute * minutes)),
+                    );
                     return;
                 }
             }
@@ -303,19 +433,22 @@ impl CrewHub {
     }
 
     /// Runs `prompt` in `service`'s oversight conversation with `person`,
-    /// kept as a check-in (the ceiling counts it), under its mind.
+    /// at `hop` hand-offs with `approvals` beside it, kept as a check-in of
+    /// its own kind (the ceiling counts it), under its mind.
     async fn notices_turn(
         &self,
         service: &Arc<AgentService>,
         person: &str,
         prompt: &str,
+        hop: i16,
+        approvals: Vec<MentionedApproval>,
     ) -> Result<(), Ran> {
         let id = service.agent_id.as_str().to_string();
         let mut record = CheckIn {
             id: crew::new_id(),
             at: crew::now(),
             agent_id: id.clone(),
-            kind: "notices".into(),
+            kind: NOTICES_KIND.into(),
             prompt: prompt.to_string(),
             reply: None,
         };
@@ -324,19 +457,23 @@ impl CrewHub {
         }
         self.yield_to_person(&id).await;
         let ran = self
-            .with_mind(
-                &id,
-                "its notices",
-                self.run_turn(
-                    service,
-                    person,
-                    &check_in_channel(&id),
-                    prompt,
-                    0,
-                    None,
-                    None,
-                ),
-            )
+            .with_mind(&id, "its notices", async {
+                // Its crew calls are one hand-off on from what woke it.
+                self.wake_hop.lock().insert(id.clone(), hop);
+                let ran = self
+                    .run_turn(
+                        service,
+                        person,
+                        &check_in_channel(&id),
+                        prompt,
+                        hop,
+                        Some(approvals),
+                        None,
+                    )
+                    .await;
+                self.wake_hop.lock().remove(&id);
+                ran
+            })
             .await;
         match ran {
             Ok((_, reply)) => {
@@ -346,7 +483,7 @@ impl CrewHub {
                 }
                 Ok(())
             }
-            Err(e) if format!("{e:#}").contains(super::deliver::STOPPED) => Err(Ran::Stopped),
+            Err(e) if super::deliver::stopped(&e) => Err(Ran::Stopped),
             Err(e) => Err(Ran::Failed(format!("{e:#}"))),
         }
     }
@@ -452,14 +589,18 @@ impl CrewHub {
     }
 }
 
-/// Whether a runner takes `q` now: notices wait, none runs, and it isn't
-/// waiting to be tried again. Taken, it is marked running.
+/// Whether a runner takes `q` now: notices wait, none runs, and nothing
+/// holds them. Taken, it is marked running.
 fn claim(q: &mut Queue) -> bool {
-    let go =
-        !q.running && !q.pending.is_empty() && q.not_before.is_none_or(|at| Instant::now() >= at);
+    let free = match q.hold {
+        None => true,
+        Some(Hold::Stopped) => false,
+        Some(Hold::Until(at)) => Instant::now() >= at,
+    };
+    let go = free && !q.running && !q.pending.is_empty();
     if go {
         q.running = true;
-        q.not_before = None;
+        q.hold = None;
     }
     go
 }
@@ -531,14 +672,63 @@ mod tests {
     fn a_queue_is_claimed_once_and_not_before_its_time() {
         let mut q = Queue::default();
         assert!(!claim(&mut q), "nothing waits");
-        q.pending.push_back(Notice::new("one"));
+        q.push(Notice::new("one"));
         assert!(claim(&mut q));
         assert!(!claim(&mut q), "its runner is on it");
         q.running = false;
-        q.not_before = Some(Instant::now() + Duration::from_secs(60));
+        q.hold = Some(Hold::Until(Instant::now() + Duration::from_secs(60)));
         assert!(!claim(&mut q), "not before its time");
-        q.not_before = Some(Instant::now());
+        q.push(Notice::new("two"));
+        assert!(!claim(&mut q), "something new doesn't lift a wait for time");
+        q.hold = Some(Hold::Until(Instant::now()));
         assert!(claim(&mut q), "its time came");
-        assert!(q.not_before.is_none());
+        assert!(q.hold.is_none());
+    }
+
+    #[test]
+    fn a_stop_holds_until_something_happens_and_the_sweep_never_lifts_it() {
+        let mut q = Queue::default();
+        q.push(Notice::new("one"));
+        q.hold = Some(Hold::Stopped);
+        assert!(!claim(&mut q), "held by the person's Stop");
+        let mut sweep = Notice::new(SWEEP);
+        sweep.sweep = true;
+        q.push(sweep);
+        assert!(!claim(&mut q), "the sweep doesn't lift it");
+        q.push(Notice::new("a session finished its turn"));
+        assert!(claim(&mut q), "something new does");
+    }
+
+    #[test]
+    fn past_the_most_held_a_plain_notice_is_folded_and_a_watch_end_never() {
+        let mut q = Queue::default();
+        let mut ended = Notice::new("your watch ended");
+        ended.watch = Some(Uuid::new_v4());
+        q.push(ended);
+        for i in 0..MAX_HELD {
+            q.push(Notice::new(format!("n{i}")));
+        }
+        assert_eq!(q.pending.len(), MAX_HELD);
+        assert_eq!(q.folded, 1);
+        assert!(q.pending.iter().any(|n| n.watch.is_some()), "kept");
+        assert_eq!(q.pending[1].text, "n1", "the oldest plain one went");
+    }
+
+    #[test]
+    fn a_trigger_keeps_its_hops_and_requests_as_a_notice_and_back() {
+        let mut t = Trigger::line("an agent answered".into());
+        t.hop = 3;
+        t.approvals = vec![MentionedApproval {
+            session_id: "s".into(),
+            approval_id: "a".into(),
+            summary: "run it".into(),
+        }];
+        let n = Notice::of(t);
+        assert_eq!(n.hop, 3);
+        assert_eq!(n.approvals.len(), 1);
+        assert!(!n.sweep);
+        let back = n.into_trigger();
+        assert_eq!((back.hop, back.approvals.len()), (3, 1));
+        assert!(Notice::of(Trigger::line(SWEEP.into())).sweep);
     }
 }

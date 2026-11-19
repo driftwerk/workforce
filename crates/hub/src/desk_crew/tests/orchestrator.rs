@@ -20,6 +20,9 @@ const FULL: &str =
 /// What only a notices turn's prompt says.
 const NOTICES: &str = "Notices for you, at Act fully";
 
+/// What the boss says at the end of each of its turns: its own notes.
+const OWN_WORDS: &str = "BOSS-OWN-NOTES on what I did";
+
 /// The boss at Act fully on a hub whose Claude Code is installed, its GitHub
 /// `gh` with the person's own key; its DM open, its crew started.
 async fn hub_on(
@@ -28,7 +31,7 @@ async fn hub_on(
     gh: &wiremock::MockServer,
 ) -> (Arc<AgentService>, Arc<CrewHub>, Desk, wiremock::MockServer) {
     let uri = gh.uri();
-    let (overseer, llm) = agent_configured(dir, "desk", "ok", &[], |c| {
+    let (overseer, llm) = agent_configured(dir, "desk", OWN_WORDS, &[], |c| {
         c.github.base_url = uri;
     })
     .await;
@@ -80,48 +83,42 @@ async fn hub_on(
     (overseer, crew, d, llm)
 }
 
-/// The boss's model answers the first notices turn that says `marker` with
-/// `calls`, all at once.
+/// The boss's notices turn that has `marker` makes `calls`, one a round in
+/// order (each round's request carries the turn, so each next call answers
+/// the round after the last).
 async fn acts_on(llm: &wiremock::MockServer, marker: &str, calls: &[(&str, Value)]) {
     use wiremock::matchers::{body_partial_json, body_string_contains, method, path};
     use wiremock::{Mock, ResponseTemplate};
     let chunk = |body: Value| format!("data: {body}\n\n");
-    let tool_calls: Vec<Value> = calls
-        .iter()
-        .enumerate()
-        .map(|(i, (tool, args))| {
-            json!({"index": i, "id": format!("call_{i}"), "type": "function",
-                "function": {"name": tool, "arguments": args.to_string()}})
-        })
-        .collect();
-    let sse = [
-        chunk(
-            json!({"id": "c0", "object": "chat.completion.chunk", "model": "mock",
-            "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": tool_calls},
-                "finish_reason": null}]}),
-        ),
-        chunk(
-            json!({"id": "c0", "object": "chat.completion.chunk", "model": "mock",
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}),
-        ),
-        "data: [DONE]\n\n".to_string(),
-    ]
-    .concat();
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(body_string_contains(NOTICES))
-        .and(body_string_contains(marker))
-        .and(body_partial_json(json!({"stream": true})))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(sse),
-        )
-        .up_to_n_times(1)
-        .with_priority(1)
-        .mount(llm)
-        .await;
+    for (i, (tool, args)) in calls.iter().enumerate() {
+        let sse = [
+            chunk(json!({"id": "c0", "object": "chat.completion.chunk", "model": "mock",
+                "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [
+                    {"index": 0, "id": format!("call_{i}_{}", uuid::Uuid::new_v4().simple()), "type": "function",
+                        "function": {"name": tool, "arguments": args.to_string()}}
+                ]}, "finish_reason": null}]})),
+            chunk(json!({"id": "c0", "object": "chat.completion.chunk", "model": "mock",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}})),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        // Mounted in order at one priority: the first not used up answers.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains(NOTICES))
+            .and(body_string_contains(marker))
+            .and(body_partial_json(json!({"stream": true})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(llm)
+            .await;
+    }
 }
 
 /// GitHub as the person's key reads it: pull request 5 in acme/web, its
@@ -392,11 +389,25 @@ async fn a_plan_of_chained_tickets_runs_to_its_end_with_no_word_from_the_person(
         ] {
             assert!(all.contains(said), "{said:?} in its conversation");
         }
+        assert!(
+            all.contains(OWN_WORDS),
+            "its own words are in its conversation"
+        );
+        assert_eq!(
+            super::decides_at_once::said(&overseer, &[OWN_WORDS]),
+            0,
+            "and never posted to the person's DM"
+        );
         assert_eq!(
             super::decides_at_once::said(&overseer, &[NOTICES]),
             0,
-            "nothing of it in the DM"
+            "nor its notices"
         );
+        // Only this hub's own boss runs on notices: never one served from
+        // another hub's grant, nor one relayed from its home.
+        assert!(crew.orchestrates("desk"));
+        assert!(!crew.orchestrates("acme-hub/desk"));
+        assert!(!crew.orchestrates(&format!("{}/desk", workforce_desk::grant::HOME_HUB)));
         let asked: Vec<_> = d
             .store()
             .items_not_closed(Some("desk"))
@@ -440,13 +451,22 @@ async fn notices_wait_their_turn_and_the_persons_dm_words_come_with_them() {
         let base = std::fs::canonicalize(dir.path()).unwrap();
         let gh = github(0).await;
         let (overseer, crew, _d, llm) = hub_on(&base, pool, &gh).await;
-        // The person answered in the DM: the next turn has it.
+        // The person answered in the DM (after the boss's own first words
+        // there, its ask for their directives): the next turn has it.
+        eventually("the boss's first words in its DM", async || {
+            (super::decides_at_once::said(&overseer, &["Before I run on my own"]) > 0).then_some(())
+        })
+        .await;
         let mut dm = overseer
             .sessions
             .get_or_create(DESK_CHANNEL, PERSON, "desk")
             .unwrap();
         dm.add_user_message("Use the blue button, and merge when green.", None);
         overseer.sessions.save(&dm).unwrap();
+        overseer
+            .sessions
+            .append_to_archive(&dm.id, dm.messages.last().unwrap())
+            .unwrap();
 
         super::one_picture::slow_once(
             &llm,

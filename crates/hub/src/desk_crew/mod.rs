@@ -307,6 +307,13 @@ pub struct CrewHub {
     watches_in_flight: Mutex<std::collections::HashSet<uuid::Uuid>>,
     /// What each watch's last read said as it ended, for its notice.
     watch_reads: Mutex<HashMap<uuid::Uuid, Option<serde_json::Value>>>,
+    /// Notices handed back to the wake loop when their boss no longer runs
+    /// on them, and its end of that, taken once it starts.
+    #[allow(clippy::type_complexity)]
+    wake_back: (
+        tokio::sync::mpsc::UnboundedSender<(String, Vec<watcher::Trigger>)>,
+        Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<(String, Vec<watcher::Trigger>)>>>,
+    ),
     /// A test's own: its boss judges turn ends with the focused call, as a
     /// boss the loop doesn't run for does.
     #[cfg(test)]
@@ -737,6 +744,10 @@ impl CrewHub {
             notices: orchestrator::Notices::default(),
             watches_in_flight: Mutex::default(),
             watch_reads: Mutex::default(),
+            wake_back: {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                (tx, Mutex::new(Some(rx)))
+            },
             #[cfg(test)]
             focused_turn_ends: std::sync::atomic::AtomicBool::new(false),
             notes_offered: Mutex::new(None),

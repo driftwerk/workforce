@@ -28,8 +28,23 @@ use crate::serve::AgentService;
 
 pub use crate::broadcast::USER_MESSAGE;
 
-/// What a crew turn the person stopped fails with.
-pub(super) const STOPPED: &str = "the turn was stopped";
+/// What a crew turn the person stopped fails with: told by its type,
+/// never its words.
+#[derive(Debug)]
+pub(super) struct TurnStopped;
+
+impl std::fmt::Display for TurnStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the turn was stopped")
+    }
+}
+
+impl std::error::Error for TurnStopped {}
+
+/// Whether `e` is a crew turn the person stopped.
+pub(super) fn stopped(e: &eyre::Report) -> bool {
+    e.chain().any(|c| c.is::<TurnStopped>())
+}
 
 impl CrewHub {
     /// Runs `prompt` as a turn in `service`'s Desk DM with `owner`, at `hop`
@@ -231,7 +246,7 @@ impl CrewHub {
         let answer = match &conducted.ending {
             Ending::Finished(Ok(result)) => Ok(result.response.clone()),
             Ending::Finished(Err(e)) => Err(eyre::eyre!("{e:#}")),
-            Ending::Stopped => Err(eyre::eyre!("{STOPPED}")),
+            Ending::Stopped => Err(eyre::Report::new(TurnStopped)),
             Ending::Failed(e) => Err(eyre::eyre!("{e}")),
         };
         for message in conducted

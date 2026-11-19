@@ -782,7 +782,7 @@ impl CrewHub {
                     crew.notify(
                         service.agent_id.as_str(),
                         &owner,
-                        super::orchestrator::Notice::new(t.line),
+                        super::orchestrator::Notice::of(t),
                     );
                 }
                 return true;
@@ -1139,6 +1139,10 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     // A check-in whose turn didn't run comes back here, to be tried again
     // once: none is dropped without a word.
     let (retry, mut retried) = tokio::sync::mpsc::unbounded_channel::<(String, Vec<Trigger>)>();
+    // What a boss's notices hand back when it no longer runs on them (Act
+    // fully ended, or isn't in force yet): checked in on here, the old way.
+    let (_unused, none_back) = tokio::sync::mpsc::unbounded_channel();
+    let mut handed_back = crew.wake_back.1.lock().take().unwrap_or(none_back);
     // The ready tickets nobody has, so that one that becomes so wakes it.
     let mut ready_seen = HashMap::new();
     let mut ready_dirty = false;
@@ -1179,6 +1183,11 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                         found.push((s.agent_id.as_str().to_string(), t));
                     }
                 }
+            }
+            Some((id, back)) = handed_back.recv() => {
+                let w = waking.entry(id).or_default();
+                w.window.get_or_insert_with(Instant::now);
+                hold(&mut w.pending, back);
             }
             Some((id, again)) = retried.recv() => {
                 tracing::warn!(agent = %id, held = again.len(), "the overseer's check-in didn't run; trying it again");
