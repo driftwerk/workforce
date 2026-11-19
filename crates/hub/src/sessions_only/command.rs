@@ -78,7 +78,14 @@ pub(super) fn steps(command: &str) -> Vec<Vec<Word>> {
                     }
                 }
             }
-            '<' if !in_word && chars.peek() == Some(&'<') => {
+            '#' if !in_word => {
+                // A comment, to the line's end.
+                while chars.peek().is_some_and(|c| *c != '\n') {
+                    chars.next();
+                }
+            }
+            '<' if chars.peek() == Some(&'<') => {
+                end_word(&mut step, &mut word, &mut quoted, &mut in_word);
                 chars.next();
                 if chars.peek() == Some(&'<') {
                     // A here-string: its word is text, read as one.
@@ -158,6 +165,55 @@ pub(super) fn steps(command: &str) -> Vec<Vec<Word>> {
         steps.push(step);
     }
     steps
+}
+
+/// The files an in-place edit writes: its operands past the values of
+/// `with` (a script, a module), and past the script itself when it is the
+/// first operand (`sed 's/a/b/' f`) and `script_first`.
+fn edited(args: &[&str], with: &[&str], script_first: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut scripted = false;
+    let mut skip = false;
+    for a in args {
+        if std::mem::take(&mut skip) {
+            continue;
+        }
+        // The flag alone, or ending a cluster (`-ne`, `-pe`): its value next.
+        let takes = with.contains(a)
+            || (a.starts_with('-')
+                && !a.starts_with("--")
+                && a.len() > 2
+                && with.iter().any(|w| w.len() == 2 && a.ends_with(&w[1..])));
+        if takes {
+            scripted = true;
+            skip = true;
+            continue;
+        }
+        // `-e'…'` and `-Mstrict` carry their value.
+        if with
+            .iter()
+            .any(|w| w.len() == 2 && a.starts_with(w) && a.len() > 2)
+        {
+            scripted = true;
+            continue;
+        }
+        if a.starts_with('-') || a.is_empty() {
+            continue;
+        }
+        if script_first && !scripted {
+            scripted = true;
+            continue;
+        }
+        out.push(a.to_string());
+    }
+    out
+}
+
+/// Whether a copy's destination is another machine's (`host:path`,
+/// `user@host:path`).
+fn remote(to: &str) -> bool {
+    to.split_once(':')
+        .is_some_and(|(host, _)| !host.is_empty() && !host.contains('/'))
 }
 
 /// Where a word that names a path points, from `here`: `~` and `$HOME`
@@ -288,7 +344,7 @@ pub(super) fn is_code(command: &str, here: &Path, touches: &dyn Fn(&Path) -> boo
             // Another machine's: what runs there is never read here.
             "ssh" | "mosh" => false,
             "cd" | "pushd" => {
-                moved_to = Some(match files(&args).first() {
+                moved_to = Some(match files(&args).first().filter(|to| *to != "-") {
                     Some(to) => path_of(to.trim_end_matches([')', '}']), &here),
                     None => std::env::var_os("HOME").map_or(here.clone(), PathBuf::from),
                 });
@@ -416,25 +472,54 @@ pub(super) fn is_code(command: &str, here: &Path, touches: &dyn Fn(&Path) -> boo
                         || a.starts_with("--in-place=")
                         || (a.starts_with('-') && !a.starts_with("--") && a.contains('i'))
                 });
-                in_place && files(&args).iter().any(|f| inside(f))
+                in_place
+                    && edited(&args, &["-e", "-f", "--expression", "--file"], true)
+                        .iter()
+                        .any(|f| inside(f))
             }
             "perl" => {
-                let in_place = args
-                    .iter()
-                    .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('i'));
-                in_place && files(&args).iter().any(|f| inside(f))
+                // `-i` itself, or a cluster with `i` before a switch that
+                // takes the rest of the word (`-pi`, `-i.bak`, not `-Mstrict`).
+                let in_place = args.iter().any(|a| {
+                    a.strip_prefix('-').is_some_and(|f| {
+                        !f.starts_with('-')
+                            && f.chars()
+                                .take_while(|c| {
+                                    !matches!(
+                                        c,
+                                        'e' | 'E'
+                                            | 'M'
+                                            | 'm'
+                                            | 'I'
+                                            | 'x'
+                                            | 'l'
+                                            | '0'
+                                            | 'C'
+                                            | 'd'
+                                            | 'D'
+                                            | 'F'
+                                    )
+                                })
+                                .any(|c| c == 'i')
+                    })
+                });
+                in_place
+                    && edited(&args, &["-e", "-E", "-M", "-I"], false)
+                        .iter()
+                        .any(|f| inside(f))
             }
             "tee" | "rm" | "mv" | "touch" | "mkdir" | "rmdir" | "unlink" => {
                 files(&args).iter().any(|f| inside(f))
             }
             // What they write is where they copy to: after `-t`, else the last.
-            "cp" | "ln" | "install" | "rsync" => {
+            "cp" | "ln" | "install" | "rsync" | "scp" => {
                 let to = args
                     .iter()
                     .position(|a| *a == "-t")
                     .and_then(|i| args.get(i + 1).map(|t| t.to_string()))
                     .or_else(|| files(&args).last().cloned());
-                to.is_some_and(|t| inside(&t))
+                // `host:path` is another machine's.
+                to.is_some_and(|t| !remote(&t) && inside(&t))
             }
             // Their first operand is a mode, an owner or a size.
             "chmod" | "chown" | "chgrp" => files(&args).iter().skip(1).any(|f| inside(f)),
@@ -538,6 +623,9 @@ mod tests {
             ("ssh devbox 'cat f' > /w/repo/out.rs", "/w"),
             ("ssh devbox uptime && cargo build", "/w/repo"),
             ("pip install -e .", "/w/repo"),
+            ("sed -i 's/a/b/' /w/repo/x", "/w/repo"),
+            ("perl -i.bak -pe 's/a/b/' src/x", "/w/repo"),
+            ("cat<<EOF > src/x\nhi\nEOF", "/w/repo"),
         ] {
             assert!(code(command, here), "{command} in {here} ran");
         }
@@ -574,6 +662,16 @@ mod tests {
             ("kubectl get pods | grep api", "/w/repo"),
             ("curl -s 'https://x.io/a?b=1&c=2'", "/w/repo"),
             ("docker ps", "/w/repo"),
+            ("sed -i 's/a/b/' /tmp/zshrc", "/w/repo"),
+            ("sed -i -e 's/a/b/' /tmp/f", "/w/repo"),
+            ("perl -pi -e 's/a/b/' /tmp/f", "/w/repo"),
+            ("perl -Mstrict -e 'print 1' src/x", "/w/repo"),
+            ("perl -i -pe 's/a/b/' /tmp/f", "/w/repo"),
+            ("sed -ne 's/a/b/p' -i /tmp/f", "/w/repo"),
+            ("rsync -az dist/ devbox:/srv/app/", "/w/repo"),
+            ("scp build.tar user@host:/tmp/", "/w/repo"),
+            ("ls # then; make", "/w/repo"),
+            ("cat<<EOF\nmake install\nEOF", "/w/repo"),
             ("", "/w/repo"),
         ] {
             assert!(!code(command, here), "{command} in {here} refused");
