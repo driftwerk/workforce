@@ -51,6 +51,11 @@ pub struct WorkspaceSpec<'a> {
     /// The repo alias a round on the coding worker starts in; unset, the
     /// worker's own choice: the lone repo, else the root above them all.
     pub primary: Option<&'a str>,
+    /// Set for an agent turn's workspace, whose keyed home keeps what its
+    /// conversation needs: the worker releases the scope once it has been
+    /// idle this long, and sooner, when it is full, to seat another turn.
+    /// Never set for a coding session's.
+    pub idle_release: Option<Duration>,
 }
 
 /// The launcher could not seat the workspace right now; a caller with time to
@@ -113,6 +118,8 @@ pub struct EmptyScope<'a> {
     pub project: &'a str,
     pub scope: &'a str,
     pub home: HomeSpec,
+    /// As [`WorkspaceSpec::idle_release`].
+    pub idle_release: Option<Duration>,
 }
 
 impl EmptyScope<'_> {
@@ -136,6 +143,7 @@ impl EmptyScope<'_> {
             tokens: &HashMap::new(),
             home: self.home,
             primary: None,
+            idle_release: self.idle_release,
         };
         ensure_with_wait(launcher, &spec, deadline, cancel, on_wait).await
     }
@@ -515,6 +523,7 @@ mod tests {
             tokens: &tokens,
             home: HomeSpec::Ephemeral,
             primary: None,
+            idle_release: None,
         };
         let launcher = Refusing(std::sync::atomic::AtomicUsize::new(refusals));
         let waits = std::cell::Cell::new(0);

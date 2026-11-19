@@ -51,6 +51,10 @@ const READY_POLL_MAX: Duration = Duration::from_secs(1);
 const CHOWN_TIMEOUT_SECS: u64 = 60;
 const GIT_TIMEOUT_SECS: u64 = 600;
 const SETUP_TIMEOUT_SECS: u64 = 1800;
+/// How long a scope that may give way must have been untouched before a
+/// prepare on a full worker takes it: far longer than any gap between the
+/// commands of one turn, which touch their scope as they start and end.
+pub(crate) const YIELD_IDLE_GRACE: Duration = Duration::from_secs(120);
 
 /// Shared caches every scope mounts, as (dataset name, path in the scope).
 const CACHES: &[(&str, &str)] = &[
@@ -78,6 +82,12 @@ pub struct Worker {
     homes: Mutex<BTreeMap<String, Home>>,
     running: Mutex<HashMap<ScopeId, HashSet<String>>>,
     prepares: tokio::sync::Mutex<()>,
+    /// Scopes that gave way but whose teardown failed: still counted against
+    /// capacity, as they may still hold the host, until a sweep takes them
+    /// down.
+    leftovers: Mutex<Vec<Scope>>,
+    /// The scopes whose teardown is under way right now.
+    tearing: Mutex<HashSet<ScopeId>>,
     pub(crate) jobs: Mutex<BTreeMap<JobId, JobRecord>>,
     pub(crate) live: Mutex<HashMap<JobId, LiveJob>>,
     pub(crate) starts: tokio::sync::Mutex<()>,
@@ -141,6 +151,8 @@ impl Worker {
             homes: Mutex::new(homes),
             running: Mutex::new(HashMap::new()),
             prepares: tokio::sync::Mutex::new(()),
+            leftovers: Mutex::new(Vec::new()),
+            tearing: Mutex::new(HashSet::new()),
             jobs: Mutex::new(jobs),
             live: Mutex::new(HashMap::new()),
             starts: tokio::sync::Mutex::new(()),
@@ -161,8 +173,15 @@ impl Worker {
     /// and those being built.
     fn census(&self) -> Census {
         let mut census = Census::default();
-        for scope in self.scopes.lock().values() {
+        // One guard of the map throughout, so a scope handed from building
+        // to the map, or out of it onto the leftovers, is counted once.
+        let scopes = self.scopes.lock();
+        for scope in scopes.values() {
             census.add(Weight::of_held(&scope.repos));
+        }
+        // What is left of a failed teardown still holds its seat.
+        for left in self.leftovers.lock().iter() {
+            census.add(Weight::of_held(&left.repos));
         }
         for building in self.building.lock().values() {
             census.add(building.weight);
@@ -321,6 +340,7 @@ impl Worker {
             }
         }
         let _same_scope = self.scope_locks.lock(request.scope.as_str()).await;
+        self.classify(&request);
         // A scope already seated is handed back without waiting on another
         // scope's build of the same home.
         if let Some(existing) = self.touch(&request.scope) {
@@ -336,45 +356,48 @@ impl Worker {
             HomeSpec::Ephemeral => None,
         };
         let weight = Weight::of(&request.repos);
-        let _seat = {
-            let _one_at_a_time = self.prepares.lock().await;
-            if let Some(existing) = self.touch(&request.scope) {
-                let home_reused = existing.home.is_some();
-                return Ok(ServerFrame::Prepared(prepared(
-                    &existing,
-                    true,
-                    home_reused,
-                )));
-            }
-            if let Err(shortfall) = self.room_for(weight) {
-                self.refusals.fetch_add(1, Ordering::Relaxed);
-                info!(
-                    scope = %request.scope,
-                    weight = weight.name(),
-                    %shortfall,
-                    "no room for a scope"
-                );
-                self.publish_load();
-                return Ok(refused(RefusalReason::AtCapacity));
-            }
-            if self.zfs.free_bytes(&self.config.pool).await? < self.config.pool_free_floor_bytes() {
-                // A refresh pruning at the same moment can take a snapshot out
-                // from under this; whatever was freed still counts below.
-                if let Err(error) = crate::refresh::reclaim(self).await {
-                    warn!(%error, "reclaiming pool space before a prepare failed");
+        // The decision is taken under the prepare lock; a teardown it calls
+        // for (an owed one of this id, or an idle scope giving way) runs
+        // outside it, still counted, and the decision is taken again.
+        let mut yielded = false;
+        let _seat = loop {
+            let teardown = {
+                let _one_at_a_time = self.prepares.lock().await;
+                if let Some(existing) = self.touch(&request.scope) {
+                    let home_reused = existing.home.is_some();
+                    return Ok(ServerFrame::Prepared(prepared(
+                        &existing,
+                        true,
+                        home_reused,
+                    )));
                 }
-                if self.zfs.free_bytes(&self.config.pool).await?
-                    < self.config.pool_free_floor_bytes()
-                {
-                    return Ok(refused(RefusalReason::PoolFull));
+                // Not in the map: a conversation back while its last
+                // scope's teardown is under way (waited out) or still owed
+                // (done first), as the new scope takes the same id, dataset
+                // and home. Asked after the map, so a release moving it out
+                // meanwhile is seen here.
+                match self.claim(&request.scope) {
+                    Claim::Absent => self.decide_seat(&request, weight, yielded).await?,
+                    Claim::Busy => return Ok(refused(RefusalReason::AtCapacity)),
+                    Claim::Owed(leftover) => Decision::TakeDown(*leftover),
                 }
-            }
-            validate_overrides(&request.env).map_err(|reason| eyre::eyre!(reason))?;
-            let home = match &request.home {
-                HomeSpec::Keyed { key, .. } => Some(key.clone()),
-                HomeSpec::Ephemeral => None,
             };
-            Seat::hold(self, &request.scope, weight, home)
+            match teardown {
+                Decision::Seat(seat) => break seat,
+                Decision::Answer(frame) => return Ok(frame),
+                Decision::TakeDown(leftover) => {
+                    if let Err(error) = self.take_down(leftover).await {
+                        warn!(scope = %request.scope, %error, "taking down a scope that gave way failed again; its conversation waits");
+                        return Ok(refused(RefusalReason::AtCapacity));
+                    }
+                }
+                Decision::GiveWay(idle, shortfall) => {
+                    yielded = true;
+                    if !self.give_way(idle, &request.scope).await {
+                        return Ok(self.no_room(&request.scope, weight, shortfall));
+                    }
+                }
+            }
         };
 
         let root = self.work_dataset(&request.scope);
@@ -400,11 +423,33 @@ impl Worker {
                 Ok(frame)
             }
             Err(error) => {
-                if let Some(container) = started {
-                    let _ = self.containers.stop(&container).await;
+                let mut cleared = true;
+                if let Some(container) = &started {
+                    if let Err(e) = self.containers.stop(container).await {
+                        warn!(scope = %request.scope, error = %e, "removing a failed scope's container");
+                        cleared = false;
+                    }
                 }
-                if self.zfs.exists(&root).await.unwrap_or(false) {
-                    let _ = self.zfs.destroy(&root).await;
+                if self.zfs.exists(&root).await.unwrap_or(true) {
+                    if let Err(e) = self.zfs.destroy(&root).await {
+                        warn!(scope = %request.scope, error = %e, "destroying a failed scope's work");
+                        cleared = false;
+                    }
+                }
+                if !cleared {
+                    // Owed, and counted, until the sweep takes it down.
+                    let container =
+                        started.unwrap_or_else(|| ContainerId(container_name(&request.scope)));
+                    let mut left = Scope::unbuilt(request.scope.clone(), container, root);
+                    left.repos = request
+                        .repos
+                        .iter()
+                        .map(|repo| (repo.alias.clone(), repo.slug.clone()))
+                        .collect();
+                    if let HomeSpec::Keyed { key, .. } = &request.home {
+                        left.home = Some(key.clone());
+                    }
+                    self.leftovers.lock().push(left);
                 }
                 Err(error)
             }
@@ -541,6 +586,7 @@ impl Worker {
                 home: home_key,
                 bench,
                 jobs: true,
+                yields_when_idle: request.yields_when_idle,
             },
             home_reused,
         ))
@@ -960,28 +1006,272 @@ impl Worker {
     }
 
     pub async fn release(&self, scope: &ScopeId) -> Result<ServerFrame> {
-        let removed = self.scopes.lock().remove(scope);
+        let removed = self.retire(&mut self.scopes.lock(), scope);
         if let Some(removed) = removed {
-            self.drop_jobs_of(scope);
-            self.save()?;
-            self.running.lock().remove(scope);
-            let _ = std::fs::remove_file(self.mcp_config_host_path(&removed));
-            if let Err(e) = self.containers.stop(&removed.container).await {
-                warn!(scope = %scope, error = %e, "stopping a released scope's container");
-            }
-            if self.zfs.exists(&removed.dataset).await? {
-                self.zfs.destroy(&removed.dataset).await?;
-            }
-            if let Some(key) = &removed.home {
-                if let Some(home) = self.homes.lock().get_mut(key) {
-                    home.last_used = Utc::now();
-                }
-                self.save()?;
-            }
+            self.take_down(removed).await?;
             info!(scope = %scope, "released");
             self.publish_load();
         }
         Ok(ServerFrame::Done(ExecSummary::exited(0)))
+    }
+
+    /// Move `scope` out of the map, held as `scopes`, to be taken down:
+    /// in one step it is listed among the leftovers, still counted, and
+    /// marked as being torn down, so no prepare finds it in neither place.
+    /// Locks in order: scopes, leftovers, tearing.
+    fn retire(&self, scopes: &mut BTreeMap<ScopeId, Scope>, scope: &ScopeId) -> Option<Scope> {
+        let removed = scopes.remove(scope)?;
+        self.leftovers.lock().push(removed.clone());
+        self.tearing.lock().insert(scope.clone());
+        Some(removed)
+    }
+
+    /// Claim `scope`'s owed teardown, when it has one nobody is doing now.
+    fn claim(&self, scope: &ScopeId) -> Claim {
+        let _scopes = self.scopes.lock();
+        let leftovers = self.leftovers.lock();
+        let mut tearing = self.tearing.lock();
+        if tearing.contains(scope) {
+            return Claim::Busy;
+        }
+        match leftovers.iter().find(|left| left.id == *scope) {
+            Some(left) => {
+                tearing.insert(scope.clone());
+                Claim::Owed(Box::new(left.clone()))
+            }
+            None => Claim::Absent,
+        }
+    }
+
+    /// Take down a scope retired or claimed for it. Until that is done it
+    /// stays among the leftovers, counted against capacity and owed by the
+    /// sweep, so a teardown that fails, or is dropped part way, never
+    /// leaves the host holding a scope nothing counts; its id stays marked
+    /// as torn down until this ends, however it ends.
+    async fn take_down(&self, scope: Scope) -> Result<()> {
+        let _tearing = Tearing {
+            tearing: &self.tearing,
+            id: scope.id.clone(),
+        };
+        self.dismantle(&scope).await?;
+        self.leftovers.lock().retain(|left| left.id != scope.id);
+        Ok(())
+    }
+
+    /// Take down a scope already taken out of the map: its jobs, container
+    /// and work go, and its keyed home, which outlives it, counts as used
+    /// now so its lifetime starts again from here.
+    async fn dismantle(&self, removed: &Scope) -> Result<()> {
+        let scope = &removed.id;
+        self.drop_jobs_of(scope);
+        self.save()?;
+        self.running.lock().remove(scope);
+        let _ = std::fs::remove_file(self.mcp_config_host_path(removed));
+        // The home's lifetime restarts first, so a failure below never
+        // leaves it counted from its scope's start.
+        if let Some(key) = &removed.home {
+            if let Some(home) = self.homes.lock().get_mut(key) {
+                home.last_used = Utc::now();
+            }
+            self.save()?;
+        }
+        // A container that may still run keeps the scope owed.
+        self.containers.stop(&removed.container).await?;
+        if self.zfs.exists(&removed.dataset).await? {
+            self.zfs.destroy(&removed.dataset).await?;
+        }
+        Ok(())
+    }
+
+    /// Whether `request`, of `weight` and with nothing owed under its id,
+    /// is seated now, answered, or first needs an idle scope to give way;
+    /// under the prepare lock. Only one scope gives way for a prepare
+    /// (`yielded` once one has).
+    async fn decide_seat(
+        &self,
+        request: &PrepareRequest,
+        weight: Weight,
+        yielded: bool,
+    ) -> Result<Decision<'_>> {
+        // With no room and no idle scope whose going would make some,
+        // refused before anything slower is asked.
+        if let Err(shortfall) = self.room_for(weight) {
+            if yielded || self.idle_yielder(Utc::now(), weight).is_none() {
+                return Ok(Decision::Answer(self.no_room(
+                    &request.scope,
+                    weight,
+                    shortfall,
+                )));
+            }
+        }
+        if self.zfs.free_bytes(&self.config.pool).await? < self.config.pool_free_floor_bytes() {
+            // A refresh pruning at the same moment can take a snapshot out
+            // from under this; whatever was freed still counts below.
+            if let Err(error) = crate::refresh::reclaim(self).await {
+                warn!(%error, "reclaiming pool space before a prepare failed");
+            }
+            if self.zfs.free_bytes(&self.config.pool).await? < self.config.pool_free_floor_bytes() {
+                return Ok(Decision::Answer(refused(RefusalReason::PoolFull)));
+            }
+        }
+        validate_overrides(&request.env).map_err(|reason| eyre::eyre!(reason))?;
+        // Last of the checks, so a prepare refused for anything else never
+        // takes down a conversation's workspace for nothing. Short of pool
+        // space it is refused before one could give way: a turn's work clone
+        // is small, and its home, the large part, stays anyway.
+        if let Err(shortfall) = self.room_for(weight) {
+            return Ok(match self.take_idle_yielder(Utc::now(), weight) {
+                Some(idle) if !yielded => Decision::GiveWay(idle, shortfall),
+                _ => Decision::Answer(self.no_room(&request.scope, weight, shortfall)),
+            });
+        }
+        let home = match &request.home {
+            HomeSpec::Keyed { key, .. } => Some(key.clone()),
+            HomeSpec::Ephemeral => None,
+        };
+        Ok(Decision::Seat(Seat::hold(
+            self,
+            &request.scope,
+            weight,
+            home,
+        )))
+    }
+
+    /// A prepare of `weight` refused for want of room: counted, logged and
+    /// published as every such refusal is.
+    fn no_room(&self, scope: &ScopeId, weight: Weight, shortfall: Shortfall) -> ServerFrame {
+        self.refusals.fetch_add(1, Ordering::Relaxed);
+        info!(
+            scope = %scope,
+            weight = weight.name(),
+            %shortfall,
+            "no room for a scope"
+        );
+        self.publish_load();
+        refused(RefusalReason::AtCapacity)
+    }
+
+    /// Whether `idle` going would make room for a scope of `weight`: the
+    /// same decision taken with it gone. Measured memory and CPU are as the
+    /// host reads them now, so an idle scope never gives way for those:
+    /// only for a seat of its ceiling or the reserve it holds.
+    fn going_would_help(&self, now: &Room, idle: &Scope, weight: Weight) -> bool {
+        let mut census = now.census;
+        match Weight::of_held(&idle.repos) {
+            Weight::Full => census.full = census.full.saturating_sub(1),
+            Weight::Light => census.light = census.light.saturating_sub(1),
+        }
+        admission::decide(&self.config, &census, weight, now.reading.as_ref()).is_ok()
+    }
+
+    /// What admission counts and reads now, taken before the locks a
+    /// choice of yielder holds.
+    fn room(&self) -> Room {
+        Room {
+            census: self.census(),
+            reading: self.config.admission.as_ref().and_then(|_| self.reading()),
+        }
+    }
+
+    /// Record what the hub now says of a scope found again: whether it may
+    /// give way, and how long it lives once idle. A scope made before the hub
+    /// asked for either learns it on its next use. The latest prepare wins,
+    /// so while hub replicas of both kinds run during a deploy an older one
+    /// can set it back for a while; the next turn on a newer one fixes it.
+    fn classify(&self, request: &PrepareRequest) {
+        if let Some(entry) = self.scopes.lock().get_mut(&request.scope) {
+            entry.yields_when_idle = request.yields_when_idle;
+            entry.ttl_secs = request.ttl_secs;
+        }
+    }
+
+    /// Take out of the map the least recently used scope that may give way
+    /// and is idle at `now`: nothing running in it, no durable job of it
+    /// remembered, and untouched for [`YIELD_IDLE_GRACE`]. A turn between
+    /// two of its commands has touched its scope moments before, so the grace
+    /// keeps it; the check and the removal hold the same locks, so an exec
+    /// that touches the scope either does so first, and keeps it, or finds
+    /// it gone. A finished job nobody collected holds its scope here though
+    /// the sweep, at the scope's lifetime, drops it: giving way comes early,
+    /// and its result may yet be asked for.
+    /// Only one whose going would make room for a scope of `weight` is
+    /// taken.
+    fn take_idle_yielder(&self, now: DateTime<Utc>, weight: Weight) -> Option<Scope> {
+        let room = self.room();
+        let running = self.running.lock();
+        let mut scopes = self.scopes.lock();
+        let jobs = self.jobs.lock();
+        let idle = self.yielder_among(&room, &running, &scopes, &jobs, now, weight)?;
+        self.retire(&mut scopes, &idle)
+    }
+
+    /// The scope [`Self::take_idle_yielder`] would take now, left in place.
+    fn idle_yielder(&self, now: DateTime<Utc>, weight: Weight) -> Option<ScopeId> {
+        let room = self.room();
+        let running = self.running.lock();
+        let scopes = self.scopes.lock();
+        let jobs = self.jobs.lock();
+        self.yielder_among(&room, &running, &scopes, &jobs, now, weight)
+    }
+
+    fn yielder_among(
+        &self,
+        room: &Room,
+        running: &HashMap<ScopeId, HashSet<String>>,
+        scopes: &BTreeMap<ScopeId, Scope>,
+        jobs: &BTreeMap<JobId, JobRecord>,
+        now: DateTime<Utc>,
+        weight: Weight,
+    ) -> Option<ScopeId> {
+        // While a teardown is still owed or under way, no other scope goes:
+        // a host failing to take scopes down would otherwise lose one more
+        // conversation's workspace on every prepare that asks again.
+        if !self.leftovers.lock().is_empty() {
+            return None;
+        }
+        let grace = chrono::Duration::from_std(YIELD_IDLE_GRACE).unwrap_or_default();
+        scopes
+            .values()
+            .filter(|scope| scope.yields_when_idle)
+            .filter(|scope| scope.last_seen + grace <= now)
+            .filter(|scope| running.get(&scope.id).is_none_or(HashSet::is_empty))
+            .filter(|scope| !jobs.values().any(|job| job.scope == scope.id))
+            .filter(|scope| self.going_would_help(room, scope, weight))
+            .min_by_key(|scope| scope.last_seen)
+            .map(|scope| scope.id.clone())
+    }
+
+    /// Release an idle scope taken by [`Self::take_idle_yielder`] so `to`
+    /// can be seated. Its keyed home stays, so its conversation's next turn
+    /// is seated over the same transcript and bench. A failure taking it
+    /// down is logged and answered `false`: it is out of the map already, so
+    /// no turn finds it again, but it is kept among the leftovers, counted
+    /// against capacity and taken down again by the sweep, so nothing is
+    /// seated over what may still be on the host.
+    async fn give_way(&self, idle: Scope, to: &ScopeId) -> bool {
+        let idle_secs = (Utc::now() - idle.last_seen).num_seconds();
+        let (id, home) = (idle.id.clone(), idle.home.clone());
+        match self.take_down(idle).await {
+            Ok(()) => {
+                info!(
+                    scope = %id,
+                    home = home.as_deref().unwrap_or("none"),
+                    idle_secs,
+                    to = %to,
+                    "an idle scope gave way to a new one on a full worker"
+                );
+                true
+            }
+            Err(error) => {
+                warn!(
+                    scope = %id,
+                    to = %to,
+                    %error,
+                    "an idle scope gave way, but taking it down failed; it still counts against capacity until a sweep takes it down"
+                );
+                false
+            }
+        }
     }
 
     /// Release every scope past its lifetime that has nothing running.
@@ -998,7 +1288,23 @@ impl Worker {
                 .collect()
         };
         for scope in &idle {
-            self.release(scope).await?;
+            if let Err(error) = self.release(scope).await {
+                warn!(scope = %scope, %error, "releasing an idle scope failed; the next sweep tries again");
+            }
+        }
+        {
+            // Each claimed first, so a prepare for the same id meanwhile
+            // finds it being torn down and waits; one a release or prepare
+            // is taking down now is left to it.
+            let owed: Vec<ScopeId> = self.leftovers.lock().iter().map(|l| l.id.clone()).collect();
+            for id in owed {
+                let Claim::Owed(leftover) = self.claim(&id) else {
+                    continue;
+                };
+                if let Err(error) = self.take_down(*leftover).await {
+                    warn!(scope = %id, %error, "taking down a scope that gave way failed again");
+                }
+            }
         }
         self.sweep_jobs(now)?;
         self.sweep_homes(now).await?;
@@ -1011,10 +1317,13 @@ impl Worker {
         let expired: Vec<Home> = {
             let scopes = self.scopes.lock();
             let building = self.building.lock();
+            let leftovers = self.leftovers.lock();
             let in_use: HashSet<&str> = scopes
                 .values()
                 .filter_map(|s| s.home.as_deref())
                 .chain(building.values().filter_map(|b| b.home.as_deref()))
+                // A container that failed to come down may still mount it.
+                .chain(leftovers.iter().filter_map(|s| s.home.as_deref()))
                 .collect();
             self.homes
                 .lock()
@@ -1064,7 +1373,10 @@ impl Worker {
                 ),
                 None => {
                     warn!(scope = %scope.id, "scope has no container; forgetting it");
-                    self.release(&scope.id).await?;
+                    if let Err(error) = self.release(&scope.id).await {
+                        // Owed now: the sweep takes it down.
+                        warn!(scope = %scope.id, %error, "taking down a scope with no container failed");
+                    }
                 }
             }
         }
@@ -1079,10 +1391,18 @@ impl Worker {
                 let _ = self.containers.stop(container).await;
             }
         }
+        // A scope whose teardown is owed keeps its work until the sweep.
+        let owed: Vec<String> = self
+            .leftovers
+            .lock()
+            .iter()
+            .map(|s| s.id.as_str().to_string())
+            .collect();
         let known: HashSet<String> = self
             .scopes()
             .into_iter()
             .map(|s| s.id.as_str().to_string())
+            .chain(owed)
             .collect();
         for dataset in self.zfs.children(&self.pool().child("work")).await? {
             if !known.contains(dataset.name()) {
@@ -1126,7 +1446,8 @@ impl Worker {
         let scopes = self.scopes.lock().len() as u32;
         let pool_free_bytes = self.zfs.free_bytes(&self.config.pool).await?;
         Ok(WorkerHealth {
-            scopes,
+            // What is left of a failed teardown still holds its seat.
+            scopes: scopes + self.leftovers.lock().len() as u32,
             homes: self.homes.lock().len() as u32,
             capacity: self.config.max_scopes + self.config.max_light_scopes,
             pool_free_bytes,
@@ -1240,6 +1561,46 @@ fn prepared(scope: &Scope, reused: bool, home_reused: bool) -> Prepared {
         reused,
         home_reused,
         jobs: scope.jobs,
+    }
+}
+
+/// The census and host reading a decision is taken on.
+struct Room {
+    census: Census,
+    reading: Option<Reading>,
+}
+
+/// What a prepare's decision under the prepare lock comes to.
+enum Decision<'a> {
+    /// Seated: counted while it is built.
+    Seat(Seat<'a>),
+    /// Answered now, refused or found.
+    Answer(ServerFrame),
+    /// The owed teardown of its own id comes first.
+    TakeDown(Scope),
+    /// An idle scope gives way first, for want of what it holds.
+    GiveWay(Scope, Shortfall),
+}
+
+/// What [`Worker::claim`] found of a scope out of the map.
+enum Claim {
+    /// Nothing is owed for it.
+    Absent,
+    /// It is being taken down now.
+    Busy,
+    /// Its teardown is owed and now claimed by the caller.
+    Owed(Box<Scope>),
+}
+
+/// Unmarks a scope's teardown as under way when it ends, however it ends.
+struct Tearing<'a> {
+    tearing: &'a Mutex<HashSet<ScopeId>>,
+    id: ScopeId,
+}
+
+impl Drop for Tearing<'_> {
+    fn drop(&mut self) {
+        self.tearing.lock().remove(&self.id);
     }
 }
 
@@ -1450,6 +1811,7 @@ mod tests {
             ttl_secs: 60,
             env: Vec::new(),
             home: HomeSpec::Ephemeral,
+            yields_when_idle: false,
         }
     }
 
@@ -1778,6 +2140,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failing_teardown_stops_further_turns_giving_way() {
+        let h = Harness::with(|config| config.max_scopes = 3).await;
+        for (id, key) in [
+            ("one", "thread-1"),
+            ("two", "thread-2"),
+            ("three", "thread-3"),
+        ] {
+            h.worker.prepare(turn(id, key)).await.unwrap();
+            age(&h.worker, id, idle_past_grace());
+        }
+        h.zfs.fail_next_destroy();
+        assert_eq!(
+            h.worker.prepare(turn("new", "thread-4")).await.unwrap(),
+            refused(RefusalReason::AtCapacity)
+        );
+        assert_eq!(
+            h.worker.prepare(turn("new", "thread-4")).await.unwrap(),
+            refused(RefusalReason::AtCapacity),
+            "asked again, it takes no second workspace down"
+        );
+        assert_eq!(h.worker.scopes().len(), 2);
+        h.worker.sweep(Utc::now()).await.unwrap();
+        assert!(matches!(
+            h.worker.prepare(turn("new", "thread-4")).await.unwrap(),
+            ServerFrame::Prepared(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_failed_build_keeps_its_weight_and_home_and_no_sweep_reclaims_that_home() {
+        let h = Harness::new().await;
+        h.containers.fail_next_run();
+        h.zfs.fail_next_destroy();
+        assert!(h.worker.prepare(keyed("a", "thread-1", 0)).await.is_err());
+        let left = h.worker.leftovers.lock()[0].clone();
+        assert_eq!(left.home.as_deref(), Some("thread-1"));
+        let far = Utc::now() + chrono::Duration::days(365);
+        assert!(h.worker.sweep_homes(far).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_build_whose_work_cannot_be_destroyed_is_owed_and_counted() {
+        let h = Harness::new().await;
+        h.containers.fail_next_run();
+        h.zfs.fail_next_destroy();
+        assert!(h.worker.prepare(spec("a", &[])).await.is_err());
+        assert_eq!(h.worker.leftovers.lock().len(), 1);
+        assert_eq!(h.worker.health().await.unwrap().scopes, 1);
+        h.worker.sweep(Utc::now()).await.unwrap();
+        assert!(h.worker.leftovers.lock().is_empty());
+        assert!(!h.zfs.exists_sync("tank/work/a"));
+    }
+
+    #[tokio::test]
     async fn prepare_under_the_floor_reclaims_old_golden_snapshots_before_refusing() {
         let h = Harness::new().await;
         h.zfs.set_free_bytes(0);
@@ -2056,6 +2472,443 @@ mod tests {
             .map(|s| s.id.as_str().to_string())
             .collect();
         assert_eq!(remaining, vec!["fresh"]);
+    }
+
+    /// An agent turn's scope: over its conversation's keyed home, and free
+    /// to give way once idle.
+    fn turn(scope: &str, key: &str) -> PrepareRequest {
+        PrepareRequest {
+            yields_when_idle: true,
+            ..keyed(scope, key, 3600)
+        }
+    }
+
+    fn idle_past_grace() -> chrono::Duration {
+        chrono::Duration::from_std(YIELD_IDLE_GRACE).unwrap() + chrono::Duration::seconds(1)
+    }
+
+    #[tokio::test]
+    async fn a_coding_session_short_of_its_own_seats_takes_no_turn_down() {
+        let h = Harness::with(|config| {
+            config.max_scopes = 1;
+            config.max_light_scopes = 1;
+        })
+        .await;
+        h.worker
+            .prepare(spec("coding-1", &[("app", "main")]))
+            .await
+            .unwrap();
+        h.worker.prepare(turn("idle", "thread-1")).await.unwrap();
+        age(&h.worker, "idle", idle_past_grace());
+        assert_eq!(
+            h.worker
+                .prepare(spec("coding-2", &[("app", "main")]))
+                .await
+                .unwrap(),
+            refused(RefusalReason::AtCapacity),
+            "a light seat freed makes no room for a full scope"
+        );
+        assert!(h.worker.scope(&ScopeId::new("idle")).is_some());
+        assert!(matches!(
+            h.worker.prepare(turn("new", "thread-2")).await.unwrap(),
+            ServerFrame::Prepared(_)
+        ));
+        assert!(
+            h.worker.scope(&ScopeId::new("idle")).is_none(),
+            "but one for a turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_idle_turn_never_gives_way_for_memory_the_host_measures_short() {
+        let h = Harness::with(|config| {
+            config.max_light_scopes = 10;
+            config.admission = Some(crate::config::AdmissionConfig {
+                full_reserve_gib: 3,
+                light_reserve_gib: 1,
+                memory_floor_gib: 6,
+                cpu_pressure_max: Some(80.0),
+            });
+        })
+        .await;
+        h.worker.prepare(turn("idle", "thread-1")).await.unwrap();
+        age(&h.worker, "idle", idle_past_grace());
+        h.load.set(Some(Reading {
+            memory_total_bytes: 64 << 30,
+            memory_available_bytes: (6 << 30) + (1 << 29),
+            cpu_pressure: Some(1.0),
+        }));
+        assert_eq!(
+            h.worker.prepare(turn("new", "thread-2")).await.unwrap(),
+            refused(RefusalReason::AtCapacity)
+        );
+        assert!(
+            h.worker.scope(&ScopeId::new("idle")).is_some(),
+            "taking it down would not have made the room the host lacks"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_scope_short_of_reserve_takes_down_no_turn_whose_reserve_is_too_small() {
+        // 64 GiB less a 6 GiB floor is 58 GiB to reserve: 18 full scopes of
+        // 3 GiB and 4 light ones of 1 GiB fill it; a light one going frees
+        // 1 GiB, short of a full scope's 3.
+        let h = Harness::with(|config| {
+            config.max_scopes = 30;
+            config.max_light_scopes = 10;
+            config.admission = Some(crate::config::AdmissionConfig {
+                full_reserve_gib: 3,
+                light_reserve_gib: 1,
+                memory_floor_gib: 6,
+                cpu_pressure_max: None,
+            });
+        })
+        .await;
+        for n in 0..18 {
+            h.worker
+                .prepare(spec(&format!("c{n}"), &[("app", "acme/app")]))
+                .await
+                .unwrap();
+        }
+        for n in 0..4 {
+            h.worker
+                .prepare(turn(&format!("t{n}"), &format!("thread-{n}")))
+                .await
+                .unwrap();
+            age(&h.worker, &format!("t{n}"), idle_past_grace());
+        }
+        assert_eq!(
+            h.worker
+                .prepare(spec("c-new", &[("app", "acme/app")]))
+                .await
+                .unwrap(),
+            refused(RefusalReason::AtCapacity)
+        );
+        assert_eq!(
+            h.worker.scopes().len(),
+            22,
+            "no turn was taken down for nothing"
+        );
+        assert!(
+            matches!(
+                h.worker.prepare(turn("t-new", "thread-new")).await.unwrap(),
+                ServerFrame::Prepared(_)
+            ),
+            "but one gives way for a turn its reserve does fit"
+        );
+        assert_eq!(h.worker.scopes().len(), 22);
+    }
+
+    #[tokio::test]
+    async fn a_full_worker_seats_a_new_turn_by_yielding_the_idle_turn_scope_and_keeps_its_home() {
+        let h = Harness::new().await;
+        h.zfs.add_snapshot("tank/golden/home", "g");
+        h.worker.prepare(turn("turn-a", "thread-a")).await.unwrap();
+        h.worker.prepare(spec("coding", &[])).await.unwrap();
+        age(&h.worker, "turn-a", idle_past_grace());
+        age(&h.worker, "coding", idle_past_grace() * 10);
+
+        let ServerFrame::Prepared(seated) =
+            h.worker.prepare(turn("turn-b", "thread-b")).await.unwrap()
+        else {
+            panic!("a full worker with an idle turn scope seats the new turn")
+        };
+        assert!(!seated.reused);
+        assert_eq!(
+            scope_ids(&h.worker),
+            vec!["coding", "turn-b"],
+            "the idle turn scope gave way; the coding session's, idler still, did not"
+        );
+        assert!(!h.zfs.exists_sync("tank/work/turn-a"));
+        assert!(h
+            .containers
+            .stopped()
+            .iter()
+            .any(|c| c.0 == container_name(&ScopeId::new("turn-a"))));
+        assert!(
+            h.zfs.exists_sync("tank/homes/thread-a"),
+            "the yielded conversation keeps its home"
+        );
+        assert!(h
+            .worker
+            .homes()
+            .iter()
+            .any(|home| home.key == "thread-a" && !home.expired_at(Utc::now())));
+
+        // Its next turn finds the transcript and bench where it left them.
+        age(&h.worker, "turn-b", idle_past_grace());
+        let ServerFrame::Prepared(back) =
+            h.worker.prepare(turn("turn-a", "thread-a")).await.unwrap()
+        else {
+            panic!("the yielded conversation is seated again")
+        };
+        assert!(!back.reused && back.home_reused);
+        assert_eq!(back.workdir, BENCH_DIR);
+        assert_eq!(scope_ids(&h.worker), vec!["coding", "turn-a"]);
+        let run = h.containers.runs().pop().unwrap();
+        assert!(run
+            .mounts
+            .iter()
+            .any(|m| m.container == AGENT_HOME && m.host.ends_with("homes/thread-a")));
+    }
+
+    #[tokio::test]
+    async fn a_full_worker_with_only_busy_or_held_scopes_still_refuses() {
+        let h = Harness::new().await;
+        h.worker.prepare(turn("running", "thread-1")).await.unwrap();
+        h.worker.prepare(turn("recent", "thread-2")).await.unwrap();
+        age(&h.worker, "running", idle_past_grace());
+        h.worker
+            .running
+            .lock()
+            .entry(ScopeId::new("running"))
+            .or_default()
+            .insert("job".into());
+        let full = ServerFrame::Refused {
+            reason: RefusalReason::AtCapacity,
+        };
+        assert_eq!(
+            h.worker.prepare(turn("new", "thread-3")).await.unwrap(),
+            full,
+            "neither a scope with a command running nor one touched moments ago gives way"
+        );
+
+        h.worker.running.lock().clear();
+        age(&h.worker, "recent", idle_past_grace());
+        let now = Utc::now();
+        for id in ["running", "recent"] {
+            h.worker.jobs.lock().insert(
+                JobId::new(format!("job-{id}")),
+                JobRecord {
+                    id: JobId::new(format!("job-{id}")),
+                    scope: ScopeId::new(id),
+                    started_at: now,
+                    deadline: now,
+                    bridge: None,
+                    stopped: None,
+                    finished: (id == "recent").then(|| crate::state::Finished {
+                        at: now,
+                        summary: ExecSummary::exited(0),
+                    }),
+                },
+            );
+        }
+        assert_eq!(
+            h.worker.prepare(turn("new", "thread-3")).await.unwrap(),
+            full,
+            "a durable job, running or not yet collected, holds its scope"
+        );
+        assert_eq!(scope_ids(&h.worker), vec!["recent", "running"]);
+        assert!(!h.zfs.exists_sync("tank/work/new"));
+    }
+
+    #[tokio::test]
+    async fn a_coding_scope_never_gives_way_and_the_least_recently_used_turn_scope_does() {
+        let h = Harness::with(|config| config.max_scopes = 3).await;
+        h.worker.prepare(spec("coding", &[])).await.unwrap();
+        h.worker.prepare(turn("older", "thread-1")).await.unwrap();
+        h.worker.prepare(turn("newer", "thread-2")).await.unwrap();
+        age(&h.worker, "coding", idle_past_grace() * 30);
+        age(&h.worker, "older", idle_past_grace() * 3);
+        age(&h.worker, "newer", idle_past_grace() * 2);
+
+        assert!(matches!(
+            h.worker.prepare(spec("another-coding", &[])).await.unwrap(),
+            ServerFrame::Prepared(_)
+        ));
+        assert_eq!(
+            scope_ids(&h.worker),
+            vec!["another-coding", "coding", "newer"]
+        );
+
+        h.worker.release(&ScopeId::new("newer")).await.unwrap();
+        h.worker.prepare(spec("third", &[])).await.unwrap();
+        age(&h.worker, "another-coding", idle_past_grace() * 30);
+        age(&h.worker, "third", idle_past_grace() * 30);
+        assert_eq!(
+            h.worker.prepare(turn("turn", "thread-3")).await.unwrap(),
+            ServerFrame::Refused {
+                reason: RefusalReason::AtCapacity
+            },
+            "only agent-turn scopes give way, however idle the others"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_idle_turn_scope_is_released_after_its_short_lifetime_and_its_home_is_kept() {
+        let h = Harness::new().await;
+        let mut request = turn("turn", "thread-1");
+        request.ttl_secs = 300;
+        h.worker.prepare(request).await.unwrap();
+        let later = Utc::now() + chrono::Duration::seconds(301);
+        h.worker
+            .running
+            .lock()
+            .entry(ScopeId::new("turn"))
+            .or_default()
+            .insert("round".into());
+        assert!(
+            h.worker.sweep(later).await.unwrap().is_empty(),
+            "a turn in flight keeps its scope however long it runs"
+        );
+        h.worker.running.lock().clear();
+        assert_eq!(
+            h.worker.sweep(later).await.unwrap(),
+            vec![ScopeId::new("turn")]
+        );
+        assert!(h.zfs.exists_sync("tank/homes/thread-1"));
+        assert!(h.worker.homes().iter().any(|home| home.key == "thread-1"));
+    }
+
+    #[tokio::test]
+    async fn a_scope_found_again_learns_whether_it_may_give_way() {
+        let h = Harness::new().await;
+        h.worker
+            .prepare(keyed("turn", "thread-1", 3600))
+            .await
+            .unwrap();
+        assert!(
+            !h.worker
+                .scope(&ScopeId::new("turn"))
+                .unwrap()
+                .yields_when_idle
+        );
+        let mut again = turn("turn", "thread-1");
+        again.ttl_secs = 300;
+        h.worker.prepare(again).await.unwrap();
+        let found = h.worker.scope(&ScopeId::new("turn")).unwrap();
+        assert!(
+            found.yields_when_idle,
+            "a scope made before the hub said so is classed on its next turn"
+        );
+        assert_eq!(found.ttl_secs, 300, "and lives as long idle as it now asks");
+
+        h.worker
+            .prepare(keyed("turn", "thread-1", 3600))
+            .await
+            .unwrap();
+        assert!(
+            !h.worker
+                .scope(&ScopeId::new("turn"))
+                .unwrap()
+                .yields_when_idle,
+            "and stops giving way when a prepare says it may not"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_idle_scope_that_fails_to_come_down_seats_nothing_over_it_and_its_home_is_kept() {
+        let h = Harness::new().await;
+        h.worker.prepare(turn("idle", "thread-1")).await.unwrap();
+        h.worker.prepare(spec("coding", &[])).await.unwrap();
+        age(&h.worker, "idle", idle_past_grace());
+        h.zfs.fail_next_destroy();
+
+        assert_eq!(
+            h.worker.prepare(turn("new", "thread-2")).await.unwrap(),
+            refused(RefusalReason::AtCapacity),
+            "nothing is seated over what may still be on the host"
+        );
+        assert!(!h.zfs.exists_sync("tank/work/new"));
+        assert!(
+            h.worker.homes.lock().contains_key("thread-1"),
+            "the conversation's home outlives the failure"
+        );
+        assert_eq!(
+            h.worker.prepare(turn("new", "thread-2")).await.unwrap(),
+            refused(RefusalReason::AtCapacity),
+            "what is left still counts against capacity"
+        );
+        h.worker.sweep(Utc::now()).await.unwrap();
+        assert!(
+            !h.zfs.exists_sync("tank/work/idle"),
+            "the sweep takes it down"
+        );
+        assert!(
+            h.worker.prepare(turn("new", "thread-2")).await.is_ok(),
+            "and its seat is free again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conversation_back_before_its_failed_teardown_is_retried_is_seated_clean() {
+        let h = Harness::new().await;
+        h.worker.prepare(turn("idle", "thread-1")).await.unwrap();
+        h.worker.prepare(spec("coding", &[])).await.unwrap();
+        age(&h.worker, "idle", idle_past_grace());
+        h.zfs.fail_next_destroy();
+        h.worker.prepare(turn("new", "thread-2")).await.unwrap();
+        assert_eq!(h.worker.leftovers.lock().len(), 1);
+
+        let back = h.worker.prepare(turn("idle", "thread-1")).await.unwrap();
+        let ServerFrame::Prepared(back) = back else {
+            panic!("the conversation is seated again: {back:?}");
+        };
+        assert!(back.home_reused, "over its kept home");
+        assert!(
+            h.worker.leftovers.lock().is_empty(),
+            "its old scope is taken down first"
+        );
+        h.worker.sweep(Utc::now()).await.unwrap();
+        assert!(
+            h.zfs.exists_sync("tank/work/idle"),
+            "and no later sweep takes down the new one"
+        );
+        assert_eq!(h.worker.health().await.unwrap().scopes, 2);
+    }
+
+    #[tokio::test]
+    async fn a_prepare_for_a_scope_being_taken_down_waits_it_out() {
+        let h = Harness::new().await;
+        let w = &h.worker;
+        w.prepare(turn("going", "thread-1")).await.unwrap();
+        let id = ScopeId::new("going");
+        // As a release does, before its teardown's first await.
+        let going = w.retire(&mut w.scopes.lock(), &id).unwrap();
+        assert_eq!(
+            w.prepare(turn("going", "thread-1")).await.unwrap(),
+            refused(RefusalReason::AtCapacity),
+            "not seated anew over a teardown under way"
+        );
+        assert_eq!(w.health().await.unwrap().scopes, 1, "and still counted");
+        w.take_down(going).await.unwrap();
+        assert!(matches!(
+            w.prepare(turn("going", "thread-1")).await.unwrap(),
+            ServerFrame::Prepared(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_release_that_fails_to_come_down_still_holds_its_seat() {
+        let h = Harness::new().await;
+        h.worker.prepare(spec("coding-1", &[])).await.unwrap();
+        h.worker.prepare(spec("coding-2", &[])).await.unwrap();
+        h.zfs.fail_next_destroy();
+        assert!(h.worker.release(&ScopeId::new("coding-1")).await.is_err());
+        assert_eq!(
+            h.worker.prepare(spec("coding-3", &[])).await.unwrap(),
+            refused(RefusalReason::AtCapacity),
+            "what is left still counts"
+        );
+        h.worker.sweep(Utc::now()).await.unwrap();
+        assert!(h.worker.leftovers.lock().is_empty());
+        assert!(h.worker.tearing.lock().is_empty());
+        assert!(h.worker.prepare(spec("coding-3", &[])).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_prepare_refused_for_want_of_pool_space_takes_no_idle_scope_down() {
+        let h = Harness::new().await;
+        h.worker.prepare(turn("idle", "thread-1")).await.unwrap();
+        h.worker.prepare(spec("coding", &[])).await.unwrap();
+        age(&h.worker, "idle", idle_past_grace());
+        h.zfs.set_free_bytes(0);
+
+        assert_eq!(
+            h.worker.prepare(turn("new", "thread-2")).await.unwrap(),
+            refused(RefusalReason::PoolFull)
+        );
+        assert_eq!(scope_ids(&h.worker), vec!["coding", "idle"]);
     }
 
     fn age(worker: &Worker, scope: &str, by: chrono::Duration) {

@@ -112,6 +112,7 @@ async fn seated(configure: impl FnOnce(&mut WorkforceConfig), seats: Option<Arc<
                 .map(|seats| seats as Arc<dyn crate::coding_sandbox::SandboxLauncher>),
             RotationPolicy::default(),
             Duration::from_secs(3600),
+            Duration::from_secs(300),
         )
         .with_program(CliKind::ClaudeCode, claude.program())
         .with_program(CliKind::Codex, codex.program()),

@@ -704,6 +704,7 @@ impl Executor {
                 tokens: &self.tokens,
                 home: HomeSpec::Ephemeral,
                 primary: None,
+                idle_release: None,
             })
             .await
         {

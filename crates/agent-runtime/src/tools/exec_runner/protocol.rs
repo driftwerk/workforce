@@ -15,7 +15,7 @@ use super::setup::SetupReport;
 /// may depend on. A request that needs one asserts the daemon announced at
 /// least this version, so a skewed pair fails loudly instead of running the
 /// command with the new fields silently dropped.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = PROTOCOL_IDLE_YIELD;
 
 /// Revision that introduced the environment and stdin fields.
 const PROTOCOL_ENV_STDIN: u32 = 1;
@@ -42,6 +42,11 @@ const PROTOCOL_CODEX_APPROVALS: u32 = 5;
 /// Revision whose daemon runs an interactive command: one whose stdin the
 /// client streams for as long as it runs.
 const PROTOCOL_INTERACTIVE: u32 = 6;
+
+/// Revision whose daemon, when full, releases the least recently used idle
+/// scope prepared with `yields_when_idle` to seat a new one. Announced, never
+/// required: an older daemon only refuses at capacity, as before.
+pub const PROTOCOL_IDLE_YIELD: u32 = 7;
 
 /// Where a scope mounts its repositories and its home: the only roots a job's
 /// working directory and file paths may reach.
@@ -300,6 +305,12 @@ pub struct PrepareRequest {
     pub env: Vec<(String, String)>,
     #[serde(default)]
     pub home: HomeSpec,
+    /// Whether the scope may give way, once idle, to a prepare that finds the
+    /// worker full: an agent turn's workspace, whose keyed home outlives it.
+    /// A daemon before [`PROTOCOL_IDLE_YIELD`] drops the field and keeps the
+    /// scope for its lifetime, as it always did, so no prepare requires it.
+    #[serde(default)]
+    pub yields_when_idle: bool,
 }
 
 /// What a worker reports once a scope is ready.
@@ -783,6 +794,7 @@ mod tests {
                 ttl_secs: 60,
                 env: Vec::new(),
                 home,
+                yields_when_idle: false,
             })
         };
         assert_eq!(prepare(HomeSpec::Ephemeral).required_protocol(), 2);
@@ -795,6 +807,32 @@ mod tests {
             3,
             "a daemon that would mount a throwaway home instead is refused"
         );
+        let yielding = Request::Prepare(PrepareRequest {
+            scope: ScopeId::new("s"),
+            repos: Vec::new(),
+            ttl_secs: 60,
+            env: Vec::new(),
+            home: HomeSpec::Keyed {
+                key: "thread".into(),
+                ttl_secs: 60,
+            },
+            yields_when_idle: true,
+        });
+        assert_eq!(
+            yielding.required_protocol(),
+            3,
+            "a daemon that cannot yield idle scopes still seats the prepare"
+        );
+    }
+
+    #[test]
+    fn a_prepare_from_an_older_hub_never_gives_way() {
+        let older = r#"{"kind":"prepare","scope":"s","repos":[],"ttl_secs":60,"env":[],
+            "home":{"kind":"keyed","key":"thread","ttl_secs":60}}"#;
+        let Request::Prepare(prepare) = serde_json::from_str::<Request>(older).unwrap() else {
+            panic!("a prepare");
+        };
+        assert!(!prepare.yields_when_idle);
     }
 
     #[test]
@@ -871,6 +909,7 @@ mod tests {
                     key: "thread-1".into(),
                     ttl_secs: 604_800,
                 },
+                yields_when_idle: true,
             }))),
             ClientFrame::Request(Box::new(Request::Release {
                 scope: ScopeId::new("s"),

@@ -159,9 +159,12 @@ impl SandboxLauncher for RemoteLauncher {
         let request = Request::Prepare(PrepareRequest {
             scope: scope.clone(),
             repos: repo_specs(spec.project, spec.tokens),
-            ttl_secs: self.ttl_secs,
+            ttl_secs: spec
+                .idle_release
+                .map_or(self.ttl_secs, |idle| idle.as_secs().max(1)),
             env: Vec::new(),
             home: spec.home.clone(),
+            yields_when_idle: spec.idle_release.is_some(),
         });
         let prepared = match self.request(request).await? {
             Outcome::Prepared(prepared) => prepared,
@@ -764,6 +767,7 @@ mod tests {
                 ttl_secs: 3600,
             },
             primary: None,
+            idle_release: (scope == "thread-1").then(|| Duration::from_secs(300)),
         };
 
         assert!(launcher.ensure(&spec("thread-1")).await.unwrap().fresh());
@@ -778,6 +782,15 @@ mod tests {
         assert_ne!(first.scope, second.scope);
         assert_eq!(first.home, spec("").home);
         assert_eq!(second.home, spec("").home);
+        assert!(
+            first.yields_when_idle && !second.yields_when_idle,
+            "the worker is told which scopes may give way when idle"
+        );
+        assert_eq!(
+            (first.ttl_secs, second.ttl_secs),
+            (300, 900),
+            "an agent turn's scope is released once idle that long; others keep the launcher's lifetime"
+        );
     }
 
     #[tokio::test]
@@ -794,6 +807,7 @@ mod tests {
             tokens: &tokens,
             home: HomeSpec::Ephemeral,
             primary: None,
+            idle_release: None,
         };
 
         let sandbox = launcher.ensure(&spec).await.unwrap();
@@ -846,6 +860,7 @@ mod tests {
             tokens: &tokens,
             home: HomeSpec::Ephemeral,
             primary,
+            idle_release: None,
         };
 
         let started = launcher
@@ -921,6 +936,7 @@ mod tests {
                 tokens: &tokens,
                 home: HomeSpec::Ephemeral,
                 primary: None,
+                idle_release: None,
             })
             .await
             .unwrap();
@@ -1034,6 +1050,7 @@ mod tests {
                 tokens: &tokens,
                 home: HomeSpec::Ephemeral,
                 primary: None,
+                idle_release: None,
             })
             .await
             .err()
@@ -1066,6 +1083,7 @@ mod tests {
                 tokens: &tokens,
                 home: HomeSpec::Ephemeral,
                 primary: None,
+                idle_release: None,
             })
             .await
             .err()

@@ -265,6 +265,7 @@ impl CliCompletion {
             project: CODEX_PROJECT,
             scope: &scope.scope,
             home: HomeSpec::Ephemeral,
+            idle_release: None,
         }
         .seat(launcher.as_ref(), seat_by.into_std(), None, || {
             std::future::ready(())
