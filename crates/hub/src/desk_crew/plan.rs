@@ -1715,7 +1715,7 @@ impl CrewHub {
     }
 
     /// One `[Desk plan]` turn of plan `id`'s boss, for `lines`.
-    async fn plan_turn(&self, id: Uuid, lines: Vec<String>) {
+    pub(super) async fn plan_turn(&self, id: Uuid, lines: Vec<String>) {
         // Its boss decides it with nothing else of its own deciding at
         // once ([`super::mind`]).
         let boss = match self.desk.plan(id).await {
