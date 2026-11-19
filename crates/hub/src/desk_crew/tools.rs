@@ -52,7 +52,7 @@ pub const READ: [&str; 23] = [
     super::machines::MACHINES,
     super::machines::FOLDERS,
 ];
-pub const ACT: [&str; 25] = [
+pub const ACT: [&str; 26] = [
     "crew.nudge",
     "crew.ask_session",
     "crew.escalate",
@@ -78,6 +78,7 @@ pub const ACT: [&str; 25] = [
     super::own_settings::NAME,
     super::assignments::CLOSE,
     super::machines::MAKE_FOLDER,
+    super::machines::RUN,
 ];
 
 pub struct CrewTool {
@@ -877,6 +878,7 @@ pub(crate) fn describe(name: &str) -> &'static str {
             super::machines::MACHINES => super::machines::MACHINES_DESCRIPTION,
             super::machines::FOLDERS => super::machines::FOLDERS_DESCRIPTION,
             super::machines::MAKE_FOLDER => super::machines::MAKE_FOLDER_DESCRIPTION,
+            super::machines::RUN => super::machines::RUN_DESCRIPTION,
             "crew.activity" => "What happened on the crew, newest first: turns started and finished, questions, requests, failures, and what you and the person did. Filter to one agent or session with subject_id.",
             "crew.account" => "What one session (session_id) is for, who asked, its plan, what it has done (with its PRs, tickets, commits and deploys), what it is doing now, what it waits on, what comes next and the choices it made: its running account, brought up to date first when it is stale, with the time it is as of. Read it before you say anything of a session. With question, also the answer its own recent conversation gives to something the account doesn't say (which key, which file, what error).",
             "crew.ask_session" => "Ask a session (session_id) a question about its work, as Desk's status question on its line, without derailing it: one that is working gets it once its turn ends, never typed in over what it is doing. Use it only when crew.account, with a question, can't answer; then answer the person now from what you have and say you asked.",
@@ -942,6 +944,10 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
         super::machines::MACHINES | super::machines::FOLDERS | super::machines::MAKE_FOLDER => {
             super::machines::schema(name)
         }
+        super::machines::RUN => act(
+            props(super::machines::run_properties()),
+            &["machine", "command"],
+        ),
         super::assignments::LIST => json!({ "type": "object", "properties": {
             "all": { "type": "boolean", "description": "true for the last day's closed ones too" }
         }}),
@@ -1151,6 +1157,8 @@ impl Tool for CrewTool {
             crew.handover_tool(&bound, &input).await
         } else if self.name == super::machines::MAKE_FOLDER {
             crew.machine_tool(self.name, &bound, &input).await
+        } else if self.name == super::machines::RUN {
+            crew.machine_run_tool(&bound, &input).await
         } else if self.name == super::assignments::CLOSE {
             crew.assignment_tool(&bound, &input).await
         } else {

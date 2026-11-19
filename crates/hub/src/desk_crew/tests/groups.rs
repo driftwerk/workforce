@@ -470,6 +470,23 @@ fn pointed_at(name: &str, other: &Client, dir: &Path) -> Vec<(Value, bool)> {
             json!({ "agent_id": other.boss, "budget_usd_per_day": 50, "reason": r }),
             false,
         )],
+        // Its own assignments alone, read or closed.
+        super::super::assignments::LIST => vec![(json!({}), false)],
+        super::super::assignments::CLOSE => vec![(
+            json!({ "id": format!("a:{}", uuid::Uuid::new_v4()), "state": "done", "note": r }),
+            false,
+        )],
+        // The person's machines: no scope of Desk's on their disks.
+        super::super::machines::MACHINES => vec![(json!({}), false)],
+        super::super::machines::FOLDERS => vec![(json!({ "machine": "devbox" }), false)],
+        super::super::machines::MAKE_FOLDER => vec![(
+            json!({ "machine": "devbox", "path": "~/projects/x", "reason": r }),
+            false,
+        )],
+        super::super::machines::RUN => vec![(
+            json!({ "machine": "devbox", "command": "ls", "reason": r }),
+            false,
+        )],
         other => {
             panic!("{other} is a crew tool with no case here: say how it is kept to its scope")
         }

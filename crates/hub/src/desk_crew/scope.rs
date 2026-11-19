@@ -114,6 +114,8 @@ impl CrewHub {
             Action::StartSession { .. } | Action::MoveTicket { .. } => Ok(()),
             // Only ever its own settings ([`super::tools`] names it).
             Action::ChangeOversight { .. } => Ok(()),
+            // A machine of the person's, not a session or an agent.
+            Action::MachineRun { .. } => Ok(()),
         }
     }
 }

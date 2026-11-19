@@ -1993,3 +1993,59 @@ async fn a_boss_finds_tickets_and_plans_on_them_as_they_are() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_boss_runs_a_check_on_a_machine_and_what_no_boss_does_is_the_persons() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
+        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("the run tool", async || overseer.tools.has("crew.machine_run").then_some(())).await;
+        let run = overseer.tools.get("crew.machine_run").unwrap();
+        let said = |r: workforce_agent::tools::ToolResult| format!("{r:?}");
+        // What it must say, and what it may not.
+        for (input, says) in [
+            (json!({ "machine": "devbox", "command": "ls" }), "Give the reason"),
+            (json!({ "machine": "devbox", "reason": "Look." }), "Say the command"),
+            (json!({ "machine": "../x", "command": "ls", "reason": "Look." }), "isn't one of the person's machines"),
+            (json!({ "machine": "devbox", "command": "ls", "timeout_secs": 60, "reason": "Look." }), "1 to 20 seconds"),
+            (json!({ "machine": "devbox", "command": "x".repeat(9000), "reason": "Look." }), "at most"),
+        ] {
+            let r = run.execute(input).await.unwrap();
+            assert!(!r.success && said(r.clone()).contains(says), "{says}: {r:?}");
+        }
+        // What no boss does is the person's: a suggestion, never sent.
+        let r = run
+            .execute(json!({ "machine": "devbox", "command": "rm -rf ~/old-checkouts", "reason": "Tidy up." }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert!(r.output["suggested"].as_str().unwrap().contains("Run on devbox"), "{r:?}");
+        let s = d.store().suggestions(10).await.unwrap();
+        let held = s.iter().find(|s| s.action["tool"] == "crew.machine_run").unwrap();
+        assert_eq!(
+            held.action["input"]["agent_id"],
+            json!(overseer.agent_id.as_str()),
+            "the boss whose check it is, kept with it"
+        );
+        // A plain check goes to the machine; with nothing carrying calls in a
+        // test, it is said, never waited on, and noted in Activity.
+        let r = run
+            .execute(json!({ "machine": "devbox", "command": "git remote -v", "cwd": "~/projects/vellev", "reason": "Which remote." }))
+            .await
+            .unwrap();
+        assert!(said(r).contains("can't be reached"));
+        eventually("the check in Activity", async || {
+            let page = d
+                .activity(workforce_desk::crew::Filter::All, None, 50)
+                .await
+                .unwrap();
+            serde_json::to_string(&page)
+                .unwrap()
+                .contains("ran `git remote -v` on devbox")
+                .then_some(())
+        })
+        .await;
+    })
+    .await;
+}

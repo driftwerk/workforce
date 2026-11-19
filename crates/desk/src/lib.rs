@@ -99,6 +99,7 @@ pub mod realtime;
 pub mod repos;
 mod repos_api;
 pub mod rooms;
+pub mod run;
 pub mod scope;
 pub mod sees;
 mod service;
