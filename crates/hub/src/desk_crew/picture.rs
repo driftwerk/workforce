@@ -349,7 +349,15 @@ impl CrewHub {
         }
         // One that holds it for the boss's answer ("change nothing until I
         // answer") isn't carried out by a later word: that is the answer.
-        if workforce_desk::line::holds(&current.text) {
+        // Another hold, or the same words again, is still a repeat.
+        let Action::Nudge { message, .. } = action else {
+            return Ok(None);
+        };
+        if workforce_desk::line::holds(&current.text)
+            && !workforce_desk::line::holds(message)
+            && workforce_desk::open_item::normalised(message)
+                != workforce_desk::open_item::normalised(&current.text)
+        {
             return Ok(None);
         }
         tracing::info!(session = %s, %boss, "a boss's message repeating what the session is carrying out wasn't sent");

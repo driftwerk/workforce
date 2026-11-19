@@ -966,7 +966,14 @@ impl Desk {
         text: String,
         refused: Refusal,
     ) -> Result<LineMessage, LineError> {
-        let Some(original) = self.0.store.line_message(to).await? else {
+        // A question keeps its rules: only a plain message is replied to so.
+        let Some(original) = self
+            .0
+            .store
+            .line_message(to)
+            .await?
+            .filter(|m| m.kind != LineKind::Ask)
+        else {
             return Err(refused.into());
         };
         let Some(target) = line::reply_target(&original, by.replier()) else {

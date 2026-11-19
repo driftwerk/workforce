@@ -496,7 +496,8 @@ pub enum Target {
 }
 
 /// What a boss says when it holds a session for its own answer: "change
-/// nothing until I answer", "wait for my decision".
+/// nothing until I answer", "wait for my decision". Each is followed by
+/// what it waits on ([`HOLD_ON`]).
 const HOLDS: [&str; 6] = [
     "until i ",
     "until desk ",
@@ -506,16 +507,20 @@ const HOLDS: [&str; 6] = [
     "wait for your boss",
 ];
 
-/// What follows "until I" when it waits on the boss's own word: stems, so
-/// "replies" and "decided" are read too.
-const HOLD_VERBS: [&str; 10] = [
-    "answer", "repl", "respond", "decid", "confirm", "say", "tell", "get back", "approv", "hear",
+/// What a hold waits on: the boss's own word, as a verb after "until I"
+/// or a noun after "wait for my" ("answer", "replies", "decided",
+/// "decision"). Never "say" or "tell": "until I say stop" keeps it going.
+const HOLD_ON: [&str; 8] = [
+    "answer", "repl", "respon", "decid", "decision", "confirm", "get back", "approv",
 ];
+
+/// Words before a hold that undo it: "no need to wait for my answer".
+const UNDONE: [&str; 5] = ["no need to ", "don't ", "do not ", "no longer ", "without "];
 
 /// Whether `text`, a boss's words to a session (or a session's of itself),
 /// holds the session for the boss's answer: it waits on the boss, not on
 /// its work. Only words that wait on an answer: "until I've checked CI"
-/// isn't one.
+/// or "until I say stop" isn't one.
 pub fn holds(text: &str) -> bool {
     let lower = text
         .to_lowercase()
@@ -523,9 +528,29 @@ pub fn holds(text: &str) -> bool {
         .replace("i've", "i have");
     HOLDS.iter().any(|h| {
         lower.match_indices(h).any(|(at, _)| {
-            let rest = &lower[at + h.len()..];
+            let before = &lower[lower[..at]
+                .char_indices()
+                .rev()
+                .nth(15)
+                .map_or(0, |(i, _)| i)..at];
+            if UNDONE.iter().any(|u| before.contains(u)) {
+                return false;
+            }
+            let rest = lower[at + h.len()..].trim_start_matches(['\'', 's', ' ']);
             let rest = rest.strip_prefix("have ").unwrap_or(rest);
-            h.starts_with("wait for") || HOLD_VERBS.iter().any(|v| rest.starts_with(v))
+            let rest = rest.strip_prefix("the ").unwrap_or(rest);
+            // "wait for desk" is Desk, never "desktop".
+            if h.ends_with("desk") || h.ends_with("boss") {
+                let next = lower[at + h.len()..].chars().next();
+                if next.is_some_and(char::is_alphanumeric) {
+                    return false;
+                }
+                return h.starts_with("wait for")
+                    && (rest.is_empty()
+                        || HOLD_ON.iter().any(|v| rest.starts_with(v))
+                        || !rest.starts_with(char::is_alphanumeric));
+            }
+            HOLD_ON.iter().any(|v| rest.starts_with(v))
         })
     })
 }
@@ -540,23 +565,13 @@ pub enum Replier<'a> {
 }
 
 /// Whether a reply `refused` as answering no question waiting on its
-/// sender still goes, as a message in reply to what it names: a session's
-/// or the overseer's always does (a late answer, or a reply to a plain
-/// message, is still words its reader waits on); the person's only to a
-/// plain message, since their answer to a question keeps its rules (the
-/// first answer stands, one they set aside stays so).
-pub fn replies_as_message(refused: &Refusal, by: Replier<'_>) -> bool {
-    match by {
-        Replier::Person => matches!(refused, Refusal::NoSuchAsk(_)),
-        Replier::Session(_) | Replier::Overseer(_) => matches!(
-            refused,
-            Refusal::NoSuchAsk(_)
-                | Refusal::Answered
-                | Refusal::WentAhead
-                | Refusal::SetAside
-                | Refusal::NotWaitingOnYou
-        ),
-    }
+/// sender still goes, as a message in reply to what it names: only when
+/// what it names was never a question (a plain message, such as Desk's
+/// status question or a session's report). A question answered, set aside
+/// or gone keeps its rules for everyone: the first answer stands, and one
+/// the person set aside reaches nobody.
+pub fn replies_as_message(refused: &Refusal, _by: Replier<'_>) -> bool {
+    matches!(refused, Refusal::NoSuchAsk(_))
 }
 
 /// Where `by`'s reply to `original` goes as a message: to whoever wrote it,
@@ -1964,12 +1979,15 @@ mod tests {
             1,
         );
         let gone = Refusal::NoSuchAsk(status.id);
-        for by in [Replier::Session(s.id), Replier::Overseer("desk")] {
+        for by in [
+            Replier::Session(s.id),
+            Replier::Overseer("desk"),
+            Replier::Person,
+        ] {
             assert!(replies_as_message(&gone, by));
-            assert!(
-                replies_as_message(&Refusal::Answered, by),
-                "a late answer still goes"
-            );
+            // A question answered or set aside keeps its rules.
+            assert!(!replies_as_message(&Refusal::Answered, by));
+            assert!(!replies_as_message(&Refusal::SetAside, by));
         }
         assert_eq!(
             reply_target(&status, Replier::Session(s.id)),
@@ -1985,9 +2003,6 @@ mod tests {
             reply_target(&report, Replier::Person),
             Some(Target::Session(s.id))
         );
-        assert!(replies_as_message(&gone, Replier::Person));
-        assert!(!replies_as_message(&Refusal::Answered, Replier::Person));
-        assert!(!replies_as_message(&Refusal::SetAside, Replier::Person));
         // No part in it: another boss, another session, or its own words.
         assert_eq!(reply_target(&report, Replier::Overseer("sarah")), None);
         assert_eq!(
@@ -2030,6 +2045,11 @@ mod tests {
             assert!(holds(held), "{held}");
         }
         for not in [
+            "Keep going until I say stop.",
+            "Carry on until I tell you otherwise.",
+            "Wait for my PR to merge, then rebase.",
+            "No need to wait for my answer: go ahead.",
+            "Wait for desktop notifications to show.",
             "Carry on until I check in tomorrow morning? No: until the tests pass.",
             "Run the drill until it is green.",
             "Keep the watcher going until CI finishes.",
