@@ -63,6 +63,9 @@ pub(crate) struct Charges {
     /// agent id, as the hub says: it only watches or suggests, or Desk's
     /// breaker holds it. A boss left out answers.
     unanswering: HashMap<String, String>,
+    /// Why each boss isn't woken by what its sessions' turns end asking,
+    /// by agent id, as the hub says: those questions are the person's.
+    unwoken: HashMap<String, String>,
     /// The requests a boss was given and left open: the person's now.
     left: std::collections::HashSet<Uuid>,
     /// The sessions whose dialog questions an Act fully boss answers, which
@@ -190,6 +193,22 @@ impl Desk {
         }
     }
 
+    /// Why each boss isn't woken by what its sessions' turns end asking
+    /// (its wake on a finish is off), by agent id, as the hub reads their
+    /// settings: a boss left out is. The sessions whose badge this changes
+    /// are shown again.
+    pub fn set_unwoken(&self, why: HashMap<String, String>) {
+        let changed = {
+            let mut st = self.0.state.lock();
+            let changed = st.charges.unwoken != why;
+            st.charges.unwoken = why;
+            changed
+        };
+        if changed {
+            self.charges_waiting_shown();
+        }
+    }
+
     /// The request `approval` of `session` was given to its boss, whose
     /// turn left it open: the person's to answer now, as its badge says.
     pub fn leave_to_person(&self, session: Uuid, approval: Uuid) {
@@ -222,8 +241,8 @@ impl Desk {
         }
     }
 
-    /// Shows again each session a boss runs that waits on a request, as
-    /// who it waits on may have changed.
+    /// Shows again each session a boss runs that waits on a request or
+    /// on what it asked, as who it waits on may have changed.
     fn charges_waiting_shown(&self) {
         let views: Vec<SessionView> = {
             let st = self.0.state.lock();
@@ -231,8 +250,11 @@ impl Desk {
                 .rows
                 .values()
                 .filter(|c| c.live())
-                .filter(|c| st.live.get(&c.session).is_some_and(|l| l.pending.is_some()))
                 .filter_map(|c| st.records.get(&c.session).map(|r| Self::view_of(&st, r)))
+                .filter(|v| {
+                    v.pending.is_some()
+                        || matches!(v.state, SessionState::Asking | SessionState::Blocked)
+                })
                 .collect()
         };
         for view in views {
@@ -248,16 +270,23 @@ impl Desk {
     /// while its boss has it, and when no boss runs it.
     pub(super) fn waits_on_you(st: &super::State, view: &SessionView) -> Option<String> {
         let c = st.charges.rows.get(&view.id).filter(|c| c.live())?;
-        // A question it asks or a stop with no request: the person's only
-        // where its boss won't answer, or they drive it.
+        // A question its turn ended asking: the person's where they drive
+        // it, its boss won't answer, or isn't woken by it. A stop with no
+        // request is a dialog only its terminal answers.
         let Some(p) = view.pending.as_ref() else {
-            if !matches!(view.state, SessionState::Asking | SessionState::Blocked) {
-                return None;
-            }
-            if Self::wheel_now(st, c).person() {
-                return Some("You're driving it.".into());
-            }
-            return st.charges.unanswering.get(&c.boss).cloned();
+            return match view.state {
+                SessionState::Blocked => Some("Only its terminal can answer this.".into()),
+                SessionState::Asking if Self::wheel_now(st, c).person() => {
+                    Some("You're driving it.".into())
+                }
+                SessionState::Asking => st
+                    .charges
+                    .unanswering
+                    .get(&c.boss)
+                    .or_else(|| st.charges.unwoken.get(&c.boss))
+                    .cloned(),
+                _ => None,
+            };
         };
         let name = st
             .charges
@@ -270,6 +299,10 @@ impl Desk {
         }
         if !p.answerable {
             return Some("Only its terminal can answer this.".into());
+        }
+        // Desk wasn't sent it whole, so its boss is never given it.
+        if p.request.is_none() {
+            return Some(format!("{name} isn't given this one: you decide."));
         }
         if let Some(why) = st.charges.unanswering.get(&c.boss) {
             return Some(why.clone());

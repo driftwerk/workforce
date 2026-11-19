@@ -380,9 +380,9 @@ pub fn moved(mut s: Said, m: Mover, work: &Work, tz: &chrono_tz::Tz) -> Said {
 
 /// The item for work whose session waits on the person's word when the
 /// boss holds it: never that it is missing. Its headline says the boss
-/// has their answers; who moves it says it is passing them on (`doing`).
+/// has their answers; `m` says who moves it (passing them on, or why not).
 /// What the session said of them being missing is dropped.
-pub fn held(s: Said, work: &Work, doing: &str, tz: &chrono_tz::Tz) -> Said {
+pub fn held(s: Said, work: &Work, m: Mover, tz: &chrono_tz::Tz) -> Said {
     let headline = cut(
         &sentence(&format!("I have your answers for {}", work.in_words())),
         HEADLINE_WORDS,
@@ -396,14 +396,7 @@ pub fn held(s: Said, work: &Work, doing: &str, tz: &chrono_tz::Tz) -> Said {
     s.ids = work.ids();
     let h = s.headline.clone();
     not_said_in(&mut s.ids, &[&h]);
-    moved(
-        s,
-        Mover::Boss {
-            doing: doing.to_string(),
-        },
-        work,
-        tz,
-    )
+    moved(s, m, work, tz)
 }
 
 /// What of the contract a line breaks.
@@ -1341,7 +1334,9 @@ mod tests {
         let held = held(
             stall.clone(),
             &w,
-            "I'm passing them to its session now.",
+            Mover::Boss {
+                doing: "I'm passing them to its session now.".into(),
+            },
             &tz,
         );
         assert_eq!(

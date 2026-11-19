@@ -111,6 +111,27 @@ fn item_of(u: &MentionedUpdate, s: uuid::Uuid) -> Said {
         .unwrap_or_else(|| panic!("no item about {s}: {:?}", u.said))
 }
 
+/// The text of the `nth` update posted: what the chat, a notification and
+/// a check-in carry.
+fn posted_text(overseer: &AgentService, nth: usize) -> String {
+    overseer
+        .sessions
+        .find(DESK_CHANNEL, PERSON)
+        .unwrap()
+        .map(|s| s.messages)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|m| {
+            m.desk
+                .as_ref()
+                .and_then(|x| x.delivery)
+                .is_some_and(|k| k == DeliveryKind::Update)
+        })
+        .nth(nth)
+        .map(|m| m.content)
+        .unwrap_or_default()
+}
+
 /// What the boss sent session `s` on its line.
 async fn sent(d: &Desk, s: uuid::Uuid) -> Vec<String> {
     d.line_thread(s, None, Some(100))
@@ -163,6 +184,9 @@ async fn held_answers_are_passed_on_and_never_said_to_be_missing() {
             "{item:?}"
         );
         assert_eq!(write::breaches(&item), vec![], "{item:?}");
+        let text = posted_text(&overseer, 0);
+        assert!(!write::says_missing(&text), "the text sent says so too: {text}");
+        assert!(text.contains("I have your answers for"), "{text}");
         let to_it = eventually("the answers sent to the session", async || {
             let s = sent(&d, s.id).await;
             (!s.is_empty()).then_some(s)
@@ -331,6 +355,79 @@ async fn a_stall_on_something_outside_is_checked_again_when_said() {
             (i.state == OpenState::Closed).then_some(())
         })
         .await;
+    })
+    .await;
+}
+
+/// What a session says it waits on outside the crew stays outside, however
+/// it is worded ("awaiting the reviewer's approval"): looked at again, never
+/// a card for the person.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_outside_wait_in_words_of_approval_is_still_outside() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        crew.set_update_writer(Arc::new(Down));
+        crew.look_at_updates().await;
+        let s = new_session(&d, dir.path(), "release").await;
+        account(
+            &d,
+            s.id,
+            "Ship the v0.39.0 release",
+            &["Blocked: awaiting the reviewer's approval on the audit PR."],
+            Some("the reviewer's approval on the audit PR"),
+        )
+        .await;
+        let u = update(&overseer, &d, 0).await;
+        let item = item_of(&u, s.id);
+        assert!(
+            matches!(item.moves, Some(Mover::Outside { .. })),
+            "{item:?}"
+        );
+        let open = d.store().items_not_closed(Some("desk")).await.unwrap();
+        assert!(
+            !open.iter().any(|i| i.dedupe_key.starts_with("waiting:")),
+            "no card for the person: {open:?}"
+        );
+    })
+    .await;
+}
+
+/// A boss not let to message its sessions (`act.nudge` off) never sends
+/// what it holds itself: the item is the person's, with their own words to
+/// send, and nothing reaches the session from the boss.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_boss_that_may_not_message_leaves_the_held_answers_to_the_person() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let no_nudge = "[oversight]\nenabled = true\nlevel = \"act\"\nact = { nudge = false }\n\
+                        wake = { waiting_remind_minutes = [10, 10, 10] }\n";
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", no_nudge, &[]).await;
+        crew.set_update_writer(Arc::new(NoAnswers));
+        crew.look_at_updates().await;
+        let answers = "VEL-22's section 7 design questions: Kingsley, 19 Nov 11:57: \"ok yes to all to approve the design\".";
+        d.store()
+            .item_open(&NewItem::order("desk", answers, vec![], None))
+            .await
+            .unwrap();
+        let s = new_session(&d, dir.path(), "VEL-22").await;
+        account(
+            &d,
+            s.id,
+            "Carry out the track 2 Workforce PRs",
+            &["Found no recorded answers to the section 7 questions; blocked."],
+            None,
+        )
+        .await;
+        let u = update(&overseer, &d, 0).await;
+        let item = item_of(&u, s.id);
+        assert!(
+            matches!(&item.moves, Some(Mover::Person { question, .. }) if question.contains("approve the design")),
+            "{item:?}"
+        );
+        assert!(!write::says_missing(&item.headline), "{item:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(sent(&d, s.id).await.is_empty(), "the boss sent nothing");
     })
     .await;
 }

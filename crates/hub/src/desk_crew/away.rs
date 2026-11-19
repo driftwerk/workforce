@@ -499,7 +499,9 @@ impl CrewHub {
             }
             return Ok(());
         }
-        let (sessions, decisions, _, _) = self.composed(boss, owner, o, &b).await;
+        // Written as any update is: each stall owned, and its words so.
+        let (written, _, _) = self.written(boss, owner, o, &b, now).await;
+        let (sessions, decisions) = (written.sessions, written.decisions);
         let full = self.level_now(boss, o).0 == workforce_common::oversight::Level::Full;
         let finished: Vec<(String, String)> = b
             .sessions

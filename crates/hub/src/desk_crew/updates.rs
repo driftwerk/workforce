@@ -702,7 +702,7 @@ impl CrewHub {
     }
 
     /// `b` written as an update for `owner`: its extras and its text.
-    async fn written(
+    pub(super) async fn written(
         &self,
         boss: &str,
         owner: &str,
@@ -786,6 +786,26 @@ impl CrewHub {
         // Every one about blocked or stalled work says who moves it next,
         // and that is done: never a stall left with nobody on it.
         self.own_stalls(boss, o, b, &mut said, now).await;
+        // What is sent as text (the chat, notifications, a check-in's
+        // post) says each owned stall as its item does: never the
+        // composer's paragraph or headline that it is missing, or stuck
+        // with nobody on it.
+        let mut sessions = sessions;
+        for i in said.iter().filter(|i| i.moves.is_some()) {
+            let Some(id) = i.session.as_ref().map(|l| l.session_id.as_str()) else {
+                continue;
+            };
+            if let Some(p) = sessions.iter_mut().find(|p| p.session_id == id) {
+                p.text = [i.headline.trim(), i.body.trim()]
+                    .into_iter()
+                    .filter(|t| !t.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+            }
+        }
+        let owned = said.iter().any(|i| i.moves.is_some());
+        let headline =
+            headline.filter(|h| !(owned && (write::says_missing(h) || write::says_stall(h))));
         // The finished sessions it closed, would close, or left open: one
         // line each.
         let notes = self.closing_notes(boss, now);

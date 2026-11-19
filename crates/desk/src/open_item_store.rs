@@ -404,6 +404,19 @@ impl DeskStore {
             .is_some())
     }
 
+    /// When `boss`'s newest closed item keyed `key` was closed, if one was.
+    pub async fn item_last_closed(&self, boss: &str, key: &str) -> Result<Option<DateTime<Utc>>> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .query_opt(
+                "SELECT max(closed_at) FROM boss_open_items \
+                 WHERE boss = $1 AND dedupe_key = $2 AND state = 'closed'",
+                &[&boss, &key],
+            )
+            .await?
+            .and_then(|r| r.get::<_, Option<DateTime<Utc>>>(0)))
+    }
+
     /// The item not closed for the session question `message`, if one.
     pub async fn item_of_line(&self, message: Uuid) -> Result<Option<OpenItem>> {
         let client = self.pool().get().await?;

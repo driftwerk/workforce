@@ -2296,18 +2296,9 @@ impl Desk {
                 boss: None,
             }
         });
-        // A session its boss has asks the boss first: only what the boss
-        // gave the person (escalated) is theirs.
-        let boss_has = |m: &crate::line::LineMessage| {
-            m.escalation.is_none()
-                && m.from_session()
-                    .and_then(|s| st.records.get(&s))
-                    .is_some_and(|r| Self::view_of(&st, r).boss_has.is_some())
-        };
         st.lines
             .for_you
             .values()
-            .filter(|m| !boss_has(m))
             .map(|m| crate::floor::Need {
                 id: format!("line:{}", m.id),
                 kind: crate::floor::NeedKind::Question,

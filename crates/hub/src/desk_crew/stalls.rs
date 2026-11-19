@@ -43,6 +43,13 @@ use workforce_desk::update_write::{self as write, Mover, Said, Work};
 use super::updates::{Batch, Changed};
 use super::CrewHub;
 
+/// Whether a stall was handed the boss's full turn now, or already, when.
+#[derive(Debug, Clone, Copy)]
+enum Handed {
+    Now,
+    At(DateTime<Utc>),
+}
+
 /// What a re-check's key starts with: `recheck:{session}:{when}`.
 pub(crate) const RECHECK: &str = "recheck:";
 
@@ -173,11 +180,14 @@ impl CrewHub {
                 .and_then(|c| c.new.iter().map(|d| d.at).max())
                 .or(s.at)
                 .unwrap_or(now);
-            // 1. The person's word, which the boss holds: given, and said so.
+            // 1. The person's word the session says is missing, which the
+            // boss holds: given, and said so.
             if let Some(held) = b.held.get(&sid).filter(|h| !h.is_empty()) {
-                if write::asks_for_word(&all) || write::says_missing(&all) {
-                    let doing = self.give_held(boss, sid, held, since, acts).await;
-                    *s = write::held(s.clone(), &work, &doing, &tz);
+                if write::says_missing(&all) {
+                    let m = self
+                        .give_held(boss, &view, &work, held, &all, since, acts)
+                        .await;
+                    *s = write::held(s.clone(), &work, m, &tz);
                     continue;
                 }
             }
@@ -188,43 +198,83 @@ impl CrewHub {
         }
     }
 
-    /// Gives session `s` the person's word `boss` holds for it (`held`),
-    /// and what the item says the boss is doing about it.
+    /// Gives session `view` the person's word `boss` holds for it
+    /// (`held`), which it says (`all`) is missing, and who moves it then:
+    /// the boss passing it on now; the boss looking at why it still waits
+    /// when it went already; else the person, who has it to send.
+    #[allow(clippy::too_many_arguments)]
     async fn give_held(
         &self,
         boss: &str,
-        s: Uuid,
+        view: &workforce_desk::model::SessionView,
+        work: &Work,
         held: &[OpenItem],
+        all: &str,
         since: DateTime<Utc>,
         acts: bool,
-    ) -> String {
-        let mut went = false;
-        let mut failed: Option<String> = None;
+    ) -> Mover {
+        use super::held::Held;
+        let s = view.id;
+        let mut sent = false;
+        let mut given: Option<DateTime<Utc>> = None;
+        let mut not: Option<String> = None;
         for i in held {
             match self.deliver_held(boss, s, i, since).await {
-                Ok(_) => went = true,
-                Err(why) => failed = Some(why),
+                Held::Sent => sent = true,
+                Held::Given(at) => given = given.max(Some(at)),
+                Held::Suggested(why) | Held::Refused(why) => not = Some(why),
             }
         }
-        match (went, failed, acts) {
-            (true, _, true) => "I'm passing them to its session now.".into(),
-            (true, _, false) => {
-                "I've put passing them to its session to you beside this message.".into()
-            }
-            (false, Some(why), true) => {
-                self.hand_stall(
-                    boss,
-                    s,
-                    format!(
-                        "{} waits on the person's word, which you hold as their order, and Desk \
-                         couldn't give it to the session ({why}). Give it to the session now \
-                         (crew.nudge), and note it on its ticket.",
-                        self.session_name(s)
+        if sent {
+            return Mover::Boss {
+                doing: "I'm passing them to its session now.".into(),
+            };
+        }
+        let tz = self.desk.timezone();
+        if let (Some(at), true) = (given, acts) {
+            let at = at.with_timezone(&tz).format("%H:%M").to_string();
+            let line = format!(
+                "{} still says the person's word is missing, though you gave it the answers you \
+                 hold at {at}: {}. Find out what it still lacks and settle it now (crew.nudge); \
+                 ask the person with crew.ask_person only if just they can.",
+                view.label(),
+                workforce_desk::crew::one_line(all, 300)
+            );
+            return Mover::Boss {
+                doing: match self.hand_stall(boss, s, line) {
+                    Handed::Now => {
+                        format!("I gave them to its session at {at}; it still waits, so I'm finding out why now.")
+                    }
+                    Handed::At(t) => format!(
+                        "I gave them to its session at {at}; I've been finding out why it still waits since {}.",
+                        t.with_timezone(&tz).format("%H:%M")
                     ),
-                );
-                "I'm getting them to its session now.".into()
-            }
-            (false, _, _) => "I'm looking at how to get them to its session now.".into(),
+                },
+            };
+        }
+        // Not the boss's to send (it suggests, it's held, a gate): the
+        // person's, with what the boss holds to answer it.
+        let words = held
+            .iter()
+            .map(|i| workforce_desk::crew::one_line(&i.text, 200))
+            .collect::<Vec<_>>()
+            .join(" ");
+        tracing::info!(session = %s, why = ?not, "the person's word a boss holds wasn't sent: theirs to send");
+        let question = format!(
+            "{} says your word is missing; you gave it as: {words} Answer here and it goes to its session",
+            work.in_words()
+        );
+        match self
+            .give_stall_to_person(boss, view, &question, all, since)
+            .await
+        {
+            Some(i) => Mover::Person {
+                question: asked(&i),
+                item: i.id,
+            },
+            None => Mover::Boss {
+                doing: "you answered it since; I'm checking it reached its session".into(),
+            },
         }
     }
 
@@ -265,8 +315,13 @@ impl CrewHub {
                 && d.at >= since
                 && !d.brief.trim().is_empty()
         }) {
+            let brief = d.brief.trim();
+            let brief = brief
+                .strip_prefix("I ")
+                .map(str::to_string)
+                .unwrap_or_else(|| write::lowered(brief));
             return Mover::Boss {
-                doing: format!("I {}", write::lowered(d.brief.trim())),
+                doing: format!("I {brief}"),
             };
         }
         let boss_name = self.boss_name_of(boss);
@@ -283,32 +338,38 @@ impl CrewHub {
             };
         }
         // 5. It waits on the boss: its full turn answers it.
-        if on_boss {
-            if acts {
-                self.hand_stall(
-                    boss,
-                    sid,
-                    format!(
-                        "{} waits on your answer{}. Answer it now (crew.nudge); give it to the \
+        if on_boss && acts {
+            let handed = self.hand_stall(
+                boss,
+                sid,
+                format!(
+                    "{} waits on your answer{}. Answer it now (crew.nudge); give it to the \
                          person with crew.ask_person only if only they can settle it, after \
                          checking your orders, your DM with them, its line, its ticket and its \
                          plan for what they already said.",
-                        view.label(),
-                        waiting_on
-                            .map(|w| format!(" ({})", workforce_desk::crew::one_line(w, 200)))
-                            .unwrap_or_default()
-                    ),
-                );
-            }
+                    view.label(),
+                    waiting_on
+                        .map(|w| format!(" ({})", workforce_desk::crew::one_line(w, 200)))
+                        .unwrap_or_default()
+                ),
+            );
             return Mover::Boss {
-                doing: "I'm answering it now.".into(),
+                doing: self.doing(
+                    handed,
+                    "I'm answering it now.",
+                    "I've been answering it since",
+                ),
             };
         }
         // 6. Only the person: their word, as an item with its answer.
+        // What it says it waits on decides; its words only where it says
+        // nothing it waits on. Where the boss doesn't act, the person is
+        // who moves what waits on the boss.
         let person = self.person(None);
-        let theirs = waiting_on.is_some_and(|w| names_person(w, person.as_deref()))
-            || write::asks_for_word(all)
-            || write::says_missing(all);
+        let theirs = match waiting_on {
+            Some(w) => names_person(w, person.as_deref()) || (on_boss && !acts),
+            None => on_boss || write::asks_for_word(all) || write::says_missing(all),
+        };
         if theirs {
             let words = words_of(changed);
             let question = match waiting_on {
@@ -320,7 +381,7 @@ impl CrewHub {
                 ),
             };
             if let Some(i) = self
-                .give_stall_to_person(boss, view, &question, &words, now)
+                .give_stall_to_person(boss, view, &question, &words, since)
                 .await
             {
                 return Mover::Person {
@@ -338,23 +399,57 @@ impl CrewHub {
                 };
             }
         }
-        // 8. Nobody: the boss's full turn is handed it.
-        if acts {
-            self.hand_stall(
-                boss,
-                sid,
-                format!(
-                    "Your update tells the person {} is blocked, and nobody moves it: {}. Move it \
+        // 8. Nobody: the boss's full turn is handed it; where the boss
+        // doesn't act, it is the person's.
+        if !acts {
+            let question = format!(
+                "{} is stuck and nothing moves it: {}. What should it do?",
+                work.in_words(),
+                workforce_desk::crew::one_line(all, 200)
+            );
+            if let Some(i) = self
+                .give_stall_to_person(boss, view, &question, &words_of(changed), since)
+                .await
+            {
+                return Mover::Person {
+                    question: asked(&i),
+                    item: i.id,
+                };
+            }
+            return Mover::Boss {
+                doing: "you settled it since; its session carries on from your word".into(),
+            };
+        }
+        let handed = self.hand_stall(
+            boss,
+            sid,
+            format!(
+                "Your update tells the person {} is blocked, and nobody moves it: {}. Move it \
                      now: unblock it, hand it on, or, only if just the person can, ask them with \
                      crew.ask_person. Before saying anything is missing, check your orders, your \
                      DM with them, its line, its ticket and its plan.",
-                    view.label(),
-                    workforce_desk::crew::one_line(all, 300)
-                ),
-            );
-        }
+                view.label(),
+                workforce_desk::crew::one_line(all, 300)
+            ),
+        );
         Mover::Boss {
-            doing: "I'm looking at what unblocks it now.".into(),
+            doing: self.doing(
+                handed,
+                "I'm looking at what unblocks it now.",
+                "I've been looking at what unblocks it since",
+            ),
+        }
+    }
+
+    /// What the boss says it is doing about a stall it handed its full
+    /// turn: `now`, or, handed within the hour, `since` and when.
+    fn doing(&self, handed: Handed, now: &str, since: &str) -> String {
+        match handed {
+            Handed::Now => now.to_string(),
+            Handed::At(t) => format!(
+                "{since} {}.",
+                t.with_timezone(&self.desk.timezone()).format("%H:%M")
+            ),
         }
     }
 
@@ -375,22 +470,21 @@ impl CrewHub {
     }
 
     /// Hands `boss`'s full turn `line` about session `s`'s stall, unless
-    /// it was handed that session's within the hour.
-    fn hand_stall(&self, boss: &str, s: Uuid, line: String) {
+    /// it was handed that session's within the hour: when.
+    fn hand_stall(&self, boss: &str, s: Uuid, line: String) -> Handed {
         let now = Utc::now();
         let minute = Duration::from_std(self.timing.minute).unwrap_or_default();
         {
             let mut handed = self.stalls_handed.lock();
+            handed.retain(|_, at| now - *at < minute * HANDED_AGAIN);
             let key = (boss.to_string(), s);
-            if handed
-                .get(&key)
-                .is_some_and(|at| now - *at < minute * HANDED_AGAIN)
-            {
-                return;
+            if let Some(at) = handed.get(&key) {
+                return Handed::At(*at);
             }
             handed.insert(key, now);
         }
         self.wake_on(boss, s, line, format!("stall:{s}"));
+        Handed::Now
     }
 
     /// Wakes `boss`'s full turn with `line` about session `s`.
@@ -409,8 +503,12 @@ impl CrewHub {
             handed: None,
         };
         let crew = self.me();
+        let boss = boss.to_string();
+        // As any turn of the boss's: holding its mind, so nothing that
+        // waits for it to be free raises meanwhile.
         tokio::spawn(async move {
-            crew.wake(service, o, vec![t]).await;
+            crew.with_mind(&boss, "a stall", crew.wake(service, o, vec![t]))
+                .await;
         });
     }
 

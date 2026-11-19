@@ -6,13 +6,17 @@
 //! answered).
 //!
 //! - **Held.** The boss's open orders (the person's words, kept from their
-//!   DM or with `crew.order`) that cover a session: linked to it, or naming
-//!   its ticket (or its name, when that is a ticket's key) in their words,
-//!   as an order made before the session was is.
+//!   DM or with `crew.order`) that answer something (an answer, approval,
+//!   decision) and cover a session: linked to it, or naming its ticket (or
+//!   its name, when that is a ticket's key) in their words, as an order
+//!   made before the session was is. "Keep the old index until Friday" is
+//!   an order, not an answer: never passed off as one.
 //! - **Given once.** [`CrewHub::deliver_held`] sends the session those words
-//!   as the boss's own message, through every gate of one; it is not sent
-//!   again while its line still has it, nor when the boss's own word has
-//!   reached the session since it said it waits.
+//!   as the boss's own message, through the gate any message of the boss's
+//!   goes through (its level, `act.nudge`, a session in another terminal);
+//!   it is not sent again while its line still has it, and says when it
+//!   went ([`Held::Given`]), so a session still waiting after is never told
+//!   "passing them now" again.
 //!
 //! The update writer ([`super::stalls`]) and the wait looked at each minute
 //! ([`super::waiting`]) both call it; so may anything else that finds a
@@ -25,7 +29,7 @@ use workforce_desk::line::{Delivery, LineMessage};
 use workforce_desk::open_item::{OpenItem, OpenKind, OpenState};
 use workforce_desk::update_write::{self as write, Work};
 
-use super::actions::{Action, Target};
+use super::actions::{Action, Gate, Target};
 use super::CrewHub;
 
 /// How far back a session's line is read for what the boss gave it.
@@ -45,9 +49,24 @@ fn names(text: &str, key: &str) -> bool {
     })
 }
 
-/// The boss's open orders in `open` that cover session `s` doing `work`:
-/// linked to it, or naming one of its tickets (or its name, when that is a
-/// ticket's key) in their words.
+/// What became of the person's word a boss holds, for a session waiting
+/// on it ([`CrewHub::deliver_held`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Held {
+    /// Sent to the session now.
+    Sent,
+    /// It reached the session already, at this time (it, or the boss's own
+    /// word after the session said it waits).
+    Given(DateTime<Utc>),
+    /// The boss may only suggest sending it: why.
+    Suggested(String),
+    /// It couldn't go: why.
+    Refused(String),
+}
+
+/// The boss's open orders in `open` that answer something and cover
+/// session `s` doing `work`: linked to it, or naming one of its tickets
+/// (or its name, when that is a ticket's key) in their words.
 pub(crate) fn held_for<'a>(open: &'a [OpenItem], s: Uuid, work: &Work) -> Vec<&'a OpenItem> {
     let mut keys: Vec<String> = work
         .titled
@@ -61,6 +80,7 @@ pub(crate) fn held_for<'a>(open: &'a [OpenItem], s: Uuid, work: &Work) -> Vec<&'
     }
     open.iter()
         .filter(|i| i.kind == OpenKind::Order && i.state != OpenState::Closed)
+        .filter(|i| write::asks_for_word(&i.text))
         .filter(|i| i.linked().contains(&s) || keys.iter().any(|k| names(&i.text, k)))
         .collect()
 }
@@ -69,7 +89,7 @@ pub(crate) fn held_for<'a>(open: &'a [OpenItem], s: Uuid, work: &Work) -> Vec<&'
 /// boss holds it.
 fn message(item: &OpenItem) -> String {
     format!(
-        "The person already gave their word on this, and I hold it: {}\n\nGo ahead on it; there is nothing to wait for.",
+        "The person already gave their word on this, and I hold it: {}\n\nIf it answers what you wait on, go ahead on it; if it doesn't, say exactly what is still open.",
         workforce_desk::crew::clip(item.text.trim(), HELD_CHARS)
     )
 }
@@ -85,64 +105,75 @@ fn bosss(m: &LineMessage, boss: &str, s: Uuid) -> bool {
         )
 }
 
-/// Whether the line `thread` already has what `item` holds, from `boss`
-/// to `s`: its message, or any word of the boss's that reached the session
-/// after `since` (when it said it waits).
+/// When the line `thread` already had what `item` holds, from `boss` to
+/// `s`: its message (sent, if not yet delivered), or any word of the
+/// boss's that reached the session after `since` (when it said it waits).
 fn given(
     thread: &[LineMessage],
     boss: &str,
     s: Uuid,
     item: &OpenItem,
     since: DateTime<Utc>,
-) -> bool {
+) -> Option<DateTime<Utc>> {
     // Its first words, its spacing aside.
     let flat = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
     let held: String = flat(&item.text).chars().take(80).collect();
-    thread.iter().filter(|m| bosss(m, boss, s)).any(|m| {
-        (m.at >= item.opened_at && flat(&m.text).contains(&held))
-            || (m.delivery == Delivery::Delivered && m.delivered_at.unwrap_or(m.at) > since)
-    })
+    let reached = |m: &LineMessage| m.delivered_at.unwrap_or(m.at);
+    thread
+        .iter()
+        .filter(|m| bosss(m, boss, s))
+        .filter(|m| {
+            (m.at >= item.opened_at && flat(&m.text).contains(&held))
+                || (m.delivery == Delivery::Delivered && reached(m) > since)
+        })
+        .map(reached)
+        .max()
 }
 
 impl CrewHub {
     /// Gives session `s` the person's word `boss` holds for it (`item`, an
-    /// order of its), as the boss's message, once. True when it went now;
-    /// false when the line has it already, or the boss's own word reached
-    /// the session after `since` (when it said it waits). The error is
-    /// why it couldn't go (a gate, its level).
+    /// order of its), as the boss's message, once, through the gate any
+    /// message of the boss's goes through ([`Held`]).
     pub(crate) async fn deliver_held(
         &self,
         boss: &str,
         s: Uuid,
         item: &OpenItem,
         since: DateTime<Utc>,
-    ) -> Result<bool, String> {
-        let thread = self
-            .desk
-            .line_thread(s, None, Some(LOOK_BACK))
-            .await
-            .map_err(|e| format!("Desk couldn't read its line: {e}"))?;
-        if given(&thread, boss, s, item, since) {
-            return Ok(false);
-        }
-        let Some((service, _)) = self.overseer_named(boss) else {
-            return Err("its boss isn't running here".into());
+    ) -> Held {
+        let thread = match self.desk.line_thread(s, None, Some(LOOK_BACK)).await {
+            Ok(t) => t,
+            Err(e) => return Held::Refused(format!("Desk couldn't read its line: {e}")),
         };
-        let by = self.by_boss(
-            &service,
-            "It waits on the person's word, which I hold: given to it.",
+        if let Some(at) = given(&thread, boss, s, item, since) {
+            return Held::Given(at);
+        }
+        let Some((service, o)) = self.overseer_named(boss) else {
+            return Held::Refused("its boss isn't running here".into());
+        };
+        let action = Action::Nudge {
+            to: Target::Session(s),
+            message: message(item),
+            reply_to: None,
+        };
+        match self.gate(&action, &o) {
+            Gate::Run => {}
+            Gate::Suggest(why) => return Held::Suggested(why.into_owned()),
+            Gate::Refuse => return Held::Suggested("it only watches".into()),
+            Gate::No(why) => return Held::Refused(why.into_owned()),
+        }
+        let by = self.by_at_level(
+            self.by_boss(
+                &service,
+                "It waits on the person's word, which I hold: given to it.",
+            ),
+            &o,
         );
-        self.perform(
-            &Action::Nudge {
-                to: Target::Session(s),
-                message: message(item),
-                reply_to: None,
-            },
-            by,
-        )
-        .await?;
+        if let Err(why) = self.perform(&action, by).await {
+            return Held::Refused(why);
+        }
         tracing::info!(session = %s, item = %item.id, "the person's word a boss held went to the session waiting on it");
-        Ok(true)
+        Held::Sent
     }
 }
 
@@ -204,9 +235,11 @@ mod tests {
             "VEL-22's eight section 7 design questions (cutover window 60-90 min, …): Kingsley, 19 Nov 11:57: \"ok yes to all to approve the design\".",
             vec![],
         );
-        let other = order("VEL-221: leave the export alone", vec![]);
-        let linked = order("Keep the old index until Friday", vec![s]);
-        let open = vec![answers.clone(), other, linked.clone()];
+        let other = order("VEL-221: the export questions are approved", vec![]);
+        let linked = order("Approved: take the 60 minute cutover window", vec![s]);
+        // An order that answers nothing is no held answer.
+        let kept = order("Keep the old index until Friday", vec![s]);
+        let open = vec![answers.clone(), other, linked.clone(), kept];
         let held: Vec<Uuid> = held_for(&open, s, &work).iter().map(|i| i.id).collect();
         assert_eq!(held, vec![answers.id, linked.id]);
         // What isn't an order is none of the person's word.

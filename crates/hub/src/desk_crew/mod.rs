@@ -930,6 +930,19 @@ impl CrewHub {
                 )
                 .collect(),
         );
+        // Who isn't woken by what its sessions' turns end asking: those
+        // questions are the person's.
+        self.desk.set_unwoken(
+            list.iter()
+                .filter(|(_, o)| !o.wake.on_finish)
+                .map(|(s, _)| {
+                    (
+                        s.agent_id.as_str().to_string(),
+                        format!("{} isn't woken when its sessions stop.", name_of(s)),
+                    )
+                })
+                .collect(),
+        );
         self.desk.set_holds(
             list.iter()
                 .map(|(s, o)| {
