@@ -947,7 +947,7 @@ impl ClaudeChatService {
                 tokens: &tokens,
                 home: self.home_for(&session_key),
                 primary: None,
-                yields_when_idle: false,
+                idle_release: None,
             })
             .await;
         let sandbox = match seated {
@@ -2684,7 +2684,7 @@ impl ClaudeChatService {
             tokens: seating.tokens,
             home: self.home_for(&turn.session_key),
             primary: None,
-            yields_when_idle: false,
+            idle_release: None,
         };
         let seated = ensure_with_wait(
             self.launcher.as_ref(),

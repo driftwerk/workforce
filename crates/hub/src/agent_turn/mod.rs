@@ -126,6 +126,7 @@ pub fn wire(
             codex_worker,
             crate::cli_session::RotationPolicy::of(&service.config.claude_chat),
             std::time::Duration::from_secs(coding.executor.scope_ttl_secs),
+            std::time::Duration::from_secs(coding.executor.agent_turn_idle_secs),
         ))),
         Err(e) => tracing::error!(
             agent = %service.agent_id,

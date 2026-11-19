@@ -559,7 +559,7 @@ impl CodingSessionTool {
                 tokens,
                 home: HomeSpec::Ephemeral,
                 primary: None,
-                yields_when_idle: false,
+                idle_release: None,
             })
             .await
             .map_err(|e| {
