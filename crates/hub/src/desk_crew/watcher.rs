@@ -252,8 +252,8 @@ pub(super) const DO_IT_YOURSELF: &str = "Your “How it works” setting is Do i
 
 /// What a boss is told of its own work where starting sessions isn't its
 /// to do (at Suggest, or with “Hand out work” off), by its style.
-pub(super) const OWN_WORK_SESSIONS_ONLY: &str = "Your “How it works” setting is Only in sessions: commands, builds and code changes go to a session, never here; you read, search and keep notes yourself.";
-pub(super) const OWN_WORK_PREFER: &str = "Your “How it works” setting is Prefer sessions: code changes, builds and long tasks go to a session; checks, lookups and ops (ssh to one of their machines, gh, reading files and logs, a quick command) you run yourself.";
+pub(super) const OWN_WORK_SESSIONS_ONLY: &str = "Your “How it works” setting is Only in sessions: commands, builds and code changes go to a session (crew.start_session, which may only suggest one), never here; you read, search and keep notes yourself.";
+pub(super) const OWN_WORK_PREFER: &str = "Your “How it works” setting is Prefer sessions: code changes, builds and long tasks go to a session (crew.start_session, which may only suggest one); checks, lookups and ops (ssh to one of their machines, gh, reading files and logs, a quick command) you run yourself.";
 
 /// What every DM turn of a boss is told before it speaks of a session.
 pub(super) const CHECK_FIRST: &str = "Before you say anything about a session, read its account with crew.account; never guess. Answer as Done / Now / Next / Waiting on, from the account, and say how fresh it is if it's over a few minutes old.";
