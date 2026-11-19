@@ -240,11 +240,9 @@ impl CrewHub {
                 Err(e) => {
                     tracing::warn!(%agent, error = %format!("{e:#}"), "telling what monitors saw failed: tried again at the next look");
                     match store.monitor_held_untake(&taken).await {
-                        Ok(0) => {}
-                        Ok(dropped) => {
-                            let monitors: Vec<&str> =
-                                held.iter().map(|h| h.monitor_id.as_str()).collect();
-                            tracing::warn!(%agent, %owner, dropped, ?monitors, "what monitors saw couldn't be told after many tries and was dropped")
+                        Ok(monitors) if monitors.is_empty() => {}
+                        Ok(monitors) => {
+                            tracing::warn!(%agent, %owner, dropped = monitors.len(), ?monitors, "what monitors saw couldn't be told after many tries and was dropped")
                         }
                         Err(e) => {
                             tracing::info!(error = %format!("{e:#}"), "letting what monitors saw go failed: taken again in a minute")
@@ -274,8 +272,8 @@ where
         let local = h.held_at.with_timezone(tz);
         let days = (today - local.date_naive()).num_days();
         match days {
-            // Today, or (another hub's clock ahead) later.
-            ..=0 => local.format("%H:%M").to_string(),
+            // Today, or tomorrow on a hub whose clock runs ahead.
+            -1..=0 => local.format("%H:%M").to_string(),
             1..=6 => local.format("%a %H:%M").to_string(),
             _ => local.format("%a %-d %b %H:%M").to_string(),
         }
@@ -398,6 +396,10 @@ mod tests {
             week.contains("**Invoices** · Thu 12 Nov 08:05\nOld."),
             "{week}"
         );
+        // A hub whose clock runs a little ahead: today's, not a date.
+        let ahead = held("Invoices", "Ahead.", HeldFor::Away, 20, 0);
+        let one = held_text(std::slice::from_ref(&ahead), now(), &tz);
+        assert!(one.contains("saw this at 00:05,"), "{one}");
     }
 
     #[test]

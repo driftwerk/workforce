@@ -221,26 +221,29 @@ impl DeskStore {
 
     /// `ids` were taken but their telling failed: put off a minute more for
     /// each failure so far (what comes since for their DM isn't held behind
-    /// them meanwhile), and dropped past [`ATTEMPTS`]. How many were dropped.
+    /// them meanwhile), and dropped past [`ATTEMPTS`]: the monitors of those
+    /// dropped. Only rows still taken are let go.
     ///
     /// The minute is the wall clock's, whatever the crew's minute is.
-    pub async fn monitor_held_untake(&self, ids: &[Uuid]) -> Result<u64> {
+    pub async fn monitor_held_untake(&self, ids: &[Uuid]) -> Result<Vec<String>> {
         let mut client = self.pool().get().await?;
         let tx = client.transaction().await?;
         let dropped = tx
-            .execute(
-                "DELETE FROM monitor_held WHERE id = ANY($1) AND attempts + 1 >= $2",
+            .query(
+                "DELETE FROM monitor_held WHERE id = ANY($1) AND claimed_until IS NOT NULL \
+                 AND attempts + 1 >= $2 RETURNING monitor_id",
                 &[&ids, &ATTEMPTS],
             )
             .await?;
         tx.execute(
             "UPDATE monitor_held SET claimed_until = NULL, attempts = attempts + 1, \
-             release_at = now() + (attempts + 1) * interval '1 minute' WHERE id = ANY($1)",
+             release_at = now() + (attempts + 1) * interval '1 minute' \
+             WHERE id = ANY($1) AND claimed_until IS NOT NULL",
             &[&ids],
         )
         .await?;
         tx.commit().await?;
-        Ok(dropped)
+        dropped.iter().map(|r| Ok(r.try_get(0)?)).collect()
     }
 }
 
@@ -327,7 +330,11 @@ mod tests {
             assert!(store.monitor_held_due(now).await.unwrap().is_empty());
             store.monitor_held_done(&[since.id]).await.unwrap();
             // Its telling failed: put off a minute, holding nothing up meanwhile.
-            assert_eq!(store.monitor_held_untake(&[due.id]).await.unwrap(), 0);
+            assert!(store
+                .monitor_held_untake(&[due.id])
+                .await
+                .unwrap()
+                .is_empty());
             assert!(store.monitor_held_due(Utc::now()).await.unwrap().is_empty());
             assert!(!store
                 .monitor_held_waiting("scout", "person-1", false, Utc::now())
@@ -338,12 +345,16 @@ mod tests {
             // Failing every time, it is dropped in the end.
             for _ in 1..ATTEMPTS - 1 {
                 store.monitor_held_take(&[due.id]).await.unwrap();
-                assert_eq!(store.monitor_held_untake(&[due.id]).await.unwrap(), 0);
+                assert!(store
+                    .monitor_held_untake(&[due.id])
+                    .await
+                    .unwrap()
+                    .is_empty());
             }
             store.monitor_held_take(&[due.id]).await.unwrap();
             assert_eq!(
                 store.monitor_held_untake(&[due.id]).await.unwrap(),
-                1,
+                vec!["invoices".to_string()],
                 "dropped"
             );
             assert_eq!(

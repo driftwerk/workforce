@@ -323,6 +323,50 @@ async fn typing_or_a_reply_being_written_holds_a_finding_in_any_agents_dm() {
     .await;
 }
 
+/// A boss's turn relayed into Scout's DM isn't the person's message: their
+/// typing there still holds what Scout's monitors would say.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relayed_turn_in_an_agents_dm_leaves_the_persons_typing_hold() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, scout, crew, _d) = scout_under(dir.path(), pool, |_| String::new()).await;
+        crew.monitor_told(&scout, PERSON, finding(DeskDelivery::Dm, "First invoice"))
+            .await
+            .unwrap();
+        let sid = scout
+            .sessions
+            .find(DESK_CHANNEL, PERSON)
+            .unwrap()
+            .expect("the DM")
+            .id;
+        assert!(crew.typing_in("scout"));
+        crew.relayed_turns.lock().insert(sid.clone());
+        let relayed = crew.track(
+            &scout,
+            DESK_CHANNEL,
+            PERSON,
+            "Relayed from the boss",
+            Some(sid.as_str()),
+            (None, None),
+        );
+        assert!(crew.typing_release("scout").is_some(), "still typing");
+        drop(relayed);
+        crew.relayed_turns.lock().remove(&sid);
+        // Their own message ends it.
+        let theirs = crew.track(
+            &scout,
+            DESK_CHANNEL,
+            PERSON,
+            "Thanks",
+            Some(sid.as_str()),
+            (None, None),
+        );
+        assert!(crew.typing_release("scout").is_none(), "sent");
+        drop(theirs);
+    })
+    .await;
+}
+
 /// What comes while older findings wait to be told for the DM goes after
 /// them, in one message, not ahead of them.
 #[tokio::test(flavor = "multi_thread")]
