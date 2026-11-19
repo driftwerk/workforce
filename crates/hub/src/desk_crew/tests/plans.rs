@@ -2008,7 +2008,7 @@ async fn a_boss_runs_a_check_on_a_machine_and_what_no_boss_does_is_the_persons()
             (json!({ "machine": "devbox", "command": "ls" }), "Give the reason"),
             (json!({ "machine": "devbox", "reason": "Look." }), "Say the command"),
             (json!({ "machine": "../x", "command": "ls", "reason": "Look." }), "isn't one of the person's machines"),
-            (json!({ "machine": "devbox", "command": "ls", "timeout_secs": 60, "reason": "Look." }), "1 to 20 seconds"),
+            (json!({ "machine": "devbox", "command": "ls", "timeout_secs": 60, "reason": "Look." }), "1 to 15 seconds"),
             (json!({ "machine": "devbox", "command": "x".repeat(9000), "reason": "Look." }), "at most"),
         ] {
             let r = run.execute(input).await.unwrap();
@@ -2042,7 +2042,7 @@ async fn a_boss_runs_a_check_on_a_machine_and_what_no_boss_does_is_the_persons()
                 .unwrap();
             serde_json::to_string(&page)
                 .unwrap()
-                .contains("ran `git remote -v` on devbox")
+                .contains("couldn't send `git remote -v` to devbox")
                 .then_some(())
         })
         .await;

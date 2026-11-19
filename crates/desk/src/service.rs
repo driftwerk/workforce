@@ -3132,9 +3132,13 @@ impl Desk {
             .lock()
             .clone()
             .unwrap_or_else(|| crate::repos::PROJECTS_ROOT.to_string());
-        self.0
-            .cloner
-            .checkout(repo, folder, &root, self.home_folder().as_deref())
+        self.0.cloner.checkout(
+            repo,
+            folder,
+            &root,
+            self.home_folder().as_deref(),
+            &self.0.env,
+        )
     }
 
     /// Every checkout of `repo` under the home ([`crate::repos::find`]).
@@ -3142,6 +3146,11 @@ impl Desk {
         self.home_folder()
             .map(|h| crate::repos::find(repo, &h))
             .unwrap_or_default()
+    }
+
+    /// The person's login environment, as their sessions get it.
+    pub(crate) fn login_env(&self) -> &BTreeMap<String, String> {
+        &self.0.env
     }
 
     /// The hub user's home folder.

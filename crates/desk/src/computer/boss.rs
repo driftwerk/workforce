@@ -102,6 +102,11 @@ pub struct Here<'a> {
     /// Whether git tracks a file (a path, real): a release's asset is one,
     /// or lies in a build output folder.
     pub tracked: &'a dyn Fn(&Path) -> bool,
+    /// The folder it is in is the person's choice (a session's), so what
+    /// runs its own code there (its scripts, builds, tests, and the
+    /// configs and plugins its tools load) may run. A boss's check on a
+    /// machine, its folder the boss's word, has none of it.
+    pub vouched: bool,
 }
 
 /// A file a boss acting fully may attach to a release: one git tracks
@@ -1765,6 +1770,9 @@ fn one(walk: &mut Walk<'_, '_>, cmd: &Cmd, next: Option<Join>) -> Judged {
         };
         return read.iter().try_for_each(|w| walk.reads(w));
     }
+    if !walk.here.vouched && PROJECT_RUNNERS.contains(&name) {
+        return no("runs a project's own code in a folder the person didn't choose; that's the person's to allow");
+    }
     match name {
         "cd" | "pushd" => {
             let to = args.first();
@@ -3407,6 +3415,14 @@ fn uv(walk: &mut Walk<'_, '_>, args: &[Word], next: Option<Join>) -> Judged {
 
 /// An interpreter given a script of the project's own, or a test runner;
 /// never code inline, which Desk doesn't read.
+/// The programs that run a project's own code as they work: its package
+/// scripts, build files, test suites, and the configs and plugins tools
+/// load from it ([`Here::vouched`]).
+const PROJECT_RUNNERS: &[&str] = &[
+    "cargo", "npm", "pnpm", "yarn", "bun", "make", "go", "uv", "pytest", "tsc", "eslint",
+    "prettier", "black", "mypy", "rustfmt", "gofmt", "ruff", "jest", "vitest",
+];
+
 fn script(walk: &Walk<'_, '_>, name: &str, args: &[Word]) -> Judged {
     let Some(first) = args.first() else {
         return no(CANT_READ);
@@ -3603,6 +3619,7 @@ pub(crate) mod tests {
             branches: &[],
             tip_tags: &[],
             tracked: &|_| false,
+            vouched: true,
         }
     }
 
@@ -4326,6 +4343,7 @@ pub(crate) mod tests {
             branches: &[],
             tip_tags: &[],
             tracked: &|_| false,
+            vouched: true,
         };
         let desk = format!(
             "cat '{}/library/application support/desk/x'",

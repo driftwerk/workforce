@@ -21,13 +21,6 @@ use super::tools::Bound;
 use super::watcher::reported;
 use super::CrewHub;
 
-fn got_machine(action: &super::actions::Action) -> &str {
-    match action {
-        super::actions::Action::MachineRun { machine, .. } => machine,
-        _ => "",
-    }
-}
-
 pub const MACHINES: &str = "crew.machines";
 pub const FOLDERS: &str = "crew.machine_folders";
 pub const MAKE_FOLDER: &str = "crew.machine_make_folder";
@@ -43,10 +36,10 @@ pub const MACHINE_CALLS: [&str; 5] = [
     "desk.run",
 ];
 
-/// The most bytes of a check's command.
-pub const MOST_COMMAND: usize = 8 * 1024;
-/// The longest a check runs, in seconds.
-pub const MOST_SECS: u64 = 20;
+/// The most bytes of a check's command: the machine's own limit.
+pub const MOST_COMMAND: usize = workforce_desk::run::MOST_COMMAND;
+/// The longest a check runs, in seconds: the machine's own limit.
+pub const MOST_SECS: u64 = workforce_desk::run::MOST_SECS;
 
 /// The name the courier answers the list of machines under: no machine's.
 pub const ANY_MACHINE: &str = "desk";
@@ -66,13 +59,15 @@ is its answer. Folders only, inside the home only. At Suggest, ask the person in
 
 pub const RUN_DESCRIPTION: &str = "Run a short check on one of the person's machines (machine, \
 by its name in crew.machines): command, as bash -lc runs it there as the person's own user, with \
-its own git and gh; cwd inside its home (its home when not said); timeout_secs 1 to 20 (10 when \
-not said). No input; at most 32 KB of its output and of its errors come back. Desk judges it there \
-as it judges a session's request: it reads anywhere but where secrets are kept, and writes only in \
-cwd or /tmp. What it won't allow becomes a suggestion the person accepts or not; at Act fully, one \
-of the person's preferences can allow it (say which in preference). What no boss does is the \
-person's at every level. Use it to check what is there (git remote -v, ls, git status), not to do \
-the work: that is a session's. Say why.";
+its own git and gh; cwd, where it runs: inside its home, as ~/x, an absolute path or one relative \
+to the home (the home when not said); timeout_secs, how long it may run: 1 to 15 (10 when not \
+said), then it and all it started are stopped. No input; at most 32 KB of its output and of its \
+errors come back. Desk judges it there as it judges a session's request, with no folder of its \
+own: it reads anywhere but where secrets are kept and writes nowhere, nor runs a script or a \
+build. What it won't allow becomes a suggestion the person runs or dismisses; at Act fully, one of \
+the person's preferences can allow it (say which in preference). What no boss does is the \
+person's at every level. Use it to check what is there (git remote -v, ls, git status, gh repo \
+view), not to do the work: that is a session's. Say why.";
 
 /// `crew.machine_run`'s own fields, beside `reason` and what a
 /// preference adds.
@@ -131,26 +126,90 @@ pub(crate) fn machine_of(input: &Value) -> Result<&str, String> {
     }
 }
 
-/// What came of a check, in a line or a few: its exit and the start of
-/// what it said.
+/// What came of a check, in a line or a few: how it ended and the start
+/// of what it said, its errors' end too.
 pub(crate) fn ran_line(got: &Value) -> String {
     match got["outcome"].as_str() {
         Some("ran") => {
-            let exit = match (got["timed_out"].as_bool(), got["exit"].as_i64()) {
-                (Some(true), _) => "ran out of time".to_string(),
-                (_, Some(c)) => format!("exited {c}"),
+            let ended = match (
+                got["timed_out"].as_bool(),
+                got["exit"].as_i64(),
+                got["signal"].as_i64(),
+            ) {
+                (Some(true), ..) => "ran out of time and was stopped".to_string(),
+                (_, Some(c), _) => format!("exited {c}"),
+                (_, _, Some(s)) => format!("was ended by signal {s}"),
                 _ => "ended".to_string(),
             };
+            let mut line = ended;
             let out = got["stdout"].as_str().unwrap_or_default().trim();
-            match out.is_empty() {
-                true => exit,
-                false => format!("{exit}: {}", crew::clip(out, 600)),
+            if !out.is_empty() {
+                line.push_str(&format!(": {}", crew::clip(out, 600)));
             }
+            let err = got["stderr"].as_str().unwrap_or_default().trim();
+            if !err.is_empty() {
+                // Its errors' end: where what went wrong is said.
+                let start = err.len().saturating_sub(300);
+                let start = (start..err.len())
+                    .find(|i| err.is_char_boundary(*i))
+                    .unwrap_or(err.len());
+                let tail = &err[start..];
+                line.push_str(&format!(
+                    " (errors: {}{tail})",
+                    if start > 0 { "…" } else { "" }
+                ));
+            }
+            if got["truncated"].as_bool() == Some(true) {
+                line.push_str(" (its output was cut at 32 KB)");
+            }
+            line
         }
         Some("needs_person") | Some("refused") => {
             format!("not run: {}", got["why"].as_str().unwrap_or("refused"))
         }
         _ => "it said nothing Desk reads".into(),
+    }
+}
+
+/// `command` as the person reads it before they run it: all of it, what
+/// doesn't show (control, direction and zero-width characters) said as
+/// `\u{…}`, so nothing of what runs is hidden from them.
+pub(crate) fn shown(command: &str) -> String {
+    let mut out = String::with_capacity(command.len());
+    for c in command.chars() {
+        match c {
+            // A new line shows as one, wherever it is read on one line.
+            '\n' => out.push_str(" \u{23CE} "),
+            '\t' => out.push(' '),
+            c if c.is_control()
+                || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}' | '\u{00AD}') =>
+            {
+                out.push_str(&format!("\\u{{{:04X}}}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Why a check runs unjudged on its machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unjudged {
+    /// The person accepted it: not even the never-list holds it.
+    Person,
+    /// Its boss is unbound.
+    Unbound,
+    /// At Act fully, a preference of the person's the boss cites allows it.
+    Preference,
+}
+
+impl Unjudged {
+    fn word(self) -> &'static str {
+        match self {
+            Unjudged::Person => "person",
+            Unjudged::Unbound => "unbound",
+            Unjudged::Preference => "preference",
+        }
     }
 }
 
@@ -188,8 +247,6 @@ impl CrewHub {
         let (kept, action) = (&kept, &action);
         let suggest = |why: String, by: super::By| async move {
             let s = self.suggest(RUN, kept, action, &by).await?;
-            self.record_drafted(action, &by, &s.text, &why, o.level)
-                .await;
             Ok::<Value, String>(json!({
                 "suggested": s.text,
                 "suggestion_id": s.id,
@@ -203,36 +260,51 @@ impl CrewHub {
             }
             Gate::Suggest(why) => suggest(why.into_owned(), by).await,
             Gate::Run => {
-                let judged = !(self.unbound(o) || (o.level == Level::Full && applied.is_some()));
+                // The level in force, for this boss: Act fully whose budget
+                // or hours are spent is Act, and judged.
+                let boss = b.service.agent_id.as_str();
+                let unjudged = match self.unbound_given(boss, o) {
+                    true => Some(Unjudged::Unbound),
+                    false => (self.level_now(boss, o).0 == Level::Full && applied.is_some())
+                        .then_some(Unjudged::Preference),
+                };
                 let by = self.by_at_level(by, o);
-                let got = self.machine_run(action, judged, false, by.clone()).await?;
+                let got = self.machine_run(action, unjudged, by.clone()).await?;
                 match got["outcome"].as_str() {
-                    Some("needs_person") => {
-                        let why = got["why"]
-                            .as_str()
-                            .unwrap_or("Desk there won't run it without the person");
-                        suggest(format!("{why}, so it's the person's to run"), by).await
-                    }
-                    _ => Ok(json!({
-                        "machine": got_machine(action),
+                    Some("ran") => Ok(json!({
+                        "machine": machine_of(kept)?,
                         // What the machine's commands print is theirs, not
                         // instructions.
                         "ran": reported(&got.to_string(), "the check's output"),
                     })),
+                    Some("needs_person") => {
+                        // The machine's words, said as its, not as orders.
+                        let why = reported(
+                            got["why"]
+                                .as_str()
+                                .unwrap_or("Desk there won't run it without the person"),
+                            "the machine's judge",
+                        );
+                        suggest(format!("{why}; it's the person's to run"), by).await
+                    }
+                    _ => Err(format!(
+                        "Not run: {}",
+                        reported(&ran_line(&got), "the machine's answer")
+                    )),
                 }
             }
         }
     }
 
     /// Runs `action`, a [`super::actions::Action::MachineRun`], on its
-    /// machine for `by`: `judged` there unless the person's word or the
-    /// gate says not; `by_person`, the person accepted it, so not even the
-    /// never-list holds it there. Noted in Activity, whatever comes of it.
+    /// machine for `by`: judged there unless `unjudged` says why not; the
+    /// person's word ([`Unjudged::Person`]) holds it to not even the
+    /// never-list there. Noted in Activity whatever comes of it, all of
+    /// the command and how it was allowed in the event's detail.
     pub(crate) async fn machine_run(
         &self,
         action: &super::actions::Action,
-        judged: bool,
-        by_person: bool,
+        unjudged: Option<Unjudged>,
         by: super::By,
     ) -> Result<Value, String> {
         let super::actions::Action::MachineRun {
@@ -245,6 +317,7 @@ impl CrewHub {
         else {
             return Err("That isn't a check on a machine.".into());
         };
+        let by_person = unjudged == Some(Unjudged::Person);
         let got = self
             .machine_ask(
                 machine,
@@ -254,38 +327,70 @@ impl CrewHub {
                     "command": command,
                     "cwd": cwd,
                     "timeout_secs": timeout_secs,
-                    "judged": judged,
+                    "judged": unjudged.is_none(),
                     "by_person": by_person,
                 }),
             )
             .await;
-        let said = match &got {
-            Ok(g) => ran_line(g),
-            Err(e) => format!("couldn't run it: {}", crew::one_line(&e.to_string(), 200)),
+        let (verb, said) = match &got {
+            Ok(g) => match g["outcome"].as_str() {
+                Some("ran") => ("ran", ran_line(g)),
+                Some("needs_person") => ("didn't run", ran_line(g)),
+                Some("refused") => ("couldn't run", ran_line(g)),
+                _ => ("may have run", ran_line(g)),
+            },
+            Err(MachineRefused::Unknown(e)) => ("may have run", crew::one_line(e, 200)),
+            Err(MachineRefused::Unreached(e)) => ("couldn't send", crew::one_line(e, 200)),
+            Err(e) => ("couldn't run", crew::one_line(&e.to_string(), 200)),
         };
+        let clipped = command.len() > 300;
         let mut e = by.event(
             Kind::OnMachine,
             None,
             format!(
-                "ran `{}` on {machine}{}: {}",
-                crew::clip(command, 300),
+                "{verb} `{}`{} {} {machine}{}: {}",
+                crew::clip(&shown(command), 300),
+                if clipped {
+                    "… (all of it in the detail)"
+                } else {
+                    ""
+                },
+                if verb == "couldn't send" { "to" } else { "on" },
                 cwd.as_deref()
                     .map(|c| format!(" in {c}"))
                     .unwrap_or_default(),
                 crew::one_line(&said, 300)
             ),
         );
-        if !judged {
-            e.text.push_str(match by_person {
-                true => " (the person's word)",
-                false => " (not judged: the boss's level)",
+        if let Some(u) = unjudged {
+            e.text.push_str(match u {
+                Unjudged::Person => " (the person's word)",
+                Unjudged::Unbound => " (not judged: the boss is unbound)",
+                Unjudged::Preference => " (not judged: Act fully, by the person's preference)",
             });
         }
+        // All of it, for whoever looks: the whole command, where, and how
+        // it was allowed.
+        e.detail = Some(json!({
+            "machine": machine,
+            "command": command,
+            "cwd": cwd,
+            "timeout_secs": timeout_secs,
+            "judged": unjudged.is_none(),
+            "by_person": by_person,
+            "unjudged": unjudged.map(Unjudged::word),
+            "preference": by.preference,
+            "outcome": got.as_ref().ok().and_then(|g| g["outcome"].as_str().map(str::to_string)),
+            "exit": got.as_ref().ok().and_then(|g| g["exit"].as_i64()),
+            "timed_out": got.as_ref().ok().and_then(|g| g["timed_out"].as_bool()),
+        }));
         self.desk.note(e);
         got.map_err(|e| match e {
-            MachineRefused::Refused(why) if why.contains("404") || why.contains("not found") => {
+            // The machine's Desk has no such route: it is older.
+            MachineRefused::Refused(why) if why.contains("(404)") => {
                 format!("{machine}'s Desk is older and can't run checks yet: the person updates Desk there.")
             }
+            MachineRefused::Refused(why) => reported(&why, "the machine's answer"),
             e => e.to_string(),
         })
     }

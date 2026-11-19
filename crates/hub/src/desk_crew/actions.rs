@@ -1431,11 +1431,12 @@ impl CrewHub {
                 cwd,
                 ..
             } => format!(
+                // All of it, nothing hidden: the person runs what they read.
                 "Run on {machine}{}: `{}`",
                 cwd.as_deref()
                     .map(|c| format!(" in {c}"))
                     .unwrap_or_default(),
-                crew::clip(command, 300)
+                super::machines::shown(command)
             ),
         }
     }
@@ -1766,13 +1767,23 @@ impl CrewHub {
         let d = &self.desk;
         match action {
             // Only by the person, accepting it: their word runs it as
-            // said. The boss's own runs go through `machine_run_tool`.
+            // said. One whose boss was turned to Watch since isn't run:
+            // the courier sends nothing for a watching boss, and the person
+            // runs it there themselves. The boss's own runs go through
+            // `machine_run_tool`.
             Action::MachineRun { .. } => {
                 if by.party.kind != crew::PartyKind::You {
                     return Err("A boss runs a check with crew.machine_run.".into());
                 }
-                let got = self.machine_run(action, false, true, by).await?;
-                Ok(super::machines::ran_line(&got))
+                let got = self
+                    .machine_run(action, Some(super::machines::Unjudged::Person), by)
+                    .await?;
+                let line = super::machines::ran_line(&got);
+                match got["outcome"].as_str() {
+                    // What it said, for the person who ran it.
+                    Some("ran") => Ok(format!("Ran it: {line}")),
+                    _ => Err(format!("It didn't run: {line}")),
+                }
             }
             Action::ChangeOversight { agent, change } => {
                 // The person, saying yes to the card: never the overseer,

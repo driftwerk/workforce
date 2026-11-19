@@ -2816,6 +2816,15 @@ mod tests {
             .await;
             assert_eq!(status, 403);
             let app = super::sessions_router(desk, allow_all());
+            // A token in the address: refused, even the hub's.
+            let (status, _) = call(
+                &app,
+                "POST",
+                "/api/desk/run?token=x",
+                Some(json!({"command": "echo hi"})),
+            )
+            .await;
+            assert_eq!(status, 400);
             let (status, ran) = call(
                 &app,
                 "POST",

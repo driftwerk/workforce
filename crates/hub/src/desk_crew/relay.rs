@@ -220,6 +220,9 @@ impl CrewHub {
             Ok(Ok(answer)) => Ok(answer),
             // Desk took it: it may have been done there. Not to be sent
             // again as new.
+            _ if taken && tool == "desk.run" => Err(MachineRefused::Unknown(format!(
+                "Sent to {machine}, but no answer came back: the check may have run there. Look at what it would have changed before you run it again."
+            ))),
             _ if taken => Err(MachineRefused::Unknown(format!(
                 "Sent to {machine}, but its outcome isn't known yet: check {machine}'s session (crew.history) before you try it again."
             ))),

