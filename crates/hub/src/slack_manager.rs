@@ -11615,7 +11615,10 @@ pub async fn resume_turn(
     crate::user_config::as_principal(principal, async {
         match delivery {
             ResumeDelivery::Thread((channel, thread)) => {
-                crate::serve::chat_turn(svc.process_message(
+                // The Slack thread it answers in, as the live dispatch
+                // scopes it, so what the turn says beside its answer (a
+                // notice) is said there too.
+                let turn = crate::serve::chat_turn(svc.process_message(
                     &session.channel,
                     &session.owner,
                     prompt,
@@ -11629,8 +11632,13 @@ pub async fn resume_turn(
                     None,
                     None,
                     run_as,
-                ))
-                .await
+                ));
+                workforce_agent::runner::CURRENT_CHANNEL_ID
+                    .scope(
+                        channel.clone(),
+                        workforce_agent::runner::CURRENT_THREAD_ID.scope(thread.clone(), turn),
+                    )
+                    .await
             }
             ResumeDelivery::Session => {
                 let desk = session.desk_origin().map(|target| {

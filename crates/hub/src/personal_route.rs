@@ -99,13 +99,19 @@ impl RouteDecider {
     /// here of a kind it allows. Anything else, a failed read included, is
     /// the hub's route.
     pub async fn chosen(&self) -> Option<Chosen> {
+        self.chosen_for(Self::payer()?).await
+    }
+
+    /// The person's own route `person`'s calls on this agent take: the one
+    /// decision [`Self::chosen`] makes for a call's payer, made for a
+    /// person named, as what an agent is shown to run on for them says it.
+    pub async fn chosen_for(&self, person: Uuid) -> Option<Chosen> {
         let switch = self
             .routes
             .for_agent(self.config.snapshot().personal_routes.as_ref());
         if !switch.enabled {
             return None;
         }
-        let person = Self::payer()?;
         let settings = self
             .routes
             .settings(person, &self.agent_id)

@@ -58,6 +58,6 @@ pub use client::{
 pub use protocol::{
     AgentDetailResponse, AgentInfo, AgentStatsResponse, AgentToolInfo, AgentsResponse, ChatOutcome,
     ChatRequest, ChatResponse, ClientMessage, CreateAgentRequest, NodeInvokeRequest,
-    NodeInvokeResult, PictureInfo, ServerMessage, ServerMessageKind, SessionInfo, SessionsResponse,
-    UpdateAgentRequest,
+    NodeInvokeResult, PersonalRouteInfo, PictureInfo, ServerMessage, ServerMessageKind,
+    SessionInfo, SessionsResponse, UpdateAgentRequest,
 };

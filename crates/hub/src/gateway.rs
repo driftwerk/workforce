@@ -4979,6 +4979,9 @@ async fn list_commands(
     ))
 }
 
+/// How many agents' routes a listing reads at once.
+const ROUTES_READ_AT_ONCE: usize = 8;
+
 /// List available agents.
 async fn list_agents(
     headers: axum::http::HeaderMap,
@@ -5004,54 +5007,68 @@ async fn list_agents(
         None => {}
     }
 
+    let person = caller_person(&caller);
     let viewer = AgentViewer::new(&state, caller);
     let faces = picture_faces(&state).await;
 
-    let agents = state
-        .registry
-        .agent_ids()
-        .iter()
-        .filter_map(|id| {
-            let id_str = id.to_string();
-            let svc = state.registry.get(&id_str)?;
-            let agent_config = svc.config.agent_by_id(&id_str);
-            let (eff_owner_id, eff_owner_type) = svc.effective_owner();
+    let mut agents = Vec::new();
+    for id in state.registry.agent_ids() {
+        let id_str = id.to_string();
+        let Some(svc) = state.registry.get(&id_str) else {
+            continue;
+        };
+        let agent_config = svc.config.agent_by_id(&id_str);
+        let (eff_owner_id, eff_owner_type) = svc.effective_owner();
 
-            let vis = viewer.visibility(&id_str, eff_owner_id.as_deref(), &eff_owner_type);
-            if !vis.visible {
-                return None;
+        let vis = viewer.visibility(&id_str, eff_owner_id.as_deref(), &eff_owner_type);
+        if !vis.visible {
+            continue;
+        }
+
+        // Owner UUIDs are management metadata. Disclose them only on the
+        // ownership path (admin / owner / team member); a caller who sees
+        // the agent purely via its access policy must not learn the owner
+        // id or type (audit F1 leaked owner UUIDs to unprivileged callers).
+        let (owner_id, owner_type) = if vis.disclose_owner {
+            (
+                eff_owner_id,
+                Some(format!("{:?}", eff_owner_type).to_lowercase()),
+            )
+        } else {
+            (None, None)
+        };
+
+        let model = svc.current_default_model.read().clone();
+        let provider = svc.provider_kind.read().canonical_name().to_string();
+        let info = workforce_gateway_client::AgentInfo {
+            id: id_str.clone(),
+            name: svc.display_name(),
+            model: Some(model).filter(|m| !m.is_empty()),
+            provider: Some(provider),
+            capabilities: agent_config
+                .map(|a| a.capabilities.clone())
+                .unwrap_or_default(),
+            default: id_str == state.registry.default_id(),
+            owner_id,
+            owner_type,
+            picture: faces.get(&id_str).map(crate::pictures::Face::info),
+            personal_route: None,
+        };
+        agents.push((svc, info));
+    }
+    // What each agent runs on for the caller, read for a few agents at once
+    // so a cold cache costs a few reads' time, not one per agent in turn.
+    let agents = futures::stream::iter(agents)
+        .map(|(svc, mut info)| async move {
+            if let Some(person) = person {
+                info.personal_route =
+                    crate::api_handlers::llm_route::shown_route(&svc, person).await;
             }
-
-            // Owner UUIDs are management metadata. Disclose them only on the
-            // ownership path (admin / owner / team member); a caller who sees
-            // the agent purely via its access policy must not learn the owner
-            // id or type (audit F1 leaked owner UUIDs to unprivileged callers).
-            let (owner_id, owner_type) = if vis.disclose_owner {
-                (
-                    eff_owner_id,
-                    Some(format!("{:?}", eff_owner_type).to_lowercase()),
-                )
-            } else {
-                (None, None)
-            };
-
-            let model = svc.current_default_model.read().clone();
-            let provider = svc.provider_kind.read().canonical_name().to_string();
-            Some(workforce_gateway_client::AgentInfo {
-                id: id_str.clone(),
-                name: svc.display_name(),
-                model: Some(model).filter(|m| !m.is_empty()),
-                provider: Some(provider),
-                capabilities: agent_config
-                    .map(|a| a.capabilities.clone())
-                    .unwrap_or_default(),
-                default: id_str == state.registry.default_id(),
-                owner_id,
-                owner_type,
-                picture: faces.get(&id_str).map(crate::pictures::Face::info),
-            })
+            info
         })
-        .collect();
+        .buffered(ROUTES_READ_AT_ONCE)
+        .collect()
+        .await;
     Ok(Json(workforce_gateway_client::AgentsResponse { agents }))
 }
 
@@ -6800,7 +6817,21 @@ async fn patch_agent(
         owner_id,
         owner_type: Some(format!("{owner_type:?}").to_lowercase()),
         picture: picture_info(&state, &crate::pictures::Owner::agent(&id)).await,
+        personal_route: match caller_person(&caller) {
+            Some(person) => crate::api_handlers::llm_route::shown_route(&service, person).await,
+            None => None,
+        },
     }))
+}
+
+/// The person `caller` is, when they are one: their identity (a paired
+/// device's, the person it is linked to); none for the admin token or a
+/// device linked to no one.
+fn caller_person(caller: &CallerContext) -> Option<uuid::Uuid> {
+    caller
+        .identity_id
+        .as_deref()
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
 }
 
 async fn apply_agent_update(
