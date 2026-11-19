@@ -247,6 +247,11 @@ impl CrewHub {
         let Some((service, o)) = self.overseer_of_session(session) else {
             return false;
         };
+        // At Act fully in force no count of turns holds it back: its
+        // budget, the audit and Stop do.
+        if self.unbound_given(service.agent_id.as_str(), &o) {
+            return true;
+        }
         let max = o.work.max_turns_per_hour;
         let hour = self.timing.minute * 60;
         let mut runs = self.work.lock();

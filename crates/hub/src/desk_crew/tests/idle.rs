@@ -251,8 +251,11 @@ async fn left_to_person(d: &Desk, since: chrono::DateTime<chrono::Utc>, id: uuid
         .count()
 }
 
+/// At Act fully no job guard holds a next step back: one that looks like
+/// it can't be taken back and says no job goes to the session at once,
+/// with no full turn to declare its job and nothing left to the person.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_next_step_refused_for_its_job_goes_to_the_full_turn_told_why_and_never_to_the_person() {
+async fn a_next_step_that_says_no_job_goes_at_once_at_act_fully() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
@@ -261,8 +264,6 @@ async fn a_next_step_refused_for_its_job_goes_to_the_full_turn_told_why_and_neve
             home: base.clone(),
             ..Default::default()
         });
-        // Its next step looks like it can't be taken back, and the fast
-        // call can't say its job.
         decides(
             &llm,
             "Built the release bundle",
@@ -279,28 +280,28 @@ async fn a_next_step_refused_for_its_job_goes_to_the_full_turn_told_why_and_neve
         let s = new_session(&d, &base, "harbor").await;
         let url = hook_url(&base, s.id).await;
         ends(&url, "Built the release bundle.").await;
-        // Its full turn takes the turn's end, with why the step wasn't sent:
-        // it can declare the job.
-        let full = eventually("its full turn", async || {
-            woken(&llm, "Built the release bundle")
+        // On its line, wherever it is in going in.
+        eventually("the step sent", async || {
+            d.line_thread(s.id, None, None)
                 .await
-                .into_iter()
-                .next()
+                .unwrap_or_default()
+                .iter()
+                .any(|m| {
+                    m.text.contains("Run the deploy.")
+                        && !matches!(
+                            m.delivery,
+                            workforce_desk::line::Delivery::Withdrawn
+                                | workforce_desk::line::Delivery::Noted
+                        )
+                })
+                .then_some(())
         })
         .await;
+        tokio::time::sleep(Duration::from_millis(2000)).await;
         assert!(
-            full.contains("Run the deploy.")
-                && full.contains("didn't send it")
-                && full.contains("job"),
-            "told why: {full}"
+            woken(&llm, "Built the release bundle").await.is_empty(),
+            "no full turn"
         );
-        tokio::time::sleep(Duration::from_millis(3000)).await;
-        assert_eq!(
-            calls_about(&llm, "Built the release bundle").await.len(),
-            1,
-            "one fast call"
-        );
-        assert!(told(&d, s.id).await.is_empty(), "nothing sent to it");
         for raw in RAW {
             assert_eq!(
                 said(&overseer, &["harbor finished", raw]),
@@ -309,72 +310,10 @@ async fn a_next_step_refused_for_its_job_goes_to_the_full_turn_told_why_and_neve
             );
         }
         assert_eq!(
-            said(&overseer, &["harbor finished its turn"]),
-            0,
-            "nothing in the DM"
-        );
-        assert_eq!(
             left_to_person(&d, since, s.id).await,
             0,
             "nothing left to the person"
         );
-    })
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_next_step_its_full_turn_cant_send_either_reaches_the_person_once_in_plain_words() {
-    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
-        let dir = tempfile::tempdir().unwrap();
-        let base = std::fs::canonicalize(dir.path()).unwrap();
-        let (overseer, _crew, d, llm) = overseeing(&base, pool, "ok", &theirs(), &[]).await;
-        d.boss_bounds_with(workforce_desk::charge::Bounds {
-            home: base.clone(),
-            ..Default::default()
-        });
-        decides(
-            &llm,
-            "Built the release bundle",
-            "CONTINUE: Run the deploy.\nWHY: the bundle is built",
-        )
-        .await;
-        eventually("Desk to know it is unbound", async || {
-            d.boss_unbound("desk").then_some(())
-        })
-        .await;
-        let since = chrono::Utc::now();
-        tokio::time::sleep(Duration::from_millis(2500)).await;
-
-        let s = new_session(&d, &base, "harbor").await;
-        // Its full turn sends the same step, again with no job: refused too.
-        calls_tool_once(
-            &llm,
-            "didn't send it",
-            "crew_nudge",
-            json!({"session_id": s.id.to_string(), "message": "Run the deploy.", "reason": "The bundle is built."}),
-        )
-        .await;
-        let url = hook_url(&base, s.id).await;
-        ends(&url, "Built the release bundle.").await;
-        let plain = ["harbor finished its turn", "Run the deploy.", "What should it do next?"];
-        eventually("the person told once its full turn is over", async || {
-            (said(&overseer, &plain) == 1).then_some(())
-        })
-        .await;
-        // Once, however many sweeps; in plain words.
-        tokio::time::sleep(Duration::from_millis(3000)).await;
-        assert_eq!(said(&overseer, &plain), 1, "said once");
-        assert_eq!(
-            said(&overseer, &["harbor finished its turn", "can't be taken back"]),
-            1,
-            "why, plainly"
-        );
-        for raw in RAW {
-            assert_eq!(said(&overseer, &["harbor finished its turn", raw]), 0, "nothing of {raw:?}");
-        }
-        assert!(told(&d, s.id).await.is_empty(), "nothing sent to it");
-        assert_eq!(calls_about(&llm, "Built the release bundle").await.len(), 1, "one fast call");
-        assert_eq!(left_to_person(&d, since, s.id).await, 1, "left to the person once");
     })
     .await;
 }
