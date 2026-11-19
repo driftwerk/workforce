@@ -20,8 +20,8 @@ use super::{Desk, DeskError};
 use crate::crew::{self, By, Event, Kind, Party, PartyKind};
 use crate::engine::{Deliver, Steer};
 use crate::line::{
-    self, Asked, Call, Delivery, LineKind, LineMessage, LineRun, Reach, Refusal, Send, Steering,
-    Target, Wait, When,
+    self, Asked, Call, Delivery, LineAction, LineKind, LineMessage, LineRun, Reach, Refusal, Send,
+    Steering, Target, Wait, When,
 };
 use crate::line_store::NotAnswered;
 use crate::model::{DeskEvent, Origin, SessionState, SessionView};
@@ -1512,6 +1512,13 @@ impl Desk {
                     {
                         break
                     }
+                    // Its turn ended: what Desk kept through it is handed
+                    // now, not at the plugin's next look.
+                    Ok(Ok(DeskEvent::Session { session }))
+                        if session.id == caller && !line::in_turn(session.state) =>
+                    {
+                        break
+                    }
                     Ok(Err(broadcast::error::RecvError::Lagged(_))) => break,
                     Ok(Ok(_)) => {}
                 }
@@ -1545,14 +1552,37 @@ impl Desk {
         (view.state == SessionState::Asking).then_some(Wait::Asking)
     }
 
+    /// Desk's plugin in `id`, waiting on its line, looks again now: a turn
+    /// Desk kept its messages through ended without a state of its own to
+    /// say so (Esc).
+    pub(super) fn line_wake(&self, id: Uuid) {
+        let desk = self.clone();
+        tokio::spawn(async move {
+            if let Ok(inbox) = desk.0.store.line_inbox(&id.to_string()).await {
+                if let Some(m) = inbox.iter().find(|m| m.delivery == Delivery::Queued) {
+                    desk.line_announce(m);
+                }
+            }
+        });
+    }
+
+    /// Whether `view` is inside a turn Desk keeps its line's messages
+    /// through, Desk's plugin handed none until it ends: running, working
+    /// or on a dialog, and not a turn Esc ended (which Desk may still read
+    /// as working, no Stop following it).
+    pub(super) fn in_a_turn(&self, view: &SessionView) -> bool {
+        view.live && line::in_turn(view.state) && !self.esc_ended(view.id)
+    }
+
     /// Who a message is typed in for: the person's own, as theirs.
-    fn typed_by(m: &LineMessage) -> Option<By> {
+    pub(super) fn typed_by(m: &LineMessage) -> Option<By> {
         (m.from.kind == PartyKind::You).then(By::you)
     }
 
     async fn line_next_now(&self, caller: Uuid) -> Result<Option<Value>, LineError> {
         let view = self.view(caller)?;
-        if !view.live {
+        // Inside a turn Desk keeps what waits (see [`line::deliverable`]).
+        if !view.live || self.in_a_turn(&view) {
             return Ok(None);
         }
         let inbox = self.0.store.line_inbox(&caller.to_string()).await?;
@@ -1579,6 +1609,38 @@ impl Desk {
             }
         }
         Ok(None)
+    }
+
+    /// Hand-offs Desk's plugin never said went in, handed before `before`
+    /// ([`HANDED_FOR`] ago), back in the queue (the plugin died between
+    /// taking and submitting one). Not one to a session still in a turn:
+    /// Claude Code holds it behind that turn and submits it as the turn
+    /// ends, so handed again it would go in twice.
+    pub(super) async fn line_requeue_stale(&self, before: DateTime<Utc>) {
+        let stale = match self.0.store.line_handed_before(before).await {
+            Ok(stale) => stale,
+            Err(e) => {
+                tracing::warn!(error = %e, "couldn't read stale line hand-offs");
+                return;
+            }
+        };
+        for m in stale {
+            let held = m
+                .to_session()
+                .and_then(|s| self.view(s).ok())
+                .is_some_and(|v| self.in_a_turn(&v));
+            if held {
+                continue;
+            }
+            // Still handed from then: one dropped and handed again since
+            // is the new hand-off's.
+            match self.0.store.line_requeue(Some(m.id), before).await {
+                Ok(back) => self.line_requeued(back).await,
+                Err(e) => {
+                    tracing::warn!(id = %m.id, error = %e, "couldn't requeue a stale line hand-off")
+                }
+            }
+        }
     }
 
     /// Desk's plugin says what became of a message it was handed: in the
@@ -1771,10 +1833,7 @@ impl Desk {
             tokio::select! {
                 _ = self.0.cancel.cancelled() => return,
                 _ = tick.tick() => {
-                    match self.0.store.line_requeue(None, Utc::now() - HANDED_FOR).await {
-                        Ok(back) => self.line_requeued(back).await,
-                        Err(e) => tracing::warn!(error = %e, "couldn't requeue stale line hand-offs"),
-                    }
+                    self.line_requeue_stale(Utc::now() - HANDED_FOR).await;
                     self.line_pump_pending().await;
                     self.line_sweep_waits().await;
                 }
@@ -1902,15 +1961,18 @@ impl Desk {
         for m in rows.iter_mut().filter(|m| m.to_session() == Some(id)) {
             m.waiting = match m.delivery {
                 Delivery::Held => Some(Wait::Stopped),
+                Delivery::Queued if self.steered(id, m.id) => Some(Wait::NextCall),
                 Delivery::Queued => match line::deliverable(&view, typed, plugin) {
-                    Err(why) => Some(why),
-                    Ok(_) if self.line_gate(&view, m).is_some() => self.line_gate(&view, m),
-                    Ok(Deliver::Submit)
-                        if matches!(view.state, SessionState::Working | SessionState::Blocked) =>
+                    // A turn Esc ended: the plugin takes it now.
+                    Err(Wait::Working)
+                        if plugin
+                            && view.caps.line == Deliver::Submit
+                            && !self.in_a_turn(&view) =>
                     {
-                        Some(Wait::Working)
+                        self.line_gate(&view, m)
                     }
-                    Ok(_) => None,
+                    Err(why) => Some(why),
+                    Ok(_) => self.line_gate(&view, m),
                 },
                 Delivery::Handed
                 | Delivery::Delivered
@@ -1918,8 +1980,69 @@ impl Desk {
                 | Delivery::Withdrawn
                 | Delivery::Noted => None,
             };
+            m.actions = self.line_actions(&view, m);
         }
         Ok(rows)
+    }
+
+    /// What the person can do now with `m`, to `view`, while it waits.
+    fn line_actions(&self, view: &SessionView, m: &LineMessage) -> Vec<LineAction> {
+        if !matches!(m.delivery, Delivery::Queued | Delivery::Held) {
+            return Vec::new();
+        }
+        let mut can = Vec::new();
+        if self.send_now_how(view, m).is_ok() {
+            can.push(LineAction::SendNow);
+        }
+        let theirs = m.from.kind == PartyKind::You;
+        if theirs {
+            can.push(LineAction::Edit);
+        }
+        if theirs || Self::boss_word(m) {
+            can.push(LineAction::Withdraw);
+        }
+        can
+    }
+
+    /// Whether `m` is a boss's tell or answer, which the person may take
+    /// back unsent ([`Self::line_take_back`]).
+    fn boss_word(m: &LineMessage) -> bool {
+        m.from.kind == PartyKind::Manager && matches!(m.kind, LineKind::Tell | LineKind::Answer)
+    }
+
+    /// The person takes back `id`, waiting to go into a session: their own
+    /// is gone, as if never sent; a boss's tell or answer is withdrawn
+    /// unsent, kept on the line, and its boss's picture says the person
+    /// took it back (an answer's question comes back to them).
+    pub async fn line_take_back(&self, id: Uuid) -> Result<(), DeskError> {
+        let m = self
+            .0
+            .store
+            .line_message(id)
+            .await?
+            .ok_or(DeskError::NotFound)?;
+        if m.from.kind == PartyKind::You {
+            return self.line_edit(id, None).await;
+        }
+        let Some(session) = m.to_session().filter(|_| Self::boss_word(&m)) else {
+            return Err(DeskError::Conflict(
+                "Only your own messages and a boss's can be taken back.".into(),
+            ));
+        };
+        match self.line_withdraw(id).await? {
+            Some((withdrawn, _)) => {
+                self.picture_note(
+                    crate::picture::Note::new(
+                        crate::picture::What::TakenBack,
+                        withdrawn.text.clone(),
+                    )
+                    .boss(&withdrawn.from.id)
+                    .session(session),
+                );
+                Ok(())
+            }
+            None => Err(DeskError::Conflict("It's already on its way.".into())),
+        }
     }
 
     /// The person writes to a session from Desk: queued for its next idle,

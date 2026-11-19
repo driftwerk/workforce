@@ -250,6 +250,22 @@ pub enum Wait {
     /// It still runs in a mode that doesn't ask, set by a boss no longer
     /// unbound over it: Desk starts it again in its own mode first.
     ModeEnding,
+    /// Sent now into its running turn: it reads it with its next tool
+    /// call's result (or, if the turn ends first, at the idle).
+    NextCall,
+}
+
+/// What the person can do with a message waiting to go into a session,
+/// as its thread row says: only what the hub can do now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LineAction {
+    /// Into its running turn now ([`crate::service::Desk::line_send_now`]).
+    SendNow,
+    /// Their own words, changed.
+    Edit,
+    /// Taken back: it never goes in.
+    Withdraw,
 }
 
 /// One message on a line, as stored and as Desk shows it.
@@ -296,6 +312,9 @@ pub struct LineMessage {
     /// running turn rather than waiting for its end (§4).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub urgency: Option<Urgency>,
+    /// What the person can do with it now, while it waits (not stored).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<LineAction>,
 }
 
 impl LineMessage {
@@ -323,6 +342,7 @@ impl LineMessage {
             delivered_at: None,
             updated_at: at,
             waiting: None,
+            actions: Vec::new(),
             urgency: None,
         }
     }
@@ -758,7 +778,11 @@ pub fn deliverable(recipient: &SessionView, typed: bool, plugin: bool) -> Result
         return Err(Wait::Stopped);
     }
     match recipient.caps.line {
-        // Desk's plugin waits for the session to be idle itself.
+        // Inside a turn Desk keeps it: handed to the plugin then, Claude
+        // Code would queue it behind the turn, where Desk can neither send
+        // it now, change it nor take it back, and a hand-off it holds that
+        // long looks lost and would go again ([`in_turn`]).
+        Deliver::Submit if plugin && in_turn(recipient.state) => Err(Wait::Working),
         Deliver::Submit if plugin => Ok(Deliver::Submit),
         Deliver::Submit | Deliver::Paste => match recipient.state {
             SessionState::Idle | SessionState::Done | SessionState::Asking if typed => {
@@ -1726,10 +1750,16 @@ mod tests {
         assert_eq!(deliverable(&codex, false, false), Err(Wait::Working));
         codex.live = false;
         assert_eq!(deliverable(&codex, false, false), Err(Wait::Stopped));
-        // Claude Code's plugin waits for idle itself.
+        // Claude Code's plugin is handed it at the idle, typed in there or
+        // not: inside a turn Desk keeps it.
         let mut claude = session("acme-web", Engine::Claude);
         claude.state = SessionState::Working;
+        assert_eq!(deliverable(&claude, true, true), Err(Wait::Working));
+        claude.state = SessionState::Blocked;
+        assert_eq!(deliverable(&claude, false, true), Err(Wait::Working));
+        claude.state = SessionState::Idle;
         assert_eq!(deliverable(&claude, true, true), Ok(Deliver::Submit));
+        claude.state = SessionState::Working;
         // Without Desk's plugin heard in it, typed in at its prompt.
         assert_eq!(deliverable(&claude, false, false), Err(Wait::Working));
         claude.state = SessionState::Idle;

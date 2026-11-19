@@ -6111,14 +6111,33 @@ impl Desk {
             }),
             // Back at its prompt, nothing on screen: a question it asked was
             // turned down (Esc fires no hook of its own).
-            Hook::AtPrompt => self.change(id, |r, l| {
-                if let Some(l) = l.filter(|l| l.open_question.is_some()) {
-                    l.end_question();
-                    if l.pending.is_none() && r.state == SessionState::Blocked {
-                        r.state = SessionState::Done;
+            Hook::AtPrompt => {
+                // Read as working with nothing running or asked, it is at
+                // its prompt: Esc ended the turn as it wrote (no hook says
+                // so), and what Desk kept through it goes in now.
+                let over = {
+                    let st = self.0.state.lock();
+                    st.records
+                        .get(&id)
+                        .is_some_and(|r| r.state == SessionState::Working)
+                        && st.live.get(&id).is_some_and(|l| {
+                            l.pending.is_none()
+                                && l.current_tool.is_none()
+                                && l.open_question.is_none()
+                        })
+                };
+                self.change(id, |r, l| {
+                    if let Some(l) = l.filter(|l| l.open_question.is_some()) {
+                        l.end_question();
+                        if l.pending.is_none() && r.state == SessionState::Blocked {
+                            r.state = SessionState::Done;
+                        }
                     }
+                });
+                if over {
+                    self.steers_stopped(id);
                 }
-            }),
+            }
             Hook::InputAnswered => self.change(id, |r, l| {
                 if let Some(l) = l {
                     if l.pending.as_ref().is_some_and(|p| p.tool == "Input") {
