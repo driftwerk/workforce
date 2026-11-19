@@ -270,6 +270,15 @@ async fn a_bosss_hold_is_the_persons_at_once_and_its_decision_closes_it() {
             .rfind(|m| m.text.contains("until I answer"))
             .unwrap();
         let _ = d.store().line_take(hold.id, Delivery::Delivered).await;
+        // It says it holds, in words that ask nothing: it waits all the same.
+        d.line_call(
+            s.id,
+            "tell",
+            &json!({"to": "desk", "text": "Understood, holding."}),
+            None,
+        )
+        .await
+        .unwrap();
         // At once: well within the hour's bound (6 s).
         let wait =
             tokio::time::timeout(std::time::Duration::from_millis(1_500), the_wait(&d, s.id))
@@ -280,11 +289,10 @@ async fn a_bosss_hold_is_the_persons_at_once_and_its_decision_closes_it() {
             "{}",
             wait.dedupe_key
         );
-        assert_eq!(
-            wait.options.len(),
-            3,
-            "the session's choice: {:?}",
-            wait.options
+        assert!(
+            wait.text.contains("holding"),
+            "its own words: {}",
+            wait.text
         );
 
         // The boss decides within its directives: it reaches the session.

@@ -44,7 +44,7 @@ const LOOK_BACK: i64 = 30;
 const KEPT_CHARS: usize = 1_500;
 
 /// Words a session says when what it says waits on its boss's answer.
-const WAITS: [&str; 12] = [
+const WAITS: [&str; 15] = [
     "need your decision",
     "needs your decision",
     "your call",
@@ -57,6 +57,22 @@ const WAITS: [&str; 12] = [
     "waiting for your",
     "until you decide",
     "until desk",
+    "wait for your",
+    "until you",
+    "i'll wait",
+];
+
+/// Words of a session going on, or done: no wait however its boss held it.
+const GOES_ON: [&str; 9] = [
+    "done",
+    "merged",
+    "finished",
+    "carrying on",
+    "going ahead",
+    "proceeding",
+    "went ahead",
+    "shipped",
+    "deployed",
 ];
 
 /// Whether `key` is a waiting item's.
@@ -95,7 +111,24 @@ pub(crate) fn waits_on_answer(text: &str) -> bool {
     workforce_desk::line::holds(text)
         || WAITS.iter().any(|w| says(&lower, w))
         || crew::question_in(text).is_some()
-        || (options_in(text).len() >= 2 && says(&lower, "recommend"))
+        || (options_in(text).len() >= 2 && recommends(&lower))
+}
+
+/// Whether `lower` recommends: "I recommend", "my recommendation",
+/// "recommended:".
+fn recommends(lower: &str) -> bool {
+    lower.match_indices("recommend").any(|(at, _)| {
+        !lower[..at]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric)
+    })
+}
+
+/// Whether a session's words say it went on, or is done.
+fn goes_on(text: &str) -> bool {
+    let lower = text.to_lowercase().replace('\u{2019}', "'");
+    GOES_ON.iter().any(|w| says(&lower, w))
 }
 
 /// The options a message lays out, one per line, each marked by a single
@@ -104,6 +137,11 @@ pub(crate) fn waits_on_answer(text: &str) -> bool {
 pub(crate) fn options_in(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in text.lines().map(str::trim) {
+        // "e.g. …" and "i.e. …" are no option (a).
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("e.g.") || lower.starts_with("i.e.") {
+            continue;
+        }
         let mut chars = line.char_indices();
         let marked = match (chars.next(), chars.next(), chars.next()) {
             // "(a) …"
@@ -211,7 +249,9 @@ fn waiting_in(thread: &[LineMessage], boss: &str, s: Uuid) -> Option<Waiting> {
         (Some(t), o) if o.is_none_or(|o| reached(o) < t.at) => {
             // Spoken since the boss's hold, its own words say whether it
             // still waits ("Done, merged" doesn't).
-            let waits = t.kind == LineKind::Tell && waits_on_answer(&t.text);
+            // "Understood, holding" waits on as the hold does.
+            let waits = t.kind == LineKind::Tell
+                && (waits_on_answer(&t.text) || (held && !goes_on(&t.text)));
             // Under the boss's hold, the wait began with the hold.
             let began = ours.filter(|_| held);
             waits.then(|| Waiting {
@@ -368,7 +408,7 @@ impl CrewHub {
                     || matches!(i.kind, OpenKind::Ask | OpenKind::Confirm)
                         && i.said()
                         && i.opened_at >= w.since
-                        && i.session.is_none_or(|s| s == view.id))
+                        && i.session == Some(view.id))
         });
         if theirs {
             return;
@@ -453,16 +493,11 @@ impl CrewHub {
                     .await
                     .map_err(refused)?;
             }
+            // As the person's own message: before anything its boss queued,
+            // and in the boss's picture.
             (None, Some(s)) => {
                 self.desk
-                    .line_send(
-                        workforce_desk::LineSender::Person,
-                        workforce_desk::line::Send::Tell {
-                            to: workforce_desk::line::Target::Session(s),
-                            text: answer.to_string(),
-                            when: workforce_desk::line::When::Queue,
-                        },
-                    )
+                    .line_post(s, answer.to_string(), workforce_desk::line::When::Queue)
                     .await
                     .map_err(refused)?;
             }
@@ -564,23 +599,24 @@ impl CrewHub {
             if now - last < minute * gap as i32 {
                 continue;
             }
-            // Never in quiet hours nor held for a roundup (a held card
-            // would come with the ones after it), and never while away:
-            // their catch-up lists what waits.
-            if workforce_desk::update_cadence::held_until(&o.updates.cadence, now, &tz).is_some()
-                || self.away_now(&i.boss).await
-            {
+            // Never while away (their catch-up lists what waits), and none
+            // while one is held for later.
+            if i.last_said_at.is_some_and(|at| at > now) || self.away_now(&i.boss).await {
                 continue;
             }
-            // Since it began to wait: the bound before it was given.
-            let since = i.opened_at - self.waiting_bound(&o);
+            // In quiet hours, or with what needs the person gathered for a
+            // roundup, it is held to then and counted as said then: one a
+            // roundup at most, and the cadence goes on from there.
+            let shown_at = workforce_desk::update_cadence::held_until(&o.updates.cadence, now, &tz)
+                .unwrap_or(now);
+            let since = i.opened_at;
             let text = format!(
                 "**Still waiting on you** ({} now). {}",
                 waited(since, now),
                 i.headline()
             );
             if self.post_item(&i.boss, i, text, Vec::new()).await {
-                if let Err(e) = self.desk.store().item_said(i.id, now, false).await {
+                if let Err(e) = self.desk.store().item_said(i.id, shown_at, false).await {
                     tracing::warn!(error = %e, "counting a waiting item's reminder failed");
                 }
             }
@@ -611,6 +647,14 @@ mod tests {
             "Done: the date picker is on 4.2 and the tests pass."
         ));
         assert!(options_in("Fixed 3 tests.\n2 left.").is_empty());
+        // A recommendation, however it is worded.
+        assert!(waits_on_answer(
+            "(a) Upgrade staging\n(b) Pin the minor\nMy recommendation: (a)."
+        ));
+        assert!(waits_on_answer("I'll wait for your decision."));
+        assert!(goes_on("Merged; carrying on with the docs."));
+        assert!(!goes_on("Understood, holding."));
+        assert!(options_in("e.g. the staging host\ni.e. not production").is_empty());
         // What was done, listed, is no choice.
         let done = "Done.\n1. Updated the migration.\n2. Ran the tests.\nCI: green on all jobs.\nPR: opened #12.";
         assert!(options_in(done).is_empty(), "{:?}", options_in(done));
