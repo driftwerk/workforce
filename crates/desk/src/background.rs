@@ -80,7 +80,8 @@ impl CutOff {
         let unnamed = other.count.saturating_sub(other.ids.len());
         let fresh = other.ids.difference(&self.ids).count();
         self.ids.extend(other.ids);
-        self.count += fresh + unnamed;
+        // A count can be under its ids (shells reported, fewer seen).
+        self.count += (fresh + unnamed).min(other.count);
         self.at = self.at.max(other.at);
         self
     }

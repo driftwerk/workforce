@@ -3708,9 +3708,12 @@ impl Desk {
         // for the run after.
         let cut = self.0.state.lock().cut_off.remove(&id);
         // Past a hold by whoever resumes it: the person, at least.
+        // The note alone starts a turn the hold stops at once: told with the
+        // person's own words, or after the hold.
         let held = self
             .breaker_refuses_prompt(id, by.as_ref().or(carrier))
-            .is_err();
+            .is_err()
+            || (prompt.is_none() && self.held(&breaker::session_subject(id)).is_some());
         // A slash command runs only as the first thing typed: told after it.
         let command = prompt
             .as_deref()
@@ -5671,7 +5674,13 @@ impl Desk {
             let live = st.live.remove(&id);
             // What it had running is stopped with it: told when it runs again.
             // Neither is what was stopped before and not yet looked at.
-            let cut = live.as_ref().and_then(|l| l.background.cut_off());
+            let cut = live
+                .as_ref()
+                .and_then(|l| l.background.cut_off())
+                .map(|c| CutOff {
+                    at: Some(Utc::now()),
+                    ..c
+                });
             let earlier = st.restarted.remove(&id).map(|(_, c)| c);
             let kept = st.cut_off.remove(&id);
             let cut = [cut, earlier, kept]
@@ -6716,12 +6725,15 @@ impl Desk {
     fn tell_kept_cut_off(&self, id: Uuid) {
         let cut = {
             let mut st = self.0.state.lock();
-            // Between turns, asking no one: typed in, it would answer that.
+            // Between turns, asking no one (nor being read for whether it
+            // asks), and not stopped on a limit: typed in, it would answer
+            // that, or fail at once.
             let between = st
                 .records
                 .get(&id)
-                .is_some_and(|r| r.state == SessionState::Done);
-            if !st.live.contains_key(&id) || !between {
+                .is_some_and(|r| r.state == SessionState::Done && r.asked.is_none());
+            let read = st.live.get(&id).is_some_and(|l| l.reading.is_none());
+            if !between || !read || st.turn_failures.contains_key(&id) {
                 return;
             }
             let Some(cut) = st.cut_off.remove(&id) else {
@@ -7514,11 +7526,12 @@ impl Desk {
             let mut read = None;
             // Its first turn after a restart that stopped work of its own
             // ended: it has looked at that.
-            if matches!(&event, CodexEvent::Idle)
-                && self
-                    .record(id)
-                    .is_ok_and(|r| r.state != SessionState::Starting)
-            {
+            // A turn that ran, not the thread's first word that it is idle.
+            let turn_ended = matches!(&event, CodexEvent::Idle)
+                && self.record(id).is_ok_and(|r| {
+                    matches!(r.state, SessionState::Working | SessionState::Blocked)
+                });
+            if turn_ended {
                 self.0.state.lock().restarted.remove(&id);
             }
             // A question its boss answers in the person's place, unless they
@@ -7645,6 +7658,9 @@ impl Desk {
             });
             if let (Some(reader), Some(end), Some(reply)) = (reader, read, said_whole) {
                 self.read_later(id, end, reader, reply);
+            }
+            if turn_ended {
+                self.tell_kept_cut_off(id);
             }
         }
         // Its server went away: what it asked can't be answered from Desk.

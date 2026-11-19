@@ -483,7 +483,7 @@ impl Desk {
         self.breaker_view(subject, &state)
     }
 
-    fn held(&self, subject: &str) -> Option<pure::State> {
+    pub(super) fn held(&self, subject: &str) -> Option<pure::State> {
         self.0
             .breakers
             .lock()
