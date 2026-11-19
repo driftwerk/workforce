@@ -35,7 +35,9 @@ async fn two_sessions_reports_are_decided_one_after_the_other_on_one_picture() {
             Duration::from_millis(7000),
             Answer::Tool(
                 "crew_nudge",
-                json!({"session_id": a.id.to_string(), "message": RUN, "reason": "It is ready."}),
+                json!({"session_id": a.id.to_string(), "message": RUN, "reason": "It is ready.",
+                       "job": {"kind": "release", "target": "acme/monorepo", "key": "release-3"},
+                       "irreversible": true}),
             ),
         )
         .await;
