@@ -16,7 +16,7 @@ use tracing::{info, warn};
 
 use crate::graph::entities::{CodeEntity, EntityId, EntityKind};
 use crate::graph::relationships::Relationship;
-use crate::graph::CodeGraph;
+use crate::graph::{CodeGraph, VectorKeys};
 use crate::lease::{IndexPhase, LeaseContext, LeaseProgress};
 use crate::vector::{CodeVectorStore, VectorCodeEntity, VectorCodeSummary};
 use crawler::{CrawledFile, CrawlerConfig, FileCrawler};
@@ -273,6 +273,11 @@ pub struct IndexingPipeline {
     vectors_behind: AtomicBool,
 }
 
+enum Carried {
+    Active(String),
+    Standby(String),
+}
+
 impl IndexingPipeline {
     pub fn new(config: IndexingConfig, graph: Arc<CodeGraph>) -> Self {
         Self {
@@ -317,14 +322,7 @@ impl IndexingPipeline {
         //    rows with the same primary key.
         //    What the repo's vectors were recorded complete in goes with
         //    it, so it is read first.
-        let whole_in = match self.tracked_store() {
-            Some(vs) => {
-                let recorded = self.graph.vectors_complete_in(&self.config.repo_id).await?;
-                let held = vs.identity(false).await.ok();
-                recorded.filter(|recorded| Some(recorded) == held.as_ref())
-            }
-            None => None,
-        };
+        let carried = self.completeness_to_carry().await?;
         // The standby is told of every file the repo had, before they go:
         // its notes outlast the purge (see `CodeGraph::delete_repo_data`),
         // and those of the files the run makes are added once they are
@@ -496,26 +494,36 @@ impl IndexingPipeline {
             .update_index_state_full(&self.config.repo_id, &commit, entity_count, rel_count)
             .await?;
         // A full index forgets what collection the repo's vectors were
-        // complete in, and any fill under way: a store that tracks
-        // completeness is filled from the graph before it is relied on,
-        // one configured later likewise. Unless the vectors were whole in
-        // the very collection the store still has: then it is relied on
-        // still, holding the repo as it was, while a fill begun here makes
-        // it the repo as it is.
-        if let (Some(whole_in), Some(vs)) = (whole_in, self.tracked_store()) {
-            let filler = fill::VectorFiller::new(self.graph.clone(), vs.clone());
-            match vs.identity(true).await {
-                Ok(held) if held == whole_in => {
-                    self.graph
-                        .set_vectors_complete_in(&self.config.repo_id, Some(&whole_in))
-                        .await?;
-                    filler.begin(&self.config.repo_id, true).await?;
+        // complete in, and the active store's fill under way: a store that
+        // tracks completeness is filled from the graph before it is relied
+        // on, one configured later likewise. Unless the vectors were whole
+        // in the very collection the active store still has: then it is
+        // relied on still, holding the repo as it was, while a fill begun
+        // here makes it the repo as it is. With vellev the standby, what its
+        // vectors were complete in is kept, and its fill: it was told of
+        // every file the repo had and has, and holds the rest as it did.
+        match (carried, self.tracked_store()) {
+            (Some(Carried::Active(whole_in)), Some(vs)) => {
+                let filler = fill::VectorFiller::new(self.graph.clone(), vs.clone());
+                match vs.identity(true).await {
+                    Ok(held) if held == whole_in => {
+                        self.graph
+                            .set_vectors_complete_in(&self.config.repo_id, Some(&whole_in))
+                            .await?;
+                        filler.begin(&self.config.repo_id, true).await?;
+                    }
+                    _ => warn!(
+                        repo_id = %self.config.repo_id,
+                        "the collection the repo's vectors were complete in could not be found again; they are filled from the graph before they are searched"
+                    ),
                 }
-                _ => warn!(
-                    repo_id = %self.config.repo_id,
-                    "the collection the repo's vectors were complete in could not be found again; they are filled from the graph before they are searched"
-                ),
             }
+            (Some(Carried::Standby(whole_in)), _) => {
+                self.graph
+                    .set_vectors_complete_in(&self.config.repo_id, Some(&whole_in))
+                    .await?;
+            }
+            _ => {}
         }
 
         if let Err(e) = self.graph.checkpoint().await {
@@ -966,6 +974,23 @@ impl IndexingPipeline {
         self.vector_store
             .as_ref()
             .filter(|vs| vs.tracks_completeness())
+    }
+
+    async fn completeness_to_carry(&self) -> Result<Option<Carried>> {
+        let recorded = || self.graph.vectors_complete_in(&self.config.repo_id);
+        Ok(
+            match (self.tracked_store(), self.graph.vector_keys().standby()) {
+                (Some(vs), _) => {
+                    let held = vs.identity(false).await.ok();
+                    recorded()
+                        .await?
+                        .filter(|recorded| Some(recorded) == held.as_ref())
+                        .map(Carried::Active)
+                }
+                (None, Some(VectorKeys::VELLEV)) => recorded().await?.map(Carried::Standby),
+                _ => None,
+            },
+        )
     }
 
     /// Whether this run's store is the one the repo's vectors are kept

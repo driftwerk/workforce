@@ -566,6 +566,7 @@ impl CodeGraphBackend for SqliteCodeGraphBackend {
 
     async fn update_index_state_full(
         &self,
+        backend: &str,
         repo_id: &str,
         commit: &str,
         total_entities: usize,
@@ -581,8 +582,8 @@ impl CodeGraphBackend for SqliteCodeGraphBackend {
         )?;
         // A fill begun while the repo was being indexed went by part of it.
         conn.execute(
-            "DELETE FROM vector_fill WHERE repo_id = ?1",
-            rusqlite::params![repo_id],
+            "DELETE FROM vector_fill WHERE backend = ?1 AND repo_id = ?2",
+            rusqlite::params![backend, repo_id],
         )?;
         Ok(())
     }
@@ -1039,7 +1040,7 @@ impl CodeGraphBackend for SqliteCodeGraphBackend {
         Ok(count as u64)
     }
 
-    async fn delete_repo_data(&self, repo_id: &str, keep_pending: &[&str]) -> Result<usize> {
+    async fn delete_repo_data(&self, repo_id: &str, keep: &[&str]) -> Result<usize> {
         let conn = self.conn.lock().await;
         let tx = conn.unchecked_transaction()?;
 
@@ -1069,16 +1070,16 @@ impl CodeGraphBackend for SqliteCodeGraphBackend {
             "DELETE FROM index_state WHERE repo_id = ?1",
             rusqlite::params![repo_id],
         )?;
-        tx.execute(
-            "DELETE FROM vector_fill WHERE repo_id = ?1",
-            rusqlite::params![repo_id],
-        )?;
-        let kept = serde_json::to_string(keep_pending)?;
-        tx.execute(
-            "DELETE FROM vector_pending
-             WHERE repo_id = ?1 AND backend NOT IN (SELECT value FROM json_each(?2))",
-            rusqlite::params![repo_id, kept],
-        )?;
+        let kept = serde_json::to_string(keep)?;
+        for table in ["vector_fill", "vector_pending"] {
+            tx.execute(
+                &format!(
+                    "DELETE FROM {table}
+                     WHERE repo_id = ?1 AND backend NOT IN (SELECT value FROM json_each(?2))"
+                ),
+                rusqlite::params![repo_id, kept],
+            )?;
+        }
 
         tx.commit()?;
 

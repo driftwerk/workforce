@@ -177,6 +177,7 @@ pub trait CodeGraphBackend: Send + Sync {
 
     async fn update_index_state_full(
         &self,
+        backend: &str,
         repo_id: &str,
         commit: &str,
         total_entities: usize,
@@ -351,10 +352,11 @@ pub trait CodeGraphBackend: Send + Sync {
     /// summaries, file_index, and index_state. Returns the number of
     /// entities deleted. Keeps the `repositories` row so a follow-up
     /// `register_repo` can reuse it for a clean re-index.
-    /// The files noted pending for the backends in `keep_pending` stay
-    /// noted: a standby is told of what a full index changes by what it
-    /// notes, and must not lose what was noted before.
-    async fn delete_repo_data(&self, repo_id: &str, keep_pending: &[&str]) -> Result<usize>;
+    /// The vector state of the backends in `keep`, their fills and the
+    /// files noted pending for them, is kept: a standby is told of what a
+    /// full index changes by what it notes, and must not lose what was
+    /// noted before.
+    async fn delete_repo_data(&self, repo_id: &str, keep: &[&str]) -> Result<usize>;
 
     /// Like [`Self::delete_repo_data`] but also drops the `repositories`
     /// row itself. Use when fully removing a repo (e.g. cascade from

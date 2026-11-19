@@ -278,7 +278,7 @@ impl CodeGraph {
         self.backend.find_entities_in_file(repo_id, file_path).await
     }
 
-    /// The standby's pending files stay noted: see
+    /// The standby's vector state is kept: see
     /// [`backend::CodeGraphBackend::delete_repo_data`].
     pub async fn delete_repo_data(&self, repo_id: &str) -> Result<usize> {
         let kept: Vec<&str> = self.vectors.standby().into_iter().collect();
@@ -345,7 +345,13 @@ impl CodeGraph {
         total_relationships: usize,
     ) -> Result<()> {
         self.backend
-            .update_index_state_full(repo_id, commit, total_entities, total_relationships)
+            .update_index_state_full(
+                self.vectors.active(),
+                repo_id,
+                commit,
+                total_entities,
+                total_relationships,
+            )
             .await
     }
 
@@ -1003,8 +1009,9 @@ pub(crate) mod tests {
 
     /// Each vector database's fill and pending files are its own: noting,
     /// moving, taking off and forgetting what is one's leaves the other's
-    /// as it was; and a full index's purge keeps the pending files of the
-    /// databases it is told to.
+    /// as it was; a full index's purge keeps the vector state of the
+    /// databases it is told to; and a full index forgets only its own
+    /// database's fill.
     pub(crate) async fn vector_state_is_kept_per_backend(graph: &CodeGraph) {
         use super::vectors::{FillStage, VectorFill};
         const REPO: &str = "keyed-repo";
@@ -1100,7 +1107,7 @@ pub(crate) mod tests {
         );
 
         // The graph in use keyed: its own calls are the active one's, and
-        // its purge keeps the standby's pending files, and no fill.
+        // its purge keeps the standby's vector state, and not its own.
         let keyed = CodeGraph::from_backend(Arc::clone(store))
             .keyed(VectorKeys::new(vellev, Some(weaviate)).unwrap());
         keyed.note_vectors_pending(REPO, &files[1..]).await.unwrap();
@@ -1130,6 +1137,42 @@ pub(crate) mod tests {
             store.count_vectors_pending(weaviate, REPO).await.unwrap(),
             0
         );
+
+        let begun_in_both = || async {
+            for backend in [vellev, weaviate] {
+                store.clear_vector_fill(backend, REPO).await.unwrap();
+                assert!(store
+                    .advance_vector_fill(backend, REPO, None, &fill(backend))
+                    .await
+                    .unwrap());
+            }
+            store
+                .note_vectors_pending(&[vellev, weaviate], REPO, &files)
+                .await
+                .unwrap();
+        };
+        let state = |backend: &'static str| async move {
+            (
+                store.vector_fill(backend, REPO).await.unwrap(),
+                store.count_vectors_pending(backend, REPO).await.unwrap(),
+            )
+        };
+        begun_in_both().await;
+        store
+            .update_index_state_full(weaviate, REPO, "c1", 0, 0)
+            .await
+            .unwrap();
+        assert_eq!(state(weaviate).await, (None, 2));
+        assert_eq!(state(vellev).await, (Some(fill(vellev)), 2));
+        begun_in_both().await;
+        store.delete_repo_data(REPO, &[vellev]).await.unwrap();
+        assert_eq!(state(vellev).await, (Some(fill(vellev)), 2));
+        assert_eq!(state(weaviate).await, (None, 0));
+        begun_in_both().await;
+        store.delete_repo_data(REPO, &[]).await.unwrap();
+        for backend in [vellev, weaviate] {
+            assert_eq!(state(backend).await, (None, 0));
+        }
 
         // A repo dropped leaves no fill nor pending file in any database,
         // a standby's included: there is nothing left to put right.

@@ -922,7 +922,7 @@ fn keyed(repo: &Repo, active: &str, standby: Option<&str>) -> Arc<CodeGraph> {
 /// files it changes are noted for the standby, whose vectors stay complete
 /// but for them, and are put right there file by file. A full index there
 /// rebuilds the graph: the standby is told of every file the repo had and
-/// has, and the tracked store is to be filled again.
+/// has, and so stays complete but for them, its fill as it was.
 #[tokio::test]
 async fn an_index_run_on_another_store_notes_its_files_for_the_standby() {
     for elsewhere in [None, Some(Arc::new(Untracked) as Arc<dyn CodeVectorStore>)] {
@@ -976,17 +976,55 @@ async fn an_index_run_on_another_store_notes_its_files_for_the_standby() {
         let had = repo.graph.get_file_paths(REPO).await.unwrap();
         assert!(had.contains(&"src/many.rs".to_string()), "{had:?}");
         assert!(!repo.pending().await.contains(&"src/many.rs".to_string()));
+        let complete_in = repo.graph.vectors_complete_in(REPO).await.unwrap();
+        let fill = repo.graph.vector_fill(REPO).await.unwrap();
+        assert!(complete_in.is_some() && fill.is_some());
         other(&repo)
             .run_full_index(RunOptions::default())
             .await
             .unwrap();
-        assert!(!repo.complete().await, "a full index elsewhere");
-        assert_eq!(repo.graph.vector_fill(REPO).await.unwrap(), None);
+        assert_eq!(
+            repo.graph.vectors_complete_in(REPO).await.unwrap(),
+            complete_in,
+            "a full index elsewhere"
+        );
+        assert_eq!(repo.graph.vector_fill(REPO).await.unwrap(), fill);
         let mut expected: Vec<String> = had;
         expected.push("src/post.rs".to_string());
         expected.sort();
         expected.dedup();
         assert_eq!(repo.pending().await, expected);
+    }
+}
+
+/// A full index carries no completeness for vellev that nothing kept: not
+/// with vellev in use but no store of it built, whose run notes nothing
+/// for it, nor with Weaviate in use and no standby.
+#[tokio::test]
+async fn a_full_index_forgets_completeness_nothing_kept() {
+    for (active, standby, store) in [
+        ("vellev", Some("weaviate"), None),
+        (
+            "weaviate",
+            None,
+            Some(Arc::new(Untracked) as Arc<dyn CodeVectorStore>),
+        ),
+    ] {
+        let repo = Repo::filled().await;
+        let graph = keyed(&repo, active, standby);
+        let pipeline = match store {
+            Some(store) => IndexingPipeline::with_vector_store(repo.config(), graph, store),
+            None => IndexingPipeline::new(repo.config(), graph),
+        };
+        pipeline
+            .run_full_index(RunOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.graph.vectors_complete_in(REPO).await.unwrap(),
+            None,
+            "{active}"
+        );
     }
 }
 
