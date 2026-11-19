@@ -182,8 +182,19 @@ impl CrewHub {
         // line) is background work: the plan guard holds it while the
         // person's plan is nearly full. One that answers the person's own
         // words is theirs, and never waits on it.
-        let work = (!persons)
-            .then(|| workforce_common::work_use::Work::boss(agent_id, &super::name_of(service)));
+        let work = (!persons).then(|| {
+            workforce_common::work_use::Work::boss(agent_id, owner, &super::name_of(service))
+        });
+        // Held by the plan guard: not run, and nothing posted. The next
+        // wake-up or check-in comes as it would; a runaway is told once.
+        if let Some(work) = &work {
+            if let Some(why) = self
+                .held_by_plan(service, owner, work, model.as_deref())
+                .await
+            {
+                return Err(eyre::eyre!(why));
+            }
+        }
         let progress = workforce_common::work_use::within_opt(
             work,
             workforce_agent::runner::with_desk(
@@ -250,6 +261,60 @@ impl CrewHub {
         }
         drop(live);
         Ok((session_id, answer?))
+    }
+}
+
+impl CrewHub {
+    /// Why the plan guard holds the boss's own turn `work` for `owner`, if
+    /// it does. A runaway is told to the person once, in the DM.
+    async fn held_by_plan(
+        &self,
+        service: &Arc<AgentService>,
+        owner: &str,
+        work: &workforce_common::work_use::Work,
+        model: Option<&str>,
+    ) -> Option<String> {
+        use crate::cost_governor::{Admission, OnPlan};
+        let admitted = workforce_common::work_use::within(work.clone(), async {
+            let login = crate::turn_loop::plan_login(service, model).await;
+            service.cost_governor.preflight_on(
+                service.agent_id.as_str(),
+                Some(owner),
+                OnPlan {
+                    login: login.as_ref(),
+                },
+            )
+        })
+        .await;
+        match admitted {
+            Admission::Waits(why) => Some(why),
+            Admission::Stopped { why, first } => {
+                if first {
+                    let notice = format!("{why} {}", crate::plan_guard::stopped_choices(work));
+                    let dm = DeskTarget::of_turn(
+                        &DeskPlace::Dm { thread: None },
+                        DESK_CHANNEL,
+                        None,
+                        false,
+                    );
+                    if let Err(e) = crate::desk_surface::deliver(
+                        service,
+                        owner,
+                        &dm,
+                        crate::desk_surface::Delivery::text(
+                            workforce_common::channels::desk::DeliveryKind::Notice,
+                            &notice,
+                        ),
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %e, "Telling the person their boss was stopped failed");
+                    }
+                }
+                Some(why)
+            }
+            _ => None,
+        }
     }
 }
 

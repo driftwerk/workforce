@@ -305,7 +305,7 @@ impl TurnHost for TurnLoop {
         identity: Option<&str>,
         channel_id: Option<&str>,
     ) -> Option<String> {
-        admit_turn_or_deny(service, identity, channel_id).await
+        admit_turn_or_deny(service, identity, channel_id, None).await
     }
 }
 
@@ -3061,6 +3061,7 @@ pub(crate) async fn admit_turn_or_deny(
     service: &AgentService,
     identity: Option<&str>,
     channel_id: Option<&str>,
+    model: Option<&str>,
 ) -> Option<String> {
     if let Some(person) = identity.and_then(|principal| service.suspended(principal)) {
         tracing::warn!(agent = %service.agent_id, person = %person.id, "Turn refused: the person it runs as is suspended");
@@ -3068,7 +3069,8 @@ pub(crate) async fn admit_turn_or_deny(
     }
     let identity = crate::user_config::current_billing_identity_id()
         .or_else(|| identity.map(str::to_string).filter(|s| !s.is_empty()));
-    let login = plan_login(service, None).await;
+    // The plan the turn runs on: its own model's route.
+    let login = plan_login(service, model).await;
     match service.cost_governor.admit_turn_on(
         service.agent_id.as_str(),
         identity.as_deref(),
@@ -3303,7 +3305,9 @@ pub(crate) async fn process_turn(
 
     // Mandatory budget admission — the single choke point for every LLM
     // turn (chat, scheduler jobs, heartbeats, monitors, consolidation).
-    if let Some(denied) = admit_turn_or_deny(service, Some(principal), channel_id).await {
+    if let Some(denied) =
+        admit_turn_or_deny(service, Some(principal), channel_id, model_override).await
+    {
         return Ok(TurnOutcome::Skipped(Skip::Denied(denied)));
     }
 
@@ -4124,7 +4128,7 @@ pub(crate) async fn run_isolated(
     let principal = &run.principal;
     // Mandatory budget admission — mirrors `process_message` so isolated
     // work (subagents, curation) cannot spend past a denied scope.
-    let budget = admit_turn_or_deny(service, principal.run_as.as_deref(), None);
+    let budget = admit_turn_or_deny(service, principal.run_as.as_deref(), None, model_override);
     if let Some(denied) = as_principal(principal, budget).await {
         eyre::bail!("{denied}");
     }
@@ -4694,7 +4698,8 @@ pub(crate) async fn process_message_with_progress(
 
     // Mandatory budget admission — mirrors `process_message`; a denied
     // turn streams the refusal as its whole response.
-    if let Some(denied) = admit_turn_or_deny(service, Some(principal), channel_id).await {
+    if let Some(denied) = admit_turn_or_deny(service, Some(principal), channel_id, step_model).await
+    {
         let (progress_tx, progress_rx) = tokio::sync::mpsc::channel(64);
         let sid = session_id
             .map(|s| s.to_string())

@@ -593,8 +593,9 @@ What a plan does have is its usage windows, as the provider reports them:
 Claude's five-hour and weekly windows (only those its plan reports; a plan
 with no five-hour window has none), ChatGPT's primary and secondary windows.
 `[budget.plan]` guards background work against them: scheduled jobs,
-monitors' agent tasks and a boss's own turns. The person's own turns are
-never held by it. It applies whether or not `[budget] enabled` is on.
+monitors' agent tasks, heartbeats and a boss's own turns, with the tools,
+subagents and model calls they make. The person's own turns are never held
+by it. It applies whether or not `[budget] enabled` is on.
 
 ```toml
 [budget.plan]
@@ -603,8 +604,8 @@ pause_at_percent = 80.0       # background work waits from here, in any window
 runaway_multiple = 10.0       # an hour this many times its usual is a runaway
 runaway_min_percent = 3.0     # ...once it is at least this share of the plan
 runaway_turns_per_hour = 120  # or began this many turns in an hour
-run_max_rounds = 60           # a job run's tool rounds, when it sets none
-run_max_minutes = 30          # a job run is cut off after this (0: never)
+run_max_rounds = 60           # most rounds a job run on a plan takes
+run_max_minutes = 30          # a job run on a plan is cut off after this (0: never)
 notable_daily_percent = 5.0   # the boss's roundup names work above this a day
 ```
 
@@ -620,12 +621,20 @@ notable_daily_percent = 5.0   # the boss's roundup names work above this a day
 | `notable_daily_percent` | f64 | `5.0` |
 
 Past `pause_at_percent` in any reported window, background work waits (a
-job's run is skipped, a monitor's event retried) and goes on by itself once a
-newer reading is under it or the window resets. A runaway job is turned off
-and its owner told once, in words, with what it used and how that compares to
+job's run is skipped, a monitor's event retried, a boss's check-in left for
+the next) and goes on by itself once a newer reading is under it or the
+window resets.
+
+A runaway is judged against what the work uses in an hour it runs in, so a
+job that runs once a day is held to its own run. Work with no history yet is
+a runaway only past three times `runaway_min_percent` in an hour (or
+`runaway_turns_per_hour` turns). A runaway job or monitor is turned off and
+its owner told once, in words, with what it used and how that compares to
 its usual; turning it back on resumes it, and the scheduler's
-`plan_limit_percent_per_hour` raises the share an hour it may use. Readings
-are kept in memory per hub instance; with no reading yet, nothing waits.
+`plan_limit_percent_per_hour` (asked of the person) sets the share an hour
+it may use instead. The run caps apply to job runs on a plan only, and never
+raise a job's own rounds. Readings are kept in memory per hub instance; with
+no reading yet, nothing waits.
 
 ### `[gateway]` — WebSocket + REST Gateway
 

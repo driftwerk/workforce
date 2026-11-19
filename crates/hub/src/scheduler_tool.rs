@@ -719,6 +719,29 @@ impl SchedulerTool {
             Ok(schedule) => schedule,
             Err(e) => return Ok(ToolResult::failure(e, elapsed())),
         };
+        // Raising what of the plan a job may use, or turning back on one the
+        // plan guard stopped, is the person's call: asked, never assumed.
+        let plan_ask = match (input.plan_limit_percent_per_hour, input.enabled) {
+            (Some(limit), _) => Some(format!(
+                "Let '{}' use up to {limit}% of the plan an hour?",
+                job.name
+            )),
+            (None, Some(true)) if job.paused_by_plan => Some(format!(
+                "Turn '{}' back on? The plan guard stopped it for using far more of the plan than usual.",
+                job.name
+            )),
+            _ => None,
+        };
+        if let (Some(ask), false) = (plan_ask, input.confirmed == Some(true)) {
+            return Ok(ToolResult::success(
+                serde_json::json!({
+                    "status": "needs_confirmation",
+                    "reason": ask,
+                    "instructions": "Ask the user. Re-call with `confirmed: true` ONLY if the user explicitly approves; never confirm on their behalf.",
+                }),
+                elapsed(),
+            ));
+        }
         let rescheduled = schedule.is_some();
         let edit = JobEdit {
             name: input.name,

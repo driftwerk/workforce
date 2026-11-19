@@ -106,6 +106,11 @@ impl Default for MonitorEngineConfig {
     }
 }
 
+/// The plan guard's key for `mon`'s agent task.
+fn work_key(mon: &OwnedMonitor) -> String {
+    format!("monitor:{}", mon.def.monitor.id)
+}
+
 /// The result of executing a monitor action.
 pub enum ActionOutcome {
     /// Done — optional workflow instance id.
@@ -114,6 +119,9 @@ pub enum ActionOutcome {
     Transient(String),
     /// Never retry (e.g. the target workflow or owner is gone for good).
     Terminal(String),
+    /// Its agent task used far more of the person's plan than it usually
+    /// does: the monitor is turned off and its owner told.
+    Runaway(String),
 }
 
 /// Executes a monitor's action and carries its owner notices. Behind a trait
@@ -306,16 +314,8 @@ impl WorkflowNotifySink {
         .await;
         match admitted {
             crate::cost_governor::Admission::Waits(why) => return ActionOutcome::Transient(why),
-            crate::cost_governor::Admission::Stopped { why, first } => {
-                if let (true, Some(owner), Some(work)) =
-                    (first, owner, workforce_common::work_use::current())
-                {
-                    let notice = format!("{why} {}", crate::plan_guard::stopped_choices(&work));
-                    let _ = self
-                        .tell(owner, named_surface, "plan_runaway", &notice)
-                        .await;
-                }
-                return ActionOutcome::Terminal(why);
+            crate::cost_governor::Admission::Stopped { why, .. } => {
+                return ActionOutcome::Runaway(why);
             }
             _ => {}
         }
@@ -1203,7 +1203,32 @@ impl MonitorEngine {
                 let _ = self.store.fail(key, &err, false).await;
                 false
             }
+            // Turned off as a job is, and its owner told once: only the
+            // stop that turns it off tells. Turned back on, it starts afresh.
+            ActionOutcome::Runaway(why) => {
+                let _ = self.store.fail(key, &format!("skipped: {why}"), true).await;
+                if self.stop(mon, "plan_runaway").await {
+                    let work = self.work_of(mon);
+                    let notice = format!("{why} {}", crate::plan_guard::stopped_choices(&work));
+                    self.tell_owner(mon, "plan_runaway", &notice).await;
+                }
+                crate::plan_guard::PlanGuard::global().release(&work_key(mon));
+                false
+            }
         }
+    }
+
+    /// The background work `mon`'s agent task is.
+    fn work_of(&self, mon: &OwnedMonitor) -> workforce_common::work_use::Work {
+        let agent = match &mon.def.monitor.action {
+            Action::AgentTask { agent, .. } => agent.as_deref(),
+            _ => None,
+        };
+        workforce_common::work_use::Work::monitor(
+            agent.unwrap_or(&self.agent.id),
+            &mon.def.monitor.id,
+            &mon.def.monitor.name,
+        )
     }
 
     async fn perform_action(&self, mon: &OwnedMonitor, ev: &MonitorEvent) -> ActionOutcome {
@@ -1217,13 +1242,8 @@ impl MonitorEngine {
         // it while the person's plan is nearly full, and counts what it uses
         // toward the monitor.
         match &mon.def.monitor.action {
-            Action::AgentTask { agent, .. } => {
-                let work = workforce_common::work_use::Work::monitor(
-                    agent.as_deref().unwrap_or(&self.agent.id),
-                    &mon.def.monitor.id,
-                    &mon.def.monitor.name,
-                );
-                workforce_common::work_use::within(work, dispatch).await
+            Action::AgentTask { .. } => {
+                workforce_common::work_use::within(self.work_of(mon), dispatch).await
             }
             _ => dispatch.await,
         }
@@ -1741,7 +1761,9 @@ impl MonitorEngine {
             .or(m.action.delivery().and_then(|(_, surface)| surface));
         match self.sink.tell(owner, surface, reason, notice).await {
             ActionOutcome::Done(_) => {}
-            ActionOutcome::Transient(e) | ActionOutcome::Terminal(e) => {
+            ActionOutcome::Transient(e)
+            | ActionOutcome::Terminal(e)
+            | ActionOutcome::Runaway(e) => {
                 warn!(monitor = %id, %owner, reason, error = %e, "monitor owner DM failed: {notice}")
             }
         }

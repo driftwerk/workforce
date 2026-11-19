@@ -1092,16 +1092,20 @@ impl CrewHub {
         }
         // What background work used of the person's plans, when a notable
         // share: said in words, worth knowing.
+        // Since the last roundup, at most a day: the person's own plans'
+        // use alone, said once.
         let notable = service.config.budget.plan.notable_daily_percent;
         let store = Arc::clone(&service.telemetry_store);
-        let rows = tokio::task::spawn_blocking(move || {
-            store.work_use_rows(now - Duration::hours(24), now, None, None)
-        })
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or_default();
-        if let Some(headline) = background_plan_use(rows, notable) {
+        let from = since.max(now - Duration::hours(24));
+        let payer = owner.to_string();
+        let rows =
+            tokio::task::spawn_blocking(move || store.work_use_rows(from, now, Some(&payer), None))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default();
+        let at = from.with_timezone(&self.desk.timezone()).format("%H:%M");
+        if let Some(headline) = background_plan_use(rows, notable, &format!("since {at}")) {
             lines.push((
                 SectionKey::WorthKnowing,
                 Said {
@@ -1595,13 +1599,14 @@ impl CrewHub {
     }
 }
 
-/// What a check-in's prompt names a handed update by.
-/// The roundup's line on the last day's background work, when it used at
-/// least `notable` points of a plan's longest window: how much in all, and
-/// the most of it, by name. `None` under that.
+/// The roundup's line on background work's use of the person's plans
+/// (`when`: "since 09:00"), when it used at least `notable` points of a
+/// plan's longest window: how much in all, and the most of it, by name.
+/// `None` under that.
 fn background_plan_use(
     rows: Vec<workforce_common::work_use::WorkUseRow>,
     notable: f64,
+    when: &str,
 ) -> Option<String> {
     use crate::plan_guard::{plan_words, window_words};
     let works = workforce_common::work_use::fold(rows);
@@ -1649,7 +1654,7 @@ fn background_plan_use(
         _ => "",
     };
     let mut line = format!(
-        "Background work used about {total:.0}% of your {} {plan}plan in the last day",
+        "Background work used about {total:.0}% of your {} {plan}plan {when}",
         window_words(minutes),
         plan = if plan.is_empty() {
             String::new()
@@ -1664,6 +1669,7 @@ fn background_plan_use(
     Some(line)
 }
 
+/// What a check-in's prompt names a handed update by.
 fn marker(p: &Pending) -> String {
     format!("update {}", p.id)
 }
@@ -1722,18 +1728,18 @@ mod plan_use_tests {
     fn the_roundup_names_background_works_plan_use_only_when_notable() {
         let now = chrono::Utc::now();
         let email = Work::job("atlas", "j1", "email check");
-        let boss = Work::boss("atlas", "Atlas");
+        let boss = Work::boss("atlas", "p", "Atlas");
         let quiet = vec![WorkUseRow::share(&email, None, "claude", 10_080, 2.0, now)];
-        assert_eq!(background_plan_use(quiet, 5.0), None);
+        assert_eq!(background_plan_use(quiet, 5.0, "since 09:00"), None);
         let rows = vec![
             WorkUseRow::share(&email, None, "claude", 10_080, 6.0, now),
             WorkUseRow::share(&email, None, "claude", 300, 40.0, now),
             WorkUseRow::share(&boss, None, "claude", 10_080, 1.2, now),
         ];
         assert_eq!(
-            background_plan_use(rows, 5.0).as_deref(),
+            background_plan_use(rows, 5.0, "since 09:00").as_deref(),
             Some(
-                "Background work used about 7% of your weekly Claude plan in the last day, \
+                "Background work used about 7% of your weekly Claude plan since 09:00, \
                  most of it 'email check' 6%, 'Atlas's own turns' 1%."
             )
         );

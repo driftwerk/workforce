@@ -2765,6 +2765,58 @@ impl TelemetryStore for PostgresTelemetryStore {
         })
     }
 
+    fn work_use_sums(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        work: Option<&str>,
+        agent: Option<&str>,
+        payer: Option<&str>,
+    ) -> Result<Vec<crate::work_use::WorkUseSum>> {
+        let (work, agent, payer) = (
+            work.map(str::to_string),
+            agent.map(str::to_string),
+            payer.map(str::to_string),
+        );
+        self.block_on(async move {
+            let conn = self.pool.get().await?;
+            let rows = conn
+                .query(
+                    "SELECT MIN(at), work, MAX(label), MAX(agent_id), plan, window_minutes,
+                            SUM(share)::float8, SUM(turns)::int8, SUM(tokens)::int8,
+                            COUNT(DISTINCT date_trunc('hour', at))::int8
+                     FROM work_use
+                     WHERE at >= $1 AND at <= $2
+                       AND ($3::text IS NULL OR work = $3)
+                       AND ($4::text IS NULL OR agent_id = $4)
+                       AND ($5::text IS NULL OR payer = $5)
+                     GROUP BY work, plan, window_minutes",
+                    &[&from, &to, &work, &agent, &payer],
+                )
+                .await?;
+            Ok(rows
+                .into_iter()
+                .map(|r| crate::work_use::WorkUseSum {
+                    row: crate::work_use::WorkUseRow {
+                        at: r.get(0),
+                        work: r.get(1),
+                        label: r.get(2),
+                        agent_id: r.get(3),
+                        payer: None,
+                        plan: r.get(4),
+                        window_minutes: r
+                            .get::<_, Option<i32>>(5)
+                            .and_then(|m| u32::try_from(m).ok()),
+                        share: r.get(6),
+                        turns: u32::try_from(r.get::<_, i64>(7)).unwrap_or(u32::MAX),
+                        tokens: u64::try_from(r.get::<_, i64>(8)).unwrap_or(0),
+                    },
+                    hours: u32::try_from(r.get::<_, i64>(9)).unwrap_or(0),
+                })
+                .collect())
+        })
+    }
+
     fn prune_work_use(&self, before: DateTime<Utc>) -> Result<usize> {
         self.prune(
             "DELETE FROM work_use WHERE id IN (

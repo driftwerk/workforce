@@ -43,7 +43,7 @@ use workforce_common::telemetry::TelemetryStore;
 use workforce_common::usage::{account_key, PlanKind, Window};
 #[cfg(test)]
 use workforce_common::work_use::Allowed;
-use workforce_common::work_use::{self, Work, WorkUse, WorkUseRow};
+use workforce_common::work_use::{self, Work, WorkUseRow};
 
 use super::logins::resolve::{Credential, Login};
 
@@ -56,6 +56,14 @@ const RUNAWAY_HOLD: chrono::Duration = chrono::Duration::hours(1);
 
 /// The usual is read over this many hours before the last one.
 const USUAL_HOURS: i64 = 7 * 24;
+
+/// How a plan wait's reason begins, so what reads a skipped turn's reason
+/// can tell a wait from a refusal.
+pub const WAITS_PREFIX: &str = "Background work is waiting:";
+
+/// How many times `runaway_min_percent` new work (no usual yet) may use in
+/// an hour before it is a runaway: with nothing to compare, only a lot is.
+const NEW_WORK_FLOOR: f64 = 3.0;
 
 /// A plan's windows as last read.
 #[derive(Debug, Clone, PartialEq)]
@@ -147,6 +155,9 @@ pub struct Rate {
     pub of: Option<(PlanKind, u32)>,
 }
 
+/// What calls of one work moved of a plan, by window: (plan, minutes, points).
+type Moved = Vec<(PlanKind, u32, f64)>;
+
 /// A work's rate as last read: when, and from when it counted.
 type CachedRate = (Instant, Option<DateTime<Utc>>, Rate);
 
@@ -162,7 +173,7 @@ struct Stop {
 /// is not yet counted, and the runaways stopped.
 pub struct PlanGuard {
     books: Mutex<HashMap<String, Book>>,
-    unclaimed: Mutex<HashMap<String, Vec<(PlanKind, u32, f64)>>>,
+    unclaimed: Mutex<HashMap<(String, String), Moved>>,
     stops: Mutex<HashMap<String, Stop>>,
     released: Mutex<HashMap<String, DateTime<Utc>>>,
     rates: Mutex<HashMap<String, CachedRate>>,
@@ -194,7 +205,6 @@ impl PlanGuard {
         Arc::clone(&GLOBAL)
     }
 
-    /// Keep what background work uses in `store` from now on.
     /// Keep what background work uses in `store`: the first store given
     /// is kept (a hub has one; a test process composes many).
     pub fn keep_in(&self, store: Arc<dyn TelemetryStore>) {
@@ -234,8 +244,9 @@ impl PlanGuard {
     }
 
     /// A call on `login` read its plan's `windows` at `at`: kept, and what
-    /// moved since the plan was last read is the call's, to be counted when
-    /// it is served.
+    /// moved since the plan was last read is the call's, to be counted
+    /// toward the background work it is for when it is served. The person's
+    /// own calls move nothing any work is counted for.
     pub fn observe(&self, login: &Login, windows: &[Window], at: DateTime<Utc>) {
         if windows.is_empty() {
             return;
@@ -247,9 +258,9 @@ impl PlanGuard {
             .filter(|before| before.at <= at)
             .map(|before| moved(&before, windows))
             .unwrap_or_default();
-        if !moved.is_empty() {
+        if let (false, Some(work)) = (moved.is_empty(), work_use::current()) {
             let mut unclaimed = self.unclaimed.lock();
-            let mine = unclaimed.entry(login_key(login)).or_default();
+            let mine = unclaimed.entry((login_key(login), work.key)).or_default();
             for (minutes, share) in moved {
                 match mine
                     .iter_mut()
@@ -298,9 +309,14 @@ impl PlanGuard {
     /// A call on `login` was served: what it moved is counted toward the
     /// background work it was for, if any.
     pub fn served(&self, login: &Login, payer: &str) {
-        let moved = self.unclaimed.lock().remove(&login_key(login));
-        let (Some(moved), Some(work), Some(store)) = (moved, work_use::current(), self.store())
-        else {
+        let Some(work) = work_use::current() else {
+            return;
+        };
+        let moved = self
+            .unclaimed
+            .lock()
+            .remove(&(login_key(login), work.key.clone()));
+        let (Some(moved), Some(store)) = (moved, self.store()) else {
             return;
         };
         let now = Utc::now();
@@ -393,6 +409,11 @@ impl PlanGuard {
         }
     }
 
+    /// Whether `key` is stopped as a runaway now.
+    pub fn is_stopped(&self, key: &str) -> bool {
+        self.stopped(key, None, Utc::now()).is_some()
+    }
+
     /// Lets `work` go on: the person resumed it. What it did before now is
     /// not held against it.
     pub fn release(&self, key: &str) {
@@ -424,16 +445,25 @@ impl PlanGuard {
         let Some(store) = self.store() else {
             return Rate::default();
         };
-        let from = now - chrono::Duration::hours(USUAL_HOURS + 1);
-        let rows = match store.work_use_rows(from, now, None, Some(&work.key)) {
-            Ok(rows) => rows,
+        // Summed in the store: the hour (from `since`, when later), and the
+        // week before it.
+        let hour_ago = now - chrono::Duration::hours(1);
+        let hour_from = since.map_or(hour_ago, |s| s.max(hour_ago));
+        let read = store
+            .work_use_sums(hour_from, now, Some(&work.key), None, None)
+            .and_then(|hour| {
+                let from = now - chrono::Duration::hours(USUAL_HOURS + 1);
+                let before = store.work_use_sums(from, hour_ago, Some(&work.key), None, None)?;
+                Ok((hour, before))
+            });
+        let rate = match read {
+            Ok((hour, before)) => rate_from(&hour, &before),
             Err(e) => {
                 // Fails open: a broken store never stops work.
                 tracing::warn!(error = %e, work = %work.key, "Reading a background work's use failed");
                 return Rate::default();
             }
         };
-        let rate = rate_of(&rows, since, now);
         self.rates
             .lock()
             .insert(work.key.clone(), (Instant::now(), since, rate.clone()));
@@ -477,7 +507,7 @@ fn waits_why(standing: &PlanStanding, at: f64) -> String {
         format!(", or until it resets at {}", r.format("%a %H:%M UTC"))
     });
     format!(
-        "Background work is waiting: {}, and background work pauses from {}% so the plan is left for you. It goes on by itself once usage is under that{until}.",
+        "{WAITS_PREFIX} {}, and background work pauses from {}% so the plan is left for you. It goes on by itself once usage is under that{until}.",
         standing.says(),
         at.floor() as i64
     )
@@ -485,7 +515,8 @@ fn waits_why(standing: &PlanStanding, at: f64) -> String {
 
 /// `rows` of one unit of work over the last hour and the week before it.
 /// What it did in the hour before `since` (the person resumed it then) is
-/// neither the hour's nor its usual.
+/// neither the hour's nor its usual. [`rate_from`], summed here as the store
+/// sums them.
 pub fn rate_of(rows: &[WorkUseRow], since: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Rate {
     let hour_ago = now - chrono::Duration::hours(1);
     let (hour, before): (Vec<_>, Vec<_>) = rows
@@ -493,44 +524,77 @@ pub fn rate_of(rows: &[WorkUseRow], since: Option<DateTime<Utc>>, now: DateTime<
         .filter(|r| r.at < hour_ago || since.is_none_or(|s| r.at >= s))
         .cloned()
         .partition(|r| r.at >= hour_ago);
-    // Its usual is per hour of the history it has, not of a week it hasn't.
-    let first = before.iter().map(|r| r.at).min();
-    let hours = first.map_or(0.0, |f| {
-        ((hour_ago - f).num_minutes() as f64 / 60.0).clamp(1.0, USUAL_HOURS as f64)
-    });
-    let hour_use = work_use::fold(hour);
-    let before_use = work_use::fold(before);
-    let longest = |u: &[WorkUse]| {
-        u.first()
-            .and_then(|u| u.longest_share().cloned())
-            .map(|s| (s.plan.clone(), s.window_minutes))
+    rate_from(&sums_of(hour), &sums_of(before))
+}
+
+/// `rows` summed by work and plan window, as the store sums them.
+fn sums_of(rows: Vec<WorkUseRow>) -> Vec<work_use::WorkUseSum> {
+    use std::collections::HashSet;
+    let mut sums: Vec<(work_use::WorkUseSum, HashSet<i64>)> = Vec::new();
+    for r in rows {
+        let hour = r.at.timestamp().div_euclid(3_600);
+        match sums.iter_mut().find(|(s, _)| {
+            s.row.work == r.work && s.row.plan == r.plan && s.row.window_minutes == r.window_minutes
+        }) {
+            Some((s, hours)) => {
+                s.row.at = s.row.at.min(r.at);
+                s.row.share += r.share;
+                s.row.turns += r.turns;
+                s.row.tokens += r.tokens;
+                hours.insert(hour);
+            }
+            None => sums.push((
+                work_use::WorkUseSum { row: r, hours: 0 },
+                HashSet::from([hour]),
+            )),
+        }
+    }
+    sums.into_iter()
+        .map(|(mut s, hours)| {
+            s.hours = hours.len() as u32;
+            s
+        })
+        .collect()
+}
+
+/// One unit of work's last hour against its usual: what it uses in an hour
+/// it runs in, so a job that runs once a day is held to its own run, not to
+/// a day of nothing.
+pub fn rate_from(hour: &[work_use::WorkUseSum], before: &[work_use::WorkUseSum]) -> Rate {
+    let longest = |sums: &[work_use::WorkUseSum]| {
+        sums.iter()
+            .filter_map(|s| Some((s.row.plan.clone()?, s.row.window_minutes?)))
+            .max_by_key(|(_, minutes)| *minutes)
     };
-    let of = longest(&hour_use).or_else(|| longest(&before_use));
-    let share_of = |u: &[WorkUse]| {
-        u.first()
-            .and_then(|u| {
-                of.as_ref().and_then(|(plan, minutes)| {
-                    u.shares
-                        .iter()
-                        .find(|s| s.plan == *plan && s.window_minutes == *minutes)
+    let of = longest(hour).or_else(|| longest(before));
+    let share_of = |sums: &[work_use::WorkUseSum]| -> f64 {
+        sums.iter()
+            .filter(|s| {
+                of.as_ref().is_some_and(|(plan, minutes)| {
+                    s.row.plan.as_deref() == Some(plan.as_str())
+                        && s.row.window_minutes == Some(*minutes)
                 })
             })
-            .map_or(0.0, |s| s.share)
+            .map(|s| s.row.share)
+            .sum()
     };
-    let turns_of = |u: &[WorkUse]| u.first().map_or(0, |u| u.turns);
+    let turns_of = |sums: &[work_use::WorkUseSum]| -> u64 {
+        sums.iter().map(|s| u64::from(s.row.turns)).sum()
+    };
+    // The hours it was in use in: those its turns began in, else any.
+    let hours = before
+        .iter()
+        .filter(|s| s.row.plan.is_none() && s.row.turns > 0)
+        .map(|s| s.hours)
+        .max()
+        .or_else(|| before.iter().map(|s| s.hours).max())
+        .map_or(0.0, |h| f64::from(h).min(USUAL_HOURS as f64));
+    let per_hour = |total: f64| if hours > 0.0 { total / hours } else { 0.0 };
     Rate {
-        hour_share: share_of(&hour_use),
-        usual_share: if hours > 0.0 {
-            share_of(&before_use) / hours
-        } else {
-            0.0
-        },
-        hour_turns: turns_of(&hour_use),
-        usual_turns: if hours > 0.0 {
-            turns_of(&before_use) as f64 / hours
-        } else {
-            0.0
-        },
+        hour_share: share_of(hour),
+        usual_share: per_hour(share_of(before)),
+        hour_turns: turns_of(hour),
+        usual_turns: per_hour(turns_of(before) as f64),
         of: of.and_then(|(plan, minutes)| PlanKind::parse(&plan).map(|p| (p, minutes))),
     }
 }
@@ -550,12 +614,15 @@ fn runaway(cfg: &PlanGuardConfig, work: &Work, rate: &Rate, limit: Option<f64>) 
             String::new()
         }
     };
+    let floor = cfg.runaway_min_percent.max(0.0);
     let by_share = match limit {
         Some(limit) => rate.hour_share >= limit.max(0.0) && rate.hour_share > 0.0,
+        // New work has no usual to be far past: held to a higher floor.
+        None if rate.usual_share <= 0.0 => rate.hour_share >= NEW_WORK_FLOOR * floor.max(0.1),
         None => {
-            rate.hour_share >= cfg.runaway_min_percent.max(0.0)
+            rate.hour_share >= floor
                 && rate.hour_share > 0.0
-                && (rate.usual_share <= 0.0 || rate.hour_share >= multiple * rate.usual_share)
+                && rate.hour_share >= multiple * rate.usual_share
         }
     };
     if by_share {
@@ -569,8 +636,10 @@ fn runaway(cfg: &PlanGuardConfig, work: &Work, rate: &Rate, limit: Option<f64>) 
             share(rate.hour_share)
         ));
     }
+    // Turns are its measure only where the person set no share an hour.
     let floor = u64::from(cfg.runaway_turns_per_hour);
-    let by_turns = floor > 0
+    let by_turns = limit.is_none()
+        && floor > 0
         && rate.hour_turns >= floor
         && (rate.usual_turns <= 0.0 || rate.hour_turns as f64 >= multiple * rate.usual_turns);
     by_turns.then(|| {
@@ -873,11 +942,76 @@ mod tests {
         // An interactive call moves it too: never the job's.
         guard.observe(&l, &[week(15.0, reset)], at("2026-11-19T09:06:00Z"));
         guard.served(&l, "p1");
+        // The person's call read mid-turn (served only at its end), then a
+        // job's call served: the job takes only what its own call moved.
+        guard.observe(&l, &[week(18.0, reset)], at("2026-11-19T09:07:00Z"));
+        rt.block_on(work_use::within(job.clone(), async {
+            guard.observe(&l, &[week(18.5, reset)], at("2026-11-19T09:08:00Z"));
+            guard.served(&l, "p1");
+        }));
+        guard.served(&l, "p1");
         let rows = store
             .work_use_rows(at("2026-01-01T00:00:00Z"), Utc::now(), None, Some(&job.key))
             .unwrap();
         let used = work_use::fold(rows);
-        assert_eq!(used[0].longest_share().unwrap().share, 2.0);
+        assert_eq!(used[0].longest_share().unwrap().share, 2.5);
+    }
+
+    #[test]
+    fn a_daily_job_is_held_to_its_own_run_and_new_work_to_a_higher_floor() {
+        let job = Work::job("atlas", "daily", "morning brief");
+        let now = at("2026-11-19T10:00:00Z");
+        // A week of one 3.5% run a day, with a subagent's turn beside it.
+        let mut rows = Vec::new();
+        for d in 1..=6 {
+            let t = now - chrono::Duration::days(d);
+            rows.push(WorkUseRow::share(&job, Some("p"), "claude", 10_080, 3.5, t));
+            rows.push(WorkUseRow::turn(&job, Some("p"), t));
+            rows.push(WorkUseRow::turn(&job, Some("p"), t));
+        }
+        let mut today = rows.clone();
+        let t = now - chrono::Duration::minutes(10);
+        today.push(WorkUseRow::share(&job, Some("p"), "claude", 10_080, 3.6, t));
+        today.push(WorkUseRow::turn(&job, Some("p"), t));
+        let rate = rate_of(&today, None, now);
+        assert!((rate.usual_share - 3.5).abs() < 0.01, "{rate:?}");
+        assert!(
+            runaway(&cfg(), &job, &rate, None).is_none(),
+            "its usual run"
+        );
+        // Run ten times over in the hour: a runaway.
+        let mut looped = rows;
+        looped.push(WorkUseRow::share(
+            &job,
+            Some("p"),
+            "claude",
+            10_080,
+            36.0,
+            t,
+        ));
+        assert!(runaway(&cfg(), &job, &rate_of(&looped, None, now), None).is_some());
+        // New work: 4% in its first hour is not yet a runaway; 9% is.
+        let new = Work::job("atlas", "new", "fresh");
+        let first = |share| {
+            rate_of(
+                &[
+                    WorkUseRow::share(&new, Some("p"), "claude", 10_080, share, t),
+                    WorkUseRow::turn(&new, Some("p"), t),
+                ],
+                None,
+                now,
+            )
+        };
+        assert!(runaway(&cfg(), &new, &first(4.0), None).is_none());
+        assert!(runaway(&cfg(), &new, &first(9.0), None).is_some());
+        // A limit the person set replaces the turns floor too.
+        let mut busy = vec![];
+        for _ in 0..200 {
+            busy.push(WorkUseRow::turn(&new, Some("p"), t));
+        }
+        let busy = rate_of(&busy, None, now);
+        assert!(runaway(&cfg(), &new, &busy, None).is_some());
+        assert!(runaway(&cfg(), &new, &busy, Some(5.0)).is_none());
     }
 
     fn rows_for(

@@ -18,3 +18,5 @@ CREATE TABLE IF NOT EXISTS work_use (
 );
 CREATE INDEX IF NOT EXISTS idx_work_use_at ON work_use (at);
 CREATE INDEX IF NOT EXISTS idx_work_use_work_at ON work_use (work, at);
+CREATE INDEX IF NOT EXISTS idx_work_use_payer_at ON work_use (payer, at);
+CREATE INDEX IF NOT EXISTS idx_work_use_agent_at ON work_use (agent_id, at);

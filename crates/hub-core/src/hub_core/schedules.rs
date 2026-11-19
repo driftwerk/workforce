@@ -459,7 +459,10 @@ impl JobEdit {
             job.schedule = schedule;
         }
         if let Some(enabled) = self.enabled {
-            if enabled && (job.paused_by_plan || !job.enabled) {
+            // Turned back on after the plan guard stopped it: what it did
+            // before is not held against it. Any other resume keeps its
+            // usual.
+            if enabled && job.paused_by_plan {
                 job.plan_resumed_at = Some(*now);
             }
             job.enabled = enabled;

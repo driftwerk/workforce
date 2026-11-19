@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// One unit of background work, as the person would name it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Work {
-    /// Stable across runs: `job:<id>`, `monitor:<id>`, `boss:<agent>`,
+    /// Stable across runs: `job:<id>`, `monitor:<id>`, `boss:<agent>:<owner>`,
     /// `heartbeat:<agent>`.
     pub key: String,
     /// What the person calls it: the job's name, "Atlas's own turns".
@@ -56,10 +56,11 @@ impl Work {
         Self::new(format!("monitor:{id}"), name, agent_id)
     }
 
-    /// A boss's own turns: its check-ins, notices and wake-ups.
-    pub fn boss(agent_id: &str, name: &str) -> Self {
+    /// A boss's own turns for `owner`: its check-ins, notices and wake-ups.
+    /// Each person's apart, so one's never holds another's.
+    pub fn boss(agent_id: &str, owner: &str, name: &str) -> Self {
         Self::new(
-            format!("boss:{agent_id}"),
+            format!("boss:{agent_id}:{owner}"),
             &format!("{name}'s own turns"),
             agent_id,
         )
@@ -135,6 +136,14 @@ where
     match work {
         Some(w) => Box::pin(BACKGROUND.scope(w, fut)),
         None => Box::pin(fut),
+    }
+}
+
+/// [`within_opt`] for a closure, as across `spawn_blocking`.
+pub fn sync_within_opt<T>(work: Option<Work>, f: impl FnOnce() -> T) -> T {
+    match work {
+        Some(w) => BACKGROUND.sync_scope(w, f),
+        None => f(),
     }
 }
 
@@ -214,6 +223,15 @@ impl WorkUseRow {
             ..Self::of(work, at)
         }
     }
+}
+
+/// What one unit of work used of one plan window (or, with `plan` none, its
+/// turns and tokens) over a stretch of time, summed by the store: `row.at`
+/// is its first, and `hours` the clock hours it was in use in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkUseSum {
+    pub row: WorkUseRow,
+    pub hours: u32,
 }
 
 /// One unit of work's use over a stretch of time, for one plan window (or,
@@ -311,8 +329,8 @@ mod tests {
             assert!(bare.is_none(), "a bare spawn drops it");
         })
         .await;
-        assert_eq!(Work::boss("atlas", "Atlas").label, "Atlas's own turns");
-        assert_eq!(Work::boss("atlas", "Atlas").kind(), WorkKind::Boss);
+        assert_eq!(Work::boss("atlas", "p", "Atlas").label, "Atlas's own turns");
+        assert_eq!(Work::boss("atlas", "p", "Atlas").kind(), WorkKind::Boss);
     }
 
     #[test]

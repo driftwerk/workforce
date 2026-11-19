@@ -753,15 +753,28 @@ impl Scheduler {
         let service = self.service();
         let login = crate::turn_loop::route_login(&service, model).await?;
         let plan = crate::plan_guard::plan_of(login.kind);
+        // A week of this agent's jobs on this person's plans, summed in the
+        // store.
         let store = Arc::clone(&service.telemetry_store);
         let now = Utc::now();
-        let rows = tokio::task::spawn_blocking(move || {
-            store.work_use_rows(now - chrono::Duration::days(7), now, None, None)
+        let agent = service.agent_id.to_string();
+        let payer = crate::user_config::current_billing_identity_id();
+        let rows: Vec<_> = tokio::task::spawn_blocking(move || {
+            store.work_use_sums(
+                now - chrono::Duration::days(7),
+                now,
+                None,
+                Some(&agent),
+                payer.as_deref(),
+            )
         })
         .await
         .ok()
         .and_then(Result::ok)
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        .map(|sum| sum.row)
+        .collect();
         Some(crate::plan_guard::PlanEstimate::of(
             &rows,
             plan,
@@ -2093,12 +2106,27 @@ impl Scheduler {
                     | crate::cost_governor::Admission::Warn(_) => {}
                 }
 
-                // A run takes at most `[budget.plan] run_max_rounds` rounds
-                // where the job names none, and `run_max_minutes` in all.
+                // On the person's plan, a run takes at most `[budget.plan]
+                // run_max_rounds` rounds (never more than it would anyway)
+                // and `run_max_minutes` in all. Paid runs keep their own.
                 let caps = service.config.budget.plan.clone();
-                let max_rounds =
-                    max_rounds.or_else(|| (caps.run_max_rounds > 0).then_some(caps.run_max_rounds));
+                let capped = caps.enabled && on_plan.is_some();
+                let max_rounds = match capped && caps.run_max_rounds > 0 {
+                    true => Some(
+                        crate::turn_loop::records::resolve_max_rounds(
+                            *max_rounds,
+                            *service.active_max_rounds.read(),
+                            crate::turn_loop::records::origin_default_max_rounds(
+                                "scheduler",
+                                &service.effective_llm,
+                            ),
+                        )
+                        .min(caps.run_max_rounds),
+                    ),
+                    false => *max_rounds,
+                };
                 let max_rounds = &max_rounds;
+                let run_minutes = if capped { caps.run_max_minutes } else { 0 };
 
                 // Always deliver to DM via open_conversation for reliability.
                 // Resolve DM channel up front so we can pass it to process_message.
@@ -2185,15 +2213,15 @@ impl Scheduler {
                         ),
                     ),
                 );
-                let process_result = match run_capped(turn, caps.run_max_minutes).await {
+                let process_result = match run_capped(turn, run_minutes).await {
                     Some(result) => result,
+                    // Cut off, as a skip: a long run is not a failing job.
                     None => {
                         let reason = format!(
-                            "it was stopped after {} minutes, the most one scheduled run may take ([budget.plan] run_max_minutes)",
-                            caps.run_max_minutes
+                            "{SKIPPED_PREFIX} stopped after {run_minutes} minutes, the most one scheduled run on your plan may take ([budget.plan] run_max_minutes)"
                         );
                         warn!(job_id = %job.id, name = %job.name, %reason, "Job run cut off");
-                        return self.finish_record(job, started_at, start, false, reason, false);
+                        return self.finish_record(job, started_at, start, true, reason, false);
                     }
                 };
                 let process_result = match process_result {
@@ -2214,6 +2242,26 @@ impl Scheduler {
                                 )
                             }
                         }
+                    }
+                    // Held by the plan guard at the turn itself (its plan
+                    // filled, or it ran away, after the check above): a
+                    // skip, never a failure; a runaway is stopped and told.
+                    Ok(crate::serve::TurnOutcome::Skipped(crate::serve::Skip::Denied(reason)))
+                        if reason.starts_with(crate::plan_guard::WAITS_PREFIX)
+                            || crate::plan_guard::PlanGuard::global()
+                                .is_stopped(&format!("job:{}", job.id)) =>
+                    {
+                        if !reason.starts_with(crate::plan_guard::WAITS_PREFIX) {
+                            self.stop_as_runaway(job, &reason).await;
+                        }
+                        return self.finish_record(
+                            job,
+                            started_at,
+                            start,
+                            true,
+                            format!("{SKIPPED_PREFIX} held by the plan guard: {reason}"),
+                            true,
+                        );
                     }
                     Ok(crate::serve::TurnOutcome::Skipped(skip)) => {
                         warn!(

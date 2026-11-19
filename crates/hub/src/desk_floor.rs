@@ -1255,7 +1255,7 @@ mod tests {
             .unwrap()
             .to_utc();
         let email = Work::job("atlas", "j1", "email check");
-        let boss = Work::boss("atlas", "Atlas");
+        let boss = Work::boss("atlas", "p", "Atlas");
         let rows = vec![
             WorkUseRow::share(
                 &email,
