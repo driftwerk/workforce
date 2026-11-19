@@ -422,7 +422,10 @@ impl Desk {
     }
 
     /// When `side` is known to be full now, and until when.
-    fn full_now(st: &super::State, side: Option<Uuid>) -> Option<Option<chrono::DateTime<Utc>>> {
+    pub(super) fn full_now(
+        st: &super::State,
+        side: Option<Uuid>,
+    ) -> Option<Option<chrono::DateTime<Utc>>> {
         Self::standing_of(st, Self::canonical(st, side)).full(Utc::now())
     }
 
@@ -788,7 +791,7 @@ impl Desk {
                 }))
             }
             _ => Err(DeskError::Invalid(format!(
-                "two {what}s are called {said}: {}. Say which by its id",
+                "more than one {what} is called {said}: {}. Say which by its id",
                 named(&exact)
             ))),
         }
@@ -2044,6 +2047,7 @@ fn refused_needs(st: &super::State) -> Vec<accounts::AccountNeed> {
                         && st.signed_in_accounts.contains(&a.id)
                         && !st.sign_in_problems.contains_key(&a.id)
                         && !Desk::refused_now(st, a.id, now)
+                        && !Desk::unchecked_now(st, Some(a.id))
                         && Desk::full_now(st, Some(a.id)).is_none()
                 })
                 .map(|a| Some(a.id))
@@ -2095,6 +2099,12 @@ pub struct SwitchedAll {
 impl Desk {
     /// The account needs the Floor shows, less those the person put off.
     pub fn account_needs(&self) -> Vec<accounts::AccountNeed> {
+        self.needs_with(false)
+    }
+
+    /// The needs, those the person put off too when `put_off`: read in one
+    /// go, never by emptying what they put off for a while.
+    fn needs_with(&self, put_off: bool) -> Vec<accounts::AccountNeed> {
         let own_on_plan = self.sign_ins().of(Engine::Claude).on_plan();
         let st = self.0.state.lock();
         // The CLI's own sign-in, known to be one of the accounts, is that
@@ -2142,7 +2152,7 @@ impl Desk {
             .chain(Self::in_terminal_needs(&st))
             .chain(sign_in_needs(&st))
             .chain(refused_needs(&st))
-            .filter(|n| !st.put_off.contains(n.id()))
+            .filter(|n| put_off || !st.put_off.contains(n.id()))
             // One of each, whatever raised it twice.
             .filter(|n| seen.insert(n.id().to_string()))
             .collect()
@@ -2408,10 +2418,7 @@ impl Desk {
 
     /// Every need, those put off too.
     pub(super) fn account_needs_all(&self) -> Vec<accounts::AccountNeed> {
-        let put_off = std::mem::take(&mut self.0.state.lock().put_off);
-        let needs = self.account_needs();
-        self.0.state.lock().put_off = put_off;
-        needs
+        self.needs_with(true)
     }
 
     /// Moves every session of `engine` on `from` to `to`, each as

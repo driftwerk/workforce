@@ -613,8 +613,14 @@ impl CrewTool {
                             .and_then(|s| s.trim().parse::<uuid::Uuid>().ok()),
                         _ => None,
                     };
-                    if let Some(s) = session {
-                        crew.session_seen(s, &b.seen)?;
+                    match session {
+                        Some(s) => crew.session_seen(s, &b.seen)?,
+                        // No session it names: said as such below, never
+                        // a login looked up across providers.
+                        None if self.name == SWITCH_LOGIN => {
+                            return Err("Say which session: its id from crew.overview.".into())
+                        }
+                        None => {}
                     }
                     let engine = match self.name {
                         SWITCH_LOGIN => session

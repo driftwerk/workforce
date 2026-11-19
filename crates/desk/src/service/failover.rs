@@ -123,15 +123,19 @@ impl Desk {
             }
             return Ok(());
         }
-        if self
-            .0
-            .state
-            .lock()
-            .verified
-            .get(&side)
-            .is_some_and(|at| at.elapsed() < VERIFIED_FOR)
         {
-            return Ok(());
+            // A probe's word stands a few minutes, unless the login was
+            // found full or turned away since.
+            let st = self.0.state.lock();
+            let still = st
+                .verified
+                .get(&side)
+                .is_some_and(|at| at.elapsed() < VERIFIED_FOR)
+                && Self::full_now(&st, side).is_none()
+                && side.is_none_or(|id| !st.refused.contains_key(&id));
+            if still {
+                return Ok(());
+            }
         }
         let (name, token) = match side {
             Some(id) => {
@@ -281,10 +285,22 @@ impl Desk {
         let desk = self.clone();
         tokio::spawn(async move {
             loop {
-                let Ok(one) = desk.0.failing_over.try_lock() else {
-                    desk.0.fail_over_again.store(true, Ordering::SeqCst);
-                    return;
+                let one = match desk.0.failing_over.try_lock() {
+                    Ok(one) => one,
+                    Err(_) => {
+                        desk.0.fail_over_again.store(true, Ordering::SeqCst);
+                        // The run may have ended just before the flag was
+                        // set: then this one runs it.
+                        match desk.0.failing_over.try_lock() {
+                            Ok(one) => one,
+                            Err(_) => return,
+                        }
+                    }
                 };
+                // Turned off meanwhile: nothing more moves.
+                if !desk.auto_switch() {
+                    return;
+                }
                 desk.0.fail_over_again.store(false, Ordering::SeqCst);
                 desk.fail_over().await;
                 drop(one);
@@ -333,7 +349,10 @@ impl Desk {
                 to,
                 resets_at,
                 ..
-            } if !tried.contains(id) && !Self::moving_off(&st, *engine, from.id).is_empty() => {
+            } if !tried.contains(id)
+                && !Self::unchecked_now(&st, to.id)
+                && !Self::moving_off(&st, *engine, from.id).is_empty() =>
+            {
                 let standing = Self::standing_of(&st, from.id);
                 let window = standing
                     .full_by(now)
@@ -358,6 +377,7 @@ impl Desk {
                 using: Some(to),
                 ..
             } if !tried.contains(id)
+                && !Self::unchecked_now(&st, to.id)
                 && account.id.is_some_and(|a| Self::refused_now(&st, a, now))
                 && !Self::moving_off(&st, *engine, account.id).is_empty() =>
             {
@@ -463,6 +483,8 @@ impl Desk {
             .chain(&done.next_start)
             .copied()
             .collect();
+        // Only those this move took: one already moving was told of then.
+        let moved: Vec<Uuid> = moved.into_iter().filter(|id| moving.contains(id)).collect();
         {
             // A session it didn't take is told nothing of it later.
             let mut st = self.0.state.lock();
@@ -513,12 +535,13 @@ impl Desk {
             let mut st = self.0.state.lock();
             let stuck = |n: &AccountNeed| match n {
                 AccountNeed::AllFull { engine, .. } => Some(*engine),
+                // Turned away and not yet seen serving, as the parts say.
                 AccountNeed::Refused {
                     account,
                     using: None,
                     engine,
                     ..
-                } if account.id.is_some_and(|a| Self::refused_now(&st, a, now))
+                } if account.id.is_some_and(|a| st.refused.contains_key(&a))
                     && !Self::moving_off(&st, *engine, account.id).is_empty() =>
                 {
                     Some(*engine)
@@ -579,6 +602,13 @@ impl Desk {
                         };
                         key.push(format!("{}={k}", a.id));
                         parts.push(part);
+                    }
+                    if engine == Engine::Claude && Self::unchecked_now(&st, None) {
+                        key.push("own=unchecked".into());
+                        parts.push(
+                            "this computer's own sign-in didn't answer Desk's check just now"
+                                .into(),
+                        );
                     }
                     (
                         Some(format!("{}|{}", engine.as_str(), key.join("|"))),
