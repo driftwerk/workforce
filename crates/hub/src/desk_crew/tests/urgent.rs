@@ -527,3 +527,43 @@ async fn a_suggested_interrupt_said_yes_to_after_its_turn_ended_interrupts_nothi
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_suggested_interrupt_said_yes_to_in_its_turn_interrupts_it() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (overseer, crew, d, _llm) = overseeing(&base, pool, "ok", NO_INTERRUPT, &[]).await;
+        eventually("the overseer's tools", async || {
+            overseer.tools.has("crew.nudge").then_some(())
+        })
+        .await;
+        d.set_steer_wait(Duration::from_millis(300));
+        let (s, _) = working(&d, &base, "release-prep").await;
+        let row = stand_down(&d, &crew, s, Urgency::Escalate).await;
+        let suggested = eventually("the interrupt, suggested", async || {
+            d.store()
+                .suggestions(10)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|g| g.text == "Interrupt release-prep")
+        })
+        .await;
+        assert_eq!(
+            super::super::urgent::only_turn_of(&suggested.action["input"]).map(|(r, _)| r),
+            Some(row),
+            "it reads back its stand-down"
+        );
+        // The person's yes while the turn still runs: interrupted.
+        workforce_desk::crew::Crew::accept(&*crew, &suggested)
+            .await
+            .unwrap();
+        eventually("its turn interrupted", async || {
+            (d.view(s).unwrap().state == SessionState::Done).then_some(())
+        })
+        .await;
+        went_in(&d, row).await;
+    })
+    .await;
+}
