@@ -50,7 +50,8 @@ impl JobHandler for LocalJobHandler {
             | Request::Prepare(_)
             | Request::Release { .. }
             | Request::Run(_)
-            | Request::Forget { .. } => Ok(ServerFrame::Refused {
+            | Request::Forget { .. }
+            | Request::Leave { .. } => Ok(ServerFrame::Refused {
                 reason: RefusalReason::ProtocolMismatch,
             }),
             Request::Health => Ok(ServerFrame::Healthy(WorkerHealth::without_scopes())),

@@ -69,10 +69,18 @@ pub struct WorkerConfig {
     pub max_golden_age_hours: u32,
     #[serde(default)]
     pub secrets: SecretsConfig,
+    /// The share of `max_scopes` one person (or agent working for nobody)
+    /// may hold while others queue for a seat.
+    #[serde(default = "default_fair_share")]
+    pub fair_share: f64,
 }
 
 fn default_max_golden_age_hours() -> u32 {
     36
+}
+
+fn default_fair_share() -> f64 {
+    0.25
 }
 
 /// `[worker.admission]`: what each scope is charged against the host's
@@ -300,6 +308,9 @@ impl WorkerConfig {
                 bail!("[worker] {key} must be at least 1");
             }
         }
+        if !(self.fair_share > 0.0 && self.fair_share <= 1.0) {
+            bail!("[worker] fair_share must be above 0 and at most 1");
+        }
         if self.max_scopes.saturating_add(self.max_light_scopes) > MAX_SCOPES_CEILING {
             bail!(
                 "[worker] max_scopes and max_light_scopes together must be at most {MAX_SCOPES_CEILING}"
@@ -515,6 +526,7 @@ pub(crate) mod tests {
             ],
             services: Vec::new(),
             max_golden_age_hours: 36,
+            fair_share: 0.25,
             secrets: SecretsConfig {
                 github_token: Some("/workforce/prod/worker/github-read-token".into()),
                 env: BTreeMap::from([(
@@ -547,6 +559,16 @@ pub(crate) mod tests {
             .unwrap_err()
             .to_string()
             .contains("max_scopes"));
+
+        for share in [0.0, 1.5, f64::NAN] {
+            let mut config = sample();
+            config.fair_share = share;
+            assert!(config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("fair_share"));
+        }
 
         let mut config = sample();
         config.golden.push(config.golden[0].clone());

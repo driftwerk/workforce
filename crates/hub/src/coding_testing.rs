@@ -131,10 +131,16 @@ impl SandboxLauncher for Seats {
 }
 
 /// A coding worker whose every scope is busy: each prepare is refused at
-/// capacity, and counted.
+/// capacity, and counted. With `ahead` set it keeps a queue, and tells each
+/// queued prepare that many go first.
 #[derive(Default)]
 pub(crate) struct FullWorker {
     pub(crate) refused: std::sync::atomic::AtomicUsize,
+    pub(crate) ahead: Option<u32>,
+    /// Whom each queued prepare was for.
+    pub(crate) owners: std::sync::Mutex<Vec<String>>,
+    /// How many queued callers gave their place up.
+    pub(crate) left: std::sync::atomic::AtomicUsize,
 }
 
 #[async_trait]
@@ -143,6 +149,22 @@ impl SandboxLauncher for FullWorker {
         self.refused
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Err(crate::coding_sandbox::AtCapacity.into())
+    }
+    async fn ensure_queued(
+        &self,
+        spec: &WorkspaceSpec<'_>,
+        owner: &str,
+    ) -> Result<Arc<dyn CodingSandbox>> {
+        let Some(ahead) = self.ahead else {
+            return self.ensure(spec).await;
+        };
+        self.refused
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.owners.lock().unwrap().push(owner.to_string());
+        Err(crate::coding_sandbox::Queued { ahead }.into())
+    }
+    async fn leave_queue(&self, _: &str, _: &str, _: &str) {
+        self.left.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
     async fn exists(&self, _: &str, _: &str, _: &str) -> bool {
         false

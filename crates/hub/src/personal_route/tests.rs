@@ -45,7 +45,21 @@ async fn routed() -> (Hub, Arc<MemoryRouteStore>) {
 /// As [`routed`], with every Claude Code turn seated on a coding worker
 /// whose every scope is busy, waited on briefly.
 async fn routed_on_a_full_worker() -> (Hub, Arc<MemoryRouteStore>, Arc<FullWorker>) {
-    let worker = Arc::new(FullWorker::default());
+    routed_on(FullWorker::default()).await
+}
+
+/// As [`routed_on_a_full_worker`], on a worker that keeps a queue in which
+/// `ahead` go first.
+async fn routed_on_a_queueing_worker(ahead: u32) -> (Hub, Arc<MemoryRouteStore>, Arc<FullWorker>) {
+    routed_on(FullWorker {
+        ahead: Some(ahead),
+        ..FullWorker::default()
+    })
+    .await
+}
+
+async fn routed_on(worker: FullWorker) -> (Hub, Arc<MemoryRouteStore>, Arc<FullWorker>) {
+    let worker = Arc::new(worker);
     let hub = hub_seated_by(
         switch_on,
         Arc::clone(&worker) as Arc<dyn crate::coding_sandbox::SandboxLauncher>,
@@ -996,6 +1010,45 @@ async fn her_background_calls_run_the_light_and_heavy_codex_models_she_chose() {
         "anything else billed to her is heavy"
     );
     assert_eq!(hub.chatgpt_requests().await, 0);
+}
+
+#[tokio::test]
+async fn queued_on_a_full_worker_she_sees_her_place_then_hears_why_and_gives_it_up() {
+    use workforce_agent::runner::ProgressEvent;
+    let (hub, store, worker) = routed_on_a_queueing_worker(2).await;
+    hub.claude_login(ALICE);
+    hub.chatgpt_login(ALICE).await;
+    choose(&hub, &store, ALICE, Some(claude(RouteFallback::Wait))).await;
+
+    let (events, run) = hub.stream(ALICE, "hello", None, None).await;
+
+    let said = "Your Claude plan couldn't take this right now: the coding worker is full. \
+                Try again in a minute, or switch this agent to the hub's models.";
+    assert_eq!(
+        run.unwrap().response,
+        said,
+        "a wait past its bound ends as before"
+    );
+    assert!(
+        events.iter().any(
+            |event| matches!(event, ProgressEvent::SubActivity { detail, .. }
+            if detail == "queued for the coding worker · 2 ahead")
+        ),
+        "the status line says where her turn stands"
+    );
+    let owners = worker.owners.lock().unwrap().clone();
+    assert!(!owners.is_empty());
+    assert!(
+        owners
+            .iter()
+            .all(|owner| *owner == format!("person-{ALICE}")),
+        "queued under her own share: {owners:?}"
+    );
+    assert_eq!(
+        worker.left.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the place she gave up goes to the next in line"
+    );
 }
 
 #[tokio::test]

@@ -31,7 +31,7 @@ use crate::cli_session::RotationPolicy;
 use crate::code::worktree::WorktreeManager;
 use crate::coding_engine::codex;
 use crate::coding_sandbox::{
-    clean_up_detached, AtCapacity, CodingSandbox, EmptyScope, HomeSpec, SandboxCommand,
+    clean_up_detached, worker_full, CodingSandbox, EmptyScope, HomeSpec, SandboxCommand,
     SandboxLauncher,
 };
 use crate::mcp_turn::{ClientTimeout, McpExposure, RoundTools};
@@ -507,6 +507,12 @@ impl AgentTurnRig {
             "the coding worker is full; waiting up to {} for a workspace",
             spoken_duration(turn.seat_wait)
         );
+        // Whose share of the worker the turn counts against while it queues:
+        // the person it is for, else the agent working for nobody.
+        let owner = match crate::user_config::current_payer() {
+            workforce_common::subscription::Payer::Person(person) => format!("person-{person}"),
+            _ => format!("agent-{}", service.agent_id),
+        };
         let sandbox = match (EmptyScope {
             agent_id: service.agent_id.as_str(),
             project: AGENT_TURN_PROJECT,
@@ -519,18 +525,27 @@ impl AgentTurnRig {
             // releases the scope once the conversation is idle, and sooner
             // when it is full; the home stays for the next turn.
             idle_release: Some(self.idle_release),
+            queue: Some(&owner),
         })
         .seat(
             launcher.as_ref(),
             deadline.min(Instant::now() + turn.seat_wait).into_std(),
             Some(&turn.cancel),
-            || waiting(turn.cli, turn.progress.as_ref(), &full_worker),
+            |ahead| {
+                let detail = match ahead {
+                    Some(ahead) => queued_detail(ahead),
+                    None => full_worker.clone(),
+                };
+                let progress = turn.progress.clone();
+                let cli = turn.cli;
+                async move { waiting(cli, progress.as_ref(), &detail).await }
+            },
         )
         .await
         {
             Ok(sandbox) => sandbox,
             Err(_) if turn.cancel.is_cancelled() => return Err(eyre!("turn cancelled")),
-            Err(e) if e.downcast_ref::<AtCapacity>().is_some() => {
+            Err(e) if worker_full(&e) => {
                 return Ok(CliAttempt::Unserved(
                     RouteMiss::new(route.clone(), format!("no workspace for the turn: {e:#}"))
                         .worker_full(),
@@ -764,6 +779,14 @@ fn spoken_duration(wait: Duration) -> String {
         secs @ 0..=59 => format!("{secs}s"),
         60..=119 => "a minute".to_string(),
         secs => format!("{} minutes", secs / 60),
+    }
+}
+
+/// What the status line says of a turn queued for the coding worker.
+fn queued_detail(ahead: u32) -> String {
+    match ahead {
+        0 => "queued for the coding worker · next in line".to_string(),
+        ahead => format!("queued for the coding worker · {ahead} ahead"),
     }
 }
 

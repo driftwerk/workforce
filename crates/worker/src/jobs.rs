@@ -631,6 +631,7 @@ mod tests {
                 env: Vec::new(),
                 home: HomeSpec::Ephemeral,
                 yields_when_idle: false,
+                queue: None,
             })
             .await
             .unwrap();
