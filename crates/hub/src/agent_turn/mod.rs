@@ -105,6 +105,10 @@ impl TurnRoute {
     }
 }
 
+/// The least an agent turn's scope stays up once its turn is over, whatever
+/// `agent_turn_idle_secs` says: a quick reply finds it warm.
+const AGENT_TURN_IDLE_FLOOR_SECS: u64 = 60;
+
 /// Wire what runs `service`'s turns on CLI routes: workspaces from the
 /// coding executor, transcripts rotated as `/cc`'s are. Wired whatever
 /// logins exist today, since a turn resolves its payer's login itself.
@@ -128,7 +132,12 @@ pub fn wire(
             codex_worker,
             crate::cli_session::RotationPolicy::of(&service.config.claude_chat),
             std::time::Duration::from_secs(coding.executor.scope_ttl_secs),
-            std::time::Duration::from_secs(coding.executor.agent_turn_idle_secs),
+            std::time::Duration::from_secs(
+                coding
+                    .executor
+                    .agent_turn_idle_secs
+                    .max(AGENT_TURN_IDLE_FLOOR_SECS),
+            ),
         ))),
         Err(e) => tracing::error!(
             agent = %service.agent_id,

@@ -826,6 +826,16 @@ mod tests {
     }
 
     #[test]
+    fn a_prepare_from_an_older_hub_never_gives_way() {
+        let older = r#"{"kind":"prepare","scope":"s","repos":[],"ttl_secs":60,"env":[],
+            "home":{"kind":"keyed","key":"thread","ttl_secs":60}}"#;
+        let Request::Prepare(prepare) = serde_json::from_str::<Request>(older).unwrap() else {
+            panic!("a prepare");
+        };
+        assert!(!prepare.yields_when_idle);
+    }
+
+    #[test]
     fn every_server_frame_round_trips() {
         for frame in [
             ServerFrame::Ready {
