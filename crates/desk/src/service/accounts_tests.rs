@@ -4788,17 +4788,17 @@ async fn a_move_waits_for_running_work_and_a_restart_tells_what_it_stopped() {
             kind: TaskKind::Agent,
             label: Some(label.into()),
         };
-        // Its turn is done; two sub-agents it started still run.
+        // Interrupted, two sub-agents it started still run.
         let (a1, a2) = (
             agent("a1", "Watch CI on #450"),
             agent("a2", "Review the diff"),
         );
         d.change(s.id, |r, l| {
-            r.state = SessionState::Done;
+            r.state = SessionState::Interrupted;
             let l = l.expect("it runs");
             l.background = Background::default().reported(Some(vec![a1, a2]), chrono::Utc::now());
         });
-        assert_eq!(d.view(s.id).unwrap().waiting_on(), 2);
+        assert_eq!(d.view(s.id).unwrap().background.map(|b| b.count), Some(2));
 
         // Desk moves it off a full account: not while that runs.
         let moved = By::desk("Work reached its plan's limit");
@@ -4845,18 +4845,40 @@ async fn a_move_waits_for_running_work_and_a_restart_tells_what_it_stopped() {
         let v = d.view(s.id).unwrap();
         assert_eq!(v.background, None, "nothing it ran before");
         assert_eq!(v.restarted.map(|r| r.stopped), Some(1));
-        // The resumed CLI still reports it at its turn's end: not counted,
-        // and the turn that looked at it is over.
-        d.change(s.id, |r, l| {
-            r.state = SessionState::Done;
+        // The note is not what it was last asked.
+        let last = d.record(s.id).unwrap().last_prompt;
+        d.prompted(
+            s.id,
+            "This session was restarted at 18:32. Background tasks and subagents started before \
+             then were stopped. Check what each was doing, and restart any you still need."
+                .into(),
+            false,
+        );
+        assert_eq!(d.record(s.id).unwrap().last_prompt, last);
+        // The resumed CLI still reports it at its turn's end, which a new
+        // sub-agent of its own keeps open: what was stopped is not counted,
+        // what runs now is, and the turn that looked at it is over.
+        d.change(s.id, |_, l| {
             let l = l.expect("it runs");
-            l.background = std::mem::take(&mut l.background).reported(
-                Some(vec![agent("a3", "Watch CI on #451")]),
+            l.background = std::mem::take(&mut l.background).started(
+                "a4",
+                TaskKind::Agent,
                 chrono::Utc::now(),
             );
         });
+        d.turn_ended(
+            s.id,
+            None,
+            Some("Restarted the CI watch.".into()),
+            Some(vec![
+                agent("a3", "Watch CI on #451"),
+                agent("a4", "Watch CI again"),
+            ]),
+            None,
+        )
+        .await;
         let v = d.view(s.id).unwrap();
-        assert_eq!((v.waiting_on(), v.restarted), (0, None));
+        assert_eq!((v.waiting_on(), v.restarted), (1, None));
 
         // Who did each: Desk's move, the person's restart, never the other.
         let mut restarts = Vec::new();

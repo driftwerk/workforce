@@ -487,7 +487,12 @@ impl CrewHub {
             true => format!(
                 "{} {}. Make sure it restarts what it still needs of that work, and that what \
                  waited on it (CI, a review, an answer) still happens; it was told to check.",
-                event.actor.name, event.text
+                match event.actor.kind {
+                    // Said to the boss, "You" would be it.
+                    PartyKind::You => "The person",
+                    _ => event.actor.name.as_str(),
+                },
+                event.text
             ),
             false => format!("{} {}", who(subject), event.text),
         };

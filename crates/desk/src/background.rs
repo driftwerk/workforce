@@ -63,7 +63,26 @@ const NAMED_CHARS: usize = 120;
 /// The most stopped pieces named; the rest are counted.
 const NAMED_AT_MOST: usize = 8;
 
+const NOTE_STARTS: &str = "This session was restarted at ";
+const NOTE_ENDS: &str = " Check what each was doing, and restart any you still need.";
+
 impl CutOff {
+    /// `self` and `other`, both stopped and neither told yet: one.
+    pub fn merged(mut self, other: CutOff) -> Self {
+        for (kind, label) in other.named {
+            if !self.named.iter().any(|(k, l)| *k == kind && *l == label) {
+                self.named.push((kind, label));
+            }
+        }
+        let fresh = other.ids.difference(&self.ids).count();
+        self.ids.extend(other.ids);
+        self.count += match fresh {
+            0 => 0,
+            _ => other.count.min(fresh).max(1),
+        };
+        self
+    }
+
     /// What the session is told first when it runs again, restarted at
     /// `at` (local time, "18:32"): what was stopped, and to look at it.
     pub fn note(&self, at: &str) -> String {
@@ -91,9 +110,22 @@ impl CutOff {
             false => format!(" Desk knew of {}.", named.join(", ")),
         };
         format!(
-            "This session was restarted at {at}. Background tasks and subagents started before \
-             then were stopped.{which} Check what each was doing, and restart any you still need."
+            "{NOTE_STARTS}{at}. Background tasks and subagents started before \
+             then were stopped.{which}{NOTE_ENDS}"
         )
+    }
+
+    /// `prompt` without the note Desk put before it: what was asked.
+    /// `None` when the note is all there is.
+    pub fn asked(prompt: &str) -> Option<&str> {
+        let rest = match prompt.strip_prefix(NOTE_STARTS) {
+            Some(_) => prompt
+                .split_once(NOTE_ENDS)
+                .map_or(prompt, |(_, rest)| rest)
+                .trim_start(),
+            None => prompt,
+        };
+        (!rest.is_empty()).then_some(rest)
     }
 }
 
@@ -312,6 +344,12 @@ mod tests {
             note.starts_with("This session was restarted at 18:32."),
             "{note}"
         );
+        assert_eq!(CutOff::asked(&note), None);
+        assert_eq!(
+            CutOff::asked(&format!("{note}\n\nCarry on")),
+            Some("Carry on")
+        );
+        assert_eq!(CutOff::asked("Carry on"), Some("Carry on"));
         assert!(note.contains("the subagent “Watch CI on #450”"), "{note}");
         assert!(note.contains("the shell `gh run watch 123`"), "{note}");
         assert!(note.ends_with("restart any you still need."), "{note}");
