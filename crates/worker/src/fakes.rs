@@ -38,9 +38,15 @@ pub struct FakeZfs {
     free: AtomicI64,
     clock: AtomicI64,
     root: PathBuf,
+    fail_destroy: AtomicBool,
 }
 
 impl FakeZfs {
+    /// Fail the next dataset destroy, as a busy dataset does.
+    pub fn fail_next_destroy(&self) {
+        self.fail_destroy.store(true, Ordering::SeqCst);
+    }
+
     /// A pool whose datasets mount under `root`, so what a test writes to a
     /// host path is really written.
     pub fn rooted(root: PathBuf) -> Self {
@@ -49,6 +55,7 @@ impl FakeZfs {
             free: AtomicI64::new(100 << 30),
             clock: AtomicI64::new(1_700_000_000),
             root,
+            fail_destroy: AtomicBool::new(false),
         };
         for dataset in [
             "tank",
@@ -240,6 +247,9 @@ impl Zfs for FakeZfs {
     }
 
     async fn destroy(&self, dataset: &Dataset) -> Result<()> {
+        if self.fail_destroy.swap(false, Ordering::SeqCst) {
+            bail!("cannot destroy '{dataset}': dataset is busy");
+        }
         let mut state = self.state.lock();
         let prefix = format!("{}/", dataset.0);
         if !state

@@ -131,34 +131,13 @@ impl Desk {
         m: &mut LineMessage,
         urgency: Urgency,
     ) -> Result<Plan<'_>, LineError> {
-        let (engine, heard, dialog, link, mark) = {
-            let st = self.0.state.lock();
-            let engine = st.records.get(&v.id).map(|r| r.engine);
-            let mark = Self::mark_in(&st, v.id);
-            match st.live.get(&v.id) {
-                Some(l) => (
-                    engine,
-                    l.breaker.heard,
-                    l.pending.is_some(),
-                    l._codex.is_some(),
-                    mark,
-                ),
-                None => (engine, false, false, false, None),
-            }
-        };
+        let mark = self.turn_mark(v.id);
         let plan = |rushed| Plan {
             rushed,
             mark,
             counted: None,
         };
-        let heard = match engine {
-            Some(Engine::Codex) => link,
-            _ => heard,
-        };
-        let how = match engine {
-            Some(engine) => line::mid_turn(engine, v.state, heard, dialog),
-            None => Ok(None),
-        };
+        let how = self.mid_turn_of(v);
         if matches!(how, Ok(None)) || !v.live {
             return Ok(plan(Rushed::NotWorking));
         }
@@ -202,6 +181,128 @@ impl Desk {
             mark,
             counted,
         })
+    }
+
+    /// How `v` takes words mid-turn now ([`line::mid_turn`]): `Ok(None)`
+    /// when it isn't working.
+    fn mid_turn_of(&self, v: &SessionView) -> Result<Option<MidTurn>, line::Unsteerable> {
+        let (engine, heard, dialog, link) = {
+            let st = self.0.state.lock();
+            let engine = st.records.get(&v.id).map(|r| r.engine);
+            match st.live.get(&v.id) {
+                Some(l) => (
+                    engine,
+                    l.breaker.heard,
+                    l.pending.is_some(),
+                    l._codex.is_some(),
+                ),
+                None => (engine, false, false, false),
+            }
+        };
+        let heard = match engine {
+            Some(Engine::Codex) => link,
+            _ => heard,
+        };
+        match engine {
+            Some(engine) => line::mid_turn(engine, v.state, heard, dialog),
+            None => Ok(None),
+        }
+    }
+
+    /// Whether `row` waits in `id`'s steer queue, or a hook is taking it:
+    /// its running turn's next tool call reads it.
+    pub(super) fn steered(&self, id: Uuid, row: Uuid) -> bool {
+        let st = self.0.state.lock();
+        st.live.get(&id).is_some_and(|l| {
+            l.breaker.taking.contains(&row)
+                || l.breaker
+                    .steers
+                    .iter()
+                    .any(|s| matches!(s, Steer::Line { row: r } if *r == row))
+        })
+    }
+
+    /// How the person's Send now puts `m`, waiting for `v`'s turn to end,
+    /// into that turn instead, or why it can't, in plain words.
+    pub(super) fn send_now_how(&self, v: &SessionView, m: &LineMessage) -> Result<MidTurn, String> {
+        if m.delivery != line::Delivery::Queued || m.to_session() != Some(v.id) {
+            return Err("It isn't waiting to go in.".into());
+        }
+        if self.steered(v.id, m.id) || self.steer_reserved(v.id, m) {
+            return Err(
+                "It's already sent now: it reads it with its next tool call's result.".into(),
+            );
+        }
+        if self.waited_on(m) {
+            return Err("A question of its waits on this answer: it gets it there.".into());
+        }
+        if !v.live {
+            return Err("It isn't running: it gets this when it runs again.".into());
+        }
+        if let Some(wait) = self.line_gate(v, m) {
+            return Err(match wait {
+                line::Wait::Paused => "Desk's breaker paused it: only your own messages go in.",
+                line::Wait::PersonDriving => {
+                    "You're driving it: hand it back for its boss's messages to go in."
+                }
+                line::Wait::Asking => "It's asking you something: answer that first.",
+                line::Wait::ModeEnding => "Desk is putting it back in its own mode first.",
+                line::Wait::Stopped
+                | line::Wait::Working
+                | line::Wait::Typing
+                | line::Wait::NextCall => "It can't take this now.",
+            }
+            .into());
+        }
+        match self.mid_turn_of(v) {
+            Ok(Some(how)) => Ok(how),
+            Ok(None) => Err("It isn't in a turn: this goes in on its own.".into()),
+            Err(line::Unsteerable::Dialog) => {
+                Err("It's waiting on a dialog in its terminal: answer that first.".into())
+            }
+            Err(line::Unsteerable::Engine) => {
+                Err("Its engine can't take words in the middle of a turn.".into())
+            }
+            Err(line::Unsteerable::NoHooks) => Err(
+                "Desk hasn't heard its hooks in this run, so it can't reach the running turn."
+                    .into(),
+            ),
+        }
+    }
+
+    /// The person's Send now for `id`, a message waiting for its session's
+    /// turn to end: into that turn, as a boss's urgent words go (beside the
+    /// next tool call's result, or Codex's `turn/steer`). The person's own
+    /// choice, so never counted against a boss's urgent orders, and not
+    /// kept as urgent: after a restart it goes in at the turn's end. The
+    /// row as it now is.
+    pub async fn line_send_now(&self, id: Uuid) -> Result<LineMessage, LineError> {
+        let mut m = self
+            .0
+            .store
+            .line_message(id)
+            .await?
+            .ok_or(DeskError::NotFound)?;
+        let session = m.to_session().ok_or(DeskError::NotFound)?;
+        let view = self.view(session)?;
+        let how = self.send_now_how(&view, &m).map_err(DeskError::Conflict)?;
+        match how {
+            MidTurn::Hook => {
+                if let Some(l) = self.0.state.lock().live.get_mut(&session) {
+                    l.breaker.steers.push_back(Steer::Line { row: m.id });
+                }
+                // A turn that ended as it was queued: the idle takes it.
+                self.line_pump_later(session);
+                m.waiting = Some(line::Wait::NextCall);
+                self.line_announce(&m);
+            }
+            MidTurn::TurnSteer => {
+                let by = Self::typed_by(&m).unwrap_or_else(|| By::desk("sent now by the person"));
+                self.rush_codex(session, &mut m, &by).await?;
+            }
+        }
+        tracing::info!(session = %session, row = %m.id, "the person sent a waiting line message now");
+        Ok(m)
     }
 
     /// Sends the kept urgent `m` on to session `id` as `rushed` planned, as
@@ -315,6 +416,13 @@ impl Desk {
                 .any(|s| matches!(s, Steer::Line { row } if *row == m.id))
     }
 
+    /// Whether Esc ended the turn `id` is in now ([`Self::steers_stopped`]).
+    pub(super) fn esc_ended(&self, id: Uuid) -> bool {
+        let st = self.0.state.lock();
+        let mark = Self::mark_in(&st, id);
+        mark.is_some() && st.live.get(&id).is_some_and(|l| l.breaker.stopped == mark)
+    }
+
     /// Esc ended `id`'s turn: what waited for its next call goes in at the
     /// idle, never into a call the person stopped, even while Desk still
     /// reads the session as working.
@@ -327,6 +435,8 @@ impl Desk {
             }
         }
         self.steers_released(id);
+        // What Desk kept through the turn goes to the plugin now.
+        self.line_wake(id);
     }
 
     /// What goes with `id`'s tool call result (hook `event`): the breaker's

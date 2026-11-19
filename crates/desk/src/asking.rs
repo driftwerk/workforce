@@ -104,6 +104,15 @@ impl Denied {
     pub fn name(&self) -> &str {
         self.tool.split('(').next().unwrap_or(&self.tool).trim()
     }
+
+    /// Whether it is Desk's own line answering one of its tools (its words
+    /// are the call's result, which the session read and went on from):
+    /// no verdict of auto mode's and no safety check, so it stops no turn
+    /// and asks the person nothing. Auto mode's own refusal of a line tool
+    /// stays a refusal.
+    pub fn of_line_tool(&self) -> bool {
+        crate::claude::is_line_tool(&self.call.tool) && !self.allowable && self.transient
+    }
 }
 
 /// Whether a refusal's reason is the classifier's verdict: not one it gave
@@ -234,6 +243,14 @@ pub fn denials_in<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<Denied> {
                         .get(id)
                         .map(|(n, i)| (n.as_str(), Some(i)))
                         .unwrap_or(("a tool", None));
+                    // Desk's own line answering its tool (marked as a
+                    // permission rule's): the session read its words and
+                    // went on, no refusal the turn stops on. Auto mode's
+                    // refusal of one stays a refusal.
+                    if kind == "permission-rule" && crate::claude::is_line_tool(name) {
+                        went_on(&mut out, true);
+                        continue;
+                    }
                     out.push(Denied::new(
                         name,
                         input,
@@ -618,6 +635,53 @@ mod tests {
             asked.why,
             "auto mode refused Bash ([Credential Exploration])"
         );
+    }
+
+    /// Cufflink Migration, 19 Nov: Desk's line refused its reply (the line's
+    /// own rule, which Claude Code marks as a permission rule's refusal),
+    /// and the turn ended there on its own words. Nothing was stopped, and
+    /// nothing waits on the person to allow.
+    #[test]
+    fn a_desk_line_tool_turned_down_by_the_line_is_no_refusal() {
+        let lines = turn(&[
+            prompt("Desk asks you: resend the rest in short form."),
+            tool_use(
+                "t1",
+                "mcp__desk__reply",
+                json!({ "message_id": "4288d9ac", "text": "The short form, resent." }),
+            ),
+            result(
+                "t1",
+                "<tool_use_error>There is no question 4288d9ac waiting on you.</tool_use_error>",
+                Some("permission-rule"),
+            ),
+            reply("I've resent Desk the reply, and I'm changing nothing until Desk answers."),
+        ]);
+        assert!(denials_in(lines.lines()).is_empty());
+        // Auto mode refusing a line tool is still a refusal.
+        let blocked = turn(&[
+            prompt("Ask Desk which key to use."),
+            tool_use(
+                "t1",
+                "mcp__desk__ask",
+                json!({ "to": "desk", "text": "Which key?" }),
+            ),
+            result("t1", REFUSED, Some("automode-blocked")),
+        ]);
+        assert_eq!(denials_in(blocked.lines()).len(), 1);
+        assert!(!Denied::from_hook(
+            "mcp__desk__ask",
+            None,
+            "[Credential Exploration] reads a key"
+        )
+        .of_line_tool());
+        let hooked = Denied::from_hook(
+            "mcp__desk__reply",
+            Some(&json!({ "message_id": "4288d9ac" })),
+            "",
+        );
+        assert!(hooked.of_line_tool());
+        assert!(!Denied::from_hook("Bash", Some(&json!({ "command": "ls" })), "").of_line_tool());
     }
 
     #[test]

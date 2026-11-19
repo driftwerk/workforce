@@ -14,8 +14,10 @@ use workforce_common::personal_route::{
 use workforce_common::settings::WorkforceConfig;
 use workforce_common::subscription::{CredentialTier, SubscriptionKind};
 
-use crate::agent_turn::tests::{hub, Hub, ALICE};
+use crate::agent_turn::tests::{hub, hub_seated_by, Hub, ALICE};
+use crate::agent_turn::SeatWait;
 use crate::claude_code::tests::scripted::{answer, assistant, print, rejected, result};
+use crate::coding_testing::FullWorker;
 use crate::hub_core::personal_routes::{MemoryRouteStore, PersonRouteStore};
 use crate::subscription::test_support::SKY;
 
@@ -38,6 +40,41 @@ async fn routed() -> (Hub, Arc<MemoryRouteStore>) {
         .personal_routes()
         .attach_store(Arc::clone(&store) as Arc<dyn PersonRouteStore>);
     (hub, store)
+}
+
+/// As [`routed`], with every Claude Code turn seated on a coding worker
+/// whose every scope is busy, waited on briefly.
+async fn routed_on_a_full_worker() -> (Hub, Arc<MemoryRouteStore>, Arc<FullWorker>) {
+    routed_on(FullWorker::default()).await
+}
+
+/// As [`routed_on_a_full_worker`], on a worker that keeps a queue in which
+/// `ahead` go first.
+async fn routed_on_a_queueing_worker(ahead: u32) -> (Hub, Arc<MemoryRouteStore>, Arc<FullWorker>) {
+    routed_on(FullWorker {
+        ahead: Some(ahead),
+        ..FullWorker::default()
+    })
+    .await
+}
+
+async fn routed_on(worker: FullWorker) -> (Hub, Arc<MemoryRouteStore>, Arc<FullWorker>) {
+    let worker = Arc::new(worker);
+    let hub = hub_seated_by(
+        switch_on,
+        Arc::clone(&worker) as Arc<dyn crate::coding_sandbox::SandboxLauncher>,
+        SeatWait {
+            before_another_route: std::time::Duration::from_millis(200),
+            last_route: std::time::Duration::from_millis(400),
+        },
+    )
+    .await;
+    let store = Arc::new(MemoryRouteStore::default());
+    hub.service
+        .subscriptions()
+        .personal_routes()
+        .attach_store(Arc::clone(&store) as Arc<dyn PersonRouteStore>);
+    (hub, store, worker)
 }
 
 async fn choose(hub: &Hub, store: &MemoryRouteStore, person: &str, route: Option<PersonalRoute>) {
@@ -973,6 +1010,116 @@ async fn her_background_calls_run_the_light_and_heavy_codex_models_she_chose() {
         "anything else billed to her is heavy"
     );
     assert_eq!(hub.chatgpt_requests().await, 0);
+}
+
+#[tokio::test]
+async fn queued_on_a_full_worker_she_sees_her_place_then_hears_why_and_gives_it_up() {
+    use workforce_agent::runner::ProgressEvent;
+    let (hub, store, worker) = routed_on_a_queueing_worker(2).await;
+    hub.claude_login(ALICE);
+    hub.chatgpt_login(ALICE).await;
+    choose(&hub, &store, ALICE, Some(claude(RouteFallback::Wait))).await;
+
+    let (events, run) = hub.stream(ALICE, "hello", None, None).await;
+
+    let said = "Your Claude plan couldn't take this right now: the coding worker is full. \
+                Try again in a minute, or switch this agent to the hub's models.";
+    assert_eq!(
+        run.unwrap().response,
+        said,
+        "a wait past its bound ends as before"
+    );
+    assert!(
+        events.iter().any(
+            |event| matches!(event, ProgressEvent::SubActivity { detail, .. }
+            if detail == "queued for the coding worker · 2 ahead")
+        ),
+        "the status line says where her turn stands"
+    );
+    let owners = worker.owners.lock().unwrap().clone();
+    assert!(!owners.is_empty());
+    assert!(
+        owners
+            .iter()
+            .all(|owner| *owner == format!("person-{ALICE}")),
+        "queued under her own share: {owners:?}"
+    );
+    assert_eq!(
+        worker.left.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the place she gave up goes to the next in line"
+    );
+}
+
+#[tokio::test]
+async fn on_a_full_worker_with_wait_she_is_told_why_and_what_to_do_and_the_status_line_is_closed() {
+    use workforce_agent::runner::ProgressEvent;
+    let (hub, store, worker) = routed_on_a_full_worker().await;
+    hub.claude_login(ALICE);
+    hub.chatgpt_login(ALICE).await;
+    choose(&hub, &store, ALICE, Some(claude(RouteFallback::Wait))).await;
+
+    let (events, run) = hub.stream(ALICE, "hello", None, None).await;
+
+    let said = "Your Claude plan couldn't take this right now: the coding worker is full. \
+                Try again in a minute, or switch this agent to the hub's models.";
+    assert_eq!(run.unwrap().response, said, "the turn answers her");
+    assert!(
+        worker.refused.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "it waited for a workspace, and tried again"
+    );
+    let waited = events.iter().position(|event| {
+        matches!(event, ProgressEvent::SubActivity { detail, .. }
+            if detail.contains("coding worker is full") && detail.contains("waiting up to"))
+    });
+    let waited = waited.expect("the wait was shown, with its bound");
+    let answered = events
+        .iter()
+        .rposition(|event| matches!(event, ProgressEvent::Response { text } if text == said))
+        .expect("the notice reached the watcher as the turn's answer");
+    assert!(waited < answered);
+    assert!(
+        events[answered..]
+            .iter()
+            .any(|event| matches!(event, ProgressEvent::Done { .. })),
+        "and the turn was finished after it, so every surface closes its status line"
+    );
+    assert!(hub.claude.calls().is_empty());
+    assert_eq!(hub.chatgpt_requests().await, 0, "she chose to wait");
+
+    let kept = hub
+        .service
+        .sessions
+        .get_or_create("web", ALICE, hub.service.agent_id.as_str())
+        .unwrap();
+    assert_eq!(
+        kept.messages.last().map(|m| m.content.as_str()),
+        Some(said),
+        "the notice is kept as the turn's answer"
+    );
+}
+
+#[tokio::test]
+async fn on_a_full_worker_with_hub_her_turn_runs_on_the_hubs_models_and_says_so() {
+    use workforce_agent::runner::ProgressEvent;
+    let (hub, store, _worker) = routed_on_a_full_worker().await;
+    hub.claude_login(ALICE);
+    hub.chatgpt_login(ALICE).await;
+    choose(&hub, &store, ALICE, Some(claude(RouteFallback::Hub))).await;
+
+    let (events, run) = hub.stream(ALICE, "why is the sky blue?", None, None).await;
+
+    let note = "\n\n_Your Claude plan couldn't take this right now (the coding worker was \
+                full), so the hub's models answered._";
+    assert_eq!(run.unwrap().response, format!("{SKY}{note}"));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ProgressEvent::StreamDelta { text } if text == note)),
+        "the note is streamed as the answer's last part, so screen and record agree"
+    );
+    assert!(hub.claude.calls().is_empty());
+    assert!(hub.chatgpt_requests().await > 0, "the hub's route answered");
 }
 
 /// What `person`'s own conversations with the agent are shown to run on.

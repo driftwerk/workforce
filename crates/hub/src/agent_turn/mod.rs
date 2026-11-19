@@ -18,6 +18,8 @@ pub(crate) mod tests;
 pub(crate) mod tool_loop;
 
 pub use cli::AgentTurnRig;
+#[cfg(test)]
+pub(crate) use cli::SeatWait;
 pub use round::TOOL_SEARCH;
 pub use tool_loop::{ProviderLoop, ToolLoop, UsageFn};
 
@@ -103,6 +105,24 @@ impl TurnRoute {
     }
 }
 
+/// The least an agent turn's scope stays up once its turn is over, whatever
+/// `agent_turn_idle_secs` says: a quick reply finds it warm.
+const AGENT_TURN_IDLE_FLOOR_SECS: u64 = 60;
+
+/// How long an agent turn's scope stays up once its turn is over: as
+/// configured, but never under [`AGENT_TURN_IDLE_FLOOR_SECS`], which is said.
+fn agent_turn_idle_secs(agent: &str, configured: u64) -> u64 {
+    if configured < AGENT_TURN_IDLE_FLOOR_SECS {
+        tracing::warn!(
+            agent,
+            configured,
+            floor = AGENT_TURN_IDLE_FLOOR_SECS,
+            "agent_turn_idle_secs is under its floor; the floor applies"
+        );
+    }
+    configured.max(AGENT_TURN_IDLE_FLOOR_SECS)
+}
+
 /// Wire what runs `service`'s turns on CLI routes: workspaces from the
 /// coding executor, transcripts rotated as `/cc`'s are. Wired whatever
 /// logins exist today, since a turn resolves its payer's login itself.
@@ -126,6 +146,10 @@ pub fn wire(
             codex_worker,
             crate::cli_session::RotationPolicy::of(&service.config.claude_chat),
             std::time::Duration::from_secs(coding.executor.scope_ttl_secs),
+            std::time::Duration::from_secs(agent_turn_idle_secs(
+                service.agent_id.as_str(),
+                coding.executor.agent_turn_idle_secs,
+            )),
         ))),
         Err(e) => tracing::error!(
             agent = %service.agent_id,
@@ -423,6 +447,12 @@ impl RouteTag {
 pub struct RouteMiss {
     pub route: String,
     pub reason: String,
+    /// The CLI route that missed, and whether it was the person's own: whose
+    /// plan a person is told could not take the turn.
+    pub plan: Option<(CliKind, bool)>,
+    /// The coding worker had no workspace for the turn: every scope on it
+    /// was busy for as long as the turn could wait.
+    pub worker_full: bool,
 }
 
 impl RouteMiss {
@@ -430,8 +460,158 @@ impl RouteMiss {
         Self {
             route,
             reason: reason.into(),
+            plan: None,
+            worker_full: false,
         }
     }
+
+    /// This miss, for want of a workspace on a full coding worker.
+    fn worker_full(self) -> Self {
+        Self {
+            worker_full: true,
+            ..self
+        }
+    }
+
+    /// This miss, of the CLI route on `cli`, the person's own when
+    /// `personal`.
+    fn on_plan(self, cli: CliKind, personal: bool) -> Self {
+        Self {
+            plan: Some((cli, personal)),
+            ..self
+        }
+    }
+}
+
+/// The plan a CLI's turns run on, as a person names it.
+fn plan_name(cli: CliKind) -> &'static str {
+    match cli {
+        CliKind::ClaudeCode => "Claude",
+        CliKind::Codex => "ChatGPT",
+    }
+}
+
+/// Whose plan `plan` is, as the person the turn is for reads it.
+fn whose(plan: (CliKind, bool)) -> String {
+    match plan {
+        (cli, true) => format!("Your {} plan", plan_name(cli)),
+        (cli, false) => format!("This agent's {} plan", plan_name(cli)),
+    }
+}
+
+/// What the person hears when no route served because the coding worker was
+/// full: why, and what to do. A person whose route waits rather than fall
+/// back is told they can let it. Only for a person in the loop
+/// (`interactive`): a job or trigger fails with its misses instead, so it is
+/// retried or alerted on. And only when the worker is all that stood in the
+/// way, every other miss a login one: a route that failed for some other
+/// reason is not hidden behind a full worker.
+fn worker_full_notice(
+    misses: &[RouteMiss],
+    personal_only: bool,
+    interactive: bool,
+) -> Option<String> {
+    if !interactive
+        || !misses
+            .iter()
+            .all(|miss| miss.worker_full || names_a_login(&miss.reason))
+    {
+        return None;
+    }
+    let plan = misses.iter().find(|miss| miss.worker_full)?.plan?;
+    let advice = match personal_only {
+        true => "Try again in a minute, or switch this agent to the hub's models.",
+        false => "Try again in a minute.",
+    };
+    Some(format!(
+        "{} couldn't take this right now: the coding worker is full. {advice}",
+        whose(plan)
+    ))
+}
+
+/// The line a served turn ends with when the person's own route could not
+/// take it for want of a workspace on a full coding worker and another
+/// route did (`by`, as the person reads it): brief, and only what they need
+/// to know. Every other hand-over (no login of hers, her plan at its limit,
+/// the agent's own failover) stays as quiet as it always was, so a standing
+/// setup never closes each answer with the same line. Only a person in the
+/// loop (`interactive`) is told; a job's answer is its own.
+fn fallback_note(misses: &[RouteMiss], by: &str, interactive: bool) -> Option<String> {
+    if !interactive {
+        return None;
+    }
+    let miss = misses
+        .iter()
+        .find(|miss| miss.worker_full && miss.plan.is_some_and(|(_, personal)| personal))?;
+    let plan = whose(miss.plan?);
+    Some(format!(
+        "\n\n_{plan} couldn't take this right now (the coding worker was full), so {by} answered._"
+    ))
+}
+
+/// Stream `note` to whoever watches the turn as the last part of its answer,
+/// before the answer is given whole, so what is on screen and what is kept
+/// are the same words and nothing follows the turn's `Done`.
+async fn stream_note(note: &str, progress: &mpsc::Sender<ProgressEvent>) {
+    for event in [
+        ProgressEvent::StreamStart,
+        ProgressEvent::StreamDelta {
+            text: note.to_string(),
+        },
+        ProgressEvent::StreamEnd,
+    ] {
+        let _ = progress.send(event).await;
+    }
+}
+
+/// A progress channel for a runner route whose answer closes with `note`:
+/// everything the runner says passes through, its whole answer with the
+/// note streamed just before and appended, so the note lands before `Done`.
+/// Await the handle once the runner is over, before anything else is said.
+fn noting(
+    note: Option<&str>,
+    progress: Option<&mpsc::Sender<ProgressEvent>>,
+) -> (
+    Option<mpsc::Sender<ProgressEvent>>,
+    Option<tokio::task::JoinHandle<()>>,
+) {
+    let (Some(note), Some(progress)) = (note, progress) else {
+        return (progress.cloned(), None);
+    };
+    let (tx, mut rx) = mpsc::channel(64);
+    let (note, progress) = (note.to_string(), progress.clone());
+    let forward = tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            let event = match event {
+                ProgressEvent::Response { text } => {
+                    stream_note(&note, &progress).await;
+                    ProgressEvent::Response {
+                        text: format!("{text}{note}"),
+                    }
+                }
+                event => event,
+            };
+            let _ = progress.send(event).await;
+        }
+    });
+    (Some(tx), Some(forward))
+}
+
+/// No route served, and `text` says why: the turn's answer, given to
+/// whoever watches it as a finished one, so every surface replaces its
+/// status line with it. A bare `Response` is enough: the notice comes only
+/// after every route missed before any output (a miss after output is an
+/// error, not a miss), so no surface has a streamed answer to keep.
+async fn notice(text: String, progress: Option<&mpsc::Sender<ProgressEvent>>) -> ChainOutcome {
+    if let Some(progress) = progress {
+        for event in [
+            ProgressEvent::Response { text: text.clone() },
+            done_of(&TokenUsage::default(), 0, 0),
+        ] {
+            let _ = progress.send(event).await;
+        }
+    }
+    ChainOutcome::Notice { text }
 }
 
 /// No route of a turn could serve it; each says why.
@@ -572,21 +752,32 @@ impl TurnChain {
                         true => runner,
                         false => runner.without_silent_retry(),
                     };
-                    match Box::pin(run_runner(
+                    let note = fallback_note(&misses, "the hub's models", interactive);
+                    let (watched, forward) = noting(note.as_deref(), progress.as_ref());
+                    let ran = Box::pin(run_runner(
                         &runner,
                         task.clone(),
                         prior.clone(),
-                        progress.clone(),
+                        watched,
                         Some(cancel.clone()),
                         inbox,
                     ))
-                    .await
-                    {
-                        Ok(result) => {
+                    .await;
+                    // Every sender the runner was given is dropped once it
+                    // returns (tools read the turn's progress sender inline,
+                    // never keeping it), so the forwarder ends here.
+                    if let Some(forward) = forward {
+                        let _ = forward.await;
+                    }
+                    match ran {
+                        Ok(mut result) => {
+                            if let Some(note) = &note {
+                                result.response.push_str(note);
+                            }
                             return Ok(ChainOutcome::Served {
                                 result: Box::new(result),
                                 route: RouteTag::Runner,
-                            })
+                            });
                         }
                         Err(e) if !answered(slice.as_deref()) && !cancel.is_cancelled() => {
                             tracing::warn!(agent = %service.agent_id, route = %route.name(), error = %e, "turn route unserved; trying the next");
@@ -603,10 +794,11 @@ impl TurnChain {
                     let rig = match rig_or_miss(service, route) {
                         Ok(rig) => rig,
                         Err(miss) => {
-                            misses.push(miss);
+                            misses.push(miss.on_plan(*cli, *personal));
                             continue;
                         }
                     };
+                    let seat_wait = rig.seat_wait().of(at == last);
                     let mut inbox = inbox;
                     let mut tries = 0;
                     loop {
@@ -629,6 +821,7 @@ impl TurnChain {
                                     progress: progress.clone(),
                                     cancel: cancel.clone(),
                                     timeout: AGENT_TURN_TIMEOUT,
+                                    seat_wait,
                                 },
                                 Some(&conversation),
                                 inbox.take(),
@@ -637,10 +830,22 @@ impl TurnChain {
                         .await?;
                         match attempt {
                             CliAttempt::Served(served) => {
+                                let note = fallback_note(
+                                    &misses,
+                                    &match personal {
+                                        true => format!("your {} plan", plan_name(*cli)),
+                                        false => format!("this agent's {} plan", plan_name(*cli)),
+                                    },
+                                    interactive,
+                                )
+                                .unwrap_or_default();
                                 if let Some(progress) = &progress {
+                                    if !note.is_empty() {
+                                        stream_note(&note, progress).await;
+                                    }
                                     let _ = progress
                                         .send(ProgressEvent::Response {
-                                            text: served.text.clone(),
+                                            text: format!("{}{note}", served.text),
                                         })
                                         .await;
                                     let _ = progress
@@ -652,8 +857,10 @@ impl TurnChain {
                                         .await;
                                 }
                                 let slot = served.slot.clone();
+                                let mut result = served.into_result(seeds.invocations.clone());
+                                result.response.push_str(&note);
                                 return Ok(ChainOutcome::Served {
-                                    result: Box::new(served.into_result(seeds.invocations.clone())),
+                                    result: Box::new(result),
                                     route: RouteTag::Cli { cli: *cli, slot },
                                 });
                             }
@@ -675,14 +882,17 @@ impl TurnChain {
                                 };
                             }
                             CliAttempt::Unserved(miss) => {
-                                tracing::warn!(agent = %service.agent_id, route = %miss.route, reason = %miss.reason, "turn route unserved; trying the next");
-                                misses.push(miss);
+                                tracing::warn!(agent = %service.agent_id, route = %miss.route, reason = %miss.reason, worker_full = miss.worker_full, "turn route unserved; trying the next");
+                                misses.push(miss.on_plan(*cli, *personal));
                                 break;
                             }
                         }
                     }
                 }
             }
+        }
+        if cancel.is_cancelled() {
+            eyre::bail!("turn cancelled");
         }
         let connect = match misses.iter().all(|miss| names_a_login(&miss.reason)) {
             true => {
@@ -691,8 +901,14 @@ impl TurnChain {
             }
             false => None,
         };
-        match connect {
-            Some(connect) => Ok(connect.notice(progress.as_ref()).await),
+        if let Some(connect) = connect {
+            return Ok(connect.notice(progress.as_ref()).await);
+        }
+        match worker_full_notice(&misses, self.personal_only(), interactive) {
+            Some(text) => {
+                tracing::warn!(agent = %service.agent_id, misses = %describe(&misses), "no route could serve the turn: the coding worker is full; the person is told");
+                Ok(notice(text, progress.as_ref()).await)
+            }
             None => Err(TurnUnavailable { misses }.into()),
         }
     }

@@ -259,13 +259,24 @@ pub fn spawn(s: &ClaudeSpawn<'_>) -> Spawn {
     }
 }
 
+/// How Claude Code names Desk's plugin's line tools: `mcp__desk__reply`.
+pub const LINE_TOOL_PREFIX: &str = "mcp__desk__";
+
 /// What Claude Code names Desk's plugin's line tools (`mcp__desk__reply`),
 /// as `permissions.allow` lists them.
 pub fn line_tools_allowed() -> Vec<String> {
     crate::line::TOOLS
         .iter()
-        .map(|t| format!("mcp__desk__{}", t.name))
+        .map(|t| format!("{LINE_TOOL_PREFIX}{}", t.name))
         .collect()
+}
+
+/// Whether the tool Claude Code calls `name` is one of Desk's own line
+/// tools. What turns one down is the line's own rule, said to the session
+/// in the call's result (Claude Code marks it as a permission rule's
+/// refusal): never auto mode's, nor anything the person is to allow.
+pub fn is_line_tool(name: &str) -> bool {
+    name.starts_with(LINE_TOOL_PREFIX)
 }
 
 /// Where Desk's plugin posts the plan's rate limits from.

@@ -12764,6 +12764,7 @@ dependencies = [
  "eyre",
  "futures",
  "hex",
+ "libc",
  "parking_lot",
  "reqwest 0.12.28",
  "serde",

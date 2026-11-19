@@ -43,7 +43,8 @@ brief, column, who has it, what it needs and what waits on it, its comments and 
 for a ticket of a plan, the plan and where it runs (machine, folder, engine, model). Read it before \
 you change a ticket.";
 
-pub const EDIT_DESCRIPTION: &str = "Change a ticket on one of Desk's own boards (ticket, its key): \
+pub const EDIT_DESCRIPTION: &str =
+    "Change a ticket on one of Desk's own boards (ticket, its key): \
 its title, its brief in full (body), or words added to the end of its brief (append, which keeps \
 what it says). Only what you give changes. For a ticket of a plan that hasn't started, machine, \
 folder, engine and model say where its session runs: that, and its words, change through the plan, \
@@ -595,7 +596,14 @@ impl CrewHub {
                 let lines: Vec<String> = page
                     .events
                     .iter()
-                    .map(|e| format!("{} · {} · {}", e.at.to_rfc3339(), e.actor.name, cell(&e.text)))
+                    .map(|e| {
+                        format!(
+                            "{} · {} · {}",
+                            e.at.to_rfc3339(),
+                            e.actor.name,
+                            cell(&e.text)
+                        )
+                    })
                     .collect();
                 out["history"] = json!(reported(&lines.join("\n"), &format!("{key}'s history")));
             }
@@ -622,9 +630,10 @@ impl CrewHub {
         let runs = RUNS
             .iter()
             .any(|f| input.get(*f).is_some_and(|v| !v.is_null()));
-        let words = ["title", "body", "append"]
-            .iter()
-            .any(|f| input.get(*f).is_some_and(|v| !v.is_null()));
+        // A blank title or addition says nothing; an empty brief is said.
+        let words = said(input, "title")?.is_some()
+            || said(input, "append")?.is_some()
+            || input.get("body").is_some_and(|v| !v.is_null());
         let store = self.desk.store();
         let plan = match store.plan_of_ticket(t.ticket.id).await {
             Ok(Some(id)) => store.plan(id).await.ok().flatten(),
@@ -747,8 +756,7 @@ impl CrewHub {
                 }
                 // A plan keeps its own tickets' needs: one made here would
                 // be undone at its next revision.
-                if let (Some((p, _)), Some((q, _))) =
-                    (&plan, self.open_plan_of(o.ticket.id).await)
+                if let (Some((p, _)), Some((q, _))) = (&plan, self.open_plan_of(o.ticket.id).await)
                 {
                     if *p == q {
                         return Err(format!(
@@ -759,7 +767,8 @@ impl CrewHub {
             }
             // A plan's own ticket goes with the plan: deleting it would
             // leave the plan naming a ticket that isn't there.
-            TicketChange::Delete if plan.as_ref().is_some_and(|(_, adopted)| !adopted) => {
+            // Taken on from its board or not: the plan still names it.
+            TicketChange::Delete if plan.is_some() => {
                 return Err(format!(
                     "{ticket} is a ticket of an open plan: take it out through the plan (crew.plan_update), or drop it (crew.move_ticket)."
                 ));
