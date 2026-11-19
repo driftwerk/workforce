@@ -1900,8 +1900,12 @@ async fn a_boss_finds_tickets_and_plans_on_them_as_they_are() {
             d.list().into_iter().find(|v| v.name == keys[0])
         })
         .await;
-        let t = d.ticket_by_key(&keys[0]).await.unwrap();
-        assert_eq!(t.ticket.session(), Some(first.id));
+        // Its ticket is given it as the start ends: a moment after it shows.
+        let t = eventually("its ticket given that session", async || {
+            let t = d.ticket_by_key(&keys[0]).await.ok()?;
+            (t.ticket.session() == Some(first.id)).then_some(t)
+        })
+        .await;
         assert_eq!(t.ticket.title, "The cart empties on reload", "as it was");
         // Nothing copied: the board has its three and the plan's new one.
         assert_eq!(d.tickets(b.id, &Default::default()).await.unwrap().len(), 4);
