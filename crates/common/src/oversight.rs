@@ -13,7 +13,7 @@
 //! max_checkins_per_hour = 6
 //! max_checkins_per_day = 100
 //! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = true, interrupt = false, message_agents = false, message_terminal_sessions = false, answer_sessions = true, hand_off = false, set_mode = false }
-//! work = { prefer_sessions = true, parallel = 4, take_on = "handed", engine = "claude", model = "", max_turns_per_hour = 60, close_finished = true }
+//! work = { style = "sessions_only", parallel = 4, take_on = "handed", engine = "claude", model = "", max_turns_per_hour = 60, close_finished = true }
 //! full = { repos = ["acme/acme-web", "~/dev/globex-api"], workflows = ["deploy.yml", "promote.yml"], budget_usd_per_day = 25 }
 //! updates = { cheap_calls_per_day = 500, account_questions_per_day = 60, close_from_accounts = false, enabled = true, every_minutes = 3, max_wait_minutes = 10, away_after_minutes = 15 }
 //! ```
@@ -336,13 +336,72 @@ fn model_name_ok(m: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "-_.:/[]@".contains(c))
 }
 
+/// How the overseer does the work it is given: in real, visible sessions
+/// the person can watch, type into and take over, or itself.
+///
+/// `[oversight.work] style` says it. A config from before `style` says
+/// `prefer_sessions` (a switch) instead: on is [`Self::SessionsOnly`], off
+/// [`Self::Direct`]. `style` wins when both are there, and Desk writes
+/// both, so a hub that doesn't know `style` reads Prefer sessions as the
+/// stricter Only in sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkStyle {
+    /// Only in sessions: no coding work in-process (`code.*` and
+    /// `coding.*` calls that change or run something, file writes inside
+    /// code), no commands of its own, and helpers only for read-only
+    /// lookups.
+    #[default]
+    SessionsOnly,
+    /// Prefer sessions: changing code and long tasks go to sessions, while
+    /// checks, lookups and ops (ssh, gh, reading files and logs, a quick
+    /// command) it may run itself.
+    PreferSessions,
+    /// Do it myself: no session preference.
+    Direct,
+}
+
+impl WorkStyle {
+    pub const ALL: [Self; 3] = [Self::SessionsOnly, Self::PreferSessions, Self::Direct];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionsOnly => "sessions_only",
+            Self::PreferSessions => "prefer_sessions",
+            Self::Direct => "direct",
+        }
+    }
+
+    /// Its name in Desk's settings, as the person reads it.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::SessionsOnly => "Only in sessions",
+            Self::PreferSessions => "Prefer sessions",
+            Self::Direct => "Do it myself",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|w| w.as_str() == s.trim())
+    }
+
+    /// Whether code changes and long tasks go to real sessions: every
+    /// style but Do it myself.
+    pub fn sessions_for_code(self) -> bool {
+        self != Self::Direct
+    }
+
+    /// Whether every command, build and code change goes to a session.
+    pub fn sessions_only(self) -> bool {
+        self == Self::SessionsOnly
+    }
+}
+
 /// How the overseer runs sessions for the person.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Work {
-    /// Always work in real, visible sessions: no coding work in-process
-    /// (`code.*` and `coding.*` calls that change or run something) and
-    /// helpers only for read-only lookups. The key keeps its first name.
-    pub prefer_sessions: bool,
+    /// Whether it does the work in real sessions or itself ([`WorkStyle`]).
+    pub style: WorkStyle,
     /// How many of its sessions may be starting or working at once.
     pub parallel: u32,
     pub take_on: TakeOn,
@@ -681,8 +740,8 @@ impl Default for Oversight {
                 nudge: true,
                 resume_restart: true,
                 read_only_approvals: false,
-                // At Act it starts the sessions its work needs: with
-                // `prefer_sessions` on too, that is how it does any.
+                // At Act it starts the sessions its work needs: working
+                // only in sessions too, that is how it does any.
                 hand_out_work: true,
                 interrupt: false,
                 message_agents: false,
@@ -692,7 +751,7 @@ impl Default for Oversight {
                 set_mode: false,
             },
             work: Work {
-                prefer_sessions: true,
+                style: WorkStyle::SessionsOnly,
                 parallel: 4,
                 take_on: TakeOn::Handed,
                 engine: "claude".into(),
@@ -1057,6 +1116,24 @@ impl Oversight {
             root.and_then(|t| t.get("updates")),
             "how it keeps you posted",
         )?;
+        // `style`, else the switch it replaced: on is only in sessions.
+        let style = match work.and_then(|t| t.get("style")) {
+            Some(Value::String(s)) if WorkStyle::parse(s).is_some() => {
+                WorkStyle::parse(s).unwrap_or_default()
+            }
+            Some(_) => {
+                return Err("How it works must be \"sessions_only\" (Only in sessions), \"prefer_sessions\" (Prefer sessions) or \"direct\" (Do it myself).".into())
+            }
+            None => match switch(
+                work,
+                "prefer_sessions",
+                d.work.style.sessions_for_code(),
+                "always using real sessions",
+            )? {
+                true => WorkStyle::SessionsOnly,
+                false => WorkStyle::Direct,
+            },
+        };
         let take_on = match work.and_then(|t| t.get("take_on")) {
             None => d.work.take_on,
             Some(Value::String(s)) if s.trim() == "handed" => TakeOn::Handed,
@@ -1284,12 +1361,7 @@ impl Oversight {
                 )?,
             },
             work: Work {
-                prefer_sessions: switch(
-                    work,
-                    "prefer_sessions",
-                    d.work.prefer_sessions,
-                    "always using real sessions",
-                )?,
+                style,
                 parallel: whole(
                     work,
                     "parallel",
@@ -1789,7 +1861,7 @@ mod tests {
     #[test]
     fn how_it_runs_sessions_defaults_to_real_ones_four_at_a_time_only_those_handed_it() {
         let d = parse("[oversight]\nenabled = true\n").unwrap().work;
-        assert!(d.prefer_sessions);
+        assert_eq!(d.style, WorkStyle::SessionsOnly);
         assert_eq!((d.parallel, d.take_on), (4, TakeOn::Handed));
         assert_eq!((d.engine.as_str(), d.max_turns_per_hour), ("claude", 60));
         assert_eq!(d.model, None, "the engine's own default model");
@@ -1817,7 +1889,7 @@ mod tests {
         assert_eq!(
             inline.work,
             Work {
-                prefer_sessions: false,
+                style: WorkStyle::Direct,
                 parallel: 12,
                 take_on: TakeOn::All,
                 engine: "codex".into(),
@@ -1826,6 +1898,64 @@ mod tests {
                 close_finished: false,
             }
         );
+    }
+
+    /// The three ways of working, and the switch they replaced read as
+    /// the two it was: an old config works as it did.
+    #[test]
+    fn how_it_works_is_its_style_or_the_switch_it_replaced() {
+        let style = |src: &str| parse(src).map(|o| o.work.style);
+        for (src, want) in [
+            ("[oversight]\nenabled = true\n", WorkStyle::SessionsOnly),
+            // The switch, as configs before `style` say it.
+            (
+                "[oversight]\nwork = { prefer_sessions = true }\n",
+                WorkStyle::SessionsOnly,
+            ),
+            (
+                "[oversight]\nwork = { prefer_sessions = false }\n",
+                WorkStyle::Direct,
+            ),
+            (
+                "[oversight]\n[oversight.work]\nstyle = \"sessions_only\"\n",
+                WorkStyle::SessionsOnly,
+            ),
+            (
+                "[oversight]\nwork = { style = \"prefer_sessions\" }\n",
+                WorkStyle::PreferSessions,
+            ),
+            (
+                "[oversight]\nwork = { style = \" direct \" }\n",
+                WorkStyle::Direct,
+            ),
+            // `style` wins: Desk writes both, the switch for older hubs.
+            (
+                "[oversight]\nwork = { style = \"prefer_sessions\", prefer_sessions = true }\n",
+                WorkStyle::PreferSessions,
+            ),
+            (
+                "[oversight]\nwork = { style = \"direct\", prefer_sessions = true }\n",
+                WorkStyle::Direct,
+            ),
+        ] {
+            assert_eq!(style(src), Ok(want), "{src}");
+        }
+        for wrong in [
+            "[oversight]\nwork = { style = \"sometimes\" }\n",
+            "[oversight]\nwork = { style = true }\n",
+        ] {
+            let e = style(wrong).unwrap_err();
+            assert!(
+                e.starts_with("How it works must be") && e.contains("Do it myself"),
+                "{wrong} → {e}"
+            );
+        }
+        for w in WorkStyle::ALL {
+            assert_eq!(WorkStyle::parse(w.as_str()), Some(w));
+        }
+        assert!(WorkStyle::PreferSessions.sessions_for_code());
+        assert!(!WorkStyle::PreferSessions.sessions_only());
+        assert!(!WorkStyle::Direct.sessions_for_code());
     }
 
     #[test]
