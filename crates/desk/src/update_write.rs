@@ -258,6 +258,8 @@ const MISSING_WORDS: &[&str] = &[
     "no answer",
     "no answers",
     "no recorded answer",
+    "no recorded answers",
+    "nothing recorded",
     "no reply",
     "not answered",
     "unanswered",

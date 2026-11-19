@@ -415,13 +415,13 @@ impl CrewHub {
             .collect();
         let open: Vec<OpenItem> = all_open
             .iter()
-            .cloned()
             // The person in that session now: theirs, nothing said of it,
             // nor counted as said again.
             .filter(|i| {
                 !matches!(i.kind, OpenKind::Ask | OpenKind::Confirm)
                     || i.session.is_none_or(|s| !self.person_in_for(s, i.opened_at, gap))
             })
+            .cloned()
             .collect();
         let restated: Vec<(Uuid, bool)> = match composed {
             true => self
