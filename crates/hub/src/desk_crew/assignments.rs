@@ -1363,6 +1363,7 @@ impl CrewHub {
             hop: 0,
             about: Some(format!("assignment:{session}")),
             group,
+            handed: None,
         };
         let crew = Arc::clone(self);
         tokio::spawn(async move {

@@ -389,12 +389,13 @@ impl CrewHub {
     /// One turn of the overseer's on `session`'s line, for `messages`,
     /// and for what `ended` says of its turn's end when the overseer runs
     /// it (a work turn).
+    /// Whether its boss's turn ran.
     pub(crate) async fn answer_line(
         &self,
         session: Uuid,
         messages: Vec<LineMessage>,
         ended: Vec<String>,
-    ) {
+    ) -> bool {
         // Its boss decides it with nothing else of its own deciding at
         // once, its prompt and picture read once it holds its mind
         // ([`super::mind`]).
@@ -417,7 +418,13 @@ impl CrewHub {
             .map(|(s, _)| s.agent_id.as_str().to_string())
     }
 
-    async fn answer_line_now(&self, session: Uuid, messages: Vec<LineMessage>, ended: Vec<String>) {
+    /// Whether the boss's turn ran.
+    async fn answer_line_now(
+        &self,
+        session: Uuid,
+        messages: Vec<LineMessage>,
+        ended: Vec<String>,
+    ) -> bool {
         // Taken back from its boss, it is the person's: what it tells Desk
         // is kept (its thread, the picture) and no boss's turn is spent on
         // it; what it asks goes to the person.
@@ -432,7 +439,7 @@ impl CrewHub {
                 "Desk no longer runs this session, so its questions come to you.",
             )
             .await;
-            return;
+            return false;
         }
         // The overseer of the session's scope answers it, and no other.
         let Some((service, o)) = self.overseer_of_session(session) else {
@@ -442,7 +449,7 @@ impl CrewHub {
                 .collect();
             self.all_to_person(session, &asks, "No overseer answers sessions now.")
                 .await;
-            return;
+            return false;
         };
         // Held by Desk's breaker, it takes no turns: what its session asks
         // goes straight to the person, saying why, and its turn's end waits
@@ -454,7 +461,7 @@ impl CrewHub {
                 .collect();
             let why = format!("{} is {held}, so this came to you.", name_of(&service));
             self.all_to_person(session, &asks, &why).await;
-            return;
+            return false;
         }
         // Each read again as it is now: one the session's move (or anyone)
         // took from this overseer since it was gathered isn't its to read,
@@ -493,7 +500,7 @@ impl CrewHub {
             }
         }
         if kept.is_empty() && ended.is_empty() {
-            return;
+            return false;
         }
         let mut messages = kept;
         let mut asks: Vec<LineMessage> = messages
@@ -505,7 +512,7 @@ impl CrewHub {
         if let Some(why) = straight_to_person(&o, hop) {
             self.all_to_person(session, &asks, why).await;
             if ended.is_empty() {
-                return;
+                return false;
             }
             // Its turn's end is still the overseer's to follow up.
             messages.retain(|m| m.kind != LineKind::Ask);
@@ -518,7 +525,7 @@ impl CrewHub {
                 "Desk has no conversation with you to work from yet.",
             )
             .await;
-            return;
+            return false;
         };
         {
             let mut known = self.questions.lock();
@@ -639,6 +646,7 @@ impl CrewHub {
                     .await;
             }
         }
+        ran.is_ok()
     }
 
     /// What the overseer reads for a session's messages to it, and its
@@ -1008,10 +1016,10 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 session,
                 (
                     tokio::spawn(async move {
-                        crew.answer_line(session, messages, ended).await;
+                        let ran = crew.answer_line(session, messages, ended).await;
                         // A refused next step handed to it was its to take
-                        // (`super::idle`).
-                        if let Some(b) = &turn_boss {
+                        // (`super::idle`), once its turn ran.
+                        if let Some(b) = turn_boss.as_ref().filter(|_| ran) {
                             crew.full_turn_over(b, session);
                         }
                         // What its turn was given and left open is the
