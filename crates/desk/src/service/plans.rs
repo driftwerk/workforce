@@ -1568,8 +1568,7 @@ impl Desk {
         let mut next = match (&edit.tickets, &edit.ticket_edits) {
             (Some(_), Some(_)) => {
                 return Err(DeskError::Invalid(
-                    "Say every ticket (tickets) or the ones to change (tickets_edit), not both."
-                        .into(),
+                    "Say every ticket the plan is to have, or the ones to change, not both.".into(),
                 ))
             }
             (None, Some(edits)) => {
@@ -1577,7 +1576,8 @@ impl Desk {
                 // anything else is read of the edit.
                 let moved: Vec<Problem> = edits
                     .iter()
-                    .filter(|e| e.moves() && started.contains(&e.id))
+                    .filter(|e| started.contains(&e.id))
+                    .filter(|e| newest.ticket(e.id).is_none_or(|was| e.moves_from(was)))
                     .filter_map(|e| {
                         let t = rows.iter().find(|t| t.id == e.id)?;
                         let column = match (t.state, t.starting) {

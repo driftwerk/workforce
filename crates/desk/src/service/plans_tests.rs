@@ -765,23 +765,30 @@ async fn a_ticket_edited_by_its_key_keeps_its_brief_and_a_started_one_keeps_wher
                 .contains("ACM-1 has started (it is in Doing), so where it runs can't change"),
             "{refused}"
         );
-        // Its title still changes: that isn't where it runs.
-        d.change_plan(
-            id,
-            PlanEdit {
-                ticket_edits: Some(vec![TicketEdit {
-                    id: a,
-                    title: Some("a, renamed".into()),
+        // Its title still changes: that isn't where it runs, nor is where
+        // it runs already, said again.
+        let renamed = d
+            .change_plan(
+                id,
+                PlanEdit {
+                    ticket_edits: Some(vec![TicketEdit {
+                        id: a,
+                        title: Some("a, renamed".into()),
+                        folder: Some(dir.path().to_string_lossy().into_owned()),
+                        machine: Some("local".into()),
+                        ..Default::default()
+                    }]),
                     ..Default::default()
-                }]),
-                ..Default::default()
-            },
-            Engine::Claude,
-            false,
-            &By::you(),
-        )
-        .await
-        .unwrap();
+                },
+                Engine::Claude,
+                false,
+                &By::you(),
+            )
+            .await
+            .unwrap();
+        assert!(renamed.applied);
+        let newest = renamed.plan.revisions.last().unwrap();
+        assert_eq!(newest.snapshot.ticket(a).unwrap().title, "a, renamed");
 
         // Never both lists.
         let both = d

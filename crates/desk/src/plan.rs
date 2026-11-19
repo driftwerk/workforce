@@ -444,6 +444,34 @@ impl TicketEdit {
             || self.machine.is_some()
             || self.model.is_some()
     }
+
+    /// Whether it changes where, or how, `was` runs: a field it gives that
+    /// says what `was` says already changes nothing.
+    pub fn moves_from(&self, was: &Planned) -> bool {
+        let differs = |said: &Option<String>, now: Option<&str>| {
+            said.as_deref()
+                .map(str::trim)
+                .is_some_and(|s| s != now.unwrap_or_default())
+        };
+        let machine = self.machine.as_deref().map(str::trim).is_some_and(|m| {
+            let m = (!m.is_empty() && !m.eq_ignore_ascii_case(THIS_COMPUTER)).then_some(m);
+            match (m, was.machine.as_deref()) {
+                (None, None) => false,
+                (Some(a), Some(b)) => !a.eq_ignore_ascii_case(b),
+                _ => true,
+            }
+        });
+        let engine = self
+            .engine
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|e| !e.eq_ignore_ascii_case(was.engine.as_str()));
+        machine
+            || engine
+            || differs(&self.folder, Some(&was.folder))
+            || differs(&self.view, was.view.map(|v| v.as_str()))
+            || differs(&self.model, was.model.as_deref())
+    }
 }
 
 /// `before` with `edits` made, each to the ticket of it its id names; the
@@ -527,7 +555,21 @@ pub fn edited(before: &Snapshot, edits: &[TicketEdit]) -> Result<Snapshot, Vec<P
                 true => None,
                 false => Some(to),
             };
-            if now != was.machine.as_deref() && e.folder.is_none() {
+            // The machine it runs on already, however it is spelled.
+            let same = match (now, was.machine.as_deref()) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                _ => false,
+            };
+            if same {
+                t.machine = Some(
+                    was.machine
+                        .clone()
+                        .unwrap_or_else(|| THIS_COMPUTER.to_string()),
+                );
+                continue;
+            }
+            if e.folder.is_none() {
                 problems.push(Problem::MovedWithoutFolder {
                     key: key.clone(),
                     machine: now.unwrap_or("this computer").to_string(),

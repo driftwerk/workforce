@@ -129,6 +129,12 @@ impl CrewHub {
             .map(str::trim)
             .filter(|p| !p.is_empty())
         else {
+            if input
+                .get("briefs")
+                .is_some_and(|v| !v.is_null() && *v != Value::Bool(false))
+            {
+                return Err("Briefs are read for one plan: give its plan_id with briefs.".into());
+            }
             return self.board(&b.seen).await;
         };
         let briefs = super::plan::briefs_of(input)?;

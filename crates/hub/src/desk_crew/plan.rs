@@ -206,8 +206,8 @@ is one it has (leave both out to add one, or give adopt: a key from crew.find_ti
 ticket on as it is), with needs by place in the list; one it has that leaves out its title or body \
 keeps them. Not both. Leaving out one it took on lets it go where it is, never dropped. Read its \
 tickets and briefs first with crew.board (plan_id, briefs). machine and model here are for new \
-tickets only. A ticket that has started can't change where it runs. Reordering, needs, titles \
-and descriptions apply at once, and so does where a ticket not started runs, on a machine and in \
+tickets only. A ticket that has started can't change where it runs. Reordering, needs and titles \
+apply at once, and so does where a ticket not started runs, on a machine and in \
 a folder the approved plan already uses; adding or dropping a ticket, changing the goal or what a \
 ticket says, or moving one to a machine or folder the approved plan doesn't use waits for the \
 person to approve, while the plan runs on as approved. A draft the person hasn't approved stays \
@@ -665,39 +665,76 @@ pub(crate) fn plan_out_with(p: &PlanDetail, briefs: &Briefs) -> Value {
     }
     let mut left = BRIEFS_CHARS;
     let mut cut = Vec::new();
+    let mut shortened = Vec::new();
     let mut found = HashSet::new();
+    // The words the newest revision gives each, what a change is made on;
+    // the board's own while a revision waits for the person.
+    let newest = p.revisions.last().map(|r| &r.snapshot);
+    let waits = p.summary.plan.approved_revision != Some(p.summary.plan.revision);
     if let Some(rows) = out["tickets"].as_array_mut() {
         for (row, t) in rows.iter_mut().zip(&p.tickets) {
-            let key = t.ticket.key.clone().unwrap_or_default();
+            let id = t.ticket.ticket.id;
+            // A ticket with no key is named by its id.
+            let key = t.ticket.key.clone().unwrap_or_else(|| id.to_string());
             let wanted = match briefs {
                 Briefs::None => false,
                 Briefs::All => true,
-                Briefs::Of(keys) => keys.contains(&key.to_uppercase()),
+                Briefs::Of(keys) => {
+                    keys.contains(&key.to_uppercase())
+                        || keys.contains(&id.to_string().to_uppercase())
+                }
             };
             if !wanted {
                 continue;
             }
             found.insert(key.to_uppercase());
-            let body = &t.ticket.ticket.body;
+            found.insert(id.to_string().to_uppercase());
+            let body = newest
+                .and_then(|s| s.ticket(id))
+                .filter(|n| !n.adopted)
+                .map_or(t.ticket.ticket.body.as_str(), |n| n.body.as_str());
             let n = body.chars().count();
-            if n > left {
-                cut.push(key);
-                continue;
+            let body: std::borrow::Cow<'_, str> = match (n > left, briefs) {
+                // Alone, it is given as far as it fits.
+                (true, Briefs::Of(keys)) if keys.len() == 1 => {
+                    shortened.push(key.clone());
+                    body.chars().take(left).collect::<String>().into()
+                }
+                (true, _) => {
+                    cut.push(key);
+                    continue;
+                }
+                (false, _) => body.into(),
+            };
+            left = left.saturating_sub(body.chars().count());
+            row["brief"] = json!(reported(&body, &format!("{key}'s brief")));
+            if waits && body != t.ticket.ticket.body.as_str() {
+                row["brief_waits"] = json!(true);
             }
-            left -= n;
-            row["brief"] = json!(reported(body, &format!("{key}'s brief")));
         }
     }
     let mut notes = Vec::new();
     if !cut.is_empty() {
         notes.push(format!(
-            "Too long to give at once, so left out: {}. Ask for them by key (briefs: [\"{}\"]).",
+            "Too long to give at once, so left out: {}. Ask for each by key alone (briefs: [\"{}\"]).",
             cut.join(", "),
             cut[0]
         ));
     }
+    if !shortened.is_empty() {
+        notes.push(format!(
+            "{}'s brief is longer than can be given here: only its first {BRIEFS_CHARS} characters are. Change it by its whole words only once you have them from the person.",
+            shortened.join(", ")
+        ));
+    }
+    if waits {
+        notes.push("A brief marked brief_waits is as the plan's newest revision says it, which waits for the person to approve.".into());
+    }
     if let Briefs::Of(keys) = briefs {
-        let mut missing: Vec<&String> = keys.iter().filter(|k| !found.contains(*k)).collect();
+        let mut missing: Vec<&String> = keys
+            .iter()
+            .filter(|k| !found.contains(&k.to_uppercase()))
+            .collect();
         missing.sort();
         if !missing.is_empty() {
             notes.push(format!(
@@ -1125,11 +1162,25 @@ impl CrewHub {
             }
             None => None,
         };
+        // Words kept for a known ticket that left them out are the ones read
+        // here: the change is made on this revision, or refused as stale.
+        let filled = input
+            .get("tickets")
+            .and_then(Value::as_array)
+            .is_some_and(|l| {
+                l.iter().any(|t| {
+                    (t.get("key").is_some_and(|k| !k.is_null())
+                        || t.get("id").is_some_and(|k| !k.is_null()))
+                        && (t.get("title").is_none_or(Value::is_null)
+                            || t.get("body").is_none_or(Value::is_null))
+                })
+            });
+        let said_revision = input
+            .get("revision")
+            .and_then(Value::as_i64)
+            .and_then(|r| i32::try_from(r).ok());
         let edit = PlanEdit {
-            revision: input
-                .get("revision")
-                .and_then(Value::as_i64)
-                .and_then(|r| i32::try_from(r).ok()),
+            revision: said_revision.or(filled.then_some(detail.summary.plan.revision)),
             goal: input
                 .get("goal")
                 .and_then(Value::as_str)
