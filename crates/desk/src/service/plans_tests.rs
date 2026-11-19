@@ -686,6 +686,123 @@ async fn a_started_ticket_keeps_where_it_runs_and_dropping_the_plan_stops_or_lea
     .await;
 }
 
+#[tokio::test]
+async fn a_ticket_edited_by_its_key_keeps_its_brief_and_a_started_one_keeps_where_it_runs() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let mut new = new_plan(dir.path(), &[("a", &[]), ("b", &[0])]);
+        new.draft.tickets[1].body = "Read through the cache, and say what got faster.".into();
+        let p = d.propose_plan(new, &sarah(), &by_sarah()).await.unwrap();
+        let id = p.summary.plan.id;
+        let p = d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let (a, b) = (p.tickets[0].ticket.ticket.id, p.tickets[1].ticket.ticket.id);
+        let start = Start {
+            ticket: a,
+            engine: Engine::Claude,
+            folder: dir.path().to_string_lossy().into_owned(),
+            view: None,
+            worktree: false,
+        };
+        d.plan_start(&p.summary.plan, &start, &sarah(), &by_sarah())
+            .await
+            .unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let elsewhere = other.path().to_string_lossy().into_owned();
+        let edit = |id: Uuid, key: &str| TicketEdit {
+            id,
+            key: Some(key.into()),
+            folder: Some(elsewhere.clone()),
+            ..Default::default()
+        };
+
+        // Only the folder of the one not started changes.
+        let changed = d
+            .change_plan(
+                id,
+                PlanEdit {
+                    ticket_edits: Some(vec![edit(b, "ACM-2")]),
+                    ..Default::default()
+                },
+                Engine::Claude,
+                false,
+                &By::you(),
+            )
+            .await
+            .unwrap();
+        assert!(changed.applied);
+        let t = changed
+            .plan
+            .tickets
+            .iter()
+            .find(|t| t.ticket.ticket.id == b)
+            .unwrap();
+        assert_eq!(t.folder.as_deref(), Some(elsewhere.as_str()));
+        assert_eq!(t.ticket.ticket.title, "b");
+        assert_eq!(
+            t.ticket.ticket.body, "Read through the cache, and say what got faster.",
+            "its brief is kept"
+        );
+        assert_eq!(t.ticket.ticket.needs, vec![a], "its needs are kept");
+
+        // The started one is refused by its key, and says why.
+        let refused = d
+            .change_plan(
+                id,
+                PlanEdit {
+                    ticket_edits: Some(vec![edit(a, "ACM-1")]),
+                    ..Default::default()
+                },
+                Engine::Claude,
+                false,
+                &By::you(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("ACM-1 has started (it is in Doing), so where it runs can't change"),
+            "{refused}"
+        );
+        // Its title still changes: that isn't where it runs.
+        d.change_plan(
+            id,
+            PlanEdit {
+                ticket_edits: Some(vec![TicketEdit {
+                    id: a,
+                    title: Some("a, renamed".into()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+            Engine::Claude,
+            false,
+            &By::you(),
+        )
+        .await
+        .unwrap();
+
+        // Never both lists.
+        let both = d
+            .change_plan(
+                id,
+                PlanEdit {
+                    tickets: Some(kept(&d.plan(id).await.unwrap())),
+                    ticket_edits: Some(vec![edit(b, "ACM-2")]),
+                    ..Default::default()
+                },
+                Engine::Claude,
+                false,
+                &By::you(),
+            )
+            .await
+            .unwrap_err();
+        assert!(both.to_string().contains("not both"), "{both}");
+    })
+    .await;
+}
+
 /// A ticket's session runs the model the person chose for it.
 #[tokio::test]
 async fn a_tickets_session_runs_the_tickets_model() {

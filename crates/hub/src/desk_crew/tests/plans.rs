@@ -534,6 +534,107 @@ async fn a_boss_keeps_its_plan_current_and_a_change_of_scope_waits_for_the_perso
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_boss_moves_tickets_by_key_keeping_their_briefs_and_reads_them_back() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
+        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("the plan tools", async || overseer.tools.has("crew.plan").then_some(())).await;
+        let folder = dir.path().to_string_lossy().into_owned();
+        let made = overseer
+            .tools
+            .get("crew.plan")
+            .unwrap()
+            .execute(json!({ "goal": "Faster reads", "tickets": [
+                { "title": "Add the cache", "body": "Cache the index; keep it under 50 MB.", "folder": folder },
+                { "title": "Use the cache", "body": "Read through the cache.", "folder": folder, "needs": [0] },
+            ] }))
+            .await
+            .unwrap();
+        let plan = &made.output["proposed"];
+        let id = plan["plan_id"].as_str().unwrap().to_string();
+        let keys: Vec<String> = plan["tickets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["key"].as_str().unwrap().to_string())
+            .collect();
+        let update = overseer.tools.get("crew.plan_update").unwrap();
+        // Both to devbox, by key alone: titles and briefs stay.
+        let r = update
+            .execute(json!({ "plan_id": id, "why": "The person wants it on devbox.",
+                "tickets_edit": [
+                    { "key": keys[0], "machine": "devbox", "folder": "/home/dev/projects/driftwerk/vellev" },
+                    { "key": keys[1].to_lowercase(), "machine": "devbox", "folder": "/home/dev/projects/driftwerk/vellev" },
+                ] }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        let board = overseer.tools.get("crew.board").unwrap();
+        let read = board
+            .execute(json!({ "plan_id": id, "briefs": [keys[1]] }))
+            .await
+            .unwrap();
+        assert!(read.success, "{read:?}");
+        let rows = read.output["plan"]["tickets"].as_array().unwrap().clone();
+        assert!(rows.iter().all(|t| t["machine"] == "devbox"), "{rows:?}");
+        assert_eq!(rows[1]["title"], "Use the cache");
+        assert!(rows[0].get("brief").is_none(), "only the brief asked for");
+        assert!(
+            rows[1]["brief"].as_str().unwrap().contains("Read through the cache."),
+            "{rows:?}"
+        );
+        let all = board
+            .execute(json!({ "plan_id": id, "briefs": true }))
+            .await
+            .unwrap();
+        assert!(all.output["plan"]["tickets"][0]["brief"]
+            .as_str()
+            .unwrap()
+            .contains("under 50 MB"));
+        // A whole list that leaves out a title and a body keeps them.
+        let r = update
+            .execute(json!({ "plan_id": id, "why": "Order.", "tickets": [
+                { "key": keys[0], "folder": "/home/dev/projects/driftwerk/vellev" },
+                { "key": keys[1], "folder": "/home/dev/projects/driftwerk/vellev", "needs": [0] },
+            ] }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        let p = d.plan(id.parse().unwrap()).await.unwrap();
+        assert_eq!(p.tickets[0].ticket.ticket.title, "Add the cache");
+        assert_eq!(p.tickets[0].ticket.ticket.body, "Cache the index; keep it under 50 MB.");
+        assert_eq!(p.tickets[1].machine.as_deref(), Some("devbox"), "where it runs is kept");
+        // Refused in the boss's words.
+        let said = |r: workforce_agent::tools::ToolResult| format!("{r:?}");
+        let unknown = update
+            .execute(json!({ "plan_id": id, "why": "x", "tickets_edit": [{ "key": "ZZZ-9", "folder": "/x" }] }))
+            .await
+            .unwrap();
+        assert!(said(unknown).contains("ZZZ-9 isn't one of the plan's tickets"));
+        let away = update
+            .execute(json!({ "plan_id": id, "why": "x", "tickets_edit": [{ "key": keys[0], "machine": "local" }] }))
+            .await
+            .unwrap();
+        assert!(said(away).contains("moves to this computer: say its folder there too"));
+        let both = update
+            .execute(json!({ "plan_id": id, "why": "x",
+                "tickets": tickets(dir.path(), 1),
+                "tickets_edit": [{ "key": keys[0], "model": "opus" }] }))
+            .await
+            .unwrap();
+        assert!(said(both).contains("not both"));
+        // Another's plan is read as none.
+        let none = board
+            .execute(json!({ "plan_id": uuid::Uuid::new_v4().to_string() }))
+            .await
+            .unwrap();
+        assert!(!none.success);
+    })
+    .await;
+}
+
 /// How many of the boss's model requests say `marker`.
 async fn said(llm: &wiremock::MockServer, marker: &str) -> usize {
     llm.received_requests()

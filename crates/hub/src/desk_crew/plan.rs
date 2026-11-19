@@ -198,11 +198,18 @@ pub const BOARD_CREATE_DESCRIPTION: &str = "Make a board of Desk's own for work 
 have with that prefix is given back as it is. Make it yourself when the person asks for a board; \
 then crew.plan with board, or crew.plan_update with board to move a plan onto it. Say why.";
 
-pub const UPDATE_DESCRIPTION: &str = "Keep a plan of yours current (plan_id): give every ticket \
-it is to have, in order, each by its id or key when it is one it has (leave both out to add one, \
-or give adopt: a key from crew.find_tickets to take that ticket on as it is), with needs by place \
-in the list. Leaving out one it took on lets it go where it is, never dropped. Reordering, needs, \
-titles and descriptions, and where a ticket not started runs apply at once; adding or dropping a ticket, or changing the goal, waits for the \
+pub const UPDATE_DESCRIPTION: &str = "Keep a plan of yours current (plan_id). To change some \
+of its tickets, give tickets_edit: each by its key with only what changes (machine, folder, \
+engine, model, title, body); everything else of it is kept, its brief and needs too. To change \
+the list itself, give tickets: every ticket it is to have, in order, each by its id or key when it \
+is one it has (leave both out to add one, or give adopt: a key from crew.find_tickets to take that \
+ticket on as it is), with needs by place in the list; one it has that leaves out its title or body \
+keeps them. Not both. Leaving out one it took on lets it go where it is, never dropped. Read its \
+tickets and briefs first with crew.board (plan_id, briefs). machine and model here are for new \
+tickets only. A ticket that has started can't change where it runs. Reordering, needs, titles \
+and descriptions apply at once, and so does where a ticket not started runs, on a machine and in \
+a folder the approved plan already uses; adding or dropping a ticket, changing the goal or what a \
+ticket says, or moving one to a machine or folder the approved plan doesn't use waits for the \
 person to approve, while the plan runs on as approved. A draft the person hasn't approved stays \
 one: unbound, start_now with the person's own words asking to start it approves it. board (a \
 prefix) or new_board moves the whole plan to that board in your group, each ticket re-filed under \
@@ -228,6 +235,21 @@ fn ticket_schema() -> Value {
         "needs": { "type": "array", "items": { "type": "integer", "minimum": 0 },
             "description": "The places (from 0) in this list of the tickets it needs done first" }
     }, "required": ["folder"] })
+}
+
+fn ticket_edit_schema() -> Value {
+    json!({ "type": "object", "properties": {
+        "key": { "type": "string", "description": "The ticket, by its key, like VEL-2 (or id: its id)" },
+        "id": { "type": "string", "description": "The ticket, by its id, where its board has no keys" },
+        "title": { "type": "string", "description": "Its new title; not for one taken on" },
+        "body": { "type": "string", "description": "Its new brief, in full; not for one taken on" },
+        "engine": { "type": "string", "description": "claude or codex, only when the person named one" },
+        "folder": { "type": "string", "description": "Absolute path of the folder it works in, on the computer it runs on" },
+        "machine": machine_schema("Where it runs now"),
+        "model": { "type": "string", "description": "The model its session runs; \"\" is its engine's own" },
+        "view": { "type": "string", "enum": ["terminal"] }
+    },
+    "description": "One ticket of the plan, by its key: only what is given changes" })
 }
 
 fn new_board_schema() -> Value {
@@ -327,6 +349,8 @@ pub fn update_schema() -> Value {
         "parallel": { "type": "integer", "minimum": 1, "maximum": 12 },
         "budget": budget_schema(),
         "tickets": { "type": "array", "items": ticket_schema(), "minItems": 1, "maxItems": plan::MAX_TICKETS },
+        "tickets_edit": { "type": "array", "items": ticket_edit_schema(), "minItems": 1, "maxItems": plan::MAX_TICKETS,
+            "description": "Tickets it has, each changed in place by its key; not with tickets" },
         "start_now": start_now_schema(),
         "why": { "type": "string", "description": "Why, in a sentence the person reads" }
     }, "required": ["plan_id", "why"] })
@@ -350,11 +374,14 @@ fn plain(e: workforce_desk::DeskError) -> String {
 
 /// The tickets of a tool's input: as written, with a ticket named by its
 /// key read as its id among `known` (key → id), and one it takes on by
-/// the id `adopted` found for its place.
+/// the id `adopted` found for its place. A ticket the plan has that leaves
+/// out its title or body keeps the one `kept` says it has (by id), so
+/// leaving them out never empties them.
 fn tickets_of(
     input: &Value,
     known: &HashMap<String, Uuid>,
     adopted: &HashMap<usize, Uuid>,
+    kept: &HashMap<Uuid, (String, String)>,
 ) -> Result<Vec<DraftTicket>, String> {
     let Some(list) = input.get("tickets").and_then(Value::as_array) else {
         return Err("Say the tickets.".into());
@@ -401,11 +428,159 @@ fn tickets_of(
                     }
                 }
                 o.remove("key");
+                let had = o
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .and_then(|i| i.trim().parse::<Uuid>().ok())
+                    .and_then(|id| kept.get(&id));
+                if let (Some((title, body)), None) = (had, adopted.get(&i)) {
+                    if o.get("title").is_none_or(Value::is_null) {
+                        o.insert("title".into(), json!(title));
+                    }
+                    if o.get("body").is_none_or(Value::is_null) {
+                        o.insert("body".into(), json!(body));
+                    }
+                }
             }
             serde_json::from_value(t).map_err(|e| format!("Ticket {} doesn't read: {e}.", i + 1))
         })
         .collect()
 }
+
+/// The fields a ticket's edit may say, each a string.
+const EDIT_FIELDS: [&str; 7] = [
+    "title", "body", "engine", "folder", "machine", "model", "view",
+];
+
+/// `tickets_edit` of a tool's input, each by the id its key names among
+/// `known` (key → id), or its id among the plan's own (`kept`); none when
+/// it isn't given.
+fn edits_of(
+    input: &Value,
+    known: &HashMap<String, Uuid>,
+    kept: &HashMap<Uuid, (String, String)>,
+) -> Result<Option<Vec<plan::TicketEdit>>, String> {
+    let list = match input.get("tickets_edit") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Array(l)) if !l.is_empty() => l,
+        Some(_) => {
+            return Err("tickets_edit is a list of the tickets to change, each by its key.".into())
+        }
+    };
+    let mut out = Vec::with_capacity(list.len());
+    for (i, e) in list.iter().enumerate() {
+        let Some(o) = e.as_object() else {
+            return Err(format!("Edit {} isn't a ticket's change.", i + 1));
+        };
+        let key = o
+            .get("key")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|k| !k.is_empty());
+        let named = o
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|k| !k.is_empty());
+        let (id, key) = match (key, named) {
+            (Some(k), _) => {
+                let k = k.to_uppercase();
+                let id = *known
+                    .get(&k)
+                    .ok_or_else(|| format!("{k} isn't one of the plan's tickets."))?;
+                (id, Some(k))
+            }
+            (None, Some(raw)) => {
+                let id = raw
+                    .parse::<Uuid>()
+                    .ok()
+                    .filter(|id| kept.contains_key(id))
+                    .ok_or_else(|| format!("{raw} isn't one of the plan's tickets."))?;
+                let key = known
+                    .iter()
+                    .find(|(_, v)| **v == id)
+                    .map(|(k, _)| k.clone());
+                (id, key)
+            }
+            (None, None) => {
+                return Err(format!(
+                    "Edit {} says no ticket: give its key, like VEL-2.",
+                    i + 1
+                ))
+            }
+        };
+        let field = |f: &str| -> Result<Option<String>, String> {
+            match o.get(f) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::String(v)) => Ok(Some(v.clone())),
+                Some(_) => Err(format!(
+                    "{}'s {f} is a string.",
+                    key.as_deref().unwrap_or("That ticket")
+                )),
+            }
+        };
+        let mut edit = plan::TicketEdit {
+            id,
+            key: key.clone(),
+            ..Default::default()
+        };
+        for f in EDIT_FIELDS {
+            let v = field(f)?;
+            match f {
+                "title" => edit.title = v,
+                "body" => edit.body = v,
+                "engine" => edit.engine = v,
+                "folder" => edit.folder = v,
+                "machine" => edit.machine = v,
+                "model" => edit.model = v,
+                _ => edit.view = v,
+            }
+        }
+        if !EDIT_FIELDS
+            .iter()
+            .any(|f| o.get(*f).is_some_and(|v| !v.is_null()))
+        {
+            return Err(format!(
+                "The edit of {} changes nothing: say what of it changes.",
+                edit.name()
+            ));
+        }
+        out.push(edit);
+    }
+    Ok(Some(out))
+}
+
+/// Which tickets' briefs a plan read back carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Briefs {
+    None,
+    All,
+    /// By key, as typed in capitals.
+    Of(HashSet<String>),
+}
+
+/// The briefs a read tool's input asks for: `briefs: true`, or a list of
+/// keys.
+pub(crate) fn briefs_of(input: &Value) -> Result<Briefs, String> {
+    match input.get("briefs") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => Ok(Briefs::None),
+        Some(Value::Bool(true)) => Ok(Briefs::All),
+        Some(Value::Array(keys)) => keys
+            .iter()
+            .map(|k| {
+                k.as_str()
+                    .map(|k| k.trim().to_uppercase())
+                    .filter(|k| !k.is_empty())
+                    .ok_or_else(|| "briefs is true, or a list of tickets' keys.".to_string())
+            })
+            .collect::<Result<HashSet<_>, _>>()
+            .map(Briefs::Of),
+        Some(_) => Err("briefs is true, or a list of tickets' keys.".into()),
+    }
+}
+
+/// The most characters of briefs one read back carries.
+const BRIEFS_CHARS: usize = 48_000;
 
 /// A string field of a tool's input, trimmed, when said.
 fn str_of<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
@@ -477,6 +652,72 @@ pub(crate) fn machine_of_items<'a>(items: impl IntoIterator<Item = &'a String>) 
 
 /// A plan as the boss reads it back: its tickets by key, id and place.
 fn plan_out(p: &PlanDetail) -> Value {
+    plan_out_with(p, &Briefs::None)
+}
+
+/// [`plan_out`], with the briefs `briefs` asks for, as what was reported
+/// (a ticket taken on says what its board says), up to [`BRIEFS_CHARS`]
+/// in all.
+pub(crate) fn plan_out_with(p: &PlanDetail, briefs: &Briefs) -> Value {
+    let mut out = plan_view(p);
+    if *briefs == Briefs::None {
+        return out;
+    }
+    let mut left = BRIEFS_CHARS;
+    let mut cut = Vec::new();
+    let mut found = HashSet::new();
+    if let Some(rows) = out["tickets"].as_array_mut() {
+        for (row, t) in rows.iter_mut().zip(&p.tickets) {
+            let key = t.ticket.key.clone().unwrap_or_default();
+            let wanted = match briefs {
+                Briefs::None => false,
+                Briefs::All => true,
+                Briefs::Of(keys) => keys.contains(&key.to_uppercase()),
+            };
+            if !wanted {
+                continue;
+            }
+            found.insert(key.to_uppercase());
+            let body = &t.ticket.ticket.body;
+            let n = body.chars().count();
+            if n > left {
+                cut.push(key);
+                continue;
+            }
+            left -= n;
+            row["brief"] = json!(reported(body, &format!("{key}'s brief")));
+        }
+    }
+    let mut notes = Vec::new();
+    if !cut.is_empty() {
+        notes.push(format!(
+            "Too long to give at once, so left out: {}. Ask for them by key (briefs: [\"{}\"]).",
+            cut.join(", "),
+            cut[0]
+        ));
+    }
+    if let Briefs::Of(keys) = briefs {
+        let mut missing: Vec<&String> = keys.iter().filter(|k| !found.contains(*k)).collect();
+        missing.sort();
+        if !missing.is_empty() {
+            notes.push(format!(
+                "Not tickets of this plan: {}.",
+                missing
+                    .iter()
+                    .map(|k| k.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    if !notes.is_empty() {
+        out["briefs_note"] = json!(notes.join(" "));
+    }
+    out
+}
+
+/// The plan's fields and its tickets, without briefs.
+fn plan_view(p: &PlanDetail) -> Value {
     let place: HashMap<Uuid, usize> = p
         .tickets
         .iter()
@@ -723,7 +964,7 @@ impl CrewHub {
             .filter(|g| !g.is_empty())
             .ok_or("Say the goal.")?;
         let adopted = self.adopted_of(b, input).await?;
-        let tickets = tickets_of(input, &HashMap::new(), &adopted)?;
+        let tickets = tickets_of(input, &HashMap::new(), &adopted, &HashMap::new())?;
         let start_now = start_now_of(input)?;
         if tickets.iter().any(|t| t.id.is_some()) {
             return Err("A new plan's tickets have no ids yet.".into());
@@ -844,12 +1085,30 @@ impl CrewHub {
             .iter()
             .filter_map(|t| t.ticket.key.clone().map(|k| (k, t.ticket.ticket.id)))
             .collect();
+        // Each ticket's words as the newest revision has them.
+        let kept: HashMap<Uuid, (String, String)> = detail
+            .revisions
+            .last()
+            .map(|r| {
+                r.snapshot
+                    .tickets
+                    .iter()
+                    .map(|t| (t.id, (t.title.clone(), t.body.clone())))
+                    .collect()
+            })
+            .unwrap_or_default();
         // Read before anything changes: one that doesn't read changes nothing.
         let start_now = start_now_of(input)?;
-        let tickets = match input.get("tickets") {
+        let ticket_edits = edits_of(input, &known, &kept)?;
+        if ticket_edits.is_some() && input.get("tickets").is_some_and(|t| !t.is_null()) {
+            return Err(
+                "Say every ticket (tickets) or the ones to change (tickets_edit), not both.".into(),
+            );
+        }
+        let tickets = match input.get("tickets").filter(|t| !t.is_null()) {
             Some(_) => {
                 let adopted = self.adopted_of(b, input).await?;
-                let mut t = tickets_of(input, &known, &adopted)?;
+                let mut t = tickets_of(input, &known, &adopted, &kept)?;
                 // Said for the plan, or else where its group's sessions run:
                 // each new ticket that doesn't say. The others stay where
                 // they run unless a ticket says otherwise.
@@ -880,6 +1139,7 @@ impl CrewHub {
                 .and_then(Value::as_i64)
                 .map(|n| i16::try_from(n).ok()),
             tickets,
+            ticket_edits,
             budget: budget_of(input)?,
             why: Some(why.to_string()),
         };
@@ -893,6 +1153,7 @@ impl CrewHub {
         let more = edit.goal.is_some()
             || edit.parallel.is_some()
             || edit.tickets.is_some()
+            || edit.ticket_edits.is_some()
             || edit.budget.is_some();
         // The change first, by the keys the boss read: the move after it
         // renumbers them.
