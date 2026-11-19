@@ -1432,11 +1432,11 @@ impl CrewHub {
                 ..
             } => format!(
                 // All of it, nothing hidden: the person runs what they read.
-                "Run on {machine}{}: `{}`",
+                "Run on {machine}{}: {}",
                 cwd.as_deref()
                     .map(|c| format!(" in {c}"))
                     .unwrap_or_default(),
-                super::machines::shown(command)
+                super::machines::code(command)
             ),
         }
     }
@@ -1782,6 +1782,12 @@ impl CrewHub {
                 match got["outcome"].as_str() {
                     // What it said, for the person who ran it.
                     Some("ran") => Ok(format!("Ran it: {line}")),
+                    // Sent, and maybe run: done with, so a second yes
+                    // doesn't run it again.
+                    Some(super::machines::UNKNOWN) => Ok(got["why"]
+                        .as_str()
+                        .unwrap_or("Sent, but no answer came back: it may have run.")
+                        .to_string()),
                     _ => Err(format!("It didn't run: {line}")),
                 }
             }

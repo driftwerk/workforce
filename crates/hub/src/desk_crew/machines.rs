@@ -76,7 +76,7 @@ pub fn run_properties() -> Value {
         "machine": { "type": "string", "description": "The machine, by its name in crew.machines (like devbox)" },
         "command": { "type": "string", "description": "The command, as bash -lc runs it" },
         "cwd": { "type": "string", "description": "Where it runs, inside the home: ~/x or absolute; the home when not said" },
-        "timeout_secs": { "type": "integer", "minimum": 1, "maximum": MOST_SECS }
+        "timeout_secs": { "type": "integer", "minimum": 1, "maximum": MOST_SECS, "description": "How long it may run, in seconds (10 when not said); then it and all it started are stopped" }
     })
 }
 
@@ -167,8 +167,30 @@ pub(crate) fn ran_line(got: &Value) -> String {
         Some("needs_person") | Some("refused") => {
             format!("not run: {}", got["why"].as_str().unwrap_or("refused"))
         }
+        Some(UNKNOWN) => format!(
+            "it may have run: {}",
+            got["why"].as_str().unwrap_or("no answer came back")
+        ),
         _ => "it said nothing Desk reads".into(),
     }
+}
+
+/// What came of a check whose answer was lost: it may have run.
+pub(crate) const UNKNOWN: &str = "unknown";
+
+/// `command` as a code span, all of it ([`shown`]): its fence longer than
+/// any run of backticks in it, so none of it reads as outside the span.
+pub(crate) fn code(command: &str) -> String {
+    let shown = shown(command);
+    let mut longest = 0;
+    let mut run = 0;
+    for c in shown.chars() {
+        run = if c == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    let fence = "`".repeat(longest + 1);
+    let pad = if longest > 0 { " " } else { "" };
+    format!("{fence}{pad}{shown}{pad}{fence}")
 }
 
 /// `command` as the person reads it before they run it: all of it, what
@@ -182,7 +204,7 @@ pub(crate) fn shown(command: &str) -> String {
             '\n' => out.push_str(" \u{23CE} "),
             '\t' => out.push(' '),
             c if c.is_control()
-                || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}' | '\u{00AD}') =>
+                || matches!(c, '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}' | '\u{00AD}' | '\u{FE00}'..='\u{FE0F}' | '\u{E0000}'..='\u{E007F}') =>
             {
                 out.push_str(&format!("\\u{{{:04X}}}", c as u32));
             }
@@ -287,6 +309,11 @@ impl CrewHub {
                         );
                         suggest(format!("{why}; it's the person's to run"), by).await
                     }
+                    // Desk's own words: the answer was lost on the way.
+                    Some(UNKNOWN) => Err(got["why"]
+                        .as_str()
+                        .unwrap_or("Sent, but no answer came back: it may have run.")
+                        .to_string()),
                     _ => Err(format!(
                         "Not run: {}",
                         reported(&ran_line(&got), "the machine's answer")
@@ -332,6 +359,12 @@ impl CrewHub {
                 }),
             )
             .await;
+        // An answer lost: it may have run there, said as an outcome of its
+        // own, never as a refusal (the person's accept is done with).
+        let got = match got {
+            Err(MachineRefused::Unknown(why)) => Ok(json!({ "outcome": UNKNOWN, "why": why })),
+            got => got,
+        };
         let (verb, said) = match &got {
             Ok(g) => match g["outcome"].as_str() {
                 Some("ran") => ("ran", ran_line(g)),
@@ -339,19 +372,19 @@ impl CrewHub {
                 Some("refused") => ("couldn't run", ran_line(g)),
                 _ => ("may have run", ran_line(g)),
             },
-            Err(MachineRefused::Unknown(e)) => ("may have run", crew::one_line(e, 200)),
             Err(MachineRefused::Unreached(e)) => ("couldn't send", crew::one_line(e, 200)),
             Err(e) => ("couldn't run", crew::one_line(&e.to_string(), 200)),
         };
-        let clipped = command.len() > 300;
+        let span = code(command);
+        let clipped = span.chars().count() > 300;
         let mut e = by.event(
             Kind::OnMachine,
             None,
             format!(
-                "{verb} `{}`{} {} {machine}{}: {}",
-                crew::clip(&shown(command), 300),
+                "{verb} {}{} {} {machine}{}: {}",
+                crew::clip(&span, 300),
                 if clipped {
-                    "… (all of it in the detail)"
+                    " (all of it in the detail)"
                 } else {
                     ""
                 },

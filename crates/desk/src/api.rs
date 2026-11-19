@@ -2825,6 +2825,15 @@ mod tests {
             )
             .await;
             assert_eq!(status, 400);
+            // Any other word in the address is no matter.
+            let (status, ran) = call(
+                &app,
+                "POST",
+                "/api/desk/run?x=1",
+                Some(json!({"command": "true"})),
+            )
+            .await;
+            assert_eq!(status, 200, "{ran}");
             let (status, ran) = call(
                 &app,
                 "POST",

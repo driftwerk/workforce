@@ -213,8 +213,10 @@ struct Group(Option<i32>);
 impl Group {
     fn kill(&mut self) {
         if let Some(pid) = self.0.take() {
-            // SAFETY: killpg only signals the session the check made; it
-            // is killed while its leader is still unreaped, or once only.
+            // SAFETY: killpg only signals the session the check made. Out
+            // of time or dropped, its leader is still unreaped; ended, it is
+            // killed at once after, while nothing can have taken its id as
+            // a group's but what it left running there. Once only.
             unsafe {
                 libc::killpg(pid, libc::SIGKILL);
             }
@@ -286,11 +288,14 @@ pub async fn run(command: &str, cwd: &Path, secs: u64, env: &[(String, String)])
         None => child.wait().await.ok().filter(|_| !timed_out),
     };
     // What is left in the pipes, a moment longer; what was read is kept.
+    // Whatever escaped its session and holds a pipe still isn't waited on.
+    let aborts: Vec<_> = reading.iter().map(|h| h.abort_handle()).collect();
     let _ = tokio::time::timeout(
         Duration::from_millis(500),
         futures::future::join_all(reading),
     )
     .await;
+    aborts.iter().for_each(tokio::task::AbortHandle::abort);
     let (stdout, cut_out) = capped(&out.lock(), MOST_OUT);
     let (stderr, cut_err) = capped(&err.lock(), MOST_OUT);
     Ran::Ran {
@@ -305,8 +310,35 @@ pub async fn run(command: &str, cwd: &Path, secs: u64, env: &[(String, String)])
 }
 
 impl crate::Desk {
-    /// `check`, here, as the module says.
+    /// `check`, here, as the module says. The machine keeps its own word
+    /// of every one, beside the hub's Activity: its start (the hub's keeps
+    /// all of it), where, how it was allowed and what came of it.
     pub async fn machine_run(&self, check: Check) -> Ran {
+        let (judged, by_person) = (check.judged, check.by_person);
+        let start: String = check.command.trim().chars().take(120).collect();
+        let cwd = check.cwd.clone().unwrap_or_else(|| "~".into());
+        let ran = self.check_here(check).await;
+        let (outcome, exit, timed_out) = match &ran {
+            Ran::Ran {
+                exit, timed_out, ..
+            } => ("ran", *exit, *timed_out),
+            Ran::NeedsPerson { .. } => ("needs_person", None, false),
+            Ran::Refused { .. } => ("refused", None, false),
+        };
+        tracing::info!(
+            command = %start,
+            cwd = %cwd,
+            judged,
+            by_person,
+            outcome,
+            ?exit,
+            timed_out,
+            "desk was asked to run a check"
+        );
+        ran
+    }
+
+    async fn check_here(&self, check: Check) -> Ran {
         let refused = |why: String| Ran::Refused { why };
         let command = check.command.trim();
         if command.is_empty() {
@@ -369,27 +401,7 @@ impl crate::Desk {
                 ("GIT_ASKPASS".to_string(), String::new()),
             ])
             .collect();
-        let ran = run(command, &cwd, secs, &env).await;
-        // The machine keeps its own word of every check, beside the hub's.
-        if let Ran::Ran {
-            exit,
-            signal,
-            timed_out,
-            ..
-        } = &ran
-        {
-            tracing::info!(
-                command,
-                cwd = %cwd.display(),
-                judged = check.judged,
-                by_person = check.by_person,
-                ?exit,
-                ?signal,
-                timed_out,
-                "desk ran a check"
-            );
-        }
-        ran
+        run(command, &cwd, secs, &env).await
     }
 }
 
@@ -405,7 +417,6 @@ pub(crate) mod api {
     use axum::response::{IntoResponse, Response};
     use axum::routing::post;
     use axum::{Json, Router};
-    use serde::Deserialize;
     use serde_json::json;
 
     use super::Check;
@@ -417,20 +428,13 @@ pub(crate) mod api {
         auth: Arc<dyn Authorize>,
     }
 
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct TokenQuery {
-        #[serde(default)]
-        token: Option<String>,
-    }
-
     async fn run(
         State(s): State<Arc<RunApi>>,
         h: HeaderMap,
-        Query(q): Query<TokenQuery>,
+        Query(q): Query<std::collections::HashMap<String, String>>,
         body: Result<Json<Check>, JsonRejection>,
     ) -> Response {
-        if q.token.is_some() {
+        if q.contains_key("token") {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": "a check takes the hub's token in the Authorization header only"})),
@@ -616,6 +620,15 @@ mod tests {
             withheld: vec![home.join(".ssh")],
         };
         assert_eq!(judged("git status", &repo, &bounds), Ok(()));
+        for reads in [
+            "git remote -v",
+            "git log --oneline -5",
+            "git branch -a",
+            "git stash list",
+            "git fetch origin",
+        ] {
+            assert_eq!(judged(reads, &repo, &bounds), Ok(()), "{reads}");
+        }
         assert_eq!(judged("ls -la", &home, &bounds), Ok(()));
         assert!(judged("rm -rf ~/projects", &repo, &bounds).is_err());
         assert!(judged("cat ~/.ssh/id_ed25519", &repo, &bounds).is_err());
@@ -630,6 +643,15 @@ mod tests {
             "echo x > /tmp/t.py && python3 /tmp/t.py",
             "make",
             "cp README.md README.old",
+            "python3 -m pytest",
+            "python3 -m unittest",
+            "git commit -am x",
+            "git stash",
+            "git pull",
+            "git switch main",
+            "git checkout -b x",
+            "git branch new",
+            "git add .",
         ] {
             assert!(judged(own_code, &repo, &bounds).is_err(), "{own_code}");
         }
