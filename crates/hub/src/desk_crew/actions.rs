@@ -169,6 +169,18 @@ pub(crate) enum Action {
         session: Uuid,
         mode: Mode,
     },
+    /// Change a ticket on one of Desk's own boards (by its key): its words,
+    /// a comment, a need, or deleting it ([`super::tickets`]).
+    ChangeTicket {
+        ticket: String,
+        /// Its id once resolved, which a suggestion keeps.
+        id: Option<Uuid>,
+        change: Box<super::tickets::TicketChange>,
+    },
+    /// A new ticket on one of Desk's own boards.
+    CreateTicket {
+        new: Box<super::tickets::NewOne>,
+    },
     /// Change the overseer `agent`'s own `[oversight]`: only ever a
     /// suggestion, which only the person can accept, as its own limits are
     /// never the overseer's to change.
@@ -234,7 +246,7 @@ fn text(raw: Option<String>, what: &str) -> Result<String, String> {
 }
 
 /// The key of a ticket as typed: `acm-12` is `ACM-12`.
-fn ticket_key(raw: Option<String>) -> Result<String, String> {
+pub(super) fn ticket_key(raw: Option<String>) -> Result<String, String> {
     let key = text(raw, "which ticket, by its key (like ACM-12)")?;
     workforce_desk::board::parse_key(&key)
         .map(|(prefix, n)| format!("{prefix}-{n}"))
@@ -455,6 +467,17 @@ impl Action {
                     "Say which mode: default, acceptEdits, auto, plan or bypassPermissions.",
                 )?,
             },
+            super::tickets::EDIT
+            | super::tickets::COMMENT
+            | super::tickets::LINK
+            | super::tickets::DELETE => Self::ChangeTicket {
+                ticket: ticket_key(i.ticket)?,
+                id: ticket_id(i.ticket_id)?,
+                change: Box::new(super::tickets::change_of(tool, input)?),
+            },
+            super::tickets::CREATE => Self::CreateTicket {
+                new: Box::new(super::tickets::new_of(input)?),
+            },
             super::own_settings::NAME => Self::ChangeOversight {
                 agent: text(i.agent_id, "whose settings")?,
                 change: super::own_settings::Change::parse(input)?,
@@ -466,7 +489,9 @@ impl Action {
     /// The key of the ticket it is about.
     pub(crate) fn ticket_key(&self) -> Option<&str> {
         match self {
-            Self::AssignTicket { ticket, .. } | Self::MoveTicket { ticket, .. } => Some(ticket),
+            Self::AssignTicket { ticket, .. }
+            | Self::MoveTicket { ticket, .. }
+            | Self::ChangeTicket { ticket, .. } => Some(ticket),
             _ => None,
         }
     }
@@ -474,9 +499,16 @@ impl Action {
     /// The id of the ticket it is about, once resolved.
     pub(crate) fn ticket_id(&self) -> Option<Uuid> {
         match self {
-            Self::AssignTicket { id, .. } | Self::MoveTicket { id, .. } => *id,
+            Self::AssignTicket { id, .. }
+            | Self::MoveTicket { id, .. }
+            | Self::ChangeTicket { id, .. } => *id,
             _ => None,
         }
+    }
+
+    /// Whether it deletes a ticket: never undone, so the person's yes.
+    pub(crate) fn deletes_ticket(&self) -> bool {
+        matches!(self, Self::ChangeTicket { change, .. } if matches!(**change, super::tickets::TicketChange::Delete))
     }
 
     /// Whether it starts a session.
@@ -516,8 +548,12 @@ impl Action {
             } => return Cow::Owned(format!("{goal}.\n{name}")),
             Self::StartSession { goal, .. } => goal.as_str(),
             Self::Assign { task, .. } => task.as_str(),
+            // A ticket's words aren't read for what no boss does: they
+            // can't act, and a brief that speaks of a deploy is no deploy.
             Self::AssignTicket { .. }
             | Self::MoveTicket { .. }
+            | Self::ChangeTicket { .. }
+            | Self::CreateTicket { .. }
             | Self::Approve { .. }
             | Self::Deny { .. }
             | Self::Stop { .. }
@@ -591,7 +627,7 @@ fn answer_refused(e: workforce_desk::DeskError) -> Result<String, workforce_desk
 }
 
 /// A board change refused, in the words the person reads, as they are.
-fn board_plain(e: workforce_desk::DeskError) -> String {
+pub(super) fn board_plain(e: workforce_desk::DeskError) -> String {
     match e {
         workforce_desk::DeskError::Conflict(why) | workforce_desk::DeskError::Invalid(why) => why,
         e
@@ -634,6 +670,13 @@ impl CrewHub {
         }
         if let Some(why) = self.left_alone(action) {
             return Gate::No(why.into());
+        }
+        // Deleting a ticket can't be undone: the person's yes, unbound too.
+        if action.deletes_ticket() {
+            return match o.level {
+                Level::Watch => Gate::Refuse,
+                _ => Gate::Suggest(super::tickets::DELETE_WHY.into()),
+            };
         }
         let boss = self.boss_id(o);
         if o.level != Level::Watch && self.unbound(o) {
@@ -750,6 +793,9 @@ impl CrewHub {
             Level::Watch => return Gate::Refuse,
             Level::Suggest => return Gate::Suggest("you suggest; the person decides".into()),
             Level::Act | Level::Full => {}
+        }
+        if action.deletes_ticket() {
+            return Gate::Suggest(super::tickets::DELETE_WHY.into());
         }
         // What no boss does at any level, said in words: in what it says,
         // and in the question it answers.
@@ -884,6 +930,9 @@ impl CrewHub {
             // Decided above.
             Action::TakeOn { .. } | Action::Release { .. } => (true, None),
             Action::Handoff { .. } | Action::ChangeOversight { .. } => (false, None),
+            // A ticket's words, comments and needs, and a new ticket on
+            // Desk's own boards: ordinary work at Act (deleting is above).
+            Action::ChangeTicket { .. } | Action::CreateTicket { .. } => (true, None),
             // At Act, only to a mode that still asks before it runs a
             // command; any other is an unbound overseer's alone.
             // Only a mode that asks gets here.
@@ -1077,6 +1126,8 @@ impl CrewHub {
                 ..
             }
             | Action::MoveTicket { .. } => true,
+            // Nothing is sent to a session or an agent.
+            Action::ChangeTicket { .. } | Action::CreateTicket { .. } => true,
             Action::Approve { .. }
             | Action::Deny { .. }
             | Action::Stop { .. }
@@ -1214,6 +1265,8 @@ impl CrewHub {
                 ..
             }
             | Action::MoveTicket { .. }
+            | Action::ChangeTicket { .. }
+            | Action::CreateTicket { .. }
             | Action::Escalate { .. } => None,
             Action::ChangeOversight { agent, .. } => self.party_of_agent(agent),
             Action::Nudge {
@@ -1331,6 +1384,15 @@ impl CrewHub {
             Action::MoveTicket { ticket, state, .. } => {
                 format!("Move {ticket} to {}", state.title())
             }
+            Action::ChangeTicket { ticket, change, .. } => super::tickets::describe(ticket, change),
+            Action::CreateTicket { new } => format!(
+                "Make a ticket{}: “{}”",
+                new.board
+                    .as_deref()
+                    .map(|b| format!(" on {b}"))
+                    .unwrap_or_default(),
+                crew::clip(&new.title, 120)
+            ),
             Action::TakeOn { session } => {
                 format!("Run {} for you", self.session_name(*session))
             }
@@ -1941,6 +2003,9 @@ impl CrewHub {
                     .map_err(board_plain)?;
                 Ok(format!("moved {ticket} to {}", state.title()))
             }
+            Action::ChangeTicket { .. } | Action::CreateTicket { .. } => {
+                self.change_ticket_boxed(action, by).await
+            }
             Action::TakeOn { session } => {
                 let (service, o) = self
                     .boss_for(&by)
@@ -2342,7 +2407,7 @@ impl CrewHub {
     /// key; with `seen`, only one on a board its scope sees: one on another
     /// scope's board is refused in the words one that isn't there is, so
     /// a key never says what another scope holds.
-    async fn ticket_named(
+    pub(super) async fn ticket_named(
         &self,
         key: &str,
         id: Option<Uuid>,
@@ -2461,6 +2526,10 @@ impl CrewHub {
                         .and_then(|s| self.desk.view(s).ok())
                         .is_some_and(|v| v.origin == Origin::External);
             }
+            Action::ChangeTicket { ticket, id, change } => {
+                self.resolve_change_boxed(ticket, id, change, seen).await?;
+            }
+            Action::CreateTicket { new } => self.resolve_new_boxed(new, seen).await?,
             _ => {}
         }
         Ok(())

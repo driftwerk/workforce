@@ -63,6 +63,7 @@ mod scope;
 pub(crate) mod served;
 pub(crate) mod shared_budget;
 mod spend;
+mod tickets;
 mod tools;
 mod updates;
 mod urgent;
