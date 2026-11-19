@@ -45,6 +45,17 @@ async fn agent_calling(
     reply: &str,
     calls: &[(&str, &str)],
 ) -> (Arc<AgentService>, wiremock::MockServer) {
+    agent_configured(dir, id, reply, calls, |_| {}).await
+}
+
+/// [`agent_calling`], with `configure` applied to its config last.
+async fn agent_configured(
+    dir: &Path,
+    id: &str,
+    reply: &str,
+    calls: &[(&str, &str)],
+    configure: impl FnOnce(&mut workforce_common::settings::WorkforceConfig),
+) -> (Arc<AgentService>, wiremock::MockServer) {
     use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, ResponseTemplate};
     let (config, server) = crate::serve::testing::mock_llm_config(&dir.join(id), |c| {
@@ -56,6 +67,7 @@ async fn agent_calling(
             name: Some(name),
             ..Default::default()
         }];
+        configure(c);
     })
     .await;
     let chunk = |body: Value| format!("data: {body}\n\n");
@@ -1899,6 +1911,7 @@ mod urgent;
 mod away;
 
 mod boss_waits;
+mod orchestrator;
 
 mod remote_asks;
 mod remote_decide;

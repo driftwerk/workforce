@@ -70,7 +70,9 @@ async fn act_fully_tells_a_finished_session_its_next_step_itself_and_never_while
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
-        let (overseer, _crew, d, llm) = overseeing(&base, pool, "ok", &theirs(), &[]).await;
+        let (overseer, crew, d, llm) = overseeing(&base, pool, "ok", &theirs(), &[]).await;
+        // The focused call a boss outside the loop judges turn ends with.
+        crew.focused_turn_ends();
         d.boss_bounds_with(workforce_desk::charge::Bounds {
             home: base.clone(),
             ..Default::default()
@@ -259,7 +261,9 @@ async fn a_next_step_that_says_no_job_goes_at_once_at_act_fully() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
-        let (overseer, _crew, d, llm) = overseeing(&base, pool, "ok", &theirs(), &[]).await;
+        let (overseer, crew, d, llm) = overseeing(&base, pool, "ok", &theirs(), &[]).await;
+        // The focused call a boss outside the loop judges turn ends with.
+        crew.focused_turn_ends();
         d.boss_bounds_with(workforce_desk::charge::Bounds {
             home: base.clone(),
             ..Default::default()
