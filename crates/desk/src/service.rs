@@ -4570,7 +4570,14 @@ impl Desk {
             return self.view(id);
         };
         pty.write(keys)?;
-        let mut interrupted = false;
+        // Its turn ends, interrupted: a restart's note it carried was read.
+        // Gone before the change below says so.
+        {
+            let mut st = self.0.state.lock();
+            if st.records.get(&id).map(|r| r.state) == Some(SessionState::Working) {
+                st.restarted.remove(&id);
+            }
+        }
         // Claude Code runs no hook for an interrupted turn, nor for a
         // dialog Esc turned down: that wait is over, and what queues
         // behind it shows next (its own notice, for one its terminal asks).
@@ -4580,7 +4587,6 @@ impl Desk {
                 r.state = SessionState::Done;
                 l.current_tool = None;
                 l.interrupted = true;
-                interrupted = true;
             } else if r.state == SessionState::Blocked
                 && l.pending.as_ref().is_some_and(|p| !p.answerable)
             {
@@ -4591,10 +4597,6 @@ impl Desk {
                 };
             }
         });
-        // Its turn ended, interrupted: a restart's note it carried was read.
-        if interrupted {
-            self.0.state.lock().restarted.remove(&id);
-        }
         // The turn is over: what waited for its next tool call goes in at
         // the idle.
         self.steers_released(id);
