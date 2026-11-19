@@ -109,6 +109,20 @@ impl TurnRoute {
 /// `agent_turn_idle_secs` says: a quick reply finds it warm.
 const AGENT_TURN_IDLE_FLOOR_SECS: u64 = 60;
 
+/// How long an agent turn's scope stays up once its turn is over: as
+/// configured, but never under [`AGENT_TURN_IDLE_FLOOR_SECS`], which is said.
+fn agent_turn_idle_secs(agent: &str, configured: u64) -> u64 {
+    if configured < AGENT_TURN_IDLE_FLOOR_SECS {
+        tracing::warn!(
+            agent,
+            configured,
+            floor = AGENT_TURN_IDLE_FLOOR_SECS,
+            "agent_turn_idle_secs is under its floor; the floor applies"
+        );
+    }
+    configured.max(AGENT_TURN_IDLE_FLOOR_SECS)
+}
+
 /// Wire what runs `service`'s turns on CLI routes: workspaces from the
 /// coding executor, transcripts rotated as `/cc`'s are. Wired whatever
 /// logins exist today, since a turn resolves its payer's login itself.
@@ -132,12 +146,10 @@ pub fn wire(
             codex_worker,
             crate::cli_session::RotationPolicy::of(&service.config.claude_chat),
             std::time::Duration::from_secs(coding.executor.scope_ttl_secs),
-            std::time::Duration::from_secs(
-                coding
-                    .executor
-                    .agent_turn_idle_secs
-                    .max(AGENT_TURN_IDLE_FLOOR_SECS),
-            ),
+            std::time::Duration::from_secs(agent_turn_idle_secs(
+                service.agent_id.as_str(),
+                coding.executor.agent_turn_idle_secs,
+            )),
         ))),
         Err(e) => tracing::error!(
             agent = %service.agent_id,
