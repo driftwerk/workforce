@@ -538,6 +538,20 @@ impl DeskStore {
             .collect()
     }
 
+    /// Whether ticket `id` was ever worked on by a session that let it go:
+    /// started again, its new session checks what is already done first.
+    pub async fn ticket_worked_before(&self, id: Uuid) -> Result<bool> {
+        let c = self.pool().get().await?;
+        let row = c
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM ticket_assignments \
+                 WHERE ticket = $1 AND until_at IS NOT NULL)",
+                &[&id],
+            )
+            .await?;
+        Ok(row.try_get(0)?)
+    }
+
     /// The key of each ticket of `ids` that has one: its issue's, else its
     /// board's prefix and number.
     pub async fn ticket_keys(&self, ids: &[Uuid]) -> Result<HashMap<Uuid, String>> {

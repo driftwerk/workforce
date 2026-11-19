@@ -761,6 +761,7 @@ impl CodeGraphBackend for PostgresCodeGraphBackend {
 
     async fn update_index_state_full(
         &self,
+        backend: &str,
         repo_id: &str,
         commit: &str,
         total_entities: usize,
@@ -786,8 +787,11 @@ impl CodeGraphBackend for PostgresCodeGraphBackend {
         )
         .await?;
         // A fill begun while the repo was being indexed went by part of it.
-        conn.execute("DELETE FROM vector_fill WHERE repo_id = $1", &[&repo_id])
-            .await?;
+        conn.execute(
+            "DELETE FROM vector_fill WHERE backend = $1 AND repo_id = $2",
+            &[&backend, &repo_id],
+        )
+        .await?;
         Ok(())
     }
 
@@ -1067,7 +1071,7 @@ impl CodeGraphBackend for PostgresCodeGraphBackend {
             .query_opt(
                 "SELECT repo_id, last_commit, last_full_index_at, last_incremental_at,
                         total_entities, total_relationships, indexing_in_progress
-                 FROM index_state WHERE repo_id = $1",
+                 FROM index_state WHERE repo_id = $1 AND last_full_index_at IS NOT NULL",
                 &[&repo_id],
             )
             .await?;
@@ -1215,7 +1219,12 @@ impl CodeGraphBackend for PostgresCodeGraphBackend {
         Ok(count as u64)
     }
 
-    async fn delete_repo_data(&self, repo_id: &str, keep_pending: &[&str]) -> Result<usize> {
+    async fn delete_repo_data(
+        &self,
+        repo_id: &str,
+        keep: &[&str],
+        keep_complete_in: bool,
+    ) -> Result<usize> {
         let mut conn = self.pool.get().await?;
         let tx = conn.transaction().await?;
 
@@ -1240,16 +1249,26 @@ impl CodeGraphBackend for PostgresCodeGraphBackend {
             .execute("DELETE FROM entities WHERE repo_id = $1", &[&repo_id])
             .await?;
 
-        tx.execute("DELETE FROM index_state WHERE repo_id = $1", &[&repo_id])
-            .await?;
-        tx.execute("DELETE FROM vector_fill WHERE repo_id = $1", &[&repo_id])
-            .await?;
-        let kept: Vec<String> = keep_pending.iter().map(|b| b.to_string()).collect();
         tx.execute(
-            "DELETE FROM vector_pending WHERE repo_id = $1 AND NOT (backend = ANY($2))",
-            &[&repo_id, &kept],
+            if keep_complete_in {
+                "UPDATE index_state
+                 SET last_commit = NULL, last_full_index_at = NULL, last_incremental_at = NULL,
+                     total_entities = 0, total_relationships = 0, indexing_in_progress = FALSE
+                 WHERE repo_id = $1"
+            } else {
+                "DELETE FROM index_state WHERE repo_id = $1"
+            },
+            &[&repo_id],
         )
         .await?;
+        let kept: Vec<String> = keep.iter().map(|b| b.to_string()).collect();
+        for table in ["vector_fill", "vector_pending"] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE repo_id = $1 AND NOT (backend = ANY($2))"),
+                &[&repo_id, &kept],
+            )
+            .await?;
+        }
 
         tx.commit().await?;
         Ok(count as usize)

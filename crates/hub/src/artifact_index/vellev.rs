@@ -252,13 +252,13 @@ impl ArtifactVectors for VellevArtifacts {
                 .next(),
             _ => None,
         };
-        let content = Content {
-            properties: json!({ "artifactId": artifact_id, "text": text, TEXT_HASH: text_hash })
+        let content = Content::new(
+            json!({ "artifactId": artifact_id, "text": text, TEXT_HASH: text_hash })
                 .as_object()
                 .cloned()
                 .unwrap_or_default(),
-            vector,
-        };
+        );
+        let content = vector.into_iter().fold(content, Content::vector);
         let id = ObjectId(object_id(artifact_id));
         let put = self.artifacts.run(|| self.writes.put(id, &content)).await;
         put.map(|_| ())
@@ -281,14 +281,7 @@ impl ArtifactVectors for VellevArtifacts {
             .artifacts
             .run(|| {
                 self.cap.ask(limit, |limit| {
-                    let nearest = Nearest {
-                        vector: None,
-                        text: Some(query.as_str().to_string()),
-                        limit,
-                        filter: None,
-                        oversample: None,
-                        vectors: false,
-                    };
+                    let nearest = Nearest::to_text(query.as_str(), limit);
                     async move { index_call(self.artifacts.collection().nearest(&nearest)).await }
                 })
             })
@@ -374,12 +367,7 @@ impl ArtifactVectors for VellevArtifacts {
             .artifacts
             .run(|| {
                 self.cap.ask(limit.min(self.list_page as usize), |limit| {
-                    let page = Page {
-                        filter: None,
-                        after,
-                        limit,
-                        vectors: false,
-                    };
+                    let page = after.into_iter().fold(Page::new(limit), Page::after);
                     async move { self.artifacts.collection().list(&page).await }
                 })
             })

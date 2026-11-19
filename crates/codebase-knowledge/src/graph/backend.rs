@@ -175,8 +175,10 @@ pub trait CodeGraphBackend: Send + Sync {
 
     // ─── Index state ───────────────────────────────────────────────
 
+    /// Forgets `backend`'s fill of the repo; other backends' are kept.
     async fn update_index_state_full(
         &self,
+        backend: &str,
         repo_id: &str,
         commit: &str,
         total_entities: usize,
@@ -191,6 +193,7 @@ pub trait CodeGraphBackend: Send + Sync {
         total_relationships: usize,
     ) -> Result<()>;
 
+    /// The repo's state once a full index has written it.
     async fn get_index_state(&self, repo_id: &str) -> Result<Option<IndexState>>;
 
     async fn set_indexing_in_progress(&self, repo_id: &str, in_progress: bool) -> Result<()>;
@@ -358,10 +361,17 @@ pub trait CodeGraphBackend: Send + Sync {
     /// summaries, file_index, and index_state. Returns the number of
     /// entities deleted. Keeps the `repositories` row so a follow-up
     /// `register_repo` can reuse it for a clean re-index.
-    /// The files noted pending for the backends in `keep_pending` stay
-    /// noted: a standby is told of what a full index changes by what it
-    /// notes, and must not lose what was noted before.
-    async fn delete_repo_data(&self, repo_id: &str, keep_pending: &[&str]) -> Result<usize>;
+    /// The vector state of the backends in `keep`, their fills and the
+    /// files noted pending for them, is kept: a standby is told of what a
+    /// full index changes by what it notes, and must not lose what was
+    /// noted before. With `keep_complete_in`, what the repo's vectors were
+    /// complete in is kept too, in a state row no full index has written.
+    async fn delete_repo_data(
+        &self,
+        repo_id: &str,
+        keep: &[&str],
+        keep_complete_in: bool,
+    ) -> Result<usize>;
 
     /// Like [`Self::delete_repo_data`] but also drops the `repositories`
     /// row itself. Use when fully removing a repo (e.g. cascade from

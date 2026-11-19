@@ -5466,12 +5466,7 @@ async fn artifacts_are_seeded_with_vectors_made_outside_the_node() {
                 "each artifact's vector made outside"
             );
 
-            let page = vellev_client::api::Page {
-                filter: None,
-                after: None,
-                limit: 10,
-                vectors: true,
-            };
+            let page = vellev_client::api::Page::new(10).vectors(true);
             let name = vellev_core::CollectionName::new("Artifacts").unwrap();
             let held = node.tenant().collection(&name).list(&page).await.unwrap();
             assert_eq!(held.objects.len(), 2);

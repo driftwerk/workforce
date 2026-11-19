@@ -68,7 +68,7 @@ pub const DIRECTIVES: &[Directive] = &[
             a(
                 "checks",
                 "After checks pass",
-                "merge only once CI is green and any review is done",
+                "merge only once CI is green on its head and an independent review of that head is clean; nothing more is needed",
             ),
             a(
                 "no",
