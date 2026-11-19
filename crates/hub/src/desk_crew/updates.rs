@@ -144,10 +144,14 @@ pub(super) struct Changed {
     repo: Option<String>,
     /// Its account as the update tells of it ([`update::as_told`]).
     account: Account,
-    new: Vec<Done>,
+    pub new: Vec<Done>,
     /// What its work is, from facts: its goal and its tickets' and PRs'
     /// titles.
     pub work: Work,
+    /// What its account says it waits on and is doing now, as it is (not
+    /// only as news): who moves a stall is read from them.
+    pub waiting_on: Option<String>,
+    pub doing: String,
 }
 
 impl Changed {
@@ -181,6 +185,12 @@ pub(super) struct Batch {
     /// Suggestions its quiet check-ins made, or notes on finished
     /// sessions, wait for the next update.
     noted: bool,
+    /// Every item of the boss's not closed: who already has a stall.
+    pub open: Vec<OpenItem>,
+    /// The person's word the boss holds for each changed session (its
+    /// orders covering it, [`super::held::held_for`]): never said to be
+    /// missing.
+    pub held: HashMap<Uuid, Vec<OpenItem>>,
 }
 
 impl Batch {
@@ -261,6 +271,8 @@ impl Batch {
             restated,
             told,
             noted: self.noted && needs,
+            open: self.open,
+            held: self.held,
         }
     }
 }
@@ -345,6 +357,13 @@ impl CrewHub {
                 account: update::as_told(was, a),
                 new,
                 work,
+                waiting_on: a
+                    .waiting_on
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|w| !w.is_empty())
+                    .map(str::to_string),
+                doing: a.now.trim().to_string(),
             });
         }
         // Since what was last said, or left for the roundup.
@@ -382,11 +401,21 @@ impl CrewHub {
             false => Vec::new(),
         };
         let gap = self.answer_gap(o);
-        let open: Vec<OpenItem> = store
-            .items_not_closed(Some(boss))
-            .await
-            .unwrap_or_default()
-            .into_iter()
+        let all_open: Vec<OpenItem> = store.items_not_closed(Some(boss)).await.unwrap_or_default();
+        let held: HashMap<Uuid, Vec<OpenItem>> = sessions
+            .iter()
+            .map(|s| {
+                let h: Vec<OpenItem> = super::held::held_for(&all_open, s.id, &s.work)
+                    .into_iter()
+                    .cloned()
+                    .collect();
+                (s.id, h)
+            })
+            .filter(|(_, h)| !h.is_empty())
+            .collect();
+        let open: Vec<OpenItem> = all_open
+            .iter()
+            .cloned()
             // The person in that session now: theirs, nothing said of it,
             // nor counted as said again.
             .filter(|i| {
@@ -442,6 +471,8 @@ impl CrewHub {
             restated,
             told,
             noted,
+            open: all_open,
+            held,
         }
     }
 
@@ -492,6 +523,12 @@ impl CrewHub {
                 let works: Vec<(Uuid, &Work)> =
                     b.sessions.iter().map(|s| (s.id, &s.work)).collect();
                 user.push_str(&update::composer_work(&works));
+                let held: Vec<(Uuid, Vec<String>)> = b
+                    .held
+                    .iter()
+                    .map(|(id, items)| (*id, items.iter().map(|i| i.text.clone()).collect()))
+                    .collect();
+                user.push_str(&update::composer_held(&held));
                 user.push_str(&update::composer_decisions(&acted));
                 let made = writer
                     .write_billed(boss, owner, update::COMPOSER_SYSTEM, &user)
@@ -583,6 +620,7 @@ impl CrewHub {
                     did: vec![],
                     at: None,
                     decisions: None,
+                    moves: None,
                 })
             };
             if let Some(h) = w.headline.as_deref() {
@@ -745,6 +783,9 @@ impl CrewHub {
             let kind = write::kind_of(&[], &did);
             said.push(write::plain_said(&work, &[], "", None, did, kind));
         }
+        // Every one about blocked or stalled work says who moves it next,
+        // and that is done: never a stall left with nobody on it.
+        self.own_stalls(boss, o, b, &mut said, now).await;
         // The finished sessions it closed, would close, or left open: one
         // line each.
         let notes = self.closing_notes(boss, now);
@@ -1026,6 +1067,7 @@ impl CrewHub {
                     did: vec![],
                     at: None,
                     decisions: None,
+                    moves: None,
                 },
             ));
         }
@@ -1087,6 +1129,7 @@ impl CrewHub {
                     did: vec![],
                     at: None,
                     decisions: None,
+                    moves: None,
                 },
             ));
         }

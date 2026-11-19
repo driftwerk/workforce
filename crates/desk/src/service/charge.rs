@@ -247,8 +247,18 @@ impl Desk {
     /// its boss won't answer requests, or its boss left it to them. None
     /// while its boss has it, and when no boss runs it.
     pub(super) fn waits_on_you(st: &super::State, view: &SessionView) -> Option<String> {
-        let p = view.pending.as_ref()?;
         let c = st.charges.rows.get(&view.id).filter(|c| c.live())?;
+        // A question it asks or a stop with no request: the person's only
+        // where its boss won't answer, or they drive it.
+        let Some(p) = view.pending.as_ref() else {
+            if !matches!(view.state, SessionState::Asking | SessionState::Blocked) {
+                return None;
+            }
+            if Self::wheel_now(st, c).person() {
+                return Some("You're driving it.".into());
+            }
+            return st.charges.unanswering.get(&c.boss).cloned();
+        };
         let name = st
             .charges
             .names
@@ -268,6 +278,30 @@ impl Desk {
             return Some(format!("{name} left this to you."));
         }
         None
+    }
+
+    /// The boss that has `view` now, by name: a live charge, the boss at
+    /// the wheel, and nothing it waits on the person's
+    /// ([`Self::waits_on_you`], already set on `view`). None when no boss
+    /// runs it.
+    pub(super) fn boss_has(st: &super::State, view: &SessionView) -> Option<String> {
+        let c = st.charges.rows.get(&view.id).filter(|c| c.live())?;
+        if view.waits_on_you.is_some() || Self::wheel_now(st, c).person() {
+            return None;
+        }
+        Some(
+            st.charges
+                .names
+                .get(&c.boss)
+                .cloned()
+                .unwrap_or_else(|| "Your boss".into()),
+        )
+    }
+
+    /// Whether a boss has session `id` now ([`Self::boss_has`]): what of it
+    /// would call for the person goes to that boss first.
+    pub fn boss_has_it(&self, id: Uuid) -> bool {
+        self.view(id).is_ok_and(|v| v.boss_has.is_some())
     }
 
     /// The repositories each boss acting fully may ship in, by its agent

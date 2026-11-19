@@ -839,6 +839,7 @@ impl CrewHub {
             did: Vec::new(),
             at: Some(at),
             decisions: None,
+            moves: None,
         };
         let extras = Extras {
             update: Some(workforce_desk::update::MentionedUpdate {
@@ -1791,6 +1792,7 @@ impl CrewHub {
         };
         self.resurface(&items).await;
         self.remind_waiting(&items).await;
+        self.look_at_rechecks(&items).await;
         self.post_held_questions().await;
         self.look_for_silent_waits().await;
     }

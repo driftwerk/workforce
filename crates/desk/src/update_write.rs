@@ -20,6 +20,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::account::{Done, RefKind};
 use crate::update::BriefItem;
@@ -188,6 +189,219 @@ pub struct Said {
     /// every one it stands for). None on any other line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decisions: Option<u32>,
+    /// Who moves it next and what happens then, on an item about work
+    /// that is blocked or stalled ([`stalled`]); said in its body too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moves: Option<Mover>,
+}
+
+/// Who moves a blocked or stalled piece of work next, and what happens
+/// then: an item about one says one of these, or isn't said at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "by", rename_all = "snake_case")]
+pub enum Mover {
+    /// The boss moves it, now, and has done or handed on what it says
+    /// (`doing`, a sentence in its voice: "I'm passing them to its session
+    /// now.").
+    Boss { doing: String },
+    /// Only the person can: the exact question, answered from the open
+    /// item's card (`item`), which straight reaches the session and is
+    /// reminded until it is.
+    Person { question: String, item: Uuid },
+    /// Something outside the crew: what, and when the boss looks again
+    /// (kept, and looked at then).
+    Outside { on: String, check_at: DateTime<Utc> },
+}
+
+impl Mover {
+    /// What it says, as the sentence that opens the item's body: "Yours:
+    /// …", "Waiting on …; I'll check again at 15:20.", or what the boss is
+    /// doing.
+    pub fn said(&self, tz: &chrono_tz::Tz) -> String {
+        match self {
+            Self::Boss { doing } => sentence(&capitalised(doing.trim())),
+            Self::Person { question, .. } => {
+                sentence(&format!("Yours: {}", question.trim().trim_end_matches('.')))
+            }
+            Self::Outside { on, check_at } => sentence(&format!(
+                "Waiting on {}; I'll check again at {}",
+                lowered(on.trim().trim_end_matches('.')),
+                check_at.with_timezone(tz).format("%H:%M")
+            )),
+        }
+    }
+}
+
+/// Words that say a piece of work is blocked or stalled.
+const STALL_WORDS: &[&str] = &[
+    "blocked",
+    "stalled",
+    "stuck",
+    "haven't started",
+    "hasn't started",
+    "has not started",
+    "have not started",
+    "not started",
+    "can't start",
+    "cannot start",
+    "can't proceed",
+    "cannot proceed",
+    "can't go on",
+    "on hold",
+    "held up",
+    "no reply",
+    "timed out",
+];
+
+/// Words that say an answer, an approval or a decision isn't there.
+const MISSING_WORDS: &[&str] = &[
+    "no answer",
+    "no answers",
+    "no recorded answer",
+    "no reply",
+    "not answered",
+    "unanswered",
+    "not recorded",
+    "no approval",
+    "not approved",
+    "no decision",
+    "not decided",
+    "undecided",
+    "haven't answered",
+    "hasn't answered",
+    "has not answered",
+    "have not answered",
+    "missing",
+    "awaiting",
+];
+
+/// Words that say what is waited on is the person's word: an answer,
+/// an approval, a decision, a go-ahead.
+const ASKS_FOR: &[&str] = &[
+    "answer",
+    "answers",
+    "answered",
+    "question",
+    "questions",
+    "approval",
+    "approve",
+    "approved",
+    "decision",
+    "decide",
+    "decided",
+    "go-ahead",
+    "sign-off",
+    "confirmation",
+    "confirm",
+];
+
+/// `text` in lower case with its apostrophes plain.
+fn lower(text: &str) -> String {
+    text.to_lowercase().replace('\u{2019}', "'")
+}
+
+/// Whether `lower` says `phrase` as words.
+fn says_words(lower: &str, phrase: &str) -> bool {
+    lower.match_indices(phrase).any(|(at, _)| {
+        let before = lower[..at].chars().next_back();
+        let after = lower[at + phrase.len()..].chars().next();
+        !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+    })
+}
+
+/// Whether `text` says work is blocked or stalled.
+pub fn says_stall(text: &str) -> bool {
+    let l = lower(text);
+    STALL_WORDS.iter().any(|w| says_words(&l, w))
+}
+
+/// Whether `text` says an answer, an approval or a decision is missing.
+pub fn says_missing(text: &str) -> bool {
+    let l = lower(text);
+    MISSING_WORDS.iter().any(|w| says_words(&l, w))
+}
+
+/// Whether `text` says what is waited on is the person's word.
+pub fn asks_for_word(text: &str) -> bool {
+    let l = lower(text);
+    ASKS_FOR.iter().any(|w| says_words(&l, w))
+}
+
+/// Whether `s` is about work that is blocked or stalled: a problem, what
+/// needs the person, or said in words to be stuck (or its session's own
+/// `account` lines, `said_of_it`, say so).
+pub fn stalled(s: &Said, said_of_it: &[&str]) -> bool {
+    matches!(s.kind, EventKind::Problem | EventKind::NeedsYou)
+        || says_stall(&s.headline)
+        || says_stall(&s.body)
+        || said_of_it.iter().any(|t| says_stall(t))
+}
+
+/// Whether `s` is blocked or stalled and says nobody moves it: never
+/// said so.
+pub fn unowned(s: &Said, said_of_it: &[&str]) -> bool {
+    s.moves.is_none() && stalled(s, said_of_it)
+}
+
+/// `s` with who moves it (`m`): its body opens on what that is, the rest
+/// of it after, within [`BODY_WORDS`] (the mover's sentence is never cut).
+/// What it says keeps the contract: ids in it go to the brackets.
+pub fn moved(mut s: Said, m: Mover, work: &Work, tz: &chrono_tz::Tz) -> Said {
+    let (line, lifted) = in_words(&m.said(tz), work);
+    for id in lifted {
+        if !s.ids.contains(&id) {
+            s.ids.push(id);
+        }
+    }
+    let room = BODY_WORDS.saturating_sub(crate::crew::word_count(&line));
+    let rest = match s.body.trim() {
+        _ if room == 0 => String::new(),
+        "" => String::new(),
+        b => cut(b, room),
+    };
+    s.body = match rest.is_empty() {
+        true => line,
+        false => format!("{line} {rest}"),
+    };
+    if matches!(m, Mover::Person { .. }) {
+        s.kind = EventKind::NeedsYou;
+    }
+    s.moves = Some(m);
+    let (h, b, g) = (
+        s.headline.clone(),
+        s.body.clone(),
+        s.not_checked.clone().unwrap_or_default(),
+    );
+    not_said_in(&mut s.ids, &[&h, &b, &g]);
+    s
+}
+
+/// The item for work whose session waits on the person's word when the
+/// boss holds it: never that it is missing. Its headline says the boss
+/// has their answers; who moves it says it is passing them on (`doing`).
+/// What the session said of them being missing is dropped.
+pub fn held(s: Said, work: &Work, doing: &str, tz: &chrono_tz::Tz) -> Said {
+    let headline = cut(
+        &sentence(&format!("I have your answers for {}", work.in_words())),
+        HEADLINE_WORDS,
+    );
+    let mut s = Said {
+        headline,
+        body: String::new(),
+        kind: EventKind::Progress,
+        ..s
+    };
+    s.ids = work.ids();
+    let h = s.headline.clone();
+    not_said_in(&mut s.ids, &[&h]);
+    moved(
+        s,
+        Mover::Boss {
+            doing: doing.to_string(),
+        },
+        work,
+        tz,
+    )
 }
 
 /// What of the contract a line breaks.
@@ -526,7 +740,7 @@ const OPENERS: &[&str] = &[
 
 /// `s` to read on after a colon: its first letter lowered when it opens
 /// on a common opening word ([`OPENERS`]), else as it is.
-fn lowered(s: &str) -> String {
+pub fn lowered(s: &str) -> String {
     let first = s
         .split(|c: char| !c.is_alphanumeric() && c != '\'')
         .next()
@@ -635,6 +849,7 @@ pub fn plain_said(
             .max(),
         did,
         decisions: None,
+        moves: None,
     }
 }
 
@@ -1009,6 +1224,7 @@ mod tests {
             kind: EventKind::Finished,
             at: None,
             decisions: None,
+            moves: None,
         };
         let b = breaches(&terse);
         assert!(b.contains(&Breach::OpensOnId("MAN-636".into())), "{b:?}");
@@ -1084,6 +1300,132 @@ mod tests {
             ..good
         };
         assert_eq!(said_from(plain.clone(), &bad, &w).headline, plain.headline);
+    }
+
+    /// The 19 Nov update: a stall said with nobody on it is unowned until
+    /// who moves it is set, and then its body opens on that, whole, inside
+    /// the contract.
+    #[test]
+    fn a_stall_says_who_moves_it_next_and_what_happens_then() {
+        let tz: chrono_tz::Tz = "Europe/London".parse().unwrap();
+        let mut w = rust_fix();
+        w.name = "VEL-22".into();
+        w.titled = vec![Titled {
+            kind: RefKind::Ticket,
+            id: "VEL-22".into(),
+            title: Some("Track 2 Workforce PRs".into()),
+        }];
+        let d = done(
+            "Found no recorded answers to the section 7 questions; commented on VEL-22 that it is blocked on the owner's answers.",
+            &[],
+        );
+        let stall = plain_said(&w, &[&d], "", None, vec![], kind_of(&[&d], &[]));
+        assert_eq!(stall.kind, EventKind::Problem);
+        assert!(unowned(&stall, &[]), "{stall:?}");
+        assert!(says_missing(&d.text) && asks_for_word(&d.text));
+        // Progress that waits on nothing is no stall.
+        let fine = plain_said(
+            &w,
+            &[&done("Opened the pull request", &[])],
+            "",
+            None,
+            vec![],
+            EventKind::Progress,
+        );
+        assert!(!stalled(&fine, &[]));
+        assert!(stalled(&fine, &["The deploy is stuck on a lock"]));
+
+        // Held: the person's answers are never said to be missing.
+        let held = held(
+            stall.clone(),
+            &w,
+            "I'm passing them to its session now.",
+            &tz,
+        );
+        assert_eq!(
+            held.headline,
+            "I have your answers for Track 2 Workforce PRs."
+        );
+        assert!(
+            held.body
+                .starts_with("I'm passing them to its session now."),
+            "{}",
+            held.body
+        );
+        assert!(
+            !says_missing(&held.headline) && !says_missing(&held.body),
+            "{held:?}"
+        );
+        assert!(!unowned(&held, &[]));
+        assert_eq!(breaches(&held), vec![], "{held:?}");
+
+        // The person's: "Yours: …", the item's card answers it.
+        let item = Uuid::new_v4();
+        let yours = moved(
+            stall.clone(),
+            Mover::Person {
+                question: "Approve the eight answers in the plan's section 7".into(),
+                item,
+            },
+            &w,
+            &tz,
+        );
+        assert_eq!(yours.kind, EventKind::NeedsYou);
+        assert!(
+            yours
+                .body
+                .starts_with("Yours: Approve the eight answers in the plan's section 7."),
+            "{}",
+            yours.body
+        );
+        assert_eq!(breaches(&yours), vec![]);
+
+        // Outside: what, and when it is looked at again, in local time.
+        let at = DateTime::parse_from_rfc3339("2026-11-19T15:20:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let out = moved(
+            stall.clone(),
+            Mover::Outside {
+                on: "CI on the wasmtime pull request (#103)".into(),
+                check_at: at,
+            },
+            &w,
+            &tz,
+        );
+        assert!(
+            out.body.starts_with(
+                "Waiting on CI on the wasmtime pull request (#103); I'll check again at 15:20."
+            ),
+            "{}",
+            out.body
+        );
+
+        // However long the rest, who moves it is never cut.
+        let mut long = stall.clone();
+        long.body = "word ".repeat(BODY_WORDS * 2);
+        let kept = moved(
+            long,
+            Mover::Boss {
+                doing: "I'm looking at what unblocks it now".into(),
+            },
+            &w,
+            &tz,
+        );
+        assert!(
+            kept.body
+                .starts_with("I'm looking at what unblocks it now."),
+            "{}",
+            kept.body
+        );
+        assert!(
+            crate::crew::word_count(&kept.body) <= BODY_WORDS + 1,
+            "{}",
+            kept.body
+        );
+        // Kept with the update and read back.
+        let back: Said = serde_json::from_value(serde_json::to_value(&yours).unwrap()).unwrap();
+        assert_eq!(back.moves, yours.moves);
     }
 
     #[test]

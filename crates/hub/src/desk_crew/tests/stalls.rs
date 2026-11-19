@@ -1,0 +1,336 @@
+//! No update says work is stuck with nobody on it (19 Nov, 14:51: "The
+//! Workforce track 2 PRs (VEL-22) haven't started, because no answers to
+//! the plan's open questions are recorded", when the person had answered
+//! all eight at 11:57 and the boss held their answers as an order). Every
+//! stalled item says who moves it; what the boss holds goes to the session
+//! and is never said to be missing; what only the person can settle is an
+//! item with its answer, reminded until it is answered.
+
+use super::super::updates::UpdateWriter;
+use super::*;
+use workforce_common::channels::desk::DeliveryKind;
+use workforce_desk::account::{Account, Done};
+use workforce_desk::crew::PartyKind;
+use workforce_desk::open_item::{NewItem, OpenItem, OpenKind, OpenState};
+use workforce_desk::update::MentionedUpdate;
+use workforce_desk::update_write::{self as write, Mover, Said};
+
+/// A minute is 100 ms; a waiting item is reminded after 1 s.
+const ACT: &str = "[oversight]\nenabled = true\nlevel = \"act\"\nact = { nudge = true }\n\
+                   wake = { waiting_remind_minutes = [10, 10, 10] }\n";
+
+/// The writer of 19 Nov: says, of every session, that no answers are
+/// recorded and nothing has changed.
+struct NoAnswers;
+
+#[async_trait::async_trait]
+impl UpdateWriter for NoAnswers {
+    async fn write(&self, _: &str, _: &str, _: &str, user: &str) -> eyre::Result<String> {
+        let sessions: Vec<serde_json::Value> = user
+            .lines()
+            .filter_map(|l| l.strip_prefix("Session "))
+            .filter_map(|l| l.split_whitespace().next())
+            .map(|id| {
+                json!({
+                    "id": id,
+                    "headline": "The Workforce track 2 PRs haven't started, because no answers to the plan's open questions are recorded.",
+                    "text": "Nothing on track 2 has changed. I noted the block on the ticket.",
+                })
+            })
+            .collect();
+        Ok(json!({ "sessions": sessions }).to_string())
+    }
+}
+
+/// A writer that is down: written plainly.
+struct Down;
+
+#[async_trait::async_trait]
+impl UpdateWriter for Down {
+    async fn write(&self, _: &str, _: &str, _: &str, _: &str) -> eyre::Result<String> {
+        eyre::bail!("the model is down")
+    }
+}
+
+/// Keeps `s`'s account: `done` just now, waiting on `waiting_on`.
+async fn account(d: &Desk, s: uuid::Uuid, purpose: &str, done: &[&str], waiting_on: Option<&str>) {
+    let mut a = Account::new(s, "", chrono::Utc::now());
+    a.purpose = purpose.into();
+    for text in done {
+        a.done.push(Done {
+            text: (*text).into(),
+            refs: vec![],
+            at: chrono::Utc::now(),
+            restated: false,
+        });
+    }
+    a.waiting_on = waiting_on.map(str::to_string);
+    d.store().session_account_put(&a).await.unwrap();
+}
+
+/// The newest update posted, and its items.
+async fn update(overseer: &AgentService, d: &Desk, nth: usize) -> MentionedUpdate {
+    let posted = eventually("the update", async || {
+        overseer
+            .sessions
+            .find(DESK_CHANNEL, PERSON)
+            .unwrap()
+            .map(|s| s.messages)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| {
+                m.desk
+                    .as_ref()
+                    .and_then(|x| x.delivery)
+                    .is_some_and(|k| k == DeliveryKind::Update)
+            })
+            .nth(nth)
+    })
+    .await;
+    eventually("its extras", async || {
+        d.store()
+            .extras(std::slice::from_ref(&posted.id))
+            .await
+            .unwrap()
+            .remove(&posted.id)
+            .and_then(|e| e.update)
+    })
+    .await
+}
+
+/// The item of `u` about session `s`.
+fn item_of(u: &MentionedUpdate, s: uuid::Uuid) -> Said {
+    u.said
+        .iter()
+        .find(|i| {
+            i.session
+                .as_ref()
+                .is_some_and(|l| l.session_id == s.to_string())
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("no item about {s}: {:?}", u.said))
+}
+
+/// What the boss sent session `s` on its line.
+async fn sent(d: &Desk, s: uuid::Uuid) -> Vec<String> {
+    d.line_thread(s, None, Some(100))
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.from.kind == PartyKind::Manager && m.to_session() == Some(s))
+        .map(|m| m.text)
+        .collect()
+}
+
+/// The person answered in the DM, and the boss kept it as an order naming
+/// the ticket, with no session linked. The session then says no answers
+/// are recorded, and the writer says so too: the update instead says the
+/// boss has the answers and is passing them on, and the session is sent
+/// them, once, however often the update is written again.
+#[tokio::test(flavor = "multi_thread")]
+async fn held_answers_are_passed_on_and_never_said_to_be_missing() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        crew.set_update_writer(Arc::new(NoAnswers));
+        crew.look_at_updates().await;
+        let answers = "VEL-22's eight section 7 design questions (cutover window 60-90 min, bge-small-en-v1.5 at 384 dims): Kingsley, 19 Nov 11:57: \"ok yes to all to approve the design\".";
+        d.store()
+            .item_open(&NewItem::order("desk", answers, vec![], None))
+            .await
+            .unwrap();
+        let s = new_session(&d, dir.path(), "VEL-22").await;
+        account(
+            &d,
+            s.id,
+            "Carry out the track 2 Workforce PRs, once the owner has answered the plan's section 7 questions",
+            &[
+                "Read the handoff and the plan; found no recorded answers to the section 7 questions.",
+                "Commented on VEL-22 that it is blocked on the owner's answers.",
+            ],
+            None,
+        )
+        .await;
+        let u = update(&overseer, &d, 0).await;
+        let item = item_of(&u, s.id);
+        assert!(
+            !write::says_missing(&item.headline) && !write::says_missing(&item.body),
+            "never that what the boss holds is missing: {item:?}"
+        );
+        assert!(item.headline.starts_with("I have your answers for"), "{item:?}");
+        assert!(
+            matches!(&item.moves, Some(Mover::Boss { doing }) if doing.contains("passing them")),
+            "{item:?}"
+        );
+        assert_eq!(write::breaches(&item), vec![], "{item:?}");
+        let to_it = eventually("the answers sent to the session", async || {
+            let s = sent(&d, s.id).await;
+            (!s.is_empty()).then_some(s)
+        })
+        .await;
+        assert_eq!(to_it.len(), 1, "{to_it:?}");
+        assert!(to_it[0].contains("ok yes to all to approve the design"), "{to_it:?}");
+
+        // Said again: not sent again.
+        account(
+            &d,
+            s.id,
+            "Carry out the track 2 Workforce PRs, once the owner has answered the plan's section 7 questions",
+            &["Still no recorded answers to the section 7 questions; blocked."],
+            None,
+        )
+        .await;
+        // What the next update says of it (what the boss sent, within the
+        // cadence) never says it is missing.
+        let next = update(&overseer, &d, 1).await;
+        for i in next.said.iter().filter(|i| {
+            i.session
+                .as_ref()
+                .is_some_and(|l| l.session_id == s.id.to_string())
+        }) {
+            assert!(
+                !write::says_missing(&i.headline) && !write::says_missing(&i.body),
+                "{i:?}"
+            );
+            assert_eq!(write::breaches(i), vec![], "{i:?}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(sent(&d, s.id).await.len(), 1, "given once");
+    })
+    .await;
+}
+
+/// A blocked item with nobody on it, nothing held and nothing it waits on,
+/// is never said so: the boss's full turn is handed it, and the item says
+/// that.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blocked_item_always_says_who_moves_it() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        crew.set_update_writer(Arc::new(Down));
+        crew.look_at_updates().await;
+        let s = new_session(&d, dir.path(), "legacy-removal").await;
+        account(
+            &d,
+            s.id,
+            "Remove the legacy services from staging",
+            &["Legacy removal is blocked until the partner API docs move to Cufflink."],
+            None,
+        )
+        .await;
+        let u = update(&overseer, &d, 0).await;
+        for i in &u.said {
+            assert!(!write::unowned(i, &[]), "an item with nobody on it: {i:?}");
+        }
+        let item = item_of(&u, s.id);
+        assert!(item.moves.is_some(), "{item:?}");
+        assert!(!item.body.is_empty());
+    })
+    .await;
+}
+
+/// What only the person can settle is theirs as an item: "Yours: …" in the
+/// update, the item's card answering straight to the session, reminded
+/// until it is; their answer reaches the session and closes it in one line.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stall_only_the_person_can_settle_is_their_item_until_answered() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        crew.set_update_writer(Arc::new(Down));
+        crew.look_at_updates().await;
+        let s = new_session(&d, dir.path(), "cutover").await;
+        account(
+            &d,
+            s.id,
+            "Cut the search index over to the new store",
+            &["Blocked: the cutover window needs the owner's decision."],
+            Some("your decision on the cutover window"),
+        )
+        .await;
+        let u = update(&overseer, &d, 0).await;
+        let item = item_of(&u, s.id);
+        let Some(Mover::Person { question, item: id }) = item.moves.clone() else {
+            panic!("the person's: {item:?}");
+        };
+        assert!(item.body.starts_with("Yours:"), "{item:?}");
+        assert!(question.contains("cutover window"), "{question}");
+        let open: OpenItem = d.store().open_item(id).await.unwrap().expect("its item");
+        assert!(open.dedupe_key.starts_with("waiting:"), "{open:?}");
+        assert_eq!(open.session, Some(s.id));
+        // Reminded until it is answered.
+        let reminded = eventually("a reminder", async || {
+            let i = d.store().open_item(id).await.unwrap()?;
+            (i.said_count > 1).then_some(i)
+        })
+        .await;
+        assert_eq!(reminded.state, OpenState::Open);
+        // Answered from its card: to the session, and closed in one line.
+        crew.answer_wait(&open, "Take the 60 minute window tonight")
+            .await
+            .unwrap();
+        let closed = d.store().open_item(id).await.unwrap().unwrap();
+        assert_eq!(closed.state, OpenState::Closed);
+        assert_eq!(
+            closed.closed_why.as_deref(),
+            Some("You answered: Take the 60 minute window tonight")
+        );
+        let thread = d.line_thread(s.id, None, Some(50)).await.unwrap();
+        assert!(
+            thread
+                .iter()
+                .any(|m| m.text.contains("Take the 60 minute window tonight")),
+            "{thread:?}"
+        );
+    })
+    .await;
+}
+
+/// What waits outside the crew is looked at again, and when is said: a
+/// promise kept, which the minute's look closes once due.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stall_on_something_outside_is_checked_again_when_said() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        crew.set_update_writer(Arc::new(Down));
+        crew.look_at_updates().await;
+        let s = new_session(&d, dir.path(), "release").await;
+        account(
+            &d,
+            s.id,
+            "Ship the v0.39.0 release",
+            &["The release is blocked on the wasmtime audit exception."],
+            Some("CI on the wasmtime pull request"),
+        )
+        .await;
+        let u = update(&overseer, &d, 0).await;
+        let item = item_of(&u, s.id);
+        let Some(Mover::Outside { check_at, .. }) = item.moves.clone() else {
+            panic!("outside: {item:?}");
+        };
+        assert!(item.body.contains("I'll check again at"), "{item:?}");
+        let recheck = d
+            .store()
+            .items_not_closed(Some("desk"))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|i| i.dedupe_key.starts_with("recheck:"))
+            .expect("the re-check kept");
+        assert_eq!(recheck.kind, OpenKind::Promise);
+        assert_eq!(
+            super::super::stalls::recheck_of(&recheck.dedupe_key),
+            Some((s.id, check_at))
+        );
+        // Due, it is looked at and closed.
+        eventually("the re-check looked at", async || {
+            crew.look_at_items().await;
+            let i = d.store().open_item(recheck.id).await.unwrap()?;
+            (i.state == OpenState::Closed).then_some(())
+        })
+        .await;
+    })
+    .await;
+}

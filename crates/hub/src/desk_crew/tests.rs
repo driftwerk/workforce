@@ -1892,6 +1892,7 @@ mod preferences;
 mod promises;
 mod repeats;
 mod silent_waits;
+mod stalls;
 mod updates;
 mod urgent;
 
@@ -4378,6 +4379,47 @@ async fn a_session_whose_overseer_only_suggests_waits_on_you() {
         })
         .await;
         assert_eq!(why, format!("{name} only suggests: you decide."));
+    })
+    .await;
+}
+
+/// A session its boss has calls for nobody's attention but the boss's
+/// (19 Nov: "if Desk is driving it and dealing with it then it doesn't need
+/// me"): its request says "Desk has it", never "waiting on you"; once the
+/// person drives it, it is theirs again; one no boss runs is as it always
+/// was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_its_boss_has_calls_for_no_attention_but_the_bosss() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _crew, d, _llm, id, url) = handed_session(dir.path(), pool).await;
+        // Unbossed: what it asks is the person's, as ever.
+        let _asked = ask_to_run(&url, "cargo test -p acme");
+        eventually("the request", async || d.view(id).unwrap().pending).await;
+        assert_eq!(d.view(id).unwrap().boss_has, None);
+        assert!(!d.boss_has_it(id));
+
+        let name = super::name_of(&overseer);
+        let boss = workforce_desk::crew::Party::manager("desk", &name);
+        d.take_on(
+            id,
+            &boss,
+            workforce_desk::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        let v = d.view(id).unwrap();
+        assert_eq!(v.boss_has.as_deref(), Some(name.as_str()), "{v:?}");
+        assert_eq!(v.waits_on_you, None);
+        assert!(d.boss_has_it(id));
+
+        // The person takes the wheel: theirs.
+        d.drive(id).await.unwrap();
+        let v = d.view(id).unwrap();
+        assert_eq!(v.boss_has, None);
+        assert!(v.waits_on_you.is_some());
     })
     .await;
 }

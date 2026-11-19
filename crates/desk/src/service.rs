@@ -2234,6 +2234,7 @@ impl Desk {
         view.failure = state.turn_failures.get(&r.id).cloned();
         view.mode = live.and(state.modes_started.get(&r.id).copied());
         view.waits_on_you = Self::waits_on_you(state, &view);
+        view.boss_has = Self::boss_has(state, &view);
         view
     }
 

@@ -43,6 +43,7 @@ mod extras;
 mod find;
 mod github;
 mod handover;
+mod held;
 mod idle;
 mod items;
 mod line;
@@ -64,6 +65,7 @@ mod scope;
 pub(crate) mod served;
 pub(crate) mod shared_budget;
 mod spend;
+mod stalls;
 mod tools;
 mod updates;
 mod urgent;
@@ -233,6 +235,9 @@ pub struct CrewHub {
     update_writer: Mutex<Option<Arc<dyn updates::UpdateWriter>>>,
     /// The bosses the person asked for a roundup now ("Roundup now").
     roundup_asked: Mutex<std::collections::HashSet<String>>,
+    /// When each boss's full turn was last handed a stall of a session's
+    /// that nobody moved ([`stalls`]): not handed again within the hour.
+    stalls_handed: Mutex<HashMap<(String, uuid::Uuid), DateTime<Utc>>>,
     /// The bosses whose update is being looked at now.
     updating: Mutex<std::collections::HashSet<String>>,
     /// The suggestions each boss's quiet check-ins made, and when, for its
@@ -695,6 +700,7 @@ impl CrewHub {
             redecided: Mutex::default(),
             update_writer: Mutex::default(),
             roundup_asked: Mutex::default(),
+            stalls_handed: Mutex::default(),
             updating: Mutex::default(),
             quiet_made: Mutex::default(),
             closing: Mutex::default(),
