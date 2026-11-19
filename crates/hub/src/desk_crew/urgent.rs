@@ -77,6 +77,12 @@ pub(crate) struct Unreadable;
 pub(crate) const UNREADABLE: &str = "This suggestion to interrupt can't say which turn it was for, \
      so nothing was interrupted and it was set aside. Interrupt the session yourself if it still needs it.";
 
+/// [`UNREADABLE`], when it couldn't be set aside (answered meanwhile, or
+/// the store failed).
+pub(crate) const UNREADABLE_KEPT: &str =
+    "This suggestion to interrupt can't say which turn it was for, \
+     so nothing was interrupted. Interrupt the session yourself if it still needs it.";
+
 impl CrewHub {
     /// `boss`'s escalating stand-down (line row `row`) wasn't read by
     /// `session` in turn `turn`: interrupts that turn as `crew.interrupt`
@@ -127,15 +133,16 @@ impl CrewHub {
 
     /// The person said yes to `s`, a suggestion to interrupt whose
     /// stand-down mark can't be read ([`Unreadable`]): it is set aside, only
-    /// while still open, and said so, so it isn't asked again.
-    pub(crate) async fn set_aside_unreadable(&self, s: &crew::Suggestion) {
-        tracing::warn!(suggestion = %s.id, "a suggestion to interrupt has a stand-down mark that can't be read: set aside, nothing interrupted");
+    /// while still open, and said so, so it isn't asked again. Whether it
+    /// was.
+    pub(crate) async fn set_aside_unreadable(&self, s: &crew::Suggestion) -> bool {
+        tracing::warn!(suggestion = %s.id, "a suggestion to interrupt has a stand-down mark that can't be read: nothing interrupted");
         match self.desk.store().suggestion_dismiss_open(&s.id).await {
             Ok(true) => {}
-            Ok(false) => return,
+            Ok(false) => return false,
             Err(e) => {
                 tracing::warn!(suggestion = %s.id, error = %e, "a suggestion to interrupt with an unreadable mark couldn't be set aside");
-                return;
+                return false;
             }
         }
         let mut by = crew::By::desk("It couldn't say which turn it was for.");
@@ -145,6 +152,7 @@ impl CrewHub {
             s.subject.clone(),
             format!("set aside the suggestion: {}", s.text),
         ));
+        true
     }
 
     /// The suggestion `s` to interrupt `session` for its stand-down `row`

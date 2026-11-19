@@ -1469,8 +1469,11 @@ impl Crew for CrewHub {
         let only_turn = match urgent::only_turn_of(&suggestion.action["input"]) {
             Ok(only) => only,
             Err(urgent::Unreadable) => {
-                self.set_aside_unreadable(suggestion).await;
-                return Err(urgent::UNREADABLE.into());
+                return Err(match self.set_aside_unreadable(suggestion).await {
+                    true => urgent::UNREADABLE,
+                    false => urgent::UNREADABLE_KEPT,
+                }
+                .into());
             }
         };
         let order = assignments::Order {

@@ -592,9 +592,8 @@ async fn a_yes_to_an_interrupt_whose_mark_cant_be_read_is_refused_and_set_aside(
                 .find(|g| g.text == "Interrupt release-prep")
         })
         .await;
-        // Its mark damaged where it is kept: the turn no longer reads.
+        // Its mark damaged as the yes reads it: the turn no longer reads.
         suggested.action["input"]["stand_down"]["turn"] = json!("its last one");
-        d.store().put_suggestion(&suggested).await.unwrap();
         // The person's yes, while the turn still runs and the row is unread:
         // refused in plain words, never a plain interrupt. (Desk's route
         // answers a refusal without keeping the suggestion it read, so the
