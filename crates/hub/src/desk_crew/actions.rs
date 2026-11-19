@@ -21,6 +21,7 @@ use workforce_desk::{AssignTo, ChargedTo, Move, NewSessionFor, Speaker};
 
 use super::decisions::Done;
 use super::read_only::read_only_in;
+use super::refusal::{Refusal, Refused};
 use super::CrewHub;
 
 /// Who a nudge goes to.
@@ -1381,6 +1382,36 @@ impl CrewHub {
         by: By,
         order: &super::assignments::Order,
     ) -> Result<String, String> {
+        Box::pin(self.perform_judged(action, by, order))
+            .await
+            .map_err(String::from)
+    }
+
+    /// [`Self::perform_with`], refused with its kind
+    /// ([`super::refusal`]): what acts on a refusal by itself, rather than
+    /// handing its words to a boss's turn, reads this.
+    pub(crate) async fn perform_judged(
+        &self,
+        action: &Action,
+        by: By,
+        order: &super::assignments::Order,
+    ) -> Result<String, Refused> {
+        let to = Self::lane_of(action, &by).map(|s| (by.party.id.clone(), s));
+        let done = Box::pin(self.perform_typed(action, by, order)).await;
+        // What became of a boss's step for a session whose refused next
+        // step its full turn has (`super::idle`).
+        if let Some((boss, s)) = to {
+            self.step_went(&boss, s, done.as_ref().map(|_| ()));
+        }
+        done
+    }
+
+    async fn perform_typed(
+        &self,
+        action: &Action,
+        by: By,
+        order: &super::assignments::Order,
+    ) -> Result<String, Refused> {
         // A held order going out that isn't sent after all holds nothing.
         let unheld = |why: &str| {
             let why = why.to_string();
@@ -1424,9 +1455,9 @@ impl CrewHub {
                 ))
                 .await
                 {
-                    return Err(format!(
+                    return Err(Refused::other(format!(
                         "Not allowed: {conflict}. It's the person's to answer."
-                    ));
+                    )));
                 }
             }
         }
@@ -1435,7 +1466,7 @@ impl CrewHub {
         if by.party.kind == crew::PartyKind::Manager {
             if let Some(why) = self.left_alone(action) {
                 unheld(&why).await;
-                return Err(why);
+                return Err(Refused::new(Refusal::TakenBack, why));
             }
         }
         // A boss's message to a session goes through the session's lane,
@@ -1453,7 +1484,7 @@ impl CrewHub {
                 }
                 Err(why) => {
                     unheld(&why).await;
-                    return Err(why);
+                    return Err(Refused::new(Refusal::Stale, why));
                 }
                 Ok(None) => {}
             }
@@ -1576,7 +1607,7 @@ impl CrewHub {
                 if let Some(t) = told {
                     self.untell(t);
                 }
-                return Err(e);
+                return Err(Refused::other(e));
             }
         };
         self.after_action(action, &who, &done).await;

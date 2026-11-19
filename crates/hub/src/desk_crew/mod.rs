@@ -55,6 +55,7 @@ mod plan;
 mod preferences;
 mod read_only;
 mod reading;
+mod refusal;
 pub(crate) mod relay;
 pub(crate) mod relayed_decide;
 pub(crate) mod remote_asks;
@@ -193,6 +194,9 @@ pub struct CrewHub {
     to_work: Mutex<std::collections::HashSet<(uuid::Uuid, u64)>>,
     /// Those turn ends, said again to the loops that wake a full turn.
     rework: tokio::sync::broadcast::Sender<workforce_desk::crew::Event>,
+    /// The turn ends handed to the full turn because the fast call's next
+    /// step was refused for what the boss can fix, by session (`idle`).
+    refused_steps: Mutex<HashMap<uuid::Uuid, idle::Handed>>,
     /// The words of sessions' questions on Desk's line the overseer may
     /// answer, by message: an answer is gated by what was asked as well as
     /// by what it says. One not known here is the person's.
@@ -676,6 +680,7 @@ impl CrewHub {
             poke: tokio::sync::Notify::new(),
             to_work: Mutex::default(),
             rework: tokio::sync::broadcast::channel(64).0,
+            refused_steps: Mutex::default(),
             questions: Mutex::default(),
             acted: Mutex::default(),
             asked_person: Mutex::default(),
