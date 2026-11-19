@@ -24,7 +24,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -667,6 +667,7 @@ fn service_tz(service: &AgentService) -> chrono_tz::Tz {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn a_queue_is_claimed_once_and_not_before_its_time() {
