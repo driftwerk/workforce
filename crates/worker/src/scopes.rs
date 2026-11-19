@@ -1371,6 +1371,12 @@ impl Worker {
         now: DateTime<Utc>,
         weight: Weight,
     ) -> Option<ScopeId> {
+        // While a teardown is still owed or under way, no other scope goes:
+        // a host failing to take scopes down would otherwise lose one more
+        // conversation's workspace on every prepare that asks again.
+        if !self.leftovers.lock().is_empty() {
+            return None;
+        }
         let grace = chrono::Duration::from_std(YIELD_IDLE_GRACE).unwrap_or_default();
         scopes
             .values()
@@ -2302,6 +2308,47 @@ mod tests {
         assert!(h.worker.building.lock().is_empty());
         h.worker.prepare(spec("a", &[])).await.unwrap();
         h.worker.prepare(spec("b", &[])).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failing_teardown_stops_further_turns_giving_way() {
+        let h = Harness::with(|config| config.max_scopes = 3).await;
+        for (id, key) in [
+            ("one", "thread-1"),
+            ("two", "thread-2"),
+            ("three", "thread-3"),
+        ] {
+            h.worker.prepare(turn(id, key)).await.unwrap();
+            age(&h.worker, id, idle_past_grace());
+        }
+        h.zfs.fail_next_destroy();
+        assert_eq!(
+            h.worker.prepare(turn("new", "thread-4")).await.unwrap(),
+            refused(RefusalReason::AtCapacity)
+        );
+        assert_eq!(
+            h.worker.prepare(turn("new", "thread-4")).await.unwrap(),
+            refused(RefusalReason::AtCapacity),
+            "asked again, it takes no second workspace down"
+        );
+        assert_eq!(h.worker.scopes().len(), 2);
+        h.worker.sweep(Utc::now()).await.unwrap();
+        assert!(matches!(
+            h.worker.prepare(turn("new", "thread-4")).await.unwrap(),
+            ServerFrame::Prepared(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_failed_build_keeps_its_weight_and_home_and_no_sweep_reclaims_that_home() {
+        let h = Harness::new().await;
+        h.containers.fail_next_run();
+        h.zfs.fail_next_destroy();
+        assert!(h.worker.prepare(keyed("a", "thread-1", 0)).await.is_err());
+        let left = h.worker.leftovers.lock()[0].clone();
+        assert_eq!(left.home.as_deref(), Some("thread-1"));
+        let far = Utc::now() + chrono::Duration::days(365);
+        assert!(h.worker.sweep_homes(far).await.unwrap().is_empty());
     }
 
     #[tokio::test]
