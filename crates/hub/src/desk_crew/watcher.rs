@@ -104,6 +104,20 @@ pub(super) struct Trigger {
     pub handed: Option<uuid::Uuid>,
 }
 
+impl Trigger {
+    /// Only `line`: what happened, with nothing beside it.
+    pub(super) fn line(line: String) -> Self {
+        Self {
+            line,
+            approvals: Vec::new(),
+            hop: 0,
+            about: None,
+            group: None,
+            handed: None,
+        }
+    }
+}
+
 /// What an Act-level check-in is asked while the composer writes the
 /// boss's updates.
 pub(super) const QUIET_ACT: &str =
@@ -760,6 +774,20 @@ impl CrewHub {
             tracing::info!("the overseer has no Desk conversation to check in on yet");
             return false;
         };
+        // At Act fully what it found is a notice in its own running
+        // conversation (`super::orchestrator`), acted on there at once.
+        if self.orchestrates(service.agent_id.as_str()) {
+            if let Some(crew) = self.me.upgrade() {
+                for t in triggers {
+                    crew.notify(
+                        service.agent_id.as_str(),
+                        &owner,
+                        super::orchestrator::Notice::new(t.line),
+                    );
+                }
+                return true;
+            }
+        }
         let lines: Vec<String> = triggers.iter().map(|t| format!("- {}", t.line)).collect();
         let (level, why) = self.level_now(service.agent_id.as_str(), &o);
         let hint = match self.unbound_given(service.agent_id.as_str(), &o) {
@@ -1050,7 +1078,7 @@ impl CrewHub {
 
     /// Tells the person, where they look, that the overseer holds its
     /// check-ins until `until`, and why.
-    fn paused(&self, service: &AgentService, until: DateTime<Utc>, daily: bool) {
+    pub(super) fn paused(&self, service: &AgentService, until: DateTime<Utc>, daily: bool) {
         let why = if daily { "daily" } else { "hourly" };
         let text = format!(
             "paused check-ins until {}: {why} limit reached",
@@ -1183,7 +1211,10 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                     // there is anything in it, whatever else woke it.
                     let every = crew.timing.minute * UNBOUND_SWEEP_MINUTES;
                     let due = w.swept.is_none_or(|at| at.elapsed() >= every);
-                    if due && crew.unbound(o) && crew.has_work(&id, o).await {
+                    // Running on notices, it is swept only once they have
+                    // been quiet a while: the net under them.
+                    let noticed = crew.orchestrates(&id) && crew.noticed_lately(&id);
+                    if due && !noticed && crew.unbound(o) && crew.has_work(&id, o).await {
                         if let Some(w) = waking.get_mut(&id) {
                             w.swept = Some(Instant::now());
                         }

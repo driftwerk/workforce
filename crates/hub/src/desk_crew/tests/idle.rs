@@ -70,7 +70,9 @@ async fn act_fully_tells_a_finished_session_its_next_step_itself_and_never_while
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
-        let (overseer, _crew, d, llm) = overseeing(&base, pool, "ok", &theirs(), &[]).await;
+        let (overseer, crew, d, llm) = overseeing(&base, pool, "ok", &theirs(), &[]).await;
+        // The focused call a boss outside the loop judges turn ends with.
+        crew.focused_turn_ends();
         d.boss_bounds_with(workforce_desk::charge::Bounds {
             home: base.clone(),
             ..Default::default()
@@ -256,7 +258,9 @@ async fn a_next_step_refused_for_its_job_goes_to_the_full_turn_told_why_and_neve
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
-        let (overseer, _crew, d, llm) = overseeing(&base, pool, "ok", &theirs(), &[]).await;
+        let (overseer, crew, d, llm) = overseeing(&base, pool, "ok", &theirs(), &[]).await;
+        // The focused call a boss outside the loop judges turn ends with.
+        crew.focused_turn_ends();
         d.boss_bounds_with(workforce_desk::charge::Bounds {
             home: base.clone(),
             ..Default::default()
@@ -327,7 +331,9 @@ async fn a_next_step_its_full_turn_cant_send_either_reaches_the_person_once_in_p
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
-        let (overseer, _crew, d, llm) = overseeing(&base, pool, "ok", &theirs(), &[]).await;
+        let (overseer, crew, d, llm) = overseeing(&base, pool, "ok", &theirs(), &[]).await;
+        // The focused call a boss outside the loop judges turn ends with.
+        crew.focused_turn_ends();
         d.boss_bounds_with(workforce_desk::charge::Bounds {
             home: base.clone(),
             ..Default::default()

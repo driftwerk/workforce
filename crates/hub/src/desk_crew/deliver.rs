@@ -28,6 +28,9 @@ use crate::serve::AgentService;
 
 pub use crate::broadcast::USER_MESSAGE;
 
+/// What a crew turn the person stopped fails with.
+pub(super) const STOPPED: &str = "the turn was stopped";
+
 impl CrewHub {
     /// Runs `prompt` as a turn in `service`'s Desk DM with `owner`, at `hop`
     /// hand-offs; `listed` are the requests a wake-up names. A prompt with
@@ -170,7 +173,12 @@ impl CrewHub {
         // session's line, a summary): its heavy background model's work. A
         // message with one (the person's words, a task the overseer hands
         // on) is real work for the agent, on its own model.
+        // An orchestrating boss's own conversation is real work too: on
+        // the person's chosen model, as its DM is (`super::orchestrator`).
+        let own_conversation =
+            channel == super::watcher::check_in_channel(agent_id) && self.orchestrates(agent_id);
         let model = match &author {
+            None if own_conversation => None,
             None => crate::turn_loop::heavy_model(service),
             Some(_) => None,
         };
@@ -223,7 +231,7 @@ impl CrewHub {
         let answer = match &conducted.ending {
             Ending::Finished(Ok(result)) => Ok(result.response.clone()),
             Ending::Finished(Err(e)) => Err(eyre::eyre!("{e:#}")),
-            Ending::Stopped => Err(eyre::eyre!("the turn was stopped")),
+            Ending::Stopped => Err(eyre::eyre!("{STOPPED}")),
             Ending::Failed(e) => Err(eyre::eyre!("{e}")),
         };
         for message in conducted

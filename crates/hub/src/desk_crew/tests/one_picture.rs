@@ -475,6 +475,8 @@ async fn the_idle_sweep_decides_again_on_the_persons_words_and_sends_only_that()
             "quiet_minutes = 30\nanswer_after_minutes = 30\n",
         );
         let (_overseer, crew, d, llm) = overseeing(&base, pool, "ok", &full, &[]).await;
+        // The focused call a boss outside the loop judges turn ends with.
+        crew.focused_turn_ends();
         d.picture_load().await;
         d.boss_bounds_with(workforce_desk::charge::Bounds {
             home: base.clone(),
