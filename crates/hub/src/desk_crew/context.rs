@@ -10,11 +10,14 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 use workforce_common::channels::DESK_CHANNEL;
-use workforce_desk::account::Account;
+use workforce_desk::account::{Account, Staleness};
 use workforce_desk::model::SessionState;
 
 use super::watcher::reported;
 use crate::serve::AgentService;
+
+/// What every boss turn is told of the summaries it reads.
+pub(super) const CHECK_FIRST: &str = "Never tell anyone that something has or hasn't happened (a run started, a PR merged, a release went out) on the strength of a summary marked STALE, or of one written plainly: check it first (crew.account, crew.ask_session, or your GitHub tools) and say where you checked.";
 
 /// The block's most, about 3k tokens.
 pub(super) const CAP_CHARS: usize = 12_000;
@@ -37,6 +40,8 @@ pub(super) struct Entry {
     /// Its last turn failed.
     pub failed: bool,
     pub account: Option<Account>,
+    /// Why its account can't be relied on as it stands, if so.
+    pub stale: Option<Staleness>,
 }
 
 /// One of the boss's own DM posts.
@@ -65,6 +70,24 @@ fn clip(s: &str, max: usize) -> String {
     }
 }
 
+/// When an account was written, and, stale, why it can't be relied on:
+/// "summary from 19:48, 27 min older than its last activity: check before
+/// relying on it".
+fn as_of(a: &Account, stale: Option<Staleness>, tz: chrono_tz::Tz) -> String {
+    let at = a.written_at.with_timezone(&tz).format("%H:%M");
+    let why = match stale {
+        None => return format!("as of {at}"),
+        Some(Staleness::Behind { minutes }) => {
+            format!("{minutes} min older than its last activity")
+        }
+        Some(Staleness::Expired) => "past the time it said it would be out of date".to_string(),
+        Some(Staleness::Plain) => {
+            "written plainly from its last words, and it has worked since".to_string()
+        }
+    };
+    format!("STALE: summary from {at}, {why}: check before relying on it")
+}
+
 fn line(e: &Entry, short: bool, tz: chrono_tz::Tz) -> String {
     let state = match e.failed {
         true => format!("{}, its last turn failed", e.state.as_str()),
@@ -72,10 +95,10 @@ fn line(e: &Entry, short: bool, tz: chrono_tz::Tz) -> String {
     };
     let head = match &e.account {
         Some(a) => format!(
-            "- {} ({state}, session_id {}, as of {})",
+            "- {} ({state}, session_id {}, {})",
             e.name,
             e.id,
-            a.written_at.with_timezone(&tz).format("%H:%M")
+            as_of(a, e.stale, tz)
         ),
         None => format!("- {} ({state}, session_id {})", e.name, e.id),
     };
@@ -122,9 +145,9 @@ pub(super) fn body(
             head.push('\n');
         }
         head.push_str(&format!(
-            "The session this turn is about, {} (as of {}):\n{}\n",
+            "The session this turn is about, {} ({}):\n{}\n",
             a.0.name,
-            a.1.written_at.with_timezone(&tz).format("%H:%M"),
+            as_of(a.1, a.0.stale, tz),
             render.trim_end()
         ));
         headed = Some(a.0.id);
@@ -210,12 +233,18 @@ pub(crate) async fn block(service: &AgentService, channel: &str, owner: &str) ->
     };
     let entries: Vec<Entry> = views
         .iter()
-        .map(|v| Entry {
-            id: v.id,
-            name: v.label().to_string(),
-            state: v.state,
-            failed: v.failure.is_some(),
-            account: accounts.iter().find(|a| a.session == v.id).cloned(),
+        .map(|v| {
+            let account = accounts.iter().find(|a| a.session == v.id).cloned();
+            Entry {
+                id: v.id,
+                name: v.label().to_string(),
+                state: v.state,
+                failed: v.failure.is_some(),
+                stale: account
+                    .as_ref()
+                    .and_then(|a| crew.desk.account_staleness(boss.agent_id.as_str(), v.id, a)),
+                account,
+            }
         })
         .collect();
     let posts = recent_posts(&boss, owner);
@@ -257,7 +286,7 @@ pub(crate) async fn block(service: &AgentService, channel: &str, owner: &str) ->
     let how = how.map(|h| format!("\n\n{h}")).unwrap_or_default();
     Some(format!(
         "What Desk keeps of your crew now, the same in every turn of yours (read crew.account \
-         before you say anything specific of one session):\n{}{how}",
+         before you say anything specific of one session). {CHECK_FIRST}\n{}{how}",
         reported(&body, "Desk's notes on your crew")
     ))
 }
@@ -311,6 +340,7 @@ mod tests {
             state,
             failed: false,
             account: Some(a),
+            stale: None,
         }
     }
 
@@ -402,6 +432,73 @@ mod tests {
         assert!(
             text.contains("- other-0 "),
             "the others still have room: {text}"
+        );
+    }
+
+    #[test]
+    fn a_stale_summary_is_flagged_with_why_and_a_fresh_one_is_not() {
+        let tz = chrono_tz::Europe::London;
+        let mut e = entry("payments", SessionState::Idle, "Ship release 4");
+        let at = e
+            .account
+            .as_ref()
+            .unwrap()
+            .written_at
+            .with_timezone(&tz)
+            .format("%H:%M")
+            .to_string();
+        assert!(line(&e, false, tz).contains(&format!("as of {at}")));
+        e.stale = Some(Staleness::Behind { minutes: 27 });
+        let said = line(&e, false, tz);
+        assert!(
+            said.contains(&format!("STALE: summary from {at}, 27 min older than its last activity: check before relying on it")),
+            "{said}"
+        );
+        e.stale = Some(Staleness::Plain);
+        assert!(line(&e, true, tz).contains("written plainly from its last words"));
+        // The session the turn is about says it too.
+        e.stale = Some(Staleness::Expired);
+        let id = e.id;
+        let b = body(&[e], Some(id), &[], None, tz).unwrap();
+        assert!(
+            b.contains("past the time it said it would be out of date"),
+            "{b}"
+        );
+    }
+
+    #[test]
+    fn an_account_is_stale_once_its_session_did_more_or_its_time_passed() {
+        let now = Utc::now();
+        let mut a = Account::new(Uuid::new_v4(), "", now - chrono::Duration::minutes(30));
+        a.by_model = true;
+        assert_eq!(
+            a.staleness(now, false, None),
+            None,
+            "idle and nothing since"
+        );
+        assert_eq!(
+            a.staleness(now, true, None),
+            None,
+            "a model's, nothing since"
+        );
+        assert_eq!(
+            a.staleness(now, false, Some(now - chrono::Duration::minutes(3))),
+            Some(Staleness::Behind { minutes: 27 })
+        );
+        a.by_model = false;
+        assert_eq!(
+            a.staleness(now, false, None),
+            None,
+            "plain, but nothing since"
+        );
+        assert_eq!(a.staleness(now, true, None), Some(Staleness::Plain));
+        a.stale_after = Some(now - chrono::Duration::minutes(1));
+        assert_eq!(a.staleness(now, false, None), Some(Staleness::Expired));
+        // A turn end it already caught up with doesn't count.
+        a.stale_after = None;
+        assert_eq!(
+            a.staleness(now, false, Some(now - chrono::Duration::minutes(40))),
+            None
         );
     }
 }

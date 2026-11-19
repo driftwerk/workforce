@@ -1563,3 +1563,42 @@ async fn a_spent_day_is_said_only_while_metered_and_holds_across_a_restart() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn a_boss_reads_an_account_as_stale_once_its_session_did_more_since() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::answering(&[ANSWER]);
+        let (d, id, _cancel) = start(&pool, dir.path(), &fake).await;
+        let mut a = Account::new(id, "", Utc::now() - chrono::Duration::minutes(20));
+        a.by_model = true;
+        assert_eq!(d.account_staleness("boss", id, &a), None, "nothing since");
+        // The boss told it something on its line after it was written.
+        d.picture_note(
+            crate::picture::Note::new(crate::picture::What::Instruction, "Run release 4.")
+                .boss("boss")
+                .session(id),
+        );
+        assert!(
+            matches!(
+                d.account_staleness("boss", id, &a),
+                Some(crate::account::Staleness::Behind { minutes }) if minutes >= 19
+            ),
+            "{:?}",
+            d.account_staleness("boss", id, &a)
+        );
+        // Written after it: relied on again.
+        a.written_at = Utc::now() + chrono::Duration::seconds(1);
+        assert_eq!(d.account_staleness("boss", id, &a), None);
+        // A turn ended it hasn't caught up with.
+        d.0.accounts
+            .ended
+            .lock()
+            .insert(id, Utc::now() + chrono::Duration::minutes(5));
+        assert!(matches!(
+            d.account_staleness("boss", id, &a),
+            Some(crate::account::Staleness::Behind { .. })
+        ));
+    })
+    .await;
+}

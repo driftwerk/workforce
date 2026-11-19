@@ -369,6 +369,27 @@ impl Desk {
         Ok(AccountAnswer::Answered(self.account_redacted_text(answer)))
     }
 
+    /// How far `a`, session `id`'s account, can be relied on now as
+    /// `boss`'s turn reads it: stale once a turn ended that it hasn't
+    /// caught up with, or anything touched the session on `boss`'s
+    /// picture (its line, the person's words) after it was written. None
+    /// while it can. Read without waiting on the store.
+    pub fn account_staleness(
+        &self,
+        boss: &str,
+        id: Uuid,
+        a: &Account,
+    ) -> Option<account::Staleness> {
+        let working = self.view(id).is_ok_and(|v| {
+            use crate::model::SessionState as S;
+            matches!(v.state, S::Working | S::Blocked | S::Asking)
+        });
+        let ended = self.0.accounts.ended.lock().get(&id).copied();
+        let touched = self.picture_recent(boss, id, 1).first().map(|h| h.at);
+        let activity = ended.max(touched);
+        a.staleness(crate::crew::now(), working, activity)
+    }
+
     /// A turn of session `id` ended and the harvest read it: its account
     /// is refreshed off the caller.
     pub(super) fn account_turn_ended(&self, id: Uuid) {
@@ -751,6 +772,17 @@ impl Desk {
                     cap = limits.cheap_calls_per_day,
                     "the day's metered cheap calls are spent: sessions' accounts are said plainly until tomorrow"
                 );
+                // On the Floor, as it happens: summaries read plainly from
+                // now on.
+                self.note(crate::crew::Event::new(
+                    crate::crew::Kind::Limit,
+                    crate::crew::Party::desk(),
+                    None,
+                    format!(
+                        "today's {} metered cheap calls are spent: sessions' summaries are written plainly from their last words until tomorrow",
+                        limits.cheap_calls_per_day
+                    ),
+                ));
             }
         }
         Ok(taken)

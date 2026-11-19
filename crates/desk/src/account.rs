@@ -38,6 +38,19 @@ pub const MID_TURN_EVERY: Duration = Duration::from_secs(5 * 60);
 /// How old an account of a working session may be before a read refreshes
 /// it, and the least time between two such refreshes.
 pub const FRESH_FOR: Duration = Duration::from_secs(2 * 60);
+
+/// Why an account can't be relied on as it stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Staleness {
+    /// The session did more since: its last turn ended this many minutes
+    /// after the account was written.
+    Behind { minutes: i64 },
+    /// Past the time it said it would be out of date by.
+    Expired,
+    /// Written plainly from the session's last words, not by a model,
+    /// and the session has worked since.
+    Plain,
+}
 /// A turn whose replies say less than this, with no steps, is said plainly.
 pub const SHORT_REPLY: usize = 300;
 /// How far back from the newest exchange read the cursor keeps keys.
@@ -238,6 +251,27 @@ impl Account {
     /// Its age at `now`.
     pub fn age(&self, now: DateTime<Utc>) -> chrono::Duration {
         now - self.written_at
+    }
+
+    /// How far it can be relied on at `now` for a session that is
+    /// `working`, whose last activity it hasn't caught up with (a turn's
+    /// end, a message on its line, the person's words in it) was at
+    /// `activity`: None while it can.
+    pub fn staleness(
+        &self,
+        now: DateTime<Utc>,
+        working: bool,
+        activity: Option<DateTime<Utc>>,
+    ) -> Option<Staleness> {
+        if let Some(a) = activity.filter(|a| *a > self.written_at) {
+            return Some(Staleness::Behind {
+                minutes: (a - self.written_at).num_minutes().max(1),
+            });
+        }
+        if self.stale_after.is_some_and(|s| now >= s) {
+            return Some(Staleness::Expired);
+        }
+        (!self.by_model && working).then_some(Staleness::Plain)
     }
 
     /// Whether it is out of date at `now` for a session that is `working`:
