@@ -271,7 +271,7 @@ impl Worker {
             Claim::Absent => {}
             Claim::Busy => return Ok(refused(RefusalReason::AtCapacity)),
             Claim::Owed(leftover) => {
-                if let Err(error) = self.take_down(leftover).await {
+                if let Err(error) = self.take_down(*leftover).await {
                     warn!(scope = %request.scope, %error, "taking down a scope that gave way failed again; its conversation waits");
                     return Ok(refused(RefusalReason::AtCapacity));
                 }
@@ -902,7 +902,7 @@ impl Worker {
         match leftovers.iter().find(|left| left.id == *scope) {
             Some(left) => {
                 tearing.insert(scope.clone());
-                Claim::Owed(left.clone())
+                Claim::Owed(Box::new(left.clone()))
             }
             None => Claim::Absent,
         }
@@ -1055,7 +1055,7 @@ impl Worker {
                 let Claim::Owed(leftover) = self.claim(&id) else {
                     continue;
                 };
-                if let Err(error) = self.take_down(leftover).await {
+                if let Err(error) = self.take_down(*leftover).await {
                     warn!(scope = %id, %error, "taking down a scope that gave way failed again");
                 }
             }
@@ -1224,7 +1224,7 @@ enum Claim {
     /// It is being taken down now.
     Busy,
     /// Its teardown is owed and now claimed by the caller.
-    Owed(Scope),
+    Owed(Box<Scope>),
 }
 
 /// Unmarks a scope's teardown as under way when it ends, however it ends.
