@@ -809,6 +809,9 @@ struct Gathered {
     /// for the work turn: read again as the turn starts, and only those
     /// still open go in.
     asks: Vec<(Uuid, String)>,
+    /// Its turn's end is one the fast call handed over with its refused
+    /// next step (`super::idle`).
+    handed: bool,
 }
 
 impl Gathered {
@@ -818,6 +821,7 @@ impl Gathered {
             messages: Vec::new(),
             ended: Vec::new(),
             asks: Vec::new(),
+            handed: false,
         }
     }
 }
@@ -899,11 +903,9 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
             Ok(event) = rework.recv() => {
                 if let Some((session, line)) = crew.work_line(&event) {
                     let line = crew.with_doing(session, line).await;
-                    gathering
-                        .entry(session)
-                        .or_insert_with(Gathered::new)
-                        .ended
-                        .push(line);
+                    let g = gathering.entry(session).or_insert_with(Gathered::new);
+                    g.ended.push(line);
+                    g.handed = true;
                 }
             }
             _ = tick.tick() => {}
@@ -951,6 +953,7 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 messages,
                 mut ended,
                 mut asks,
+                mut handed,
                 ..
             }) = gathering.remove(&session)
             else {
@@ -970,6 +973,7 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
             // requests are the boss's to be given again once it drives.
             if work && !crew.still_works(session) {
                 ended.clear();
+                handed = false;
                 let boss = crew.boss_of(session);
                 for (approval, _) in asks.drain(..) {
                     offered.retain(|(a, b)| *a != approval || Some(b) != boss.as_ref());
@@ -986,6 +990,7 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                     Gathered {
                         ended: std::mem::take(&mut ended),
                         asks: std::mem::take(&mut asks),
+                        handed: std::mem::take(&mut handed),
                         ..Gathered::new()
                     },
                 );
@@ -998,11 +1003,17 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 busy.insert(b.clone());
             }
             let crew = Arc::clone(&crew);
+            let turn_boss = boss.clone().filter(|_| handed);
             running.insert(
                 session,
                 (
                     tokio::spawn(async move {
                         crew.answer_line(session, messages, ended).await;
+                        // A refused next step handed to it was its to take
+                        // (`super::idle`).
+                        if let Some(b) = &turn_boss {
+                            crew.full_turn_over(b, session);
+                        }
                         // What its turn was given and left open is the
                         // person's: never given to it again by itself.
                         crew.left_open(session, &asks).await;

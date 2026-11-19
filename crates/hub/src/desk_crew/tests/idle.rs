@@ -378,3 +378,44 @@ async fn a_next_step_its_full_turn_cant_send_either_reaches_the_person_once_in_p
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_step_the_person_took_back_or_the_full_turn_chose_otherwise_is_never_told() {
+    use super::super::refusal::{Refusal, Refused};
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (overseer, crew, d, _llm) = overseeing(&base, pool, "ok", &theirs(), &[]).await;
+        let s = new_session(&d, &base, "harbor").await;
+        let view = d.view(s.id).unwrap();
+        let refused = |kind| Refused::new(kind, "Not sent: …");
+
+        // Its full turn's step refused as the person took it back: theirs,
+        // and nothing is followed.
+        crew.handed_refused("desk", &view, "Run the deploy.");
+        crew.step_went("desk", s.id, Err(&refused(Refusal::TakenBack)));
+        assert!(!crew.follows_refused(s.id), "theirs now");
+
+        // Another boss's refusal, or a moved picture, changes nothing; a
+        // step that went ends it.
+        crew.handed_refused("desk", &view, "Run the deploy.");
+        crew.step_went("sarah", s.id, Err(&refused(Refusal::NoJob)));
+        crew.step_went("desk", s.id, Err(&refused(Refusal::Stale)));
+        assert!(crew.follows_refused(s.id));
+        crew.step_went("desk", s.id, Ok(()));
+        assert!(!crew.follows_refused(s.id), "it went");
+
+        // Only a full turn given its turn's end is its; one of another
+        // boss's never.
+        crew.handed_refused("desk", &view, "Run the deploy.");
+        crew.full_turn_over("sarah", s.id);
+        assert_eq!(crew.refused_turn_over(s.id), Some(false));
+        crew.full_turn_over("desk", s.id);
+        assert_eq!(crew.refused_turn_over(s.id), Some(true));
+        // Over with nothing of its refused: it chose, and is let go untold.
+        assert!(crew.refused_again().is_empty());
+        assert!(!crew.follows_refused(s.id), "let go");
+        assert_eq!(said(&overseer, &["harbor finished its turn"]), 0);
+    })
+    .await;
+}

@@ -1088,6 +1088,9 @@ struct Waking {
     told: Option<DateTime<Utc>>,
     /// When it, unbound, last swept its scope.
     swept: Option<Instant>,
+    /// The sessions whose refused next step the fast call handed to its
+    /// full turn, in what waits (`super::idle`).
+    handed: HashSet<uuid::Uuid>,
 }
 
 /// Turns what happens into the overseers' check-ins: each event, and each
@@ -1111,6 +1114,8 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     loop {
         // What was found, by the overseer it is for.
         let mut found: Vec<(String, Trigger)> = Vec::new();
+        // The handed turn ends among it, by the overseer and session.
+        let mut handed: Vec<(String, uuid::Uuid)> = Vec::new();
         tokio::select! {
             () = cancel.cancelled() => return,
             received = events.recv() => match received {
@@ -1139,6 +1144,7 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                     if let Some(mut t) = crew.trigger_for(&event, s.agent_id.as_str(), &o) {
                         if let Some(session) = finished_session(&event) {
                             t.line = crew.with_doing(session, t.line).await;
+                            handed.push((s.agent_id.as_str().to_string(), session));
                         }
                         found.push((s.agent_id.as_str().to_string(), t));
                     }
@@ -1191,6 +1197,9 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 // An overseer gone has nothing waiting.
                 waking.retain(|id, _| overseers.iter().any(|(s, _)| s.agent_id.as_str() == id));
             }
+        }
+        for (id, session) in handed {
+            waking.entry(id).or_default().handed.insert(session);
         }
         let now = Utc::now();
         for (id, mut t) in found {
@@ -1303,12 +1312,19 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                     ..t.clone()
                 })
                 .collect();
+            let handed = std::mem::take(&mut w.handed);
             w.firing = Some(tokio::spawn(async move {
                 // Its prompt is written once it holds its mind.
                 let woke = crew
                     .with_mind(&id, "a check-in", crew.wake(service, o, triggers))
                     .await;
-                if !woke && !again.is_empty() {
+                if woke {
+                    // A refused next step handed to it was its to take
+                    // (`super::idle`).
+                    for s in handed {
+                        crew.full_turn_over(&id, s);
+                    }
+                } else if !again.is_empty() {
                     let _ = retry.send((id, again));
                 }
             }));
