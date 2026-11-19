@@ -74,6 +74,10 @@ pub struct Worker {
     homes: Mutex<BTreeMap<String, Home>>,
     running: Mutex<HashMap<ScopeId, HashSet<String>>>,
     prepares: tokio::sync::Mutex<()>,
+    /// Scopes that gave way but whose teardown failed: still counted against
+    /// capacity, as they may still hold the host, until a sweep takes them
+    /// down.
+    leftovers: Mutex<Vec<Scope>>,
     pub(crate) jobs: Mutex<BTreeMap<JobId, JobRecord>>,
     pub(crate) live: Mutex<HashMap<JobId, LiveJob>>,
     pub(crate) starts: tokio::sync::Mutex<()>,
@@ -130,6 +134,7 @@ impl Worker {
             homes: Mutex::new(homes),
             running: Mutex::new(HashMap::new()),
             prepares: tokio::sync::Mutex::new(()),
+            leftovers: Mutex::new(Vec::new()),
             jobs: Mutex::new(jobs),
             live: Mutex::new(HashMap::new()),
             starts: tokio::sync::Mutex::new(()),
@@ -267,7 +272,9 @@ impl Worker {
             }
         }
         // Last of the checks, so a prepare refused for anything else never
-        // takes down a conversation's workspace for nothing.
+        // takes down a conversation's workspace for nothing. Short of pool
+        // space it is refused before one could give way: a turn's work
+        // clone is small, and its home, the large part, stays anyway.
         if self.room_for_another().is_err() {
             if let Some(idle) = self.take_idle_yielder(Utc::now()) {
                 if !self.give_way(idle, &request.scope).await {
@@ -885,7 +892,8 @@ impl Worker {
     /// Whether one more scope may be seated now: the one test admission
     /// asks, before and after an idle scope gives way.
     fn room_for_another(&self) -> Result<(), RefusalReason> {
-        match self.scopes.lock().len() as u32 >= self.config.max_scopes {
+        let held = self.scopes.lock().len() + self.leftovers.lock().len();
+        match held as u32 >= self.config.max_scopes {
             true => Err(RefusalReason::AtCapacity),
             false => Ok(()),
         }
@@ -931,9 +939,10 @@ impl Worker {
     /// Release an idle scope taken by [`Self::take_idle_yielder`] so `to`
     /// can be seated. Its keyed home stays, so its conversation's next turn
     /// is seated over the same transcript and bench. A failure taking it
-    /// down is logged and answered `false`: it is out of the map already,
-    /// its container stopped or stopping, and the next reconcile clears what
-    /// is left, but nothing is seated over what may still be on the host.
+    /// down is logged and answered `false`: it is out of the map already, so
+    /// no turn finds it again, but it is kept among the leftovers, counted
+    /// against capacity and taken down again by the sweep, so nothing is
+    /// seated over what may still be on the host.
     async fn give_way(&self, idle: Scope, to: &ScopeId) -> bool {
         let idle_secs = (Utc::now() - idle.last_seen).num_seconds();
         match self.dismantle(&idle).await {
@@ -952,8 +961,9 @@ impl Worker {
                     scope = %idle.id,
                     to = %to,
                     %error,
-                    "an idle scope gave way, but taking it down failed, so nothing is seated on top of it; reconcile clears what is left"
+                    "an idle scope gave way, but taking it down failed; it still counts against capacity until a sweep takes it down"
                 );
+                self.leftovers.lock().push(idle);
                 false
             }
         }
@@ -974,6 +984,13 @@ impl Worker {
         };
         for scope in &idle {
             self.release(scope).await?;
+        }
+        let leftovers = std::mem::take(&mut *self.leftovers.lock());
+        for leftover in leftovers {
+            if let Err(error) = self.dismantle(&leftover).await {
+                warn!(scope = %leftover.id, %error, "taking down a scope that gave way failed again");
+                self.leftovers.lock().push(leftover);
+            }
         }
         self.sweep_jobs(now)?;
         self.sweep_homes(now).await?;
@@ -2013,9 +2030,19 @@ mod tests {
             h.worker.homes.lock().contains_key("thread-1"),
             "the conversation's home outlives the failure"
         );
+        assert_eq!(
+            h.worker.prepare(turn("new", "thread-2")).await.unwrap(),
+            refused(RefusalReason::AtCapacity),
+            "what is left still counts against capacity"
+        );
+        h.worker.sweep(Utc::now()).await.unwrap();
+        assert!(
+            !h.zfs.exists_sync("tank/work/idle"),
+            "the sweep takes it down"
+        );
         assert!(
             h.worker.prepare(turn("new", "thread-2")).await.is_ok(),
-            "the next prepare finds room"
+            "and its seat is free again"
         );
     }
 
