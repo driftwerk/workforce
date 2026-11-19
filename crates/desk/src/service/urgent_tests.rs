@@ -386,6 +386,23 @@ impl Crew for Interrupting {
     ) -> Result<String, String> {
         self.asked.lock().push((boss.to_string(), session, row));
         if !self.let_it {
+            // As the hub does: the interrupt is suggested, bound to its
+            // stand-down's turn.
+            let d = self.desk.lock().clone().unwrap();
+            let mut input = json!({ "session_id": session.to_string() });
+            input[line::STAND_DOWN_KEY] = json!({ "row": row.to_string(), "turn": turn });
+            d.store()
+                .put_suggestion(&Suggestion {
+                    id: crate::crew::new_id(),
+                    at: crate::crew::now(),
+                    text: "Interrupt it".into(),
+                    action: json!({ "tool": "crew.interrupt", "input": input }),
+                    state: crate::crew::SuggestionState::Open,
+                    subject: None,
+                    agent_id: boss.to_string(),
+                })
+                .await
+                .unwrap();
             return Err("the person hasn't let you interrupt sessions".into());
         }
         let d = self.desk.lock().clone().unwrap();
@@ -536,6 +553,7 @@ async fn restarted(d: &Desk, s: Uuid) {
         let l = st.live.get_mut(&s).unwrap();
         l.breaker.steers.clear();
         l.breaker.heard = false;
+        l.breaker.run = super::breaker::RunId::default();
     }
     d.rush_load().await;
 }
@@ -844,6 +862,67 @@ async fn an_urgent_row_left_from_an_earlier_turn_isnt_held_for_a_later_one() {
             .await
             .expect("not held for this turn");
         assert_eq!(next["id"], json!(m.id));
+    })
+    .await;
+}
+
+/// The open suggestions to interrupt for a stand-down.
+async fn suggested(d: &Desk) -> Vec<Suggestion> {
+    d.store()
+        .suggestions(50)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|g| {
+            g.state == crate::crew::SuggestionState::Open
+                && g.action["input"].get(line::STAND_DOWN_KEY).is_some()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_suggested_interrupt_from_before_a_restart_interrupts_nothing_and_isnt_doubled() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        d.set_steer_wait(Duration::from_millis(200));
+        let crew = interrupting(&d, false);
+        let s = working(&d, dir.path()).await;
+        let before = d.turn_mark(s).unwrap();
+        let (hard, _) = urgent(&d, s, "Stand down from a:2.", Urgency::Escalate).await;
+        for _ in 0..100 {
+            if suggested(&d).await.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(suggested(&d).await.len(), 1);
+
+        // A restart: the same counters, a new run.
+        restarted(&d, s).await;
+        let after = d.turn_mark(s).unwrap();
+        assert_eq!((after.ends, after.turns), (before.ends, before.turns));
+        assert_ne!(after, before);
+        assert!(suggested(&d).await.is_empty(), "the old one withdrawn");
+        // A yes to it, late, interrupts nothing.
+        assert!(d.interrupt_turn(s, before, hard.id, None).await.is_err());
+        assert_eq!(d.view(s).unwrap().state, SessionState::Working);
+
+        // The escalation timed again suggests it once, for this run.
+        for _ in 0..100 {
+            if crew.asked.lock().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let now = suggested(&d).await;
+        assert_eq!(now.len(), 1, "never doubled");
+        let turn: line::TurnMark = serde_json::from_value(
+            now[0].action["input"][line::STAND_DOWN_KEY]["turn"].clone(),
+        )
+        .unwrap();
+        assert_eq!(turn, after);
     })
     .await;
 }

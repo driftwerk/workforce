@@ -115,6 +115,7 @@ impl Desk {
         let state = st.records.get(&id)?.state;
         let l = st.live.get(&id)?;
         line::in_turn(state).then_some(TurnMark {
+            run: l.breaker.run.0,
             ends: l.ends,
             turns: l.breaker.turns,
         })
@@ -518,6 +519,25 @@ impl Desk {
     /// rest are steered again from each session's first tool call heard
     /// ([`Self::steer_heard`]).
     pub(super) async fn rush_load(&self) {
+        // A suggestion to interrupt from before is bound to a run that is
+        // over: withdrawn, so a yes to it interrupts nothing, and the
+        // escalation timed again below suggests it once, for this run.
+        match self.0.store.suggestions_stand_down_dismiss().await {
+            Ok(gone) => {
+                for g in gone {
+                    let mut by = By::desk("Desk restarted: its turn is over.");
+                    by.suggestion_id = Some(g.id.clone());
+                    self.note(by.event(
+                        Kind::Dismissed,
+                        g.subject.clone(),
+                        format!("withdrew the suggestion: {}", g.text),
+                    ));
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "couldn't withdraw the suggestions to interrupt a restart left");
+            }
+        }
         let rows = match self.0.store.line_urgent_queued().await {
             Ok(rows) => rows,
             Err(e) => {
@@ -668,6 +688,20 @@ impl Desk {
                 ));
             }
         }
+    }
+
+    /// Whether a suggestion to interrupt `id`'s turn `mark` for its
+    /// stand-down `row` is over: that turn ended, or the row went in (taken
+    /// and delivered, handed to Desk's plugin, or withdrawn). A row a hook
+    /// is taking isn't yet: the take may put it back.
+    pub async fn steer_settled(&self, id: Uuid, mark: TurnMark, row: Uuid) -> bool {
+        if self.turn_mark(id) != Some(mark) {
+            return true;
+        }
+        !matches!(
+            self.0.store.line_message(row).await,
+            Ok(Some(m)) if m.delivery == line::Delivery::Queued
+        )
     }
 
     /// Interrupts `id`'s turn `mark` as [`Self::interrupt`] does, for its

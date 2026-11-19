@@ -48,7 +48,7 @@ pub(crate) fn told(name: &str, rushed: Option<Rushed>) -> Option<String> {
 /// carries it: the person's yes interrupts that turn alone, while the row
 /// is unread ([`workforce_desk::Desk::interrupt_turn`]).
 pub(crate) fn only_turn_of(input: &serde_json::Value) -> Option<(Uuid, TurnMark)> {
-    let s = input.get("stand_down")?;
+    let s = input.get(workforce_desk::line::STAND_DOWN_KEY)?;
     let row = s.get("row")?.as_str()?.parse().ok()?;
     let turn = serde_json::from_value(s.get("turn")?.clone()).ok()?;
     Some((row, turn))
@@ -88,8 +88,9 @@ impl CrewHub {
                 Box::pin(self.perform_with(&action, by, &order)).await
             }
             Gate::Suggest(why) => {
-                let input = json!({ "session_id": session.to_string(), "reason": reason,
-                    "stand_down": { "row": row.to_string(), "turn": turn } });
+                let mut input = json!({ "session_id": session.to_string(), "reason": reason });
+                input[workforce_desk::line::STAND_DOWN_KEY] =
+                    json!({ "row": row.to_string(), "turn": turn });
                 let s = self.suggest("crew.interrupt", &input, &action, &by).await?;
                 self.withdraw_when_read(s, session, row, turn);
                 Err(format!(
@@ -102,15 +103,16 @@ impl CrewHub {
     }
 
     /// The suggestion `s` to interrupt `session` for its stand-down `row`
-    /// is withdrawn once that row is read or turn `turn` is over, looked at
-    /// again as the session or its line moves. Its yes is bound to that
+    /// is withdrawn once that row went in or turn `turn` is over, looked at
+    /// again as the session or its line moves (a hook's take that puts the
+    /// row back leaves it standing). Its yes is bound to that
     /// turn anyway; this keeps the person from being asked for nothing.
     /// Only while it is still open: an answer meanwhile stands.
     fn withdraw_when_read(&self, s: crew::Suggestion, session: Uuid, row: Uuid, turn: TurnMark) {
         let desk = self.desk.clone();
         tokio::spawn(async move {
             let (_, mut events) = desk.subscribe();
-            while desk.steer_unread(session, turn, row).await {
+            while !desk.steer_settled(session, turn, row).await {
                 match events.recv().await {
                     Ok(DeskEvent::Session { session: v }) if v.id == session => {}
                     Ok(DeskEvent::Removed { id }) if id == session => {}

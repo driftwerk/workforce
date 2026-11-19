@@ -61,9 +61,21 @@ pub(super) struct PlanFacts {
     pub(super) boss: String,
 }
 
+/// A session's run here, as its turns' marks say it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RunId(pub(super) Uuid);
+
+impl Default for RunId {
+    fn default() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
 /// What a running session's breaker has for it in this run.
 #[derive(Debug, Default)]
 pub(crate) struct LiveBreaker {
+    /// This run's own id: a turn's mark from another run never matches.
+    pub(super) run: RunId,
     /// Turns begun while it ran here (a prompt, or its own waking).
     pub(super) turns: u64,
     /// BreakerOf from the turn after this one.

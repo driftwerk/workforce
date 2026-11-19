@@ -110,12 +110,19 @@ pub fn in_turn(state: SessionState) -> bool {
 }
 
 /// Which turn of a session's run something was sent in: an escalation
-/// interrupts that turn alone, never one begun since.
+/// interrupts that turn alone, never one begun since. `run` is the run's
+/// own: its counters start again with each Desk, so a mark from before a
+/// restart never matches a turn after it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TurnMark {
+    pub(crate) run: uuid::Uuid,
     pub(crate) ends: u64,
     pub(crate) turns: u64,
 }
+
+/// Where a suggestion to interrupt for a stand-down not read in time keeps
+/// its stand-down's row and turn, in its `crew.interrupt` input.
+pub const STAND_DOWN_KEY: &str = "stand_down";
 
 /// How a session that is working takes words mid-turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
