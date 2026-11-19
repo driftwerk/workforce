@@ -130,6 +130,30 @@ impl SandboxLauncher for Seats {
     }
 }
 
+/// A coding worker whose every scope is busy: each prepare is refused at
+/// capacity, and counted.
+#[derive(Default)]
+pub(crate) struct FullWorker {
+    pub(crate) refused: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl SandboxLauncher for FullWorker {
+    async fn ensure(&self, _: &WorkspaceSpec<'_>) -> Result<Arc<dyn CodingSandbox>> {
+        self.refused
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(crate::coding_sandbox::AtCapacity.into())
+    }
+    async fn exists(&self, _: &str, _: &str, _: &str) -> bool {
+        false
+    }
+    async fn close(&self, _: &str, _: &str, _: &str) -> Result<()> {
+        Ok(())
+    }
+    async fn sweep(&self, _: &str, _: &str, _: &str, _: &(dyn for<'a> Fn(&'a str) -> bool + Sync)) {
+    }
+}
+
 /// Make `dir` a git checkout whose one commit holds `src/lib.rs`.
 fn committed_checkout(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir.join("src"))?;

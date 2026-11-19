@@ -18,6 +18,8 @@ pub(crate) mod tests;
 pub(crate) mod tool_loop;
 
 pub use cli::AgentTurnRig;
+#[cfg(test)]
+pub(crate) use cli::SeatWait;
 pub use round::TOOL_SEARCH;
 pub use tool_loop::{ProviderLoop, ToolLoop, UsageFn};
 
@@ -411,6 +413,12 @@ impl RouteTag {
 pub struct RouteMiss {
     pub route: String,
     pub reason: String,
+    /// The CLI route that missed, and whether it was the person's own: whose
+    /// plan a person is told could not take the turn.
+    pub plan: Option<(CliKind, bool)>,
+    /// The coding worker had no workspace for the turn: every scope on it
+    /// was busy for as long as the turn could wait.
+    pub worker_full: bool,
 }
 
 impl RouteMiss {
@@ -418,8 +426,114 @@ impl RouteMiss {
         Self {
             route,
             reason: reason.into(),
+            plan: None,
+            worker_full: false,
         }
     }
+
+    /// This miss, for want of a workspace on a full coding worker.
+    fn worker_full(self) -> Self {
+        Self {
+            worker_full: true,
+            ..self
+        }
+    }
+
+    /// This miss, of the CLI route on `cli`, the person's own when
+    /// `personal`.
+    fn on_plan(self, cli: CliKind, personal: bool) -> Self {
+        Self {
+            plan: Some((cli, personal)),
+            ..self
+        }
+    }
+}
+
+/// The plan a CLI's turns run on, as a person names it.
+fn plan_name(cli: CliKind) -> &'static str {
+    match cli {
+        CliKind::ClaudeCode => "Claude",
+        CliKind::Codex => "ChatGPT",
+    }
+}
+
+/// Whose plan `plan` is, as the person the turn is for reads it.
+fn whose(plan: (CliKind, bool)) -> String {
+    match plan {
+        (cli, true) => format!("Your {} plan", plan_name(cli)),
+        (cli, false) => format!("This agent's {} plan", plan_name(cli)),
+    }
+}
+
+/// What the person hears when no route served and one of them found the
+/// coding worker full: why, and what to do. A person whose route waits
+/// rather than fall back is told they can let it.
+fn worker_full_notice(misses: &[RouteMiss], personal_only: bool) -> Option<String> {
+    let plan = misses.iter().find(|miss| miss.worker_full)?.plan?;
+    let advice = match personal_only {
+        true => "Try again in a minute, or switch this agent to the hub's models.",
+        false => "Try again in a minute.",
+    };
+    Some(format!(
+        "{} couldn't take this right now: the coding worker is full. {advice}",
+        whose(plan)
+    ))
+}
+
+/// The line a served turn ends with when the person's own route could not
+/// take it and the hub's routes did: brief, and only what they need to know.
+/// The agent's own failover stays as quiet as it always was.
+fn fallback_note(misses: &[RouteMiss]) -> Option<String> {
+    let miss = misses
+        .iter()
+        .find(|miss| miss.plan.is_some_and(|(_, personal)| personal))?;
+    let plan = whose(miss.plan?);
+    let why = match miss.worker_full {
+        true => " (the coding worker was full)",
+        false => "",
+    };
+    Some(format!(
+        "\n\n_{plan} couldn't take this{why}, so the hub's models answered._"
+    ))
+}
+
+/// `result` closed by `note`, streamed to whoever watches the turn as the
+/// last part of its answer, so what is on screen and what is kept are the
+/// same words.
+async fn noted(
+    mut result: RunResult,
+    note: Option<String>,
+    progress: Option<&mpsc::Sender<ProgressEvent>>,
+) -> RunResult {
+    let Some(note) = note else {
+        return result;
+    };
+    if let Some(progress) = progress {
+        for event in [
+            ProgressEvent::StreamStart,
+            ProgressEvent::StreamDelta { text: note.clone() },
+            ProgressEvent::StreamEnd,
+        ] {
+            let _ = progress.send(event).await;
+        }
+    }
+    result.response.push_str(&note);
+    result
+}
+
+/// No route served, and `text` says why: the turn's answer, given to
+/// whoever watches it as a finished one, so every surface replaces its
+/// status line with it.
+async fn notice(text: String, progress: Option<&mpsc::Sender<ProgressEvent>>) -> ChainOutcome {
+    if let Some(progress) = progress {
+        for event in [
+            ProgressEvent::Response { text: text.clone() },
+            done_of(&TokenUsage::default(), 0, 0),
+        ] {
+            let _ = progress.send(event).await;
+        }
+    }
+    ChainOutcome::Notice { text }
 }
 
 /// No route of a turn could serve it; each says why.
@@ -571,10 +685,12 @@ impl TurnChain {
                     .await
                     {
                         Ok(result) => {
+                            let result =
+                                noted(result, fallback_note(&misses), progress.as_ref()).await;
                             return Ok(ChainOutcome::Served {
                                 result: Box::new(result),
                                 route: RouteTag::Runner,
-                            })
+                            });
                         }
                         Err(e) if !answered(slice.as_deref()) && !cancel.is_cancelled() => {
                             tracing::warn!(agent = %service.agent_id, route = %route.name(), error = %e, "turn route unserved; trying the next");
@@ -591,10 +707,11 @@ impl TurnChain {
                     let rig = match rig_or_miss(service, route) {
                         Ok(rig) => rig,
                         Err(miss) => {
-                            misses.push(miss);
+                            misses.push(miss.on_plan(*cli, *personal));
                             continue;
                         }
                     };
+                    let seat_wait = rig.seat_wait().of(at == last);
                     let mut inbox = inbox;
                     let mut tries = 0;
                     loop {
@@ -617,6 +734,7 @@ impl TurnChain {
                                     progress: progress.clone(),
                                     cancel: cancel.clone(),
                                     timeout: AGENT_TURN_TIMEOUT,
+                                    seat_wait,
                                 },
                                 Some(&conversation),
                                 inbox.take(),
@@ -640,8 +758,14 @@ impl TurnChain {
                                         .await;
                                 }
                                 let slot = served.slot.clone();
+                                let result = noted(
+                                    served.into_result(seeds.invocations.clone()),
+                                    fallback_note(&misses),
+                                    progress.as_ref(),
+                                )
+                                .await;
                                 return Ok(ChainOutcome::Served {
-                                    result: Box::new(served.into_result(seeds.invocations.clone())),
+                                    result: Box::new(result),
                                     route: RouteTag::Cli { cli: *cli, slot },
                                 });
                             }
@@ -663,14 +787,17 @@ impl TurnChain {
                                 };
                             }
                             CliAttempt::Unserved(miss) => {
-                                tracing::warn!(agent = %service.agent_id, route = %miss.route, reason = %miss.reason, "turn route unserved; trying the next");
-                                misses.push(miss);
+                                tracing::warn!(agent = %service.agent_id, route = %miss.route, reason = %miss.reason, worker_full = miss.worker_full, "turn route unserved; trying the next");
+                                misses.push(miss.on_plan(*cli, *personal));
                                 break;
                             }
                         }
                     }
                 }
             }
+        }
+        if cancel.is_cancelled() {
+            eyre::bail!("turn cancelled");
         }
         let connect = match misses.iter().all(|miss| names_a_login(&miss.reason)) {
             true => {
@@ -679,8 +806,14 @@ impl TurnChain {
             }
             false => None,
         };
-        match connect {
-            Some(connect) => Ok(connect.notice(progress.as_ref()).await),
+        if let Some(connect) = connect {
+            return Ok(connect.notice(progress.as_ref()).await);
+        }
+        match worker_full_notice(&misses, self.personal_only()) {
+            Some(text) => {
+                tracing::warn!(agent = %service.agent_id, misses = %describe(&misses), "no route could serve the turn: the coding worker is full; the person is told");
+                Ok(notice(text, progress.as_ref()).await)
+            }
             None => Err(TurnUnavailable { misses }.into()),
         }
     }

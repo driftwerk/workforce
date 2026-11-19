@@ -55,6 +55,16 @@ pub(crate) async fn hub(configure: impl FnOnce(&mut WorkforceConfig)) -> Hub {
     seated(configure, None).await
 }
 
+/// A hub like [`hub`]'s whose Claude Code turns are seated by `launcher`,
+/// waiting `seat_wait` for a workspace when it is full.
+pub(crate) async fn hub_seated_by(
+    configure: impl FnOnce(&mut WorkforceConfig),
+    launcher: Arc<dyn crate::coding_sandbox::SandboxLauncher>,
+    seat_wait: SeatWait,
+) -> Hub {
+    seated_on(configure, None, Some((launcher, seat_wait))).await
+}
+
 /// Codex first, on its worker, then `claude-code:sonnet`.
 fn codex_first(config: &mut WorkforceConfig) {
     config.coding_session.executor.kind = ExecutorKind::Remote;
@@ -77,6 +87,14 @@ pub(crate) async fn codex_hub(configure: impl FnOnce(&mut WorkforceConfig)) -> H
 }
 
 async fn seated(configure: impl FnOnce(&mut WorkforceConfig), seats: Option<Arc<Seats>>) -> Hub {
+    seated_on(configure, seats, None).await
+}
+
+async fn seated_on(
+    configure: impl FnOnce(&mut WorkforceConfig),
+    seats: Option<Arc<Seats>>,
+    claude_seats: Option<(Arc<dyn crate::coding_sandbox::SandboxLauncher>, SeatWait)>,
+) -> Hub {
     let dir = tempfile::tempdir().unwrap();
     let server = wiremock::MockServer::start().await;
     let service = chatgpt_service_on(
@@ -104,15 +122,21 @@ async fn seated(configure: impl FnOnce(&mut WorkforceConfig), seats: Option<Arc<
             exposed_tools: None,
         },
     );
+    let (launcher, seat_wait): (Arc<dyn crate::coding_sandbox::SandboxLauncher>, _) =
+        match claude_seats {
+            Some((launcher, seat_wait)) => (launcher, seat_wait),
+            None => (Arc::new(launcher), SeatWait::default()),
+        };
     service.turn_rig.set(Arc::new(
         AgentTurnRig::new(
-            Arc::new(launcher),
+            launcher,
             seats
                 .clone()
                 .map(|seats| seats as Arc<dyn crate::coding_sandbox::SandboxLauncher>),
             RotationPolicy::default(),
             Duration::from_secs(3600),
         )
+        .with_seat_wait(seat_wait)
         .with_program(CliKind::ClaudeCode, claude.program())
         .with_program(CliKind::Codex, codex.program()),
     ));
@@ -533,6 +557,7 @@ fn cli_turn(task: Vec<ContentBlock>, service: &AgentService) -> CliTurn {
         progress: None,
         cancel: tokio_util::sync::CancellationToken::new(),
         timeout: AGENT_TURN_TIMEOUT,
+        seat_wait: SeatWait::default().last_route,
     }
 }
 

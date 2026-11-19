@@ -14,8 +14,10 @@ use workforce_common::personal_route::{
 use workforce_common::settings::WorkforceConfig;
 use workforce_common::subscription::{CredentialTier, SubscriptionKind};
 
-use crate::agent_turn::tests::{hub, Hub, ALICE};
+use crate::agent_turn::tests::{hub, hub_seated_by, Hub, ALICE};
+use crate::agent_turn::SeatWait;
 use crate::claude_code::tests::scripted::{answer, assistant, print, rejected, result};
+use crate::coding_testing::FullWorker;
 use crate::hub_core::personal_routes::{MemoryRouteStore, PersonRouteStore};
 use crate::subscription::test_support::SKY;
 
@@ -40,6 +42,27 @@ async fn routed() -> (Hub, Arc<MemoryRouteStore>) {
     (hub, store)
 }
 
+/// As [`routed`], with every Claude Code turn seated on a coding worker
+/// whose every scope is busy, waited on briefly.
+async fn routed_on_a_full_worker() -> (Hub, Arc<MemoryRouteStore>, Arc<FullWorker>) {
+    let worker = Arc::new(FullWorker::default());
+    let hub = hub_seated_by(
+        switch_on,
+        Arc::clone(&worker) as Arc<dyn crate::coding_sandbox::SandboxLauncher>,
+        SeatWait {
+            before_another_route: std::time::Duration::from_millis(200),
+            last_route: std::time::Duration::from_millis(400),
+        },
+    )
+    .await;
+    let store = Arc::new(MemoryRouteStore::default());
+    hub.service
+        .subscriptions()
+        .personal_routes()
+        .attach_store(Arc::clone(&store) as Arc<dyn PersonRouteStore>);
+    (hub, store, worker)
+}
+
 async fn choose(hub: &Hub, store: &MemoryRouteStore, person: &str, route: Option<PersonalRoute>) {
     let person = person.parse().unwrap();
     store.set_every_agent(person, route, "test").await.unwrap();
@@ -53,6 +76,12 @@ async fn choose_here(hub: &Hub, store: &MemoryRouteStore, person: &str, route: A
         .await
         .unwrap();
     hub.service.subscriptions().personal_routes().forget(person);
+}
+
+/// The agent's answer, closed by the line saying her own `plan` couldn't
+/// take the turn and the hub's models answered it.
+fn fell_back(plan: &str) -> String {
+    format!("{SKY}\n\n_Your {plan} plan couldn't take this, so the hub's models answered._")
 }
 
 /// A Claude login the agent shares with everyone.
@@ -213,7 +242,10 @@ async fn without_her_login_hub_falls_back_to_the_agents_route() {
     hub.chatgpt_login(ALICE).await;
     choose(&hub, &store, ALICE, Some(claude(RouteFallback::Hub))).await;
 
-    assert_eq!(hub.ask(ALICE, "why is the sky blue?").await.unwrap(), SKY);
+    assert_eq!(
+        hub.ask(ALICE, "why is the sky blue?").await.unwrap(),
+        fell_back("Claude")
+    );
     assert!(hub.claude.calls().is_empty(), "not on the shared login");
 }
 
@@ -370,7 +402,10 @@ async fn at_her_plans_limit_hub_answers_on_the_agents_route() {
     choose(&hub, &store, ALICE, Some(claude(RouteFallback::Hub))).await;
     hub.claude.reply(None, &rejected());
 
-    assert_eq!(hub.ask(ALICE, "why is the sky blue?").await.unwrap(), SKY);
+    assert_eq!(
+        hub.ask(ALICE, "why is the sky blue?").await.unwrap(),
+        fell_back("Claude")
+    );
     assert_eq!(hub.claude.calls().len(), 1);
     assert_eq!(hub.chatgpt_requests().await, 1);
 }
@@ -408,7 +443,10 @@ async fn hub_hands_over_a_failure_before_output_but_never_one_after() {
     );
 
     hub.claude.script(None, "exit 1\n");
-    assert_eq!(hub.ask(ALICE, "why is the sky blue?").await.unwrap(), SKY);
+    assert_eq!(
+        hub.ask(ALICE, "why is the sky blue?").await.unwrap(),
+        fell_back("Claude")
+    );
     assert_eq!(hub.claude.calls().len(), 2);
     assert_eq!(hub.chatgpt_requests().await, 1, "handed over before output");
 }
@@ -773,7 +811,10 @@ async fn off_the_worker_hub_runs_her_turn_on_the_agents_route() {
     hub.chatgpt_login(ALICE).await;
     choose(&hub, &store, ALICE, Some(codex(RouteFallback::Hub))).await;
 
-    assert_eq!(hub.ask(ALICE, "why is the sky blue?").await.unwrap(), SKY);
+    assert_eq!(
+        hub.ask(ALICE, "why is the sky blue?").await.unwrap(),
+        fell_back("ChatGPT")
+    );
     assert_eq!(hub.codex.runs(), 0);
 }
 
@@ -973,4 +1014,75 @@ async fn her_background_calls_run_the_light_and_heavy_codex_models_she_chose() {
         "anything else billed to her is heavy"
     );
     assert_eq!(hub.chatgpt_requests().await, 0);
+}
+
+#[tokio::test]
+async fn on_a_full_worker_with_wait_she_is_told_why_and_what_to_do_and_the_status_line_is_closed() {
+    use workforce_agent::runner::ProgressEvent;
+    let (hub, store, worker) = routed_on_a_full_worker().await;
+    hub.claude_login(ALICE);
+    hub.chatgpt_login(ALICE).await;
+    choose(&hub, &store, ALICE, Some(claude(RouteFallback::Wait))).await;
+
+    let (events, run) = hub.stream(ALICE, "hello", None, None).await;
+
+    let said = "Your Claude plan couldn't take this right now: the coding worker is full. \
+                Try again in a minute, or switch this agent to the hub's models.";
+    assert_eq!(run.unwrap().response, said, "the turn answers her");
+    assert!(
+        worker.refused.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "it waited for a workspace, and tried again"
+    );
+    let waited = events.iter().position(|event| {
+        matches!(event, ProgressEvent::SubActivity { detail, .. }
+            if detail.contains("coding worker is full") && detail.contains("waiting up to"))
+    });
+    let waited = waited.expect("the wait was shown, with its bound");
+    let answered = events
+        .iter()
+        .rposition(|event| matches!(event, ProgressEvent::Response { text } if text == said))
+        .expect("the notice reached the watcher as the turn's answer");
+    assert!(waited < answered);
+    assert!(
+        events[answered..]
+            .iter()
+            .any(|event| matches!(event, ProgressEvent::Done { .. })),
+        "and the turn was finished after it, so every surface closes its status line"
+    );
+    assert!(hub.claude.calls().is_empty());
+    assert_eq!(hub.chatgpt_requests().await, 0, "she chose to wait");
+
+    let kept = hub
+        .service
+        .sessions
+        .get_or_create("web", ALICE, hub.service.agent_id.as_str())
+        .unwrap();
+    assert_eq!(
+        kept.messages.last().map(|m| m.content.as_str()),
+        Some(said),
+        "the notice is kept as the turn's answer"
+    );
+}
+
+#[tokio::test]
+async fn on_a_full_worker_with_hub_her_turn_runs_on_the_hubs_models_and_says_so() {
+    use workforce_agent::runner::ProgressEvent;
+    let (hub, store, _worker) = routed_on_a_full_worker().await;
+    hub.claude_login(ALICE);
+    hub.chatgpt_login(ALICE).await;
+    choose(&hub, &store, ALICE, Some(claude(RouteFallback::Hub))).await;
+
+    let (events, run) = hub.stream(ALICE, "why is the sky blue?", None, None).await;
+
+    let note = "\n\n_Your Claude plan couldn't take this (the coding worker was full), \
+                so the hub's models answered._";
+    assert_eq!(run.unwrap().response, format!("{SKY}{note}"));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ProgressEvent::StreamDelta { text } if text == note)),
+        "the note is streamed as the answer's last part, so screen and record agree"
+    );
+    assert!(hub.claude.calls().is_empty());
+    assert!(hub.chatgpt_requests().await > 0, "the hub's route answered");
 }
