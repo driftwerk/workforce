@@ -75,6 +75,9 @@ pub struct PlanTicketView {
     pub machine: Option<String>,
     /// The model its session runs; none is its engine's default.
     pub model: Option<String>,
+    /// The repository it works in, by where it comes from
+    /// (`github.com/owner/name`).
+    pub repo: Option<String>,
     /// Taken on from its board, not made by the plan: its key and link are
     /// its board's (a Linear or Jira issue's, when synced).
     pub adopted: bool,
@@ -165,6 +168,10 @@ pub enum StartRefused {
     /// anything else that keeps it from starting until someone acts.
     #[error("{0}")]
     Failed(DeskError),
+    /// It waits on something under way that it needs, its repository being
+    /// cloned: it starts once that is done, and nothing failed.
+    #[error("{0}")]
+    Waits(String),
 }
 
 impl From<DeskError> for StartRefused {
@@ -428,6 +435,7 @@ impl Desk {
                     view: r.view,
                     machine: r.machine,
                     model: r.model,
+                    repo: r.repo,
                     adopted: r.adopted,
                     ticket: v,
                 }
@@ -762,6 +770,7 @@ impl Desk {
                 view: t.view,
                 machine: t.machine.clone(),
                 model: t.model.clone(),
+                repo: t.repo.clone(),
                 adopted: t.adopted,
             };
             if t.adopted {
@@ -1433,6 +1442,7 @@ impl Desk {
                 view: t.view,
                 machine: t.machine.clone(),
                 model: t.model.clone(),
+                repo: t.repo.clone(),
                 adopted: true,
             };
             if let Err(e) = self.0.store.adopt_ticket(t.id, &runs).await {
@@ -1466,6 +1476,7 @@ impl Desk {
                     view: t.view,
                     machine: t.machine.clone(),
                     model: t.model.clone(),
+                    repo: t.repo.clone(),
                     adopted: t.adopted,
                 },
             )
@@ -2255,6 +2266,11 @@ impl Desk {
                 "That ticket isn't waiting to start any more.".into(),
             ));
         }
+        // Its folder there is its repository's checkout: found, or cloned
+        // first, and kept on it.
+        if start.repo.is_some() && self.plan_checkout(p, &t, boss).await? {
+            t = self.ticket_of(start.ticket).await?;
+        }
         if self
             .0
             .store
@@ -2287,6 +2303,75 @@ impl Desk {
         Ok(self
             .plan_launch(p, t, session, at, false, &runs, start.worktree, boss, by)
             .await?)
+    }
+
+    /// The checkout of `t`'s repository where it runs, as its folder: on
+    /// its machine through the relay (`desk.checkout`), on this computer
+    /// here. Whether its folder changed (it is kept on it); a clone under
+    /// way is [`StartRefused::Waits`].
+    async fn plan_checkout(
+        &self,
+        p: &Plan,
+        t: &Ticket,
+        boss: &Party,
+    ) -> Result<bool, StartRefused> {
+        let rows = self.0.store.plan_runs(p.id).await.map_err(internal)?;
+        let Some(mut runs) = rows.into_iter().find(|(id, _)| *id == t.id).map(|(_, r)| r) else {
+            return Ok(false);
+        };
+        let Some(repo) = runs.repo.as_deref().and_then(crate::repos::repo_of) else {
+            return Ok(false);
+        };
+        let key = self.key_of(t).await?;
+        let folder = runs.folder.clone().filter(|f| !f.trim().is_empty());
+        let got = match runs.machine.as_deref() {
+            None => {
+                let d = self.clone();
+                let (r, f) = (repo.clone(), folder.clone());
+                tokio::task::spawn_blocking(move || d.repo_checkout(&r, f.as_deref()))
+                    .await
+                    .map_err(|e| internal(eyre::eyre!("looking for a checkout: {e}")))?
+            }
+            Some(machine) => {
+                let crew = self.plan_crew().ok_or_else(|| {
+                    StartRefused::Failed(DeskError::Invalid(format!(
+                        "{machine} can't be reached from this hub."
+                    )))
+                })?;
+                let body = serde_json::json!({ "remote": repo.key(), "folder": folder });
+                let answer = crew
+                    .machine_call(machine, p.group.as_deref(), &boss.id, "desk.checkout", body)
+                    .await
+                    .map_err(|e| {
+                        StartRefused::Failed(DeskError::Invalid(match e {
+                            crew::MachineRefused::Refused(why) if why.contains("404") || why.contains("not found") => format!(
+                                "{machine}'s Desk is older and can't find {repo} there yet: update Desk on {machine}, or give {key} its folder there"
+                            ),
+                            e => format!("{key}'s checkout of {repo} on {machine} couldn't be read: {e}"),
+                        }))
+                    })?;
+                serde_json::from_value(answer).map_err(|_| {
+                    StartRefused::Failed(DeskError::Invalid(format!(
+                        "{machine}'s answer about {repo} couldn't be read."
+                    )))
+                })?
+            }
+        };
+        let on = runs.machine.as_deref().unwrap_or("this computer");
+        match got {
+            crate::repos::Got::Ready { path } if Some(&path) == folder.as_ref() => Ok(false),
+            crate::repos::Got::Ready { path } => {
+                runs.folder = Some(path);
+                self.0.store.put_runs(t.id, &runs).await.map_err(internal)?;
+                Ok(true)
+            }
+            crate::repos::Got::Cloning { path } => Err(StartRefused::Waits(format!(
+                "{key} waits while Desk clones {repo} into {path} on {on}; it starts once that is done."
+            ))),
+            crate::repos::Got::Failed { why } => Err(StartRefused::Failed(DeskError::Invalid(
+                format!("{key} has no checkout of {repo} on {on}: {why}."),
+            ))),
+        }
     }
 
     /// Finishes the start `s` that a stop cut off: its session is known (it
@@ -2804,6 +2889,7 @@ fn plan_ticket(
         view: r.view,
         machine: r.machine,
         model: r.model,
+        repo: r.repo,
         assigned: v.ticket.assignee.is_some(),
         starting,
     }
@@ -2852,6 +2938,7 @@ fn plan_why(s: &Snapshot, parallel: Option<i16>) -> String {
             view: t.view,
             machine: t.machine.clone(),
             model: t.model.clone(),
+            repo: t.repo.clone(),
             assigned: false,
             starting: false,
         })

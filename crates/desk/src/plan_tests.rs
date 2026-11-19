@@ -33,6 +33,7 @@ fn plan(state: PlanState) -> Plan {
 
 fn ticket(n: u128, state: TicketState, needs: &[u128]) -> PlanTicket {
     PlanTicket {
+        repo: None,
         id: u(n),
         key: Some(format!("ACM-{n}")),
         state,
@@ -50,6 +51,7 @@ fn ticket(n: u128, state: TicketState, needs: &[u128]) -> PlanTicket {
 
 fn planned(n: u128, title: &str, needs: &[u128]) -> Planned {
     Planned {
+        repo: None,
         id: u(n),
         title: title.into(),
         body: String::new(),
@@ -97,6 +99,7 @@ fn is_dir(p: &str) -> bool {
 
 fn draft_ticket(title: &str, needs: &[usize]) -> DraftTicket {
     DraftTicket {
+        repo: None,
         id: None,
         adopt: None,
         title: title.into(),
@@ -1030,6 +1033,7 @@ fn over_the_limit_nothing_starts_until_it_drains() {
     let mut tickets = Vec::new();
     for i in 0..3 {
         tickets.push(PlanTicket {
+            repo: None,
             id: u(i),
             key: None,
             state: TicketState::Todo,
@@ -1190,4 +1194,132 @@ fn an_edit_is_refused_by_the_key_it_names() {
         }]
     )
     .is_ok());
+}
+
+#[test]
+fn a_ticket_moved_with_its_repository_leaves_its_old_folder_behind() {
+    let mut a = planned(1, "Add the cache", &[]);
+    a.folder = "/Users/k/dev/vellev".into();
+    a.repo = Some("github.com/driftwerk/vellev".into());
+    let b = planned(2, "Use the cache", &[1]);
+    let before = Snapshot {
+        goal: "Faster reads".into(),
+        tickets: vec![a.clone(), b],
+        parallel: None,
+        budget: None,
+    };
+    // Its repository says its folder on devbox: the Mac's path goes.
+    let after = edited(
+        &before,
+        &[TicketEdit {
+            machine: Some("devbox".into()),
+            ..edit(1)
+        }],
+    )
+    .unwrap();
+    let moved = &after.tickets[0];
+    assert_eq!(moved.machine.as_deref(), Some("devbox"));
+    assert_eq!(moved.folder, "", "found as it starts");
+    assert_eq!(moved.repo, a.repo, "its repository is kept");
+    // Given as owner/name, it is kept as host/owner/name; one that can't
+    // be one is refused.
+    let named = edited(
+        &before,
+        &[TicketEdit {
+            machine: Some("devbox".into()),
+            repo: Some("driftwerk/workforce".into()),
+            ..edit(2)
+        }],
+    )
+    .unwrap();
+    assert_eq!(
+        named.tickets[1].repo.as_deref(),
+        Some("github.com/driftwerk/workforce")
+    );
+    assert_eq!(named.tickets[1].folder, "");
+    let bad = edited(
+        &before,
+        &[TicketEdit {
+            repo: Some("not a repo".into()),
+            ..edit(2)
+        }],
+    )
+    .unwrap_err();
+    assert!(
+        bad.iter().any(|p| matches!(p, Problem::BadRepo { .. })),
+        "{bad:?}"
+    );
+    // Without one, the move says its folder there.
+    let none = edited(
+        &before,
+        &[TicketEdit {
+            machine: Some("devbox".into()),
+            ..edit(2)
+        }],
+    )
+    .unwrap_err();
+    assert!(none[0].to_string().contains("or its repo"), "{}", none[0]);
+    // Saying the machine it is on already, in other letters, moves nothing.
+    let mut on_devbox = before.clone();
+    on_devbox.tickets[1].machine = Some("devbox".into());
+    let same = edited(
+        &on_devbox,
+        &[TicketEdit {
+            machine: Some("DevBox".into()),
+            ..edit(2)
+        }],
+    )
+    .unwrap();
+    assert_eq!(same.tickets[1].machine.as_deref(), Some("devbox"));
+    assert_eq!(same.tickets[1].folder, "/work/acme-web");
+}
+
+#[test]
+fn a_ticket_of_a_repository_starts_with_its_checkout_found_there() {
+    let mut a = ticket(1, TicketState::Todo, &[]);
+    a.folder = Some(String::new());
+    a.repo = Some("github.com/driftwerk/vellev".into());
+    a.machine = Some("devbox".into());
+    let mut b = ticket(2, TicketState::Todo, &[]);
+    b.folder = Some("/home/dev/projects/driftwerk/vellev".into());
+    b.repo = Some("github.com/driftwerk/vellev".into());
+    b.machine = Some("devbox".into());
+    let p = plan(PlanState::Running);
+    let starts = next_starts(&p, &[a, b], 0, 4, None);
+    assert_eq!(starts.len(), 2);
+    assert_eq!(
+        starts[0].repo.as_deref(),
+        Some("github.com/driftwerk/vellev")
+    );
+    assert_eq!(starts[0].folder, "");
+    assert_eq!(
+        starts.iter().map(|s| s.worktree).collect::<Vec<_>>(),
+        [false, true],
+        "one checkout of it on devbox: the second gets a copy"
+    );
+}
+
+#[test]
+fn a_ticket_names_its_folder_or_its_repository() {
+    let mut t = draft_ticket("a", &[]);
+    t.folder = String::new();
+    let mut d = Draft {
+        goal: "Ship it".into(),
+        tickets: vec![t],
+    };
+    let s = snapshot_of(&d, None, Engine::Claude, &mut counter()).unwrap();
+    let refused = validate(&s, &engines(), &is_dir).unwrap_err();
+    assert!(
+        refused
+            .iter()
+            .any(|p| matches!(p, Problem::NoFolderOrRepo { .. })),
+        "{refused:?}"
+    );
+    d.tickets[0].repo = Some("driftwerk/vellev".into());
+    let s = snapshot_of(&d, None, Engine::Claude, &mut counter()).unwrap();
+    assert_eq!(validate(&s, &engines(), &is_dir), Ok(()));
+    assert_eq!(
+        s.tickets[0].repo.as_deref(),
+        Some("github.com/driftwerk/vellev")
+    );
 }

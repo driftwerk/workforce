@@ -170,6 +170,9 @@ kinds! {
     AssignmentClosed => "assignment_closed",
     AssignmentRefused => "assignment_refused",
     AssignmentHeld => "assignment_held",
+    // A boss's work on one of the person's machines, itself: a folder made
+    // there, a check run there (designs/plans-across-machines.md).
+    OnMachine => "on_machine",
 }
 
 /// One thing that happened on the crew.

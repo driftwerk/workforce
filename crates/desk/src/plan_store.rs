@@ -124,6 +124,9 @@ pub struct Runs {
     pub machine: Option<String>,
     /// The model its session runs; none is its engine's default.
     pub model: Option<String>,
+    /// The repository it works in (`github.com/owner/name`): its folder on
+    /// the computer it runs on is that repository's checkout there.
+    pub repo: Option<String>,
     /// Taken on from a board, not made by the plan: never deleted, dropped,
     /// renamed or re-filed by it. Read only: [`DeskStore::put_runs`] leaves
     /// it, [`DeskStore::adopt_ticket`] and [`DeskStore::release_ticket`]
@@ -177,7 +180,7 @@ async fn adopt_in<C: tokio_postgres::GenericClient>(
         .execute(
             &format!(
                 "UPDATE tickets SET plan = $2, engine = $3, folder = $4, view = $5, machine = $6, \
-                 model = $7, adopted = true, version = version + 1 \
+                 model = $7, repo = $8, adopted = true, version = version + 1 \
                  WHERE id = $1 AND (({ADOPTABLE}) OR (plan = $2 AND adopted AND assignee IS NULL \
                  AND state IN ('backlog', 'todo')))"
             ),
@@ -189,6 +192,7 @@ async fn adopt_in<C: tokio_postgres::GenericClient>(
                 &runs.view.map(View::as_str),
                 &runs.machine,
                 &runs.model,
+                &runs.repo,
             ],
         )
         .await?;
@@ -349,8 +353,12 @@ impl DeskStore {
         let client = self.pool().get().await?;
         client
             .execute(
-                "UPDATE tickets SET plan = $2, engine = $3, folder = $4, view = $5, \
-                 machine = $6, model = $7, version = version + 1 \
+                // A folder left empty for its repository to say keeps the
+                // checkout a start found, while the repository is the same.
+                "UPDATE tickets SET plan = $2, engine = $3, \
+                 folder = CASE WHEN $4 = '' AND repo IS NOT DISTINCT FROM $8 AND machine IS NOT DISTINCT FROM $6 \
+                 THEN folder ELSE $4 END, view = $5, \
+                 machine = $6, model = $7, repo = $8, version = version + 1 \
                  WHERE id = $1 AND (plan = $2 OR (plan IS NULL AND NOT adopted))",
                 &[
                     &ticket,
@@ -360,6 +368,7 @@ impl DeskStore {
                     &runs.view.map(View::as_str),
                     &runs.machine,
                     &runs.model,
+                    &runs.repo,
                 ],
             )
             .await?;
@@ -371,7 +380,7 @@ impl DeskStore {
         let client = self.pool().get().await?;
         client
             .query(
-                "SELECT id, plan, engine, folder, view, machine, model, adopted FROM tickets \
+                "SELECT id, plan, engine, folder, view, machine, model, repo, adopted FROM tickets \
                  WHERE plan = $1",
                 &[&plan_id],
             )
@@ -389,6 +398,7 @@ impl DeskStore {
                         view: view.as_deref().map(View::parse).transpose()?,
                         machine: r.try_get("machine")?,
                         model: r.try_get("model")?,
+                        repo: r.try_get("repo")?,
                         adopted: r.try_get("adopted")?,
                     },
                 ))
@@ -438,7 +448,7 @@ impl DeskStore {
             .query_opt(
                 "UPDATE tickets SET state = $3, rank = $4, state_at = $5, updated_at = $5, \
                  version = version + 1 WHERE id = $1 AND version = $2 AND plan = $6 \
-                 RETURNING version, engine, folder, view, machine, model, adopted",
+                 RETURNING version, engine, folder, view, machine, model, adopted, repo",
                 &[
                     &t.id,
                     &t.version,
@@ -473,6 +483,7 @@ impl DeskStore {
             machine: row.try_get(4)?,
             model: row.try_get(5)?,
             adopted: row.try_get(6)?,
+            repo: row.try_get(7)?,
         })
     }
 
@@ -528,7 +539,7 @@ impl DeskStore {
         let n = tx
             .execute(
                 "UPDATE tickets SET plan = NULL, engine = NULL, folder = NULL, view = NULL, \
-                 machine = NULL, model = NULL, adopted = false, version = version + 1 \
+                 machine = NULL, model = NULL, repo = NULL, adopted = false, version = version + 1 \
                  WHERE id = $1 AND plan = $2",
                 &[&ticket, &plan],
             )
@@ -580,7 +591,7 @@ impl DeskStore {
             crate::board_store::insert_ticket_in(&*tx, t).await?;
             tx.execute(
                 "UPDATE tickets SET plan = $2, engine = $3, folder = $4, view = $5, \
-                 machine = $6, model = $7 WHERE id = $1",
+                 machine = $6, model = $7, repo = $8 WHERE id = $1",
                 &[
                     &t.id,
                     &runs.plan,
@@ -589,6 +600,7 @@ impl DeskStore {
                     &runs.view.map(View::as_str),
                     &runs.machine,
                     &runs.model,
+                    &runs.repo,
                 ],
             )
             .await?;
@@ -776,6 +788,7 @@ mod tests {
                     budget: None,
                     goal: p.goal.clone(),
                     tickets: vec![Planned {
+                        repo: None,
                         id: t.id,
                         title: t.title.clone(),
                         body: String::new(),
@@ -800,6 +813,7 @@ mod tests {
             assert_eq!(s.revisions(p.id).await.unwrap().len(), 1);
 
             let runs = Runs {
+                repo: None,
                 plan: Some(p.id),
                 engine: Some(Engine::Codex),
                 folder: Some("/work/acme-api".into()),
@@ -825,6 +839,7 @@ mod tests {
         s.put_runs(
             t.id,
             &Runs {
+                repo: None,
                 plan: Some(p.id),
                 engine: Some(Engine::Claude),
                 folder: Some("/work/acme-web".into()),
@@ -897,6 +912,7 @@ mod tests {
             s.put_runs(
                 t.id,
                 &Runs {
+                    repo: None,
                     plan: Some(p.id),
                     engine: Some(Engine::Claude),
                     folder: Some("/work/acme-api".into()),
@@ -964,6 +980,7 @@ mod tests {
             let first = mk("a", vec![]);
             let second = mk("b", vec![first.id]);
             let runs = Runs {
+                repo: None,
                 plan: Some(p.id),
                 engine: Some(Engine::Claude),
                 folder: Some("/work".into()),

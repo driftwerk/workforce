@@ -747,6 +747,11 @@ pub struct DeskConfig {
     /// GitHub is connected with a token.
     #[serde(default)]
     pub github_client_id: Option<String>,
+    /// Where a plan's repository is cloned on this computer when it has no
+    /// checkout of it (`<root>/<owner>/<name>`): `~/x`, or a folder inside
+    /// the home. Unset: `~/projects`.
+    #[serde(default)]
+    pub projects_root: Option<String>,
     /// Where the person's engine accounts' sign-ins are kept (`[desk.accounts]`).
     /// Unset: Desk keeps no accounts, and every session runs on the CLI's
     /// own sign-in on this computer.
@@ -1132,6 +1137,7 @@ impl Default for DeskConfig {
             attachment_max_mb: default_desk_attachment_max_mb(),
             attachment_retention_days: default_desk_attachment_retention_days(),
             github_client_id: None,
+            projects_root: None,
             accounts: DeskAccounts::default(),
             agents: true,
             machine: None,

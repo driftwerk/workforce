@@ -25,6 +25,7 @@ fn draft(dir: &Path, titles: &[(&str, &[usize])]) -> Draft {
         tickets: titles
             .iter()
             .map(|(title, needs)| DraftTicket {
+                repo: None,
                 id: None,
                 adopt: None,
                 title: (*title).into(),
@@ -57,6 +58,7 @@ fn kept(p: &PlanDetail) -> Vec<DraftTicket> {
     p.tickets
         .iter()
         .map(|t| DraftTicket {
+            repo: None,
             id: Some(t.ticket.ticket.id),
             adopt: None,
             title: t.ticket.ticket.title.clone(),
@@ -133,6 +135,7 @@ async fn a_proposed_plan_waits_in_backlog_for_the_persons_approval() {
         assert_eq!(needs[0].why.as_deref(), Some("2 tickets in 2 waves."));
         // Nothing of it can start.
         let start = Start {
+            repo: None,
             ticket: p.tickets[0].ticket.ticket.id,
             engine: Engine::Claude,
             folder: dir.path().to_string_lossy().into_owned(),
@@ -472,6 +475,7 @@ async fn a_start_cut_off_before_its_session_starts_that_session_and_no_other() {
             Ok(Some(v)) if v.id == session
         ));
         let start = Start {
+            repo: None,
             ticket: a,
             engine: Engine::Claude,
             folder: dir.path().to_string_lossy().into_owned(),
@@ -630,6 +634,7 @@ async fn a_started_ticket_keeps_where_it_runs_and_dropping_the_plan_stops_or_lea
         let p = d.approve_plan(id, 1, &By::you()).await.unwrap();
         let plan = p.summary.plan.clone();
         let start = Start {
+            repo: None,
             ticket: p.tickets[0].ticket.ticket.id,
             engine: Engine::Claude,
             folder: dir.path().to_string_lossy().into_owned(),
@@ -698,6 +703,7 @@ async fn a_ticket_edited_by_its_key_keeps_its_brief_and_a_started_one_keeps_wher
         let p = d.approve_plan(id, 1, &By::you()).await.unwrap();
         let (a, b) = (p.tickets[0].ticket.ticket.id, p.tickets[1].ticket.ticket.id);
         let start = Start {
+            repo: None,
             ticket: a,
             engine: Engine::Claude,
             folder: dir.path().to_string_lossy().into_owned(),
@@ -825,6 +831,7 @@ async fn a_tickets_session_runs_the_tickets_model() {
             .unwrap();
         let plan = p.summary.plan.clone();
         let start = |i: usize| Start {
+            repo: None,
             ticket: p.tickets[i].ticket.ticket.id,
             engine: Engine::Claude,
             folder: dir.path().to_string_lossy().into_owned(),
