@@ -900,7 +900,7 @@ impl CrewHub {
         // An irreversible request on a job another session holds, as
         // irreversible: never the boss's to allow (R5), the person's.
         if matches!(verdict, Verdict::Allow(_)) {
-            if let Some(conflict) = Box::pin(self.request_conflict(boss, view.id, p)).await {
+            if let Some(conflict) = Box::pin(self.request_conflict(boss, view.id, p, &[])).await {
                 if !still() {
                     return Outcome::NotOurs;
                 }

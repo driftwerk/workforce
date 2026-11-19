@@ -675,14 +675,18 @@ fn dry(ws: &[Word], sentence: usize) -> bool {
         if t.contains("dry-run=false") || t.contains("dry_run=false") {
             return false;
         }
-        let flag = matches!(t, "--dry-run" | "-dry-run" | "dry-run" | "dry_run" | "--dry")
-            || t.starts_with("--dry-run=")
+        let flag = matches!(
+            t,
+            "--dry-run" | "-dry-run" | "dry-run" | "dry_run" | "--dry"
+        ) || t.starts_with("--dry-run=")
             || t.starts_with("dry_run=");
         let said = t == "dry"
             && words
                 .get(k + 1)
                 .is_some_and(|n| matches!(n.text.as_str(), "run" | "runs"));
-        let after = words.get(k + if said { 2 } else { 1 }).map(|n| n.text.as_str());
+        let after = words
+            .get(k + if said { 2 } else { 1 })
+            .map(|n| n.text.as_str());
         let before = k.checked_sub(1).map(|p| words[p].text.as_str());
         (flag || said)
             && !matches!(after, Some("off" | "false" | "disabled"))
@@ -861,7 +865,13 @@ fn normal_target(target: &str) -> Option<String> {
             t = rest.to_string();
         }
     }
-    for host in ["github.com/", "github.com:", "www.github.com/", "gitlab.com/", "gitlab.com:"] {
+    for host in [
+        "github.com/",
+        "github.com:",
+        "www.github.com/",
+        "gitlab.com/",
+        "gitlab.com:",
+    ] {
         if let Some(rest) = t.strip_prefix(host) {
             t = rest.to_string();
         }
@@ -878,16 +888,19 @@ fn normal_key(kind: &str, key: &str) -> Option<String> {
     let seps = |c: char| matches!(c, '-' | '_' | ' ' | '#' | ':' | '=' | '/' | '.');
     let words: &[&str] = match kind {
         "merge" => &["pull-request", "pull", "pr", "merge"],
-        "release" | "deploy" | "promote" | "rollback" | "dispatch" | "publish" | "tag" => {
-            &["release", "deploy", "promote", "rollback", "dispatch", "publish", "tag"]
-        }
+        "release" | "deploy" | "promote" | "rollback" | "dispatch" | "publish" | "tag" => &[
+            "release", "deploy", "promote", "rollback", "dispatch", "publish", "tag",
+        ],
         _ => &[],
     };
     loop {
         let before = k.clone();
         for w in words.iter().copied().chain(std::iter::once(kind)) {
             if let Some(rest) = k.strip_prefix(w) {
-                if rest.is_empty() || rest.starts_with(seps) || rest.starts_with(|c: char| c.is_ascii_digit()) {
+                if rest.is_empty()
+                    || rest.starts_with(seps)
+                    || rest.starts_with(|c: char| c.is_ascii_digit())
+                {
                     k = rest.trim_start_matches(seps).to_string();
                 }
             }
@@ -906,7 +919,11 @@ fn normal_key(kind: &str, key: &str) -> Option<String> {
     let k = k.trim_end_matches(seps).to_string();
     let k = if digits(&k) {
         let n = k.trim_start_matches('0');
-        if n.is_empty() { "0".to_string() } else { n.to_string() }
+        if n.is_empty() {
+            "0".to_string()
+        } else {
+            n.to_string()
+        }
     } else {
         k.split_whitespace().collect::<Vec<_>>().join("-")
     };
@@ -1134,7 +1151,10 @@ mod tests {
         ] {
             assert!(!read(text, false).irreversible, "{text}");
             let four = Job::new("release", "harbor/monorepo", "4").unwrap();
-            assert!(!looks_like(text, &four), "a no names nothing to confirm: {text}");
+            assert!(
+                !looks_like(text, &four),
+                "a no names nothing to confirm: {text}"
+            );
         }
         assert_eq!(
             keys("Do NOT start releases 4, 5 or 6"),
@@ -1164,12 +1184,18 @@ mod tests {
         assert!(keys("id 0c9d3f6e-1a2b-4c5d-8e9f-0123456789ab").is_empty());
         // Releases, PRs and workflows however they are written.
         assert_eq!(keys("Cut R4 now"), vec!["release:4"]);
-        assert!(keys("Upload it to the R2 bucket").is_empty(), "Cloudflare's R2");
+        assert!(
+            keys("Upload it to the R2 bucket").is_empty(),
+            "Cloudflare's R2"
+        );
         assert!(keys("This is the #1 priority").is_empty());
         assert!(keys("account 123456789012").is_empty(), "an AWS account");
         assert_eq!(keys("run 123456789012"), vec!["run:123456789012"]);
         assert_eq!(keys("release 1.4.0"), vec!["release:1.4.0"]);
-        assert_eq!(keys("Deploy v4.2 to prod"), vec!["release:4.2", "env:production"]);
+        assert_eq!(
+            keys("Deploy v4.2 to prod"),
+            vec!["release:4.2", "env:production"]
+        );
         assert_eq!(keys("gh pr merge 711"), vec!["pr:711"]);
         assert_eq!(keys("release-4"), vec!["release:4"]);
         assert_eq!(
@@ -1184,12 +1210,17 @@ mod tests {
 
     #[test]
     fn a_declared_job_is_one_key_however_it_is_written() {
-        let key = |kind: &str, target: &str, key: &str| Job::new(kind, target, key).unwrap().as_key();
+        let key =
+            |kind: &str, target: &str, key: &str| Job::new(kind, target, key).unwrap().as_key();
         let four = "mantis-crm/monorepo/release/4";
         for (kind, target, k) in [
             ("release", "mantis-crm/monorepo", "release-4"),
             ("Release", "Mantis-CRM/monorepo", "Release 4"),
-            ("releases", "https://github.com/mantis-crm/monorepo.git", "r4"),
+            (
+                "releases",
+                "https://github.com/mantis-crm/monorepo.git",
+                "r4",
+            ),
             ("release", "git@github.com:mantis-crm/monorepo.git", "4"),
             ("release", "github.com/mantis-crm/monorepo/", "#4"),
         ] {
@@ -1198,7 +1229,10 @@ mod tests {
         for k in ["pr-711", "#711", "711", "PR 711", "pull/711"] {
             assert_eq!(key("pr", "acme/harbor", k), "acme/harbor/merge/711", "{k}");
         }
-        assert_eq!(key("release", "acme/harbor", "v1.4.0"), "acme/harbor/release/1.4.0");
+        assert_eq!(
+            key("release", "acme/harbor", "v1.4.0"),
+            "acme/harbor/release/1.4.0"
+        );
         assert_eq!(
             key("migration", "acme/harbor", "Ledger table v2"),
             "acme/harbor/migration/ledger-table-v2"
@@ -1214,7 +1248,10 @@ mod tests {
         let four = Job::new("release", "harbor/monorepo", "4").unwrap();
         let pr = Job::new("merge", "harbor/monorepo", "711").unwrap();
         assert!(looks_like("Pick up release 4 and watch it through.", &four));
-        assert!(looks_like("Review #711.", &pr), "a mention asks to confirm, never claims");
+        assert!(
+            looks_like("Review #711.", &pr),
+            "a mention asks to confirm, never claims"
+        );
         assert!(!looks_like("Review #711.", &four));
         assert!(!looks_like("Release 5 is next.", &four));
         assert!(!looks_like("Don't start release 4.", &four));
@@ -1274,7 +1311,13 @@ mod tests {
             }
         );
         // A word on a job it holds is sent and holds nothing.
-        let word = live(a, "When release 3 finishes, send Desk its run id.", Some("3"), false).a;
+        let word = live(
+            a,
+            "When release 3 finishes, send Desk its run id.",
+            Some("3"),
+            false,
+        )
+        .a;
         assert_eq!(
             rule(&word, &first, None),
             Ruling::Send {

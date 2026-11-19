@@ -1,7 +1,9 @@
 //! A boss's assignments over HTTP, for the Floor: who holds which job
 //! (`GET /api/desk/assignments?boss=`), and the person closing one
-//! (`POST /api/desk/assignments/{id}/close`). A boss reads and closes its
-//! own with its crew tools, never here.
+//! (`POST /api/desk/assignments/{id}/close`), and letting a held one go
+//! once they checked its old holder didn't start it
+//! (`POST /api/desk/assignments/{id}/release`). A boss reads, closes and
+//! lets go its own with its crew tools, never here.
 
 use std::sync::Arc;
 
@@ -133,10 +135,54 @@ async fn close(
     }
 }
 
+#[derive(Deserialize)]
+struct ReleaseBody {
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// The person lets a held assignment go: they checked its old holder
+/// didn't start it. The boss's loop sends it, checked as any send.
+async fn release(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path(id): Path<Uuid>,
+    Json(b): Json<ReleaseBody>,
+) -> Response {
+    if let Err(status) = s.auth.authorize(&h, q.token.as_deref()).await {
+        return (status, Json(json!({ "error": "not allowed" }))).into_response();
+    }
+    let note = b
+        .note
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .unwrap_or("The person checked it and let it go.");
+    match s.desk.store().assignment_let_go(id, note).await {
+        Ok(true) => {
+            s.desk.note(Event::new(
+                Kind::AssignmentClosed,
+                Party::you(),
+                None,
+                format!("let {} go: {note}", assignment::short(id)),
+            ));
+            Json(json!({ "released": true })).into_response()
+        }
+        Ok(false) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "That assignment isn't held." })),
+        )
+            .into_response(),
+        Err(e) => failed(e),
+    }
+}
+
 /// The assignments' routes.
 pub(crate) fn api_routes(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
     Router::new()
         .route("/api/desk/assignments", get(list))
         .route("/api/desk/assignments/{id}/close", post(close))
+        .route("/api/desk/assignments/{id}/release", post(release))
         .with_state(Arc::new(Api { desk, auth }))
 }

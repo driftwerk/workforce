@@ -6047,7 +6047,10 @@ async fn work_a_session_cant_take_starts_a_session_instead() {
         )
         .unwrap();
         let by = crew.by_overseer("Sam asked").unwrap();
-        let (done, gave) = crew.give_or_start(&nudge, &start, gone, by).await.unwrap();
+        let (done, gave) = crew
+            .give_or_start(&nudge, &start, gone, by, &Default::default())
+            .await
+            .unwrap();
         assert!(!gave);
         assert!(done.starts_with("started "), "{done}");
         assert_eq!(d.list().len(), before + 1);

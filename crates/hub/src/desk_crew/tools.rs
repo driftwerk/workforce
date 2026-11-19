@@ -604,8 +604,8 @@ impl CrewTool {
             Gate::Run => {
                 let by = crew.by_at_level(by, oversight);
                 let actor = by.party.clone();
+                let order = super::assignments::Order::of(input);
                 let Some((start, name)) = reused else {
-                    let order = super::assignments::Order::of(input);
                     let done = Box::pin(crew.perform_with(&action, by, &order)).await?;
                     return Ok(json!({ "done": done }));
                 };
@@ -613,7 +613,7 @@ impl CrewTool {
                     return Err("That isn't a session to give work to.".into());
                 };
                 let s = *s;
-                let (done, gave) = crew.give_or_start(&action, &start, s, by).await?;
+                let (done, gave) = Box::pin(crew.give_or_start(&action, &start, s, by, &order)).await?;
                 if !gave {
                     return Ok(json!({ "done": done }));
                 }
@@ -781,23 +781,20 @@ impl CrewTool {
         let agent = b.service.agent_id.as_str();
         // Who holds which job is kept here, the boss's home, for its
         // sessions here and on machines alike: reserved before it goes.
-        let assigned = match crew.assign_relayed(agent, machine, id, name, input).await {
+        let assigned = match crew.assign_relayed(agent, machine, id, name, &sent).await {
             Ok(a) => a,
             Err(why) => return Some(Err(why)),
         };
-        if let Some(o) = sent.as_object_mut() {
-            for f in ["job", "irreversible", "urgent", "replaces"] {
-                o.remove(f);
-            }
-            // Taken over: its new holder checks it hasn't been started.
-            if let Some(guard) = assigned.as_ref().and_then(|a| a.guard) {
-                for f in ["message", "prompt"] {
-                    if let Some(t) = o.get(f).and_then(Value::as_str) {
-                        let t = format!("{}\n\n{guard}", t.trim_end());
-                        o.insert(f.into(), json!(t));
-                    }
-                }
-            }
+        // Held for its old holder's stand-down: relayed once it answers.
+        if let Some(said) = assigned.as_ref().and_then(|a| a.held.clone()) {
+            return Some(Ok(json!({ "done": said })));
+        }
+        // Taken over: its new holder checks it hasn't been started.
+        let mut sent =
+            super::assignments::relayed_input(&sent, assigned.as_ref().and_then(|a| a.guard));
+        // The machine compares a request with the jobs kept here (R5).
+        if name == "crew.approve" {
+            sent[super::assignments::HELD_JOBS] = json!(crew.held_irreversible(agent).await);
         }
         let relayed = crew.relay(machine, g, name, sent, agent, &ceiling).await;
         if let Some(a) = assigned.map(|a| a.id) {
@@ -932,7 +929,7 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
         super::assignments::CLOSE => act(
             props(json!({
                 "id": { "type": "string", "description": "The assignment, as a:… from crew.assignments" },
-                "state": { "type": "string", "enum": ["done", "cancelled"] },
+                "state": { "type": "string", "enum": ["done", "cancelled", "release"] },
                 "note": { "type": "string", "description": "Why, in a sentence the person reads" }
             })),
             &["id", "state", "note"],
@@ -1027,7 +1024,10 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
                     "view": { "type": "string", "enum": ["terminal"], "description": "Where it runs (default terminal)" },
                     "worktree": { "type": "string", "description": "A new branch to work on, in a worktree of its own" },
                     "new": { "type": "boolean", "description": "true only when the person asked for a new session: none already there gets the work" }
-                })),
+                }))
+                .into_iter()
+                .chain(props(super::assignments::order_properties(true)))
+                .collect(),
                 &["folder", "goal"],
             )
         }
@@ -1056,7 +1056,7 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
                     }
                 }))
                 .into_iter()
-                .chain(props(super::assignments::order_properties(false)))
+                .chain(props(super::assignments::order_properties(true)))
                 .collect(),
                 &["ticket", "to"],
             )

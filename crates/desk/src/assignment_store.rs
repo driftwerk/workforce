@@ -203,12 +203,20 @@ impl DeskStore {
             // Another claim on the job reached the table past the lock: the
             // index refuses it as R2 would.
             if e.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) {
-                drop(tx);
-                let holder = self
-                    .assignments_of(&new.boss, true)
+                tx.rollback().await?;
+                // On the same connection: no second one taken while this
+                // one is held.
+                let holder = client
+                    .query_opt(
+                        &select(&format!(
+                            "WHERE a.boss = $1 AND a.job_key = $2 AND a.claims AND a.state IN {LIVE} LIMIT 1"
+                        )),
+                        &[&new.boss, &new.job_key],
+                    )
                     .await?
-                    .into_iter()
-                    .find(|a| a.claims && a.job_key == new.job_key);
+                    .as_ref()
+                    .map(assignment)
+                    .transpose()?;
                 if let Some(holder) = holder {
                     return Ok(Reserved::Refused {
                         rule: Rule::SameJob,
@@ -287,8 +295,11 @@ impl DeskStore {
             .query_opt(
                 &format!(
                     "UPDATE boss_assignments a SET state = $2, line_message = COALESCE($3, line_message), \
-                     closed_at = CASE WHEN $2 = 'failed' THEN now() END, closed_why = $4 \
-                     WHERE id = $1 AND state = 'sending' RETURNING {COLUMNS}, NULL::timestamptz"
+                     closed_at = CASE WHEN $2 = 'failed' THEN now() END, \
+                     closed_by = CASE WHEN $2 = 'failed' THEN 'desk' END, closed_why = $4 \
+                     WHERE id = $1 AND (state = 'sending' \
+                       OR ($2 = 'open' AND state = 'failed' AND closed_by = 'restart')) \
+                     RETURNING {COLUMNS}, NULL::timestamptz"
                 ),
                 &[&id, &state, &line_message, &why],
             )
@@ -354,6 +365,34 @@ impl DeskStore {
             .transpose()
     }
 
+    /// The order `id`, which carries no line message here (a ticket, a
+    /// resume, a restart, a start, or one relayed to a machine), reached its
+    /// session at `at`.
+    pub async fn assignment_delivered_by_id(&self, id: Uuid, at: DateTime<Utc>) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "UPDATE boss_assignments SET delivered_at = $2 WHERE id = $1 AND delivered_at IS NULL",
+                &[&id, &at],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Closed assignments older than `before` are let go: what holds a job
+    /// is only ever a live one. How many.
+    pub async fn assignments_prune(&self, before: DateTime<Utc>) -> Result<u64> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .execute(
+                &format!(
+                    "DELETE FROM boss_assignments WHERE state NOT IN {LIVE} AND closed_at < $1"
+                ),
+                &[&before],
+            )
+            .await?)
+    }
+
     /// Its line message went in at `at`.
     pub async fn assignment_delivered(&self, line_message: Uuid, at: DateTime<Utc>) -> Result<()> {
         let client = self.pool().get().await?;
@@ -414,6 +453,181 @@ impl DeskStore {
         Ok(())
     }
 
+    /// The live assignment of `boss`'s that `given` names: its whole id,
+    /// or `a:` and the start of it, read from the table, never from a
+    /// page of the newest.
+    pub async fn assignment_named(&self, boss: &str, given: &str) -> Result<Option<Assignment>> {
+        let given = given.trim();
+        let start = given
+            .strip_prefix("a:")
+            .unwrap_or(given)
+            .replace('-', "")
+            .to_lowercase();
+        if start.len() < 6 || !start.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(None);
+        }
+        let client = self.pool().get().await?;
+        let rows = client
+            .query(
+                &select(&format!(
+                    "WHERE a.boss = $1 AND a.state IN {LIVE} \
+                     AND replace(a.id::text, '-', '') LIKE $2 || '%' LIMIT 2"
+                )),
+                &[&boss, &start],
+            )
+            .await?;
+        // Two that start alike: neither is named.
+        match rows.as_slice() {
+            [one] => Ok(Some(assignment(one)?)),
+            _ => Ok(None),
+        }
+    }
+
+    /// An order superseded by `new`, which then couldn't go (its line
+    /// message had gone in meanwhile), stands again, and `new` failed:
+    /// both in one transaction under the boss's lock.
+    pub async fn assignment_unsupersede(&self, boss: &str, new: Uuid, old: Uuid) -> Result<()> {
+        let mut client = self.pool().get().await?;
+        let tx = client.transaction().await?;
+        tx.execute(
+            "SELECT pg_advisory_xact_lock(hashtext('boss_assignments:' || $1))",
+            &[&boss],
+        )
+        .await?;
+        tx.execute(
+            "UPDATE boss_assignments SET state = 'failed', closed_at = now(), closed_by = 'desk', \
+             closed_why = 'its earlier order went in meanwhile' WHERE id = $1",
+            &[&new],
+        )
+        .await?;
+        tx.execute(
+            "UPDATE boss_assignments SET state = 'open', closed_at = NULL, closed_by = NULL, \
+             closed_why = NULL WHERE id = $1 AND state = 'superseded'",
+            &[&old],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The new session `session` that the start `id` was reserved for.
+    pub async fn assignment_set_session(&self, id: Uuid, session: Uuid) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "UPDATE boss_assignments SET session = $2 WHERE id = $1",
+                &[&id, &session],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The order `id` being sent is held after all (its old holder couldn't
+    /// be told to stand down): kept to send later as `action`, on the
+    /// picture at `basis`.
+    pub async fn assignment_hold(
+        &self,
+        id: Uuid,
+        action: Option<&serde_json::Value>,
+        basis: Option<i64>,
+    ) -> Result<bool> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .execute(
+                "UPDATE boss_assignments SET state = 'held', action = COALESCE($2, action), \
+                 basis = COALESCE($3, basis) WHERE id = $1 AND state = 'sending'",
+                &[&id, &action, &basis],
+            )
+            .await?
+            > 0)
+    }
+
+    /// The held assignment `id` may go: the person (or its boss) said so,
+    /// or its old holder answered. Its loop sends it. False when it wasn't
+    /// held.
+    pub async fn assignment_let_go(&self, id: Uuid, answer: &str) -> Result<bool> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .execute(
+                "UPDATE boss_assignments SET answer = $2 WHERE id = $1 AND state = 'held'",
+                &[&id, &answer],
+            )
+            .await?
+            > 0)
+    }
+
+    /// The first answer to the stand-down `stand_down` that came from
+    /// `session` since `since`: a reply to it, or a message quoting its
+    /// mark. Read from the line, so one whose event was missed is found.
+    pub async fn stand_down_answer(
+        &self,
+        stand_down: Uuid,
+        session: Uuid,
+        since: DateTime<Utc>,
+    ) -> Result<Option<String>> {
+        let client = self.pool().get().await?;
+        let mark = format!("%m:{}%", &stand_down.simple().to_string()[..8]);
+        Ok(client
+            .query_opt(
+                "SELECT text FROM line_messages WHERE sender ->> 'id' = $2 AND at >= $3 \
+                 AND (in_reply_to = $1 OR lower(text) LIKE $4) ORDER BY at LIMIT 1",
+                &[&stand_down, &session.to_string(), &since, &mark],
+            )
+            .await?
+            .map(|r| r.get(0)))
+    }
+
+    /// The live assignments whose line message was withdrawn or refused:
+    /// it never went in, so they hold nothing.
+    pub async fn assignments_never_went_in(&self) -> Result<Vec<Assignment>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                &select(
+                    "WHERE a.state IN ('open', 'sending') AND l.delivery IN ('withdrawn', 'refused')",
+                ),
+                &[],
+            )
+            .await?
+            .iter()
+            .map(assignment)
+            .collect()
+    }
+
+    /// The live assignments kept before a job was declared with each (no
+    /// `job`): read from their words, which no longer make a job, so they
+    /// are closed once. How many.
+    pub async fn assignments_close_undeclared(&self) -> Result<u64> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .execute(
+                &format!(
+                    "UPDATE boss_assignments SET state = 'cancelled', closed_at = now(), \
+                     closed_by = 'desk', closed_why = 'kept before jobs were declared' \
+                     WHERE job IS NULL AND state IN {LIVE}"
+                ),
+                &[],
+            )
+            .await?)
+    }
+
+    /// The state of `boss`'s open item kept under `key`, and who closed it.
+    pub async fn item_state_of_key(
+        &self,
+        boss: &str,
+        key: &str,
+    ) -> Result<Option<(String, Option<String>)>> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .query_opt(
+                "SELECT state, closed_by FROM boss_open_items WHERE boss = $1 AND dedupe_key = $2 \
+                 ORDER BY opened_at DESC LIMIT 1",
+                &[&boss, &key],
+            )
+            .await?
+            .map(|r| (r.get(0), r.get(1))))
+    }
+
     /// The person's order `item` is what `boss`'s turn on runner session
     /// `sid` (its turn keys start `<sid>#`) served, since `since`.
     pub async fn assignments_serve_item(
@@ -434,10 +648,13 @@ impl DeskStore {
             .await?)
     }
 
-    /// After a restart: what was still being sent before `before` is
-    /// settled. One whose line message is there (its boss's, to its
-    /// session, its words, sent after it) is `open`; any other `failed`.
-    /// Each as it now is.
+    /// What was still being sent before `before` is settled: after a
+    /// restart, or a send whose end was never kept. A message whose line
+    /// row is there (its boss's, to its session, starting with its words,
+    /// sent after it) is `open`, one with none `failed`; a ticket, resume,
+    /// restart or start carries no line message, so it is kept `open`:
+    /// it holds its job until it is closed, never dropped for not being
+    /// seen. Each as it now is.
     pub async fn assignments_reconcile(&self, before: DateTime<Utc>) -> Result<Vec<Assignment>> {
         let client = self.pool().get().await?;
         let rows = client
@@ -448,13 +665,16 @@ impl DeskStore {
                          SELECT l.id FROM line_messages l \
                          WHERE l.sender ->> 'id' = a.boss AND l.recipient ->> 'id' = a.session::text \
                          AND starts_with(l.text, a.text) AND l.at >= a.sent_at - interval '1 second' \
-                         ORDER BY l.at LIMIT 1) AS line \
+                         ORDER BY l.at LIMIT 1) AS line, \
+                         COALESCE(a.action ->> 'tool', 'crew.nudge') = 'crew.nudge' AS by_line \
                        FROM boss_assignments a WHERE a.state = 'sending' AND a.sent_at < $1) \
                      UPDATE boss_assignments a SET \
-                       state = CASE WHEN f.line IS NULL THEN 'failed' ELSE 'open' END, \
+                       state = CASE WHEN f.line IS NULL AND f.by_line THEN 'failed' ELSE 'open' END, \
                        line_message = COALESCE(f.line, a.line_message), \
-                       closed_at = CASE WHEN f.line IS NULL THEN now() END, \
-                       closed_why = CASE WHEN f.line IS NULL THEN 'Desk restarted before it was sent' END \
+                       closed_at = CASE WHEN f.line IS NULL AND f.by_line THEN now() END, \
+                       closed_by = CASE WHEN f.line IS NULL AND f.by_line THEN 'restart' END, \
+                       closed_why = CASE WHEN f.line IS NULL AND f.by_line \
+                         THEN 'Desk restarted before it was sent' END \
                      FROM found f WHERE a.id = f.id RETURNING {COLUMNS}, NULL::timestamptz"
                 ),
                 &[&before],

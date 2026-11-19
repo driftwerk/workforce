@@ -3,23 +3,30 @@
 //! ([`workforce_desk::assignment`]), kept until it is done, cancelled,
 //! superseded or let lapse.
 //!
-//! - **Reserved before it is sent.** [`CrewHub::perform_with`] checks a
-//!   boss's message (or ticket, resume or restart prompt) against the
-//!   boss's live assignments in its session's lane, after the picture's own
-//!   check, under the boss's Postgres lock: a second session is never given
-//!   a job another holds (R2, R3), and a session that has an irreversible
-//!   job is never told to start it again (R1). Whichever of the boss's turns
-//!   sends it (its DM, a line, a check-in, a focused call), it is the same
-//!   reservation.
+//! - **The job is declared.** A boss's order (a message, ticket, resume or
+//!   restart prompt, or a start's goal) says the job it hands out
+//!   (`job: { kind, target, key }`); only a declared job is kept and
+//!   compared, never one read from its words. An order that looks like it
+//!   can't be taken back and declares none isn't sent; one whose words
+//!   seem to name a job another session holds asks the boss to say which
+//!   job it is ([`assignment::looks_like`]), and claims nothing.
+//! - **Reserved before it is sent.** [`CrewHub::perform_with`] checks it
+//!   against the boss's live assignments in its session's lane, after the
+//!   picture's own check, under the boss's Postgres lock: a second session
+//!   is never given a job another holds (R2), and a session that has an
+//!   irreversible job is never told to start it again (R1). Whichever of
+//!   the boss's turns sends it, it is the same reservation.
 //! - **Moved with `replaces`.** The old holder is told to stand down (a
 //!   line message that asks for an answer), and the new holder's order is
 //!   held while the old one may have started it, until the old holder
 //!   answers the stand-down or its session goes; then it goes through
-//!   `perform`, on the picture as it was when it was held. Unanswered for
-//!   [`HOLD_FOR`], it is the person's.
-//! - **Approvals** of an irreversible request that another session's
-//!   irreversible assignment acts on are the person's, never the boss's
-//!   (R5, [`CrewHub::request_conflict`]).
+//!   `perform`, on the picture as it was when it was held. The person (or
+//!   the boss, once it knows) can let it go; unanswered for [`HOLD_FOR`],
+//!   it is the person's. Its old order not yet in is withdrawn first, and
+//!   a stand-down that can't be sent holds it for the person.
+//! - **Approvals** of an irreversible request beside another session's
+//!   irreversible job in the same repository are the person's, never the
+//!   boss's (R5, [`CrewHub::request_conflict`]).
 //! - **Kept up to date** by [`assignments_loop`]: delivered and answered
 //!   from the line, cancelled when its message is withdrawn, lapsed when
 //!   reversible and old, closed from the session's account with
@@ -33,9 +40,7 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use workforce_desk::assignment::{
-    self, short, Assignment, AssignmentState, Rule, Target, TargetKind,
-};
+use workforce_desk::assignment::{self, short, Assignment, AssignmentState, Job, Rule, Target};
 use workforce_desk::assignment_store::Reserved;
 use workforce_desk::crew::{self, By, Event, Kind, Party, PartyKind};
 use workforce_desk::line::{Delivery, LineKind, LineMessage};
@@ -51,8 +56,8 @@ pub(crate) const CLOSE: &str = "crew.assignment";
 /// The boss's tool that lists them.
 pub(crate) const LIST: &str = "crew.assignments";
 
-pub(crate) const CLOSE_DESCRIPTION: &str = "Close one of your assignments (id, as a:… from crew.assignments): state done when its session did it, or cancelled when it no longer should; note says why, in a sentence the person reads. Closing it lets you give that job to another session.";
-pub(crate) const LIST_DESCRIPTION: &str = "Your assignments: every job you gave a session (each message, ticket, resume or restart prompt), with who holds it, when it was sent, delivered and answered, and whether it can be undone. With all, the last day's closed ones too. A job one session holds isn't given to another: move it with crew.nudge's replaces.";
+pub(crate) const CLOSE_DESCRIPTION: &str = "Close one of your assignments (id, as a:… from crew.assignments): state done when its session did it, or cancelled when it no longer should; note says why, in a sentence the person reads. Closing it lets you give that job to another session. state release lets a held one go to its new holder once you know its old holder didn't start it.";
+pub(crate) const LIST_DESCRIPTION: &str = "Your assignments: every job you gave a session (each order that declared its job), with who holds it, when it was sent, delivered and answered, and whether it can be undone. With all, the last day's closed ones too. A job one session holds isn't given to another: move it with crew.nudge's replaces.";
 
 /// How long a held assignment waits for its old holder to answer its
 /// stand-down, in the crew's minutes, before it is the person's.
@@ -62,13 +67,69 @@ pub(crate) const HOLD_FOR: u32 = 10;
 /// stand-down: the new holder checks first.
 const CHECK_FIRST: &str = "Before you start it, check it hasn't already been started.";
 
-/// What a boss's order says of the job it is, besides its words: the
-/// fields of `crew.nudge` (and `urgent`, `replaces` of a ticket, resume or
-/// restart). Every field is optional: an older hub's orders carry none,
-/// and their job is read from what they name.
+/// How a job is declared, as the boss's refusals show it.
+const JOB_EXAMPLE: &str =
+    r#"job: { "kind": "release", "target": "mantis-crm/monorepo", "key": "release-4" }"#;
+
+/// The field a relayed call carries the home's irreversible jobs in, for
+/// the machine to compare a request with (R5).
+pub(super) const HELD_JOBS: &str = "held_jobs";
+
+/// What a boss's order says of the job it hands out: the job it declares,
+/// never one read from its words.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum Declared {
+    /// Nothing said: it holds no job.
+    #[default]
+    Unsaid,
+    /// `job: "none"`: the boss says it is no job.
+    NoJob,
+    /// The job; its target, left out, is the session's repository.
+    Job {
+        kind: String,
+        target: Option<String>,
+        key: String,
+    },
+    /// Said, but not as a job is: what the boss is told.
+    Malformed(String),
+}
+
+impl Declared {
+    fn of(v: &Value) -> Self {
+        let field = |o: &serde_json::Map<String, Value>, k: &str| {
+            o.get(k)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+        };
+        match v {
+            Value::Null => Self::Unsaid,
+            Value::String(s) if s.trim().is_empty() => Self::Unsaid,
+            Value::String(s) if s.trim().eq_ignore_ascii_case("none") => Self::NoJob,
+            Value::Object(o) => match (field(o, "kind"), field(o, "key")) {
+                (Some(kind), Some(key)) => Self::Job {
+                    kind,
+                    target: field(o, "target"),
+                    key,
+                },
+                _ => Self::Malformed(format!(
+                    "Not sent: a job says its kind and its key, as {JOB_EXAMPLE}."
+                )),
+            },
+            _ => Self::Malformed(format!(
+                "Not sent: say the job as {JOB_EXAMPLE}, or job: \"none\" when this isn't one."
+            )),
+        }
+    }
+}
+
+/// What a boss's order says besides its words: the fields of `crew.nudge`
+/// (and of a ticket, a resume, a restart or a start). Every field is
+/// optional: an order that declares no job holds none.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Order {
-    pub job: Option<String>,
+    pub job: Declared,
     /// The boss says it can't be taken back, whatever the words say.
     pub irreversible: bool,
     /// Kept for its delivery: an urgent order is steered in by a later
@@ -80,6 +141,9 @@ pub(crate) struct Order {
     pub unrecorded: bool,
     /// A held assignment going out now: its row, already reserved.
     pub released: Option<Uuid>,
+    /// Relayed from the boss's home: the irreversible jobs it keeps for its
+    /// other sessions, which a request here is compared with (R5).
+    pub held_elsewhere: Vec<Assignment>,
 }
 
 impl Order {
@@ -93,10 +157,11 @@ impl Order {
                 .map(str::to_string)
         };
         Self {
-            job: text("job"),
+            job: Declared::of(&input["job"]),
             irreversible: input["irreversible"].as_bool().unwrap_or(false),
             urgent: input["urgent"].as_bool().unwrap_or(false),
             replaces: text("replaces"),
+            held_elsewhere: serde_json::from_value(input[HELD_JOBS].clone()).unwrap_or_default(),
             ..Default::default()
         }
     }
@@ -106,11 +171,19 @@ impl Order {
 pub(crate) fn order_properties(with_job: bool) -> Value {
     let mut p = json!({
         "urgent": { "type": "boolean", "description": "It can't wait for the session's turn to end (a correction, a stop)" },
-        "replaces": { "type": "string", "description": "The assignment (a:… from crew.assignments) this takes over: its holder is told to stand down first, and this waits until it answers when it may have started" }
+        "replaces": { "type": "string", "description": "The assignment (a:… from crew.assignments) this takes over, with its job: its holder is told to stand down first, and this waits until it answers when it may have started" }
     });
     if with_job {
-        p["job"] = json!({ "type": "string", "description": "The job this hands out, in a few words (\"release 4\", \"#708\"): one session holds a job at a time" });
-        p["irreversible"] = json!({ "type": "boolean", "description": "true when it starts something that can't be taken back (a release, deploy, merge, delete), whatever the words say" });
+        p["job"] = json!({
+            "type": ["object", "string"],
+            "description": "The job this hands out, so no second session is given it: { kind, target, key }. Declare one with any release, deploy, merge to a protected branch, migration, publish, dispatch or rollback, and with any work only one session should do. kind: release, deploy, merge, migration, publish, dispatch, rollback, or another word for it. target: the repository it is in, owner/name (left out: the session's own). key: the job's own id, the same whoever says it and however (release-4, pr-711, the migration's file name, the run id); never a session's name. \"none\" when this isn't a job. An order that looks like it can't be taken back isn't sent without one.",
+            "properties": {
+                "kind": { "type": "string" },
+                "target": { "type": "string" },
+                "key": { "type": "string" }
+            }
+        });
+        p["irreversible"] = json!({ "type": "boolean", "description": "true when it starts something that can't be taken back (a release, deploy, merge, migration, publish, delete), whatever the words say; it then needs its job" });
     }
     p
 }
@@ -121,6 +194,8 @@ pub(super) struct Reservation {
     pub id: Uuid,
     /// What Desk adds to the order: the guard to check first.
     pub guard: Option<String>,
+    /// Kept for a session the order starts: its id once started.
+    pub starts: bool,
 }
 
 /// A relayed order kept here before it goes to its machine: its row, and
@@ -128,11 +203,14 @@ pub(super) struct Reservation {
 pub(super) struct Relayed {
     pub id: Uuid,
     pub guard: Option<&'static str>,
+    /// Held for its old holder's stand-down, not relayed now: what the boss
+    /// is told.
+    pub held: Option<String>,
 }
 
 /// What [`CrewHub::assign_before`] decided.
 pub(super) enum Before {
-    /// Not an assignment (an answer, a status question, the person's).
+    /// No job: an answer, a status question, the person's, or plain words.
     Not,
     /// Send it, reserved.
     Send(Reservation),
@@ -140,24 +218,36 @@ pub(super) enum Before {
     Held(String),
 }
 
-/// The session `action`, a boss's, gives work to, what it says, and the
-/// ticket it hands out.
-fn assigned(action: &Action) -> Option<(Uuid, String, Option<String>)> {
+/// Who an order goes to: a session, or one started for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Holder {
+    Session(Uuid),
+    New,
+}
+
+/// Who `action`, a boss's, gives work to, what it says, and the ticket it
+/// hands out.
+fn assigned(action: &Action) -> Option<(Holder, String, Option<String>)> {
     match action {
         Action::Nudge {
             to: To::Session(s),
             message,
             reply_to: None,
-        } if !message.starts_with(STATUS_QUESTION) => Some((*s, message.clone(), None)),
-        Action::AssignTicket {
-            ticket,
-            to: Handout::Session(s),
-            ..
-        } => Some((
-            *s,
-            format!("Ticket {ticket} is yours to work on."),
-            Some(ticket.clone()),
-        )),
+        } if !message.starts_with(STATUS_QUESTION) => {
+            Some((Holder::Session(*s), message.clone(), None))
+        }
+        Action::AssignTicket { ticket, to, .. } => {
+            let holder = match to {
+                Handout::Session(s) => Holder::Session(*s),
+                Handout::NewSession { .. } => Holder::New,
+                Handout::Agent(_) => return None,
+            };
+            Some((
+                holder,
+                format!("Ticket {ticket} is yours to work on."),
+                Some(ticket.clone()),
+            ))
+        }
         Action::Resume {
             session,
             prompt: Some(p),
@@ -165,9 +255,85 @@ fn assigned(action: &Action) -> Option<(Uuid, String, Option<String>)> {
         | Action::Restart {
             session,
             prompt: Some(p),
-        } => Some((*session, p.clone(), None)),
+        } => Some((Holder::Session(*session), p.clone(), None)),
+        Action::StartSession { goal, .. } if !goal.trim().is_empty() => {
+            Some((Holder::New, goal.clone(), None))
+        }
         _ => None,
     }
+}
+
+/// The job `said` declares, `repo` being the session's: one taken over
+/// with `replaces` is the old one's, unless another is said. A ticket
+/// holds no job of its own unless one is declared with it: the board
+/// already gives a ticket to one holder.
+fn job_of(
+    said: &Declared,
+    repo: Option<&str>,
+    old: Option<&Assignment>,
+) -> Result<Option<Job>, String> {
+    match said {
+        Declared::Malformed(why) => Err(why.clone()),
+        Declared::Job { kind, target, key } => {
+            let Some(target) = target.as_deref().or(repo) else {
+                return Err(format!(
+                    "Not sent: say which repository the job is in, as {JOB_EXAMPLE}: Desk doesn't know this session's."
+                ));
+            };
+            Job::new(kind, target, key).map(Some).ok_or_else(|| {
+                format!("Not sent: a job says its kind, target and key, as {JOB_EXAMPLE}.")
+            })
+        }
+        Declared::NoJob => Ok(None),
+        Declared::Unsaid => Ok(old.and_then(|o| o.job_key.as_deref()).and_then(Job::of_key)),
+    }
+}
+
+/// The refusal of an order that looks like it can't be taken back but
+/// declares no job.
+fn no_job() -> String {
+    format!(
+        "Not sent: this looks like it starts something that can't be taken back, and it says no job, so Desk can't keep a second session from being given it. Send it again with the job it is, as {JOB_EXAMPLE} (the key is the release's, PR's or migration's own id)."
+    )
+}
+
+/// How an old holder was told to stand down.
+enum StoodDown {
+    /// A line message to it, which its answer replies to.
+    Asked(Uuid),
+    /// The person was asked to tell it: they drive it, or it is on a
+    /// machine.
+    Person,
+    /// It couldn't be told.
+    Unsent,
+}
+
+/// `input`, a crew call for a machine, without the fields its order says
+/// here (kept at the home, never relayed), with `guard` said after what it
+/// says.
+pub(super) fn relayed_input(input: &Value, guard: Option<&str>) -> Value {
+    let mut sent = input.clone();
+    if let Some(o) = sent.as_object_mut() {
+        for f in ["job", "irreversible", "urgent", "replaces"] {
+            o.remove(f);
+        }
+        if let Some(guard) = guard {
+            for f in ["message", "prompt"] {
+                if let Some(t) = o.get(f).and_then(Value::as_str) {
+                    let t = format!("{}\n\n{guard}", t.trim_end());
+                    o.insert(f.into(), json!(t));
+                }
+            }
+        }
+    }
+    sent
+}
+
+/// What a list of assignments' lines read besides themselves, read once:
+/// their sessions' accounts, and the old holders the held ones wait on.
+struct Looked {
+    accounts: Vec<workforce_desk::account::Account>,
+    olds: Vec<Assignment>,
 }
 
 /// `action` with `guard` said after what it says.
@@ -348,37 +514,51 @@ impl CrewHub {
             Rule::Held => format!(
                 "Not sent: {name} already waits to be given this job ({id}): it goes to it once its old holder answers its stand-down. To change what it is given, close {id} (crew.assignment) and send again."
             ),
+            Rule::SameJob if self.holder_gone(h) => format!(
+                "Not sent: {name} held this job ({id}, {}), and its session has gone. Send again with replaces: \"{id}\" to move it at once; check first that it hadn't started it.",
+                said.join(", ")
+            ),
             Rule::SameJob => format!(
                 "Not sent: {name} holds this job ({id}, {}). {undone} To move it, send again with replaces: \"{id}\": Desk tells {name} to stand down first. Check that it hasn't already started.",
                 said.join(", ")
             ),
-            Rule::SharedTarget => {
-                let theirs = h.parsed_targets();
-                let shared: Vec<String> = new
-                    .parsed_targets()
-                    .into_iter()
-                    .filter(|t| t.kind != TargetKind::Environment && theirs.contains(t))
-                    .map(|t| t.said())
-                    .collect();
-                format!(
-                    "Not sent: {name} holds an order that acts on {} too ({id}, {}). {undone} To move it, send again with replaces: \"{id}\": Desk tells {name} to stand down first. Check that it hasn't already started.",
-                    shared.join(", "),
-                    said.join(", ")
-                )
-            }
         }
     }
-
     /// Notes `kind` in Activity: the boss `by` did it, to `a`'s session.
     fn note_assignment(&self, kind: Kind, by: &Party, a: &Assignment, text: String) {
         let subject = self.desk.view(a.session).ok().map(|v| Party::session(&v));
         self.desk.note(Event::new(kind, by.clone(), subject, text));
     }
 
-    /// Reads and reserves `action`, a boss's order, before it is sent: R1–R3
-    /// against the boss's live assignments under its lock, the job taken
-    /// over with `replaces`, and held when its old holder may have started
-    /// it. `Err` says why it isn't sent.
+    /// Whether `text`, an order to `to` that declares no job, names a job
+    /// one of `boss`'s other sessions holds: then the boss is asked to say
+    /// which job it is. A backstop only: it never claims, and never stops
+    /// an order when the jobs can't be read.
+    async fn looks_held(
+        &self,
+        boss: &str,
+        to: Option<(Uuid, Option<&str>)>,
+        text: &str,
+    ) -> Option<String> {
+        let live = self.desk.store().assignments_of(boss, true).await.ok()?;
+        let (h, job) = live.iter().find_map(|a| {
+            let theirs = to.is_some_and(|(s, m)| a.session == s && a.machine.as_deref() == m);
+            let job = a.job_key.as_deref().and_then(Job::of_key)?;
+            (a.claims && !theirs && assignment::looks_like(text, &job)).then_some((a, job))
+        })?;
+        Some(format!(
+            "Not sent: this looks like {}, which {} holds ({}). Send it again with job to say which job this is, or job: \"none\" if it isn't one.",
+            job.said(),
+            self.holder_name(h),
+            short(h.id)
+        ))
+    }
+
+    /// Reads and reserves `action`, a boss's order, before it is sent: the
+    /// job it declares checked against the boss's live assignments under
+    /// its lock (R1, R2), taken over with `replaces`, and held when its old
+    /// holder may have started it. An order that looks irreversible
+    /// declares its job, or isn't sent. `Err` says why it isn't sent.
     pub(super) async fn assign_before(
         &self,
         action: &Action,
@@ -388,74 +568,82 @@ impl CrewHub {
         if by.party.kind != PartyKind::Manager || order.unrecorded {
             return Ok(Before::Not);
         }
-        let Some((s, text, ticket)) = assigned(action) else {
+        let Some((to, text, _)) = assigned(action) else {
             return Ok(Before::Not);
         };
         if let Some(id) = order.released {
-            return Ok(Before::Send(Reservation { id, guard: None }));
+            return Ok(Before::Send(Reservation {
+                id,
+                guard: None,
+                starts: false,
+            }));
         }
         let boss = by.party.id.as_str();
-        let (repo, place) = self.place_of(s).await;
-        let job = order.job.clone().or(ticket);
-        let r = assignment::read(&text, job.as_deref(), &place, order.irreversible);
-        let mut a = Assignment::new(boss, s, &text);
-        a.job = job.clone();
-        a.job_key = r.job_key;
-        a.repo = repo;
-        a.targets = r.targets.iter().map(Target::key).collect();
-        a.irreversible = r.irreversible;
-        a.urgent = order.urgent;
-        a.claims = r.irreversible || job.is_some();
-        a.turn = self.current_turn();
+        let s = match to {
+            Holder::Session(s) => Some(s),
+            Holder::New => None,
+        };
+        let repo = match s {
+            Some(s) => self.place_of(s).await.0,
+            None => None,
+        };
         let internal = |e: eyre::Report| {
             tracing::warn!(error = %format!("{e:#}"), "a boss's assignment couldn't be kept");
             "Not sent: Desk couldn't record who holds this job just now, so it sent nothing. Try again in a moment.".to_string()
         };
         let old = match order.replaces.as_deref() {
             None => None,
-            Some(named) => {
-                let live = self
-                    .desk
+            Some(named) => Some(
+                self.desk
                     .store()
-                    .assignments_of(boss, true)
+                    .assignment_named(boss, named)
                     .await
-                    .map_err(internal)?;
-                let ids: Vec<Uuid> = live.iter().map(|l| l.id).collect();
-                let id = assignment::named(named, &ids).ok_or_else(|| {
-                    format!("Not sent: {named} isn't one of your open assignments; crew.assignments lists them.")
-                })?;
-                live.into_iter().find(|l| l.id == id)
-            }
+                    .map_err(internal)?
+                    .ok_or_else(|| {
+                        format!("Not sent: {named} isn't one of your open assignments; crew.assignments lists them.")
+                    })?,
+            ),
         };
-        let name = self.session_name(s);
+        let job = job_of(&order.job, repo.as_deref(), old.as_ref())?;
+        let r = assignment::read(&text, order.irreversible);
+        let Some(job) = job else {
+            if r.irreversible {
+                return Err(no_job());
+            }
+            if order.job == Declared::Unsaid {
+                if let Some(why) = self.looks_held(boss, s.map(|s| (s, None)), &text).await {
+                    return Err(why);
+                }
+            }
+            return Ok(Before::Not);
+        };
+        let session = s.unwrap_or_else(Uuid::new_v4);
+        let name = match s {
+            Some(s) => self.session_name(s),
+            None => "the session it starts".into(),
+        };
+        let mut a = Assignment::new(boss, session, &text);
+        a.job = Some(job.said());
+        a.job_key = Some(job.as_key());
+        a.repo = repo;
+        a.targets = r.targets.iter().map(Target::key).collect();
+        a.irreversible = r.irreversible;
+        a.urgent = order.urgent;
+        a.claims = true;
+        a.turn = self.current_turn();
         let mut guard = None;
-        let mut stand_down_of = None;
+        let mut moving = None;
         let mut why = String::new();
         if let Some(old) = &old {
             a.replaces = Some(old.id);
             guard = Some(CHECK_FIRST.to_string());
-            if old.session == s && old.machine.is_none() {
+            if Some(old.session) == s && old.machine.is_none() {
                 why = format!("replaced by {}", short(a.id));
             } else if self.holder_gone(old) {
                 why = format!("moved to {name}; its holder had gone");
             } else {
                 why = format!("moved to {name}");
-                let working = self
-                    .desk
-                    .view(old.session)
-                    .is_ok_and(|v| v.state == SessionState::Working);
-                // It may have started it: what it says first decides.
-                let may_have = (old.irreversible && old.delivered_at.is_some()) || working;
-                if may_have {
-                    a.state = AssignmentState::Held;
-                    a.action = kept_form(action);
-                    a.basis = Some(
-                        self.deciding_now()
-                            .map_or(self.desk.picture_seq(), |d| d.basis)
-                            as i64,
-                    );
-                }
-                stand_down_of = Some(old.clone());
+                moving = Some(old.clone());
             }
         }
         let reserved = self
@@ -467,7 +655,7 @@ impl CrewHub {
         let superseded = match reserved {
             Reserved::Refused { rule, holder } => {
                 let why = self.refusal(rule, &holder, &a);
-                tracing::info!(session = %s, %boss, holder = %holder.id, ?rule, "a boss's order for a job another assignment holds wasn't sent");
+                tracing::info!(%session, %boss, holder = %holder.id, ?rule, "a boss's order for a job another assignment holds wasn't sent");
                 self.note_assignment(Kind::AssignmentRefused, &by.party, &a, why.clone());
                 return Err(why);
             }
@@ -479,61 +667,161 @@ impl CrewHub {
             let Some(line) = was.line_message else {
                 continue;
             };
-            match self.desk.line_withdraw(line).await {
-                Ok(Some(_)) => {}
-                _ => {
-                    // It went in meanwhile: it stands, and this doesn't go.
-                    let store = self.desk.store();
-                    let _ = store
-                        .assignment_close(
-                            a.id,
-                            AssignmentState::Failed,
-                            "desk",
-                            "its earlier order went in meanwhile",
-                        )
-                        .await;
-                    let _ = store.assignment_reopen(was.id).await;
-                    let mut held = was.clone();
-                    held.delivered_at = held.delivered_at.or(Some(Utc::now()));
-                    return Err(self.refusal(Rule::SameSession, &held, &a));
+            if !matches!(self.desk.line_withdraw(line).await, Ok(Some(_))) {
+                // It went in meanwhile: it stands, and this doesn't go.
+                if let Err(e) = self
+                    .desk
+                    .store()
+                    .assignment_unsupersede(boss, a.id, was.id)
+                    .await
+                {
+                    tracing::warn!(error = %format!("{e:#}"), "an order that went in meanwhile wasn't kept open again");
                 }
+                let mut held = was.clone();
+                held.delivered_at = held.delivered_at.or(Some(Utc::now()));
+                return Err(self.refusal(Rule::SameSession, &held, &a));
             }
         }
-        if let Some(old) = &stand_down_of {
-            let line = self.stand_down(by, old, &a, &name).await;
-            if a.state == AssignmentState::Held {
-                if let Some(line) = line {
-                    if let Err(e) = self.desk.store().assignment_wait_on(a.id, line).await {
-                        tracing::warn!(error = %format!("{e:#}"), "a held assignment's stand-down wasn't kept with it");
-                    }
+        let Some(old) = moving else {
+            return Ok(Before::Send(Reservation {
+                id: a.id,
+                guard,
+                starts: s.is_none(),
+            }));
+        };
+        let held = self
+            .move_from(by, &old, &a, &name, kept_form(action))
+            .await?;
+        if let Some(said) = held {
+            self.note_assignment(Kind::AssignmentHeld, &by.party, &a, said.clone());
+            return Ok(Before::Held(said));
+        }
+        Ok(Before::Send(Reservation {
+            id: a.id,
+            guard,
+            starts: s.is_none(),
+        }))
+    }
+
+    /// The job `new` (reserved, being sent) takes over from `old`, another
+    /// session's: `old`'s order not yet in is withdrawn, and its holder is
+    /// told to stand down when it got it. `new` is held while `old`'s
+    /// holder may have started it, or when the stand-down couldn't be sent
+    /// (then it is the person's): what the boss is told, when held. `kept`
+    /// is `new`'s order, as kept to send later.
+    async fn move_from(
+        &self,
+        by: &By,
+        old: &Assignment,
+        new: &Assignment,
+        name: &str,
+        kept: Option<Value>,
+    ) -> Result<Option<String>, String> {
+        let went_in = match (old.line_message, old.delivered_at) {
+            (_, Some(_)) => true,
+            (Some(line), None) => !matches!(self.desk.line_withdraw(line).await, Ok(Some(_))),
+            (None, None) => false,
+        };
+        let working = old.machine.is_none()
+            && self
+                .desk
+                .view(old.session)
+                .is_ok_and(|v| v.state == SessionState::Working);
+        if !went_in && !working {
+            tracing::info!(old = %old.id, "a job moved on before its order went in: its order was withdrawn");
+            return Ok(None);
+        }
+        let may_have = (old.irreversible && went_in) || working;
+        let told = self.stand_down(by, old, new, name).await;
+        let unsent = matches!(told, StoodDown::Unsent);
+        if !may_have && !unsent {
+            return Ok(None);
+        }
+        let store = self.desk.store();
+        let basis = self
+            .deciding_now()
+            .map_or(self.desk.picture_seq(), |d| d.basis) as i64;
+        let kept_held = match &kept {
+            Some(k) => store.assignment_hold(new.id, Some(k), Some(basis)).await,
+            None => Ok(false),
+        };
+        if !matches!(kept_held, Ok(true)) {
+            let _ = store
+                .assignment_close(
+                    new.id,
+                    AssignmentState::Failed,
+                    "desk",
+                    "it couldn't be held for its old holder's stand-down",
+                )
+                .await;
+            return Err(format!(
+                "Not sent: {} may have started {} already, and Desk couldn't hold your order until it stands down. Ask it where it stands (crew.ask_session), then send again.",
+                self.holder_name(old),
+                old.about()
+            ));
+        }
+        let old_name = self.holder_name(old);
+        let said = match told {
+            StoodDown::Asked(line) => {
+                if let Err(e) = store.assignment_wait_on(new.id, line).await {
+                    tracing::warn!(error = %format!("{e:#}"), "a held assignment's stand-down wasn't kept with it");
                 }
-                let old_name = self.holder_name(old);
-                let said = format!(
+                format!(
                     "held {} for {name}: {old_name} may have started {} already, so Desk told it to stand down first. Your order goes to {name} once {old_name} answers (or its session goes), checked against what has changed by then; if it hasn't answered within {HOLD_FOR} minutes, it's the person's.",
-                    short(a.id),
+                    short(new.id),
                     old.about()
-                );
-                tracing::info!(session = %s, %boss, old = %old.id, "a reassigned job is held until its old holder stands down");
-                self.note_assignment(Kind::AssignmentHeld, &by.party, &a, said.clone());
-                return Ok(Before::Held(said));
+                )
             }
+            StoodDown::Person => format!(
+                "held {} for {name}: {old_name} may have started {} already, and the person is driving it, so Desk asked them to tell it to stand down. Your order goes to {name} once they have dealt with it, or let it go (crew.assignment, state release, once you know it hasn't started).",
+                short(new.id),
+                old.about()
+            ),
+            StoodDown::Unsent => {
+                let what = format!(
+                    "Desk couldn't tell {old_name} to stand down from {} ({}), so {} for {name} is held. Check it hasn't started it, then let {} go (or close it).",
+                    short(old.id),
+                    old.about(),
+                    short(new.id),
+                    short(new.id)
+                );
+                self.for_the_person(&old.boss, Some(old.session), &what, format!("stand-down:{}", new.id))
+                    .await;
+                format!(
+                    "held {} for {name}: Desk couldn't tell {old_name} to stand down, so it's the person's to check it hasn't started {} first. It goes once they let it go.",
+                    short(new.id),
+                    old.about()
+                )
+            }
+        };
+        tracing::info!(old = %old.id, new = %new.id, "a moved job is held until its old holder stands down");
+        Ok(Some(said))
+    }
+
+    /// Opens an item for the person (`key` keeps it once), and says it in
+    /// the boss's DM.
+    async fn for_the_person(&self, boss: &str, session: Option<Uuid>, what: &str, key: String) {
+        let mut item = NewItem::ask(boss, OpenKind::Todo, session, what);
+        item.dedupe_key = key;
+        if let Err(e) = self.desk.store().item_open(&item).await {
+            tracing::warn!(error = %format!("{e:#}"), "an assignment's item for the person wasn't kept");
         }
-        Ok(Before::Send(Reservation { id: a.id, guard }))
+        self.tell_dm(boss, what).await;
     }
 
     /// Tells `old`'s holder to stand down from it: `new` is moved to
     /// `name`. The one place a stand-down is sent, so the urgent delivery
     /// to come (§4) takes it from here; for now it is a line message, queued
     /// as any other, that asks for an answer. While the person drives the
-    /// old holder (or took it back), it goes to them instead, never into
-    /// the session. The line message's id, when one was sent.
+    /// old holder (or took it back), or it is on a machine, it goes to the
+    /// person instead, never into the session.
     async fn stand_down(
         &self,
         by: &By,
         old: &Assignment,
         new: &Assignment,
         name: &str,
-    ) -> Option<Uuid> {
+    ) -> StoodDown {
         let text = format!(
             "Stand down from {} ({}): it is moved to {name}. Don't start it. If you already started it, answer this message with the run id.",
             short(old.id),
@@ -544,18 +832,21 @@ impl CrewHub {
                 || self.taken_back(old.session));
         if old.machine.is_some() || person {
             let what = format!(
-                "{} should stand down from {} ({}): it is moved to {name}. You are driving it, so Desk hasn't told it; tell it, or check it hasn't started it.",
+                "{} should stand down from {} ({}): it is moved to {name}, and {} waits for it. Desk hasn't told it{}; tell it, or check it hasn't started it, then close this.",
                 self.holder_name(old),
                 short(old.id),
-                old.about()
+                old.about(),
+                short(new.id),
+                if person { " as you are driving it" } else { "" }
             );
-            let mut item = NewItem::ask(&old.boss, OpenKind::Todo, Some(old.session), &what);
-            item.dedupe_key = format!("stand-down:{}", new.id);
-            if let Err(e) = self.desk.store().item_open(&item).await {
-                tracing::warn!(error = %format!("{e:#}"), "a stand-down for the person wasn't kept");
-            }
-            self.tell_dm(&old.boss, &what).await;
-            return None;
+            self.for_the_person(
+                &old.boss,
+                Some(old.session),
+                &what,
+                format!("stand-down:{}", new.id),
+            )
+            .await;
+            return StoodDown::Person;
         }
         let sent = self
             .desk
@@ -574,27 +865,59 @@ impl CrewHub {
             Ok(m) => {
                 tracing::info!(session = %old.session, old = %old.id, "a session was told to stand down from a job moved on");
                 self.picture_instruction(&old.boss, old.session, &text, self.current_turn());
-                Some(m.id)
+                StoodDown::Asked(m.id)
             }
             Err(e) => {
                 tracing::warn!(session = %old.session, error = ?e, "a stand-down couldn't be sent");
-                None
+                StoodDown::Unsent
             }
         }
     }
 
-    /// The reserved order `r` was sent (`done_line`, its line message) or
-    /// wasn't.
+    /// The reserved order `r` was sent (`line`, its line message; `started`,
+    /// the session it started) or wasn't. Kept again once if it couldn't
+    /// be; otherwise it stays being sent, and the crew minute's look
+    /// settles it from the line.
     pub(super) async fn assign_after(
         &self,
         r: &Reservation,
         by: &By,
         line: Option<Uuid>,
+        started: Option<Uuid>,
         ok: bool,
     ) {
-        match self.desk.store().assignment_sent(r.id, line, ok).await {
-            // Only a job held is news: a plain word to a session is in Activity already.
-            Ok(Some(a)) if ok && (a.claims || a.irreversible) => {
+        let store = self.desk.store();
+        if ok && r.starts {
+            let kept = match started {
+                Some(s) => store.assignment_set_session(r.id, s).await,
+                None => Err(eyre::eyre!("no session was said to start")),
+            };
+            if let Err(e) = kept {
+                // No holder known: it holds nothing, rather than a job no
+                // session can be asked about.
+                tracing::warn!(assignment = %r.id, error = %format!("{e:#}"), "the session a start's assignment went to wasn't kept");
+                let _ = store
+                    .assignment_close(
+                        r.id,
+                        AssignmentState::Cancelled,
+                        "desk",
+                        "the session it started isn't known",
+                    )
+                    .await;
+                return;
+            }
+        }
+        let mut kept = store.assignment_sent(r.id, line, ok).await;
+        if kept.is_err() {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            kept = store.assignment_sent(r.id, line, ok).await;
+        }
+        match kept {
+            Ok(Some(a)) if ok => {
+                // A ticket, resume, restart or start reached it as it went.
+                if line.is_none() {
+                    let _ = store.assignment_delivered_by_id(a.id, Utc::now()).await;
+                }
                 let text = format!(
                     "gave {} {} ({}){}",
                     self.holder_name(&a),
@@ -610,7 +933,7 @@ impl CrewHub {
             }
             Ok(_) => {}
             Err(e) => {
-                tracing::warn!(assignment = %r.id, error = %format!("{e:#}"), "an assignment's sending wasn't kept")
+                tracing::warn!(assignment = %r.id, error = %format!("{e:#}"), "an assignment's sending wasn't kept: the next look settles it")
             }
         }
     }
@@ -618,7 +941,7 @@ impl CrewHub {
     /// Reserves `input`, the home's own boss `boss`'s call for `machine`'s
     /// session `id`, before it is relayed: the home is where a local boss's
     /// assignments are kept, so its sessions here and on machines are
-    /// compared. None when it is no assignment.
+    /// compared. None when it holds no job.
     pub(super) async fn assign_relayed(
         &self,
         boss: &str,
@@ -641,44 +964,64 @@ impl CrewHub {
         let Some(text) = text.map(str::trim).filter(|t| !t.is_empty()) else {
             return Ok(None);
         };
+        if text.starts_with(STATUS_QUESTION) {
+            return Ok(None);
+        }
         let order = Order::of(input);
-        let r = assignment::read(text, order.job.as_deref(), machine, order.irreversible);
-        let mut a = Assignment::new(boss, id, text);
-        a.machine = Some(machine.to_string());
-        a.job = order.job.clone();
-        a.job_key = r.job_key;
-        a.targets = r.targets.iter().map(Target::key).collect();
-        a.irreversible = r.irreversible;
-        a.urgent = order.urgent;
-        a.claims = r.irreversible || order.job.is_some();
-        a.turn = self.current_turn();
         let internal = |e: eyre::Report| {
             tracing::warn!(error = %format!("{e:#}"), "a relayed assignment couldn't be kept");
             "Not sent: Desk couldn't record who holds this job just now, so it sent nothing. Try again in a moment.".to_string()
         };
-        // Moved to a machine's session: its old holder stands down, and as
-        // a relayed call can't wait here, the order goes now, guarded.
         let old = match order.replaces.as_deref() {
             None => None,
-            Some(named) => {
-                let live = self
-                    .desk
+            Some(named) => Some(
+                self.desk
                     .store()
-                    .assignments_of(boss, true)
+                    .assignment_named(boss, named)
                     .await
-                    .map_err(internal)?;
-                let ids: Vec<Uuid> = live.iter().map(|l| l.id).collect();
-                let id = assignment::named(named, &ids).ok_or_else(|| {
-                    format!("Not sent: {named} isn't one of your open assignments; crew.assignments lists them.")
-                })?;
-                live.into_iter().find(|l| l.id == id)
-            }
+                    .map_err(internal)?
+                    .ok_or_else(|| {
+                        format!("Not sent: {named} isn't one of your open assignments; crew.assignments lists them.")
+                    })?,
+            ),
         };
+        // A machine's session's repository isn't known here: the job says it.
+        let job = job_of(&order.job, None, old.as_ref())?;
+        let r = assignment::read(text, order.irreversible);
+        let Some(job) = job else {
+            if r.irreversible {
+                return Err(no_job());
+            }
+            if order.job == Declared::Unsaid {
+                if let Some(why) = self.looks_held(boss, Some((id, Some(machine))), text).await {
+                    return Err(why);
+                }
+            }
+            return Ok(None);
+        };
+        let mut a = Assignment::new(boss, id, text);
+        a.machine = Some(machine.to_string());
+        a.job = Some(job.said());
+        a.job_key = Some(job.as_key());
+        a.targets = r.targets.iter().map(Target::key).collect();
+        a.irreversible = r.irreversible;
+        a.urgent = order.urgent;
+        a.claims = true;
+        a.turn = self.current_turn();
         if let Some(o) = &old {
             a.replaces = Some(o.id);
         }
         let name = self.holder_name(&a);
-        let why = format!("moved to {name}");
+        let moving = old.as_ref().filter(|o| {
+            let gone = o.machine.is_none() && self.holder_gone(o);
+            let same = o.session == a.session && o.machine == a.machine;
+            !gone && !same
+        });
+        let why = match (&old, moving) {
+            (Some(_), Some(_)) => format!("moved to {name}"),
+            (Some(o), None) if o.session == a.session => format!("replaced by {}", short(a.id)),
+            _ => format!("moved to {name}; its holder had gone"),
+        };
         match self
             .desk
             .store()
@@ -689,69 +1032,108 @@ impl CrewHub {
             Reserved::Kept { .. } => {}
             Reserved::Refused { rule, holder } => return Err(self.refusal(rule, &holder, &a)),
         }
-        if let Some(o) = &old {
-            let gone = o.machine.is_none() && self.holder_gone(o);
-            let same = o.session == a.session && o.machine == a.machine;
-            if !gone && !same {
-                if let Some((service, _)) = self.overseer_named(boss) {
-                    let by = self.by_boss(&service, &why);
-                    self.stand_down(&by, o, &a, &name).await;
-                }
+        let mut held = None;
+        if let Some(o) = moving {
+            if let Some((service, _)) = self.overseer_named(boss) {
+                let by = self.by_boss(&service, &why);
+                let kept = json!({ "tool": tool, "input": relayed_input(input, None), "machine": machine });
+                held = self.move_from(&by, o, &a, &name, Some(kept)).await?;
             }
         }
         Ok(Some(Relayed {
             id: a.id,
             guard: old.is_some().then_some(CHECK_FIRST),
+            held,
         }))
     }
 
-    /// A relayed assignment was done on its machine, or wasn't.
+    /// A relayed assignment was done on its machine (and so reached its
+    /// session), or wasn't.
     pub(super) async fn assign_relayed_done(&self, id: Uuid, ok: bool) {
-        if let Err(e) = self.desk.store().assignment_sent(id, None, ok).await {
+        let store = self.desk.store();
+        if let Err(e) = store.assignment_sent(id, None, ok).await {
             tracing::warn!(assignment = %id, error = %format!("{e:#}"), "a relayed assignment's outcome wasn't kept");
+        }
+        if ok {
+            let _ = store.assignment_delivered_by_id(id, Utc::now()).await;
         }
     }
 
+    /// The irreversible jobs `boss` keeps, for a call relayed to a machine
+    /// to carry ([`HELD_JOBS`]): the machine compares a request there with
+    /// them (R5).
+    pub(super) async fn held_irreversible(&self, boss: &str) -> Vec<Assignment> {
+        self.desk
+            .store()
+            .assignments_of(boss, true)
+            .await
+            .map(|l| l.into_iter().filter(|a| a.irreversible).collect())
+            .unwrap_or_default()
+    }
+
     /// Why `boss` may not allow the request `pending` of `session` itself,
-    /// if it may not: it is irreversible, and another session's irreversible
-    /// assignment is on the same job or acts on the same thing (R5). Then
-    /// it is the person's.
+    /// if it may not: it looks irreversible, and another session holds an
+    /// irreversible job in the same repository (R5), or which repository
+    /// either is in isn't known, or the jobs couldn't be read. Then it is
+    /// the person's. `elsewhere`: the home's, for a call it relayed here.
     pub(super) async fn request_conflict(
         &self,
         boss: &str,
         session: Uuid,
         pending: &workforce_desk::model::PendingApproval,
+        elsewhere: &[Assignment],
     ) -> Option<String> {
         let asked = format!("{} {}", pending.tool, pending.detail);
         if !assignment::irreversible(&asked) {
             return None;
         }
-        let live = self.desk.store().assignments_of(boss, true).await.ok()?;
-        if !live.iter().any(|a| a.irreversible && a.session != session) {
-            return None;
-        }
-        let (repo, place) = self.place_of(session).await;
-        let r = assignment::read(&asked, None, &place, true);
-        let theirs = live.into_iter().find(|a| {
+        let live = match self.desk.store().assignments_of(boss, true).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "which jobs a boss's sessions hold couldn't be read for a request");
+                return Some(
+                    "Desk couldn't read which jobs your sessions hold just now, and this looks like it can't be taken back"
+                        .into(),
+                );
+            }
+        };
+        let repo = self
+            .place_of(session)
+            .await
+            .0
+            .and_then(|r| Job::new("release", &r, "0"))
+            .map(|j| j.target);
+        let theirs = live.iter().chain(elsewhere).find(|a| {
             a.irreversible
-                && (a.session != session || a.machine.is_some())
-                && (a.repo.is_none() || repo.is_none() || a.repo == repo)
-                && ((a.job_key.is_some() && a.job_key == r.job_key)
-                    || assignment::share_target(&a.parsed_targets(), &r.targets))
+                && a.state.live()
+                && a.session != session
+                && match (a.job_key.as_deref().and_then(Job::of_key), &repo) {
+                    (Some(j), Some(r)) => j.target == *r,
+                    // Where one of them acts isn't known: the person's.
+                    _ => true,
+                }
         })?;
-        tracing::info!(%session, %boss, holder = %theirs.id, "a request for a job another session holds goes to the person");
+        tracing::info!(%session, %boss, holder = %theirs.id, "a request beside a job another session holds goes to the person");
         Some(format!(
-            "{} holds {} ({}), so allowing this here could run it twice",
-            self.holder_name(&theirs),
+            "{} holds {} ({}), which can't be undone, so allowing this here could run it twice",
+            self.holder_name(theirs),
             theirs.about(),
             short(theirs.id)
         ))
     }
 
+    /// Sends the held assignment `id` in the background: see
+    /// [`Self::release_held`].
+    fn spawn_release(self: &Arc<Self>, id: Uuid, answer: Option<String>) {
+        let crew = Arc::clone(self);
+        tokio::spawn(async move { Box::pin(crew.release_held(id, answer)).await });
+    }
+
     /// Sends the held assignment `id` now: its old holder answered its
-    /// stand-down (`answer`), or is gone. Through `perform`, as any send,
-    /// checked against the picture as it was when it was held; if the
-    /// picture moved, the boss decides again.
+    /// stand-down (`answer`), the person or its boss let it go, or the old
+    /// holder is gone. Through `perform`, as any send, checked against the
+    /// picture as it was when it was held; if the picture moved, the boss
+    /// decides again. One relayed to a machine is relayed now.
     pub(super) async fn release_held(self: &Arc<Self>, id: Uuid, answer: Option<String>) {
         let store = self.desk.store();
         let Ok(Some(a)) = store.assignment_release(id, answer.as_deref()).await else {
@@ -773,6 +1155,41 @@ impl CrewHub {
                 ),
             );
         };
+        let guard = match &answer {
+            Some(said) => format!(
+                "{CHECK_FIRST} Desk was told: “{}”",
+                crew::one_line(said, 300)
+            ),
+            None => format!("{CHECK_FIRST} Its last holder's session has gone."),
+        };
+        let Some((service, o)) = self.overseer_named(&a.boss) else {
+            return fail("you no longer oversee its session".into()).await;
+        };
+        if let Some(held) = self.desk.agent_held_why(&a.boss) {
+            return fail(format!("you are {held}")).await;
+        }
+        if let Some(machine) = a.machine.clone() {
+            let Some(kept) = a.action.clone() else {
+                return fail("Desk kept no order to send".into()).await;
+            };
+            let tool = kept["tool"].as_str().unwrap_or("crew.nudge").to_string();
+            let input = relayed_input(&kept["input"], Some(&guard));
+            let item = format!("session:{machine}/{}", a.session);
+            let Some(g) = self.desk.group_of_member(&item) else {
+                return fail("its session is no longer in your group".into()).await;
+            };
+            let ceiling = self.ceiling_now(&a.boss, &o);
+            let ok = self
+                .relay(&machine, &g, &tool, input, &a.boss, &ceiling)
+                .await
+                .is_ok_and(|r| r.status == super::served::ServedStatus::Ok);
+            if !ok {
+                return fail(format!("{machine} didn't take it")).await;
+            }
+            self.assign_relayed_done(id, true).await;
+            tracing::info!(assignment = %id, %machine, "a held assignment was relayed");
+            return;
+        }
         let Some(action) = a
             .action
             .as_ref()
@@ -780,23 +1197,10 @@ impl CrewHub {
         else {
             return fail("Desk kept no order to send".into()).await;
         };
-        let guard = match &answer {
-            Some(said) => format!(
-                "{CHECK_FIRST} Its last holder answered Desk: “{}”",
-                crew::one_line(said, 300)
-            ),
-            None => format!("{CHECK_FIRST} Its last holder's session has gone."),
-        };
         let action = guarded(&action, &guard).unwrap_or(action);
-        let Some((service, o)) = self.overseer_named(&a.boss) else {
-            return fail("you no longer oversee its session".into()).await;
-        };
         if let super::actions::Gate::Run = self.gate(&action, &o) {
         } else {
             return fail("you may no longer send it yourself".into()).await;
-        }
-        if let Some(held) = self.desk.agent_held_why(&a.boss) {
-            return fail(format!("you are {held}")).await;
         }
         let by = self.by_boss(&service, "Its old holder stood down.");
         let d = Deciding {
@@ -823,7 +1227,6 @@ impl CrewHub {
             }
         }
     }
-
     /// Wakes `boss` with `line` about `session`.
     fn wake_for(self: &Arc<Self>, boss: &str, session: Uuid, line: String) {
         let Some((service, o)) = self.overseer_named(boss) else {
@@ -849,7 +1252,8 @@ impl CrewHub {
     }
 
     /// `m` came on a line: what it says of the assignments it carries or
-    /// answers.
+    /// answers. Anything missed here (a lagged event) the minute's look
+    /// reads from the line.
     async fn assignment_heard(self: &Arc<Self>, m: &LineMessage) {
         let store = self.desk.store();
         // Its own message: delivered, or never.
@@ -862,18 +1266,7 @@ impl CrewHub {
                 }
                 Delivery::Withdrawn | Delivery::Refused => {
                     if let Ok(Some(a)) = store.assignment_of_line(m.id).await {
-                        let why = "its message never went in";
-                        if let Ok(Some(a)) = store
-                            .assignment_close(a.id, AssignmentState::Cancelled, "desk", why)
-                            .await
-                        {
-                            self.note_assignment(
-                                Kind::AssignmentClosed,
-                                &Party::manager(&a.boss, &a.boss),
-                                &a,
-                                format!("cancelled {}: {why}", short(a.id)),
-                            );
-                        }
+                        self.never_went_in(&a).await;
                     }
                 }
                 _ => {}
@@ -891,96 +1284,117 @@ impl CrewHub {
         };
         for a in &live {
             // An answer to one of its own assignments.
-            if a.session == from && a.state == AssignmentState::Open {
-                if let Some(line) = a.line_message.filter(|l| answers(m, *l)) {
-                    let _ = line;
-                    let _ = store.assignment_acked(a.id, m.at).await;
-                }
+            if a.session == from
+                && a.state == AssignmentState::Open
+                && a.line_message.is_some_and(|l| answers(m, l))
+            {
+                let _ = store.assignment_acked(a.id, m.at).await;
             }
-            // An answer to a stand-down another assignment waits on.
-            if a.state == AssignmentState::Held {
-                if let Some(sd) = a.stand_down.filter(|sd| answers(m, *sd)) {
-                    let _ = sd;
-                    let said = workforce_desk::line::without_marks(&m.text);
-                    tracing::info!(assignment = %a.id, session = %from, "a stand-down was answered: its job goes to its new holder");
-                    self.release_held(a.id, Some(said)).await;
-                }
+            // An answer to a stand-down another assignment waits on, from
+            // the session that was told to stand down.
+            if a.state != AssignmentState::Held || !a.stand_down.is_some_and(|sd| answers(m, sd)) {
+                continue;
+            }
+            let old = match a.replaces {
+                Some(o) => store.assignment(o).await.ok().flatten(),
+                None => None,
+            };
+            if old.is_some_and(|o| o.session == from && o.machine.is_none()) {
+                let said = workforce_desk::line::without_marks(&m.text);
+                tracing::info!(assignment = %a.id, session = %from, "a stand-down was answered: its job goes to its new holder");
+                self.spawn_release(a.id, Some(said));
             }
         }
     }
 
-    /// Looks at every live assignment: held ones whose old holder has gone
-    /// go out, and those waiting past [`HOLD_FOR`] are the person's;
-    /// reversible ones past their lapse lapse; done ones close when the
-    /// boss lets accounts close them.
+    /// `a`'s line message was withdrawn or refused: it holds nothing.
+    async fn never_went_in(&self, a: &Assignment) {
+        let why = "its message never went in";
+        if let Ok(Some(a)) = self
+            .desk
+            .store()
+            .assignment_close(a.id, AssignmentState::Cancelled, "desk", why)
+            .await
+        {
+            self.note_assignment(
+                Kind::AssignmentClosed,
+                &Party::manager(&a.boss, &a.boss),
+                &a,
+                format!("cancelled {}: {why}", short(a.id)),
+            );
+        }
+    }
+
+    /// When `a` was last heard of: sent, delivered, answered, or its
+    /// session's last word since.
+    fn last_heard(&self, a: &Assignment) -> DateTime<Utc> {
+        [
+            Some(a.sent_at),
+            a.delivered_at,
+            a.acked_at,
+            self.written_since(a).map(|(t, _)| t),
+        ]
+        .into_iter()
+        .flatten()
+        .max()
+        .unwrap_or(a.sent_at)
+    }
+
+    /// Looks at every live assignment: what was left being sent is settled
+    /// from the line, and one whose message never went in is cancelled;
+    /// held ones go out once their old holder answered (read from the
+    /// line), the person dealt with it, or the holder has gone, and those
+    /// waiting past [`HOLD_FOR`] are the person's; reversible ones nothing
+    /// was heard of past their lapse lapse; done ones close when the boss
+    /// lets accounts close them.
     async fn assignments_look(self: &Arc<Self>, raised: &mut HashSet<Uuid>) {
         let store = self.desk.store();
+        let now = Utc::now();
+        let minute = chrono::TimeDelta::from_std(self.timing.minute).unwrap_or_default();
+        if let Err(e) = store.assignments_reconcile(now - minute * 2).await {
+            tracing::warn!(error = %format!("{e:#}"), "assignments left being sent couldn't be settled");
+        }
+        if let Ok(gone) = store.assignments_never_went_in().await {
+            for a in &gone {
+                self.never_went_in(a).await;
+            }
+        }
         let Ok(live) = store.assignments_live().await else {
             return;
         };
-        let now = Utc::now();
-        let minute = chrono::TimeDelta::from_std(self.timing.minute).unwrap_or_default();
         let lapse = minute * (assignment::LAPSE.num_minutes() as i32);
         for a in &live {
             match a.state {
-                AssignmentState::Held => {
-                    let old = match a.replaces {
-                        Some(o) => store.assignment(o).await.ok().flatten(),
-                        None => None,
-                    };
-                    if old.as_ref().is_none_or(|o| self.holder_gone(o)) {
-                        self.release_held(a.id, None).await;
-                        continue;
-                    }
-                    if now - a.sent_at >= minute * HOLD_FOR as i32 && raised.insert(a.id) {
-                        let old = old.unwrap_or_else(|| a.clone());
-                        let line = format!(
-                            "{} hasn't answered its stand-down; {} is held for {} ({}).",
-                            self.holder_name(&old),
-                            a.about(),
-                            self.holder_name(a),
-                            short(a.id)
-                        );
-                        let mut item = NewItem::ask(&a.boss, OpenKind::Todo, Some(a.session), &format!(
-                            "{line} Check it hasn't started it, then close {} or tell Desk to send it.",
-                            short(old.id)
-                        ));
-                        item.dedupe_key = format!("held:{}", a.id);
-                        if let Err(e) = store.item_open(&item).await {
-                            tracing::warn!(error = %format!("{e:#}"), "a held assignment wasn't given to the person");
-                        }
-                        tracing::info!(assignment = %a.id, "a held assignment's stand-down went unanswered: it is the person's");
-                        self.wake_for(&a.boss, a.session, line);
-                    }
-                }
-                AssignmentState::Open if !a.irreversible && now - a.sent_at >= lapse => {
+                AssignmentState::Held => self.look_held(a, raised, now, minute).await,
+                AssignmentState::Open if !a.irreversible && now - self.last_heard(a) >= lapse => {
                     let _ = store
                         .assignment_close(
                             a.id,
                             AssignmentState::Lapsed,
                             "desk",
-                            "nothing closed it for 12 hours",
+                            "nothing was heard of it for 12 hours",
                         )
                         .await;
                 }
                 AssignmentState::Open if a.machine.is_none() => {
-                    if let Some(done) = self.looks_done(a).await {
-                        let closes = self
-                            .overseer_named(&a.boss)
-                            .is_some_and(|(_, o)| o.updates.close_from_accounts);
-                        if closes {
-                            let why = format!("its account says {done}");
-                            if let Ok(Some(c)) = store
-                                .assignment_close(a.id, AssignmentState::Done, "session", &why)
-                                .await
-                            {
-                                self.note_assignment(
-                                    Kind::AssignmentClosed,
-                                    &Party::manager(&a.boss, &a.boss),
-                                    &c,
-                                    format!("{} is done: {why}", short(c.id)),
-                                );
-                            }
+                    let closes = self
+                        .overseer_named(&a.boss)
+                        .is_some_and(|(_, o)| o.updates.close_from_accounts);
+                    if !closes {
+                        continue;
+                    }
+                    if let Some(done) = self.looks_done(a, None).await {
+                        let why = format!("its account says {done}");
+                        if let Ok(Some(c)) = store
+                            .assignment_close(a.id, AssignmentState::Done, "session", &why)
+                            .await
+                        {
+                            self.note_assignment(
+                                Kind::AssignmentClosed,
+                                &Party::manager(&a.boss, &a.boss),
+                                &c,
+                                format!("{} is done: {why}", short(c.id)),
+                            );
                         }
                     }
                 }
@@ -989,34 +1403,133 @@ impl CrewHub {
         }
     }
 
-    /// What `a`'s session's account says it did of `a`'s job since it got
-    /// it, if it did it: a release or deploy deployed, a PR merged.
-    async fn looks_done(&self, a: &Assignment) -> Option<String> {
-        let t = assignment::strongest(&a.parsed_targets())?.clone();
-        let done_when = match t.kind {
-            TargetKind::Pr => "merged",
-            TargetKind::Release | TargetKind::Workflow | TargetKind::Run | TargetKind::Commit => {
-                "deployed"
-            }
-            TargetKind::Environment => return None,
+    /// The held assignment `a`, looked at.
+    async fn look_held(
+        self: &Arc<Self>,
+        a: &Assignment,
+        raised: &mut HashSet<Uuid>,
+        now: DateTime<Utc>,
+        minute: chrono::TimeDelta,
+    ) {
+        let store = self.desk.store();
+        // Let go by the person or its boss.
+        if let Some(said) = &a.answer {
+            self.spawn_release(a.id, Some(said.clone()));
+            return;
+        }
+        let old = match a.replaces {
+            Some(o) => store.assignment(o).await.ok().flatten(),
+            None => None,
         };
-        let account = self
-            .desk
-            .session_accounts_of(&[a.session])
+        let Some(old) = old.filter(|o| !self.holder_gone(o)) else {
+            self.spawn_release(a.id, None);
+            return;
+        };
+        // Its stand-down's answer, from the line.
+        if let (Some(sd), None) = (a.stand_down, &old.machine) {
+            if let Ok(Some(said)) = store.stand_down_answer(sd, old.session, a.sent_at).await {
+                let said = workforce_desk::line::without_marks(&said);
+                self.spawn_release(a.id, Some(said));
+                return;
+            }
+        }
+        // The person was asked to tell its old holder, and closed that.
+        if let Ok(Some((state, by))) = store
+            .item_state_of_key(&a.boss, &format!("stand-down:{}", a.id))
             .await
-            .ok()?
-            .into_iter()
-            .next()?;
-        let d = workforce_desk::open_item::kept_by(done_when, &account.done, a.sent_at)?;
-        Some(crew::one_line(&d.text, 120))
+        {
+            if state == "closed" && by.as_deref() == Some("person") {
+                self.spawn_release(a.id, Some("The person dealt with its old holder.".into()));
+                return;
+            }
+        }
+        if now - a.sent_at < minute * HOLD_FOR as i32 || !raised.insert(a.id) {
+            return;
+        }
+        let line = format!(
+            "{} hasn't answered its stand-down; {} is held for {} ({}).",
+            self.holder_name(&old),
+            a.about(),
+            self.holder_name(a),
+            short(a.id)
+        );
+        self.for_the_person(
+            &a.boss,
+            Some(a.session),
+            &format!(
+                "{line} Check {} hasn't started it, then let {} go (Desk sends it) or close it.",
+                self.holder_name(&old),
+                short(a.id)
+            ),
+            format!("held:{}", a.id),
+        )
+        .await;
+        tracing::info!(assignment = %a.id, "a held assignment's stand-down went unanswered: it is the person's");
+        self.wake_for(&a.boss, a.session, line);
+    }
+
+    /// What `a`'s session's account (`account`, else read) says it did of
+    /// `a`'s own job since it got it, if it did it: its release or deploy
+    /// deployed, its PR merged. Never another job's.
+    async fn looks_done(
+        &self,
+        a: &Assignment,
+        account: Option<&workforce_desk::account::Account>,
+    ) -> Option<String> {
+        let job = a.job_key.as_deref().and_then(Job::of_key)?;
+        let done_when = match job.kind.as_str() {
+            "merge" => "merged",
+            "release" | "deploy" | "promote" | "rollback" | "dispatch" => "deployed",
+            _ => return None,
+        };
+        let read;
+        let account = match account {
+            Some(a) => a,
+            None => {
+                read = self
+                    .desk
+                    .session_accounts_of(&[a.session])
+                    .await
+                    .ok()?
+                    .into_iter()
+                    .next()?;
+                &read
+            }
+        };
+        let names_it = |d: &workforce_desk::account::Done| {
+            d.refs
+                .iter()
+                .any(|r| Job::new(&job.kind, &job.target, &r.id).is_some_and(|j| j.key == job.key))
+                || {
+                    let words: Vec<String> = d
+                        .text
+                        .split(|c: char| !c.is_alphanumeric() && c != '.')
+                        .map(|w| w.trim_matches('.').to_lowercase())
+                        .collect();
+                    words.iter().enumerate().any(|(i, w)| {
+                        *w == job.key
+                            && (job.key.len() >= 3
+                                || i.checked_sub(1)
+                                    .is_some_and(|p| words[p] == job.kind || words[p] == "pr"))
+                    })
+                }
+        };
+        account
+            .done
+            .iter()
+            .filter(|d| names_it(d))
+            .find_map(|d| {
+                workforce_desk::open_item::kept_by(done_when, std::slice::from_ref(d), a.sent_at)
+            })
+            .map(|d| crew::one_line(&d.text, 120))
     }
 
     /// After a restart: what was still being sent two minutes before
-    /// `now` is settled ([`workforce_desk::DeskStore::assignments_reconcile`]).
+    /// `now` is settled ([`workforce_desk::DeskStore::assignments_reconcile`]),
+    /// and closed assignments a month old are let go.
     pub(super) async fn assignments_after_restart(&self, now: DateTime<Utc>) {
-        match self
-            .desk
-            .store()
+        let store = self.desk.store();
+        match store
             .assignments_reconcile(now - chrono::TimeDelta::minutes(2))
             .await
         {
@@ -1031,23 +1544,35 @@ impl CrewHub {
                 tracing::warn!(error = %format!("{e:#}"), "assignments a restart left being sent couldn't be settled")
             }
         }
+        // Kept before jobs were declared: their words made their job, and
+        // no longer do.
+        if let Ok(n) = store.assignments_close_undeclared().await {
+            if n > 0 {
+                tracing::info!(
+                    closed = n,
+                    "assignments kept before jobs were declared were closed"
+                );
+            }
+        }
+        let _ = store
+            .assignments_prune(now - chrono::TimeDelta::days(30))
+            .await;
     }
 
     /// What a boss's turn reads of its assignments: the open and held ones,
-    /// newest first, at most 20.
+    /// newest first, at most 20, read with one query for their sessions'
+    /// accounts and one for the holders the held ones wait on.
     pub(super) async fn assignments_block(&self, boss: &str) -> Option<String> {
-        let live = self.desk.store().assignments_of(boss, true).await.ok()?;
-        // The jobs it holds, never every plain word it sent.
-        let live: Vec<Assignment> = live
-            .into_iter()
-            .filter(|a| a.claims || a.irreversible || a.state == AssignmentState::Held)
-            .collect();
+        let store = self.desk.store();
+        let live = store.assignments_of(boss, true).await.ok()?;
+        let live: Vec<Assignment> = live.into_iter().take(20).collect();
         if live.is_empty() {
             return None;
         }
+        let looked = self.looked_up(&live).await;
         let mut lines = Vec::new();
-        for a in live.iter().take(20) {
-            lines.push(format!("- {}", self.assignment_line(a).await));
+        for a in &live {
+            lines.push(format!("- {}", self.assignment_line(a, &looked).await));
         }
         Some(format!(
             "Your open assignments, newest first (one session holds a job at a time; move one with replaces):\n{}",
@@ -1055,8 +1580,38 @@ impl CrewHub {
         ))
     }
 
+    /// What `list`'s lines read besides themselves, read at once.
+    async fn looked_up(&self, list: &[Assignment]) -> Looked {
+        let mut sessions: Vec<Uuid> = list
+            .iter()
+            .filter(|a| a.state == AssignmentState::Open && a.machine.is_none())
+            .map(|a| a.session)
+            .collect();
+        sessions.sort();
+        sessions.dedup();
+        let accounts = match sessions.is_empty() {
+            true => Vec::new(),
+            false => self
+                .desk
+                .session_accounts_of(&sessions)
+                .await
+                .unwrap_or_default(),
+        };
+        let mut olds = Vec::new();
+        for o in list
+            .iter()
+            .filter(|a| a.state == AssignmentState::Held)
+            .filter_map(|a| a.replaces)
+        {
+            if let Ok(Some(old)) = self.desk.store().assignment(o).await {
+                olds.push(old);
+            }
+        }
+        Looked { accounts, olds }
+    }
+
     /// One assignment in a line: `a:id → session · job · times · state`.
-    async fn assignment_line(&self, a: &Assignment) -> String {
+    async fn assignment_line(&self, a: &Assignment, looked: &Looked) -> String {
         let tz = self.desk.timezone();
         let at = |t: DateTime<Utc>| t.with_timezone(&tz).format("%H:%M").to_string();
         let mut times = vec![format!("sent {}", at(a.sent_at))];
@@ -1072,14 +1627,12 @@ impl CrewHub {
         }
         let mut state = match a.state {
             AssignmentState::Held => {
-                let from = match a.replaces {
-                    Some(o) => self.desk.store().assignment(o).await.ok().flatten(),
-                    None => None,
-                };
+                let from = a
+                    .replaces
+                    .and_then(|o| looked.olds.iter().find(|x| x.id == o));
                 format!(
-                    "held: waits for {} to answer its stand-down",
-                    from.as_ref()
-                        .map_or_else(|| "its old holder".into(), |o| self.holder_name(o))
+                    "held: waits for {} to stand down (let it go with crew.assignment, state release, once you know it hasn't started)",
+                    from.map_or_else(|| "its old holder".into(), |o| self.holder_name(o))
                 )
             }
             s => s.as_str().to_string(),
@@ -1093,10 +1646,13 @@ impl CrewHub {
         if self.holder_gone(a) {
             state.push_str(" · holder gone: replaces moves it at once");
         } else if a.state == AssignmentState::Open && a.machine.is_none() {
-            if let Some(done) = self.looks_done(a).await {
-                state.push_str(&format!(
-                    " · looks done (“{done}”): close it with crew.assignment"
-                ));
+            let account = looked.accounts.iter().find(|x| x.session == a.session);
+            if let Some(account) = account {
+                if let Some(done) = self.looks_done(a, Some(account)).await {
+                    state.push_str(&format!(
+                        " · looks done (“{done}”): close it with crew.assignment"
+                    ));
+                }
             }
         }
         format!(
@@ -1107,7 +1663,6 @@ impl CrewHub {
             times.join(", ")
         )
     }
-
     /// `crew.assignments`: the boss's assignments in full.
     pub(super) async fn assignments_tool(
         &self,
@@ -1124,9 +1679,10 @@ impl CrewHub {
                 tracing::warn!(error = %format!("{e:#}"), "the assignments couldn't be read");
                 "Your assignments couldn't be read just now.".to_string()
             })?;
+        let looked = self.looked_up(&list).await;
         let mut rows = Vec::new();
         for a in &list {
-            let mut row = self.assignment_line(a).await;
+            let mut row = self.assignment_line(a, &looked).await;
             if !a.state.live() {
                 if let Some(why) = &a.closed_why {
                     row.push_str(&format!(" ({why})"));
@@ -1139,8 +1695,9 @@ impl CrewHub {
         )
     }
 
-    /// `crew.assignment`: the boss closes one of its own, through the same
-    /// gate as a message to its session.
+    /// `crew.assignment`: the boss closes one of its own, or lets a held
+    /// one go once it knows its old holder didn't start it, through the
+    /// same gate as a message to its session.
     pub(super) async fn assignment_tool(
         &self,
         b: &super::tools::Bound,
@@ -1148,9 +1705,10 @@ impl CrewHub {
     ) -> Result<Value, String> {
         let boss = b.service.agent_id.as_str();
         let state = match input["state"].as_str().map(str::trim) {
-            Some("done") => AssignmentState::Done,
-            Some("cancelled" | "canceled") => AssignmentState::Cancelled,
-            _ => return Err("Say state: done or cancelled.".into()),
+            Some("done") => Some(AssignmentState::Done),
+            Some("cancelled" | "canceled") => Some(AssignmentState::Cancelled),
+            Some("release") => None,
+            _ => return Err("Say state: done, cancelled, or release (a held one).".into()),
         };
         let note = input["note"]
             .as_str()
@@ -1158,22 +1716,17 @@ impl CrewHub {
             .map(str::trim)
             .filter(|n| !n.is_empty())
             .ok_or("Say why in note: the person reads it.")?;
-        let live = self
+        let named = input["id"].as_str().unwrap_or_default();
+        let a = self
             .desk
             .store()
-            .assignments_of(boss, true)
+            .assignment_named(boss, named)
             .await
-            .map_err(|_| "Your assignments couldn't be read just now.".to_string())?;
-        let ids: Vec<Uuid> = live.iter().map(|a| a.id).collect();
-        let named = input["id"].as_str().unwrap_or_default();
-        let id = assignment::named(named, &ids).ok_or_else(|| {
-            format!("{named} isn't one of your open assignments; crew.assignments lists them.")
-        })?;
-        let a = live
-            .iter()
-            .find(|a| a.id == id)
-            .cloned()
-            .ok_or("That assignment is closed already.")?;
+            .map_err(|_| "Your assignments couldn't be read just now.".to_string())?
+            .ok_or_else(|| {
+                format!("{named} isn't one of your open assignments; crew.assignments lists them.")
+            })?;
+        let id = a.id;
         let as_message = Action::Nudge {
             to: To::Session(a.session),
             message: note.to_string(),
@@ -1183,13 +1736,37 @@ impl CrewHub {
             match self.gate(&as_message, &b.oversight) {
                 super::actions::Gate::Run => {}
                 super::actions::Gate::Suggest(why) | super::actions::Gate::No(why) => {
-                    return Err(format!("Not closed: {why}. Tell the person instead."))
+                    return Err(format!("Not done: {why}. Tell the person instead."))
                 }
                 super::actions::Gate::Refuse => {
                     return Err("You only watch the crew: tell the person instead.".into())
                 }
             }
         }
+        let by = self.by_boss(&b.service, note);
+        let Some(state) = state else {
+            if a.state != AssignmentState::Held {
+                return Err(format!("{} isn't held: it went already.", short(id)));
+            }
+            let let_go = self
+                .desk
+                .store()
+                .assignment_let_go(id, note)
+                .await
+                .map_err(|_| "It couldn't be let go just now.".to_string())?;
+            if !let_go {
+                return Err(format!("{} isn't held any more.", short(id)));
+            }
+            self.note_assignment(
+                Kind::AssignmentClosed,
+                &by.party,
+                &a,
+                format!("let {} go: {note}", short(id)),
+            );
+            return Ok(
+                json!({ "done": format!("let {} go: Desk sends it within a minute, checked as any order", short(id)) }),
+            );
+        };
         let closed = self
             .desk
             .store()
@@ -1197,7 +1774,6 @@ impl CrewHub {
             .await
             .map_err(|_| "It couldn't be closed just now.".to_string())?
             .ok_or("That assignment is closed already.")?;
-        let by = self.by_boss(&b.service, note);
         self.note_assignment(
             Kind::AssignmentClosed,
             &by.party,
@@ -1215,7 +1791,7 @@ impl CrewHub {
 
 /// Keeps the assignments up to date with what happens on the lines, and
 /// looks at them every crew minute. First settles what a restart left
-/// being sent.
+/// being sent. Events missed (lagged) are read from the line at once.
 pub(super) async fn assignments_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     let (_, mut events) = crew.desk.subscribe();
     crew.assignments_after_restart(Utc::now()).await;
@@ -1229,7 +1805,8 @@ pub(super) async fn assignments_loop(crew: Arc<CrewHub>, cancel: CancellationTok
                 Ok(DeskEvent::Line { message, removed: false }) => {
                     crew.assignment_heard(&message).await;
                 }
-                Ok(_) | Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Lagged(_)) => crew.assignments_look(&mut raised).await,
+                Ok(_) => {}
                 Err(RecvError::Closed) => return,
             },
             _ = every.tick() => crew.assignments_look(&mut raised).await,
@@ -1269,14 +1846,56 @@ mod tests {
     }
 
     #[test]
-    fn an_order_reads_its_fields_and_none_is_needed() {
-        let o = Order::of(
-            &json!({ "job": " release 4 ", "irreversible": true, "replaces": "a:3f2a1b2c" }),
+    fn an_order_reads_its_declared_job_and_none_is_needed() {
+        let o = Order::of(&json!({
+            "job": { "kind": "release", "target": "mantis-crm/monorepo", "key": " release-4 " },
+            "irreversible": true,
+            "replaces": "a:3f2a1b2c"
+        }));
+        assert_eq!(
+            o.job,
+            Declared::Job {
+                kind: "release".into(),
+                target: Some("mantis-crm/monorepo".into()),
+                key: "release-4".into()
+            }
         );
-        assert_eq!(o.job.as_deref(), Some("release 4"));
         assert!(o.irreversible && !o.urgent);
         assert_eq!(o.replaces.as_deref(), Some("a:3f2a1b2c"));
         let none = Order::of(&json!({ "message": "Carry on." }));
-        assert!(none.job.is_none() && none.replaces.is_none() && !none.irreversible);
+        assert!(none.job == Declared::Unsaid && none.replaces.is_none() && !none.irreversible);
+        assert_eq!(Order::of(&json!({ "job": "None" })).job, Declared::NoJob);
+        assert!(matches!(
+            Order::of(&json!({ "job": "release 4" })).job,
+            Declared::Malformed(why) if why.contains("\"kind\": \"release\"")
+        ));
+        assert!(matches!(
+            Order::of(&json!({ "job": { "kind": "release" } })).job,
+            Declared::Malformed(_)
+        ));
+    }
+
+    #[test]
+    fn a_job_is_its_target_its_kind_and_its_key_or_the_old_ones() {
+        let said = Declared::Job {
+            kind: "release".into(),
+            target: None,
+            key: "R4".into(),
+        };
+        let job = job_of(&said, Some("Mantis-CRM/monorepo"), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.as_key(), "mantis-crm/monorepo/release/4");
+        assert!(job_of(&said, None, None)
+            .unwrap_err()
+            .contains("which repository"));
+        assert_eq!(job_of(&Declared::NoJob, None, None), Ok(None));
+        assert_eq!(job_of(&Declared::Unsaid, None, None), Ok(None));
+        let mut old = Assignment::new("desk", Uuid::new_v4(), "Start release 4.");
+        old.job_key = Some(job.as_key());
+        assert_eq!(
+            job_of(&Declared::Unsaid, None, Some(&old)).unwrap(),
+            Some(job)
+        );
     }
 }

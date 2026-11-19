@@ -1411,8 +1411,13 @@ impl CrewHub {
                 .and_then(|v| v.pending)
                 .filter(|p| p.id == *approval);
             if let Some(p) = pending {
-                if let Some(conflict) =
-                    Box::pin(self.request_conflict(&by.party.id, *session, &p)).await
+                if let Some(conflict) = Box::pin(self.request_conflict(
+                    &by.party.id,
+                    *session,
+                    &p,
+                    &order.held_elsewhere,
+                ))
+                .await
                 {
                     return Err(format!(
                         "Not allowed: {conflict}. It's the person's to answer."
@@ -1494,8 +1499,14 @@ impl CrewHub {
         let mut done = Done::default();
         let performed = self.perform_as(action, by, &mut done).await;
         if let Some(r) = &reserved {
-            Box::pin(self.assign_after(r, &who, done.line.map(|(id, _)| id), performed.is_ok()))
-                .await;
+            Box::pin(self.assign_after(
+                r,
+                &who,
+                done.line.map(|(id, _)| id),
+                done.started,
+                performed.is_ok(),
+            ))
+            .await;
         }
         let said = match performed {
             Ok(said) => {
@@ -2165,8 +2176,9 @@ impl CrewHub {
         start: &Action,
         session: Uuid,
         by: By,
+        order: &super::assignments::Order,
     ) -> Result<(String, bool), String> {
-        match self.perform(nudge, by.clone()).await {
+        match Box::pin(self.perform_with(nudge, by.clone(), order)).await {
             Ok(done) => Ok((done, true)),
             // Decided on a picture that moved: decided again, not done
             // anyway in a new session.
@@ -2178,7 +2190,7 @@ impl CrewHub {
             Err(why) => {
                 self.unclaim(session);
                 tracing::info!(%session, %why, "a session given a start's work couldn't take it; starting one");
-                Ok((self.perform(start, by).await?, false))
+                Ok((Box::pin(self.perform_with(start, by, order)).await?, false))
             }
         }
     }
