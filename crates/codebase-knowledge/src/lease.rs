@@ -3,7 +3,8 @@
 //! Replaces the in-process `DashSet` "currently indexing" flag with a
 //! SQLite-backed record that survives restarts. Each lease carries:
 //!
-//! - the **worker id** of the process that owns it (UUID per hub start),
+//! - the **worker id** of the run that holds it (the hub's id, then one
+//!   of the run's own),
 //! - the **target commit** the run is indexing toward,
 //! - the **phase** the run is currently in,
 //! - **progress counters** so observers can chart the long phases,
@@ -72,7 +73,7 @@ impl IndexPhase {
 }
 
 /// Snapshot of the persisted lease row.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexLease {
     pub repo_id: String,
     pub worker_id: String,
@@ -84,6 +85,9 @@ pub struct IndexLease {
     pub entities_processed: Option<u64>,
     pub summaries_total: Option<u64>,
     pub summaries_processed: Option<u64>,
+    /// The graph's mark of pending notes as the lease was taken: every
+    /// note the run holding it makes is above it.
+    pub noted_from: i64,
 }
 
 impl IndexLease {
@@ -102,6 +106,52 @@ pub enum AcquireOutcome {
     Acquired,
     /// Another worker holds a fresh lease. The caller should not start.
     Held(IndexLease),
+}
+
+/// The columns of a lease row, in the order both backends read them.
+pub(crate) const LEASE_COLUMNS: &str = "repo_id, worker_id, target_commit, phase, \
+     acquired_at_ms, last_heartbeat_at_ms, entities_total, entities_processed, \
+     summaries_total, summaries_processed, noted_from";
+
+/// The one statement that takes a repo's lease, stealing it if its
+/// heartbeat is older than the cutoff, and returns the row as it then
+/// is: the acquirer holds it if the row's worker is the acquirer. A taken
+/// lease records the graph's mark of pending notes. `param` writes the
+/// backend's placeholder for a parameter: 1 the repo, 2 the worker, 3 the
+/// target commit, 4 the phase, 5 now, 6 the cutoff.
+pub(crate) fn acquire_lease_sql(param: impl Fn(usize) -> String) -> String {
+    let taken = [
+        "worker_id",
+        "target_commit",
+        "phase",
+        "acquired_at_ms",
+        "last_heartbeat_at_ms",
+        "entities_total",
+        "entities_processed",
+        "summaries_total",
+        "summaries_processed",
+        "noted_from",
+    ]
+    .map(|column| {
+        format!(
+            "{column} = CASE WHEN index_lease.last_heartbeat_at_ms < {cutoff} \
+             THEN excluded.{column} ELSE index_lease.{column} END",
+            cutoff = param(6)
+        )
+    })
+    .join(", ");
+    format!(
+        "INSERT INTO index_lease ({LEASE_COLUMNS}) \
+         VALUES ({repo}, {worker}, {target}, {phase}, {now}, {now}, NULL, NULL, NULL, NULL, \
+                 (SELECT last FROM vector_note_mark)) \
+         ON CONFLICT (repo_id) DO UPDATE SET {taken} \
+         RETURNING {LEASE_COLUMNS}",
+        repo = param(1),
+        worker = param(2),
+        target = param(3),
+        phase = param(4),
+        now = param(5),
+    )
 }
 
 /// Convenience: "now" in unix milliseconds, the unit the schema uses.

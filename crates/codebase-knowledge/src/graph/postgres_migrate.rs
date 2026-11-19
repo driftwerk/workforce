@@ -144,6 +144,8 @@ struct VectorState {
     fills: Vec<(String, String, String, String, String, String, i64, i64)>,
     /// `(backend, repo, file, seq)`.
     pending: Vec<(String, String, String, i64)>,
+    /// The last mark a note was made under, if the source keeps one.
+    note_mark: Option<i64>,
 }
 
 /// The source's identity and vector state, or `None` for a source from
@@ -208,17 +210,23 @@ fn read_vector_state(sqlite: &Connection) -> Result<Option<VectorState>> {
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
     }
+    let note_mark = has("vector_note_mark")?
+        .then(|| sqlite.query_row("SELECT last FROM vector_note_mark", [], |r| r.get(0)))
+        .transpose()?;
     Ok(Some(VectorState {
         identity,
         complete_in,
         fills,
         pending,
+        note_mark,
     }))
 }
 
 /// Make the destination the graph the source was, and record of its code
 /// vectors what the source did. Returns how many fills and pending files
-/// were written.
+/// were written. The counter of marks is the source's, or, from a source
+/// from before marks, starts at the highest note, as the source's own
+/// migration would start it; it never goes back.
 async fn write_vector_state(pool: &PostgresPool, vectors: VectorState) -> Result<(usize, usize)> {
     let conn = pool.get().await?;
     conn.execute("UPDATE graph_identity SET id = $1", &[&vectors.identity])
@@ -254,6 +262,13 @@ async fn write_vector_state(pool: &PostgresPool, vectors: VectorState) -> Result
         .await
         .context("insert vector_pending row")?;
     }
+    conn.execute(
+        "UPDATE vector_note_mark
+         SET last = GREATEST(last, $1, (SELECT COALESCE(max(seq), 0) FROM vector_pending))",
+        &[&vectors.note_mark.unwrap_or(0)],
+    )
+    .await
+    .context("carry vector_note_mark across")?;
     Ok((vectors.fills.len(), vectors.pending.len()))
 }
 
@@ -841,10 +856,23 @@ mod tests {
         .await;
     }
 
+    /// The destination's counter of marks.
+    async fn note_mark(pool: &workforce_postgres::PostgresPool) -> i64 {
+        pool.get()
+            .await
+            .unwrap()
+            .query_one("SELECT last FROM vector_note_mark", &[])
+            .await
+            .unwrap()
+            .get(0)
+    }
+
     /// What a source graph keeps for each vector database is carried
-    /// across as that database's; and a source from before it was kept per
-    /// database (schema v6), read only and so never migrated, has its rows
-    /// carried as vellev's, as its own migration would label them.
+    /// across as that database's, with its counter of marks; and a source
+    /// from before it was kept per database (schema v6), read only and so
+    /// never migrated, has its rows carried as vellev's, as its own
+    /// migration would label them, and its marks started at its highest
+    /// note.
     #[tokio::test(flavor = "multi_thread")]
     async fn vector_state_is_carried_per_backend_and_an_older_sources_as_vellevs() {
         use crate::graph::vectors::{FillStage, VectorFill};
@@ -869,12 +897,23 @@ mod tests {
                     .await
                     .unwrap());
             }
-            store
+            let w = store
                 .note_vectors_pending(&["weaviate"], "r", &["src/w.rs".to_string()])
                 .await
                 .unwrap();
-            store
+            let v = store
                 .note_vectors_pending(&["vellev", "weaviate"], "r", &["src/v.rs".to_string()])
+                .await
+                .unwrap();
+            // A mark above every note left: the counter is carried, not
+            // started again from the notes.
+            let cleared = vec!["src/x.rs".to_string()];
+            let last = store
+                .note_vectors_pending(&["vellev"], "r", &cleared)
+                .await
+                .unwrap();
+            store
+                .clear_vectors_pending("vellev", "r", &cleared, last)
                 .await
                 .unwrap();
             drop(sqlite);
@@ -882,7 +921,10 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!((report.vector_fills, report.vector_pending), (2, 3));
-            let dest = PostgresCodeGraphBackend::with_pool(pool).await.unwrap();
+            let dest = PostgresCodeGraphBackend::with_pool(pool.clone())
+                .await
+                .unwrap();
+            assert_eq!(note_mark(&pool).await, last);
             assert_eq!(
                 dest.vector_fill(VectorKeys::VELLEV, "r").await.unwrap(),
                 Some(fill("v1"))
@@ -895,17 +937,28 @@ mod tests {
                 dest.vectors_pending(VectorKeys::VELLEV, "r", 10)
                     .await
                     .unwrap(),
-                [("src/v.rs".to_string(), 1)]
+                [("src/v.rs".to_string(), v)]
             );
             assert_eq!(
                 dest.vectors_pending(VectorKeys::WEAVIATE, "r", 10)
                     .await
                     .unwrap(),
-                [("src/v.rs".to_string(), 1), ("src/w.rs".to_string(), 1)]
+                [("src/v.rs".to_string(), v), ("src/w.rs".to_string(), w)]
             );
+            // Carried again, it does not go back from a mark taken since.
+            assert_eq!(
+                dest.note_vectors_pending(&["vellev"], "r", &["src/y.rs".to_string()])
+                    .await
+                    .unwrap(),
+                last + 1
+            );
+            migrate_sqlite_to_postgres_with_pool(tmp.path(), pool.clone())
+                .await
+                .unwrap();
+            assert_eq!(note_mark(&pool).await, last + 1);
         })
         .await;
-        // A source as schema v5 left it: no database named.
+        // A source as schema v5 left it: no database named, and no marks.
         with_test_pool(PostgresCodeGraphBackend::build_pool, |pool| async move {
             let tmp = tempfile::NamedTempFile::new().unwrap();
             let sqlite = CodeGraph::open(tmp.path()).unwrap();
@@ -916,6 +969,7 @@ mod tests {
                 conn.execute_batch(
                     "DROP TABLE vector_fill;
                      DROP TABLE vector_pending;
+                     DROP TABLE vector_note_mark;
                      CREATE TABLE vector_fill (
                          repo_id TEXT PRIMARY KEY, generation TEXT NOT NULL,
                          collection TEXT NOT NULL, stage TEXT NOT NULL,
@@ -935,6 +989,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!((report.vector_fills, report.vector_pending), (1, 1));
+            assert_eq!(note_mark(&pool).await, 4, "started at the highest note");
             let dest = PostgresCodeGraphBackend::with_pool(pool).await.unwrap();
             assert_eq!(
                 dest.vector_fill(VectorKeys::VELLEV, "r").await.unwrap(),

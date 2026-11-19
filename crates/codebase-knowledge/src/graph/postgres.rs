@@ -9,7 +9,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use eyre::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use tokio_postgres::Row;
 use workforce_postgres::{
@@ -23,7 +23,10 @@ use super::entities::{
 use super::relationships::Relationship;
 use super::vectors::{summary_cursor, FillStage, PendingFile, StoredSummary, VectorFill};
 use super::{GraphStats, IndexState, RepoLineage, RepositoryRow};
-use crate::lease::{now_ms, AcquireOutcome, IndexLease, IndexPhase, STALE_THRESHOLD};
+use crate::lease::{
+    acquire_lease_sql, now_ms, AcquireOutcome, IndexLease, IndexPhase, LEASE_COLUMNS,
+    STALE_THRESHOLD,
+};
 use std::str::FromStr;
 
 mod embedded {
@@ -978,18 +981,17 @@ impl CodeGraphBackend for PostgresCodeGraphBackend {
         backends: &[&str],
         repo_id: &str,
         files: &[String],
-    ) -> Result<()> {
+    ) -> Result<i64> {
+        let files: Vec<&String> = files.iter().collect::<BTreeSet<_>>().into_iter().collect();
+        if backends.is_empty() || files.is_empty() {
+            return Ok(0);
+        }
         let backends: Vec<String> = backends.iter().map(|b| b.to_string()).collect();
         let conn = self.pool.get().await?;
-        conn.execute(
-            "INSERT INTO vector_pending (backend, repo_id, file_path)
-             SELECT backend, $1, file
-             FROM unnest($2::text[]) AS b(backend), unnest($3::text[]) AS noted(file)
-             ON CONFLICT (backend, repo_id, file_path) DO UPDATE SET seq = vector_pending.seq + 1",
-            &[&repo_id, &backends, &files],
-        )
-        .await?;
-        Ok(())
+        Ok(conn
+            .query_one(NOTE_PENDING_SQL, &[&backends, &repo_id, &files])
+            .await?
+            .get(0))
     }
 
     async fn vectors_pending(
@@ -1025,14 +1027,14 @@ impl CodeGraphBackend for PostgresCodeGraphBackend {
         &self,
         backend: &str,
         repo_id: &str,
-        file_path: &str,
+        files: &[String],
         seq: i64,
     ) -> Result<()> {
         let conn = self.pool.get().await?;
         conn.execute(
             "DELETE FROM vector_pending
-             WHERE backend = $1 AND repo_id = $2 AND file_path = $3 AND seq = $4",
-            &[&backend, &repo_id, &file_path, &seq],
+             WHERE backend = $1 AND repo_id = $2 AND file_path = ANY($3) AND seq = $4",
+            &[&backend, &repo_id, &files, &seq],
         )
         .await?;
         Ok(())
@@ -1103,59 +1105,27 @@ impl CodeGraphBackend for PostgresCodeGraphBackend {
         target_commit: Option<&str>,
         phase: IndexPhase,
     ) -> Result<AcquireOutcome> {
-        let mut conn = self.pool.get().await?;
-        let tx = conn.transaction().await?;
         let now = now_ms();
         let stale_cutoff = now - (STALE_THRESHOLD.as_millis() as i64);
-        let phase_str = phase.as_str();
-        let target = target_commit;
-
-        let stolen = tx
-            .execute(
-                "UPDATE index_lease
-                 SET worker_id = $2, target_commit = $3, phase = $4,
-                     acquired_at_ms = $5, last_heartbeat_at_ms = $5,
-                     entities_total = NULL, entities_processed = NULL,
-                     summaries_total = NULL, summaries_processed = NULL
-                 WHERE repo_id = $1 AND last_heartbeat_at_ms < $6",
+        let conn = self.pool.get().await?;
+        let row = conn
+            .query_one(
+                &acquire_lease_sql(|n| format!("${n}")),
                 &[
                     &repo_id,
                     &worker_id,
-                    &target,
-                    &phase_str,
+                    &target_commit,
+                    &phase.as_str(),
                     &now,
                     &stale_cutoff,
                 ],
             )
             .await?;
-        if stolen > 0 {
-            tx.commit().await?;
-            tracing::info!(repo_id, worker_id, "Stole stale indexing lease");
-            return Ok(AcquireOutcome::Acquired);
-        }
-
-        let inserted = tx
-            .execute(
-                "INSERT INTO index_lease
-                 (repo_id, worker_id, target_commit, phase,
-                  acquired_at_ms, last_heartbeat_at_ms,
-                  entities_total, entities_processed,
-                  summaries_total, summaries_processed)
-                 VALUES ($1, $2, $3, $4, $5, $5, NULL, NULL, NULL, NULL)
-                 ON CONFLICT (repo_id) DO NOTHING",
-                &[&repo_id, &worker_id, &target, &phase_str, &now],
-            )
-            .await?;
-        if inserted > 0 {
-            tx.commit().await?;
-            return Ok(AcquireOutcome::Acquired);
-        }
-
-        let row = tx.query_opt(LEASE_SELECT_SQL, &[&repo_id]).await?;
-        tx.commit().await?;
-        Ok(match row.as_ref().map(row_to_lease) {
-            Some(l) => AcquireOutcome::Held(l),
-            None => AcquireOutcome::Acquired,
+        let lease = row_to_lease(&row);
+        Ok(if lease.worker_id == worker_id {
+            AcquireOutcome::Acquired
+        } else {
+            AcquireOutcome::Held(lease)
         })
     }
 
@@ -1211,7 +1181,12 @@ impl CodeGraphBackend for PostgresCodeGraphBackend {
 
     async fn get_lease(&self, repo_id: &str) -> Result<Option<IndexLease>> {
         let conn = self.pool.get().await?;
-        let row = conn.query_opt(LEASE_SELECT_SQL, &[&repo_id]).await?;
+        let row = conn
+            .query_opt(
+                &format!("SELECT {LEASE_COLUMNS} FROM index_lease WHERE repo_id = $1"),
+                &[&repo_id],
+            )
+            .await?;
         Ok(row.as_ref().map(row_to_lease))
     }
 
@@ -1374,12 +1349,7 @@ impl CodeGraphBackend for PostgresCodeGraphBackend {
         let conn = self.pool.get().await?;
         let rows = conn
             .query(
-                "SELECT repo_id, worker_id, target_commit, phase,
-                        acquired_at_ms, last_heartbeat_at_ms,
-                        entities_total, entities_processed,
-                        summaries_total, summaries_processed
-                 FROM index_lease
-                 ORDER BY acquired_at_ms ASC",
+                &format!("SELECT {LEASE_COLUMNS} FROM index_lease ORDER BY acquired_at_ms ASC"),
                 &[],
             )
             .await?;
@@ -1493,17 +1463,18 @@ impl CodeGraphBackend for PostgresCodeGraphBackend {
     }
 }
 
-/// `SELECT` clause for the lease table, shared between `acquire_lease`
-/// (inside its transaction) and `get_lease` (against a pooled client).
-/// The two callers use different connection types — `tokio_postgres::Transaction`
-/// and `deadpool_postgres::ClientWrapper` — neither of which share a
-/// trait that would let us factor the call into a generic helper, so
-/// the SQL string and row mapper are extracted instead.
-const LEASE_SELECT_SQL: &str = "SELECT repo_id, worker_id, target_commit, phase,
-            acquired_at_ms, last_heartbeat_at_ms,
-            entities_total, entities_processed,
-            summaries_total, summaries_processed
-     FROM index_lease WHERE repo_id = $1";
+/// Note files pending under one mark, taken from the counter in the same
+/// statement, which returns it: `$1` the backends, `$2` the repo, `$3` the
+/// files, each once.
+const NOTE_PENDING_SQL: &str =
+    "WITH m AS (UPDATE vector_note_mark SET last = last + 1 RETURNING last),
+     noted AS (
+       INSERT INTO vector_pending (backend, repo_id, file_path, seq)
+       SELECT b.backend, $2, f.file, m.last
+       FROM m, unnest($1::text[]) AS b(backend), unnest($3::text[]) AS f(file)
+       ON CONFLICT (backend, repo_id, file_path) DO UPDATE SET seq = excluded.seq
+     )
+SELECT last FROM m";
 
 fn row_to_lease(r: &Row) -> IndexLease {
     let phase_str: String = r.get("phase");
@@ -1522,6 +1493,7 @@ fn row_to_lease(r: &Row) -> IndexLease {
         summaries_processed: r
             .get::<_, Option<i64>>("summaries_processed")
             .map(|n| n as u64),
+        noted_from: r.get("noted_from"),
     }
 }
 
@@ -1788,6 +1760,256 @@ mod tests {
                 )
                 .await
                 .is_err());
+        })
+        .await;
+    }
+
+    /// V008: a graph from before marks keeps every pending note and lease
+    /// as they were; its leases are as if taken at mark 0, and the counter
+    /// of marks starts at the highest note. Opening it again changes
+    /// nothing, and the next note is above every one before.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn v008_starts_the_marks_above_every_note_and_keeps_notes_and_leases() {
+        with_test_pool(PostgresCodeGraphBackend::build_pool, |pool| async move {
+            let older = MigrationSet::new(
+                PostgresCodeGraphBackend::SCHEMA,
+                Box::new(MigratedUpTo(7)) as Box<dyn MigrationRun>,
+            );
+            MigrationRunner::run(&pool, &[older]).await.unwrap();
+            let conn = pool.get().await.unwrap();
+            conn.batch_execute(
+                "INSERT INTO repositories (id, name, root_path) VALUES ('r', 'r', '/r');
+                 INSERT INTO vector_pending (backend, repo_id, file_path, seq)
+                 VALUES ('vellev', 'r', 'src/a.rs', 3), ('weaviate', 'r', 'src/b.rs', 7);
+                 INSERT INTO index_lease (repo_id, worker_id, phase, acquired_at_ms, last_heartbeat_at_ms)
+                 VALUES ('r', 'w', 'parsing', 10, 20);",
+            )
+            .await
+            .unwrap();
+            for _ in 0..2 {
+                let backend = PostgresCodeGraphBackend::with_pool(pool.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    backend.vectors_pending("vellev", "r", 10).await.unwrap(),
+                    [("src/a.rs".to_string(), 3)]
+                );
+                assert_eq!(
+                    backend.vectors_pending("weaviate", "r", 10).await.unwrap(),
+                    [("src/b.rs".to_string(), 7)]
+                );
+                let lease = backend.get_lease("r").await.unwrap().unwrap();
+                assert_eq!(
+                    (
+                        lease.worker_id.as_str(),
+                        lease.phase,
+                        lease.acquired_at_ms,
+                        lease.last_heartbeat_at_ms,
+                        lease.noted_from
+                    ),
+                    ("w", IndexPhase::Parsing, 10, 20, 0)
+                );
+                let last: i64 = conn
+                    .query_one("SELECT last FROM vector_note_mark", &[])
+                    .await
+                    .unwrap()
+                    .get(0);
+                assert_eq!(last, 7);
+            }
+            let backend = PostgresCodeGraphBackend::with_pool(pool).await.unwrap();
+            assert_eq!(
+                backend
+                    .note_vectors_pending(&["vellev"], "r", &["src/c.rs".to_string()])
+                    .await
+                    .unwrap(),
+                8
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn notes_carry_their_marks_and_leases_record_theirs() {
+        with_test_pool(PostgresCodeGraphBackend::build_pool, |pool| async move {
+            let backend = PostgresCodeGraphBackend::with_pool(pool.clone())
+                .await
+                .unwrap();
+            let graph = CodeGraph::from_backend(backend);
+            crate::graph::tests::notes_carry_their_marks(&graph).await;
+            crate::graph::tests::leases_record_the_mark_they_are_taken_at(&graph, |repo| {
+                let pool = pool.clone();
+                async move {
+                    let stale = now_ms() - (STALE_THRESHOLD.as_millis() as i64) - 5_000;
+                    pool.get()
+                        .await
+                        .unwrap()
+                        .execute(
+                            "UPDATE index_lease SET last_heartbeat_at_ms = $2 WHERE repo_id = $1",
+                            &[&repo, &stale],
+                        )
+                        .await
+                        .unwrap();
+                }
+            })
+            .await;
+            // The copy is a snapshot read on another connection, as
+            // `pg_dump` takes one.
+            crate::graph::tests::a_copy_tells_a_runs_notes_by_its_lease(
+                &graph,
+                |repo| async move {
+                    let mut conn = pool.get().await.unwrap();
+                    let copy = conn
+                        .build_transaction()
+                        .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+                        .read_only(true)
+                        .start()
+                        .await
+                        .unwrap();
+                    let noted_from: i64 = copy
+                        .query_one(
+                            "SELECT noted_from FROM index_lease WHERE repo_id = $1",
+                            &[&repo],
+                        )
+                        .await
+                        .unwrap()
+                        .get(0);
+                    let pending = copy
+                        .query(
+                            "SELECT file_path, seq FROM vector_pending
+                         WHERE backend = 'vellev' AND repo_id = $1 ORDER BY file_path",
+                            &[&repo],
+                        )
+                        .await
+                        .unwrap()
+                        .iter()
+                        .map(|row| (row.get(0), row.get(1)))
+                        .collect();
+                    copy.commit().await.unwrap();
+                    (noted_from, pending)
+                },
+            )
+            .await;
+        })
+        .await;
+    }
+
+    /// A note's mark is taken in the order notes commit: one call waits
+    /// for another holding the counter to commit, and takes the mark after
+    /// its; a snapshot read meanwhile holds neither note, and the counter as
+    /// it was.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn marks_are_taken_in_the_order_their_notes_commit() {
+        with_test_pool(PostgresCodeGraphBackend::build_pool, |pool| async move {
+            let backend = PostgresCodeGraphBackend::with_pool(pool.clone())
+                .await
+                .unwrap();
+            backend.register_repo("r", "r", "/r").await.unwrap();
+            let before = backend
+                .note_vectors_pending(&["vellev"], "r", &["src/z.rs".to_string()])
+                .await
+                .unwrap();
+            let mut holding = pool.get().await.unwrap();
+            let a = holding.transaction().await.unwrap();
+            let a_mark: i64 = a
+                .query_one(
+                    NOTE_PENDING_SQL,
+                    &[&vec!["vellev"], &"r", &vec!["src/a.rs"]],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(a_mark, before + 1);
+            let b = tokio::spawn({
+                let backend = Arc::clone(&backend);
+                async move {
+                    backend
+                        .note_vectors_pending(&["vellev"], "r", &["src/b.rs".to_string()])
+                        .await
+                        .unwrap()
+                }
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert!(!b.is_finished(), "B waits for A to commit");
+            let last: i64 = pool
+                .get()
+                .await
+                .unwrap()
+                .query_one("SELECT last FROM vector_note_mark", &[])
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(last, before);
+            assert_eq!(
+                backend.vectors_pending("vellev", "r", 10).await.unwrap(),
+                [("src/z.rs".to_string(), before)]
+            );
+            a.commit().await.unwrap();
+            let b_mark = tokio::time::timeout(std::time::Duration::from_secs(10), b)
+                .await
+                .expect("B goes on once A commits")
+                .unwrap();
+            assert_eq!(b_mark, a_mark + 1);
+            assert_eq!(
+                backend.vectors_pending("vellev", "r", 10).await.unwrap(),
+                [
+                    ("src/a.rs".to_string(), a_mark),
+                    ("src/b.rs".to_string(), b_mark),
+                    ("src/z.rs".to_string(), before)
+                ]
+            );
+        })
+        .await;
+    }
+
+    /// Acquirers of one repo's lease at once: never two holders together,
+    /// and every one that acquires finds its row, taken at the mark.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn acquirers_at_once_never_hold_one_lease_together() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        with_test_pool(PostgresCodeGraphBackend::build_pool, |pool| async move {
+            let backend = PostgresCodeGraphBackend::with_pool(pool).await.unwrap();
+            backend.register_repo("r", "r", "/r").await.unwrap();
+            let mark = backend
+                .note_vectors_pending(&["vellev"], "r", &["src/a.rs".to_string()])
+                .await
+                .unwrap();
+            let holders = Arc::new(AtomicUsize::new(0));
+            let acquirers = (0..8).map(|n| {
+                let (backend, holders) = (Arc::clone(&backend), Arc::clone(&holders));
+                tokio::spawn(async move {
+                    let worker = format!("w{n}");
+                    let mut acquired = 0;
+                    for _ in 0..25 {
+                        match backend
+                            .acquire_lease("r", &worker, None, IndexPhase::Crawling)
+                            .await
+                            .unwrap()
+                        {
+                            AcquireOutcome::Acquired => {
+                                assert_eq!(holders.fetch_add(1, Ordering::SeqCst), 0);
+                                let lease = backend.get_lease("r").await.unwrap();
+                                let lease = lease.expect("an acquired lease has its row");
+                                assert_eq!(
+                                    (lease.worker_id, lease.noted_from),
+                                    (worker.clone(), mark)
+                                );
+                                holders.fetch_sub(1, Ordering::SeqCst);
+                                backend.release_lease("r", &worker).await.unwrap();
+                                acquired += 1;
+                            }
+                            AcquireOutcome::Held(lease) => assert_ne!(lease.worker_id, worker),
+                        }
+                    }
+                    acquired
+                })
+            });
+            let acquired: usize = futures::future::join_all(acquirers)
+                .await
+                .into_iter()
+                .map(|joined| joined.unwrap())
+                .sum();
+            assert!(acquired > 0);
+            assert!(backend.get_lease("r").await.unwrap().is_none());
         })
         .await;
     }

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dashmap::DashSet;
+use dashmap::DashMap;
 use eyre::{Result, WrapErr};
 use futures::StreamExt;
 use tracing::{info, warn};
@@ -86,12 +86,13 @@ pub struct KnowledgeService {
     /// part of this file into RAM, so its size is a useful proxy for
     /// the codegraph share of process RSS.
     db_path: Option<PathBuf>,
-    /// In-process mirror of which repos this hub is actively indexing.
-    /// The persistent lease in storage is the source of truth for
-    /// cross-process correctness; this set exists so the synchronous
-    /// `is_indexing_repo` check (used by status endpoints on the hot
-    /// path) doesn't pay a DB round trip.
-    indexing_repos: Arc<DashSet<String>>,
+    /// In-process mirror of which repos this hub is actively indexing,
+    /// each with the holder id of its run's lease. The persistent lease in
+    /// storage is the source of truth for cross-process correctness; this
+    /// map exists so the synchronous `is_indexing_repo` check (used by
+    /// status endpoints on the hot path) doesn't pay a DB round trip, and
+    /// so that a cancel releases the lease of the run it cancels.
+    indexing_repos: Arc<DashMap<String, String>>,
     /// How each repo's vectors stood when they were last compared with
     /// the graph, or filled from it.
     compared: dashmap::DashMap<String, Compared>,
@@ -108,10 +109,10 @@ pub struct KnowledgeService {
     /// Whether this service keeps its vectors in line with the graph in
     /// the background.
     keeping: std::sync::atomic::AtomicBool,
-    /// Per-process worker id stamped on every lease this service
-    /// acquires. A UUID generated at construction; lets storage tell
-    /// our heartbeats apart from another hub's that touched the same
-    /// data dir.
+    /// Per-process worker id, a UUID generated at construction: each run's
+    /// lease is held under an id of its own that begins with it, so that
+    /// storage tells our runs apart from each other and from another
+    /// hub's that touched the same data dir.
     worker_id: String,
     parse_concurrency: usize,
     summary_concurrency: usize,
@@ -488,7 +489,7 @@ impl KnowledgeService {
             vector_store,
             workspace: root,
             db_path: Some(db_path),
-            indexing_repos: Arc::new(DashSet::new()),
+            indexing_repos: Arc::new(DashMap::new()),
             compared: dashmap::DashMap::new(),
             reconcile: Duration::from_secs(config.vector_reconcile_secs.max(1)),
             fill_errors: dashmap::DashMap::new(),
@@ -531,7 +532,7 @@ impl KnowledgeService {
             vector_store: None,
             workspace,
             db_path: None,
-            indexing_repos: Arc::new(DashSet::new()),
+            indexing_repos: Arc::new(DashMap::new()),
             compared: dashmap::DashMap::new(),
             reconcile: Duration::from_secs(21_600),
             fill_errors: dashmap::DashMap::new(),
@@ -1273,14 +1274,10 @@ impl KnowledgeService {
             )
             .await?;
 
+        let holder = format!("{}:{}", self.worker_id, Uuid::new_v4());
         match self
             .graph
-            .acquire_lease(
-                &repo_id,
-                &self.worker_id,
-                target_commit.as_deref(),
-                initial_phase,
-            )
+            .acquire_lease(&repo_id, &holder, target_commit.as_deref(), initial_phase)
             .await?
         {
             AcquireOutcome::Acquired => {}
@@ -1294,14 +1291,14 @@ impl KnowledgeService {
             }
         }
 
-        // Mirror the lease into the in-process set so the synchronous
+        // Mirror the lease into the in-process map so the synchronous
         // `is_indexing_repo` check is correct for status endpoints.
-        self.indexing_repos.insert(repo_id.clone());
+        self.indexing_repos.insert(repo_id.clone(), holder.clone());
 
         let lease = LeaseContext::new(
             self.graph.clone(),
             repo_id.clone(),
-            self.worker_id.clone(),
+            holder.clone(),
             initial_phase,
         );
         // `_heartbeat` is a `HeartbeatGuard`: its `Drop` aborts the task,
@@ -1314,8 +1311,11 @@ impl KnowledgeService {
         let opts = RunOptions::default().with_lease(Arc::clone(&lease));
         let outcome = tokio::time::timeout(self.index_timeout, run(&pipeline, opts)).await;
 
-        self.indexing_repos.remove(&repo_id);
-        if let Err(e) = self.graph.release_lease(&repo_id, &self.worker_id).await {
+        // A run cancelled meanwhile leaves the entry of the run that
+        // replaced it.
+        self.indexing_repos
+            .remove_if(&repo_id, |_, running| *running == holder);
+        if let Err(e) = self.graph.release_lease(&repo_id, &holder).await {
             warn!(repo_id = %repo_id, error = %e, "Lease release failed");
         }
 
@@ -1422,7 +1422,7 @@ impl KnowledgeService {
 
     /// Check if a specific repo is currently being indexed.
     pub fn is_indexing_repo(&self, repo_id: &str) -> bool {
-        self.indexing_repos.contains(repo_id)
+        self.indexing_repos.contains_key(repo_id)
     }
 
     /// Check if any repo is currently being indexed.
@@ -1450,19 +1450,21 @@ impl KnowledgeService {
         Ok(String::from_utf8(output.stdout)?.trim().to_string())
     }
 
-    /// Release this hub's hold on a repo's indexing lease and drop it
-    /// from the in-process active set, allowing another worker (or our
+    /// Release the lease of this hub's run indexing a repo and drop it
+    /// from the in-process active map, allowing another worker (or our
     /// own retry) to acquire immediately. Returns `true` if we actually
     /// held it. The background task may keep running for a beat until
     /// its next phase boundary — its heartbeats stop refreshing the
     /// lease (the row is gone), so a steal-time-out backstop is no
     /// longer needed.
     pub async fn cancel_indexing(&self, repo_id: &str) -> bool {
-        let in_set = self.indexing_repos.remove(repo_id).is_some();
-        if let Err(e) = self.graph.release_lease(repo_id, &self.worker_id).await {
+        let Some((_, holder)) = self.indexing_repos.remove(repo_id) else {
+            return false;
+        };
+        if let Err(e) = self.graph.release_lease(repo_id, &holder).await {
             warn!(repo_id, error = %e, "Lease release during cancel failed");
         }
-        in_set
+        true
     }
 }
 
@@ -1651,6 +1653,27 @@ mod tests {
         indexed: std::sync::atomic::AtomicUsize,
         /// Said to be another database than Weaviate.
         named: Option<&'static str>,
+        /// The service's graph, set once it is made: the lease of the run
+        /// writing is read from it as each write comes in.
+        graph: std::sync::OnceLock<Arc<CodeGraph>>,
+        /// The mark of the lease the run held as each write came in.
+        leased_from: std::sync::Mutex<Vec<i64>>,
+        /// A write of entities waits here for leave to go on, if set.
+        gate: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+        /// Writes of entities that came to the gate.
+        at_gate: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Untracked {
+        /// Record the mark of the lease the run writing to `repo_id` holds.
+        async fn see_lease(&self, repo_id: &str) {
+            let Some(graph) = self.graph.get() else {
+                return;
+            };
+            if let Some(lease) = graph.get_lease(repo_id).await.unwrap() {
+                self.leased_from.lock().unwrap().push(lease.noted_from);
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -1676,6 +1699,15 @@ mod tests {
             &self,
             entities: &[workforce_codebase_knowledge::vector::VectorCodeEntity],
         ) -> Result<usize> {
+            if let Some(entity) = entities.first() {
+                self.see_lease(&entity.repo_id).await;
+            }
+            let gate = self.gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                self.at_gate
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                gate.acquire().await.unwrap().forget();
+            }
             self.indexed
                 .fetch_add(entities.len(), std::sync::atomic::Ordering::SeqCst);
             Ok(entities.len())
@@ -1697,9 +1729,10 @@ mod tests {
         }
         async fn delete_entities_by_file(
             &self,
-            _: &str,
+            repo_id: &str,
             file: &str,
         ) -> Result<workforce_codebase_knowledge::vector::DeleteOutcome> {
+            self.see_lease(repo_id).await;
             self.dropped.lock().unwrap().push(file.to_string());
             Ok(Default::default())
         }
@@ -1734,6 +1767,22 @@ mod tests {
         store: Arc<dyn CodeVectorStore>,
         standby: &str,
     ) -> Result<(PathBuf, KnowledgeService)> {
+        let config = KnowledgeConfig {
+            vector_backfill_per_sec: 0,
+            vector_standby: standby.into(),
+            ..KnowledgeConfig::default()
+        };
+        service_with(dir, store, &config, None)
+    }
+
+    /// A repo of one file, on a service configured by `config`, keeping
+    /// its code vectors in `store` and summarising with `summariser`.
+    fn service_with(
+        dir: &Path,
+        store: Arc<dyn CodeVectorStore>,
+        config: &KnowledgeConfig,
+        summariser: Option<Arc<dyn SummariserBuilder>>,
+    ) -> Result<(PathBuf, KnowledgeService)> {
         let root = dir.join("repo");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(
@@ -1741,21 +1790,294 @@ mod tests {
             "/// Reads the configuration.\npub fn parse_config(path: &str) -> String {\n    path.to_string()\n}\n\n/// Sends a message.\npub fn send_email(to: &str) -> bool {\n    !to.is_empty()\n}\n",
         )
         .unwrap();
-        let config = KnowledgeConfig {
-            vector_backfill_per_sec: 0,
-            vector_standby: standby.into(),
-            ..KnowledgeConfig::default()
-        };
         let service = KnowledgeService::new_with_backend(
             root.clone(),
             dir.join("data"),
-            &config,
+            config,
             VectorBackend::Given(store),
             &CodegraphConfig::default(),
             None,
-            None,
+            summariser,
         )?;
         Ok((root, service))
+    }
+
+    /// Commit `root`'s work tree, making it a git repo first if it is not
+    /// one: an incremental index goes by what changed between commits.
+    fn commit(root: &Path) {
+        for args in [
+            &["init", "-q"][..],
+            &["add", "-A"],
+            &["commit", "-q", "-m", "change"],
+        ] {
+            let done = std::process::Command::new("git")
+                .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(done.status.success(), "git {args:?}: {done:?}");
+        }
+    }
+
+    /// Wait until `done`, failing after long enough that it never will.
+    async fn eventually(what: &str, done: impl Fn() -> bool) {
+        let began = Instant::now();
+        while !done() {
+            assert!(began.elapsed() < Duration::from_secs(30), "{what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The files noted pending for `backend` in `repo`, forgetting them.
+    async fn take_noted(service: &KnowledgeService, backend: &str, repo: &str) -> Vec<String> {
+        let store = service.graph().backend();
+        let noted = store.vectors_pending(backend, repo, 1000).await.unwrap();
+        for (file, mark) in &noted {
+            store
+                .clear_vectors_pending(backend, repo, std::slice::from_ref(file), *mark)
+                .await
+                .unwrap();
+        }
+        noted.into_iter().map(|(file, _)| file).collect()
+    }
+
+    /// Every note a run makes for the standby is above the mark its lease
+    /// was taken at, as the lease is read while the run writes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_runs_notes_are_above_the_mark_its_lease_was_taken_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Untracked::default());
+        let (root, service) = service_on(
+            dir.path(),
+            Arc::clone(&store) as Arc<dyn CodeVectorStore>,
+            "vellev",
+        )
+        .unwrap();
+        assert!(store.graph.set(Arc::clone(service.graph())).is_ok());
+        let repo = KnowledgeService::repo_id_for(&root);
+        commit(&root);
+        service.trigger_full_index_for(&root).await.unwrap();
+        store.leased_from.lock().unwrap().clear();
+
+        std::fs::write(root.join("src/config.rs"), "pub fn parse_config() {}\n").unwrap();
+        std::fs::write(root.join("src/mail.rs"), "pub fn send_email() {}\n").unwrap();
+        commit(&root);
+        let run = service.trigger_incremental_index_for(&root).await.unwrap();
+        assert_eq!(run.files_indexed, 2, "{run:?}");
+
+        let leased_from = store.leased_from.lock().unwrap().clone();
+        assert!(!leased_from.is_empty(), "the lease was read as it wrote");
+        assert!(leased_from.iter().all(|mark| *mark == leased_from[0]));
+        let noted = service
+            .graph()
+            .backend()
+            .vectors_pending("vellev", &repo, 10)
+            .await
+            .unwrap();
+        let files: Vec<&str> = noted.iter().map(|(file, _)| file.as_str()).collect();
+        assert_eq!(files, ["src/config.rs", "src/mail.rs"]);
+        assert!(
+            noted.iter().all(|(_, mark)| *mark > leased_from[0]),
+            "{noted:?} above {}",
+            leased_from[0]
+        );
+        assert!(service.graph().get_lease(&repo).await.unwrap().is_none());
+    }
+
+    /// Each run holds its repo's lease under an id of its own: another run
+    /// of the same service is refused while one holds it; a cancel releases
+    /// the lease of the run it cancels, so that another starts at once;
+    /// and a cancelled run that ends late leaves the run that replaced it
+    /// be.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn each_run_holds_the_lease_under_its_own_id() {
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Untracked::default());
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *store.gate.lock().unwrap() = Some(Arc::clone(&gate));
+        let (root, service) = service_on(
+            dir.path(),
+            Arc::clone(&store) as Arc<dyn CodeVectorStore>,
+            "vellev",
+        )
+        .unwrap();
+        let service = Arc::new(service);
+        let repo = KnowledgeService::repo_id_for(&root);
+        let run = || {
+            let (service, root) = (Arc::clone(&service), root.clone());
+            tokio::spawn(async move { service.trigger_full_index_for(&root).await })
+        };
+        let lease = || async { service.graph().get_lease(&repo).await.unwrap() };
+
+        let first = run();
+        eventually("the first run writes", || {
+            store.at_gate.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        let held = lease().await.expect("the first run's lease");
+        assert!(held.worker_id.starts_with(&service.worker_id), "{held:?}");
+        assert!(service.is_indexing_repo(&repo));
+        let refused = service.trigger_full_index_for(&root).await;
+        let error = format!("{:#}", refused.expect_err("held"));
+        assert!(error.contains("already in progress"), "{error}");
+        assert_eq!(lease().await, Some(held.clone()), "its row as it was");
+
+        assert!(service.cancel_indexing(&repo).await);
+        assert_eq!(lease().await, None, "released");
+        assert!(!service.is_indexing_repo(&repo));
+        let replacing = run();
+        eventually("the replacing run writes", || {
+            store.at_gate.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        let taken = lease().await.expect("the replacing run's lease");
+        assert_ne!(taken.worker_id, held.worker_id);
+
+        gate.add_permits(1);
+        first.await.unwrap().unwrap();
+        assert!(service.is_indexing_repo(&repo), "the replacing run's entry");
+        assert_eq!(
+            lease().await.map(|lease| lease.worker_id),
+            Some(taken.worker_id.clone()),
+            "the replacing run's lease"
+        );
+        assert!(service.cancel_indexing(&repo).await);
+        assert_eq!(lease().await, None);
+        assert!(
+            !service.cancel_indexing(&repo).await,
+            "nothing left to cancel"
+        );
+
+        gate.add_permits(1);
+        replacing.await.unwrap().unwrap();
+        assert!(!service.is_indexing_repo(&repo));
+    }
+
+    /// A model that fails while told to, and otherwise answers as many times
+    /// as it is let before it hangs, as one cut off.
+    #[derive(Clone, Default)]
+    struct Scripted {
+        failing: Arc<std::sync::atomic::AtomicBool>,
+        /// Answers left before it hangs; none for no end.
+        answers: Arc<std::sync::Mutex<Option<usize>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SummaryLlm for Scripted {
+        async fn generate_text(&self, _prompt: &str, _max_tokens: usize) -> Result<String> {
+            if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(eyre::eyre!("the model is down"));
+            }
+            let answering = match &mut *self.answers.lock().unwrap() {
+                Some(0) => false,
+                Some(left) => {
+                    *left -= 1;
+                    true
+                }
+                None => true,
+            };
+            if !answering {
+                std::future::pending::<()>().await;
+            }
+            Ok("Does what it says.".to_string())
+        }
+
+        fn model_name(&self) -> &str {
+            "scripted"
+        }
+    }
+
+    impl SummariserBuilder for Scripted {
+        fn build(&self) -> Result<Box<dyn SummaryLlm>> {
+            Ok(Box::new(self.clone()))
+        }
+    }
+
+    /// A resumed summary phase cut off part of the way has noted the file
+    /// of every summary it wrote for the standby, and the next resume notes
+    /// only the files of the summaries it has yet to write.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resumed_summary_phase_cut_off_has_noted_every_summary_it_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = Scripted::default();
+        let config = KnowledgeConfig {
+            vector_backfill_per_sec: 0,
+            vector_standby: "vellev".into(),
+            generate_summaries: true,
+            summary_concurrency: 1,
+            index_timeout_secs: 2,
+            ..KnowledgeConfig::default()
+        };
+        let (root, service) = service_with(
+            dir.path(),
+            Arc::new(Untracked::default()),
+            &config,
+            Some(Arc::new(model.clone())),
+        )
+        .unwrap();
+        for file in ["a", "b"] {
+            std::fs::write(
+                root.join(format!("src/{file}.rs")),
+                format!("/// Does {file}.\npub fn do_{file}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        commit(&root);
+        let repo = KnowledgeService::repo_id_for(&root);
+        let graph = service.graph();
+
+        model
+            .failing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            service.trigger_for(&root).await.unwrap(),
+            TriggerOutcome::Full(_)
+        ));
+        assert!(graph.summary_hashes(&repo).await.unwrap().is_empty());
+        take_noted(&service, "vellev", &repo).await;
+
+        // Cut off by the run's timeout, with two summaries written.
+        model
+            .failing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        *model.answers.lock().unwrap() = Some(2);
+        let cut = service.trigger_for(&root).await;
+        assert!(format!("{:#}", cut.err().expect("cut off")).contains("timed out"));
+        let written = graph.summary_hashes(&repo).await.unwrap();
+        assert_eq!(written.len(), 2);
+        let noted = take_noted(&service, "vellev", &repo).await;
+        for (entity, _) in written.keys() {
+            let file = graph.get_entity(entity).await.unwrap().unwrap().file_path;
+            assert!(noted.contains(&file), "{file} noted: {noted:?}");
+        }
+
+        // The next resume: the files of the summaries yet to write, only.
+        let written = graph.summary_hashes(&repo).await.unwrap();
+        let entities = graph.all_entities(&repo).await.unwrap();
+        let mut unwritten: Vec<String> = entities
+            .iter()
+            .filter(|entity| entity.is_summarisable())
+            .filter(|entity| !written.keys().any(|(id, _)| *id == entity.id))
+            .map(|entity| entity.file_path.clone())
+            .collect();
+        unwritten.dedup();
+        let files: Vec<&String> = entities.iter().map(|entity| &entity.file_path).collect();
+        assert!(
+            unwritten.len()
+                < files
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+            "a file's summaries were all written: {unwritten:?}"
+        );
+        *model.answers.lock().unwrap() = None;
+        assert!(matches!(
+            service.trigger_for(&root).await.unwrap(),
+            TriggerOutcome::ResumeSummaries(_)
+        ));
+        assert_eq!(take_noted(&service, "vellev", &repo).await, unwritten);
     }
 
     /// The graph keeps its vector state as the database in use's, with the
