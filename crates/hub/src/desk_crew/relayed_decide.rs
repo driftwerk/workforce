@@ -122,7 +122,9 @@ pub(crate) struct Outbox {
     latest: HashMap<Key, i64>,
     /// The irreversible jobs the home said its boss holds, with its latest
     /// answer for each (none when it didn't say): what a request here is
-    /// compared with before it is allowed (R5).
+    /// compared with before it is allowed (R5). Each decision the home
+    /// sends for the boss and group replaces it, whichever request it was
+    /// for: each is the home's newest reading of the same record.
     held: HashMap<Key, Option<Vec<workforce_desk::assignment::Assignment>>>,
 }
 

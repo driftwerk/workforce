@@ -981,7 +981,12 @@ async fn what_a_dropped_send_left_reserved_is_settled_by_how_it_was_sent() {
         let u = session_in(&d, dir.path(), "harbor", "harbor-web").await;
         // Each reserved and sent as the boss's tools do: two messages on
         // their lines, and a resume, which carries none.
-        crew.perform_with(&nudge(s.id, "Start release 6."), by(), &release("6"))
+        // Declared irreversible: what is settled as gone must never lapse.
+        let for_good = |key: &str| Order {
+            irreversible: true,
+            ..release(key)
+        };
+        crew.perform_with(&nudge(s.id, "Start release 6."), by(), &for_good("6"))
             .await
             .unwrap();
         crew.perform_with(&nudge(t.id, "Start release 7."), by(), &release("7"))
@@ -991,7 +996,7 @@ async fn what_a_dropped_send_left_reserved_is_settled_by_how_it_was_sent() {
             session: u.id,
             prompt: Some("Pick up release 8 where you left it.".into()),
         };
-        let _ = crew.perform_with(&resume, by(), &release("8")).await;
+        let _ = crew.perform_with(&resume, by(), &for_good("8")).await;
         let (went, lost, resumed) = (held_by(&d, s.id).await, held_by(&d, t.id).await, {
             d.store()
                 .assignments_of("desk", false)
@@ -1035,14 +1040,18 @@ async fn what_a_dropped_send_left_reserved_is_settled_by_how_it_was_sent() {
         .await;
         let l = state(lost.id).await;
         assert_eq!(l.state, AssignmentState::Failed, "{l:?}");
-        // Settled as gone (and, unreported ten minutes on, lapsed by the
-        // look after): never as unsent.
-        let gone = [AssignmentState::Open, AssignmentState::Lapsed];
+        // Settled as gone, never as unsent; and, irreversible, never
+        // lapsed by the looks after, however long nothing is heard.
+        eventually("a look after the settling", async || {
+            (state(went.id).await.state != AssignmentState::Sending).then_some(())
+        })
+        .await;
+        tokio::time::sleep(crew.timing.minute * 3).await;
         let w = state(went.id).await;
-        assert!(gone.contains(&w.state), "{:?}", w.state);
+        assert_eq!(w.state, AssignmentState::Open, "{w:?}");
         assert_eq!(w.line_message, went.line_message);
         let r = state(resumed.id).await.state;
-        assert!(gone.contains(&r), "a resume carries no line message: {r:?}");
+        assert_eq!(r, AssignmentState::Open, "a resume carries no line message");
         // Its send ending late still keeps what happened.
         let late = d
             .store()

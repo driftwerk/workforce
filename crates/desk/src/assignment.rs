@@ -828,9 +828,16 @@ pub fn asks_an_act(text: &str) -> bool {
     let ws = words(text);
     (0..ws.len()).any(|i| {
         let t = ws[i].text.as_str();
-        (ACTS.contains(&t) || STARTS.contains(&t)) && !noun_at(&ws, i) && !negated(&ws, i)
+        (ACTS.contains(&t) || STARTS.contains(&t) || GO_ON.contains(&t))
+            && !noun_at(&ws, i)
+            && !negated(&ws, i)
     })
 }
+
+/// The words that tell a session to carry on with what it holds ("Go
+/// ahead now.", "Continue.", "Retry it."): on a delivered irreversible
+/// job they ask for the act again, never a follow-up.
+const GO_ON: &[&str] = &["go", "continue", "retry", "redo", "again", "resume"];
 
 /// Whether `text` asks for something that can't be taken back: one of
 /// the verbs that do (release, deploy, promote, dispatch, run a workflow,
@@ -1298,6 +1305,9 @@ mod tests {
             assert!(!irreversible(text), "not irreversible: {text}");
         }
         assert!(asks_an_act("Go ahead and proceed."));
+        for text in ["Go ahead now.", "Continue.", "Retry it.", "Do it again."] {
+            assert!(asks_an_act(text), "asks for the act again: {text}");
+        }
         assert!(!asks_an_act(
             "When release 3 finishes, send Desk its run id."
         ));
