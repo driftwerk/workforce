@@ -850,7 +850,9 @@ impl CrewHub {
             Action::Escalate { .. } => (true, None),
             // Switched on by `message_agents`, above.
             Action::Assign { .. } => (true, None),
-            Action::Resume { .. } | Action::Restart { .. } => {
+            // A move to another login starts it again in place, as a
+            // restart does.
+            Action::Resume { .. } | Action::Restart { .. } | Action::SwitchLogin { .. } => {
                 (o.act.resume_restart, Some(switch::RESUME_RESTART))
             }
             Action::StartSession { .. } => (o.act.hand_out_work, Some(switch::HAND_OUT_WORK)),
@@ -913,9 +915,6 @@ impl CrewHub {
             // command; any other is an unbound overseer's alone.
             // Only a mode that asks gets here.
             Action::SetMode { .. } => (o.act.set_mode, Some(switch::SET_MODE)),
-            // Another of the person's own logins of the same provider: an
-            // ordinary move, its conversation kept.
-            Action::SwitchLogin { .. } => (true, None),
         };
         match (allowed, needs) {
             (true, _) => Gate::Run,
@@ -1034,12 +1033,13 @@ impl CrewHub {
             Action::Interrupt { .. } => Some(Gate::Run),
             // A session started again reads its settings again: changes to
             // them it made by itself are the person's to let take effect.
-            Action::Resume { .. } | Action::Restart { .. } => Some(Gate::Suggest(
-                "starting it again loads whatever settings it changed; that's the person's call"
-                    .into(),
-            )),
-            // Moving it to another login of the person's is ordinary.
-            Action::SwitchLogin { .. } => Some(Gate::Run),
+            // A move to another login starts it again too.
+            Action::Resume { .. } | Action::Restart { .. } | Action::SwitchLogin { .. } => {
+                Some(Gate::Suggest(
+                    "starting it again loads whatever settings it changed; that's the person's call"
+                        .into(),
+                ))
+            }
             _ => None,
         }
     }
@@ -1083,9 +1083,9 @@ impl CrewHub {
                 Ok(Origin::External) => true,
                 Err(_) => false,
             },
-            Action::Resume { session: s, .. } | Action::Restart { session: s, .. } => {
-                started_here(s)
-            }
+            Action::Resume { session: s, .. }
+            | Action::Restart { session: s, .. }
+            | Action::SwitchLogin { session: s, .. } => started_here(s),
             Action::StartSession { .. } => true,
             // What a ticket's session or agent is told is a message to it.
             Action::AssignTicket {
@@ -1121,9 +1121,6 @@ impl CrewHub {
             | Action::Handoff { .. }
             // Below unbound, only to a mode that still asks.
             | Action::SetMode { .. }
-            // The same session, on another login: what it does next waits
-            // as before.
-            | Action::SwitchLogin { .. }
             // Only ever a card the person approves.
             | Action::ChangeOversight { .. } => true,
             Action::Nudge {

@@ -837,8 +837,12 @@ struct State {
     /// sign-in): a move onto it within minutes needs no new one.
     verified: HashMap<Option<Uuid>, std::time::Instant>,
     /// What each session moving off a login that can't serve is told when
-    /// it runs on the new one: why it moved.
-    switch_notes: HashMap<Uuid, String>,
+    /// it runs on the new one, why it moved: with the login it moves to, so
+    /// a later move elsewhere is never told it.
+    switch_notes: HashMap<Uuid, (Option<Uuid>, String)>,
+    /// Logins (`None`: the CLI's own sign-in) whose probe didn't answer, when
+    /// and their names: left out of moves for a while.
+    unchecked: HashMap<Option<Uuid>, (std::time::Instant, String)>,
     /// What the person was last told of no login having room (kept).
     no_room_told: Option<String>,
     /// Each turned-away account's refusal the person was told of: its
@@ -1054,6 +1058,11 @@ struct Inner {
     read_wait: Mutex<Duration>,
     /// Held while the accounts' needs are acted on.
     accounts_moving: tokio::sync::Mutex<()>,
+    /// Desk's own moves off logins that can't serve, one run at a time,
+    /// off whoever's task asked ([`Desk::fail_over_soon`]).
+    failing_over: tokio::sync::Mutex<()>,
+    /// Asked for again while one ran: it runs once more.
+    fail_over_again: std::sync::atomic::AtomicBool,
     /// The accounts' standing as last written ([`accounts::STANDING`]).
     standing_kept: Mutex<Option<accounts::KeptStanding>>,
     /// The budgets and every subject's breaker.
@@ -1868,6 +1877,8 @@ impl Desk {
             reader: Mutex::new(None),
             read_wait: Mutex::new(READ_LATER),
             accounts_moving: tokio::sync::Mutex::new(()),
+            failing_over: tokio::sync::Mutex::new(()),
+            fail_over_again: std::sync::atomic::AtomicBool::new(false),
             standing_kept: Mutex::new(Some(kept_standing.clone())),
             breakers: Mutex::new(breaker::BreakerRun::default()),
             agent_spend: Mutex::new(None),
@@ -2986,7 +2997,7 @@ impl Desk {
                         };
                         let text = match &now.account {
                             Some(a) => format!("hit {}'s {window}", a.name),
-                            None => format!("hit its {window} on this computer's sign-in"),
+                            None => format!("hit its {window}"),
                         };
                         own(Kind::Limit, text).detail(serde_json::json!({
                             "login": now.account,
@@ -3000,7 +3011,7 @@ impl Desk {
                         let reason = crate::limit::refusal_reason(Some(reply));
                         let text = match &now.account {
                             Some(a) => format!("was turned away on {}: {reason}", a.name),
-                            None => format!("was turned away on this computer's sign-in: {reason}"),
+                            None => format!("was turned away: {reason}"),
                         };
                         own(Kind::Failed, text)
                             .detail(serde_json::json!({ "login": now.account, "refused": reason }))

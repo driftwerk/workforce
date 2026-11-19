@@ -470,8 +470,7 @@ impl Desk {
             .filter(|s| s.is_none_or(|id| !Self::refused_now(st, id, now)))
             .copied()
             .collect();
-        let used = Self::plans_used(&Self::effective_standing(st), now);
-        if let Some(side) = accounts::with_headroom(&room, &used).as_ref() {
+        if let Some(side) = room.first() {
             if *side != first {
                 tracing::info!(
                     engine = engine.as_str(),
@@ -738,9 +737,9 @@ impl Desk {
     }
 
     /// One of the person's logins (engine accounts) by what someone called
-    /// it: its id, else its name, case aside, else the one name that
-    /// contains it ("Gmail" for "Kingsley Gmail"). Of `engine` alone when
-    /// given. Two that match are said, never guessed between.
+    /// it: its id, else its whole name, case aside. Of `engine` alone when
+    /// given. A part of a name is offered back, never taken; two of one name
+    /// are said, never guessed between.
     pub fn login_named(&self, engine: Option<Engine>, said: &str) -> Result<Uuid, DeskError> {
         let said = said.trim();
         let st = self.0.state.lock();
@@ -762,29 +761,35 @@ impl Desk {
             .iter()
             .filter(|a| a.name.trim().to_lowercase() == lower)
             .collect();
-        let found: Vec<&&Account> = match exact.len() {
-            0 if !lower.is_empty() => of
-                .iter()
-                .filter(|a| a.name.to_lowercase().contains(&lower))
-                .collect(),
-            _ => exact,
-        };
         let named = |list: &[&&Account]| -> String {
             list.iter()
                 .map(|a| format!("{} ({}, {})", a.name, a.engine.title(), a.id))
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        match found[..] {
+        match exact[..] {
             [one] => Ok(one.id),
             [] if of.is_empty() => Err(DeskError::Invalid(format!("there are no {what}s"))),
-            [] => Err(DeskError::Invalid(format!(
-                "there is no {what} called {said}; there are {}",
-                named(&of.iter().collect::<Vec<_>>())
-            ))),
+            [] => {
+                // A part of a name is offered, never taken.
+                let near: Vec<&&Account> = of
+                    .iter()
+                    .filter(|a| !lower.is_empty() && a.name.to_lowercase().contains(&lower))
+                    .collect();
+                Err(DeskError::Invalid(match near.is_empty() {
+                    true => format!(
+                        "there is no {what} called {said}; there are {}",
+                        named(&of.iter().collect::<Vec<_>>())
+                    ),
+                    false => format!(
+                        "there is no {what} called {said}: did you mean {}? Say it by its full name or id",
+                        named(&near)
+                    ),
+                }))
+            }
             _ => Err(DeskError::Invalid(format!(
-                "“{said}” could be {}: say which by its full name or id",
-                named(&found)
+                "two {what}s are called {said}: {}. Say which by its id",
+                named(&exact)
             ))),
         }
     }
@@ -1716,7 +1721,7 @@ impl Desk {
         // Never onto a login that can't serve: probed first. Staying on its
         // own, its sign-in is still read.
         if r.account != to {
-            self.verify_login(to).await?;
+            self.verify_login(r.engine, to).await?;
         } else if let Some(to) = to {
             let a = self.account(to)?;
             self.read_token(&a).await?;
@@ -1785,6 +1790,7 @@ impl Desk {
                 let mut st = self.0.state.lock();
                 st.switches.remove(&id);
                 st.switch_by.remove(&id);
+                st.switch_notes.remove(&id);
                 drop(st);
                 return self.view(id);
             }
@@ -1813,6 +1819,7 @@ impl Desk {
                     let mut st = self.0.state.lock();
                     st.switches.remove(&id);
                     st.switch_by.remove(&id);
+                    st.switch_notes.remove(&id);
                     drop(st);
                     if let Ok(view) = self.view(id) {
                         self.announce(DeskEvent::Session {
@@ -1828,7 +1835,11 @@ impl Desk {
                 let mut st = self.0.state.lock();
                 st.switches.remove(&id);
                 st.switch_by.remove(&id);
-                st.switch_notes.remove(&id)
+                // Only Desk's own move to where it now goes.
+                st.switch_notes
+                    .remove(&id)
+                    .filter(|(for_to, _)| *for_to == to)
+                    .map(|(_, note)| note)
             };
             self.change(id, |r, _| r.account = to);
             {
@@ -2117,6 +2128,8 @@ impl Desk {
                 .iter()
                 .filter(|id| !st.sign_in_problems.contains_key(id))
                 .filter(|id| !Self::refused_now(&st, **id, now))
+                // Nor, for a while, onto one whose probe didn't answer.
+                .filter(|id| !Self::unchecked_now(&st, Some(**id)))
                 .copied()
                 .collect(),
             &used,
@@ -2386,8 +2399,9 @@ impl Desk {
         }
         self.keep_standing();
         if self.auto_switch() {
-            // Desk's own moves, as the person set it to: never theirs.
-            self.fail_over().await;
+            // Desk's own moves, as the person set it to: never theirs. Its
+            // probes may take a while: never on the asker's time.
+            self.fail_over_soon();
         }
         self.announce_accounts();
     }
@@ -2417,7 +2431,7 @@ impl Desk {
             self.account_for(engine, Some(Some(to)))?;
         }
         // It must serve before any session is stopped: probed first.
-        self.verify_login(to).await?;
+        self.verify_login(engine, to).await?;
         let (ids, full) = {
             let st = self.0.state.lock();
             let ids: Vec<(Uuid, bool, bool)> = st

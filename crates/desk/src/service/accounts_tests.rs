@@ -3162,6 +3162,9 @@ async fn a_machine_told_an_account_is_full_starts_new_sessions_on_the_next_and_s
                 signed_out_options(machine_dir.path(), Arc::new(MemoryKeys::default())),
             )
             .await;
+            // What each tells the other alone: neither moves anything itself.
+            mac.set_auto_switch(false).await.unwrap();
+            machine.set_auto_switch(false).await.unwrap();
             let (_, _, a, _) = two_on_work(&mac, mac_dir.path()).await;
             paste(&machine, "Work", GOOD, true).await;
             let personal = paste(&machine, "Personal", OTHER, false).await;
@@ -4960,10 +4963,14 @@ async fn a_login_is_named_by_its_id_or_its_name_case_aside_and_never_guessed_bet
         assert_eq!(d.login_named(None, "kingsley gmail").unwrap(), gmail);
         assert_eq!(d.login_named(None, "  Kingsley Apple ").unwrap(), apple);
         assert_eq!(d.login_named(None, &work.to_string()).unwrap(), work);
-        assert_eq!(d.login_named(Some(Engine::Claude), "apple").unwrap(), apple);
-        // Two it could be: both said, neither taken.
+        // Part of a name: offered, never taken, and two are both said.
+        let DeskError::Invalid(why) = d.login_named(Some(Engine::Claude), "apple").unwrap_err()
+        else {
+            panic!("a part of a name was taken");
+        };
+        assert!(why.contains("did you mean Kingsley Apple"), "{why}");
         let DeskError::Invalid(why) = d.login_named(None, "gmail").unwrap_err() else {
-            panic!("not refused as unclear");
+            panic!("guessed between two");
         };
         assert!(
             why.contains("Kingsley Gmail") && why.contains("Gmail Work"),
@@ -5107,9 +5114,15 @@ async fn a_login_at_its_limit_fails_over_past_one_turned_away_and_the_person_is_
             moved.text
         );
         assert!(
-            moved
-                .text
-                .ends_with("I moved auth-fix and auth-fix to Kingsley Gmail."),
+            moved.text.ends_with(&format!(
+                "I moved auth-fix [{}] and auth-fix [{}] to Kingsley Gmail.",
+                &a.to_string()[..8],
+                &b.to_string()[..8]
+            )) || moved.text.ends_with(&format!(
+                "I moved auth-fix [{}] and auth-fix [{}] to Kingsley Gmail.",
+                &b.to_string()[..8],
+                &a.to_string()[..8]
+            )),
             "{}",
             moved.text
         );

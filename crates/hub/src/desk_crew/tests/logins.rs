@@ -38,7 +38,7 @@ async fn a_login_the_boss_names_that_isnt_there_is_said_with_the_ones_there_are(
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
-        let (_overseer, crew, d, _llm) = overseeing(&base, pool, "ok", THEIRS, &[]).await;
+        let (overseer, crew, d, _llm) = overseeing(&base, pool, "ok", THEIRS, &[]).await;
         let seen = workforce_desk::scope::Seen::new(
             workforce_common::oversight::Scope::Ungrouped,
             Default::default(),
@@ -49,7 +49,28 @@ async fn a_login_the_boss_names_that_isnt_there_is_said_with_the_ones_there_are(
             out["moves"].as_str().unwrap().contains("by itself"),
             "{out}"
         );
-        assert!(d.login_named(None, "Kingsley Gmail").is_err());
+        // The boss names one the person hasn't: told so by the tool, nothing
+        // moved.
+        eventually("the overseer's tools", async || {
+            overseer.tools.has("crew.switch_login").then_some(())
+        })
+        .await;
+        let s = new_session(&d, &base, "auth-fix").await;
+        let r = overseer
+            .tools
+            .get("crew.switch_login")
+            .unwrap()
+            .execute(json!({"session_id": s.id.to_string(), "login": "Kingsley Gmail", "reason": "Its login is full."}))
+            .await
+            .unwrap();
+        assert!(!r.success, "{r:?}");
+        assert!(
+            r.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("there are no Claude Code logins"),
+            "{r:?}"
+        );
     })
     .await;
 }

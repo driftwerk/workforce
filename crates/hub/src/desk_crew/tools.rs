@@ -602,7 +602,30 @@ impl CrewTool {
                     .filter(|s| !s.is_empty() && *s != "own")
                     .map(str::to_string);
                 if let Some(said) = said {
-                    let id = crew.desk.login_named(None, &said).map_err(|e| match e {
+                    // Of the session's own provider, or the one it continues
+                    // in: another's login is never a match.
+                    // A session outside its scope is refused as any is,
+                    // before a login is looked up for it.
+                    let session = match self.name {
+                        SWITCH_LOGIN => o
+                            .get("session_id")
+                            .and_then(Value::as_str)
+                            .and_then(|s| s.trim().parse::<uuid::Uuid>().ok()),
+                        _ => None,
+                    };
+                    if let Some(s) = session {
+                        crew.session_seen(s, &b.seen)?;
+                    }
+                    let engine = match self.name {
+                        SWITCH_LOGIN => session
+                            .and_then(|s| crew.desk.view(s).ok())
+                            .map(|v| v.engine),
+                        _ => o
+                            .get("engine")
+                            .cloned()
+                            .and_then(|e| serde_json::from_value(e).ok()),
+                    };
+                    let id = crew.desk.login_named(engine, &said).map_err(|e| match e {
                         workforce_desk::DeskError::Invalid(why)
                         | workforce_desk::DeskError::Conflict(why) => why,
                         e => e.to_string(),

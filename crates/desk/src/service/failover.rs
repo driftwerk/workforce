@@ -24,6 +24,9 @@ use crate::model::SessionState;
 pub(super) const REFUSED_RECHECK: chrono::TimeDelta = chrono::TimeDelta::hours(1);
 /// How long a probe that found a login serving stands for further moves.
 const VERIFIED_FOR: Duration = Duration::from_secs(5 * 60);
+/// How long a login whose probe didn't answer is left out of moves, so
+/// each look at the needs doesn't wait on it again.
+const UNCHECKED_FOR: Duration = Duration::from_secs(10 * 60);
 /// The longest a probe may take.
 const PROBE_WAIT: Duration = Duration::from_secs(90);
 /// The most moves one look at the needs makes: each login is tried once.
@@ -95,11 +98,31 @@ impl Desk {
         }
     }
 
-    /// Checks that `side` (`None`: the CLI's own sign-in) serves a call
-    /// now, with a one-word probe, unless one found so in the last few
-    /// minutes. A login at its limit is marked full, and one turned away is
-    /// marked so: either way nothing moves to it.
-    pub(super) async fn verify_login(&self, side: Option<Uuid>) -> Result<(), DeskError> {
+    /// Checks that `side` (`None`: the CLI's own sign-in) of `engine`
+    /// serves a call now, with a one-word probe, unless one found so in the
+    /// last few minutes. A login at its limit is marked full, and one turned
+    /// away is marked so: either way nothing moves to it. Only Claude Code is
+    /// probed: another engine's login has its sign-in read, as before.
+    pub(super) async fn verify_login(
+        &self,
+        engine: Engine,
+        side: Option<Uuid>,
+    ) -> Result<(), DeskError> {
+        if engine != Engine::Claude {
+            if let Some(id) = side {
+                let a = self.account(id)?;
+                if a.engine != engine {
+                    return Err(DeskError::Invalid(format!(
+                        "{} is a {} login, not {}'s",
+                        a.name,
+                        a.engine.title(),
+                        engine.title()
+                    )));
+                }
+                self.read_token(&a).await?;
+            }
+            return Ok(());
+        }
         if self
             .0
             .state
@@ -113,6 +136,14 @@ impl Desk {
         let (name, token) = match side {
             Some(id) => {
                 let a = self.account(id)?;
+                if a.engine != engine {
+                    return Err(DeskError::Invalid(format!(
+                        "{} is a {} login, not {}'s",
+                        a.name,
+                        a.engine.title(),
+                        engine.title()
+                    )));
+                }
                 let token = self.read_token(&a).await?;
                 (a.name, Some(token))
             }
@@ -122,7 +153,15 @@ impl Desk {
         let now = Utc::now();
         match said.map(|out| accounts::claude_probe_said(&out)) {
             Ok(Probe::Serves) => {
-                self.0.state.lock().verified.insert(side, Instant::now());
+                {
+                    let mut st = self.0.state.lock();
+                    st.verified.insert(side, Instant::now());
+                    st.unchecked.remove(&side);
+                }
+                // One turned away before serves again: no longer so.
+                if let Some(id) = side {
+                    self.ok_seen(&identities::Raw::Account(id), now);
+                }
                 Ok(())
             }
             Ok(Probe::Full) => {
@@ -156,6 +195,11 @@ impl Desk {
             }
             Ok(Probe::Failed(w)) | Err(w) => {
                 tracing::warn!(login = %name, said = %w, "a login probed before a move didn't answer");
+                self.0
+                    .state
+                    .lock()
+                    .unchecked
+                    .insert(side, (Instant::now(), name.clone()));
                 Err(DeskError::Conflict(format!(
                     "Desk couldn't check that {name} can serve just now ({w}): nothing was moved"
                 )))
@@ -171,7 +215,8 @@ impl Desk {
             .program_of(Engine::Claude)
             .map_err(|e| e.to_string())?
             .to_path_buf();
-        let mut env = self.with_added(&self.0.state.lock().session_env.clone());
+        let base = self.0.state.lock().session_env.clone();
+        let mut env = self.with_added(&base);
         for k in accounts::OUTRANKS_CLAUDE_TOKEN {
             env.remove(k);
         }
@@ -229,6 +274,27 @@ impl Desk {
         Ok(said)
     }
 
+    /// [`Self::fail_over`] on its own task, one run at a time: one asked
+    /// for while another runs makes that one run once more.
+    pub(super) fn fail_over_soon(&self) {
+        use std::sync::atomic::Ordering;
+        let desk = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok(one) = desk.0.failing_over.try_lock() else {
+                    desk.0.fail_over_again.store(true, Ordering::SeqCst);
+                    return;
+                };
+                desk.0.fail_over_again.store(false, Ordering::SeqCst);
+                desk.fail_over().await;
+                drop(one);
+                if !desk.0.fail_over_again.swap(false, Ordering::SeqCst) {
+                    return;
+                }
+            }
+        });
+    }
+
     /// Moves what runs on a login that can't serve (at its limit, or turned
     /// away) to the login with most headroom that a probe finds serving,
     /// one need at a time; a login a probe finds full or turned away is
@@ -242,7 +308,7 @@ impl Desk {
                 break;
             };
             tried.insert(step.need.clone());
-            if let Err(e) = self.verify_login(step.to.id).await {
+            if let Err(e) = self.verify_login(step.engine, step.to.id).await {
                 tracing::warn!(from = %step.from.name, to = %step.to.name, error = %e, "a login wasn't moved to: it can't serve");
                 continue;
             }
@@ -267,7 +333,7 @@ impl Desk {
                 to,
                 resets_at,
                 ..
-            } if !tried.contains(id) => {
+            } if !tried.contains(id) && !Self::moving_off(&st, *engine, from.id).is_empty() => {
                 let standing = Self::standing_of(&st, from.id);
                 let window = standing
                     .full_by(now)
@@ -314,7 +380,8 @@ impl Desk {
     }
 
     /// The sessions of `engine` on `side` a move would take: not closed,
-    /// and not in a terminal of their own.
+    /// not in a terminal of their own, and not already moving (one waiting
+    /// for its turn to end is moved, and told of, once).
     fn moving_off(st: &super::State, engine: Engine, side: Option<Uuid>) -> Vec<Uuid> {
         st.records
             .values()
@@ -324,6 +391,7 @@ impl Desk {
                     && r.terminal_id.is_none()
                     && r.origin != crate::model::Origin::External
                     && Self::side_of_session(st, r.id) == Some(side)
+                    && !st.switches.contains_key(&r.id)
             })
             .map(|r| r.id)
             .collect()
@@ -367,7 +435,7 @@ impl Desk {
         {
             let mut st = self.0.state.lock();
             for id in &moving {
-                st.switch_notes.insert(*id, note.clone());
+                st.switch_notes.insert(*id, (step.to.id, note.clone()));
             }
         }
         let by = By::desk(&format!(
@@ -395,6 +463,13 @@ impl Desk {
             .chain(&done.next_start)
             .copied()
             .collect();
+        {
+            // A session it didn't take is told nothing of it later.
+            let mut st = self.0.state.lock();
+            for id in moving.iter().filter(|id| !moved.contains(id)) {
+                st.switch_notes.remove(id);
+            }
+        }
         tracing::info!(
             from = %step.from.name,
             to = %step.to.name,
@@ -404,11 +479,12 @@ impl Desk {
         if moved.is_empty() {
             return;
         }
-        let names: Vec<String> = moved
+        let labels: Vec<(Uuid, String)> = moved
             .iter()
             .filter_map(|id| self.view(*id).ok())
-            .map(|v| v.label().to_string())
+            .map(|v| (v.id, v.label().to_string()))
             .collect();
+        let names = told_apart(&labels);
         let text = format!(
             "{said_why}; I moved {} to {}.",
             and_list(&names),
@@ -425,45 +501,60 @@ impl Desk {
     }
 
     /// When sessions sit on a login that can't serve and no login of the
-    /// same provider has room, the person is told so once, with when each
-    /// resets; again only once that changes.
+    /// same provider has room (each full, turned away, or not answering a
+    /// probe), the person is told so once, with when each resets; again only
+    /// once that changes. Whether it changed is read from the logins' states,
+    /// never the words (a reset said "Fri 16:00" reads "16:00" on Friday).
     async fn tell_no_room(&self) {
         let needs = self.account_needs_all();
         let now = Utc::now();
         let tz = self.timezone();
-        let (said, key) = {
-            let st = self.0.state.lock();
-            let stuck_refused = needs.iter().any(|n| {
-                matches!(n, AccountNeed::Refused { account, using: None, engine, .. }
-                    if account.id.is_some_and(|a| Self::refused_now(&st, a, now))
-                        && !Self::moving_off(&st, *engine, account.id).is_empty())
-            });
-            let all_full = needs.iter().find_map(|n| match n {
+        let said = {
+            let mut st = self.0.state.lock();
+            let stuck = |n: &AccountNeed| match n {
                 AccountNeed::AllFull { engine, .. } => Some(*engine),
+                AccountNeed::Refused {
+                    account,
+                    using: None,
+                    engine,
+                    ..
+                } if account.id.is_some_and(|a| Self::refused_now(&st, a, now))
+                    && !Self::moving_off(&st, *engine, account.id).is_empty() =>
+                {
+                    Some(*engine)
+                }
+                // A move it couldn't check: sessions still on a full login.
+                AccountNeed::Limit {
+                    engine, from, to, ..
+                } if Self::unchecked_now(&st, to.id)
+                    && !Self::moving_off(&st, *engine, from.id).is_empty() =>
+                {
+                    Some(*engine)
+                }
                 _ => None,
-            });
-            let engine = match (all_full, stuck_refused) {
-                (Some(e), _) => Some(e),
-                (None, true) => Some(Engine::Claude),
-                (None, false) => None,
             };
-            match engine {
+            let engine = needs.iter().find_map(stuck);
+            let (key, text) = match engine {
                 None => (None, None),
                 Some(engine) => {
-                    let parts: Vec<String> = st
-                        .accounts
-                        .iter()
-                        .filter(|a| a.engine == engine)
-                        .map(|a| {
-                            let full = Self::standing_of(&st, Some(a.id)).full_by(now);
-                            match (
-                                st.refused
-                                    .get(&a.id)
-                                    .filter(|_| Self::refused_now(&st, a.id, now)),
-                                full,
-                            ) {
-                                (Some(r), _) => format!("{} is turned away ({})", a.name, r.reason),
-                                (None, Some(f)) => match f.until {
+                    let mut key = Vec::new();
+                    let mut parts = Vec::new();
+                    for a in st.accounts.iter().filter(|a| a.engine == engine) {
+                        let full = Self::standing_of(&st, Some(a.id)).full_by(now);
+                        // Turned away and not yet seen serving: so, until a
+                        // probe or a turn on it says otherwise.
+                        let (k, part) = match (st.refused.get(&a.id), full) {
+                            (Some(r), _) => (
+                                format!("refused:{}", r.reason),
+                                format!("{} is turned away ({})", a.name, r.reason),
+                            ),
+                            (None, Some(f)) => (
+                                format!(
+                                    "full:{}:{}",
+                                    f.window_name(),
+                                    f.until.map(|u| u.to_rfc3339()).unwrap_or_default()
+                                ),
+                                match f.until {
                                     Some(u) => format!(
                                         "{}'s {} resets {}",
                                         a.name,
@@ -476,29 +567,63 @@ impl Desk {
                                         f.window_name()
                                     ),
                                 },
-                                (None, None) => format!("{} has no sign-in Desk can use", a.name),
-                            }
-                        })
-                        .collect();
-                    let text = format!(
-                        "No {} login has room to move your sessions to: {}.",
-                        engine.title(),
-                        parts.join("; ")
-                    );
-                    (Some(text.clone()), Some(text))
+                            ),
+                            (None, None) if Self::unchecked_now(&st, Some(a.id)) => (
+                                "unchecked".into(),
+                                format!("{} didn't answer Desk's check just now", a.name),
+                            ),
+                            (None, None) => (
+                                "unusable".into(),
+                                format!("{} has no sign-in Desk can use", a.name),
+                            ),
+                        };
+                        key.push(format!("{}={k}", a.id));
+                        parts.push(part);
+                    }
+                    (
+                        Some(format!("{}|{}", engine.as_str(), key.join("|"))),
+                        Some(format!(
+                            "No {} login has room to move your sessions to: {}.",
+                            engine.title(),
+                            parts.join("; ")
+                        )),
+                    )
                 }
+            };
+            // Read and set together: two looks close together say it once.
+            if key == st.no_room_told {
+                return;
             }
+            st.no_room_told = key.clone();
+            drop(st);
+            self.keep_state(NO_ROOM_TOLD, serde_json::json!(key));
+            text
         };
-        let told = self.0.state.lock().no_room_told.clone();
-        if key == told {
-            return;
-        }
-        self.0.state.lock().no_room_told = key.clone();
-        self.keep_state(NO_ROOM_TOLD, serde_json::json!(key));
         if let Some(text) = said {
             self.note(Event::new(Kind::LoginsFull, Party::desk(), None, text));
         }
     }
+
+    /// Whether `side`'s last probe didn't answer, a short while ago.
+    pub(super) fn unchecked_now(st: &super::State, side: Option<Uuid>) -> bool {
+        st.unchecked
+            .get(&side)
+            .is_some_and(|(at, _)| at.elapsed() < UNCHECKED_FOR)
+    }
+}
+
+/// Sessions' names for one line: one that two share is told apart by the
+/// start of its id, in brackets.
+fn told_apart(labels: &[(Uuid, String)]) -> Vec<String> {
+    labels
+        .iter()
+        .map(
+            |(id, label)| match labels.iter().filter(|(_, l)| l == label).count() {
+                1 => label.clone(),
+                _ => format!("{label} [{}]", &id.to_string()[..8]),
+            },
+        )
+        .collect()
 }
 
 /// "18:53" today, "Fri 16:00" within the week, "21 Nov 16:00" further.
@@ -532,5 +657,18 @@ mod tests {
         assert_eq!(n(&["A"]), "A");
         assert_eq!(n(&["A", "B"]), "A and B");
         assert_eq!(n(&["A", "B", "C"]), "A, B and C");
+    }
+
+    #[test]
+    fn two_sessions_of_one_name_are_told_apart_by_their_ids() {
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let named = told_apart(&[
+            (a, "auth-fix".into()),
+            (b, "auth-fix".into()),
+            (c, "invites".into()),
+        ]);
+        assert_eq!(named[0], format!("auth-fix [{}]", &a.to_string()[..8]));
+        assert_eq!(named[1], format!("auth-fix [{}]", &b.to_string()[..8]));
+        assert_eq!(named[2], "invites");
     }
 }
