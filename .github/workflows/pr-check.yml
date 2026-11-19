@@ -445,7 +445,8 @@ jobs:
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/vellev-models
-          key: vellev-models-bge-base-en-v1.5
+          key: vellev-models-bge-base-bge-small-en-v1.5
+          restore-keys: vellev-models-
       - name: Start a vellev node
         timeout-minutes: 30
         run: |
@@ -462,6 +463,7 @@ jobs:
             -e VELLEV_MODEL_DIR=/models \
             -e VELLEV_API_KEYS="$VELLEV_TEST_KEY" \
             -e VELLEV_MAX_FORMAT=2 \
+            -e VELLEV_LOCAL_MODELS_ALLOWED=BAAI/bge-small-en-v1.5 \
             -v "$RUNNER_TEMP/vellev-data:/data" \
             -v "$HOME/vellev-models:/models" \
             "$VELLEV_IMAGE" serve
@@ -470,30 +472,39 @@ jobs:
             sleep 1
           done
           if [ "${ready:-}" != 1 ]; then docker logs vellev | tail -n 100; exit 1; fi
-          # Embed once so the model download isn't charged to a test's timeout,
-          # into a collection that does not store what it embeds: the node
-          # raises its format to 2 in the background, after it is ready, and
-          # until then refuses such a collection naming VELLEV_MAX_FORMAT.
+          # Embed once with each model the tests use, the node's own and the
+          # code tests' bge-small, so neither download is charged to a
+          # test's timeout, into collections that do not store what they
+          # embed: the node raises its format to 2 in the background, after
+          # it is ready, and until then refuses such a collection naming
+          # VELLEV_MAX_FORMAT.
           call() { curl -sS -H "authorization: Bearer $VELLEV_TEST_KEY" -H 'content-type: application/json' "$@"; }
           probe="$VELLEV_TEST_URL/v1/tenants/ci-probe"
           call -f -X PUT "$probe"
-          for _ in $(seq 1 90); do
-            if [ "${created:-}" != 1 ]; then
-              answer=$(call -w '\n%{http_code}' -X PUT "$probe/collections/Probe" -d '{"name":"Probe","properties":[{"name":"text","data_type":"text","stored":false,"filterable":false}],"embedding":{"provider":"local","model":"BAAI/bge-base-en-v1.5","dimensions":768,"properties":["text"]}}')
-              case "${answer##*$'\n'}" in
-                2??) created=1 ;;
-                400) grep -q VELLEV_MAX_FORMAT <<<"$answer" || break ;;
-                *) break ;;
-              esac
-            fi
-            if [ "${created:-}" = 1 ]; then
-              code=$(call -o /dev/null -w '%{http_code}' -X PUT "$probe/collections/Probe/objects/00000000-0000-0000-0000-000000000001" -d '{"properties":{"text":"warm up"}}')
-              [ "$code" = 200 ] && embeds=1 && break
-            fi
-            sleep 10
-          done
+          warm() {
+            local name=$1 model=$2 dimensions=$3 created='' answer
+            for _ in $(seq 1 90); do
+              if [ -z "$created" ]; then
+                answer=$(call -w '\n%{http_code}' -X PUT "$probe/collections/$name" -d '{"name":"'"$name"'","properties":[{"name":"text","data_type":"text","stored":false,"filterable":false}],"embedding":{"provider":"local","model":"'"$model"'","dimensions":'"$dimensions"',"properties":["text"]}}')
+                case "${answer##*$'\n'}" in
+                  2??) created=1 ;;
+                  400) grep -q VELLEV_MAX_FORMAT <<<"$answer" || break ;;
+                  *) break ;;
+                esac
+              fi
+              if [ -n "$created" ]; then
+                code=$(call -o /dev/null -w '%{http_code}' -X PUT "$probe/collections/$name/objects/00000000-0000-0000-0000-000000000001" -d '{"properties":{"text":"warm up"}}')
+                [ "$code" = 200 ] && return 0
+              fi
+              sleep 10
+            done
+            echo "$name: ${answer:-}"
+            return 1
+          }
+          warmed=1
+          warm Probe BAAI/bge-base-en-v1.5 768 && warm ProbeSmall BAAI/bge-small-en-v1.5 384 || warmed=''
           call -X DELETE "$probe" || true
-          if [ "${embeds:-}" != 1 ]; then echo "${answer:-}"; docker logs vellev | tail -n 100; exit 1; fi
+          if [ -z "$warmed" ]; then docker logs vellev | tail -n 100; exit 1; fi
       # A Weaviate, for the memory shadow's end-to-end test, which moves
       # memories from one. Its release binary, pinned by sha256 (see
       # WEAVIATE_SHA256). The collection memories are moved from names the

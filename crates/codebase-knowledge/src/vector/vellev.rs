@@ -1,6 +1,7 @@
 //! The [`CodeVectorStore`] on vellev: `CodeEntity` and `CodeSummary`
 //! collections of one tenant, named as in Weaviate and embedded by the
-//! node's own bge, so nothing but the database changes for the indexer.
+//! node with the configured code model (bge-base unless `[vellev.code]`
+//! names another), so nothing but the database changes for the indexer.
 //!
 //! A collection is made sure of before its first use, and again before
 //! each use while the node does not answer. One of the wrong shape is
@@ -12,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use eyre::Result;
@@ -20,12 +21,14 @@ use serde_json::{json, Map, Value};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 use vellev_client::api::{Change, Changes, Content, Nearest, OnlyIf, Page};
-use vellev_client::{Client, Tenant};
-use vellev_core::{Collection, CollectionName, DataType, ObjectId, Property};
+use vellev_client::Client;
+use vellev_core::{Collection, CollectionName, DataType, Embedding, ObjectId, Property};
 use vellev_index::filter::Filter;
+use workforce_common::settings::{CodeModel, QueryPrefix, VellevConfig};
 use workforce_vellev::seeding::{apply_embedded, Seeding};
 use workforce_vellev::{
-    collection, failure, is_conflict, local_embedding, Asked, Cap, Ensured, Unusable,
+    collection, embedding_of, failure, is_conflict, local_embedding, Asked, Cap, Ensured, Unusable,
+    LOCAL_MODEL, LOCAL_QUERY_PREFIX, RECHECK_AFTER,
 };
 
 use super::health::{InsertErrorSink, InsertErrorSlot};
@@ -87,12 +90,40 @@ const REINDEX: &str = "drop it, then run a full index of each repository (the kn
 /// as they are, but for their fill.
 pub(crate) type Matched = HashSet<ObjectId>;
 
+/// How the code collections embed for `model`, as `[vellev.code]` names
+/// it: today's bge-base and its query prefix when it names none. An unset
+/// prefix is bge's only for bge-base, the model it belongs to.
+pub fn code_embedding(model: Option<CodeModel<'_>>) -> Embedding {
+    let Some(CodeModel {
+        model,
+        dimensions,
+        query_prefix,
+    }) = model
+    else {
+        return local_embedding(&[]);
+    };
+    let query_prefix = match query_prefix {
+        QueryPrefix::Unset if model == LOCAL_MODEL => Some(LOCAL_QUERY_PREFIX),
+        QueryPrefix::Unset | QueryPrefix::None => None,
+        QueryPrefix::Given(prefix) => Some(prefix),
+    };
+    embedding_of(model, dimensions, query_prefix, &[])
+}
+
+/// What was last found of whose the tenant's code vectors are, and when.
+#[derive(Clone)]
+enum Owned {
+    Ours(Instant),
+    /// The node does not serve the tenant.
+    Misrouted(Unusable, Instant),
+}
+
 /// The [`CodeVectorStore`] on vellev.
 pub struct VellevCodeVectorStore {
     base_url: String,
-    /// The tenant as writes the node embeds, a batch at a time, reach it.
-    writes: Tenant,
     tenants: workforce_vellev::Tenants,
+    /// How the collections embed, but for what.
+    local: Embedding,
     entities: Ensured,
     summaries: Ensured,
     /// The most results the node gives for one request.
@@ -105,9 +136,9 @@ pub struct VellevCodeVectorStore {
     seeding: Option<Seeding>,
     /// The code graph these vectors are kept for, when it is known.
     graph: std::sync::OnceLock<String>,
-    /// Set once the tenant's code vectors are found to be this graph's.
-    /// When the tenant's code vectors were last found to be this graph's.
-    owned: std::sync::Mutex<Option<std::time::Instant>>,
+    /// When the tenant's code vectors were last found to be this graph's,
+    /// or its node found not to serve the tenant.
+    owned: std::sync::Mutex<Option<Owned>>,
     /// For how long that is taken as still so, by a write.
     claim_recheck: Duration,
 }
@@ -117,14 +148,14 @@ impl VellevCodeVectorStore {
     /// `api_key`; every request is bounded by the client's timeout.
     pub fn new(url: &str, api_key: &str, tenant: &str) -> Result<Self> {
         let tenants = workforce_vellev::connect(url, api_key, tenant)?;
+        let local = local_embedding(&[]);
+        let (entities, summaries) = collections(&tenants, &local)?;
         Ok(Self {
             base_url: url.to_string(),
-            entities: Ensured::new(tenants.reads.clone(), entity_collection()?, REINDEX)
-                .identified(),
-            summaries: Ensured::new(tenants.reads.clone(), summary_collection()?, REINDEX)
-                .identified(),
-            tenants: tenants.clone(),
-            writes: tenants.writes,
+            entities,
+            summaries,
+            tenants,
+            local,
             cap: Cap::default(),
             health: Client::new(url, HEALTH_TIMEOUT)?,
             insert_errors: InsertErrorSlot::default(),
@@ -143,6 +174,30 @@ impl VellevCodeVectorStore {
     pub fn for_graph(self, graph: &str) -> Self {
         self.keep_for_graph(graph);
         self
+    }
+
+    /// The store `vellev` configures for code vectors: on the node, tenant
+    /// and key `[vellev.code]` names, each `[vellev]`'s where it does not,
+    /// embedding with the code model it names.
+    pub fn configured(vellev: &VellevConfig) -> Result<Self> {
+        let node = vellev.code_node();
+        node.reachable("[knowledge] vector_backend = \"vellev\"")?;
+        let key = node.api_key.map_or("", |key| key.value);
+        Self::new(node.url.value, key, node.tenant.value)?
+            .embedding(code_embedding(vellev.code_model()?))
+    }
+
+    /// Have the collections embed as `local` does, but for what: the
+    /// configured code model ([`code_embedding`]). Before first use, as
+    /// the other builders.
+    pub fn embedding(self, local: Embedding) -> Result<Self> {
+        let (entities, summaries) = collections(&self.tenants, &local)?;
+        Ok(Self {
+            local,
+            entities,
+            summaries,
+            ..self
+        })
     }
 
     /// Look at whose the tenant's code vectors are no less often than
@@ -171,17 +226,34 @@ impl VellevCodeVectorStore {
         self.owned_within(Duration::ZERO).await
     }
 
+    /// A node found not to serve the tenant is taken not to, without
+    /// asking, until [`RECHECK_AFTER`], except before anything is removed.
     async fn owned_within(&self, recheck: Duration) -> Result<()> {
         let Some(graph) = self.graph.get() else {
             return Ok(());
         };
-        let last = *self.owned.lock().unwrap_or_else(|e| e.into_inner());
-        if last.is_some_and(|at| at.elapsed() < recheck) {
-            return Ok(());
+        let owned = || self.owned.lock().unwrap_or_else(|e| e.into_inner());
+        let last = owned().clone();
+        match last {
+            Some(Owned::Ours(at)) if at.elapsed() < recheck => return Ok(()),
+            Some(Owned::Misrouted(misrouted, at))
+                if !recheck.is_zero() && at.elapsed() < RECHECK_AFTER =>
+            {
+                return Err(eyre::Report::new(misrouted))
+            }
+            _ => {}
         }
-        let owner = workforce_vellev::index_claim(&self.tenants.reads, OWNER, graph).await?;
+        let owner = match workforce_vellev::index_claim(&self.tenants, OWNER, graph).await {
+            Ok(owner) => owner,
+            Err(e) => {
+                if let Some(misrouted) = e.downcast_ref::<Unusable>() {
+                    *owned() = Some(Owned::Misrouted(misrouted.clone(), Instant::now()));
+                }
+                return Err(e);
+            }
+        };
         let ours = owner == *graph;
-        *self.owned.lock().unwrap_or_else(|e| e.into_inner()) = ours.then(std::time::Instant::now);
+        *owned() = ours.then(|| Owned::Ours(Instant::now()));
         if !ours {
             return Err(eyre::eyre!(
                 "the code vectors of vellev tenant '{}' are kept for another code graph ({owner}), not this one ({graph}): a tenant holds one code graph's vectors. Give each code graph a tenant of its own, or have every hub use one code graph ([codegraph] backend = \"postgres\"); or, if this graph has replaced that one (the code graph database was made again), run `workforce code reindex-vectors --take-over`",
@@ -203,16 +275,17 @@ impl VellevCodeVectorStore {
 
     /// The tenant, as reads and as writes reach it, and how the code
     /// collections embed: what an equivalence check needs.
-    pub fn embedded_as(&self) -> Result<(&workforce_vellev::Tenants, vellev_core::Embedding)> {
-        Ok((&self.tenants, entity_collection()?.embedding))
+    pub fn embedded_as(&self) -> Result<(&workforce_vellev::Tenants, Embedding)> {
+        Ok((&self.tenants, self.entities.wanted().embedding.clone()))
     }
 
-    /// `e`, an indexing of `what` that failed, as the sink hears of it.
+    /// `e`, an indexing of `what` that failed, as the sink hears of it,
+    /// keeping what it is.
     fn told(&self, what: &str, e: eyre::Report) -> eyre::Report {
-        let message = format!("vellev batch index of {what} failed: {e}");
+        let failed = format!("vellev batch index of {what} failed");
         warn!(error = %e, what, "vellev batch insert failed");
-        self.insert_errors.notify(&message);
-        eyre::eyre!(message)
+        self.insert_errors.notify(&format!("{failed}: {e}"));
+        e.wrap_err(failed)
     }
 
     /// Store `changes` into `collection`, a batch at a time; the sink hears
@@ -223,7 +296,7 @@ impl VellevCodeVectorStore {
         let told = |e| self.told(what, e);
         if let Some(seeding) = &self.seeding {
             collection.records().await.map_err(told)?;
-            let stored = apply_embedded(&self.writes, collection.wanted(), seeding, changes)
+            let stored = apply_embedded(&self.tenants, collection.wanted(), seeding, changes)
                 .await
                 .map_err(told)?;
             debug!(
@@ -239,7 +312,7 @@ impl VellevCodeVectorStore {
             let applied = collection
                 .run(|| {
                     let batch = batch.to_vec();
-                    async move { self.writes.apply(batch).await }
+                    async move { self.tenants.writes.apply(batch).await }
                 })
                 .await;
             applied.map_err(told)?;
@@ -337,11 +410,15 @@ impl VellevCodeVectorStore {
                 .iter()
                 .map(|entity| fill_patch(name, entity))
                 .collect();
-            match self.writes.apply(patches).await {
+            match self.tenants.writes.apply(patches).await {
                 Ok(_) => refilled += batch.len(),
                 Err(e) if is_conflict(&e) || e.is_not_found() => refused.extend_from_slice(batch),
                 Err(e) => {
-                    let failed = failure(e, &self.writes, Asked::Request(name));
+                    let asked = Asked::Request {
+                        name,
+                        model: &self.local.model,
+                    };
+                    let failed = failure(e, &self.tenants, asked);
                     return Err(self.told("entities", failed));
                 }
             }
@@ -405,7 +482,7 @@ impl VellevCodeVectorStore {
                         .iter()
                         .map(|id| Change::delete(collection.name().clone(), *id))
                         .collect();
-                    async move { self.writes.apply(deletes).await }
+                    async move { self.tenants.writes.apply(deletes).await }
                 })
                 .await?;
         }
@@ -421,7 +498,7 @@ impl VellevCodeVectorStore {
             .run(|| {
                 workforce_vellev::delete_where(
                     &self.tenants.reads,
-                    &self.writes,
+                    &self.tenants.writes,
                     collection.name(),
                     &filter,
                 )
@@ -434,9 +511,29 @@ impl VellevCodeVectorStore {
     }
 }
 
+/// The two code collections in the tenant, embedding as `local` does.
+fn collections(
+    tenants: &workforce_vellev::Tenants,
+    local: &Embedding,
+) -> Result<(Ensured, Ensured)> {
+    let ensured = |wanted| Ensured::new(tenants.clone(), wanted, REINDEX).identified();
+    Ok((
+        ensured(entity_collection(local)?),
+        ensured(summary_collection(local)?),
+    ))
+}
+
+/// How a collection embedding as `local` does embeds `property`.
+fn embedding_on(local: &Embedding, property: &str) -> Embedding {
+    Embedding {
+        properties: vec![property.to_string()],
+        ..local.clone()
+    }
+}
+
 /// `CodeEntity` as search, deletes and a fill's compare read it, embedded
 /// by the node on its searchable content, which it does not keep.
-fn entity_collection() -> Result<Collection> {
+fn entity_collection(local: &Embedding) -> Result<Collection> {
     Ok(collection(
         CollectionName::new(CODE_ENTITY_COLLECTION)?,
         [
@@ -452,7 +549,7 @@ fn entity_collection() -> Result<Collection> {
             filtered(HASH),
         ]
         .into(),
-        local_embedding(&["searchableContent"]),
+        embedding_on(local, "searchableContent"),
     ))
 }
 
@@ -511,7 +608,7 @@ fn fill_patch(collection: &CollectionName, entity: &VectorCodeEntity) -> Change 
 }
 
 /// `CodeSummary` as Weaviate has it, embedded by the node on its text.
-fn summary_collection() -> Result<Collection> {
+fn summary_collection(local: &Embedding) -> Result<Collection> {
     Ok(collection(
         CollectionName::new(CODE_SUMMARY_COLLECTION)?,
         [
@@ -526,7 +623,7 @@ fn summary_collection() -> Result<Collection> {
             filtered(SUMMARY_KEY),
         ]
         .into(),
-        local_embedding(&["summaryText"]),
+        embedding_on(local, "summaryText"),
     ))
 }
 
@@ -659,6 +756,10 @@ impl CodeVectorStore for VellevCodeVectorStore {
         &self.base_url
     }
 
+    fn tenant(&self) -> Option<String> {
+        Some(self.tenants.reads.id().to_string())
+    }
+
     fn set_insert_error_sink(&self, sink: Arc<dyn InsertErrorSink>) {
         self.insert_errors.set(sink);
     }
@@ -780,7 +881,7 @@ impl CodeVectorStore for VellevCodeVectorStore {
         if self.graph.get().is_none() {
             return Ok(());
         }
-        workforce_vellev::index_unmark(&self.tenants.reads, OWNER).await?;
+        workforce_vellev::index_unmark(&self.tenants, OWNER).await?;
         self.owned_now().await
     }
 
@@ -997,9 +1098,86 @@ mod tests {
         }
     }
 
+    const SMALL: &str = "BAAI/bge-small-en-v1.5";
+
+    /// bge-small, as `[vellev.code]` would name it with bge's prefix.
+    fn small() -> Embedding {
+        embedding_of(SMALL, 384, Some(LOCAL_QUERY_PREFIX), &[])
+    }
+
+    /// A store of `node`'s tenant embedding as `local` does.
+    fn embedding_as(node: &Node, local: Embedding) -> VellevCodeVectorStore {
+        VellevCodeVectorStore::new(&node.url, &node.key, &node.tenant)
+            .unwrap()
+            .embedding(local)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_configured_code_model_shapes_both_collections() {
+        let store = VellevCodeVectorStore::new("http://127.0.0.1:1", "key", "code").unwrap();
+        for (collection, property) in [
+            (&store.entities, "searchableContent"),
+            (&store.summaries, "summaryText"),
+        ] {
+            assert_eq!(
+                collection.wanted().embedding,
+                local_embedding(&[property]),
+                "{property}"
+            );
+        }
+        let configured = store.embedding(small()).unwrap();
+        for (collection, property) in [
+            (&configured.entities, "searchableContent"),
+            (&configured.summaries, "summaryText"),
+        ] {
+            let embedding = &collection.wanted().embedding;
+            assert_eq!(
+                (embedding.model.as_str(), embedding.dimensions),
+                (SMALL, 384)
+            );
+            assert_eq!(embedding.query_prefix.as_deref(), Some(LOCAL_QUERY_PREFIX));
+            assert_eq!(embedding.document_prefix, None);
+            assert_eq!(embedding.properties, [property]);
+        }
+        assert_eq!(
+            configured.embedded_as().unwrap().1,
+            configured.entities.wanted().embedding
+        );
+    }
+
+    #[test]
+    fn the_code_model_resolves_to_todays_embedding_unless_configured() {
+        let model = |model, dimensions, query_prefix| {
+            code_embedding(Some(CodeModel {
+                model,
+                dimensions,
+                query_prefix,
+            }))
+        };
+        assert_eq!(code_embedding(None), local_embedding(&[]));
+        assert_eq!(
+            model(LOCAL_MODEL, 768, QueryPrefix::Unset),
+            local_embedding(&[])
+        );
+        let mini = "Qdrant/all-MiniLM-L6-v2-onnx";
+        assert_eq!(
+            model(mini, 384, QueryPrefix::Unset),
+            embedding_of(mini, 384, None, &[])
+        );
+        assert_eq!(
+            model(LOCAL_MODEL, 768, QueryPrefix::None).query_prefix,
+            None
+        );
+        assert_eq!(
+            model(mini, 384, QueryPrefix::Given("query: ")).query_prefix,
+            Some("query: ".to_string())
+        );
+    }
+
     #[test]
     fn the_entity_collection_keeps_only_what_is_read_and_embeds_what_it_does_not_keep() {
-        let made = entity_collection().unwrap();
+        let made = entity_collection(&local_embedding(&[])).unwrap();
         made.validate().unwrap();
         let unstored: Vec<&str> = made
             .properties
@@ -1029,7 +1207,7 @@ mod tests {
             .keys()
             .cloned()
             .collect();
-        let shaped: HashSet<String> = entity_collection()
+        let shaped: HashSet<String> = entity_collection(&local_embedding(&[]))
             .unwrap()
             .properties
             .into_iter()
@@ -1445,11 +1623,29 @@ mod tests {
     /// kept that nothing reads.
     #[tokio::test]
     async fn the_slim_collection_is_made_as_wanted() {
-        let Some(node) = Node::embedding().await else {
-            return;
-        };
-        let store = VellevCodeVectorStore::new(&node.url, &node.key, &node.tenant).unwrap();
+        for local in [local_embedding(&[]), small()] {
+            let Some(node) = Node::embedding().await else {
+                return;
+            };
+            made_as_wanted(embedding_as(&node, local)).await;
+        }
+    }
+
+    /// The store's collections as the node made them: as wanted, and an
+    /// entity found by its text.
+    async fn made_as_wanted(store: VellevCodeVectorStore) {
         store.ensure_collections().await.unwrap();
+        for collection in [&store.entities, &store.summaries] {
+            let made = collection.collection().schema().await.unwrap().unwrap();
+            assert_eq!(made.embedding, collection.wanted().embedding);
+        }
+        let entity = documented("repo", "parse_config", "Reads the TOML configuration file");
+        assert_eq!(store.index_entities(&[entity]).await.unwrap(), 1);
+        let found = store
+            .search_entities("reading the configuration", Some("repo"), None, 5)
+            .await
+            .unwrap();
+        assert_eq!(found[0].entity_id, "parse_config");
         let made = store.entities.collection().schema().await.unwrap().unwrap();
         assert!(!made.property("searchableContent").unwrap().stored);
         assert!(made
@@ -1645,7 +1841,7 @@ mod tests {
     #[tokio::test]
     async fn a_patch_the_node_fails_reaches_the_insert_error_sink() {
         use axum::response::IntoResponse;
-        let mut held = entity_collection().unwrap();
+        let mut held = entity_collection(&local_embedding(&[])).unwrap();
         held.properties.push(Property {
             filterable: false,
             ..Property::new("incarnation_0", DataType::Bool)
@@ -1703,7 +1899,7 @@ mod tests {
     /// needs, is used as it is: written to, searched and compared, and
     /// its fills patched.
     #[tokio::test]
-    async fn a_collection_made_before_the_slim_shape_is_still_used() {
+    async fn a_collection_that_keeps_its_embedded_text_is_still_used() {
         let Some(node) = Node::embedding().await else {
             return;
         };
@@ -1715,7 +1911,18 @@ mod tests {
             .await
             .unwrap();
         let store = VellevCodeVectorStore::new(&node.url, &node.key, &node.tenant).unwrap();
-        store.ensure_collections().await.unwrap();
+        let logged = crate::vector::tests::logged(async {
+            store.ensure_collections().await.unwrap();
+        })
+        .await;
+        let warned: Vec<&str> = logged
+            .lines()
+            .filter(|line| line.contains("WARN") && line.contains("collection keeps text"))
+            .collect();
+        assert!(
+            warned.len() == 1 && warned[0].contains("searchableContent"),
+            "{logged}"
+        );
         let entities = [
             documented("repo", "parse_config", "Reads the TOML configuration file"),
             documented("repo", "send_email", "Delivers a message over SMTP"),
@@ -1740,6 +1947,91 @@ mod tests {
             .map(|properties| properties[FILL].clone())
             .collect();
         assert_eq!(fills, [json!("two"), json!("two")]);
+    }
+
+    /// The text a code collection of bge-base at 768 is refused with, by a
+    /// store configured for bge-small at 384.
+    fn refused_as_bge_base(e: &eyre::Report, collection: &str) {
+        let Some(Unusable::Refused(_)) = e.downcast_ref::<Unusable>() else {
+            panic!("refused, not {e:?}");
+        };
+        let told = format!("{e:#}");
+        for said in [
+            &format!("'{collection}'"),
+            "it embeds with 'BAAI/bge-base-en-v1.5', expected 'BAAI/bge-small-en-v1.5'",
+            "vectors have 768 dimensions, expected 384",
+        ] {
+            assert!(told.contains(said), "{said}: {told}");
+        }
+    }
+
+    /// A collection of another model is refused, naming both models and
+    /// sizes, and nothing is written to it or added to its schema.
+    #[tokio::test]
+    async fn a_collection_of_another_size_is_refused_naming_both_and_nothing_written() {
+        let today = local_embedding(&[]);
+        for made in [
+            entity_collection(&today).unwrap(),
+            summary_collection(&today).unwrap(),
+        ] {
+            let Some(node) = Node::embedding().await else {
+                return;
+            };
+            let tenant = node.tenant();
+            let held = tenant.collection(&made.name);
+            held.create(&made).await.unwrap();
+            let before = held.schema().await.unwrap().unwrap();
+            let store = embedding_as(&node, small());
+            let name = made.name.to_string();
+            refused_as_bge_base(&store.ensure_collections().await.unwrap_err(), &name);
+            let content = "parse_config reads the configuration";
+            let written = match name.as_str() {
+                CODE_ENTITY_COLLECTION => store
+                    .index_entities(&[entity("r", "e", "f", "Function", content)])
+                    .await
+                    .map(|_| ()),
+                _ => store
+                    .index_summaries(&[summary("r", "e", "f", content)])
+                    .await
+                    .map(|_| ()),
+            };
+            assert!(written.is_err(), "{name}");
+            assert_eq!(held.schema().await.unwrap().unwrap(), before, "{name}");
+            assert_eq!(held.count(None).await.unwrap(), 0, "{name}");
+        }
+    }
+
+    /// A collection replaced underneath a store, at another model's size
+    /// as a restored backup of another model would be, is refused once
+    /// the store looks again, and nothing is written to it.
+    #[tokio::test]
+    async fn a_collection_replaced_underneath_at_another_size_is_refused_at_the_recheck() {
+        let Some(node) = Node::embedding().await else {
+            return;
+        };
+        let store = embedding_as(&node, small());
+        let content = "parse_config reads the configuration";
+        let one = entity("r", "e", "f", "Function", content);
+        assert_eq!(
+            store
+                .index_entities(std::slice::from_ref(&one))
+                .await
+                .unwrap(),
+            1
+        );
+        let tenant = node.tenant();
+        let held = tenant.collection(&store.entities.wanted().name);
+        held.drop().await.unwrap();
+        held.create(&entity_collection(&local_embedding(&[])).unwrap())
+            .await
+            .unwrap();
+        let rechecked = store.entities.recheck().await.map(|_| ()).unwrap_err();
+        refused_as_bge_base(&rechecked, CODE_ENTITY_COLLECTION);
+        let searched = store.search_entities(content, None, None, 5).await;
+        refused_as_bge_base(&searched.unwrap_err(), CODE_ENTITY_COLLECTION);
+        let written = store.index_entities(std::slice::from_ref(&one)).await;
+        refused_as_bge_base(&written.unwrap_err(), CODE_ENTITY_COLLECTION);
+        assert_eq!(held.count(None).await.unwrap(), 0);
     }
 
     /// Needs a node that runs the local model.
@@ -2002,7 +2294,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let (now, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let sizes = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut held = entity_collection().unwrap();
+        let mut held = entity_collection(&local_embedding(&[])).unwrap();
         held.properties
             .push(Property::new("incarnation_1", DataType::Bool));
         let (counted, peak, seen) = (now.clone(), most.clone(), sizes.clone());
@@ -2128,11 +2420,11 @@ mod tests {
     async fn no_keyword_or_hybrid_question_is_asked_of_the_code_collections() {
         use axum::response::IntoResponse;
         let asked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let mut entities = entity_collection().unwrap();
+        let mut entities = entity_collection(&local_embedding(&[])).unwrap();
         entities
             .properties
             .push(Property::new("incarnation_1", DataType::Bool));
-        let mut summaries = summary_collection().unwrap();
+        let mut summaries = summary_collection(&local_embedding(&[])).unwrap();
         summaries
             .properties
             .push(Property::new("incarnation_1", DataType::Bool));

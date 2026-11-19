@@ -480,7 +480,7 @@ impl IndexingPipeline {
                     "{}",
                     format_vector_index_outcome("entities", submitted, indexed)
                 ),
-                Err(e) => warn!("Vector indexing failed (non-fatal): {}", e),
+                Err(e) => warn!("Vector indexing failed (non-fatal): {e:#}"),
             }
         }
 
@@ -796,7 +796,7 @@ impl IndexingPipeline {
                     format_vector_index_outcome("entities", submitted, indexed)
                 ),
                 Err(e) => {
-                    warn!("Vector indexing failed (non-fatal): {}", e);
+                    warn!("Vector indexing failed (non-fatal): {e:#}");
                     self.vectors_behind.store(true, Ordering::SeqCst);
                 }
             }
@@ -1403,7 +1403,7 @@ impl IndexingPipeline {
                 format_vector_index_outcome("summaries", submitted, indexed)
             ),
             Err(e) => {
-                warn!("Vector summary indexing failed (non-fatal): {}", e);
+                warn!("Vector summary indexing failed (non-fatal): {e:#}");
                 if kept_track && !elsewhere {
                     pending().await;
                 }

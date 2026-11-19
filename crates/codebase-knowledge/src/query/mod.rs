@@ -14,7 +14,7 @@ use workforce_common::breaker::Breaker;
 use crate::freshness::{FreshnessResult, FreshnessTracker};
 use crate::graph::entities::{CodeEntity, EntityId};
 use crate::graph::CodeGraph;
-use crate::vector::CodeVectorStore;
+use crate::vector::{CodeSearchUnavailable, CodeVectorStore};
 
 use self::confidence::{ConfidenceFactors, ConfidenceScore};
 use self::explanation::{ExplanationAspect, ExplanationBuilder};
@@ -120,6 +120,8 @@ pub struct QueryEngine {
     /// Why the last search of each repo's vectors did not serve, if it did
     /// not.
     unserved: Mutex<HashMap<String, String>>,
+    /// Whether questions search the vectors at all.
+    code_search: bool,
 }
 
 /// How long a question waits on the vector store before going on without
@@ -131,6 +133,18 @@ pub struct QueryEngine {
 pub struct VectorWait {
     pub deadline: Duration,
     pub rest: Duration,
+}
+
+/// Why the vectors did not serve, the store having failed with `e`: a
+/// node that does not serve the tenant leaves code search unavailable,
+/// saying so; anything else is said after `prefix`.
+fn unserved_by(prefix: &str, e: &eyre::Report) -> String {
+    match e.downcast_ref::<workforce_vellev::Unusable>() {
+        Some(misrouted @ workforce_vellev::Unusable::Misrouted { .. }) => {
+            CodeSearchUnavailable::Misrouted(misrouted.to_string()).to_string()
+        }
+        _ => format!("{prefix}: {e:#}"),
+    }
 }
 
 const LEFT_ALONE: &str =
@@ -158,7 +172,16 @@ impl QueryEngine {
             vectors_suspected: Arc::default(),
             wait: None,
             unserved: Mutex::default(),
+            code_search: true,
         }
+    }
+
+    /// Search the vectors for questions only if `enabled`: off, questions
+    /// are answered from the graph alone, saying so, and the store is not
+    /// asked anything for them.
+    pub fn code_search(mut self, enabled: bool) -> Self {
+        self.code_search = enabled;
+        self
     }
 
     /// Wait on the vector store as `wait` says. Without this a question
@@ -242,6 +265,9 @@ impl QueryEngine {
         let Some(vs) = self.vector_store.as_ref() else {
             return Err("no vector store is configured".to_string());
         };
+        if !self.code_search {
+            return Err(CodeSearchUnavailable::Off.to_string());
+        }
         if !vs.tracks_completeness() {
             return Ok(vs);
         }
@@ -261,7 +287,7 @@ impl QueryEngine {
                     repo_id,
                     "could not tell whether the repo's vectors are complete: {e}"
                 );
-                Err(format!("the vector store failed: {e:#}"))
+                Err(unserved_by("the vector store failed", &e))
             }
         }
     }
@@ -280,7 +306,10 @@ impl QueryEngine {
         let Some(vs) = self.vector_store.as_ref() else {
             return Err("no vector store is configured".to_string());
         };
-        let failed = |e: eyre::Report| format!("the search of the vector store failed: {e:#}");
+        if !self.code_search {
+            return Err(CodeSearchUnavailable::Off.to_string());
+        }
+        let failed = |e: eyre::Report| unserved_by("the search of the vector store failed", &e);
         if !vs.tracks_completeness() {
             let found = vs.search_entities(question, Some(repo_id), None, 20).await;
             return found.map_err(failed);

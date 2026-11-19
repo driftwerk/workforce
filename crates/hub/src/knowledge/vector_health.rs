@@ -36,10 +36,15 @@ pub enum VectorBackendHealth {
     Disabled,
     Healthy {
         url: String,
+        /// The tenant the store keeps its vectors in, where it has one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tenant: Option<String>,
         last_checked_at: DateTime<Utc>,
     },
     Unhealthy {
         url: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tenant: Option<String>,
         last_checked_at: DateTime<Utc>,
         reason: UnhealthyReason,
     },
@@ -94,11 +99,12 @@ impl BackendHealthProbe {
         let Some(store) = &self.store else {
             return VectorBackendHealth::Disabled;
         };
-        let url = store.base_url().to_string();
+        let (url, tenant) = (store.base_url().to_string(), store.tenant());
         let now = Utc::now();
         match tokio::time::timeout(self.readiness_timeout, store.health_check()).await {
             Err(_) => VectorBackendHealth::Unhealthy {
                 url,
+                tenant,
                 last_checked_at: now,
                 reason: UnhealthyReason::Timeout {
                     after_ms: self.readiness_timeout.as_millis() as u64,
@@ -106,6 +112,7 @@ impl BackendHealthProbe {
             },
             Ok(Err(e)) => VectorBackendHealth::Unhealthy {
                 url,
+                tenant,
                 last_checked_at: now,
                 reason: UnhealthyReason::ReadinessFailed {
                     error: e.to_string(),
@@ -113,20 +120,27 @@ impl BackendHealthProbe {
             },
             Ok(Ok(false)) => VectorBackendHealth::Unhealthy {
                 url,
+                tenant,
                 last_checked_at: now,
                 reason: UnhealthyReason::ReadinessFailed {
                     error: "readiness endpoint returned non-success".to_string(),
                 },
             },
-            Ok(Ok(true)) => self.recent_errors_state(url, now),
+            Ok(Ok(true)) => self.recent_errors_state(url, tenant, now),
         }
     }
 
-    fn recent_errors_state(&self, url: String, now: DateTime<Utc>) -> VectorBackendHealth {
+    fn recent_errors_state(
+        &self,
+        url: String,
+        tenant: Option<String>,
+        now: DateTime<Utc>,
+    ) -> VectorBackendHealth {
         let in_window = self.recent_errors_within_window(now);
         if in_window.is_empty() {
             return VectorBackendHealth::Healthy {
                 url,
+                tenant,
                 last_checked_at: now,
             };
         }
@@ -136,6 +150,7 @@ impl BackendHealthProbe {
             .unwrap_or_default();
         VectorBackendHealth::Unhealthy {
             url,
+            tenant,
             last_checked_at: now,
             reason: UnhealthyReason::RecentInsertErrors {
                 window_secs: self.error_window.as_secs(),
@@ -271,8 +286,51 @@ mod tests {
         let probe = BackendHealthProbe::new(Some(up));
         assert!(matches!(
             probe.current().await,
-            VectorBackendHealth::Healthy { ref url, .. } if *url == node.url
+            VectorBackendHealth::Healthy { ref url, ref tenant, .. }
+                if *url == node.url && *tenant == Some(node.tenant.clone())
         ));
+    }
+
+    /// A code store whose node does not serve its tenant is unhealthy,
+    /// naming the node and the tenant.
+    #[tokio::test]
+    async fn a_misrouted_code_store_is_unhealthy_naming_its_node_and_tenant() {
+        use axum::response::IntoResponse;
+        let app = axum::Router::new().fallback(|uri: axum::http::Uri| async move {
+            if uri.path().starts_with("/health") {
+                return axum::http::StatusCode::OK.into_response();
+            }
+            (
+                axum::http::StatusCode::MISDIRECTED_REQUEST,
+                axum::Json(serde_json::json!({ "error": {
+                    "code": "not_served_here",
+                    "message": "tenant code is not served by this node; ask a node that serves it",
+                }})),
+            )
+                .into_response()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let store: Arc<dyn CodeVectorStore> = Arc::new(
+            workforce_codebase_knowledge::vector::VellevCodeVectorStore::new(&url, "key", "code")
+                .unwrap(),
+        );
+        let probe = BackendHealthProbe::new(Some(store));
+        match probe.current().await {
+            VectorBackendHealth::Unhealthy {
+                tenant,
+                reason: UnhealthyReason::ReadinessFailed { error },
+                ..
+            } => {
+                assert_eq!(tenant.as_deref(), Some("code"));
+                assert!(
+                    error.contains("misrouted") && error.contains("'code'") && error.contains(&url),
+                    "{error}"
+                );
+            }
+            other => panic!("expected a misroute, got {other:?}"),
+        }
     }
 
     /// A code collection of the wrong shape, such as one vellev's importer
@@ -377,13 +435,19 @@ mod tests {
     fn state_serialises_with_tag() {
         let v = serde_json::to_value(VectorBackendHealth::Disabled).unwrap();
         assert_eq!(v, serde_json::json!({ "state": "disabled" }));
-        let v = serde_json::to_value(VectorBackendHealth::Healthy {
-            url: "u".into(),
-            last_checked_at: DateTime::<Utc>::from_timestamp(0, 0).unwrap(),
-        })
-        .unwrap();
+        let healthy = |tenant: Option<&str>| {
+            serde_json::to_value(VectorBackendHealth::Healthy {
+                url: "u".into(),
+                tenant: tenant.map(str::to_string),
+                last_checked_at: DateTime::<Utc>::from_timestamp(0, 0).unwrap(),
+            })
+            .unwrap()
+        };
+        let v = healthy(None);
         assert_eq!(v["state"], "healthy");
         assert_eq!(v["url"], "u");
+        assert!(v.get("tenant").is_none(), "weaviate has none: {v}");
+        assert_eq!(healthy(Some("code"))["tenant"], "code");
     }
 
     #[test]

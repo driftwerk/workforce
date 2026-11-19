@@ -2,9 +2,10 @@
 //! the node's own embedding model, the limit on one request, making sure a
 //! collection exists in a shape the store can use, and markers.
 //!
-//! Artifacts and code are always embedded by the node's own bge
-//! ([`LOCAL_MODEL`]), so the node must run it; memories are too, unless
-//! `[embeddings]` has the hub embed them.
+//! Artifacts are always embedded by the node's own bge ([`LOCAL_MODEL`]),
+//! so the node must run it; memories are too, unless `[embeddings]` has the
+//! hub embed them. Code is embedded with the model `[vellev.code]` names,
+//! bge by default, and its node must run that one.
 
 mod cap;
 mod deletes;
@@ -27,8 +28,8 @@ use vellev_core::{
 pub use cap::{Cap, MAX_RESULTS};
 pub use deletes::{delete_where, DELETE_CAP};
 pub use ensure::{
-    doctor, ensure, failure, identity, probe_model, Asked, Ensured, ModelUnavailable, Unusable,
-    RECHECK_AFTER, RETRY_AFTER,
+    classified, doctor, ensure, failure, identity, probe_model, Asked, Ensured, ModelUnavailable,
+    Unusable, RECHECK_AFTER, RETRY_AFTER,
 };
 pub use markers::{
     index_claim, index_mark, index_marked, index_unmark, mark, mark_promoted, marked, marker_id,
@@ -79,6 +80,8 @@ impl Default for Timeouts {
 pub struct Tenants {
     pub reads: Tenant,
     pub writes: Tenant,
+    /// The URL of the node they were reached at, without a trailing `/`.
+    pub node: String,
 }
 
 /// `tenant` on the node at `url`, reached with `api_key`, with the default
@@ -98,6 +101,7 @@ pub fn connect_with(url: &str, api_key: &str, tenant: &str, timeouts: Timeouts) 
     Ok(Tenants {
         reads: client.tenant(&tenant),
         writes: client.within(timeouts.write).tenant(&tenant),
+        node: url.trim_end_matches('/').to_string(),
     })
 }
 
@@ -110,6 +114,23 @@ pub fn local_embedding(properties: &[&str]) -> Embedding {
         query_prefix: Some(LOCAL_QUERY_PREFIX.to_string()),
         document_prefix: None,
         properties: properties.iter().map(|p| p.to_string()).collect(),
+    }
+}
+
+/// Embedding by the node's own `model`, of vectors of `dimensions`, with
+/// `query_prefix` before a query and nothing before a document, of
+/// `properties` in order.
+pub fn embedding_of(
+    model: &str,
+    dimensions: u32,
+    query_prefix: Option<&str>,
+    properties: &[&str],
+) -> Embedding {
+    Embedding {
+        model: model.to_string(),
+        dimensions,
+        query_prefix: query_prefix.map(str::to_string),
+        ..local_embedding(properties)
     }
 }
 
@@ -138,7 +159,9 @@ pub fn is_conflict(error: &vellev_client::Error) -> bool {
 /// and `VELLEV_TEST_LOCAL_EMBED=1` says it runs the local model. It must be
 /// a throwaway node run with `VELLEV_MAX_FORMAT=2`, as CI runs one, never
 /// one holding data you keep: the code tests make collections only format 2
-/// holds, and a node's format, once raised, is never lowered.
+/// holds, and a node's format, once raised, is never lowered. Tests of a
+/// configured code model embed with bge-small as well, so the node must
+/// allow it (`VELLEV_LOCAL_MODELS_ALLOWED=BAAI/bge-small-en-v1.5`).
 #[cfg(feature = "testing")]
 pub mod testing {
     use super::*;
@@ -151,10 +174,12 @@ pub mod testing {
     }
 
     /// An embedder that has the node itself embed, as a server of the same
-    /// model would: with `prefix` before every text, or its vectors
-    /// `scaled`, when told to be one that embeds otherwise.
+    /// model would: as `embedding` says (bge by default), with `prefix`
+    /// before every text, or its vectors `scaled`, when told to be one that
+    /// embeds otherwise.
     pub struct ByNode {
         pub tenants: Tenants,
+        pub embedding: Embedding,
         pub prefix: String,
         pub scaled: f32,
         /// How many texts it was asked for.
@@ -164,7 +189,8 @@ pub mod testing {
     impl ByNode {
         pub fn of(node: &Node) -> Self {
             Self {
-                tenants: connect(&node.url, &node.key, &node.tenant).expect("a usable test node"),
+                tenants: node.tenants(),
+                embedding: local_embedding(&["text"]),
                 prefix: String::new(),
                 scaled: 1.0,
                 asked: Default::default(),
@@ -185,7 +211,10 @@ pub mod testing {
             let scratch = collection(
                 CollectionName::new(format!("ByNode{}", uuid::Uuid::new_v4().simple()))?,
                 vec![Property::new("text", vellev_core::DataType::Text)],
-                local_embedding(&["text"]),
+                Embedding {
+                    properties: vec!["text".into()],
+                    ..self.embedding.clone()
+                },
             );
             let records = self.tenants.reads.collection(&scratch.name);
             records.create(&scratch).await?;
@@ -272,10 +301,12 @@ pub mod testing {
             Self::fresh().await
         }
 
+        pub fn tenants(&self) -> Tenants {
+            connect(&self.url, &self.key, &self.tenant).expect("a usable test node")
+        }
+
         pub fn tenant(&self) -> Tenant {
-            connect(&self.url, &self.key, &self.tenant)
-                .expect("a usable test node")
-                .reads
+            self.tenants().reads
         }
 
         /// A local URL that answers nothing yet, as a node not up; see
@@ -354,6 +385,9 @@ mod tests {
     use super::*;
 
     const REMEDY: &str = "put it right";
+
+    /// The model the tests of a configured one embed with.
+    const SMALL: &str = "BAAI/bge-small-en-v1.5";
 
     fn notes(embedding: Embedding) -> Collection {
         collection(
@@ -512,7 +546,7 @@ mod tests {
             self.requests.load(std::sync::atomic::Ordering::SeqCst)
         }
 
-        async fn serve(self: &std::sync::Arc<Self>) -> Tenant {
+        async fn serve(self: &std::sync::Arc<Self>) -> Tenants {
             use axum::response::IntoResponse;
             let fake = std::sync::Arc::clone(self);
             let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
@@ -535,7 +569,7 @@ mod tests {
                 }
             });
             let url = crate::serve(app).await;
-            connect(&url, "key", "harbor").unwrap().reads
+            connect(&url, "key", "harbor").unwrap()
         }
     }
 
@@ -592,8 +626,8 @@ mod tests {
             ..Timeouts::default()
         };
         let asking = || {
-            let tenant = connect_with(&url, "key", "harbor", timeouts).unwrap().reads;
-            Ensured::new(tenant, notes(local_embedding(&["body"])), REMEDY)
+            let tenants = connect_with(&url, "key", "harbor", timeouts).unwrap();
+            Ensured::new(tenants, notes(local_embedding(&["body"])), REMEDY)
         };
         let requests = || asked.load(std::sync::atomic::Ordering::SeqCst);
 
@@ -724,7 +758,7 @@ mod tests {
             "invalid",
             "limit must be from 1 to 3, not 10",
         ));
-        let tenant = fake.serve().await;
+        let tenant = fake.serve().await.reads;
         let cap = Cap::default();
         let asked = std::sync::Mutex::new(Vec::new());
         let _ = cap
@@ -774,10 +808,10 @@ mod tests {
             "unavailable",
             "the collection's embedding model could not be used just now",
         ));
-        let tenant = fake.serve().await;
+        let tenants = fake.serve().await;
         let wanted = notes(local_embedding(&["body"]));
-        let records = tenant.collection(&wanted.name);
-        let refused = probe_model(&tenant, &records, &wanted).await.unwrap_err();
+        let records = tenants.reads.collection(&wanted.name);
+        let refused = probe_model(&tenants, &records, &wanted).await.unwrap_err();
         let unavailable = refused
             .downcast_ref::<ModelUnavailable>()
             .expect("the model, named");
@@ -786,7 +820,7 @@ mod tests {
             .to_string()
             .contains("check that the node runs BAAI/bge-base-en-v1.5"));
         let asked = fake.requests();
-        probe_model(&tenant, &records, &notes(supplied("hub", 2)))
+        probe_model(&tenants, &records, &notes(supplied("hub", 2)))
             .await
             .unwrap();
         assert_eq!(fake.requests(), asked, "nothing to probe");
@@ -801,13 +835,18 @@ mod tests {
             "not_found",
             "collection TenantNotes does not exist",
         ));
-        let tenant = fake.serve().await;
+        let tenants = fake.serve().await;
         let name = CollectionName::new("TenantNotes").unwrap();
-        let answered = tenant.collection(&name).count(None).await.unwrap_err();
-        let failed = failure(answered, &tenant, Asked::Request(&name));
+        let records = tenants.reads.collection(&name);
+        let answered = records.count(None).await.unwrap_err();
+        let asked = Asked::Request {
+            name: &name,
+            model: LOCAL_MODEL,
+        };
+        let failed = failure(answered, &tenants, asked);
         assert!(failed.downcast_ref::<Unusable>().is_none(), "{failed}");
-        let answered = tenant.collections().await.unwrap_err();
-        let failed = failure(answered, &tenant, Asked::Tenant);
+        let answered = tenants.reads.collections().await.unwrap_err();
+        let failed = failure(answered, &tenants, Asked::Tenant);
         assert!(
             matches!(
                 failed.downcast_ref::<Unusable>(),
@@ -839,24 +878,24 @@ mod tests {
     }
 
     /// A node that says it cannot run the model at all is for an operator:
-    /// final, naming the model, where one that cannot just now is asked
-    /// again.
+    /// final, naming the collection's own model, where one that cannot just
+    /// now is asked again.
     #[tokio::test]
-    async fn a_node_that_cannot_run_the_model_at_all_is_unusable_naming_the_model() {
+    async fn a_node_that_cannot_run_the_model_names_the_collections_model() {
         let fake = std::sync::Arc::new(Fake::answering(
             501,
             "model_unavailable",
             "the collection's embedding model cannot be used by this node",
         ));
-        let tenant = fake.serve().await;
-        let wanted = notes(local_embedding(&["body"]));
-        let records = tenant.collection(&wanted.name);
+        let tenants = fake.serve().await;
+        let wanted = notes(embedding_of(SMALL, 384, None, &["body"]));
+        let records = tenants.reads.collection(&wanted.name);
         for refused in [
-            probe_model(&tenant, &records, &wanted).await.unwrap_err(),
+            probe_model(&tenants, &records, &wanted).await.unwrap_err(),
             failure(
                 records.count(None).await.unwrap_err(),
-                &tenant,
-                Asked::Request(&wanted.name),
+                &tenants,
+                Asked::request(&wanted),
             ),
         ] {
             let Some(Unusable::Model {
@@ -865,13 +904,10 @@ mod tests {
             else {
                 panic!("final, for an operator: {refused:?}");
             };
-            assert_eq!(
-                (model.as_str(), collection.as_str()),
-                (LOCAL_MODEL, "Notes")
-            );
+            assert_eq!((model.as_str(), collection.as_str()), (SMALL, "Notes"));
             let said = refused.to_string();
             assert!(
-                said.contains("cannot run 'BAAI/bge-base-en-v1.5'")
+                said.contains("cannot run 'BAAI/bge-small-en-v1.5'")
                     && said.contains("cannot be used by this node")
                     && said.contains("[vellev] url"),
                 "{said}"
@@ -879,14 +915,328 @@ mod tests {
         }
         // A refusal with another code is not it.
         let other = std::sync::Arc::new(Fake::answering(409, "conflict", "odd"));
-        let tenant = other.serve().await;
-        let answered = tenant
+        let tenants = other.serve().await;
+        let answered = tenants
+            .reads
             .collection(&wanted.name)
             .count(None)
             .await
             .unwrap_err();
-        let failed = failure(answered, &tenant, Asked::Request(&wanted.name));
+        let failed = failure(answered, &tenants, Asked::request(&wanted));
         assert!(failed.downcast_ref::<Unusable>().is_none(), "{failed}");
+    }
+
+    /// An embedder that gives every text the same made-up vector.
+    pub(super) struct Fixed(pub(super) Vec<f32>);
+
+    #[async_trait::async_trait]
+    impl seeding::DocumentEmbedder for Fixed {
+        fn name(&self) -> String {
+            "a made-up embedder".to_string()
+        }
+
+        async fn documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| self.0.clone()).collect())
+        }
+    }
+
+    const NOT_SERVED: (u16, &str, &str) = (
+        421,
+        "not_served_here",
+        "tenant harbor is not served by this node; ask a node that serves it",
+    );
+
+    fn not_served() -> std::sync::Arc<Fake> {
+        let (status, code, message) = NOT_SERVED;
+        std::sync::Arc::new(Fake::answering(status, code, message))
+    }
+
+    fn is_misrouted(report: &Report, at: &Tenants) -> bool {
+        unusable(report).is_some_and(|unusable| {
+            *unusable
+                == Unusable::Misrouted {
+                    tenant: "harbor".into(),
+                    node: at.node.clone(),
+                }
+        })
+    }
+
+    /// A collection made sure of whose node then stops serving the tenant
+    /// is told so by the request that meets it, and every request after
+    /// until the recheck is told without asking.
+    #[tokio::test]
+    async fn a_misroute_met_by_run_is_kept_until_the_recheck() {
+        use axum::response::IntoResponse;
+        let wanted = notes(local_embedding(&["body"]));
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let misrouting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (held, counting, flipping) = (
+            wanted.clone(),
+            std::sync::Arc::clone(&asked),
+            std::sync::Arc::clone(&misrouting),
+        );
+        let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let (held, counting, flipping) = (
+                held.clone(),
+                std::sync::Arc::clone(&counting),
+                std::sync::Arc::clone(&flipping),
+            );
+            async move {
+                use std::sync::atomic::Ordering::SeqCst;
+                counting.fetch_add(1, SeqCst);
+                let path = uri.path();
+                if flipping.load(SeqCst) {
+                    let (status, code, message) = NOT_SERVED;
+                    return (
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        axum::Json(serde_json::json!({
+                            "error": { "code": code, "message": message }
+                        })),
+                    )
+                        .into_response();
+                }
+                if path.ends_with("/collections") {
+                    return axum::Json(serde_json::json!({ "collections": [] })).into_response();
+                }
+                if path.ends_with("/nearest") {
+                    flipping.store(true, SeqCst);
+                    return axum::Json(serde_json::json!({ "results": [] })).into_response();
+                }
+                axum::Json(held).into_response()
+            }
+        });
+        let tenants = connect(&crate::serve(app).await, "key", "harbor").unwrap();
+        let ensured = Ensured::new(tenants.clone(), wanted, REMEDY);
+        let requests = || asked.load(std::sync::atomic::Ordering::SeqCst);
+        let first = ensured.run(|| ensured.collection().count(None)).await;
+        let first = first.unwrap_err();
+        assert!(is_misrouted(&first, &tenants), "{first:?}");
+        let made_sure = requests();
+        let second = ensured.run(|| ensured.collection().count(None)).await;
+        let second = second.unwrap_err();
+        assert!(is_misrouted(&second, &tenants), "{second:?}");
+        assert_eq!(requests(), made_sure, "told without asking");
+    }
+
+    /// The requests made outside a collection's checks, markers and
+    /// seeding, are told as misrouted as well; anything else is as it was.
+    #[tokio::test]
+    async fn a_marker_or_seeding_request_the_node_does_not_serve_is_misrouted() {
+        let tenants = not_served().serve().await;
+        let claimed = index_claim(&tenants, "CodeGraph", "g").await.unwrap_err();
+        assert!(is_misrouted(&claimed, &tenants), "{claimed:?}");
+        let lines = notes(local_embedding(&["body"]));
+        let seeding = seeding::Seeding::new(
+            std::sync::Arc::new(Fixed(vec![0.0; LOCAL_DIMENSIONS as usize])),
+            2,
+            1,
+        );
+        let upsert = vellev_client::api::Change::upsert(
+            lines.name.clone(),
+            vellev_core::ObjectId(uuid::Uuid::from_u128(1)),
+            vellev_client::api::Content::new(
+                serde_json::json!({ "body": "a line" })
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            ),
+        );
+        let applied = seeding::apply_embedded(&tenants, &lines, &seeding, vec![upsert]).await;
+        let applied = applied.unwrap_err();
+        assert!(is_misrouted(&applied, &tenants), "{applied:?}");
+        let measured = seeding::equivalence(
+            &tenants,
+            &local_embedding(&["text"]),
+            &Fixed(vec![1.0]),
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert!(is_misrouted(&measured, &tenants), "{measured:?}");
+
+        let missing = std::sync::Arc::new(Fake::answering(
+            404,
+            "not_found",
+            "tenant harbor does not exist",
+        ));
+        let tenants = missing.serve().await;
+        let claimed = index_claim(&tenants, "CodeGraph", "g").await.unwrap_err();
+        assert!(unusable(&claimed).is_none(), "{claimed:?}");
+        assert!(
+            claimed
+                .downcast_ref::<vellev_client::Error>()
+                .is_some_and(vellev_client::Error::is_not_found),
+            "{claimed:?}"
+        );
+    }
+
+    /// Vectors made outside the node of another size than the collection's
+    /// are refused, naming both, before anything is written.
+    #[tokio::test]
+    async fn a_seeded_vector_of_another_size_is_refused_and_nothing_written() {
+        let fake = std::sync::Arc::new(Fake::answering(500, "internal", "not to be asked"));
+        let tenants = fake.serve().await;
+        let small = notes(embedding_of(SMALL, 384, None, &["body"]));
+        let seeding = seeding::Seeding::new(
+            std::sync::Arc::new(Fixed(vec![0.5; LOCAL_DIMENSIONS as usize])),
+            2,
+            1,
+        );
+        let upsert = vellev_client::api::Change::upsert(
+            small.name.clone(),
+            vellev_core::ObjectId(uuid::Uuid::from_u128(1)),
+            vellev_client::api::Content::new(
+                serde_json::json!({ "body": "a line" })
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            ),
+        );
+        let refused = seeding::apply_embedded(&tenants, &small, &seeding, vec![upsert])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            refused,
+            "a made-up embedder gave a vector of 768 dimensions, and collection 'Notes' holds 384"
+        );
+        assert_eq!(fake.requests(), 0, "nothing written");
+    }
+
+    /// A made-up vector of `text`: the same for the same text, far from
+    /// another's.
+    fn made_up(text: &str) -> Vec<f32> {
+        use std::hash::{Hash, Hasher};
+        let vector: Vec<f32> = (0..16u8)
+            .map(|at| {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                (text, at).hash(&mut hasher);
+                (hasher.finish() % 2001) as f32 / 1000.0 - 1.0
+            })
+            .collect();
+        let length = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+        vector.into_iter().map(|x| x / length).collect()
+    }
+
+    /// An embedder of [`made_up`] vectors of each text after `prefix`.
+    struct Prefixing(String);
+
+    #[async_trait::async_trait]
+    impl seeding::DocumentEmbedder for Prefixing {
+        fn name(&self) -> String {
+            "a prefixing embedder".to_string()
+        }
+
+        async fn documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|text| made_up(&format!("{}{text}", self.0)))
+                .collect())
+        }
+    }
+
+    /// A node that embeds what is written to it as [`made_up`] does, and
+    /// keeps every text it was sent.
+    async fn embedding_node() -> (Tenants, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::response::IntoResponse;
+        let held: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
+        let sent: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let (holding, sending) = (std::sync::Arc::clone(&held), std::sync::Arc::clone(&sent));
+        let app =
+            axum::Router::new().fallback(move |uri: axum::http::Uri, body: axum::body::Bytes| {
+                let (held, sent) = (
+                    std::sync::Arc::clone(&holding),
+                    std::sync::Arc::clone(&sending),
+                );
+                async move {
+                    let written =
+                        serde_json::json!({ "incarnation": 1, "position": 1, "outcomes": [] });
+                    if uri.path().ends_with("/list") {
+                        let objects: Vec<serde_json::Value> = held
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .map(|(id, text)| {
+                                serde_json::json!({
+                                    "id": id,
+                                    "properties": { "text": text },
+                                    "vector": made_up(text),
+                                })
+                            })
+                            .collect();
+                        return axum::Json(serde_json::json!({ "objects": objects }))
+                            .into_response();
+                    }
+                    if uri.path().ends_with("/changes") {
+                        let batch: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        for change in batch["changes"].as_array().into_iter().flatten() {
+                            let text = change["properties"]["text"].as_str().unwrap().to_string();
+                            sent.lock().unwrap().push(text.clone());
+                            held.lock()
+                                .unwrap()
+                                .push((change["id"].as_str().unwrap().to_string(), text));
+                        }
+                    }
+                    axum::Json(written).into_response()
+                }
+            });
+        let tenants = connect(&crate::serve(app).await, "key", "harbor").unwrap();
+        (tenants, sent)
+    }
+
+    /// An embedder that puts the collection's own query prefix before
+    /// documents is told so by that prefix; with no prefix there is none
+    /// to confuse, so no text is sent after one.
+    #[tokio::test]
+    async fn equivalence_compares_with_the_collections_own_prefix() {
+        let texts = ["parse the config".to_string()];
+        let custom = embedding_of(SMALL, 16, Some("query: "), &["text"]);
+        let (tenants, sent) = embedding_node().await;
+        let measured =
+            seeding::equivalence(&tenants, &custom, &Prefixing("query: ".into()), &texts)
+                .await
+                .unwrap();
+        let sent = sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2 * measured.compared);
+        assert_eq!(
+            sent.iter()
+                .filter(|text| text.starts_with("query: "))
+                .count(),
+            measured.compared,
+            "{sent:?}"
+        );
+        assert_eq!(measured.query_prefix.as_deref(), Some("query: "));
+        assert!(
+            measured
+                .mean_against_prefixed
+                .is_some_and(|mean| mean > 0.999),
+            "{measured:?}"
+        );
+        let refused = measured
+            .checked("the endpoint", seeding::MIN_COSINE)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("it puts the query prefix (\"query: \") before documents"),
+            "{refused}"
+        );
+
+        let unprefixed = embedding_of(SMALL, 16, None, &["text"]);
+        let (tenants, sent) = embedding_node().await;
+        let measured =
+            seeding::equivalence(&tenants, &unprefixed, &Prefixing(String::new()), &texts)
+                .await
+                .unwrap();
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            measured.compared,
+            "sent once each"
+        );
+        assert_eq!(
+            (measured.query_prefix, measured.mean_against_prefixed),
+            (None, None)
+        );
+        assert!(measured.lowest > 0.9999, "{}", measured.lowest);
     }
 }
 
@@ -897,6 +1247,7 @@ mod node_tests {
     use vellev_core::DataType;
 
     use super::testing::Node;
+    use super::tests::Fixed;
     use super::*;
 
     fn notes() -> Collection {
@@ -921,8 +1272,9 @@ mod node_tests {
             return;
         };
         let missing = format!("{}-missing", node.tenant);
-        let tenant = connect(&node.url, &node.key, &missing).unwrap().reads;
-        let ensured = Ensured::new(tenant.clone(), notes(), "put it right");
+        let tenants = connect(&node.url, &node.key, &missing).unwrap();
+        let tenant = tenants.reads.clone();
+        let ensured = Ensured::new(tenants, notes(), "put it right");
         let refused = ensured.records().await.unwrap_err();
         assert!(
             matches!(refused.downcast_ref::<Unusable>(), Some(Unusable::NoTenant { tenant }) if *tenant == missing),
@@ -939,7 +1291,7 @@ mod node_tests {
         let Some(node) = Node::fresh().await else {
             return;
         };
-        let ensured = Ensured::new(node.tenant(), notes(), "put it right");
+        let ensured = Ensured::new(node.tenants(), notes(), "put it right");
         ensured.records().await.unwrap();
         assert!(ensured.take_created());
         ensured.collection().drop().await.unwrap();
@@ -960,7 +1312,7 @@ mod node_tests {
             notes().embedding,
         );
         tenant.collection(&wrong.name).create(&wrong).await.unwrap();
-        let ensured = Ensured::new(tenant.clone(), notes(), "put it right");
+        let ensured = Ensured::new(node.tenants(), notes(), "put it right");
         assert!(ensured.records().await.is_err());
         tenant.collection(&wrong.name).drop().await.unwrap();
         assert!(
@@ -982,7 +1334,7 @@ mod node_tests {
         };
         let theirs = other.tenant().issue_key().await.unwrap().key;
         let ensured = Ensured::new(
-            connect(&node.url, &theirs, &node.tenant).unwrap().reads,
+            connect(&node.url, &theirs, &node.tenant).unwrap(),
             notes(),
             "put it right",
         );
@@ -995,9 +1347,7 @@ mod node_tests {
             "{refused}"
         );
         let unknown = Ensured::new(
-            connect(&node.url, "no-such-key", &node.tenant)
-                .unwrap()
-                .reads,
+            connect(&node.url, "no-such-key", &node.tenant).unwrap(),
             notes(),
             "put it right",
         );
@@ -1018,7 +1368,7 @@ mod node_tests {
         let Some(node) = Node::fresh().await else {
             return;
         };
-        let ensured = Ensured::new(node.tenant(), notes(), "put it right");
+        let ensured = Ensured::new(node.tenants(), notes(), "put it right");
         let oversize = Nearest::to_vector(vec![1.0, 0.0], 100_000);
         let refused = ensured
             .run(|| ensured.collection().nearest(&oversize))
@@ -1036,8 +1386,9 @@ mod node_tests {
         let Some(node) = Node::fresh().await else {
             return;
         };
-        let tenant = node.tenant();
-        mark(&tenant, "Memories").await.unwrap();
+        let tenants = node.tenants();
+        let tenant = &tenants.reads;
+        mark(&tenants, "Memories").await.unwrap();
         // What vellev's importer makes of Weaviate's WorkforceMemorySwitch
         // class, spelled out here rather than taken from the code under test.
         let imported = collection(
@@ -1060,21 +1411,22 @@ mod node_tests {
             .create(&imported)
             .await
             .expect("an import after a mark finds the collection as it makes it");
-        assert!(marked(&tenant, "Memories").await.unwrap());
+        assert!(marked(&tenants, "Memories").await.unwrap());
 
         let Some(other) = Node::fresh().await else {
             return;
         };
-        let tenant = other.tenant();
+        let tenants = other.tenants();
+        let tenant = &tenants.reads;
         tenant
             .collection(&imported.name)
             .create(&imported)
             .await
             .unwrap();
-        mark(&tenant, "Memories")
+        mark(&tenants, "Memories")
             .await
             .expect("a mark after an import");
-        assert!(marked(&tenant, "Memories").await.unwrap());
+        assert!(marked(&tenants, "Memories").await.unwrap());
     }
 
     /// A test node's tenant goes when the node does.
@@ -1096,11 +1448,11 @@ mod node_tests {
         let Some(node) = Node::fresh().await else {
             return;
         };
-        let tenant = node.tenant();
+        let tenants = node.tenants();
         let claims = (0..4).map(|n| {
-            let tenant = tenant.clone();
+            let tenants = tenants.clone();
             async move {
-                index_claim(&tenant, "CodeGraph", &format!("graph-{n}"))
+                index_claim(&tenants, "CodeGraph", &format!("graph-{n}"))
                     .await
                     .unwrap()
             }
@@ -1108,10 +1460,13 @@ mod node_tests {
         let owners = futures::future::join_all(claims).await;
         assert!(owners.iter().all(|owner| *owner == owners[0]), "{owners:?}");
         assert_eq!(
-            index_claim(&tenant, "CodeGraph", "late").await.unwrap(),
+            index_claim(&tenants, "CodeGraph", "late").await.unwrap(),
             owners[0]
         );
-        assert_eq!(index_claim(&tenant, "Other", "late").await.unwrap(), "late");
+        assert_eq!(
+            index_claim(&tenants, "Other", "late").await.unwrap(),
+            "late"
+        );
     }
 
     /// Index markers are kept in a collection of their own, so that the
@@ -1122,12 +1477,13 @@ mod node_tests {
         let Some(node) = Node::fresh().await else {
             return;
         };
-        let tenant = node.tenant();
-        assert!(!index_marked(&tenant, "Artifacts@a").await.unwrap());
-        index_mark(&tenant, "Artifacts@a").await.unwrap();
-        index_mark(&tenant, "Artifacts@a").await.unwrap();
-        assert!(index_marked(&tenant, "Artifacts@a").await.unwrap());
-        assert!(!index_marked(&tenant, "Artifacts@b").await.unwrap());
+        let tenants = node.tenants();
+        let tenant = &tenants.reads;
+        assert!(!index_marked(&tenants, "Artifacts@a").await.unwrap());
+        index_mark(&tenants, "Artifacts@a").await.unwrap();
+        index_mark(&tenants, "Artifacts@a").await.unwrap();
+        assert!(index_marked(&tenants, "Artifacts@a").await.unwrap());
+        assert!(!index_marked(&tenants, "Artifacts@b").await.unwrap());
         let switches = tenant.collection(&CollectionName::new(MARKERS).unwrap());
         assert_eq!(
             switches.schema().await.unwrap(),
@@ -1137,14 +1493,14 @@ mod node_tests {
         let indexes = tenant.collection(&CollectionName::new(INDEX_MARKERS).unwrap());
         assert_eq!(indexes.count(None).await.unwrap(), 1);
 
-        mark(&tenant, "Artifacts@a").await.unwrap();
-        index_unmark(&tenant, "Artifacts@a").await.unwrap();
-        assert!(!index_marked(&tenant, "Artifacts@a").await.unwrap());
+        mark(&tenants, "Artifacts@a").await.unwrap();
+        index_unmark(&tenants, "Artifacts@a").await.unwrap();
+        assert!(!index_marked(&tenants, "Artifacts@a").await.unwrap());
         assert!(
-            marked(&tenant, "Artifacts@a").await.unwrap(),
+            marked(&tenants, "Artifacts@a").await.unwrap(),
             "the switch's own"
         );
-        index_unmark(&tenant, "Artifacts@a").await.unwrap();
+        index_unmark(&tenants, "Artifacts@a").await.unwrap();
     }
 
     /// A collection made identified is told from the next making of it,
@@ -1156,7 +1512,7 @@ mod node_tests {
         };
         let at_once = Duration::ZERO;
         let look = || {
-            Ensured::new(node.tenant(), notes(), "put it right")
+            Ensured::new(node.tenants(), notes(), "put it right")
                 .identified()
                 .rechecking(at_once)
         };
@@ -1176,7 +1532,7 @@ mod node_tests {
             made,
             "the same to another store"
         );
-        let plain = Ensured::new(node.tenant(), notes(), "put it right");
+        let plain = Ensured::new(node.tenants(), notes(), "put it right");
         plain
             .records()
             .await
@@ -1199,7 +1555,7 @@ mod node_tests {
         let stores: Vec<_> = (0..6)
             .map(|_| {
                 std::sync::Arc::new(
-                    Ensured::new(node.tenant(), notes(), "put it right")
+                    Ensured::new(node.tenants(), notes(), "put it right")
                         .identified()
                         .rechecking(Duration::ZERO),
                 )
@@ -1230,7 +1586,7 @@ mod node_tests {
         let Some(node) = Node::fresh().await else {
             return;
         };
-        let kept = Ensured::new(node.tenant(), notes(), "put it right").identified();
+        let kept = Ensured::new(node.tenants(), notes(), "put it right").identified();
         let made = kept.identity().await.unwrap();
         kept.collection().drop().await.unwrap();
         assert_eq!(kept.identity().await.unwrap(), made, "not read again yet");
@@ -1250,7 +1606,7 @@ mod node_tests {
             return;
         };
         let wanted = notes();
-        let plain = Ensured::new(node.tenant(), wanted.clone(), "put it right");
+        let plain = Ensured::new(node.tenants(), wanted.clone(), "put it right");
         let records = plain.records().await.unwrap();
         assert_eq!(identity(&records.schema().await.unwrap().unwrap()), None);
         let content = vellev_client::api::Content::new(
@@ -1263,26 +1619,12 @@ mod node_tests {
         let id = vellev_core::ObjectId(uuid::Uuid::new_v4());
         records.put(id, &content).await.unwrap();
 
-        let adopting = Ensured::new(node.tenant(), wanted.clone(), "put it right").identified();
+        let adopting = Ensured::new(node.tenants(), wanted.clone(), "put it right").identified();
         let adopted = adopting.identity().await.unwrap();
         assert!(!adopting.take_created(), "adopted, not made");
         assert_eq!(records.count(None).await.unwrap(), 1);
-        let other = Ensured::new(node.tenant(), wanted, "put it right").identified();
+        let other = Ensured::new(node.tenants(), wanted, "put it right").identified();
         assert_eq!(other.identity().await.unwrap(), adopted);
-    }
-
-    /// An embedder that gives every text the same made-up vector.
-    struct Fixed(Vec<f32>);
-
-    #[async_trait::async_trait]
-    impl seeding::DocumentEmbedder for Fixed {
-        fn name(&self) -> String {
-            "a made-up embedder".to_string()
-        }
-
-        async fn documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-            Ok(texts.iter().map(|_| self.0.clone()).collect())
-        }
     }
 
     fn lines() -> Collection {
@@ -1362,9 +1704,9 @@ mod node_tests {
             (from..from + 12).map(|n| line(n, "a line")).collect()
         };
         let pages = (0..3).map(|n| {
-            let (seeding, wanted, writes) = (seeding.clone(), wanted.clone(), &tenants.writes);
+            let (seeding, wanted, tenants) = (seeding.clone(), wanted.clone(), &tenants);
             let page = page(100 * (n + 1));
-            async move { seeding::apply_embedded(writes, &wanted, &seeding, page).await }
+            async move { seeding::apply_embedded(tenants, &wanted, &seeding, page).await }
         });
         let stored = futures::future::try_join_all(pages).await.unwrap();
         assert_eq!(stored, [12, 12, 12]);
@@ -1397,7 +1739,7 @@ mod node_tests {
             line(4, "four"),
             line(5, "five"),
         ];
-        let applied = seeding::apply_embedded(&tenants.writes, &wanted, &seeding, changes)
+        let applied = seeding::apply_embedded(&tenants, &wanted, &seeding, changes)
             .await
             .unwrap();
         assert_eq!(applied, 5);
@@ -1429,11 +1771,10 @@ mod node_tests {
 
         // A vector of another size is refused before anything is written.
         let short = seeding::Seeding::new(std::sync::Arc::new(Fixed(vec![1.0, 0.0])), 2, 2);
-        let refused =
-            seeding::apply_embedded(&tenants.writes, &wanted, &short, vec![line(9, "nine")])
-                .await
-                .unwrap_err()
-                .to_string();
+        let refused = seeding::apply_embedded(&tenants, &wanted, &short, vec![line(9, "nine")])
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
             refused.contains("2 dimensions") && refused.contains("768"),
             "{refused}"
@@ -1477,7 +1818,12 @@ mod node_tests {
         );
         assert!(measured.lowest > 0.9999, "{measured:?}");
         assert!((measured.mean_length - 1.0).abs() < 0.001, "{measured:?}");
-        assert!(measured.mean_against_prefixed < 0.99, "{measured:?}");
+        assert!(
+            measured
+                .mean_against_prefixed
+                .is_some_and(|mean| mean < 0.99),
+            "{measured:?}"
+        );
         measured.checked("it", seeding::MIN_COSINE).unwrap();
 
         let prefixing = testing::ByNode {

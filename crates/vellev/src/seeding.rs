@@ -18,10 +18,9 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 use vellev_client::api::{Change, Content, Page};
-use vellev_client::Tenant;
 use vellev_core::{Collection, CollectionName, DataType, Embedding, ObjectId, Property};
 
-use crate::{collection, Tenants, LOCAL_QUERY_PREFIX};
+use crate::{classified, collection, Tenants};
 
 /// Makes the vectors of documents, outside the node.
 #[async_trait]
@@ -110,14 +109,15 @@ pub fn embedded_text(embedding: &Embedding, properties: &Map<String, Value>) -> 
     }
 }
 
-/// Apply `changes` to `wanted`'s collection, giving each upsert that has
+/// Apply `changes` to `wanted`'s collection in the tenant `at`, through its
+/// writes, giving each upsert that has
 /// text to embed a vector made by `seeding`'s embedder: `seeding.batch`
 /// to a request, each batch one atomic step. However many calls are under
 /// way, the embedder has no more than `seeding.concurrency` requests at
 /// once; a batch being written to the node holds none of them up. Returns how many changes were applied; `Err` at the first
 /// batch that fails, the others under way finishing or not.
 pub async fn apply_embedded(
-    writes: &Tenant,
+    at: &Tenants,
     wanted: &Collection,
     seeding: &Seeding,
     changes: Vec<Change>,
@@ -172,7 +172,10 @@ pub async fn apply_embedded(
                 }
             }
             let size = batch.len();
-            writes.apply(batch).await?;
+            at.writes
+                .apply(batch)
+                .await
+                .map_err(|e| classified(e, at))?;
             Ok(size)
         })
         .buffer_unordered(seeding.concurrency.max(1) * 2)
@@ -259,10 +262,13 @@ pub struct Equivalence {
     /// embedder's.
     pub lowest: f32,
     pub mean: f32,
+    /// The query prefix the collection puts before a query, if it has one.
+    pub query_prefix: Option<String>,
     /// The mean cosine between the embedder's vector of a text and the
-    /// node's vector of the text after the query prefix: high when the
-    /// embedder puts that prefix before documents.
-    pub mean_against_prefixed: f32,
+    /// node's vector of the text after [`Self::query_prefix`]: high when
+    /// the embedder puts that prefix before documents. `None` with no
+    /// prefix, when nothing could be confused.
+    pub mean_against_prefixed: Option<f32>,
     /// The mean length of the embedder's vectors: the node's are 1.
     pub mean_length: f32,
 }
@@ -280,9 +286,14 @@ impl Equivalence {
         if self.lowest >= least {
             return Ok(());
         }
-        let differs = if self.mean_against_prefixed >= least {
+        let prefixed = self
+            .query_prefix
+            .as_ref()
+            .zip(self.mean_against_prefixed)
+            .filter(|(_, mean)| *mean >= least);
+        let differs = if let Some((prefix, _)) = prefixed {
             format!(
-                "it puts the query prefix ({LOCAL_QUERY_PREFIX:?}) before documents, which the node does not: send documents with no prefix"
+                "it puts the query prefix ({prefix:?}) before documents, which the node does not: send documents with no prefix"
             )
         } else if (self.mean_length - 1.0).abs() > 0.01 && self.lowest > 0.99 {
             format!(
@@ -314,7 +325,9 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 /// Measure how near `embedder`'s vectors of `texts` are to those the node
 /// makes of them, embedding as `embedding` does: the texts are written to
 /// a collection made for the purpose, which the node embeds, read back
-/// with their vectors, and the collection dropped.
+/// with their vectors, and the collection dropped. Each is also written
+/// after the embedding's query prefix, if it has one, to tell an embedder
+/// that puts it before documents.
 pub async fn equivalence(
     tenants: &Tenants,
     embedding: &Embedding,
@@ -347,15 +360,27 @@ pub async fn equivalence(
         records: Some(tenants.reads.collection(&probe.name)),
         name: probe.name.clone(),
     };
+    let failed = |e| classified(e, tenants);
     let records = tenants.reads.collection(&probe.name);
-    records.create(&probe).await?;
+    records.create(&probe).await.map_err(failed)?;
     let measured = async {
-        // Each text as it is, and after the query prefix.
-        let prefixed = |text: &String| format!("{LOCAL_QUERY_PREFIX}{text}");
+        let prefix = embedding.query_prefix.as_deref();
+        let ids: Vec<(ObjectId, Option<ObjectId>)> = texts
+            .iter()
+            .map(|_| {
+                let new = || ObjectId(Uuid::new_v4());
+                (new(), prefix.map(|_| new()))
+            })
+            .collect();
         let written: Vec<(ObjectId, String)> = texts
             .iter()
-            .flat_map(|text| [(*text).clone(), prefixed(text)])
-            .map(|text| (ObjectId(Uuid::new_v4()), text))
+            .zip(&ids)
+            .flat_map(|(text, (plain, prefixed))| {
+                let prefixed = prefixed
+                    .zip(prefix)
+                    .map(|(id, prefix)| (id, format!("{prefix}{text}")));
+                std::iter::once((*plain, (*text).clone())).chain(prefixed)
+            })
             .collect();
         for batch in written.chunks(32) {
             let changes = batch
@@ -373,7 +398,7 @@ pub async fn equivalence(
                     )
                 })
                 .collect();
-            tenants.writes.apply(changes).await?;
+            tenants.writes.apply(changes).await.map_err(failed)?;
         }
         let mut by_node = std::collections::HashMap::new();
         let mut after = None;
@@ -381,7 +406,7 @@ pub async fn equivalence(
             let page = after
                 .into_iter()
                 .fold(Page::new(200).vectors(true), Page::after);
-            let listed = records.list(&page).await?;
+            let listed = records.list(&page).await.map_err(failed)?;
             for object in listed.objects {
                 by_node.insert(object.id, object.vector.unwrap_or_default());
             }
@@ -404,12 +429,12 @@ pub async fn equivalence(
             ));
         }
         let (mut lowest, mut sum, mut sum_prefixed, mut sum_length) = (1.0f32, 0.0, 0.0, 0.0);
-        for (pair, outside) in written.chunks(2).zip(&by_embedder) {
-            let node = |at: usize| by_node.get(&pair[at].0).map(Vec::as_slice).unwrap_or(&[]);
-            let near = cosine(node(0), outside);
+        let node = |id: &ObjectId| by_node.get(id).map(Vec::as_slice).unwrap_or(&[]);
+        for ((plain, prefixed), outside) in ids.iter().zip(&by_embedder) {
+            let near = cosine(node(plain), outside);
             lowest = lowest.min(near);
             sum += near;
-            sum_prefixed += cosine(node(1), outside);
+            sum_prefixed += prefixed.map_or(0.0, |id| cosine(node(&id), outside));
             sum_length += outside.iter().map(|x| x * x).sum::<f32>().sqrt();
         }
         let compared = by_embedder.len();
@@ -424,7 +449,8 @@ pub async fn equivalence(
             compared,
             lowest: if compared == 0 { 0.0 } else { lowest },
             mean: mean(sum),
-            mean_against_prefixed: mean(sum_prefixed),
+            query_prefix: prefix.map(str::to_string),
+            mean_against_prefixed: prefix.map(|_| mean(sum_prefixed)),
             mean_length: mean(sum_length),
         })
     }

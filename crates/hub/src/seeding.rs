@@ -353,13 +353,8 @@ pub async fn reindex_code_vectors(
             config.knowledge.vector_backend
         ));
     }
-    let vellev = &config.vellev;
-    let key = vellev
-        .api_key
-        .as_deref()
-        .ok_or_else(|| eyre!("[vellev] api_key is not set"))?;
-    let mut store = VellevCodeVectorStore::new(&vellev.url, key, &vellev.tenant)?;
-    let plain = VellevCodeVectorStore::new(&vellev.url, key, &vellev.tenant)?;
+    let mut store = VellevCodeVectorStore::configured(&config.vellev)?;
+    let plain = VellevCodeVectorStore::configured(&config.vellev)?;
     if let Some(seeding) = &options.outside {
         store = store.seeded_by(seeding.clone());
     }
@@ -905,6 +900,15 @@ mod tests {
     /// A small repo indexed into a SQLite code graph under `dir`, and the
     /// config that keeps its vectors in `node`'s tenant.
     async fn indexed(node: &Node, dir: &std::path::Path) -> (WorkforceConfig, String) {
+        indexed_with(node, dir, Default::default()).await
+    }
+
+    /// As [`indexed`], with code vectors kept as `code` says.
+    async fn indexed_with(
+        node: &Node,
+        dir: &std::path::Path,
+        code: workforce_common::settings::VellevCodeConfig,
+    ) -> (WorkforceConfig, String) {
         let root = dir.join("repo");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(
@@ -922,6 +926,7 @@ mod tests {
         config.vellev.url = node.url.clone();
         config.vellev.api_key = Some(node.key.clone());
         config.vellev.tenant = node.tenant.clone();
+        *config.vellev.code = code;
         let service = KnowledgeService::new_with_backend(
             root.clone(),
             dir.join("data"),
@@ -947,16 +952,35 @@ mod tests {
     /// refused before anything is written.
     #[tokio::test]
     async fn code_vectors_are_seeded_with_vectors_made_outside_the_node() {
-        let Some(node) = Node::embedding().await else {
+        let (Some(node), Some(code)) = (Node::embedding().await, Node::embedding().await) else {
             return;
         };
         let dir = tempfile::tempdir().unwrap();
-        let (config, repo) = indexed(&node, dir.path()).await;
-        let store = VellevCodeVectorStore::new(&node.url, &node.key, &node.tenant).unwrap();
+        let small = workforce_common::settings::VellevCodeConfig {
+            tenant: Some(code.tenant.clone()),
+            model: Some("BAAI/bge-small-en-v1.5".into()),
+            dimensions: Some(384),
+            query_prefix: Some(workforce_vellev::LOCAL_QUERY_PREFIX.into()),
+            ..Default::default()
+        };
+        let (config, repo) = indexed_with(&node, dir.path(), small).await;
+        let store = VellevCodeVectorStore::configured(&config.vellev).unwrap();
+        let by_code_node = || ByNode {
+            embedding: store.embedded_as().unwrap().1,
+            ..ByNode::of(&code)
+        };
+
+        let base = Arc::new(ByNode::of(&code));
+        let refused = reindex_code_vectors(&config, None, options(Some(base)), &|_| {}, &|_, _| {})
+            .await
+            .unwrap_err();
+        let refused = format!("{refused:#}");
+        assert!(refused.contains("768 dimensions"), "{refused}");
+        assert_eq!(store.entity_count(&repo).await.unwrap(), 0);
 
         let otherwise = Arc::new(ByNode {
             prefix: "search_document: ".into(),
-            ..ByNode::of(&node)
+            ..by_code_node()
         });
         let refused =
             reindex_code_vectors(&config, None, options(Some(otherwise)), &|_| {}, &|_, _| {})
@@ -973,7 +997,7 @@ mod tests {
             "nothing written"
         );
 
-        let outside = Arc::new(ByNode::of(&node));
+        let outside = Arc::new(by_code_node());
         let measured = std::sync::Mutex::new(None);
         let pages = std::sync::Mutex::new(Vec::new());
         let seeded = reindex_code_vectors(
@@ -1007,6 +1031,13 @@ mod tests {
             found[0].qualified_name.contains("parse_config"),
             "found by a question the node embeds: {found:?}"
         );
+        let in_memories = node.tenant().collections().await.unwrap();
+        assert!(
+            in_memories
+                .iter()
+                .all(|c| !c.name.as_str().starts_with("Code")),
+            "{in_memories:?}"
+        );
 
         let again = reindex_code_vectors(&config, Some(&repo), options(None), &|_| {}, &|_, _| {})
             .await
@@ -1022,7 +1053,7 @@ mod tests {
                 dir.path().join("data"),
                 &config.knowledge,
                 VectorBackend::Given(Arc::new(
-                    VellevCodeVectorStore::new(&node.url, &node.key, &node.tenant).unwrap(),
+                    VellevCodeVectorStore::configured(&config.vellev).unwrap(),
                 )),
                 &config.codegraph,
                 None,
@@ -1237,8 +1268,9 @@ mod tests {
         // any outside embedder can reach), and what it takes from an
         // embedder that answers each request after a fixed while: if
         // `--embed-concurrency` requests are kept with it across pages,
-        // that is concurrency x batch / the while, up to the ceiling.
-        struct ReadyMade(Duration);
+        // that is concurrency x batch / the while, up to the ceiling. Its
+        // vectors are of the size the store keeps.
+        struct ReadyMade(Duration, usize);
         #[async_trait]
         impl DocumentEmbedder for ReadyMade {
             fn name(&self) -> String {
@@ -1251,8 +1283,8 @@ mod tests {
                 Ok(texts
                     .iter()
                     .map(|text| {
-                        let mut vector = vec![0.01f32; 768];
-                        vector[text.len() % 768] = 1.0;
+                        let mut vector = vec![0.01f32; self.1];
+                        vector[text.len() % self.1] = 1.0;
                         vector
                     })
                     .collect())
@@ -1272,10 +1304,11 @@ mod tests {
                 let _ = node.tenant().collection(&name_of(collection)).drop().await;
             }
             service.graph().clear_vector_fill(&repo).await.unwrap();
-            let seeding = Seeding::new(Arc::new(ReadyMade(latency)), batch, concurrency);
-            let seeded = VellevCodeVectorStore::new(&node.url, &node.key, &node.tenant)
-                .unwrap()
-                .seeded_by(seeding.clone());
+            let store = VellevCodeVectorStore::new(&node.url, &node.key, &node.tenant).unwrap();
+            let dimensions = store.embedded_as().unwrap().1.dimensions as usize;
+            let made = ReadyMade(latency, dimensions);
+            let seeding = Seeding::new(Arc::new(made), batch, concurrency);
+            let seeded = store.seeded_by(seeding.clone());
             let seeded: Arc<dyn CodeVectorStore> = Arc::new(seeded);
             let given = KnowledgeService::new_with_backend(
                 root.clone(),

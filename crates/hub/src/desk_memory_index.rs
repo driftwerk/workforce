@@ -89,7 +89,7 @@ impl VellevDeskIndex {
             return Ok(Arc::clone(e));
         }
         let e = Arc::new(Ensured::new(
-            self.tenants.reads.clone(),
+            self.tenants.clone(),
             memory_collection(name)?,
             REMEDY,
         ));

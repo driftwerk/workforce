@@ -2182,3 +2182,405 @@ async fn methods_of_one_name_in_one_file_are_two_entities_and_stay_so() {
     rewritten(&["C"], entities - 1).await;
     assert_eq!(news().await, named(&[("C::new", &id_of("new"))]));
 }
+
+/// How a [`Counting`] store fails, where it does.
+#[derive(Clone, Copy, PartialEq)]
+enum Failing {
+    Not,
+    Misrouted,
+    Otherwise,
+}
+
+/// A store that counts every call made of it, keeping track of what it
+/// holds or not, and failing which way it is told to where a question
+/// asks it first, once `spared` such askings have not: `identity` when it
+/// keeps track, the search when not.
+struct Counting {
+    calls: AtomicUsize,
+    tracked: bool,
+    failing: Failing,
+    spared: AtomicUsize,
+}
+
+impl Counting {
+    fn new(tracked: bool, failing: Failing) -> Arc<Self> {
+        Self::sparing(tracked, failing, 0)
+    }
+
+    fn sparing(tracked: bool, failing: Failing, spared: usize) -> Arc<Self> {
+        Arc::new(Self {
+            calls: AtomicUsize::new(0),
+            tracked,
+            failing,
+            spared: AtomicUsize::new(spared),
+        })
+    }
+
+    fn called(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn call(&self) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn asked(&self) -> Result<()> {
+        self.call();
+        let spare = |left: usize| left.checked_sub(1);
+        if self
+            .spared
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, spare)
+            .is_ok()
+        {
+            return Ok(());
+        }
+        match self.failing {
+            Failing::Not => Ok(()),
+            Failing::Misrouted => Err(eyre::Report::new(workforce_vellev::Unusable::Misrouted {
+                tenant: "code".into(),
+                node: "http://code-node:18080".into(),
+            })),
+            Failing::Otherwise => Err(eyre!("the node went away")),
+        }
+    }
+}
+
+#[async_trait]
+impl CodeVectorStore for Counting {
+    fn backend(&self) -> &'static str {
+        self.call();
+        VectorKeys::VELLEV
+    }
+    async fn ensure_collections(&self) -> Result<()> {
+        self.call();
+        Ok(())
+    }
+    async fn health_check(&self) -> Result<bool> {
+        self.call();
+        Ok(true)
+    }
+    fn base_url(&self) -> &str {
+        self.call();
+        "http://code-node:18080"
+    }
+    fn set_insert_error_sink(&self, _sink: Arc<dyn InsertErrorSink>) {
+        self.call();
+    }
+    async fn index_entities(&self, entities: &[VectorCodeEntity]) -> Result<usize> {
+        self.call();
+        Ok(entities.len())
+    }
+    async fn search_entities(
+        &self,
+        _query: &str,
+        _repo_id: Option<&str>,
+        _kind: Option<EntityKind>,
+        _limit: usize,
+    ) -> Result<Vec<VectorSearchResult>> {
+        if self.tracked {
+            self.call();
+            return Ok(Vec::new());
+        }
+        self.asked().map(|()| Vec::new())
+    }
+    async fn delete_repo_entities(&self, _repo_id: &str) -> Result<DeleteOutcome> {
+        self.call();
+        Ok(DeleteOutcome::default())
+    }
+    async fn delete_entities_by_file(&self, _: &str, _: &str) -> Result<DeleteOutcome> {
+        self.call();
+        Ok(DeleteOutcome::default())
+    }
+    async fn index_summaries(&self, summaries: &[VectorCodeSummary]) -> Result<usize> {
+        self.call();
+        Ok(summaries.len())
+    }
+    async fn delete_repo_summaries(&self, _repo_id: &str) -> Result<DeleteOutcome> {
+        self.call();
+        Ok(DeleteOutcome::default())
+    }
+    async fn delete_summaries_by_file(&self, _: &str, _: &str) -> Result<DeleteOutcome> {
+        self.call();
+        Ok(DeleteOutcome::default())
+    }
+    async fn entity_count(&self, _repo_id: &str) -> Result<usize> {
+        self.call();
+        Ok(0)
+    }
+    fn tracks_completeness(&self) -> bool {
+        self.call();
+        self.tracked
+    }
+    async fn identity(&self, _afresh: bool) -> Result<String> {
+        self.asked().map(|()| RECORDED.to_string())
+    }
+}
+
+/// What the graph records the repo's vectors complete in, for a store
+/// that keeps track.
+const RECORDED: &str = "recorded";
+
+/// A repo indexed, its vectors recorded complete in [`RECORDED`].
+async fn recorded() -> Repo {
+    let repo = Repo::new();
+    repo.index().await;
+    repo.graph
+        .set_vectors_complete_in(REPO, Some(RECORDED))
+        .await
+        .unwrap();
+    repo
+}
+
+/// With code search off a question is answered from the graph alone,
+/// saying so, and asks the store nothing: nothing is wanted of whoever
+/// fills the vectors, and nothing is suspected of them.
+#[tokio::test]
+async fn with_code_search_off_a_question_asks_no_store_and_says_why() {
+    use workforce_codebase_knowledge::vector::CodeSearchUnavailable;
+    let repo = recorded().await;
+    for tracked in [true, false] {
+        let store = Counting::new(tracked, Failing::Not);
+        let engine = QueryEngine::with_vector_store(Arc::clone(&repo.graph), store.clone())
+            .waiting(VectorWait::default())
+            .code_search(false);
+        let wanted = engine.vectors_wanted();
+        let told = tokio::spawn(async move { wanted.notified().await });
+        tokio::task::yield_now().await;
+        let answer = engine.ask(REPO, QUESTION, None, false).await.unwrap();
+        assert_eq!(
+            answer.vectors_skipped,
+            Some(CodeSearchUnavailable::Off.to_string()),
+            "tracked: {tracked}"
+        );
+        assert_eq!(store.called(), 0, "tracked: {tracked}");
+        let waited = tokio::time::timeout(std::time::Duration::from_millis(100), told).await;
+        assert!(waited.is_err(), "nothing is wanted of the filler");
+        assert!(engine.vectors_suspected().lock().unwrap().is_empty());
+    }
+}
+
+/// A store whose node does not serve its tenant leaves code search
+/// unavailable, saying so in the store's own words, whether its search or
+/// its readiness after a search finds that; any other failure is said as
+/// it was.
+#[tokio::test]
+async fn a_misrouted_store_leaves_code_search_unavailable_saying_so() {
+    let repo = recorded().await;
+    let skipped = |store: Arc<Counting>| {
+        let engine = QueryEngine::with_vector_store(Arc::clone(&repo.graph), store);
+        async move {
+            let answer = engine.ask(REPO, QUESTION, None, false).await.unwrap();
+            answer.vectors_skipped.expect("the vectors were skipped")
+        }
+    };
+    let searched = "the search of the vector store failed: the node went away";
+    let readied = "the vector store failed: the node went away";
+    for (tracked, spared, failed) in [
+        (true, 0, searched),
+        (false, 0, searched),
+        (true, 1, readied),
+    ] {
+        let misrouted = skipped(Counting::sparing(tracked, Failing::Misrouted, spared)).await;
+        assert!(
+            misrouted.starts_with("code search unavailable: misrouted: ")
+                && misrouted.contains("http://code-node:18080")
+                && misrouted.contains("'code'"),
+            "tracked: {tracked}, spared: {spared}: {misrouted}"
+        );
+        let otherwise = skipped(Counting::sparing(tracked, Failing::Otherwise, spared)).await;
+        assert_eq!(otherwise, failed, "tracked: {tracked}, spared: {spared}");
+    }
+}
+
+/// What is logged on this thread, by a subscriber of the whole process: a
+/// test's events, on its own thread, are kept apart from every other's,
+/// and no test's subscriber can leave another's events unheard.
+mod logged {
+    use std::cell::RefCell;
+    use std::sync::Once;
+
+    thread_local! {
+        static LOGGED: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    }
+
+    struct ThisThread;
+
+    impl std::io::Write for ThisThread {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            LOGGED.with(|logged| logged.borrow_mut().extend_from_slice(buf));
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Start keeping what this thread logs, from now.
+    pub fn kept() {
+        static SUBSCRIBED: Once = Once::new();
+        SUBSCRIBED.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(|| ThisThread)
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber).unwrap();
+        });
+        LOGGED.with(|logged| logged.borrow_mut().clear());
+    }
+
+    /// The lines this thread logged since [`kept`] that hold `level`.
+    pub fn at(level: &str) -> Vec<String> {
+        LOGGED.with(|logged| {
+            String::from_utf8_lossy(&logged.borrow())
+                .lines()
+                .filter(|line| line.contains(level))
+                .map(str::to_string)
+                .collect()
+        })
+    }
+}
+
+/// A node that says it does not serve the tenant to every request of it,
+/// counting those; its readiness, which the health client asks, is not
+/// one.
+async fn not_serving() -> (String, Arc<AtomicUsize>) {
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counting = Arc::clone(&asked);
+    let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+        let counting = Arc::clone(&counting);
+        async move {
+            if uri.path().starts_with("/v1/tenants/") {
+                counting.fetch_add(1, Ordering::SeqCst);
+            }
+            (
+                axum::http::StatusCode::MISDIRECTED_REQUEST,
+                axum::Json(serde_json::json!({ "error": {
+                    "code": "not_served_here",
+                    "message": "tenant code is not served by this node; ask a node that serves it",
+                }})),
+            )
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, asked)
+}
+
+/// An insert-error sink that keeps what it hears.
+#[derive(Default)]
+struct Heard(Mutex<Vec<String>>);
+
+impl InsertErrorSink for Heard {
+    fn record(&self, message: String) {
+        self.0.lock().unwrap().push(message);
+    }
+}
+
+fn is_misrouted(e: &eyre::Report, node: &str) -> bool {
+    e.downcast_ref::<workforce_vellev::Unusable>()
+        == Some(&workforce_vellev::Unusable::Misrouted {
+            tenant: "code".into(),
+            node: node.to_string(),
+        })
+}
+
+/// A code store whose node does not serve its tenant asks once, from
+/// every way in, and says where it asked: so does a failed write, as the
+/// insert-error sink and the indexer's warning hear of it.
+#[tokio::test]
+async fn a_misrouted_code_store_asks_once_and_says_where() {
+    use workforce_codebase_knowledge::vector::VellevCodeVectorStore;
+    let (node, asked) = not_serving().await;
+    let fresh = || {
+        VellevCodeVectorStore::new(&node, "key", "code")
+            .unwrap()
+            .for_graph("g")
+    };
+    let once = |before: usize| asked.load(Ordering::SeqCst) - before;
+
+    let before = asked.load(Ordering::SeqCst);
+    let searched = fresh().search_entities(QUESTION, Some(REPO), None, 5).await;
+    assert!(is_misrouted(&searched.unwrap_err(), &node));
+    assert_eq!(once(before), 1, "search");
+
+    let before = asked.load(Ordering::SeqCst);
+    let identified = fresh().identity(false).await;
+    assert!(is_misrouted(&identified.unwrap_err(), &node));
+    assert_eq!(once(before), 1, "identity");
+
+    let before = asked.load(Ordering::SeqCst);
+    let deleted = fresh().delete_repo_entities(REPO).await;
+    assert!(is_misrouted(&deleted.unwrap_err(), &node));
+    assert_eq!(once(before), 1, "delete");
+
+    let before = asked.load(Ordering::SeqCst);
+    let store = fresh();
+    let heard = Arc::new(Heard::default());
+    store.set_insert_error_sink(Arc::clone(&heard) as Arc<dyn InsertErrorSink>);
+    let entity = VectorCodeEntity {
+        entity_id: "e".into(),
+        repo_id: REPO.into(),
+        qualified_name: "crate::e".into(),
+        name: "e".into(),
+        kind: "Function".into(),
+        file_path: "src/e.rs".into(),
+        language: "Rust".into(),
+        signature: String::new(),
+        doc_comment: String::new(),
+        summary: String::new(),
+        searchable_content: "parses the configuration".into(),
+        start_line: 1,
+        end_line: 2,
+        generation: String::new(),
+    };
+    let indexed = store.index_entities(&[entity]).await;
+    assert!(is_misrouted(&indexed.unwrap_err(), &node));
+    assert_eq!(once(before), 1, "index");
+    let heard = heard.0.lock().unwrap().clone();
+    assert!(
+        heard.len() == 1 && heard[0].contains("misrouted") && heard[0].contains(&node),
+        "{heard:?}"
+    );
+
+    let repo = Repo::new();
+    repo.index().await;
+    repo.change_mail();
+    let misrouted: Arc<dyn CodeVectorStore> = Arc::new(fresh());
+    let pipeline =
+        IndexingPipeline::with_vector_store(repo.config(), Arc::clone(&repo.graph), misrouted);
+    logged::kept();
+    repo.incremental(&pipeline, 1).await;
+    let warned = logged::at("WARN");
+    assert!(
+        warned
+            .iter()
+            .any(|line| line.contains("Vector indexing failed") && line.contains("misrouted")),
+        "{warned:?}"
+    );
+}
+
+/// Two questions of a store whose node does not serve its tenant, within
+/// the recheck, reach the node once between them, and both say why code
+/// search is unavailable.
+#[tokio::test]
+async fn two_questions_of_a_misrouted_store_within_the_recheck_cost_one_request() {
+    use workforce_codebase_knowledge::vector::VellevCodeVectorStore;
+    let (node, asked) = not_serving().await;
+    let repo = recorded().await;
+    let store = VellevCodeVectorStore::new(&node, "key", "code")
+        .unwrap()
+        .for_graph("g");
+    let engine = QueryEngine::with_vector_store(Arc::clone(&repo.graph), Arc::new(store))
+        .waiting(VectorWait::default());
+    for _ in 0..2 {
+        let answer = engine.ask(REPO, QUESTION, None, false).await.unwrap();
+        let why = answer.vectors_skipped.expect("the vectors were skipped");
+        assert!(
+            why.starts_with("code search unavailable: misrouted:"),
+            "{why}"
+        );
+    }
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+}

@@ -54,6 +54,7 @@ static OTEL_PROVIDERS: OnceLock<OtelProviders> = OnceLock::new();
 //   - `outcome`       — "ok" | "err" | "timeout" | "rate_limited" etc.
 //   - `endpoint`      — HTTP route (must be the matched pattern, NOT the raw URL).
 //   - `class`, `kind` — bounded enums chosen at the call site.
+//   - `tenant`        — a vellev tenant, from config: one to three per install.
 //
 // Forbidden labels (unbounded — cause Prometheus/Datadog series explosions
 // and per-series billing on Datadog):

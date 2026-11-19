@@ -22,7 +22,7 @@ use vellev_client::api::{
     Change, Changes, Content, Found, Hybrid, Keyword, Nearest, OnlyIf, Outcome, Page, Results,
     Stored, Weighted, Written,
 };
-use vellev_client::{Records, Tenant};
+use vellev_client::Records;
 use vellev_core::{
     Collection, CollectionName, DataType, Embedding, EmbeddingProvider, ObjectId, Property,
 };
@@ -45,7 +45,7 @@ use crate::store::{
 };
 use crate::types::{Memory, MemoryFilter, MemoryId, MemorySearchResult, Visibility};
 use workforce_vellev::{
-    collection, is_conflict, local_embedding, Asked, Cap, Timeouts, MAX_RESULTS,
+    collection, embedding_of, is_conflict, local_embedding, Asked, Cap, Timeouts, MAX_RESULTS,
 };
 
 /// The collection memories live in when the node embeds them: Weaviate's,
@@ -113,9 +113,7 @@ const PROPERTIES: &[(&str, DataType)] = &[
 
 /// vellev-backed memory store.
 pub struct VellevStore {
-    tenant: Tenant,
-    /// The tenant as writes the node embeds, a batch at a time, reach it.
-    writes: Tenant,
+    tenants: workforce_vellev::Tenants,
     collection: CollectionName,
     records: Records,
     /// The most results the node gives for one request.
@@ -170,8 +168,7 @@ impl VellevStore {
         let collection = CollectionName::new(collection)?;
         Ok(Self {
             records: tenants.reads.collection(&collection),
-            tenant: tenants.reads,
-            writes: tenants.writes,
+            tenants,
             collection,
             cap: Cap::default(),
             embedder: None,
@@ -196,12 +193,7 @@ impl VellevStore {
         dimensions: u32,
         query_prefix: Option<&str>,
     ) -> Self {
-        self.local = Embedding {
-            model: model.to_string(),
-            dimensions,
-            query_prefix: query_prefix.map(str::to_string),
-            ..local_embedding(&["content"])
-        };
+        self.local = embedding_of(model, dimensions, query_prefix, &["content"]);
         self
     }
 
@@ -260,15 +252,23 @@ impl VellevStore {
     /// Delete every memory passing `filter`, however many match (see
     /// [`workforce_vellev::delete_where`]), and return how many went.
     async fn delete_where(&self, filter: &Filter) -> Result<u64> {
-        let deleted =
-            workforce_vellev::delete_where(&self.tenant, &self.writes, &self.collection, filter)
-                .await;
+        let deleted = workforce_vellev::delete_where(
+            &self.tenants.reads,
+            &self.tenants.writes,
+            &self.collection,
+            filter,
+        )
+        .await;
         self.answered(deleted).await
     }
 
     /// A failed request, saying what to fix when an operator has to.
     fn failed(&self, error: vellev_client::Error) -> eyre::Report {
-        workforce_vellev::failure(error, &self.tenant, Asked::Request(&self.collection))
+        let asked = Asked::Request {
+            name: &self.collection,
+            model: &self.local.model,
+        };
+        workforce_vellev::failure(error, &self.tenants, asked)
     }
 
     /// What a request came to, its failure explained as [`Self::failed`]
@@ -280,8 +280,12 @@ impl VellevStore {
             Err(error) => error,
         };
         if error.is_not_found() {
-            if let Err(gone) = self.tenant.collections().await {
-                return Err(workforce_vellev::failure(gone, &self.tenant, Asked::Tenant));
+            if let Err(gone) = self.tenants.reads.collections().await {
+                return Err(workforce_vellev::failure(
+                    gone,
+                    &self.tenants,
+                    Asked::Tenant,
+                ));
             }
         }
         Err(self.failed(error))
@@ -305,7 +309,7 @@ impl VellevStore {
             Ok(erased) => return Ok(erased),
             Err(failed) => failed,
         };
-        match self.tenant.collections().await {
+        match self.tenants.reads.collections().await {
             Ok(held) if !held.iter().any(|c| c.name == self.collection) => Ok(0),
             _ => Err(failed),
         }
@@ -315,12 +319,12 @@ impl VellevStore {
     /// longer a replica of Weaviate (DW-676, `workforce shadow promote`).
     /// Idempotent.
     pub async fn mark_promoted(&self) -> Result<()> {
-        workforce_vellev::mark_promoted(&self.tenant, self.collection.as_str()).await
+        workforce_vellev::mark_promoted(&self.tenants, self.collection.as_str()).await
     }
 
     /// Take the promotion's mark away (`workforce shadow rollback`).
     pub async fn unmark_promoted(&self) -> Result<()> {
-        workforce_vellev::unmark_promoted(&self.tenant, self.collection.as_str()).await
+        workforce_vellev::unmark_promoted(&self.tenants, self.collection.as_str()).await
     }
 
     /// Drop the collection if it holds nothing at all, deleted memories
@@ -426,7 +430,8 @@ impl VellevStore {
     async fn patch_all(&self, ids: &[ObjectId], properties: Map<String, Value>) -> Result<usize> {
         for chunk in ids.chunks(IMPORT_BATCH_SIZE) {
             self.answered(
-                self.writes
+                self.tenants
+                    .writes
                     .apply(
                         chunk
                             .iter()
@@ -702,7 +707,8 @@ impl VellevStore {
                 )
             })
             .collect();
-        self.writes
+        self.tenants
+            .writes
             .apply(changes)
             .await
             .map_err(|e| self.failed(e))?;
@@ -936,8 +942,8 @@ impl MemoryAdmin for VellevStore {
     /// model fails readiness, saying so, rather than every write after.
     async fn ensure_collection(&self) -> Result<()> {
         let wanted = self.wanted().await?;
-        workforce_vellev::ensure(&self.tenant, &self.records, &wanted, REIMPORT).await?;
-        workforce_vellev::probe_model(&self.tenant, &self.records, &wanted).await
+        workforce_vellev::ensure(&self.tenants, &self.records, &wanted, REIMPORT).await?;
+        workforce_vellev::probe_model(&self.tenants, &self.records, &wanted).await
     }
 
     /// vellev changes a collection in place, so there is nothing to rebuild.
@@ -947,7 +953,13 @@ impl MemoryAdmin for VellevStore {
     }
 
     async fn doctor(&self) -> Result<()> {
-        workforce_vellev::doctor(&self.tenant, &self.records, &self.wanted().await?, REIMPORT).await
+        workforce_vellev::doctor(
+            &self.tenants,
+            &self.records,
+            &self.wanted().await?,
+            REIMPORT,
+        )
+        .await
     }
 
     /// Objects whose id is not a UUID are passed over, and so is a batch
@@ -1116,17 +1128,17 @@ impl SyncTarget for VellevStore {
     /// Whether memories have switched to this collection: a marker in the
     /// collection Weaviate keeps them in, so one imported comes along.
     async fn switched(&self) -> Result<bool> {
-        workforce_vellev::marked(&self.tenant, self.collection.as_str()).await
+        workforce_vellev::marked(&self.tenants, self.collection.as_str()).await
     }
 
     /// Record the switch (see [`Self::switched`]); idempotent.
     async fn mark_switched(&self) -> Result<()> {
-        workforce_vellev::mark(&self.tenant, self.collection.as_str()).await
+        workforce_vellev::mark(&self.tenants, self.collection.as_str()).await
     }
 
     /// A marker in workforce's own markers, which no import brings.
     async fn promoted(&self) -> Result<bool> {
-        workforce_vellev::promoted(&self.tenant, self.collection.as_str()).await
+        workforce_vellev::promoted(&self.tenants, self.collection.as_str()).await
     }
 }
 
@@ -1174,7 +1186,8 @@ impl MemoryStore for VellevStore {
         let id = object_id(&memory.id.0).unwrap_or_else(|_| ObjectId::generate());
         // The node embeds the memory within the request unless the hub did.
         self.answered(
-            self.writes
+            self.tenants
+                .writes
                 .apply(vec![Change::upsert(
                     self.collection.clone(),
                     id,
@@ -1329,7 +1342,7 @@ impl MemoryStore for VellevStore {
                 props([("importance", json!(adjusted))]),
                 Some(only_if),
             );
-            match self.writes.apply(vec![change]).await {
+            match self.tenants.writes.apply(vec![change]).await {
                 Ok(_) => return Ok(adjusted),
                 Err(e) if is_conflict(&e) => {
                     tokio::time::sleep(self.retry.wait(attempt)).await;
@@ -1519,7 +1532,8 @@ impl MemoryStore for VellevStore {
         );
         let written = self
             .answered(
-                self.writes
+                self.tenants
+                    .writes
                     .apply(
                         std::iter::once(increment)
                             .chain(append)

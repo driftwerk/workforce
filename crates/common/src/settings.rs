@@ -2233,11 +2233,13 @@ impl Default for WeaviateConfig {
 /// chosen apart from the others.
 ///
 /// Whichever of memories, artifacts and code vectors are kept in vellev
-/// are kept in the tenant. Artifacts and code are always embedded by the
-/// node's own model (bge-base-en-v1.5), as memories are unless
-/// `[embeddings]` has the hub embed them, so the node must run it: on one
-/// that does not, writes and searches of those collections fail, saying
-/// the node cannot use its embedding model.
+/// are kept in the tenant, but code vectors where `[vellev.code]` says
+/// otherwise: a node, tenant and key of their own, and a model of their
+/// own. Artifacts are always embedded by the node's own model
+/// (bge-base-en-v1.5), as memories are unless `[embeddings]` has the hub
+/// embed them, and code by default, so the node must run it: on one that
+/// does not, writes and searches of those collections fail, saying the
+/// node cannot use its embedding model.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct VellevConfig {
     /// A vellev node's HTTP URL; by default port 18080 on this host, clear
@@ -2262,6 +2264,10 @@ pub struct VellevConfig {
     /// overflowed one (`coding_rounds::a_rejected_step_is_corrected_...`).
     #[serde(default)]
     pub shadow: Box<VellevShadowConfig>,
+    /// Where code vectors are kept and how they are embedded, where not as
+    /// `[vellev]` says (`[vellev.code]`). Boxed, as `shadow` is.
+    #[serde(default)]
+    pub code: Box<VellevCodeConfig>,
 }
 
 impl Default for VellevConfig {
@@ -2272,6 +2278,7 @@ impl Default for VellevConfig {
             tenant: String::new(),
             connect_timeout_secs: crate::postgres::default_backend_connect_timeout_secs(),
             shadow: Box::default(),
+            code: Box::default(),
         }
     }
 }
@@ -2284,12 +2291,238 @@ impl std::fmt::Debug for VellevConfig {
             .field("tenant", &self.tenant)
             .field("connect_timeout_secs", &self.connect_timeout_secs)
             .field("shadow", &self.shadow)
+            .field("code", &self.code)
             .finish()
     }
 }
 
 fn default_vellev_url() -> String {
     "http://localhost:18080".to_string()
+}
+
+/// `[vellev.code]`: the node, tenant and key code vectors are kept with,
+/// each `[vellev]`'s where left out, and the model the node embeds them
+/// with, bge-base-en-v1.5 at 768 dimensions where left out. `model` and
+/// `dimensions` come together; `query_prefix`, read only with a model, is
+/// bge's own only for the default model, so another that wants one names
+/// it, and `""` is none.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VellevCodeConfig {
+    pub url: Option<String>,
+    pub tenant: Option<String>,
+    pub api_key: Option<String>,
+    pub model: Option<String>,
+    pub dimensions: Option<u32>,
+    pub query_prefix: Option<String>,
+    /// `WORKFORCE_VELLEV_CODE_DIMENSIONS` as it was given, read by
+    /// [`VellevConfig::code_model`], which refuses a value that is not a
+    /// size.
+    #[serde(skip)]
+    pub dimensions_env: Option<String>,
+    /// Keys this hub does not know (see [`VellevShadowConfig::unknown`]).
+    #[serde(flatten, default, skip_serializing)]
+    pub unknown: std::collections::BTreeMap<String, toml::Value>,
+}
+
+impl std::fmt::Debug for VellevCodeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VellevCodeConfig")
+            .field("url", &self.url)
+            .field("tenant", &self.tenant)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("model", &self.model)
+            .field("dimensions", &self.dimensions)
+            .field("query_prefix", &self.query_prefix)
+            .field("dimensions_env", &self.dimensions_env)
+            .finish()
+    }
+}
+
+/// The tables a vellev setting is read from.
+const VELLEV: &str = "[vellev]";
+const VELLEV_CODE: &str = "[vellev.code]";
+
+/// The environment variable that sets `key` of `table`.
+fn vellev_variable(table: &str, key: &str) -> String {
+    let prefix = match table {
+        VELLEV_CODE => "WORKFORCE_VELLEV_CODE",
+        _ => "WORKFORCE_VELLEV",
+    };
+    format!("{prefix}_{}", key.to_uppercase())
+}
+
+/// A value as resolved, and the table it was read from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Setting<'a> {
+    pub value: &'a str,
+    pub table: &'static str,
+}
+
+/// The vellev node a store keeps its vectors with: its URL, key and
+/// tenant, each from the table it was read from. No `Debug`: it holds the
+/// key.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct VellevNode<'a> {
+    pub url: Setting<'a>,
+    pub api_key: Option<Setting<'a>>,
+    pub tenant: Setting<'a>,
+    /// The table read first, whose keys fall back to `[vellev]`'s.
+    pub table: &'static str,
+}
+
+/// The query prefix a code model was given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryPrefix<'a> {
+    /// None was named: the model's own default.
+    Unset,
+    /// `""`: none.
+    None,
+    Given(&'a str),
+}
+
+/// The model `[vellev.code]` names for code vectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodeModel<'a> {
+    pub model: &'a str,
+    pub dimensions: u32,
+    pub query_prefix: QueryPrefix<'a>,
+}
+
+impl VellevConfig {
+    /// `[vellev]`'s own node: where memories and artifacts are kept.
+    pub fn node(&self) -> VellevNode<'_> {
+        let at = |value| Setting {
+            value,
+            table: VELLEV,
+        };
+        VellevNode {
+            url: at(&self.url),
+            api_key: self.api_key.as_deref().map(at),
+            tenant: at(&self.tenant),
+            table: VELLEV,
+        }
+    }
+
+    /// The node code vectors are kept with: each of `[vellev.code]`'s keys
+    /// where set, otherwise `[vellev]`'s.
+    pub fn code_node(&self) -> VellevNode<'_> {
+        let node = self.node();
+        let code = |value| Setting {
+            value,
+            table: VELLEV_CODE,
+        };
+        VellevNode {
+            url: self.code.url.as_deref().map_or(node.url, code),
+            api_key: self.code.api_key.as_deref().map(code).or(node.api_key),
+            tenant: self.code.tenant.as_deref().map_or(node.tenant, code),
+            table: VELLEV_CODE,
+        }
+    }
+
+    /// The model `[vellev.code]` names, `None` where it names none, or
+    /// `Err` naming what is wrong with it: a model without a size or a
+    /// size without a model, a size of 0 or not a size at all, or a query
+    /// prefix without a model. A size given by the environment overrides
+    /// the file's.
+    pub fn code_model(&self) -> eyre::Result<Option<CodeModel<'_>>> {
+        let code = &self.code;
+        let variable = vellev_variable(VELLEV_CODE, "dimensions");
+        let dimensions = match code.dimensions_env.as_deref() {
+            Some(raw) => Some(
+                raw.trim()
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|size| *size > 0)
+                    .ok_or_else(|| {
+                        eyre::eyre!("{variable} must be a whole number above 0, not \"{raw}\"")
+                    })?,
+            ),
+            None => code.dimensions,
+        };
+        let query_prefix = match code.query_prefix.as_deref() {
+            None => QueryPrefix::Unset,
+            Some("") => QueryPrefix::None,
+            Some(prefix) => QueryPrefix::Given(prefix),
+        };
+        match (code.model.as_deref(), dimensions) {
+            (None, None) if query_prefix != QueryPrefix::Unset => Err(eyre::eyre!(
+                "{VELLEV_CODE} query_prefix is read only with a model: set {VELLEV_CODE} model and dimensions, or leave query_prefix out"
+            )),
+            (None, None) => Ok(None),
+            (Some(_), None) => Err(eyre::eyre!(
+                "{VELLEV_CODE} model needs {VELLEV_CODE} dimensions (or {variable}): the size of the model's vectors"
+            )),
+            (None, Some(_)) => Err(eyre::eyre!(
+                "{VELLEV_CODE} dimensions needs {VELLEV_CODE} model (or {}): the model whose vectors are that size",
+                vellev_variable(VELLEV_CODE, "model")
+            )),
+            (Some(_), Some(0)) => Err(eyre::eyre!(
+                "{VELLEV_CODE} dimensions must be more than 0"
+            )),
+            (Some(model), Some(dimensions)) => Ok(Some(CodeModel {
+                model,
+                dimensions,
+                query_prefix,
+            })),
+        }
+    }
+
+    /// Every key under `[vellev.shadow]` and `[vellev.code]` this hub does
+    /// not know, each with its table.
+    pub fn unknown_keys(&self) -> Vec<(&'static str, String)> {
+        let code = self.code.unknown.keys().map(|k| (VELLEV_CODE, k.clone()));
+        self.shadow.unknown_keys().into_iter().chain(code).collect()
+    }
+}
+
+impl VellevNode<'_> {
+    /// `Err` naming the first of the key, address and tenant that
+    /// `on_vellev` (a setting and its value) needs and does not have, in
+    /// the table it was read from; a key set in neither table is named in
+    /// both.
+    pub fn reachable(self, on_vellev: &str) -> eyre::Result<()> {
+        if self.api_key.is_none_or(|key| key.value.is_empty()) {
+            let tables = match self.api_key {
+                Some(key) => vec![key.table],
+                None if self.table == VELLEV => vec![VELLEV],
+                None => vec![self.table, VELLEV],
+            };
+            let named = |name: &dyn Fn(&str) -> String| {
+                tables
+                    .iter()
+                    .map(|table| name(table))
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            };
+            return Err(eyre::eyre!(
+                "{on_vellev} needs {} (or {})",
+                named(&|table| format!("{table} api_key")),
+                named(&|table| vellev_variable(table, "api_key"))
+            ));
+        }
+        let url = self.url.value.trim();
+        let host = url
+            .strip_prefix("http://")
+            .or_else(|| url.strip_prefix("https://"))
+            .unwrap_or_default();
+        if host.is_empty() || host.starts_with('/') || url.contains(char::is_whitespace) {
+            return Err(eyre::eyre!(
+                "{} url must be an http:// or https:// address of a vellev node, not \"{}\"",
+                self.url.table,
+                self.url.value
+            ));
+        }
+        if self.tenant.value.trim().is_empty() {
+            return Err(eyre::eyre!(
+                "{on_vellev} needs {} tenant (or {}): \
+                 the tenant everything is kept in, which an operator creates on the node",
+                self.tenant.table,
+                vellev_variable(self.tenant.table, "tenant")
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// `[memory] backend` and `[artifacts] index_backend`: Weaviate serves, and
@@ -5311,6 +5544,12 @@ pub struct KnowledgeConfig {
     /// was restored from a backup. Also done when a hub starts.
     #[serde(default = "default_vector_reconcile_secs")]
     pub vector_reconcile_secs: u64,
+    /// Whether code questions search the code vectors (default true). Off,
+    /// they are answered from the code graph alone, saying so, and no
+    /// vector store is asked anything for them; index runs, fills and
+    /// drains go on as configured.
+    #[serde(default = "default_true")]
+    pub code_search_enabled: bool,
 }
 
 /// Six hours: a comparison of millions of entities takes tens of minutes
@@ -5346,6 +5585,7 @@ impl Default for KnowledgeConfig {
             vector_backfill_per_sec: default_vector_backfill_per_sec(),
             vector_search_timeout_ms: default_search_timeout_ms(),
             vector_reconcile_secs: default_vector_reconcile_secs(),
+            code_search_enabled: true,
         }
     }
 }
@@ -7275,6 +7515,7 @@ impl AgentConfig {
                 vector_backfill_per_sec: global.vector_backfill_per_sec,
                 vector_search_timeout_ms: global.vector_search_timeout_ms,
                 vector_reconcile_secs: global.vector_reconcile_secs,
+                code_search_enabled: global.code_search_enabled,
             },
         }
     }
@@ -11620,6 +11861,19 @@ impl WorkforceConfig {
         if let Ok(v) = var("WORKFORCE_VELLEV_TENANT") {
             self.vellev.tenant = v;
         }
+        let code = &mut self.vellev.code;
+        for (name, setting) in [
+            ("WORKFORCE_VELLEV_CODE_URL", &mut code.url),
+            ("WORKFORCE_VELLEV_CODE_TENANT", &mut code.tenant),
+            ("WORKFORCE_VELLEV_CODE_API_KEY", &mut code.api_key),
+            ("WORKFORCE_VELLEV_CODE_MODEL", &mut code.model),
+            ("WORKFORCE_VELLEV_CODE_QUERY_PREFIX", &mut code.query_prefix),
+            ("WORKFORCE_VELLEV_CODE_DIMENSIONS", &mut code.dimensions_env),
+        ] {
+            if let Ok(v) = var(name) {
+                *setting = (!v.trim().is_empty()).then_some(v);
+            }
+        }
         if let Ok(v) = var("WORKFORCE_LISTEN") {
             self.hub.listen = v;
         }
@@ -11832,13 +12086,21 @@ impl WorkforceConfig {
     /// The first setting that keeps something in vellev, if any does:
     /// memories, the artifact index and code vectors are each chosen apart.
     pub fn kept_in_vellev(&self) -> Option<&'static str> {
+        self.memories_or_artifacts_in_vellev().or_else(|| {
+            self.code_vectors_in_vellev()
+                .then_some("[knowledge] vector_backend")
+        })
+    }
+
+    /// The first setting that keeps memories or artifacts in vellev, on
+    /// `[vellev]`'s own node, if any does.
+    fn memories_or_artifacts_in_vellev(&self) -> Option<&'static str> {
         [
             (self.memory.is_vellev(), "[memory] backend"),
             (
                 self.artifacts_indexed_in_vellev(),
                 "[artifacts] index_backend",
             ),
-            (self.code_vectors_in_vellev(), "[knowledge] vector_backend"),
         ]
         .into_iter()
         .find_map(|(chosen, setting)| chosen.then_some(setting))
@@ -11870,7 +12132,9 @@ impl WorkforceConfig {
     /// What a store set to `"shadow"` by `setting` needs, or `Err` naming
     /// the first thing missing.
     fn shadow_refusal(&self, setting: &'static str) -> eyre::Result<()> {
-        self.vellev_reachable(&format!("{setting} = \"shadow\""))?;
+        self.vellev
+            .node()
+            .reachable(&format!("{setting} = \"shadow\""))?;
         if !self.weaviate.enabled {
             return Err(eyre::eyre!(
                 "{setting} = \"shadow\" needs [weaviate] enabled = true: Weaviate serves every read and write while vellev is shadowed"
@@ -11888,34 +12152,6 @@ impl WorkforceConfig {
         }
         // Both stores' shadows are built (DW-676: artifacts in PR 5,
         // memories in PR 8).
-        Ok(())
-    }
-
-    /// The vellev key, address and tenant that `on_vellev` (a setting and
-    /// its value) needs.
-    fn vellev_reachable(&self, on_vellev: &str) -> eyre::Result<()> {
-        if self.vellev.api_key.as_deref().is_none_or(str::is_empty) {
-            return Err(eyre::eyre!(
-                "{on_vellev} needs [vellev] api_key (or WORKFORCE_VELLEV_API_KEY)"
-            ));
-        }
-        let url = self.vellev.url.trim();
-        let host = url
-            .strip_prefix("http://")
-            .or_else(|| url.strip_prefix("https://"))
-            .unwrap_or_default();
-        if host.is_empty() || host.starts_with('/') || url.contains(char::is_whitespace) {
-            return Err(eyre::eyre!(
-                "[vellev] url must be an http:// or https:// address of a vellev node, not \"{}\"",
-                self.vellev.url
-            ));
-        }
-        if self.vellev.tenant.trim().is_empty() {
-            return Err(eyre::eyre!(
-                "{on_vellev} needs [vellev] tenant (or WORKFORCE_VELLEV_TENANT): \
-                 the tenant everything is kept in, which an operator creates on the node"
-            ));
-        }
         Ok(())
     }
 
@@ -11995,15 +12231,23 @@ impl WorkforceConfig {
         self.vellev.shadow.judge_cap()?;
         self.vellev.shadow.gates()?;
         self.vellev.shadow.self_first_gate()?;
-        for (table, key) in self.vellev.shadow.unknown_keys() {
+        for (table, key) in self.vellev.unknown_keys() {
             tracing::warn!(
                 table,
                 key = %key,
                 "{table} has no setting {key:?}; it is ignored: a newer hub's setting, or mistyped"
             );
         }
-        if let Some(on_vellev) = self.kept_in_vellev() {
-            self.vellev_reachable(&format!("{on_vellev} = \"vellev\""))?;
+        if let Some(on_vellev) = self.memories_or_artifacts_in_vellev() {
+            self.vellev
+                .node()
+                .reachable(&format!("{on_vellev} = \"vellev\""))?;
+        }
+        if self.code_vectors_in_vellev() {
+            self.vellev
+                .code_node()
+                .reachable("[knowledge] vector_backend = \"vellev\"")?;
+            self.vellev.code_model()?;
         }
         if self.artifacts.index_backend == SHADOWED {
             self.shadow_refusal("[artifacts] index_backend")?;
@@ -12194,6 +12438,16 @@ enabled = false
 # The node embeds artifacts and code (and memories, without [embeddings])
 # with its own bge-base-en-v1.5, so a node that holds any of those must run
 # that model, whatever embeds the memories.
+# [vellev.code]               # Where code vectors are kept and how they are embedded, if not as [vellev] says
+# url = "http://vellev-code:18080"   # Or WORKFORCE_VELLEV_CODE_URL; default [vellev] url
+# tenant = "code"                    # Or WORKFORCE_VELLEV_CODE_TENANT; default [vellev] tenant
+# api_key = "..."                    # Or WORKFORCE_VELLEV_CODE_API_KEY; default [vellev] api_key
+# model = "BAAI/bge-small-en-v1.5"   # Or WORKFORCE_VELLEV_CODE_MODEL; default BAAI/bge-base-en-v1.5
+# dimensions = 384                   # Or WORKFORCE_VELLEV_CODE_DIMENSIONS; required with model
+# query_prefix = "Represent this sentence for searching relevant passages: "  # Or WORKFORCE_VELLEV_CODE_QUERY_PREFIX
+# The query prefix is bge's own only for the default model: any other model
+# that wants one names it, and "" is none. The node must run the model.
+# [knowledge] code_search_enabled = true   # false answers code questions from the code graph alone
 
 [llm]
 # Provider options:
@@ -16373,3 +16627,6 @@ draft = true
 
 #[cfg(test)]
 mod shadow_config_tests;
+
+#[cfg(test)]
+mod vellev_code_config_tests;

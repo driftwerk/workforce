@@ -20,7 +20,7 @@ use crate::graph::entities::{CodeEntity, EntityKind};
 use health::{InsertErrorSink, InsertErrorSlot};
 
 pub use health::InsertError;
-pub use vellev::VellevCodeVectorStore;
+pub use vellev::{code_embedding, VellevCodeVectorStore};
 
 const CODE_ENTITY_COLLECTION: &str = "CodeEntity";
 const CODE_SUMMARY_COLLECTION: &str = "CodeSummary";
@@ -232,6 +232,15 @@ pub struct VectorSearchResult {
 
 /// Semantic search over a codebase's entities and summaries, whichever
 /// vector database holds them.
+/// Why a code question was answered without searching the code vectors.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CodeSearchUnavailable {
+    #[error("code search unavailable: [knowledge] code_search_enabled is off")]
+    Off,
+    #[error("code search unavailable: {0}")]
+    Misrouted(String),
+}
+
 #[async_trait]
 pub trait CodeVectorStore: Send + Sync {
     /// Ensure the entity and summary collections exist.
@@ -242,6 +251,11 @@ pub trait CodeVectorStore: Send + Sync {
 
     /// The address the store points at, for status output.
     fn base_url(&self) -> &str;
+
+    /// The tenant the store keeps its vectors in, where it has one.
+    fn tenant(&self) -> Option<String> {
+        None
+    }
 
     /// Wire a sink that receives every non-fatal insert error. Later
     /// calls replace the earlier sink. The sink must not block.
@@ -1455,7 +1469,7 @@ mod tests {
     }
 
     /// What is logged while `f` runs, as text.
-    async fn logged<F: std::future::Future>(f: F) -> String {
+    pub(super) async fn logged<F: std::future::Future>(f: F) -> String {
         #[derive(Clone, Default)]
         struct Captured(Arc<Mutex<Vec<u8>>>);
         impl std::io::Write for Captured {

@@ -9,6 +9,7 @@ publish = false
 async-trait = { workspace = true }
 eyre = { workspace = true }
 futures = { workspace = true }
+metrics = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "net", "io-util", "rt"] }
 tracing = { workspace = true }
@@ -21,6 +22,7 @@ vellev-index = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
+tracing-subscriber = { workspace = true }
 workforce-vellev = { path = ".", features = ["testing"] }
 
 [features]
