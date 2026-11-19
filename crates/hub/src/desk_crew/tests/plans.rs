@@ -17,7 +17,7 @@ use super::super::actions::{Action, Gate};
 
 /// An overseer `desk` at `oversight`, on a hub whose Claude Code is
 /// installed, with its DM open; the crew not started yet.
-async fn hub_with(
+pub(super) async fn hub_with(
     dir: &Path,
     pool: workforce_postgres::PostgresPool,
     oversight: &str,
@@ -55,7 +55,7 @@ async fn hub_with(
 
 /// Act, with `hand_out_work` off: what a plan the person approved starts
 /// runs whatever it says.
-const ACTS: &str =
+pub(super) const ACTS: &str =
     "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = false\n";
 
 fn tickets(dir: &Path, n: usize) -> Vec<Value> {
@@ -66,7 +66,7 @@ fn tickets(dir: &Path, n: usize) -> Vec<Value> {
 
 /// A plan of `n` independent tickets proposed by `desk`, without its
 /// tools: for a hub whose crew isn't running yet.
-async fn proposed(d: &Desk, dir: &Path, n: usize) -> workforce_desk::PlanDetail {
+pub(super) async fn proposed(d: &Desk, dir: &Path, n: usize) -> workforce_desk::PlanDetail {
     d.propose_plan(
         NewPlan {
             draft: Draft {
@@ -93,7 +93,7 @@ async fn proposed(d: &Desk, dir: &Path, n: usize) -> workforce_desk::PlanDetail 
 }
 
 /// The sessions that are running for the plan's tickets.
-fn started(d: &Desk) -> Vec<workforce_desk::model::SessionView> {
+pub(super) fn started(d: &Desk) -> Vec<workforce_desk::model::SessionView> {
     d.list()
         .into_iter()
         .filter(|v| v.name.starts_with("DES-"))
@@ -1900,8 +1900,12 @@ async fn a_boss_finds_tickets_and_plans_on_them_as_they_are() {
             d.list().into_iter().find(|v| v.name == keys[0])
         })
         .await;
-        let t = d.ticket_by_key(&keys[0]).await.unwrap();
-        assert_eq!(t.ticket.session(), Some(first.id));
+        // Its ticket is given it as the start ends: a moment after it shows.
+        let t = eventually("its ticket given that session", async || {
+            let t = d.ticket_by_key(&keys[0]).await.ok()?;
+            (t.ticket.session() == Some(first.id)).then_some(t)
+        })
+        .await;
         assert_eq!(t.ticket.title, "The cart empties on reload", "as it was");
         // Nothing copied: the board has its three and the plan's new one.
         assert_eq!(d.tickets(b.id, &Default::default()).await.unwrap().len(), 4);

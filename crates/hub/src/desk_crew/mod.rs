@@ -52,6 +52,7 @@ mod observe;
 mod own_settings;
 mod picture;
 mod plan;
+mod plan_watch;
 mod preferences;
 mod read_only;
 mod reading;
@@ -274,6 +275,8 @@ pub struct CrewHub {
     /// The plan tickets whose session failed to start: each is tried again
     /// after a wait that doubles.
     plan_failed: Mutex<HashMap<uuid::Uuid, plan::Failed>>,
+    /// What the plan watchdog did, once each ([`plan_watch`]).
+    plan_watch: Mutex<plan_watch::Watch>,
     /// What failed to start, for its plan's next turn.
     plan_failures: Mutex<Vec<(uuid::Uuid, String)>>,
     /// Plans' sessions on the person's machines, as last read there, by
@@ -711,6 +714,7 @@ impl CrewHub {
             work: Mutex::default(),
             starting: tokio::sync::Mutex::new(()),
             plan_failed: Mutex::default(),
+            plan_watch: Mutex::default(),
             plan_failures: Mutex::default(),
             machine_seen: Mutex::default(),
             machine_read: Mutex::default(),
