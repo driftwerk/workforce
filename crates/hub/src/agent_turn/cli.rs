@@ -31,7 +31,8 @@ use crate::cli_session::RotationPolicy;
 use crate::code::worktree::WorktreeManager;
 use crate::coding_engine::codex;
 use crate::coding_sandbox::{
-    clean_up_detached, CodingSandbox, EmptyScope, HomeSpec, SandboxCommand, SandboxLauncher,
+    clean_up_detached, AtCapacity, CodingSandbox, EmptyScope, HomeSpec, SandboxCommand,
+    SandboxLauncher,
 };
 use crate::mcp_turn::{ClientTimeout, McpExposure, RoundTools};
 use crate::serve::AgentService;
@@ -60,10 +61,42 @@ pub struct AgentTurnRig {
     rotation: RotationPolicy,
     /// How long a turn's keyed home outlives its last turn on a worker.
     home_ttl: Duration,
+    /// How long a turn waits for a workspace on a full coding worker.
+    seat_wait: SeatWait,
     /// How long a turn's scope stays up on a worker once the turn is over.
     idle_release: Duration,
     #[cfg(test)]
     programs: std::collections::HashMap<CliKind, PathBuf>,
+}
+
+/// How long a turn waits for a workspace on a full coding worker before its
+/// route gives the turn up: briefly when another route can take it, longer
+/// when the person would otherwise get no answer at all. Only a worker whose
+/// every scope is busy makes a turn wait: an idle conversation's workspace
+/// gives way to it at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SeatWait {
+    pub before_another_route: Duration,
+    pub last_route: Duration,
+}
+
+impl Default for SeatWait {
+    fn default() -> Self {
+        Self {
+            before_another_route: Duration::from_secs(15),
+            last_route: Duration::from_secs(120),
+        }
+    }
+}
+
+impl SeatWait {
+    /// The wait of a route that is `last` in its turn's chain, or not.
+    pub(crate) fn of(self, last: bool) -> Duration {
+        match last {
+            true => self.last_route,
+            false => self.before_another_route,
+        }
+    }
 }
 
 impl AgentTurnRig {
@@ -79,10 +112,23 @@ impl AgentTurnRig {
             codex_worker,
             rotation,
             home_ttl,
+            seat_wait: SeatWait::default(),
             idle_release,
             #[cfg(test)]
             programs: std::collections::HashMap::new(),
         }
+    }
+
+    /// How long this rig's turns wait for a workspace on a full worker.
+    pub(crate) fn seat_wait(&self) -> SeatWait {
+        self.seat_wait
+    }
+
+    /// Wait `seat_wait` for a workspace on a full worker instead.
+    #[cfg(test)]
+    pub(crate) fn with_seat_wait(mut self, seat_wait: SeatWait) -> Self {
+        self.seat_wait = seat_wait;
+        self
     }
 
     /// Whether the rig seats Codex turns: on the hub's coding worker only.
@@ -125,6 +171,9 @@ pub(crate) struct CliTurn {
     pub progress: Option<mpsc::Sender<ProgressEvent>>,
     pub cancel: CancellationToken,
     pub timeout: Duration,
+    /// The most the turn waits for a workspace on a full coding worker,
+    /// within `timeout`.
+    pub seat_wait: Duration,
 }
 
 /// How a CLI route took a turn.
@@ -454,6 +503,10 @@ impl AgentTurnRig {
                     .map_or("tool-loop", |c| c.session.id.as_str())
             )
         );
+        let full_worker = format!(
+            "the coding worker is full; waiting up to {} for a workspace",
+            spoken_duration(turn.seat_wait)
+        );
         let sandbox = match (EmptyScope {
             agent_id: service.agent_id.as_str(),
             project: AGENT_TURN_PROJECT,
@@ -469,19 +522,20 @@ impl AgentTurnRig {
         })
         .seat(
             launcher.as_ref(),
-            deadline.into_std(),
+            deadline.min(Instant::now() + turn.seat_wait).into_std(),
             Some(&turn.cancel),
-            || {
-                waiting(
-                    turn.cli,
-                    turn.progress.as_ref(),
-                    "waiting for the coding worker",
-                )
-            },
+            || waiting(turn.cli, turn.progress.as_ref(), &full_worker),
         )
         .await
         {
             Ok(sandbox) => sandbox,
+            Err(_) if turn.cancel.is_cancelled() => return Err(eyre!("turn cancelled")),
+            Err(e) if e.downcast_ref::<AtCapacity>().is_some() => {
+                return Ok(CliAttempt::Unserved(
+                    RouteMiss::new(route.clone(), format!("no workspace for the turn: {e:#}"))
+                        .worker_full(),
+                ))
+            }
             Err(e) => return Ok(unserved(format!("no workspace for the turn: {e:#}"))),
         };
         let instructions = match Instructions::of(turn.cli, &sandbox, &turn.system_prompt).await {
@@ -701,6 +755,15 @@ pub(crate) fn client_timeout(timeout: Duration) -> ClientTimeout {
     ClientTimeout {
         tool: client.saturating_sub(SELF_SERVE_APPROVAL_TIMEOUT),
         client,
+    }
+}
+
+/// `wait` as a person reads it: whole minutes once it is a minute or more.
+fn spoken_duration(wait: Duration) -> String {
+    match wait.as_secs() {
+        secs @ 0..=59 => format!("{secs}s"),
+        60..=119 => "a minute".to_string(),
+        secs => format!("{} minutes", secs / 60),
     }
 }
 
