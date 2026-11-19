@@ -130,6 +130,7 @@ async fn a_session_stopped_on_its_boss_is_the_persons_and_reminded_until_answere
             .pop()
         })
         .await;
+        let carded = std::time::Instant::now();
         // Once a wait, one item: looked at again, nothing new.
         crew.look_at_items().await;
         let open: Vec<_> = d
@@ -142,16 +143,27 @@ async fn a_session_stopped_on_its_boss_is_the_persons_and_reminded_until_answere
             .collect();
         assert_eq!(open.len(), 1);
 
-        // Reminded after 10 minutes, saying how long it has waited.
+        // Reminded after 10 minutes (1 s), not before, saying how long it
+        // has waited.
+        assert!(
+            dm(&overseer, "**Still waiting on you**").is_empty(),
+            "not yet"
+        );
         let reminded = eventually("the first reminder", async || {
-            dm(
-                &overseer,
-                "**Still waiting on you.** Cufflink Migration has waited",
-            )
-            .pop()
+            dm(&overseer, "**Still waiting on you** (").pop()
         })
         .await;
-        assert!(reminded.contains("for your decision"), "{reminded}");
+        assert!(
+            carded.elapsed() >= std::time::Duration::from_millis(800),
+            "on its cadence: {:?}",
+            carded.elapsed()
+        );
+        assert!(
+            reminded.contains(" now). Cufflink Migration waits on a decision"),
+            "{reminded}"
+        );
+        let item = d.store().open_item(wait.id).await.unwrap().unwrap();
+        assert_eq!(item.said_count, 2, "said, then reminded once");
         assert_eq!(
             d.store().open_item(wait.id).await.unwrap().unwrap().state,
             OpenState::Open,
@@ -174,10 +186,11 @@ async fn a_session_stopped_on_its_boss_is_the_persons_and_reminded_until_answere
         assert_eq!(answer.kind, LineKind::Tell);
         assert_eq!(answer.to_session(), Some(s.id));
         assert_eq!(answer.in_reply_to, Some(report));
-        let said = dm(&overseer, "**Still waiting on you.**").len();
-        tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+        // The next would have come 30 minutes (3 s) on: none comes.
+        let said = dm(&overseer, "**Still waiting on you**").len();
+        tokio::time::sleep(std::time::Duration::from_millis(4_000)).await;
         assert_eq!(
-            dm(&overseer, "**Still waiting on you.**").len(),
+            dm(&overseer, "**Still waiting on you**").len(),
             said,
             "none once answered"
         );
@@ -213,9 +226,10 @@ async fn a_wait_settled_in_its_session_is_closed_and_said_in_one_line() {
             "{ack}"
         );
         assert!(!ack.contains("Needs you"), "a line, never a card: {ack}");
+        // Past the first reminder's 10 minutes (1 s): none comes.
         tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
         assert!(
-            dm(&overseer, "**Still waiting on you.**").is_empty(),
+            dm(&overseer, "**Still waiting on you**").is_empty(),
             "never reminded once settled"
         );
         assert_eq!(dm(&overseer, "You settled it").len(), 1, "said once");
@@ -256,7 +270,11 @@ async fn a_bosss_hold_is_the_persons_at_once_and_its_decision_closes_it() {
             .rfind(|m| m.text.contains("until I answer"))
             .unwrap();
         let _ = d.store().line_take(hold.id, Delivery::Delivered).await;
-        let wait = the_wait(&d, s.id).await;
+        // At once: well within the hour's bound (6 s).
+        let wait =
+            tokio::time::timeout(std::time::Duration::from_millis(1_500), the_wait(&d, s.id))
+                .await
+                .expect("at once, not after the bound");
         assert!(
             wait.dedupe_key.ends_with(&hold.id.to_string()),
             "{}",
@@ -290,6 +308,30 @@ async fn a_bosss_hold_is_the_persons_at_once_and_its_decision_closes_it() {
         .await;
         assert!(ack.contains("“Decision: (b), not (a) today.”"), "{ack}");
         assert!(ack.ends_with("I've closed the question."), "{ack}");
+    })
+    .await;
+}
+
+/// What a session did, listed ("1. …", "CI: green"), waits on no one: no
+/// item, however long it sits.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_report_of_what_was_done_waits_on_no_one() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        let (s, _) = stopped(&d, dir.path(), "Cufflink Migration").await;
+        let done = "Done.\n1. Updated the migration.\n2. Ran the tests.\nCI: green on all jobs.\nPR: opened #12.";
+        d.line_call(s.id, "tell", &json!({"to": "desk", "text": done}), None)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
+        crew.look_at_items().await;
+        let open = d.store().items_not_closed(Some("desk")).await.unwrap();
+        assert!(
+            !open.iter().any(|i| i.dedupe_key.starts_with("waiting:")),
+            "{open:?}"
+        );
+        assert!(dm(&overseer, "waits on a decision").is_empty());
     })
     .await;
 }

@@ -75,40 +75,62 @@ fn session_of(key: &str) -> Option<Uuid> {
     key.strip_prefix(KEY)?.split(':').next()?.parse().ok()
 }
 
+/// Whether `phrase` is in `lower` as words: never "your callback" for
+/// "your call", nor "until desktop" for "until desk".
+fn says(lower: &str, phrase: &str) -> bool {
+    lower.match_indices(phrase).any(|(at, _)| {
+        let before = lower[..at].chars().next_back();
+        let after = lower[at + phrase.len()..].chars().next();
+        !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+    })
+}
+
 /// Whether a session's own words to its boss wait on its answer: a
-/// question, a choice laid out, or "I change nothing until you decide".
+/// question, "both need your decision", "I change nothing until Desk
+/// answers", or options laid out with a recommendation. A report that
+/// only lists what it did ("1. Updated the migration", "CI: green") never
+/// does.
 pub(crate) fn waits_on_answer(text: &str) -> bool {
     let lower = text.to_lowercase();
     workforce_desk::line::holds(text)
-        || WAITS.iter().any(|w| lower.contains(w))
-        || options_in(text).len() >= 2
+        || WAITS.iter().any(|w| says(&lower, w))
         || crew::question_in(text).is_some()
+        || (options_in(text).len() >= 2 && says(&lower, "recommend"))
 }
 
-/// The options a message lays out, one per line: "(a) …", "a) …", "1. …",
-/// "Option A: …".
+/// The options a message lays out, one per line, each marked by a single
+/// letter: "(a) …", "a) …", "Option A: …". Numbered steps and labels
+/// ("1. Ran the tests", "CI: green") are no options.
 pub(crate) fn options_in(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in text.lines().map(str::trim) {
-        let lower = line.to_lowercase();
-        let rest = lower
-            .strip_prefix("option ")
-            .map(|r| r.trim_start_matches(|c: char| c.is_alphanumeric()));
-        let marked = match line.chars().next() {
-            Some('(') => line.find(')').filter(|i| *i <= 3).map(|i| &line[i + 1..]),
-            Some(c) if c.is_ascii_alphanumeric() => {
-                let mark = line.find([')', '.', ':']).filter(|i| *i <= 2);
-                mark.filter(|i| line[..*i].chars().all(|c| c.is_ascii_alphanumeric()))
-                    .map(|i| &line[i + 1..])
+        let mut chars = line.char_indices();
+        let marked = match (chars.next(), chars.next(), chars.next()) {
+            // "(a) …"
+            (Some((_, '(')), Some((_, c)), Some((at, ')'))) if c.is_ascii_alphabetic() => {
+                Some(&line[at + 1..])
             }
-            _ => None,
+            // "a) …", "a. …"
+            (Some((_, c)), Some((at, ')' | '.')), _) if c.is_ascii_alphabetic() => {
+                Some(&line[at + 1..])
+            }
+            _ => line
+                .get(..7)
+                .filter(|p| p.eq_ignore_ascii_case("option "))
+                .and_then(|_| {
+                    let rest = &line[7..];
+                    let mut r = rest.char_indices();
+                    match (r.next(), r.next()) {
+                        (Some((_, c)), Some((at, ':' | ')' | '.' | ' ')))
+                            if c.is_ascii_alphanumeric() =>
+                        {
+                            Some(&rest[at + 1..])
+                        }
+                        _ => None,
+                    }
+                }),
         };
-        let option = match (marked, rest) {
-            (Some(m), _) => Some(m),
-            (None, Some(r)) => Some(&line[line.len() - r.len()..]),
-            _ => None,
-        };
-        if let Some(o) = option
+        if let Some(o) = marked
             .map(|o| o.trim_start_matches([':', ' ', '-']).trim())
             .filter(|o| o.split_whitespace().count() >= 2)
         {
@@ -187,7 +209,9 @@ fn waiting_in(thread: &[LineMessage], boss: &str, s: Uuid) -> Option<Waiting> {
         // (escalated, or lapsed as it goes ahead): only a message waits
         // with nothing to take it there.
         (Some(t), o) if o.is_none_or(|o| reached(o) < t.at) => {
-            let waits = t.kind == LineKind::Tell && (held || waits_on_answer(&t.text));
+            // Spoken since the boss's hold, its own words say whether it
+            // still waits ("Done, merged" doesn't).
+            let waits = t.kind == LineKind::Tell && waits_on_answer(&t.text);
             // Under the boss's hold, the wait began with the hold.
             let began = ours.filter(|_| held);
             waits.then(|| Waiting {
@@ -209,6 +233,36 @@ fn waiting_in(thread: &[LineMessage], boss: &str, s: Uuid) -> Option<Waiting> {
 }
 
 impl CrewHub {
+    /// When the person last took part in session `s` after `since`, and
+    /// in what words when the picture kept them: what they typed while the
+    /// hub ran, or what the picture kept across a restart.
+    fn person_since(
+        &self,
+        boss: &str,
+        s: Uuid,
+        since: DateTime<Utc>,
+    ) -> Option<(DateTime<Utc>, Option<String>)> {
+        let kept = self
+            .desk
+            .picture_recent(boss, s, LOOK_BACK as usize)
+            .into_iter()
+            .filter(|r| {
+                r.what == workforce_desk::picture::What::PersonSaid
+                    && r.session == Some(s)
+                    && r.at > since
+            })
+            .max_by_key(|r| r.at);
+        let typed = self.desk.person_input_at(s).filter(|t| *t > since);
+        match (typed, kept) {
+            (Some(t), Some(r)) if r.at >= t - chrono::Duration::seconds(5) => {
+                Some((t, Some(r.text)))
+            }
+            (Some(t), _) => Some((t, None)),
+            (None, Some(r)) => Some((r.at, Some(r.text))),
+            (None, None) => None,
+        }
+    }
+
     /// What the person calls boss `boss`.
     fn boss_name(&self, boss: &str) -> String {
         self.overseer_named(boss)
@@ -266,11 +320,7 @@ impl CrewHub {
                 continue;
             }
             // The person took part in it since: theirs, not a silent wait.
-            if self
-                .desk
-                .person_input_at(view.id)
-                .is_some_and(|t| t > w.since)
-            {
+            if self.person_since(&boss, view.id, w.since).is_some() {
                 continue;
             }
             self.give_wait_to_person(&boss, &o, &view, &w, now).await;
@@ -286,7 +336,13 @@ impl CrewHub {
         now: DateTime<Utc>,
     ) {
         let store = self.desk.store();
-        let line = w.said.as_ref().map(|m| m.id);
+        // Answered from the item, its answer goes to the session in reply
+        // to its message; a question of its own has its own answer.
+        let line = w
+            .said
+            .as_ref()
+            .filter(|m| m.kind == LineKind::Tell)
+            .map(|m| m.id);
         // Each wait is given to the person once: settled, it stays so.
         let key = key(view.id, w.message);
         match store.item_ever_keyed(boss, &key).await {
@@ -297,15 +353,25 @@ impl CrewHub {
                 return;
             }
         }
-        if let Some(line) = line {
-            match store.items_not_closed(Some(boss)).await {
-                Ok(open) if open.iter().any(|i| i.line_message == Some(line)) => return,
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::info!(error = %e, "a boss's open items couldn't be read for what waits");
-                    return;
-                }
+        // Already the person's: its question raised, or the boss asked
+        // them since it began to wait (about it, or with no session named).
+        let open = match store.items_not_closed(Some(boss)).await {
+            Ok(open) => open,
+            Err(e) => {
+                tracing::info!(error = %e, "a boss's open items couldn't be read for what waits");
+                return;
             }
+        };
+        let theirs = open.iter().any(|i| {
+            !is_waiting(&i.dedupe_key)
+                && (line.is_some() && i.line_message == line
+                    || matches!(i.kind, OpenKind::Ask | OpenKind::Confirm)
+                        && i.said()
+                        && i.opened_at >= w.since
+                        && i.session.is_none_or(|s| s == view.id))
+        });
+        if theirs {
+            return;
         }
         let name = view.label().to_string();
         let words = w
@@ -370,6 +436,46 @@ impl CrewHub {
             .await;
     }
 
+    /// The person's `answer` to waiting item `i`: to its session, in reply
+    /// to what it waits on when that was its message, and the item closed.
+    pub(super) async fn answer_wait(&self, i: &OpenItem, answer: &str) -> Result<(), String> {
+        let refused = |e: workforce_desk::LineError| match e {
+            workforce_desk::LineError::Refused(r) => r.to_string(),
+            workforce_desk::LineError::Desk(e) => format!("Desk couldn't send it: {e}"),
+        };
+        match (
+            i.line_message,
+            i.session.or_else(|| session_of(&i.dedupe_key)),
+        ) {
+            (Some(m), _) => {
+                self.desk
+                    .line_answer(m, workforce_desk::LineSender::Person, answer.to_string())
+                    .await
+                    .map_err(refused)?;
+            }
+            (None, Some(s)) => {
+                self.desk
+                    .line_send(
+                        workforce_desk::LineSender::Person,
+                        workforce_desk::line::Send::Tell {
+                            to: workforce_desk::line::Target::Session(s),
+                            text: answer.to_string(),
+                            when: workforce_desk::line::When::Queue,
+                        },
+                    )
+                    .await
+                    .map_err(refused)?;
+            }
+            (None, None) => return Err("Its session is gone.".into()),
+        }
+        self.desk
+            .store()
+            .item_close(i.id, ClosedBy::Person, &format!("You answered: {answer}"))
+            .await
+            .map_err(|e| format!("The answer went, but the item didn't close: {e}"))?;
+        Ok(())
+    }
+
     /// What closes waiting item `i`, when something did: the person's own
     /// input into the session, the boss's word reaching it, or the session
     /// going on; with the one line that says so.
@@ -391,9 +497,9 @@ impl CrewHub {
                 format!("{name} ended; I've closed the question."),
             ));
         }
-        if let Some(t) = self.desk.person_input_at(s).filter(|t| *t > i.opened_at) {
-            let words = view
-                .last_prompt
+        if let Some((t, kept)) = self.person_since(&i.boss, s, i.opened_at) {
+            let words = kept
+                .or_else(|| view.last_prompt.clone())
                 .as_deref()
                 .map(|p| crew::words(&crew::one_line(p, 200), 12))
                 .filter(|p| !p.trim().is_empty())
@@ -458,18 +564,19 @@ impl CrewHub {
             if now - last < minute * gap as i32 {
                 continue;
             }
-            if workforce_desk::update_cadence::quiet_now(&o.updates.cadence, now, &tz)
+            // Never in quiet hours nor held for a roundup (a held card
+            // would come with the ones after it), and never while away:
+            // their catch-up lists what waits.
+            if workforce_desk::update_cadence::held_until(&o.updates.cadence, now, &tz).is_some()
                 || self.away_now(&i.boss).await
             {
                 continue;
             }
-            let name = i
-                .session
-                .map(|s| self.name_of_session(s))
-                .unwrap_or_else(|| "A session".into());
+            // Since it began to wait: the bound before it was given.
+            let since = i.opened_at - self.waiting_bound(&o);
             let text = format!(
-                "**Still waiting on you.** {name} has waited {} for your decision: {}",
-                i.age(now),
+                "**Still waiting on you** ({} now). {}",
+                waited(since, now),
                 i.headline()
             );
             if self.post_item(&i.boss, i, text, Vec::new()).await {
@@ -504,6 +611,24 @@ mod tests {
             "Done: the date picker is on 4.2 and the tests pass."
         ));
         assert!(options_in("Fixed 3 tests.\n2 left.").is_empty());
+        // What was done, listed, is no choice.
+        let done = "Done.\n1. Updated the migration.\n2. Ran the tests.\nCI: green on all jobs.\nPR: opened #12.";
+        assert!(options_in(done).is_empty(), "{:?}", options_in(done));
+        assert!(!waits_on_answer(done));
+        assert!(!waits_on_answer(
+            "Wired up your callback and the until-desktop flag."
+        ));
+        // Options alone, without a recommendation or a question, are a list.
+        assert!(!waits_on_answer(
+            "Tried:\n(a) the 16.15 image\n(b) the 16.16 image"
+        ));
+        assert_eq!(
+            options_in("Option A: upgrade staging first\nOption B: pin the minor").len(),
+            2
+        );
+        // Text that changes length in lower case never panics.
+        let _ = options_in("Option Éé: İ foo bar\nİİİİ Option: x y");
+        let _ = waits_on_answer("İİİİ until Desk answers; K your call");
     }
 
     #[test]

@@ -948,6 +948,12 @@ impl CrewHub {
         match (text("answer"), text("why")) {
             // A session's question: the person's answer goes on to it, as
             // theirs, and that closes the item.
+            (Some(answer), _) if waiting::is_waiting(&item.dedupe_key) => {
+                self.answer_wait(&item, answer).await?;
+                Ok(json!(
+                    "Their answer went to the session, and the item is closed."
+                ))
+            }
             (Some(answer), _) if item.line_message.is_some() => {
                 let ask = item.line_message.unwrap_or_default();
                 self.desk
@@ -1170,6 +1176,13 @@ impl CrewHub {
         if item.state == OpenState::Closed {
             return Err(ItemRefused::Closed);
         }
+        // What a session waits on: the answer goes to it, and closes it.
+        if waiting::is_waiting(&item.dedupe_key) {
+            self.answer_wait(&item, answer)
+                .await
+                .map_err(ItemRefused::Cant)?;
+            return Ok("Sent.".into());
+        }
         if let Some(ask) = item.line_message {
             self.desk
                 .line_answer(ask, workforce_desk::LineSender::Person, answer.to_string())
@@ -1180,16 +1193,6 @@ impl CrewHub {
                         ItemRefused::Cant(Self::item_err(eyre::eyre!("{e}")))
                     }
                 })?;
-            // What a session waited on is answered once it has the answer:
-            // nothing more is said of it.
-            if waiting::is_waiting(&item.dedupe_key) {
-                if let Err(e) = store
-                    .item_close(id, ClosedBy::Person, &format!("You answered: {answer}"))
-                    .await
-                {
-                    tracing::warn!(error = %e, "closing an answered wait failed");
-                }
-            }
             return Ok("Sent.".into());
         }
         let closed = store
