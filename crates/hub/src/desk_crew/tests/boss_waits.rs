@@ -175,39 +175,86 @@ async fn what_a_session_and_its_boss_say_reaches_whom_it_answers_whole() {
         assert!(closed.closed_why.unwrap().contains("replied"));
 
         // 10:29: Desk's hold, from one turn; 10:30 its decision, from
-        // another: sent, never dropped as a repeat of the hold it answers.
+        // another, in reply to the report (a message, no question): sent as
+        // a message, never refused, never dropped as a repeat of the hold.
         crew.picture_turn_began("line-1029");
         let hold = "Send your full answer as a new report. Don't change staging any further until I answer.";
         in_turn("line-1029", crew.perform(&nudge(s.id, hold, None), by()))
             .await
             .unwrap();
+        // The same hold again is still a repeat.
+        crew.picture_turn_began("line-1029b");
+        let again = in_turn("line-1029b", crew.perform(&nudge(s.id, hold, None), by()))
+            .await
+            .unwrap();
+        assert!(!again.starts_with("told"), "{again}");
         crew.picture_turn_began("line-1030");
         let decided = in_turn(
             "line-1030",
-            crew.perform(&nudge(s.id, "Decision: (b), not (a) today.", None), by()),
+            crew.perform(
+                &nudge(s.id, "Decision: (b), not (a) today.", Some(report_id)),
+                by(),
+            ),
         )
         .await
         .unwrap();
         assert!(decided.starts_with("told Cufflink Migration"), "the answer to a hold: {decided}");
-        // In reply to its report, a message, which is no question: it goes
-        // as a message in reply, never refused.
-        crew.picture_turn_began("line-1031");
-        let replied = in_turn(
-            "line-1031",
-            crew.perform(&nudge(s.id, "And file the 16.16 ticket.", Some(report_id)), by()),
+        let thread = d.line_thread(s.id, None, None).await.unwrap();
+        let answer = thread
+            .iter()
+            .find(|m| m.text == "Decision: (b), not (a) today.")
+            .expect("the decision is on its line");
+        assert_eq!(answer.kind, LineKind::Tell);
+        assert_eq!(answer.from.kind, PartyKind::Manager);
+        // A reply can't reach another session through what it cites.
+        crew.picture_turn_began("line-1032");
+        let other = new_session(&d, dir.path(), "acme-api").await;
+        let cited = in_turn(
+            "line-1032",
+            crew.perform(&nudge(other.id, "Merge it.", Some(report_id)), by()),
+        )
+        .await
+        .unwrap_err();
+        assert!(cited.starts_with("Not sent: message"), "{cited}");
+    })
+    .await;
+}
+
+/// A reply to a session's report is a message: with messaging sessions
+/// off, citing the report doesn't send it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reply_to_a_report_keeps_the_gates_of_a_message() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let config = "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nnudge = false\nanswer_sessions = true\n";
+        let (_overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", config, &[]).await;
+        let s = new_session(&d, dir.path(), "Cufflink Migration").await;
+        let r = d
+            .line_call(s.id, "tell", &json!({"to": "desk", "text": report()}), None)
+            .await
+            .unwrap();
+        let report_id: uuid::Uuid = serde_json::from_value(r["id"].clone()).unwrap();
+        let said = workforce_agent::tools::Tool::execute(
+            &tool(&crew, "crew.nudge"),
+            json!({
+                "session_id": s.id.to_string(),
+                "reply_to": report_id.to_string(),
+                "message": "Upgrade production now.",
+                "reason": "It reported."
+            }),
         )
         .await
         .unwrap();
-        assert!(replied.starts_with("told Cufflink Migration, in reply to its message"), "{replied}");
+        assert!(
+            !said.output.to_string().contains("told Cufflink"),
+            "{:?}",
+            said
+        );
         let thread = d.line_thread(s.id, None, None).await.unwrap();
-        assert!(thread.iter().any(|m| m.text == "Decision: (b), not (a) today."));
-        let answer = thread
-            .iter()
-            .find(|m| m.text == "And file the 16.16 ticket.")
-            .expect("the reply is on its line");
-        assert_eq!(answer.kind, LineKind::Tell);
-        assert_eq!(answer.in_reply_to, Some(report_id));
-        assert_eq!(answer.from.kind, PartyKind::Manager);
+        assert!(
+            !thread.iter().any(|m| m.text == "Upgrade production now."),
+            "never sent"
+        );
     })
     .await;
 }

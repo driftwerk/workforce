@@ -105,11 +105,13 @@ impl Denied {
         self.tool.split('(').next().unwrap_or(&self.tool).trim()
     }
 
-    /// Whether it refused one of Desk's own line tools: the line's rule,
-    /// whose words the session read in the call's result and went on
-    /// from. It stops no turn and asks the person nothing.
+    /// Whether it is Desk's own line answering one of its tools (its words
+    /// are the call's result, which the session read and went on from):
+    /// no verdict of auto mode's and no safety check, so it stops no turn
+    /// and asks the person nothing. Auto mode's own refusal of a line tool
+    /// stays a refusal.
     pub fn of_line_tool(&self) -> bool {
-        crate::claude::is_line_tool(&self.call.tool)
+        crate::claude::is_line_tool(&self.call.tool) && !self.allowable && self.transient
     }
 }
 
@@ -241,9 +243,12 @@ pub fn denials_in<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<Denied> {
                         .get(id)
                         .map(|(n, i)| (n.as_str(), Some(i)))
                         .unwrap_or(("a tool", None));
-                    // Desk's own line tool, turned down by the line's own
-                    // rule: no refusal the turn stops on.
-                    if crate::claude::is_line_tool(name) {
+                    // Desk's own line answering its tool (marked as a
+                    // permission rule's): the session read its words and
+                    // went on, no refusal the turn stops on. Auto mode's
+                    // refusal of one stays a refusal.
+                    if kind == "permission-rule" && crate::claude::is_line_tool(name) {
+                        went_on(&mut out, true);
                         continue;
                     }
                     out.push(Denied::new(
@@ -653,6 +658,23 @@ mod tests {
             reply("I've resent Desk the reply, and I'm changing nothing until Desk answers."),
         ]);
         assert!(denials_in(lines.lines()).is_empty());
+        // Auto mode refusing a line tool is still a refusal.
+        let blocked = turn(&[
+            prompt("Ask Desk which key to use."),
+            tool_use(
+                "t1",
+                "mcp__desk__ask",
+                json!({ "to": "desk", "text": "Which key?" }),
+            ),
+            result("t1", REFUSED, Some("automode-blocked")),
+        ]);
+        assert_eq!(denials_in(blocked.lines()).len(), 1);
+        assert!(!Denied::from_hook(
+            "mcp__desk__ask",
+            None,
+            "[Credential Exploration] reads a key"
+        )
+        .of_line_tool());
         let hooked = Denied::from_hook(
             "mcp__desk__reply",
             Some(&json!({ "message_id": "4288d9ac" })),

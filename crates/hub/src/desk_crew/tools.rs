@@ -133,7 +133,6 @@ fn session_schema() -> Value {
     json!({ "type": "string", "description": "A session id from crew.overview" })
 }
 
-/// A session id from crew.overview, read.
 /// The line message `raw` (its full id), whole, when its session is one
 /// the boss may see (`seen`).
 pub(super) async fn line_message_read(
@@ -168,6 +167,7 @@ pub(super) async fn line_message_read(
     Ok(json!({ "message": reported(&said.to_string(), "a message on the session's line") }))
 }
 
+/// A session id from crew.overview, read.
 fn session_id(s: &str) -> Result<uuid::Uuid, String> {
     s.parse()
         .map_err(|_| "That isn’t a session id from crew.overview.".to_string())
@@ -626,6 +626,7 @@ impl CrewTool {
         let input = &kept;
         let mut by = crew.by_boss(&b.service, &reason);
         by.preference = applied.as_ref().map(|a| a.id);
+        let action = crew.as_sent(&action).await?;
         crew.know_question(&action).await;
         match crew.gate(&action, oversight) {
             Gate::No(why) => Err(why.into_owned()),

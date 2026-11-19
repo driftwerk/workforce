@@ -162,7 +162,11 @@ impl Happened {
         // the session's own words breaking off.
         let flat = self.text.split_whitespace().collect::<Vec<_>>().join(" ");
         let shown = crate::crew::clip(&flat, SAID_MAX);
-        let cut = shown.chars().count() < flat.chars().count() || self.text.ends_with('…');
+        // Stored cut at TEXT_MAX, it ends on the clip's mark there; a
+        // session's own "…" shorter than that is its own.
+        let stored_cut =
+            self.text.ends_with('…') && self.text.chars().count() >= TEXT_MAX.saturating_sub(2);
+        let cut = shown.chars().count() < flat.chars().count() || stored_cut;
         let text = match (cut, self.message) {
             (false, _) => shown,
             (true, Some(m)) => format!(

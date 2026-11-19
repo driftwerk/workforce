@@ -1369,6 +1369,42 @@ impl CrewHub {
     /// words. A boss's is recorded in its decision log as it is done, with
     /// how it is undone; an answer to a session's question is said in its
     /// DM from that row. Recording never stops the action.
+    /// `action` as it is sent: a reply to what is no question (a session's
+    /// report, or Desk's status question) is a message like any other, so
+    /// every gate of one applies to it; and one citing what isn't on the
+    /// named session's line is refused, never sent to another through it.
+    pub(crate) async fn as_sent(&self, action: &Action) -> Result<Action, String> {
+        let Action::Nudge {
+            to: Target::Session(s),
+            message,
+            reply_to: Some(id),
+        } = action
+        else {
+            return Ok(action.clone());
+        };
+        let cited = self
+            .desk
+            .store()
+            .line_message(*id)
+            .await
+            .map_err(|e| format!("Desk couldn't read that message: {e}"))?;
+        let on_its_line = |m: &workforce_desk::line::LineMessage| {
+            m.from_session() == Some(*s) || m.to_session() == Some(*s)
+        };
+        match cited.filter(on_its_line) {
+            None => Err(format!(
+                "Not sent: message {id} isn't on {}'s line. Answer a question with the id the question came with.",
+                self.session_name(*s)
+            )),
+            Some(m) if m.kind != workforce_desk::line::LineKind::Ask => Ok(Action::Nudge {
+                to: Target::Session(*s),
+                message: message.clone(),
+                reply_to: None,
+            }),
+            Some(_) => Ok(action.clone()),
+        }
+    }
+
     pub(crate) async fn perform(&self, action: &Action, by: By) -> Result<String, String> {
         // Boxed: its future is large, and is awaited from deep in a turn.
         Box::pin(self.perform_with(action, by, &super::assignments::Order::default())).await
@@ -1401,6 +1437,10 @@ impl CrewHub {
                 }
             }
         };
+        let sent = self.as_sent(action).await?;
+        if &sent != action {
+            return Box::pin(self.perform_with(&sent, by, order)).await;
+        }
         // R5: a boss allows no irreversible request on a job another
         // session holds, as irreversible, whichever path it came by.
         if let (crew::PartyKind::Manager, Action::Approve { session, approval }) =
@@ -1733,20 +1773,7 @@ impl CrewHub {
                             .await
                             .map_err(line)?;
                         done.line = Some((answer.id, answer.delivery));
-                        // What it replied to was no question waiting on the
-                        // boss (a report, or one answered since): its words
-                        // still go, as a message in reply.
-                        Ok(match answer.kind {
-                            workforce_desk::line::LineKind::Answer => format!("answered {name}"),
-                            _ => match answer.delivery {
-                                workforce_desk::line::Delivery::Delivered => {
-                                    format!("told {name}, in reply to its message")
-                                }
-                                _ => format!(
-                                    "told {name}, in reply to its message; it gets it once its turn ends"
-                                ),
-                            },
-                        })
+                        Ok(format!("answered {name}"))
                     }
                     // On its line: it gets it once its turn ends, never typed
                     // in over what it is doing (Interrupt is for that); a
