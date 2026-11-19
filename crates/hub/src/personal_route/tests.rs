@@ -1081,3 +1081,62 @@ async fn only_a_person_whose_turns_take_their_own_route_is_shown_one() {
     });
     assert_eq!(shown(&hub, ALICE).await, None, "Claude isn't offered");
 }
+
+#[tokio::test]
+async fn with_the_agents_own_conversation_model_she_is_shown_the_claude_model_her_turn_runs() {
+    let (hub, store) = routed().await;
+    hub.claude_login(ALICE);
+    choose(&hub, &store, ALICE, Some(claude(RouteFallback::Wait))).await;
+    let on_default = shown(&hub, ALICE).await.expect("her route").model;
+    let mut resolved = (*hub.service.resolved.snapshot()).clone();
+    resolved.model_preferences = Some(std::collections::HashMap::from([(
+        "conversation".to_string(),
+        "cheap".to_string(),
+    )]));
+    hub.service.resolved.store(resolved);
+    hub.claude.reply(None, &answer("Claude answers."));
+
+    let shown = shown(&hub, ALICE).await.expect("her route");
+    let (_, result) = crate::serve::chat_turn(hub.stream_at(
+        ("desk", None, None),
+        ALICE,
+        "hello there",
+        None,
+        None,
+    ))
+    .await;
+
+    result.unwrap();
+    assert_eq!(
+        hub.claude.calls()[0].flag("--model"),
+        Some(shown.model.as_str())
+    );
+    assert_ne!(
+        shown.model, on_default,
+        "the agent's conversation model, not its default"
+    );
+}
+
+#[tokio::test]
+async fn off_the_worker_her_codex_route_is_shown_refused_or_as_the_hubs() {
+    let (hub, store) = routed().await;
+    choose(&hub, &store, ALICE, Some(codex(RouteFallback::Wait))).await;
+    let waits = shown(&hub, ALICE).await.expect("her route, refused");
+    assert_eq!(waits.kind, "codex");
+    assert_eq!(
+        waits.refused.as_deref(),
+        Some(super::CODEX_NEEDS_WORKER),
+        "a turn of hers stops and says this"
+    );
+
+    choose(&hub, &store, ALICE, Some(codex(RouteFallback::Hub))).await;
+    assert_eq!(
+        shown(&hub, ALICE).await,
+        None,
+        "every turn of hers runs on the hub's route"
+    );
+
+    let (hub, store) = routed_on_worker().await;
+    choose(&hub, &store, ALICE, Some(codex(RouteFallback::Wait))).await;
+    assert_eq!(shown(&hub, ALICE).await.expect("her route").refused, None);
+}

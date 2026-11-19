@@ -35,6 +35,7 @@ struct Hub {
     service: Arc<AgentService>,
     alice: Identity,
     bob: Identity,
+    admin: Identity,
     _dirs: (tempfile::TempDir, tempfile::TempDir),
 }
 
@@ -48,6 +49,8 @@ impl Hub {
         let bob = Identity::new("Bob", IdentityRole::Member);
         identities.create(&alice).unwrap();
         identities.create(&bob).unwrap();
+        let admin = Identity::new("Ada", IdentityRole::SystemAdmin);
+        identities.create(&admin).unwrap();
         let mut config = workforce_common::settings::WorkforceConfig::default();
         config.hub.data_dir = data.path().to_string_lossy().to_string();
         config.memory.db_path = std::path::Path::new(&config.hub.data_dir)
@@ -88,8 +91,12 @@ impl Hub {
                 .collect(),
             "scout".into(),
         );
+        // The file an agent's rename is written to.
+        let config_path = data.path().join("workforce.toml");
+        std::fs::write(&config_path, "[[agents]]\nid = \"scout\"\n").unwrap();
         let state = GatewayParts {
             vault: Some(Arc::clone(&vault)),
+            config_path: Some(config_path),
             ..GatewayParts::new(
                 registry,
                 Arc::new(identities),
@@ -104,6 +111,7 @@ impl Hub {
             service,
             alice,
             bob,
+            admin,
             _dirs: (data, vaults),
         }
     }
@@ -529,4 +537,25 @@ async fn the_agent_list_says_what_each_persons_own_conversations_run_on() {
         scout(&listing).get("personal_route").is_none(),
         "the agent opted out: {listing}"
     );
+}
+
+#[tokio::test]
+async fn a_renamed_agent_is_answered_with_what_the_renamers_own_conversations_run_on() {
+    let hub = Hub::on().await;
+    hub.claude_login(&hub.admin);
+    hub.put(&hub.admin, "/api/me/llm-route", claude("hub"))
+        .await;
+
+    let (status, agent) = hub
+        .call(
+            &hub.admin,
+            Method::PATCH,
+            "/api/agents/scout",
+            Some(json!({ "name": "Lookout" })),
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::OK, "{agent}");
+    assert_eq!(agent["personal_route"]["kind"], "claude-code", "{agent}");
+    assert_eq!(agent["personal_route"]["fallback"], "hub");
 }

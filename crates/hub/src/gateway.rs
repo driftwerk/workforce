@@ -4979,6 +4979,9 @@ async fn list_commands(
     ))
 }
 
+/// How many agents' routes a listing reads at once.
+const ROUTES_READ_AT_ONCE: usize = 8;
+
 /// List available agents.
 async fn list_agents(
     headers: axum::http::HeaderMap,
@@ -5037,11 +5040,7 @@ async fn list_agents(
 
         let model = svc.current_default_model.read().clone();
         let provider = svc.provider_kind.read().canonical_name().to_string();
-        let personal_route = match person {
-            Some(person) => crate::api_handlers::llm_route::shown_route(&svc, person).await,
-            None => None,
-        };
-        agents.push(workforce_gateway_client::AgentInfo {
+        let info = workforce_gateway_client::AgentInfo {
             id: id_str.clone(),
             name: svc.display_name(),
             model: Some(model).filter(|m| !m.is_empty()),
@@ -5053,9 +5052,23 @@ async fn list_agents(
             owner_id,
             owner_type,
             picture: faces.get(&id_str).map(crate::pictures::Face::info),
-            personal_route,
-        });
+            personal_route: None,
+        };
+        agents.push((svc, info));
     }
+    // What each agent runs on for the caller, read for a few agents at once
+    // so a cold cache costs a few reads' time, not one per agent in turn.
+    let agents = futures::stream::iter(agents)
+        .map(|(svc, mut info)| async move {
+            if let Some(person) = person {
+                info.personal_route =
+                    crate::api_handlers::llm_route::shown_route(&svc, person).await;
+            }
+            info
+        })
+        .buffered(ROUTES_READ_AT_ONCE)
+        .collect()
+        .await;
     Ok(Json(workforce_gateway_client::AgentsResponse { agents }))
 }
 
@@ -6811,8 +6824,9 @@ async fn patch_agent(
     }))
 }
 
-/// The person `caller` is, when they are one: their identity, never a
-/// device's own id or the admin token.
+/// The person `caller` is, when they are one: their identity (a paired
+/// device's, the person it is linked to); none for the admin token or a
+/// device linked to no one.
 fn caller_person(caller: &CallerContext) -> Option<uuid::Uuid> {
     caller
         .identity_id

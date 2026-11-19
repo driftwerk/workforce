@@ -19,7 +19,7 @@ use workforce_agent::llm::provider::ProviderKind;
 use workforce_agent::llm::responses::ChatGptModel;
 use workforce_agent::llm::tiers::{ModelTier, TierRegistry};
 use workforce_common::personal_route::{
-    AgentRoute, PersonalRoute, PersonalRouteKind, PersonalRoutesConfig,
+    AgentRoute, PersonalRoute, PersonalRouteKind, PersonalRoutesConfig, RouteFallback,
 };
 use workforce_common::settings::ExecutorKind;
 use workforce_common::subscription::{AgentOwner, CredentialTier};
@@ -381,7 +381,9 @@ fn agent_options(
 /// their own route, as an agent listing shows it to them; `None` is the
 /// hub's route. The route is the one a turn of theirs takes
 /// ([`crate::personal_route::RouteDecider::chosen_for`]), its model the
-/// one a chat turn on the agent's default model runs.
+/// one a new conversation's chat turn runs. A Codex route on a hub without
+/// its coding worker is the hub's route when it falls back to it, and said
+/// refused when it waits, as a turn finds it.
 pub(crate) async fn shown_route(
     service: &AgentService,
     person: Uuid,
@@ -389,7 +391,19 @@ pub(crate) async fn shown_route(
     let chosen = crate::personal_route::RouteDecider::of(service)
         .chosen_for(person)
         .await?;
-    let spec = service.current_default_model.read().clone();
+    let refused = crate::agent_turn::personal_refusal(service, chosen.cli);
+    if refused.is_some() && chosen.route.fallback == RouteFallback::Hub {
+        // Every turn of theirs runs on the hub's route instead.
+        return None;
+    }
+    // The model a new conversation's chat turn starts from: the agent's
+    // conversation model, else its default, as `resolve_chat_model` picks.
+    let fresh = workforce_common::session::Session::new(
+        "desk",
+        &person.to_string(),
+        service.agent_id.as_str(),
+    );
+    let spec = service.resolve_model(&fresh, Some(crate::serve::CONVERSATION), None);
     let model = crate::personal_route::personal_model(
         &service.tier_registry(),
         &service.tier_key.read().clone(),
@@ -410,6 +424,7 @@ pub(crate) async fn shown_route(
             &[CredentialTier::AgentUser, CredentialTier::GlobalUser],
             person,
         ),
+        refused: refused.map(str::to_string),
     })
 }
 

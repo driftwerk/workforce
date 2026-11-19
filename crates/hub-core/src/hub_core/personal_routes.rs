@@ -161,9 +161,11 @@ impl PersonalRoutes {
             }
         }
         let settings = store.settings(person, Some(agent_id)).await?;
-        self.cache
-            .lock()
-            .insert(key, (std::time::Instant::now(), settings.clone()));
+        let mut cache = self.cache.lock();
+        // What has gone stale is read again anyway: dropped, so the cache
+        // holds only who was asked about lately.
+        cache.retain(|_, (at, _)| at.elapsed() < SETTINGS_TTL);
+        cache.insert(key, (std::time::Instant::now(), settings.clone()));
         Ok(settings)
     }
 

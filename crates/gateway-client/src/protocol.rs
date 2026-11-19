@@ -796,7 +796,8 @@ pub struct AgentInfo {
     /// What the caller's own conversations with the agent run on, when that
     /// is their own subscription rather than the hub's route that
     /// `provider` and `model` name. Absent: the hub's route, or a hub from
-    /// before it said.
+    /// before it said. Its model is the one a new conversation runs; a
+    /// session's own `cmd: model` or a spoken turn's voice model can differ.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub personal_route: Option<PersonalRouteInfo>,
 }
@@ -819,6 +820,11 @@ pub struct PersonalRouteInfo {
     /// its usage limit counts). Without one, a turn waits or runs on the
     /// hub's route, as `fallback` says.
     pub connected: bool,
+    /// Why the route can't take the agent's turns here at all (a Codex
+    /// route on a hub without its coding worker), so they stop and say
+    /// this; none when it can.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
 }
 
 /// The picture an agent or a person is shown with: one chosen for them,
