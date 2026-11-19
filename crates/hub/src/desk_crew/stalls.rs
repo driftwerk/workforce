@@ -257,6 +257,18 @@ impl CrewHub {
                 doing: "I'm passing them to its session now.".into(),
             });
         }
+        // On its line, but stopped, and not the boss's to start again: the
+        // person's to resume.
+        if let Some(why) = parked.filter(|_| !sent && not.is_none()) {
+            tracing::info!(session = %s, %why, "the person's word waits on a stopped session's line: theirs to resume");
+            let question = format!(
+                "{} has stopped, and the answers you gave wait on its line. Resume it and it reads them",
+                work.in_words()
+            );
+            return self
+                .person_moves(boss, o, view, &question, all, since, acts, now)
+                .await;
+        }
         let tz = self.desk.timezone();
         if let (Some(at), true) = (given, acts) {
             let at = at.with_timezone(&tz).format("%H:%M").to_string();
@@ -278,18 +290,6 @@ impl CrewHub {
                     ),
                 },
             });
-        }
-        // On its line, but stopped, and not the boss's to start again: the
-        // person's to resume.
-        if let Some(why) = parked.filter(|_| !sent && not.is_none()) {
-            tracing::info!(session = %s, %why, "the person's word waits on a stopped session's line: theirs to resume");
-            let question = format!(
-                "{} has stopped, and the answers you gave wait on its line. Resume it and it reads them",
-                work.in_words()
-            );
-            return self
-                .person_moves(boss, o, view, &question, all, since, acts, now)
-                .await;
         }
         // Not the boss's to send (it suggests, it's held, a gate): the
         // person's, with what the boss holds to answer it.

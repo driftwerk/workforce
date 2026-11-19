@@ -136,8 +136,15 @@ fn standing(text: &str) -> bool {
         })
         .is_some_and(|p| {
             let p = p.to_lowercase();
-            rules.iter().any(|w| p.starts_with(w))
+            rules
+                .iter()
+                .any(|w| p.starts_with(w) || p == w.trim_end())
         })
+}
+
+/// Whether session `v` runs, or is starting: never started again.
+fn running(v: &workforce_desk::model::SessionView) -> bool {
+    v.live || v.state == workforce_desk::model::SessionState::Starting
 }
 
 /// What the session is sent of `item`: the person's word, said as the
@@ -253,7 +260,7 @@ impl CrewHub {
         tracing::info!(session = %s, item = %item.id, "the person's word a boss held went to the session waiting on it");
         // A session not running has it when it runs again: started again.
         match self.desk.view(s) {
-            Ok(v) if !v.live => self.resume_for_held(boss, s).await,
+            Ok(v) if !running(&v) => self.resume_for_held(boss, s).await,
             _ => Held::Sent,
         }
     }
@@ -262,8 +269,9 @@ impl CrewHub {
     /// goes through, to read the person's word left on its line for it:
     /// [`Held::Resumed`], or [`Held::Parked`] with why it is the person's.
     async fn resume_for_held(&self, boss: &str, s: Uuid) -> Held {
-        // Running (or started) already: it reads them in Desk's next pass.
-        if self.desk.view(s).is_ok_and(|v| v.live) {
+        // Running, or starting, already: it reads them in Desk's next pass,
+        // never started twice.
+        if self.desk.view(s).is_ok_and(|v| running(&v)) {
             return Held::Going;
         }
         let Some((service, o)) = self.overseer_named(boss) else {
@@ -291,7 +299,7 @@ impl CrewHub {
                 Held::Resumed
             }
             // Started meanwhile, or still starting: on its way.
-            Err(_) if self.desk.view(s).is_ok_and(|v| v.live) => Held::Resumed,
+            Err(_) if self.desk.view(s).is_ok_and(|v| running(&v)) => Held::Resumed,
             Err(why) if why.contains("may still be starting") => Held::Resumed,
             Err(why) => Held::Parked(why),
         }
@@ -373,6 +381,7 @@ mod tests {
             "VEL-22: pick up the importer tests too",
             "VEL-22: wait until Friday, then ship it",
             "VEL-22: hold the release until the approval lands",
+            "VEL-22: hold off.",
         ] {
             assert!(
                 held_for(&[order(not, vec![s])], s, &work).is_empty(),
