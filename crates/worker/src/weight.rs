@@ -33,15 +33,6 @@ impl Weight {
         }
     }
 
-    /// The weight of a scope already prepared, from the repos it holds.
-    pub fn of_held<K, V>(repos: &std::collections::BTreeMap<K, V>) -> Self {
-        if repos.is_empty() {
-            Self::Light
-        } else {
-            Self::Full
-        }
-    }
-
     pub fn name(self) -> &'static str {
         match self {
             Self::Light => "light",
@@ -57,6 +48,9 @@ impl Weight {
 pub struct ServicePlan {
     pub eager: Vec<&'static str>,
     pub lazy: Vec<&'static str>,
+    /// Whether the scope's own Docker engine waits for first use too: only a
+    /// light scope's, since a full scope's setup may need it at seat.
+    pub docker_lazy: bool,
 }
 
 impl ServicePlan {
@@ -66,7 +60,9 @@ impl ServicePlan {
     /// before goldens could say.
     pub fn of(config: &WorkerConfig, repos: &[RepoSpec]) -> Self {
         let configured = config.service_names();
-        let wanted: Option<Vec<&str>> = match Weight::of(repos) {
+        let weight = Weight::of(repos);
+        let wanted: Option<Vec<&str>> = match weight {
+            _ if !config.lazy_services => None,
             Weight::Light => Some(Vec::new()),
             Weight::Full => repos
                 .iter()
@@ -86,14 +82,16 @@ impl ServicePlan {
                 .into_iter()
                 .partition(|service| wanted.contains(service)),
         };
-        Self { eager, lazy }
+        Self {
+            eager,
+            lazy,
+            docker_lazy: weight == Weight::Light && config.lazy_services,
+        }
     }
 
     /// The toolbox's contract for this plan: what to start now, what to
     /// start on first use, and whether the scope's own Docker engine waits
-    /// for first use too, which it does when nothing at seat needs it. An
-    /// image that predates the lazy variables ignores them and starts its
-    /// engine and nothing lazy.
+    /// for first use too.
     pub fn env(&self) -> Vec<(String, String)> {
         let eager = match self.eager.is_empty() {
             true => NO_SERVICES.to_string(),
@@ -103,7 +101,7 @@ impl ServicePlan {
         if !self.lazy.is_empty() {
             env.push(("TOOLBOX_LAZY_SERVICES".to_string(), self.lazy.join(",")));
         }
-        if self.eager.is_empty() {
+        if self.docker_lazy {
             env.push(("TOOLBOX_DOCKER".to_string(), "lazy".to_string()));
         }
         env
@@ -180,6 +178,11 @@ mod tests {
         );
         let env = ServicePlan::of(&config(), &[kotlin]).env();
         assert!(!env.iter().any(|(key, _)| key == "TOOLBOX_DOCKER"));
+        let env = ServicePlan::of(&config(), &[repo("web", "acme/web")]).env();
+        assert!(
+            !env.iter().any(|(key, _)| key == "TOOLBOX_DOCKER"),
+            "a full scope's setup may need its engine at seat"
+        );
 
         let web = repo("web", "ACME/Web");
         assert_eq!(
@@ -192,6 +195,23 @@ mod tests {
             (vec!["postgres", "ministack"], vec!["mysql", "redis"]),
             "several repos start the union, in the configured order"
         );
+    }
+
+    #[test]
+    fn without_lazy_services_every_scope_starts_everything_as_before() {
+        let config = WorkerConfig {
+            lazy_services: false,
+            ..config()
+        };
+        for repos in [vec![], vec![repo("web", "acme/web")]] {
+            assert_eq!(
+                ServicePlan::of(&config, &repos).env(),
+                [(
+                    "TOOLBOX_SERVICES".to_string(),
+                    "mysql,postgres,redis,ministack".to_string()
+                )]
+            );
+        }
     }
 
     #[test]
@@ -210,13 +230,5 @@ mod tests {
                 "mysql,postgres,redis,ministack".to_string()
             )]
         );
-    }
-
-    #[test]
-    fn a_held_scope_weighs_what_its_repos_say() {
-        let none: std::collections::BTreeMap<String, String> = Default::default();
-        assert_eq!(Weight::of_held(&none), Weight::Light);
-        let one = std::collections::BTreeMap::from([("a".to_string(), "/work/a".to_string())]);
-        assert_eq!(Weight::of_held(&one), Weight::Full);
     }
 }

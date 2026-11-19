@@ -40,9 +40,12 @@ pub const AGENT_GID: u32 = 1000;
 pub use workforce_agent::tools::exec_runner::SCOPE_MCP_CONFIG_PATH as MCP_CONFIG_PATH;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
-/// A light scope's init is ready almost at once, so its seat is the
-/// container's start plus at most one of these.
+/// The first pause between readiness checks: a light scope's init is ready
+/// almost at once, so its seat is the container's start plus about this.
+/// Pauses double up to [`READY_POLL_MAX`], so a full scope's long start
+/// costs few checks.
 const READY_POLL: Duration = Duration::from_millis(250);
+const READY_POLL_MAX: Duration = Duration::from_secs(1);
 const CHOWN_TIMEOUT_SECS: u64 = 60;
 const GIT_TIMEOUT_SECS: u64 = 600;
 const SETUP_TIMEOUT_SECS: u64 = 1800;
@@ -583,6 +586,7 @@ impl Worker {
 
     pub(crate) async fn await_ready(&self, container: &ContainerId) -> Result<()> {
         let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+        let mut pause = READY_POLL;
         while !self.containers.ready(container).await? {
             if tokio::time::Instant::now() >= deadline {
                 bail!(
@@ -590,7 +594,8 @@ impl Worker {
                     READY_TIMEOUT.as_secs()
                 );
             }
-            tokio::time::sleep(READY_POLL).await;
+            tokio::time::sleep(pause).await;
+            pause = (pause * 2).min(READY_POLL_MAX);
         }
         Ok(())
     }

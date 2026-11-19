@@ -23,12 +23,15 @@ pub struct WorkerConfig {
     pub toolbox_image_file: PathBuf,
     #[serde(default)]
     pub registry_mirror: Option<String>,
-    /// The most full scopes (those checking repos out) at once.
     pub max_scopes: u32,
-    /// The most light scopes (those with no repos: agent turns) at once; 0,
-    /// the default, counts them against `max_scopes` as full ones are.
+    /// Whether a scope starts at seat only the services it needs: none for a
+    /// scope with no repos, a golden's `services` for one with repos. The
+    /// rest are left to start on first use, which needs a toolbox image whose
+    /// toolbox-init reads `TOOLBOX_LAZY_SERVICES`; turn this on only once the
+    /// deployed image does. Off, the default, every scope starts every
+    /// service, as before.
     #[serde(default)]
-    pub max_light_scopes: u32,
+    pub lazy_services: bool,
     pub pool_free_floor_gib: u64,
     pub scope_memory_gib: u32,
     pub scope_cpus: u32,
@@ -90,9 +93,11 @@ pub struct GoldenConfig {
     /// Paths on `branch` whose change makes the golden stale.
     #[serde(default)]
     pub watch: Vec<String>,
-    /// The services a scope checking this repo out starts with it, by name
-    /// (`mysql`, `postgres`, `redis`, `ministack`); unset, every configured
-    /// one. The others start on first use where the toolbox can.
+    /// With `lazy_services`, the services a scope checking this repo out
+    /// starts with it, by name (`mysql`, `postgres`, `redis`, `ministack`);
+    /// unset, every configured one. The others start on first use. It must
+    /// cover what `install` and a repo's setup need at seat, as they run
+    /// before anything else in the scope.
     #[serde(default)]
     pub services: Option<Vec<String>>,
 }
@@ -428,7 +433,7 @@ pub(crate) mod tests {
             toolbox_image_file: "/etc/workforce/toolbox-image".into(),
             registry_mirror: Some("http://host.docker.internal:5000".into()),
             max_scopes: 2,
-            max_light_scopes: 0,
+            lazy_services: true,
             pool_free_floor_gib: 1,
             scope_memory_gib: 8,
             scope_cpus: 4,
@@ -720,6 +725,37 @@ scope_cpus = 4
 snapshot_retention_days = 7
 backup_pool = "backup"
 "#;
+
+    #[test]
+    fn lazy_services_and_a_goldens_services_load_and_an_older_file_has_neither() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("worker.toml");
+        std::fs::write(
+            &path,
+            format!("{MINIMAL}backup_bucket_prefix = \"s3://b/golden\"\n"),
+        )
+        .unwrap();
+        let older = WorkerConfig::load(&path).unwrap();
+        assert!(!older.lazy_services, "off unless asked for");
+
+        let newer = MINIMAL.replace(
+            "[worker]\n",
+            "[worker]\nlazy_services = true\nservices = [\"redis\"]\n",
+        );
+        std::fs::write(
+            &path,
+            format!(
+                "{newer}backup_bucket_prefix = \"s3://b/golden\"\n\
+                 [[worker.golden]]\nname = \"web\"\nslug = \"acme/web\"\nbranch = \"main\"\nservices = []\n\
+                 [[worker.golden]]\nname = \"api\"\nslug = \"acme/api\"\nbranch = \"main\"\nservices = [\"redis\"]\n"
+            ),
+        )
+        .unwrap();
+        let newer = WorkerConfig::load(&path).unwrap_or_else(|e| panic!("{e:#}"));
+        assert!(newer.lazy_services);
+        assert_eq!(newer.golden[0].services, Some(Vec::new()));
+        assert_eq!(newer.golden[1].services, Some(vec!["redis".to_string()]));
+    }
 
     #[test]
     fn load_anchors_relative_paths_to_the_file() {
