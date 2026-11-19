@@ -357,6 +357,10 @@ impl CrewHub {
         }
         let store = self.desk.store();
         let composed = o.updates.enabled;
+        // Every decision timed up to `now` written first: one still being
+        // written as this reads would be timed before the mark this update
+        // moves to, and never said.
+        self.decisions_settled().await;
         let decisions: Vec<BossDecision> = store
             .decisions_since(boss, last, 500)
             .await

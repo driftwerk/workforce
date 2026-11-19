@@ -159,6 +159,10 @@ pub struct CrewHub {
     deciders: remote_decide::Deciders,
     /// Decisions of bosses being done from the decide loop, by boss.
     served_deciding: Mutex<HashMap<String, usize>>,
+    /// Held shared by each decision kept, from its time to its row being
+    /// written; taken whole by an update before it reads decisions up to a
+    /// time ([`decisions::Kept`]).
+    keeping: decisions::Kept,
     /// On a machine, the decisions of bosses relayed from the home, and
     /// when the home last held each at Act fully ([`relayed_decide`]).
     relayed: Mutex<relayed_decide::Outbox>,
@@ -660,6 +664,7 @@ impl CrewHub {
             remote_up: Mutex::default(),
             deciders: Mutex::default(),
             served_deciding: Mutex::default(),
+            keeping: decisions::Kept::default(),
             relayed: Mutex::default(),
             manager_turns: Mutex::default(),
             listed: Mutex::default(),

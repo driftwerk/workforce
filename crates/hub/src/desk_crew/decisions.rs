@@ -243,6 +243,16 @@ fn why_of(by: &By) -> String {
     by.reason.clone().unwrap_or_default()
 }
 
+/// Decisions being kept. An update says the decisions timed after its last
+/// and up to now, then moves its mark to now; a decision timed before now
+/// but written after it read them would never be said. So each decision is
+/// timed and written under this held shared, and an update takes it whole
+/// before it reads them ([`CrewHub::decisions_settled`]): by then every
+/// decision timed before its now is written, and every one timed after
+/// is timed after it.
+#[derive(Default)]
+pub(crate) struct Kept(pub(super) tokio::sync::RwLock<()>);
+
 impl CrewHub {
     /// The boss a decision by `by` is recorded for: a boss overseeing
     /// here, or a boss on another hub served from a grant while it is at
@@ -287,11 +297,26 @@ impl CrewHub {
     }
 
     /// Keeps `d`. A write that fails is logged, never the action's failure.
-    pub(crate) async fn record(&self, d: &BossDecision) {
+    pub(crate) async fn record(&self, d: &mut BossDecision) {
         self.acted_on(&d.boss, d.session);
-        if let Err(e) = self.desk.store().decision_put(d).await {
+        if let Err(e) = self.keep(d).await {
             tracing::warn!(boss = %d.boss, error = %e, "a boss's decision wasn't kept");
         }
+    }
+
+    /// Writes `d`, timed now: as it is written, so an update that reads
+    /// decisions up to a time never misses one timed before it and written
+    /// after ([`Kept`]).
+    async fn keep(&self, d: &mut BossDecision) -> eyre::Result<()> {
+        let _keeping = self.keeping.0.read().await;
+        d.at = crew::now();
+        self.desk.store().decision_put(d).await
+    }
+
+    /// Waits until every decision timed so far is written, or failed: what
+    /// an update reads of them up to now is then all there will be.
+    pub(crate) async fn decisions_settled(&self) {
+        drop(self.keeping.0.write().await);
     }
 
     /// What `before` an action knows that its undo goes back to.
@@ -444,7 +469,7 @@ impl CrewHub {
         d.undo = undo;
         d.action = plan.map(|p| p.value()).unwrap_or(Value::Null);
         d.important = important_of(action, before, by);
-        self.record(&d).await;
+        self.record(&mut d).await;
         if let Some(p) = d.preference {
             self.preference_used(p).await;
         }
@@ -511,7 +536,7 @@ impl CrewHub {
         d.kind = DecisionKind::Escalated;
         d.need_ref = need_ref;
         d.session = session_of(action, &Done::default());
-        self.record(&d).await;
+        self.record(&mut d).await;
     }
 
     /// Records a session's question `ask` given to the person by `by`,
@@ -530,7 +555,7 @@ impl CrewHub {
         d.kind = DecisionKind::Escalated;
         d.need_ref = Some(q.id.to_string());
         d.session = q.from_session();
-        self.record(&d).await;
+        self.record(&mut d).await;
     }
 
     /// Records that `boss`'s line or work turn on `session` ended doing
@@ -553,7 +578,7 @@ impl CrewHub {
             d.undo = Undo::Reverse;
             d.action = UndoPlan::GoAhead { session }.value();
         }
-        self.record(&d).await;
+        self.record(&mut d).await;
     }
 
     pub(crate) fn name_of_session(&self, id: Uuid) -> String {
@@ -638,7 +663,7 @@ impl CrewHub {
                 mine.kind = DecisionKind::Undone;
                 mine.session = claimed.session;
                 mine.need_ref = Some(claimed.id.to_string());
-                if let Err(e) = store.decision_put(&mine).await {
+                if let Err(e) = self.keep(&mut mine).await {
                     tracing::warn!(error = %e, "an undo wasn't kept as a decision");
                 }
                 // Undoing what a preference decided overrules it: counted,

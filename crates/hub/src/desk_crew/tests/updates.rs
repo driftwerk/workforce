@@ -998,3 +998,44 @@ async fn the_cadence_is_changed_only_on_the_persons_own_word() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_reads_the_decisions_only_once_those_timed_before_it_are_written() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        // A decision still being written: an update waits for it before it
+        // reads, as it would otherwise move its mark past it unsaid.
+        let writing = crew.keeping.0.read().await;
+        let settled = {
+            let crew = Arc::clone(&crew);
+            tokio::spawn(async move { crew.decisions_settled().await })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !settled.is_finished(),
+            "read while a decision timed before it was still being written"
+        );
+        drop(writing);
+        tokio::time::timeout(Duration::from_secs(5), settled)
+            .await
+            .expect("read once it is written")
+            .unwrap();
+        // A decision is timed as it is written, not as it was made: one made
+        // before an update read and written after is timed after it.
+        let mut late = workforce_desk::decision::BossDecision::new(
+            "desk",
+            workforce_desk::decision::Need::Question,
+            "told it to wait",
+            "CI is red.",
+            workforce_desk::decision::How::Own,
+        );
+        late.at -= chrono::Duration::hours(1);
+        let before = workforce_desk::crew::now();
+        crew.record(&mut late).await;
+        let kept = d.store().decision(late.id).await.unwrap().expect("kept");
+        assert!(kept.at >= before, "{} < {before}", kept.at);
+        assert_eq!(kept.at, late.at);
+    })
+    .await;
+}
