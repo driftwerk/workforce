@@ -22,6 +22,7 @@ use workforce_desk::crew::Crew as _;
 use workforce_desk::crew::{
     self, Event, ItemKind, ItemState, Kind, MentionedApproval, Party, PartyKind,
 };
+use workforce_desk::line::{LineMessage, Wait};
 use workforce_desk::model::{DeskEvent, Origin};
 use workforce_desk::CheckIn;
 
@@ -84,6 +85,26 @@ pub(super) fn unbound_timings(o: &Oversight) -> Oversight {
     o.max_checkins_per_hour = UNBOUND_CHECKINS_PER_HOUR;
     o.max_checkins_per_day = UNBOUND_CHECKINS_PER_DAY;
     o
+}
+
+/// A session's messages from the boss that never went in, as the boss is
+/// told of them.
+struct Undelivered {
+    trigger: Trigger,
+    /// They wait behind what it asks the person, which is raised too.
+    behind_person: bool,
+}
+
+/// When `item` last moved, as the keys of what is said of its stopping
+/// carry it: each is said once each time it stops.
+fn moved_at(item: &crew::Item) -> i64 {
+    item.last_activity
+        .map(|t| t.timestamp_millis())
+        .unwrap_or_default()
+}
+
+fn quiet_key(item: &crew::Item) -> String {
+    format!("quiet:{}:{}", item.id, moved_at(item))
 }
 
 /// One thing worth waking the overseer for.
@@ -579,6 +600,7 @@ impl CrewHub {
         };
         let mut holding = HashSet::new();
         let mut out = Vec::new();
+        let waiting = self.waiting_from(overseer).await;
         for item in &overview.items {
             if item.id == overseer {
                 continue;
@@ -599,6 +621,24 @@ impl CrewHub {
             // A session the person took back is left alone.
             if item.kind == ItemKind::Session && item.id.parse().is_ok_and(|s| self.taken_back(s)) {
                 continue;
+            }
+            // Said once a stall, instead of its quiet from then on.
+            let waits = waiting.get(&item.id).map(Vec::as_slice).unwrap_or_default();
+            if let Some(oldest) = waits.first() {
+                let key = format!("undelivered:{}:{}:{}", item.id, oldest.id, moved_at(item));
+                holding.insert(key.clone());
+                holding.insert(quiet_key(item));
+                if let Some(found) =
+                    self.undelivered(overseer, item, &party, waits, now, o.work.stall_minutes)
+                {
+                    if noted.insert(key) {
+                        noted.insert(quiet_key(item));
+                        out.push(found.trigger);
+                    }
+                    if !found.behind_person {
+                        continue;
+                    }
+                }
             }
             // A session's question the person is in control of, or its Act
             // fully boss answers itself (`answer`), and a request its decision
@@ -687,13 +727,7 @@ impl CrewHub {
                         .map(|s| (now - s).num_minutes().max(1))
                         .unwrap_or(1);
                     (
-                        format!(
-                            "quiet:{}:{}",
-                            item.id,
-                            item.last_activity
-                                .map(|t| t.timestamp_millis())
-                                .unwrap_or(0)
-                        ),
+                        quiet_key(item),
                         Trigger {
                             line: format!(
                                 "{} has been quiet for {quiet} min while working on {}{}",
@@ -722,6 +756,112 @@ impl CrewHub {
         }
         noted.retain(|k| holding.contains(k));
         out
+    }
+
+    /// `overseer`'s own messages still waiting to go into each session, by
+    /// session id, oldest first.
+    async fn waiting_from(&self, overseer: &str) -> HashMap<String, Vec<LineMessage>> {
+        match self.desk.store().line_waiting().await {
+            Ok(rows) => rows
+                .into_iter()
+                .filter(|m| m.from.kind == PartyKind::Manager && m.from.id == overseer)
+                .fold(HashMap::new(), |mut by, m| {
+                    by.entry(m.to.id.clone()).or_default().push(m);
+                    by
+                }),
+            Err(e) => {
+                tracing::warn!(error = %e, "the boss's waiting messages couldn't be read");
+                HashMap::new()
+            }
+        }
+    }
+
+    /// The trigger for a session `waiting`, `overseer`'s messages to it
+    /// (oldest first), haven't reached for `stall_minutes` while it showed
+    /// no progress of its own: none while Desk holds any of them on purpose,
+    /// or once it isn't running (stopped, closed, or its process lost: Desk
+    /// offers the person to run it again).
+    fn undelivered(
+        &self,
+        overseer: &str,
+        item: &crew::Item,
+        party: &Party,
+        waiting: &[LineMessage],
+        now: DateTime<Utc>,
+        stall_minutes: u32,
+    ) -> Option<Undelivered> {
+        let stall = self.crew_minutes(i64::from(stall_minutes));
+        let oldest = waiting.first()?;
+        let quiet = item.last_activity.is_none_or(|at| now - at >= stall);
+        if now - oldest.at < stall || !quiet {
+            return None;
+        }
+        let view = self.desk.view(item.id.parse().ok()?).ok()?;
+        if !view.state.is_running() || self.person_has_questions(&view, overseer) {
+            return None;
+        }
+        let waits = self.desk.line_waits(&view, waiting)?;
+        const LONG_STEP: &str =
+            "it may be stuck, or in one long step (a build, a test run), which a restart would cut off";
+        let (why, behind_person) = match waits.first().copied().flatten() {
+            _ if view.pending.is_some() => (
+                "it waits on an approval or a dialog in its terminal, and your messages wait behind that"
+                    .to_string(),
+                true,
+            ),
+            Some(Wait::Asking) => (
+                "it ended its turn asking the person something, and your messages wait behind that"
+                    .to_string(),
+                true,
+            ),
+            Some(Wait::Stopped) => ("Desk can't reach it to put them in".to_string(), false),
+            Some(Wait::Working) => (format!("its turn hasn't ended: {LONG_STEP}"), false),
+            Some(Wait::NextCall) => (
+                format!("it was told to read it with its next tool call, and hasn't made one: {LONG_STEP}"),
+                false,
+            ),
+            None => ("it was free to take it, and nothing took it in".to_string(), false),
+            Some(Wait::Typing | Wait::Paused | Wait::PersonDriving | Wait::ModeEnding) => {
+                return None
+            }
+        };
+        let move_it = match behind_person {
+            true => {
+                "Answer what it waits on if that is yours to (crew.history shows it); it stays \
+                 raised for the person meanwhile."
+            }
+            false => {
+                "First read where it stands (crew.history), then move it now: answer what it waits \
+                 on, restart it (crew.restart) only if its history shows it stuck, start a fresh \
+                 session on the work (crew.start_session), or do the step yourself; if a restart \
+                 of it already failed, don't try another. Tell the person only if none of those \
+                 can work."
+            }
+        };
+        let at = oldest
+            .at
+            .with_timezone(&self.desk.timezone())
+            .format("%H:%M");
+        let minutes = (now - oldest.at).num_minutes().max(1);
+        let line = format!(
+            "{} hasn't taken your message of {at} in {minutes} min ({} waiting, the oldest “{}”) \
+             and has shown no progress meanwhile: {why}. {move_it}",
+            who(party),
+            waiting.len(),
+            crew::words(&oldest.text, 20),
+        );
+        Some(Undelivered {
+            trigger: Trigger {
+                line,
+                approvals: vec![],
+                hop: 0,
+                about: None,
+                group: item.group_id.clone(),
+                handed: None,
+                routine: false,
+            },
+            behind_person,
+        })
     }
 
     /// What an unbound overseer is told each time it wakes: be the boss.

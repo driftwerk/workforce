@@ -255,6 +255,17 @@ pub enum Wait {
     NextCall,
 }
 
+impl Wait {
+    /// Whether Desk holds a message for this on purpose, until the person
+    /// or Desk itself lets it go: no one need move it.
+    pub fn on_purpose(self) -> bool {
+        match self {
+            Self::Typing | Self::Paused | Self::PersonDriving | Self::ModeEnding => true,
+            Self::Stopped | Self::Working | Self::Asking | Self::NextCall => false,
+        }
+    }
+}
+
 /// What the person can do with a message waiting to go into a session,
 /// as its thread row says: only what the hub can do now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
