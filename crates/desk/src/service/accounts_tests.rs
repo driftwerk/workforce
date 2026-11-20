@@ -5240,11 +5240,11 @@ async fn with_moves_turned_off_a_login_at_its_limit_moves_nothing() {
     .await;
 }
 
-/// Sessions whose link to the holder ended before their processes did: the
-/// hub has them stopped while each process waits at its login's limit in
-/// the holder, deaf to a hang-up; one's record already names the login it
-/// is moved to. Moved, each process is ended and the same conversation
-/// goes on on that login, told to carry on.
+/// Sessions whose link to the holder ended before their processes did, deaf
+/// to a hang-up: some wait at their login's limit (one's record already
+/// names the login it is moved to), others were cut off mid-turn. Moved,
+/// each process is ended and the same conversation goes on on that login,
+/// told to carry on only when its login stopped it.
 #[tokio::test]
 async fn a_switch_ends_the_process_the_holder_kept_and_goes_on_there() {
     with_test_pool(build_pool, |pool| async move {
@@ -5259,7 +5259,13 @@ async fn a_switch_ends_the_process_the_holder_kept_and_goes_on_there() {
         let d = desk(pool, o).await;
         paste(&d, "Kingsley Gmail", GOOD, true).await;
         let star = paste(&d, "Kingsley Starmoire", OTHER, false).await;
-        for named_there in [false, true] {
+        let limit = "You’ve hit your weekly limit · resets 4pm (Europe/London)";
+        for (state, reply, named_there) in [
+            (SessionState::Stopped, Some(limit), false),
+            (SessionState::Stopped, Some(limit), true),
+            (SessionState::Interrupted, None, false),
+            (SessionState::Working, None, false),
+        ] {
             let s = d.create(session(dir.path(), None), None).await.unwrap();
             started(dir.path(), s.id, 0).await;
             let pid = d.attach(s.id).unwrap().pid().unwrap();
@@ -5269,9 +5275,8 @@ async fn a_switch_ends_the_process_the_holder_kept_and_goes_on_there() {
                 .cli_session_id
                 .expect("its conversation");
             d.change(s.id, |r, _| {
-                r.state = SessionState::Stopped;
-                r.last_reply =
-                    Some("You’ve hit your weekly limit · resets 4pm (Europe/London)".into());
+                r.state = state;
+                r.last_reply = reply.map(Into::into);
                 if named_there {
                     r.account = Some(star);
                 }
@@ -5290,8 +5295,10 @@ async fn a_switch_ends_the_process_the_holder_kept_and_goes_on_there() {
             assert_eq!(env["TOKEN_ON_FD"], OTHER, "on the other login");
             assert!(args.starts_with(&format!("--resume {cli}")), "{args}");
             assert_eq!(
-                d.record(s.id).unwrap().last_prompt.as_deref(),
-                Some(crate::engine_accounts::CONTINUE)
+                d.record(s.id).unwrap().last_prompt.as_deref()
+                    == Some(crate::engine_accounts::CONTINUE),
+                reply.is_some(),
+                "{state:?}"
             );
             // SAFETY: kill with no signal only asks.
             assert_ne!(
