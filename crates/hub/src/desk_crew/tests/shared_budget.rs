@@ -134,7 +134,7 @@ async fn one_budget_is_counted_across_the_mac_and_every_machine_and_ends_act_ful
             "no machine is told Act fully is in force"
         );
         // A late answer from before never lowers what was counted.
-        crew.machine_reported("desk", "devbox", crew.count_from(&o).unwrap(), 1.0)
+        crew.machine_reported("desk", "devbox", "acme", crew.count_from(&o).unwrap(), 1.0)
             .await;
         assert_eq!(crew.level_now("desk", &o).0, Level::Act);
 
@@ -148,12 +148,14 @@ async fn one_budget_is_counted_across_the_mac_and_every_machine_and_ends_act_ful
 }
 
 /// Until what the machines spent has been read back after a start, a boss
-/// here doesn't act fully: a restart never forgets it.
+/// here doesn't act fully: a restart never forgets it, nor what a machine
+/// said in all before its grants were counted apart.
 #[tokio::test(flavor = "multi_thread")]
 async fn act_fully_waits_until_what_the_machines_spent_is_read_back() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let (_sarah, crew, d, _llm) = overseeing(dir.path(), pool, "ok", SARAH_FULL, &[]).await;
+        let (_sarah, crew, d, _llm) =
+            overseeing(dir.path(), pool.clone(), "ok", SARAH_FULL, &[]).await;
         let remote = uuid::Uuid::new_v4();
         d.change_layout(|l| l.create("acme", "Acme", &[format!("session:devbox/{remote}")], None))
             .await
@@ -165,9 +167,21 @@ async fn act_fully_waits_until_what_the_machines_spent_is_read_back() {
             .machine_spent_put(&workforce_desk::machine_spent_store::MachineSpent {
                 agent: "desk".into(),
                 machine: "devbox".into(),
+                grant: "acme".into(),
                 count_from: from,
                 usd: 30.0,
             })
+            .await
+            .unwrap();
+        // atlas, as an older hub kept it: one count for the machine.
+        pool.get()
+            .await
+            .unwrap()
+            .execute(
+                "INSERT INTO machine_spent (agent, machine, count_from, usd, updated_at) \
+                 VALUES ('desk', 'atlas', $1, 5.0, now())",
+                &[&from],
+            )
             .await
             .unwrap();
         // The hub starts again: nothing is known until it is read back.
@@ -175,10 +189,10 @@ async fn act_fully_waits_until_what_the_machines_spent_is_read_back() {
         assert_eq!(crew.machines_spent("desk", from), None, "not read yet");
         assert_eq!(crew.level_now("desk", &o).0, Level::Act, "Act fully waits");
         crew.read_spent_today(&crew.overseers()).await;
-        assert_eq!(crew.machines_spent("desk", from), Some(30.0));
+        assert_eq!(crew.machines_spent("desk", from), Some(35.0));
         let (level, why) = crew.level_now("desk", &o);
         assert_eq!(level, Level::Act);
-        assert!(why.unwrap().contains("$30.00 of $25.00"));
+        assert!(why.unwrap().contains("$35.00 of $25.00"));
         // A count for another day counts nothing today.
         let earlier = from - chrono::Duration::days(1);
         assert_eq!(crew.machines_spent("desk", earlier), Some(0.0));

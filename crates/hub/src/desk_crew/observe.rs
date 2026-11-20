@@ -4,6 +4,7 @@
 //! failure), from the digest helpers — no model call of its own. Turns of a
 //! hub without the desk pass straight through.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -48,6 +49,10 @@ pub(super) struct Track {
     /// answers, stamped on each of its events.
     place: Option<Place>,
     message: Option<uuid::Uuid>,
+    /// A boss's line or work turn: its end is held, by boss, channel and
+    /// the turn's number among those begun, for its caller to say once it
+    /// knows whether the turn did anything.
+    held: Option<(String, String, u64)>,
     done: bool,
 }
 
@@ -139,12 +144,17 @@ impl CrewHub {
                 _person: person,
                 place,
                 message: asked,
+                held: None,
                 done: false,
             });
         }
         if message.starts_with(CHECK_IN) {
             return None;
         }
+        let held = (overseer && woken(message)).then(|| {
+            let began = self.turns_begun.fetch_add(1, Ordering::SeqCst);
+            (agent_id.clone(), channel.to_string(), began)
+        });
         // Its reply in the DM is running: what it would post there on its
         // own waits, so nothing lands in the middle of it.
         let dm_session = session_id
@@ -171,20 +181,22 @@ impl CrewHub {
                 last_activity: now,
             },
         );
-        self.desk.note(
-            Event::new(
-                Kind::Started,
-                party.clone(),
-                Some(party.clone()),
-                match &task {
-                    Some(t) => format!("started “{t}”"),
-                    None => "started".to_string(),
-                },
-            )
-            .hop(hop)
-            .detail(json!({ "task": task }))
-            .at_place(place.clone(), asked),
-        );
+        if held.is_none() {
+            self.desk.note(
+                Event::new(
+                    Kind::Started,
+                    party.clone(),
+                    Some(party.clone()),
+                    match &task {
+                        Some(t) => format!("started “{t}”"),
+                        None => "started".to_string(),
+                    },
+                )
+                .hop(hop)
+                .detail(json!({ "task": task }))
+                .at_place(place.clone(), asked),
+            );
+        }
         Some(Track {
             crew: self.me(),
             key,
@@ -197,6 +209,7 @@ impl CrewHub {
             _person: None,
             place,
             message: asked,
+            held,
             done: false,
         })
     }
@@ -260,8 +273,65 @@ impl Track {
             text,
         )
         .detail(json!({ "task": self.task, "answer": answer, "question": question }))
-        .at_place(self.place.clone(), self.message);
-        crew.desk.note(event.hop(self.hop));
+        .at_place(self.place.clone(), self.message)
+        .hop(self.hop);
+        match self.held.take().filter(|_| ended == Outcome::Finished) {
+            Some(key) => {
+                let mut held = crew.quiet_ends.lock();
+                held.retain(|_, end| end.at.elapsed() < HELD_FOR);
+                held.insert(
+                    key,
+                    HeldEnd {
+                        at: std::time::Instant::now(),
+                        event,
+                    },
+                );
+            }
+            None => crew.desk.note(event),
+        }
+    }
+}
+
+/// How long a held turn end waits for its caller: one no caller came back
+/// for (a cancelled one) is let go as later ends are held or said.
+const HELD_FOR: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// A line or work turn's end, held for its caller.
+pub(super) struct HeldEnd {
+    pub(super) at: std::time::Instant,
+    pub(super) event: Event,
+}
+
+impl CrewHub {
+    /// How many line and work turns have begun: one its caller starts
+    /// after reading it is numbered at least this.
+    pub(super) fn turns_begun(&self) -> u64 {
+        self.turns_begun.load(Ordering::SeqCst)
+    }
+
+    /// Says the end of `boss`'s line or work turn on `channel`, numbered at
+    /// least `since` ([`Self::turns_begun`]), once its caller has settled
+    /// what the turn did: only when it did something. An end held from an
+    /// earlier turn there, whose caller was cancelled before it came back
+    /// for it, is dropped, never said for this one. One turn runs on a
+    /// channel at a time (`begin_live_turn` refuses a second), so every
+    /// end there numbered at least `since` is this caller's.
+    pub(super) fn turn_end_said(&self, boss: &str, channel: &str, since: u64, acted: bool) {
+        let ends: Vec<(u64, HeldEnd)> = {
+            let mut held = self.quiet_ends.lock();
+            held.retain(|_, end| end.at.elapsed() < HELD_FOR);
+            let keys: Vec<_> = held
+                .keys()
+                .filter(|(b, c, _)| b == boss && c == channel)
+                .cloned()
+                .collect();
+            keys.into_iter()
+                .filter_map(|k| held.remove(&k).map(|end| (k.2, end)))
+                .collect()
+        };
+        ends.into_iter()
+            .filter(|(began, _)| acted && *began >= since)
+            .for_each(|(_, end)| self.desk.note(end.event));
     }
 }
 
@@ -295,6 +365,14 @@ impl Drop for Track {
             .at_place(self.place.clone(), self.message),
         );
     }
+}
+
+/// Whether `message` woke a boss on a session's line or turn end, which
+/// its caller settles ([`CrewHub::turn_end_said`]).
+fn woken(message: &str) -> bool {
+    [super::line::LINE, super::work::WORK]
+        .iter()
+        .any(|p| message.starts_with(p))
 }
 
 /// The room a turn was asked in, or that an unattended run answers to,

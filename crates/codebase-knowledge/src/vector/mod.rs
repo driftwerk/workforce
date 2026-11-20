@@ -5,7 +5,7 @@
 //! - `CodeSummary`: semantic search over generated summaries at various granularity levels
 
 pub mod health;
-mod vellev;
+pub(crate) mod vellev;
 
 use async_trait::async_trait;
 use eyre::Result;
@@ -209,12 +209,86 @@ impl VectorCodeSummary {
 /// How a page of what a store should hold differs from what it does.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Differing {
-    /// The places in the page of what the store lacks or holds otherwise.
+    /// The places in the page of what the store lacks or holds otherwise:
+    /// [`Self::missing`] and those held beside something [`Self::stale`].
     pub places: Vec<usize>,
+    /// The places of those the store holds nothing of as they are.
+    pub missing: Vec<usize>,
+    /// The ids of what the store holds under the page's keys other than
+    /// each record's own: earlier versions, and second copies. Every part
+    /// of a record's id is in its hash, so the record as it is is never
+    /// among them.
+    pub stale: Vec<String>,
     /// How many vectors the store holds under the page's keys: over a
     /// whole repo, what the store holds beyond their sum is of entities
     /// the graph does not have.
     pub held: usize,
+}
+
+/// Something a store holds of a repo, as [`CodeVectorStore::held_after`]
+/// lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldRecord {
+    /// Its id in the store.
+    pub id: String,
+    /// An entity's id, or [`VectorCodeSummary::key`].
+    pub key: String,
+    pub file_path: String,
+}
+
+/// Why records are being written, as the count of what was embedded tells
+/// them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedReason {
+    /// An index run's own write.
+    Index,
+    /// A fill's.
+    Refill,
+    /// A pending file put right.
+    Pending,
+    /// An adoption mending what differs.
+    Adopt,
+}
+
+impl EmbedReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Index => "index",
+            Self::Refill => "refill",
+            Self::Pending => "pending",
+            Self::Adopt => "adopt",
+        }
+    }
+}
+
+tokio::task_local! {
+    static EMBEDDING_FOR: EmbedReason;
+}
+
+/// Run `work` with what it has embedded counted as for `reason`. A task it
+/// spawns is not: the scope goes inside the spawned future.
+pub async fn embedding_for<T>(
+    reason: EmbedReason,
+    work: impl std::future::Future<Output = T>,
+) -> T {
+    EMBEDDING_FOR.scope(reason, work).await
+}
+
+/// Count `records` sent to `backend` to be embedded, as for the reason of
+/// the scope they were written in, or as an index run's outside any.
+pub(crate) fn count_embedded(backend: &'static str, records: usize) {
+    if records == 0 {
+        return;
+    }
+    let reason = EMBEDDING_FOR
+        .try_with(|reason| *reason)
+        .unwrap_or(EmbedReason::Index);
+    metrics::counter!(
+        "workforce.code_vectors.embedded_total",
+        "backend" => backend,
+        "reason" => reason.as_str(),
+    )
+    .increment(records as u64);
 }
 
 /// Result from a vector search query.
@@ -352,8 +426,8 @@ pub trait CodeVectorStore: Send + Sync {
         entities: &[VectorCodeEntity],
     ) -> Result<Differing> {
         Ok(Differing {
-            places: Vec::new(),
             held: entities.len(),
+            ..Differing::default()
         })
     }
 
@@ -364,25 +438,42 @@ pub trait CodeVectorStore: Send + Sync {
         summaries: &[VectorCodeSummary],
     ) -> Result<Differing> {
         Ok(Differing {
-            places: Vec::new(),
             held: summaries.len(),
+            ..Differing::default()
         })
     }
 
     /// A page of what the store holds of the repo, entities or
-    /// `summaries`, after `after` (the start if `None`): each as its key
-    /// (an entity's id, or [`VectorCodeSummary::key`]) and its file, with
-    /// where the next page starts if there is one. Read only to find what
-    /// the store holds that the graph does not, when it holds more than it
-    /// should. A store that keeps no track lists nothing.
+    /// `summaries`, after `after` (the start if `None`), with where the
+    /// next page starts if there is one. Read only to find what the store
+    /// holds that the graph does not, when it holds more than it should. A
+    /// store that keeps no track lists nothing.
     async fn held_after(
         &self,
         _repo_id: &str,
         _summaries: bool,
         _after: Option<String>,
         _limit: usize,
-    ) -> Result<(Vec<(String, String)>, Option<String>)> {
+    ) -> Result<(Vec<HeldRecord>, Option<String>)> {
         Ok((Vec::new(), None))
+    }
+
+    /// Forget the entities, or `summaries`, held under these ids
+    /// ([`HeldRecord::id`], [`Differing::stale`]).
+    async fn remove_held(&self, _summaries: bool, _ids: &[String]) -> Result<()> {
+        Ok(())
+    }
+
+    /// A repo, not one of `repos`, that the store holds anything of, if
+    /// there is one. A store that keeps no track finds none.
+    async fn held_outside(&self, _repos: &[String]) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// How many entities and summaries the store holds of one file of a
+    /// repo. A store that keeps no track says none.
+    async fn file_held(&self, _repo_id: &str, _file_path: &str) -> Result<usize> {
+        Ok(0)
     }
 
     /// Forget these entities, each as it would be stored.

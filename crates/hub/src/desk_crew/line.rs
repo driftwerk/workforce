@@ -30,7 +30,7 @@ use workforce_desk::open_item::{self, NewItem, OpenKind};
 use workforce_desk::open_item_store::Opened;
 
 use super::actions::{Action, Gate, Target};
-use super::watcher::reported;
+use super::watcher::{reported, STANDING_RULE};
 use super::{name_of, CrewHub, MAX_HOPS};
 use crate::serve::AgentService;
 
@@ -594,8 +594,9 @@ impl CrewHub {
         let prompt = self.line_prompt(session, &messages, &ended, &o);
         let boss = service.agent_id.as_str().to_string();
         let mark = self.acted_mark(&boss, session);
+        let since = self.turns_begun();
         let ran = self
-            .run_turn(
+            .run_turn_with(
                 &service,
                 &owner,
                 &line_channel(session),
@@ -603,8 +604,11 @@ impl CrewHub {
                 hop,
                 None,
                 None,
+                None,
             )
             .await;
+        let did = ran.as_ref().is_ok_and(|r| r.acted);
+        let ran = ran.map(|r| (r.session_id, r.answer));
         if let Err(e) = &ran {
             tracing::warn!(%session, error = %format!("{e:#}"), "the overseer's line turn failed");
         }
@@ -696,14 +700,15 @@ impl CrewHub {
                 }
             }
         }
-        // A turn that did nothing, and suggested nothing, is a decision
-        // too: recorded here, never read from what it said.
-        if let Ok((_, reply)) = &ran {
-            if self.acted_mark(&boss, session) == mark {
-                self.record_nothing(&boss, session, !ended.is_empty(), reply)
-                    .await;
-            }
+        // A turn that decided nothing for the session, and suggested
+        // nothing, is a decision too: recorded here, never read from what
+        // it said. One that did nothing at all is kept out of Activity.
+        let decided = self.acted_mark(&boss, session) != mark;
+        if let (Ok((_, reply)), false) = (&ran, decided) {
+            self.record_nothing(&boss, session, !ended.is_empty(), reply)
+                .await;
         }
+        self.turn_end_said(&boss, &line_channel(session), since, did || decided);
         match ran {
             Ok(_) => LineTurn::Ran,
             Err(_) => LineTurn::NotRun,
@@ -766,17 +771,7 @@ impl CrewHub {
         let unbound = self.unbound(o);
         let (outward, level_line) = match unbound {
             true => ("you truly can't decide, and say why", Self::boss_hint(o)),
-            false => (
-                outward,
-                match level {
-                    Level::Full => format!(
-                        "{} {}",
-                        Self::level_line(level),
-                        super::watcher::STANDING_RULE
-                    ),
-                    _ => Self::level_line(level).to_string(),
-                },
-            ),
+            false => (outward, Self::bound_level_line(level)),
         };
         if !ended.is_empty() {
             let said = match lines.is_empty() {
@@ -804,6 +799,16 @@ impl CrewHub {
             reported(&lines.join("\n"), "the session"),
             level_line,
         )
+    }
+
+    /// What a line turn says of `level` when its boss isn't unbound: at
+    /// Act fully (shipping in a repository the person named), the standing
+    /// rule too.
+    pub(super) fn bound_level_line(level: Level) -> String {
+        match level {
+            Level::Full => format!("{} {STANDING_RULE}", Self::level_line(level)),
+            _ => Self::level_line(level).to_string(),
+        }
     }
 
     fn level_line(level: Level) -> &'static str {

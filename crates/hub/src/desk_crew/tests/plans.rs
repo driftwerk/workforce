@@ -534,6 +534,145 @@ async fn a_boss_keeps_its_plan_current_and_a_change_of_scope_waits_for_the_perso
     .await;
 }
 
+/// The plan a boss proposes in `dir`: a ticket whose brief names this
+/// computer's home and a volume mounted here, and one that names neither.
+async fn plan_with_local_paths(
+    overseer: &AgentService,
+    d: &Desk,
+    dir: &Path,
+) -> (String, Vec<String>) {
+    let folder = dir.to_string_lossy();
+    let home = d
+        .home_folder()
+        .unwrap()
+        .to_string_lossy()
+        .trim_end_matches('/')
+        .to_string();
+    let made = overseer
+        .tools
+        .get("crew.plan")
+        .unwrap()
+        .execute(json!({ "goal": "Faster reads", "tickets": [
+            { "title": "Add the cache", "body": format!("Read {home}/Library/Desk/notes.md and /Volumes/T9/data/x.csv."), "folder": folder },
+            { "title": "Use the cache", "body": "Read through the cache.", "folder": folder },
+        ] }))
+        .await
+        .unwrap();
+    let plan = &made.output["proposed"];
+    let keys = plan["tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["key"].as_str().unwrap().to_string())
+        .collect();
+    (plan["plan_id"].as_str().unwrap().to_string(), keys)
+}
+
+/// Tickets moved to a machine whose briefs name paths only this computer
+/// has: the boss is told which, and the move is made all the same; and a
+/// plan the person said to start isn't started while one is said.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_boss_moving_tickets_to_a_machine_is_told_of_paths_in_briefs_only_this_computer_has() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, _llm) = hub_with(dir.path(), pool, super::unbound::UNBOUND).await;
+        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("the plan tools", async || {
+            overseer.tools.has("crew.plan").then_some(())
+        })
+        .await;
+        let home = d
+            .home_folder()
+            .unwrap()
+            .to_string_lossy()
+            .trim_end_matches('/')
+            .to_string();
+        let update = overseer.tools.get("crew.plan_update").unwrap();
+        let moved = |id: &str, keys: &[String], machine: &str| {
+            json!({ "plan_id": id, "why": "The person wants it there.", "tickets_edit": [
+                { "key": keys[0], "machine": machine, "folder": "/home/dev/vellev" },
+                { "key": keys[1], "machine": machine, "folder": "/home/dev/vellev" },
+            ] })
+        };
+
+        let (id, keys) = plan_with_local_paths(&overseer, &d, dir.path()).await;
+        let r = update.execute(moved(&id, &keys, "devbox")).await.unwrap();
+        assert!(r.success, "{r:?}");
+        let note = r.output["note"].as_str().unwrap();
+        assert!(
+            note.contains(&format!("{}'s brief names ", keys[0])),
+            "{note}"
+        );
+        assert!(
+            note.contains("/Volumes/T9") && note.contains(&home),
+            "{note}"
+        );
+        assert!(
+            note.contains("on this computer, which devbox may not have"),
+            "{note}"
+        );
+        assert!(!note.contains(&keys[1]), "{note}");
+        let rows = d.plan(id.parse().unwrap()).await.unwrap().tickets;
+        assert!(rows.iter().all(|t| t.machine.as_deref() == Some("devbox")));
+        let r = update
+            .execute(json!({ "plan_id": id, "why": "Its goal.", "goal": "Faster reads, soon" }))
+            .await
+            .unwrap();
+        assert!(
+            !r.output["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("may not have"),
+            "{r:?}"
+        );
+
+        // Told to start it as it moves: it waits for the briefs.
+        let (id, keys) = plan_with_local_paths(&overseer, &d, dir.path()).await;
+        let mut start = moved(&id, &keys, "devbox");
+        start["start_now"] = json!({ "person_said": "Move it to devbox and start it now" });
+        let r = update.execute(start).await.unwrap();
+        assert!(r.success, "{r:?}");
+        assert!(
+            r.output["note"]
+                .as_str()
+                .unwrap()
+                .contains("isn't started yet"),
+            "{r:?}"
+        );
+        assert_eq!(r.output["plan"]["state"], "proposed", "{r:?}");
+    })
+    .await;
+}
+
+/// Below unbound, a move of an approved plan's tickets that rewrites their
+/// briefs is proposed: what the boss is told is of the briefs as proposed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_proposed_move_is_told_of_the_briefs_it_proposes() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
+        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("the plan tools", async || overseer.tools.has("crew.plan").then_some(())).await;
+        let update = overseer.tools.get("crew.plan_update").unwrap();
+        let (id, keys) = plan_with_local_paths(&overseer, &d, dir.path()).await;
+        d.approve_plan(id.parse().unwrap(), 1, &By::you()).await.unwrap();
+        let r = update
+            .execute(json!({ "plan_id": id, "why": "The person wants it on devbox.", "tickets_edit": [
+                { "key": keys[0], "machine": "devbox", "folder": "/home/dev/vellev", "body": "Read the notes in the repo." },
+                { "key": keys[1], "machine": "devbox", "folder": "/home/dev/vellev", "body": "Read /Volumes/T9/data/y.csv." },
+            ] }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert_eq!(r.output["applied"], false, "{r:?}");
+        let note = r.output["note"].as_str().unwrap();
+        assert!(note.contains(&format!("{}'s brief names /Volumes/T9 on", keys[1])), "{note}");
+        assert!(!note.contains(&format!("{}'s brief", keys[0])), "{note}");
+
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_boss_moves_tickets_by_key_keeping_their_briefs_and_reads_them_back() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
@@ -1673,9 +1812,10 @@ async fn a_plans_ticket_on_a_machine_starts_there_once_and_its_turns_wake_the_bo
 }
 
 /// A start on a machine whose answer never came isn't undone or made
-/// again: Desk looks for it there, takes up the session it made, and the
-/// ticket is that session's. An older session of the same key is never
-/// taken up.
+/// again: Desk looks for it there and takes up the session it made, by the
+/// id it gave it, though it waits on the person there by then; the ticket
+/// is that session's. An older session of the same key is never taken up,
+/// nor the person's own of that key there.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_machine_start_never_answered_is_found_there_and_never_made_twice() {
     use super::super::relay::RelayAnswer;
@@ -1711,14 +1851,19 @@ async fn a_machine_start_never_answered_is_found_there_and_never_made_twice() {
             .unwrap()
             .to_string();
 
-        // devbox has an old session of that key, from long ago, and answers
-        // no start: it makes the session, but the answer is lost.
+        // devbox has an old session of that key, from long ago, and the
+        // person's own of it, just made; it answers no start: it makes the
+        // session, but the answer is lost.
         let old = json!({
             "id": uuid::Uuid::new_v4(), "name": key, "cwd": "/home/dev/vellev",
             "state": "idle", "lastReply": "old work", "createdAt": "2026-01-01T00:00:00Z",
         });
+        let persons = json!({
+            "id": uuid::Uuid::new_v4(), "name": key, "cwd": "/home/dev/vellev",
+            "state": "idle", "lastReply": null, "createdAt": chrono::Utc::now().to_rfc3339(),
+        });
         let there: Arc<parking_lot::Mutex<Vec<Value>>> =
-            Arc::new(parking_lot::Mutex::new(vec![old.clone()]));
+            Arc::new(parking_lot::Mutex::new(vec![old, persons]));
         let starts: Arc<parking_lot::Mutex<usize>> = Arc::default();
         let poller = {
             let (crew, there, starts) =
@@ -1739,9 +1884,11 @@ async fn a_machine_start_never_answered_is_found_there_and_never_made_twice() {
                             }
                             "desk.session_start" => {
                                 *starts.lock() += 1;
+                                // Under the id it was given, run by its
+                                // boss but waiting on the person by now.
                                 there.lock().push(json!({
-                                    "id": uuid::Uuid::new_v4(), "name": c.input["name"],
-                                    "cwd": c.input["cwd"], "state": "working", "lastReply": null,
+                                    "id": c.input["id"], "name": c.input["name"],
+                                    "cwd": c.input["cwd"], "state": "waiting", "lastReply": null,
                                     "createdAt": chrono::Utc::now().to_rfc3339(),
                                 }));
                                 // No answer.
@@ -1760,8 +1907,12 @@ async fn a_machine_start_never_answered_is_found_there_and_never_made_twice() {
             t.assignee.as_ref().map(|a| a.id.clone())
         })
         .await;
-        let made = there.lock()[1]["id"].as_str().unwrap().to_string();
-        assert_eq!(given, format!("devbox/{made}"), "the new one, not the old");
+        let made = there.lock()[2]["id"].as_str().unwrap().to_string();
+        assert_eq!(
+            given,
+            format!("devbox/{made}"),
+            "the one it made, run by its boss"
+        );
         tokio::time::sleep(Duration::from_millis(800)).await;
         assert_eq!(*starts.lock(), 1, "made once");
         assert_eq!(
@@ -1845,6 +1996,7 @@ async fn a_machine_start_whose_retry_cant_read_there_keeps_its_link() {
                                 there.lock().push(json!({
                                     "id": uuid::Uuid::new_v4(), "name": c.input["name"],
                                     "cwd": c.input["cwd"], "state": "working", "lastReply": null,
+                                    "bossHas": "desk",
                                     "createdAt": chrono::Utc::now().to_rfc3339(),
                                 }));
                             }

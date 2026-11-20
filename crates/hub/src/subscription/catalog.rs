@@ -17,11 +17,15 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
+#[cfg(feature = "test-support")]
+use std::sync::OnceLock;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use chrono::TimeDelta;
 use eyre::{eyre, Result};
+#[cfg(feature = "test-support")]
+use futures::future::BoxFuture;
 use workforce_agent::llm::responses::{CatalogModel, ChatGptAccess, ChatGptModel};
 use workforce_common::subscription::SubscriptionKind;
 
@@ -250,9 +254,41 @@ pub async fn read_chatgpt(backend: &ChatGptBackend, login: &Login) -> Result<Vec
         .collect())
 }
 
+/// How many Claude Code CLIs may be listing models at once, hub-wide: a
+/// hub of many people opening their settings cold starts a few CLIs at a
+/// time, never one each at once.
+const CLAUDE_LISTS_AT_ONCE: usize = 4;
+
+/// What lists a Claude login's models in place of the CLI, once
+/// `list_claude_with` has set one.
+#[cfg(feature = "test-support")]
+pub type ClaudeLister =
+    Arc<dyn Fn(Login) -> BoxFuture<'static, Result<Vec<PlanModel>>> + Send + Sync>;
+
+#[cfg(feature = "test-support")]
+static CLAUDE_LISTER: OnceLock<ClaudeLister> = OnceLock::new();
+
+/// Lists every Claude login's models with `lister` instead of the Claude
+/// Code CLI, for a test of a whole hub, which has no `claude` to ask;
+/// whether it was the first set. Only built with `test-support`.
+#[cfg(feature = "test-support")]
+pub fn list_claude_with(lister: ClaudeLister) -> bool {
+    CLAUDE_LISTER.set(lister).is_ok()
+}
+
 /// The models the Claude Code CLI runs for `login`, asked of it in a
-/// directory of its own under `root`.
+/// directory of its own under `root`, a few logins at a time.
 pub async fn read_claude(login: &Login, root: &Path) -> Result<Vec<PlanModel>> {
+    #[cfg(feature = "test-support")]
+    if let Some(lister) = CLAUDE_LISTER.get() {
+        return lister(login.clone()).await;
+    }
+    static LISTING: tokio::sync::Semaphore =
+        tokio::sync::Semaphore::const_new(CLAUDE_LISTS_AT_ONCE);
+    let _turn = LISTING
+        .acquire()
+        .await
+        .map_err(|_| eyre!("the hub has stopped listing models"))?;
     let workdir = Workdir::create(root, "List the models you offer.")?;
     let models = crate::claude_code::list_models(
         login.clone(),
@@ -320,16 +356,25 @@ pub async fn claude_models(
         SubscriptionKind::Claude,
         scope.resolve(SubscriptionKind::Claude),
     )?;
-    let key = login.key.fingerprint.clone();
+    claude_models_of(shared, &login).await
+}
+
+/// The Claude models `login` runs, as the Claude Code CLI lists them for
+/// it: kept per login for [`FRESH_FOR`], and none when it has never been
+/// read.
+pub async fn claude_models_of(
+    shared: &SharedSubscriptions,
+    login: &Login,
+) -> Option<Arc<Vec<PlanModel>>> {
     PlanCatalog::global()
-        .models(SubscriptionKind::Claude, &key, || {
-            read_claude(&login, shared.completions_dir())
+        .models(SubscriptionKind::Claude, &login.key.fingerprint, || {
+            read_claude(login, shared.completions_dir())
         })
         .await
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -487,7 +532,7 @@ mod tests {
 
     /// A `claude` that answers `initialize` with the CLI's list, then waits
     /// for a prompt that never comes.
-    fn lister(dir: &Path, reply: &str) -> std::path::PathBuf {
+    pub(crate) fn lister(dir: &Path, reply: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let program = dir.join("claude");
         std::fs::write(

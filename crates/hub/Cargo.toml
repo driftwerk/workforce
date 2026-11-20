@@ -176,6 +176,9 @@ url = { workspace = true }
 
 [features]
 default = []
+# Seams a test of a whole hub sets, such as listing Claude models without
+# the CLI. Never on in a release build.
+test-support = []
 oidc = ["dep:openidconnect"]
 postgres = [
     "dep:tokio-postgres",
@@ -197,6 +200,7 @@ postgres = [
 ed25519-dalek = "2"
 curve25519-dalek = "4"
 workforce-hub-core = { path = "../hub-core", features = ["test-support"] }
+workforce-hub = { path = ".", features = ["test-support"] }
 workforce-agent = { path = "../agent-runtime", features = ["s3", "test-support"] }
 tempfile = "3"
 tower = "0.5"
@@ -206,6 +210,7 @@ rust_xlsxwriter = { workspace = true }
 workforce-postgres = { workspace = true, features = ["test-support"] }
 workforce-vellev = { workspace = true, features = ["testing"] }
 workforce-memory = { path = "../memory", features = ["testing"] }
+workforce-codebase-knowledge = { path = "../codebase-knowledge", features = ["testing"] }
 
 [build-dependencies]
 workforce-build-support = { path = "../build-support" }

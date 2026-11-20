@@ -92,7 +92,9 @@
 //! (`desk_crew::plan_watch`): a ticket in Doing whose session went away
 //! for `orphan_grace_minutes` is started again, a session that ended its
 //! turn waiting on CI or a merge is told when it lands, and the person is
-//! told once when no ticket has moved for `stall_minutes`.
+//! told once when no ticket has moved for `stall_minutes`. The boss is
+//! also woken once when a session it writes to hasn't taken its message,
+//! nor moved, for as long.
 //!
 //! A session asks the overseer on Desk's line: with `on_message` it gets a
 //! turn of its own for that, else every question goes straight to the
@@ -440,7 +442,10 @@ pub struct Work {
     /// started again.
     pub orphan_grace_minutes: u32,
     /// How long a plan may go without a ticket moving, while one is ready
-    /// or in Doing, before the person is told.
+    /// or in Doing, before the person is told; and a session without
+    /// taking the boss's message or moving, before the boss is woken. Never
+    /// off, and the same unbound: a message that never goes in is always
+    /// the boss's to move.
     pub stall_minutes: u32,
 }
 
@@ -1483,7 +1488,7 @@ impl Oversight {
                     d.work.stall_minutes,
                     5..=MAX_MINUTES,
                     &format!(
-                        "How long a plan may go without moving before you are told must be a whole number of minutes from 5 to {MAX_MINUTES} (a day)."
+                        "How long a plan or a session may go without moving before it is chased must be a whole number of minutes from 5 to {MAX_MINUTES} (a day)."
                     ),
                 )?,
             },
@@ -2125,7 +2130,7 @@ mod tests {
             ),
             (
                 "[oversight]\nwork = { stall_minutes = 2 }\n",
-                "How long a plan may go without moving before you are told must be a whole number of minutes from 5 to 1440 (a day).",
+                "How long a plan or a session may go without moving before it is chased must be a whole number of minutes from 5 to 1440 (a day).",
             ),
         ] {
             let e = parse(source).unwrap_err();

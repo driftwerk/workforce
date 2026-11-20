@@ -124,6 +124,8 @@ jobs:
         with:
           persist-credentials: false
       - run: cargo fmt --all -- --check
+      # A manifest change must carry its Cargo.lock: release builds use --locked.
+      - run: cargo metadata --locked --format-version 1 > /dev/null
 
   licenses:
     name: Dependency licences
