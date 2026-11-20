@@ -313,7 +313,9 @@ impl CrewHub {
     /// least `since` ([`Self::turns_begun`]), once its caller has settled
     /// what the turn did: only when it did something. An end held from an
     /// earlier turn there, whose caller was cancelled before it came back
-    /// for it, is dropped, never said for this one.
+    /// for it, is dropped, never said for this one. One turn runs on a
+    /// channel at a time (`begin_live_turn` refuses a second), so every
+    /// end there numbered at least `since` is this caller's.
     pub(super) fn turn_end_said(&self, boss: &str, channel: &str, since: u64, acted: bool) {
         let ends: Vec<(u64, HeldEnd)> = {
             let mut held = self.quiet_ends.lock();

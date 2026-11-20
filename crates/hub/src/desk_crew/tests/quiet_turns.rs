@@ -276,14 +276,21 @@ async fn an_end_held_from_an_earlier_turn_is_never_said_for_a_later_one() {
                 text,
             )
         };
+        // Whether it was held: a host up for less than `ago` can't date one
+        // that far back.
         let hold = |channel: &str, began: u64, ago: u64, text: &str| {
-            crew.quiet_ends.lock().insert(
-                ("desk".to_string(), channel.to_string(), began),
-                super::super::observe::HeldEnd {
-                    at: std::time::Instant::now() - Duration::from_secs(ago),
-                    event: end(text),
-                },
-            );
+            std::time::Instant::now()
+                .checked_sub(Duration::from_secs(ago))
+                .map(|at| {
+                    crew.quiet_ends.lock().insert(
+                        ("desk".to_string(), channel.to_string(), began),
+                        super::super::observe::HeldEnd {
+                            at,
+                            event: end(text),
+                        },
+                    );
+                })
+                .is_some()
         };
         let held = |channel: &str| crew.quiet_ends.lock().keys().any(|(_, c, _)| c == channel);
         // A turn that finished after its caller had settled it.
@@ -293,10 +300,10 @@ async fn an_end_held_from_an_earlier_turn_is_never_said_for_a_later_one() {
         // Another session's line turn, still running, keeps its own; one
         // no caller came back for in ten minutes is let go.
         hold("desk:line:t", 0, 0, "finished · another");
-        hold("desk:line:u", 0, 601, "finished · long gone");
+        let aged = hold("desk:line:u", 0, 601, "finished · long gone");
         crew.turn_end_said("desk", "desk:line:s", 1, true);
         assert!(held("desk:line:t"), "kept");
-        assert!(!held("desk:line:u"), "let go");
+        assert!(!aged || !held("desk:line:u"), "let go");
         crew.quiet_ends.lock().clear();
         // A cancelled turn's late end beside this turn's own: this one's is
         // said.
