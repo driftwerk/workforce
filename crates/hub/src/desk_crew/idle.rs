@@ -184,8 +184,11 @@ struct Seen {
     ends: HashMap<Uuid, Event>,
 }
 
-pub(super) async fn idle_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
-    let (_, mut events) = crew.desk.subscribe();
+pub(super) async fn idle_loop(
+    crew: Arc<CrewHub>,
+    mut events: super::Events,
+    cancel: CancellationToken,
+) {
     let mut sweep = tokio::time::interval(SWEEP);
     sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let seen: Arc<parking_lot::Mutex<Seen>> = Arc::default();

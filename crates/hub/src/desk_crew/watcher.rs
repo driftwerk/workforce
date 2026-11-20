@@ -1351,9 +1351,12 @@ struct Waking {
 /// Turns what happens into the overseers' check-ins: each event, and each
 /// threshold passed, goes to the overseer whose scope sees its group, and
 /// no other; each overseer's check-ins are gathered and spent apart.
-pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
-    let (_, mut events) = crew.desk.subscribe();
-    let mut rework = crew.rework.subscribe();
+pub(super) async fn wake_loop(
+    crew: Arc<CrewHub>,
+    mut events: super::Events,
+    mut rework: super::Rework,
+    cancel: CancellationToken,
+) {
     let mut tick = tokio::time::interval(crew.timing.tick.min(crew.timing.coalesce));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut waking: HashMap<String, Waking> = HashMap::new();

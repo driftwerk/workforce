@@ -6267,7 +6267,15 @@ async fn a_start_reuses_only_the_overseers_own_session_on_its_engine_once_and_as
     use super::actions::Action;
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", REUSES, &[]).await;
+        // Another boss, here and overseeing (of acme): a session of a boss
+        // no longer here is passed on to this one.
+        let (sarah, _l2) = agent(dir.path(), "sarah", "ok").await;
+        write_config(&sarah, "[oversight]\nenabled = true\ngroup = \"acme\"\n");
+        let (overseer, crew, d, _llm) =
+            overseeing(dir.path(), pool, "ok", REUSES, &[Arc::clone(&sarah)]).await;
+        d.change_layout(|l| l.create("acme", "Acme", &[], None))
+            .await
+            .unwrap();
         let mine = dir.path().join("mine");
         let theirs = dir.path().join("theirs");
         let others = dir.path().join("others");

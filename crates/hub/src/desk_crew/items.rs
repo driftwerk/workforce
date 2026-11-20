@@ -1972,8 +1972,11 @@ impl CrewHub {
 /// Keeps the open items: each session question that stops waiting on the
 /// person closes its item as it happens; every minute what is past closes
 /// and what is due is said again; and the nightly sweep runs.
-pub(super) async fn items_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
-    let (_, mut events) = crew.desk.subscribe();
+pub(super) async fn items_loop(
+    crew: Arc<CrewHub>,
+    mut events: super::Events,
+    cancel: CancellationToken,
+) {
     let mut every = tokio::time::interval(crew.timing.minute);
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let sweep_after = chrono::Duration::from_std(crew.timing.minute)

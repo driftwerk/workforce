@@ -2623,8 +2623,11 @@ impl CrewHub {
 /// anything they wait on changes and every tick, the starts cut off by a
 /// stop finished first; and what happens to a plan, gathered into its
 /// boss's `[Desk plan]` turns, one at a time per plan.
-pub(super) async fn plan_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
-    let (_, mut events) = crew.desk.subscribe();
+pub(super) async fn plan_loop(
+    crew: Arc<CrewHub>,
+    mut events: super::Events,
+    cancel: CancellationToken,
+) {
     // Desk knows which sessions bosses run before anything is started.
     while !crew.desk.charges_loaded() {
         tokio::select! {

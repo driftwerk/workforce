@@ -194,6 +194,9 @@ pub struct CrewHub {
     /// keys paid for, never the person's plans. Act fully holds only under
     /// its budget, and not before this is read.
     spent_today: Mutex<HashMap<String, f64>>,
+    /// What a test says an overseer spent today, kept over each read.
+    #[cfg(test)]
+    spent_pinned: Mutex<HashMap<String, f64>>,
     /// What each machine last said each boss's sessions there spent today
     /// ([`shared_budget`]): one Act fully budget across them all.
     machine_spent: Mutex<shared_budget::Machines>,
@@ -714,6 +717,15 @@ fn mtime(workspace: &Path) -> Option<SystemTime> {
         .ok()
 }
 
+/// What happens on Desk, as a loop of the crew hears it: subscribed in
+/// [`CrewHub::start`], before the loop is spawned, so nothing that happens
+/// once the crew has started is missed while its loops start.
+pub(super) type Events = tokio::sync::broadcast::Receiver<workforce_desk::model::DeskEvent>;
+
+/// A boss's turn ends its fast call handed on, as a loop hears them:
+/// subscribed as [`Events`] are.
+pub(super) type Rework = tokio::sync::broadcast::Receiver<workforce_desk::crew::Event>;
+
 impl CrewHub {
     /// Starts the crew for the hub `state` serves: the overseer's tools and
     /// summaries kept in step with its config, and the watcher that wakes it.
@@ -743,6 +755,8 @@ impl CrewHub {
             sent: Mutex::default(),
             read: Mutex::default(),
             spent_today: Mutex::default(),
+            #[cfg(test)]
+            spent_pinned: Mutex::default(),
             machine_spent: Mutex::default(),
             tooled: Mutex::default(),
             poke: tokio::sync::Notify::new(),
@@ -836,22 +850,57 @@ impl CrewHub {
             }
         });
         tokio::spawn(watcher::sync_loop(Arc::clone(&crew), cancel.clone()));
-        tokio::spawn(watcher::wake_loop(Arc::clone(&crew), cancel.clone()));
-        tokio::spawn(decide::decide_loop(Arc::clone(&crew), cancel.clone()));
+        tokio::spawn(watcher::wake_loop(
+            Arc::clone(&crew),
+            crew.desk.subscribe().1,
+            crew.rework.subscribe(),
+            cancel.clone(),
+        ));
+        tokio::spawn(decide::decide_loop(
+            Arc::clone(&crew),
+            crew.desk.subscribe().1,
+            cancel.clone(),
+        ));
         tokio::spawn(relayed_decide::pump_loop(Arc::clone(&crew), cancel.clone()));
-        tokio::spawn(answer::answer_loop(Arc::clone(&crew), cancel.clone()));
-        tokio::spawn(idle::idle_loop(Arc::clone(&crew), cancel.clone()));
-        tokio::spawn(logins::logins_loop(Arc::clone(&crew), cancel.clone()));
+        tokio::spawn(answer::answer_loop(
+            Arc::clone(&crew),
+            crew.desk.subscribe().1,
+            cancel.clone(),
+        ));
+        tokio::spawn(idle::idle_loop(
+            Arc::clone(&crew),
+            crew.desk.subscribe().1,
+            cancel.clone(),
+        ));
+        tokio::spawn(logins::logins_loop(
+            Arc::clone(&crew),
+            crew.desk.subscribe().1,
+            cancel.clone(),
+        ));
         tokio::spawn(watches::watch_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(closing::closing_loop(Arc::clone(&crew), cancel.clone()));
-        tokio::spawn(plan::plan_loop(Arc::clone(&crew), cancel.clone()));
-        tokio::spawn(items::items_loop(Arc::clone(&crew), cancel.clone()));
+        tokio::spawn(plan::plan_loop(
+            Arc::clone(&crew),
+            crew.desk.subscribe().1,
+            cancel.clone(),
+        ));
+        tokio::spawn(items::items_loop(
+            Arc::clone(&crew),
+            crew.desk.subscribe().1,
+            cancel.clone(),
+        ));
         tokio::spawn(updates::updates_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(assignments::assignments_loop(
             Arc::clone(&crew),
+            crew.desk.subscribe().1,
             cancel.clone(),
         ));
-        tokio::spawn(line::line_loop(Arc::clone(&crew), cancel));
+        tokio::spawn(line::line_loop(
+            Arc::clone(&crew),
+            crew.desk.subscribe().1,
+            crew.rework.subscribe(),
+            cancel,
+        ));
         crew
     }
 
@@ -1149,6 +1198,21 @@ impl CrewHub {
                 .is_some_and(|id| self.fully(id, o).is_ok() && self.desk.acts_fully_in(session, id))
     }
 
+    /// Pins what `agent` spent today at `usd` (none: as read), for tests:
+    /// the tick's read of the spend doesn't undo it.
+    #[cfg(test)]
+    pub(super) fn pin_spent_today(&self, agent: &str, usd: Option<f64>) {
+        match usd {
+            Some(usd) => {
+                self.spent_pinned.lock().insert(agent.to_string(), usd);
+                self.spent_today.lock().insert(agent.to_string(), usd);
+            }
+            None => {
+                self.spent_pinned.lock().remove(agent);
+            }
+        }
+    }
+
     /// Reads the real money each overseer that chose Act fully has spent
     /// today, for [`Self::fully`], and tells Desk, which shows it: its
     /// scope's Desk sessions' calls a key paid for, and the model calls of
@@ -1225,6 +1289,8 @@ impl CrewHub {
             let mut today = self.spent_today.lock();
             today.retain(|agent, _| served.contains(agent));
             today.extend(spent);
+            #[cfg(test)]
+            today.extend(self.spent_pinned.lock().clone());
         }
         self.desk.set_full_budgets(shown);
         for boss in served {

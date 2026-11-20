@@ -97,8 +97,11 @@ impl CrewHub {
 
 /// Desk's own moves between logins, and that none has room, each said in
 /// the main boss's DM as Desk said it in Activity: once.
-pub(super) async fn logins_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
-    let (_, mut events) = crew.desk.subscribe();
+pub(super) async fn logins_loop(
+    crew: Arc<CrewHub>,
+    mut events: super::Events,
+    cancel: CancellationToken,
+) {
     loop {
         let event = tokio::select! {
             () = cancel.cancelled() => return,

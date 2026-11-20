@@ -847,8 +847,12 @@ impl Gathered {
 /// its mind is held, or the person's own turn runs in its DM, what its
 /// sessions say keeps gathering, and the session that has waited longest
 /// goes first. It takes sessions on as they appear, when it is set to.
-pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
-    let (_, mut events) = crew.desk.subscribe();
+pub(super) async fn line_loop(
+    crew: Arc<CrewHub>,
+    mut events: super::Events,
+    mut rework: super::Rework,
+    cancel: CancellationToken,
+) {
     let mut gathering: HashMap<Uuid, Gathered> = HashMap::new();
     for (session, asks) in crew.take_up_open_asks().await {
         gathering.insert(
@@ -861,7 +865,6 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     }
     // Each line turn running, by session, with the boss it is for.
     let mut running: HashMap<Uuid, (tokio::task::JoinHandle<()>, Option<String>)> = HashMap::new();
-    let mut rework = crew.rework.subscribe();
     let mut tick = tokio::time::interval(Duration::from_millis(500));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut taking_on: Option<tokio::task::JoinHandle<()>> = None;

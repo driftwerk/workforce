@@ -1925,8 +1925,11 @@ impl CrewHub {
 /// Keeps the assignments up to date with what happens on the lines, and
 /// looks at them every crew minute. First settles what a restart left
 /// being sent. Events missed (lagged) are read from the line at once.
-pub(super) async fn assignments_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
-    let (_, mut events) = crew.desk.subscribe();
+pub(super) async fn assignments_loop(
+    crew: Arc<CrewHub>,
+    mut events: super::Events,
+    cancel: CancellationToken,
+) {
     crew.assignments_after_restart(Utc::now()).await;
     let mut every = tokio::time::interval(crew.timing.minute);
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

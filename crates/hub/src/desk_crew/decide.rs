@@ -214,8 +214,11 @@ pub(crate) const ASK_AGAIN: &str = "Desk here, for the person: a permission prom
 /// and why. Each reason is said once a boss while it holds anything.
 type Told = HashMap<Uuid, (String, String)>;
 
-pub(super) async fn decide_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
-    let (_, mut events) = crew.desk.subscribe();
+pub(super) async fn decide_loop(
+    crew: Arc<CrewHub>,
+    mut events: super::Events,
+    cancel: CancellationToken,
+) {
     let mut sweep = tokio::time::interval(SWEEP);
     sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let (tx, mut said) = mpsc::unbounded_channel::<Said>();

@@ -166,8 +166,11 @@ pub(super) fn question_of(view: &SessionView) -> Option<&Asked> {
         .filter(|a| a.denied.is_none() && view.pending.is_none())
 }
 
-pub(super) async fn answer_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
-    let (_, mut events) = crew.desk.subscribe();
+pub(super) async fn answer_loop(
+    crew: Arc<CrewHub>,
+    mut events: super::Events,
+    cancel: CancellationToken,
+) {
     let mut sweep = tokio::time::interval(SWEEP);
     sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The questions handed to a boss: each is answered once, unless the
