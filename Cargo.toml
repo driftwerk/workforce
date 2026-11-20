@@ -115,7 +115,7 @@ tracing-opentelemetry = "0.34"
 # Metrics — Prometheus-style emission via the `metrics` facade so the
 # hub can expose /metrics for in-cluster scrapers while still honouring the
 # `tracing::info!` log-based pipeline a Datadog integration uses.
-metrics = "0.24"
+metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
 
 # Sentry — opt-in via SENTRY_DSN env var; no-op when unset.

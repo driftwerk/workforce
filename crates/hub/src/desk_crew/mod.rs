@@ -43,9 +43,11 @@ mod extras;
 mod find;
 mod github;
 mod handover;
+mod held;
 mod idle;
 mod items;
 mod line;
+mod logins;
 pub(crate) mod machine_grants;
 mod mind;
 mod observe;
@@ -66,6 +68,7 @@ mod scope;
 pub(crate) mod served;
 pub(crate) mod shared_budget;
 mod spend;
+mod stalls;
 mod tickets;
 mod tools;
 mod updates;
@@ -237,6 +240,9 @@ pub struct CrewHub {
     update_writer: Mutex<Option<Arc<dyn updates::UpdateWriter>>>,
     /// The bosses the person asked for a roundup now ("Roundup now").
     roundup_asked: Mutex<std::collections::HashSet<String>>,
+    /// When each boss's full turn was last handed a stall of a session's
+    /// that nobody moved ([`stalls`]): not handed again within the hour.
+    stalls_handed: Mutex<HashMap<(String, uuid::Uuid), DateTime<Utc>>>,
     /// The bosses whose update is being looked at now.
     updating: Mutex<std::collections::HashSet<String>>,
     /// The suggestions each boss's quiet check-ins made, and when, for its
@@ -720,6 +726,7 @@ impl CrewHub {
             redecided: Mutex::default(),
             update_writer: Mutex::default(),
             roundup_asked: Mutex::default(),
+            stalls_handed: Mutex::default(),
             updating: Mutex::default(),
             quiet_made: Mutex::default(),
             closing: Mutex::default(),
@@ -792,6 +799,7 @@ impl CrewHub {
         tokio::spawn(relayed_decide::pump_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(answer::answer_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(idle::idle_loop(Arc::clone(&crew), cancel.clone()));
+        tokio::spawn(logins::logins_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(watches::watch_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(closing::closing_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(plan::plan_loop(Arc::clone(&crew), cancel.clone()));
@@ -958,6 +966,19 @@ impl CrewHub {
                             .collect::<Vec<_>>(),
                     ),
                 )
+                .collect(),
+        );
+        // Who isn't woken by what its sessions' turns end asking: those
+        // questions are the person's.
+        self.desk.set_unwoken(
+            list.iter()
+                .filter(|(s, o)| !o.wake.on_finish && !self.unbound_given(s.agent_id.as_str(), o))
+                .map(|(s, _)| {
+                    (
+                        s.agent_id.as_str().to_string(),
+                        format!("{} isn't woken when its sessions stop.", name_of(s)),
+                    )
+                })
                 .collect(),
         );
         self.desk.set_holds(

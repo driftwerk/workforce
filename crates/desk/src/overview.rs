@@ -100,6 +100,17 @@ fn session_item(
         group_id: v.group.as_ref().map(|g| g.id.clone()),
         engine: Some(v.engine),
         origin: Some(v.origin),
+        login: match (&v.account, &v.switching_to) {
+            (Some(a), Some(to)) => {
+                Some(format!("{} (moves to {} after this turn)", a.name, to.name))
+            }
+            (None, Some(to)) => Some(format!(
+                "this computer's sign-in (moves to {} after this turn)",
+                to.name
+            )),
+            (Some(a), None) => Some(a.name.clone()),
+            (None, None) => None,
+        },
         state,
         task,
         detail,
@@ -158,6 +169,7 @@ fn agent_item(
         group_id: None,
         engine: None,
         origin: None,
+        login: None,
         state: ItemState::Idle,
         task: None,
         detail: None,
@@ -547,6 +559,7 @@ mod tests {
             group_id: None,
             engine: None,
             origin: None,
+            login: None,
             state,
             task: None,
             detail: None,

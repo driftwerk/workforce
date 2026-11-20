@@ -55,6 +55,19 @@ pub fn settled_by(i: &OpenItem) -> Option<crate::update::SettledBy> {
 /// Why a "for you" item closed when the person said they did it.
 pub const DONE_WHY: &str = "You did it.";
 
+/// How an ask closed with the person's answer begins, then the answer:
+/// "You answered: …" from Desk, "They answered: …" from their boss.
+pub const ANSWERED_WHY: [&str; 2] = ["You answered: ", "They answered: "];
+
+/// Whether an item the person closed for `why` was settled by them (their
+/// answer, wherever given, settling it in its session, or their Done), not
+/// dropped or set aside.
+pub fn settled_why(why: &str) -> bool {
+    ANSWERED_WHY.iter().any(|p| why.starts_with(p))
+        || why.starts_with("You answered")
+        || matches!(why, SETTLED_WHY | DONE_WHY)
+}
+
 /// How old an ask is before it is first restated.
 pub const FIRST_RESTATE: Duration = Duration::minutes(30);
 /// How many restatements an ask gets before it is parked.
@@ -751,6 +764,22 @@ pub fn listed(items: &[OpenItem], now: DateTime<Utc>, tz: chrono_tz::Tz) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_answer_wherever_given_settles_and_a_drop_does_not() {
+        for why in [
+            "You answered: take the 60 minute window",
+            "They answered: take the 60 minute window",
+            "You answered it.",
+            SETTLED_WHY,
+            DONE_WHY,
+        ] {
+            assert!(settled_why(why), "{why}");
+        }
+        for why in ["You dropped it.", "Set aside.", ""] {
+            assert!(!settled_why(why), "{why}");
+        }
+    }
 
     fn item(age: i64, said: i32, last: Option<i64>) -> OpenItem {
         let now = Utc::now();

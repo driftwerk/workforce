@@ -11,7 +11,7 @@ use workforce_desk::open_item::{ClosedBy, OpenItem, OpenState};
 use super::super::actions::{Action, Target};
 use super::*;
 
-/// A minute is 100 ms: the bound is 200 ms, reminders come 1 s, 3 s, then
+/// A minute is 100 ms: the boss's fair chance is 1 s, reminders come 1 s, 3 s, then
 /// every 6 s after the last.
 const ACT: &str = "[oversight]\nenabled = true\nlevel = \"act\"\nact = { nudge = true }\n\
                    updates = { enabled = false }\n";
@@ -237,8 +237,9 @@ async fn a_wait_settled_in_its_session_is_closed_and_said_in_one_line() {
     .await;
 }
 
-/// The boss holds the session for its answer: the person has it at once;
-/// the boss's own decision reaching the session closes it, said in a line.
+/// The boss holds the session saying it is the person's: the person has it
+/// at once; the boss's own decision reaching the session closes it, said in
+/// a line.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_bosss_hold_is_the_persons_at_once_and_its_decision_closes_it() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
@@ -257,7 +258,7 @@ async fn a_bosss_hold_is_the_persons_at_once_and_its_decision_closes_it() {
             reply_to: None,
         };
         crew.perform(
-            &nudge("Don't change staging any further until I answer."),
+            &nudge("Don't change staging any further until I answer: this is the person's call."),
             by(),
         )
         .await
@@ -316,6 +317,86 @@ async fn a_bosss_hold_is_the_persons_at_once_and_its_decision_closes_it() {
         .await;
         assert!(ack.contains("“Decision: (b), not (a) today.”"), "{ack}");
         assert!(ack.ends_with("I've closed the question."), "{ack}");
+    })
+    .await;
+}
+
+/// The boss's own hold, which says nothing of the person, is the boss's to
+/// answer: nothing pops up for the person within its fair chance.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bosss_own_hold_is_no_pop_up_for_the_person() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let config = format!("{ACT}wake = {{ waiting_after_minutes = 60 }}\n");
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", &config, &[]).await;
+        let (s, _) = stopped(&d, dir.path(), "Cufflink Migration").await;
+        d.line_call(s.id, "tell", &json!({"to": "desk", "text": REPORT}), None)
+            .await
+            .unwrap();
+        crew.perform(
+            &Action::Nudge {
+                to: Target::Session(s.id),
+                message: "Don't change staging any further until I answer.".into(),
+                reply_to: None,
+            },
+            crew.by_overseer("It needs a decision.").unwrap(),
+        )
+        .await
+        .unwrap();
+        let hold = d
+            .line_thread(s.id, None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .rfind(|m| m.text.contains("until I answer"))
+            .unwrap();
+        let _ = d.store().line_take(hold.id, Delivery::Delivered).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+        crew.look_at_items().await;
+        let open = d.store().items_not_closed(Some("desk")).await.unwrap();
+        assert!(
+            !open.iter().any(|i| i.dedupe_key.starts_with("waiting:")),
+            "{open:?}"
+        );
+        assert!(dm(&overseer, "Needs you").is_empty());
+    })
+    .await;
+}
+
+/// While the boss's turn is working, what waits on it is never raised to
+/// the person, however long past the bound; once its turn is over, it is.
+#[tokio::test(flavor = "multi_thread")]
+async fn nothing_is_raised_while_the_bosss_turn_is_working() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        let (s, _) = stopped(&d, dir.path(), "Cufflink Migration").await;
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+        let c = Arc::clone(&crew);
+        let holder = tokio::spawn(async move {
+            c.with_mind("desk", "a check-in", async move {
+                go_rx.await.ok();
+            })
+            .await
+        });
+        eventually("the mind held", async || {
+            crew.mind_holder("desk").map(|_| ())
+        })
+        .await;
+        d.line_call(s.id, "tell", &json!({"to": "desk", "text": REPORT}), None)
+            .await
+            .unwrap();
+        // Past the boss's fair chance (10 minutes, 1 s).
+        tokio::time::sleep(std::time::Duration::from_millis(2_000)).await;
+        crew.look_at_items().await;
+        let open = d.store().items_not_closed(Some("desk")).await.unwrap();
+        assert!(
+            !open.iter().any(|i| i.dedupe_key.starts_with("waiting:")),
+            "nothing while its turn works: {open:?}"
+        );
+        go_tx.send(()).unwrap();
+        holder.await.unwrap();
+        the_wait(&d, s.id).await;
     })
     .await;
 }

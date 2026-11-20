@@ -497,7 +497,7 @@ fn rule_then(i: &OpenItem, answer: &str) -> String {
 /// answer that went on to a session (its words are the session's line's).
 fn answer_of(i: &OpenItem) -> Option<String> {
     let why = i.closed_why.as_deref()?;
-    ["You answered: ", "They answered: "]
+    workforce_desk::open_item::ANSWERED_WHY
         .iter()
         .find_map(|p| why.strip_prefix(p))
         .map(str::trim)

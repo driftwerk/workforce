@@ -263,6 +263,13 @@ pub struct SessionView {
     /// boss runs it. Its badge says "Waiting on you" while it is set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waits_on_you: Option<String>,
+    /// The boss that has it now, by name: it runs it, has the wheel, and
+    /// nothing it waits on is the person's (`waits_on_you` none). While it
+    /// is set, nothing of it calls for the person's attention (badges,
+    /// counts, the Floor, notifications, "waiting on you"): the boss deals
+    /// with it, and what it gives the person comes as its own card.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boss_has: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -371,6 +378,7 @@ impl SessionView {
             reading: false,
             mode: None,
             waits_on_you: None,
+            boss_has: None,
             failure: None,
             created_at: r.created_at,
             updated_at: r.updated_at,

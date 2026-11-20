@@ -1270,6 +1270,7 @@ mod tests {
             did: vec![],
             at: None,
             decisions: None,
+            moves: None,
         }
     }
 
