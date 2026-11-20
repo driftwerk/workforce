@@ -263,10 +263,16 @@ impl PlanSink for Plans {
         if windows.is_empty() {
             return;
         }
+        let key = account_key(kind, &account.ids);
+        // The plan guard reads this Mac's own use of the account too: the
+        // person's sessions fill the plan the hub's background work runs on.
+        if let Some(key) = &key {
+            crate::plan_guard::PlanGuard::global().observe_account(kind, key, &windows, at);
+        }
         self.keep(Reading {
             kind,
             login: LoginRef::Mac,
-            account: account_key(kind, &account.ids),
+            account: key,
             plan: account.plan,
             windows,
             observed_at: at,

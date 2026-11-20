@@ -149,6 +149,8 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
         "owner_instance",
         NotPersonal(INSTANCE),
     ),
+    // Whose plan background work drew on: kept 35 days, then pruned.
+    ("common", "work_use", "payer", By(C::RetentionBound)),
     (
         "desk",
         "access_activity",

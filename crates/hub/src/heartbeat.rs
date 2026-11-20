@@ -219,9 +219,14 @@ impl HeartbeatRunner {
                     relayed: false,
                 },
             );
-        // The agent's own check-in: its heavy background model's work.
+        // The agent's own check-in: its heavy background model's work, and
+        // background work the plan guard holds and counts.
         let model = crate::turn_loop::heavy_model(&self.service);
-        workforce_agent::runner::with_desk(
+        let work = workforce_common::work_use::Work::heartbeat(
+            self.service.agent_id.as_str(),
+            &crate::desk_crew::name_of(&self.service),
+        );
+        let run = workforce_agent::runner::with_desk(
             desk,
             self.service.run_background_unit(
                 &principal,
@@ -246,8 +251,8 @@ impl HeartbeatRunner {
                     )),
                 ),
             ),
-        )
-        .await
+        );
+        workforce_common::work_use::within(work, run).await
     }
 
     /// The Desk conversation `check` was made in, and the person it is

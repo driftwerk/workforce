@@ -1446,7 +1446,7 @@ async fn the_breaker_holding_the_plans_group_holds_its_starts() {
                         priced: Priced::Reported,
                         billing: None,
                     },
-                    billing: Billing::Plan,
+                    billing: Billing::Key,
                     account: None,
                 }],
             )
@@ -1709,7 +1709,7 @@ async fn spent_at(d: &Desk, session: Uuid, usd: f64, at: chrono::DateTime<chrono
                     priced: Priced::Reported,
                     billing: None,
                 },
-                billing: Billing::Plan,
+                billing: Billing::Key,
                 account: None,
             }],
         )
@@ -2033,7 +2033,7 @@ async fn ticketless_spend_goes_to_one_plan_by_each_hand_out() {
         ] {
             c.execute(
                 "INSERT INTO ledger (engine, key, session, at, input, usd, priced, billing) \
-                 VALUES ('claude', $1, $2, $3, 10, $4, 'reported', 'plan')",
+                 VALUES ('claude', $1, $2, $3, 10, $4, 'reported', 'key')",
                 &[&Uuid::new_v4().to_string(), &s, &at, &usd],
             )
             .await
