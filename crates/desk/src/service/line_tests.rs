@@ -553,9 +553,8 @@ async fn send_now_types_into_a_working_claude_session_and_is_refused_from_a_sess
 /// A stand-in `codex`, as `codex_asks_tests` has it: it says where its
 /// app-server was told to listen, and what else it was told.
 fn fake_codex(dir: &Path) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join("fake-codex");
-    std::fs::write(
+    workforce_common::executable::write(
         &path,
         format!(
             "#!/bin/sh\n[ \"$1\" = app-server ] && echo \"${{3#unix://}}\" > '{d}/listen' && echo \"$@\" > '{d}/server-args' && echo \"$DESK_LINE_TOKEN\" > '{d}/server-token'\nexec sleep 60\n",
@@ -563,7 +562,6 @@ fn fake_codex(dir: &Path) -> PathBuf {
         ),
     )
     .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
 }
 
