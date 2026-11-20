@@ -12150,6 +12150,7 @@ dependencies = [
  "workforce-distributed",
  "workforce-games",
  "workforce-gateway-client",
+ "workforce-hub",
  "workforce-hub-core",
  "workforce-identity",
  "workforce-knowledge-service",
