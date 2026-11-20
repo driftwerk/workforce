@@ -5,7 +5,7 @@
 //! - `CodeSummary`: semantic search over generated summaries at various granularity levels
 
 pub mod health;
-mod vellev;
+pub(crate) mod vellev;
 
 use async_trait::async_trait;
 use eyre::Result;
@@ -20,8 +20,6 @@ use crate::graph::entities::{CodeEntity, EntityKind};
 use health::{InsertErrorSink, InsertErrorSlot};
 
 pub use health::InsertError;
-#[cfg(feature = "testing")]
-pub use vellev::pre_w4_entity_collection;
 pub use vellev::{code_embedding, VellevCodeVectorStore};
 
 const CODE_ENTITY_COLLECTION: &str = "CodeEntity";

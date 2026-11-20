@@ -60,7 +60,7 @@ refinery = { workspace = true, optional = true }
 [features]
 default = []
 # The in-memory vector stores its tests use, for other crates' tests.
-testing = []
+testing = ["workforce-vellev/testing"]
 postgres = [
     "dep:tokio-postgres",
     "dep:deadpool-postgres",
@@ -71,8 +71,6 @@ postgres = [
 [dev-dependencies]
 workforce-codebase-knowledge = { path = ".", features = ["testing"] }
 workforce-vellev = { workspace = true, features = ["testing"] }
-metrics-util = { version = "0.19", default-features = false, features = ["debugging"] }
-tracing-subscriber = { workspace = true }
 tempfile = "3"
 axum = { workspace = true }
 tokio = { version = "1", features = ["full", "test-util"] }

@@ -1,26 +1,95 @@
 //! Vector stores kept in memory, for tests here and in other crates: one
 //! that keeps what it is given as a real store does and can be made to
 //! fail or change the graph as told ([`Held`]), and one that counts every
-//! call made of it ([`Counting`]); and the shape a vellev collection of
-//! code entities was made in before the slim one.
+//! call made of it ([`Counting`]); a vellev store whose embeds are
+//! counted ([`counted`]), and a collection of entities in the shape that
+//! keeps their text ([`collection_keeping_text`]).
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use eyre::{eyre, Result};
+use vellev_core::Embedding;
+use workforce_vellev::seeding::Seeding;
+use workforce_vellev::testing::Counted;
 
 use crate::graph::entities::{CodeEntity, EntityKind};
+use crate::graph::vectors::FillStage;
 use crate::graph::{CodeGraph, VectorKeys};
-pub use crate::vector::pre_w4_entity_collection;
+use crate::indexer::fill::VectorFiller;
+pub use crate::vector::vellev::collection_keeping_text;
 use crate::vector::{
     health::InsertErrorSink, CodeVectorStore, DeleteOutcome, Differing, HeldRecord,
-    VectorCodeEntity, VectorCodeSummary, VectorSearchResult,
+    VectorCodeEntity, VectorCodeSummary, VectorSearchResult, VellevCodeVectorStore,
 };
 
-/// The repo the fakes' graph changes are made in.
+/// The repo of the tests that have one.
 pub const REPO: &str = "repo";
+
+/// What `graph` has of the repo, as a store holds it.
+pub async fn as_held(
+    graph: &CodeGraph,
+    repo_id: &str,
+) -> (Vec<VectorCodeEntity>, Vec<VectorCodeSummary>) {
+    let entities = graph.all_entities(repo_id).await.expect("the entities");
+    let summaries = graph
+        .summaries_page(repo_id, "", None, 1_000_000)
+        .await
+        .expect("the summaries");
+    (
+        entities
+            .iter()
+            .map(|entity| VectorCodeEntity::from_code_entity(entity, repo_id, None))
+            .collect(),
+        summaries
+            .iter()
+            .map(|summary| VectorCodeSummary::of(summary, repo_id, ""))
+            .collect(),
+    )
+}
+
+/// Step the repo's fill or adoption until it is done, doing `each` after
+/// every step: the stage each step left it at.
+pub async fn stepped<F: Future<Output = ()>>(
+    filler: &VectorFiller,
+    repo_id: &str,
+    mut each: impl FnMut() -> F,
+) -> Vec<FillStage> {
+    let mut stages = Vec::new();
+    for _ in 0..10_000 {
+        let fill = filler.step(repo_id).await.expect("a step");
+        stages.push(fill.stage);
+        each().await;
+        if fill.stage == FillStage::Done {
+            return stages;
+        }
+    }
+    panic!("the fill of '{repo_id}' did not end");
+}
+
+/// A store on the vellev tenant `tenant` of `url`, embedding as `local`
+/// where said, given vectors made from each text's hash, which are
+/// counted: what is written whole.
+pub fn counted(
+    url: &str,
+    key: &str,
+    tenant: &str,
+    local: Option<&Embedding>,
+) -> (VellevCodeVectorStore, Arc<Counted>) {
+    let store = VellevCodeVectorStore::new(url, key, tenant).expect("a store");
+    let store = match local {
+        Some(local) => store.embedding(local.clone()).expect("the embedding"),
+        None => store,
+    };
+    let counted = Arc::new(Counted::new(store.embedded_as().1.dimensions as usize));
+    (
+        store.seeded_by(Seeding::new(counted.clone(), 200, 2)),
+        counted,
+    )
+}
 
 /// What a [`Held`] store does to the graph, as an index run would, as a
 /// write of entities comes in and before it lands.
@@ -74,9 +143,8 @@ pub struct Held {
     /// Entities that come into the graph as the next write of entities
     /// comes in: an index run's, between a page's two reads.
     pub crowd: Mutex<Vec<CodeEntity>>,
-    /// An entity changed in the graph again as every write of entities
-    /// comes in.
-    pub restless: Mutex<Option<CodeEntity>>,
+    /// The crowd comes in as every write does, changed again each time.
+    pub restless: AtomicBool,
     /// Entities that come into the graph and the store as the next
     /// removal by id comes in: an index run's, and its write.
     pub on_remove: Mutex<Vec<CodeEntity>>,
@@ -219,11 +287,11 @@ impl Held {
         Ok(())
     }
 
-    /// Hold a vector of an entity the graph does not have.
-    pub fn hold_stale(&self, id: &str) {
+    /// Hold a vector of `repo_id`'s of an entity the graph does not have.
+    pub fn hold_stale(&self, repo_id: &str, id: &str) {
         let stale = VectorCodeEntity {
             entity_id: id.to_string(),
-            repo_id: REPO.to_string(),
+            repo_id: repo_id.to_string(),
             qualified_name: id.to_string(),
             name: id.to_string(),
             kind: "Function".into(),
@@ -254,6 +322,13 @@ impl Held {
         for summary in summaries {
             held.insert(summary_key(summary), summary.clone());
         }
+    }
+
+    /// Hold the repo as `graph` has it, as a store built elsewhere does.
+    pub async fn hold_graph(&self, graph: &CodeGraph, repo_id: &str) {
+        let (entities, summaries) = as_held(graph, repo_id).await;
+        self.hold(&entities);
+        self.hold_summaries(&summaries);
     }
 
     fn graph(&self) -> Arc<CodeGraph> {
@@ -310,22 +385,29 @@ impl CodeVectorStore for Held {
                 self.unkept.store(true, Ordering::SeqCst);
             }
         }
-        let crowd = std::mem::take(&mut *self.crowd.lock().unwrap());
+        let crowd = {
+            let mut crowd = self.crowd.lock().unwrap();
+            match self.restless.load(Ordering::SeqCst) {
+                true => {
+                    for entity in crowd.iter_mut() {
+                        let said = entity.doc_comment.clone().unwrap_or_default();
+                        entity.doc_comment = Some(format!("{said} Again."));
+                    }
+                    crowd.clone()
+                }
+                false => std::mem::take(&mut *crowd),
+            }
+        };
         if !crowd.is_empty() {
             self.graph().upsert_entities(&crowd).await?;
-        }
-        let restless = self.restless.lock().unwrap().as_mut().map(|entity| {
-            let said = entity.doc_comment.clone().unwrap_or_default();
-            entity.doc_comment = Some(format!("{said} Again."));
-            entity.clone()
-        });
-        if let Some(entity) = restless {
-            self.graph().upsert_entities(&[entity]).await?;
         }
         let meanwhile = self.meanwhile.lock().unwrap().take();
         match meanwhile {
             Some(Meanwhile::FileDeleted(file)) => {
-                self.graph().delete_file_entities(REPO, file).await?;
+                let repo = entities
+                    .first()
+                    .map_or("", |entity| entity.repo_id.as_str());
+                self.graph().delete_file_entities(repo, file).await?;
                 let mut held = self.entities.lock().unwrap();
                 held.retain(|_, entity| entity.file_path != file);
             }
@@ -439,7 +521,7 @@ impl CodeVectorStore for Held {
             self.graph().upsert_entities(&added).await?;
             let written: Vec<VectorCodeEntity> = added
                 .iter()
-                .map(|entity| VectorCodeEntity::from_code_entity(entity, REPO, None))
+                .map(|entity| VectorCodeEntity::from_code_entity(entity, &entity.repo_id, None))
                 .collect();
             self.hold(&written);
         }

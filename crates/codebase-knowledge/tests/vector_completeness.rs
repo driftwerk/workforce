@@ -21,7 +21,7 @@ use workforce_codebase_knowledge::indexer::{IndexingConfig, IndexingPipeline, Ru
 use workforce_codebase_knowledge::query::natural_language::QueryPlanner;
 use workforce_codebase_knowledge::query::{QueryEngine, VectorWait};
 use workforce_codebase_knowledge::testing::{
-    entity_key, summary_key, Counting, Failing, Held, Meanwhile, RECORDED, REPO,
+    as_held, entity_key, stepped, summary_key, Counting, Failing, Held, Meanwhile, RECORDED, REPO,
 };
 use workforce_codebase_knowledge::vector::{
     health::InsertErrorSink, CodeVectorStore, DeleteOutcome, VectorCodeEntity, VectorCodeSummary,
@@ -153,13 +153,18 @@ impl Repo {
 
     /// A repo of two small files and one of `functions` functions.
     fn of(functions: usize) -> Self {
+        Self::of_graph(functions, CodeGraph::open_in_memory().unwrap())
+    }
+
+    /// As [`Self::of`], its graph `graph`.
+    fn of_graph(functions: usize, graph: CodeGraph) -> Self {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "config.rs", CONFIG_RS);
         write(dir.path(), "mail.rs", MAIL_RS);
         write(dir.path(), "many.rs", &many(functions));
         git(dir.path(), &["init", "-q"]);
         commit(dir.path());
-        let graph = Arc::new(CodeGraph::open_in_memory().unwrap());
+        let graph = Arc::new(graph);
         let held = Arc::new(Held::default());
         *held.graph.lock().unwrap() = Some(Arc::clone(&graph));
         Self { dir, graph, held }
@@ -375,7 +380,7 @@ async fn a_fill_stopped_part_of_the_way_goes_on_from_where_it_stopped() {
 #[tokio::test]
 async fn a_fill_replaces_what_is_held_and_removes_what_is_stale_at_the_end() {
     let repo = Repo::filled().await;
-    repo.held.hold_stale("gone::long_ago");
+    repo.held.hold_stale(REPO, "gone::long_ago");
     let filler = repo.filler();
     // Filled again at an operator's word: a store holding the repo is
     // otherwise adopted.
@@ -1278,7 +1283,7 @@ async fn a_store_that_has_drifted_from_the_graph_is_put_right_where_it_differs()
     assert_eq!(repo.held.listed.load(Ordering::SeqCst), 0, "nothing listed");
     // One held that the graph has not: as many held as the graph has, one
     // of the graph's lacking. Now it is gone through, and the one found.
-    repo.held.hold_stale("gone::long_ago");
+    repo.held.hold_stale(REPO, "gone::long_ago");
     assert_eq!(
         repo.compare().await,
         Verified::Done {
@@ -1971,42 +1976,20 @@ async fn two_questions_of_a_misrouted_store_within_the_recheck_cost_one_request(
 }
 
 impl Repo {
-    /// What the graph has of the repo, as a store holds it.
-    async fn as_held(&self) -> (Vec<VectorCodeEntity>, Vec<VectorCodeSummary>) {
-        let entities = self.graph.all_entities(REPO).await.unwrap();
-        let summaries = self
-            .graph
-            .summaries_page(REPO, "", None, 100_000)
-            .await
-            .unwrap();
-        (
-            entities
-                .iter()
-                .map(|entity| VectorCodeEntity::from_code_entity(entity, REPO, None))
-                .collect(),
-            summaries
-                .iter()
-                .map(|summary| VectorCodeSummary::of(summary, REPO, ""))
-                .collect(),
-        )
-    }
-
     /// A repo of `functions` functions indexed in full, the store holding
     /// it as the graph has it though it is recorded complete nowhere: as a
     /// tenant built elsewhere and adopted whole.
     async fn prebuilt(functions: usize) -> Self {
         let repo = Self::of(functions);
         repo.index().await;
-        let (entities, summaries) = repo.as_held().await;
-        repo.held.hold(&entities);
-        repo.held.hold_summaries(&summaries);
+        repo.held.hold_graph(&repo.graph, REPO).await;
         repo
     }
 
     /// Whether the store holds the repo's entities and summaries exactly as
     /// the graph has them.
     async fn held_as_graph(&self) -> bool {
-        let (entities, summaries) = self.as_held().await;
+        let (entities, summaries) = as_held(&self.graph, REPO).await;
         let mut wanted: Vec<String> = entities.iter().map(entity_key).collect();
         wanted.extend(summaries.iter().map(summary_key));
         let mut held: Vec<String> = self.held.entities.lock().unwrap().keys().cloned().collect();
@@ -2039,15 +2022,7 @@ impl Repo {
 /// Step the adoption of the repo until it is done, saying every stage it
 /// was at.
 async fn adopted(filler: &VectorFiller) -> Vec<FillStage> {
-    let mut stages = Vec::new();
-    for _ in 0..1000 {
-        let fill = filler.step(REPO).await.unwrap();
-        stages.push(fill.stage);
-        if fill.stage == FillStage::Done {
-            return stages;
-        }
-    }
-    panic!("the adoption did not end");
+    stepped(filler, REPO, || async {}).await
 }
 
 /// A repo being adopted is served from its vectors, and found empty it is
@@ -2088,7 +2063,7 @@ async fn an_adopting_repo_found_empty_is_not_suspected_but_a_complete_one_is() {
 #[tokio::test]
 async fn a_page_with_an_earlier_version_beside_a_right_record_embeds_nothing() {
     let repo = Repo::prebuilt(12).await;
-    let (entities, _) = repo.as_held().await;
+    let (entities, _) = as_held(&repo.graph, REPO).await;
     let named = |name: &str| entities.iter().find(|e| e.name == name).unwrap().clone();
     let beside = VectorCodeEntity {
         start_line: named("thing_0").start_line + 40,
@@ -2106,7 +2081,7 @@ async fn a_page_with_an_earlier_version_beside_a_right_record_embeds_nothing() {
         start_line: moved.start_line + 5,
         ..moved.clone()
     }]);
-    repo.held.hold_stale("gone::long_ago");
+    repo.held.hold_stale(REPO, "gone::long_ago");
     *repo.held.kept.lock().unwrap() = Some(moved.entity_id.clone());
 
     adopted(&repo.filler()).await;
@@ -2127,7 +2102,7 @@ async fn an_adoption_stopped_mid_way_goes_on_without_embedding_twice() {
     let repo = Repo::prebuilt(400).await;
     let mut ids = repo.graph_ids().await;
     ids.sort();
-    let (entities, _) = repo.as_held().await;
+    let (entities, _) = as_held(&repo.graph, REPO).await;
     let changed: Vec<&str> = ids
         .chunks(100)
         .map(|page| {
@@ -2176,7 +2151,12 @@ async fn a_page_changed_while_it_is_mended_ends_as_the_graph_has_it() {
     let repo = Repo::prebuilt(12).await;
     repo.held_otherwise(&["thing_3"]);
     let entity = repo.graph.all_entities(REPO).await.unwrap();
-    *repo.held.restless.lock().unwrap() = entity.iter().find(|e| e.name == "thing_5").cloned();
+    *repo.held.crowd.lock().unwrap() = entity
+        .iter()
+        .filter(|e| e.name == "thing_5")
+        .cloned()
+        .collect();
+    repo.held.restless.store(true, Ordering::SeqCst);
     let filler = repo.filler();
     let begun = filler.step(REPO).await.unwrap_err().to_string();
     assert!(
@@ -2209,7 +2189,7 @@ async fn a_full_index_during_an_adoption_begins_it_again_and_embeds_nothing_twic
     let repo = Repo::prebuilt(250).await;
     let mut ids = repo.graph_ids().await;
     ids.sort();
-    let (entities, _) = repo.as_held().await;
+    let (entities, _) = as_held(&repo.graph, REPO).await;
     let changed: Vec<&str> = ids
         .chunks(100)
         .map(|page| {
@@ -2233,7 +2213,7 @@ async fn a_full_index_during_an_adoption_begins_it_again_and_embeds_nothing_twic
 #[tokio::test]
 async fn forcing_a_refill_during_an_adoption_fills() {
     let repo = Repo::prebuilt(12).await;
-    repo.held.hold_stale("gone::long_ago");
+    repo.held.hold_stale(REPO, "gone::long_ago");
     let filler = repo.filler();
     assert!(filler.step(REPO).await.unwrap().stage.adopting());
     let forced = filler.begin(REPO, false).await.unwrap();
@@ -2251,7 +2231,7 @@ async fn forcing_a_refill_during_an_adoption_fills() {
 #[tokio::test]
 async fn the_stray_rule_walks_when_a_run_deletes_what_was_compared() {
     let repo = Repo::prebuilt(12).await;
-    repo.held.hold_stale("gone::long_ago");
+    repo.held.hold_stale(REPO, "gone::long_ago");
     let filler = repo.filler();
     filler.step(REPO).await.unwrap();
     for file in ["src/config.rs", "src/mail.rs"] {
@@ -2311,7 +2291,7 @@ async fn a_pending_file_held_exactly_is_settled_without_a_write() {
     assert_eq!(repo.filler().settle_pending(REPO).await.unwrap(), 0);
     assert_eq!(writes(), before, "nothing deleted or written");
 
-    let (entities, _) = repo.as_held().await;
+    let (entities, _) = as_held(&repo.graph, REPO).await;
     let config = entities.iter().find(|e| e.name == "parse_config").unwrap();
     repo.held
         .entities
@@ -2413,4 +2393,25 @@ async fn a_file_settled_during_a_fill_is_rewritten_not_skipped() {
     stepped_to(&filler, FillStage::Done).await;
     assert!(repo.agrees().await, "nothing swept that the graph has");
     assert_eq!(repo.held.generations(), [fill.generation]);
+}
+
+/// A fill of a stage this build cannot read, as a later build may leave,
+/// holds nothing up: the repo is adopted over it.
+#[tokio::test]
+async fn a_fill_of_a_stage_this_build_cannot_read_is_adopted_over() {
+    let data = tempfile::tempdir().unwrap();
+    let path = data.path().join("codegraph.db");
+    let repo = Repo::of_graph(12, CodeGraph::open(&path).unwrap());
+    repo.index().await;
+    repo.held.hold_graph(&repo.graph, REPO).await;
+    let filler = repo.filler();
+    assert!(filler.step(REPO).await.unwrap().stage.adopting());
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute("UPDATE vector_fill SET stage = 'of_a_later_build'", [])
+        .unwrap();
+    assert_eq!(repo.graph.vector_fill(REPO).await.unwrap(), None);
+    let stages = adopted(&filler).await;
+    assert!(stages[0].adopting(), "{stages:?}");
+    assert!(repo.complete().await && repo.held_as_graph().await);
 }

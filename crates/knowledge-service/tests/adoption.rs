@@ -18,13 +18,14 @@ use workforce_codebase_knowledge::graph::vectors::FillStage;
 use workforce_codebase_knowledge::graph::CodeGraph;
 use workforce_codebase_knowledge::indexer::fill::{VectorFiller, Verified, Verifying};
 use workforce_codebase_knowledge::lease::{AcquireOutcome, IndexPhase};
-use workforce_codebase_knowledge::testing::{pre_w4_entity_collection, Counting, Failing, Held};
+use workforce_codebase_knowledge::testing::{
+    as_held, collection_keeping_text, counted, stepped, Counting, Failing, Held,
+};
 use workforce_codebase_knowledge::vector::{
     CodeVectorStore, VectorCodeEntity, VectorCodeSummary, VellevCodeVectorStore,
 };
 use workforce_common::settings::{CodegraphConfig, KnowledgeConfig};
 use workforce_knowledge_service::{KnowledgeService, VectorBackend};
-use workforce_vellev::seeding::Seeding;
 use workforce_vellev::testing::{logged, Counted, Node, SMALL};
 use workforce_vellev::{embedding_of, LOCAL_QUERY_PREFIX};
 
@@ -55,22 +56,6 @@ fn service_on(
         None,
     )
     .unwrap()
-}
-
-/// The repo's entities and summaries as a store holds them.
-async fn as_held(graph: &CodeGraph, repo: &str) -> (Vec<VectorCodeEntity>, Vec<VectorCodeSummary>) {
-    let entities = graph.all_entities(repo).await.unwrap();
-    let summaries = graph.summaries_page(repo, "", None, 100_000).await.unwrap();
-    (
-        entities
-            .iter()
-            .map(|entity| VectorCodeEntity::from_code_entity(entity, repo, None))
-            .collect(),
-        summaries
-            .iter()
-            .map(|summary| VectorCodeSummary::of(summary, repo, ""))
-            .collect(),
-    )
 }
 
 /// Whether the store holds the repo as the graph has it: as many records
@@ -111,20 +96,17 @@ async fn stepped_asking(
     filler: &VectorFiller,
     repo: &str,
 ) -> Vec<Option<String>> {
-    let mut skipped = Vec::new();
-    for _ in 0..10_000 {
-        let fill = filler.step(repo).await.unwrap();
+    let skipped = std::sync::Mutex::new(Vec::new());
+    stepped(filler, repo, || async {
         let answer = service
             .query_engine()
             .ask(repo, QUESTION, None, false)
             .await
             .unwrap();
-        skipped.push(answer.vectors_skipped);
-        if fill.stage == FillStage::Done {
-            return skipped;
-        }
-    }
-    panic!("the fill of '{repo}' did not end");
+        skipped.lock().unwrap().push(answer.vectors_skipped);
+    })
+    .await;
+    skipped.into_inner().unwrap()
 }
 
 /// A repo of the fixture: its entities, in how many files, and how many
@@ -281,23 +263,9 @@ impl Shape {
 }
 
 /// A store on `node`'s tenant whose vectors are made from each text's
-/// hash, counted.
-fn counted_on(node: &Node) -> (VellevCodeVectorStore, Arc<Counted>) {
-    counted_as(node, None)
-}
-
-/// As [`counted_on`], embedding as `local` where it is said.
+/// hash, counted, embedding as `local` where it is said.
 fn counted_as(node: &Node, local: Option<&Embedding>) -> (VellevCodeVectorStore, Arc<Counted>) {
-    let store = VellevCodeVectorStore::new(&node.url, &node.key, &node.tenant).unwrap();
-    let store = match local {
-        Some(local) => store.embedding(local.clone()).unwrap(),
-        None => store,
-    };
-    let counted = Arc::new(Counted::new(store.embedded_as().1.dimensions as usize));
-    (
-        store.seeded_by(Seeding::new(counted.clone(), 200, 2)),
-        counted,
-    )
+    counted(&node.url, &node.key, &node.tenant, local)
 }
 
 /// Every object of the tenant's code collections, by id: its text's hash
@@ -329,8 +297,8 @@ async fn objects(node: &Node) -> BTreeMap<String, (String, String)> {
     held
 }
 
-/// Plan N3.3's fixture: a graph whose repos were copied at T0, a tenant
-/// built from that copy, and the graph changed since.
+/// A graph whose repos were copied, a tenant built from that copy, and
+/// the graph changed since.
 struct Fixture {
     dir: tempfile::TempDir,
     node: Node,
@@ -499,7 +467,7 @@ async fn a_repo_three_tenths_changed_reembeds_three_tenths() {
             generation: String::new(),
         })
         .collect::<Vec<_>>();
-    let (behind, _) = counted_on(&fixture.node);
+    let (behind, _) = counted_as(&fixture.node, None);
     behind.index_entities(&rewritten).await.unwrap();
     behind.index_summaries(&summaries).await.unwrap();
 
@@ -618,7 +586,7 @@ async fn a_collection_replaced_during_an_adoption_is_never_recorded_complete() {
         .drop()
         .await
         .unwrap();
-    let (other, _) = counted_on(&fixture.node);
+    let (other, _) = counted_as(&fixture.node, None);
     let made = VectorCodeSummary {
         entity_id: "elsewhere".into(),
         repo_id: "elsewhere".into(),
@@ -679,7 +647,7 @@ async fn an_adopted_collection_that_keeps_its_text_is_adopted_and_said_at_begin(
     let Some(node) = Node::embedding().await else {
         return;
     };
-    let earlier = pre_w4_entity_collection();
+    let earlier = collection_keeping_text();
     node.tenant()
         .collection(&earlier.name)
         .create(&earlier)
@@ -858,9 +826,8 @@ impl Hub {
         let service = hub.service();
         *hub.held.graph.lock().unwrap() = Some(Arc::clone(service.graph()));
         service.trigger_full_index_for(&hub.root).await.unwrap();
-        let (entities, _) = as_held(service.graph(), &hub.repo).await;
         hub.held.entities.lock().unwrap().clear();
-        hub.held.hold(&entities);
+        hub.held.hold_graph(service.graph(), &hub.repo).await;
         hub
     }
 
@@ -1015,8 +982,8 @@ async fn two_workers_adopting_one_repo_end_agreeing() {
 }
 
 /// What the store holds of a repo the graph no longer has is removed by
-/// the first pass, and only then; one registered meanwhile is left, as is
-/// a record of no repo. A sweep that fails leaves the pass to go on, and
+/// the first pass, and only then; one registered meanwhile is left while
+/// the rest are swept, as is a record of no repo left. A sweep that fails leaves the pass to go on, and
 /// the next sweeps.
 #[tokio::test]
 async fn a_dropped_repos_vectors_are_swept_once_and_a_new_one_kept() {
@@ -1037,10 +1004,12 @@ async fn a_dropped_repos_vectors_are_swept_once_and_a_new_one_kept() {
         .lock()
         .unwrap()
         .retain(|_, e| e.repo_id != "dropped");
+    hub.hold_of("early", "early::one");
     hub.hold_of("late", "late::one");
-    *hub.held.registered_meanwhile.lock().unwrap() = Some("late".into());
+    *hub.held.registered_meanwhile.lock().unwrap() = Some("early".into());
     hub.service().backfill_vectors().await.unwrap();
-    assert!(hub.holds_of("late"), "registered meanwhile");
+    assert!(hub.holds_of("early"), "registered meanwhile");
+    assert!(!hub.holds_of("late"), "swept after the one registered");
 
     let hub = Hub::prebuilt(12).await;
     hub.hold_of("dropped", "dropped::one");
@@ -1062,6 +1031,21 @@ async fn a_dropped_repos_vectors_are_swept_once_and_a_new_one_kept() {
     assert!(complete(&service, &hub.repo).await, "adopted all the same");
     service.backfill_vectors().await.unwrap();
     assert!(!hub.holds_of("dropped"));
+}
+
+/// A graph that lists no repo sweeps nothing, and is swept once it lists
+/// its repos again.
+#[tokio::test]
+async fn a_graph_listing_no_repo_sweeps_nothing() {
+    let hub = Hub::prebuilt(12).await;
+    hub.hold_of("dropped", "dropped::one");
+    hub.graph().drop_repo(&hub.repo).await.unwrap();
+    let service = hub.service();
+    service.backfill_vectors().await.unwrap();
+    assert!(hub.holds_of("dropped") && hub.holds_of(&hub.repo));
+    service.trigger_full_index_for(&hub.root).await.unwrap();
+    service.backfill_vectors().await.unwrap();
+    assert!(!hub.holds_of("dropped") && hub.holds_of(&hub.repo));
 }
 
 /// A repo of which the store holds half, as inline writes before its

@@ -830,15 +830,15 @@ impl KnowledgeService {
         if !complete || filler.filling(&repo_id).await? {
             let began = Instant::now();
             let before = self.graph.vector_fill(&repo_id).await?;
+            let was_adopting = before
+                .as_ref()
+                .is_some_and(|before| before.stage.adopting());
             let fill = tokio::time::timeout(pace.page_timeout, filler.step(&repo_id))
                 .await
-                .map_err(timed("stored"))??;
+                .map_err(timed(if was_adopting { "compared" } else { "stored" }))??;
             // An adoption is a comparison, paced as one, that leaves the
             // repo compared.
-            let adopting = fill.stage.adopting()
-                || before
-                    .as_ref()
-                    .is_some_and(|before| before.stage.adopting());
+            let adopting = was_adopting || fill.stage.adopting();
             progress(&repo_id, &fill);
             {
                 let mut seen = self.vector_status.lock().unwrap_or_else(|e| e.into_inner());
@@ -1066,8 +1066,9 @@ impl KnowledgeService {
     /// Remove from the store what it holds of repos the graph no longer
     /// has, once for each collection it has: the tenant's code vectors are
     /// this graph's alone, so whatever repo they hold that the graph has
-    /// not was dropped. A repo registered meanwhile is left. A sweep that
-    /// fails is said, and tried again by the next pass; the pass goes on.
+    /// not was dropped. A repo registered meanwhile is left, as is all of
+    /// it while the graph lists no repo. A sweep that fails is said, and
+    /// tried again by the next pass; the pass goes on.
     async fn sweep_dropped(&self) {
         let Some(store) = self
             .vector_store
@@ -1082,14 +1083,21 @@ impl KnowledgeService {
             if swept.as_deref() == Some(collection.as_str()) {
                 return eyre::Ok(());
             }
+            let repos = || async {
+                let listed = self.graph.list_repositories().await?;
+                eyre::Ok(listed.into_iter().map(|repo| repo.id).collect::<Vec<_>>())
+            };
             let mut removed: Vec<String> = Vec::new();
             loop {
-                let repos: Vec<String> = self.graph.list_repos().await?;
-                let Some(dropped) = store.held_outside(&repos).await? else {
+                let listed = repos().await?;
+                if listed.is_empty() {
+                    return Ok(());
+                }
+                let Some(dropped) = store.held_outside(&listed).await? else {
                     break;
                 };
-                if self.graph.list_repos().await?.contains(&dropped) {
-                    break;
+                if repos().await?.contains(&dropped) {
+                    continue;
                 }
                 if removed.contains(&dropped) {
                     return Err(eyre::eyre!(

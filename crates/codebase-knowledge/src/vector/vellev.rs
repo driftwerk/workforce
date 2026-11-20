@@ -346,8 +346,9 @@ impl VellevCodeVectorStore {
         for (repo_id, held) in by_repo {
             for page in held.chunks(VERIFY_PAGE) {
                 let wanted = entity_keys(page.iter().copied());
+                let own: Vec<ObjectId> = page.iter().map(|entity| entity_id(entity)).collect();
                 let differing = self
-                    .differing(&self.entities, repo_id, ENTITY_KEY, &wanted)
+                    .differing(&self.entities, repo_id, ENTITY_KEY, &wanted, &own)
                     .await?;
                 let differing: HashSet<usize> = differing.places.into_iter().collect();
                 matched.extend(
@@ -434,22 +435,24 @@ impl VellevCodeVectorStore {
         Ok((refilled, refused))
     }
 
-    /// How `wanted`, `(key, hash)` pairs of one repo, differs from what
-    /// `collection` holds: told by counting where all are held (see
-    /// [`workforce_vellev::unmatched`]), [`VERIFY_PAGE`] pairs at a time.
-    /// Every id held under a wanted key beside the one that matches is
-    /// [`Differing::stale`], the wanted records' own ids among them until
-    /// the caller drops those ([`without_own`]).
+    /// How `wanted`, `(key, hash)` pairs of one repo whose records are
+    /// kept at the ids `own`, differs from what `collection` holds: told by
+    /// counting where all are held (see [`workforce_vellev::unmatched`]),
+    /// [`VERIFY_PAGE`] pairs at a time. Every object held under a wanted
+    /// key at another id than the record's own is [`Differing::stale`]:
+    /// an earlier version, or a second copy of the same text.
     async fn differing(
         &self,
         collection: &Ensured,
         repo_id: &str,
         key: &str,
         wanted: &[(String, String)],
+        own: &[ObjectId],
     ) -> Result<Differing> {
         let scope = of_repo(repo_id);
         let mut differing = Differing::default();
-        for (page, chunk) in wanted.chunks(VERIFY_PAGE).enumerate() {
+        let pages = wanted.chunks(VERIFY_PAGE).zip(own.chunks(VERIFY_PAGE));
+        for (page, (chunk, own)) in pages.enumerate() {
             let found = collection
                 .run(|| {
                     workforce_vellev::unmatched(
@@ -474,12 +477,50 @@ impl VellevCodeVectorStore {
                     differing.missing.push(offset + at);
                 }
             }
-            differing
-                .stale
-                .extend(found.stale.iter().map(|(id, _)| id.0.to_string()));
+            let own: HashMap<&str, ObjectId> = chunk
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .zip(own.iter().copied())
+                .collect();
+            for (id, held_key) in &found.stale {
+                if own.get(held_key.as_str()) != Some(id) {
+                    differing.stale.push(id.0.to_string());
+                } else if !missing.contains(held_key) {
+                    // Another object of the wanted text was taken for the
+                    // record: it is the one held besides.
+                    let besides = self.held_under(collection, &scope, key, held_key).await?;
+                    let besides = besides.into_iter().filter(|other| other != id);
+                    differing
+                        .stale
+                        .extend(besides.map(|other| other.0.to_string()));
+                }
+            }
             differing.held += usize::try_from(found.held)?;
         }
+        differing.stale.sort();
+        differing.stale.dedup();
         Ok(differing)
+    }
+
+    /// The ids of the objects `collection` holds within `scope` under the
+    /// key `held_key`.
+    async fn held_under(
+        &self,
+        collection: &Ensured,
+        scope: &Filter,
+        key: &str,
+        held_key: &str,
+    ) -> Result<Vec<ObjectId>> {
+        let filter = Filter::And(vec![scope.clone(), eq(key, held_key)]);
+        let listed = collection
+            .run(|| {
+                self.cap.ask(VERIFY_PAGE, |limit| {
+                    let page = Page::new(limit).filter(filter.clone());
+                    async move { collection.collection().list(&page).await }
+                })
+            })
+            .await?;
+        Ok(listed.objects.iter().map(|object| object.id).collect())
     }
 
     /// The collection of entities, or `summaries`, and the property each
@@ -528,20 +569,6 @@ impl VellevCodeVectorStore {
             successful: usize::try_from(deleted)?,
             failed: 0,
         })
-    }
-}
-
-/// `differing` with the ids of the records wanted, `own`, left out of what
-/// is stale: the record as it is wanted is never removed for another.
-fn without_own(differing: Differing, own: impl IntoIterator<Item = ObjectId>) -> Differing {
-    let own: HashSet<String> = own.into_iter().map(|id| id.0.to_string()).collect();
-    Differing {
-        stale: differing
-            .stale
-            .into_iter()
-            .filter(|id| !own.contains(id))
-            .collect(),
-        ..differing
     }
 }
 
@@ -951,10 +978,15 @@ impl CodeVectorStore for VellevCodeVectorStore {
         repo_id: &str,
         entities: &[VectorCodeEntity],
     ) -> Result<Differing> {
-        let differing = self
-            .differing(&self.entities, repo_id, ENTITY_KEY, &entity_keys(entities))
-            .await?;
-        Ok(without_own(differing, entities.iter().map(entity_id)))
+        let own: Vec<ObjectId> = entities.iter().map(entity_id).collect();
+        self.differing(
+            &self.entities,
+            repo_id,
+            ENTITY_KEY,
+            &entity_keys(entities),
+            &own,
+        )
+        .await
     }
 
     async fn differing_summaries(
@@ -966,10 +998,9 @@ impl CodeVectorStore for VellevCodeVectorStore {
             .iter()
             .map(|summary| (summary.key(), summary.record_hash()))
             .collect();
-        let differing = self
-            .differing(&self.summaries, repo_id, SUMMARY_KEY, &wanted)
-            .await?;
-        Ok(without_own(differing, summaries.iter().map(summary_id)))
+        let own: Vec<ObjectId> = summaries.iter().map(summary_id).collect();
+        self.differing(&self.summaries, repo_id, SUMMARY_KEY, &wanted, &own)
+            .await
     }
 
     async fn held_after(
@@ -1110,11 +1141,10 @@ impl CodeVectorStore for VellevCodeVectorStore {
     }
 }
 
-/// `CodeEntity` as the hub made it before the slim shape: every
-/// property stored, those since left out among them, and its text
-/// indexed for keywords.
+/// `CodeEntity` in the shape that stores every property, those the slim
+/// shape leaves out among them, and indexes its text for keywords.
 #[cfg(any(test, feature = "testing"))]
-pub fn pre_w4_entity_collection() -> Collection {
+pub fn collection_keeping_text() -> Collection {
     collection(
         CollectionName::new(CODE_ENTITY_COLLECTION).unwrap(),
         vec![
@@ -1156,7 +1186,7 @@ mod tests {
                 document_prefix: None,
                 properties: Vec::new(),
             },
-            ..pre_w4_entity_collection()
+            ..collection_keeping_text()
         }
     }
 
@@ -1712,21 +1742,6 @@ mod tests {
         assert_eq!((found.places, found.held), (vec![1], 2));
     }
 
-    /// A store seeded by vectors made from each text's hash, counting
-    /// them: no model is run, and what is written whole is counted.
-    fn counted(
-        node: &Node,
-    ) -> (
-        VellevCodeVectorStore,
-        Arc<workforce_vellev::testing::Counted>,
-    ) {
-        let store = VellevCodeVectorStore::new(&node.url, &node.key, &node.tenant).unwrap();
-        let dimensions = store.embedded_as().1.dimensions as usize;
-        let counted = Arc::new(workforce_vellev::testing::Counted::new(dimensions));
-        let store = store.seeded_by(Seeding::new(counted.clone(), 200, 2));
-        (store, counted)
-    }
-
     /// An earlier version held beside a record wanted is stale, and the
     /// record is not missing; the wanted record's own id is never stale,
     /// whatever it holds. A summary has no other id to be held at.
@@ -1735,7 +1750,7 @@ mod tests {
         let Some(node) = Node::embedding().await else {
             return;
         };
-        let (store, _) = counted(&node);
+        let (store, _) = crate::testing::counted(&node.url, &node.key, &node.tenant, None);
         let now = entity(
             "repo",
             "Config",
@@ -1786,6 +1801,46 @@ mod tests {
         assert!(found.stale.is_empty(), "{:?}", found.stale);
     }
 
+    /// A second object of a record's text, at an id not the record's own,
+    /// is stale whichever of the two is listed first, and once it is
+    /// removed the record agrees.
+    #[tokio::test]
+    async fn a_second_copy_of_a_records_text_is_stale() {
+        let Some(node) = Node::embedding().await else {
+            return;
+        };
+        let (store, _) = crate::testing::counted(&node.url, &node.key, &node.tenant, None);
+        let wanted = entity(
+            "repo",
+            "Config",
+            "src/config.rs",
+            "Struct",
+            "the configuration",
+        );
+        store
+            .index_entities(std::slice::from_ref(&wanted))
+            .await
+            .unwrap();
+        let first = ObjectId(Uuid::nil());
+        let vector = vec![0.5_f32; store.embedded_as().1.dimensions as usize];
+        let copy = Change::upsert(
+            CollectionName::new(CODE_ENTITY_COLLECTION).unwrap(),
+            first,
+            Content::new(entity_properties(&wanted)).vector(vector),
+        );
+        store.tenants.writes.apply(vec![copy]).await.unwrap();
+        let wanted = std::slice::from_ref(&wanted);
+        let found = store.differing_entities("repo", wanted).await.unwrap();
+        assert_eq!((found.places, found.missing), (vec![0], vec![]));
+        assert_eq!(found.stale, [first.0.to_string()]);
+        store.remove_held(false, &found.stale).await.unwrap();
+        let found = store.differing_entities("repo", wanted).await.unwrap();
+        assert!(
+            found.places.is_empty() && found.stale.is_empty(),
+            "{found:?}"
+        );
+    }
+
     /// A file's records are counted in both collections, and no other
     /// file's or repo's; a compare of more than a page is asked a page at
     /// a time, and finds what a compare of each page does.
@@ -1794,7 +1849,7 @@ mod tests {
         let Some(node) = Node::embedding().await else {
             return;
         };
-        let (store, _) = counted(&node);
+        let (store, _) = crate::testing::counted(&node.url, &node.key, &node.tenant, None);
         let many: Vec<VectorCodeEntity> = (0..250)
             .map(|n| {
                 let id = format!("e{n:03}");
@@ -1846,7 +1901,7 @@ mod tests {
         let Some(node) = Node::embedding().await else {
             return;
         };
-        let (store, _) = counted(&node);
+        let (store, _) = crate::testing::counted(&node.url, &node.key, &node.tenant, None);
         let repos = |repos: &[&str]| repos.iter().map(|r| r.to_string()).collect::<Vec<_>>();
         store
             .index_entities(&[entity("kept", "a", "src/a.rs", "Function", "does a")])
@@ -2174,7 +2229,7 @@ mod tests {
         let Some(node) = Node::embedding().await else {
             return;
         };
-        let earlier = pre_w4_entity_collection();
+        let earlier = collection_keeping_text();
         let tenant = node.tenant();
         tenant
             .collection(&earlier.name)

@@ -635,13 +635,10 @@ compared with. A repo the store holds nothing of is filled as before.
   (the build's graph is a copy of this one, so it is). One claimed for
   another graph is refused, with nothing compared or written; `workforce
   code reindex-vectors --take-over` fills it again instead.
-- **The shape.** Both collections are looked at afresh before an adoption
-  begins and again before it finishes: one of another model, size or
-  prefix is refused as any other is (above), and one made again meanwhile
-  is never recorded complete. A collection that keeps
-  `searchableContent` is said at the start ("keeps text the slim shape
-  does not") and used; dropping it on a node that writes format 2 makes
-  it slim.
+- **The shape.** A collection of another model, size or prefix is
+  refused as any other is (above); one made again meanwhile is never
+  recorded complete. One that keeps `searchableContent` is said at the
+  start and used.
 - **Searched meanwhile.** A repo being adopted is answered from its
   vectors throughout, while the store has the collection it is being
   compared with. A repo the store held only part of is adopted too, and
@@ -650,10 +647,8 @@ compared with. A repo the store holds nothing of is filled as before.
   adopted, with `complete` of `repos` recorded complete; a failure
   outranks it. `/health`'s `code_vectors` gives `adopting`, `compared`
   and `to_compare`.
-- **Pending files** the store already holds exactly as the graph has them
-  are settled with two counts and a compare, and nothing written; the
-  rest are written again as before. While a fill that sweeps is under way
-  they are written again regardless.
+- **Pending files** the store holds as the graph has them are settled
+  without a write, except while a fill that sweeps is under way.
 - **What is embedded** is counted in
   `workforce_code_vectors_embedded_total{backend, reason}` on the hub's
   `/metrics`: `adopt` for an adoption's mending, `refill` for a fill,

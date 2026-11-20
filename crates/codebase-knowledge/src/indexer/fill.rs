@@ -19,14 +19,10 @@
 //! recorded cursor only from where the worker found it, so a worker that
 //! lost the race takes up from where the other got to.
 //!
-//! A repo the store already holds when it is first found incomplete, as
-//! one built elsewhere and adopted whole, is not filled but adopted: its
-//! entities, then its summaries, are compared with the store a page at a
-//! time, and only what differs is written, what is held besides removed,
-//! and, where the store then holds another number of the repo's records
-//! than the graph has, what it holds that the graph has not. Its vectors
-//! are searched meanwhile, and recorded complete in the collection they
-//! were compared with once it ends.
+//! A repo the store already holds something of when it is found
+//! incomplete is adopted instead: compared with the store a page at a
+//! time, only what differs written and what is held besides removed, and
+//! searched meanwhile.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -96,17 +92,27 @@ trait Kept: Clone + Send + Sync + Sized + 'static {
 
     fn file(&self) -> &str;
 
+    /// The text a store embeds.
+    fn text(&self) -> &str;
+
     /// As written in or since the fill or adoption `generation`.
     fn stamped(self, generation: &str) -> Self;
 
-    /// The graph's page after `from`, or read again up to `upto`, compared
-    /// with the store; `None` if the graph has nothing there.
-    fn compared<'a>(
-        filler: &'a VectorFiller,
+    /// The graph's page after `from` (up to `upto`), at most `limit`, as
+    /// the store is to hold it, and where its last row is.
+    fn page<'a>(
+        graph: &'a CodeGraph,
         repo_id: &'a str,
         from: &'a str,
         upto: Option<&'a str>,
-    ) -> impl Future<Output = Result<Option<ComparedPage<Self>>>> + Send + 'a;
+        limit: usize,
+    ) -> impl Future<Output = Result<(Vec<Self>, Option<String>)>> + Send + 'a;
+
+    fn differing<'a>(
+        store: &'a dyn CodeVectorStore,
+        repo_id: &'a str,
+        wanted: &'a [Self],
+    ) -> impl Future<Output = Result<Differing>> + Send + 'a;
 
     fn written<'a>(
         store: &'a dyn CodeVectorStore,
@@ -121,17 +127,36 @@ impl Kept for VectorCodeEntity {
         &self.file_path
     }
 
+    fn text(&self) -> &str {
+        &self.searchable_content
+    }
+
     fn stamped(self, generation: &str) -> Self {
         self.of_generation(generation)
     }
 
-    fn compared<'a>(
-        filler: &'a VectorFiller,
+    async fn page(
+        graph: &CodeGraph,
+        repo_id: &str,
+        from: &str,
+        upto: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<Self>, Option<String>)> {
+        let page = graph.entities_page(repo_id, from, upto, limit).await?;
+        let last = page.last().map(|entity| entity.id.as_str().to_string());
+        let held = page
+            .iter()
+            .map(|entity| VectorCodeEntity::from_code_entity(entity, repo_id, None))
+            .collect();
+        Ok((held, last))
+    }
+
+    fn differing<'a>(
+        store: &'a dyn CodeVectorStore,
         repo_id: &'a str,
-        from: &'a str,
-        upto: Option<&'a str>,
-    ) -> impl Future<Output = Result<Option<ComparedPage<Self>>>> + Send + 'a {
-        filler.entities_compared(repo_id, from, upto)
+        wanted: &'a [Self],
+    ) -> impl Future<Output = Result<Differing>> + Send + 'a {
+        store.differing_entities(repo_id, wanted)
     }
 
     fn written<'a>(
@@ -149,6 +174,10 @@ impl Kept for VectorCodeSummary {
         &self.file_path
     }
 
+    fn text(&self) -> &str {
+        &self.summary_text
+    }
+
     fn stamped(self, generation: &str) -> Self {
         Self {
             generation: generation.to_string(),
@@ -156,13 +185,28 @@ impl Kept for VectorCodeSummary {
         }
     }
 
-    fn compared<'a>(
-        filler: &'a VectorFiller,
+    async fn page(
+        graph: &CodeGraph,
+        repo_id: &str,
+        from: &str,
+        upto: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<Self>, Option<String>)> {
+        let page = graph.summaries_page(repo_id, from, upto, limit).await?;
+        let last = page.last().map(StoredSummary::cursor);
+        let held = page
+            .iter()
+            .map(|summary| VectorCodeSummary::of(summary, repo_id, ""))
+            .collect();
+        Ok((held, last))
+    }
+
+    fn differing<'a>(
+        store: &'a dyn CodeVectorStore,
         repo_id: &'a str,
-        from: &'a str,
-        upto: Option<&'a str>,
-    ) -> impl Future<Output = Result<Option<ComparedPage<Self>>>> + Send + 'a {
-        filler.summaries_compared(repo_id, from, upto)
+        wanted: &'a [Self],
+    ) -> impl Future<Output = Result<Differing>> + Send + 'a {
+        store.differing_summaries(repo_id, wanted)
     }
 
     fn written<'a>(
@@ -394,8 +438,11 @@ impl VectorFiller {
         let held =
             self.store.entity_count(repo_id).await? + self.store.summary_count(repo_id).await?;
         if held == 0 {
-            return self.begin(repo_id, false).await;
+            return self.begin_in(repo_id, false, collection).await;
         }
+        // Whatever row there is, such as one of a stage this build cannot
+        // read, is not gone on with.
+        self.graph.clear_vector_fill(repo_id).await?;
         let adopting = VectorFill {
             generation: uuid::Uuid::new_v4().simple().to_string(),
             collection,
@@ -445,10 +492,21 @@ impl VectorFiller {
     /// word. Returns the fill under way, which is another worker's if one
     /// began first.
     pub async fn begin(&self, repo_id: &str, keep_complete: bool) -> Result<VectorFill> {
+        let collection = self.store.identity(true).await?;
+        self.begin_in(repo_id, keep_complete, collection).await
+    }
+
+    /// [`Self::begin`] in `collection`, the store's looked at afresh.
+    async fn begin_in(
+        &self,
+        repo_id: &str,
+        keep_complete: bool,
+        collection: String,
+    ) -> Result<VectorFill> {
         self.graph.clear_vector_fill(repo_id).await?;
         let begun = VectorFill {
             generation: uuid::Uuid::new_v4().simple().to_string(),
-            collection: self.store.identity(true).await?,
+            collection,
             stage: FillStage::Entities,
             cursor: String::new(),
             done: 0,
@@ -501,7 +559,9 @@ impl VectorFiller {
         let mut files: Vec<String> = Vec::new();
         let mut compared = 0;
         match at.stage {
-            VerifyStage::Entities => match self.entities_compared(repo_id, &at.cursor, None).await?
+            VerifyStage::Entities => match self
+                .compared::<VectorCodeEntity>(repo_id, &at.cursor, None)
+                .await?
             {
                 Some(page) => {
                     at.cursor = page.upto.clone();
@@ -513,7 +573,10 @@ impl VectorFiller {
                 None => at.turn_to(VerifyStage::Summaries),
             },
             VerifyStage::Summaries => {
-                match self.summaries_compared(repo_id, &at.cursor, None).await? {
+                match self
+                    .compared::<VectorCodeSummary>(repo_id, &at.cursor, None)
+                    .await?
+                {
                     Some(page) => {
                         at.cursor = page.upto.clone();
                         at.summaries += page.wanted.len();
@@ -598,73 +661,36 @@ impl VectorFiller {
         upto.map_or(VERIFY_PAGE, |_| self.check_limit())
     }
 
-    /// The graph's entities after `from` (up to `upto`, if read again)
-    /// compared with the store; `None` if the graph has none there.
-    async fn entities_compared(
+    /// The graph's entities or summaries after `from` (up to `upto`, if
+    /// read again) compared with the store; `None` if the graph has none
+    /// there.
+    async fn compared<T: Kept>(
         &self,
         repo_id: &str,
         from: &str,
         upto: Option<&str>,
-    ) -> Result<Option<ComparedPage<VectorCodeEntity>>> {
+    ) -> Result<Option<ComparedPage<T>>> {
         let limit = self.read_limit(upto);
-        let page = self.graph.entities_page(repo_id, from, upto, limit).await?;
+        let (page, last) = T::page(&self.graph, repo_id, from, upto, limit).await?;
         if let Some(upto) = upto {
             Self::all_read(repo_id, upto, page.len(), limit)?;
         }
-        let Some(last) = page.last() else {
+        let Some(last) = last else {
             return Ok(None);
         };
-        let upto = upto.map_or_else(|| last.id.as_str().to_string(), str::to_string);
-        let wanted: Vec<VectorCodeEntity> = page
-            .iter()
-            .map(|entity| VectorCodeEntity::from_code_entity(entity, repo_id, None))
-            .filter(|entity| embeddable(&entity.searchable_content))
+        let rows = page.len() as u64;
+        let wanted: Vec<T> = page
+            .into_iter()
+            .filter(|record| embeddable(record.text()))
             .collect();
         let differing = match wanted.is_empty() {
             true => Differing::default(),
-            false => self.store.differing_entities(repo_id, &wanted).await?,
+            false => T::differing(self.store.as_ref(), repo_id, &wanted).await?,
         };
         Ok(Some(ComparedPage {
             from: from.to_string(),
-            upto,
-            rows: page.len() as u64,
-            wanted,
-            differing,
-        }))
-    }
-
-    /// As [`Self::entities_compared`], of summaries.
-    async fn summaries_compared(
-        &self,
-        repo_id: &str,
-        from: &str,
-        upto: Option<&str>,
-    ) -> Result<Option<ComparedPage<VectorCodeSummary>>> {
-        let limit = self.read_limit(upto);
-        let page = self
-            .graph
-            .summaries_page(repo_id, from, upto, limit)
-            .await?;
-        if let Some(upto) = upto {
-            Self::all_read(repo_id, upto, page.len(), limit)?;
-        }
-        let Some(last) = page.last() else {
-            return Ok(None);
-        };
-        let upto = upto.map_or_else(|| last.cursor(), str::to_string);
-        let wanted: Vec<VectorCodeSummary> = page
-            .iter()
-            .filter(|summary| embeddable(&summary.text))
-            .map(|summary| VectorCodeSummary::of(summary, repo_id, ""))
-            .collect();
-        let differing = match wanted.is_empty() {
-            true => Differing::default(),
-            false => self.store.differing_summaries(repo_id, &wanted).await?,
-        };
-        Ok(Some(ComparedPage {
-            from: from.to_string(),
-            upto,
-            rows: page.len() as u64,
+            upto: upto.map_or(last, str::to_string),
+            rows,
             wanted,
             differing,
         }))
@@ -795,7 +821,7 @@ impl VectorFiller {
         if self.store.identity(true).await? != fill.collection {
             self.graph.clear_vector_fill(repo_id).await?;
             return Err(eyre!(
-                "the collection the code vectors of '{repo_id}' were being stored in was made again meanwhile; they are begun again"
+                "the collection of the code vectors of '{repo_id}' was made again meanwhile, so they are begun again"
             ));
         }
         // Recorded complete before the fill is recorded finished, so
@@ -850,7 +876,7 @@ impl VectorFiller {
     /// store and mend it; at the graph's end, turn to what the store may
     /// hold besides, if its count says it may.
     async fn adopt_page<T: Kept>(&self, repo_id: &str, fill: &VectorFill) -> Result<VectorFill> {
-        let Some(page) = T::compared(self, repo_id, &fill.cursor, None).await? else {
+        let Some(page) = self.compared::<T>(repo_id, &fill.cursor, None).await? else {
             let mut held = self.store.entity_count(repo_id).await?;
             if T::SUMMARIES {
                 held += self.store.summary_count(repo_id).await?;
@@ -881,9 +907,13 @@ impl VectorFiller {
         page: ComparedPage<T>,
     ) -> Result<()> {
         let (from, upto) = (page.from.clone(), page.upto.clone());
-        let mut page = Some(page);
+        let mut first = Some(page);
         for _ in 0..SETTLE_TRIES {
-            let Some(compared) = page.filter(|page| !page.differing.places.is_empty()) else {
+            let compared = match first.take() {
+                Some(page) => Some(page),
+                None => self.compared::<T>(repo_id, &from, Some(&upto)).await?,
+            };
+            let Some(compared) = compared.filter(|page| !page.differing.places.is_empty()) else {
                 return Ok(());
             };
             let missing: Vec<T> = compared
@@ -900,7 +930,6 @@ impl VectorFiller {
                     .remove_held(T::SUMMARIES, &compared.differing.stale)
                     .await?;
             }
-            page = T::compared(self, repo_id, &from, Some(&upto)).await?;
         }
         Err(eyre!(
             "the code vectors of '{repo_id}' up to '{upto}' kept changing while they were adopted"
