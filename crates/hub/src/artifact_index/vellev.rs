@@ -20,7 +20,7 @@ use serde_json::json;
 use tokio::sync::Mutex;
 use tracing::warn;
 use vellev_client::api::{Content, Nearest, Page};
-use vellev_client::{Records, Tenant};
+use vellev_client::Records;
 use vellev_core::{Collection, CollectionName, DataType, ObjectId, Property};
 use workforce_common::shadow::index_call;
 use workforce_common::vectorizable::VectorizableText;
@@ -96,7 +96,6 @@ impl Default for Pace {
 
 /// The `Artifacts` collection of a vellev tenant.
 pub struct VellevArtifacts {
-    tenant: Tenant,
     artifacts: Ensured,
     /// The collection as writes the node embeds reach it, given longer.
     writes: Records,
@@ -132,10 +131,9 @@ impl VellevArtifacts {
         let wanted = artifacts_collection()?;
         Ok(Self {
             writes: tenants.writes.collection(&wanted.name),
-            artifacts: Ensured::new(tenants.reads.clone(), wanted, REINDEX)
+            artifacts: Ensured::new(tenants.clone(), wanted, REINDEX)
                 .identified()
                 .rechecking(recheck_after),
-            tenant: tenants.reads.clone(),
             cap: Cap::default(),
             marked: Mutex::new(None),
             backfilling: Mutex::new(None),
@@ -149,17 +147,18 @@ impl VellevArtifacts {
     /// Whether the artifact index is marked promoted: served from vellev,
     /// no longer a mirror of Weaviate's (DW-676, PR 11).
     pub async fn promoted(&self) -> eyre::Result<bool> {
-        workforce_vellev::promoted(&self.tenant, artifacts_collection()?.name.as_str()).await
+        workforce_vellev::promoted(&self.tenants, artifacts_collection()?.name.as_str()).await
     }
 
     /// Mark the artifact index promoted; idempotent.
     pub async fn mark_promoted(&self) -> eyre::Result<()> {
-        workforce_vellev::mark_promoted(&self.tenant, artifacts_collection()?.name.as_str()).await
+        workforce_vellev::mark_promoted(&self.tenants, artifacts_collection()?.name.as_str()).await
     }
 
     /// Take the promotion's mark away (`workforce shadow rollback`).
     pub async fn unmark_promoted(&self) -> eyre::Result<()> {
-        workforce_vellev::unmark_promoted(&self.tenant, artifacts_collection()?.name.as_str()).await
+        workforce_vellev::unmark_promoted(&self.tenants, artifacts_collection()?.name.as_str())
+            .await
     }
 
     /// Have each artifact's vector made by `seeding`'s embedder and sent
@@ -309,14 +308,14 @@ impl ArtifactVectors for VellevArtifacts {
                 return Ok(true);
             }
         }
-        let complete = workforce_vellev::index_marked(&self.tenant, &marker(&making)).await?;
+        let complete = workforce_vellev::index_marked(&self.tenants, &marker(&making)).await?;
         *self.marked.lock().await = complete.then(|| (making, Instant::now()));
         Ok(complete)
     }
 
     async fn mark_incomplete(&self) -> eyre::Result<()> {
         let making = self.making().await?;
-        workforce_vellev::index_unmark(&self.tenant, &marker(&making)).await?;
+        workforce_vellev::index_unmark(&self.tenants, &marker(&making)).await?;
         *self.marked.lock().await = None;
         *self.backfilling.lock().await = Some(making);
         Ok(())
@@ -330,7 +329,7 @@ impl ArtifactVectors for VellevArtifacts {
                 "the vellev collection '{COLLECTION}' was made again while it was being indexed, and holds only part"
             );
         }
-        workforce_vellev::index_mark(&self.tenant, &marker(&making)).await?;
+        workforce_vellev::index_mark(&self.tenants, &marker(&making)).await?;
         *self.marked.lock().await = Some((making, Instant::now()));
         Ok(())
     }

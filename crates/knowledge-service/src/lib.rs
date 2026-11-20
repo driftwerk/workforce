@@ -347,17 +347,7 @@ impl<'a> VectorBackend<'a> {
                 &weaviate.url,
                 weaviate.api_key.as_deref(),
             )),
-            Self::Vellev(vellev) => {
-                let key = vellev
-                    .api_key
-                    .as_deref()
-                    .ok_or_else(|| eyre::eyre!("[vellev] api_key is not set"))?;
-                Arc::new(VellevCodeVectorStore::new(
-                    &vellev.url,
-                    key,
-                    &vellev.tenant,
-                )?)
-            }
+            Self::Vellev(vellev) => Arc::new(VellevCodeVectorStore::configured(vellev)?),
         };
         let ensuring = Arc::clone(&store);
         tokio::spawn(async move {
@@ -455,7 +445,11 @@ impl KnowledgeService {
                 deadline: Duration::from_millis(config.vector_search_timeout_ms),
                 ..VectorWait::default()
             };
-            Arc::new(QueryEngine::with_vector_store(graph.clone(), vs.clone()).waiting(wait))
+            Arc::new(
+                QueryEngine::with_vector_store(graph.clone(), vs.clone())
+                    .waiting(wait)
+                    .code_search(config.code_search_enabled),
+            )
         } else {
             Arc::new(QueryEngine::new(graph.clone()))
         };
@@ -1658,12 +1652,14 @@ mod tests {
         (root, service)
     }
 
-    /// A store like Weaviate's, keeping no track of its vectors'
-    /// completeness, that records what is put right in it, file by file.
+    /// A store that records what is put right in it, file by file. Like
+    /// Weaviate's it keeps no track of its vectors' completeness, unless
+    /// `misrouted`.
     #[derive(Default)]
-    struct Untracked {
+    struct Recording {
         dropped: std::sync::Mutex<Vec<String>>,
         indexed: std::sync::atomic::AtomicUsize,
+        searched: std::sync::atomic::AtomicUsize,
         /// Said to be another database than Weaviate.
         named: Option<&'static str>,
         /// The service's graph, set once it is made: the lease of the run
@@ -1675,9 +1671,26 @@ mod tests {
         gate: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
         /// Writes of entities that came to the gate.
         at_gate: std::sync::atomic::AtomicUsize,
+        /// Keeping track of its vectors on a node that does not serve its
+        /// tenant: everything but making its collections is refused, and
+        /// counted in `asked` by method. Its collections are made: a
+        /// failure there is logged where another test listens.
+        misrouted: bool,
+        asked: std::sync::Mutex<std::collections::BTreeMap<&'static str, usize>>,
     }
 
-    impl Untracked {
+    impl Recording {
+        fn refused(&self, method: &'static str) -> Result<()> {
+            if !self.misrouted {
+                return Ok(());
+            }
+            *self.asked.lock().unwrap().entry(method).or_default() += 1;
+            Err(eyre::Report::new(workforce_vellev::Unusable::Misrouted {
+                tenant: "code".into(),
+                node: self.base_url().into(),
+            }))
+        }
+
         /// Record the mark of the lease the run writing to `repo_id` holds.
         async fn see_lease(&self, repo_id: &str) {
             let Some(graph) = self.graph.get() else {
@@ -1690,14 +1703,22 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl CodeVectorStore for Untracked {
+    impl CodeVectorStore for Recording {
         fn backend(&self) -> &'static str {
             self.named.unwrap_or(VectorKeys::WEAVIATE)
+        }
+        fn tracks_completeness(&self) -> bool {
+            self.misrouted
+        }
+        async fn identity(&self, _: bool) -> Result<String> {
+            self.refused("identity")?;
+            Ok(format!("untracked:{}", self.base_url()))
         }
         async fn ensure_collections(&self) -> Result<()> {
             Ok(())
         }
         async fn health_check(&self) -> Result<bool> {
+            self.refused("health_check")?;
             Ok(true)
         }
         fn base_url(&self) -> &str {
@@ -1712,6 +1733,7 @@ mod tests {
             &self,
             entities: &[workforce_codebase_knowledge::vector::VectorCodeEntity],
         ) -> Result<usize> {
+            self.refused("index_entities")?;
             if let Some(entity) = entities.first() {
                 self.see_lease(&entity.repo_id).await;
             }
@@ -1732,12 +1754,16 @@ mod tests {
             _: Option<workforce_codebase_knowledge::graph::entities::EntityKind>,
             _: usize,
         ) -> Result<Vec<workforce_codebase_knowledge::vector::VectorSearchResult>> {
+            self.refused("search_entities")?;
+            self.searched
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(Vec::new())
         }
         async fn delete_repo_entities(
             &self,
             _: &str,
         ) -> Result<workforce_codebase_knowledge::vector::DeleteOutcome> {
+            self.refused("delete_repo_entities")?;
             Ok(Default::default())
         }
         async fn delete_entities_by_file(
@@ -1745,6 +1771,7 @@ mod tests {
             repo_id: &str,
             file: &str,
         ) -> Result<workforce_codebase_knowledge::vector::DeleteOutcome> {
+            self.refused("delete_entities_by_file")?;
             self.see_lease(repo_id).await;
             self.dropped.lock().unwrap().push(file.to_string());
             Ok(Default::default())
@@ -1753,12 +1780,14 @@ mod tests {
             &self,
             summaries: &[workforce_codebase_knowledge::vector::VectorCodeSummary],
         ) -> Result<usize> {
+            self.refused("index_summaries")?;
             Ok(summaries.len())
         }
         async fn delete_repo_summaries(
             &self,
             _: &str,
         ) -> Result<workforce_codebase_knowledge::vector::DeleteOutcome> {
+            self.refused("delete_repo_summaries")?;
             Ok(Default::default())
         }
         async fn delete_summaries_by_file(
@@ -1766,9 +1795,19 @@ mod tests {
             _: &str,
             _: &str,
         ) -> Result<workforce_codebase_knowledge::vector::DeleteOutcome> {
+            self.refused("delete_summaries_by_file")?;
             Ok(Default::default())
         }
         async fn entity_count(&self, _: &str) -> Result<usize> {
+            self.refused("entity_count")?;
+            Ok(0)
+        }
+        async fn summary_count(&self, _: &str) -> Result<usize> {
+            self.refused("summary_count")?;
+            Ok(0)
+        }
+        async fn sweep(&self, _: &str, _: &str) -> Result<usize> {
+            self.refused("sweep")?;
             Ok(0)
         }
     }
@@ -1860,7 +1899,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_runs_notes_are_above_the_mark_its_lease_was_taken_at() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Untracked::default());
+        let store = Arc::new(Recording::default());
         let (root, service) = service_on(
             dir.path(),
             Arc::clone(&store) as Arc<dyn CodeVectorStore>,
@@ -1922,7 +1961,7 @@ mod tests {
     async fn each_run_holds_the_lease_under_its_own_id() {
         use std::sync::atomic::Ordering;
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Untracked::default());
+        let store = Arc::new(Recording::default());
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         *store.gate.lock().unwrap() = Some(Arc::clone(&gate));
         let (root, service) = service_on(
@@ -2040,7 +2079,7 @@ mod tests {
         };
         let (root, service) = service_with(
             dir.path(),
-            Arc::new(Untracked::default()),
+            Arc::new(Recording::default()),
             &config,
             Some(Arc::new(model.clone())),
         )
@@ -2115,16 +2154,16 @@ mod tests {
     async fn the_graph_keeps_vector_state_for_the_database_in_use_and_its_standby() {
         let dir = tempfile::tempdir().unwrap();
         let (_, service) =
-            service_on(dir.path(), Arc::new(Untracked::default()), "vellev").unwrap();
+            service_on(dir.path(), Arc::new(Recording::default()), "vellev").unwrap();
         let keys = service.graph().vector_keys();
         assert_eq!(
             (keys.active(), keys.standby()),
             ("weaviate", Some("vellev"))
         );
-        let (_, service) = service_on(dir.path(), Arc::new(Untracked::default()), " ").unwrap();
+        let (_, service) = service_on(dir.path(), Arc::new(Recording::default()), " ").unwrap();
         assert_eq!(service.graph().vector_keys().standby(), None);
         for refused in ["weaviate", "qdrant"] {
-            let made = service_on(dir.path(), Arc::new(Untracked::default()), refused);
+            let made = service_on(dir.path(), Arc::new(Recording::default()), refused);
             let error = format!("{:#}", made.err().expect("refused"));
             assert!(error.contains("vector_standby"), "{error}");
         }
@@ -2136,9 +2175,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_given_store_is_keyed_as_the_database_it_names() {
         let dir = tempfile::tempdir().unwrap();
-        let named = Untracked {
+        let named = Recording {
             named: Some(VectorKeys::VELLEV),
-            ..Untracked::default()
+            ..Recording::default()
         };
         assert!(!named.tracks_completeness());
         let (_, service) = service_on(dir.path(), Arc::new(named), "weaviate").unwrap();
@@ -2155,7 +2194,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn the_files_noted_for_a_store_that_keeps_no_track_are_put_right_in_it() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Untracked::default());
+        let store = Arc::new(Recording::default());
         let (root, service) = service_on(
             dir.path(),
             Arc::clone(&store) as Arc<dyn CodeVectorStore>,
@@ -3097,6 +3136,13 @@ mod tests {
         free: std::sync::Mutex<Vec<String>>,
         /// Requests waiting there.
         held: std::sync::atomic::AtomicUsize,
+        /// The size of the vectors it makes: the store's.
+        dimensions: usize,
+    }
+
+    /// The size of the vectors `store` keeps.
+    fn dimensions_of(store: &VellevCodeVectorStore) -> usize {
+        store.embedded_as().1.dimensions as usize
     }
 
     #[async_trait::async_trait]
@@ -3126,7 +3172,7 @@ mod tests {
                 gate.acquire().await.expect("open").forget();
             }
             tokio::time::sleep(Duration::from_millis(80)).await;
-            let mut vector = vec![0.0f32; 768];
+            let mut vector = vec![0.0f32; self.dimensions];
             vector[5] = 1.0;
             Ok(texts.iter().map(|_| vector.clone()).collect())
         }
@@ -3147,11 +3193,13 @@ mod tests {
                 return;
             };
             let dir = tempfile::tempdir().unwrap();
-            let busy = Arc::new(Busy::default());
+            let store = VellevCodeVectorStore::new(&node.url, &node.key, &node.tenant).unwrap();
+            let busy = Arc::new(Busy {
+                dimensions: dimensions_of(&store),
+                ..Busy::default()
+            });
             let seeding = workforce_vellev::seeding::Seeding::new(busy.clone(), 2, 2);
-            let seeded = VellevCodeVectorStore::new(&node.url, &node.key, &node.tenant)
-                .unwrap()
-                .seeded_by(seeding.clone());
+            let seeded = store.seeded_by(seeding.clone());
             let service = KnowledgeService::new_with_backend(
                 dir.path().join("repo"),
                 dir.path().join("data"),
@@ -3206,6 +3254,8 @@ mod tests {
         under_way: std::sync::Mutex<Vec<String>>,
         most_repos: std::sync::atomic::AtomicUsize,
         most: std::sync::atomic::AtomicUsize,
+        /// The size of the vectors it makes: the store's.
+        dimensions: usize,
     }
 
     #[async_trait::async_trait]
@@ -3236,7 +3286,7 @@ mod tests {
                 let at = under_way.iter().position(|repo| *repo == of).unwrap();
                 under_way.remove(at);
             }
-            let mut vector = vec![0.0f32; 768];
+            let mut vector = vec![0.0f32; self.dimensions];
             vector[9] = 1.0;
             Ok(texts.iter().map(|_| vector.clone()).collect())
         }
@@ -3255,13 +3305,15 @@ mod tests {
             return;
         };
         let dir = tempfile::tempdir().unwrap();
-        let busy = Arc::new(Busy::default());
+        let store = VellevCodeVectorStore::new(&node.url, &node.key, &node.tenant).unwrap();
+        let busy = Arc::new(Busy {
+            dimensions: dimensions_of(&store),
+            ..Busy::default()
+        });
         // A page is one request, and the embedder is given more at once
         // than there are pages on their way: none waits for another.
         let seeding = workforce_vellev::seeding::Seeding::new(busy.clone(), PAGE, 2 * AHEAD);
-        let seeded = VellevCodeVectorStore::new(&node.url, &node.key, &node.tenant)
-            .unwrap()
-            .seeded_by(seeding.clone());
+        let seeded = store.seeded_by(seeding.clone());
         let service = KnowledgeService::new_with_backend(
             dir.path().join("repo"),
             dir.path().join("data"),
@@ -3452,11 +3504,13 @@ mod tests {
                 return;
             };
             let dir = tempfile::tempdir().unwrap();
-            let telling = Arc::new(Telling::default());
+            let store = VellevCodeVectorStore::new(&node.url, &node.key, &node.tenant).unwrap();
+            let telling = Arc::new(Telling {
+                dimensions: dimensions_of(&store),
+                ..Telling::default()
+            });
             let seeding = workforce_vellev::seeding::Seeding::new(telling.clone(), 2, 3);
-            let seeded = VellevCodeVectorStore::new(&node.url, &node.key, &node.tenant)
-                .unwrap()
-                .seeded_by(seeding.clone());
+            let seeded = store.seeded_by(seeding.clone());
             let service = KnowledgeService::new_with_backend(
                 dir.path().join("repo"),
                 dir.path().join("data"),
@@ -3493,5 +3547,340 @@ mod tests {
                 "within the allowance"
             );
         }
+    }
+
+    /// `[knowledge] code_search_enabled = false` reaches the query engine:
+    /// a question says code search is off and asks the store nothing; on,
+    /// as by default, the same question asks it.
+    #[tokio::test]
+    async fn code_search_off_in_config_reaches_the_query_engine() {
+        use std::sync::atomic::Ordering;
+        use workforce_codebase_knowledge::vector::CodeSearchUnavailable;
+        for enabled in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(Recording::default());
+            let config = KnowledgeConfig {
+                code_search_enabled: enabled,
+                ..KnowledgeConfig::default()
+            };
+            let given = Arc::clone(&store) as Arc<dyn CodeVectorStore>;
+            let (root, service) = service_with(dir.path(), given, &config, None).unwrap();
+            service.trigger_full_index_for(&root).await.unwrap();
+            let repo = KnowledgeService::repo_id_for(&root);
+            let answer = service
+                .query_engine()
+                .ask(&repo, QUESTION, None, false)
+                .await
+                .unwrap();
+            let searched = store.searched.load(Ordering::SeqCst);
+            if enabled {
+                assert!(searched > 0, "the store is asked");
+            } else {
+                assert_eq!(
+                    answer.vectors_skipped,
+                    Some(CodeSearchUnavailable::Off.to_string())
+                );
+                assert_eq!(searched, 0, "the store is asked nothing");
+            }
+        }
+    }
+
+    /// A fill whose store's node does not serve its tenant stops the
+    /// repo's turn at the first refusal, keeps its pending files, and says
+    /// why.
+    #[tokio::test]
+    async fn a_misrouted_fill_stops_the_repos_turn_and_keeps_its_pending_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Recording {
+            named: Some(VectorKeys::VELLEV),
+            misrouted: true,
+            ..Recording::default()
+        });
+        let given = Arc::clone(&store) as Arc<dyn CodeVectorStore>;
+        let (root, service) = service_on(dir.path(), given, "").unwrap();
+        std::fs::write(
+            root.join("src/mail.rs"),
+            "/// Sends a letter.\npub fn post(to: &str) -> bool {\n    !to.is_empty()\n}\n",
+        )
+        .unwrap();
+        service.trigger_full_index_for(&root).await.unwrap();
+        let repo = KnowledgeService::repo_id_for(&root);
+        let files = ["src/config.rs".to_string(), "src/mail.rs".to_string()];
+        service
+            .graph()
+            .note_vectors_pending(&repo, &files)
+            .await
+            .unwrap();
+        let pending = service.graph().count_vectors_pending(&repo).await.unwrap();
+        assert!(pending >= 2, "{pending}");
+        store.asked.lock().unwrap().clear();
+
+        let pass = service.backfill_vectors().await.unwrap();
+        assert_eq!(pass.failed, std::slice::from_ref(&repo));
+        let asked = store.asked.lock().unwrap().clone();
+        assert!(
+            asked
+                .iter()
+                .all(|(method, times)| *method == "identity" || *times <= 1),
+            "{asked:?}"
+        );
+        assert_eq!(
+            service.graph().count_vectors_pending(&repo).await.unwrap(),
+            pending
+        );
+        let status = service.vector_status().await.unwrap();
+        let last_error = status[0].last_error.clone().unwrap_or_default();
+        assert!(last_error.contains("misrouted"), "{last_error}");
+    }
+
+    use workforce_vellev::testing::SMALL;
+
+    /// `memories`' node, with code vectors in `code`'s tenant, embedded
+    /// with bge-small and bge's query prefix.
+    fn with_code_in(memories: &workforce_vellev::testing::Node, code: &str) -> VellevConfig {
+        VellevConfig {
+            code: Box::new(workforce_common::settings::VellevCodeConfig {
+                tenant: Some(code.to_string()),
+                model: Some(SMALL.to_string()),
+                dimensions: Some(384),
+                query_prefix: Some(workforce_vellev::LOCAL_QUERY_PREFIX.to_string()),
+                ..Default::default()
+            }),
+            ..on(memories)
+        }
+    }
+
+    /// Two tenants of one node: one `[vellev] tenant` names, and the code
+    /// tenant `[vellev.code]` names.
+    async fn two_tenants() -> Option<(
+        workforce_vellev::testing::Node,
+        workforce_vellev::testing::Node,
+    )> {
+        let memories = workforce_vellev::testing::Node::embedding().await?;
+        let code = workforce_vellev::testing::Node::embedding().await?;
+        Some((memories, code))
+    }
+
+    /// A service keeping its code vectors where `vellev` says, as the hub
+    /// makes it, over a repo of two files: indexed, its vectors filled.
+    async fn filled_by_config(dir: &Path, vellev: &VellevConfig) -> (String, KnowledgeService) {
+        let (root, service) = repo_and_service(dir, vellev);
+        std::fs::write(
+            root.join("src/mail.rs"),
+            "/// Sends a letter by post.\npub fn post(to: &str) -> bool {\n    !to.is_empty()\n}\n",
+        )
+        .unwrap();
+        service.trigger_full_index_for(&root).await.unwrap();
+        let repo = KnowledgeService::repo_id_for(&root);
+        let pass = service.backfill_vectors().await.unwrap();
+        assert_eq!(pass.filled, std::slice::from_ref(&repo));
+        (repo, service)
+    }
+
+    /// The names of the collections `node`'s tenant holds.
+    async fn collections_of(node: &workforce_vellev::testing::Node) -> Vec<String> {
+        let held = node.tenant().collections().await.unwrap();
+        held.into_iter().map(|c| c.name.to_string()).collect()
+    }
+
+    /// Code vectors go to the node and tenant `[vellev.code]` names, as
+    /// the model it names embeds them, and nothing of them to `[vellev]`'s.
+    #[tokio::test]
+    async fn code_vectors_go_to_the_code_node_and_tenant_and_nothing_else_does() {
+        let Some((memories, code)) = two_tenants().await else {
+            return;
+        };
+        let vellev = with_code_in(&memories, &code.tenant);
+        let mut config = WorkforceConfig::default();
+        config.knowledge.vector_backend = "vellev".into();
+        config.vellev = vellev.clone();
+        let store = VectorBackend::of(&config).store().unwrap().unwrap();
+        assert_eq!(store.tenant(), Some(code.tenant.clone()));
+
+        let dir = tempfile::tempdir().unwrap();
+        filled_by_config(dir.path(), &vellev).await;
+        for name in ["CodeEntity", "CodeSummary"] {
+            let name = vellev_core::CollectionName::new(name).unwrap();
+            let made = code.tenant().collection(&name).schema().await.unwrap();
+            let embedding = made.expect("made in the code tenant").embedding;
+            assert_eq!(
+                (embedding.model.as_str(), embedding.dimensions),
+                (SMALL, 384)
+            );
+            assert_eq!(
+                embedding.query_prefix.as_deref(),
+                Some(workforce_vellev::LOCAL_QUERY_PREFIX)
+            );
+        }
+        assert_eq!(collections_of(&memories).await, Vec::<String>::new());
+    }
+
+    /// A fill into a collection of another model's size writes nothing,
+    /// says why naming both, and leaves the repo to be filled.
+    #[tokio::test]
+    async fn a_fill_into_a_collection_of_another_size_writes_nothing_and_keeps_the_repo_pending() {
+        let Some((memories, code)) = two_tenants().await else {
+            return;
+        };
+        let today = VellevCodeVectorStore::new(&code.url, &code.key, &code.tenant).unwrap();
+        let made = today.embedded_as().1;
+        assert_eq!(made.dimensions, 768);
+        today.ensure_collections().await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let (root, service) = repo_and_service(dir.path(), &with_code_in(&memories, &code.tenant));
+        service.trigger_full_index_for(&root).await.unwrap();
+        let repo = KnowledgeService::repo_id_for(&root);
+        let files = ["src/config.rs".to_string()];
+        service
+            .graph()
+            .note_vectors_pending(&repo, &files)
+            .await
+            .unwrap();
+        let pending = service.graph().count_vectors_pending(&repo).await.unwrap();
+
+        let pass = service.backfill_vectors().await.unwrap();
+        assert_eq!(pass.failed, std::slice::from_ref(&repo));
+        let status = service.vector_status().await.unwrap();
+        let last_error = status[0].last_error.clone().unwrap_or_default();
+        for said in [
+            "'CodeEntity'",
+            "it embeds with 'BAAI/bge-base-en-v1.5', expected 'BAAI/bge-small-en-v1.5'",
+            "vectors have 768 dimensions, expected 384",
+        ] {
+            assert!(last_error.contains(said), "{said}: {last_error}");
+        }
+        assert_eq!(
+            service.graph().count_vectors_pending(&repo).await.unwrap(),
+            pending
+        );
+        let name = vellev_core::CollectionName::new("CodeEntity").unwrap();
+        let held = code.tenant().collection(&name).count(None).await.unwrap();
+        assert_eq!(held, 0);
+    }
+
+    /// A summary of `file` of `repo`.
+    fn file_summary(
+        repo: &str,
+        file: &str,
+    ) -> workforce_codebase_knowledge::vector::VectorCodeSummary {
+        workforce_codebase_knowledge::vector::VectorCodeSummary {
+            entity_id: file.to_string(),
+            repo_id: repo.to_string(),
+            granularity: "file".into(),
+            file_path: file.to_string(),
+            summary_text: format!("What {file} does."),
+            is_stale: false,
+            generation: String::new(),
+        }
+    }
+
+    /// The keys and files of what the store holds of `repo`, entities or
+    /// `summaries`.
+    async fn held_of(
+        store: &Arc<dyn CodeVectorStore>,
+        repo: &str,
+        summaries: bool,
+    ) -> Vec<(String, String)> {
+        store
+            .held_after(repo, summaries, None, 1000)
+            .await
+            .unwrap()
+            .0
+    }
+
+    /// A repo dropped everywhere leaves the code tenant, entities and
+    /// summaries, and another repo's vectors stay.
+    #[tokio::test]
+    async fn a_dropped_repos_vectors_leave_the_code_tenant() {
+        let Some((memories, code)) = two_tenants().await else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let vellev = with_code_in(&memories, &code.tenant);
+        let (first, service) = filled_by_config(dir.path(), &vellev).await;
+        let second = another_repo(&service, dir.path(), "other", 3).await;
+        let pass = service.backfill_vectors().await.unwrap();
+        assert_eq!(pass.filled, std::slice::from_ref(&second));
+        let store = service.vector_store().clone().unwrap();
+        store
+            .index_summaries(&[
+                file_summary(&first, "src/config.rs"),
+                file_summary(&second, "src/config.rs"),
+            ])
+            .await
+            .unwrap();
+        let kept = (
+            store.entity_count(&second).await.unwrap(),
+            store.summary_count(&second).await.unwrap(),
+        );
+        assert!(kept.0 > 0 && kept.1 > 0, "{kept:?}");
+
+        store.delete_repo_entities(&first).await.unwrap();
+        store.delete_repo_summaries(&first).await.unwrap();
+        assert_eq!(store.entity_count(&first).await.unwrap(), 0);
+        assert_eq!(store.summary_count(&first).await.unwrap(), 0);
+        assert_eq!(
+            (
+                store.entity_count(&second).await.unwrap(),
+                store.summary_count(&second).await.unwrap(),
+            ),
+            kept
+        );
+        assert_eq!(collections_of(&memories).await, Vec::<String>::new());
+    }
+
+    /// A file's vectors leave the code tenant, entities and summaries, and
+    /// the other file's stay.
+    #[tokio::test]
+    async fn a_files_vectors_leave_the_code_tenant() {
+        let Some((memories, code)) = two_tenants().await else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, service) =
+            filled_by_config(dir.path(), &with_code_in(&memories, &code.tenant)).await;
+        let store = service.vector_store().clone().unwrap();
+        store
+            .index_summaries(&[
+                file_summary(&repo, "src/config.rs"),
+                file_summary(&repo, "src/mail.rs"),
+            ])
+            .await
+            .unwrap();
+        let of_file = |held: &[(String, String)], file: &str| {
+            held.iter().filter(|(_, held)| held == file).count()
+        };
+        let (entities, summaries) = (
+            held_of(&store, &repo, false).await,
+            held_of(&store, &repo, true).await,
+        );
+        let kept = (
+            of_file(&entities, "src/mail.rs"),
+            of_file(&summaries, "src/mail.rs"),
+        );
+        assert!(of_file(&entities, "src/config.rs") > 0 && kept.0 > 0 && kept.1 == 1);
+
+        store
+            .delete_entities_by_file(&repo, "src/config.rs")
+            .await
+            .unwrap();
+        store
+            .delete_summaries_by_file(&repo, "src/config.rs")
+            .await
+            .unwrap();
+        let (entities, summaries) = (
+            held_of(&store, &repo, false).await,
+            held_of(&store, &repo, true).await,
+        );
+        assert_eq!(of_file(&entities, "src/config.rs"), 0);
+        assert_eq!(of_file(&summaries, "src/config.rs"), 0);
+        assert_eq!(
+            (
+                of_file(&entities, "src/mail.rs"),
+                of_file(&summaries, "src/mail.rs")
+            ),
+            kept
+        );
     }
 }

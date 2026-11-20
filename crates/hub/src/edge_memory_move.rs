@@ -471,10 +471,10 @@ struct TenantMarker(workforce_vellev::Tenants);
 #[async_trait]
 impl Marker for TenantMarker {
     async fn marked(&self) -> Result<bool> {
-        workforce_vellev::index_marked(&self.0.reads, MOVED_MARKER).await
+        workforce_vellev::index_marked(&self.0, MOVED_MARKER).await
     }
     async fn mark(&self) -> Result<()> {
-        workforce_vellev::index_mark(&self.0.writes, MOVED_MARKER).await
+        workforce_vellev::index_mark(&self.0, MOVED_MARKER).await
     }
 }
 

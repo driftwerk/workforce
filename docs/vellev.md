@@ -549,3 +549,74 @@ ignoring case), a promoted replica, and any `[memory] backend` but
    must find nothing.
 
 `WorkforceMemory` may be dropped only after step 9.
+
+## Code vectors on a node of their own
+
+Code vectors (`[knowledge] vector_backend = "vellev"`) are kept where
+`[vellev]` says unless `[vellev.code]` says otherwise. Each of its keys
+falls back on its own, and each has an environment variable; an empty
+value is unset.
+
+| Key | Variable | Default |
+|---|---|---|
+| `url` | `WORKFORCE_VELLEV_CODE_URL` | `[vellev] url` |
+| `tenant` | `WORKFORCE_VELLEV_CODE_TENANT` | `[vellev] tenant` |
+| `api_key` | `WORKFORCE_VELLEV_CODE_API_KEY` | `[vellev] api_key` |
+| `model` | `WORKFORCE_VELLEV_CODE_MODEL` | `BAAI/bge-base-en-v1.5` |
+| `dimensions` | `WORKFORCE_VELLEV_CODE_DIMENSIONS` | 768, with the default model |
+| `query_prefix` | `WORKFORCE_VELLEV_CODE_QUERY_PREFIX` | bge's, with the default model |
+
+**Another code model** is named in the deployment's own config, with its
+size, and with its query prefix if it wants one: none is assumed for a
+model other than the default, and `""` is none. For example:
+
+```toml
+[vellev.code]
+url = "http://vellev-code:18080"
+tenant = "code"
+model = "BAAI/bge-small-en-v1.5"
+dimensions = 384
+query_prefix = "Represent this sentence for searching relevant passages: "
+```
+
+A hub refuses to start on a code URL that is not an address, a code
+tenant that resolves empty, a key set in neither table, a model without a
+size or a size without a model, a size of 0 or one that is not a number,
+and a `query_prefix` without a model.
+
+**The node** must serve the tenant and run the model:
+
+- its `VELLEV_TENANTS` lists the code tenant, and the memories' node's
+  list leaves it out, set first, so that no request reaches the wrong
+  node meanwhile;
+- its `VELLEV_LOCAL_MODEL` (or `VELLEV_LOCAL_MODELS_ALLOWED`) names the
+  code model;
+- every node of the cluster runs with `VELLEV_MAX_FORMAT=2` before code is
+  seeded, since the code collections store no text. Format 2 is one-way
+  past vellev 0.2.0.
+
+**A node that does not serve the tenant** answers 421 `not_served_here`.
+The hub says so once, naming the node and the tenant ("misrouted: the
+vellev node at … does not serve tenant '…'"), logs it at ERROR, counts it
+in `workforce_vellev_misrouted_total{tenant}` on the hub's `/metrics`,
+and asks again only at the next recheck (60 s). Alert on
+`increase(workforce_vellev_misrouted_total[5m]) > 0`. Meanwhile
+`vector_health` is unhealthy naming the node and tenant, and code
+questions are answered from the graph with `vectors_skipped` saying
+"code search unavailable: misrouted: …". `[knowledge] code_search_enabled
+= false` answers them from the graph alone, saying so, without asking
+the store; index runs and fills go on as configured.
+
+**A refused collection**, one made with another model, size or prefix,
+is named with both: "it embeds with 'BAAI/bge-base-en-v1.5', expected
+'BAAI/bge-small-en-v1.5'; vectors have 768 dimensions, expected 384".
+Nothing is written to it, and a fill keeps the repo pending. To put it
+right:
+
+1. drop `CodeEntity` and `CodeSummary` in that tenant, or point
+   `[vellev.code]` at a fresh tenant;
+2. the hub makes them again in the configured shape at the next recheck,
+   and its background fill rebuilds them from the code graph;
+3. `workforce code reindex-vectors` does the same at once, with
+   `--embed-url` to a server of the configured model for speed (it asks
+   the endpoint for that model unless `--embed-model` names another).
