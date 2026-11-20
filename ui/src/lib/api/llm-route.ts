@@ -64,16 +64,37 @@ export function keptModels(route: PersonalRoute | null | undefined, kind: Person
 /** A person's setting for one agent: their own route there, or the hub's. */
 export type AgentRoute = PersonalRoute | "hub";
 
+/** One model a route can run: what its setting names, and what a person
+ *  reads ("Fable 5.2"). */
+export interface RouteModel {
+  id: string;
+  name: string;
+}
+
 /** One kind as the person may pick it where they are; `refused` says why
  *  it can't be picked, and is absent when it can. */
 export interface RouteOption {
   kind: PersonalRouteKind;
   title: string;
   refused: string | null;
-  /** The models a route of this kind can run beside the tiers, most capable
-   *  first. A hub from before route models were chosen sends none. */
+  /** The ids of `choices`. A hub from before route models were chosen
+   *  sends none. */
   models?: string[];
+  /** The models a route of this kind can run beside the tiers, by name: on
+   *  Claude, the ones the person's own login runs, in its order. A hub from
+   *  before names sends only `models`. */
+  choices?: RouteModel[];
+  /** Whether `choices` are the person's login's own or the hub's. */
+  models_from?: "login" | "hub";
+  /** Why `choices` aren't the login's own, when they couldn't be read. */
+  models_note?: string | null;
   defaults?: RouteDefaults;
+}
+
+/** The models `option` offers by name; a hub from before names offers its
+ *  ids as they are. */
+export function routeChoices(option: RouteOption): RouteModel[] {
+  return option.choices ?? (option.models ?? []).map((id) => ({ id, name: id }));
 }
 
 export interface MyRouteView {

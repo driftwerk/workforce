@@ -39,8 +39,47 @@ struct Hub {
     _dirs: (tempfile::TempDir, tempfile::TempDir),
 }
 
+/// A token whose login's models can't be read.
+const UNLISTED: &str = "unlisted-";
+
+/// What every Claude login here lists, as its CLI would: aliases first,
+/// then models by their full ids. A login whose token starts [`UNLISTED`]
+/// lists nothing, as a CLI that can't be asked.
+fn list_claude_logins() {
+    use workforce_hub::subscription::catalog::{list_claude_with, PlanModel};
+    use workforce_hub::subscription::resolve::Credential;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        list_claude_with(Arc::new(|login| {
+            Box::pin(async move {
+                if matches!(&login.credential, Credential::Token(t) if t.starts_with(UNLISTED)) {
+                    return Err(eyre::eyre!("the Claude Code CLI didn't start"));
+                }
+                let model = |id: &str, resolves_to: Option<&str>, name: &str| PlanModel {
+                    id: id.into(),
+                    resolves_to: resolves_to.map(str::to_string),
+                    name: name.into(),
+                    description: String::new(),
+                    efforts: Vec::new(),
+                    default_effort: None,
+                    context_window: None,
+                    fast: None,
+                };
+                Ok(vec![
+                    model("fable", Some("claude-fable-5-2"), "Fable 5.2"),
+                    model("opus", Some("claude-opus-5-5"), "Opus 5.5"),
+                    model("claude-fable-5-2", None, "Fable 5.2"),
+                    model("claude-fable-5-1", None, "Fable 5.1"),
+                    model("claude-opus-4-8", None, "Opus 4.8"),
+                ])
+            })
+        }));
+    });
+}
+
 impl Hub {
     async fn new(switch: PersonalRoutesConfig) -> Self {
+        list_claude_logins();
         let data = tempfile::tempdir().unwrap();
         let vaults = tempfile::tempdir().unwrap();
         let vault = Arc::new(Vault::open(&vaults.path().join("global.enc"), "test-key").unwrap());
@@ -153,11 +192,12 @@ impl Hub {
 
     /// `who`'s own Claude login for the whole hub.
     fn claude_login(&self, who: &Identity) {
+        self.claude_token(who, &format!("token-{}", uuid::Uuid::new_v4()));
+    }
+
+    fn claude_token(&self, who: &Identity, token: &str) {
         self.vault
-            .set(
-                &format!("users/{}/{CLAUDE_LOGIN}", who.id),
-                &format!("token-{}", uuid::Uuid::new_v4()),
-            )
+            .set(&format!("users/{}/{CLAUDE_LOGIN}", who.id), token)
             .unwrap();
     }
 }
@@ -467,6 +507,133 @@ async fn her_routes_models_are_kept_and_a_retired_one_is_refused_in_plain_words(
     let unknown = json!({ "kind": "codex", "fallback": "wait", "model_preferences": { "coding": "gpt-6-sol" } });
     let (status, _) = hub.put(&hub.alice, "/api/me/llm-route", unknown).await;
     assert_eq!(status, StatusCode::CONFLICT);
+}
+
+/// `kind`'s option in `view`.
+fn option<'a>(view: &'a Value, kind: &str) -> &'a Value {
+    view["options"]
+        .as_array()
+        .unwrap_or_else(|| panic!("options listed: {view}"))
+        .iter()
+        .find(|option| option["kind"] == kind)
+        .unwrap_or_else(|| panic!("{kind} listed: {view}"))
+}
+
+#[tokio::test]
+async fn her_claude_route_offers_the_models_her_own_login_lists_by_name() {
+    let hub = Hub::on().await;
+    hub.claude_login(&hub.alice);
+
+    for path in ["/api/me/llm-route", "/api/me/agents/scout/llm-route"] {
+        let (status, body) = hub.get(&hub.alice, path).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let claude = option(&body, "claude-code");
+        assert_eq!(claude["models_from"], "login", "{path}: {claude}");
+        assert!(claude["models_note"].is_null());
+        let shown: Vec<(&str, &str)> = claude["choices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| (c["id"].as_str().unwrap(), c["name"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("fable", "Fable 5.2"),
+                ("opus", "Opus 5.5"),
+                ("claude-fable-5-1", "Fable 5.1"),
+                ("claude-opus-4-8", "Opus 4.8"),
+            ],
+            "{path}: in her login's order, each once"
+        );
+        assert_eq!(
+            claude["models"],
+            json!(["fable", "opus", "claude-fable-5-1", "claude-opus-4-8"]),
+            "the ids, for a page from before"
+        );
+        assert_eq!(option(&body, "codex")["choices"][0]["name"], "GPT-6.1 Sol");
+    }
+
+    let chosen = json!({
+        "kind": "claude-code",
+        "fallback": "wait",
+        "model_preferences": { "conversation": "claude-fable-5-2" },
+        "light_model": "claude-fable-5-1",
+        "heavy_model": "powerful",
+    });
+    let (status, body) = hub
+        .put(&hub.alice, "/api/me/llm-route", chosen.clone())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["route"], chosen);
+    let (status, body) = hub
+        .put(&hub.alice, "/api/me/agents/scout/llm-route", chosen.clone())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let unlisted =
+        json!({ "kind": "claude-code", "fallback": "wait", "heavy_model": "claude-opus-3" });
+    let (status, body) = hub.put(&hub.alice, "/api/me/llm-route", unlisted).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let why = body["error"].as_str().unwrap();
+    assert!(
+        why.contains("heavy") && why.contains("claude-opus-3") && why.contains("your Claude login"),
+        "{why}"
+    );
+    let (_, body) = hub.get(&hub.alice, "/api/me/llm-route").await;
+    assert_eq!(body["route"], chosen, "a refused change keeps what she had");
+}
+
+#[tokio::test]
+async fn a_login_whose_models_cant_be_read_offers_the_hubs_and_says_so() {
+    let hub = Hub::on().await;
+    hub.claude_token(&hub.bob, &format!("{UNLISTED}{}", uuid::Uuid::new_v4()));
+
+    let (status, body) = hub.get(&hub.bob, "/api/me/llm-route").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let claude = option(&body, "claude-code");
+    assert_eq!(claude["models_from"], "hub", "{claude}");
+    assert!(
+        claude["models_note"]
+            .as_str()
+            .is_some_and(|n| n.contains("couldn't be read")),
+        "{claude}"
+    );
+    let ids: Vec<&str> = claude["choices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert!(!ids.is_empty(), "the hub's tier models: {claude}");
+    assert_eq!(claude["models"], json!(ids));
+
+    let (status, body) = hub
+        .put(
+            &hub.bob,
+            "/api/me/llm-route",
+            json!({ "kind": "claude-code", "fallback": "wait", "light_model": ids[0] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "a tier model still saves: {body}");
+    let (status, body) = hub
+        .put(
+            &hub.bob,
+            "/api/me/llm-route",
+            json!({ "kind": "claude-code", "fallback": "wait", "light_model": "claude-fable-5-1" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("isn't a Claude model this hub runs"));
+
+    // Without a login of her own, nothing is asked and nothing is said.
+    let (_, body) = hub.get(&hub.admin, "/api/me/llm-route").await;
+    let claude = option(&body, "claude-code");
+    assert_eq!(claude["models_from"], "hub");
+    assert!(claude["models_note"].is_null(), "{claude}");
 }
 
 /// The agent `scout` as `/api/agents` lists it.
