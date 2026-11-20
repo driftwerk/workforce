@@ -257,8 +257,8 @@ fn who(p: &Party) -> String {
 pub(super) const PLAN_DRAFT: &str = "A plan you make is a draft for the person to review and approve; start one only when their own words ask you to start the work (start_now).";
 
 /// What Act fully aims at: the end state an order names, with no polish
-/// before it. Its decisions carry it (`idle`, `answer`), and
-/// [`STANDING_RULE`].
+/// before it. Worded once for [`STANDING_RULE`] and the decision prompts in
+/// `idle` and `answer`.
 macro_rules! end_state {
     () => {
         "Aim straight at the end state an order names: that is the deliverable, and everything else serves it. Never hold the deliverable behind polish their instructions don't ask for (another review round once one came back clean, an extra watch, groundwork it doesn't need): ship it, and polish beside it or after."
@@ -269,7 +269,7 @@ pub(crate) use end_state;
 /// What a boss at Act fully decides by: the person's own instructions,
 /// both ways, with no stance of its own on production, and the end state
 /// they ordered as the work, its independent steps at once.
-pub(crate) const STANDING_RULE: &str = concat!("The person's instructions are the rule, both ways: their open orders (in your open items, in their words), their preferences, and each session's own instructions. Where they forbid a kind of step (\"don't allow anything that would impact production\"), refuse it and say what to do instead. Where they want work shipped (\"getting stuff out to production is vital as long as nothing breaks\"), do it and have the session check nothing broke. Where they say keep work going or take over, act on a session's sensible next step that serves it (have the session run it) and report \"✓ did X — why\". Touching production or staging is no reason by itself to ask. Ask the person only when their instructions don't cover the step and you truly can't judge (a destructive or irreversible step outside their orders is such a step), or when only they can physically do it (their credentials, a payment). That is rare: you handle about 99 in 100 yourself. When you must ask, answer buttons are fine, alone: no recommendation essay beside them. ", end_state!(), " Run steps that don't depend on each other at once (in sessions of their own where your “How it works” setting starts them), within your parallel limit.");
+pub(crate) const STANDING_RULE: &str = concat!("The person's instructions are the rule, both ways: their open orders (in your open items, in their words), their preferences, and each session's own instructions. Where they forbid a kind of step (\"don't allow anything that would impact production\"), refuse it and say what to do instead. Where they want work shipped (\"getting stuff out to production is vital as long as nothing breaks\"), do it and have the session check nothing broke. Where they say keep work going or take over, act on a session's sensible next step that serves it (have the session run it) and report \"✓ did X — why\". Touching production or staging is no reason by itself to ask. Ask the person only when their instructions don't cover the step and you truly can't judge (a destructive or irreversible step outside their orders is such a step), or when only they can physically do it (their credentials, a payment). That is rare: you handle about 99 in 100 yourself. When you must ask, answer buttons are fine, alone: no recommendation essay beside them. ", end_state!(), " Run steps that don't depend on each other at once (each in a session of its own, where you may start one), within your parallel limit.");
 
 /// What a boss that starts sessions does with work the person asks it
 /// for in its DM: starts the session itself, at once, in the folder the
