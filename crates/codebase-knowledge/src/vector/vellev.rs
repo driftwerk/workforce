@@ -1628,6 +1628,75 @@ mod tests {
         );
     }
 
+    /// A question is embedded as it is, in a probe with no document prefix
+    /// whatever the code collection puts before documents, listed within
+    /// the store's own cap.
+    #[tokio::test]
+    async fn embedded_writes_the_bare_text_within_the_stores_cap() {
+        use axum::response::IntoResponse;
+        let (asked, ids): (Asked, Arc<std::sync::Mutex<Vec<String>>>) = Default::default();
+        let (recording, holding) = (Arc::clone(&asked), Arc::clone(&ids));
+        let app = axum::Router::new().fallback(
+            move |method: axum::http::Method, uri: axum::http::Uri, body: String| {
+                let (recording, holding) = (Arc::clone(&recording), Arc::clone(&holding));
+                async move {
+                    let path = uri.path().to_string();
+                    recording.lock().unwrap().push((method.to_string(), path.clone(), body.clone()));
+                    let sent: Value = serde_json::from_str(&body).unwrap_or_default();
+                    if path.ends_with("/changes") {
+                        let changes = sent["changes"].as_array().cloned().unwrap_or_default();
+                        let mut held = holding.lock().unwrap();
+                        held.extend(changes.iter().map(|change| change["id"].as_str().unwrap().into()));
+                    }
+                    if path.ends_with("/list") {
+                        if sent["limit"].as_u64().is_some_and(|limit| limit > 2) {
+                            let message = "limit must be from 1 to 2, not more";
+                            let refused = json!({ "error": { "code": "invalid", "message": message } });
+                            return (axum::http::StatusCode::BAD_REQUEST, axum::Json(refused)).into_response();
+                        }
+                        let objects: Vec<Value> = holding
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .map(|id| json!({ "id": id, "properties": {}, "vector": vec![0.5; 384] }))
+                            .collect();
+                        return axum::Json(json!({ "objects": objects })).into_response();
+                    }
+                    axum::Json(json!({ "incarnation": 1, "position": 1, "outcomes": [] })).into_response()
+                }
+            },
+        );
+        let url = workforce_vellev::testing::serve(app).await;
+        let prefixed = Embedding {
+            document_prefix: Some("passage: ".into()),
+            ..small()
+        };
+        let store = VellevCodeVectorStore::new(&url, "key", "code")
+            .unwrap()
+            .embedding(prefixed)
+            .unwrap();
+
+        let embedded = store.embedded(&["parse the config".to_string()]).await;
+        assert_eq!(embedded.unwrap().len(), 1);
+        assert_eq!(store.cap.most(), 2);
+        let asked = asked.lock().unwrap().clone();
+        let made = asked
+            .iter()
+            .find(|(method, path, _)| method == "PUT" && path.contains("WorkforceEmbedProbe"));
+        let made: Value = serde_json::from_str(&made.unwrap().2).unwrap();
+        assert_eq!(made["embedding"]["model"], SMALL, "{made}");
+        assert!(made["embedding"].get("document_prefix").is_none(), "{made}");
+        let written = asked
+            .iter()
+            .find(|(_, path, _)| path.ends_with("/changes"))
+            .unwrap();
+        let written: Value = serde_json::from_str(&written.2).unwrap();
+        assert_eq!(
+            written["changes"][0]["properties"]["text"],
+            "parse the config"
+        );
+    }
+
     /// A search for more than the node gives for one is refused, never cut:
     /// once the node has said so, before anything is asked.
     #[tokio::test]

@@ -462,7 +462,8 @@ enum Commands {
         #[arg(short, long, default_value = "workforce.toml")]
         config: PathBuf,
         /// SQLite source `codegraph.db`. Defaults to the code graph under
-        /// `[knowledge] data_dir`, else `root`, else `hub.data_dir`.
+        /// `[knowledge] data_dir`, else `root`, else `hub.data_dir`, as the
+        /// hub's shared (multi-agent) knowledge service keeps it.
         #[arg(long)]
         from: Option<PathBuf>,
     },
@@ -13294,8 +13295,8 @@ mod tests {
     }
 
     /// The codegraph migration reads, unless told otherwise, the graph the
-    /// hub keeps under `[knowledge] data_dir`, else its root, else the
-    /// hub's data dir.
+    /// hub's shared (multi-agent) knowledge service keeps under
+    /// `[knowledge] data_dir`, else its root, else the hub's data dir.
     #[test]
     fn the_code_graph_migrated_is_the_hubs() {
         let mut config = workforce_common::settings::WorkforceConfig::default();

@@ -503,9 +503,7 @@ mod tests {
     async fn a_refused_upsert_is_logged_in_weaviates_words() {
         let app = with_class(axum::Router::new())
             .fallback(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = workforce_vellev::testing::serve(app).await;
 
         #[derive(Clone, Default)]
         struct Captured(Arc<Mutex<Vec<u8>>>);
@@ -546,10 +544,7 @@ mod tests {
     async fn a_refused_removal_is_told_and_a_missing_object_is_removed_already() {
         async fn serving(status: axum::http::StatusCode) -> String {
             let app = axum::Router::new().fallback(move || async move { status });
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!("http://{}", listener.local_addr().unwrap());
-            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-            url
+            workforce_vellev::testing::serve(app).await
         }
         let down = serving(axum::http::StatusCode::INTERNAL_SERVER_ERROR).await;
         assert!(WeaviateArtifacts::new(&down, None)
@@ -590,9 +585,7 @@ mod tests {
                 },
             ),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = workforce_vellev::testing::serve(app).await;
         let weaviate = WeaviateArtifacts::new(&url, None);
         let (mut ids, mut after, mut pages) = (Vec::new(), None, 0);
         loop {
@@ -637,9 +630,7 @@ mod tests {
             std::future::pending::<()>().await;
             axum::http::StatusCode::OK
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = workforce_vellev::testing::serve(app).await;
         let request = Duration::from_millis(300);
         let weaviate = WeaviateArtifacts::waiting(&url, None, Duration::from_secs(5), request);
         let page = [("a".to_string(), "h".to_string())];
@@ -707,9 +698,7 @@ mod tests {
                     "put object: import into index artifacts: put local object",
                 )),
             );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = workforce_vellev::testing::serve(app).await;
         let weaviate = WeaviateArtifacts::new(&url, None);
         let told = weaviate.upsert("a", "some text", "hash").await.unwrap_err();
         assert!(
@@ -972,10 +961,7 @@ mod tests {
                 )
                 .route("/v1/graphql", post(asked))
                 .with_state(Arc::clone(self));
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!("http://{}", listener.local_addr().unwrap());
-            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-            url
+            workforce_vellev::testing::serve(app).await
         }
     }
 
@@ -1446,9 +1432,7 @@ mod tests {
                 "/v1/objects",
                 get(|| async { panic!("the class is not listed") as axum::http::StatusCode }),
             );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = workforce_vellev::testing::serve(app).await;
         let weaviate = WeaviateArtifacts::new(&url, None);
         assert_eq!(weaviate.count().await.unwrap(), 7);
         let page = [

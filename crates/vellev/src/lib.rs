@@ -1348,7 +1348,8 @@ mod tests {
     /// As [`embedding_node`], answering `dropping` to a collection's drop,
     /// leaving the first `losing` objects out of what it lists, and listing
     /// the rest with their vectors only if `vectors`. A collection it drops
-    /// takes its objects with it.
+    /// takes its objects with it, and it lists no more than two objects for
+    /// one request.
     async fn probe_node(
         dropping: u16,
         losing: usize,
@@ -1379,6 +1380,15 @@ mod tests {
                         held.lock().unwrap().clear();
                     }
                     if uri.path().ends_with("/list") {
+                        let asked: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        if let Some(limit) = asked["limit"].as_u64().filter(|limit| *limit > 2) {
+                            let refused = serde_json::json!({ "error": {
+                                "code": "invalid",
+                                "message": format!("limit must be from 1 to 2, not {limit}"),
+                            }});
+                            return (axum::http::StatusCode::BAD_REQUEST, axum::Json(refused))
+                                .into_response();
+                        }
                         let objects: Vec<serde_json::Value> = held
                             .lock()
                             .unwrap()
@@ -1487,11 +1497,24 @@ mod tests {
 
         async fn documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
             let probe = CollectionName::new("WorkforceEmbedProbeWatched").unwrap();
-            let page = vellev_client::api::Page::new(10);
+            let page = vellev_client::api::Page::new(2);
             let held = self.tenants.reads.collection(&probe).list(&page).await?;
             self.listed.lock().unwrap().push(held.objects.len());
             Ok(texts.iter().map(|text| made_up(text)).collect())
         }
+    }
+
+    /// The probe is listed within the cap the embedder is given, which
+    /// learns what the node allows.
+    #[tokio::test]
+    async fn the_probe_is_listed_within_the_cap_it_shares() {
+        let (tenants, _) = embedding_node().await;
+        let cap = std::sync::Arc::new(Cap::default());
+        let small = embedding_of(SMALL, 16, None, &["text"]);
+        let node =
+            seeding::NodeEmbedder::new(tenants, small, 1).sharing(std::sync::Arc::clone(&cap));
+        let vectors = node.documents(&["a".to_string(), "b".to_string()]).await;
+        assert_eq!((vectors.unwrap().len(), cap.most()), (2, 2));
     }
 
     /// The node's probe is dropped before the outside embedder is asked.
