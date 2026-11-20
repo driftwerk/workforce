@@ -245,6 +245,42 @@
           "00000000-0000-4000-8000-000000000001"
         ]
       }
+    },
+    {
+      "name": "a ticket held back waits on someone, and the next starts",
+      "tickets": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "state": "todo",
+          "rank": 1024,
+          "needs": [],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-1",
+          "heldBack": "its session ended as it started (exit 1)"
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000002",
+          "state": "todo",
+          "rank": 2048,
+          "needs": [],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-2"
+        }
+      ],
+      "progress": {
+        "done": 0,
+        "doing": 0,
+        "review": 0,
+        "ready": 1,
+        "blocked": 1,
+        "waiting": 0,
+        "total": 2,
+        "next": [
+          "ACM-2"
+        ]
+      }
     }
   ]
 }
