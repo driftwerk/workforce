@@ -163,3 +163,51 @@ pub(crate) fn programs(
     ]
     .into()
 }
+
+/// Everything logged, as one string.
+#[derive(Clone, Default)]
+pub(crate) struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl Captured {
+    /// What this thread logs, at every level, while the guard lives: a
+    /// desk on a current-thread runtime logs its tasks' here.
+    pub(crate) fn on_this_thread() -> (Self, (tracing::subscriber::DefaultGuard, tracing::Dispatch))
+    {
+        let log = Self::default();
+        let logging = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_ansi(false)
+                .with_writer(log.clone())
+                .finish(),
+        );
+        // Under `cargo test` other tests' threads share these callsites. A
+        // second live subscriber keeps tracing from caching "off" for them
+        // on a thread that listens to nothing; what is caught is still only
+        // what this thread logs.
+        let second = tracing::Dispatch::new(tracing_subscriber::registry());
+        tracing::callsite::rebuild_interest_cache();
+        (log, (logging, second))
+    }
+
+    pub(crate) fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Captured;
+    fn make_writer(&'a self) -> Captured {
+        self.clone()
+    }
+}

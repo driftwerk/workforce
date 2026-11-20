@@ -132,6 +132,11 @@ pub struct Runs {
     /// it, [`DeskStore::adopt_ticket`] and [`DeskStore::release_ticket`]
     /// set it.
     pub adopted: bool,
+    /// Why it waits in To do for someone to start it, its plan not
+    /// starting it by itself. Read only: [`DeskStore::put_ticket_holding`]
+    /// sets it, and starting it, handing it out, moving it to another
+    /// column or letting it go from its plan clears it.
+    pub held_back: Option<String>,
 }
 
 /// What a ticket a plan takes on must be as it is claimed: no one has it,
@@ -405,8 +410,8 @@ impl DeskStore {
         let client = self.pool().get().await?;
         client
             .query(
-                "SELECT id, plan, engine, folder, view, machine, model, repo, adopted FROM tickets \
-                 WHERE plan = $1",
+                "SELECT id, plan, engine, folder, view, machine, model, repo, adopted, held_back \
+                 FROM tickets WHERE plan = $1",
                 &[&plan_id],
             )
             .await?
@@ -425,6 +430,7 @@ impl DeskStore {
                         model: r.try_get("model")?,
                         repo: r.try_get("repo")?,
                         adopted: r.try_get("adopted")?,
+                        held_back: r.try_get("held_back")?,
                     },
                 ))
             })
@@ -472,7 +478,7 @@ impl DeskStore {
         let row = tx
             .query_opt(
                 "UPDATE tickets SET state = $3, rank = $4, state_at = $5, updated_at = $5, \
-                 version = version + 1 WHERE id = $1 AND version = $2 AND plan = $6 \
+                 held_back = NULL, version = version + 1 WHERE id = $1 AND version = $2 AND plan = $6 \
                  RETURNING version, engine, folder, view, machine, model, adopted, repo",
                 &[
                     &t.id,
@@ -508,6 +514,7 @@ impl DeskStore {
             machine: row.try_get(4)?,
             model: row.try_get(5)?,
             adopted: row.try_get(6)?,
+            held_back: None,
             repo: row.try_get(7)?,
         })
     }
@@ -564,7 +571,8 @@ impl DeskStore {
         let n = tx
             .execute(
                 "UPDATE tickets SET plan = NULL, engine = NULL, folder = NULL, view = NULL, \
-                 machine = NULL, model = NULL, repo = NULL, adopted = false, version = version + 1 \
+                 machine = NULL, model = NULL, repo = NULL, adopted = false, held_back = NULL, \
+                 version = version + 1 \
                  WHERE id = $1 AND plan = $2",
                 &[&ticket, &plan],
             )
@@ -846,6 +854,7 @@ mod tests {
                 machine: Some("devbox".into()),
                 model: Some("gpt-5.5".into()),
                 adopted: false,
+                held_back: None,
             };
             s.put_runs(t.id, &runs).await.unwrap();
             assert_eq!(s.plan_runs(p.id).await.unwrap(), vec![(t.id, runs)]);
@@ -872,6 +881,7 @@ mod tests {
                 machine: None,
                 model: None,
                 adopted: false,
+                held_back: None,
             },
         )
         .await
@@ -945,6 +955,7 @@ mod tests {
                     machine: None,
                     model: None,
                     adopted: false,
+                    held_back: None,
                 },
             )
             .await
@@ -1013,6 +1024,7 @@ mod tests {
                 machine: None,
                 model: None,
                 adopted: false,
+                held_back: None,
             };
             let mut rows = vec![(first, runs.clone()), (second, runs)];
             let r = Revision {
