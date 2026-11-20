@@ -5,4 +5,6 @@ pub mod graph;
 pub mod indexer;
 pub mod lease;
 pub mod query;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 pub mod vector;
