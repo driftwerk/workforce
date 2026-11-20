@@ -47,7 +47,7 @@ fn code_vectors_are_kept_where_vellev_code_says_and_in_vellev_otherwise() {
     assert!(
         plain.vellev.code_node()
             == VellevNode {
-                table: "[vellev.code]",
+                keys: &[CODE_API_KEY, VELLEV_API_KEY],
                 ..plain.vellev.node()
             }
     );

@@ -246,7 +246,7 @@ impl VellevCodeVectorStore {
         let owner = match workforce_vellev::index_claim(&self.tenants, OWNER, graph).await {
             Ok(owner) => owner,
             Err(e) => {
-                if let Some(misrouted) = e.downcast_ref::<Unusable>() {
+                if let Some(misrouted @ Unusable::Misrouted { .. }) = e.downcast_ref() {
                     *owned() = Some(Owned::Misrouted(misrouted.clone(), Instant::now()));
                 }
                 return Err(e);
@@ -275,8 +275,8 @@ impl VellevCodeVectorStore {
 
     /// The tenant, as reads and as writes reach it, and how the code
     /// collections embed: what an equivalence check needs.
-    pub fn embedded_as(&self) -> Result<(&workforce_vellev::Tenants, Embedding)> {
-        Ok((&self.tenants, self.entities.wanted().embedding.clone()))
+    pub fn embedded_as(&self) -> (&workforce_vellev::Tenants, Embedding) {
+        (&self.tenants, self.entities.wanted().embedding.clone())
     }
 
     /// `e`, an indexing of `what` that failed, as the sink hears of it,
@@ -1098,7 +1098,7 @@ mod tests {
         }
     }
 
-    const SMALL: &str = "BAAI/bge-small-en-v1.5";
+    use workforce_vellev::testing::SMALL;
 
     /// bge-small, as `[vellev.code]` would name it with bge's prefix.
     fn small() -> Embedding {
@@ -1141,7 +1141,7 @@ mod tests {
             assert_eq!(embedding.properties, [property]);
         }
         assert_eq!(
-            configured.embedded_as().unwrap().1,
+            configured.embedded_as().1,
             configured.entities.wanted().embedding
         );
     }
@@ -1911,7 +1911,7 @@ mod tests {
             .await
             .unwrap();
         let store = VellevCodeVectorStore::new(&node.url, &node.key, &node.tenant).unwrap();
-        let logged = crate::vector::tests::logged(async {
+        let logged = workforce_vellev::testing::logged::during(async {
             store.ensure_collections().await.unwrap();
         })
         .await;

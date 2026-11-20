@@ -598,8 +598,9 @@ and a `query_prefix` without a model.
 **A node that does not serve the tenant** answers 421 `not_served_here`.
 The hub says so once, naming the node and the tenant ("misrouted: the
 vellev node at … does not serve tenant '…'"), logs it at ERROR, counts it
-in `workforce.vellev.misrouted_total{tenant}`, and asks again only at the
-next recheck (60 s). Alert on that counter above 0. Meanwhile
+in `workforce_vellev_misrouted_total{tenant}` on the hub's `/metrics`,
+and asks again only at the next recheck (60 s). Alert on
+`increase(workforce_vellev_misrouted_total[5m]) > 0`. Meanwhile
 `vector_health` is unhealthy naming the node and tenant, and code
 questions are answered from the graph with `vectors_skipped` saying
 "code search unavailable: misrouted: …". `[knowledge] code_search_enabled

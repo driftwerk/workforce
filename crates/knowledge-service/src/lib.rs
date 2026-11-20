@@ -1670,9 +1670,26 @@ mod tests {
         gate: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
         /// Writes of entities that came to the gate.
         at_gate: std::sync::atomic::AtomicUsize,
+        /// Keeping track of its vectors on a node that does not serve its
+        /// tenant: everything but making its collections is refused, and
+        /// counted in `asked` by method. Its collections are made: a
+        /// failure there is logged where another test listens.
+        misrouted: bool,
+        asked: std::sync::Mutex<std::collections::BTreeMap<&'static str, usize>>,
     }
 
     impl Untracked {
+        fn refused(&self, method: &'static str) -> Result<()> {
+            if !self.misrouted {
+                return Ok(());
+            }
+            *self.asked.lock().unwrap().entry(method).or_default() += 1;
+            Err(eyre::Report::new(workforce_vellev::Unusable::Misrouted {
+                tenant: "code".into(),
+                node: self.base_url().into(),
+            }))
+        }
+
         /// Record the mark of the lease the run writing to `repo_id` holds.
         async fn see_lease(&self, repo_id: &str) {
             let Some(graph) = self.graph.get() else {
@@ -1689,10 +1706,18 @@ mod tests {
         fn backend(&self) -> &'static str {
             self.named.unwrap_or(VectorKeys::WEAVIATE)
         }
+        fn tracks_completeness(&self) -> bool {
+            self.misrouted
+        }
+        async fn identity(&self, _: bool) -> Result<String> {
+            self.refused("identity")?;
+            Ok(format!("untracked:{}", self.base_url()))
+        }
         async fn ensure_collections(&self) -> Result<()> {
             Ok(())
         }
         async fn health_check(&self) -> Result<bool> {
+            self.refused("health_check")?;
             Ok(true)
         }
         fn base_url(&self) -> &str {
@@ -1707,6 +1732,7 @@ mod tests {
             &self,
             entities: &[workforce_codebase_knowledge::vector::VectorCodeEntity],
         ) -> Result<usize> {
+            self.refused("index_entities")?;
             if let Some(entity) = entities.first() {
                 self.see_lease(&entity.repo_id).await;
             }
@@ -1727,6 +1753,7 @@ mod tests {
             _: Option<workforce_codebase_knowledge::graph::entities::EntityKind>,
             _: usize,
         ) -> Result<Vec<workforce_codebase_knowledge::vector::VectorSearchResult>> {
+            self.refused("search_entities")?;
             self.searched
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(Vec::new())
@@ -1735,6 +1762,7 @@ mod tests {
             &self,
             _: &str,
         ) -> Result<workforce_codebase_knowledge::vector::DeleteOutcome> {
+            self.refused("delete_repo_entities")?;
             Ok(Default::default())
         }
         async fn delete_entities_by_file(
@@ -1742,6 +1770,7 @@ mod tests {
             repo_id: &str,
             file: &str,
         ) -> Result<workforce_codebase_knowledge::vector::DeleteOutcome> {
+            self.refused("delete_entities_by_file")?;
             self.see_lease(repo_id).await;
             self.dropped.lock().unwrap().push(file.to_string());
             Ok(Default::default())
@@ -1750,12 +1779,14 @@ mod tests {
             &self,
             summaries: &[workforce_codebase_knowledge::vector::VectorCodeSummary],
         ) -> Result<usize> {
+            self.refused("index_summaries")?;
             Ok(summaries.len())
         }
         async fn delete_repo_summaries(
             &self,
             _: &str,
         ) -> Result<workforce_codebase_knowledge::vector::DeleteOutcome> {
+            self.refused("delete_repo_summaries")?;
             Ok(Default::default())
         }
         async fn delete_summaries_by_file(
@@ -1763,9 +1794,19 @@ mod tests {
             _: &str,
             _: &str,
         ) -> Result<workforce_codebase_knowledge::vector::DeleteOutcome> {
+            self.refused("delete_summaries_by_file")?;
             Ok(Default::default())
         }
         async fn entity_count(&self, _: &str) -> Result<usize> {
+            self.refused("entity_count")?;
+            Ok(0)
+        }
+        async fn summary_count(&self, _: &str) -> Result<usize> {
+            self.refused("summary_count")?;
+            Ok(0)
+        }
+        async fn sweep(&self, _: &str, _: &str) -> Result<usize> {
+            self.refused("sweep")?;
             Ok(0)
         }
     }
@@ -3100,7 +3141,7 @@ mod tests {
 
     /// The size of the vectors `store` keeps.
     fn dimensions_of(store: &VellevCodeVectorStore) -> usize {
-        store.embedded_as().unwrap().1.dimensions as usize
+        store.embedded_as().1.dimensions as usize
     }
 
     #[async_trait::async_trait]
@@ -3543,115 +3584,17 @@ mod tests {
         }
     }
 
-    /// A store that keeps track of its vectors and whose node does not
-    /// serve its tenant, counting what it is asked, by method. Its
-    /// collections are made: a failure there is logged where another
-    /// test listens.
-    #[derive(Default)]
-    struct Misrouting {
-        asked: std::sync::Mutex<std::collections::BTreeMap<&'static str, usize>>,
-    }
-
-    impl Misrouting {
-        fn refused<T>(&self, method: &'static str) -> Result<T> {
-            *self.asked.lock().unwrap().entry(method).or_default() += 1;
-            Err(eyre::Report::new(workforce_vellev::Unusable::Misrouted {
-                tenant: "code".into(),
-                node: "http://code-node:18080".into(),
-            }))
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl CodeVectorStore for Misrouting {
-        fn backend(&self) -> &'static str {
-            VectorKeys::VELLEV
-        }
-        fn tracks_completeness(&self) -> bool {
-            true
-        }
-        async fn identity(&self, _: bool) -> Result<String> {
-            self.refused("identity")
-        }
-        async fn ensure_collections(&self) -> Result<()> {
-            Ok(())
-        }
-        async fn health_check(&self) -> Result<bool> {
-            self.refused("health_check")
-        }
-        fn base_url(&self) -> &str {
-            "http://code-node:18080"
-        }
-        fn set_insert_error_sink(
-            &self,
-            _: Arc<dyn workforce_codebase_knowledge::vector::health::InsertErrorSink>,
-        ) {
-        }
-        async fn index_entities(
-            &self,
-            _: &[workforce_codebase_knowledge::vector::VectorCodeEntity],
-        ) -> Result<usize> {
-            self.refused("index_entities")
-        }
-        async fn search_entities(
-            &self,
-            _: &str,
-            _: Option<&str>,
-            _: Option<workforce_codebase_knowledge::graph::entities::EntityKind>,
-            _: usize,
-        ) -> Result<Vec<workforce_codebase_knowledge::vector::VectorSearchResult>> {
-            self.refused("search_entities")
-        }
-        async fn delete_repo_entities(
-            &self,
-            _: &str,
-        ) -> Result<workforce_codebase_knowledge::vector::DeleteOutcome> {
-            self.refused("delete_repo_entities")
-        }
-        async fn delete_entities_by_file(
-            &self,
-            _: &str,
-            _: &str,
-        ) -> Result<workforce_codebase_knowledge::vector::DeleteOutcome> {
-            self.refused("delete_entities_by_file")
-        }
-        async fn index_summaries(
-            &self,
-            _: &[workforce_codebase_knowledge::vector::VectorCodeSummary],
-        ) -> Result<usize> {
-            self.refused("index_summaries")
-        }
-        async fn delete_repo_summaries(
-            &self,
-            _: &str,
-        ) -> Result<workforce_codebase_knowledge::vector::DeleteOutcome> {
-            self.refused("delete_repo_summaries")
-        }
-        async fn delete_summaries_by_file(
-            &self,
-            _: &str,
-            _: &str,
-        ) -> Result<workforce_codebase_knowledge::vector::DeleteOutcome> {
-            self.refused("delete_summaries_by_file")
-        }
-        async fn entity_count(&self, _: &str) -> Result<usize> {
-            self.refused("entity_count")
-        }
-        async fn summary_count(&self, _: &str) -> Result<usize> {
-            self.refused("summary_count")
-        }
-        async fn sweep(&self, _: &str, _: &str) -> Result<usize> {
-            self.refused("sweep")
-        }
-    }
-
     /// A fill whose store's node does not serve its tenant stops the
     /// repo's turn at the first refusal, keeps its pending files, and says
     /// why.
     #[tokio::test]
     async fn a_misrouted_fill_stops_the_repos_turn_and_keeps_its_pending_files() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Misrouting::default());
+        let store = Arc::new(Untracked {
+            named: Some(VectorKeys::VELLEV),
+            misrouted: true,
+            ..Untracked::default()
+        });
         let given = Arc::clone(&store) as Arc<dyn CodeVectorStore>;
         let (root, service) = service_on(dir.path(), given, "").unwrap();
         std::fs::write(
@@ -3689,7 +3632,7 @@ mod tests {
         assert!(last_error.contains("misrouted"), "{last_error}");
     }
 
-    const SMALL: &str = "BAAI/bge-small-en-v1.5";
+    use workforce_vellev::testing::SMALL;
 
     /// `memories`' node, with code vectors in `code`'s tenant, embedded
     /// with bge-small and bge's query prefix.
@@ -3779,7 +3722,7 @@ mod tests {
             return;
         };
         let today = VellevCodeVectorStore::new(&code.url, &code.key, &code.tenant).unwrap();
-        let made = today.embedded_as().unwrap().1;
+        let made = today.embedded_as().1;
         assert_eq!(made.dimensions, 768);
         today.ensure_collections().await.unwrap();
 
@@ -3815,6 +3758,22 @@ mod tests {
         assert_eq!(held, 0);
     }
 
+    /// A summary of `file` of `repo`.
+    fn file_summary(
+        repo: &str,
+        file: &str,
+    ) -> workforce_codebase_knowledge::vector::VectorCodeSummary {
+        workforce_codebase_knowledge::vector::VectorCodeSummary {
+            entity_id: file.to_string(),
+            repo_id: repo.to_string(),
+            granularity: "file".into(),
+            file_path: file.to_string(),
+            summary_text: format!("What {file} does."),
+            is_stale: false,
+            generation: String::new(),
+        }
+    }
+
     /// The keys and files of what the store holds of `repo`, entities or
     /// `summaries`.
     async fn held_of(
@@ -3843,17 +3802,11 @@ mod tests {
         let pass = service.backfill_vectors().await.unwrap();
         assert_eq!(pass.filled, std::slice::from_ref(&second));
         let store = service.vector_store().clone().unwrap();
-        let summary = |repo: &str| workforce_codebase_knowledge::vector::VectorCodeSummary {
-            entity_id: "src/config.rs".into(),
-            repo_id: repo.to_string(),
-            granularity: "file".into(),
-            file_path: "src/config.rs".into(),
-            summary_text: "Reads the configuration.".into(),
-            is_stale: false,
-            generation: String::new(),
-        };
         store
-            .index_summaries(&[summary(&first), summary(&second)])
+            .index_summaries(&[
+                file_summary(&first, "src/config.rs"),
+                file_summary(&second, "src/config.rs"),
+            ])
             .await
             .unwrap();
         let kept = (
@@ -3887,17 +3840,11 @@ mod tests {
         let (repo, service) =
             filled_by_config(dir.path(), &with_code_in(&memories, &code.tenant)).await;
         let store = service.vector_store().clone().unwrap();
-        let summary = |file: &str| workforce_codebase_knowledge::vector::VectorCodeSummary {
-            entity_id: file.to_string(),
-            repo_id: repo.clone(),
-            granularity: "file".into(),
-            file_path: file.to_string(),
-            summary_text: format!("What {file} does."),
-            is_stale: false,
-            generation: String::new(),
-        };
         store
-            .index_summaries(&[summary("src/config.rs"), summary("src/mail.rs")])
+            .index_summaries(&[
+                file_summary(&repo, "src/config.rs"),
+                file_summary(&repo, "src/mail.rs"),
+            ])
             .await
             .unwrap();
         let of_file = |held: &[(String, String)], file: &str| {

@@ -257,6 +257,132 @@ pub mod testing {
         }
     }
 
+    /// The model tests of a configured code model embed with, as a node
+    /// under test allows it.
+    pub const SMALL: &str = "BAAI/bge-small-en-v1.5";
+
+    /// A local node that serves no tenant: it answers its health, and
+    /// every request of a tenant with 421 `not_served_here`, counting those.
+    pub struct NotServing {
+        pub url: String,
+        asked: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    /// What a node answers a request of a tenant it does not serve.
+    pub fn not_served_here() -> axum::response::Response {
+        use axum::response::IntoResponse;
+        (
+            axum::http::StatusCode::MISDIRECTED_REQUEST,
+            axum::Json(serde_json::json!({ "error": {
+                "code": "not_served_here",
+                "message": "this node does not serve the tenant; ask a node that serves it",
+            }})),
+        )
+            .into_response()
+    }
+
+    impl NotServing {
+        pub async fn up() -> Self {
+            use axum::response::IntoResponse;
+            let asked = std::sync::Arc::<std::sync::atomic::AtomicUsize>::default();
+            let counting = std::sync::Arc::clone(&asked);
+            let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+                let counting = std::sync::Arc::clone(&counting);
+                async move {
+                    if uri.path().starts_with("/health") {
+                        return axum::http::StatusCode::OK.into_response();
+                    }
+                    counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    not_served_here()
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("a free port");
+            let url = format!("http://{}", listener.local_addr().expect("bound"));
+            tokio::spawn(async move { axum::serve(listener, app).await });
+            Self { url, asked }
+        }
+
+        /// The requests of a tenant it was sent.
+        pub fn asked(&self) -> usize {
+            self.asked.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        pub fn tenants(&self, tenant: &str) -> Tenants {
+            connect(&self.url, "key", tenant).expect("a usable fake node")
+        }
+
+        /// What a request of `tenant` here fails as.
+        pub fn misrouted(&self, tenant: &str) -> Unusable {
+            Unusable::Misrouted {
+                tenant: tenant.to_string(),
+                node: self.url.clone(),
+            }
+        }
+    }
+
+    /// What is logged on this thread, by a subscriber of the whole process:
+    /// a test's events, on its own thread, are kept apart from every
+    /// other's, and no test's subscriber can leave another's events
+    /// unheard, as one of a thread's own can once a callsite was first
+    /// reached on a thread without one.
+    pub mod logged {
+        use std::cell::RefCell;
+
+        thread_local! {
+            static LOGGED: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+        }
+
+        struct ThisThread;
+
+        impl std::io::Write for ThisThread {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                LOGGED.with(|logged| logged.borrow_mut().extend_from_slice(buf));
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// Start keeping what this thread logs, from now.
+        pub fn kept() {
+            static SUBSCRIBED: std::sync::Once = std::sync::Once::new();
+            SUBSCRIBED.call_once(|| {
+                let subscriber = tracing_subscriber::fmt()
+                    .with_writer(|| ThisThread)
+                    .with_ansi(false)
+                    .finish();
+                tracing::subscriber::set_global_default(subscriber)
+                    .expect("no other subscriber of the whole process");
+            });
+            LOGGED.with(|logged| logged.borrow_mut().clear());
+        }
+
+        /// What this thread logged since [`kept`].
+        pub fn text() -> String {
+            LOGGED.with(|logged| String::from_utf8_lossy(&logged.borrow()).into_owned())
+        }
+
+        /// The lines of [`text`] that hold `level`.
+        pub fn at(level: &str) -> Vec<String> {
+            text()
+                .lines()
+                .filter(|line| line.contains(level))
+                .map(str::to_string)
+                .collect()
+        }
+
+        /// What is logged on this thread while `f` runs.
+        pub async fn during<F: std::future::Future>(f: F) -> String {
+            kept();
+            f.await;
+            text()
+        }
+    }
+
     /// A fresh tenant on the node under test.
     pub struct Node {
         pub url: String,
@@ -387,7 +513,7 @@ mod tests {
     const REMEDY: &str = "put it right";
 
     /// The model the tests of a configured one embed with.
-    const SMALL: &str = "BAAI/bge-small-en-v1.5";
+    use crate::testing::SMALL;
 
     fn notes(embedding: Embedding) -> Collection {
         collection(
@@ -940,25 +1066,70 @@ mod tests {
         }
     }
 
-    const NOT_SERVED: (u16, &str, &str) = (
-        421,
-        "not_served_here",
-        "tenant harbor is not served by this node; ask a node that serves it",
-    );
-
-    fn not_served() -> std::sync::Arc<Fake> {
-        let (status, code, message) = NOT_SERVED;
-        std::sync::Arc::new(Fake::answering(status, code, message))
+    fn is_misrouted(report: &Report, at: &Tenants) -> bool {
+        unusable(report)
+            == Some(&Unusable::Misrouted {
+                tenant: "harbor".into(),
+                node: at.node.clone(),
+            })
     }
 
-    fn is_misrouted(report: &Report, at: &Tenants) -> bool {
-        unusable(report).is_some_and(|unusable| {
-            *unusable
-                == Unusable::Misrouted {
-                    tenant: "harbor".into(),
-                    node: at.node.clone(),
+    /// A node that does not serve the tenant is told once, by its tenant and
+    /// its URL, counted, and not asked again until the recheck; a request
+    /// made outside a collection's checks is told and counted too. Run on a
+    /// runtime of this thread, as `Ensured` spawns its check, with what it
+    /// counts scraped as the hub's `/metrics` renders it.
+    #[test]
+    fn a_tenant_the_node_does_not_serve_is_told_once_named_and_counted() {
+        use crate::testing::logged;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let scrape = recorder.handle();
+        let scraped = |count: u64| {
+            let rendered = scrape.render();
+            let line = format!("workforce_vellev_misrouted_total{{tenant=\"harbor\"}} {count}");
+            assert!(rendered.lines().any(|at| at == line), "{line}: {rendered}");
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        logged::kept();
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let node = crate::testing::NotServing::up().await;
+                let tenants = node.tenants("harbor");
+                let wanted = notes(local_embedding(&["body"]));
+                let ensured = Ensured::new(tenants.clone(), wanted.clone(), REMEDY);
+                let first = ensured.records().await.unwrap_err();
+                assert!(is_misrouted(&first, &tenants), "{first:?}");
+                assert!(first.to_string().starts_with("misrouted: "), "{first}");
+                assert_eq!(node.asked(), 1);
+                scraped(1);
+                let errors = logged::at("ERROR");
+                assert_eq!(errors.len(), 1, "{errors:?}");
+                assert!(
+                    errors[0].contains("tenant=harbor")
+                        && errors[0].contains(&format!("node={}", node.url)),
+                    "{errors:?}"
+                );
+
+                tokio::time::sleep(RETRY_AFTER + Duration::from_millis(100)).await;
+                let again = ensured.records().await.unwrap_err();
+                let written = ensured.run(|| tenants.writes.apply(Vec::new())).await;
+                for cached in [again, written.unwrap_err()] {
+                    assert!(is_misrouted(&cached, &tenants), "{cached:?}");
                 }
-        })
+                assert_eq!(node.asked(), 1, "told again without asking");
+                scraped(1);
+
+                let direct = tenants.writes.apply(Vec::new()).await.unwrap_err();
+                let direct = failure(direct, &tenants, Asked::request(&wanted));
+                assert!(is_misrouted(&direct, &tenants), "{direct:?}");
+                assert_eq!(node.asked(), 2);
+                scraped(2);
+                assert_eq!(logged::at("ERROR").len(), 2);
+            })
+        });
     }
 
     /// A collection made sure of whose node then stops serving the tenant
@@ -986,14 +1157,7 @@ mod tests {
                 counting.fetch_add(1, SeqCst);
                 let path = uri.path();
                 if flipping.load(SeqCst) {
-                    let (status, code, message) = NOT_SERVED;
-                    return (
-                        axum::http::StatusCode::from_u16(status).unwrap(),
-                        axum::Json(serde_json::json!({
-                            "error": { "code": code, "message": message }
-                        })),
-                    )
-                        .into_response();
+                    return crate::testing::not_served_here();
                 }
                 if path.ends_with("/collections") {
                     return axum::Json(serde_json::json!({ "collections": [] })).into_response();
@@ -1018,30 +1182,32 @@ mod tests {
         assert_eq!(requests(), made_sure, "told without asking");
     }
 
+    /// Seeding by an embedder of [`LOCAL_DIMENSIONS`]-sized vectors.
+    fn seeded() -> seeding::Seeding {
+        let embedder = Fixed(vec![0.5; LOCAL_DIMENSIONS as usize]);
+        seeding::Seeding::new(std::sync::Arc::new(embedder), 2, 1)
+    }
+
+    /// A line of `lines` to write.
+    fn a_line(lines: &Collection) -> vellev_client::api::Change {
+        let body = serde_json::json!({ "body": "a line" });
+        vellev_client::api::Change::upsert(
+            lines.name.clone(),
+            vellev_core::ObjectId(uuid::Uuid::from_u128(1)),
+            vellev_client::api::Content::new(body.as_object().cloned().unwrap()),
+        )
+    }
+
     /// The requests made outside a collection's checks, markers and
     /// seeding, are told as misrouted as well; anything else is as it was.
     #[tokio::test]
     async fn a_marker_or_seeding_request_the_node_does_not_serve_is_misrouted() {
-        let tenants = not_served().serve().await;
+        let tenants = crate::testing::NotServing::up().await.tenants("harbor");
         let claimed = index_claim(&tenants, "CodeGraph", "g").await.unwrap_err();
         assert!(is_misrouted(&claimed, &tenants), "{claimed:?}");
         let lines = notes(local_embedding(&["body"]));
-        let seeding = seeding::Seeding::new(
-            std::sync::Arc::new(Fixed(vec![0.0; LOCAL_DIMENSIONS as usize])),
-            2,
-            1,
-        );
-        let upsert = vellev_client::api::Change::upsert(
-            lines.name.clone(),
-            vellev_core::ObjectId(uuid::Uuid::from_u128(1)),
-            vellev_client::api::Content::new(
-                serde_json::json!({ "body": "a line" })
-                    .as_object()
-                    .cloned()
-                    .unwrap(),
-            ),
-        );
-        let applied = seeding::apply_embedded(&tenants, &lines, &seeding, vec![upsert]).await;
+        let applied =
+            seeding::apply_embedded(&tenants, &lines, &seeded(), vec![a_line(&lines)]).await;
         let applied = applied.unwrap_err();
         assert!(is_misrouted(&applied, &tenants), "{applied:?}");
         let measured = seeding::equivalence(
@@ -1077,22 +1243,7 @@ mod tests {
         let fake = std::sync::Arc::new(Fake::answering(500, "internal", "not to be asked"));
         let tenants = fake.serve().await;
         let small = notes(embedding_of(SMALL, 384, None, &["body"]));
-        let seeding = seeding::Seeding::new(
-            std::sync::Arc::new(Fixed(vec![0.5; LOCAL_DIMENSIONS as usize])),
-            2,
-            1,
-        );
-        let upsert = vellev_client::api::Change::upsert(
-            small.name.clone(),
-            vellev_core::ObjectId(uuid::Uuid::from_u128(1)),
-            vellev_client::api::Content::new(
-                serde_json::json!({ "body": "a line" })
-                    .as_object()
-                    .cloned()
-                    .unwrap(),
-            ),
-        );
-        let refused = seeding::apply_embedded(&tenants, &small, &seeding, vec![upsert])
+        let refused = seeding::apply_embedded(&tenants, &small, &seeded(), vec![a_line(&small)])
             .await
             .unwrap_err()
             .to_string();

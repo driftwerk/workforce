@@ -25,6 +25,7 @@ use workforce_codebase_knowledge::vector::{
     health::InsertErrorSink, CodeVectorStore, DeleteOutcome, Differing, VectorCodeEntity,
     VectorCodeSummary, VectorSearchResult,
 };
+use workforce_vellev::testing::{logged, NotServing};
 
 const REPO: &str = "repo";
 const QUESTION: &str = "how is `parse_config` used";
@@ -2392,82 +2393,6 @@ async fn a_misrouted_store_leaves_code_search_unavailable_saying_so() {
     }
 }
 
-/// What is logged on this thread, by a subscriber of the whole process: a
-/// test's events, on its own thread, are kept apart from every other's,
-/// and no test's subscriber can leave another's events unheard.
-mod logged {
-    use std::cell::RefCell;
-    use std::sync::Once;
-
-    thread_local! {
-        static LOGGED: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
-    }
-
-    struct ThisThread;
-
-    impl std::io::Write for ThisThread {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            LOGGED.with(|logged| logged.borrow_mut().extend_from_slice(buf));
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// Start keeping what this thread logs, from now.
-    pub fn kept() {
-        static SUBSCRIBED: Once = Once::new();
-        SUBSCRIBED.call_once(|| {
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(|| ThisThread)
-                .with_ansi(false)
-                .finish();
-            tracing::subscriber::set_global_default(subscriber).unwrap();
-        });
-        LOGGED.with(|logged| logged.borrow_mut().clear());
-    }
-
-    /// The lines this thread logged since [`kept`] that hold `level`.
-    pub fn at(level: &str) -> Vec<String> {
-        LOGGED.with(|logged| {
-            String::from_utf8_lossy(&logged.borrow())
-                .lines()
-                .filter(|line| line.contains(level))
-                .map(str::to_string)
-                .collect()
-        })
-    }
-}
-
-/// A node that says it does not serve the tenant to every request of it,
-/// counting those; its readiness, which the health client asks, is not
-/// one.
-async fn not_serving() -> (String, Arc<AtomicUsize>) {
-    let asked = Arc::new(AtomicUsize::new(0));
-    let counting = Arc::clone(&asked);
-    let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
-        let counting = Arc::clone(&counting);
-        async move {
-            if uri.path().starts_with("/v1/tenants/") {
-                counting.fetch_add(1, Ordering::SeqCst);
-            }
-            (
-                axum::http::StatusCode::MISDIRECTED_REQUEST,
-                axum::Json(serde_json::json!({ "error": {
-                    "code": "not_served_here",
-                    "message": "tenant code is not served by this node; ask a node that serves it",
-                }})),
-            )
-        }
-    });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (url, asked)
-}
-
 /// An insert-error sink that keeps what it hears.
 #[derive(Default)]
 struct Heard(Mutex<Vec<String>>);
@@ -2478,12 +2403,8 @@ impl InsertErrorSink for Heard {
     }
 }
 
-fn is_misrouted(e: &eyre::Report, node: &str) -> bool {
-    e.downcast_ref::<workforce_vellev::Unusable>()
-        == Some(&workforce_vellev::Unusable::Misrouted {
-            tenant: "code".into(),
-            node: node.to_string(),
-        })
+fn is_misrouted(e: &eyre::Report, node: &NotServing) -> bool {
+    e.downcast_ref() == Some(&node.misrouted("code"))
 }
 
 /// A code store whose node does not serve its tenant asks once, from
@@ -2492,30 +2413,30 @@ fn is_misrouted(e: &eyre::Report, node: &str) -> bool {
 #[tokio::test]
 async fn a_misrouted_code_store_asks_once_and_says_where() {
     use workforce_codebase_knowledge::vector::VellevCodeVectorStore;
-    let (node, asked) = not_serving().await;
+    let node = NotServing::up().await;
     let fresh = || {
-        VellevCodeVectorStore::new(&node, "key", "code")
+        VellevCodeVectorStore::new(&node.url, "key", "code")
             .unwrap()
             .for_graph("g")
     };
-    let once = |before: usize| asked.load(Ordering::SeqCst) - before;
+    let once = |before: usize| node.asked() - before;
 
-    let before = asked.load(Ordering::SeqCst);
+    let before = node.asked();
     let searched = fresh().search_entities(QUESTION, Some(REPO), None, 5).await;
     assert!(is_misrouted(&searched.unwrap_err(), &node));
     assert_eq!(once(before), 1, "search");
 
-    let before = asked.load(Ordering::SeqCst);
+    let before = node.asked();
     let identified = fresh().identity(false).await;
     assert!(is_misrouted(&identified.unwrap_err(), &node));
     assert_eq!(once(before), 1, "identity");
 
-    let before = asked.load(Ordering::SeqCst);
+    let before = node.asked();
     let deleted = fresh().delete_repo_entities(REPO).await;
     assert!(is_misrouted(&deleted.unwrap_err(), &node));
     assert_eq!(once(before), 1, "delete");
 
-    let before = asked.load(Ordering::SeqCst);
+    let before = node.asked();
     let store = fresh();
     let heard = Arc::new(Heard::default());
     store.set_insert_error_sink(Arc::clone(&heard) as Arc<dyn InsertErrorSink>);
@@ -2540,7 +2461,7 @@ async fn a_misrouted_code_store_asks_once_and_says_where() {
     assert_eq!(once(before), 1, "index");
     let heard = heard.0.lock().unwrap().clone();
     assert!(
-        heard.len() == 1 && heard[0].contains("misrouted") && heard[0].contains(&node),
+        heard.len() == 1 && heard[0].contains("misrouted") && heard[0].contains(&node.url),
         "{heard:?}"
     );
 
@@ -2567,9 +2488,9 @@ async fn a_misrouted_code_store_asks_once_and_says_where() {
 #[tokio::test]
 async fn two_questions_of_a_misrouted_store_within_the_recheck_cost_one_request() {
     use workforce_codebase_knowledge::vector::VellevCodeVectorStore;
-    let (node, asked) = not_serving().await;
+    let node = NotServing::up().await;
     let repo = recorded().await;
-    let store = VellevCodeVectorStore::new(&node, "key", "code")
+    let store = VellevCodeVectorStore::new(&node.url, "key", "code")
         .unwrap()
         .for_graph("g");
     let engine = QueryEngine::with_vector_store(Arc::clone(&repo.graph), Arc::new(store))
@@ -2582,5 +2503,5 @@ async fn two_questions_of_a_misrouted_store_within_the_recheck_cost_one_request(
             "{why}"
         );
     }
-    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    assert_eq!(node.asked(), 1);
 }

@@ -295,23 +295,7 @@ mod tests {
     /// naming the node and the tenant.
     #[tokio::test]
     async fn a_misrouted_code_store_is_unhealthy_naming_its_node_and_tenant() {
-        use axum::response::IntoResponse;
-        let app = axum::Router::new().fallback(|uri: axum::http::Uri| async move {
-            if uri.path().starts_with("/health") {
-                return axum::http::StatusCode::OK.into_response();
-            }
-            (
-                axum::http::StatusCode::MISDIRECTED_REQUEST,
-                axum::Json(serde_json::json!({ "error": {
-                    "code": "not_served_here",
-                    "message": "tenant code is not served by this node; ask a node that serves it",
-                }})),
-            )
-                .into_response()
-        });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = workforce_vellev::testing::NotServing::up().await.url;
         let store: Arc<dyn CodeVectorStore> = Arc::new(
             workforce_codebase_knowledge::vector::VellevCodeVectorStore::new(&url, "key", "code")
                 .unwrap(),

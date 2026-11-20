@@ -230,8 +230,6 @@ pub struct VectorSearchResult {
     pub score: f32,
 }
 
-/// Semantic search over a codebase's entities and summaries, whichever
-/// vector database holds them.
 /// Why a code question was answered without searching the code vectors.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CodeSearchUnavailable {
@@ -241,6 +239,8 @@ pub enum CodeSearchUnavailable {
     Misrouted(String),
 }
 
+/// Semantic search over a codebase's entities and summaries, whichever
+/// vector database holds them.
 #[async_trait]
 pub trait CodeVectorStore: Send + Sync {
     /// Ensure the entity and summary collections exist.
@@ -1468,43 +1468,24 @@ mod tests {
         }
     }
 
-    /// What is logged while `f` runs, as text.
-    pub(super) async fn logged<F: std::future::Future>(f: F) -> String {
-        #[derive(Clone, Default)]
-        struct Captured(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Captured {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let captured = Captured::default();
-        let writer = captured.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .finish();
-        let _logging = tracing::subscriber::set_default(subscriber);
-        f.await;
-        let bytes = captured.0.lock().unwrap().clone();
-        String::from_utf8(bytes).unwrap()
-    }
-
     /// Operators alert on these words, so they stay as they were.
     #[tokio::test]
     async fn skipped_records_are_logged_in_weaviates_words() {
         let store = WeaviateCodeVectorStore::new("http://127.0.0.1:1", None);
-        let entities = logged(store.index_entities(&[fixture_entity_with_content("")])).await;
+        let entities = workforce_vellev::testing::logged::during(
+            store.index_entities(&[fixture_entity_with_content("")]),
+        )
+        .await;
         assert!(
             entities.contains("skipped non-vectorizable entities in batch")
                 && entities.contains("operation=\"code_index_entities\"")
                 && entities.contains("filtered=1"),
             "{entities}"
         );
-        let summaries = logged(store.index_summaries(&[fixture_summary("")])).await;
+        let summaries = workforce_vellev::testing::logged::during(
+            store.index_summaries(&[fixture_summary("")]),
+        )
+        .await;
         assert!(
             summaries.contains("skipped non-vectorizable summaries in batch"),
             "{summaries}"

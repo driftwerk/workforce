@@ -2343,21 +2343,39 @@ impl std::fmt::Debug for VellevCodeConfig {
 const VELLEV: &str = "[vellev]";
 const VELLEV_CODE: &str = "[vellev.code]";
 
-/// The environment variable that sets `key` of `table`.
-fn vellev_variable(table: &str, key: &str) -> String {
-    let prefix = match table {
-        VELLEV_CODE => "WORKFORCE_VELLEV_CODE",
-        _ => "WORKFORCE_VELLEV",
-    };
-    format!("{prefix}_{}", key.to_uppercase())
-}
-
-/// A value as resolved, and the table it was read from.
+/// A value as resolved, the table it was read from, and the environment
+/// variable that sets it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Setting<'a> {
     pub value: &'a str,
     pub table: &'static str,
+    pub variable: &'static str,
 }
+
+impl Setting<'static> {
+    const fn unset(table: &'static str, variable: &'static str) -> Self {
+        Self {
+            value: "",
+            table,
+            variable,
+        }
+    }
+
+    fn set(self, value: &str) -> Setting<'_> {
+        Setting { value, ..self }
+    }
+}
+
+const VELLEV_URL: Setting = Setting::unset(VELLEV, "WORKFORCE_VELLEV_URL");
+const VELLEV_API_KEY: Setting = Setting::unset(VELLEV, "WORKFORCE_VELLEV_API_KEY");
+const VELLEV_TENANT: Setting = Setting::unset(VELLEV, "WORKFORCE_VELLEV_TENANT");
+const CODE_URL: Setting = Setting::unset(VELLEV_CODE, "WORKFORCE_VELLEV_CODE_URL");
+const CODE_API_KEY: Setting = Setting::unset(VELLEV_CODE, "WORKFORCE_VELLEV_CODE_API_KEY");
+const CODE_TENANT: Setting = Setting::unset(VELLEV_CODE, "WORKFORCE_VELLEV_CODE_TENANT");
+const CODE_MODEL: Setting = Setting::unset(VELLEV_CODE, "WORKFORCE_VELLEV_CODE_MODEL");
+const CODE_DIMENSIONS: Setting = Setting::unset(VELLEV_CODE, "WORKFORCE_VELLEV_CODE_DIMENSIONS");
+const CODE_QUERY_PREFIX: Setting =
+    Setting::unset(VELLEV_CODE, "WORKFORCE_VELLEV_CODE_QUERY_PREFIX");
 
 /// The vellev node a store keeps its vectors with: its URL, key and
 /// tenant, each from the table it was read from. No `Debug`: it holds the
@@ -2367,8 +2385,8 @@ pub struct VellevNode<'a> {
     pub url: Setting<'a>,
     pub api_key: Option<Setting<'a>>,
     pub tenant: Setting<'a>,
-    /// The table read first, whose keys fall back to `[vellev]`'s.
-    pub table: &'static str,
+    /// Where the key is read from, first to last.
+    pub keys: &'static [Setting<'static>],
 }
 
 /// The query prefix a code model was given.
@@ -2392,31 +2410,33 @@ pub struct CodeModel<'a> {
 impl VellevConfig {
     /// `[vellev]`'s own node: where memories and artifacts are kept.
     pub fn node(&self) -> VellevNode<'_> {
-        let at = |value| Setting {
-            value,
-            table: VELLEV,
-        };
         VellevNode {
-            url: at(&self.url),
-            api_key: self.api_key.as_deref().map(at),
-            tenant: at(&self.tenant),
-            table: VELLEV,
+            url: VELLEV_URL.set(&self.url),
+            api_key: self.api_key.as_deref().map(|key| VELLEV_API_KEY.set(key)),
+            tenant: VELLEV_TENANT.set(&self.tenant),
+            keys: &[VELLEV_API_KEY],
         }
     }
 
     /// The node code vectors are kept with: each of `[vellev.code]`'s keys
     /// where set, otherwise `[vellev]`'s.
     pub fn code_node(&self) -> VellevNode<'_> {
-        let node = self.node();
-        let code = |value| Setting {
-            value,
-            table: VELLEV_CODE,
-        };
+        let (node, code) = (self.node(), &self.code);
         VellevNode {
-            url: self.code.url.as_deref().map_or(node.url, code),
-            api_key: self.code.api_key.as_deref().map(code).or(node.api_key),
-            tenant: self.code.tenant.as_deref().map_or(node.tenant, code),
-            table: VELLEV_CODE,
+            url: code
+                .url
+                .as_deref()
+                .map_or(node.url, |url| CODE_URL.set(url)),
+            api_key: code
+                .api_key
+                .as_deref()
+                .map(|key| CODE_API_KEY.set(key))
+                .or(node.api_key),
+            tenant: code
+                .tenant
+                .as_deref()
+                .map_or(node.tenant, |tenant| CODE_TENANT.set(tenant)),
+            keys: &[CODE_API_KEY, VELLEV_API_KEY],
         }
     }
 
@@ -2427,7 +2447,7 @@ impl VellevConfig {
     /// the file's.
     pub fn code_model(&self) -> eyre::Result<Option<CodeModel<'_>>> {
         let code = &self.code;
-        let variable = vellev_variable(VELLEV_CODE, "dimensions");
+        let variable = CODE_DIMENSIONS.variable;
         let dimensions = match code.dimensions_env.as_deref() {
             Some(raw) => Some(
                 raw.trim()
@@ -2455,7 +2475,7 @@ impl VellevConfig {
             )),
             (None, Some(_)) => Err(eyre::eyre!(
                 "{VELLEV_CODE} dimensions needs {VELLEV_CODE} model (or {}): the model whose vectors are that size",
-                vellev_variable(VELLEV_CODE, "model")
+                CODE_MODEL.variable
             )),
             (Some(_), Some(0)) => Err(eyre::eyre!(
                 "{VELLEV_CODE} dimensions must be more than 0"
@@ -2483,22 +2503,17 @@ impl VellevNode<'_> {
     /// both.
     pub fn reachable(self, on_vellev: &str) -> eyre::Result<()> {
         if self.api_key.is_none_or(|key| key.value.is_empty()) {
-            let tables = match self.api_key {
-                Some(key) => vec![key.table],
-                None if self.table == VELLEV => vec![VELLEV],
-                None => vec![self.table, VELLEV],
-            };
-            let named = |name: &dyn Fn(&str) -> String| {
-                tables
-                    .iter()
-                    .map(|table| name(table))
-                    .collect::<Vec<_>>()
-                    .join(" or ")
-            };
+            let keys = self.api_key.as_slice();
+            let keys = if keys.is_empty() { self.keys } else { keys };
+            let tables: Vec<String> = keys
+                .iter()
+                .map(|key| format!("{} api_key", key.table))
+                .collect();
+            let variables: Vec<&str> = keys.iter().map(|key| key.variable).collect();
             return Err(eyre::eyre!(
                 "{on_vellev} needs {} (or {})",
-                named(&|table| format!("{table} api_key")),
-                named(&|table| vellev_variable(table, "api_key"))
+                tables.join(" or "),
+                variables.join(" or ")
             ));
         }
         let url = self.url.value.trim();
@@ -2518,7 +2533,7 @@ impl VellevNode<'_> {
                 "{on_vellev} needs {} tenant (or {}): \
                  the tenant everything is kept in, which an operator creates on the node",
                 self.tenant.table,
-                vellev_variable(self.tenant.table, "tenant")
+                self.tenant.variable
             ));
         }
         Ok(())
@@ -11863,14 +11878,14 @@ impl WorkforceConfig {
         }
         let code = &mut self.vellev.code;
         for (name, setting) in [
-            ("WORKFORCE_VELLEV_CODE_URL", &mut code.url),
-            ("WORKFORCE_VELLEV_CODE_TENANT", &mut code.tenant),
-            ("WORKFORCE_VELLEV_CODE_API_KEY", &mut code.api_key),
-            ("WORKFORCE_VELLEV_CODE_MODEL", &mut code.model),
-            ("WORKFORCE_VELLEV_CODE_QUERY_PREFIX", &mut code.query_prefix),
-            ("WORKFORCE_VELLEV_CODE_DIMENSIONS", &mut code.dimensions_env),
+            (CODE_URL, &mut code.url),
+            (CODE_TENANT, &mut code.tenant),
+            (CODE_API_KEY, &mut code.api_key),
+            (CODE_MODEL, &mut code.model),
+            (CODE_QUERY_PREFIX, &mut code.query_prefix),
+            (CODE_DIMENSIONS, &mut code.dimensions_env),
         ] {
-            if let Ok(v) = var(name) {
+            if let Ok(v) = var(name.variable) {
                 *setting = (!v.trim().is_empty()).then_some(v);
             }
         }

@@ -365,23 +365,18 @@ pub async fn equivalence(
     records.create(&probe).await.map_err(failed)?;
     let measured = async {
         let prefix = embedding.query_prefix.as_deref();
-        let ids: Vec<(ObjectId, Option<ObjectId>)> = texts
-            .iter()
-            .map(|_| {
-                let new = || ObjectId(Uuid::new_v4());
-                (new(), prefix.map(|_| new()))
-            })
-            .collect();
-        let written: Vec<(ObjectId, String)> = texts
-            .iter()
-            .zip(&ids)
-            .flat_map(|(text, (plain, prefixed))| {
-                let prefixed = prefixed
-                    .zip(prefix)
-                    .map(|(id, prefix)| (id, format!("{prefix}{text}")));
-                std::iter::once((*plain, (*text).clone())).chain(prefixed)
-            })
-            .collect();
+        let (ids, written) = texts.iter().fold(
+            (Vec::new(), Vec::<(ObjectId, String)>::new()),
+            |(mut ids, mut written), text| {
+                let plain = ObjectId(Uuid::new_v4());
+                let prefixed =
+                    prefix.map(|prefix| (ObjectId(Uuid::new_v4()), format!("{prefix}{text}")));
+                ids.push((plain, prefixed.as_ref().map(|(id, _)| *id)));
+                written.push((plain, (*text).clone()));
+                written.extend(prefixed);
+                (ids, written)
+            },
+        );
         for batch in written.chunks(32) {
             let changes = batch
                 .iter()

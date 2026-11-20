@@ -388,7 +388,7 @@ pub async fn reindex_code_vectors(
             seeding.embedder.name(),
             texts.len() + workforce_vellev::seeding::MIN_SAMPLE
         ));
-        let (tenants, embedding) = plain.embedded_as()?;
+        let (tenants, embedding) = plain.embedded_as();
         checked(&trusted(tenants, &embedding, seeding, &texts).await?);
     }
     if options.take_over {
@@ -958,7 +958,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let small = workforce_common::settings::VellevCodeConfig {
             tenant: Some(code.tenant.clone()),
-            model: Some("BAAI/bge-small-en-v1.5".into()),
+            model: Some(workforce_vellev::testing::SMALL.into()),
             dimensions: Some(384),
             query_prefix: Some(workforce_vellev::LOCAL_QUERY_PREFIX.into()),
             ..Default::default()
@@ -966,7 +966,7 @@ mod tests {
         let (config, repo) = indexed_with(&node, dir.path(), small).await;
         let store = VellevCodeVectorStore::configured(&config.vellev).unwrap();
         let by_code_node = || ByNode {
-            embedding: store.embedded_as().unwrap().1,
+            embedding: store.embedded_as().1,
             ..ByNode::of(&code)
         };
 
@@ -1308,7 +1308,7 @@ mod tests {
             }
             service.graph().clear_vector_fill(&repo).await.unwrap();
             let store = VellevCodeVectorStore::new(&node.url, &node.key, &node.tenant).unwrap();
-            let dimensions = store.embedded_as().unwrap().1.dimensions as usize;
+            let dimensions = store.embedded_as().1.dimensions as usize;
             let made = ReadyMade(latency, dimensions);
             let seeding = Seeding::new(Arc::new(made), batch, concurrency);
             let seeded = store.seeded_by(seeding.clone());
