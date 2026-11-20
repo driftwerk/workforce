@@ -506,9 +506,10 @@ async fn act_fully_reviews_a_sessions_plan_in_its_place() {
 
 /// VEL-4 (20 Nov): a session its boss runs, at Act, ended its turn on
 /// "Should I go ahead?", with no dialog on its screen. Its boss's nudges
-/// answer it: none waits behind the question it answers.
+/// answer it: none waits behind the question it answers. An answer to a
+/// question it no longer asks is never sent in its place.
 #[tokio::test(flavor = "multi_thread")]
-async fn at_act_the_bosss_nudge_answers_a_session_whose_turn_ended_on_a_question() {
+async fn at_act_the_boss_that_runs_it_answers_a_session_whose_turn_ended_on_a_question() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
@@ -550,17 +551,39 @@ async fn at_act_the_bosss_nudge_answers_a_session_whose_turn_ended_on_a_question
         })
         .await;
         assert!(v.pending.is_none(), "no dialog on its screen");
-        crew.perform(
-            &Action::Nudge {
-                to: Target::Session(s.id),
-                message: "Yes, go ahead and switch reads to the replica.".into(),
-                reply_to: None,
-            },
-            crew.by_overseer("It asked whether to go ahead.").unwrap(),
-        )
-        .await
-        .unwrap();
+        let stale = crew
+            .perform_with(
+                &Action::Nudge {
+                    to: Target::Session(s.id),
+                    message: "Yes, drop the old table.".into(),
+                    reply_to: None,
+                },
+                crew.by_overseer("It asked whether to drop it.").unwrap(),
+                &super::super::assignments::Order {
+                    answers: Some("Should I drop the old table?".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("it asks something else now");
+        assert!(super::super::picture::stale(&stale), "{stale}");
+        let said = crew
+            .perform(
+                &Action::Nudge {
+                    to: Target::Session(s.id),
+                    message: "Yes, go ahead and switch reads to the replica.".into(),
+                    reply_to: None,
+                },
+                crew.by_overseer("It asked whether to go ahead.").unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(!said.contains(';'), "nothing holds it, so nothing is said to: {said}");
         let thread = d.line_thread(s.id, None, None).await.unwrap();
+        assert!(
+            thread.iter().all(|m| !m.text.starts_with("Yes, drop")),
+            "the stale answer was never sent"
+        );
         let row = thread
             .iter()
             .find(|m| m.text.starts_with("Yes, go ahead"))
@@ -575,6 +598,62 @@ async fn at_act_the_bosss_nudge_answers_a_session_whose_turn_ended_on_a_question
                 .filter(|m| m.delivery != workforce_desk::line::Delivery::Queued)
         })
         .await;
+    })
+    .await;
+}
+
+/// A boss that doesn't run a session whose turn ended asking the person
+/// something is told its message waits on their answer, not on a turn
+/// that has already ended.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bosss_message_to_a_session_asking_the_person_is_said_to_wait_on_their_answer() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (_overseer, crew, d, _llm) = overseeing(
+            &base,
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\nact = { nudge = true }\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, &base, "Vellev status").await;
+        let url = hook_url(&base, s.id).await;
+        hook(
+            &url,
+            json!({"hook_event_name": "SessionStart", "session_id": "cc-vel-4b"}),
+        )
+        .await;
+        hook(
+            &url,
+            json!({"hook_event_name": "Stop",
+                "last_assistant_message": "The replica is ready. Should I switch reads to it?"}),
+        )
+        .await;
+        eventually("its turn to end asking", async || {
+            d.view(s.id)
+                .ok()
+                .filter(|v| v.state == SessionState::Asking)
+        })
+        .await;
+        let said = crew
+            .perform(
+                &Action::Nudge {
+                    to: Target::Session(s.id),
+                    message: "Also note the replica lag.".into(),
+                    reply_to: None,
+                },
+                crew.by_overseer("Worth saying.").unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            said.ends_with(
+                "its turn ended asking the person something, so it gets it once they answer"
+            ),
+            "{said}"
+        );
     })
     .await;
 }

@@ -310,7 +310,12 @@ fn only_claude_code_devin_and_codex_take_a_bosss_words_mid_turn() {
         mid_turn(Engine::Claude, SessionState::Blocked, true, false),
         Err(Unsteerable::Dialog)
     );
-    // A turn that ended on a question is over: at its prompt, no dialog.
+    // A turn that ended on a question is over: it takes them as any
+    // message, as `line::deliverable` gives it.
+    assert_eq!(
+        mid_turn(Engine::Claude, SessionState::Asking, true, true),
+        Ok(None)
+    );
     for s in [
         SessionState::Asking,
         SessionState::Idle,

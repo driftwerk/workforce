@@ -1080,27 +1080,36 @@ impl CrewHub {
         })
     }
 
-    /// What the boss is told of its message to session `s` (`name`), as
-    /// `did` ("told", "answered"): when it goes in.
+    /// What the boss is told of its message `m` to session `name`, as
+    /// `did` ("told", "answered"): what, if anything, it waits on.
     fn nudge_said(
         d: &workforce_desk::Desk,
-        s: Uuid,
         name: &str,
         did: &str,
-        delivery: workforce_desk::line::Delivery,
+        m: &workforce_desk::line::LineMessage,
     ) -> String {
-        if d.wheel_of(s).is_some_and(|w| w.person()) {
-            return format!(
-                "{did} {name}; the person is driving it, so your message waits until they stop giving it input for a little while or hand it back"
-            );
-        }
-        match delivery {
-            workforce_desk::line::Delivery::Held => {
-                format!("{did} {name}; it is stopped and gets it when it runs again")
-            }
-            workforce_desk::line::Delivery::Delivered => format!("{did} {name}"),
-            _ => format!("{did} {name}; it gets it once its turn ends"),
-        }
+        use workforce_desk::line::Wait;
+        // The person's wheel holds it past whatever else does.
+        let driving = m
+            .to_session()
+            .is_some_and(|s| d.wheel_of(s).is_some_and(|w| w.person()));
+        let wait = match driving {
+            true => Some(Wait::PersonDriving),
+            false => d.line_waits(m),
+        };
+        let why = match wait {
+            None => return format!("{did} {name}"),
+            Some(Wait::Stopped) => "it is stopped and gets it when it runs again",
+            Some(Wait::Working) => "it gets it once its turn ends",
+            Some(Wait::Dialog) => "a dialog in its terminal waits on an answer: it gets it once that is answered and its turn ends",
+            Some(Wait::Asking) => "its turn ended asking the person something, so it gets it once they answer",
+            Some(Wait::Typing) => "the person is typing in its terminal: it gets it once they stop",
+            Some(Wait::Paused) => "Desk's breaker paused it: it gets it once the person lets it go on",
+            Some(Wait::ModeEnding) => "Desk starts it again in its own mode first, then it gets it",
+            Some(Wait::PersonDriving) => "the person is driving it, so your message waits until they stop giving it input for a little while or hand it back",
+            Some(Wait::NextCall) => "it reads it with its next tool call's result",
+        };
+        format!("{did} {name}; {why}")
     }
 
     /// The session `action` is done to, when it is one.
@@ -2092,8 +2101,6 @@ impl CrewHub {
                         done.line = Some((answer.id, answer.delivery));
                         Ok(format!("answered {name}"))
                     }
-                    // The answer to the question its turn ended on, while
-                    // that is still what it asks: it goes in as the answer.
                     None if self.answers_turn(*s, order) => {
                         let (answer, _) = d
                             .line_send_with(
@@ -2107,8 +2114,14 @@ impl CrewHub {
                             .await
                             .map_err(line)?;
                         done.line = Some((answer.id, answer.delivery));
-                        Ok(Self::nudge_said(d, *s, &name, "answered", answer.delivery))
+                        Ok(Self::nudge_said(d, &name, "answered", &answer))
                     }
+                    // It asks something else now: never a plain message
+                    // in its place.
+                    None if order.answers.is_some() => Err(format!(
+                        "{} {name} asks something else now: decide again on what it asks.",
+                        super::picture::STALE
+                    )),
                     // On its line: it gets it once its turn ends, never typed
                     // in over what it is doing (Interrupt is for that); a
                     // boss's urgent one, with its next tool call's result.
@@ -2130,7 +2143,7 @@ impl CrewHub {
                         if let Some(said) = super::urgent::told(&name, rushed) {
                             return Ok(said);
                         }
-                        Ok(Self::nudge_said(d, *s, &name, "told", told.delivery))
+                        Ok(Self::nudge_said(d, &name, "told", &told))
                     }
                 }
             }

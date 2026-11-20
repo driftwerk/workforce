@@ -652,7 +652,6 @@ impl Desk {
             Send::Reply { to, text } => return Ok((self.line_answer(to, from, text).await?, None)),
             Send::Ask { to, text, .. } => (to, text, LineKind::Ask, When::Queue),
             Send::Tell { to, text, when } => (to, text, LineKind::Tell, when),
-            // A session answers no other's turn: its boss or the person do.
             Send::Answer { .. } if matches!(from, Sender::Session(_)) => {
                 return Err(Refusal::NotYours.into())
             }
@@ -1617,10 +1616,9 @@ impl Desk {
     /// a session Desk's breaker paused takes only the person's own
     /// messages; one the person drives, none of its boss's; one whose turn
     /// ended asking the person something, only theirs, or a boss's that
-    /// runs it or gives its answer ([`Send::Answer`]): at its prompt, with
-    /// no dialog on screen, those go in as the answer. A dialog on screen
-    /// holds every message in [`line::deliverable`] until it is answered
-    /// and its turn ends.
+    /// runs it or gives its answer ([`Send::Answer`]): those go in as the
+    /// answer. A dialog on its screen holds every message earlier, in
+    /// [`line::deliverable`], until it is answered and its turn ends.
     pub(super) fn line_gate(&self, view: &SessionView, m: &LineMessage) -> Option<Wait> {
         if m.from.kind == PartyKind::You {
             return None;
@@ -1634,22 +1632,19 @@ impl Desk {
         if self.mode_ending(view.id) {
             return Some(Wait::ModeEnding);
         }
-        // A boss's answer to the question its turn ended on, not to an ask.
-        let answers = m.kind == LineKind::Answer && m.in_reply_to.is_none();
-        if m.from.kind == PartyKind::Manager
-            && (m.kind == LineKind::Tell || answers)
-            && self.person_driving(view.id)
-        {
+        let boss = m.from.kind == PartyKind::Manager;
+        let driving = self.person_driving(view.id);
+        if boss && (m.kind == LineKind::Tell || m.answers_turn()) && driving {
             return Some(Wait::PersonDriving);
         }
-        let boss_runs = || {
-            !self.person_driving(view.id)
-                && self
-                    .charge_of(view.id)
-                    .is_some_and(|c| c.live() && c.boss == m.from.id)
-        };
-        let answered = m.from.kind == PartyKind::Manager && (answers || boss_runs());
-        (view.state == SessionState::Asking && !answered).then_some(Wait::Asking)
+        // A boss's ask, while the person drives, waits on their answer too.
+        let may_answer = boss
+            && (m.answers_turn()
+                || (!driving
+                    && self
+                        .charge_of(view.id)
+                        .is_some_and(|c| c.live() && c.boss == m.from.id)));
+        (view.state == SessionState::Asking && !may_answer).then_some(Wait::Asking)
     }
 
     /// Desk's plugin in `id`, waiting on its line, looks again now: a turn
@@ -2059,30 +2054,45 @@ impl Desk {
             .await?;
         rows.reverse();
         for m in rows.iter_mut().filter(|m| m.to_session() == Some(id)) {
-            m.waiting = match m.delivery {
-                Delivery::Held => Some(Wait::Stopped),
-                Delivery::Queued if self.steered(id, m.id) => Some(Wait::NextCall),
-                Delivery::Queued => match line::deliverable(&view, typed, plugin) {
-                    // A turn Esc ended: the plugin takes it now.
-                    Err(Wait::Working | Wait::Dialog)
-                        if plugin
-                            && view.caps.line == Deliver::Submit
-                            && !self.in_a_turn(&view) =>
-                    {
-                        self.line_gate(&view, m)
-                    }
-                    Err(why) => Some(why),
-                    Ok(_) => self.line_gate(&view, m),
-                },
-                Delivery::Handed
-                | Delivery::Delivered
-                | Delivery::Refused
-                | Delivery::Withdrawn
-                | Delivery::Noted => None,
-            };
+            m.waiting = self.line_waits_in(&view, typed, plugin, m);
             m.actions = self.line_actions(&view, m);
         }
         Ok(rows)
+    }
+
+    /// Why `m`, sent to a session, waits now: none once it has gone.
+    pub fn line_waits(&self, m: &LineMessage) -> Option<Wait> {
+        let id = m.to_session()?;
+        let view = self.view(id).ok()?;
+        self.line_waits_in(&view, self.typed_since_idle(id), self.plugin_heard(id), m)
+    }
+
+    fn line_waits_in(
+        &self,
+        view: &SessionView,
+        typed: bool,
+        plugin: bool,
+        m: &LineMessage,
+    ) -> Option<Wait> {
+        match m.delivery {
+            Delivery::Held => Some(Wait::Stopped),
+            Delivery::Queued if self.steered(view.id, m.id) => Some(Wait::NextCall),
+            Delivery::Queued => match line::deliverable(view, typed, plugin) {
+                // A turn Esc ended: the plugin takes it now.
+                Err(Wait::Working | Wait::Dialog)
+                    if plugin && view.caps.line == Deliver::Submit && !self.in_a_turn(view) =>
+                {
+                    self.line_gate(view, m)
+                }
+                Err(why) => Some(why),
+                Ok(_) => self.line_gate(view, m),
+            },
+            Delivery::Handed
+            | Delivery::Delivered
+            | Delivery::Refused
+            | Delivery::Withdrawn
+            | Delivery::Noted => None,
+        }
     }
 
     /// What the person can do now with `m`, to `view`, while it waits.

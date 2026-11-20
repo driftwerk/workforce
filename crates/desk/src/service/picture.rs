@@ -117,13 +117,7 @@ impl Desk {
         let Some(s) = m.to_session() else {
             return false;
         };
-        // A tell, or its answer to the question a turn ended on (not an
-        // ask's): the person's own words there settled it.
-        let said = match m.kind {
-            crate::line::LineKind::Tell => true,
-            crate::line::LineKind::Answer => m.in_reply_to.is_none(),
-            crate::line::LineKind::Ask => false,
-        };
+        let said = m.kind == crate::line::LineKind::Tell || m.answers_turn();
         if m.from.kind != crate::crew::PartyKind::Manager
             || !said
             || !self.0.picture.lock().person_since(s, m.at)
