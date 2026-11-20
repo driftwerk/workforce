@@ -2041,6 +2041,31 @@ impl Desk {
         st.lines.seen.remove(&id);
     }
 
+    /// Each of `rows`' reason to wait to go into `view` (a hand-off behind
+    /// its running turn waits on that), or none while Desk holds any of them
+    /// on purpose, whatever its turn ([`Wait::on_purpose`]).
+    pub fn rows_wait(
+        &self,
+        view: &SessionView,
+        rows: &[LineMessage],
+    ) -> Option<Vec<Option<Wait>>> {
+        let (typed, plugin) = (self.typed_since_idle(view.id), self.plugin_heard(view.id));
+        let in_turn = self.in_a_turn(view);
+        let waits: Vec<Option<Wait>> = rows
+            .iter()
+            .map(|m| match m.delivery {
+                Delivery::Handed if in_turn => Some(Wait::Working),
+                _ => self.line_waits_in(view, typed, plugin, m),
+            })
+            .collect();
+        let on_purpose = rows
+            .iter()
+            .filter_map(|m| self.line_gate(view, m))
+            .chain(waits.iter().flatten().copied())
+            .any(Wait::on_purpose);
+        (!on_purpose).then_some(waits)
+    }
+
     /// A session's thread, oldest first, the page before `before`; each
     /// waiting message says why it waits.
     pub async fn line_thread(
