@@ -2357,7 +2357,9 @@ impl Desk {
                     allowed: HashSet::new(),
                     interrupted: false,
                     ends: 0,
-                    ended_at: None,
+                    // Whatever it asks now, it asked before Desk took it
+                    // back: nothing sent before then answers it.
+                    ended_at: Some(Utc::now()),
                     reading: None,
                     closing: false,
                     codex_asks: Vec::new(),

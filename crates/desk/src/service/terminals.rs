@@ -819,7 +819,9 @@ impl Desk {
                             fail_closed: false,
                             interrupted: false,
                             ends: 0,
-                            ended_at: None,
+                            // What it asks now it asked before this hub
+                            // linked it again: nothing sent before answers it.
+                            ended_at: Some(Utc::now()),
                             reading: None,
                             closing: false,
                             codex_asks: Vec::new(),

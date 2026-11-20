@@ -1566,9 +1566,9 @@ impl Desk {
                 continue;
             }
             if let Some(taken) = self.0.store.line_take(m.id, Delivery::Delivered).await? {
-                if taken.answers_turn() && !self.still_asks(caller, &taken) {
-                    self.put_back_passed(caller, &taken, Delivery::Delivered)
-                        .await?;
+                after_take(caller);
+                if !self.still_goes_in(caller, &taken) {
+                    self.put_back(caller, &taken, Delivery::Delivered).await?;
                     continue;
                 }
                 self.line_delivered_into(caller, &taken);
@@ -1659,6 +1659,11 @@ impl Desk {
             return Some(Wait::ModeEnding);
         }
         let boss = m.from.kind == PartyKind::Manager;
+        // Its reply still read for whether it asks: its turn is open until
+        // that is said, and what the boss said before it never answers it.
+        if boss && view.reading {
+            return Some(Wait::Working);
+        }
         let driving = self.person_driving(view.id);
         if boss && (m.kind == LineKind::Tell || m.answers_turn()) && driving {
             return Some(Wait::PersonDriving);
@@ -1666,6 +1671,7 @@ impl Desk {
         // While the person drives, its boss's asks wait on their answer.
         // What its running boss said before the turn ended on a question
         // was not said to that question: the boss answers it on its own.
+        // With no turn end known (none seen here yet), none was.
         let ended_at = self
             .0
             .state
@@ -1676,7 +1682,7 @@ impl Desk {
         let may_answer = boss
             && (m.answers_turn()
                 || (!driving
-                    && ended_at.is_none_or(|t| m.at > t)
+                    && ended_at.is_some_and(|t| m.at > t)
                     && self
                         .charge_of(view.id)
                         .is_some_and(|c| c.live() && c.boss == m.from.id)));
@@ -1710,15 +1716,29 @@ impl Desk {
         (m.from.kind == PartyKind::You).then(By::you)
     }
 
-    /// A boss's answer `taken` (`how`) to go into session `id`, whose
-    /// question passed between the look and the take: back in the queue
-    /// and withdrawn there, never put to what it asks now.
-    async fn put_back_passed(
+    /// Whether the boss's `taken`, taken to go into session `id`, still
+    /// goes in: what the gate let through can have moved since it looked.
+    /// Its answer to a question that passed doesn't, nor what waits on the
+    /// person's wheel once they have taken it.
+    pub(super) fn still_goes_in(&self, id: Uuid, taken: &LineMessage) -> bool {
+        if taken.from.kind != PartyKind::Manager {
+            return true;
+        }
+        let held = taken.kind == LineKind::Tell || taken.answers_turn();
+        let passed = taken.answers_turn() && !self.still_asks(id, taken);
+        let wheel = held && self.person_driving(id);
+        !(passed || wheel)
+    }
+
+    /// The boss's `taken` (`how`) to go into session `id`, which no longer
+    /// goes in ([`Self::still_goes_in`]): back in the queue, and withdrawn
+    /// there when what it answered has passed. Whether it was withdrawn.
+    pub(super) async fn put_back(
         &self,
         id: Uuid,
         taken: &LineMessage,
         how: Delivery,
-    ) -> Result<(), LineError> {
+    ) -> Result<bool, LineError> {
         let back = match how {
             Delivery::Handed => self
                 .0
@@ -1729,12 +1749,14 @@ impl Desk {
                 .next(),
             _ => self.0.store.line_untake(taken.id, &id.to_string()).await?,
         };
-        if let Some(back) = back {
-            if !self.line_overtaken(&back).await {
-                self.line_announce(&back);
-            }
+        let Some(back) = back else {
+            return Ok(false);
+        };
+        if self.line_overtaken(&back).await {
+            return Ok(true);
         }
-        Ok(())
+        self.line_announce(&back);
+        Ok(false)
     }
 
     async fn line_next_now(&self, caller: Uuid) -> Result<Option<Value>, LineError> {
@@ -1761,9 +1783,9 @@ impl Desk {
                 continue;
             }
             if let Some(taken) = self.0.store.line_take(m.id, Delivery::Handed).await? {
-                if taken.answers_turn() && !self.still_asks(caller, &taken) {
-                    self.put_back_passed(caller, &taken, Delivery::Handed)
-                        .await?;
+                after_take(caller);
+                if !self.still_goes_in(caller, &taken) {
+                    self.put_back(caller, &taken, Delivery::Handed).await?;
                     continue;
                 }
                 self.line_announce(&taken);
@@ -1917,11 +1939,12 @@ impl Desk {
             let Some(taken) = self.0.store.line_take(m.id, Delivery::Delivered).await? else {
                 continue;
             };
+            after_take(id);
             let text = self.rendered(&taken).await;
-            // Its question passed while it was taken: it never goes in.
-            if taken.answers_turn() && !self.still_asks(id, &taken) {
-                self.put_back_passed(id, &taken, Delivery::Delivered)
-                    .await?;
+            // What moved while it was taken (its question passed, the
+            // person took the wheel) keeps it out.
+            if !self.still_goes_in(id, &taken) {
+                self.put_back(id, &taken, Delivery::Delivered).await?;
                 continue;
             }
             if let Err(e) = self.type_prompt(id, &text, Self::typed_by(&taken).as_ref()) {
@@ -2525,3 +2548,27 @@ impl Desk {
 #[cfg(test)]
 #[path = "line_tests.rs"]
 mod tests;
+
+/// What a test does to session `id` between a pump's take and its look
+/// again: the race the look again is there for.
+#[cfg(test)]
+type AfterTake = Box<dyn FnOnce() + std::marker::Send>;
+
+#[cfg(test)]
+pub(super) static AFTER_TAKE: parking_lot::Mutex<Vec<(Uuid, AfterTake)>> =
+    parking_lot::Mutex::new(Vec::new());
+
+pub(super) fn after_take(id: Uuid) {
+    #[cfg(test)]
+    {
+        let mut hooks = AFTER_TAKE.lock();
+        let at = hooks.iter().position(|(s, _)| *s == id);
+        let hook = at.map(|i| hooks.remove(i).1);
+        drop(hooks);
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+    #[cfg(not(test))]
+    let _ = id;
+}

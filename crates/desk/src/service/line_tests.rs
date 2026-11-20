@@ -1298,6 +1298,252 @@ async fn what_its_running_boss_said_before_the_turn_ended_on_a_question_is_not_i
 }
 
 #[tokio::test]
+async fn a_tell_its_running_boss_queued_before_a_restart_is_not_its_answer_after_it() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let by = sarah_bosses(&d);
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        d.take_on(
+            s.id,
+            &by.party,
+            crate::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        d.change(s.id, |r, _| r.state = SessionState::Working);
+        let earlier = d
+            .line_send(
+                Sender::Overseer(by.clone()),
+                tell(s.id, "When that is done, run the linter."),
+            )
+            .await
+            .unwrap();
+        ends_asking(&d, s.id, "Should I switch reads to the replica?", false).await;
+        // Desk restarts: its counters start again, and it still asks. With
+        // no turn end known, none is taken to be after the Tell.
+        let restart = |ended_at| {
+            let mut st = d.0.state.lock();
+            let l = st.live.get_mut(&s.id).unwrap();
+            l.ends = 0;
+            l.ended_at = ended_at;
+            l.breaker.run = crate::service::breaker::RunId::default();
+        };
+        restart(None);
+        assert!(d.asked_mark(s.id).is_some(), "it still asks");
+        assert_eq!(d.line_waits(&row(&d, earlier.id).await), Some(Wait::Asking));
+        assert_eq!(d.line_next(s.id, Duration::from_millis(300)).await, None);
+        // Taken back, a session counts what it asks as asked then.
+        restart(Some(chrono::Utc::now()));
+        assert_eq!(d.line_next(s.id, Duration::from_millis(300)).await, None);
+        assert_eq!(row(&d, earlier.id).await.delivery, Delivery::Queued);
+        let after = d
+            .line_send(Sender::Overseer(by), tell(s.id, "Yes, switch them."))
+            .await
+            .unwrap();
+        let next = d.line_next(s.id, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(next["id"], json!(after.id));
+    })
+    .await;
+}
+
+/// Session `s`, its turn ended asking, sent its boss's answer; between the
+/// pump's take of it and its look again, its turn ends once more.
+async fn answered_as_it_moves(
+    d: &Desk,
+    dir: &std::path::Path,
+    plugin: bool,
+) -> (Uuid, LineMessage) {
+    let by = sarah_bosses(d);
+    let s = new_session(d, dir).await;
+    idle(d, s.id).await;
+    ends_asking(d, s.id, "Should I switch reads to the replica?", false).await;
+    if plugin {
+        d.plugin_heard_from(s.id);
+    } else {
+        // No plugin heard from: Desk types it in itself.
+        d.0.state.lock().lines.plugin.remove(&s.id);
+    }
+    let moved = d.clone();
+    let id = s.id;
+    super::AFTER_TAKE.lock().push((
+        s.id,
+        Box::new(move || {
+            moved.0.state.lock().live.get_mut(&id).unwrap().ends += 1;
+        }),
+    ));
+    let turn = d.asked_mark(s.id).expect("it asks");
+    let sent = d
+        .line_send(
+            Sender::Overseer(by),
+            Send::Answer {
+                to: s.id,
+                text: "Yes, switch them.".into(),
+                turn,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(d.0.state.lock().lines.answers.contains_key(&sent.id));
+    (s.id, sent)
+}
+
+async fn never_went_in(d: &Desk, s: Uuid, sent: &LineMessage) {
+    until_async(|| async { row(d, sent.id).await.delivery == Delivery::Withdrawn }).await;
+    assert!(
+        !d.0.state.lock().lines.answers.contains_key(&sent.id),
+        "Desk keeps no mark for it"
+    );
+    assert!(
+        d.picture_recent("sarah", s, 10)
+            .iter()
+            .any(|h| h.what == crate::picture::What::Withdrawn),
+        "its boss hears it never went in"
+    );
+}
+
+#[tokio::test]
+async fn an_answer_whose_question_passed_as_the_plugin_took_it_is_withdrawn() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let (s, sent) = answered_as_it_moves(&d, dir.path(), true).await;
+        assert_eq!(d.line_next(s, Duration::from_millis(300)).await, None);
+        never_went_in(&d, s, &sent).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_answer_whose_question_passed_as_its_inbox_took_it_is_withdrawn() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let (s, sent) = answered_as_it_moves(&d, dir.path(), true).await;
+        assert!(d.line_take_inbox(s).await.unwrap().is_empty());
+        never_went_in(&d, s, &sent).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_answer_whose_question_passed_as_desk_took_it_to_type_is_withdrawn() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let (s, sent) = answered_as_it_moves(&d, dir.path(), false).await;
+        d.line_pump(s).await;
+        never_went_in(&d, s, &sent).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_answer_that_went_in_leaves_no_mark_behind() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let by = sarah_bosses(&d);
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        ends_asking(&d, s.id, "Should I switch reads to the replica?", false).await;
+        let sent = d
+            .line_send(
+                Sender::Overseer(by),
+                Send::Answer {
+                    to: s.id,
+                    text: "Yes, switch them.".into(),
+                    turn: d.asked_mark(s.id).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        let next = d.line_next(s.id, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(next["id"], json!(sent.id));
+        d.line_ack(s.id, sent.id, true).await.unwrap();
+        assert_eq!(row(&d, sent.id).await.delivery, Delivery::Delivered);
+        assert!(d.0.state.lock().lines.answers.is_empty());
+    })
+    .await;
+}
+
+/// A crew whose model reads every reply as asking, once let go.
+struct SlowReader(tokio::sync::Notify);
+
+#[async_trait::async_trait]
+impl crate::crew::Crew for SlowReader {
+    fn overseer(&self) -> Option<crate::crew::Overseer> {
+        None
+    }
+    fn agents(&self) -> Vec<crate::crew::CrewAgent> {
+        vec![]
+    }
+    fn midnight(&self) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now()
+    }
+    async fn accept(&self, _: &crate::crew::Suggestion) -> Result<(), String> {
+        Ok(())
+    }
+    async fn asks(&self, _: &str, _: Option<&str>) -> Option<bool> {
+        self.0.notified().await;
+        Some(true)
+    }
+}
+
+#[tokio::test]
+async fn what_its_running_boss_said_waits_while_its_reply_is_read_for_a_question() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let by = sarah_bosses(&d);
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        d.take_on(
+            s.id,
+            &by.party,
+            crate::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        let reader = std::sync::Arc::new(SlowReader(tokio::sync::Notify::new()));
+        let crew: std::sync::Arc<dyn crate::crew::Crew> = reader.clone();
+        d.read_replies_with(&crew);
+        d.change(s.id, |r, _| r.state = SessionState::Working);
+        let earlier = d
+            .line_send(
+                Sender::Overseer(by),
+                tell(s.id, "When that is done, run the linter."),
+            )
+            .await
+            .unwrap();
+        hook(
+            &d,
+            s.id,
+            json!({"hook_event_name": "Stop",
+                "last_assistant_message": "Pushed the branch. Let me know if you want me to open the PR."}),
+        )
+        .await;
+        let v = d.view(s.id).unwrap();
+        assert!(v.reading && v.state == SessionState::Done, "read still");
+        assert_eq!(d.line_waits(&row(&d, earlier.id).await), Some(Wait::Working));
+        assert_eq!(d.line_next(s.id, Duration::from_millis(300)).await, None);
+        // Read as a question: the boss answers it, its Tell does not.
+        reader.0.notify_one();
+        until(|| d.view(s.id).is_ok_and(|v| v.state == SessionState::Asking)).await;
+        assert_eq!(d.line_next(s.id, Duration::from_millis(300)).await, None);
+        assert_eq!(row(&d, earlier.id).await.delivery, Delivery::Queued);
+        assert_eq!(d.line_waits(&row(&d, earlier.id).await), Some(Wait::Asking));
+        drop(crew);
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn a_dialog_on_its_screen_holds_what_waits_at_its_prompt_too() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();

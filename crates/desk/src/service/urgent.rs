@@ -573,6 +573,11 @@ impl Desk {
         else {
             return Ok(Took::Gone);
         };
+        super::line::after_take(id);
+        if !self.still_goes_in(id, &taken) {
+            let withdrawn = self.put_back(id, &taken, line::Delivery::Delivered).await?;
+            return Ok(if withdrawn { Took::Gone } else { Took::Back });
+        }
         self.line_delivered_into(id, &taken);
         tracing::info!(session = %id, %row, "an urgent line message was read mid-turn");
         Ok(Took::Read(self.rendered(&taken).await))
