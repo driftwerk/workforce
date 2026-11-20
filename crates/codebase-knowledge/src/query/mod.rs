@@ -101,6 +101,28 @@ pub struct SeedResolution {
     pub vector_configured: bool,
 }
 
+/// What the graph records of where a repo's vectors serve questions from:
+/// the collection they are complete in, and the one an adoption under way
+/// is comparing them with.
+struct Servable {
+    complete_in: Option<String>,
+    adopting_in: Option<String>,
+}
+
+impl Servable {
+    /// Whether vectors held in the collection `held` serve, and if so
+    /// whether they are recorded complete there or being adopted there.
+    fn serves(&self, held: &str) -> Option<bool> {
+        if self.complete_in.as_deref() == Some(held) {
+            Some(true)
+        } else if self.adopting_in.as_deref() == Some(held) {
+            Some(false)
+        } else {
+            None
+        }
+    }
+}
+
 /// The main query engine for answering questions about codebases.
 /// Performs multi-step retrieval: NL planning → entity search → graph traversal →
 /// freshness check → live verification → answer synthesis.
@@ -224,12 +246,26 @@ impl QueryEngine {
 
     /// What the graph records of the repo's vectors, for a store that may
     /// lack them (see [`CodeVectorStore::tracks_completeness`]): the
-    /// collection they are complete in, or why they are not to be used.
-    /// Read from the graph, and never against the store's deadline.
-    async fn recorded_complete(&self, repo_id: &str) -> std::result::Result<String, String> {
-        match self.graph.vectors_complete_in(repo_id).await {
-            Ok(Some(recorded)) => Ok(recorded),
-            Ok(None) => Err(self.incomplete()),
+    /// collections they serve from, or why they are not to be used. Read
+    /// from the graph, and never against the store's deadline.
+    async fn servable(&self, repo_id: &str) -> std::result::Result<Servable, String> {
+        let recorded = async {
+            let complete_in = self.graph.vectors_complete_in(repo_id).await?;
+            let fill = self.graph.vector_fill(repo_id).await?;
+            let adopting_in = fill
+                .filter(|fill| fill.stage.adopting())
+                .map(|fill| fill.collection);
+            eyre::Ok(Servable {
+                complete_in,
+                adopting_in,
+            })
+        };
+        match recorded.await {
+            Ok(Servable {
+                complete_in: None,
+                adopting_in: None,
+            }) => Err(self.incomplete()),
+            Ok(servable) => Ok(servable),
             Err(e) => {
                 tracing::warn!(
                     repo_id,
@@ -271,7 +307,7 @@ impl QueryEngine {
         if !vs.tracks_completeness() {
             return Ok(vs);
         }
-        let recorded = self.recorded_complete(repo_id).await?;
+        let servable = self.servable(repo_id).await?;
         let held = match &self.wait {
             None => vs.identity(false).await,
             Some((_, breaker)) if breaker.told() != "closed" => return Err(LEFT_ALONE.to_string()),
@@ -280,7 +316,7 @@ impl QueryEngine {
                 .map_err(|_| format!("the vector store did not answer within {deadline:?}"))?,
         };
         match held {
-            Ok(held) if held == recorded => Ok(vs),
+            Ok(held) if servable.serves(&held).is_some() => Ok(vs),
             Ok(_) => Err(self.incomplete()),
             Err(e) => {
                 tracing::warn!(
@@ -292,17 +328,18 @@ impl QueryEngine {
         }
     }
 
-    /// What the repo's vectors hold nearest `question`, or why they did
-    /// not serve. One asking of the store: which collection it has, then
-    /// the search, together within the deadline where there is one. That
-    /// asking is what the breaker counts: not answered in time
-    /// [`VECTOR_TRIPS_AFTER`] times in a row, the store is left alone for
-    /// a rest, then tried by one question at a time.
+    /// What the repo's vectors hold nearest `question`, and whether they
+    /// are recorded complete, or why they did not serve. One asking of the
+    /// store: which collection it has, then the search, together within
+    /// the deadline where there is one. That asking is what the breaker
+    /// counts: not answered in time [`VECTOR_TRIPS_AFTER`] times in a row,
+    /// the store is left alone for a rest, then tried by one question at a
+    /// time.
     async fn search_vectors(
         &self,
         repo_id: &str,
         question: &str,
-    ) -> std::result::Result<Vec<crate::vector::VectorSearchResult>, String> {
+    ) -> std::result::Result<(Vec<crate::vector::VectorSearchResult>, bool), String> {
         let Some(vs) = self.vector_store.as_ref() else {
             return Err("no vector store is configured".to_string());
         };
@@ -312,17 +349,17 @@ impl QueryEngine {
         let failed = |e: eyre::Report| unserved_by("the search of the vector store failed", &e);
         if !vs.tracks_completeness() {
             let found = vs.search_entities(question, Some(repo_id), None, 20).await;
-            return found.map_err(failed);
+            return found.map(|found| (found, false)).map_err(failed);
         }
-        let recorded = self.recorded_complete(repo_id).await?;
+        let servable = self.servable(repo_id).await?;
         let asking = async {
-            if vs.identity(false).await? != recorded {
+            let Some(complete) = servable.serves(&vs.identity(false).await?) else {
                 return eyre::Ok(None);
-            }
+            };
             let found = vs
                 .search_entities(question, Some(repo_id), None, 20)
                 .await?;
-            Ok(Some(found))
+            Ok(Some((found, complete)))
         };
         let asked = match &self.wait {
             None => asking.await,
@@ -569,7 +606,7 @@ impl QueryEngine {
 
         // Vector semantic search (if available)
         let mut best_vector_score: f32 = 0.0;
-        if let Some(vs) = self.vector_store.as_ref() {
+        if self.vector_store.is_some() {
             let found = self.search_vectors(repo_id, question).await;
             {
                 let mut last = self.unserved.lock().expect("not poisoned");
@@ -578,11 +615,12 @@ impl QueryEngine {
                     Ok(_) => last.remove(repo_id),
                 };
             }
-            if let Ok(vector_results) = found {
-                if vector_results.is_empty() && vs.tracks_completeness() {
+            if let Ok((vector_results, complete)) = found {
+                if vector_results.is_empty() && complete {
                     // Recorded complete, and nothing of the repo found: the
                     // store may have lost it, so it is compared with the
-                    // graph by whoever keeps it.
+                    // graph by whoever keeps it. One being adopted is
+                    // being compared already.
                     let mut suspected = self.vectors_suspected.lock().expect("not poisoned");
                     suspected.insert(repo_id.to_string());
                     self.vectors_wanted.notify_one();

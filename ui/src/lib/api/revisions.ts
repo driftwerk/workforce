@@ -12,7 +12,7 @@ export interface DefRevision {
   deleted: boolean;
   /** Authenticated identity, or null for unattributed (seed/oob) captures. */
   edited_by: string | null;
-  /** web | slack | cli | agent_tool | restore | oob | seed */
+  /** web | slack | cli | agent_tool | agent_tool:<agent> | restore | oob | seed */
   edited_via: string;
   /** Source revision when edited_via === "restore". */
   restored_from: number | null;

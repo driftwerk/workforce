@@ -12,6 +12,7 @@ use serde::Serialize;
 use tracing::warn;
 use workforce_codebase_knowledge::vector::health::{InsertError, InsertErrorSink};
 use workforce_codebase_knowledge::vector::CodeVectorStore;
+use workforce_knowledge_service::RepoVectors;
 
 use super::ring_buffer::RingBuffer;
 
@@ -28,8 +29,8 @@ pub const DEFAULT_READINESS_TIMEOUT: Duration = Duration::from_secs(2);
 /// capacity so a burst of failures during one pass is fully visible.
 const ERROR_HISTORY_CAPACITY: usize = 32;
 
-/// Discrete vector-backend state. Always one of three values; the
-/// `Unhealthy` variant carries a typed reason.
+/// Discrete vector-backend state. The `Unhealthy` variant carries a typed
+/// reason.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum VectorBackendHealth {
@@ -40,6 +41,17 @@ pub enum VectorBackendHealth {
         #[serde(skip_serializing_if = "Option::is_none")]
         tenant: Option<String>,
         last_checked_at: DateTime<Utc>,
+    },
+    /// Ready, with what the store already held of some repo being compared
+    /// with the graph and mended, searched meanwhile: `complete` of
+    /// `repos` are recorded complete.
+    Adopting {
+        url: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tenant: Option<String>,
+        last_checked_at: DateTime<Utc>,
+        complete: usize,
+        repos: usize,
     },
     Unhealthy {
         url: String,
@@ -64,6 +76,46 @@ pub enum UnhealthyReason {
         error_count: u64,
         sample_error: String,
     },
+}
+
+/// What a probe found of a store itself: where it is, when it looked, and
+/// why it is unhealthy, if it is.
+struct Checked {
+    url: String,
+    tenant: Option<String>,
+    at: DateTime<Utc>,
+    failed: Option<UnhealthyReason>,
+}
+
+/// The state of a store found as `checked`, keeping `repos`' code vectors:
+/// a failure outranks all, then any repo being adopted.
+fn state(checked: Checked, repos: &[RepoVectors]) -> VectorBackendHealth {
+    let Checked {
+        url,
+        tenant,
+        at,
+        failed,
+    } = checked;
+    match failed {
+        Some(reason) => VectorBackendHealth::Unhealthy {
+            url,
+            tenant,
+            last_checked_at: at,
+            reason,
+        },
+        None if repos.iter().any(RepoVectors::adopting) => VectorBackendHealth::Adopting {
+            url,
+            tenant,
+            last_checked_at: at,
+            complete: repos.iter().filter(|repo| repo.complete).count(),
+            repos: repos.len(),
+        },
+        None => VectorBackendHealth::Healthy {
+            url,
+            tenant,
+            last_checked_at: at,
+        },
+    }
 }
 
 /// Composes the readiness probe with the recent-insert error stream.
@@ -94,70 +146,50 @@ impl BackendHealthProbe {
     }
 
     /// Snapshot the current backend state. Always returns; readiness
-    /// failures and timeouts both translate to `Unhealthy` variants.
+    /// failures and timeouts both translate to `Unhealthy` variants. A
+    /// store that keeps track of its repos' vectors is `Adopting` while
+    /// this process's knowledge services last saw one being adopted.
     pub async fn current(&self) -> VectorBackendHealth {
         let Some(store) = &self.store else {
             return VectorBackendHealth::Disabled;
         };
-        let (url, tenant) = (store.base_url().to_string(), store.tenant());
-        let now = Utc::now();
-        match tokio::time::timeout(self.readiness_timeout, store.health_check()).await {
-            Err(_) => VectorBackendHealth::Unhealthy {
-                url,
-                tenant,
-                last_checked_at: now,
-                reason: UnhealthyReason::Timeout {
-                    after_ms: self.readiness_timeout.as_millis() as u64,
-                },
-            },
-            Ok(Err(e)) => VectorBackendHealth::Unhealthy {
-                url,
-                tenant,
-                last_checked_at: now,
-                reason: UnhealthyReason::ReadinessFailed {
-                    error: e.to_string(),
-                },
-            },
-            Ok(Ok(false)) => VectorBackendHealth::Unhealthy {
-                url,
-                tenant,
-                last_checked_at: now,
-                reason: UnhealthyReason::ReadinessFailed {
-                    error: "readiness endpoint returned non-success".to_string(),
-                },
-            },
-            Ok(Ok(true)) => self.recent_errors_state(url, tenant, now),
-        }
+        let at = Utc::now();
+        let failed = match tokio::time::timeout(self.readiness_timeout, store.health_check()).await
+        {
+            Err(_) => Some(UnhealthyReason::Timeout {
+                after_ms: self.readiness_timeout.as_millis() as u64,
+            }),
+            Ok(Err(e)) => Some(UnhealthyReason::ReadinessFailed {
+                error: e.to_string(),
+            }),
+            Ok(Ok(false)) => Some(UnhealthyReason::ReadinessFailed {
+                error: "readiness endpoint returned non-success".to_string(),
+            }),
+            Ok(Ok(true)) => self.recent_errors_reason(at),
+        };
+        let repos = match store.tracks_completeness() {
+            true => super::wire::code_vector_status(),
+            false => Vec::new(),
+        };
+        let checked = Checked {
+            url: store.base_url().to_string(),
+            tenant: store.tenant(),
+            at,
+            failed,
+        };
+        state(checked, &repos)
     }
 
-    fn recent_errors_state(
-        &self,
-        url: String,
-        tenant: Option<String>,
-        now: DateTime<Utc>,
-    ) -> VectorBackendHealth {
+    /// Why the store is unhealthy for the insert errors it had within the
+    /// window, if it had any.
+    fn recent_errors_reason(&self, now: DateTime<Utc>) -> Option<UnhealthyReason> {
         let in_window = self.recent_errors_within_window(now);
-        if in_window.is_empty() {
-            return VectorBackendHealth::Healthy {
-                url,
-                tenant,
-                last_checked_at: now,
-            };
-        }
-        let sample = in_window
-            .last()
-            .map(|e| e.message.clone())
-            .unwrap_or_default();
-        VectorBackendHealth::Unhealthy {
-            url,
-            tenant,
-            last_checked_at: now,
-            reason: UnhealthyReason::RecentInsertErrors {
-                window_secs: self.error_window.as_secs(),
-                error_count: in_window.len() as u64,
-                sample_error: sample,
-            },
-        }
+        let sample = in_window.last()?.message.clone();
+        Some(UnhealthyReason::RecentInsertErrors {
+            window_secs: self.error_window.as_secs(),
+            error_count: in_window.len() as u64,
+            sample_error: sample,
+        })
     }
 
     fn recent_errors_within_window(&self, now: DateTime<Utc>) -> Vec<InsertError> {
@@ -192,12 +224,9 @@ pub fn log_state_transition(previous: Option<&VectorBackendHealth>, current: &Ve
         return;
     }
     match current {
-        VectorBackendHealth::Healthy { .. } => tracing::info!(
-            previous = prev_tag.unwrap_or("none"),
-            current = curr_tag,
-            "vector_backend state changed"
-        ),
-        VectorBackendHealth::Disabled => tracing::info!(
+        VectorBackendHealth::Healthy { .. }
+        | VectorBackendHealth::Adopting { .. }
+        | VectorBackendHealth::Disabled => tracing::info!(
             previous = prev_tag.unwrap_or("none"),
             current = curr_tag,
             "vector_backend state changed"
@@ -215,6 +244,7 @@ fn state_tag(state: &VectorBackendHealth) -> &'static str {
     match state {
         VectorBackendHealth::Disabled => "disabled",
         VectorBackendHealth::Healthy { .. } => "healthy",
+        VectorBackendHealth::Adopting { .. } => "adopting",
         VectorBackendHealth::Unhealthy { .. } => "unhealthy",
     }
 }
@@ -432,6 +462,77 @@ mod tests {
         assert_eq!(v["url"], "u");
         assert!(v.get("tenant").is_none(), "weaviate has none: {v}");
         assert_eq!(healthy(Some("code"))["tenant"], "code");
+    }
+
+    /// Repos as a knowledge service saw them: `complete` of them recorded
+    /// complete, then `adopting` being adopted, then the rest filled.
+    fn repos(complete: usize, adopting: usize, of: usize) -> Vec<RepoVectors> {
+        use workforce_codebase_knowledge::graph::vectors::{FillStage, VectorFill};
+        (0..of)
+            .map(|n| RepoVectors {
+                repo_id: format!("r{n}"),
+                name: format!("r{n}"),
+                complete: n < complete,
+                fill: Some(VectorFill {
+                    generation: "g".into(),
+                    collection: "c".into(),
+                    stage: match n {
+                        n if n < complete => FillStage::Done,
+                        n if n < complete + adopting => FillStage::AdoptEntities,
+                        _ => FillStage::Entities,
+                    },
+                    cursor: String::new(),
+                    done: 0,
+                    total: 10,
+                }),
+                pending_files: 0,
+                last_error: None,
+                compared_secs_ago: None,
+            })
+            .collect()
+    }
+
+    /// A store with a repo being adopted is adopting, saying how many of
+    /// its repos are complete; one that failed is unhealthy whatever its
+    /// repos are; one adopting none is healthy.
+    #[test]
+    fn an_adopting_store_is_adopting_n_of_m_and_unhealthy_outranks_it() {
+        let at = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+        let checked = |failed| Checked {
+            url: "u".into(),
+            tenant: Some("code".into()),
+            at,
+            failed,
+        };
+        let adopting = state(checked(None), &repos(1, 1, 3));
+        assert_eq!(
+            adopting,
+            VectorBackendHealth::Adopting {
+                url: "u".into(),
+                tenant: Some("code".into()),
+                last_checked_at: at,
+                complete: 1,
+                repos: 3,
+            }
+        );
+        let said = serde_json::to_value(&adopting).unwrap();
+        assert_eq!(
+            (said["state"].clone(), said["complete"].clone()),
+            ("adopting".into(), 1.into())
+        );
+        let failed = UnhealthyReason::RecentInsertErrors {
+            window_secs: 60,
+            error_count: 1,
+            sample_error: "refused".into(),
+        };
+        assert!(matches!(
+            state(checked(Some(failed)), &repos(1, 1, 3)),
+            VectorBackendHealth::Unhealthy { .. }
+        ));
+        assert!(matches!(
+            state(checked(None), &repos(1, 0, 3)),
+            VectorBackendHealth::Healthy { .. }
+        ));
     }
 
     #[test]

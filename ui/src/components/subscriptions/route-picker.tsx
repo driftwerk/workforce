@@ -4,6 +4,7 @@ import { cn } from "@/lib/utils";
 import { apiErrorMessage } from "@/lib/api-error";
 import {
   chosenModel,
+  routeChoices,
   type PersonalRouteKind,
   type RouteFallback,
   type RouteModels,
@@ -185,7 +186,7 @@ const TIERS = [
 const DEFAULT = "";
 
 /** The models a person's own route runs by kind of work: the route's
- *  default, a tier, or one of the models its provider offers (and for
+ *  default, a tier, or one of the models its login runs, by name (and for
  *  background work, the conversation model). Each change saves at once. */
 export function RouteModelsPicker({
   name,
@@ -201,16 +202,20 @@ export function RouteModelsPicker({
   pending: boolean;
   onChange: (work: RouteWork, model: string | undefined) => void;
 }) {
-  const models = option.models ?? [];
+  const models = routeChoices(option);
   // Every tier on Codex is the one plan model, so only its models are offered.
   const tiers = option.kind === "codex" ? [] : TIERS;
+  const note = option.models_note;
   return (
     <fieldset className="space-y-2" disabled={pending}>
       <legend className="mb-2 text-sm font-medium">Models on {ROUTE_LABELS[option.kind]}</legend>
+      {note && <p className="text-xs text-muted-foreground">{note}</p>}
       {WORK.map(({ work, name: label, what }) => {
         const set = chosenModel(route, work);
-        // A model the hub no longer lists stays shown as chosen.
-        const unlisted = set && !models.includes(set) && !tiers.some(([t]) => t === set) && set !== "chat";
+        // A setting naming a listed model by another of its ids reads as
+        // that model; one the login no longer lists stays shown as chosen.
+        const listed = set ? models.find((m) => m.id === set || m.same_as?.includes(set)) : undefined;
+        const unlisted = set && !listed && !tiers.some(([t]) => t === set) && set !== "chat";
         const id = `${name}-${work}`;
         return (
           <div key={work} className="flex flex-wrap items-center justify-between gap-2 rounded-md border p-3 text-sm">
@@ -234,8 +239,8 @@ export function RouteModelsPicker({
                 </option>
               ))}
               {models.map((model) => (
-                <option key={model} value={model}>
-                  {model}
+                <option key={model.id} value={model === listed ? set : model.id}>
+                  {model.name}
                 </option>
               ))}
               {unlisted && <option value={set}>{set}</option>}

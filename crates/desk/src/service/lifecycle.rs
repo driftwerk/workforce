@@ -759,9 +759,14 @@ impl Desk {
                 None => None,
             }
         };
+        // Its process outlived the hub's hold on it: it is ended with it.
+        if running_here.is_none() && self.held_untaken(id).await {
+            self.end_held(id).await?;
+        }
         match running_here {
             Some(pty) => {
                 pty.kill();
+                self.stop_firmly(id, &pty);
                 let deadline = tokio::time::Instant::now() + END_WAIT;
                 // Until its exit has closed it, so what this answers is so.
                 while self.record(id)?.state != SessionState::Closed {
