@@ -561,6 +561,7 @@ mod tests {
             secret_policy: None,
             served: None,
             desk: None,
+            work: None,
         }
     }
 

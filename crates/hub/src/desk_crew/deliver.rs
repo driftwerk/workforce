@@ -170,6 +170,10 @@ impl CrewHub {
         // another.
         let _under = self.turn_under_mind(agent_id, &sid);
         // Gone with the turn, however it ends, as the person's own are.
+        let persons = theirs.is_some()
+            || author
+                .as_ref()
+                .is_some_and(|a| a.kind == workforce_desk::conversations::SpeakerKind::You);
         let _theirs = theirs.map(|words| Theirs::keep(&self.person_turns, &sid, words));
         // The crew's own wake-up, by name, for as long as its turn runs:
         // named only once the turn is the crew's (a session busy with the
@@ -197,35 +201,58 @@ impl CrewHub {
             None => crate::turn_loop::heavy_model(service),
             Some(_) => None,
         };
-        let progress = workforce_agent::runner::with_desk(
-            Some(scope),
-            service.process_message_with_progress(
-                channel,
-                owner,
-                None,
-                prompt,
-                relay.as_deref(),
-                Some(&sid),
-                None,
-                None,
-                None,
-                None,
-                Some(inbox),
-                None,
-                None,
-                None,
-                model.as_deref(),
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(TrustLevel::Paired),
-                Some(live.cancel_token()),
-                None,
-                None,
+        // The boss's own turn (a check-in, a notice, a wake-up, a session's
+        // line) is background work: the plan guard holds it while the
+        // person's plan is nearly full. One that answers the person's own
+        // words is theirs, and never waits on it.
+        // Only the boss's own wake: its DM's turns and quiet check-ins with
+        // no word of the person's. What the person set going (a handover
+        // they sent, a plan, a session's line) is theirs, never held.
+        let own_wake = in_dm || channel.starts_with(&format!("{DESK_CHANNEL}:checkin:"));
+        let work = (!persons && own_wake).then(|| {
+            workforce_common::work_use::Work::boss(agent_id, owner, &super::name_of(service))
+        });
+        // Held by the plan guard: not run, and nothing posted. The next
+        // wake-up or check-in comes as it would; a runaway is told once.
+        if let Some(work) = &work {
+            if let Some(why) =
+                Box::pin(self.held_by_plan(service, owner, work, model.as_deref())).await
+            {
+                return Err(eyre::eyre!(why));
+            }
+        }
+        let progress = Box::pin(workforce_common::work_use::within_opt(
+            work,
+            workforce_agent::runner::with_desk(
+                Some(scope),
+                service.process_message_with_progress(
+                    channel,
+                    owner,
+                    None,
+                    prompt,
+                    relay.as_deref(),
+                    Some(&sid),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(inbox),
+                    None,
+                    None,
+                    None,
+                    model.as_deref(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(TrustLevel::Paired),
+                    Some(live.cancel_token()),
+                    None,
+                    None,
+                ),
             ),
-        )
+        ))
         .await?;
         let session_id = progress.session_id.clone();
         let tx = if session_id == sid {
@@ -260,6 +287,64 @@ impl CrewHub {
         }
         drop(live);
         Ok((session_id, answer?))
+    }
+}
+
+impl CrewHub {
+    /// Why the plan guard holds the boss's own turn `work` for `owner`, if
+    /// it does. A runaway is told to the person once, in the DM.
+    async fn held_by_plan(
+        &self,
+        service: &Arc<AgentService>,
+        owner: &str,
+        work: &workforce_common::work_use::Work,
+        model: Option<&str>,
+    ) -> Option<String> {
+        use crate::cost_governor::{Admission, OnPlan};
+        // On the plan the turn runs on: the owner's.
+        let person = owner.parse::<uuid::Uuid>().ok();
+        let admitted = workforce_common::work_use::within(work.clone(), async {
+            let login =
+                crate::user_config::billed_to(person, crate::turn_loop::plan_login(service, model))
+                    .await;
+            service.cost_governor.preflight_on(
+                service.agent_id.as_str(),
+                Some(owner),
+                OnPlan {
+                    login: login.as_ref(),
+                },
+            )
+        })
+        .await;
+        match admitted {
+            Admission::Waits(why) => Some(why),
+            Admission::Stopped { why, first } => {
+                if first {
+                    let notice = format!("{why} {}", crate::plan_guard::stopped_choices(work));
+                    let dm = DeskTarget::of_turn(
+                        &DeskPlace::Dm { thread: None },
+                        DESK_CHANNEL,
+                        None,
+                        false,
+                    );
+                    if let Err(e) = crate::desk_surface::deliver(
+                        service,
+                        owner,
+                        &dm,
+                        crate::desk_surface::Delivery::text(
+                            workforce_common::channels::desk::DeliveryKind::Notice,
+                            &notice,
+                        ),
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %e, "Telling the person their boss was stopped failed");
+                    }
+                }
+                Some(why)
+            }
+            _ => None,
+        }
     }
 }
 

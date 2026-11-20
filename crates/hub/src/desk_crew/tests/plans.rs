@@ -903,7 +903,7 @@ async fn newly_said(llm: &wiremock::MockServer, marker: &str) -> usize {
         .count()
 }
 
-/// `usd` spent by `session` now, and the budgets counted again.
+/// `usd` spent by `session` now on a paid key, and the budgets counted again.
 async fn spent(d: &Desk, session: uuid::Uuid, usd: f64) {
     use workforce_desk::ledger::{Billing, Priced, Spend, Tokens};
     use workforce_desk::ledger_store::Kept;
@@ -925,7 +925,8 @@ async fn spent(d: &Desk, session: uuid::Uuid, usd: f64) {
                     priced: Priced::Reported,
                     billing: None,
                 },
-                billing: Billing::Plan,
+                // On a paid key: a dollar budget never holds plan use.
+                billing: Billing::Key,
                 account: None,
             }],
         )

@@ -342,6 +342,32 @@ pub trait TelemetryStore: Send + Sync + 'static {
     /// What each agent used in the window, every billing counted: what the
     /// person's own budgets on Desk count.
     fn agent_use(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Vec<AgentUse>>;
+    /// Keep one row of what background work used ([`crate::work_use`]).
+    fn record_work_use(&self, row: &crate::work_use::WorkUseRow) -> Result<()>;
+    /// What background work used from `from` to `to`: of `payer`'s plans
+    /// alone when one is named, of `work` alone, and of `agent`'s alone,
+    /// when named.
+    fn work_use_rows(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        payer: Option<&str>,
+        work: Option<&str>,
+        agent: Option<&str>,
+    ) -> Result<Vec<crate::work_use::WorkUseRow>>;
+    /// What background work used from `from` to `to`, summed in the store
+    /// by work and plan window: of `work` alone, of `agent`'s alone, of
+    /// `payer`'s plans alone, when named.
+    fn work_use_sums(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        work: Option<&str>,
+        agent: Option<&str>,
+        payer: Option<&str>,
+    ) -> Result<Vec<crate::work_use::WorkUseSum>>;
+    /// Remove what background work used before `before`.
+    fn prune_work_use(&self, before: DateTime<Utc>) -> Result<usize>;
     fn cost_by_model(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Vec<(String, f64)>>;
     fn cost_token_totals(
         &self,
@@ -1265,6 +1291,33 @@ impl TelemetryStore for SqliteStore {
     }
     fn agent_use(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Vec<AgentUse>> {
         SqliteStore::agent_use(self, from, to)
+    }
+    fn record_work_use(&self, row: &crate::work_use::WorkUseRow) -> Result<()> {
+        SqliteStore::record_work_use(self, row)
+    }
+    fn work_use_rows(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        payer: Option<&str>,
+        work: Option<&str>,
+        agent: Option<&str>,
+    ) -> Result<Vec<crate::work_use::WorkUseRow>> {
+        SqliteStore::work_use_rows(self, from, to, payer, work, agent)
+    }
+    fn work_use_sums(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        work: Option<&str>,
+        agent: Option<&str>,
+        payer: Option<&str>,
+    ) -> Result<Vec<crate::work_use::WorkUseSum>> {
+        SqliteStore::work_use_sums(self, from, to, work, agent, payer)
+    }
+
+    fn prune_work_use(&self, before: DateTime<Utc>) -> Result<usize> {
+        SqliteStore::prune_work_use(self, before)
     }
 
     // ─── Per-identity stats slices ───

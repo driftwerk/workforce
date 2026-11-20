@@ -35,6 +35,7 @@ pub mod owners;
 pub mod permissions_audit;
 pub mod personal_routes;
 pub mod pipelines;
+pub mod plan_guard;
 pub mod playbooks;
 pub mod pools;
 pub mod profile;

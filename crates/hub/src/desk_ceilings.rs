@@ -42,7 +42,9 @@ impl Ceilings for DeskCeilings {
     }
 }
 
-/// The hub's agents' use, every billing, for the desk's totals.
+/// The hub's agents' use for the desk's totals: the money they spent (a
+/// plan's calls are no money, so a dollar budget never holds them) and
+/// every token.
 pub struct HubAgentSpend(pub Arc<dyn TelemetryStore>);
 
 impl AgentSpend for HubAgentSpend {
@@ -56,7 +58,7 @@ impl AgentSpend for HubAgentSpend {
                     u.agent_id,
                     Used {
                         tokens: u.tokens,
-                        usd: u.cost_usd,
+                        usd: u.metered_usd,
                     },
                 )
             })
