@@ -612,6 +612,21 @@ async fn an_unanswered_promise_is_chased_by_the_boss_then_told_to_the_person() {
             .find(|i| i.kind == OpenKind::Promise)
             .expect("the promise");
         assert!(promise.due_at.is_some(), "a promise to report back is due");
+        // While the question hasn't gone in, it is chased as a message that
+        // didn't reach its session, never as owed as well.
+        let asked = promise.line_message.expect("the question it reports on");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let chased = d.store().latest_check_in("desk").await.unwrap();
+        assert!(
+            chased.is_none_or(|c| !c.prompt.contains("it is due and not kept")),
+            "chased while its question waits"
+        );
+        assert_eq!(said(&overseer, "Still owed to you: "), None);
+        d.store()
+            .line_set_waiting(asked, workforce_desk::line::Delivery::Delivered)
+            .await
+            .unwrap()
+            .expect("it waited to go in");
         let woke = eventually("the boss told to get it itself", async || {
             d.store()
                 .latest_check_in("desk")
