@@ -133,6 +133,76 @@ pub fn claude_notice_window(text: &str) -> Option<&'static str> {
     })
 }
 
+/// How Claude Code opens a notice that the provider refused the account
+/// itself, lower-cased: the organisation turned Claude Code off (an unpaid
+/// bill, an admin's switch), the account is on hold, suspended or disabled.
+/// Unlike a limit it does not lift at a reset, and unlike a revoked token it
+/// can lift without a new sign-in, once the account is put right. The shared
+/// rule of the hub's own calls and Desk's sessions.
+const ACCOUNT_REFUSAL_OPENINGS: &[&str] = &[
+    "your organization has disabled claude subscription access",
+    "your organisation has disabled claude subscription access",
+    "your account is on hold",
+    "your account has been disabled",
+    "your account has been suspended",
+    "your organization has been disabled",
+    "your organization has been suspended",
+    "your organisation has been disabled",
+    "your organisation has been suspended",
+    "your organization is not authorized",
+    "your organization isn't authorized",
+    "your organization does not have access to claude code",
+    "your account is not authorized for claude code",
+    "your account isn't authorized for claude code",
+    "your organization's billing",
+    "your account has a billing issue",
+];
+
+/// A line as Claude Code's notice starts it, lower-cased: trimmed, past any
+/// blockquote marker or ellipsis a caller quoted it behind, and past the
+/// generic "API Error:" prefix.
+fn notice_line(line: &str) -> &str {
+    let line = line
+        .trim()
+        .trim_start_matches('…')
+        .trim_start_matches("> ")
+        .trim_start_matches('…')
+        .trim_start();
+    line.strip_prefix("api error:")
+        .map_or(line, str::trim_start)
+}
+
+/// Why the provider refused the account itself, in plain words, when
+/// `text` carries that refusal where Claude Code puts one (at the start of
+/// a line: narration that quotes one is not one). None for anything else.
+pub fn claude_account_refusal(text: &str) -> Option<&'static str> {
+    let normal = text.replace(['\u{2018}', '\u{2019}'], "'").to_lowercase();
+    normal
+        .lines()
+        .map(notice_line)
+        .any(|line| ACCOUNT_REFUSAL_OPENINGS.iter().any(|o| line.starts_with(o)))
+        .then(|| claude_refusal_reason(text))
+}
+
+/// What an account refusal says, in plain words for the person: why the
+/// login was turned away.
+pub fn claude_refusal_reason(text: &str) -> &'static str {
+    let lower = text.replace(['\u{2018}', '\u{2019}'], "'").to_lowercase();
+    if lower.contains("disabled claude subscription access") {
+        "its organisation has turned off Claude Code access"
+    } else if lower.contains("on hold") {
+        "the account is on hold"
+    } else if lower.contains("suspended") {
+        "the account is suspended"
+    } else if lower.contains("billing") {
+        "the account has a billing problem"
+    } else if lower.contains("authorized") || lower.contains("does not have access") {
+        "the account isn't allowed to use Claude Code"
+    } else {
+        "the account is disabled"
+    }
+}
+
 /// `windows`, shortest first.
 pub fn ordered(mut windows: Vec<Window>) -> Vec<Window> {
     windows.sort_by_key(|w| w.minutes);
@@ -249,6 +319,22 @@ mod tests {
 
     fn at(rfc3339: &str) -> Option<DateTime<Utc>> {
         Some(DateTime::parse_from_rfc3339(rfc3339).unwrap().to_utc())
+    }
+
+    #[test]
+    fn a_refusal_of_the_account_itself_is_told_from_any_other_line_and_said_plainly() {
+        let org = "Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead";
+        assert_eq!(
+            claude_account_refusal(org),
+            Some("its organisation has turned off Claude Code access")
+        );
+        assert_eq!(
+            claude_account_refusal("> … Your account is on hold. Contact support."),
+            Some("the account is on hold")
+        );
+        assert!(claude_account_refusal("You’ve hit your weekly limit · resets 4pm").is_none());
+        // Said mid-answer, it isn't Claude Code's notice.
+        assert!(claude_account_refusal("I read that your account is on hold upstream.").is_none());
     }
 
     #[test]

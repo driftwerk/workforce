@@ -47,6 +47,11 @@ pub(super) struct Entry {
     pub state: SessionState,
     /// Its last turn failed.
     pub failed: bool,
+    /// The person's login it runs on, by its name; none, the CLI's own.
+    pub login: Option<String>,
+    /// How its last turn failed, when it was its login's doing: "stopped on
+    /// Kingsley Apple's limit", "turned away on Kingsley Starmoire".
+    pub on_login: Option<String>,
     pub account: Option<Account>,
     /// Why its account can't be relied on as it stands, if so.
     pub stale: Option<Staleness>,
@@ -104,9 +109,14 @@ pub(super) fn as_of(a: &Account, stale: Option<Staleness>, tz: chrono_tz::Tz) ->
 }
 
 fn line(e: &Entry, short: bool, tz: chrono_tz::Tz) -> String {
-    let state = match e.failed {
-        true => format!("{}, its last turn failed", e.state.as_str()),
-        false => e.state.as_str().to_string(),
+    let state = match (e.failed, &e.on_login) {
+        (true, Some(why)) => format!("{}, its last turn {why}", e.state.as_str()),
+        (true, None) => format!("{}, its last turn failed", e.state.as_str()),
+        (false, _) => e.state.as_str().to_string(),
+    };
+    let state = match &e.login {
+        Some(l) => format!("{state}, on login {l}"),
+        None => state,
     };
     let head = match &e.account {
         Some(a) => format!(
@@ -267,6 +277,18 @@ pub(crate) async fn block(service: &AgentService, channel: &str, owner: &str) ->
             name: v.label().to_string(),
             state: v.state,
             failed: v.failure.is_some(),
+            login: v.account.as_ref().map(|a| a.name.clone()),
+            on_login: v.failure.as_ref().and_then(|f| {
+                let login = v
+                    .account
+                    .as_ref()
+                    .map_or("this computer's sign-in", |a| a.name.as_str());
+                match (f.limit(), f.refused()) {
+                    (Some(_), _) => Some(format!("stopped on {login}'s usage limit")),
+                    (None, true) => Some(format!("was turned away by the provider on {login}")),
+                    (None, false) => None,
+                }
+            }),
             account: accounts.iter().find(|a| a.session == v.id).cloned(),
             stale: stale.get(&v.id).copied(),
         })
@@ -376,9 +398,28 @@ mod tests {
             name: name.into(),
             state,
             failed: false,
+            login: None,
+            on_login: None,
             account: Some(a),
             stale: None,
         }
+    }
+
+    #[test]
+    fn a_sessions_line_names_its_login_and_a_stop_on_it() {
+        let mut e = entry(
+            "Mantis Keycloak upgrade",
+            SessionState::Done,
+            "Upgrade Keycloak.",
+        );
+        e.login = Some("Kingsley Starmoire".into());
+        e.failed = true;
+        e.on_login = Some("was turned away by the provider on Kingsley Starmoire".into());
+        let l = line(&e, true, chrono_tz::UTC);
+        assert!(
+            l.contains("done, its last turn was turned away by the provider on Kingsley Starmoire, on login Kingsley Starmoire"),
+            "{l}"
+        );
     }
 
     #[test]

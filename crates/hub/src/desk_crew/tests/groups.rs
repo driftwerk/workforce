@@ -377,6 +377,12 @@ fn pointed_at(name: &str, other: &Client, dir: &Path) -> Vec<(Value, bool)> {
             json!({ "session_id": s, "engine": "codex", "reason": r }),
             true,
         )],
+        "crew.switch_login" => vec![(
+            json!({ "session_id": s, "login": "Kingsley Gmail", "reason": r }),
+            true,
+        )],
+        // The person's logins, and only the sessions on them it sees.
+        "crew.logins" => vec![(json!({}), false)],
         "crew.set_mode" => vec![(
             json!({ "session_id": s, "mode": "plan", "reason": r }),
             true,
