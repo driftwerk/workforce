@@ -184,6 +184,15 @@ impl From<DeskError> for StartRefused {
     }
 }
 
+impl From<StartRefused> for DeskError {
+    fn from(e: StartRefused) -> Self {
+        match e {
+            StartRefused::Failed(e) => e,
+            StartRefused::Skipped(why) | StartRefused::Waits(why) => Self::Conflict(why),
+        }
+    }
+}
+
 /// A plan's ticket's session, started: on this computer (`machine` none),
 /// or on one of the person's machines, by its id there.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,6 +200,9 @@ pub struct Started {
     pub id: Uuid,
     pub machine: Option<String>,
     pub name: String,
+    /// What its boss is told of how it started, when it isn't as asked: a
+    /// machine's session started as the person's, not its boss's.
+    pub note: Option<String>,
 }
 
 impl Started {
@@ -2302,9 +2314,8 @@ impl Desk {
                 ),
                 BeginStart::Other(e) => StartRefused::Failed(DeskError::Internal(e)),
             })?;
-        Ok(self
-            .plan_launch(p, t, session, at, false, &runs, start.worktree, boss, by)
-            .await?)
+        self.plan_launch(p, t, session, at, false, &runs, start.worktree, boss, by)
+            .await
     }
 
     /// Readies `ticket`, a plan's ticket of a repository, to start: its
@@ -2469,6 +2480,7 @@ impl Desk {
                 id: view.id,
                 machine: None,
                 name: view.label().to_string(),
+                note: None,
             }));
         }
         let plan_id = self.0.store.plan_of_ticket(t.id).await.map_err(internal)?;
@@ -2531,6 +2543,7 @@ impl Desk {
         self.plan_launch(&p, t, s.session, s.at, true, &runs, worktree, boss, by)
             .await
             .map(Some)
+            .map_err(DeskError::from)
     }
 
     /// The starts on the person's machines whose outcome wasn't known, made
@@ -2622,7 +2635,7 @@ impl Desk {
         worktree: bool,
         boss: &Party,
         by: &By,
-    ) -> Result<Started, DeskError> {
+    ) -> Result<Started, StartRefused> {
         let s = Starting {
             ticket: t.id,
             session,
@@ -2637,11 +2650,13 @@ impl Desk {
                         id: v.id,
                         machine: None,
                         name: v.label().to_string(),
+                        note: None,
                     };
                     (started, Some(v))
-                }),
+                })
+                .map_err(StartRefused::from),
             Some(m) => match self
-                .plan_spawn_on(&m, p, &t, since, retry, runs, worktree, boss)
+                .plan_spawn_on(&m, p, &t, session, since, retry, runs, worktree, boss)
                 .await
             {
                 Ok(started) => Ok((started, None)),
@@ -2676,20 +2691,25 @@ impl Desk {
     /// one there already for it (named for its key, in its folder), when
     /// one is, so a start cut off or never answered is never made twice;
     /// else one started there now in the machine's own folder, its prompt
-    /// saying its board is here.
+    /// saying its board is here. A plan of the main boss (no group) on an
+    /// engine Desk checks every call of starts in its plan's grant there,
+    /// run by its boss from launch ([`Desk::create_held`]), as `session`:
+    /// until the machine holds that grant, the start waits.
     #[allow(clippy::too_many_arguments)]
     async fn plan_spawn_on(
         &self,
         machine: &str,
         p: &Plan,
         t: &Ticket,
+        session: Uuid,
         since: chrono::DateTime<chrono::Utc>,
         retry: bool,
         runs: &Runs,
         worktree: bool,
         boss: &Party,
-    ) -> Result<Started, (DeskError, bool)> {
-        let sure = |e: DeskError| (e, false);
+    ) -> Result<Started, (StartRefused, bool)> {
+        let failed = |e: DeskError, unsure: bool| (StartRefused::Failed(e), unsure);
+        let sure = |e: DeskError| failed(e, false);
         let key = self.key_of(t).await.map_err(sure)?;
         let needs = self.need_keys(t).await.map_err(sure)?;
         let (Some(engine), Some(folder)) = (runs.engine, runs.folder.clone()) else {
@@ -2711,16 +2731,26 @@ impl Desk {
                 }
                 e => DeskError::Invalid(e.to_string()),
             };
-            (e, retry)
+            failed(e, retry)
         };
-        // Only a start that may have reached the machine is unsure.
+        // Only a start that may have reached the machine is unsure; one the
+        // machine can't hold for its boss yet waits, as the machine says.
         let refused = |e: crew::MachineRefused| match e {
+            crew::MachineRefused::NotHeld(why) => (
+                StartRefused::Waits(format!("{key} waits on {machine}: {why}")),
+                false,
+            ),
             crew::MachineRefused::Refused(why) => sure(DeskError::Invalid(format!(
                 "{machine} didn't start {key}: {why}"
             ))),
-            e @ crew::MachineRefused::Unknown(_) => (DeskError::Invalid(e.to_string()), true),
+            e @ crew::MachineRefused::Unknown(_) => failed(DeskError::Invalid(e.to_string()), true),
             e => sure(DeskError::Invalid(e.to_string())),
         };
+        // Started in its plan's grant there, run by its boss from launch, for
+        // a plan of the main boss on an engine Desk checks every call of;
+        // Desk carries the start's grant and boss from the call itself.
+        let held = (p.group.is_none() && crate::engine::boss_safe(engine))
+            .then(|| crate::grant::plan_key(p.id));
         let group = p.group.as_deref();
         let listed = crew
             .machine_call(
@@ -2733,7 +2763,7 @@ impl Desk {
             .await
             .map_err(read_refused)?;
         let listed: Vec<crew::MachineSession> = serde_json::from_value(listed).map_err(|_| {
-            (
+            failed(
                 DeskError::Invalid(format!("{machine}'s sessions couldn't be read.")),
                 retry,
             )
@@ -2742,24 +2772,41 @@ impl Desk {
             cwd == folder
                 || cwd.starts_with(&format!("{}/.worktrees/", folder.trim_end_matches('/')))
         };
-        // Only one made for this start: an older session of the same key
-        // (the ticket was sent back and started again) is never taken up.
-        // Wide enough for the two computers' clocks to differ.
+        // The one made for this start: a held start's is the session id it
+        // gave, whatever has come of it since (the person may have it). Else
+        // (a start not held, or a machine that doesn't take its id), one of
+        // its key made since: an older session of the same key (the ticket
+        // was sent back and started again) is never taken up. Wide enough
+        // for the two computers' clocks to differ. A held start takes up
+        // only one its boss has there: never the person's own of that name.
         let after = since - chrono::Duration::minutes(10);
-        if let Some(there) = listed
-            .iter()
-            .filter(|s| {
-                s.name == key
-                    && made_in(&s.cwd)
-                    && !matches!(s.state.as_str(), "closed" | "stopped")
-                    && s.created_at.is_none_or(|c| c >= after)
-            })
-            .max_by_key(|s| s.created_at)
-        {
+        // There, a boss of this hub goes by its agent's id
+        // ([`crate::grant::BossRef::name`]).
+        let made_for = |s: &crew::MachineSession| match held {
+            Some(_) => {
+                s.created_at.is_some_and(|c| c >= after)
+                    && s.boss_has.as_deref() == Some(boss.id.as_str())
+            }
+            None => s.created_at.is_none_or(|c| c >= after),
+        };
+        let by_name = || {
+            listed
+                .iter()
+                .filter(|s| {
+                    s.name == key
+                        && made_in(&s.cwd)
+                        && !matches!(s.state.as_str(), "closed" | "stopped")
+                        && made_for(s)
+                })
+                .max_by_key(|s| s.created_at)
+        };
+        let by_id = listed.iter().find(|s| held.is_some() && s.id == session);
+        if let Some(there) = by_id.or_else(by_name) {
             return Ok(Started {
                 id: there.id,
                 machine: Some(machine.to_string()),
                 name: there.label().to_string(),
+                note: None,
             });
         }
         let prompt = format!(
@@ -2786,23 +2833,43 @@ impl Desk {
         if let Some(model) = &runs.model {
             body["model"] = model.clone().into();
         }
+        if held.is_some() {
+            body["id"] = session.to_string().into();
+        }
         let made = crew
-            .machine_call(machine, group, &boss.id, "desk.session_start", body)
+            .machine_call(
+                machine,
+                held.as_deref().or(group),
+                &boss.id,
+                "desk.session_start",
+                body,
+            )
             .await
             .map_err(refused)?;
         let made: crew::MachineSession = serde_json::from_value(made).map_err(|_| {
             // Started there, its answer unread: found there next time.
-            (
+            failed(
                 DeskError::Invalid(format!(
                     "{machine} started {key}, but its answer couldn't be read; Desk finds it there next time."
                 )),
                 true,
             )
         })?;
+        // A Desk there, or here, older than held starts makes it the
+        // person's, under an id of its own: said, so its boss knows why it
+        // only suggests.
+        let note = (held.is_some() && made.id != session).then(|| {
+            format!(
+                "{key} started on {machine} as the person's, not yours: Desk on {machine}, or on this computer, \
+                 is older and doesn't start a plan's sessions for its boss. Until it is updated, what you send \
+                 {key} is a suggestion the person hands over."
+            )
+        });
         Ok(Started {
             id: made.id,
             machine: Some(machine.to_string()),
             name: made.label().to_string(),
+            note,
         })
     }
 

@@ -218,6 +218,12 @@ pub struct CrewHub {
     /// How many decisions (and suggestions) each boss made, by the session
     /// they were about: a line or work turn that moved none let it wait.
     acted: Mutex<HashMap<(String, Option<uuid::Uuid>), u64>>,
+    /// The ends of line and work turns, by boss, channel and the turn's
+    /// number among those begun, until their caller knows whether the turn
+    /// did anything ([`Self::turn_end_said`]).
+    quiet_ends: Mutex<HashMap<(String, String, u64), observe::HeldEnd>>,
+    /// How many line and work turns have begun.
+    turns_begun: std::sync::atomic::AtomicU64,
     /// When each boss last asked the person with `crew.ask_person`: its
     /// turn's reply then isn't also kept as a question of its own.
     asked_person: Mutex<HashMap<String, DateTime<Utc>>>,
@@ -293,12 +299,22 @@ pub struct CrewHub {
     plan_watch: Mutex<plan_watch::Watch>,
     /// What failed to start, for its plan's next turn.
     plan_failures: Mutex<Vec<(uuid::Uuid, String)>>,
-    /// The plan tickets waiting on something under way (a clone) to start,
-    /// with what they wait on: their boss is told once.
-    plan_waiting: Mutex<HashMap<uuid::Uuid, (uuid::Uuid, String)>>,
+    /// What its boss is told of how a ticket started, when it isn't as
+    /// asked ([`workforce_desk::Started::note`]), for its plan's next turn.
+    plan_notes: Mutex<Vec<(uuid::Uuid, String)>>,
+    /// The plan tickets waiting on something under way (a clone, their
+    /// plan's grant on a machine) to start, with what they wait on, and
+    /// whether they are ready to be tried again: their boss is told once.
+    plan_waiting: Mutex<HashMap<uuid::Uuid, (uuid::Uuid, String, bool)>>,
     /// Plans' sessions on the person's machines, as last read there, by
     /// `<machine>/<id>`; and when each machine was last read.
     machine_seen: Mutex<HashMap<String, plan::MachineSeen>>,
+    /// The machines each running plan of a boss of no group has tickets
+    /// still to start on, by machine and plan, as last read.
+    machine_plans: Mutex<std::collections::BTreeMap<(String, uuid::Uuid), plan::MachinePlan>>,
+    /// Whether the plans' machine sessions were read since the hub started:
+    /// until then no plan grant is said ([`machine_grants`]).
+    plans_watched: std::sync::atomic::AtomicBool,
     machine_read: Mutex<HashMap<String, std::time::Instant>>,
     /// Each machine's plan reads that failed in a row.
     machine_down: Mutex<HashMap<String, u32>>,
@@ -735,6 +751,8 @@ impl CrewHub {
             refused_steps: Mutex::default(),
             questions: Mutex::default(),
             acted: Mutex::default(),
+            quiet_ends: Mutex::default(),
+            turns_begun: std::sync::atomic::AtomicU64::default(),
             asked_person: Mutex::default(),
             asks_checked: Mutex::default(),
             turn_acts: Mutex::default(),
@@ -764,8 +782,11 @@ impl CrewHub {
             plan_failed: Mutex::default(),
             plan_watch: Mutex::default(),
             plan_failures: Mutex::default(),
+            plan_notes: Mutex::default(),
             plan_waiting: Mutex::default(),
             machine_seen: Mutex::default(),
+            machine_plans: Mutex::default(),
+            plans_watched: std::sync::atomic::AtomicBool::new(false),
             machine_read: Mutex::default(),
             machine_down: Mutex::default(),
             reuse_claims: Mutex::default(),
@@ -1388,14 +1409,18 @@ impl Crew for CrewHub {
         let a = self
             .relay_as(machine, group.unwrap_or(""), call, input, boss, &ceiling)
             .await?;
+        let why = || {
+            a.body
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .map_or_else(|| format!("{machine} refused it."), str::to_string)
+        };
         match a.status {
             served::ServedStatus::Ok => Ok(a.body),
-            _ => Err(MachineRefused::Refused(
-                a.body
-                    .get("error")
-                    .and_then(serde_json::Value::as_str)
-                    .map_or_else(|| format!("{machine} refused it."), str::to_string),
-            )),
+            _ if a.body["code"] == workforce_desk::grant::NOT_HELD => {
+                Err(MachineRefused::NotHeld(why()))
+            }
+            _ => Err(MachineRefused::Refused(why())),
         }
     }
 

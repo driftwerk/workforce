@@ -537,8 +537,9 @@ impl CrewHub {
         let prompt = self.line_prompt(session, &messages, &ended, &o);
         let boss = service.agent_id.as_str().to_string();
         let mark = self.acted_mark(&boss, session);
+        let since = self.turns_begun();
         let ran = self
-            .run_turn(
+            .run_turn_with(
                 &service,
                 &owner,
                 &line_channel(session),
@@ -546,8 +547,11 @@ impl CrewHub {
                 hop,
                 None,
                 None,
+                None,
             )
             .await;
+        let did = ran.as_ref().is_ok_and(|r| r.acted);
+        let ran = ran.map(|r| (r.session_id, r.answer));
         if let Err(e) = &ran {
             tracing::warn!(%session, error = %format!("{e:#}"), "the overseer's line turn failed");
         }
@@ -639,14 +643,15 @@ impl CrewHub {
                 }
             }
         }
-        // A turn that did nothing, and suggested nothing, is a decision
-        // too: recorded here, never read from what it said.
-        if let Ok((_, reply)) = &ran {
-            if self.acted_mark(&boss, session) == mark {
-                self.record_nothing(&boss, session, !ended.is_empty(), reply)
-                    .await;
-            }
+        // A turn that decided nothing for the session, and suggested
+        // nothing, is a decision too: recorded here, never read from what
+        // it said. One that did nothing at all is kept out of Activity.
+        let decided = self.acted_mark(&boss, session) != mark;
+        if let (Ok((_, reply)), false) = (&ran, decided) {
+            self.record_nothing(&boss, session, !ended.is_empty(), reply)
+                .await;
         }
+        self.turn_end_said(&boss, &line_channel(session), since, did || decided);
         ran.is_ok()
     }
 
