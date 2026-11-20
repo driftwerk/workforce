@@ -163,6 +163,12 @@ pub struct OpenItem {
     /// lets an ask carry answers.
     #[serde(default)]
     pub cant_decide: Option<String>,
+    /// A promise's: when it is chased next, if it is still owed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_at: Option<DateTime<Utc>>,
+    /// When its boss was last told to go and get it itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chased_at: Option<DateTime<Utc>>,
 }
 
 /// An item to open (or, when one with its key is open, to update).
@@ -186,6 +192,9 @@ pub struct NewItem {
     pub sessions: Vec<Uuid>,
     pub layout: AskLayout,
     pub cant_decide: Option<String>,
+    /// A promise's: when it is chased if still owed. Given again, it is
+    /// chased afresh from then.
+    pub due_at: Option<DateTime<Utc>>,
 }
 
 impl NewItem {
@@ -207,6 +216,7 @@ impl NewItem {
             sessions: Vec::new(),
             layout: AskLayout::default(),
             cant_decide: None,
+            due_at: None,
         }
     }
 
@@ -229,6 +239,7 @@ impl NewItem {
             sessions: Vec::new(),
             layout: AskLayout::default(),
             cant_decide: None,
+            due_at: None,
         }
     }
 
@@ -810,6 +821,8 @@ mod tests {
             closed_why: None,
             layout: AskLayout::default(),
             cant_decide: None,
+            due_at: None,
+            chased_at: None,
         }
     }
 

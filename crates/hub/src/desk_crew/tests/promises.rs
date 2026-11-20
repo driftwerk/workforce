@@ -581,3 +581,79 @@ async fn without_the_composer_what_was_done_is_said_at_once() {
     })
     .await;
 }
+
+/// What the boss owes the person is chased, never left to wait on the
+/// session (20 Nov: the partner-docs differences, owed from about 03:00,
+/// brought only at 06:51 when the person asked): past its due time the boss
+/// is woken once to get it itself from the session's transcript and files,
+/// and once as long again, the person is told it is still owed. Each once.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unanswered_promise_is_chased_by_the_boss_then_told_to_the_person() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        let s = new_session(&d, dir.path(), "Legacy removal").await;
+        crew.perform(
+            &Action::Nudge {
+                to: Target::Session(s.id),
+                message: format!("{STATUS_QUESTION} Which partner docs differ?"),
+                reply_to: None,
+            },
+            crew.by_overseer("The person asked.").unwrap(),
+        )
+        .await
+        .unwrap();
+        let promise = d
+            .store()
+            .items_not_closed(Some("desk"))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|i| i.kind == OpenKind::Promise)
+            .expect("the promise");
+        assert!(promise.due_at.is_some(), "a promise to report back is due");
+        let woke = eventually("the boss told to get it itself", async || {
+            d.store()
+                .latest_check_in("desk")
+                .await
+                .unwrap()
+                .filter(|c| c.prompt.contains("it is due and not kept"))
+        })
+        .await;
+        assert!(
+            woke.prompt.contains("Which partner docs differ?")
+                && woke.prompt.contains("crew.history")
+                && woke.prompt.contains(&promise.id.to_string()),
+            "{}",
+            woke.prompt
+        );
+        let told = eventually("the person told it is still owed", async || {
+            said(&overseer, "Still owed to you since ")
+        })
+        .await;
+        assert!(told.contains("Which partner docs differ?"), "{told}");
+        let after = d.store().open_item(promise.id).await.unwrap().unwrap();
+        assert_eq!(after.state, OpenState::Open, "still owed until kept");
+        assert_eq!(after.due_at, None, "and chased no more");
+        // Each once.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let line = overseer
+            .sessions
+            .find(DESK_CHANNEL, PERSON)
+            .unwrap()
+            .unwrap();
+        let notices = line
+            .messages
+            .iter()
+            .filter(|m| m.content.starts_with("Still owed to you since "))
+            .count();
+        assert_eq!(notices, 1);
+        let latest = d.store().latest_check_in("desk").await.unwrap().unwrap();
+        assert!(
+            latest.id == woke.id || !latest.prompt.contains("it is due and not kept"),
+            "woken again: {}",
+            latest.prompt
+        );
+    })
+    .await;
+}

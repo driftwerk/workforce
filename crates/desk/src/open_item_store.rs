@@ -16,7 +16,7 @@ use crate::store::DeskStore;
 const COLUMNS: &str = "id, boss, owner, kind, session, line_message, text, holding_up, \
      recommendation, options, generalizes, done_when, dedupe_key, opened_at, last_said_at, \
      said_count, changed_at, state, closed_at, closed_by, closed_why, raised_at, sessions, \
-     prefer_scope, question, points, recommended, not_blocking, cant_decide";
+     prefer_scope, question, points, recommended, not_blocking, cant_decide, due_at, chased_at";
 
 fn item(r: &Row) -> Result<OpenItem> {
     Ok(OpenItem {
@@ -54,6 +54,8 @@ fn item(r: &Row) -> Result<OpenItem> {
             not_blocking: r.try_get(27)?,
         },
         cant_decide: r.try_get(28)?,
+        due_at: r.try_get(29)?,
+        chased_at: r.try_get(30)?,
     })
 }
 
@@ -131,9 +133,10 @@ impl DeskStore {
                         "INSERT INTO boss_open_items (id, boss, owner, kind, session, line_message, \
                          text, holding_up, recommendation, options, generalizes, done_when, \
                          dedupe_key, opened_at, last_said_at, said_count, changed_at, state, \
-                         sessions, question, points, recommended, not_blocking, cant_decide) \
+                         sessions, question, points, recommended, not_blocking, cant_decide, \
+                         due_at) \
                          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-                         $16, $14, 'open', $17, $18, $19, $20, $21, $22) \
+                         $16, $14, 'open', $17, $18, $19, $20, $21, $22, $23) \
                          ON CONFLICT (boss, dedupe_key) WHERE state <> 'closed' DO NOTHING \
                          RETURNING {COLUMNS}"
                     ),
@@ -160,6 +163,7 @@ impl DeskStore {
                         &new.layout.recommended,
                         &new.layout.not_blocking,
                         &new.cant_decide,
+                        &new.due_at,
                     ],
                 )
                 .await?;
@@ -237,7 +241,9 @@ impl DeskStore {
                      recommended = $16, \
                      not_blocking = COALESCE($17, not_blocking), \
                      cant_decide = COALESCE($18, cant_decide), \
-                     done_when = COALESCE(done_when, $19) \
+                     done_when = COALESCE(done_when, $19), \
+                     due_at = COALESCE($20, due_at), \
+                     chased_at = CASE WHEN $20::timestamptz IS NULL THEN chased_at END \
                      WHERE id = $1 RETURNING {COLUMNS}"
                 ),
                 &[
@@ -260,6 +266,7 @@ impl DeskStore {
                     &new.layout.not_blocking,
                     &new.cant_decide,
                     &new.done_when,
+                    &new.due_at,
                 ],
             )
             .await?;
@@ -442,6 +449,45 @@ impl DeskStore {
 
     /// Closes item `id` (open or parked) as `by` says, for `why`: the item
     /// as closed, or `None` when it was already closed.
+    /// Open promises whose chase is due by `now`.
+    pub async fn items_due(&self, now: DateTime<Utc>) -> Result<Vec<OpenItem>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                &format!(
+                    "SELECT {COLUMNS} FROM boss_open_items \
+                     WHERE due_at <= $1 AND state <> 'closed' ORDER BY due_at, id"
+                ),
+                &[&now],
+            )
+            .await?
+            .iter()
+            .map(item)
+            .collect()
+    }
+
+    /// `id` was chased at `at` from the due time it was read with
+    /// (`was`), and is due again at `next` (none: never again). Whether
+    /// this caller moved it: an item closed, chased or asked afresh since
+    /// it was read is left as it is.
+    pub async fn item_chased(
+        &self,
+        id: Uuid,
+        was: DateTime<Utc>,
+        at: DateTime<Utc>,
+        next: Option<DateTime<Utc>>,
+    ) -> Result<bool> {
+        let client = self.pool().get().await?;
+        let n = client
+            .execute(
+                "UPDATE boss_open_items SET chased_at = $3, due_at = $4 \
+                 WHERE id = $1 AND due_at = $2 AND state <> 'closed'",
+                &[&id, &was, &at, &next],
+            )
+            .await?;
+        Ok(n == 1)
+    }
+
     pub async fn item_close(&self, id: Uuid, by: ClosedBy, why: &str) -> Result<Option<OpenItem>> {
         let client = self.pool().get().await?;
         client

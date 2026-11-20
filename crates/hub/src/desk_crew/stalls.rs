@@ -582,7 +582,7 @@ impl CrewHub {
     }
 
     /// Wakes `boss`'s full turn with `line` about session `s`.
-    fn wake_on(&self, boss: &str, s: Uuid, line: String, about: String) {
+    pub(super) fn wake_on(&self, boss: &str, s: Uuid, line: String, about: String) {
         let Some((service, o)) = self.overseer_named(boss) else {
             tracing::info!(%boss, "a stall has no boss here to hand it to");
             return;
