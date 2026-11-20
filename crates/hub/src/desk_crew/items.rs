@@ -353,8 +353,7 @@ impl CrewHub {
             });
             at_full = full.is_some();
             if let Some((_, o)) = full {
-                let about = session;
-                let standing = self.standing_words(boss, &o, about).await;
+                let standing = self.standing_words(boss, &o, session).await;
                 let words = |lead: &str| match standing.is_empty() {
                     true => lead.to_string(),
                     false => format!("{lead}\n\n{standing}"),
@@ -374,7 +373,7 @@ impl CrewHub {
                 }
                 // A matter is its session, or its words when about none:
                 // reworded, it is not checked twice.
-                let matter = match about {
+                let matter = match session {
                     Some(s) => format!("{boss}\u{1f}{s}"),
                     None => format!("{boss}\u{1f}{}", open_item::normalised(text)),
                 };

@@ -669,6 +669,73 @@ async fn kept_out(
     }
 }
 
+/// Each boss, through every crew tool, kept out of the other group's
+/// session and ticket (and Desk's own out of both): and nothing it was
+/// refused became a suggestion, a message or a move; asking for settings
+/// asked for its own.
+async fn every_boss_kept_out(c: &Clients, dir: &Path) {
+    let suggestions = c.d.store().suggestions(100).await.unwrap().len();
+    kept_out(
+        &c.sarah,
+        Some(&c.acme.ticket),
+        &c.atlas,
+        ATLAS_SECRET,
+        "That isn't one of Acme's.",
+        dir,
+    )
+    .await;
+    kept_out(
+        &c.mia,
+        Some(&c.atlas.ticket),
+        &c.acme,
+        ACME_SECRET,
+        "That isn't one of Atlas's.",
+        dir,
+    )
+    .await;
+    let main = "That isn't one of yours.";
+    kept_out(&c.desk, None, &c.acme, ACME_SECRET, main, dir).await;
+    kept_out(&c.desk, None, &c.atlas, ATLAS_SECRET, main, dir).await;
+
+    let after = c.d.store().suggestions(100).await.unwrap();
+    for s in after.iter().skip(suggestions) {
+        if s.action["tool"] == super::super::own_settings::NAME {
+            assert_eq!(
+                s.action["input"]["agent_id"].as_str(),
+                Some(s.agent_id.as_str()),
+                "{s:?}"
+            );
+        }
+    }
+    let outside = [
+        c.acme.session.id.to_string(),
+        c.atlas.session.id.to_string(),
+    ];
+    assert!(
+        after
+            .iter()
+            .skip(suggestions)
+            .all(|s| s.subject.as_ref().is_none_or(|p| !outside.contains(&p.id))),
+        "{after:?}"
+    );
+    let thread =
+        c.d.line_thread(c.atlas.session.id, None, None)
+            .await
+            .unwrap();
+    assert!(thread
+        .iter()
+        .all(|m| m.from.id != "sarah" && m.from.id != "desk"));
+    assert_eq!(
+        c.d.ticket_by_key(&c.atlas.ticket)
+            .await
+            .unwrap()
+            .ticket
+            .state,
+        TicketState::Todo
+    );
+    assert!(c.d.charge_of(c.atlas.session.id).is_none());
+}
+
 /// The same at Act fully, where some tools read more before they act.
 #[tokio::test(flavor = "multi_thread")]
 async fn at_act_fully_each_boss_reads_and_acts_only_inside_its_own_group_too() {
@@ -684,27 +751,7 @@ async fn at_act_fully_each_boss_reads_and_acts_only_inside_its_own_group_too() {
                 boss.agent_id
             );
         }
-        kept_out(
-            &c.sarah,
-            Some(&c.acme.ticket),
-            &c.atlas,
-            ATLAS_SECRET,
-            "That isn't one of Acme's.",
-            dir.path(),
-        )
-        .await;
-        kept_out(
-            &c.mia,
-            Some(&c.atlas.ticket),
-            &c.acme,
-            ACME_SECRET,
-            "That isn't one of Atlas's.",
-            dir.path(),
-        )
-        .await;
-        let main = "That isn't one of yours.";
-        kept_out(&c.desk, None, &c.acme, ACME_SECRET, main, dir.path()).await;
-        kept_out(&c.desk, None, &c.atlas, ATLAS_SECRET, main, dir.path()).await;
+        every_boss_kept_out(&c, dir.path()).await;
     })
     .await;
 }
@@ -714,69 +761,7 @@ async fn each_boss_reads_and_acts_only_inside_its_own_group_through_every_crew_t
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let c = clients(dir.path(), pool).await;
-        let suggestions = c.d.store().suggestions(100).await.unwrap().len();
-
-        kept_out(
-            &c.sarah,
-            Some(&c.acme.ticket),
-            &c.atlas,
-            ATLAS_SECRET,
-            "That isn't one of Acme's.",
-            dir.path(),
-        )
-        .await;
-        kept_out(
-            &c.mia,
-            Some(&c.atlas.ticket),
-            &c.acme,
-            ACME_SECRET,
-            "That isn't one of Atlas's.",
-            dir.path(),
-        )
-        .await;
-        let main = "That isn't one of yours.";
-        kept_out(&c.desk, None, &c.acme, ACME_SECRET, main, dir.path()).await;
-        kept_out(&c.desk, None, &c.atlas, ATLAS_SECRET, main, dir.path()).await;
-
-        // Nothing it was refused became a suggestion, a message or a move;
-        // asking for settings asked for its own.
-        let after = c.d.store().suggestions(100).await.unwrap();
-        for s in after.iter().skip(suggestions) {
-            if s.action["tool"] == super::super::own_settings::NAME {
-                assert_eq!(
-                    s.action["input"]["agent_id"].as_str(),
-                    Some(s.agent_id.as_str()),
-                    "{s:?}"
-                );
-            }
-        }
-        let outside = [
-            c.acme.session.id.to_string(),
-            c.atlas.session.id.to_string(),
-        ];
-        assert!(
-            after
-                .iter()
-                .skip(suggestions)
-                .all(|s| s.subject.as_ref().is_none_or(|p| !outside.contains(&p.id))),
-            "{after:?}"
-        );
-        let thread =
-            c.d.line_thread(c.atlas.session.id, None, None)
-                .await
-                .unwrap();
-        assert!(thread
-            .iter()
-            .all(|m| m.from.id != "sarah" && m.from.id != "desk"));
-        assert_eq!(
-            c.d.ticket_by_key(&c.atlas.ticket)
-                .await
-                .unwrap()
-                .ticket
-                .state,
-            TicketState::Todo
-        );
-        assert!(c.d.charge_of(c.atlas.session.id).is_none());
+        every_boss_kept_out(&c, dir.path()).await;
 
         // The registry: every overseer's tools are bound to its own scope.
         for (boss, scope) in [

@@ -78,6 +78,13 @@ pub(crate) enum Stands {
     Busy,
 }
 
+/// The key that puts `ticket` back once each time its session went: its
+/// time in Doing says which time, and it is let go of once the ticket is on
+/// a session again.
+fn back_key(ticket: &workforce_desk::board::Ticket) -> String {
+    format!("back:{}:{}", ticket.id, ticket.state_at.timestamp_millis())
+}
+
 /// How the watchdog reads a ticket in Doing or Review whose session is
 /// `session`: `view` is what Desk has of it (none, gone), `ours` whether
 /// the boss runs it, `rested` whether it has been still for the grace.
@@ -261,6 +268,12 @@ impl CrewHub {
                 Err(DeskError::NotFound) => None,
                 Err(_) => continue,
             };
+            // On a session again (given another within Doing, whose time
+            // in Doing doesn't change): when that one goes, it goes back
+            // again.
+            if view.is_some() {
+                self.plan_watch.lock().done.remove(&back_key(ticket));
+            }
             let since = view
                 .as_ref()
                 .map_or(ticket.state_at, |v| v.updated_at.max(ticket.state_at));
@@ -320,7 +333,7 @@ impl CrewHub {
     /// back in To do, so the plan starts it again, as its own
     /// `crew.move_ticket` ([`CrewHub::gate`]: a planned ticket that ran goes
     /// back in the queue by the person, so below Act fully it is suggested
-    /// to them). Once each time it went to Doing, however a look sees it
+    /// to them). Once each time its session went, however a look sees it
     /// gone: a session removed is gone from Desk before the ticket's let go
     /// of it is written, so one look may see it still on the ticket and the
     /// next the ticket with no one on it.
@@ -333,7 +346,7 @@ impl CrewHub {
     ) {
         let boss = service.agent_id.as_str();
         let ticket = &t.ticket.ticket;
-        let once = format!("back:{}:{}", ticket.id, ticket.state_at.timestamp_millis());
+        let once = back_key(ticket);
         // Claimed before anything is awaited: two looks never both act.
         if !self.plan_watch.lock().done.insert(once.clone()) {
             return;

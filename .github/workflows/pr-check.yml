@@ -166,7 +166,7 @@ jobs:
 
   # The test suite is built once here and run in parallel partitions below:
   # the tests of every crate that can reach Postgres (each that depends on
-  # workforce-postgres) against a real one (`hub-postgres`), the other
+  # workforce-postgres) against a real one (`postgres`), the other
   # crates' in `test-run`, and the doctests in their own job (`test-doc`). Together
   # they run exactly what one `cargo nextest run --all-features` plus
   # `cargo test --all-features --doc` ran; `test-count` fails the run if the
@@ -284,7 +284,7 @@ jobs:
           name: nextest-archive
           path: ${{ runner.temp }}
       - run: mkdir -p ui/dist
-      # The crates that can reach Postgres run in `hub-postgres`, against one;
+      # The crates that can reach Postgres run in `postgres`, against one;
       # these are the rest, which never touch it.
       - name: Run partition ${{ matrix.partition }} of 2
         run: |
@@ -312,7 +312,7 @@ jobs:
   # connections.
   # Every nextest test is a process of its own, so the URL is what keeps
   # each from starting an embedded Postgres of its own.
-  hub-postgres:
+  postgres:
     name: Postgres tests (${{ matrix.partition }}/8)
     needs: [changes, test-build]
     if: needs.changes.outputs.code == 'true'
@@ -338,7 +338,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/start-postgres
         with:
-          name: hub-postgres
+          name: postgres
           user: hub
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
         with:
@@ -365,7 +365,7 @@ jobs:
       - name: The Postgres tests ran
         run: |
           set -euo pipefail
-          made="$(docker logs hub-postgres 2>&1 | grep -c 'CREATE DATABASE' || true)"
+          made="$(docker logs postgres 2>&1 | grep -c 'CREATE DATABASE' || true)"
           echo "databases made: $made"
           if [ "$made" -lt 40 ]; then
             echo "::error::only $made databases were made: the Postgres tests didn't run"; exit 1
@@ -373,7 +373,7 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
-          name: junit-hub-${{ matrix.partition }}
+          name: junit-postgres-${{ matrix.partition }}
           path: target/nextest/ci/junit.xml
           retention-days: 1
           overwrite: true
@@ -381,10 +381,10 @@ jobs:
 
   # Fails unless the partitions together ran every test in the archive, so a
   # partition that is dropped from the matrix, or that runs nothing, can't
-  # shrink the suite unseen. Both `test-run`'s and `hub-postgres`'s count.
+  # shrink the suite unseen. Both `test-run`'s and `postgres`'s count.
   test-count:
     name: Test count
-    needs: [test-build, test-run, hub-postgres]
+    needs: [test-build, test-run, postgres]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -439,7 +439,7 @@ jobs:
   # job means they ran.
   # Desk's tests (its sessions, rooms, ledger, plans, memory) against a real
   # Postgres as `cargo test` runs them, every test of a binary in one
-  # process: `hub-postgres` runs each in a process of its own, so this is
+  # process: `postgres` runs each in a process of its own, so this is
   # where what they share is tested. Postgres as there
   # (.github/actions/start-postgres).
   desk-postgres:
@@ -743,7 +743,7 @@ jobs:
   ci-ok:
     name: CI OK
     if: always()
-    needs: [changes, secrets, ui, fmt, licenses, clippy, test-build, test-run, hub-postgres, test-count, test-doc, desk-postgres, vellev-node, docs-embed]
+    needs: [changes, secrets, ui, fmt, licenses, clippy, test-build, test-run, postgres, test-count, test-doc, desk-postgres, vellev-node, docs-embed]
     runs-on: ubuntu-latest
     permissions: {}
     steps:
