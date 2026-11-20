@@ -396,7 +396,7 @@ impl CrewHub {
         session: Uuid,
         messages: Vec<LineMessage>,
         ended: Vec<String>,
-    ) -> bool {
+    ) -> LineRan {
         // Its boss decides it with nothing else of its own deciding at
         // once, its prompt and picture read once it holds its mind
         // ([`super::mind`]).
@@ -419,13 +419,13 @@ impl CrewHub {
             .map(|(s, _)| s.agent_id.as_str().to_string())
     }
 
-    /// Whether the boss's turn ran.
+    /// Whether the boss's turn ran, or waits for its next turn in the hour.
     async fn answer_line_now(
         &self,
         session: Uuid,
         messages: Vec<LineMessage>,
         ended: Vec<String>,
-    ) -> bool {
+    ) -> LineRan {
         // Taken back from its boss, it is the person's: what it tells Desk
         // is kept (its thread, the picture) and no boss's turn is spent on
         // it; what it asks goes to the person.
@@ -440,7 +440,7 @@ impl CrewHub {
                 "Desk no longer runs this session, so its questions come to you.",
             )
             .await;
-            return false;
+            return LineRan::Ran(false);
         }
         // The overseer of the session's scope answers it, and no other.
         let Some((service, o)) = self.overseer_of_session(session) else {
@@ -450,7 +450,7 @@ impl CrewHub {
                 .collect();
             self.all_to_person(session, &asks, "No overseer answers sessions now.")
                 .await;
-            return false;
+            return LineRan::Ran(false);
         };
         // Held by Desk's breaker, it takes no turns: what its session asks
         // goes straight to the person, saying why, and its turn's end waits
@@ -462,7 +462,7 @@ impl CrewHub {
                 .collect();
             let why = format!("{} is {held}, so this came to you.", name_of(&service));
             self.all_to_person(session, &asks, &why).await;
-            return false;
+            return LineRan::Ran(false);
         }
         // Each read again as it is now: one the session's move (or anyone)
         // took from this overseer since it was gathered isn't its to read,
@@ -501,7 +501,7 @@ impl CrewHub {
             }
         }
         if kept.is_empty() && ended.is_empty() {
-            return false;
+            return LineRan::Ran(false);
         }
         let mut messages = kept;
         let mut asks: Vec<LineMessage> = messages
@@ -513,7 +513,7 @@ impl CrewHub {
         if let Some(why) = straight_to_person(&o, hop, self.unbound(&o)) {
             self.all_to_person(session, &asks, why).await;
             if ended.is_empty() {
-                return false;
+                return LineRan::Ran(false);
             }
             // Its turn's end is still the overseer's to follow up.
             messages.retain(|m| m.kind != LineKind::Ask);
@@ -526,8 +526,14 @@ impl CrewHub {
                 "Desk has no conversation with you to work from yet.",
             )
             .await;
-            return false;
+            return LineRan::Ran(false);
         };
+        // Out of its boss's turns for the hour: what is left of it waits,
+        // gathered, for the next. Only a turn that would run is paced: what
+        // went to the person above never waits on the boss's turns.
+        if !self.spend_work_turn(session) {
+            return LineRan::Paced(messages);
+        }
         {
             let mut known = self.questions.lock();
             for a in &asks {
@@ -647,7 +653,7 @@ impl CrewHub {
                     .await;
             }
         }
-        ran.is_ok()
+        LineRan::Ran(ran.is_ok())
     }
 
     /// What the overseer reads for a session's messages to it, and its
@@ -809,9 +815,21 @@ impl CrewHub {
     }
 }
 
+/// What became of a session's line turn.
+#[derive(Debug)]
+pub(crate) enum LineRan {
+    /// Whether its boss's turn ran.
+    Ran(bool),
+    /// Out of its boss's turns for the hour: what of its messages is still
+    /// the boss's waits for the next.
+    Paced(Vec<LineMessage>),
+}
+
 /// What waits to become a session's next line turn.
 struct Gathered {
     since: Instant,
+    /// Paced past its boss's turns for the hour: not tried again before.
+    retry: Option<Instant>,
     messages: Vec<LineMessage>,
     /// What its turn's end said, when the overseer runs it.
     ended: Vec<String>,
@@ -828,6 +846,7 @@ impl Gathered {
     fn new() -> Self {
         Self {
             since: Instant::now(),
+            retry: None,
             messages: Vec::new(),
             ended: Vec::new(),
             asks: Vec::new(),
@@ -845,6 +864,9 @@ impl Gathered {
 pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     let (_, mut events) = crew.desk.subscribe();
     let mut gathering: HashMap<Uuid, Gathered> = HashMap::new();
+    // A line turn paced past its boss's turns for the hour, given back to
+    // be gathered again for the next.
+    let (paced_tx, mut paced_rx) = tokio::sync::mpsc::unbounded_channel::<(Uuid, Gathered)>();
     for (session, asks) in crew.take_up_open_asks().await {
         gathering.insert(
             session,
@@ -918,6 +940,18 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                     g.handed = true;
                 }
             }
+            Some((session, mut back)) = paced_rx.recv() => {
+                // What came while it was tried goes after it, in one turn;
+                // it keeps its place in line.
+                if let Some(came) = gathering.remove(&session) {
+                    back.messages.extend(came.messages);
+                    back.ended.extend(came.ended);
+                    back.asks.extend(came.asks);
+                    back.handed |= came.handed;
+                }
+                back.retry = Some(Instant::now() + GATHER);
+                gathering.insert(session, back);
+            }
             _ = tick.tick() => {}
         }
         // What the sessions a boss runs ask Desk to allow, at most twice a
@@ -943,7 +977,11 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
         running.retain(|_, (h, _)| !h.is_finished());
         let mut due: Vec<(Uuid, Instant)> = gathering
             .iter()
-            .filter(|(s, g)| g.since.elapsed() >= GATHER && !running.contains_key(s))
+            .filter(|(s, g)| {
+                g.since.elapsed() >= GATHER
+                    && g.retry.is_none_or(|r| Instant::now() >= r)
+                    && !running.contains_key(s)
+            })
             .map(|(s, g)| (*s, g.since))
             .collect();
         // The longest waiting first: each boss starts one at a time.
@@ -960,7 +998,7 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 }
             }
             let Some(Gathered {
-                mut messages,
+                messages,
                 mut ended,
                 mut asks,
                 mut handed,
@@ -992,35 +1030,39 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                     continue;
                 }
             }
-            // Out of its boss's turns for the hour: what it said, its turn's
-            // end and what it asked wait for the next, gathered as one. The
-            // line never refuses a session's report to its boss; this paces
-            // the exchange instead.
-            let paced = work || (boss.is_some() && !messages.is_empty());
-            if paced && !crew.spend_work_turn(session) {
-                gathering.insert(
-                    session,
-                    Gathered {
-                        messages: std::mem::take(&mut messages),
-                        ended: std::mem::take(&mut ended),
-                        asks: std::mem::take(&mut asks),
-                        handed: std::mem::take(&mut handed),
-                        ..Gathered::new()
-                    },
-                );
-                continue;
-            }
+            // Kept as gathered, should its turn wait for the next hour's.
+            let gathered_ended = ended.clone();
             ended.extend(asks.iter().map(|(_, line)| line.clone()));
             if let Some(b) = &boss {
                 busy.insert(b.clone());
             }
             let crew = Arc::clone(&crew);
+            let paced_tx = paced_tx.clone();
             let turn_boss = boss.clone().filter(|_| handed);
             running.insert(
                 session,
                 (
                     tokio::spawn(async move {
-                        let ran = crew.answer_line(session, messages, ended).await;
+                        let ran = match crew.answer_line(session, messages, ended).await {
+                            // Out of its boss's turns for the hour: all of
+                            // it waits, gathered, for the next, its place
+                            // in line kept.
+                            LineRan::Paced(messages) => {
+                                let _ = paced_tx.send((
+                                    session,
+                                    Gathered {
+                                        since,
+                                        retry: None,
+                                        messages,
+                                        ended: gathered_ended,
+                                        asks,
+                                        handed,
+                                    },
+                                ));
+                                return;
+                            }
+                            LineRan::Ran(ran) => ran,
+                        };
                         // A refused next step handed to it was its to take
                         // (`super::idle`), once its turn ran.
                         if let Some(b) = turn_boss.as_ref().filter(|_| ran) {

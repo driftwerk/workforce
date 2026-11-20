@@ -327,3 +327,48 @@ async fn reports_past_the_bosss_turns_for_the_hour_wait_for_the_next_and_none_is
     })
     .await;
 }
+
+/// Only a boss's turn that would run waits on its turns for the hour: a
+/// question Desk gives the person without one (Desk only watches) reaches
+/// them at once, however many of the hour's turns are spent.
+#[tokio::test(flavor = "multi_thread")]
+async fn past_the_hours_turns_a_question_desk_only_watches_still_reaches_the_person() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "Noted.",
+            "[oversight]\nenabled = true\nlevel = \"watch\"\nwork = { max_turns_per_hour = 1 }\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, dir.path(), "Legacy removal").await;
+        assert!(crew.spend_work_turn(s.id), "the hour's one turn");
+        assert!(!crew.spend_work_turn(s.id), "spent");
+        let asked = d
+            .line_call(
+                s.id,
+                "ask",
+                &json!({"to": "desk", "text": "Drop the legacy queue table?", "wait_seconds": 60}),
+                Some(std::time::Duration::from_millis(10)),
+            )
+            .await
+            .unwrap();
+        let ask: uuid::Uuid = serde_json::from_value(asked["id"].clone()).unwrap();
+        let q = eventually("its question, the person's", async || {
+            d.store()
+                .line_message(ask)
+                .await
+                .unwrap()
+                .filter(|q| q.asked != Some(workforce_desk::line::Asked::Open))
+        })
+        .await;
+        assert_eq!(
+            q.asked,
+            Some(workforce_desk::line::Asked::Escalated),
+            "given to the person, never held for the boss's next turn: {q:?}"
+        );
+    })
+    .await;
+}

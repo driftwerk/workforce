@@ -729,8 +729,8 @@ pub enum Refusal {
 /// hop delivered into it, how many messages it sent since the person or
 /// its own boss last spoke to it (`sent`), how many since the person last
 /// did (`since_person`), and how many of those went to other sessions
-/// (`to_sessions`). What it tells a boss is never counted: its boss's own
-/// turns pace that exchange. Kept in memory: after a restart it starts
+/// (`to_sessions`). What it tells the boss that runs it is never counted:
+/// that boss's own turns pace the exchange. Kept in memory: after a restart it starts
 /// again from the person-spoke state, the safe side for a loop guard.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LineRun {
@@ -746,9 +746,10 @@ impl LineRun {
         self.cause = self.cause.max(hop);
     }
 
-    /// The session sent a message to `to`.
-    pub fn sent_one(&mut self, to: &Party) {
-        if to.kind == PartyKind::Manager {
+    /// The session sent a message to `to`; `to_its_boss`: the boss that
+    /// runs it, whose turns pace what it is told.
+    pub fn sent_one(&mut self, to: &Party, to_its_boss: bool) {
+        if to_its_boss {
             return;
         }
         self.sent += 1;
@@ -881,13 +882,14 @@ pub fn hops(hop: i16) -> Result<(), Refusal> {
 /// Refuses a hand-off chain run too long ([`hops`]), and a sender over its
 /// budget for `to`: [`TURN_BUDGET`] since the person or its boss last spoke
 /// to it, and as many to other sessions since the person did; and
-/// [`BOSS_RUN_CEILING`] in all since the person did. A report to a boss is
-/// never refused by a count: it is the work, and the boss's own turns
-/// gather what comes while one runs.
-pub fn guard(hop: i16, run: &LineRun, to: &Party) -> Result<(), Refusal> {
+/// [`BOSS_RUN_CEILING`] in all since the person did. A report to the boss
+/// that runs it (`to_its_boss`) is never refused by a count: it is the
+/// work, and that boss's own turns gather what comes while one runs. To a
+/// boss that doesn't run it (one that only watches, say) the counts hold.
+pub fn guard(hop: i16, run: &LineRun, to: &Party, to_its_boss: bool) -> Result<(), Refusal> {
     hops(hop)?;
     match to.kind {
-        PartyKind::Manager => Ok(()),
+        _ if to_its_boss => Ok(()),
         _ if run.since_person >= BOSS_RUN_CEILING as usize => Err(Refusal::Ceiling),
         PartyKind::Session if run.to_sessions >= TURN_BUDGET as usize => Err(Refusal::Peers),
         _ if run.sent >= TURN_BUDGET as usize => Err(Refusal::Budget),
@@ -1863,22 +1865,28 @@ mod tests {
             ..LineRun::default()
         };
         let you = Party::you();
-        assert_eq!(guard(MAX_HOPS, &run(0), &you), Ok(()));
-        assert_eq!(guard(MAX_HOPS + 1, &run(0), &you), Err(Refusal::Hops));
-        assert_eq!(guard(1, &run(TURN_BUDGET as usize - 1), &you), Ok(()));
+        assert_eq!(guard(MAX_HOPS, &run(0), &you, false), Ok(()));
         assert_eq!(
-            guard(1, &run(TURN_BUDGET as usize), &you),
+            guard(MAX_HOPS + 1, &run(0), &you, false),
+            Err(Refusal::Hops)
+        );
+        assert_eq!(
+            guard(1, &run(TURN_BUDGET as usize - 1), &you, false),
+            Ok(())
+        );
+        assert_eq!(
+            guard(1, &run(TURN_BUDGET as usize), &you, false),
             Err(Refusal::Budget)
         );
     }
 
     #[test]
-    fn a_report_to_its_boss_is_never_counted_nor_refused_but_a_long_chain_is() {
+    fn a_report_to_the_boss_that_runs_it_is_never_counted_nor_refused_but_a_long_chain_is() {
         let boss = Party::manager("sarah", "Sarah");
         let mut run = LineRun::default();
         for _ in 0..BOSS_RUN_CEILING * 4 {
-            assert_eq!(guard(1, &run, &boss), Ok(()));
-            run.sent_one(&boss);
+            assert_eq!(guard(1, &run, &boss, true), Ok(()));
+            run.sent_one(&boss, true);
         }
         assert_eq!(run, LineRun::default(), "none of it counted");
         let spent = LineRun {
@@ -1887,9 +1895,14 @@ mod tests {
             to_sessions: TURN_BUDGET as usize,
             ..LineRun::default()
         };
-        assert_eq!(guard(1, &spent, &boss), Ok(()), "over every count");
-        assert_eq!(guard(MAX_HOPS + 1, &spent, &boss), Err(Refusal::Hops));
-        assert_eq!(guard(1, &spent, &Party::you()), Err(Refusal::Ceiling));
+        assert_eq!(guard(1, &spent, &boss, true), Ok(()), "over every count");
+        // A boss that doesn't run it (one that only watches, say): the counts hold.
+        assert_eq!(guard(1, &spent, &boss, false), Err(Refusal::Ceiling));
+        assert_eq!(guard(MAX_HOPS + 1, &spent, &boss, true), Err(Refusal::Hops));
+        assert_eq!(
+            guard(1, &spent, &Party::you(), false),
+            Err(Refusal::Ceiling)
+        );
     }
 
     #[test]
@@ -1897,24 +1910,28 @@ mod tests {
         let you = Party::you();
         let mut run = LineRun::default();
         let mut sent = 0;
-        while guard(1, &run, &you).is_ok() {
-            run.sent_one(&you);
+        while guard(1, &run, &you, false).is_ok() {
+            run.sent_one(&you, false);
             sent += 1;
             if sent % 5 == 0 {
                 run.boss_spoke();
             }
         }
         assert_eq!(sent, BOSS_RUN_CEILING as usize, "answered by its boss");
-        assert_eq!(guard(1, &run, &you), Err(Refusal::Ceiling));
+        assert_eq!(guard(1, &run, &you, false), Err(Refusal::Ceiling));
         // To other sessions, its boss answering it doesn't start it again.
         let peer = Party::session(&session("acme-api", Engine::Codex));
         let mut run = LineRun::default();
         for _ in 0..TURN_BUDGET {
-            run.sent_one(&peer);
+            run.sent_one(&peer, false);
             run.boss_spoke();
         }
-        assert_eq!(guard(1, &run, &peer), Err(Refusal::Peers));
-        assert_eq!(guard(1, &run, &you), Ok(()), "the person still hears it");
+        assert_eq!(guard(1, &run, &peer, false), Err(Refusal::Peers));
+        assert_eq!(
+            guard(1, &run, &you, false),
+            Ok(()),
+            "the person still hears it"
+        );
     }
 
     #[test]

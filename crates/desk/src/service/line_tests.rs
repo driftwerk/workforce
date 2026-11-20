@@ -1819,7 +1819,7 @@ impl crate::crew::Crew for Answering {
 }
 
 #[tokio::test]
-async fn a_sessions_reports_to_its_boss_are_never_refused_nor_counted() {
+async fn a_sessions_reports_to_the_boss_that_runs_it_are_never_refused_nor_counted() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let d = desk(pool, dir.path()).await;
@@ -1828,14 +1828,40 @@ async fn a_sessions_reports_to_its_boss_are_never_refused_nor_counted() {
         d.answer_lines_with(&crew);
         // Kept alive by the test: the desk holds it weakly.
         std::mem::forget(crew);
+        // One its boss doesn't run: what it tells the boss is counted.
+        let free = new_session(&d, dir.path()).await;
+        idle(&d, free.id).await;
+        for i in 0..crate::rooms::TURN_BUDGET {
+            tell_desk(&d, free.id, &format!("report {i}"))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            tell_desk(&d, free.id, "one more").await,
+            Err(Refusal::Budget.to_string()),
+            "a boss that doesn't run it paces nothing of its"
+        );
         let s = new_session(&d, dir.path()).await;
         idle(&d, s.id).await;
+        d.take_on(
+            s.id,
+            &Party::manager("sarah", "Sarah"),
+            crate::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
         for i in 0..crate::rooms::BOSS_RUN_CEILING * 4 {
             tell_desk(&d, s.id, &format!("report {i}"))
                 .await
                 .unwrap_or_else(|e| panic!("report {i} refused: {e}"));
         }
-        assert!(d.line_needs().is_empty(), "never stopped");
+        assert_eq!(
+            d.line_needs().len(),
+            1,
+            "only the one it doesn't run stopped"
+        );
         assert!(stalled_items(&d, s.id).await.is_empty());
         assert_eq!(d.line_run(s.id), LineRun::default());
         // What it still sends the person is counted as before.

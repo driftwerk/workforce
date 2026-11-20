@@ -305,6 +305,24 @@ impl Desk {
             .map(|b| b.agent)
     }
 
+    /// Whether `to` is the boss that runs `id`, at a level that gives it
+    /// turns of its own for `id`'s line: what `id` tells it then is paced
+    /// by those turns, never refused by the loop guard's counts.
+    fn reports_to_its_boss(&self, id: Uuid, to: &Party) -> bool {
+        to.kind == PartyKind::Manager
+            && self
+                .charge_of(id)
+                .filter(crate::charge::Charge::live)
+                .is_some_and(|c| {
+                    c.boss == to.id
+                        && self
+                            .bosses()
+                            .iter()
+                            .find(|b| b.agent == c.boss)
+                            .is_none_or(|b| b.level != "watch")
+                })
+    }
+
     /// Whether `boss` is `id`'s own boss.
     fn own_boss(&self, id: Uuid, boss: &str) -> bool {
         self.boss_of_session(id).is_some_and(|b| b == boss)
@@ -680,7 +698,8 @@ impl Desk {
                     self.line_reach(),
                     &bossed,
                 )?;
-                if let Err(r) = line::guard(checked, &run, &recipient) {
+                let to_its_boss = self.reports_to_its_boss(me.id, &recipient);
+                if let Err(r) = line::guard(checked, &run, &recipient, to_its_boss) {
                     // Only the budget its boss's answers renew is lifted
                     // by them.
                     self.line_stalled(me, &r, r == Refusal::Budget).await;
@@ -821,6 +840,7 @@ impl Desk {
         }
         match &from {
             Sender::Session(id) => {
+                let to_its_boss = self.reports_to_its_boss(*id, &m.to);
                 self.0
                     .state
                     .lock()
@@ -828,7 +848,7 @@ impl Desk {
                     .runs
                     .entry(*id)
                     .or_default()
-                    .sent_one(&m.to);
+                    .sent_one(&m.to, to_its_boss);
                 let what = match kind {
                     LineKind::Ask => crate::picture::What::SessionAsked,
                     _ => crate::picture::What::SessionReported,
@@ -1068,6 +1088,7 @@ impl Desk {
                 self.person_spoke(v.id)
             }
             (Sender::Session(id), _) => {
+                let to_its_boss = self.reports_to_its_boss(*id, &question.from);
                 self.0
                     .state
                     .lock()
@@ -1075,7 +1096,7 @@ impl Desk {
                     .runs
                     .entry(*id)
                     .or_default()
-                    .sent_one(&question.from);
+                    .sent_one(&question.from, to_its_boss);
             }
             // Its own boss's answer starts the asker's budget again; any
             // other overseer's counts against it: its budget holds the
