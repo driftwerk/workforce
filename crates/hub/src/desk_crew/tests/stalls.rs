@@ -595,7 +595,6 @@ async fn a_message_that_never_reaches_a_session_wakes_its_boss_once() {
             )
             .await
         };
-        let since = chrono::Utc::now();
         assert!(tell(stuck.id, "Go ahead: run step 12 now.")
             .await
             .unwrap()
@@ -627,17 +626,9 @@ async fn a_message_that_never_reaches_a_session_wakes_its_boss_once() {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         });
-        // What the boss was told of session `s`, from its waiting message
-        // to what it should do.
-        let untaken = |s: uuid::Uuid| format!("session {s}) hasn't taken your message");
         let woken = async |s: uuid::Uuid| {
-            let said = untaken(s);
             eventually("the boss woken", async || {
-                prompted(&llm, &said).await.first().and_then(|b| {
-                    let (_, rest) = b.split_once(&said)?;
-                    rest.split_once("can work.")
-                        .map(|(said, _)| said.to_string())
-                })
+                told_of(&llm, s).await.into_iter().next()
             })
             .await
         };
@@ -656,7 +647,7 @@ async fn a_message_that_never_reaches_a_session_wakes_its_boss_once() {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         progress.abort();
         assert!(
-            prompted(&llm, &untaken(busy.id)).await.is_empty(),
+            told_of(&llm, busy.id).await.is_empty(),
             "none for the session at work"
         );
         assert_eq!(
@@ -664,12 +655,29 @@ async fn a_message_that_never_reaches_a_session_wakes_its_boss_once() {
             workforce_desk::line::Delivery::Queued,
             "still waiting: left to it only for its progress"
         );
-        assert!(
-            (1..=2).contains(&d.store().wake_ups_since("desk", since).await.unwrap()),
-            "one wake a stall, and none for the session at work"
-        );
+        for s in [stuck.id, steered.id] {
+            assert_eq!(told_of(&llm, s).await.len(), 1, "one wake a stall");
+        }
     })
     .await;
+}
+
+/// Each thing the boss was told, in any of its calls, of session `s` not
+/// taking its message: one a wake.
+async fn told_of(llm: &wiremock::MockServer, s: uuid::Uuid) -> Vec<String> {
+    let said = format!("session {s}) hasn't taken your message");
+    let told: std::collections::BTreeSet<String> = prompted(llm, &said)
+        .await
+        .iter()
+        .flat_map(|b| {
+            b.split(&said)
+                .skip(1)
+                .filter_map(|rest| rest.split(['"', '\\']).next())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    told.into_iter().collect()
 }
 
 /// The boss's model calls whose prompt says `what`.
@@ -729,11 +737,12 @@ async fn a_message_behind_a_sessions_question_still_raises_the_question() {
         .await
         .unwrap();
         let woke = eventually("the boss woken", async || {
-            prompted(&llm, "hasn't taken your message").await.pop()
+            told_of(&llm, s.id).await.into_iter().next()
         })
         .await;
         assert!(
-            woke.contains("it ended its turn asking the person something"),
+            woke.contains("it ended its turn asking the person something")
+                && !woke.contains("crew.restart"),
             "{woke}"
         );
         eventually("its question raised", async || {
@@ -809,6 +818,77 @@ async fn a_message_held_while_the_person_drives_wakes_no_one() {
             prompted(&llm, "hasn't taken your message").await.is_empty(),
             "no one is woken for it"
         );
+    })
+    .await;
+}
+
+/// A message waiting behind a session's request for approval wakes its
+/// boss with that, never a restart, and the approval is still raised.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_behind_an_approval_still_raises_the_approval() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, crew, d, llm) = overseeing(
+            dir.path(),
+            pool,
+            "I'll read its history.",
+            "[oversight]\nenabled = true\nlevel = \"act\"\nact = { nudge = true }\n\
+             updates = { enabled = false }\nwork = { stall_minutes = 5 }\n\
+             wake = { waiting_minutes = 5, hold_minutes = 2, answer_after_minutes = 2 }\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, dir.path(), "Cufflink Migration").await;
+        let url = hook_url(dir.path(), s.id).await;
+        hook(
+            &url,
+            json!({"hook_event_name": "SessionStart", "session_id": s.id.to_string()}),
+        )
+        .await;
+        hook(
+            &url,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "Run step 12."}),
+        )
+        .await;
+        let request = {
+            let url = url.clone();
+            tokio::spawn(async move {
+                hook(
+                    &url,
+                    json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash",
+                           "tool_input": {"command": "./migrate --step 12 --env production"}}),
+                )
+                .await
+            })
+        };
+        eventually("it asks for approval", async || {
+            d.view(s.id).unwrap().pending.map(|_| ())
+        })
+        .await;
+        crew.perform(
+            &Action::Nudge {
+                to: Target::Session(s.id),
+                message: "Then report the row counts.".into(),
+                reply_to: None,
+            },
+            crew.by_overseer("Its step is next.").unwrap(),
+        )
+        .await
+        .unwrap();
+        let woke = eventually("the boss woken", async || {
+            told_of(&llm, s.id).await.into_iter().next()
+        })
+        .await;
+        assert!(
+            woke.contains("it waits on an approval or a dialog in its terminal")
+                && !woke.contains("crew.restart"),
+            "{woke}"
+        );
+        eventually("its approval raised", async || {
+            prompted(&llm, "has waited on you").await.pop()
+        })
+        .await;
+        request.abort();
     })
     .await;
 }

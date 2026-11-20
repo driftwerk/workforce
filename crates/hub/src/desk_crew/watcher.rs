@@ -92,16 +92,7 @@ pub(super) fn unbound_timings(o: &Oversight) -> Oversight {
 struct Undelivered {
     trigger: Trigger,
     /// They wait behind what it asks the person, which is raised too.
-    asking: bool,
-}
-
-/// Whether Desk holds a message for `wait` on purpose, which no one is
-/// woken about.
-fn held_on_purpose(wait: Wait) -> bool {
-    match wait {
-        Wait::Typing | Wait::Paused | Wait::PersonDriving | Wait::ModeEnding => true,
-        Wait::Stopped | Wait::Working | Wait::Asking | Wait::NextCall => false,
-    }
+    behind_person: bool,
 }
 
 /// One thing worth waking the overseer for.
@@ -587,7 +578,6 @@ impl CrewHub {
         let mut holding = HashSet::new();
         let mut out = Vec::new();
         let waiting = self.waiting_from(overseer).await;
-        let stall = minute * o.work.stall_minutes as i32;
         for item in &overview.items {
             if item.id == overseer {
                 continue;
@@ -625,14 +615,14 @@ impl CrewHub {
                 );
                 holding.insert(key.clone());
                 if let Some(found) =
-                    self.undelivered(overseer, item, &party, waits, now, minute, stall)
+                    self.undelivered(overseer, item, &party, waits, now, o.work.stall_minutes)
                 {
                     if noted.insert(key) {
                         out.push(found.trigger);
                     }
                     // Behind what it asks the person: that is still raised
                     // as it waits, with its approval and its reminders.
-                    if !found.asking {
+                    if !found.behind_person {
                         continue;
                     }
                 }
@@ -777,11 +767,10 @@ impl CrewHub {
     }
 
     /// The trigger for a session `waiting`, `overseer`'s messages to it
-    /// (oldest first), haven't reached for `stall` while it showed no
-    /// progress of its own: none while Desk holds any of them on purpose
-    /// (the person typing or driving, the breaker, a mode ending), or once
-    /// someone stopped or closed it.
-    #[allow(clippy::too_many_arguments)]
+    /// (oldest first), haven't reached for `stall_minutes` while it showed
+    /// no progress of its own: none while Desk holds any of them on purpose,
+    /// or once it was stopped (a lost process too: Desk offers the person to
+    /// run it again) or closed.
     fn undelivered(
         &self,
         overseer: &str,
@@ -789,9 +778,10 @@ impl CrewHub {
         party: &Party,
         waiting: &[LineMessage],
         now: DateTime<Utc>,
-        minute: chrono::Duration,
-        stall: chrono::Duration,
+        stall_minutes: u32,
     ) -> Option<Undelivered> {
+        let minute = chrono::Duration::from_std(self.timing.minute).unwrap_or_default();
+        let stall = minute * stall_minutes as i32;
         let oldest = waiting.first()?;
         let quiet = item.last_activity.is_none_or(|at| now - at >= stall);
         if now - oldest.at < stall || !quiet {
@@ -803,26 +793,46 @@ impl CrewHub {
         {
             return None;
         }
-        let waits: Vec<Option<Wait>> = waiting.iter().map(|m| self.desk.line_waits(m)).collect();
-        if waits.iter().flatten().any(|w| held_on_purpose(*w)) {
-            return None;
-        }
-        let wait = waits.first().copied().flatten();
-        let why = match wait {
-            Some(Wait::Stopped) => "it isn't running, so it is held until it runs again",
-            Some(Wait::Working) => {
-                "its turn hasn't ended: it may be stuck, or in one long step (a build, a test run), \
-                 which a restart would cut off"
-            }
-            Some(Wait::NextCall) => {
-                "it was told to read it with its next tool call, and hasn't made one: it may be \
-                 stuck, or in one long step (a build, a test run), which a restart would cut off"
-            }
-            Some(Wait::Asking) => {
+        let waits = self.desk.line_waits(view.id, waiting)?;
+        const LONG_STEP: &str =
+            "it may be stuck, or in one long step (a build, a test run), which a restart would cut off";
+        let (why, behind_person) = match waits.first().copied().flatten() {
+            _ if view.pending.is_some() => (
+                "it waits on an approval or a dialog in its terminal, and your messages wait behind that"
+                    .to_string(),
+                true,
+            ),
+            Some(Wait::Asking) => (
                 "it ended its turn asking the person something, and your messages wait behind that"
+                    .to_string(),
+                true,
+            ),
+            Some(Wait::Stopped) => (
+                "it isn't running, so it is held until it runs again".to_string(),
+                false,
+            ),
+            Some(Wait::Working) => (format!("its turn hasn't ended: {LONG_STEP}"), false),
+            Some(Wait::NextCall) => (
+                format!("it was told to read it with its next tool call, and hasn't made one: {LONG_STEP}"),
+                false,
+            ),
+            None => ("it was free to take it, and nothing took it in".to_string(), false),
+            Some(Wait::Typing | Wait::Paused | Wait::PersonDriving | Wait::ModeEnding) => {
+                return None
             }
-            None => "it was free to take it, and nothing took it in",
-            Some(_) => return None,
+        };
+        let move_it = match behind_person {
+            true => {
+                "Answer what it waits on if that is yours to (crew.history shows it); it stays \
+                 raised for the person meanwhile."
+            }
+            false => {
+                "First read where it stands (crew.history), then move it now: answer what it waits \
+                 on, restart it (crew.restart) only if its history shows it stuck, start a fresh \
+                 session on the work (crew.start_session), or do the step yourself; if a restart \
+                 of it already failed, don't try another. Tell the person only if none of those \
+                 can work."
+            }
         };
         let at = oldest
             .at
@@ -832,11 +842,7 @@ impl CrewHub {
             ((now - oldest.at).num_milliseconds() / minute.num_milliseconds().max(1)).max(1);
         let line = format!(
             "{} hasn't taken your message of {at} in {minutes} min ({} waiting, the oldest “{}”) \
-             and has shown no progress meanwhile: {why}. First read where it stands \
-             (crew.history), then move it now: answer what it waits on, restart it (crew.restart) \
-             only if its history shows it stuck, start a fresh session on the work \
-             (crew.start_session), or do the step yourself; if a restart of it already failed, \
-             don't try another. Tell the person only if none of those can work.",
+             and has shown no progress meanwhile: {why}. {move_it}",
             who(party),
             waiting.len(),
             crew::words(&oldest.text, 20),
@@ -851,7 +857,7 @@ impl CrewHub {
                 handed: None,
                 routine: false,
             },
-            asking: wait == Some(Wait::Asking),
+            behind_person,
         })
     }
 

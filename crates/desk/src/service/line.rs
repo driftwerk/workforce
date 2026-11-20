@@ -2023,12 +2023,22 @@ impl Desk {
         st.lines.seen.remove(&id);
     }
 
-    /// Why `m`, still to go into its session, waits now; none when nothing
-    /// holds it there.
-    pub fn line_waits(&self, m: &LineMessage) -> Option<Wait> {
-        let id = m.to_session()?;
+    /// Why each of `rows`, still to go into session `id`, waits now (none:
+    /// nothing holds it there); nothing at all while Desk holds any of them
+    /// on purpose, whatever its turn ([`Wait::on_purpose`]).
+    pub fn line_waits(&self, id: Uuid, rows: &[LineMessage]) -> Option<Vec<Option<Wait>>> {
         let view = self.view(id).ok()?;
-        self.waits_why(&view, self.typed_since_idle(id), self.plugin_heard(id), m)
+        let (typed, plugin) = (self.typed_since_idle(id), self.plugin_heard(id));
+        let waits: Vec<Option<Wait>> = rows
+            .iter()
+            .map(|m| self.waits_why(&view, typed, plugin, m))
+            .collect();
+        let on_purpose = rows
+            .iter()
+            .filter_map(|m| self.line_gate(&view, m))
+            .chain(waits.iter().flatten().copied())
+            .any(Wait::on_purpose);
+        (!on_purpose).then_some(waits)
     }
 
     fn waits_why(
