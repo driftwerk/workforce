@@ -964,7 +964,28 @@ pub(crate) mod tests {
             graph.advance_vector_fill(REPO, None, &rival).await.unwrap(),
             "finished, another may begin"
         );
-        assert_eq!(graph.vector_fill(REPO).await.unwrap(), Some(rival));
+        assert_eq!(graph.vector_fill(REPO).await.unwrap(), Some(rival.clone()));
+
+        // An adoption's stages are kept and read back as any other's.
+        let mut at = rival;
+        for stage in [
+            FillStage::AdoptEntities,
+            FillStage::AdoptStrayEntities,
+            FillStage::AdoptSummaries,
+            FillStage::AdoptStraySummaries,
+        ] {
+            let next = VectorFill {
+                stage,
+                cursor: format!("{}-cursor", stage.as_str()),
+                ..at.clone()
+            };
+            assert!(graph
+                .advance_vector_fill(REPO, Some(&at), &next)
+                .await
+                .unwrap());
+            assert_eq!(graph.vector_fill(REPO).await.unwrap(), Some(next.clone()));
+            at = next;
+        }
 
         // A full index forgets the fill; so does forgetting it.
         graph

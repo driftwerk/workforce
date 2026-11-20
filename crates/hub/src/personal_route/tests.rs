@@ -957,6 +957,48 @@ async fn her_chat_turn_runs_the_conversation_model_she_chose_and_a_job_its_tier(
     );
 }
 
+/// A model her Claude login lists by its full id (`claude-fable-5-2`), as
+/// the route picker offers it, reaches the CLI as that id: on a chat turn
+/// and on the background work she set it for.
+#[tokio::test]
+async fn a_versioned_claude_model_she_picked_runs_as_that_id_end_to_end() {
+    let (hub, store) = routed().await;
+    let token = hub.claude_login(ALICE);
+    let route = with_models(
+        claude(RouteFallback::Wait),
+        Some("claude-fable-5-2"),
+        None,
+        Some("claude-opus-4-8"),
+    );
+    choose(&hub, &store, ALICE, Some(route)).await;
+
+    hub.claude.reply(None, &answer("Claude answers."));
+    crate::serve::chat_turn(hub.ask(ALICE, "hello there"))
+        .await
+        .unwrap();
+    let calls = hub.claude.calls();
+    assert_eq!(calls[0].token, token, "her own login");
+    assert_eq!(calls[0].flag("--model"), Some("claude-fable-5-2"));
+
+    hub.claude.reply(None, &[result("A summary.")]);
+    let llm = Arc::clone(&hub.service.llm);
+    let messages = [LlmMessage::user("Summarise this conversation.")];
+    CURRENT_USER_ID
+        .scope(
+            ALICE.to_string(),
+            hub.claude
+                .scoped(llm.create_message(None, &messages, &[], None, None, false)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        hub.claude.calls()[1].flag("--model"),
+        Some("claude-opus-4-8"),
+        "her heavy background work on the model she chose"
+    );
+    assert_eq!(hub.chatgpt_requests().await, 0);
+}
+
 #[tokio::test]
 async fn her_background_calls_run_the_light_and_heavy_codex_models_she_chose() {
     let (hub, store) = routed_on_worker().await;

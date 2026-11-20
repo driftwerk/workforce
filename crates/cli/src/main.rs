@@ -12001,8 +12001,12 @@ Describe what you should do in this step and what to discuss with the user.
                     let rate = fill.done.saturating_sub(last.1) as f64
                         / last.0.elapsed().as_secs_f64().max(0.001);
                     *last = (std::time::Instant::now(), fill.done);
+                    let did = match fill.stage.adopting() {
+                        true => "compared",
+                        false => "stored",
+                    };
                     println!(
-                        "  {repo}: {} of {} stored ({}), {rate:.0}/s",
+                        "  {repo}: {} of {} {did} ({}), {rate:.0}/s",
                         fill.done,
                         fill.total,
                         fill.stage.as_str()

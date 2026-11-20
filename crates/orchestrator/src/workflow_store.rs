@@ -63,7 +63,9 @@ pub const DEFAULT_MAX_REVISIONS: u32 = 100;
 pub struct EditContext<'a> {
     /// Authenticated identity that made the change (`None` = unattributed).
     pub edited_by: Option<&'a str>,
-    /// Channel: `web` | `slack` | `cli` | `agent_tool` | `restore` | `oob` | `seed`.
+    /// Channel: `web` | `slack` | `cli` | `agent_tool` | `restore` | `oob` | `seed`;
+    /// `agent_tool:<agent>` names the agent whose tool made it, where the
+    /// tool records one (the monitor tool does).
     pub edited_via: &'a str,
     /// Source revision number when `edited_via == "restore"`.
     pub restored_from: Option<i32>,

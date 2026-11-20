@@ -11873,11 +11873,8 @@ async fn monitor_put(
     let previous = runtime.stored_definition(&id, ctx.owner.as_deref()).await;
     let parsed = workforce_orchestrator::monitor::MonitorDefinition::from_toml(&body).ok();
 
+    let mut notes = Vec::new();
     if let Some(def) = &parsed {
-        engine
-            .preflight(def)
-            .await
-            .map_err(|refused| (StatusCode::BAD_REQUEST, refused))?;
         gate_monitor_binding(&state, engine.as_ref(), &caller, def, previous.as_ref()).await?;
         if let workforce_orchestrator::monitor::Action::Persona { agent, .. } = &def.monitor.action
         {
@@ -11888,6 +11885,11 @@ async fn monitor_put(
                 ));
             }
         }
+        // After the gates, as it may load the tool's skill for the owner.
+        notes = engine
+            .preflight(def, ctx.owner.as_deref())
+            .await
+            .map_err(|refused| (StatusCode::BAD_REQUEST, refused))?;
     }
 
     if let Err(e) = runtime
@@ -11920,12 +11922,16 @@ async fn monitor_put(
     }
     engine.reconcile_personas().await;
     let summary = engine.summary_of(&id, ctx.owner.as_deref()).await;
-    Ok(Json(serde_json::json!({
+    let mut saved = serde_json::json!({
         "saved": id,
         "agent": summary.as_ref().and_then(|s| s.agent.clone()),
         "status": summary.as_ref().map(|s| s.status),
         "block": summary.and_then(|s| s.block),
-    })))
+    });
+    if !notes.is_empty() {
+        saved["notes"] = serde_json::json!(notes);
+    }
+    Ok(Json(saved))
 }
 
 async fn monitor_delete(
@@ -12031,12 +12037,14 @@ async fn monitor_revision_restore(
     // target: it passes the same membership gate and the same catch-up policy.
     let previous = runtime.stored_definition(&id, ctx.owner.as_deref()).await;
     let parsed = workforce_orchestrator::monitor::MonitorDefinition::from_toml(&content).ok();
+    let mut notes = Vec::new();
     if let Some(def) = &parsed {
-        engine
-            .preflight(def)
+        gate_monitor_binding(&state, engine.as_ref(), &caller, def, previous.as_ref()).await?;
+        // After the gate, as it may load the tool's skill for the owner.
+        notes = engine
+            .preflight(def, ctx.owner.as_deref())
             .await
             .map_err(|refused| (StatusCode::BAD_REQUEST, refused))?;
-        gate_monitor_binding(&state, engine.as_ref(), &caller, def, previous.as_ref()).await?;
     }
     let visibility = match runtime
         .definition_ownership(&id, ctx.owner.as_deref())
@@ -12061,7 +12069,11 @@ async fn monitor_revision_restore(
             )
             .await;
     }
-    Ok(Json(serde_json::json!({ "restored": id, "from_rev": rev })))
+    let mut restored = serde_json::json!({ "restored": id, "from_rev": rev });
+    if !notes.is_empty() {
+        restored["notes"] = serde_json::json!(notes);
+    }
+    Ok(Json(restored))
 }
 
 /// `GET /api/monitors/{id}/activity` — recent dispatches for the monitor.

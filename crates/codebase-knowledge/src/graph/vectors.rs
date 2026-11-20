@@ -40,6 +40,16 @@ pub enum FillStage {
     Sweep,
     /// Finished.
     Done,
+    /// Comparing the repo's entities with what a store already holding
+    /// them has, a page at a time, and writing only what differs.
+    AdoptEntities,
+    /// Removing what the store holds of the repo's entities that the graph
+    /// has not.
+    AdoptStrayEntities,
+    /// As [`Self::AdoptEntities`], of summaries.
+    AdoptSummaries,
+    /// As [`Self::AdoptStrayEntities`], of summaries.
+    AdoptStraySummaries,
 }
 
 impl FillStage {
@@ -49,13 +59,44 @@ impl FillStage {
             Self::Summaries => "summaries",
             Self::Sweep => "sweep",
             Self::Done => "done",
+            Self::AdoptEntities => "adopt_entities",
+            Self::AdoptStrayEntities => "adopt_stray_entities",
+            Self::AdoptSummaries => "adopt_summaries",
+            Self::AdoptStraySummaries => "adopt_stray_summaries",
         }
     }
 
     pub fn parse(stage: &str) -> Option<Self> {
-        [Self::Entities, Self::Summaries, Self::Sweep, Self::Done]
-            .into_iter()
-            .find(|known| known.as_str() == stage)
+        [
+            Self::Entities,
+            Self::Summaries,
+            Self::Sweep,
+            Self::Done,
+            Self::AdoptEntities,
+            Self::AdoptStrayEntities,
+            Self::AdoptSummaries,
+            Self::AdoptStraySummaries,
+        ]
+        .into_iter()
+        .find(|known| known.as_str() == stage)
+    }
+
+    /// Whether this is a stage of an adoption: a store already holding
+    /// the repo compared with the graph and mended, never swept.
+    pub fn adopting(self) -> bool {
+        matches!(
+            self,
+            Self::AdoptEntities
+                | Self::AdoptStrayEntities
+                | Self::AdoptSummaries
+                | Self::AdoptStraySummaries
+        )
+    }
+
+    /// Whether this is a stage of a fill whose sweep removes, when it
+    /// ends, whatever of the repo lacks its generation.
+    pub fn sweeps(self) -> bool {
+        matches!(self, Self::Entities | Self::Summaries | Self::Sweep)
     }
 }
 
@@ -71,11 +112,47 @@ pub struct VectorFill {
     /// The last entity, or summary, of the stage stored; empty before the
     /// first.
     pub cursor: String,
-    /// Entities and summaries stored so far.
+    /// Entities and summaries stored so far; of an adoption, the graph's
+    /// compared so far.
     pub done: u64,
-    /// Entities and summaries there were when the fill began.
+    /// Entities and summaries the graph had when the fill, or adoption,
+    /// began.
     pub total: u64,
 }
 
 /// A file noted as pending, and the note's mark.
 pub type PendingFile = (String, i64);
+
+#[cfg(test)]
+mod tests {
+    use super::FillStage;
+
+    const ALL: [FillStage; 8] = [
+        FillStage::Entities,
+        FillStage::Summaries,
+        FillStage::Sweep,
+        FillStage::Done,
+        FillStage::AdoptEntities,
+        FillStage::AdoptStrayEntities,
+        FillStage::AdoptSummaries,
+        FillStage::AdoptStraySummaries,
+    ];
+
+    /// Every stage is read back as it is written; the four of an adoption
+    /// are adopting and sweep nothing, and only a fill's own sweep.
+    #[test]
+    fn fill_stages_round_trip() {
+        for stage in ALL {
+            assert_eq!(FillStage::parse(stage.as_str()), Some(stage));
+            assert_eq!(
+                serde_json::to_value(stage).unwrap(),
+                serde_json::json!(stage.as_str())
+            );
+        }
+        let adopting: Vec<FillStage> = ALL.into_iter().filter(|s| s.adopting()).collect();
+        assert_eq!(adopting, &ALL[4..]);
+        let sweeps: Vec<FillStage> = ALL.into_iter().filter(|s| s.sweeps()).collect();
+        assert_eq!(sweeps, &ALL[..3]);
+        assert_eq!(FillStage::parse("adopt"), None);
+    }
+}
