@@ -1609,9 +1609,12 @@ impl Desk {
     }
 
     /// Why `m` mustn't go into `view` now, whatever its engine could take:
-    /// a session Desk's breaker paused, or one asking the person something,
-    /// takes only the person's own messages; one the person drives, none
-    /// of its boss's.
+    /// a session Desk's breaker paused takes only the person's own
+    /// messages; one the person drives, none of its boss's; one whose turn
+    /// ended asking the person something, only theirs or its boss's (at
+    /// its prompt, with no dialog on screen, the boss's words go in as the
+    /// answer). A dialog on screen holds every message in
+    /// [`line::deliverable`] until it is answered.
     pub(super) fn line_gate(&self, view: &SessionView, m: &LineMessage) -> Option<Wait> {
         if m.from.kind == PartyKind::You {
             return None;
@@ -1631,7 +1634,8 @@ impl Desk {
         {
             return Some(Wait::PersonDriving);
         }
-        (view.state == SessionState::Asking).then_some(Wait::Asking)
+        (view.state == SessionState::Asking && m.from.kind != PartyKind::Manager)
+            .then_some(Wait::Asking)
     }
 
     /// Desk's plugin in `id`, waiting on its line, looks again now: a turn

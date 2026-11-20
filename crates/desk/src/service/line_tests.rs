@@ -1141,6 +1141,142 @@ async fn a_session_asking_the_person_takes_no_one_elses_answer() {
 }
 
 #[tokio::test]
+async fn its_bosss_message_goes_in_as_the_answer_when_its_turn_ended_on_a_question() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let by = sarah_bosses(&d);
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        hook(
+            &d,
+            s.id,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "status?"}),
+        )
+        .await;
+        hook(
+            &d,
+            s.id,
+            json!({"hook_event_name": "Stop",
+                "last_assistant_message": "The release is built. Should I go ahead and ship it?"}),
+        )
+        .await;
+        until(|| d.view(s.id).is_ok_and(|v| v.state == SessionState::Asking)).await;
+        let v = d.view(s.id).unwrap();
+        assert!(v.pending.is_none(), "no dialog on its screen");
+        // A peer's words still wait on the person's answer.
+        let peer = new_session(&d, dir.path()).await;
+        idle(&d, peer.id).await;
+        let theirs = d
+            .line_send(Sender::Session(peer.id), tell(s.id, "ship it"))
+            .await
+            .unwrap();
+        // Its boss's go in, as the answer.
+        let answer = d
+            .line_send(Sender::Overseer(by), tell(s.id, "Yes, ship it."))
+            .await
+            .unwrap();
+        let thread = d.line_thread(s.id, None, None).await.unwrap();
+        let waiting = |id| thread.iter().find(|m| m.id == id).unwrap().waiting;
+        assert_eq!(waiting(theirs.id), Some(Wait::Asking));
+        assert_eq!(waiting(answer.id), None, "nothing holds its boss's answer");
+        let next = d.line_next(s.id, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(next["id"], json!(answer.id));
+        // Sent now, the peer's is told why in the words of what it waits on.
+        let refused = d.send_now_how(&v, &theirs).unwrap_err();
+        assert!(refused.contains("Its turn ended asking you"), "{refused}");
+        assert!(!refused.contains("dialog"), "{refused}");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_dialog_on_its_screen_holds_its_bosss_message_until_it_is_answered() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let by = sarah_bosses(&d);
+        let s = d
+            .create(
+                NewSession {
+                    fresh_worktree: false,
+                    engine: Engine::Claude,
+                    view: None,
+                    name: "deploy".into(),
+                    cwd: dir.path().to_string_lossy().into_owned(),
+                    goal: "ship the release".into(),
+                    worktree: None,
+                    prompt: None,
+                    approvals: Some(crate::model::Approvals::Terminal),
+                    approve_for_me: false,
+                    fast: false,
+                    model: None,
+                    account: None,
+                    env: Default::default(),
+                    group: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        idle(&d, s.id).await;
+        hook(
+            &d,
+            s.id,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "deploy it"}),
+        )
+        .await;
+        hook(
+            &d,
+            s.id,
+            json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_use_id": "toolu_1",
+                "tool_input": {"command": "make deploy"}}),
+        )
+        .await;
+        hook(
+            &d,
+            s.id,
+            json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash",
+                "tool_input": {"command": "make deploy"}}),
+        )
+        .await;
+        until(|| d.view(s.id).is_ok_and(|v| v.pending.is_some())).await;
+        let v = d.view(s.id).unwrap();
+        assert_eq!(v.state, SessionState::Blocked);
+        let told = d
+            .line_send(Sender::Overseer(by), tell(s.id, "Go on."))
+            .await
+            .unwrap();
+        assert!(d
+            .line_next(s.id, Duration::from_millis(100))
+            .await
+            .is_none());
+        let thread = d.line_thread(s.id, None, None).await.unwrap();
+        assert_eq!(
+            thread.iter().find(|m| m.id == told.id).unwrap().waiting,
+            Some(Wait::Dialog),
+            "it says it waits on a dialog, not on a turn's work"
+        );
+        // Answered, the dialog's call runs and its turn ends: it goes in.
+        hook(
+            &d,
+            s.id,
+            json!({"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_use_id": "toolu_1"}),
+        )
+        .await;
+        hook(
+            &d,
+            s.id,
+            json!({"hook_event_name": "Stop", "last_assistant_message": "Deployed."}),
+        )
+        .await;
+        let next = d.line_next(s.id, Duration::from_secs(2)).await.unwrap();
+        assert_eq!(next["id"], json!(told.id));
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn send_now_never_types_into_a_dialog_it_waits_for_the_turn() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();

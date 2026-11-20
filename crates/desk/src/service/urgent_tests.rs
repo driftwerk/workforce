@@ -306,13 +306,13 @@ fn only_claude_code_devin_and_codex_take_a_bosss_words_mid_turn() {
         mid_turn(Engine::Claude, working, true, true),
         Err(Unsteerable::Dialog)
     );
-    for s in [SessionState::Blocked, SessionState::Asking] {
-        assert_eq!(
-            mid_turn(Engine::Claude, s, true, false),
-            Err(Unsteerable::Dialog)
-        );
-    }
+    assert_eq!(
+        mid_turn(Engine::Claude, SessionState::Blocked, true, false),
+        Err(Unsteerable::Dialog)
+    );
+    // A turn that ended on a question is over: at its prompt, no dialog.
     for s in [
+        SessionState::Asking,
         SessionState::Idle,
         SessionState::Done,
         SessionState::Starting,

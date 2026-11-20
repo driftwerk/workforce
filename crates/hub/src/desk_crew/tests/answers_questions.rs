@@ -9,8 +9,10 @@
 //!   turn woken for it.
 //! - Only what it can't decide is the person's: the DM asks it in one line.
 
+use super::super::actions::{Action, Target};
 use super::decides_at_once::{calls_about, decides, said, THEIRS};
 use super::*;
+use workforce_desk::model::SessionState;
 
 /// The person's settings that day, their questions theirs for 30 of the
 /// crew's minutes (three seconds here).
@@ -490,6 +492,72 @@ async fn act_fully_reviews_a_sessions_plan_in_its_place() {
         hook(&url, json!({"hook_event_name": "UserPromptSubmit", "prompt": "hold on, let me look"})).await;
         let theirs = hook(&url, check_of("Plan: shadow the writes")).await;
         assert_eq!(theirs, json!({}), "the person drives it now: {theirs}");
+    })
+    .await;
+}
+
+/// VEL-4 (20 Nov): a session its boss runs, at Act, ended its turn on
+/// "Should I go ahead?", with no dialog on its screen. Its boss's nudges
+/// answer it: none waits behind the question it answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn at_act_the_bosss_nudge_answers_a_session_whose_turn_ended_on_a_question() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (overseer, crew, d, _llm) = overseeing(
+            &base,
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\nact = { nudge = true }\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, &base, "Vellev status").await;
+        let url = hook_url(&base, s.id).await;
+        hook(
+            &url,
+            json!({"hook_event_name": "SessionStart", "session_id": "cc-vel-4"}),
+        )
+        .await;
+        let boss = workforce_desk::crew::Party::manager("desk", &super::super::name_of(&overseer));
+        d.take_on(
+            s.id,
+            &boss,
+            workforce_desk::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        hook(
+            &url,
+            json!({"hook_event_name": "Stop",
+                "last_assistant_message": "Status: the replica is ready. Should I go ahead and switch reads to it?"}),
+        )
+        .await;
+        let v = eventually("its turn to end asking", async || {
+            d.view(s.id)
+                .ok()
+                .filter(|v| v.state == SessionState::Asking)
+        })
+        .await;
+        assert!(v.pending.is_none(), "no dialog on its screen");
+        crew.perform(
+            &Action::Nudge {
+                to: Target::Session(s.id),
+                message: "Yes, go ahead and switch reads to the replica.".into(),
+                reply_to: None,
+            },
+            crew.by_overseer("It asked whether to go ahead.").unwrap(),
+        )
+        .await
+        .unwrap();
+        let thread = d.line_thread(s.id, None, None).await.unwrap();
+        let row = thread
+            .iter()
+            .find(|m| m.text.starts_with("Yes, go ahead"))
+            .expect("the nudge on its line");
+        assert_eq!(row.waiting, None, "nothing holds it: {row:?}");
     })
     .await;
 }

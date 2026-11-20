@@ -196,10 +196,11 @@ pub fn mid_turn(
     use crate::engine::Engine;
     match state {
         SessionState::Working if !dialog => {}
-        SessionState::Working | SessionState::Blocked | SessionState::Asking => {
-            return Err(Unsteerable::Dialog)
-        }
+        SessionState::Working | SessionState::Blocked => return Err(Unsteerable::Dialog),
+        // Its turn ended on a question: it is at its prompt, no dialog on
+        // screen, and the words go in as the next prompt.
         SessionState::Starting
+        | SessionState::Asking
         | SessionState::Idle
         | SessionState::Done
         | SessionState::Interrupted
@@ -242,8 +243,13 @@ pub enum Wait {
     Typing,
     /// Desk's breaker paused it: only the person's own messages go in.
     Paused,
-    /// It is asking the person something: only the person answers it.
+    /// Its turn ended asking the person something, in its reply or on a
+    /// tool auto mode refused: it is at its prompt with nothing on screen,
+    /// and only the person, or its own boss, answers it.
     Asking,
+    /// A dialog in its terminal (a permission request, or questions it
+    /// asks there) waits on an answer: it gets this once that is answered.
+    Dialog,
     /// The person has the wheel of a session a boss runs: the boss's
     /// messages wait until their hold is up or they hand it back.
     PersonDriving,
@@ -905,6 +911,15 @@ pub fn stalled_why(r: &Refusal) -> Option<String> {
     Some(format!("stopped: {why}. Reply to let it carry on."))
 }
 
+/// Why a message waits for `recipient`'s turn: a dialog on its screen,
+/// or its work.
+fn turn_wait(recipient: &SessionView) -> Wait {
+    match recipient.pending {
+        Some(_) if in_turn(recipient.state) => Wait::Dialog,
+        _ => Wait::Working,
+    }
+}
+
 /// How a message reaches `recipient` now, or why it must wait. `typed` is
 /// whether the person typed in its terminal since their last prompt;
 /// `plugin` whether Desk's plugin was heard from in it. A Claude Code
@@ -919,7 +934,7 @@ pub fn deliverable(recipient: &SessionView, typed: bool, plugin: bool) -> Result
         // Code would queue it behind the turn, where Desk can neither send
         // it now, change it nor take it back, and a hand-off it holds that
         // long looks lost and would go again ([`in_turn`]).
-        Deliver::Submit if plugin && in_turn(recipient.state) => Err(Wait::Working),
+        Deliver::Submit if plugin && in_turn(recipient.state) => Err(turn_wait(recipient)),
         Deliver::Submit if plugin => Ok(Deliver::Submit),
         Deliver::Submit | Deliver::Paste => match recipient.state {
             SessionState::Idle | SessionState::Done | SessionState::Asking if typed => {
@@ -927,7 +942,7 @@ pub fn deliverable(recipient: &SessionView, typed: bool, plugin: bool) -> Result
             }
             SessionState::Idle | SessionState::Done | SessionState::Asking => Ok(Deliver::Paste),
             SessionState::Starting | SessionState::Working | SessionState::Blocked => {
-                Err(Wait::Working)
+                Err(turn_wait(recipient))
             }
             SessionState::Interrupted | SessionState::Stopped | SessionState::Closed => {
                 Err(Wait::Stopped)
