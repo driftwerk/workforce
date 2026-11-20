@@ -263,6 +263,80 @@ async fn a_status_question_is_a_promise_kept_by_the_sessions_reply() {
     .await;
 }
 
+/// Asking a session where it is again keeps the one promise, which now
+/// reports on the newest question: a reply to that one keeps it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_status_question_moves_its_promise_onto_the_newest_question() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        let s = new_session(&d, dir.path(), "acme-web").await;
+        let ask = |q: &'static str| {
+            let crew = crew.clone();
+            async move {
+                crew.perform(
+                    &Action::Nudge {
+                        to: Target::Session(s.id),
+                        message: format!("{STATUS_QUESTION} {q}"),
+                        reply_to: None,
+                    },
+                    crew.by_overseer("The person asked.").unwrap(),
+                )
+                .await
+                .unwrap();
+            }
+        };
+        let promise = || async {
+            d.store()
+                .items_not_closed(Some("desk"))
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|i| i.kind == OpenKind::Promise)
+                .collect::<Vec<_>>()
+        };
+        ask("Which API key did you use?").await;
+        let first = promise().await.pop().expect("the promise");
+        ask("Is the migration done?").await;
+        let promises = promise().await;
+        assert_eq!(promises.len(), 1, "one promise per session");
+        let again = &promises[0];
+        assert_eq!(again.id, first.id);
+        assert!(
+            again.text.contains("Is the migration done?"),
+            "{}",
+            again.text
+        );
+        let newest = again.line_message.expect("the question it reports on");
+        assert_ne!(Some(newest), first.line_message, "the newest question");
+        let mut reply = workforce_desk::line::LineMessage::new(
+            workforce_desk::crew::Party::session(&d.view(s.id).unwrap()),
+            workforce_desk::crew::Party {
+                kind: PartyKind::Manager,
+                id: "desk".into(),
+                name: "Scout".into(),
+                engine: None,
+                origin: None,
+            },
+            workforce_desk::line::LineKind::Answer,
+            "Yes, all 20 tables moved.".into(),
+            0,
+        );
+        reply.in_reply_to = Some(newest);
+        crew.replied(&reply).await;
+        let closed = eventually("kept by the reply to the newest question", async || {
+            d.store()
+                .open_item(first.id)
+                .await
+                .unwrap()
+                .filter(|i| i.state == OpenState::Closed)
+        })
+        .await;
+        assert_eq!(closed.closed_by, Some(ClosedBy::Boss));
+    })
+    .await;
+}
+
 /// The Cufflink case (16 Nov): a session's reply opened on the mark it
 /// answered ("Re m:9d966bcb:") and the boss said only that line. A reply
 /// is said as what was asked and what it answered, in words, with its

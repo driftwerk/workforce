@@ -69,7 +69,7 @@ const CHECK_ORDERS: &str = "Not asked yet: check this against the person's own i
 const CHECKED_FOR: chrono::TimeDelta = chrono::TimeDelta::hours(1);
 
 pub const CLOSE_DESCRIPTION: &str = "Close one of your open items (item_id from crew.open_items or the open items Desk gives you): with answer when the person answered it in their own words (for a session's question, their answer goes on to the session), or with why when it no longer applies or you decided it yourself. A why is never said to the person. For a promise or one of their orders that ended in a real result they would want, say what was done in done (at most 12 words, e.g. \"Cufflink migration: 18 of 20 tables moved\"): it reaches them once as \"✓ <done>\". One that simply ended (its time or condition passed, the person came back or checked in, the morning came) or duplicated another item takes why only: nothing is said of it.";
-pub const PROMISE_DESCRIPTION: &str = "Keep a promise you made the person about a session (session_id): what you promised (text, in full) and when it is kept (done_when: \"merged\", \"in production\", \"PR open\", or your own words). Desk tracks it until the session's account shows it done, then reports it once; it lapses if the session ends or nothing changes for 3 days. For something you'll bring the person, set due_minutes; if not kept by then you're woken to fetch it, then they're told it's owed. crew.ask_session keeps its own promise to report back.";
+pub const PROMISE_DESCRIPTION: &str = "Keep a promise you made the person about a session (session_id): what you promised (text, in full) and when it is kept (done_when: \"merged\", \"in production\", \"PR open\", or your own words). Desk tracks it until the session's account shows it done, then reports it once; it lapses if the session ends or nothing changes for 3 days. For something you'll bring the person, set due_minutes; if not kept by then you're woken to fetch it, then they're told it's owed, and it doesn't lapse before that. crew.ask_session keeps its own promise to report back.";
 pub const ORDER_DESCRIPTION: &str = "Keep one of the person's orders you are carrying out (text, in their words) with the sessions working on it (session_ids), and done_when if it has a clear end (\"merged\", \"in production\"). An order you act on from their message (starting, telling or handing work to a session) is kept for you; use this for one that started nothing yet (\"leave the export alone\"). It is in every turn of yours until it is done or closed with crew.close_item.";
 pub const OPEN_DESCRIPTION: &str = "What you owe the person now (\"what's open?\"): the questions you asked them, the decisions you want confirmed, your promises, their orders, and the parked ones (no longer restated; they can answer or drop them), each with its item_id, when it was opened and last said, and what it holds up.";
 
@@ -79,9 +79,10 @@ const REPLIED: &str = "replied";
 /// What such a promise says before what it reports.
 const REPORT_BACK: &str = "Report back ";
 
-/// How long a promise to report what a session says waits on its reply
-/// before its boss is told to go and get it itself, and how long after
-/// that the person is told it is still owed, in the crew's minutes.
+/// In the crew's minutes: how long a promise to report what a session
+/// says waits on its reply, how long a due promise's boss has to get it
+/// itself before the person is told it is still owed, and how far a due
+/// time moves on while its question is still on its way in.
 const OWED_MINUTES: i64 = 10;
 
 /// The most of a session's reply said to the person, in characters.
@@ -141,7 +142,7 @@ pub fn schema(name: &str) -> Value {
             "session_id": { "type": "string" },
             "text": { "type": "string", "description": "What you promised, in full" },
             "done_when": { "type": "string", "description": "merged, in production, PR open, or your own words" },
-            "due_minutes": { "type": "integer", "description": "For something you will bring the person: by when, in minutes from now (1 to 4320, three days)" }
+            "due_minutes": { "type": "integer", "description": format!("For something you will bring the person: by when, in minutes from now (1 to {DUE_MAX})") }
         }, "required": ["session_id", "text", "done_when"] }),
         ORDER => json!({ "type": "object", "properties": {
             "text": { "type": "string", "description": "The person's order, in their words" },
@@ -263,7 +264,7 @@ fn due_minutes(v: &Value) -> Result<Option<i64>, String> {
         v => match v.as_i64() {
             Some(m) if (1..=DUE_MAX).contains(&m) => Ok(Some(m)),
             Some(m) => Err(format!(
-                "due_minutes must be from 1 to {DUE_MAX} (three days); {m} isn't."
+                "due_minutes must be from 1 to {DUE_MAX}; {m} isn't."
             )),
             None => Err("due_minutes must be a whole number of minutes.".into()),
         },
@@ -932,16 +933,11 @@ impl CrewHub {
             let Some(was) = i.due_at else {
                 continue;
             };
-            // Its boss isn't served now (between reloads, or its scope
-            // moved): looked at again once it is, as resurfacing does.
+            // Its boss isn't served now: looked at again once it is.
             let Some((_, o)) = self.overseer_named(&i.boss) else {
                 continue;
             };
-            // A question its boss asked a running session that is still
-            // waiting to go in: its due time moves on by as long again, and
-            // the boss isn't woken for it twice meanwhile ([`super::watcher`]
-            // chases an undelivered message). One held while the session is
-            // stopped is chased as owed now: nothing else chases it.
+            // Its question still on its way in is chased as undelivered.
             if i.done_when.as_deref() == Some(REPLIED) && self.ask_still_queued(i).await {
                 let next = now + self.crew_minutes(OWED_MINUTES);
                 if let Err(e) = self
@@ -983,8 +979,8 @@ impl CrewHub {
                         "You promised the person {}, and it is due and not kept. Don't wait on \
                          the session: read its transcript and files yourself now (crew.history, \
                          crew.account, your file and machine tools), bring the person what you \
-                         find in your DM, and close this promise (crew.close_item, item_id {}, \
-                         done: what you brought).",
+                         find in your DM, then close this promise (crew.close_item, item_id {}, \
+                         why: brought in the DM): they have it already, so nothing more is said.",
                         match reported {
                             Some(what) => format!("to report {what}"),
                             None => format!("“{what}”"),
@@ -994,8 +990,6 @@ impl CrewHub {
                     format!("owed:{}", i.id),
                     "a promise due",
                 ),
-                // Said at once, as a lapsed promise is: what is owed waits
-                // on no roundup.
                 None => {
                     self.say(
                         &i.boss,
@@ -1007,18 +1001,10 @@ impl CrewHub {
         }
     }
 
-    /// When `i` is due, as its reply says it: "; due by 14:30", with its day
-    /// when that isn't today; nothing when it isn't due.
+    /// When `i` is due, as its reply says it: "; due by 14:30".
     fn due_said(&self, i: &OpenItem) -> String {
-        let Some(at) = i.due_at else {
-            return String::new();
-        };
-        let tz = self.desk.timezone();
-        let at = at.with_timezone(&tz);
-        match at.date_naive() == Utc::now().with_timezone(&tz).date_naive() {
-            true => format!("; due by {}", at.format("%H:%M")),
-            false => format!("; due by {}", at.format("%a %-d %b, %H:%M")),
-        }
+        i.due_by(crew::now(), &self.desk.timezone())
+            .map_or_else(String::new, |by| format!("; {by}"))
     }
 
     /// Whether the question promise `i` reports the answer to still waits
@@ -1029,7 +1015,7 @@ impl CrewHub {
         };
         matches!(
             self.desk.store().line_message(m).await,
-            Ok(Some(m)) if m.delivery == Delivery::Queued
+            Ok(Some(m)) if matches!(m.delivery, Delivery::Queued | Delivery::Handed)
         )
     }
 
@@ -1071,10 +1057,7 @@ impl CrewHub {
                     "done is for a promise or an order; close this with answer or why.".into(),
                 );
             }
-            if item.kind == OpenKind::Promise
-                && item.done_when.as_deref() == Some(REPLIED)
-                && item.chased_at.is_none()
-            {
+            if item.kind == OpenKind::Promise && item.done_when.as_deref() == Some(REPLIED) {
                 return Err("This promise is kept by the session's reply, said as it comes: close it with why.".into());
             }
             if crew::word_count(done) > KEPT_WORDS || done.contains('\n') {
@@ -2031,17 +2014,11 @@ mod tests {
         assert_eq!(due_minutes(&Value::Null), Ok(None));
         assert_eq!(due_minutes(&json!(30)), Ok(Some(30)));
         for (bad, why) in [
-            (
-                json!(0),
-                "due_minutes must be from 1 to 4320 (three days); 0 isn't.",
-            ),
-            (
-                json!(-5),
-                "due_minutes must be from 1 to 4320 (three days); -5 isn't.",
-            ),
+            (json!(0), "due_minutes must be from 1 to 4320; 0 isn't."),
+            (json!(-5), "due_minutes must be from 1 to 4320; -5 isn't."),
             (
                 json!(4321),
-                "due_minutes must be from 1 to 4320 (three days); 4321 isn't.",
+                "due_minutes must be from 1 to 4320; 4321 isn't.",
             ),
         ] {
             assert_eq!(due_minutes(&bad), Err(why.into()), "{bad}");

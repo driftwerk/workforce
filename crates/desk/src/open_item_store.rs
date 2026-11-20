@@ -219,7 +219,8 @@ impl DeskStore {
             || recommended != was.layout.recommended
             || (new.layout.not_blocking.is_some()
                 && new.layout.not_blocking != was.layout.not_blocking)
-            || (new.cant_decide.is_some() && new.cant_decide != was.cant_decide);
+            || (new.cant_decide.is_some() && new.cant_decide != was.cant_decide)
+            || (new.due_at.is_some() && new.due_at != was.due_at);
         let first_said = new.said && !was.said();
         let r = tx
             .query_one(
@@ -228,7 +229,8 @@ impl DeskStore {
                      holding_up = COALESCE($3, holding_up), \
                      recommendation = COALESCE($4, recommendation), \
                      options = CASE WHEN $5 = '[]'::jsonb THEN options ELSE $5 END, \
-                     line_message = COALESCE(line_message, $6), \
+                     line_message = CASE WHEN $9 = 'promise' THEN COALESCE($6, line_message) \
+                     ELSE COALESCE(line_message, $6) END, \
                      generalizes = COALESCE(generalizes, $7), \
                      kind = CASE WHEN $8 THEN $9 ELSE kind END, \
                      session = COALESCE(session, $10), \
