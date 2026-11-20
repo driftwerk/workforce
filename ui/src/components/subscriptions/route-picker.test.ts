@@ -10,7 +10,7 @@ const claude: RouteOption = {
   refused: null,
   models: ["fable", "opus", "claude-fable-5-1", "claude-haiku-4-5-20251001"],
   choices: [
-    { id: "fable", name: "Fable 5.2" },
+    { id: "fable", name: "Fable 5.2", same_as: ["claude-fable-5-2"] },
     { id: "opus", name: "Opus 5.5" },
     { id: "claude-fable-5-1", name: "Fable 5.1" },
     { id: "claude-haiku-4-5-20251001", name: "Haiku 4.5" },
@@ -61,6 +61,15 @@ describe("a route's model picker", () => {
     expect(choices(html, "light").some(([v]) => v === "claude-opus-4-1")).toBe(false);
   });
 
+  it("reads a full id saved behind an alias as that model, once", () => {
+    const html = render(claude, { model_preferences: { conversation: "claude-fable-5-2" } });
+    const shown = choices(html, "conversation");
+    expect(shown.filter(([, label]) => label === "Fable 5.2")).toEqual([["claude-fable-5-2", "Fable 5.2"]]);
+    expect(shown.some(([v]) => v === "fable")).toBe(false);
+    expect(html).toMatch(/<option value="claude-fable-5-2" selected="">Fable 5.2<\/option>/);
+    expect(choices(html, "light")).toContainEqual(["fable", "Fable 5.2"]);
+  });
+
   it("selects a listed model by its id without repeating it", () => {
     const html = render(claude, { heavy_model: "claude-fable-5-1" });
     const shown = choices(html, "heavy");
@@ -73,10 +82,10 @@ describe("a route's model picker", () => {
       choices: [{ id: "opus", name: "opus" }],
       models: ["opus"],
       models_from: "hub",
-      models_note: "your Claude login's models couldn't be read just now, so the hub's own Claude models are offered",
+      models_note: "Your Claude login's models couldn't be read just now, so the hub's own Claude models are offered.",
     });
     expect(html).toContain(
-      '<p class="text-xs text-muted-foreground">Your Claude login&#x27;s models couldn&#x27;t be read just now',
+      '<p class="text-xs text-muted-foreground">Your Claude login&#x27;s models couldn&#x27;t be read just now, so the hub&#x27;s own Claude models are offered.</p>',
     );
     expect(render(claude)).not.toContain("couldn&#x27;t be read");
   });

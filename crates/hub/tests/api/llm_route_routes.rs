@@ -585,6 +585,57 @@ async fn her_claude_route_offers_the_models_her_own_login_lists_by_name() {
 }
 
 #[tokio::test]
+async fn her_per_agent_model_gone_from_the_list_stays_while_she_changes_another() {
+    let hub = Hub::on().await;
+    hub.claude_login(&hub.alice);
+    // Saved before her login's list said otherwise.
+    let gone = json!({
+        "kind": "claude-code",
+        "fallback": "wait",
+        "model_preferences": { "conversation": "claude-fable-5-0" },
+    });
+    hub.store
+        .set_for_agent(
+            hub.alice.id,
+            "scout",
+            Some(serde_json::from_value(gone).unwrap()),
+            "test",
+        )
+        .await
+        .unwrap();
+
+    let changed = json!({
+        "kind": "claude-code",
+        "fallback": "wait",
+        "model_preferences": { "conversation": "claude-fable-5-0" },
+        "light_model": "claude-fable-5-1",
+    });
+    let (status, body) = hub
+        .put(
+            &hub.alice,
+            "/api/me/agents/scout/llm-route",
+            changed.clone(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["route"], changed);
+
+    let moved = json!({
+        "kind": "claude-code",
+        "fallback": "wait",
+        "heavy_model": "claude-fable-5-0",
+    });
+    let (status, body) = hub
+        .put(&hub.alice, "/api/me/agents/scout/llm-route", moved)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "not newly set for other work: {body}"
+    );
+}
+
+#[tokio::test]
 async fn a_login_whose_models_cant_be_read_offers_the_hubs_and_says_so() {
     let hub = Hub::on().await;
     hub.claude_token(&hub.bob, &format!("{UNLISTED}{}", uuid::Uuid::new_v4()));

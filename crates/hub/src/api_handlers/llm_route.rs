@@ -21,12 +21,12 @@ use workforce_agent::llm::tiers::{ModelTier, TierRegistry};
 use workforce_common::personal_route::{
     AgentRoute, PersonalRoute, PersonalRouteKind, PersonalRoutesConfig, RouteFallback,
 };
-use workforce_common::settings::ExecutorKind;
-use workforce_common::subscription::{AgentOwner, CredentialTier};
+use workforce_common::settings::{ExecutorKind, LoginPolicy};
+use workforce_common::subscription::{AgentOwner, CredentialTier, Payer, SharedServes};
 
 use crate::gateway::{AgentViewer, GatewayState};
 use crate::hub_core::logins::cooldown::CooldownStore;
-use crate::hub_core::logins::resolve::{login_state, Login, Miss, Vaults};
+use crate::hub_core::logins::resolve::{holding, Login, Vaults};
 use crate::hub_core::personal_routes::{PersonRouteStore, PersonalRoutes};
 use crate::hub_core::subscriptions::SharedSubscriptions;
 use crate::serve::AgentService;
@@ -77,6 +77,11 @@ pub struct RouteModel {
     id: String,
     /// What a person reads: "Fable 5.2".
     name: String,
+    /// The other ids the login lists that run this same model (the full id
+    /// behind an alias, or the alias for a full id), so a setting naming
+    /// one of them reads as this choice.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    same_as: Vec<String>,
 }
 
 /// Where a route's models come from.
@@ -111,9 +116,15 @@ struct Offered {
     note: Option<String>,
 }
 
-/// Said when a Claude login's models couldn't be read.
+/// Said when a Claude login's models couldn't be read: a sentence a
+/// picker shows as it is.
 const UNREAD_NOTE: &str =
-    "your Claude login's models couldn't be read just now, so the hub's own Claude models are offered";
+    "Your Claude login's models couldn't be read just now, so the hub's own Claude models are offered.";
+
+/// How long a settings request waits for a Claude login's models before it
+/// answers with the hub's: the read goes on, and fills the list for the
+/// next request.
+const LIST_WAIT: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// What each kind of work on a route runs when the person sets none, as a
 /// picker says it.
@@ -217,8 +228,8 @@ fn switch_for(routes: &PersonalRoutes, service: &AgentService) -> PersonalRoutes
 }
 
 /// `person`'s own working login for `kind`, the first at one of `tiers` in
-/// `vaults`: one at its usage limit still counts; one never set, or
-/// refused, does not.
+/// `vaults`, each read once: one at its usage limit still counts; one never
+/// set, or refused, does not.
 fn own_login(
     kind: PersonalRouteKind,
     vaults: &Vaults<'_>,
@@ -227,25 +238,22 @@ fn own_login(
 ) -> Option<Login> {
     let kind = kind.login_kind()?;
     let now = Utc::now();
-    let at = |tier: CredentialTier, cooldowns: &CooldownStore| {
-        login_state(
-            kind,
-            tier,
-            vaults,
-            Some(person),
-            &AgentOwner::Unowned,
-            cooldowns,
-            now,
-        )
-    };
-    tiers
-        .iter()
-        .find_map(|&tier| match at(tier, CooldownStore::global()) {
-            Ok(login) => Some(login),
-            // Cooling, the login is read as it is: it is still theirs.
-            Err(Miss::Cooling { .. }) => at(tier, &CooldownStore::default()).ok(),
-            Err(_) => None,
-        })
+    let cooldowns = CooldownStore::global();
+    holding(
+        kind,
+        vaults,
+        &Payer::Person(person),
+        &AgentOwner::Unowned,
+        &LoginPolicy {
+            tiers: tiers.to_vec(),
+            shared_serves: SharedServes::Anyone,
+        },
+        |login| {
+            cooldowns
+                .dead_at(&login.slot, &login.credential.fingerprint(), now)
+                .is_none()
+        },
+    )
 }
 
 /// Whether `person` has a working login of their own for `kind`
@@ -261,20 +269,29 @@ fn has_own_login(
 
 /// The models `login` (the person's own Claude login, when they have one)
 /// lists, asked only when `asked`: a route that can't be picked here
-/// never starts a CLI.
+/// never starts a CLI. A read that takes longer than `wait` goes on in the
+/// background, and this answers [`ClaudeList::Unread`] meanwhile.
 async fn claude_list(
     shared: &SharedSubscriptions,
     login: Option<Login>,
     asked: bool,
+    wait: std::time::Duration,
 ) -> ClaudeList {
-    match (login, asked) {
-        (Some(login), true) => {
-            match crate::subscription::catalog::claude_models_of(shared, &login).await {
-                Some(models) => ClaudeList::Read(models),
-                None => ClaudeList::Unread,
-            }
+    let (Some(login), true) = (login, asked) else {
+        return ClaudeList::Unasked;
+    };
+    let shared = shared.clone();
+    let read = tokio::spawn(crate::claude_code::with_program(async move {
+        crate::subscription::catalog::claude_models_of(&shared, &login).await
+    }));
+    match tokio::time::timeout(wait, read).await {
+        Ok(Ok(Some(models))) => ClaudeList::Read(models),
+        Ok(Ok(None)) => ClaudeList::Unread,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "a Claude login's model list read ended early");
+            ClaudeList::Unread
         }
-        _ => ClaudeList::Unasked,
+        Err(_) => ClaudeList::Unread,
     }
 }
 
@@ -332,6 +349,7 @@ fn route_models(kind: PersonalRouteKind, tiers: &TierRegistry, claude: &ClaudeLi
             .map(|id| RouteModel {
                 id: id.clone(),
                 name: name(id),
+                same_as: Vec::new(),
             })
             .collect(),
         accepted: ids,
@@ -359,19 +377,43 @@ fn route_models(kind: PersonalRouteKind, tiers: &TierRegistry, claude: &ClaudeLi
 
 /// The models a Claude login lists, as a picker offers them: in the
 /// login's order, each once. The CLI lists an alias beside the model it
-/// runs now (`sonnet` and `claude-sonnet-5-5`, both "Sonnet 5.5"); the
-/// first stands for both. Every id listed is accepted, and every model an
-/// alias runs.
+/// runs now (`sonnet` and `claude-sonnet-5-5`); the first listed stands for
+/// both, and names the other as the same model. Ids are folded only when
+/// one runs the other, never by name. Every id listed is accepted, and
+/// every model an alias runs.
 fn login_models(listed: &[PlanModel]) -> Offered {
-    let mut shown: Vec<&PlanModel> = Vec::new();
+    // What an id runs: an alias's model, else the id itself.
+    let runs = |m: &PlanModel| m.resolves_to.clone().unwrap_or_else(|| m.id.clone());
+    let mut choices: Vec<(RouteModel, String)> = Vec::new();
     for model in listed {
-        let offered = shown.iter().any(|s| {
-            s.id == model.id
-                || s.name == model.name
-                || s.resolves_to.as_deref() == Some(model.id.as_str())
-        });
-        if !offered {
-            shown.push(model);
+        let target = runs(model);
+        match choices
+            .iter_mut()
+            .find(|(c, ran)| c.id == model.id || *ran == target)
+        {
+            Some((choice, _)) => {
+                for id in std::iter::once(&model.id).chain(&model.resolves_to) {
+                    if *id != choice.id && !choice.same_as.contains(id) {
+                        choice.same_as.push(id.clone());
+                    }
+                }
+            }
+            None => {
+                let same_as = model
+                    .resolves_to
+                    .iter()
+                    .filter(|r| **r != model.id)
+                    .cloned()
+                    .collect();
+                choices.push((
+                    RouteModel {
+                        id: model.id.clone(),
+                        name: model.name.clone(),
+                        same_as,
+                    },
+                    target,
+                ));
+            }
         }
     }
     let mut accepted: Vec<String> = Vec::new();
@@ -384,26 +426,25 @@ fn login_models(listed: &[PlanModel]) -> Offered {
         }
     }
     Offered {
-        choices: shown
-            .into_iter()
-            .map(|m| RouteModel {
-                id: m.id.clone(),
-                name: m.name.clone(),
-            })
-            .collect(),
+        choices: choices.into_iter().map(|(choice, _)| choice).collect(),
         accepted,
         from: ModelsFrom::Login,
         note: None,
     }
 }
 
-/// A ChatGPT model as Desk words it: `gpt-6.1-sol` is "GPT-6.1 Sol".
+/// A built-in ChatGPT model's name, made from its id as Desk's own table
+/// words them: `gpt-6.1-sol` is "GPT-6.1 Sol". An id of another shape is
+/// shown as it is.
 fn chatgpt_name(id: &str) -> String {
     let Some(rest) = id.strip_prefix("gpt-") else {
         return id.to_string();
     };
     let mut parts = rest.split('-');
     let version = parts.next().unwrap_or_default();
+    if version.is_empty() {
+        return id.to_string();
+    }
     let words: Vec<String> = parts
         .filter(|w| !w.is_empty())
         .map(|w| {
@@ -539,7 +580,8 @@ fn kind_refusal(
 /// The person's own logins where a route reads them, and the hub's
 /// subscriptions their models are listed through.
 struct Logins<'a> {
-    shared: &'a SharedSubscriptions,
+    /// None on a hub without a host agent: nothing is listed there.
+    shared: Option<&'a SharedSubscriptions>,
     vaults: Vaults<'a>,
     tiers: &'a [CredentialTier],
     person: Uuid,
@@ -550,22 +592,69 @@ impl Logins<'_> {
         own_login(kind, &self.vaults, self.tiers, self.person)
     }
 
-    fn has(&self, kind: PersonalRouteKind) -> bool {
-        self.of(kind).is_some()
-    }
-
-    /// The models the person's Claude login lists, asked only while a
-    /// Claude route can be picked here.
-    async fn claude(
+    /// Every kind as the person may pick it here, their Claude login read
+    /// once for whether they hold it and for its models.
+    async fn options(
         &self,
         hub_on: bool,
         switch: &PersonalRoutesConfig,
         worker: bool,
+        tiers: &TierRegistry,
+    ) -> Vec<RouteOption> {
+        let claude_login = self.of(PersonalRouteKind::ClaudeCode);
+        let has_claude = claude_login.is_some();
+        let claude = self
+            .claude(claude_login, hub_on, switch, worker, LIST_WAIT)
+            .await;
+        options(
+            hub_on,
+            switch,
+            |kind| match kind {
+                PersonalRouteKind::ClaudeCode => has_claude,
+                kind => self.of(kind).is_some(),
+            },
+            worker,
+            tiers,
+            &claude,
+        )
+    }
+
+    /// The models `login` (the person's Claude login) lists, asked only
+    /// while a Claude route can be picked here.
+    async fn claude(
+        &self,
+        login: Option<Login>,
+        hub_on: bool,
+        switch: &PersonalRoutesConfig,
+        worker: bool,
+        wait: std::time::Duration,
     ) -> ClaudeList {
         let kind = PersonalRouteKind::ClaudeCode;
-        let login = self.of(kind);
         let asked = kind_refusal(kind, hub_on, switch, login.is_some(), worker).is_none();
-        claude_list(self.shared, login, asked).await
+        match self.shared {
+            Some(shared) => claude_list(shared, login, asked, wait).await,
+            None => ClaudeList::Unasked,
+        }
+    }
+
+    /// The models a route of `route`'s kind offers here, for checking a
+    /// save: a Claude login's list is read only for a Claude route.
+    async fn offered(
+        &self,
+        route: &PersonalRoute,
+        login: Option<Login>,
+        hub_on: bool,
+        switch: &PersonalRoutesConfig,
+        worker: bool,
+        tiers: &TierRegistry,
+    ) -> Offered {
+        let claude = match route.kind {
+            PersonalRouteKind::ClaudeCode => {
+                self.claude(login, hub_on, switch, worker, LIST_WAIT).await
+            }
+            _ => ClaudeList::Unasked,
+        };
+        route_models(route.kind, tiers, &claude)
     }
 }
 
@@ -578,33 +667,30 @@ async fn every_agent_options(
     switch: &PersonalRoutesConfig,
     person: Uuid,
 ) -> Vec<RouteOption> {
-    let Some(host) = state.registry.host() else {
-        return Vec::new();
-    };
-    let logins = every_agent_logins(state, &host, person);
+    let host = state.registry.host();
+    let logins = every_agent_logins(state, host.as_deref(), person);
     let hub_on = switch.enabled && routes.store().is_some();
     // As the every-agent PUT checks it: an agent without the worker
     // refuses a Codex turn when it comes.
-    let claude = logins.claude(hub_on, switch, true).await;
-    options(
-        hub_on,
-        switch,
-        |kind| logins.has(kind),
-        true,
-        &host.tier_registry(),
-        &claude,
-    )
+    logins
+        .options(hub_on, switch, true, &hub_tiers(host.as_deref()))
+        .await
+}
+
+/// The tiers models are named by for every agent: the host agent's.
+fn hub_tiers(host: Option<&AgentService>) -> TierRegistry {
+    host.map_or_else(|| TierRegistry::new(None), AgentService::tier_registry)
 }
 
 /// `person`'s own logins for the whole hub, as an every-agent route reads
 /// them.
 fn every_agent_logins<'a>(
     state: &'a GatewayState,
-    host: &'a AgentService,
+    host: Option<&'a AgentService>,
     person: Uuid,
 ) -> Logins<'a> {
     Logins {
-        shared: host.subscriptions(),
+        shared: host.map(AgentService::subscriptions),
         vaults: Vaults {
             agent: None,
             global: state.vault.as_ref(),
@@ -618,7 +704,7 @@ fn every_agent_logins<'a>(
 /// route reads them.
 fn agent_logins(service: &AgentService, person: Uuid) -> Logins<'_> {
     Logins {
-        shared: service.subscriptions(),
+        shared: Some(service.subscriptions()),
         vaults: service.logins.vaults(),
         tiers: &[CredentialTier::AgentUser, CredentialTier::GlobalUser],
         person,
@@ -635,17 +721,14 @@ async fn agent_options(
     person: Uuid,
 ) -> Vec<RouteOption> {
     let hub_on = routes.switch().enabled && routes.store().is_some();
-    let logins = agent_logins(service, person);
-    let worker = has_worker(service);
-    let claude = logins.claude(hub_on, switch, worker).await;
-    options(
-        hub_on,
-        switch,
-        |kind| logins.has(kind),
-        worker,
-        &service.tier_registry(),
-        &claude,
-    )
+    agent_logins(service, person)
+        .options(
+            hub_on,
+            switch,
+            has_worker(service),
+            &service.tier_registry(),
+        )
+        .await
 }
 
 /// What `person`'s own conversations with `service` run on, when that is
@@ -752,27 +835,29 @@ pub async fn put_my_route(
     let store = store(&routes)?;
     let switch = routes.switch();
     if let Some(route) = &write.route {
-        let host = state
-            .registry
-            .host()
-            .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "no agents on this hub"))?;
-        let logins = every_agent_logins(&state, &host, person);
-        if let Some(reason) = refusal(
-            route,
-            routes.switch().enabled,
-            &switch,
-            logins.has(route.kind),
-            true,
-        ) {
+        let host = state.registry.host();
+        let logins = every_agent_logins(&state, host.as_deref(), person);
+        let login = logins.of(route.kind);
+        if let Some(reason) = refusal(route, switch.enabled, &switch, login.is_some(), true) {
             return Err(refused(reason));
         }
+        // Read then written without a lock: two saves at once may each
+        // keep a model the other dropped, which the next save settles.
         let before = store
             .settings(person, None)
             .await
             .map_err(store_failed)?
             .every_agent;
-        let claude = logins.claude(switch.enabled, &switch, true).await;
-        let offered = route_models(route.kind, &host.tier_registry(), &claude);
+        let offered = logins
+            .offered(
+                route,
+                login,
+                switch.enabled,
+                &switch,
+                true,
+                &hub_tiers(host.as_deref()),
+            )
+            .await;
         if let Some(reason) = model_refusal(route, &offered, before.as_ref()) {
             return Err(refused(reason));
         }
@@ -858,15 +943,17 @@ pub async fn put_my_agent_route(
     if let Some(AgentRoute::Personal(route)) = &write.route {
         let logins = agent_logins(&service, person);
         let worker = has_worker(&service);
+        let login = logins.of(route.kind);
         if let Some(reason) = refusal(
             route,
             routes.switch().enabled,
             &switch,
-            logins.has(route.kind),
+            login.is_some(),
             worker,
         ) {
             return Err(refused(reason));
         }
+        // Read then written without a lock, as the every-agent save is.
         let before = match store
             .settings(person, Some(&agent_id))
             .await
@@ -877,8 +964,16 @@ pub async fn put_my_agent_route(
             _ => None,
         };
         let hub_on = routes.switch().enabled && routes.store().is_some();
-        let claude = logins.claude(hub_on, &switch, worker).await;
-        let offered = route_models(route.kind, &service.tier_registry(), &claude);
+        let offered = logins
+            .offered(
+                route,
+                login,
+                hub_on,
+                &switch,
+                worker,
+                &service.tier_registry(),
+            )
+            .await;
         if let Some(reason) = model_refusal(route, &offered, before.as_ref()) {
             return Err(refused(reason));
         }
@@ -1100,22 +1195,28 @@ mod tests {
             &TierRegistry::new(None),
             &listed(),
         );
-        let shown: Vec<(&str, &str)> = offered
+        let shown: Vec<(&str, &str, Vec<&str>)> = offered
             .choices
             .iter()
-            .map(|c| (c.id.as_str(), c.name.as_str()))
+            .map(|c| {
+                (
+                    c.id.as_str(),
+                    c.name.as_str(),
+                    c.same_as.iter().map(String::as_str).collect(),
+                )
+            })
             .collect();
         assert_eq!(
             shown,
             [
-                ("fable", "Fable 5.2"),
-                ("opus", "Opus 5.5"),
-                ("sonnet", "Sonnet 5.5"),
-                ("claude-fable-5-1", "Fable 5.1"),
-                ("claude-haiku-4-5-20251001", "Haiku 4.5"),
-                ("claude-opus-4-8", "Opus 4.8"),
+                ("fable", "Fable 5.2", vec!["claude-fable-5-2"]),
+                ("opus", "Opus 5.5", vec!["claude-opus-5-5"]),
+                ("sonnet", "Sonnet 5.5", vec!["claude-sonnet-5-5"]),
+                ("claude-fable-5-1", "Fable 5.1", vec![]),
+                ("claude-haiku-4-5-20251001", "Haiku 4.5", vec![]),
+                ("claude-opus-4-8", "Opus 4.8", vec![]),
             ],
-            "an alias stands for the model it runs, each once"
+            "an alias stands for the model it runs, each once, naming the other id"
         );
         assert_eq!(offered.from, ModelsFrom::Login);
         assert_eq!(offered.note, None);
@@ -1125,6 +1226,33 @@ mod tests {
                 "{id} runs, though shown by its alias"
             );
         }
+    }
+
+    #[test]
+    fn models_fold_only_when_one_runs_the_other_never_by_name() {
+        let offered = login_models(&[
+            plan("claude-opus-5-5", None, "Opus 5.5"),
+            plan("opus", Some("claude-opus-5-5"), "Opus 5.5"),
+            plan("claude-opus-5-5[1m]", None, "Opus 5.5"),
+        ]);
+        let shown: Vec<(&str, Vec<&str>)> = offered
+            .choices
+            .iter()
+            .map(|c| {
+                (
+                    c.id.as_str(),
+                    c.same_as.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("claude-opus-5-5", vec!["opus"]),
+                ("claude-opus-5-5[1m]", vec![]),
+            ],
+            "a later alias folds into the full id it runs; a same-named model stays"
+        );
     }
 
     #[test]
@@ -1194,6 +1322,10 @@ mod tests {
         let unread = route_models(PersonalRouteKind::ClaudeCode, &tiers, &ClaudeList::Unread);
         assert_eq!(unread.from, ModelsFrom::Hub);
         assert_eq!(unread.note.as_deref(), Some(UNREAD_NOTE));
+        assert!(
+            UNREAD_NOTE.starts_with("Your") && UNREAD_NOTE.ends_with('.'),
+            "a finished sentence, shown as it is"
+        );
         assert_eq!(
             unread.choices.iter().map(|c| &c.id).collect::<Vec<_>>(),
             crate::subscription::tier_models(ProviderKind::ClaudeCode, &tiers)
@@ -1225,6 +1357,7 @@ mod tests {
         assert_eq!(chatgpt_name("gpt-5.6-terra"), "GPT-5.6 Terra");
         assert_eq!(chatgpt_name("gpt-7"), "GPT-7");
         assert_eq!(chatgpt_name("o9-mini"), "o9-mini");
+        assert_eq!(chatgpt_name("gpt-"), "gpt-");
         let codex = route_models(
             PersonalRouteKind::Codex,
             &TierRegistry::new(None),
@@ -1270,7 +1403,7 @@ mod tests {
         let read = CLAUDE
             .scope(
                 listing.clone(),
-                claude_list(&shared, Some(login.clone()), true),
+                claude_list(&shared, Some(login.clone()), true, LIST_WAIT),
             )
             .await;
         let ClaudeList::Read(models) = read else {
@@ -1285,7 +1418,7 @@ mod tests {
         let again = CLAUDE
             .scope(
                 refusing.clone(),
-                claude_list(&shared, Some(login.clone()), true),
+                claude_list(&shared, Some(login.clone()), true, LIST_WAIT),
             )
             .await;
         assert!(matches!(again, ClaudeList::Read(ref m) if m[1].id == "claude-fable-5-1"));
@@ -1300,7 +1433,7 @@ mod tests {
         let missing = CLAUDE
             .scope(
                 std::path::PathBuf::from("/nonexistent/claude"),
-                claude_list(&shared, Some(other.clone()), true),
+                claude_list(&shared, Some(other.clone()), true, LIST_WAIT),
             )
             .await;
         assert!(matches!(missing, ClaudeList::Unread), "{missing:?}");
@@ -1309,13 +1442,174 @@ mod tests {
         let unasked = tempfile::tempdir().unwrap();
         let never = lister(unasked.path(), &reply);
         let off = CLAUDE
-            .scope(never, claude_list(&shared, Some(login), false))
+            .scope(never, claude_list(&shared, Some(login), false, LIST_WAIT))
             .await;
         assert!(matches!(off, ClaudeList::Unasked));
         assert!(!unasked.path().join("args").exists(), "no CLI started");
         assert!(matches!(
-            claude_list(&shared, None, true).await,
+            claude_list(&shared, None, true, LIST_WAIT).await,
             ClaudeList::Unasked
         ));
+    }
+
+    #[test]
+    fn her_login_at_its_limit_is_still_hers_and_a_refused_one_is_not() {
+        use crate::hub_core::logins::cooldown::{LimitSignal, LimitStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let vault =
+            Arc::new(crate::vault::Vault::open(&dir.path().join("v.enc"), "test-key").unwrap());
+        let person = Uuid::new_v4();
+        vault
+            .set(
+                &crate::user_config::per_user_key(
+                    &person.to_string(),
+                    workforce_common::subscription::SubscriptionKind::Claude.vault_key(),
+                ),
+                &format!("token-{}", Uuid::new_v4()),
+            )
+            .unwrap();
+        let vaults = Vaults {
+            agent: None,
+            global: Some(&vault),
+        };
+        let tiers = [CredentialTier::GlobalUser];
+        let login = own_login(PersonalRouteKind::ClaudeCode, &vaults, &tiers, person)
+            .expect("her own login");
+        CooldownStore::global().note(
+            &login.key,
+            &LimitSignal {
+                status: LimitStatus::Rejected,
+                resets_at: Some(Utc::now() + chrono::TimeDelta::hours(2)),
+                window: Some("five_hour".into()),
+            },
+            Utc::now(),
+        );
+        let cooling = own_login(PersonalRouteKind::ClaudeCode, &vaults, &tiers, person)
+            .expect("still hers while it cools, so its models are listed");
+        assert_eq!(cooling.key, login.key);
+        assert!(own_login(PersonalRouteKind::ClaudeCode, &vaults, &[], person).is_none());
+        assert!(own_login(PersonalRouteKind::Devin, &vaults, &tiers, person).is_none());
+    }
+
+    #[tokio::test]
+    async fn without_a_host_agent_the_hubs_models_are_offered_and_nothing_is_listed() {
+        let person = Uuid::new_v4();
+        let logins = Logins {
+            shared: None,
+            vaults: Vaults {
+                agent: None,
+                global: None,
+            },
+            tiers: &[CredentialTier::GlobalUser],
+            person,
+        };
+        let listed = logins
+            .options(true, &on(), true, &TierRegistry::new(None))
+            .await;
+        let claude = &listed[0];
+        assert_eq!(claude.models_from, ModelsFrom::Hub);
+        assert_eq!(claude.models_note, None);
+        assert!(claude.refused.is_some(), "no login of hers here");
+    }
+
+    #[tokio::test]
+    async fn a_codex_or_devin_save_never_lists_claude_models() {
+        use crate::claude_code::tests::CLAUDE;
+        use crate::subscription::catalog::tests::lister;
+        let dir = tempfile::tempdir().unwrap();
+        let shared = shared(dir.path());
+        let watched = tempfile::tempdir().unwrap();
+        let program = lister(watched.path(), r#"{"type":"assistant"}"#);
+        let logins = Logins {
+            shared: Some(&shared),
+            vaults: Vaults {
+                agent: None,
+                global: None,
+            },
+            tiers: &[CredentialTier::GlobalUser],
+            person: Uuid::new_v4(),
+        };
+        let login =
+            crate::subscription::test_support::claude_login(&format!("her-{}", Uuid::new_v4()));
+        for kind in [PersonalRouteKind::Codex, PersonalRouteKind::Devin] {
+            let route = PersonalRoute::new(kind, RouteFallback::Wait);
+            let offered = CLAUDE
+                .scope(
+                    program.clone(),
+                    logins.offered(
+                        &route,
+                        Some(login.clone()),
+                        true,
+                        &on(),
+                        true,
+                        &TierRegistry::new(None),
+                    ),
+                )
+                .await;
+            assert_eq!(offered.from, ModelsFrom::Hub);
+        }
+        assert!(
+            !watched.path().join("args").exists(),
+            "no Claude CLI started"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slow_list_answers_with_the_hubs_and_fills_in_for_the_next_ask() {
+        use crate::claude_code::tests::CLAUDE;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let shared = shared(dir.path());
+        let reply = serde_json::json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": "wf-list-models",
+                "response": { "models": [ { "value": "claude-fable-5-1", "displayName": "Fable 5.1" } ] }
+            }
+        })
+        .to_string();
+        let program = dir.path().join("claude");
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\nread line\nsleep 1\nprintf '%s\\n' '{reply}'\nsleep 30\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let login =
+            crate::subscription::test_support::claude_login(&format!("slow-{}", Uuid::new_v4()));
+
+        let first = CLAUDE
+            .scope(
+                program.clone(),
+                claude_list(
+                    &shared,
+                    Some(login.clone()),
+                    true,
+                    std::time::Duration::from_millis(100),
+                ),
+            )
+            .await;
+        assert!(matches!(first, ClaudeList::Unread), "{first:?}");
+
+        let started = std::time::Instant::now();
+        loop {
+            let next = claude_list(
+                &shared,
+                Some(login.clone()),
+                true,
+                std::time::Duration::from_millis(100),
+            )
+            .await;
+            if let ClaudeList::Read(models) = next {
+                assert_eq!(models[0].id, "claude-fable-5-1", "the read went on");
+                break;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(8),
+                "the list never filled in"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 }

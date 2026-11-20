@@ -69,6 +69,9 @@ export type AgentRoute = PersonalRoute | "hub";
 export interface RouteModel {
   id: string;
   name: string;
+  /** The other ids the login lists for this same model (the full id behind
+   *  an alias), so a setting naming one reads as this choice. */
+  same_as?: string[];
 }
 
 /** One kind as the person may pick it where they are; `refused` says why
@@ -86,7 +89,8 @@ export interface RouteOption {
   choices?: RouteModel[];
   /** Whether `choices` are the person's login's own or the hub's. */
   models_from?: "login" | "hub";
-  /** Why `choices` aren't the login's own, when they couldn't be read. */
+  /** Why `choices` aren't the login's own, when they couldn't be read: a
+   *  finished sentence, shown as it is. */
   models_note?: string | null;
   defaults?: RouteDefaults;
 }

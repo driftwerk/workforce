@@ -1671,6 +1671,28 @@ pub(crate) fn claude_program() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("claude"))
 }
 
+/// `run`, carried to another task with the `claude` a test scoped in, so a
+/// read spawned off a test's scope runs its scripted CLI too.
+#[cfg(not(test))]
+pub(crate) fn with_program<F: std::future::Future>(run: F) -> F {
+    run
+}
+
+/// `run`, carried to another task with the `claude` a test scoped in, so a
+/// read spawned off a test's scope runs its scripted CLI too.
+#[cfg(test)]
+pub(crate) fn with_program<F: std::future::Future>(
+    run: F,
+) -> impl std::future::Future<Output = F::Output> {
+    let program = tests::CLAUDE.try_with(PathBuf::clone).ok();
+    async move {
+        match program {
+            Some(program) => tests::CLAUDE.scope(program, run).await,
+            None => run.await,
+        }
+    }
+}
+
 /// The scripted `claude` a test scopes in; outside such a scope, a path
 /// that never resolves, so no test reaches the real CLI.
 #[cfg(test)]
