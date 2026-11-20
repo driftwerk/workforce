@@ -223,13 +223,10 @@ impl Probe {
             return Ok(());
         };
         match records.drop().await {
-            Err(e) if !e.is_not_found() => {
-                tracing::warn!(collection = %self.name, error = %e, "the collection made to embed with the node was not dropped");
-                Err(eyre::Report::new(e).wrap_err(format!(
-                    "the collection made to embed with the node, '{}', was not dropped",
-                    self.name
-                )))
-            }
+            Err(e) if !e.is_not_found() => Err(eyre::Report::new(e).wrap_err(format!(
+                "the collection made to embed with the node, '{}', was not dropped",
+                self.name
+            ))),
             _ => Ok(()),
         }
     }
@@ -261,6 +258,8 @@ pub struct NodeEmbedder {
 }
 
 impl NodeEmbedder {
+    /// Embedding with `tenants`' node as `embedding` does, `per_write`
+    /// texts to a write (at least one).
     pub fn new(tenants: Tenants, embedding: Embedding, per_write: usize) -> Self {
         Self {
             tenants,
@@ -313,12 +312,17 @@ impl NodeEmbedder {
                 .into_iter()
                 .fold(Page::new(PROBE_LIST).vectors(true), Page::after);
             let listed = records.list(&page).await.map_err(failed)?;
-            by_node.extend(
-                listed
-                    .objects
-                    .into_iter()
-                    .map(|object| (object.id, object.vector.unwrap_or_default())),
-            );
+            for object in listed.objects {
+                let vector = object.vector.ok_or_else(|| {
+                    eyre!(
+                        "{} listed object {} of the probe '{}' with no vector",
+                        self.name(),
+                        object.id.0,
+                        probe.name
+                    )
+                })?;
+                by_node.insert(object.id, vector);
+            }
             after = listed.next;
             if after.is_none() {
                 break;

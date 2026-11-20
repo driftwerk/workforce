@@ -145,9 +145,42 @@ fn collapse_whitespace(text: &str) -> String {
     out
 }
 
+/// Escape a dynamic string for embedding inside a double-quoted GraphQL
+/// string literal. GraphQL forbids raw control characters in strings, and
+/// they do occur in our data — the edge's external identity ids join issuer
+/// and subject with a `\u{1F}` unit separator, which unescaped makes Weaviate
+/// reject the whole query ("Invalid character within String"). Backslash
+/// first, then quote, then `\uXXXX` for controls.
+pub fn graphql_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graphql_escape_handles_backslash_quote_and_controls() {
+        let bs = '\u{5c}'; // literal backslash
+        assert_eq!(graphql_escape("plain"), "plain");
+        assert_eq!(graphql_escape("say \"hi\""), format!("say {bs}\"hi{bs}\""));
+        // Backslash escaped first, so a pre-escaped-looking input stays literal.
+        assert_eq!(graphql_escape(&format!("a{bs}b")), format!("a{bs}{bs}b"));
+        // Control characters become uXXXX escapes - GraphQL forbids them raw.
+        assert_eq!(graphql_escape("a\u{1F}b"), format!("a{bs}u001Fb"));
+        assert_eq!(graphql_escape("a\nb"), format!("a{bs}u000Ab"));
+    }
 
     #[test]
     fn truncate_str_short_input_unchanged() {

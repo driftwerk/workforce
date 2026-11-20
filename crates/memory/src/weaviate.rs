@@ -7,6 +7,7 @@ use reqwest::Client;
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
+use workforce_common::text::graphql_escape;
 use workforce_common::vectorizable::VectorizableText;
 
 use crate::admin::{
@@ -1529,27 +1530,6 @@ const MEMORY_PROPERTY_FIELDS: &str = "content memoryId layer owner visibility im
 /// Whether a row read back is `owner`'s and about exactly `identity`.
 fn is_about(item: &serde_json::Value, owner: &AgentId, identity: &str) -> bool {
     item["owner"].as_str() == Some(owner.as_str()) && item["identityId"].as_str() == Some(identity)
-}
-
-/// Escape a dynamic string for embedding inside a double-quoted GraphQL
-/// string literal. GraphQL forbids raw control characters in strings, and
-/// they do occur in our data — the edge's external identity ids join issuer
-/// and subject with a `\u{1F}` unit separator, which unescaped makes Weaviate
-/// reject the whole query ("Invalid character within String"). Backslash
-/// first, then quote, then `\uXXXX` for controls.
-fn graphql_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04X}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 // Weaviate `get` excludes soft-deleted rows; SQLite/InMemory `get` do not.
@@ -3283,18 +3263,6 @@ mod tests {
             .await
             .expect("must short-circuit at the scope gate, not error");
         assert!(out.is_empty());
-    }
-
-    #[test]
-    fn graphql_escape_handles_backslash_quote_and_controls() {
-        let bs = '\u{5c}'; // literal backslash
-        assert_eq!(graphql_escape("plain"), "plain");
-        assert_eq!(graphql_escape("say \"hi\""), format!("say {bs}\"hi{bs}\""));
-        // Backslash escaped first, so a pre-escaped-looking input stays literal.
-        assert_eq!(graphql_escape(&format!("a{bs}b")), format!("a{bs}{bs}b"));
-        // Control characters become uXXXX escapes - GraphQL forbids them raw.
-        assert_eq!(graphql_escape("a\u{1F}b"), format!("a{bs}u001Fb"));
-        assert_eq!(graphql_escape("a\nb"), format!("a{bs}u000Ab"));
     }
 
     #[test]

@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+use workforce_common::text::graphql_escape;
 use workforce_common::vectorizable::VectorizableText;
 
 use crate::graph::entities::{CodeEntity, EntityKind};
@@ -333,7 +334,9 @@ pub struct Scanned {
 pub trait SearchedByVector: Send + Sync {
     /// The prefix the node puts before a question's text.
     fn query_prefix(&self) -> Option<String>;
-    /// The node's vector of each text, each embedded alone, nothing put before it.
+    /// The node's vector of each text, each embedded alone, nothing put before
+    /// it: the texts are written to a probe collection made in the tenant for
+    /// them, and it is dropped.
     async fn embedded(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
     /// The `limit` entities of `repo_id` nearest, as the node's index finds them.
     async fn nearest(&self, to: NearestTo<'_>, repo_id: &str, limit: usize) -> Result<Vec<Near>>;
@@ -348,21 +351,6 @@ pub trait SearchedByVector: Send + Sync {
     ) -> Result<Scanned>;
     /// How many entities of `repo_id` the store holds.
     async fn counted(&self, repo_id: &str) -> Result<usize>;
-}
-
-pub(crate) fn kept_nearest(top: Vec<Near>, more: Vec<Near>, limit: usize) -> Vec<Near> {
-    let mut nearest: Vec<Near> = top.into_iter().chain(more).collect();
-    nearest.sort_by(|a, b| {
-        a.distance
-            .total_cmp(&b.distance)
-            .then_with(|| a.object.cmp(&b.object))
-    });
-    nearest.truncate(limit);
-    nearest
-}
-
-fn graphql_string(text: &str) -> String {
-    serde_json::Value::from(text).to_string()
 }
 
 /// Why a code question was answered without searching the code vectors.
@@ -1059,8 +1047,8 @@ impl CodeVectorStore for WeaviateCodeVectorStore {
         .flatten()
         .map(|(path, value)| {
             format!(
-                r#"{{ path: ["{path}"], operator: Equal, valueText: {} }}"#,
-                graphql_string(&value)
+                r#"{{ path: ["{path}"], operator: Equal, valueText: "{}" }}"#,
+                graphql_escape(&value)
             )
         })
         .collect();
@@ -1073,8 +1061,8 @@ impl CodeVectorStore for WeaviateCodeVectorStore {
             ),
         };
         let graphql = format!(
-            "{{ Get {{ {CODE_ENTITY_COLLECTION}( nearText: {{ concepts: [{}] }} limit: {limit} {where_clause} ) {{ entityId repoId qualifiedName kind filePath startLine endLine _additional {{ certainty }} }} }} }}",
-            graphql_string(query.as_str()),
+            "{{ Get {{ {CODE_ENTITY_COLLECTION}( nearText: {{ concepts: [\"{}\"] }} limit: {limit} {where_clause} ) {{ entityId repoId qualifiedName kind filePath startLine endLine _additional {{ certainty }} }} }} }}",
+            graphql_escape(query.as_str()),
         );
 
         let url = format!("{}/v1/graphql", self.base_url);
@@ -1244,8 +1232,8 @@ impl CodeVectorStore for WeaviateCodeVectorStore {
     /// Get entity count for a repo.
     async fn entity_count(&self, repo_id: &str) -> Result<usize> {
         let graphql = format!(
-            r#"{{ Aggregate {{ {CODE_ENTITY_COLLECTION}(where: {{ path: ["repoId"], operator: Equal, valueText: {} }}) {{ meta {{ count }} }} }} }}"#,
-            graphql_string(repo_id),
+            r#"{{ Aggregate {{ {CODE_ENTITY_COLLECTION}(where: {{ path: ["repoId"], operator: Equal, valueText: "{}" }}) {{ meta {{ count }} }} }} }}"#,
+            graphql_escape(repo_id),
         );
 
         let url = format!("{}/v1/graphql", self.base_url);
@@ -1628,7 +1616,7 @@ mod tests {
         assert_eq!(store.entity_count(repo).await.unwrap(), 3);
         let asked = asked.lock().unwrap().clone();
         assert_eq!(literal_after(&asked[0], "concepts: ["), question);
-        assert!(asked[0].contains(&format!("concepts: [{}]", graphql_string(question))));
+        assert!(asked[0].contains(&format!("concepts: [\"{}\"]", graphql_escape(question))));
         assert_eq!(
             literal_after(
                 &asked[0],

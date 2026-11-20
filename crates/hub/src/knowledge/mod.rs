@@ -68,5 +68,6 @@ pub use wire::{
     rebind_tools, register_tools, set_maintenance_runner, start_background, VectorUpkeep,
 };
 pub use workforce_knowledge_service::{
-    FillPace, FillRun, KnowledgeService, RepoVectors, SummariserBuilder, VectorBackend,
+    code_graph_path, knowledge_dirs, FillPace, FillRun, KnowledgeService, RepoVectors,
+    SummariserBuilder, VectorBackend,
 };

@@ -429,7 +429,7 @@ impl KnowledgeService {
     ) -> Result<Self> {
         let db_path = code_graph_path(&data_dir);
         let graph = Arc::new(open_code_graph(
-            &data_dir,
+            &db_path,
             config,
             vectors.key(),
             codegraph_config,
@@ -1568,22 +1568,30 @@ pub fn code_graph_path(data_dir: &Path) -> PathBuf {
         .join("codegraph.db")
 }
 
-/// The code graph of `data_dir`, on the backend `[codegraph]` names, its vector
-/// state kept as `active`'s, with `[knowledge] vector_standby` told of changes.
+/// The knowledge root and data dir `[knowledge]` names, each falling back
+/// as the hub's: the root to `hub_data_dir`, the data dir to the root.
+pub fn knowledge_dirs(config: &KnowledgeConfig, hub_data_dir: &str) -> (PathBuf, PathBuf) {
+    let root = PathBuf::from(config.root.as_deref().unwrap_or(hub_data_dir));
+    let data_dir = config
+        .data_dir
+        .as_ref()
+        .map_or_else(|| root.clone(), PathBuf::from);
+    (root, data_dir)
+}
+
+/// The code graph on the backend `[codegraph]` names, at `db_path` if it is
+/// SQLite ([`code_graph_path`]), its vector state kept as `active`'s, with
+/// `[knowledge] vector_standby` told of changes.
 pub fn open_code_graph(
-    data_dir: &Path,
+    db_path: &Path,
     config: &KnowledgeConfig,
     active: &str,
     codegraph: &CodegraphConfig,
     postgres: Option<&PostgresConfig>,
 ) -> Result<CodeGraph> {
-    let db_path = code_graph_path(data_dir);
-    if let Some(dir) = db_path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
     let standby = Some(config.vector_standby.trim()).filter(|standby| !standby.is_empty());
     let keys = VectorKeys::new(active, standby).wrap_err("[knowledge] vector_standby")?;
-    Ok(build_code_graph(&db_path, codegraph, postgres)?.keyed(keys))
+    Ok(build_code_graph(db_path, codegraph, postgres)?.keyed(keys))
 }
 
 /// Build a `CodeGraph` using the backend selected by `[codegraph] backend`.
@@ -1627,12 +1635,34 @@ fn build_code_graph(
         }
     }
     info!(path = %db_path.display(), "Using SQLite code graph backend");
+    if let Some(dir) = db_path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
     CodeGraph::open(db_path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Postgres code graph is opened with nothing made on disk for it,
+    /// where a SQLite one has its directory made.
+    #[test]
+    fn only_a_sqlite_code_graph_makes_its_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = code_graph_path(dir.path());
+        let postgres = CodegraphConfig {
+            backend: "postgres".into(),
+        };
+        let knowledge = KnowledgeConfig::default();
+        assert!(
+            open_code_graph(&db_path, &knowledge, VectorKeys::WEAVIATE, &postgres, None).is_err()
+        );
+        assert!(!dir.path().join(".workforce").exists(), "nothing made");
+        let sqlite = CodegraphConfig::default();
+        open_code_graph(&db_path, &knowledge, VectorKeys::WEAVIATE, &sqlite, None).unwrap();
+        assert!(db_path.is_file());
+    }
 
     /// Code vectors are kept where `[knowledge] vector_backend` says,
     /// wherever memories are.

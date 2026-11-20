@@ -461,8 +461,8 @@ enum Commands {
     MigrateCodegraph {
         #[arg(short, long, default_value = "workforce.toml")]
         config: PathBuf,
-        /// SQLite source `codegraph.db`. Defaults to
-        /// `{hub.data_dir}/.workforce/knowledge/codegraph.db`.
+        /// SQLite source `codegraph.db`. Defaults to the code graph of the
+        /// `[knowledge]` data dir, as the hub opens it.
         #[arg(long)]
         from: Option<PathBuf>,
     },
@@ -11857,10 +11857,11 @@ Describe what you should do in this step and what to discuss with the user.
             };
 
             let sqlite_path = from.unwrap_or_else(|| {
-                std::path::PathBuf::from(&wf_config.hub.data_dir)
-                    .join(".workforce")
-                    .join("knowledge")
-                    .join("codegraph.db")
+                let (_, data_dir) = workforce_hub::knowledge::knowledge_dirs(
+                    &wf_config.knowledge,
+                    &wf_config.hub.data_dir,
+                );
+                workforce_hub::knowledge::code_graph_path(&data_dir)
             });
             if !sqlite_path.exists() {
                 eyre::bail!(

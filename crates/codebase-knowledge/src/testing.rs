@@ -3,8 +3,7 @@
 //! fail or change the graph as told ([`Held`]), and one that counts every
 //! call made of it ([`Counting`]); a vellev store whose embeds are
 //! counted ([`counted`]), and a collection of entities in the shape that
-//! keeps their text ([`collection_keeping_text`]); and one that answers
-//! searches as it is told to ([`Answering`]).
+//! keeps their text ([`collection_keeping_text`]).
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -821,113 +820,5 @@ impl CodeVectorStore for Counting {
     }
     async fn identity(&self, _afresh: bool) -> Result<String> {
         self.asked().map(|()| RECORDED.to_string())
-    }
-}
-
-/// What [`Answering`] does after one of its questions, before answering it.
-pub type Hook = Arc<dyn Fn() -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
-
-/// A store that answers each question from what it was given for the
-/// question's repo and text, recording every question as asked, and that
-/// can fail one of them or act after one.
-#[derive(Default)]
-pub struct Answering {
-    answers: BTreeMap<(String, String), Vec<VectorSearchResult>>,
-    held: BTreeMap<String, usize>,
-    /// Each question: its text, repo and limit.
-    asked: Mutex<Vec<(String, Option<String>, usize)>>,
-    after: Option<(usize, Hook)>,
-    failing_at: Option<usize>,
-}
-
-impl Answering {
-    /// Answering `answers`, by repo and text, and nothing else.
-    pub fn new(answers: BTreeMap<(String, String), Vec<VectorSearchResult>>) -> Self {
-        Self {
-            answers,
-            ..Self::default()
-        }
-    }
-
-    /// Saying it holds `entities` of `repo_id`.
-    pub fn holding(mut self, repo_id: &str, entities: usize) -> Self {
-        self.held.insert(repo_id.to_string(), entities);
-        self
-    }
-
-    /// Doing `hook` after the `n`th question, counted from one.
-    pub fn after(mut self, n: usize, hook: Hook) -> Self {
-        self.after = Some((n, hook));
-        self
-    }
-
-    /// Failing the `n`th question, counted from one.
-    pub fn failing_at(mut self, n: usize) -> Self {
-        self.failing_at = Some(n);
-        self
-    }
-
-    /// The questions asked so far.
-    pub fn questions(&self) -> Vec<(String, Option<String>, usize)> {
-        self.asked.lock().unwrap_or_else(|e| e.into_inner()).clone()
-    }
-}
-
-#[async_trait]
-impl CodeVectorStore for Answering {
-    fn backend(&self) -> &'static str {
-        VectorKeys::WEAVIATE
-    }
-    async fn ensure_collections(&self) -> Result<()> {
-        Ok(())
-    }
-    async fn health_check(&self) -> Result<bool> {
-        Ok(true)
-    }
-    fn base_url(&self) -> &str {
-        "http://localhost:8080"
-    }
-    fn set_insert_error_sink(&self, _sink: Arc<dyn InsertErrorSink>) {}
-    async fn index_entities(&self, entities: &[VectorCodeEntity]) -> Result<usize> {
-        Ok(entities.len())
-    }
-    async fn search_entities(
-        &self,
-        query: &str,
-        repo_id: Option<&str>,
-        _kind: Option<EntityKind>,
-        limit: usize,
-    ) -> Result<Vec<VectorSearchResult>> {
-        let n = {
-            let mut asked = self.asked.lock().unwrap_or_else(|e| e.into_inner());
-            asked.push((query.to_string(), repo_id.map(str::to_string), limit));
-            asked.len()
-        };
-        if self.failing_at == Some(n) {
-            return Err(eyre!("the store went away at question {n}"));
-        }
-        if let Some((_, hook)) = self.after.as_ref().filter(|(after, _)| *after == n) {
-            hook().await;
-        }
-        let key = (repo_id.unwrap_or_default().to_string(), query.to_string());
-        Ok(self.answers.get(&key).cloned().unwrap_or_default())
-    }
-    async fn delete_repo_entities(&self, _repo_id: &str) -> Result<DeleteOutcome> {
-        Ok(DeleteOutcome::default())
-    }
-    async fn delete_entities_by_file(&self, _: &str, _: &str) -> Result<DeleteOutcome> {
-        Ok(DeleteOutcome::default())
-    }
-    async fn index_summaries(&self, summaries: &[VectorCodeSummary]) -> Result<usize> {
-        Ok(summaries.len())
-    }
-    async fn delete_repo_summaries(&self, _repo_id: &str) -> Result<DeleteOutcome> {
-        Ok(DeleteOutcome::default())
-    }
-    async fn delete_summaries_by_file(&self, _: &str, _: &str) -> Result<DeleteOutcome> {
-        Ok(DeleteOutcome::default())
-    }
-    async fn entity_count(&self, repo_id: &str) -> Result<usize> {
-        Ok(self.held.get(repo_id).copied().unwrap_or_default())
     }
 }

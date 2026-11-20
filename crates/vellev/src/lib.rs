@@ -459,23 +459,6 @@ pub mod testing {
             self.tenants().reads
         }
 
-        /// Where the node's metrics are read (`GET`), as
-        /// `VELLEV_TEST_METRICS_URL` names it, for a node run with
-        /// `VELLEV_METRICS_LISTEN`; or `None`, said why, to skip.
-        pub fn metrics(&self) -> Option<String> {
-            let metrics = std::env::var("VELLEV_TEST_METRICS_URL").ok();
-            if metrics.is_none() {
-                assert!(
-                    !required(),
-                    "VELLEV_TEST_REQUIRED is set, and VELLEV_TEST_METRICS_URL names no metrics listener of the node"
-                );
-                eprintln!(
-                    "skipping: VELLEV_TEST_METRICS_URL names no metrics listener of the node"
-                );
-            }
-            metrics
-        }
-
         /// A local URL that answers nothing yet, as a node not up; see
         /// [`Self::come_up_at`].
         pub async fn not_up_yet() -> (String, u16) {
@@ -1331,14 +1314,16 @@ mod tests {
     /// A node that embeds what is written to it as [`made_up`] does, and
     /// keeps every text it was sent.
     async fn embedding_node() -> (Tenants, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
-        probe_node(200, 0).await
+        probe_node(200, 0, true).await
     }
 
-    /// As [`embedding_node`], answering `dropping` to a collection's drop
-    /// and leaving the first `losing` objects out of what it lists.
+    /// As [`embedding_node`], answering `dropping` to a collection's drop,
+    /// leaving the first `losing` objects out of what it lists, and listing
+    /// the rest with their vectors only if `vectors`.
     async fn probe_node(
         dropping: u16,
         losing: usize,
+        vectors: bool,
     ) -> (Tenants, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         use axum::response::IntoResponse;
         let held: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
@@ -1371,7 +1356,7 @@ mod tests {
                                 serde_json::json!({
                                     "id": id,
                                     "properties": { "text": text },
-                                    "vector": made_up(text),
+                                    "vector": vectors.then(|| made_up(text)),
                                 })
                             })
                             .collect();
@@ -1398,12 +1383,12 @@ mod tests {
 
     /// A probe the node cannot drop fails the embedding that made it, and
     /// the comparison made with it, naming it; so does a vector the node
-    /// did not give back.
+    /// did not give back, or an object it listed with none.
     #[tokio::test]
     async fn a_probe_that_cannot_be_dropped_is_an_error() {
         let texts = ["parse the config".to_string()];
         let small = embedding_of(SMALL, 16, None, &["text"]);
-        let (tenants, _) = probe_node(500, 0).await;
+        let (tenants, _) = probe_node(500, 0, true).await;
         let node = seeding::NodeEmbedder::new(tenants.clone(), small.clone(), 1);
         let refused = node.documents(&texts).await.unwrap_err().to_string();
         assert!(
@@ -1420,8 +1405,8 @@ mod tests {
             "{refused}"
         );
 
-        let (tenants, _) = probe_node(200, 1).await;
-        let node = seeding::NodeEmbedder::new(tenants, small, 1);
+        let (tenants, _) = probe_node(200, 1, true).await;
+        let node = seeding::NodeEmbedder::new(tenants, small.clone(), 1);
         let short = node
             .documents(&["a".to_string(), "b".to_string()])
             .await
@@ -1430,6 +1415,15 @@ mod tests {
         assert!(
             short.ends_with("gave back 1 vectors for 2 texts"),
             "{short}"
+        );
+
+        let (tenants, _) = probe_node(200, 0, false).await;
+        let node = seeding::NodeEmbedder::new(tenants, small, 1);
+        let bare = node.documents(&texts).await.unwrap_err().to_string();
+        assert!(
+            bare.contains("of the probe 'WorkforceEmbedProbe")
+                && bare.ends_with("' with no vector"),
+            "{bare}"
         );
     }
 
