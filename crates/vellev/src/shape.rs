@@ -115,6 +115,18 @@ fn distance_name(distance: Distance) -> &'static str {
     }
 }
 
+/// The properties `wanted` does not keep that `found` keeps: a collection
+/// made before its shape was slimmed, which is used as it is.
+fn kept_stored<'a>(found: &'a Collection, wanted: &Collection) -> Vec<&'a str> {
+    found
+        .properties
+        .iter()
+        .filter(|have| have.stored)
+        .filter(|have| wanted.property(&have.name).is_some_and(|want| !want.stored))
+        .map(|have| have.name.as_str())
+        .collect()
+}
+
 /// [`Refused`] naming every [`mismatches`] of `found`, if it has any.
 pub fn checked(found: &Collection, wanted: &Collection, remedy: &str) -> Result<()> {
     let problems = mismatches(found, wanted, remedy);
@@ -130,6 +142,14 @@ pub fn checked(found: &Collection, wanted: &Collection, remedy: &str) -> Result<
             recorded = %found.embedding.model,
             model = %wanted.embedding.model,
             "collection imported from Weaviate with its vectors; taking them to be this model's, as their size matches"
+        );
+    }
+    let kept = kept_stored(found, wanted);
+    if !kept.is_empty() {
+        warn!(
+            collection = %found.name,
+            properties = ?kept,
+            "collection keeps text the slim shape does not: it is used, at a memory cost; drop it on a node that writes format 2 to make it slim"
         );
     }
     Ok(())

@@ -9,10 +9,9 @@ use eyre::Result;
 use serde_json::json;
 use uuid::Uuid;
 use vellev_client::api::Change;
-use vellev_client::Tenant;
 use vellev_core::{CollectionName, DataType, Embedding, EmbeddingProvider, ObjectId, Property};
 
-use crate::{collection, is_conflict};
+use crate::{classified, collection, is_conflict, Tenants};
 
 /// The collection markers are kept in, named as in Weaviate, so a marker
 /// imported from there is found.
@@ -97,28 +96,40 @@ const INDEXES: Kept = Kept {
 };
 
 impl Kept {
-    fn records(self, tenant: &Tenant) -> Result<vellev_client::Records> {
-        Ok(tenant.collection(&CollectionName::new(self.name)?))
+    fn records(self, at: &Tenants) -> Result<vellev_client::Records> {
+        Ok(at.reads.collection(&CollectionName::new(self.name)?))
     }
 
-    async fn marked(self, tenant: &Tenant, name: &str) -> Result<bool> {
-        Ok(self
-            .records(tenant)?
-            .get(ObjectId(marker_id(name)))
-            .await?
-            .is_some())
+    async fn marked(self, at: &Tenants, name: &str) -> Result<bool> {
+        let held = self.records(at)?.get(ObjectId(marker_id(name))).await;
+        Ok(held.map_err(|e| classified(e, at))?.is_some())
     }
 
-    async fn mark(self, tenant: &Tenant, name: &str) -> Result<()> {
-        let records = self.records(tenant)?;
-        if records.schema().await?.is_none() {
-            records.create(&(self.shape)()?).await?;
+    /// Make the collection, unless the node holds it already.
+    async fn made(self, at: &Tenants) -> Result<vellev_client::Records> {
+        let records = self.records(at)?;
+        if records
+            .schema()
+            .await
+            .map_err(|e| classified(e, at))?
+            .is_none()
+        {
+            match records.create(&(self.shape)()?).await {
+                Err(e) if !is_conflict(&e) => return Err(classified(e, at)),
+                _ => {}
+            }
         }
+        Ok(records)
+    }
+
+    /// Insert `value` under `what`, unless something is recorded there
+    /// already.
+    async fn insert(self, at: &Tenants, what: &str, value: &str) -> Result<()> {
         let marker = Change::Insert {
             collection: CollectionName::new(self.name)?,
-            id: ObjectId(marker_id(name)),
+            id: ObjectId(marker_id(what)),
             properties: json!({
-                "collection": name,
+                "collection": value,
                 "switchedAt": chrono::Utc::now().to_rfc3339(),
             })
             .as_object()
@@ -126,70 +137,52 @@ impl Kept {
             .unwrap_or_default(),
             vector: None,
         };
-        match tenant.apply(vec![marker]).await {
-            Err(e) if !is_conflict(&e) => Err(e.into()),
+        match at.reads.apply(vec![marker]).await {
+            Err(e) if !is_conflict(&e) => Err(classified(e, at)),
             _ => Ok(()),
         }
+    }
+
+    async fn mark(self, at: &Tenants, name: &str) -> Result<()> {
+        self.made(at).await?;
+        self.insert(at, name, name).await
     }
 
     /// Record `owner` under `what`, unless something is recorded there
     /// already; returns what is then recorded.
-    async fn claim(self, tenant: &Tenant, what: &str, owner: &str) -> Result<String> {
-        let records = self.records(tenant)?;
-        if records.schema().await?.is_none() {
-            match records.create(&(self.shape)()?).await {
-                Err(e) if !is_conflict(&e) => return Err(e.into()),
-                _ => {}
-            }
-        }
-        let id = ObjectId(marker_id(what));
-        let claim = Change::Insert {
-            collection: CollectionName::new(self.name)?,
-            id,
-            properties: json!({
-                "collection": owner,
-                "switchedAt": chrono::Utc::now().to_rfc3339(),
-            })
-            .as_object()
-            .cloned()
-            .unwrap_or_default(),
-            vector: None,
-        };
-        match tenant.apply(vec![claim]).await {
-            Err(e) if !is_conflict(&e) => return Err(e.into()),
-            _ => {}
-        }
-        let held = records.get(id).await?;
+    async fn claim(self, at: &Tenants, what: &str, owner: &str) -> Result<String> {
+        let records = self.made(at).await?;
+        self.insert(at, what, owner).await?;
+        let held = records
+            .get(ObjectId(marker_id(what)))
+            .await
+            .map_err(|e| classified(e, at))?;
         held.and_then(|held| Some(held.properties.get("collection")?.as_str()?.to_string()))
             .ok_or_else(|| eyre::eyre!("the claim on '{what}' cannot be read back"))
     }
 
-    async fn unmark(self, tenant: &Tenant, name: &str) -> Result<()> {
-        match self
-            .records(tenant)?
-            .delete(ObjectId(marker_id(name)))
-            .await
-        {
-            Err(e) if !e.is_not_found() => Err(e.into()),
+    async fn unmark(self, at: &Tenants, name: &str) -> Result<()> {
+        match self.records(at)?.delete(ObjectId(marker_id(name))).await {
+            Err(e) if !e.is_not_found() => Err(classified(e, at)),
             _ => Ok(()),
         }
     }
 }
 
-/// Whether memories are marked as switched to `name` in `tenant`.
-pub async fn marked(tenant: &Tenant, name: &str) -> Result<bool> {
-    SWITCHES.marked(tenant, name).await
+/// Whether memories are marked as switched to `name` in the tenant `at`.
+pub async fn marked(at: &Tenants, name: &str) -> Result<bool> {
+    SWITCHES.marked(at, name).await
 }
 
 /// Mark memories as switched to `name`; idempotent, keeping when it was
 /// first marked.
-pub async fn mark(tenant: &Tenant, name: &str) -> Result<()> {
-    SWITCHES.mark(tenant, name).await
+pub async fn mark(at: &Tenants, name: &str) -> Result<()> {
+    SWITCHES.mark(at, name).await
 }
 
 /// Take `name`'s switch marker away, if it has one.
-pub async fn unmark(tenant: &Tenant, name: &str) -> Result<()> {
-    SWITCHES.unmark(tenant, name).await
+pub async fn unmark(at: &Tenants, name: &str) -> Result<()> {
+    SWITCHES.unmark(at, name).await
 }
 
 /// The key memories' promotion to `name` is marked under, in
@@ -199,41 +192,42 @@ fn promotion(name: &str) -> String {
     format!("promoted:{name}")
 }
 
-/// Whether memories have been promoted to `name` in `tenant`: served from
-/// it, after it was a shadow replica of Weaviate (DW-676).
-pub async fn promoted(tenant: &Tenant, name: &str) -> Result<bool> {
-    INDEXES.marked(tenant, &promotion(name)).await
+/// Whether memories have been promoted to `name` in the tenant `at`:
+/// served from it, after it was a shadow replica of Weaviate (DW-676).
+pub async fn promoted(at: &Tenants, name: &str) -> Result<bool> {
+    INDEXES.marked(at, &promotion(name)).await
 }
 
 /// Mark memories as promoted to `name`; idempotent.
-pub async fn mark_promoted(tenant: &Tenant, name: &str) -> Result<()> {
-    INDEXES.mark(tenant, &promotion(name)).await
+pub async fn mark_promoted(at: &Tenants, name: &str) -> Result<()> {
+    INDEXES.mark(at, &promotion(name)).await
 }
 
 /// Take away the mark of memories' promotion to `name`, if it has one: a
 /// rollback, once everything written there since is carried back.
-pub async fn unmark_promoted(tenant: &Tenant, name: &str) -> Result<()> {
-    INDEXES.unmark(tenant, &promotion(name)).await
+pub async fn unmark_promoted(at: &Tenants, name: &str) -> Result<()> {
+    INDEXES.unmark(at, &promotion(name)).await
 }
 
-/// Whether the index `name` is marked complete in `tenant`.
-pub async fn index_marked(tenant: &Tenant, name: &str) -> Result<bool> {
-    INDEXES.marked(tenant, name).await
+/// Whether the index `name` is marked complete in the tenant `at`.
+pub async fn index_marked(at: &Tenants, name: &str) -> Result<bool> {
+    INDEXES.marked(at, name).await
 }
 
 /// Mark the index `name` complete; idempotent.
-pub async fn index_mark(tenant: &Tenant, name: &str) -> Result<()> {
-    INDEXES.mark(tenant, name).await
+pub async fn index_mark(at: &Tenants, name: &str) -> Result<()> {
+    INDEXES.mark(at, name).await
 }
 
 /// Take the index `name`'s marker away, if it has one.
-pub async fn index_unmark(tenant: &Tenant, name: &str) -> Result<()> {
-    INDEXES.unmark(tenant, name).await
+pub async fn index_unmark(at: &Tenants, name: &str) -> Result<()> {
+    INDEXES.unmark(at, name).await
 }
 
-/// Record that `what` in `tenant` is `owner`'s, unless it is recorded as
-/// another's already, and return whose it is: for what only one owner may
-/// keep in a tenant, as one code graph keeps its code vectors.
-pub async fn index_claim(tenant: &Tenant, what: &str, owner: &str) -> Result<String> {
-    INDEXES.claim(tenant, what, owner).await
+/// Record that `what` in the tenant `at` is `owner`'s, unless it is
+/// recorded as another's already, and return whose it is: for what only
+/// one owner may keep in a tenant, as one code graph keeps its code
+/// vectors.
+pub async fn index_claim(at: &Tenants, what: &str, owner: &str) -> Result<String> {
+    INDEXES.claim(at, what, owner).await
 }

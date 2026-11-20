@@ -4219,7 +4219,7 @@ mod embedded_tests {
         assert!(by_id[0]["vector"].is_array(), "{by_id:?}");
         assert_eq!(by_id[0]["properties"], held[0]["properties"]);
 
-        workforce_vellev::mark_promoted(&node.tenant(), "WorkforceMemory")
+        workforce_vellev::mark_promoted(&node.tenants(), "WorkforceMemory")
             .await
             .unwrap();
         assert!(vellev.promoted().await.unwrap());

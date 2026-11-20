@@ -8,14 +8,14 @@ use std::time::{Duration, Instant};
 
 use eyre::{eyre, Report, Result};
 use tokio::sync::watch;
-use tracing::info;
+use tracing::{error, info};
 use vellev_client::api::{Code, Nearest};
-use vellev_client::{Records, Tenant};
+use vellev_client::Records;
 use vellev_core::{Collection, CollectionName, DataType, EmbeddingProvider, Property};
 
 use crate::shape::{checked, Refused};
 use crate::signals::no_tenant;
-use crate::LOCAL_MODEL;
+use crate::Tenants;
 
 /// How long a collection found unusable stays so before it is looked at
 /// again, so that one an operator has put right is used without a restart.
@@ -28,13 +28,13 @@ pub const RECHECK_AFTER: Duration = Duration::from_secs(60);
 pub enum Unusable {
     #[error(transparent)]
     Refused(#[from] Refused),
-    #[error("vellev has no tenant '{tenant}' that the key reaches: create the tenant with an admin key, or give [vellev] api_key a key for it")]
+    #[error("vellev has no tenant '{tenant}' that the key reaches: create the tenant with an admin key, or give [vellev] api_key (or [vellev.code] api_key, for code vectors) a key for it")]
     NoTenant { tenant: String },
     #[error(
-        "vellev does not accept the key for tenant '{tenant}': {message}; check [vellev] api_key"
+        "vellev does not accept the key for tenant '{tenant}': {message}; check [vellev] api_key (or [vellev.code] api_key, for code vectors)"
     )]
     Key { tenant: String, message: String },
-    #[error("the key for tenant '{tenant}' may not do this: {message}; give [vellev] api_key a key that may")]
+    #[error("the key for tenant '{tenant}' may not do this: {message}; give [vellev] api_key (or [vellev.code] api_key, for code vectors) a key that may")]
     Forbidden { tenant: String, message: String },
     #[error(
         "vellev cannot serve collection '{collection}' of tenant '{tenant}' as asked: {message}"
@@ -44,13 +44,15 @@ pub enum Unusable {
         collection: String,
         message: String,
     },
-    #[error("the vellev node cannot run '{model}', which embeds collection '{collection}' of tenant '{tenant}': {message}; run a node at [vellev] url that has {model}")]
+    #[error("the vellev node cannot run '{model}', which embeds collection '{collection}' of tenant '{tenant}': {message}; run a node at [vellev] url (or [vellev.code] url, for code vectors) that has {model}")]
     Model {
         tenant: String,
         collection: String,
         model: String,
         message: String,
     },
+    #[error("misrouted: the vellev node at {node} does not serve tenant '{tenant}' (it answered 421 not_served_here): point [vellev] url, or [vellev.code] url for code vectors, at a node that serves it, or list the tenant in that node's VELLEV_TENANTS")]
+    Misrouted { tenant: String, node: String },
 }
 
 /// The node cannot embed with a collection's model just now. Not
@@ -72,47 +74,73 @@ pub enum Asked<'a> {
     /// The tenant itself, as listing its collections does: not found means
     /// no such tenant, or one the key does not reach.
     Tenant,
-    /// The shape of `collection`, as making sure of it does: invalid means
-    /// the node will not hold it as wanted.
-    Collection(&'a CollectionName),
-    /// One ordinary request about `collection`: what is invalid about it is
-    /// the request's own fault, for its caller.
-    Request(&'a CollectionName),
+    /// The shape of collection `name`, embedded with `model`, as making
+    /// sure of it does: invalid means the node will not hold it as wanted.
+    Collection {
+        name: &'a CollectionName,
+        model: &'a str,
+    },
+    /// One ordinary request about collection `name`, embedded with
+    /// `model`: what is invalid about it is the request's own fault, for
+    /// its caller.
+    Request {
+        name: &'a CollectionName,
+        model: &'a str,
+    },
 }
 
-/// `error` from a request of `tenant`, as [`Unusable`] when an operator has
-/// to act, otherwise as it is. This is the one place a node's answer is
-/// classified. A tenant the key does not reach is to it one that does not
-/// exist, so either is `NoTenant`; it is told by what was asked, never by
-/// the message. A node that cannot run a collection's model at all (its
-/// `model_unavailable`, until it or the collection is set up otherwise) is
-/// named with [`LOCAL_MODEL`], the one model a workforce collection has a
-/// node embed with.
-pub fn failure(error: vellev_client::Error, tenant: &Tenant, asked: Asked) -> Report {
-    let tenant = tenant.id().to_string();
+impl<'a> Asked<'a> {
+    /// Making sure of `wanted`.
+    pub fn collection(wanted: &'a Collection) -> Self {
+        Self::Collection {
+            name: &wanted.name,
+            model: &wanted.embedding.model,
+        }
+    }
+
+    /// An ordinary request about `wanted`.
+    pub fn request(wanted: &'a Collection) -> Self {
+        Self::Request {
+            name: &wanted.name,
+            model: &wanted.embedding.model,
+        }
+    }
+}
+
+/// `error` from a request of the tenant `at`, as [`Unusable`] when an
+/// operator has to act, otherwise as it is. This is the one place a node's
+/// answer is classified. A node that does not serve the tenant is
+/// [`Unusable::Misrouted`] whatever was asked. A tenant the key does not
+/// reach is to it one that does not exist, so either is `NoTenant`; it is
+/// told by what was asked, never by the message. A node that cannot run a
+/// collection's model at all (its `model_unavailable`, until it or the
+/// collection is set up otherwise) is named with the model asked for.
+pub fn failure(error: vellev_client::Error, at: &Tenants, asked: Asked) -> Report {
+    let tenant = at.reads.id().to_string();
     let message = error.to_string();
     let unusable = match (error.code(), asked) {
-        (_, Asked::Collection(collection) | Asked::Request(collection))
+        (Some(Code::NotServedHere), _) => misrouted(at),
+        (_, Asked::Collection { name, model } | Asked::Request { name, model })
             if error.is_model_unavailable() =>
         {
             Unusable::Model {
                 tenant,
-                collection: collection.to_string(),
-                model: LOCAL_MODEL.to_string(),
+                collection: name.to_string(),
+                model: model.to_string(),
                 message,
             }
         }
         (_, Asked::Tenant) if no_tenant(&error, true) => Unusable::NoTenant { tenant },
         (Some(Code::Unauthorized), _) => Unusable::Key { tenant, message },
         (Some(Code::Forbidden), _) => Unusable::Forbidden { tenant, message },
-        (Some(Code::Invalid), Asked::Collection(collection)) => Unusable::Invalid {
+        (Some(Code::Invalid), Asked::Collection { name, .. }) => Unusable::Invalid {
             tenant,
-            collection: collection.to_string(),
+            collection: name.to_string(),
             message,
         },
-        (_, Asked::Request(collection)) => {
+        (_, Asked::Request { name, .. }) => {
             return Report::new(error).wrap_err(format!(
-                "vellev request about collection '{collection}' of tenant '{tenant}' failed"
+                "vellev request about collection '{name}' of tenant '{tenant}' failed"
             ))
         }
         _ => return Report::new(error),
@@ -120,10 +148,33 @@ pub fn failure(error: vellev_client::Error, tenant: &Tenant, asked: Asked) -> Re
     Report::new(unusable)
 }
 
+/// `error` from a request of the tenant `at` that [`failure`] does not
+/// classify, as markers and seeding make: [`Unusable::Misrouted`] when the
+/// node does not serve the tenant, otherwise as it is.
+pub fn classified(error: vellev_client::Error, at: &Tenants) -> Report {
+    match error.code() {
+        Some(Code::NotServedHere) => Report::new(misrouted(at)),
+        _ => Report::new(error),
+    }
+}
+
+/// The node at `at` does not serve its tenant: told, counted and named,
+/// here alone.
+fn misrouted(at: &Tenants) -> Unusable {
+    let (tenant, node) = (at.reads.id().to_string(), at.node.clone());
+    error!(
+        tenant = %tenant,
+        node = %node,
+        "vellev node does not serve the tenant: misrouted"
+    );
+    metrics::counter!("workforce.vellev.misrouted_total", "tenant" => tenant.clone()).increment(1);
+    Unusable::Misrouted { tenant, node }
+}
+
 /// Embed one probe query in `records`, when its node embeds for it, so that
 /// a node that cannot run the model is told at once rather than by every
 /// write after. Nothing is written.
-pub async fn probe_model(tenant: &Tenant, records: &Records, wanted: &Collection) -> Result<()> {
+pub async fn probe_model(at: &Tenants, records: &Records, wanted: &Collection) -> Result<()> {
     if wanted.embedding.provider == EmbeddingProvider::None {
         return Ok(());
     }
@@ -132,13 +183,13 @@ pub async fn probe_model(tenant: &Tenant, records: &Records, wanted: &Collection
         Ok(_) => Ok(()),
         Err(e) if matches!(e.code(), Some(Code::Unavailable | Code::Invalid)) => {
             Err(Report::new(ModelUnavailable {
-                tenant: tenant.id().to_string(),
+                tenant: at.reads.id().to_string(),
                 collection: wanted.name.to_string(),
                 model: wanted.embedding.model.clone(),
                 message: e.to_string(),
             }))
         }
-        Err(e) => Err(failure(e, tenant, Asked::Request(&wanted.name))),
+        Err(e) => Err(failure(e, at, Asked::request(wanted))),
     }
 }
 
@@ -180,28 +231,28 @@ pub fn identity(found: &Collection) -> Option<String> {
 /// `remedy` (see [`crate::mismatches`]), and is left as it was found: a
 /// property that is embedded but not stored cannot be added to it.
 pub async fn ensure(
-    tenant: &Tenant,
+    at: &Tenants,
     records: &Records,
     wanted: &Collection,
     remedy: &str,
 ) -> Result<bool> {
-    ensure_as(tenant, records, wanted, remedy, false).await
+    ensure_as(at, records, wanted, remedy, false).await
 }
 
 /// As [`ensure`]; `identified` gives a collection it creates, or finds
 /// without one, an [`identity`].
 async fn ensure_as(
-    tenant: &Tenant,
+    at: &Tenants,
     records: &Records,
     wanted: &Collection,
     remedy: &str,
     identified: bool,
 ) -> Result<bool> {
-    let failed = |e| failure(e, tenant, Asked::Collection(&wanted.name));
-    tenant
+    let failed = |e| failure(e, at, Asked::collection(wanted));
+    at.reads
         .collections()
         .await
-        .map_err(|e| failure(e, tenant, Asked::Tenant))?;
+        .map_err(|e| failure(e, at, Asked::Tenant))?;
     let found = match records.schema().await.map_err(failed)? {
         Some(found) => found,
         None => {
@@ -246,7 +297,7 @@ async fn ensure_as(
 
 /// Check an existing collection against `wanted` without changing it.
 pub async fn doctor(
-    tenant: &Tenant,
+    at: &Tenants,
     records: &Records,
     wanted: &Collection,
     remedy: &str,
@@ -254,7 +305,7 @@ pub async fn doctor(
     let found = records
         .schema()
         .await
-        .map_err(|e| failure(e, tenant, Asked::Collection(&wanted.name)))?
+        .map_err(|e| failure(e, at, Asked::collection(wanted)))?
         .ok_or_else(|| eyre!("vellev collection '{}' does not exist", wanted.name))?;
     checked(&found, wanted, remedy).map_err(as_unusable)
 }
@@ -350,7 +401,7 @@ impl Known {
 /// rest wait for what it learns, and none holds a lock while the node is
 /// asked, so a node that hangs costs them all one timeout between them.
 pub struct Ensured {
-    tenant: Tenant,
+    tenants: Tenants,
     records: Records,
     wanted: Collection,
     remedy: &'static str,
@@ -361,11 +412,12 @@ pub struct Ensured {
 }
 
 impl Ensured {
-    /// `wanted` in `tenant`, refused with `remedy` (see [`crate::mismatches`]).
-    pub fn new(tenant: Tenant, wanted: Collection, remedy: &'static str) -> Self {
+    /// `wanted` in the tenant `tenants` reach, refused with `remedy` (see
+    /// [`crate::mismatches`]).
+    pub fn new(tenants: Tenants, wanted: Collection, remedy: &'static str) -> Self {
         Self {
-            records: tenant.collection(&wanted.name),
-            tenant,
+            records: tenants.reads.collection(&wanted.name),
+            tenants,
             wanted,
             remedy,
             known: Arc::new(Known {
@@ -404,7 +456,7 @@ impl Ensured {
                 return Ok(identity.clone());
             }
         }
-        let failed = |e| failure(e, &self.tenant, Asked::Collection(&self.wanted.name));
+        let failed = |e| failure(e, &self.tenants, Asked::collection(&self.wanted));
         self.records().await?;
         let found = match self.records.schema().await.map_err(failed)? {
             Some(found) => found,
@@ -500,16 +552,16 @@ impl Ensured {
         &self,
         told: watch::Sender<Option<Outcome>>,
     ) -> impl Future<Output = ()> + Send + 'static {
-        let (tenant, wanted, remedy) = (self.tenant.clone(), self.wanted.clone(), self.remedy);
+        let (tenants, wanted, remedy) = (self.tenants.clone(), self.wanted.clone(), self.remedy);
         let (identified, known) = (self.identified, Arc::clone(&self.known));
         async move {
-            let records = tenant.collection(&wanted.name);
+            let records = tenants.reads.collection(&wanted.name);
             // Whatever the node holds now may be another making of it.
             *known.identity() = None;
-            let checked = match ensure_as(&tenant, &records, &wanted, remedy, identified).await {
+            let checked = match ensure_as(&tenants, &records, &wanted, remedy, identified).await {
                 Ok(created) => {
                     known.created.fetch_or(created, Ordering::SeqCst);
-                    probe_model(&tenant, &records, &wanted).await
+                    probe_model(&tenants, &records, &wanted).await
                 }
                 Err(e) => Err(e),
             };
@@ -548,9 +600,11 @@ impl Ensured {
     }
 
     /// Run `op` on the collection once it is made sure of. A collection
-    /// found gone is made again and `op` run once more. Any other failure is
-    /// the request's, for its caller: what is known of the collection stays
-    /// as it was, and only making sure of it can find it unusable.
+    /// found gone is made again and `op` run once more. A node found not to
+    /// serve the tenant is recorded as such, as making sure of it would,
+    /// unless it is being made sure of now. Any other failure is the
+    /// request's, for its caller: what is known of the collection stays as
+    /// it was.
     pub async fn run<T, Fut>(&self, op: impl Fn() -> Fut) -> Result<T>
     where
         Fut: Future<Output = vellev_client::Result<T>>,
@@ -568,11 +622,14 @@ impl Ensured {
             }
             Err(e) => e,
         };
-        Err(failure(
-            error,
-            &self.tenant,
-            Asked::Request(&self.wanted.name),
-        ))
+        let failed = failure(error, &self.tenants, Asked::request(&self.wanted));
+        if let Some(misrouted @ Unusable::Misrouted { .. }) = failed.downcast_ref::<Unusable>() {
+            let mut state = self.known.state();
+            if !matches!(&*state, State::Checking(_)) {
+                *state = State::Unusable(misrouted.clone(), Instant::now());
+            }
+        }
+        Err(failed)
     }
 
     /// Whether the collection was created since this was last asked.
@@ -593,7 +650,7 @@ mod tests {
 
     /// A node holding `found`, recording every request, that adds a
     /// property it is asked to.
-    async fn holding(found: Collection) -> (Tenant, Arc<Mutex<Vec<String>>>) {
+    async fn holding(found: Collection) -> (Tenants, Arc<Mutex<Vec<String>>>) {
         let asked = Arc::new(Mutex::new(Vec::new()));
         let (held, seen) = (Arc::new(Mutex::new(found)), Arc::clone(&asked));
         let app = axum::Router::new().fallback(
@@ -621,7 +678,7 @@ mod tests {
             },
         );
         let url = crate::serve(app).await;
-        (connect(&url, "key", "harbor").unwrap().reads, asked)
+        (connect(&url, "key", "harbor").unwrap(), asked)
     }
 
     fn notes(properties: Vec<Property>, embedding: Embedding) -> Collection {
@@ -651,10 +708,10 @@ mod tests {
                 properties: Vec::new(),
             },
         );
-        let (tenant, asked) = holding(imported.clone()).await;
+        let (tenants, asked) = holding(imported.clone()).await;
         let refused = ensure(
-            &tenant,
-            &tenant.collection(&wanted.name),
+            &tenants,
+            &tenants.reads.collection(&wanted.name),
             &wanted,
             "remake it",
         )
@@ -676,10 +733,10 @@ mod tests {
         );
 
         let lacking_owner = notes(wanted.properties[..1].to_vec(), wanted.embedding.clone());
-        let (tenant, asked) = holding(lacking_owner).await;
+        let (tenants, asked) = holding(lacking_owner).await;
         let created = ensure(
-            &tenant,
-            &tenant.collection(&wanted.name),
+            &tenants,
+            &tenants.reads.collection(&wanted.name),
             &wanted,
             "remake it",
         )

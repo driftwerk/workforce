@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::SecondsFormat;
-use eyre::{eyre, Result};
+use eyre::{Result, WrapErr};
 use serde_json::{json, Map, Value};
 use tokio::sync::Mutex;
 use tracing::info;
@@ -20,7 +20,7 @@ use vellev_client::api::{Change, Content, Hybrid, Page, Weighted};
 use vellev_core::{CollectionName, DataType, ObjectId, Property};
 use workforce_desk::memory::index::{Differing, IndexHit, IndexQuery, KeyPage, MemoryIndex};
 use workforce_desk::memory::passage::{is_ours, Passage, PassageKind, Purge};
-use workforce_vellev::{collection, local_embedding, Cap, Ensured, Filter, Tenants};
+use workforce_vellev::{classified, collection, local_embedding, Cap, Ensured, Filter, Tenants};
 
 /// What to do about a memory collection the node cannot use.
 const REMEDY: &str = "drop it; Desk makes it again and writes every conversation it keeps into it";
@@ -89,7 +89,7 @@ impl VellevDeskIndex {
             return Ok(Arc::clone(e));
         }
         let e = Arc::new(Ensured::new(
-            self.tenants.reads.clone(),
+            self.tenants.clone(),
             memory_collection(name)?,
             REMEDY,
         ));
@@ -100,7 +100,8 @@ impl VellevDeskIndex {
     /// The collection `name` if the node holds it, not made if it doesn't.
     async fn existing(&self, name: &str) -> Result<Option<Arc<Ensured>>> {
         let records = self.tenants.reads.collection(&CollectionName::new(name)?);
-        match records.schema().await? {
+        let schema = records.schema().await;
+        match schema.map_err(|e| classified(e, &self.tenants))? {
             Some(_) => Ok(Some(self.ensured(name).await?)),
             None => Ok(None),
         }
@@ -236,17 +237,20 @@ impl MemoryIndex for VellevDeskIndex {
         match purge_filter(purge) {
             Some(filter) => {
                 let (reads, writes) = (&self.tenants.reads, &self.tenants.writes);
-                let gone = workforce_vellev::delete_where(reads, writes, e.name(), &filter)
+                e.run(|| workforce_vellev::delete_where(reads, writes, e.name(), &filter))
                     .await
-                    .map_err(|err| eyre!("deleting from {name}: {err}"))?;
-                Ok(gone)
+                    .wrap_err_with(|| format!("deleting from {name}"))
             }
             None => {
                 let held = e.collection().count(None).await.unwrap_or(0);
                 match e.collection().drop().await {
                     Ok(_) => {}
                     Err(err) if err.is_not_found() => {}
-                    Err(err) => return Err(eyre!("dropping {name}: {err}")),
+                    Err(err) => {
+                        return Err(
+                            classified(err, &self.tenants).wrap_err(format!("dropping {name}"))
+                        )
+                    }
                 }
                 // Made sure of again on its next use.
                 self.collections.lock().await.remove(name);
@@ -440,6 +444,45 @@ mod tests {
         }
         assert_eq!(object_id("a#0"), object_id("a#0"));
         assert_ne!(object_id("a#0"), object_id("a#1"));
+    }
+
+    /// A purge, of a collection the node says it holds, that the node
+    /// then does not serve is told so, by the drop and the deletion alike.
+    #[tokio::test]
+    async fn a_purge_the_node_does_not_serve_is_misrouted() {
+        use axum::response::IntoResponse;
+        let name = collection_of(None);
+        let held = memory_collection(&name).unwrap();
+        let schema = format!("/collections/{name}");
+        let app = axum::Router::new().fallback(
+            move |method: axum::http::Method, uri: axum::http::Uri| {
+                let read = method == axum::http::Method::GET && uri.path().ends_with(&schema);
+                let found = read.then(|| held.clone());
+                async move {
+                    found.map_or_else(workforce_vellev::testing::not_served_here, |held| {
+                        axum::Json(held).into_response()
+                    })
+                }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let index = VellevDeskIndex::new(&url, "key", "harbor", Vec::new()).unwrap();
+        let misrouted = workforce_vellev::Unusable::Misrouted {
+            tenant: "harbor".into(),
+            node: url.clone(),
+        };
+        for purge in [
+            Purge::All,
+            Purge::Refs {
+                refs: vec![uuid::Uuid::new_v4()],
+            },
+        ] {
+            let refused = index.purge(&name, &purge).await.unwrap_err();
+            assert_eq!(refused.downcast_ref(), Some(&misrouted), "{refused:?}");
+            assert!(format!("{refused:#}").contains("misrouted"), "{refused:#}");
+        }
     }
 
     fn row(session: uuid::Uuid, project: &str, ask: &str, answer: &str) -> IndexRow {

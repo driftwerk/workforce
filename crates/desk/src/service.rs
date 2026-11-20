@@ -1123,6 +1123,11 @@ struct Inner {
     /// Held while a plan's ticket is started, and while a plan is dropped:
     /// a drop never misses a start under way.
     plan_starting: tokio::sync::Mutex<()>,
+    /// The clones of plans' repositories under way here.
+    cloner: crate::repos::Cloner,
+    /// Where repositories are cloned (`[desk] projects_root`); none is
+    /// [`crate::repos::PROJECTS_ROOT`].
+    projects_root: Mutex<Option<String>>,
     /// This engine's copy of the home's grants, and its pause.
     grants: Mutex<grants::GrantsRun>,
     /// Held while a grant is written: one at a time, from reading the copy
@@ -1913,6 +1918,8 @@ impl Desk {
             modes_dirty: std::sync::atomic::AtomicBool::new(false),
             move_write: tokio::sync::Mutex::new(()),
             plan_starting: tokio::sync::Mutex::new(()),
+            cloner: crate::repos::Cloner::default(),
+            projects_root: Mutex::new(None),
             grants: Mutex::default(),
             grant_write: tokio::sync::Mutex::new(()),
         }));
@@ -3215,6 +3222,47 @@ impl Desk {
             .filter_map(|id| st.records.get(id))
             .map(|r| PathBuf::from(&r.cwd))
             .collect()
+    }
+
+    /// Where repositories are cloned here, from now on: `[desk]
+    /// projects_root` (`~/x`, or a folder inside the home).
+    pub fn set_projects_root(&self, root: Option<String>) {
+        *self.0.projects_root.lock() = root.filter(|r| !r.trim().is_empty());
+    }
+
+    /// `repo`'s checkout here for a session: `folder` when it is one, one
+    /// found under the home, or a clone begun into the projects folder
+    /// ([`crate::repos::Cloner::checkout`]).
+    pub fn repo_checkout(
+        &self,
+        repo: &crate::repos::Repo,
+        folder: Option<&str>,
+    ) -> crate::repos::Got {
+        let root = self
+            .0
+            .projects_root
+            .lock()
+            .clone()
+            .unwrap_or_else(|| crate::repos::PROJECTS_ROOT.to_string());
+        self.0.cloner.checkout(
+            repo,
+            folder,
+            &root,
+            self.home_folder().as_deref(),
+            &self.0.env,
+        )
+    }
+
+    /// Every checkout of `repo` under the home ([`crate::repos::find`]).
+    pub fn repo_checkouts(&self, repo: &crate::repos::Repo) -> Vec<crate::repos::Checkout> {
+        self.home_folder()
+            .map(|h| crate::repos::find(repo, &h))
+            .unwrap_or_default()
+    }
+
+    /// The person's login environment, as their sessions get it.
+    pub(crate) fn login_env(&self) -> &BTreeMap<String, String> {
+        &self.0.env
     }
 
     /// The hub user's home folder.

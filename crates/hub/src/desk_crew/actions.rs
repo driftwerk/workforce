@@ -195,6 +195,16 @@ pub(crate) enum Action {
         agent: String,
         change: super::own_settings::Change,
     },
+    /// A short check on one of the person's machines, for the boss `boss`
+    /// ([`super::machines::RUN`]): judged there unless the person (or an
+    /// unbound boss, or at Act fully a preference) says to run it.
+    MachineRun {
+        boss: String,
+        machine: String,
+        command: String,
+        cwd: Option<String>,
+        timeout_secs: Option<u64>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -234,6 +244,11 @@ struct Input {
     account: Option<String>,
     /// A permission mode, as Claude Code spells it.
     mode: Option<String>,
+    /// `crew.machine_run`'s (its machine is read as the machine tools
+    /// read it).
+    command: Option<String>,
+    cwd: Option<String>,
+    timeout_secs: Option<u64>,
     /// `crew.switch_login`'s login: its id (a name is resolved to it first).
     login: Option<String>,
 }
@@ -506,6 +521,34 @@ impl Action {
                 agent: text(i.agent_id, "whose settings")?,
                 change: super::own_settings::Change::parse(input)?,
             },
+            super::machines::RUN => {
+                let machine = super::machines::machine_of(input)?.to_string();
+                let command = text(i.command, "the command")?;
+                if command.len() > super::machines::MOST_COMMAND {
+                    return Err(format!(
+                        "A check is at most {} bytes: put more in a session's work.",
+                        super::machines::MOST_COMMAND
+                    ));
+                }
+                if command.contains('\0') {
+                    return Err("That isn't a command.".into());
+                }
+                if let Some(t) = i.timeout_secs {
+                    if !(1..=super::machines::MOST_SECS).contains(&t) {
+                        return Err(format!(
+                            "A check runs for 1 to {} seconds.",
+                            super::machines::MOST_SECS
+                        ));
+                    }
+                }
+                Self::MachineRun {
+                    boss: text(i.agent_id, "whose check")?,
+                    machine,
+                    command,
+                    cwd: blank_none(i.cwd),
+                    timeout_secs: i.timeout_secs,
+                }
+            }
             other => return Err(format!("{other} is not something the overseer can do")),
         })
     }
@@ -590,6 +633,7 @@ impl Action {
             | Self::SetMode { .. }
             | Self::SwitchLogin { .. }
             | Self::ChangeOversight { .. } => "",
+            Self::MachineRun { command, .. } => command.as_str(),
         })
     }
 }
@@ -695,6 +739,22 @@ impl CrewHub {
         }
         if let Some(why) = self.left_alone(action) {
             return Gate::No(why.into());
+        }
+        // A command on a machine: what no boss does is the person's at
+        // every level, unbound too.
+        if let Action::MachineRun { .. } = action {
+            if o.level == Level::Watch {
+                return Gate::Refuse;
+            }
+            if let Some(n) = self.never_said(action) {
+                return Gate::Suggest(
+                    format!(
+                        "it {}; that is always the person's, at every level",
+                        n.why()
+                    )
+                    .into(),
+                );
+            }
         }
         // Deleting a ticket can't be undone: the person's yes, unbound too.
         if action.deletes_ticket() {
@@ -894,6 +954,8 @@ impl CrewHub {
             } => (o.act.answer_sessions, Some(switch::ANSWER_SESSIONS)),
             Action::Nudge { .. } => (o.act.nudge, Some(switch::NUDGE)),
             Action::Escalate { .. } => (true, None),
+            // Judged on the machine as it runs.
+            Action::MachineRun { .. } => (true, None),
             // Switched on by `message_agents`, above.
             Action::Assign { .. } => (true, None),
             // A move to another login starts it again in place, as a
@@ -1173,7 +1235,9 @@ impl CrewHub {
             // Below unbound, only to a mode that still asks.
             | Action::SetMode { .. }
             // Only ever a card the person approves.
-            | Action::ChangeOversight { .. } => true,
+            | Action::ChangeOversight { .. }
+            // Judged on the machine; what it won't allow is the person's.
+            | Action::MachineRun { .. } => true,
             Action::Nudge {
                 to: Target::Agent(_),
                 ..
@@ -1308,7 +1372,8 @@ impl CrewHub {
             | Action::MoveTicket { .. }
             | Action::ChangeTicket { .. }
             | Action::CreateTicket { .. }
-            | Action::Escalate { .. } => None,
+            | Action::Escalate { .. }
+            | Action::MachineRun { .. } => None,
             Action::ChangeOversight { agent, .. } => self.party_of_agent(agent),
             Action::Nudge {
                 to: Target::Session(s),
@@ -1469,6 +1534,19 @@ impl CrewHub {
                     self.agent_name(agent)
                 )
             }
+            Action::MachineRun {
+                machine,
+                command,
+                cwd,
+                ..
+            } => format!(
+                // All of it, nothing hidden: the person runs what they read.
+                "Run on {machine}{}: {}",
+                cwd.as_deref()
+                    .map(|c| format!(" in {c}"))
+                    .unwrap_or_default(),
+                super::machines::code(command)
+            ),
         }
     }
 
@@ -1911,6 +1989,31 @@ impl CrewHub {
         };
         let d = &self.desk;
         match action {
+            // Only by the person, accepting it: their word runs it as
+            // said. One whose boss was turned to Watch since isn't run:
+            // the courier sends nothing for a watching boss, and the person
+            // runs it there themselves. The boss's own runs go through
+            // `machine_run_tool`.
+            Action::MachineRun { .. } => {
+                if by.party.kind != crew::PartyKind::You {
+                    return Err("A boss runs a check with crew.machine_run.".into());
+                }
+                let got = self
+                    .machine_run(action, Some(super::machines::Unjudged::Person), by)
+                    .await?;
+                let line = super::machines::ran_line(&got);
+                match got["outcome"].as_str() {
+                    // What it said, for the person who ran it.
+                    Some("ran") => Ok(format!("Ran it: {line}")),
+                    // Sent, and maybe run: done with, so a second yes
+                    // doesn't run it again.
+                    Some(super::machines::UNKNOWN) => Ok(got["why"]
+                        .as_str()
+                        .unwrap_or("Sent, but no answer came back: it may have run.")
+                        .to_string()),
+                    _ => Err(format!("It didn't run: {line}")),
+                }
+            }
             Action::ChangeOversight { agent, change } => {
                 // The person, saying yes to the card: never the overseer,
                 // whatever path an action takes.

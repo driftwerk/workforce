@@ -177,6 +177,12 @@ pub struct Planned {
     /// engine's own default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The repository it works in, as [`crate::repos::Repo::key`] says one
+    /// (`github.com/driftwerk/vellev`): its folder on the computer it runs
+    /// on is that repository's checkout there, found or cloned as it
+    /// starts. With one, `folder` may be empty until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
     /// A ticket taken on from a board (one of the person's own, or a synced
     /// Linear or Jira issue) rather than made by the plan: its id is that
     /// ticket's, its title is kept here only to name it, and the plan never
@@ -381,6 +387,9 @@ pub struct DraftTicket {
     /// None: the boss's default engine.
     #[serde(default)]
     pub engine: Option<String>,
+    /// Its folder on the computer it runs on; may be empty when it names
+    /// its `repo`.
+    #[serde(default)]
     pub folder: String,
     #[serde(default)]
     pub view: Option<String>,
@@ -396,6 +405,10 @@ pub struct DraftTicket {
     /// keeps a ticket the plan has on its model.
     #[serde(default)]
     pub model: Option<String>,
+    /// Its repository (`github.com/owner/name`, or `owner/name` for
+    /// GitHub); `""` none, and none keeps a ticket the plan has on its own.
+    #[serde(default)]
+    pub repo: Option<String>,
 }
 
 /// One ticket the plan has, changed in place: only what it says changes,
@@ -424,6 +437,8 @@ pub struct TicketEdit {
     pub machine: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub repo: Option<String>,
 }
 
 impl TicketEdit {
@@ -443,6 +458,7 @@ impl TicketEdit {
             || self.view.is_some()
             || self.machine.is_some()
             || self.model.is_some()
+            || self.repo.is_some()
     }
 
     /// Whether it changes where, or how, `was` runs: a field it gives that
@@ -478,6 +494,10 @@ impl TicketEdit {
             || differs(&self.folder, Some(&was.folder))
             || view
             || differs(&self.model, was.model.as_deref())
+            || self.repo.as_deref().is_some_and(|r| {
+                let r = crate::repos::repo_of(r).map(|r| r.key());
+                r.as_deref() != was.repo.as_deref()
+            })
     }
 }
 
@@ -520,6 +540,7 @@ pub fn edited(before: &Snapshot, edits: &[TicketEdit]) -> Result<Snapshot, Vec<P
                         .unwrap_or_else(|| THIS_COMPUTER.to_string()),
                 ),
                 model: None,
+                repo: None,
             })
             .collect(),
     };
@@ -556,6 +577,9 @@ pub fn edited(before: &Snapshot, edits: &[TicketEdit]) -> Result<Snapshot, Vec<P
         if let Some(folder) = &e.folder {
             t.folder.clone_from(folder);
         }
+        if let Some(repo) = &e.repo {
+            t.repo = Some(repo.clone());
+        }
         if let Some(machine) = &e.machine {
             let to = machine.trim();
             let now = match to.is_empty() || to.eq_ignore_ascii_case(THIS_COMPUTER) {
@@ -576,11 +600,21 @@ pub fn edited(before: &Snapshot, edits: &[TicketEdit]) -> Result<Snapshot, Vec<P
                 );
                 continue;
             }
+            // Its repository says its folder there, when it has one.
+            let repo = e
+                .repo
+                .as_deref()
+                .map_or(was.repo.is_some(), |r| !r.trim().is_empty());
             if e.folder.is_none() {
-                problems.push(Problem::MovedWithoutFolder {
-                    key: key.clone(),
-                    machine: now.unwrap_or("this computer").to_string(),
-                });
+                match repo {
+                    // The folder it had is on the other computer: its
+                    // repository's checkout there is found as it starts.
+                    true => t.folder.clear(),
+                    false => problems.push(Problem::MovedWithoutFolder {
+                        key: key.clone(),
+                        machine: now.unwrap_or("this computer").to_string(),
+                    }),
+                }
             }
             t.machine = Some(machine.clone());
         }
@@ -644,6 +678,10 @@ pub enum Problem {
     },
     #[error("Ticket {ticket} names the machine {machine:?}, which can't be one of the person's machines; name one as the sidebar does (like devbox), or local for this computer.")]
     BadMachine { ticket: usize, machine: String },
+    #[error("Ticket {ticket} names the repository {repo:?}: say it as host/owner/name, like github.com/driftwerk/vellev, or owner/name for GitHub.")]
+    BadRepo { ticket: usize, repo: String },
+    #[error("Ticket {ticket} says neither its folder nor its repo: say one.")]
+    NoFolderOrRepo { ticket: usize },
     #[error("Ticket {ticket} names the model {model:?}, which can't be a model's name.")]
     BadModel { ticket: usize, model: String },
     #[error("Ticket {ticket} isn't one this plan has; leave out its id to add it.")]
@@ -673,7 +711,7 @@ pub enum Problem {
     #[error("{key} is taken on from its board: its title and description are its board's, so leave title and body out.")]
     AdoptedWords { key: String },
     #[error(
-        "{key} moves to {machine}: say its folder there too, as an absolute path on {machine}."
+        "{key} moves to {machine}: say its folder there too, as an absolute path on {machine}, or its repo (like github.com/owner/name)."
     )]
     MovedWithoutFolder { key: String, machine: String },
     #[error("{key} has started (it is in {column}), so where it runs can't change: leave it out, or once it is done add a ticket for what is left.")]
@@ -814,6 +852,20 @@ pub fn snapshot_with(
                 None
             }
         };
+        let repo = match t.repo.as_deref().map(str::trim) {
+            None => was.and_then(|w| w.repo.clone()),
+            Some("") => None,
+            Some(r) => match crate::repos::repo_of(r) {
+                Some(r) => Some(r.key()),
+                None => {
+                    problems.push(Problem::BadRepo {
+                        ticket,
+                        repo: r.chars().filter(|c| !c.is_control()).take(120).collect(),
+                    });
+                    None
+                }
+            },
+        };
         let mut needs = Vec::new();
         for &n in &t.needs {
             match ids.get(n) {
@@ -843,6 +895,7 @@ pub fn snapshot_with(
                 needs,
                 machine,
                 model,
+                repo,
                 adopted: adopted.contains_key(&i),
             });
         }
@@ -913,7 +966,9 @@ pub fn validate(
                 if let Some(p) = startable_problem(ticket, t.engine, t.view) {
                     problems.push(p);
                 }
-                if !folder.starts_with('/') {
+                if folder.is_empty() && t.repo.is_none() {
+                    problems.push(Problem::NoFolderOrRepo { ticket });
+                } else if !folder.is_empty() && !folder.starts_with('/') {
                     problems.push(Problem::NoMachineFolder {
                         ticket,
                         folder: t.folder.clone(),
@@ -925,7 +980,11 @@ pub fn validate(
                 if let Some(p) = engine_problem(ticket, t.engine, t.view, engines) {
                     problems.push(p);
                 }
-                if !std::path::Path::new(folder).is_absolute() || !is_dir(folder) {
+                if folder.is_empty() && t.repo.is_none() {
+                    problems.push(Problem::NoFolderOrRepo { ticket });
+                } else if folder.is_empty() {
+                    // Its repository's checkout, found or cloned as it starts.
+                } else if !std::path::Path::new(folder).is_absolute() || !is_dir(folder) {
                     problems.push(Problem::NoFolder {
                         ticket,
                         folder: t.folder.clone(),
@@ -1065,6 +1124,9 @@ pub struct PlanTicket {
     /// The model its session runs; none is its engine's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The repository it works in ([`Planned::repo`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
     /// A session or an agent has it.
     #[serde(default)]
     pub assigned: bool,
@@ -1115,6 +1177,10 @@ pub struct Start {
     /// Another of the plan's tickets works in the same folder: this one
     /// gets a worktree of its own.
     pub worktree: bool,
+    /// Its repository, whose checkout its folder is (found or cloned as it
+    /// starts, when its folder is empty).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
 }
 
 /// What the runner starts now for `plan`: its ready tickets in rank order,
@@ -1142,11 +1208,23 @@ pub fn next_starts(
     let mut ready: Vec<&PlanTicket> = tickets.iter().filter(|t| startable(t, &states)).collect();
     ready.sort_by(|a, b| a.rank.total_cmp(&b.rank));
     // A folder is in use on its own computer: the same path on a machine is
-    // another folder.
-    let mut in_use: HashSet<(Option<&str>, &str)> = tickets
+    // another folder. A repository is one checkout on each computer, so two
+    // tickets of it there share a folder; so do a ticket of its folder and
+    // one of its repository whose found checkout it is.
+    let places = |t: &PlanTicket| -> Vec<String> {
+        let mut at = Vec::new();
+        if let Some(r) = t.repo.as_deref() {
+            at.push(format!("repo:{r}"));
+        }
+        if let Some(f) = t.folder.as_deref().filter(|f| !f.is_empty()) {
+            at.push(f.trim_end_matches('/').to_string());
+        }
+        at
+    };
+    let mut in_use: HashSet<(Option<&str>, String)> = tickets
         .iter()
         .filter(|t| t.state == TicketState::Doing || t.starting)
-        .filter_map(|t| t.folder.as_deref().map(|f| (t.machine.as_deref(), f)))
+        .flat_map(|t| places(t).into_iter().map(|f| (t.machine.as_deref(), f)))
         .collect();
     let mut busy = busy;
     let mut out = Vec::new();
@@ -1154,15 +1232,21 @@ pub fn next_starts(
         if busy >= cap {
             break;
         }
-        let (Some(engine), Some(folder)) = (t.engine, t.folder.as_deref()) else {
+        let at = places(t);
+        let Some(engine) = t.engine.filter(|_| !at.is_empty()) else {
             continue;
         };
+        let mut shared = false;
+        for f in at {
+            shared |= !in_use.insert((t.machine.as_deref(), f));
+        }
         out.push(Start {
             ticket: t.id,
             engine,
-            folder: folder.to_string(),
+            folder: t.folder.clone().unwrap_or_default(),
             view: t.view,
-            worktree: !in_use.insert((t.machine.as_deref(), folder)),
+            worktree: shared,
+            repo: t.repo.clone(),
         });
         busy += 1;
     }
@@ -1254,7 +1338,8 @@ pub fn plan_change(
             || was.folder != t.folder
             || was.view != t.view
             || was.machine != t.machine
-            || was.model != t.model;
+            || was.model != t.model
+            || was.repo != t.repo;
         if moved && started.contains(&t.id) {
             return Err(Problem::Started {
                 title: was.title.clone(),
@@ -1271,11 +1356,13 @@ pub fn plan_change(
         .iter()
         .map(|t| t.machine.as_deref())
         .collect();
+    let repos: HashSet<Option<&str>> = applied.tickets.iter().map(|t| t.repo.as_deref()).collect();
     let elsewhere = next.tickets.iter().any(|t| {
         applied.ticket(t.id).is_some()
             && (!engines.contains(&t.engine)
                 || !folders.contains(t.folder.as_str())
-                || !machines.contains(&t.machine.as_deref()))
+                || !machines.contains(&t.machine.as_deref())
+                || !repos.contains(&t.repo.as_deref()))
     });
     let said = next.tickets.iter().any(|t| {
         applied
@@ -1387,6 +1474,12 @@ pub fn describe(before: &Snapshot, after: &Snapshot) -> String {
         }
         if was.folder != t.folder || was.view != t.view {
             said.push(format!("moved {} to {}", q(t), t.folder));
+        }
+        if was.repo != t.repo {
+            said.push(match &t.repo {
+                Some(r) => format!("set {} to work in {r}", q(t)),
+                None => format!("set {} to work in its folder alone", q(t)),
+            });
         }
         if was.machine != t.machine {
             said.push(format!(

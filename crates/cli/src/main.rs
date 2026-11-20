@@ -1758,8 +1758,10 @@ enum PlaybookCommand {
 #[derive(clap::Args, Debug, Clone, PartialEq)]
 struct EmbedArgs {
     /// An embedding endpoint that makes the vectors instead of the vellev
-    /// node: one serving the node's own model, BAAI/bge-base-en-v1.5, with
-    /// no prefix for documents, as text-embeddings-inference does. It is
+    /// node: one serving the model of the collection being seeded (the
+    /// node's own BAAI/bge-base-en-v1.5, or the code model `[vellev.code]`
+    /// names), with no prefix for documents, as text-embeddings-inference
+    /// does. It is
     /// compared with the node over a sample before anything is written,
     /// and refused if the two do not embed alike. Without it the node
     /// embeds, one run of its model at a time.
@@ -1769,9 +1771,10 @@ struct EmbedArgs {
     /// (`POST /v1/embeddings`).
     #[arg(long, default_value = "tei")]
     embed_api: String,
-    /// The model the endpoint is asked for, where its API names one.
-    #[arg(long, default_value = "BAAI/bge-base-en-v1.5")]
-    embed_model: String,
+    /// The model the endpoint is asked for, where its API names one: the
+    /// seeded collection's unless given.
+    #[arg(long)]
+    embed_model: Option<String>,
     /// The environment variable holding the endpoint's key, if it has one.
     #[arg(long)]
     embed_key_env: Option<String>,
@@ -1794,8 +1797,9 @@ struct EmbedArgs {
 }
 
 impl EmbedArgs {
-    /// The outside embedder these name, if any.
-    fn seeding(&self) -> Result<Option<workforce_vellev::seeding::Seeding>> {
+    /// The outside embedder these name, if any, asked for `model`, the
+    /// seeded collection's, unless `--embed-model` names another.
+    fn seeding(&self, model: &str) -> Result<Option<workforce_vellev::seeding::Seeding>> {
         let Some(url) = &self.embed_url else {
             return Ok(None);
         };
@@ -1809,7 +1813,7 @@ impl EmbedArgs {
         let embedder = workforce_hub::seeding::Outside::new(
             url,
             self.embed_api.parse()?,
-            &self.embed_model,
+            self.embed_model.as_deref().unwrap_or(model),
             key,
         )?;
         let (batch, concurrency) = self.requests();
@@ -11910,7 +11914,7 @@ Describe what you should do in this step and what to discuss with the user.
                 },
         } => {
             let wf_config = workforce_common::settings::WorkforceConfig::load(&config)?;
-            let outside = embed.seeding()?;
+            let outside = embed.seeding(workforce_vellev::LOCAL_MODEL)?;
             if let Some(seeding) = &outside {
                 println!(
                     "  comparing {} with the node over a sample of the artifacts before anything is written: the node embeds it with its own model, which may take a minute",
@@ -11959,7 +11963,11 @@ Describe what you should do in this step and what to discuss with the user.
             if let Some(data_dir) = data_dir {
                 wf_config.knowledge.data_dir = Some(data_dir.to_string_lossy().to_string());
             }
-            let outside = embed.seeding()?;
+            let code_model = workforce_codebase_knowledge::vector::code_embedding(
+                wf_config.vellev.code_model()?,
+            )
+            .model;
+            let outside = embed.seeding(&code_model)?;
             let per_sec = rate.unwrap_or(match outside {
                 Some(_) => 0,
                 None => wf_config.knowledge.vector_backfill_per_sec,
@@ -13291,7 +13299,8 @@ mod tests {
             Commands::Artifacts {
                 command: ArtifactsCommand::Reindex { config, mirror: false, embed }
             } if config == std::path::Path::new("hub.toml")
-                && embed.embed_url.is_none() && embed.seeding().unwrap().is_none()
+                && embed.embed_url.is_none()
+                && embed.seeding(workforce_vellev::LOCAL_MODEL).unwrap().is_none()
         ));
         // The shadow's vellev mirror, by its own flag (DW-676).
         let cli = Cli::try_parse_from(["workforce", "artifacts", "reindex", "--mirror"]).unwrap();
@@ -13336,14 +13345,48 @@ mod tests {
             (repo.as_deref(), rate, data_dir),
             (Some("site-1a2b"), None, None)
         );
-        let seeding = embed.seeding().unwrap().expect("an outside embedder");
-        assert_eq!((seeding.batch, seeding.concurrency), (32, 16));
-        assert!(seeding.embedder.name().contains("http://tei:8080"));
+        let configured = workforce_common::settings::WorkforceConfig::from_toml(
+            "[vellev.code]\nmodel = \"BAAI/bge-small-en-v1.5\"\ndimensions = 384\n",
+        )
+        .unwrap();
+        for (config, model) in [
+            (
+                workforce_common::settings::WorkforceConfig::default(),
+                workforce_vellev::LOCAL_MODEL,
+            ),
+            (configured, "BAAI/bge-small-en-v1.5"),
+        ] {
+            let code = workforce_codebase_knowledge::vector::code_embedding(
+                config.vellev.code_model().unwrap(),
+            );
+            let seeding = embed
+                .seeding(&code.model)
+                .unwrap()
+                .expect("an outside embedder");
+            assert_eq!((seeding.batch, seeding.concurrency), (32, 16));
+            let named = seeding.embedder.name();
+            assert!(
+                named.contains("http://tei:8080") && named.contains(&format!("({model})")),
+                "{named}"
+            );
+        }
+        let chosen = EmbedArgs {
+            embed_model: Some("BAAI/bge-large-en-v1.5".into()),
+            ..embed.clone()
+        };
+        let seeding = chosen
+            .seeding(workforce_vellev::LOCAL_MODEL)
+            .unwrap()
+            .unwrap();
+        assert!(seeding.embedder.name().contains("(BAAI/bge-large-en-v1.5)"));
         let unkeyed = EmbedArgs {
             embed_key_env: Some("WORKFORCE_TEST_NO_SUCH_KEY".into()),
             ..embed.clone()
         };
-        assert!(unkeyed.seeding().is_err(), "a key named and not set");
+        assert!(
+            unkeyed.seeding(workforce_vellev::LOCAL_MODEL).is_err(),
+            "a key named and not set"
+        );
         // No more texts are with the endpoint at once than it is said to
         // hold: 16 requests of 256 would be 4096, and it holds 512.
         let large = EmbedArgs {
@@ -13365,7 +13408,7 @@ mod tests {
             embed_api: "grpc".into(),
             ..embed
         };
-        assert!(odd.seeding().is_err());
+        assert!(odd.seeding(workforce_vellev::LOCAL_MODEL).is_err());
     }
     use std::io::Write;
 

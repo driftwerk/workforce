@@ -2131,6 +2131,11 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
             desk.clone(),
             Arc::clone(&auth),
         ))
+        .merge(crate::repos_api::api_routes(
+            desk.clone(),
+            Arc::clone(&auth),
+        ))
+        .merge(crate::run::api::api_routes(desk.clone(), Arc::clone(&auth)))
         .merge(crate::grant_api::api_routes(desk, auth))
 }
 
@@ -2771,6 +2776,118 @@ mod tests {
             // The list still never says it.
             let (_, listed) = call(&app, "GET", "/api/desk/accounts", None).await;
             assert!(!listed.to_string().contains("sk-ant"), "{listed}");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_check_runs_for_the_hubs_own_token_alone_judged_unless_said() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("home")).unwrap();
+            let home = dir.path().join("home").canonicalize().unwrap();
+            std::fs::create_dir_all(home.join("app")).unwrap();
+            DeskStore::migrate(&pool).await.unwrap();
+            let mut opts = options(dir.path());
+            opts.env = BTreeMap::from([("HOME".into(), home.to_string_lossy().into_owned())]);
+            let desk = crate::Desk::start(
+                DeskStore::from_pool(pool),
+                opts,
+                Default::default(),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            desk.boss_bounds_with(crate::charge::Bounds {
+                home: home.clone(),
+                // Not the /tmp the test's home is in: nothing of it is
+                // scratch.
+                scratch: vec![dir.path().join("scratch")],
+                withheld: vec![home.join(".ssh")],
+            });
+            // Not the hub's own token: refused.
+            let page = super::sessions_router(desk.clone(), crate::testing::identified("sarah"));
+            let (status, _) = call(
+                &page,
+                "POST",
+                "/api/desk/run",
+                Some(json!({"command": "echo hi"})),
+            )
+            .await;
+            assert_eq!(status, 403);
+            let app = super::sessions_router(desk, allow_all());
+            // A token in the address: refused, even the hub's.
+            let (status, _) = call(
+                &app,
+                "POST",
+                "/api/desk/run?token=x",
+                Some(json!({"command": "echo hi"})),
+            )
+            .await;
+            assert_eq!(status, 400);
+            // Any other word in the address is no matter.
+            let (status, ran) = call(
+                &app,
+                "POST",
+                "/api/desk/run?x=1",
+                Some(json!({"command": "true"})),
+            )
+            .await;
+            assert_eq!(status, 200, "{ran}");
+            let (status, ran) = call(
+                &app,
+                "POST",
+                "/api/desk/run",
+                Some(json!({"command": "pwd", "cwd": "~/app"})),
+            )
+            .await;
+            assert_eq!(status, 200, "{ran}");
+            assert_eq!(ran["outcome"], "ran", "{ran}");
+            assert_eq!(ran["stdout"].as_str().unwrap().trim(), home.join("app").to_string_lossy());
+            // What the judge won't allow is the person's; what no boss
+            // does holds even unjudged; the person's word runs it.
+            let (_, ran) = call(
+                &app,
+                "POST",
+                "/api/desk/run",
+                Some(json!({"command": "rm -rf ~/app", "cwd": "~"})),
+            )
+            .await;
+            assert_eq!(ran["outcome"], "needs_person", "{ran}");
+            let (_, ran) = call(
+                &app,
+                "POST",
+                "/api/desk/run",
+                Some(json!({"command": "rm -rf ~/app", "cwd": "~", "judged": false})),
+            )
+            .await;
+            assert_eq!(ran["outcome"], "needs_person", "{ran}");
+            assert!(home.join("app").is_dir());
+            let (_, ran) = call(
+                &app,
+                "POST",
+                "/api/desk/run",
+                Some(json!({"command": "rmdir ~/app", "cwd": "~", "judged": false, "by_person": true})),
+            )
+            .await;
+            assert_eq!(ran["outcome"], "ran", "{ran}");
+            assert!(!home.join("app").exists());
+            // Outside the home, too long, or an odd field: refused.
+            for body in [
+                json!({"command": "ls", "cwd": "/etc"}),
+                json!({"command": "ls", "timeout_secs": 60}),
+            ] {
+                let (_, ran) = call(&app, "POST", "/api/desk/run", Some(body)).await;
+                assert_eq!(ran["outcome"], "refused", "{ran}");
+            }
+            let (status, _) = call(
+                &app,
+                "POST",
+                "/api/desk/run",
+                Some(json!({"command": "ls", "env": {"X": "1"}})),
+            )
+            .await;
+            assert_eq!(status, 400);
         })
         .await;
     }

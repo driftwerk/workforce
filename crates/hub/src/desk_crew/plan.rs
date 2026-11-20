@@ -200,7 +200,10 @@ then crew.plan with board, or crew.plan_update with board to move a plan onto it
 
 pub const UPDATE_DESCRIPTION: &str = "Keep a plan of yours current (plan_id). To change some \
 of its tickets, give tickets_edit: each by its key with only what changes (machine, folder, \
-engine, model, title, body); everything else of it is kept, its brief and needs too. To change \
+repo, engine, model, title, body); everything else of it is kept, its brief and needs too. A \
+ticket moved to another machine needs its folder there (crew.machine_folders finds it) or its \
+repo; one whose folder is a repository's checkout gets that repo by itself, and its checkout \
+there is found, or cloned under the machine's projects folder, as it starts. To change \
 the list itself, give tickets: every ticket it is to have, in order, each by its id or key when it \
 is one it has (leave both out to add one, or give adopt: a key from crew.find_tickets to take that \
 ticket on as it is), with needs by place in the list; one it has that leaves out its title or body \
@@ -228,7 +231,8 @@ fn ticket_schema() -> Value {
         "title": { "type": "string", "description": "A new ticket's title; not with adopt" },
         "body": { "type": "string", "description": "What the session is to do: its first prompt reads it. Not with adopt" },
         "engine": { "type": "string", "description": "claude or codex, only when the person named one for it; the person's default engine when not said, so omit it otherwise" },
-        "folder": { "type": "string", "description": "Absolute path of the project folder it works in, on the computer it runs on: on a machine, that machine's own path (as crew.overview shows its sessions' folders)" },
+        "folder": { "type": "string", "description": "Absolute path of the project folder it works in, on the computer it runs on: on a machine, that machine's own path (as crew.overview shows its sessions' folders, or crew.machine_folders finds); may be left out with repo" },
+        "repo": { "type": "string", "description": "The repository it works in, by where it comes from: host/owner/name like github.com/driftwerk/vellev, or owner/name for GitHub. Its folder on the computer it runs on is then that repository's checkout there, found or cloned as it starts, so folder may be left out; \"\" for none" },
         "machine": machine_schema("Where this ticket runs"),
         "model": { "type": "string", "description": "The model its session runs, as its engine names it (opus, sonnet, gpt-5.5); only when the person named one; the plan's model, else the person's default model on their default engine, else the engine's own, when not said. \"\" is the engine's own" },
         "view": { "type": "string", "enum": ["terminal"] },
@@ -245,6 +249,7 @@ fn ticket_edit_schema() -> Value {
         "body": { "type": "string", "description": "Its new brief, in full; not for one taken on" },
         "engine": { "type": "string", "description": "claude or codex, only when the person named one" },
         "folder": { "type": "string", "description": "Absolute path of the folder it works in, on the computer it runs on" },
+        "repo": { "type": "string", "description": "The repository it works in, by where it comes from: host/owner/name like github.com/driftwerk/vellev, or owner/name for GitHub. Its folder on the computer it runs on is then that repository's checkout there, found or cloned as it starts, so folder may be left out; \"\" for none" },
         "machine": machine_schema("Where it runs now"),
         "model": { "type": "string", "description": "The model its session runs; \"\" is its engine's own" },
         "view": { "type": "string", "enum": ["terminal"] }
@@ -448,8 +453,8 @@ fn tickets_of(
 }
 
 /// The fields a ticket's edit may say, each a string.
-const EDIT_FIELDS: [&str; 7] = [
-    "title", "body", "engine", "folder", "machine", "model", "view",
+const EDIT_FIELDS: [&str; 8] = [
+    "title", "body", "engine", "folder", "machine", "model", "view", "repo",
 ];
 
 /// `tickets_edit` of a tool's input, each by the id its key names among
@@ -533,6 +538,7 @@ fn edits_of(
                 "folder" => edit.folder = v,
                 "machine" => edit.machine = v,
                 "model" => edit.model = v,
+                "repo" => edit.repo = v,
                 _ => edit.view = v,
             }
         }
@@ -548,6 +554,44 @@ fn edits_of(
         out.push(edit);
     }
     Ok(Some(out))
+}
+
+impl CrewHub {
+    /// The repository `folder` is a checkout of, on `machine` (none: this
+    /// computer), as `host/owner/name`; none when it can't be read.
+    async fn remote_where(&self, b: &Bound, machine: Option<&str>, folder: &str) -> Option<String> {
+        if folder.trim().is_empty() {
+            return None;
+        }
+        match machine {
+            None => {
+                let home = self.desk.home_folder()?.canonicalize().ok()?;
+                let dir = std::path::PathBuf::from(folder);
+                tokio::task::spawn_blocking(move || {
+                    // Never the home's own repository (its dotfiles).
+                    let inside = |p: &std::path::Path| p.starts_with(&home) && p != home;
+                    workforce_desk::folders::remote_of(&dir, true, &inside)
+                })
+                .await
+                .ok()
+                .flatten()
+            }
+            Some(m) => self
+                .machine_ask(
+                    m,
+                    b.service.agent_id.as_str(),
+                    "desk.folders",
+                    json!({ "path": folder }),
+                )
+                .await
+                .ok()?
+                .get("remote")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        }
+        .and_then(|r| workforce_desk::repos::repo_of(&r))
+        .map(|r| r.key())
+    }
 }
 
 /// Which tickets' briefs a plan read back carries.
@@ -784,6 +828,7 @@ fn plan_view(p: &PlanDetail) -> Value {
             "engine": t.engine.map(Engine::as_str),
             "folder": t.folder,
             "machine": t.machine,
+            "repo": t.repo,
             "model": t.model,
             "adopted": t.adopted,
             "needs": t.ticket.ticket.needs.iter().filter_map(|n| place.get(n)).collect::<Vec<_>>(),
@@ -1139,7 +1184,26 @@ impl CrewHub {
             .unwrap_or_default();
         // Read before anything changes: one that doesn't read changes nothing.
         let start_now = start_now_of(input)?;
-        let ticket_edits = edits_of(input, &known, &kept)?;
+        let mut ticket_edits = edits_of(input, &known, &kept)?;
+        // A ticket moved to another machine without its folder there, nor
+        // its repository, gets the repository its folder is a checkout of
+        // where it ran: its checkout there is found as it starts.
+        if let (Some(edits), Some(r)) = (ticket_edits.as_mut(), detail.revisions.last()) {
+            for e in edits.iter_mut() {
+                let Some(was) = r.snapshot.ticket(e.id) else {
+                    continue;
+                };
+                let to = e.machine.as_deref().map(str::trim);
+                let to =
+                    to.filter(|m| !m.is_empty() && !m.eq_ignore_ascii_case(plan::THIS_COMPUTER));
+                let moves = e.machine.is_some() && to != was.machine.as_deref();
+                if moves && e.folder.is_none() && e.repo.is_none() && was.repo.is_none() {
+                    e.repo = self
+                        .remote_where(b, was.machine.as_deref(), &was.folder)
+                        .await;
+                }
+            }
+        }
         if ticket_edits.is_some() && input.get("tickets").is_some_and(|t| !t.is_null()) {
             return Err(
                 "Say every ticket the plan is to have (tickets) or the ones to change (tickets_edit), not both.".into(),
@@ -1661,6 +1725,27 @@ impl CrewHub {
                         }
                     }
                 }
+                // A ticket waiting on its clone holds no slot: it is asked
+                // after on its own, and starts with the rest once ready.
+                // One that left To do, or this plan, waits no more.
+                let waiting: Vec<Uuid> = {
+                    let mut w = self.plan_waiting.lock();
+                    w.retain(|id, (plan, _)| {
+                        *plan != p.id
+                            || tickets
+                                .iter()
+                                .any(|t| t.id == *id && t.state == TicketState::Todo && !t.assigned)
+                    });
+                    w.iter()
+                        .filter(|(_, (plan, _))| *plan == p.id)
+                        .map(|(id, _)| *id)
+                        .collect()
+                };
+                for t in &mut rows {
+                    if waiting.contains(&t.id) {
+                        t.starting = true;
+                    }
+                }
                 let busy = self.desk.charges_busy(&boss.id)
                     + self.desk.starts_under_way(&boss.id).await
                     + self.machine_busy(&boss.id);
@@ -1668,6 +1753,7 @@ impl CrewHub {
                     match self.desk.plan_start(&p, &s, &boss, &by).await {
                         Ok(started) => {
                             self.plan_failed.lock().remove(&s.ticket);
+                            self.plan_waiting.lock().remove(&s.ticket);
                             if let Some(m) = &started.machine {
                                 let key = tickets
                                     .iter()
@@ -1690,12 +1776,35 @@ impl CrewHub {
                         Err(e @ workforce_desk::StartRefused::Skipped(_)) => {
                             tracing::info!(plan = %p.id, ticket = %s.ticket, error = %e, "a plan's ticket didn't start now");
                         }
+                        // Under way (a clone): not a failure; its boss is
+                        // told once what it waits on.
+                        Err(workforce_desk::StartRefused::Waits(why)) => {
+                            self.plan_waits(p.id, s.ticket, why);
+                        }
                         Err(workforce_desk::StartRefused::Failed(e)) => {
+                            self.plan_waiting.lock().remove(&s.ticket);
                             tracing::info!(plan = %p.id, ticket = %s.ticket, error = %e, "a plan's ticket didn't start");
                             let Some(t) = tickets.iter().find(|t| t.id == s.ticket) else {
                                 continue;
                             };
                             self.start_failed(&p, t, scope, &plain(e)).await;
+                        }
+                    }
+                }
+                for id in waiting {
+                    match self.desk.plan_prepare(&p, id, &boss).await {
+                        // Ready: it starts with the rest, next pass.
+                        Ok(()) | Err(workforce_desk::StartRefused::Skipped(_)) => {
+                            self.plan_waiting.lock().remove(&id);
+                        }
+                        Err(workforce_desk::StartRefused::Waits(why)) => {
+                            self.plan_waits(p.id, id, why);
+                        }
+                        Err(workforce_desk::StartRefused::Failed(e)) => {
+                            self.plan_waiting.lock().remove(&id);
+                            if let Some(t) = tickets.iter().find(|t| t.id == id) {
+                                self.start_failed(&p, t, scope, &plain(e)).await;
+                            }
                         }
                     }
                 }
@@ -1705,6 +1814,19 @@ impl CrewHub {
                     .await
             }
             Level::Watch => {}
+        }
+    }
+
+    /// `ticket` of plan `plan` waits on its clone: its boss is told what it
+    /// waits on once, and again only when that changes.
+    fn plan_waits(&self, plan: Uuid, ticket: Uuid, why: String) {
+        let tell = self
+            .plan_waiting
+            .lock()
+            .insert(ticket, (plan, why.clone()))
+            .is_none_or(|(_, was)| was != why);
+        if tell {
+            self.plan_failures.lock().push((plan, why));
         }
     }
 
@@ -2309,6 +2431,7 @@ mod tests {
     #[test]
     fn a_ticket_on_the_persons_default_engine_runs_their_default_model() {
         let ticket = |engine: Option<&str>, model: Option<&str>| DraftTicket {
+            repo: None,
             id: None,
             adopt: None,
             title: "t".into(),
@@ -2347,6 +2470,7 @@ mod tests {
     #[test]
     fn failures_count_on_until_where_it_runs_or_the_plans_scope_changes() {
         let t = PlanTicket {
+            repo: None,
             id: Uuid::new_v4(),
             key: Some("ACM-3".into()),
             state: TicketState::Todo,

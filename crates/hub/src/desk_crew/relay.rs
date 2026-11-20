@@ -107,9 +107,10 @@ pub(crate) struct Relays {
 }
 
 /// What only Desk's own plan runner asks a machine through the relay, never
-/// a boss's tool: its sessions, and a new session started there. Desk's
-/// native side sends each to the machine's own sessions route.
-pub const DESK_CALLS: [&str; 2] = ["desk.sessions", "desk.session_start"];
+/// a boss's tool: its sessions, a new session started there, and a plan
+/// ticket's repository's checkout there (found, or cloned). Desk's native
+/// side sends each to the machine's own route for it.
+pub const DESK_CALLS: [&str; 3] = ["desk.sessions", "desk.session_start", "desk.checkout"];
 
 /// Whether `name` can name a machine: no `/`, `:` or space in it.
 pub fn machine_ok(name: &str) -> bool {
@@ -219,6 +220,9 @@ impl CrewHub {
             Ok(Ok(answer)) => Ok(answer),
             // Desk took it: it may have been done there. Not to be sent
             // again as new.
+            _ if taken && tool == "desk.run" => Err(MachineRefused::Unknown(format!(
+                "Sent to {machine}, but no answer came back: the check may have run there. Look at what it would have changed before you run it again."
+            ))),
             _ if taken => Err(MachineRefused::Unknown(format!(
                 "Sent to {machine}, but its outcome isn't known yet: check {machine}'s session (crew.history) before you try it again."
             ))),

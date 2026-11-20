@@ -726,6 +726,8 @@ pub fn answerable(
                 branches: &facts.branches,
                 tip_tags: &facts.tip_tags,
                 tracked,
+                // A session's folder is the person's choice.
+                vouched: true,
             };
             boss::judge(command, &here).map_err(Irreversible)
         }
