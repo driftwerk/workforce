@@ -72,13 +72,18 @@ impl MonitorTool {
         }
     }
 
-    /// `toml` with `agent = "<this agent>"` added when it names no watching
-    /// agent and this agent is not the hub's default: a monitor an agent
+    /// `toml` with `agent = "<this agent>"` added when it watches no channel,
+    /// names no watching agent, and this agent is not the hub's default: a monitor an agent
     /// saves is its own, polled with its tools and telling the person in its
     /// DM, rather than the default agent's. `None` when nothing is added.
     fn own_monitor(&self, toml: &str, def: &MonitorDefinition) -> Option<String> {
         let agent = self.agent.as_ref().filter(|a| !a.is_default)?;
-        if def.monitor.watcher().is_some() || !self.runtime.knows_agent(&agent.id) {
+        // A channel monitor is watched by an agent's bot, which must be in
+        // the channel: which bot is the author's to name.
+        if def.monitor.watcher().is_some()
+            || def.monitor.binding().is_some()
+            || !self.runtime.knows_agent(&agent.id)
+        {
             return None;
         }
         let mut doc = toml.parse::<toml_edit::DocumentMut>().ok()?;
@@ -533,24 +538,6 @@ impl MonitorTool {
             .stored_definition(&id, grant.owner.as_deref())
             .await;
         if let Some(def) = &parsed {
-            let checked = match &self.engine {
-                Some(engine) => engine.preflight(def, grant.owner.as_deref()).await,
-                None => self
-                    .runtime
-                    .check_definition(def)
-                    .await
-                    .map(|()| Vec::new())
-                    .map_err(|e| e.to_string()),
-            };
-            match checked {
-                Ok(done) => notes.extend(done),
-                Err(refused) => {
-                    return Ok(ToolResult::failure(
-                        refused,
-                        start.elapsed().as_millis() as u64,
-                    ));
-                }
-            }
             // Membership gate: a non-admin may only point a monitor at a channel
             // they can reach themselves — otherwise a member could bind a
             // notify/agent_task monitor onto a channel they're not in and have
@@ -580,6 +567,28 @@ impl MonitorTool {
             Ok(v) => v,
             Err(e) => return Ok(ToolResult::failure(e, start.elapsed().as_millis() as u64)),
         };
+        // Checked last of all, as it may load the tool's skill for the owner:
+        // a save any gate above refuses has changed nothing on the agent.
+        if let Some(def) = &parsed {
+            let checked = match &self.engine {
+                Some(engine) => engine.preflight(def, grant.owner.as_deref()).await,
+                None => self
+                    .runtime
+                    .check_definition(def)
+                    .await
+                    .map(|()| Vec::new())
+                    .map_err(|e| e.to_string()),
+            };
+            match checked {
+                Ok(done) => notes.extend(done),
+                Err(refused) => {
+                    return Ok(ToolResult::failure(
+                        refused,
+                        start.elapsed().as_millis() as u64,
+                    ));
+                }
+            }
+        }
         match self
             .runtime
             .save_definition_source(

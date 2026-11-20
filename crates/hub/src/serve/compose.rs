@@ -665,7 +665,7 @@ pub(super) async fn build_inner(
     )
     .await?;
 
-    let (policy, adapter_loader) = install_policy(
+    let policy = install_policy(
         &config,
         &credentials,
         &toolbox,
@@ -975,14 +975,7 @@ pub(super) async fn build_inner(
 
     crate::consolidation_runtime::wire(&service_arc, &config).await;
 
-    crate::monitor::wire(
-        &service_arc,
-        &config,
-        agent_config,
-        &def_write_auth,
-        &adapter_loader,
-    )
-    .await;
+    crate::monitor::wire(&service_arc, &config, agent_config, &def_write_auth).await;
 
     super::background::start_sweeps(&service_arc).await;
 
@@ -4315,7 +4308,7 @@ fn install_policy(
     admin: &Admin,
     skills: &Skills,
     workspace: &std::path::Path,
-) -> Result<(Arc<PolicyEngine>, crate::wasm_tool_invoker::AdapterLoader)> {
+) -> Result<Arc<PolicyEngine>> {
     let Credentials {
         vault,
         global_vault,
@@ -4388,7 +4381,7 @@ fn install_policy(
         }))
         .with_computer_gate(config.desk.enabled.then(|| workspace.to_path_buf())),
     ));
-    Ok((policy, adapter_loader))
+    Ok(policy)
 }
 
 async fn register_telemetry_tools(

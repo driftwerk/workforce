@@ -12,11 +12,13 @@
 //! through `run_skill` sees none of a conversation's context.
 //!
 //! A tool its agent has not loaded yet (a hub just restarted, a skill never
-//! enabled) is loaded the way the agent would load it itself: its skill is
-//! enabled through `system.enable_skill`, run as the monitor's owner through
-//! the same gauntlet, so the owner's own credentials load and the rules that
-//! decide whether that caller may enable it decide here too. Only the skill
-//! that provides the monitor's own tool is ever enabled this way.
+//! enabled) is loaded as the agent would load it itself: a call to
+//! `system.enable_skill` for the skill that names that tool is put through
+//! the same gauntlet as the monitor's owner — so whether they may enable it
+//! decides here too — and the skill is then loaded within their scope, so
+//! their own credentials load. The load only adds: nothing already loaded is
+//! unloaded, so one owner's monitor never takes another's tools away. A
+//! system monitor (no owner) is gated as no person, as its calls are.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -31,16 +33,18 @@ use workforce_common::session::TurnPrincipal;
 use workforce_policy::engine::PolicyEngine;
 use workforce_wasm_runtime::manifest::is_denied_tool;
 
-use crate::wasm_tool_invoker::AdapterLoader;
-
 /// How a monitor's missing tool is loaded: the agent's own path to it.
 const ENABLE_SKILL: &str = "system.enable_skill";
 
-/// How long a load that left a tool missing is answered from memory when
-/// nothing has registered since: what fixes it may register nothing (an
-/// account added to the vault, a capability granted), so it is tried again
-/// after this however quiet the registry is.
+/// How long a load that left a tool missing is answered from memory: what
+/// fixes it (an account added to the vault, a capability granted) may
+/// register nothing, so it is tried again after this.
 const FAILED_LOAD_RETRY: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Loads a built-in skill into the agent's registry within the scope in
+/// force, adding to what is there; what the load said about itself (its
+/// context hint), or why it failed.
+pub type SkillLoad = Arc<dyn Fn(&str) -> eyre::Result<Option<String>> + Send + Sync>;
 
 /// Beyond the families no skill may be granted, a monitor may not author
 /// monitors.
@@ -118,11 +122,10 @@ pub trait ToolInvoke: Send + Sync {
         actor: &str,
     ) -> Result<Resolved, String>;
 
-    /// A count that moves whenever the agent's tools change, so a monitor
-    /// that failed for a missing tool can be tried again once one registers.
-    fn generation(&self) -> u64 {
-        0
-    }
+    /// Whether `tool` is loaded on the agent now: a cheap look, loading
+    /// nothing, so a monitor that failed for a missing tool can be polled
+    /// again as soon as it registers.
+    fn has(&self, tool: &str) -> bool;
 
     async fn invoke(&self, call: ToolCall<'_>) -> Result<Value, InvokeError>;
 }
@@ -136,17 +139,16 @@ pub struct GovernedInvoker {
     policy: Arc<PolicyEngine>,
     gates: GatesFn,
     access: AccessFn,
-    adapters: Option<AdapterLoader>,
-    /// The loads that left a tool missing, by (skill, owner): the registry's
-    /// generation after the attempt, when, and why. While nothing has
-    /// registered since and `load_retry` has not passed, the same load is
-    /// not tried again, so monitors missing one tool never reload its skill
-    /// in turn on every poll. Held across a load, which serialises them.
+    load: Option<SkillLoad>,
+    /// The loads that left a tool missing, by (skill, owner): when, and why.
+    /// Until `load_retry` has passed the same load is answered from here, so
+    /// a monitor missing its tool does not load the skill on every poll.
+    /// Held across a load, so two monitors never load one skill at once.
     failed_loads: tokio::sync::Mutex<FailedLoads>,
     load_retry: std::time::Duration,
 }
 
-type FailedLoads = HashMap<(String, Option<String>), (u64, std::time::Instant, String)>;
+type FailedLoads = HashMap<(String, Option<String>), (std::time::Instant, String)>;
 
 impl GovernedInvoker {
     pub fn new(
@@ -154,20 +156,20 @@ impl GovernedInvoker {
         policy: Arc<PolicyEngine>,
         gates: GatesFn,
         access: AccessFn,
-        adapters: Option<AdapterLoader>,
+        load: Option<SkillLoad>,
     ) -> Self {
         Self {
             tools,
             policy,
             gates,
             access,
-            adapters,
+            load,
             failed_loads: tokio::sync::Mutex::default(),
             load_retry: FAILED_LOAD_RETRY,
         }
     }
 
-    /// How long a failed load is answered from memory while no tool registers.
+    /// How long a failed load is answered from memory.
     pub fn with_load_retry(mut self, after: std::time::Duration) -> Self {
         self.load_retry = after;
         self
@@ -175,24 +177,37 @@ impl GovernedInvoker {
 
     /// The invoker for `service`: its registry, policy, gates and access
     /// snapshot read at call time, so a changed capability matrix or tool
-    /// filter applies to the next poll.
-    pub fn for_service(
-        service: Arc<crate::serve::AgentService>,
-        adapters: Option<AdapterLoader>,
-    ) -> Self {
+    /// filter applies to the next poll; and its vaults to load a skill from.
+    pub fn for_service(service: Arc<crate::serve::AgentService>) -> Self {
         let gates = Arc::clone(&service);
+        let access = Arc::clone(&service);
+        let load: SkillLoad = Arc::new(move |skill: &str| {
+            let Some(vault) = service.vault.as_ref() else {
+                eyre::bail!("this agent has no vault to load {skill} from");
+            };
+            crate::skill_loader::load_and_track(
+                skill,
+                Arc::clone(vault),
+                service.global_vault.clone(),
+                &service.config,
+                &service.tools,
+                &service.skill_state,
+                "monitor",
+            )
+            .map(|loaded| loaded.context_hint)
+        });
         Self::new(
-            Arc::clone(&service.tools),
-            Arc::clone(&service.policy),
+            Arc::clone(&gates.tools),
+            Arc::clone(&gates.policy),
             Arc::new(move || gates.tool_gates(crate::desk_surface::allows())),
             // A monitor is no program: the board sync's byte readers are off it.
-            Arc::new(move || service.tool_access_snapshot().for_a_turn()),
-            adapters,
+            Arc::new(move || access.tool_access_snapshot().for_a_turn()),
+            Some(load),
         )
     }
 
-    /// The agent's `tool`, loading the skill that provides it as `owner`
-    /// when the agent has not loaded it; why not, with the fix.
+    /// The agent's `tool`, loading the skill that names it as `owner` when
+    /// the agent has not loaded it; why not, with the fix.
     async fn resolve_for(
         &self,
         tool: &str,
@@ -213,12 +228,12 @@ impl GovernedInvoker {
         let mut failed = self.failed_loads.lock().await;
         // Another monitor's load may have brought it while this one waited.
         if self.tools.get(tool).is_some() {
+            failed.remove(&key);
             return Ok(Resolved::Loaded);
         }
-        if let Some((generation, at, why)) = failed.get(&key) {
-            if *generation == self.tools.generation() && at.elapsed() < self.load_retry {
-                return Err(why.clone());
-            }
+        failed.retain(|_, (at, _)| at.elapsed() < self.load_retry);
+        if let Some((_, why)) = failed.get(&key) {
+            return Err(why.clone());
         }
         let who = owner.map_or_else(|| "the hub".to_string(), |o| format!("user {o}"));
         let result = match self.enable(skill, owner, actor).await {
@@ -238,61 +253,54 @@ impl GovernedInvoker {
                  failed: {why}. Fix: enable it from a turn that may (system.enable_skill {skill})"
             )),
         };
-        match &result {
-            Ok(_) => {
-                failed.remove(&key);
-            }
-            Err(why) => {
-                failed.insert(
-                    key,
-                    (
-                        self.tools.generation(),
-                        std::time::Instant::now(),
-                        why.clone(),
-                    ),
-                );
-            }
+        if let Err(why) = &result {
+            failed.insert(key, (std::time::Instant::now(), why.clone()));
         }
         result
     }
 
-    /// Enable `skill` for the agent as `owner`: through `system.enable_skill`
-    /// and the gauntlet, as the agent's own call would, else through the
-    /// adapter loader within the owner's scope. What the load said about
-    /// itself (its context hint), or why it failed.
+    /// Enable `skill` for the agent as `owner`: the `system.enable_skill`
+    /// call that would do it goes through the gauntlet as theirs would, and
+    /// the skill is then loaded within their scope, adding to what the agent
+    /// has. What the load said about itself, or why it was refused or failed.
     async fn enable(
         &self,
         skill: &str,
         owner: Option<&str>,
         actor: &str,
     ) -> Result<Option<String>, String> {
+        let Some(load) = self.load.clone() else {
+            return Err("this agent loads no skills".to_string());
+        };
         let principal = TurnPrincipal {
             run_as: owner.map(str::to_string),
             bill_to: None,
         };
-        if self.tools.get(ENABLE_SKILL).is_some() {
-            return crate::user_config::as_principal(
-                &principal,
-                self.run(actor, ENABLE_SKILL, json!({ "skill": skill })),
-            )
-            .await
-            .map(|out| {
-                out.get("context")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .map_err(|e| e.message().to_string());
-        }
-        let Some(load) = &self.adapters else {
-            return Err("this agent loads no skills (it has no vault)".to_string());
-        };
-        crate::user_config::as_principal(&principal, async { load(skill) })
-            .await
-            .map(|()| None)
-            .map_err(|e| format!("{e:#}"))
+        crate::user_config::as_principal(
+            &principal,
+            self.admit(actor, ENABLE_SKILL, json!({ "skill": skill })),
+        )
+        .await
+        .map_err(|e| e.message().to_string())?;
+        let (skill, user) = (skill.to_string(), owner.unwrap_or_default().to_string());
+        // A load reads the vault synchronously: off the async workers, in
+        // the owner's scope as the loader reads it.
+        tokio::task::spawn_blocking(move || {
+            workforce_agent::runner::CURRENT_USER_ID.sync_scope(user, || load(&skill))
+        })
+        .await
+        .map_err(|e| format!("the load stopped: {e}"))?
+        .map_err(|e| format!("{e:#}"))
     }
 
-    async fn run(&self, actor: &str, tool: &str, input: Value) -> Result<Value, InvokeError> {
+    /// Put a call to `tool` through the gauntlet without running it: the
+    /// input it would run with, or why not.
+    async fn admit(
+        &self,
+        actor: &str,
+        tool: &str,
+        input: Value,
+    ) -> Result<Option<Value>, InvokeError> {
         if let Some(refusal) = unattended_refusal(&self.tools, tool) {
             return Err(InvokeError::Denied(refusal));
         }
@@ -334,6 +342,16 @@ impl GovernedInvoker {
                 )));
             }
         };
+        if let Some(reason) = (self.access)().block_reason(tool) {
+            tracing::warn!(target: "sentinel.audit", actor = %actor, tool = %tool, reason = %reason, "monitor tool call denied");
+            return Err(InvokeError::Denied(reason.to_string()));
+        }
+        Ok(exec_input)
+    }
+
+    async fn run(&self, actor: &str, tool: &str, input: Value) -> Result<Value, InvokeError> {
+        let exec_input = self.admit(actor, tool, input.clone()).await?;
+        let gates = (self.gates)();
         tracing::info!(target: "sentinel.audit", actor = %actor, tool = %tool, "monitor tool call dispatched");
         let run = CURRENT_AGENT_ID
             .scope(
@@ -370,8 +388,8 @@ impl ToolInvoke for GovernedInvoker {
         self.resolve_for(tool, owner, actor).await
     }
 
-    fn generation(&self) -> u64 {
-        self.tools.generation()
+    fn has(&self, tool: &str) -> bool {
+        self.tools.get(tool).is_some()
     }
 
     async fn invoke(&self, call: ToolCall<'_>) -> Result<Value, InvokeError> {
@@ -707,59 +725,47 @@ mod tests {
         assert_eq!(err.message(), "too many");
     }
 
-    /// `system.enable_skill` as the agent has it: loads `email` for whoever
-    /// it runs as, with `email.inbox` only for a person whose accounts it
-    /// can read (alice), else the setup wizard alone — as a load outside
-    /// the person's scope does.
-    struct EnableSkill {
-        tools: Arc<ToolRegistry>,
-        ran_as: Mutex<Vec<Option<String>>>,
-    }
-
-    #[async_trait]
-    impl Tool for EnableSkill {
-        fn name(&self) -> &str {
-            ENABLE_SKILL
-        }
-        fn description(&self) -> &str {
-            "enable"
-        }
-        fn input_schema(&self) -> Value {
-            json!({ "type": "object", "properties": { "skill": { "type": "string" } } })
-        }
-        async fn execute(&self, input: Value) -> eyre::Result<ToolResult> {
+    /// Loads `email` into `tools` for whoever is in scope, adding to what
+    /// is there: `email.inbox` only for a person whose accounts it can read
+    /// (alice), else the setup wizard alone — as a load outside the
+    /// person's scope does. Records who each load ran as.
+    fn email_loader(
+        tools: &Arc<ToolRegistry>,
+        ran_as: &Arc<Mutex<Vec<Option<String>>>>,
+    ) -> SkillLoad {
+        let (tools, ran_as) = (Arc::clone(tools), Arc::clone(ran_as));
+        Arc::new(move |skill: &str| {
+            assert_eq!(skill, "email", "only the tool's own skill");
             let user = CURRENT_USER_ID
                 .try_with(|u| u.clone())
                 .ok()
                 .filter(|u| !u.is_empty());
-            self.ran_as.lock().unwrap().push(user.clone());
-            assert_eq!(input["skill"], "email", "only the tool's own skill");
-            self.tools
-                .register(probe("email.setup", None) as Arc<dyn Tool>);
+            ran_as.lock().unwrap().push(user.clone());
+            tools.register(probe("email.setup", None) as Arc<dyn Tool>);
             if user.as_deref() == Some("alice") {
-                self.tools
-                    .register(probe("email.inbox", None) as Arc<dyn Tool>);
-                return Ok(ToolResult::success(json!({ "enabled": true }), 1));
+                tools.register(probe("email.inbox", None) as Arc<dyn Tool>);
+                return Ok(None);
             }
-            Ok(ToolResult::success(
-                json!({
-                    "enabled": true,
-                    "context": "No email accounts configured. Use email.setup to add one.",
-                }),
-                1,
+            Ok(Some(
+                "No email accounts configured. Use email.setup to add one.".into(),
             ))
+        })
+    }
+
+    struct Loads(Arc<Mutex<Vec<Option<String>>>>);
+
+    impl Loads {
+        fn len(&self) -> usize {
+            self.0.lock().unwrap().len()
         }
     }
 
-    /// An invoker whose agent has `system.enable_skill` and no email yet;
-    /// only `allowed` may enable a skill.
-    fn enabling_invoker(allowed: &'static str) -> (GovernedInvoker, Arc<EnableSkill>) {
+    /// An invoker for agent kat with no email loaded yet; only `allowed`
+    /// may call `system.enable_skill`.
+    fn enabling_invoker(allowed: &'static str) -> (GovernedInvoker, Loads) {
         let tools = Arc::new(ToolRegistry::new());
-        let enable = Arc::new(EnableSkill {
-            tools: Arc::clone(&tools),
-            ran_as: Mutex::new(Vec::new()),
-        });
-        tools.register(Arc::clone(&enable) as Arc<dyn Tool>);
+        let ran_as = Arc::new(Mutex::new(Vec::new()));
+        let load = email_loader(&tools, &ran_as);
         let agent = AgentId::new("kat");
         let invoker = GovernedInvoker::new(
             tools,
@@ -775,9 +781,9 @@ mod tests {
                 arguments: ArgumentValidation::Off,
             }),
             Arc::new(ToolAccessSnapshot::default),
-            None,
+            Some(load),
         );
-        (invoker, enable)
+        (invoker, Loads(ran_as))
     }
 
     /// The incident: the agent had not loaded email (a restart), so its
@@ -785,13 +791,13 @@ mod tests {
     /// accounts then load — and reads their inbox, with no re-save.
     #[tokio::test]
     async fn a_tool_the_agent_has_not_loaded_is_loaded_as_the_owner_and_runs() {
-        let (invoker, enable) = enabling_invoker("alice");
+        let (invoker, loads) = enabling_invoker("alice");
         let out = invoker
             .invoke(call(Some("alice"), "email.inbox", json!({})))
             .await
             .unwrap();
         assert_eq!(out["ran_as"], "alice");
-        assert_eq!(*enable.ran_as.lock().unwrap(), vec![Some("alice".into())]);
+        assert_eq!(*loads.0.lock().unwrap(), vec![Some("alice".into())]);
 
         // Loaded now: a save resolves it without loading it again.
         assert_eq!(
@@ -800,7 +806,7 @@ mod tests {
                 .await,
             Ok(Resolved::Loaded)
         );
-        assert_eq!(enable.ran_as.lock().unwrap().len(), 1);
+        assert_eq!(loads.len(), 1);
     }
 
     #[tokio::test]
@@ -825,7 +831,7 @@ mod tests {
     /// Who may enable a skill decides here as it does for their own call.
     #[tokio::test]
     async fn a_tool_whose_skill_the_owner_may_not_enable_is_refused_with_the_fix() {
-        let (invoker, enable) = enabling_invoker("alice");
+        let (invoker, loads) = enabling_invoker("alice");
         let why = invoker
             .resolve("email.inbox", Some("bob"), "monitor:test")
             .await
@@ -835,14 +841,15 @@ mod tests {
             "{why}"
         );
         assert!(why.contains("system.enable_skill email"), "{why}");
-        assert!(enable.ran_as.lock().unwrap().is_empty(), "never ran");
+        assert_eq!(loads.len(), 0, "never loaded");
     }
 
     /// A skill that loads without the tool (no account) says why, and is
-    /// not loaded again until the agent's tools change.
+    /// not loaded again on every poll, whatever else registers meanwhile;
+    /// once someone's load brings the tool, it is there for them too.
     #[tokio::test]
     async fn a_load_that_leaves_the_tool_missing_says_why_and_is_not_repeated() {
-        let (invoker, enable) = enabling_invoker("carol");
+        let (invoker, loads) = enabling_invoker("carol");
         let why = invoker
             .resolve("email.inbox", Some("carol"), "monitor:test")
             .await
@@ -857,24 +864,46 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err, InvokeError::Unavailable(why));
-        assert_eq!(enable.ran_as.lock().unwrap().len(), 1, "tried once");
-
-        let before = invoker.generation();
         invoker
             .tools
             .register(probe("jira.search", None) as Arc<dyn Tool>);
-        assert_ne!(invoker.generation(), before, "a registration moves it");
-        let _ = invoker
+        assert!(invoker
             .resolve("email.inbox", Some("carol"), "monitor:test")
-            .await;
-        assert_eq!(enable.ran_as.lock().unwrap().len(), 2, "tried again");
+            .await
+            .is_err());
+        assert_eq!(loads.len(), 1, "loaded once");
+
+        invoker
+            .tools
+            .register(probe("email.inbox", None) as Arc<dyn Tool>);
+        assert!(invoker.has("email.inbox"));
+        assert_eq!(
+            invoker
+                .resolve("email.inbox", Some("carol"), "monitor:test")
+                .await,
+            Ok(Resolved::Loaded)
+        );
+        assert_eq!(loads.len(), 1);
+    }
+
+    /// Only the skill that names the tool is loaded: a name its family does
+    /// not list loads nothing.
+    #[tokio::test]
+    async fn a_tool_no_skill_names_loads_nothing() {
+        let (invoker, loads) = enabling_invoker("alice");
+        let why = invoker
+            .resolve("email.inbx", Some("alice"), "monitor:test")
+            .await
+            .unwrap_err();
+        assert!(why.contains("no skill provides one"), "{why}");
+        assert_eq!(loads.len(), 0);
     }
 
     /// What fixes a failed load may register nothing (an account added to
     /// the vault): it is tried again once its time is up all the same.
     #[tokio::test]
     async fn a_failed_load_is_tried_again_in_time_though_nothing_registers() {
-        let (invoker, enable) = enabling_invoker("carol");
+        let (invoker, loads) = enabling_invoker("carol");
         let invoker = invoker.with_load_retry(std::time::Duration::ZERO);
         for _ in 0..2 {
             assert!(invoker
@@ -882,7 +911,7 @@ mod tests {
                 .await
                 .is_err());
         }
-        assert_eq!(enable.ran_as.lock().unwrap().len(), 2);
+        assert_eq!(loads.len(), 2);
     }
 
     /// The incident on a real agent: the person's email account is theirs
@@ -925,7 +954,7 @@ mod tests {
             service.tools.get("email.inbox").is_none(),
             "the incident's state"
         );
-        let invoker = GovernedInvoker::for_service(Arc::clone(&service), None);
+        let invoker = GovernedInvoker::for_service(Arc::clone(&service));
 
         let resolved = invoker
             .resolve("email.inbox", Some("alice"), "monitor:alice/inbox")
@@ -937,5 +966,20 @@ mod tests {
             })
         );
         assert!(service.tools.get("email.inbox").is_some());
+
+        // Another owner's monitors leave alice's tools be: one on a tool the
+        // skill doesn't name, and one with no account of their own, which
+        // finds the tool loaded and runs it as themselves.
+        assert!(invoker
+            .resolve("email.inbx", Some("bob"), "monitor:bob/typo")
+            .await
+            .is_err());
+        assert_eq!(
+            invoker
+                .resolve("email.inbox", Some("bob"), "monitor:bob/inbox")
+                .await,
+            Ok(Resolved::Loaded)
+        );
+        assert!(service.tools.get("email.inbox").is_some(), "alice's stays");
     }
 }

@@ -69,9 +69,6 @@ pub struct MonitorEngineConfig {
     /// This hub runs Desk (`[desk] enabled`): a monitor may tell its owner
     /// there. A server hub refuses `surface = "desk"`.
     pub desk: bool,
-    /// The soonest a source whose tool was missing is polled again after
-    /// its agent's tools change, however often they change.
-    pub missing_tool_retry: Duration,
 }
 
 impl MonitorEngineConfig {
@@ -114,7 +111,6 @@ impl Default for MonitorEngineConfig {
             poll_tick: Duration::from_secs(monitor.poll_tick_secs),
             max_items: monitor.max_items,
             desk: false,
-            missing_tool_retry: Duration::from_secs(30),
         }
     }
 }
@@ -845,6 +841,10 @@ impl ToolInvoke for Unwired {
         Err("this hub runs no tools for monitors".to_string())
     }
 
+    fn has(&self, _: &str) -> bool {
+        false
+    }
+
     async fn invoke(&self, _: ToolCall<'_>) -> std::result::Result<serde_json::Value, InvokeError> {
         Err(InvokeError::Denied(
             "this hub runs no tools for monitors".to_string(),
@@ -891,11 +891,11 @@ pub struct MonitorEngine {
     /// design: a restart resets the count, and a genuinely dead channel just
     /// re-earns it. A source's count is durable, in its state row.
     sweep_failures: Mutex<HashMap<(String, String), u32>>,
-    /// Sources whose last poll found their tool missing: the agent's tool
-    /// generation after that poll, and when. One is tried again, ahead of
-    /// its cadence, once the agent's tools have changed since. In-memory: a
-    /// restart polls it on its cadence, loading the tool as its owner then.
-    missing_tools: Mutex<HashMap<MonitorKey, (u64, std::time::Instant)>>,
+    /// Sources whose last poll found their tool missing, and that tool. One
+    /// is polled again, ahead of its cadence, as soon as its tool is loaded
+    /// on the agent. In-memory: after a restart it polls on its cadence,
+    /// loading the tool as its owner then.
+    missing_tools: Mutex<HashMap<MonitorKey, String>>,
     peers: PeerEngines,
     config: MonitorEngineConfig,
 }
@@ -1073,7 +1073,6 @@ impl MonitorEngine {
             ));
         }
         if let Some(source) = m.source() {
-            notes.extend(self.callable(&source.tool, owner, &m.id).await?);
             if source.every_secs() < self.config.min_poll_secs {
                 return Err(format!(
                     "every_secs {} is below this hub's minimum of {} ([monitor] min_poll_secs)",
@@ -1081,9 +1080,6 @@ impl MonitorEngine {
                     self.config.min_poll_secs
                 ));
             }
-        }
-        if let Action::RunSkill { tool, .. } = &m.action {
-            notes.extend(self.callable(tool, owner, &m.id).await?);
         }
         if m.decide.is_some() && !self.decide.available() {
             return Err(
@@ -1104,6 +1100,14 @@ impl MonitorEngine {
                         .to_string(),
                 );
             }
+        }
+        // Last, as finding a tool may load its skill for the owner: a
+        // definition refused for anything else has changed nothing.
+        if let Some(source) = m.source() {
+            notes.extend(self.callable(&source.tool, owner, &m.id).await?);
+        }
+        if let Action::RunSkill { tool, .. } = &m.action {
+            notes.extend(self.callable(tool, owner, &m.id).await?);
         }
         Ok(notes)
     }
@@ -1553,31 +1557,32 @@ impl MonitorEngine {
         .await;
     }
 
-    /// Make due now each of `keys` whose last poll found its tool missing,
-    /// when the agent's tools have changed since (a skill enabled, a tool
-    /// registered): it need not wait out its cadence, nor be re-saved.
+    /// Make due now each of `keys` whose last poll found its tool missing
+    /// and whose tool is loaded now (a skill enabled, a tool installed): it
+    /// need not wait out its cadence, nor be re-saved.
     async fn bring_forward_registered(&self, keys: &[MonitorKey]) {
-        let generation = self.invoker.generation();
         let retry: Vec<MonitorKey> = {
+            let live: HashSet<&MonitorKey> = keys.iter().collect();
             let mut missing = self.missing_tools.lock().unwrap_or_else(|e| e.into_inner());
-            missing.retain(|key, _| keys.contains(key));
+            missing.retain(|key, _| live.contains(key));
             missing
-                .iter_mut()
-                .filter(|(_, (seen, at))| {
-                    *seen != generation && at.elapsed() >= self.config.missing_tool_retry
-                })
-                .map(|(key, (seen, _))| {
-                    *seen = generation;
-                    key.clone()
-                })
+                .iter()
+                .filter(|(_, tool)| self.invoker.has(tool))
+                .map(|(key, _)| key.clone())
                 .collect()
         };
         for key in retry {
             match self.store.bring_forward_failing(&key).await {
-                Ok(true) => {
-                    tracing::info!(monitor = %key.monitor_id, "the agent's tools changed: polling a monitor whose tool was missing again")
+                Ok(brought) => {
+                    // Its next poll settles it, whatever it finds.
+                    self.missing_tools
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&key);
+                    if brought {
+                        tracing::info!(monitor = %key.monitor_id, "a monitor's missing tool is loaded: polling it now");
+                    }
                 }
-                Ok(false) => {}
                 Err(e) => {
                     warn!(monitor = %key.monitor_id, error = %e, "bringing a monitor's poll forward failed")
                 }
@@ -1644,28 +1649,35 @@ impl MonitorEngine {
                 input: source.input.clone(),
             })
             .await;
+        let was_missing = |engine: &Self| {
+            engine
+                .missing_tools
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key)
+                .is_some()
+        };
         let output = match read {
             Ok(output) => {
-                self.missing_tools
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&key);
+                was_missing(self);
                 output
             }
             Err(InvokeError::Unavailable(e)) => {
-                self.missing_tools
+                let first = self
+                    .missing_tools
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert(
-                        key.clone(),
-                        (self.invoker.generation(), std::time::Instant::now()),
-                    );
-                return self.poll_failed(mon, &key, state, &e, next_due, true).await;
+                    .insert(key.clone(), source.tool.clone())
+                    .is_none();
+                return self
+                    .poll_failed(mon, &key, state, &e, next_due, Some(first))
+                    .await;
             }
             Err(e) => {
+                was_missing(self);
                 return self
-                    .poll_failed(mon, &key, state, e.message(), next_due, false)
-                    .await
+                    .poll_failed(mon, &key, state, e.message(), next_due, None)
+                    .await;
             }
         };
         let outcome = match observe(
@@ -1677,11 +1689,7 @@ impl MonitorEngine {
             self.config.max_items,
         ) {
             Ok(outcome) => outcome,
-            Err(e) => {
-                return self
-                    .poll_failed(mon, &key, state, &e, next_due, false)
-                    .await
-            }
+            Err(e) => return self.poll_failed(mon, &key, state, &e, next_due, None).await,
         };
         if outcome.truncated || outcome.skipped > 0 {
             warn!(monitor = %id, tool = %source.tool, seen = outcome.seen, skipped = outcome.skipped,
@@ -1702,7 +1710,7 @@ impl MonitorEngine {
             let error = format!("poll state write failed: {e}");
             self.close_claims(id, &won, &error).await;
             return self
-                .poll_failed(mon, &key, state, &error, next_due, false)
+                .poll_failed(mon, &key, state, &error, next_due, None)
                 .await;
         }
         let fired = won.len();
@@ -1734,9 +1742,12 @@ impl MonitorEngine {
 
     /// Count a failed poll durably, where its status shows it failing and
     /// why; at the threshold the monitor is disabled and its owner told. A
-    /// failure is logged when it starts or changes, not on every poll, and
-    /// one whose tool is `missing` tells its owner as it starts: nothing
-    /// they or their agent can see would say so otherwise.
+    /// failure is logged at warn when it starts or changes, at debug while it
+    /// repeats. `missing`: its tool could not be found or loaded, and this is
+    /// the first such poll (`Some(true)`) — its owner is told then, as
+    /// nothing they or their agent see would say so otherwise. Such a
+    /// failure is not counted towards the auto-disable: the monitor is
+    /// polled again as soon as its tool loads, as the notice says.
     async fn poll_failed(
         &self,
         mon: &OwnedMonitor,
@@ -1744,16 +1755,15 @@ impl MonitorEngine {
         previous: Option<&SourceState>,
         error: &str,
         next_due: DateTime<Utc>,
-        missing: bool,
+        missing: Option<bool>,
     ) -> PollReport {
         let id = mon.def.monitor.id.as_str();
-        let fresh = previous.and_then(|s| s.error.as_deref()) != Some(error);
-        if fresh {
+        if previous.and_then(|s| s.error.as_deref()) != Some(error) {
             warn!(monitor = %id, error, "monitor poll failed");
         } else {
             tracing::debug!(monitor = %id, error, "monitor poll failed again");
         }
-        if missing && fresh {
+        if missing == Some(true) {
             self.tell_owner(mon, "tool_missing", &missing_tool_notice(&mon.def, error))
                 .await;
         }
@@ -1765,7 +1775,7 @@ impl MonitorEngine {
             }
         };
         let threshold = self.config.auto_disable_after_failures;
-        if threshold > 0 && failures >= threshold {
+        if missing.is_none() && threshold > 0 && failures >= threshold {
             let what = format!(
                 "polls of {}",
                 mon.def
@@ -2444,15 +2454,12 @@ mod tests {
         outputs: std::sync::Mutex<VecDeque<std::result::Result<Value, InvokeError>>>,
         calls: std::sync::Mutex<Vec<(Option<String>, String, Value)>>,
         known: std::sync::Mutex<HashSet<String>>,
-        generation: std::sync::atomic::AtomicU64,
     }
 
     impl FakeInvoker {
         /// A tool registers on the agent.
         fn register(&self, tool: &str) {
             self.known.lock().unwrap().insert(tool.to_string());
-            self.generation
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         fn knowing(tools: &[&str]) -> Arc<Self> {
@@ -2487,8 +2494,8 @@ mod tests {
             }
         }
 
-        fn generation(&self) -> u64 {
-            self.generation.load(std::sync::atomic::Ordering::Relaxed)
+        fn has(&self, tool: &str) -> bool {
+            self.known.lock().unwrap().contains(tool)
         }
 
         async fn invoke(&self, call: ToolCall<'_>) -> std::result::Result<Value, InvokeError> {
@@ -3805,6 +3812,14 @@ template = "x"
         }
     }
 
+    async fn source_state_of(store: &MonitorStore, key: &MonitorKey) -> Option<SourceState> {
+        store
+            .source_states(std::slice::from_ref(key))
+            .await
+            .unwrap()
+            .remove(key)
+    }
+
     async fn source_state(store: &MonitorStore, id: &str) -> Option<SourceState> {
         store
             .source_states(&[MonitorKey::new(id, None)])
@@ -3998,7 +4013,7 @@ template = "x"
                     sink.clone() as Arc<dyn ActionSink>,
                     agent("atlas", true),
                     MonitorEngineConfig {
-                        missing_tool_retry: Duration::ZERO,
+                        auto_disable_after_failures: 2,
                         ..MonitorEngineConfig::default()
                     },
                 )
@@ -4019,18 +4034,33 @@ template = "x"
                 assert!(told[0].2.contains(missing), "{told:?}");
                 assert!(told[0].2.contains("no need to save it again"), "{told:?}");
 
+                // Something else registers: it keeps its cadence.
+                invoker.register("other.tool");
                 engine.poll_due().await;
                 assert_eq!(
                     invoker.calls().len(),
                     1,
-                    "nothing changed: it keeps its cadence"
+                    "its own tool is still missing: it keeps its cadence"
                 );
 
-                // The skill is enabled: the agent's tools change.
+                // Past the auto-disable threshold (2), still missing: not
+                // disabled, not told again — what the notice promised.
+                let mon = engine.runtime.get("src", Some("alice")).await.unwrap();
+                for _ in 0..2 {
+                    invoker.answer(Err(InvokeError::Unavailable(missing.into())));
+                    let state = source_state_of(&store, &mon.monitor_key()).await;
+                    engine.poll(&mon, state.as_ref()).await;
+                }
+                assert_eq!(invoker.calls().len(), 3);
+                let mon = engine.runtime.get("src", Some("alice")).await.unwrap();
+                assert!(mon.enabled(), "a missing tool never auto-disables");
+                assert_eq!(sink.notices().len(), 1, "told once");
+
+                // The skill is enabled: its tool is loaded on the agent.
                 invoker.register("jira.search");
                 invoker.answer(Ok(issues(&[("A-1", "open")])));
                 engine.poll_due().await;
-                assert_eq!(invoker.calls().len(), 2, "polled again at once");
+                assert_eq!(invoker.calls().len(), 4, "polled again at once");
                 let summary = engine.summary_of("src", Some("alice")).await.unwrap();
                 assert_eq!(summary.status, crate::monitor::MonitorStatus::Active);
                 assert_eq!(summary.poll.as_ref().unwrap().error, None);

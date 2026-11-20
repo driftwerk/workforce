@@ -51,7 +51,6 @@ pub(crate) async fn wire(
     config: &WorkforceConfig,
     agent_config: Option<&AgentConfig>,
     def_write_auth: &crate::def_write_auth::TurnDefWriteAuth,
-    adapter_loader: &crate::wasm_tool_invoker::AdapterLoader,
 ) {
     let monitors_dir = std::path::PathBuf::from(&config.hub.data_dir).join("monitors");
     let monitor_runtime = Arc::new(super::MonitorRuntime::new(monitors_dir));
@@ -96,10 +95,7 @@ pub(crate) async fn wire(
             // Sources are read, and skill actions run, through the
             // gauntlet an agent call faces, as the monitor's owner.
             let invoker: Arc<dyn super::ToolInvoke> =
-                Arc::new(super::GovernedInvoker::for_service(
-                    Arc::clone(service),
-                    Some(Arc::clone(adapter_loader)),
-                ));
+                Arc::new(super::GovernedInvoker::for_service(Arc::clone(service)));
             let sink: Arc<dyn super::ActionSink> = Arc::new(
                 super::WorkflowNotifySink::new(
                     wf_runtime,

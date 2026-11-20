@@ -2304,17 +2304,13 @@ pub fn static_skill_tool_names(skill_name: &str) -> Vec<&'static str> {
     }
 }
 
-/// The built-in skill that provides `tool`: the one whose tools name it,
-/// else the one its family (`email` of `email.inbox`) is named after.
+/// The built-in skill whose tools name `tool` exactly. A name a skill does
+/// not list (a typo in its family) is no skill's.
 pub fn skill_of_tool(tool: &str) -> Option<&'static str> {
-    let catalog = builtin_skill_catalog();
-    let loadable = || catalog.iter().filter(|meta| meta.name != "slack");
-    loadable()
+    builtin_skill_catalog()
+        .iter()
+        .filter(|meta| meta.name != "slack")
         .find(|meta| static_skill_tool_names(meta.name).contains(&tool))
-        .or_else(|| {
-            let family = tool.split_once('.')?.0;
-            loadable().find(|meta| meta.tool_prefix == family)
-        })
         .map(|meta| meta.name)
 }
 
