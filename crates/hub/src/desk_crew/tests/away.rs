@@ -570,6 +570,13 @@ async fn a_check_in_that_only_tells_gathers_while_away() {
             .insert("desk".into(), chrono::Utc::now());
         crew.present(true, None);
         let store = d.store();
+        // The boss's updates begin before what they are to say happens: an
+        // update says only what happened since they began, which its first
+        // look sets, and on a slow runner that look can come after this.
+        store
+            .update_state("desk", chrono::Utc::now())
+            .await
+            .unwrap();
         let s = session_party("acme-web");
         d.note(Event::new(
             Kind::Finished,
