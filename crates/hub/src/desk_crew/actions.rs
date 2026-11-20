@@ -1070,6 +1070,17 @@ impl CrewHub {
             .map(|(s, _)| s.agent_id.as_str().to_string())
     }
 
+    /// Whether the boss is giving the answer to the question session `s`'s
+    /// turn ended on, and that is still what it asks.
+    fn answers_turn(&self, s: Uuid) -> bool {
+        let asked = self.turn_answers.lock().get(&s).cloned();
+        asked.is_some_and(|ask| {
+            self.desk
+                .view(s)
+                .is_ok_and(|v| super::answer::question_of(&v).is_some_and(|q| q.ask == ask))
+        })
+    }
+
     /// The session `action` is done to, when it is one.
     pub(crate) fn session_of(action: &Action) -> Option<Uuid> {
         match action {
@@ -2062,6 +2073,23 @@ impl CrewHub {
                     // On its line: it gets it once its turn ends, never typed
                     // in over what it is doing (Interrupt is for that); a
                     // boss's urgent one, with its next tool call's result.
+                    // The answer to the question its turn ended on, while
+                    // that is still what it asks: it goes in as the answer.
+                    None if self.answers_turn(*s) => {
+                        let (answer, _) = d
+                            .line_send_with(
+                                sender,
+                                workforce_desk::line::Send::Answer {
+                                    to: *s,
+                                    text: message.clone(),
+                                },
+                                None,
+                            )
+                            .await
+                            .map_err(line)?;
+                        done.line = Some((answer.id, answer.delivery));
+                        Ok(format!("answered {name}"))
+                    }
                     None => {
                         let urgency = super::urgent::of(order, &sender);
                         let (told, rushed) = d

@@ -1109,7 +1109,7 @@ async fn a_held_session_takes_only_the_persons_messages_and_a_delivery_never_let
 }
 
 #[tokio::test]
-async fn a_session_asking_the_person_takes_no_one_elses_answer() {
+async fn a_session_asking_the_person_takes_no_peers_answer() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let d = desk(pool, dir.path()).await;
@@ -1140,45 +1140,86 @@ async fn a_session_asking_the_person_takes_no_one_elses_answer() {
     .await;
 }
 
+/// A session whose turn ended asking: idle at its prompt, `Asking`. The
+/// person prompted it (`prompted`), or not (its boss runs it).
+async fn ends_asking(d: &Desk, id: Uuid, reply: &str, prompted: bool) {
+    if prompted {
+        hook(
+            d,
+            id,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "status?"}),
+        )
+        .await;
+    }
+    hook(
+        d,
+        id,
+        json!({"hook_event_name": "Stop", "last_assistant_message": reply}),
+    )
+    .await;
+    until(|| d.view(id).is_ok_and(|v| v.state == SessionState::Asking)).await;
+    assert!(
+        d.view(id).unwrap().pending.is_none(),
+        "no dialog on its screen"
+    );
+}
+
 #[tokio::test]
-async fn its_bosss_message_goes_in_as_the_answer_when_its_turn_ended_on_a_question() {
+async fn its_bosss_answer_goes_in_when_its_turn_ended_on_a_question_and_nothing_else_of_its() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let d = desk(pool, dir.path()).await;
         let by = sarah_bosses(&d);
+        // A session the person runs, its turn ended on their question.
         let s = new_session(&d, dir.path()).await;
         idle(&d, s.id).await;
-        hook(
+        ends_asking(
             &d,
             s.id,
-            json!({"hook_event_name": "UserPromptSubmit", "prompt": "status?"}),
+            "The release is built. Should I go ahead and ship it?",
+            true,
         )
         .await;
-        hook(
-            &d,
-            s.id,
-            json!({"hook_event_name": "Stop",
-                "last_assistant_message": "The release is built. Should I go ahead and ship it?"}),
-        )
-        .await;
-        until(|| d.view(s.id).is_ok_and(|v| v.state == SessionState::Asking)).await;
         let v = d.view(s.id).unwrap();
-        assert!(v.pending.is_none(), "no dialog on its screen");
-        // A peer's words still wait on the person's answer.
         let peer = new_session(&d, dir.path()).await;
         idle(&d, peer.id).await;
         let theirs = d
             .line_send(Sender::Session(peer.id), tell(s.id, "ship it"))
             .await
             .unwrap();
-        // Its boss's go in, as the answer.
-        let answer = d
-            .line_send(Sender::Overseer(by), tell(s.id, "Yes, ship it."))
+        // Its boss's other words (a status question) aren't the answer.
+        let status = d
+            .line_send(Sender::Overseer(by.clone()), tell(s.id, "Where are you?"))
             .await
             .unwrap();
+        // No session gives another's answer.
+        assert!(matches!(
+            d.line_send(
+                Sender::Session(peer.id),
+                Send::Answer {
+                    to: s.id,
+                    text: "ship it".into()
+                },
+            )
+            .await,
+            Err(LineError::Refused(Refusal::NotYours))
+        ));
+        // Its boss's answer goes in, as the answer.
+        let answer = d
+            .line_send(
+                Sender::Overseer(by.clone()),
+                Send::Answer {
+                    to: s.id,
+                    text: "Yes, ship it.".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer.kind, LineKind::Answer);
         let thread = d.line_thread(s.id, None, None).await.unwrap();
         let waiting = |id| thread.iter().find(|m| m.id == id).unwrap().waiting;
         assert_eq!(waiting(theirs.id), Some(Wait::Asking));
+        assert_eq!(waiting(status.id), Some(Wait::Asking), "not its answer");
         assert_eq!(waiting(answer.id), None, "nothing holds its boss's answer");
         let next = d.line_next(s.id, Duration::from_secs(1)).await.unwrap();
         assert_eq!(next["id"], json!(answer.id));
@@ -1186,6 +1227,32 @@ async fn its_bosss_message_goes_in_as_the_answer_when_its_turn_ended_on_a_questi
         let refused = d.send_now_how(&v, &theirs).unwrap_err();
         assert!(refused.contains("Its turn ended asking you"), "{refused}");
         assert!(!refused.contains("dialog"), "{refused}");
+
+        // A session its boss runs takes that boss's words as the answer.
+        let run = new_session(&d, dir.path()).await;
+        idle(&d, run.id).await;
+        d.take_on(
+            run.id,
+            &by.party,
+            crate::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        ends_asking(
+            &d,
+            run.id,
+            "The replica is ready. Should I switch reads to it?",
+            false,
+        )
+        .await;
+        let go = d
+            .line_send(Sender::Overseer(by), tell(run.id, "Yes, switch them."))
+            .await
+            .unwrap();
+        let next = d.line_next(run.id, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(next["id"], json!(go.id));
     })
     .await;
 }

@@ -652,6 +652,11 @@ impl Desk {
             Send::Reply { to, text } => return Ok((self.line_answer(to, from, text).await?, None)),
             Send::Ask { to, text, .. } => (to, text, LineKind::Ask, When::Queue),
             Send::Tell { to, text, when } => (to, text, LineKind::Tell, when),
+            // A session answers no other's turn: its boss or the person do.
+            Send::Answer { .. } if matches!(from, Sender::Session(_)) => {
+                return Err(Refusal::NotYours.into())
+            }
+            Send::Answer { to, text } => (Target::Session(to), text, LineKind::Answer, When::Queue),
         };
         let text = line::typable(&text).trim().to_string();
         if text.is_empty() {
@@ -1611,10 +1616,11 @@ impl Desk {
     /// Why `m` mustn't go into `view` now, whatever its engine could take:
     /// a session Desk's breaker paused takes only the person's own
     /// messages; one the person drives, none of its boss's; one whose turn
-    /// ended asking the person something, only theirs or its boss's (at
-    /// its prompt, with no dialog on screen, the boss's words go in as the
-    /// answer). A dialog on screen holds every message in
-    /// [`line::deliverable`] until it is answered.
+    /// ended asking the person something, only theirs, or a boss's that
+    /// runs it or gives its answer ([`Send::Answer`]): at its prompt, with
+    /// no dialog on screen, those go in as the answer. A dialog on screen
+    /// holds every message in [`line::deliverable`] until it is answered
+    /// and its turn ends.
     pub(super) fn line_gate(&self, view: &SessionView, m: &LineMessage) -> Option<Wait> {
         if m.from.kind == PartyKind::You {
             return None;
@@ -1628,14 +1634,20 @@ impl Desk {
         if self.mode_ending(view.id) {
             return Some(Wait::ModeEnding);
         }
+        // A boss's answer to the question its turn ended on, not to an ask.
+        let answers = m.kind == LineKind::Answer && m.in_reply_to.is_none();
         if m.from.kind == PartyKind::Manager
-            && m.kind == LineKind::Tell
+            && (m.kind == LineKind::Tell || answers)
             && self.person_driving(view.id)
         {
             return Some(Wait::PersonDriving);
         }
-        (view.state == SessionState::Asking && m.from.kind != PartyKind::Manager)
-            .then_some(Wait::Asking)
+        let boss_runs = || {
+            self.charge_of(view.id)
+                .is_some_and(|c| c.live() && c.boss == m.from.id)
+        };
+        let answered = m.from.kind == PartyKind::Manager && (answers || boss_runs());
+        (view.state == SessionState::Asking && !answered).then_some(Wait::Asking)
     }
 
     /// Desk's plugin in `id`, waiting on its line, looks again now: a turn

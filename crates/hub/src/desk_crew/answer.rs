@@ -431,7 +431,10 @@ impl CrewHub {
                     message: text,
                     reply_to: None,
                 };
-                match self.perform(&action, By::manager(boss, &name, &why)).await {
+                self.turn_answers.lock().insert(view.id, q.ask.clone());
+                let performed = self.perform(&action, By::manager(boss, &name, &why)).await;
+                self.turn_answers.lock().remove(&view.id);
+                match performed {
                     Ok(done) => {
                         tracing::info!(session = %view.id, %boss, %done, "the boss answered a question itself");
                     }

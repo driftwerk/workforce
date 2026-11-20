@@ -249,10 +249,8 @@ impl Desk {
                     "Its turn ended asking you something: answer that, and this goes in after."
                 }
                 line::Wait::ModeEnding => "Desk is putting it back in its own mode first.",
-                line::Wait::Dialog => {
-                    "It's waiting on a dialog in its terminal: answer that first."
-                }
-                line::Wait::Stopped
+                line::Wait::Dialog
+                | line::Wait::Stopped
                 | line::Wait::Working
                 | line::Wait::Typing
                 | line::Wait::NextCall => "It can't take this now.",

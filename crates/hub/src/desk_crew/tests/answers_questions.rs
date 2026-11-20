@@ -108,6 +108,14 @@ async fn act_fully_answers_a_sessions_question_itself_once_the_person_is_quiet_a
         .await;
         assert_eq!(answer, "Yes, ship it to staging.");
         assert_eq!(calls_about(&llm, "Ship it?").await.len(), 1, "one call");
+        // Given as the answer to the question its turn ended on.
+        let thread = d.line_thread(s.id, None, None).await.unwrap();
+        let row = thread.iter().find(|m| m.text == answer).unwrap();
+        assert_eq!(
+            (row.kind, row.in_reply_to),
+            (workforce_desk::line::LineKind::Answer, None),
+            "{row:?}"
+        );
         let kept = eventually("its decision", async || {
             let rows = d.store().decisions_since("desk", since, 50).await.unwrap();
             rows.into_iter().find(|r| r.session == Some(s.id))
@@ -558,6 +566,15 @@ async fn at_act_the_bosss_nudge_answers_a_session_whose_turn_ended_on_a_question
             .find(|m| m.text.starts_with("Yes, go ahead"))
             .expect("the nudge on its line");
         assert_eq!(row.waiting, None, "nothing holds it: {row:?}");
+        let id = row.id;
+        eventually("the boss's answer to go in", async || {
+            d.store()
+                .line_message(id)
+                .await
+                .unwrap()
+                .filter(|m| m.delivery != workforce_desk::line::Delivery::Queued)
+        })
+        .await;
     })
     .await;
 }

@@ -245,10 +245,12 @@ pub enum Wait {
     Paused,
     /// Its turn ended asking the person something, in its reply or on a
     /// tool auto mode refused: it is at its prompt with nothing on screen,
-    /// and only the person, or its own boss, answers it.
+    /// and only the person answers it, or a boss: the one that runs it, or
+    /// one giving its answer ([`Send::Answer`]).
     Asking,
     /// A dialog in its terminal (a permission request, or questions it
-    /// asks there) waits on an answer: it gets this once that is answered.
+    /// asks there) waits on an answer: it gets this once that is answered
+    /// and its turn ends.
     Dialog,
     /// The person has the wheel of a session a boss runs: the boss's
     /// messages wait until their hold is up or they hand it back.
@@ -680,6 +682,12 @@ pub enum Send {
         to: Uuid,
         text: String,
     },
+    /// The answer to the question session `to`'s turn ended on: only its
+    /// boss or the person gives one.
+    Answer {
+        to: Uuid,
+        text: String,
+    },
 }
 
 /// What an ask says besides its question and default.
@@ -868,7 +876,7 @@ pub fn peers<'a>(
 pub fn hop_of(send: &Send, cause: i16, asked: Option<&LineMessage>) -> i16 {
     match send {
         Send::Reply { .. } => asked.map_or(cause, |a| a.hop),
-        Send::Ask { .. } | Send::Tell { .. } => cause + 1,
+        Send::Ask { .. } | Send::Tell { .. } | Send::Answer { .. } => cause + 1,
     }
 }
 
