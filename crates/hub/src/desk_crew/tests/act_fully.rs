@@ -165,3 +165,38 @@ async fn act_fully_needs_no_repositories_and_falls_back_to_act_only_over_its_bud
     })
     .await;
 }
+
+/// At Act fully the boss is told, wherever it decides (its wake-ups, its
+/// own conversation and its DM), to aim at the end state the person
+/// ordered, run independent steps side by side, and never hold the
+/// deliverable behind polish.
+#[test]
+fn act_fully_aims_at_the_end_state_in_parallel_without_polish_first() {
+    let o = Oversight {
+        enabled: true,
+        level: Level::Full,
+        ..Oversight::default()
+    };
+    let said = [
+        super::super::CrewHub::boss_hint(&o),
+        super::super::CrewHub::dm_hint(Level::Full, &o, true),
+        super::super::CrewHub::dm_hint(Level::Full, &o, false),
+        super::super::CrewHub::level_hint(Level::Full, &o),
+    ];
+    for hint in &said {
+        assert!(
+            hint.contains("Aim straight at the end state an order names"),
+            "{hint}"
+        );
+        assert!(
+            hint.contains("don't depend on each other at once"),
+            "{hint}"
+        );
+        assert!(
+            hint.contains("Never hold the deliverable behind optional polish"),
+            "{hint}"
+        );
+    }
+    let act = super::super::CrewHub::level_hint(Level::Act, &o);
+    assert!(!act.contains("end state"), "{act}");
+}
