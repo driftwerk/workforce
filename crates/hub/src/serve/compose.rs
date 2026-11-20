@@ -781,6 +781,8 @@ pub(super) async fn build_inner(
         permission_evaluator,
         ..
     } = skills;
+    // What background work uses of a plan is kept with the cost ledger.
+    crate::plan_guard::PlanGuard::global().keep_in(Arc::clone(&telemetry_store));
     let scheduler = scheduler.map(|scheduler| scheduler as Arc<dyn crate::hosts::SchedulerHost>);
     let JobRunning {
         active_runners: active_runners_for_jobs,
@@ -2696,8 +2698,8 @@ fn register_code_tools(
         tools,
         ..
     } = toolbox;
-    // Register native coding tools, each held to "always work in real
-    // sessions" (`crate::sessions_only`).
+    // Register native coding tools, each held to the boss's "How it works"
+    // style (`crate::sessions_only`).
     let bounds = crate::sessions_only::Bounds::of_agent(workspace, tool_paths[1..].to_vec());
     // Every tool the agent has, and every one it gets later (MCP, WASM,
     // skills, coding sessions), and every copy a turn or worker runs on.

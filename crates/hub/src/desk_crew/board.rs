@@ -25,7 +25,7 @@ pub const DESCRIPTION: &str = "The board's tickets that matter now, by board: th
 with everything they need done), the ones being done, and the blocked ones (to do, waiting on \
 tickets that aren't done), each with its key (like ACM-12), who has it (with their session or agent \
 id) and what it waits on. Hand a ready ticket out with crew.assign_ticket and move one with \
-crew.move_ticket, both by its key. With plan_id, one plan's tickets instead, in its order: each \
+crew.move_ticket, both by its key; read one in full with crew.ticket. With plan_id, one plan's tickets instead, in its order: each \
 with its key, column, needs and where it runs (machine, folder, engine, model), and with briefs \
 (true, or a list of keys) what each says, so you can read a ticket back before you change it.";
 
@@ -76,7 +76,11 @@ pub(crate) const NO_SESSION: &str = "in Doing, no session";
 /// Who has a ticket, with the id the overseer addresses them by. A session
 /// that `live` says no longer runs doesn't have it: a ticket in Doing says
 /// it has no session.
-fn holder(v: &TicketView, live: &dyn Fn(&str) -> bool) -> String {
+fn holder(
+    v: &TicketView,
+    live: &dyn Fn(&str) -> bool,
+    login: &dyn Fn(&str) -> Option<String>,
+) -> String {
     match &v.ticket.assignee {
         None => String::new(),
         Some(a) => match a.kind {
@@ -86,7 +90,10 @@ fn holder(v: &TicketView, live: &dyn Fn(&str) -> bool) -> String {
             PartyKind::Session if !live(&a.id) => {
                 format!("{} (session {}, no longer running)", a.name, a.id)
             }
-            PartyKind::Session => format!("{} (session {})", a.name, a.id),
+            PartyKind::Session => match login(&a.id) {
+                Some(l) => format!("{} (session {}, on login {l})", a.name, a.id),
+                None => format!("{} (session {})", a.name, a.id),
+            },
             PartyKind::Agent => format!("{} (agent {})", a.name, a.id),
             _ => a.name.clone(),
         },
@@ -102,6 +109,7 @@ fn table(
     views: &[&TicketView],
     waits: &HashMap<Uuid, String>,
     live: &dyn Fn(&str) -> bool,
+    login: &dyn Fn(&str) -> Option<String>,
 ) -> String {
     let mut rows: Vec<(Column, &TicketView)> = views
         .iter()
@@ -128,7 +136,7 @@ fn table(
             v.key.as_deref().unwrap_or("-"),
             cell(&v.ticket.said_title()),
             c.word(),
-            cell(&holder(v, live)),
+            cell(&holder(v, live, login)),
             cell(&waiting),
         ));
     }
@@ -236,7 +244,10 @@ impl CrewHub {
             out.push_str(&format!(
                 "Board “{}”:\n{}\n",
                 cell(&name),
-                table(&on, &waits, &|id| self.session_runs(id))
+                table(&on, &waits, &|id| self.session_runs(id), &|id| {
+                    let id = id.parse::<Uuid>().ok()?;
+                    self.desk.view(id).ok()?.account.map(|a| a.name)
+                })
             ));
         }
         if out.is_empty() {
@@ -354,6 +365,7 @@ impl CrewHub {
                 about: None,
                 group: b.group.clone(),
                 handed: None,
+                routine: false,
             }));
         }
         out

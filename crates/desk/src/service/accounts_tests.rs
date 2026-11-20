@@ -24,6 +24,9 @@ use crate::store::{build_pool, DeskStore};
 /// What the fake CLI takes as a working token.
 const GOOD: &str = "sk-ant-oat01-good-0123456789abcdefghijklmnopqrstuvwxyz";
 const OTHER: &str = "sk-ant-oat01-good-other-9876543210zyxwvutsrqponmlkjihgf";
+/// Signs in, but the provider turns its account away: its organisation
+/// turned Claude Code off.
+const REFUSED: &str = "sk-ant-oat01-good-refused-5555555555abcdefghijklmnopqr";
 
 /// A stand-in Claude Code: says its version, signs in by a "good" token
 /// (and by itself, unless the file `SIGNED_OUT_HERE` names is there: a
@@ -52,6 +55,12 @@ fn claude(dir: &Path) -> PathBuf {
                esac ;;\n\
                *) echo '{{\"loggedIn\":false}}' ;;\n\
              esac ;;\n\
+             '-p --model') t=$(cat <&3 2>/dev/null); echo \"$t\" >> '{d}/probes'\n\
+               case \"$t\" in\n\
+                 *refused*) echo '{{\"type\":\"result\",\"is_error\":true,\"result\":\"Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead\"}}' ;;\n\
+                 *full*) echo '{{\"type\":\"result\",\"is_error\":true,\"result\":\"You’ve hit your weekly limit · resets 4pm (Europe/London)\"}}' ;;\n\
+                 *) echo '{{\"type\":\"result\",\"is_error\":false,\"result\":\"OK\"}}' ;;\n\
+               esac ;;\n\
              'setup-token ') [ -n \"$BROWSER\" ] && \"$BROWSER\" 'https://claude.ai/oauth/authorize?code=true&redirect_uri=http%3A%2F%2Flocalhost%3A45678%2Fcallback&state=s1'\n\
                echo 'Browser did not open? Use the url below to sign in:'\n\
                echo 'https://claude.ai/oauth/authorize?code=true&state=s1'\n\
@@ -1196,6 +1205,8 @@ async fn a_working_session_switches_after_its_turn_and_one_on_its_limit_carries_
         let dir = tempfile::tempdir().unwrap();
         let keys = Arc::new(MemoryKeys::default());
         let d = desk(pool, account_options(dir.path(), keys)).await;
+        // The person's own moves: Desk moves nothing by itself.
+        d.set_auto_switch(false).await.unwrap();
         let work = paste(&d, "Work", GOOD, true).await;
         let personal = paste(&d, "Personal", OTHER, false).await;
 
@@ -1410,6 +1421,8 @@ async fn an_account_at_its_limit_asks_to_switch_all_and_asks_back_once_it_resets
             account_options(dir.path(), Arc::new(MemoryKeys::default())),
         )
         .await;
+        // The person's own moves: Desk moves nothing by itself.
+        d.set_auto_switch(false).await.unwrap();
         let (work, personal, a, b) = two_on_work(&d, dir.path()).await;
         assert!(d.account_needs().is_empty());
         stops_on_its_limit(&d, a);
@@ -1436,7 +1449,12 @@ async fn an_account_at_its_limit_asks_to_switch_all_and_asks_back_once_it_resets
         // Switch all: the one stopped on its limit carries on, the idle one
         // restarts, both on Personal.
         let done = d
-            .switch_all(Engine::Claude, Some(work), Some(personal))
+            .switch_all(
+                Engine::Claude,
+                Some(work),
+                Some(personal),
+                crate::crew::By::you(),
+            )
             .await
             .unwrap();
         assert_eq!(done.now.len(), 2, "{done:?}");
@@ -1487,9 +1505,14 @@ async fn an_account_at_its_limit_asks_to_switch_all_and_asks_back_once_it_resets
             "{need:?}"
         );
         assert_eq!(d.view(a).unwrap().account.map(|x| x.id), Some(personal));
-        d.switch_all(Engine::Claude, Some(personal), Some(work))
-            .await
-            .unwrap();
+        d.switch_all(
+            Engine::Claude,
+            Some(personal),
+            Some(work),
+            crate::crew::By::you(),
+        )
+        .await
+        .unwrap();
         assert!(d.account_needs().is_empty());
     })
     .await;
@@ -1611,7 +1634,7 @@ async fn a_turn_stopped_by_its_plans_limit_moves_at_once_and_carries_on() {
         std::fs::write(&transcript, error_line(true)).unwrap();
         let (env, args) = started(dir.path(), a, 1).await;
         assert_eq!(env["TOKEN_ON_FD"], OTHER);
-        assert!(args.trim_end().ends_with("Continue"), "{args}");
+        assert!(told_desk_moved_it(&args), "{args}");
         let (env, args) = started(dir.path(), b, 1).await;
         assert_eq!(env["TOKEN_ON_FD"], OTHER);
         assert!(!args.contains("Continue"), "{args}");
@@ -1657,6 +1680,8 @@ async fn a_limit_hit_while_background_work_runs_still_moves_the_session_at_once(
             key_options(dir.path(), Arc::new(MemoryKeys::default())),
         )
         .await;
+        // The person's own moves: Desk moves nothing by itself.
+        d.set_auto_switch(false).await.unwrap();
         let (_, personal, a, _) = two_on_work(&d, dir.path()).await;
         // Asked to move while it works: it waits for the turn to end.
         d.apply_hook(
@@ -1701,6 +1726,8 @@ async fn the_transcript_decides_what_a_rate_limit_was() {
             key_options(dir.path(), Arc::new(MemoryKeys::default())),
         )
         .await;
+        // The person's own moves: Desk moves nothing by itself.
+        d.set_auto_switch(false).await.unwrap();
         let (work, personal, a, b) = two_on_work(&d, dir.path()).await;
         let transcript = dir.path().join("a.jsonl");
         let full = |d: &Desk| {
@@ -1756,7 +1783,7 @@ async fn the_transcript_decides_what_a_rate_limit_was() {
             .is_some_and(|f| f.limit().is_some()));
         let (env, args) = started(dir.path(), a, 1).await;
         assert_eq!(env["TOKEN_ON_FD"], OTHER);
-        assert!(args.trim_end().ends_with("Continue"), "{args}");
+        assert!(told_desk_moved_it(&args), "{args}");
         started(dir.path(), b, 1).await;
         assert_eq!(d.view(b).unwrap().account.map(|x| x.id), Some(personal));
         assert_eq!(
@@ -2067,7 +2094,12 @@ async fn switch_all_and_auto_switch_never_pick_an_account_whose_sign_in_cant_be_
         keys.delete(personal).unwrap();
         // Switch all to it: refused before any session is stopped.
         let refused = d
-            .switch_all(Engine::Claude, Some(work), Some(personal))
+            .switch_all(
+                Engine::Claude,
+                Some(work),
+                Some(personal),
+                crate::crew::By::you(),
+            )
             .await
             .unwrap_err();
         assert!(refused.to_string().contains("no longer in"), "{refused}");
@@ -2386,7 +2418,7 @@ async fn with_no_sign_in_of_its_own_the_first_account_switches_to_the_next_at_it
         stops_on_its_limit(&d, a);
         let (env, args) = started(dir.path(), a, 1).await;
         assert_eq!(env["TOKEN_ON_FD"], OTHER);
-        assert!(args.trim_end().ends_with("Continue"), "{args}");
+        assert!(told_desk_moved_it(&args), "{args}");
         let (env, _) = started(dir.path(), b, 1).await;
         assert_eq!(env["TOKEN_ON_FD"], OTHER);
         for id in [a, b] {
@@ -2858,9 +2890,14 @@ async fn a_reading_of_another_account_never_ends_one_being_full_and_a_move_off_i
         }
         // Moved off it, twice over: one move, one need.
         for _ in 0..2 {
-            d.switch_all(Engine::Claude, Some(work), Some(personal))
-                .await
-                .unwrap();
+            d.switch_all(
+                Engine::Claude,
+                Some(work),
+                Some(personal),
+                crate::crew::By::you(),
+            )
+            .await
+            .unwrap();
         }
         assert_eq!(d.0.state.lock().moved_off.len(), 1);
         until(|| d.view(a).ok().filter(|v| v.live).map(drop)).await;
@@ -2926,9 +2963,14 @@ async fn standing_and_moves_off_outlive_a_restart() {
         let (work, personal, a, _) = two_on_work(&d, dir.path()).await;
         stops_on_its_limit(&d, a);
         until(|| d.account_needs().into_iter().next()).await;
-        d.switch_all(Engine::Claude, Some(work), Some(personal))
-            .await
-            .unwrap();
+        d.switch_all(
+            Engine::Claude,
+            Some(work),
+            Some(personal),
+            crate::crew::By::you(),
+        )
+        .await
+        .unwrap();
         let kept = d.0.state.lock().standing[&Some(work)].clone();
         // Written once it changes.
         let mut written = false;
@@ -3120,6 +3162,9 @@ async fn a_machine_told_an_account_is_full_starts_new_sessions_on_the_next_and_s
                 signed_out_options(machine_dir.path(), Arc::new(MemoryKeys::default())),
             )
             .await;
+            // What each tells the other alone: neither moves anything itself.
+            mac.set_auto_switch(false).await.unwrap();
+            machine.set_auto_switch(false).await.unwrap();
             let (_, _, a, _) = two_on_work(&mac, mac_dir.path()).await;
             paste(&machine, "Work", GOOD, true).await;
             let personal = paste(&machine, "Personal", OTHER, false).await;
@@ -3203,6 +3248,8 @@ async fn a_switch_waiting_on_a_rate_limit_waits_for_its_transcript_and_carries_o
             key_options(dir.path(), Arc::new(MemoryKeys::default())),
         )
         .await;
+        // The person's own moves: Desk moves nothing by itself.
+        d.set_auto_switch(false).await.unwrap();
         let (_, personal, a, _) = two_on_work(&d, dir.path()).await;
         d.apply_hook(a, crate::claude::Hook::Prompt("go".into()), None)
             .await;
@@ -3243,6 +3290,8 @@ async fn a_refusal_read_as_not_the_plans_undoes_only_its_own_sessions_stop() {
             account_options(dir.path(), Arc::new(MemoryKeys::default())),
         )
         .await;
+        // The person's own moves: Desk moves nothing by itself.
+        d.set_auto_switch(false).await.unwrap();
         let (work, _, a, b) = two_on_work(&d, dir.path()).await;
         let full = |d: &Desk| {
             d.0.state
@@ -4734,6 +4783,459 @@ async fn a_refusal_told_before_a_restart_is_not_told_again() {
         let again = refused(&d);
         assert_eq!(again.len(), 1);
         assert_ne!(again, first);
+    })
+    .await;
+}
+
+/// 19 Nov, 18:32: an account reached its limit and Desk moved its
+/// sessions, restarting seven within twenty seconds, each recorded as the
+/// person's, which stopped their CI watchers and sub-agents; they then sat
+/// idle, still said to wait on them. A move waits for work still running;
+/// it is said to be by whoever asked; and a session restarted over work it
+/// had running is told what stopped, first, and never counts it again.
+#[tokio::test]
+async fn a_move_waits_for_running_work_and_a_restart_tells_what_it_stopped() {
+    use crate::background::{Background, Reported, TaskKind};
+    use crate::crew::{By, Kind, PartyKind};
+    use crate::model::DeskEvent;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = Arc::new(MemoryKeys::default());
+        let d = desk(pool, account_options(dir.path(), keys)).await;
+        let work = paste(&d, "Work", GOOD, true).await;
+        let personal = paste(&d, "Personal", OTHER, false).await;
+        let mut events = d.0.events.subscribe();
+        let s = d.create(session(dir.path(), None), None).await.unwrap();
+        started(dir.path(), s.id, 0).await;
+        let agent = |id: &str, label: &str| Reported {
+            id: id.into(),
+            kind: TaskKind::Agent,
+            label: Some(label.into()),
+        };
+        // Interrupted, two sub-agents it started still run.
+        let (a1, a2) = (
+            agent("a1", "Watch CI on #450"),
+            agent("a2", "Review the diff"),
+        );
+        d.change(s.id, |r, l| {
+            r.state = SessionState::Interrupted;
+            let l = l.expect("it runs");
+            l.background = Background::default().reported(Some(vec![a1, a2]), chrono::Utc::now());
+        });
+        assert_eq!(d.view(s.id).unwrap().background.map(|b| b.count), Some(2));
+
+        // Desk moves it off a full account: not while that runs.
+        let moved = By::desk("Work reached its plan's limit");
+        let v = d
+            .switch_account(s.id, Some(personal), Some(moved))
+            .await
+            .unwrap();
+        assert!(v.live, "not restarted over its work");
+        assert_eq!(v.account.as_ref().map(|a| a.id), Some(work));
+        assert_eq!(v.switching_to.as_ref().map(|a| a.id), Some(personal));
+        // Its work ends: it moves now, as Desk's doing.
+        d.change(s.id, |_, l| {
+            let l = l.expect("it runs");
+            let now = chrono::Utc::now();
+            l.background = std::mem::take(&mut l.background)
+                .ended("a1", now)
+                .ended("a2", now);
+        });
+        let (env, args) = started(dir.path(), s.id, 1).await;
+        assert_eq!(env["TOKEN_ON_FD"], OTHER);
+        assert!(
+            !args.contains("was restarted"),
+            "nothing ran to be stopped: {args}"
+        );
+
+        // The person restarts it over a sub-agent still running: it is told
+        // first, by name, and counts nothing it ran before.
+        for _ in 0..200 {
+            if d.view(s.id).unwrap().live {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let a3 = agent("a3", "Watch CI on #451");
+        d.change(s.id, |r, l| {
+            r.state = SessionState::Done;
+            let l = l.expect("it runs");
+            l.background = Background::default().reported(Some(vec![a3]), chrono::Utc::now());
+        });
+        d.restart(s.id, None, By::you()).await.unwrap();
+        let (_, args) = started(dir.path(), s.id, 2).await;
+        assert!(args.contains("This session was restarted at"), "{args}");
+        assert!(args.contains("the subagent “Watch CI on #451”"), "{args}");
+        let v = d.view(s.id).unwrap();
+        assert_eq!(v.background, None, "nothing it ran before");
+        assert_eq!(v.restarted.map(|r| r.stopped), Some(1));
+        // The note is not what it was last asked.
+        let last = d.record(s.id).unwrap().last_prompt;
+        d.prompted(
+            s.id,
+            "This session was restarted at 18:32. Background tasks and subagents started before \
+             then were stopped. Check what each was doing, and restart any you still need."
+                .into(),
+            false,
+        );
+        assert_eq!(d.record(s.id).unwrap().last_prompt, last);
+        // The resumed CLI still reports it at its turn's end, which a new
+        // sub-agent of its own keeps open: what was stopped is not counted,
+        // what runs now is, and the turn that looked at it is over.
+        d.change(s.id, |_, l| {
+            let l = l.expect("it runs");
+            l.background = std::mem::take(&mut l.background).started(
+                "a4",
+                TaskKind::Agent,
+                chrono::Utc::now(),
+            );
+        });
+        d.turn_ended(
+            s.id,
+            None,
+            Some("Restarted the CI watch.".into()),
+            Some(vec![
+                agent("a3", "Watch CI on #451"),
+                agent("a4", "Watch CI again"),
+            ]),
+            None,
+        )
+        .await;
+        let v = d.view(s.id).unwrap();
+        assert_eq!((v.waiting_on(), v.restarted), (1, None));
+
+        // Who did each: Desk's move, the person's restart, never the other.
+        let mut restarts = Vec::new();
+        while let Ok(e) = events.try_recv() {
+            if let DeskEvent::Activity { event } = e {
+                if event.kind == Kind::Restarted {
+                    restarts.push(event);
+                }
+            }
+        }
+        let by: Vec<PartyKind> = restarts.iter().map(|e| e.actor.kind).collect();
+        assert_eq!(by, vec![PartyKind::Desk, PartyKind::You], "{restarts:?}");
+        assert!(
+            restarts[1].text.contains("stopped 1 background task"),
+            "{}",
+            restarts[1].text
+        );
+        assert_eq!(
+            restarts[1].detail.as_ref().and_then(|d| d.get("stopped")),
+            Some(&serde_json::json!(1))
+        );
+    })
+    .await;
+}
+
+/// Whether a restarted session's prompt is Desk's note of its own move:
+/// why it moved, then carry on.
+fn told_desk_moved_it(args: &str) -> bool {
+    args.contains("-- Desk moved this session from ")
+        && args.trim_end().to_lowercase().ends_with("carry on.")
+}
+
+/// The `LoginMoved` and `LoginsFull` events Desk said so far, from `rx`.
+fn login_events(
+    rx: &mut tokio::sync::broadcast::Receiver<crate::model::DeskEvent>,
+    seen: &mut Vec<crate::crew::Event>,
+) {
+    while let Ok(e) = rx.try_recv() {
+        if let crate::model::DeskEvent::Activity { event } = e {
+            if matches!(
+                event.kind,
+                crate::crew::Kind::LoginMoved | crate::crew::Kind::LoginsFull
+            ) {
+                seen.push(*event);
+            }
+        }
+    }
+}
+
+/// Claude Code's `StopFailure` for a turn its provider turned away: the
+/// login's organisation turned Claude Code off.
+fn turned_away(transcript: &Path) -> crate::claude::Hook {
+    crate::claude::parse_hook(
+        serde_json::json!({
+            "session_id": "s1",
+            "transcript_path": transcript,
+            "cwd": "/w",
+            "hook_event_name": "StopFailure",
+            "error": "unknown",
+            "last_assistant_message": "Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access",
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_login_is_named_by_its_id_or_its_name_case_aside_and_never_guessed_between_two() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(
+            pool,
+            account_options(dir.path(), Arc::new(MemoryKeys::default())),
+        )
+        .await;
+        let apple = paste(&d, "Kingsley Apple", GOOD, true).await;
+        let gmail = paste(&d, "Kingsley Gmail", OTHER, false).await;
+        let work = paste(&d, "Gmail Work", REFUSED, false).await;
+        assert_eq!(d.login_named(None, "kingsley gmail").unwrap(), gmail);
+        assert_eq!(d.login_named(None, "  Kingsley Apple ").unwrap(), apple);
+        assert_eq!(d.login_named(None, &work.to_string()).unwrap(), work);
+        // Part of a name: offered, never taken, and two are both said.
+        let DeskError::Invalid(why) = d.login_named(Some(Engine::Claude), "apple").unwrap_err()
+        else {
+            panic!("a part of a name was taken");
+        };
+        assert!(why.contains("did you mean Kingsley Apple"), "{why}");
+        let DeskError::Invalid(why) = d.login_named(None, "gmail").unwrap_err() else {
+            panic!("guessed between two");
+        };
+        assert!(
+            why.contains("Kingsley Gmail") && why.contains("Gmail Work"),
+            "{why}"
+        );
+        // None of them: the ones there are, said.
+        let DeskError::Invalid(why) = d.login_named(None, "Personal").unwrap_err() else {
+            panic!("not refused");
+        };
+        assert!(why.contains("there is no login called Personal"), "{why}");
+        assert!(why.contains("Kingsley Apple"), "{why}");
+        assert!(d.login_named(None, &Uuid::new_v4().to_string()).is_err());
+        assert!(d
+            .login_named(Some(Engine::Codex), "Kingsley Gmail")
+            .is_err());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn switching_a_session_to_another_login_resumes_its_own_conversation_there() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(
+            pool,
+            account_options(dir.path(), Arc::new(MemoryKeys::default())),
+        )
+        .await;
+        paste(&d, "Kingsley Apple", GOOD, true).await;
+        let gmail = paste(&d, "Kingsley Gmail", OTHER, false).await;
+        let s = d.create(session(dir.path(), None), None).await.unwrap();
+        started(dir.path(), s.id, 0).await;
+        let cli = d
+            .record(s.id)
+            .unwrap()
+            .cli_session_id
+            .expect("its conversation");
+        d.change(s.id, |r, _| r.state = SessionState::Idle);
+        let by = crate::crew::By::desk("the boss moved it");
+        d.switch_account(s.id, Some(gmail), Some(by)).await.unwrap();
+        let (env, args) = started(dir.path(), s.id, 1).await;
+        assert_eq!(env["TOKEN_ON_FD"], OTHER, "on the other login");
+        assert!(
+            args.starts_with(&format!("--resume {cli}")),
+            "the same conversation: {args}"
+        );
+        assert_eq!(d.record(s.id).unwrap().cli_session_id, Some(cli));
+        assert_eq!(
+            d.view(s.id).unwrap().account.map(|a| a.name),
+            Some("Kingsley Gmail".into())
+        );
+        // It was probed before anything stopped.
+        let probes = std::fs::read_to_string(dir.path().join("probes")).unwrap_or_default();
+        assert!(probes.lines().any(|t| t == OTHER), "{probes}");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_switch_never_goes_to_a_login_the_provider_turns_away() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(
+            pool,
+            account_options(dir.path(), Arc::new(MemoryKeys::default())),
+        )
+        .await;
+        let apple = paste(&d, "Kingsley Apple", GOOD, true).await;
+        let star = paste(&d, "Kingsley Starmoire", REFUSED, false).await;
+        let s = d.create(session(dir.path(), None), None).await.unwrap();
+        started(dir.path(), s.id, 0).await;
+        d.change(s.id, |r, _| r.state = SessionState::Idle);
+        let DeskError::Conflict(why) = d.switch_account(s.id, Some(star), None).await.unwrap_err()
+        else {
+            panic!("moved onto a login that refuses");
+        };
+        assert!(why.contains("turned away"), "{why}");
+        assert_eq!(d.view(s.id).unwrap().account.map(|a| a.id), Some(apple));
+        assert!(
+            d.0.state.lock().refused.contains_key(&star),
+            "marked turned away"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_login_at_its_limit_fails_over_past_one_turned_away_and_the_person_is_told_once() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(
+            pool,
+            key_options(dir.path(), Arc::new(MemoryKeys::default())),
+        )
+        .await;
+        assert!(d.auto_switch(), "on unless the person turns it off");
+        let apple = paste(&d, "Kingsley Apple", GOOD, true).await;
+        let star = paste(&d, "Kingsley Starmoire", REFUSED, false).await;
+        let gmail = paste(&d, "Kingsley Gmail", OTHER, false).await;
+        let (_, mut rx) = d.subscribe();
+        let a = d.create(session(dir.path(), None), None).await.unwrap().id;
+        let b = d.create(session(dir.path(), None), None).await.unwrap().id;
+        started(dir.path(), a, 0).await;
+        started(dir.path(), b, 0).await;
+        d.change(b, |r, _| r.state = SessionState::Idle);
+        // Apple's plan stops a's turn: Starmoire comes next, but a probe
+        // finds it turned away, so both move to Gmail.
+        stops_on_its_limit(&d, a);
+        let (env, args) = started(dir.path(), a, 1).await;
+        assert_eq!(env["TOKEN_ON_FD"], OTHER);
+        assert!(
+            args.contains("Desk moved this session from Kingsley Apple to Kingsley Gmail"),
+            "{args}"
+        );
+        assert!(
+            args.contains("background"),
+            "told its background work stopped: {args}"
+        );
+        let (env, _) = started(dir.path(), b, 1).await;
+        assert_eq!(env["TOKEN_ON_FD"], OTHER);
+        for s in [a, b] {
+            assert_eq!(d.view(s).unwrap().account.map(|x| x.id), Some(gmail));
+        }
+        assert!(d.0.state.lock().refused.contains_key(&star));
+        // Desk's move, said once, naming both logins and the sessions.
+        let mut said = Vec::new();
+        until(|| {
+            login_events(&mut rx, &mut said);
+            (!said.is_empty()).then_some(())
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        login_events(&mut rx, &mut said);
+        let [moved] = &said[..] else {
+            panic!("{said:?}")
+        };
+        assert_eq!(moved.kind, crate::crew::Kind::LoginMoved);
+        assert!(
+            moved.text.starts_with("Kingsley Apple hit its "),
+            "{}",
+            moved.text
+        );
+        assert!(
+            moved.text.ends_with(&format!(
+                "I moved auth-fix [{}] and auth-fix [{}] to Kingsley Gmail.",
+                &a.to_string()[..8],
+                &b.to_string()[..8]
+            )) || moved.text.ends_with(&format!(
+                "I moved auth-fix [{}] and auth-fix [{}] to Kingsley Gmail.",
+                &b.to_string()[..8],
+                &a.to_string()[..8]
+            )),
+            "{}",
+            moved.text
+        );
+        assert_eq!(moved.actor.kind, crate::crew::PartyKind::Desk);
+        // Activity says the restart was Desk's, never the person's.
+        let restarted = d
+            .store()
+            .events_since(
+                chrono::Utc::now() - chrono::Duration::hours(1),
+                &[a.to_string()],
+                50,
+                None,
+            )
+            .await
+            .unwrap();
+        let r = restarted
+            .iter()
+            .find(|e| e.kind == crate::crew::Kind::Restarted)
+            .expect("restarted");
+        assert_ne!(r.actor.kind, crate::crew::PartyKind::You, "{r:?}");
+        let _ = apple;
+
+        // Gmail turns a away too: with Apple full and Starmoire turned
+        // away, nothing has room, and that is said once.
+        let transcript = dir.path().join("a.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        d.apply_hook(a, crate::claude::Hook::Prompt("go on".into()), None)
+            .await;
+        d.apply_hook(a, turned_away(&transcript), None).await;
+        until(|| d.0.state.lock().refused.contains_key(&gmail).then_some(())).await;
+        let mut said = Vec::new();
+        until(|| {
+            login_events(&mut rx, &mut said);
+            (!said.is_empty()).then_some(())
+        })
+        .await;
+        d.accounts_moved().await;
+        d.accounts_moved().await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        login_events(&mut rx, &mut said);
+        let [full] = &said[..] else {
+            panic!("{said:?}")
+        };
+        assert_eq!(full.kind, crate::crew::Kind::LoginsFull);
+        assert!(full.text.contains("Kingsley Apple"), "{}", full.text);
+        assert!(
+            full.text.contains("Kingsley Gmail is turned away"),
+            "{}",
+            full.text
+        );
+        // And a is where it was: never onto a login that can't serve.
+        assert_eq!(d.view(a).unwrap().account.map(|x| x.id), Some(gmail));
+        // The turn's stop is said against the login it happened on.
+        let failed = d
+            .store()
+            .events_since(
+                chrono::Utc::now() - chrono::Duration::hours(1),
+                &[a.to_string()],
+                50,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            failed.iter().any(|e| e.kind == crate::crew::Kind::Failed
+                && e.text.starts_with("was turned away on Kingsley Gmail")),
+            "{failed:?}"
+        );
+        assert!(
+            failed.iter().any(|e| e.kind == crate::crew::Kind::Limit
+                && e.text.starts_with("hit Kingsley Apple's")),
+            "{failed:?}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn with_moves_turned_off_a_login_at_its_limit_moves_nothing() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(
+            pool,
+            key_options(dir.path(), Arc::new(MemoryKeys::default())),
+        )
+        .await;
+        d.set_auto_switch(false).await.unwrap();
+        let (apple, _, a, _) = two_on_work(&d, dir.path()).await;
+        stops_on_its_limit(&d, a);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(d.view(a).unwrap().account.map(|x| x.id), Some(apple));
     })
     .await;
 }

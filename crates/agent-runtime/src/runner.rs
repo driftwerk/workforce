@@ -800,6 +800,11 @@ pub struct SessionContext {
     /// [`CURRENT_DESK`], carried so a tool in the spawned task delivers to,
     /// and is gated by, the Desk conversation the run answers to.
     pub desk: Option<workforce_common::channels::desk::DeskScope>,
+    /// The background work the turn belongs to ([`workforce_common::work_use`]),
+    /// carried so a call or a turn made in the spawned task (the LLM stream,
+    /// a tool, a subagent) is held and counted as that work, never as the
+    /// person's own.
+    pub work: Option<workforce_common::work_use::Work>,
 }
 
 /// [`CURRENT_CHAT_ORIGIN`], false where unset.
@@ -856,6 +861,7 @@ impl SessionContext {
             secret_policy: workforce_common::secret_policy::capture(),
             served: CURRENT_SERVED.try_with(ServedLog::clone).ok(),
             desk: current_desk(),
+            work: workforce_common::work_use::current(),
         }
     }
 
@@ -882,6 +888,7 @@ impl SessionContext {
         let secret_policy = self.secret_policy;
         let served = self.served;
         let desk = self.desk;
+        let work = self.work;
         let layers: [(&'static tokio::task::LocalKey<String>, Option<String>, bool); 14] = [
             (&CURRENT_ARTIFACT_SCOPE, self.artifact_scope, false),
             (&CURRENT_MEMORY_FENCE, self.memory_fence, false),
@@ -943,6 +950,9 @@ impl SessionContext {
             }
         };
         let inner = with_desk(desk, inner);
+        // Boxed, as the layers above: each nests the whole future once more.
+        let inner: std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + '_>> =
+            Box::pin(workforce_common::work_use::within_opt(work, inner));
         let inner = async {
             match last_user_comm {
                 Some(clock) => LAST_USER_COMM.scope(clock, inner).await,
@@ -982,6 +992,7 @@ impl SessionContext {
         let secret_policy = self.secret_policy;
         let served = self.served;
         let desk = self.desk;
+        let work = self.work;
         let layers: [(&'static tokio::task::LocalKey<String>, Option<String>); 11] = [
             (&CURRENT_MEMORY_FENCE, self.memory_fence),
             (&CURRENT_AGENT_ID, self.agent_id),
@@ -1016,6 +1027,7 @@ impl SessionContext {
             None => outer(),
         };
         let outer = move || CURRENT_DESK.sync_scope(desk, outer);
+        let outer = move || workforce_common::work_use::sync_within_opt(work, outer);
         let outer = move || match artifact_store {
             Some(store) => CURRENT_ARTIFACT_STORE.sync_scope(store, outer),
             None => outer(),
@@ -8560,6 +8572,13 @@ mod tests {
                 relayed: false,
                 owner: "person-1".into(),
             }),
+            // A job's tools and the LLM stream run in spawned tasks: they are
+            // the job's work, held and counted as it, never the person's own.
+            work: Some(workforce_common::work_use::Work::job(
+                "aid",
+                "j1",
+                "email check",
+            )),
         };
         let captured = Arc::new(std::sync::Mutex::new(SessionContext::default()));
         let c = Arc::clone(&captured);
@@ -8594,6 +8613,11 @@ mod tests {
         assert_eq!(after.automated_origin, original.automated_origin);
         assert_eq!(after.billing_identity, original.billing_identity);
         assert_eq!(after.desk, original.desk);
+        assert_eq!(after.work, original.work);
+        let synced = original
+            .clone()
+            .sync_scope(workforce_common::work_use::current);
+        assert_eq!(synced, original.work, "and across a blocking boundary");
         after
             .served
             .expect("served log survives the spawn")

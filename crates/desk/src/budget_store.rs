@@ -213,14 +213,16 @@ impl DeskStore {
     }
 
     /// What each session spent from `from` on, in all and in each group its
-    /// rows were stamped with.
+    /// rows were stamped with: every token, and the dollars that were money
+    /// (a call on the person's Claude or ChatGPT plan is no money, so a
+    /// dollar budget never holds it).
     pub async fn ledger_used(&self, from: DateTime<Utc>) -> Result<HashMap<Uuid, SessionSpend>> {
         let client = self.pool().get().await?;
         let rows = client
             .query(
                 "SELECT session, group_id, \
                    SUM(input + output + cache_read + cache_write)::int8, \
-                   COALESCE(SUM(usd), 0)::float8 \
+                   COALESCE(SUM(usd) FILTER (WHERE billing <> 'plan'), 0)::float8 \
                  FROM ledger WHERE at >= $1 GROUP BY session, group_id",
                 &[&from],
             )
@@ -272,14 +274,16 @@ impl DeskStore {
                        COALESCE(s.until_at, 'infinity'::timestamptz) AS until \
                      FROM spans s JOIN ours o ON o.id = s.ticket), \
                    untagged AS (SELECT DISTINCT ON (l.engine, l.key) w.plan, \
-                       l.input + l.output + l.cache_read + l.cache_write AS tokens, l.usd \
+                       l.input + l.output + l.cache_read + l.cache_write AS tokens, \
+                       CASE WHEN l.billing = 'plan' THEN 0 ELSE l.usd END AS usd \
                      FROM ledger l JOIN windows w ON w.session = l.session \
                        AND l.at >= w.since AND l.at < w.until \
                      WHERE l.ticket IS NULL AND l.at >= $1 \
                      ORDER BY l.engine, l.key, w.from_at DESC) \
                  SELECT plan, SUM(tokens)::int8, COALESCE(SUM(usd), 0)::float8 FROM ( \
                    SELECT o.plan, l.input + l.output + l.cache_read + l.cache_write AS tokens, \
-                     l.usd FROM ledger l JOIN ours o ON o.id = l.ticket WHERE l.at >= $1 \
+                     CASE WHEN l.billing = 'plan' THEN 0 ELSE l.usd END AS usd \
+                     FROM ledger l JOIN ours o ON o.id = l.ticket WHERE l.at >= $1 \
                    UNION ALL \
                    SELECT plan, tokens, usd FROM untagged \
                  ) spent GROUP BY plan",

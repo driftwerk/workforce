@@ -45,6 +45,17 @@ async fn agent_calling(
     reply: &str,
     calls: &[(&str, &str)],
 ) -> (Arc<AgentService>, wiremock::MockServer) {
+    agent_configured(dir, id, reply, calls, |_| {}).await
+}
+
+/// [`agent_calling`], with `configure` applied to its config last.
+async fn agent_configured(
+    dir: &Path,
+    id: &str,
+    reply: &str,
+    calls: &[(&str, &str)],
+    configure: impl FnOnce(&mut workforce_common::settings::WorkforceConfig),
+) -> (Arc<AgentService>, wiremock::MockServer) {
     use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, ResponseTemplate};
     let (config, server) = crate::serve::testing::mock_llm_config(&dir.join(id), |c| {
@@ -56,6 +67,7 @@ async fn agent_calling(
             name: Some(name),
             ..Default::default()
         }];
+        configure(c);
     })
     .await;
     let chunk = |body: Value| format!("data: {body}\n\n");
@@ -919,6 +931,72 @@ async fn only_what_the_settings_ask_wakes_the_overseer_and_never_its_own_doing()
         assert!(crew.trigger_for(&by_you, "desk", &o).is_none(), "yours");
         let handed_on = own(Kind::Finished, &web).hop(super::MAX_HOPS);
         assert!(crew.trigger_for(&handed_on, "desk", &o).is_none(), "the loop guard");
+    })
+    .await;
+}
+
+/// A restart that stopped work a session had running (19 Nov, 18:32:
+/// Desk moved seven sessions off a full account, and their CI watchers and
+/// sub-agents stopped) wakes the boss, whoever did it but itself; one that
+/// stopped nothing is no news.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_that_stopped_work_wakes_the_boss() {
+    use workforce_desk::crew::{By, Event, Party};
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, crew, _, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nwake = { on_failure = true }\n",
+            &[],
+        )
+        .await;
+        let (_, o) = crew.overseer_service().unwrap();
+        let web = session_party("acme-web");
+        let restarted = |by: By, stopped: Option<u32>| {
+            let e = by.event(
+                Kind::Restarted,
+                Some(web.clone()),
+                "restarted acme-web".to_string(),
+            );
+            match stopped {
+                Some(n) => e.detail(json!({ "stopped": n })),
+                None => e,
+            }
+        };
+        let moved = By::desk("Work reached its plan's limit");
+        let t = crew
+            .trigger_for(&restarted(moved.clone(), Some(6)), "desk", &o)
+            .expect("Desk's restart stopped its work");
+        assert!(
+            t.line.contains("restarts what it still needs"),
+            "{}",
+            t.line
+        );
+        assert!(
+            crew.trigger_for(&restarted(By::you(), Some(2)), "desk", &o)
+                .is_some(),
+            "the person's too"
+        );
+        assert!(
+            crew.trigger_for(&restarted(moved, None), "desk", &o)
+                .is_none(),
+            "nothing stopped"
+        );
+        let by_it = By::manager("desk", "Desk", "");
+        assert!(
+            crew.trigger_for(&restarted(by_it, Some(1)), "desk", &o)
+                .is_none(),
+            "its own"
+        );
+        let plain = Event::new(
+            Kind::Restarted,
+            Party::you(),
+            Some(web.clone()),
+            "restarted acme-web",
+        );
+        assert!(crew.trigger_for(&plain, "desk", &o).is_none());
     })
     .await;
 }
@@ -1887,12 +1965,15 @@ mod directives;
 mod items;
 mod learning;
 mod left_alone;
+mod logins;
 mod one_mind;
 mod one_picture;
 mod preferences;
 mod promises;
 mod repeats;
 mod silent_waits;
+mod stalls;
+mod tickets;
 mod updates;
 mod urgent;
 
@@ -1900,6 +1981,7 @@ mod away;
 mod monitors;
 
 mod boss_waits;
+mod orchestrator;
 
 mod remote_asks;
 mod remote_decide;
@@ -4384,6 +4466,47 @@ async fn a_session_whose_overseer_only_suggests_waits_on_you() {
     .await;
 }
 
+/// A session its boss has calls for nobody's attention but the boss's
+/// (19 Nov: "if Desk is driving it and dealing with it then it doesn't need
+/// me"): its request says "Desk has it", never "waiting on you"; once the
+/// person drives it, it is theirs again; one no boss runs is as it always
+/// was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_its_boss_has_calls_for_no_attention_but_the_bosss() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _crew, d, _llm, id, url) = handed_session(dir.path(), pool).await;
+        // Unbossed: what it asks is the person's, as ever.
+        let _asked = ask_to_run(&url, "cargo test -p acme");
+        eventually("the request", async || d.view(id).unwrap().pending).await;
+        assert_eq!(d.view(id).unwrap().boss_has, None);
+        assert!(!d.boss_has_it(id));
+
+        let name = super::name_of(&overseer);
+        let boss = workforce_desk::crew::Party::manager("desk", &name);
+        d.take_on(
+            id,
+            &boss,
+            workforce_desk::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        let v = d.view(id).unwrap();
+        assert_eq!(v.boss_has.as_deref(), Some(name.as_str()), "{v:?}");
+        assert_eq!(v.waits_on_you, None);
+        assert!(d.boss_has_it(id));
+
+        // The person takes the wheel: theirs.
+        d.drive(id).await.unwrap();
+        let v = d.view(id).unwrap();
+        assert_eq!(v.boss_has, None);
+        assert!(v.waits_on_you.is_some());
+    })
+    .await;
+}
+
 /// [`fake_cli`] that says its version, as an installed Claude Code does.
 fn installed_cli(dir: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
@@ -5832,10 +5955,10 @@ fn the_act_hint_says_to_act_and_names_the_switches_that_are_off() {
 /// At Act, Act fully and unbound, work the person asks for in the DM
 /// starts its session there and then, in a folder the boss picks itself:
 /// never offered, never done in chat. A question is still answered. With
-/// "Hand out work" or "Always work in real sessions" off, it isn't told to.
+/// "Hand out work" off, or doing the work itself, it isn't told to.
 #[test]
 fn at_act_and_above_the_dm_hint_starts_the_work_in_a_session() {
-    use workforce_common::oversight::{Act, Level, Oversight, Work};
+    use workforce_common::oversight::{Act, Level, Oversight, Work, WorkStyle};
     let o = Oversight::default();
     for (level, unbound) in [
         (Level::Act, false),
@@ -5869,7 +5992,7 @@ fn at_act_and_above_the_dm_hint_starts_the_work_in_a_session() {
         },
         Oversight {
             work: Work {
-                prefer_sessions: false,
+                style: WorkStyle::Direct,
                 ..o.work.clone()
             },
             ..o.clone()
@@ -5878,9 +6001,83 @@ fn at_act_and_above_the_dm_hint_starts_the_work_in_a_session() {
         let hint = CrewHub::dm_hint(Level::Act, &o, false);
         assert!(!hint.contains("start it now"), "{hint}");
     }
+    // Each style is said by its name, and Prefer sessions runs its own
+    // checks and ops while code still goes to a session.
+    for (style, says) in [
+        (WorkStyle::SessionsOnly, "setting is Only in sessions"),
+        (WorkStyle::PreferSessions, "setting is Prefer sessions"),
+        (WorkStyle::Direct, "setting is Do it myself"),
+    ] {
+        let o = Oversight {
+            work: Work {
+                style,
+                ..o.work.clone()
+            },
+            ..o.clone()
+        };
+        for (level, unbound) in [(Level::Act, false), (Level::Full, true)] {
+            let hint = CrewHub::dm_hint(level, &o, unbound);
+            assert!(hint.contains(says), "{style:?}: {hint}");
+            assert_eq!(
+                hint.contains("never do the work here"),
+                style == WorkStyle::SessionsOnly,
+                "{style:?}: {hint}"
+            );
+        }
+    }
+    let prefer = Oversight {
+        work: Work {
+            style: WorkStyle::PreferSessions,
+            ..o.work.clone()
+        },
+        ..o.clone()
+    };
+    let hint = CrewHub::dm_hint(Level::Act, &prefer, false);
+    for says in [
+        "never change code here",
+        "ssh",
+        "gh",
+        "you run yourself",
+        "start it now with crew.start_session",
+    ] {
+        assert!(hint.contains(says), "{says:?} in {hint}");
+    }
     for level in [Level::Watch, Level::Suggest] {
         assert!(!CrewHub::dm_hint(level, &o, false).contains("start it now"));
     }
+    // Where it doesn't start the sessions (Suggest, or "Hand out work"
+    // off) it is still told its way, by the name the setting shows; at
+    // Watch it does nothing of its own.
+    for style in WorkStyle::ALL {
+        let o = Oversight {
+            work: Work {
+                style,
+                ..o.work.clone()
+            },
+            ..o.clone()
+        };
+        let off = Oversight {
+            act: Act {
+                hand_out_work: false,
+                ..o.act
+            },
+            ..o.clone()
+        };
+        let named = format!("setting is {}", style.title());
+        for hint in [
+            CrewHub::dm_hint(Level::Suggest, &o, false),
+            CrewHub::dm_hint(Level::Act, &off, false),
+            CrewHub::dm_hint(Level::Act, &o, false),
+        ] {
+            assert!(hint.contains(&named), "{style:?}: {hint}");
+        }
+        assert!(!CrewHub::dm_hint(Level::Watch, &o, false).contains("How it works"));
+    }
+    let hint = CrewHub::dm_hint(Level::Suggest, &prefer, false);
+    assert!(
+        hint.contains("you run yourself") && hint.contains("ssh"),
+        "{hint}"
+    );
 }
 
 /// The person's own turns in the overseer's DM carry its level and the

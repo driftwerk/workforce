@@ -149,6 +149,8 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
         "owner_instance",
         NotPersonal(INSTANCE),
     ),
+    // Whose plan background work drew on: kept 35 days, then pruned.
+    ("common", "work_use", "payer", By(C::RetentionBound)),
     (
         "desk",
         "access_activity",
@@ -264,6 +266,14 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
         "closed_by",
         NotPersonal(
             "which side closed a boss's assignment (boss, session, desk, restart, person), not who",
+        ),
+    ),
+    (
+        "desk",
+        "boss_watches",
+        "person",
+        NotPersonal(
+            "`you`, the one person of the Desk whose own hub this is, whose boss's waits these are; told ones go within days",
         ),
     ),
     (

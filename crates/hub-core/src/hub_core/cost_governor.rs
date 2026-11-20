@@ -9,7 +9,11 @@
 //! SysAdmin-granted runtime overrides ([`crate::budget_overrides`]) REPLACE
 //! a scope's ceiling — in either direction — and are consulted live.
 //! Budgets count money: only metered spend. A subscription call's estimated
-//! value stays in the ledger but never consumes a budget.
+//! value stays in the ledger but never consumes a budget, `[budget]`'s or a
+//! dollar budget the person set on Desk (a token budget counts every
+//! token). On a subscription the plan guard is the budget instead
+//! ([`crate::hub_core::plan_guard`]): background work waits while its plan
+//! is nearly full, and a runaway is stopped.
 //!
 //! The governor fails OPEN on telemetry-store errors: a broken store must
 //! never take down chat, and the failure is logged.
@@ -28,6 +32,8 @@ use workforce_common::telemetry::TelemetryStore;
 use workforce_core::budget::{self, Budget, Period, Standing, Unit};
 
 use crate::hub_core::budget_overrides::{BudgetOverride, BudgetOverrideStore, OverrideScope};
+use crate::hub_core::logins::resolve::Login;
+use crate::hub_core::plan_guard::PlanGuard;
 
 const SPEND_CACHE_TTL: Duration = Duration::from_secs(30);
 
@@ -74,6 +80,17 @@ pub enum Admission {
     Warn(String),
     /// A ceiling is reached; the turn must not run.
     Deny(String),
+    /// Background work waits: the person's plan is nearly full. Not a
+    /// failure of the work, which goes on once the plan has room.
+    Waits(String),
+    /// Background work using far more of the person's plan than it usually
+    /// does: stopped, and what runs it turns it off and tells its owner.
+    /// `first`: this admission stopped it (tell them now); else it was
+    /// stopped before.
+    Stopped {
+        why: String,
+        first: bool,
+    },
     /// The person's budget on Desk holds the agent until they say Continue
     /// (or the period ends): not a failure of the work, which waits.
     Held(String),
@@ -138,8 +155,16 @@ pub struct CostGovernor {
     warned: Mutex<HashSet<(Scope, NaiveDate)>>,
     /// The ceilings this governor alone reads (tests); else the hub's.
     ceilings: std::sync::RwLock<Option<Arc<dyn Ceilings>>>,
-    /// Each agent's use since a period began, every billing: (usd, tokens).
+    /// Each agent's use since a period began: (metered usd, every token).
     used: Mutex<HashMap<(String, Period), (Instant, Use)>>,
+    plan_guard: Arc<PlanGuard>,
+}
+
+/// What the plan guard reads of one prospective turn: the login it would
+/// run on (none: not on a plan, or none to tell).
+#[derive(Default, Clone, Copy)]
+pub struct OnPlan<'a> {
+    pub login: Option<&'a Login>,
 }
 
 impl CostGovernor {
@@ -173,7 +198,18 @@ impl CostGovernor {
             warned: Mutex::new(HashSet::new()),
             ceilings: std::sync::RwLock::new(None),
             used: Mutex::new(HashMap::new()),
+            plan_guard: PlanGuard::global(),
         }
+    }
+
+    /// This governor with `guard` in place of the hub's plan guard (tests).
+    pub fn with_plan_guard(mut self, guard: Arc<PlanGuard>) -> Self {
+        self.plan_guard = guard;
+        self
+    }
+
+    pub fn plan_guard(&self) -> &Arc<PlanGuard> {
+        &self.plan_guard
     }
 
     /// This governor with `ceilings` in place of the hub's.
@@ -195,8 +231,9 @@ impl CostGovernor {
             .or_else(|| CEILINGS.get().cloned())
     }
 
-    /// What `agent_id` used since `period` began, every billing counted;
-    /// cached as long as spend is.
+    /// What `agent_id` used since `period` began: the money it spent (a
+    /// plan's calls are no money) and every token; cached as long as spend
+    /// is.
     fn used_since(
         &self,
         agent_id: &str,
@@ -215,7 +252,7 @@ impl CostGovernor {
             .agent_use(from, now)?
             .into_iter()
             .find(|u| u.agent_id == agent_id)
-            .map_or((0.0, 0), |u| (u.cost_usd, u.tokens));
+            .map_or((0.0, 0), |u| (u.metered_usd, u.tokens));
         self.used
             .lock()
             .expect("used lock")
@@ -325,21 +362,73 @@ impl CostGovernor {
     /// The first breached ceiling wins; warnings are collected only when
     /// nothing denies.
     pub fn admit_turn(&self, agent_id: &str, identity: Option<&str>) -> Admission {
-        self.admit(agent_id, identity, false)
+        self.admit_turn_on(agent_id, identity, OnPlan::default())
+    }
+
+    /// [`Self::admit_turn`] for a turn that would run `on` a plan: background
+    /// work there is held by the plan guard as by any budget, and a turn it
+    /// admits is counted toward its work.
+    pub fn admit_turn_on(
+        &self,
+        agent_id: &str,
+        identity: Option<&str>,
+        on: OnPlan<'_>,
+    ) -> Admission {
+        let admitted = self.admit(agent_id, identity, false, on);
+        if matches!(admitted, Admission::Proceed | Admission::Warn(_)) {
+            if let Some(work) = workforce_common::work_use::current() {
+                self.plan_guard.began(&work, identity);
+            }
+        }
+        admitted
     }
 
     /// What [`Self::admit_turn`] would decide, asked before a scheduled run:
     /// holds and refuses as the turn would, but says no warning (the turn
     /// says it, once).
     pub fn preflight(&self, agent_id: &str, identity: Option<&str>) -> Admission {
-        self.admit(agent_id, identity, true)
+        self.preflight_on(agent_id, identity, OnPlan::default())
     }
 
-    fn admit(&self, agent_id: &str, identity: Option<&str>, preflight: bool) -> Admission {
+    /// [`Self::preflight`] for a turn that would run `on` a plan.
+    pub fn preflight_on(
+        &self,
+        agent_id: &str,
+        identity: Option<&str>,
+        on: OnPlan<'_>,
+    ) -> Admission {
+        self.admit(agent_id, identity, true, on)
+    }
+
+    fn admit(
+        &self,
+        agent_id: &str,
+        identity: Option<&str>,
+        preflight: bool,
+        on: OnPlan<'_>,
+    ) -> Admission {
         // The person's budgets on Desk hold whatever `[budget]` says.
         let ceiling = self.ceiling_admission(agent_id, preflight);
         if let Admission::Held(_) = ceiling {
             return ceiling;
+        }
+        // Background work on a plan: the plan's own budget. Never the
+        // person's own turns, which run outside any background work.
+        if let Some(work) = workforce_common::work_use::current() {
+            use crate::hub_core::plan_guard::Verdict as Plan;
+            match self
+                .plan_guard
+                .check(&self.cfg.plan, &work, on.login, Utc::now())
+            {
+                Plan::Proceed => {}
+                Plan::Waits(why) => return Admission::Waits(why),
+                Plan::Stopped { why, first } => {
+                    if first {
+                        warn!(work = %work.key, agent = %agent_id, %why, "Background work stopped as a runaway");
+                    }
+                    return Admission::Stopped { why, first };
+                }
+            }
         }
         // Each warning is said once a period: both are kept.
         match (
@@ -348,9 +437,18 @@ impl CostGovernor {
         ) {
             (_, Admission::Deny(why)) => Admission::Deny(why),
             (_, Admission::Held(why)) => Admission::Held(why),
+            (_, stopped @ Admission::Stopped { .. }) => stopped,
+            (_, Admission::Waits(why)) => Admission::Waits(why),
             (Admission::Warn(a), Admission::Warn(b)) => Admission::Warn(format!("{a} {b}")),
             (Admission::Warn(a), Admission::Proceed) => Admission::Warn(a),
-            (Admission::Proceed | Admission::Deny(_) | Admission::Held(_), decided) => decided,
+            (
+                Admission::Proceed
+                | Admission::Deny(_)
+                | Admission::Held(_)
+                | Admission::Waits(_)
+                | Admission::Stopped { .. },
+                decided,
+            ) => decided,
         }
     }
 
@@ -614,7 +712,9 @@ pub fn default_policies(budget: &BudgetConfig) -> Vec<workforce_policy::rules::P
     use workforce_policy::rules::{
         ConditionOperator, PolicyRule, PolicyScope, RuleAction, RuleCondition,
     };
-    if !budget.enabled {
+    // The plan guard asks the same way: raising a job's plan limit or
+    // turning back on one it stopped is the person's click.
+    if !budget.enabled && !budget.plan.enabled {
         return Vec::new();
     }
     vec![PolicyRule {
@@ -749,29 +849,130 @@ mod tests {
     }
 
     #[test]
-    fn a_ceiling_counts_subscription_use_and_holds_even_with_budget_off() {
-        let mut plan = record("a", None, 2.0);
+    fn a_plans_calls_never_hold_a_dollar_budget_but_their_tokens_count() {
+        let mut plan = record("a", Some("u"), 400.0);
         plan.billing = workforce_common::subscription::Billing::Subscription;
+        let paid = record("a", Some("u"), 0.5);
+        // A dollar budget the person set on Desk counts only money.
+        let dollars = Arc::new(Budgets {
+            budgets: vec![day_budget(Unit::Usd, 1.0)],
+            stood: Mutex::new(Vec::new()),
+        });
+        let g = governor(cfg(), &[plan.clone(), paid.clone()]).with_ceilings(dollars.clone());
+        assert_eq!(g.admit_turn("a", Some("u")), Admission::Proceed);
+        let stood = dollars.stood.lock().unwrap().clone();
+        assert!(
+            (stood[0].used - 0.5).abs() < 1e-9,
+            "the paid call alone: {stood:?}"
+        );
+        // `[budget]`'s ceilings likewise: $400 of plan use is under $10.
+        assert_eq!(
+            governor(cfg(), &[plan.clone()]).admit_turn("a", Some("u")),
+            Admission::Proceed
+        );
+        // A token budget counts every token, a plan's too, even with
+        // `[budget]` off.
         let off = BudgetConfig {
             enabled: false,
             ..cfg()
         };
-        let ceilings = Arc::new(Budgets {
-            budgets: vec![day_budget(Unit::Usd, 1.0), day_budget(Unit::Tokens, 100.0)],
+        let tokens = Arc::new(Budgets {
+            budgets: vec![day_budget(Unit::Tokens, 3.0)],
             stood: Mutex::new(Vec::new()),
         });
-        let g = governor(off, &[plan]).with_ceilings(ceilings.clone());
+        let g = governor(off, &[plan, paid]).with_ceilings(tokens.clone());
         assert_eq!(
             g.admit_turn("a", None),
             Admission::Held("Atlas is over its day budget.".into())
         );
-        let stood = ceilings.stood.lock().unwrap().clone();
-        assert_eq!(stood.len(), 2);
-        assert!((stood[0].used - 2.0).abs() < 1e-9, "{stood:?}");
-        assert_eq!(stood[1].used, 2.0, "two tokens");
+        assert_eq!(tokens.stood.lock().unwrap()[0].used, 4.0, "four tokens");
         // Another agent's use is its own.
         assert_eq!(g.admit_turn("b", None), Admission::Proceed);
-        assert_eq!(ceilings.stood.lock().unwrap()[0].used, 0.0);
+        assert_eq!(tokens.stood.lock().unwrap()[0].used, 0.0);
+    }
+
+    fn plan_login() -> crate::hub_core::logins::resolve::Login {
+        crate::hub_core::logins::test_support::claude_login("governor-plan")
+    }
+
+    fn weekly(used: f64) -> workforce_common::usage::Window {
+        workforce_common::usage::Window {
+            used_percent: used,
+            resets_at: Some(Utc::now() + chrono::Duration::days(3)),
+            minutes: workforce_common::usage::SEVEN_DAY,
+        }
+    }
+
+    #[tokio::test]
+    async fn background_work_waits_on_a_nearly_full_plan_and_the_persons_own_turns_never_do() {
+        let guard = Arc::new(PlanGuard::new());
+        let g = governor(cfg(), &[]).with_plan_guard(Arc::clone(&guard));
+        let login = plan_login();
+        let on = OnPlan {
+            login: Some(&login),
+        };
+        guard.observe(&login, &[weekly(99.0)], Utc::now());
+        // The person typing to their agent: never held, even at 99%.
+        assert_eq!(g.admit_turn_on("a", Some("u"), on), Admission::Proceed);
+        let job = workforce_common::work_use::Work::job("a", "j1", "email check");
+        let held = workforce_common::work_use::within(job.clone(), async {
+            (
+                g.preflight_on("a", Some("u"), on),
+                g.admit_turn_on("a", Some("u"), on),
+            )
+        })
+        .await;
+        match held {
+            (Admission::Waits(a), Admission::Waits(b)) => {
+                assert_eq!(a, b);
+                assert!(a.contains("your weekly Claude plan is at 99%"), "{a}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Usage drops (a newer reading): it goes on by itself.
+        guard.observe(
+            &login,
+            &[weekly(20.0)],
+            Utc::now() + chrono::Duration::seconds(1),
+        );
+        let admitted =
+            workforce_common::work_use::within(job, async { g.admit_turn_on("a", Some("u"), on) })
+                .await;
+        assert_eq!(admitted, Admission::Proceed);
+    }
+
+    #[tokio::test]
+    async fn a_looping_background_job_is_stopped_once_and_the_dollar_ceilings_still_come_after() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let guard = Arc::new(PlanGuard::new());
+        guard.keep_in(store.clone());
+        let g = CostGovernor::new(store, cfg(), chrono_tz::UTC).with_plan_guard(Arc::clone(&guard));
+        let job = workforce_common::work_use::Work::job("a", "j1", "email check");
+        let verdicts = workforce_common::work_use::within(job, async {
+            let mut seen = Vec::new();
+            for _ in 0..500 {
+                match g.admit_turn("a", Some("u")) {
+                    Admission::Proceed => {}
+                    other => seen.push(other),
+                }
+            }
+            seen
+        })
+        .await;
+        let firsts = verdicts
+            .iter()
+            .filter(|v| matches!(v, Admission::Stopped { first: true, .. }))
+            .count();
+        assert_eq!(firsts, 1, "told once: {verdicts:?}");
+        assert!(
+            matches!(&verdicts[0], Admission::Stopped { why, .. } if why.starts_with("Your 'email check' job began 360 turns in the last hour")),
+            "{verdicts:?}"
+        );
+        assert!(verdicts[1..]
+            .iter()
+            .all(|v| matches!(v, Admission::Stopped { first: false, .. })));
+        // Other work and the person's own are not stopped with it.
+        assert_eq!(g.admit_turn("a", Some("u")), Admission::Proceed);
     }
 
     #[test]

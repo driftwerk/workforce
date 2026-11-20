@@ -170,6 +170,24 @@ pub(crate) enum Action {
         session: Uuid,
         mode: Mode,
     },
+    /// Move a session to another of the person's logins of the same
+    /// provider: it starts again in place on it, its conversation kept.
+    SwitchLogin {
+        session: Uuid,
+        login: Uuid,
+    },
+    /// Change a ticket on one of Desk's own boards (by its key): its words,
+    /// a comment, a need, or deleting it ([`super::tickets`]).
+    ChangeTicket {
+        ticket: String,
+        /// Its id once resolved, which a suggestion keeps.
+        id: Option<Uuid>,
+        change: Box<super::tickets::TicketChange>,
+    },
+    /// A new ticket on one of Desk's own boards.
+    CreateTicket {
+        new: Box<super::tickets::NewOne>,
+    },
     /// Change the overseer `agent`'s own `[oversight]`: only ever a
     /// suggestion, which only the person can accept, as its own limits are
     /// never the overseer's to change.
@@ -216,6 +234,8 @@ struct Input {
     account: Option<String>,
     /// A permission mode, as Claude Code spells it.
     mode: Option<String>,
+    /// `crew.switch_login`'s login: its id (a name is resolved to it first).
+    login: Option<String>,
 }
 
 fn id(raw: Option<&str>, what: &str) -> Result<Uuid, String> {
@@ -237,7 +257,7 @@ fn text(raw: Option<String>, what: &str) -> Result<String, String> {
 }
 
 /// The key of a ticket as typed: `acm-12` is `ACM-12`.
-fn ticket_key(raw: Option<String>) -> Result<String, String> {
+pub(super) fn ticket_key(raw: Option<String>) -> Result<String, String> {
     let key = text(raw, "which ticket, by its key (like ACM-12)")?;
     workforce_desk::board::parse_key(&key)
         .map(|(prefix, n)| format!("{prefix}-{n}"))
@@ -452,11 +472,35 @@ impl Action {
                     })?)),
                 },
             },
+            "crew.switch_login" => Self::SwitchLogin {
+                session: session()?,
+                login: i
+                    .login
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .ok_or("Say which login: its name or id from crew.logins.")?
+                    .parse()
+                    .map_err(|_| {
+                        "That isn’t a login from crew.logins: give its name or id.".to_string()
+                    })?,
+            },
             "crew.set_mode" => Self::SetMode {
                 session: session()?,
                 mode: i.mode.as_deref().and_then(Mode::parse).ok_or(
                     "Say which mode: default, acceptEdits, auto, plan or bypassPermissions.",
                 )?,
+            },
+            super::tickets::EDIT
+            | super::tickets::COMMENT
+            | super::tickets::LINK
+            | super::tickets::DELETE => Self::ChangeTicket {
+                ticket: ticket_key(i.ticket)?,
+                id: ticket_id(i.ticket_id)?,
+                change: Box::new(super::tickets::change_of(tool, input)?),
+            },
+            super::tickets::CREATE => Self::CreateTicket {
+                new: Box::new(super::tickets::new_of(input)?),
             },
             super::own_settings::NAME => Self::ChangeOversight {
                 agent: text(i.agent_id, "whose settings")?,
@@ -469,7 +513,9 @@ impl Action {
     /// The key of the ticket it is about.
     pub(crate) fn ticket_key(&self) -> Option<&str> {
         match self {
-            Self::AssignTicket { ticket, .. } | Self::MoveTicket { ticket, .. } => Some(ticket),
+            Self::AssignTicket { ticket, .. }
+            | Self::MoveTicket { ticket, .. }
+            | Self::ChangeTicket { ticket, .. } => Some(ticket),
             _ => None,
         }
     }
@@ -477,9 +523,16 @@ impl Action {
     /// The id of the ticket it is about, once resolved.
     pub(crate) fn ticket_id(&self) -> Option<Uuid> {
         match self {
-            Self::AssignTicket { id, .. } | Self::MoveTicket { id, .. } => *id,
+            Self::AssignTicket { id, .. }
+            | Self::MoveTicket { id, .. }
+            | Self::ChangeTicket { id, .. } => *id,
             _ => None,
         }
+    }
+
+    /// Whether it deletes a ticket: never undone, so the person's yes.
+    pub(crate) fn deletes_ticket(&self) -> bool {
+        matches!(self, Self::ChangeTicket { change, .. } if matches!(**change, super::tickets::TicketChange::Delete))
     }
 
     /// Whether it starts a session.
@@ -519,8 +572,12 @@ impl Action {
             } => return Cow::Owned(format!("{goal}.\n{name}")),
             Self::StartSession { goal, .. } => goal.as_str(),
             Self::Assign { task, .. } => task.as_str(),
+            // A ticket's words aren't read for what no boss does: they
+            // can't act, and a brief that speaks of a deploy is no deploy.
             Self::AssignTicket { .. }
             | Self::MoveTicket { .. }
+            | Self::ChangeTicket { .. }
+            | Self::CreateTicket { .. }
             | Self::Approve { .. }
             | Self::Deny { .. }
             | Self::Stop { .. }
@@ -531,6 +588,7 @@ impl Action {
             | Self::Release { .. }
             | Self::Handoff { .. }
             | Self::SetMode { .. }
+            | Self::SwitchLogin { .. }
             | Self::ChangeOversight { .. } => "",
         })
     }
@@ -594,7 +652,7 @@ fn answer_refused(e: workforce_desk::DeskError) -> Result<String, workforce_desk
 }
 
 /// A board change refused, in the words the person reads, as they are.
-fn board_plain(e: workforce_desk::DeskError) -> String {
+pub(super) fn board_plain(e: workforce_desk::DeskError) -> String {
     match e {
         workforce_desk::DeskError::Conflict(why) | workforce_desk::DeskError::Invalid(why) => why,
         e
@@ -637,6 +695,13 @@ impl CrewHub {
         }
         if let Some(why) = self.left_alone(action) {
             return Gate::No(why.into());
+        }
+        // Deleting a ticket can't be undone: the person's yes, unbound too.
+        if action.deletes_ticket() {
+            return match o.level {
+                Level::Watch => Gate::Refuse,
+                _ => Gate::Suggest(super::tickets::DELETE_WHY.into()),
+            };
         }
         let boss = self.boss_id(o);
         if o.level != Level::Watch && self.unbound(o) {
@@ -754,6 +819,9 @@ impl CrewHub {
             Level::Suggest => return Gate::Suggest("you suggest; the person decides".into()),
             Level::Act | Level::Full => {}
         }
+        if action.deletes_ticket() {
+            return Gate::Suggest(super::tickets::DELETE_WHY.into());
+        }
         // What no boss does at any level, said in words: in what it says,
         // and in the question it answers.
         if let Some(n) = self.never_said(action) {
@@ -828,7 +896,9 @@ impl CrewHub {
             Action::Escalate { .. } => (true, None),
             // Switched on by `message_agents`, above.
             Action::Assign { .. } => (true, None),
-            Action::Resume { .. } | Action::Restart { .. } => {
+            // A move to another login starts it again in place, as a
+            // restart does.
+            Action::Resume { .. } | Action::Restart { .. } | Action::SwitchLogin { .. } => {
                 (o.act.resume_restart, Some(switch::RESUME_RESTART))
             }
             Action::StartSession { .. } => (o.act.hand_out_work, Some(switch::HAND_OUT_WORK)),
@@ -887,6 +957,9 @@ impl CrewHub {
             // Decided above.
             Action::TakeOn { .. } | Action::Release { .. } => (true, None),
             Action::Handoff { .. } | Action::ChangeOversight { .. } => (false, None),
+            // A ticket's words, comments and needs, and a new ticket on
+            // Desk's own boards: ordinary work at Act (deleting is above).
+            Action::ChangeTicket { .. } | Action::CreateTicket { .. } => (true, None),
             // At Act, only to a mode that still asks before it runs a
             // command; any other is an unbound overseer's alone.
             // Only a mode that asks gets here.
@@ -950,7 +1023,8 @@ impl CrewHub {
             | Action::Resume { session: s, .. }
             | Action::Restart { session: s, .. }
             | Action::Handoff { session: s, .. }
-            | Action::SetMode { session: s, .. } => Some(*s),
+            | Action::SetMode { session: s, .. }
+            | Action::SwitchLogin { session: s, .. } => Some(*s),
             _ => None,
         }
     }
@@ -1008,10 +1082,13 @@ impl CrewHub {
             Action::Interrupt { .. } => Some(Gate::Run),
             // A session started again reads its settings again: changes to
             // them it made by itself are the person's to let take effect.
-            Action::Resume { .. } | Action::Restart { .. } => Some(Gate::Suggest(
-                "starting it again loads whatever settings it changed; that's the person's call"
-                    .into(),
-            )),
+            // A move to another login starts it again too.
+            Action::Resume { .. } | Action::Restart { .. } | Action::SwitchLogin { .. } => {
+                Some(Gate::Suggest(
+                    "starting it again loads whatever settings it changed; that's the person's call"
+                        .into(),
+                ))
+            }
             _ => None,
         }
     }
@@ -1055,9 +1132,9 @@ impl CrewHub {
                 Ok(Origin::External) => true,
                 Err(_) => false,
             },
-            Action::Resume { session: s, .. } | Action::Restart { session: s, .. } => {
-                started_here(s)
-            }
+            Action::Resume { session: s, .. }
+            | Action::Restart { session: s, .. }
+            | Action::SwitchLogin { session: s, .. } => started_here(s),
             Action::StartSession { .. } => true,
             // What a ticket's session or agent is told is a message to it.
             Action::AssignTicket {
@@ -1080,6 +1157,8 @@ impl CrewHub {
                 ..
             }
             | Action::MoveTicket { .. } => true,
+            // Nothing is sent to a session or an agent.
+            Action::ChangeTicket { .. } | Action::CreateTicket { .. } => true,
             Action::Approve { .. }
             | Action::Deny { .. }
             | Action::Stop { .. }
@@ -1189,6 +1268,16 @@ impl CrewHub {
             .unwrap_or_else(|_| "that session".into())
     }
 
+    /// What the person calls one of their logins.
+    pub(super) fn login_name(&self, id: Uuid) -> String {
+        self.desk
+            .accounts()
+            .into_iter()
+            .find(|a| a.id == id)
+            .map(|a| a.name)
+            .unwrap_or_else(|| "that login".into())
+    }
+
     fn agent_name(&self, id: &str) -> String {
         self.party_of_agent(id)
             .map(|p| p.name)
@@ -1217,6 +1306,8 @@ impl CrewHub {
                 ..
             }
             | Action::MoveTicket { .. }
+            | Action::ChangeTicket { .. }
+            | Action::CreateTicket { .. }
             | Action::Escalate { .. } => None,
             Action::ChangeOversight { agent, .. } => self.party_of_agent(agent),
             Action::Nudge {
@@ -1233,7 +1324,8 @@ impl CrewHub {
             | Action::TakeOn { session: s }
             | Action::Release { session: s }
             | Action::Handoff { session: s, .. }
-            | Action::SetMode { session: s, .. } => {
+            | Action::SetMode { session: s, .. }
+            | Action::SwitchLogin { session: s, .. } => {
                 self.desk.view(*s).ok().map(|v| Party::session(&v))
             }
         }
@@ -1334,6 +1426,15 @@ impl CrewHub {
             Action::MoveTicket { ticket, state, .. } => {
                 format!("Move {ticket} to {}", state.title())
             }
+            Action::ChangeTicket { ticket, change, .. } => super::tickets::describe(ticket, change),
+            Action::CreateTicket { new } => format!(
+                "Make a ticket{}: “{}”",
+                new.board
+                    .as_deref()
+                    .map(|b| format!(" on {b}"))
+                    .unwrap_or_default(),
+                crew::clip(&new.title, 120)
+            ),
             Action::TakeOn { session } => {
                 format!("Run {} for you", self.session_name(*session))
             }
@@ -1352,6 +1453,11 @@ impl CrewHub {
                 "Put {} in {} mode",
                 self.session_name(*session),
                 mode.title()
+            ),
+            Action::SwitchLogin { session, login } => format!(
+                "Move {} to the login {}, its conversation kept",
+                self.session_name(*session),
+                self.login_name(*login)
             ),
             Action::ChangeOversight { agent, change } => {
                 let mut said = change.describe();
@@ -1496,6 +1602,11 @@ impl CrewHub {
             // step is said once, by the call that took it.
             return Box::pin(self.perform_typed(&sent, by, order)).await;
         }
+        // At Act fully (in force) only budget, audit and Stop hold a boss
+        // back: what a guard below would refuse goes all the same, and the
+        // boss is told what it would have said, as a note in its result.
+        let unbound = self.by_unbound(&by);
+        let mut notes: Vec<String> = Vec::new();
         // R5: a boss allows no irreversible request on a job another
         // session holds, as irreversible, whichever path it came by.
         if let (crew::PartyKind::Manager, Action::Approve { session, approval }) =
@@ -1521,9 +1632,12 @@ impl CrewHub {
                 ))
                 .await
                 {
-                    return Err(Refused::other(format!(
-                        "Not allowed: {conflict}. It's the person's to answer."
-                    )));
+                    if !unbound {
+                        return Err(Refused::other(format!(
+                            "Not allowed: {conflict}. It's the person's to answer."
+                        )));
+                    }
+                    notes.push(format!("{conflict}; allowed all the same at Act fully"));
                 }
             }
         }
@@ -1543,7 +1657,7 @@ impl CrewHub {
             None => None,
         };
         if let Some(s) = lane {
-            match self.check_at_send(action, &by.party.id, s).await {
+            match self.check_at_send(action, &by.party.id, s, unbound).await {
                 Ok(Some(said)) => {
                     unheld(&said).await;
                     return Ok(said);
@@ -1556,8 +1670,10 @@ impl CrewHub {
             }
         }
         // The same instruction to the same session again, soon after: said
-        // once, no second message on its line, no second decision.
+        // once, no second message on its line, no second decision. Unbound,
+        // the boss's word goes as it gives it.
         let told = match self.tell_once(action, &by) {
+            _ if unbound => None,
             Ok(told) => told,
             Err(at) => {
                 unheld("it was said already").await;
@@ -1584,6 +1700,16 @@ impl CrewHub {
                     self.untell(t);
                 }
                 return Ok(said);
+            }
+            // Unbound, a job the guard would hold back goes unrecorded:
+            // who holds a job is still kept wherever one is declared, and
+            // only what it would have refused goes without a record. What
+            // Desk failed to keep, or the same job's order already gone in
+            // meanwhile, still holds it back.
+            Err(why) if unbound && why.guard => {
+                tracing::info!(boss = %by.party.id, kind = ?why.kind, "an unbound boss's order the job guard would refuse goes all the same");
+                notes.push(why.why.clone());
+                None
             }
             Err(why) => {
                 if let Some(t) = told {
@@ -1699,7 +1825,7 @@ impl CrewHub {
                 self.post_decision(&d).await;
             }
         }
-        Ok(said)
+        Ok(with_notes(said, &notes))
     }
 
     /// Keeps that a boss (`by`) tells `action`'s session this on its line
@@ -2038,6 +2164,9 @@ impl CrewHub {
                     .map_err(board_plain)?;
                 Ok(format!("moved {ticket} to {}", state.title()))
             }
+            Action::ChangeTicket { .. } | Action::CreateTicket { .. } => {
+                self.change_ticket_boxed(action, by).await
+            }
             Action::TakeOn { session } => {
                 let (service, o) = self
                     .boss_for(&by)
@@ -2100,6 +2229,24 @@ impl CrewHub {
                     engine.title(),
                     done.session.label()
                 ))
+            }
+            Action::SwitchLogin { session, login } => {
+                let name = self.session_name(*session);
+                let login_name = self.login_name(*login);
+                let v = d
+                    .switch_account(*session, Some(*login), Some(by.clone()))
+                    .await
+                    .map_err(|e| match e {
+                        workforce_desk::DeskError::Conflict(why)
+                        | workforce_desk::DeskError::Invalid(why) => why,
+                        e => plain(e),
+                    })?;
+                Ok(match v.switching_to {
+                    Some(_) => format!(
+                        "{name} moves to {login_name} once its turn and the work it left running end, its conversation kept"
+                    ),
+                    None => format!("moved {name} to {login_name}, its conversation kept"),
+                })
             }
             Action::SetMode { session, mode } => {
                 let set = d.set_mode(*session, *mode, by).await.map_err(|e| match e {
@@ -2228,7 +2375,7 @@ impl CrewHub {
         ))
     }
 
-    /// With "always work in real sessions", the session this overseer
+    /// Working in real sessions (only, or preferring them), the session this overseer
     /// already runs to give a start's work to instead of starting another:
     /// `action` becomes a nudge to it with the goal, and the session is
     /// claimed so another start doesn't pile onto it. Only when the start
@@ -2252,7 +2399,7 @@ impl CrewHub {
         else {
             return None;
         };
-        if !o.work.prefer_sessions || self.gate(action, o) != Gate::Run {
+        if !o.work.style.sessions_for_code() || self.gate(action, o) != Gate::Run {
             return None;
         }
         let engine = self.engine_or_default(*engine, o).ok()?;
@@ -2439,7 +2586,7 @@ impl CrewHub {
     /// key; with `seen`, only one on a board its scope sees: one on another
     /// scope's board is refused in the words one that isn't there is, so
     /// a key never says what another scope holds.
-    async fn ticket_named(
+    pub(super) async fn ticket_named(
         &self,
         key: &str,
         id: Option<Uuid>,
@@ -2558,6 +2705,10 @@ impl CrewHub {
                         .and_then(|s| self.desk.view(s).ok())
                         .is_some_and(|v| v.origin == Origin::External);
             }
+            Action::ChangeTicket { ticket, id, change } => {
+                self.resolve_change_boxed(ticket, id, change, seen).await?;
+            }
+            Action::CreateTicket { new } => self.resolve_new_boxed(new, seen).await?,
             _ => {}
         }
         Ok(())
@@ -2856,14 +3007,21 @@ impl CrewHub {
                     super::MAX_HOPS
                 ));
             }
+            let unbound = self.by_unbound(&by);
             let mut sent = self.sent.lock();
-            if sent.len() >= super::TURN_BUDGET {
-                return Err(format!(
-                    "Loop guard: you have messaged the crew {} times since the person last spoke; tell the person instead.",
-                    super::TURN_BUDGET
-                ));
+            // Unbound, messaging the crew isn't counted against the
+            // person's silence (nor kept, to count against a bound boss's):
+            // it is how the boss keeps work moving. MAX_HOPS above still
+            // ends a chain handed on too long.
+            if !unbound {
+                if sent.len() >= super::TURN_BUDGET {
+                    return Err(format!(
+                        "Loop guard: you have messaged the crew {} times since the person last spoke; tell the person instead.",
+                        super::TURN_BUDGET
+                    ));
+                }
+                sent.push(chrono::Utc::now());
             }
-            sent.push(chrono::Utc::now());
         }
         let owner = self
             .person(Some(&service))
@@ -3010,6 +3168,27 @@ pub(crate) fn same_place_key(folder: &str) -> String {
 
 /// How long the same instruction to a session isn't sent again.
 const TOLD_AGAIN: chrono::TimeDelta = chrono::TimeDelta::minutes(20);
+
+/// `said`, with what a guard would have refused an unbound boss said after
+/// it, each as a note: done all the same, and why it might not have been.
+fn with_notes(said: String, notes: &[String]) -> String {
+    if notes.is_empty() {
+        return said;
+    }
+    let notes: Vec<String> = notes
+        .iter()
+        .map(|n| {
+            // What a refusal opens with isn't so: it went.
+            let n = n.trim();
+            let n = ["Not sent: ", "Not allowed: ", "not sent: "]
+                .iter()
+                .find_map(|p| n.strip_prefix(p))
+                .unwrap_or(n);
+            format!("note (done at Act fully all the same): {n}")
+        })
+        .collect();
+    format!("{}\n{}", said.trim_end(), notes.join("\n"))
+}
 
 /// The session `action` tells something on its line, and what, in plain
 /// form (case, spacing and the closing stop aside), when a boss (`by`)

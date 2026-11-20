@@ -77,5 +77,5 @@ pub struct VectorFill {
     pub total: u64,
 }
 
-/// A file noted as pending, and the note's sequence.
+/// A file noted as pending, and the note's mark.
 pub type PendingFile = (String, i64);

@@ -27,8 +27,9 @@ use super::CrewHub;
 
 /// Every `crew.*` tool: the ones it has at every level first (its reads,
 /// and what it asks of the person, which is never gated).
-pub const READ: [&str; 21] = [
+pub const READ: [&str; 25] = [
     "crew.overview",
+    LOGINS,
     "crew.activity",
     "crew.account",
     super::decisions::NAME,
@@ -36,6 +37,7 @@ pub const READ: [&str; 21] = [
     super::spend::NAME,
     super::board::NAME,
     super::find::NAME,
+    super::tickets::READ,
     super::items::ASK,
     super::items::CLOSE,
     super::items::OPEN,
@@ -49,8 +51,10 @@ pub const READ: [&str; 21] = [
     super::github::BRANCH,
     super::github::CI,
     super::assignments::LIST,
+    super::watches::WATCH,
+    super::watches::WATCHES,
 ];
-pub const ACT: [&str; 24] = [
+pub const ACT: [&str; 30] = [
     "crew.nudge",
     "crew.ask_session",
     "crew.escalate",
@@ -65,6 +69,11 @@ pub const ACT: [&str; 24] = [
     "crew.assign",
     "crew.assign_ticket",
     "crew.move_ticket",
+    super::tickets::EDIT,
+    super::tickets::COMMENT,
+    super::tickets::LINK,
+    super::tickets::CREATE,
+    super::tickets::DELETE,
     "crew.take_on",
     "crew.release",
     super::plan::NAME,
@@ -73,9 +82,15 @@ pub const ACT: [&str; 24] = [
     super::handover::NAME,
     "crew.handoff",
     "crew.set_mode",
+    SWITCH_LOGIN,
     super::own_settings::NAME,
     super::assignments::CLOSE,
 ];
+
+/// The person's logins (engine accounts), each with what runs on it.
+pub const LOGINS: &str = "crew.logins";
+/// Move a session to another of the person's logins.
+pub const SWITCH_LOGIN: &str = "crew.switch_login";
 
 pub struct CrewTool {
     name: &'static str,
@@ -244,10 +259,11 @@ fn row(i: &Item, charged: &Charged) -> String {
         format!("{} ({})", i.name, also.join(", "))
     };
     format!(
-        "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+        "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
         cell(&who),
         kind,
         i.id,
+        cell(i.login.as_deref().unwrap_or("")),
         state_word(i.state),
         cell(i.task.as_deref().unwrap_or("")),
         cell(&detail),
@@ -259,7 +275,7 @@ fn row(i: &Item, charged: &Charged) -> String {
 /// The overview as tables the overseer reads and can act from: one per
 /// sidebar group, in the person's order, then whatever is in none.
 fn table(items: &[Item], groups: &[String], charged: &Charged) -> String {
-    const HEAD: &str = "| Who | Kind | Id | State | Doing | Detail | Since | You run it |\n|---|---|---|---|---|---|---|---|\n";
+    const HEAD: &str = "| Who | Kind | Id | Login | State | Doing | Detail | Since | You run it |\n|---|---|---|---|---|---|---|---|---|\n";
     let mut out = String::new();
     let mut section = |title: Option<&str>, rows: Vec<&Item>| {
         if rows.is_empty() {
@@ -427,6 +443,7 @@ impl CrewTool {
                 crew.session_seen(id, seen)?;
                 self.account(crew, id, input["question"].as_str()).await
             }
+            LOGINS => Ok(crew.logins_seen(seen)),
             super::spend::NAME => crew.spend(input, seen).await,
             super::assignments::LIST => {
                 crew.assignments_tool(b.service.agent_id.as_str(), input)
@@ -439,6 +456,7 @@ impl CrewTool {
             }
             super::board::NAME => crew.board_tool(b, input).await,
             super::find::NAME => crew.find_tickets_tool(b, input).await,
+            super::tickets::READ => crew.ticket_tool_boxed(b, input).await,
             super::items::ASK
             | super::items::CLOSE
             | super::items::OPEN
@@ -460,6 +478,9 @@ impl CrewTool {
                     input,
                 )
                 .await
+            }
+            super::watches::WATCH | super::watches::WATCHES => {
+                crew.watch_tool(self.name, b, input).await
             }
             _ => Err("not a reading tool".into()),
         }
@@ -562,6 +583,10 @@ impl CrewTool {
         let mut kept = input.clone();
         if let Some(o) = kept.as_object_mut() {
             o.remove("ticket_id");
+            o.remove("board_id");
+            o.remove("needs_id");
+            o.remove("need_ids");
+            o.remove("brief_was");
             // What it applies is checked below and cited, never read as
             // part of the action or kept with a suggestion.
             for f in super::preferences::ACT_FIELDS {
@@ -570,6 +595,60 @@ impl CrewTool {
             // Whose settings are its own, never another's it names.
             if self.name == super::own_settings::NAME {
                 o.insert("agent_id".into(), json!(b.service.agent_id.as_str()));
+            }
+        }
+        // A login is named as the person calls it, or by its id: read here
+        // into its id, case aside, never guessed between two.
+        if let Some(o) = kept.as_object_mut() {
+            let field = match self.name {
+                SWITCH_LOGIN => Some("login"),
+                "crew.handoff" => Some("account"),
+                _ => None,
+            };
+            if let Some(field) = field {
+                let said = o
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && *s != "own")
+                    .map(str::to_string);
+                if let Some(said) = said {
+                    // Of the session's own provider, or the one it continues
+                    // in: another's login is never a match.
+                    // A session outside its scope is refused as any is,
+                    // before a login is looked up for it.
+                    let session = match self.name {
+                        SWITCH_LOGIN => o
+                            .get("session_id")
+                            .and_then(Value::as_str)
+                            .and_then(|s| s.trim().parse::<uuid::Uuid>().ok()),
+                        _ => None,
+                    };
+                    match session {
+                        Some(s) => crew.session_seen(s, &b.seen)?,
+                        // No session it names: said as such below, never
+                        // a login looked up across providers.
+                        None if self.name == SWITCH_LOGIN => {
+                            return Err("Say which session: its id from crew.overview.".into())
+                        }
+                        None => {}
+                    }
+                    let engine = match self.name {
+                        SWITCH_LOGIN => session
+                            .and_then(|s| crew.desk.view(s).ok())
+                            .map(|v| v.engine),
+                        _ => o
+                            .get("engine")
+                            .cloned()
+                            .and_then(|e| serde_json::from_value(e).ok()),
+                    };
+                    let id = crew.desk.login_named(engine, &said).map_err(|e| match e {
+                        workforce_desk::DeskError::Invalid(why)
+                        | workforce_desk::DeskError::Conflict(why) => why,
+                        e => e.to_string(),
+                    })?;
+                    o.insert(field.into(), json!(id.to_string()));
+                }
             }
         }
         let mut action = Action::parse(self.name, &kept)?;
@@ -606,8 +685,40 @@ impl CrewTool {
             o.insert("ticket_id".into(), json!(id.to_string()));
             o.insert("ticket".into(), json!(key));
         }
+        // What a ticket change names, as resolved: the suggestion acts on
+        // those, and on the brief it saw.
+        match (&action, kept.as_object_mut()) {
+            (Action::CreateTicket { new }, Some(o)) => {
+                if let Some(b) = new.board_id {
+                    o.insert("board_id".into(), json!(b.to_string()));
+                }
+                o.insert(
+                    "need_ids".into(),
+                    json!(new
+                        .need_ids
+                        .iter()
+                        .map(|i| i.to_string())
+                        .collect::<Vec<_>>()),
+                );
+            }
+            (Action::ChangeTicket { change, .. }, Some(o)) => match &**change {
+                super::tickets::TicketChange::Need {
+                    other,
+                    other_id: Some(n),
+                    ..
+                } => {
+                    o.insert("needs_id".into(), json!(n.to_string()));
+                    o.insert("needs".into(), json!(other));
+                }
+                super::tickets::TicketChange::Edit { was: Some(w), .. } => {
+                    o.insert("brief_was".into(), json!(w));
+                }
+                _ => {}
+            },
+            _ => {}
+        }
         let oversight = &b.oversight;
-        // Always working in real sessions, a start goes to the session it
+        // Working in real sessions, a start goes to the session it
         // already runs for it when one fits, as the start would have run:
         // told the goal, not a new one.
         let reused = crew
@@ -882,7 +993,7 @@ impl CrewTool {
 /// own words, the same whether its crew is here or on a linked engine.
 pub(crate) fn describe(name: &str) -> &'static str {
     match name {
-            "crew.overview" => "Everyone on the crew now: the person's agents and their Claude Code and Codex sessions, each with its state (needs you, working, quiet, done today, idle, failed, stopped), what it's doing, what it asks (with approval ids), since when, and whether you run it for the person (and whether they are driving it now). slots says how many of the sessions you run are starting or working, of the most you may run at once. For what sessions spent (tokens, cost), use crew.spend.",
+            "crew.overview" => "Everyone on the crew now: the person's agents and their Claude Code and Codex sessions, each with its state (needs you, working, quiet, done today, idle, failed, stopped), what it's doing, what it asks (with approval ids), since when, which of the person's logins it runs on (its Login), and whether you run it for the person (and whether they are driving it now). slots says how many of the sessions you run are starting or working, of the most you may run at once. For what sessions spent (tokens, cost), use crew.spend.",
             super::spend::NAME => super::spend::DESCRIPTION,
             super::github::PR | super::github::BRANCH | super::github::CI => {
                 super::github::describe(name)
@@ -899,6 +1010,12 @@ pub(crate) fn describe(name: &str) -> &'static str {
             super::cadence_tool::NAME => super::cadence_tool::DESCRIPTION,
             super::board::NAME => super::board::DESCRIPTION,
             super::find::NAME => super::find::DESCRIPTION,
+            super::tickets::READ => super::tickets::READ_DESCRIPTION,
+            super::tickets::EDIT => super::tickets::EDIT_DESCRIPTION,
+            super::tickets::COMMENT => super::tickets::COMMENT_DESCRIPTION,
+            super::tickets::LINK => super::tickets::LINK_DESCRIPTION,
+            super::tickets::CREATE => super::tickets::CREATE_DESCRIPTION,
+            super::tickets::DELETE => super::tickets::DELETE_DESCRIPTION,
             super::plan::NAME => super::plan::DESCRIPTION,
             super::plan::UPDATE => super::plan::UPDATE_DESCRIPTION,
             super::plan::BOARD_CREATE => super::plan::BOARD_CREATE_DESCRIPTION,
@@ -906,6 +1023,8 @@ pub(crate) fn describe(name: &str) -> &'static str {
             super::own_settings::NAME => super::own_settings::DESCRIPTION,
             super::assignments::CLOSE => super::assignments::CLOSE_DESCRIPTION,
             super::assignments::LIST => super::assignments::LIST_DESCRIPTION,
+            super::watches::WATCH => super::watches::WATCH_DESCRIPTION,
+            super::watches::WATCHES => super::watches::WATCHES_DESCRIPTION,
             "crew.activity" => "What happened on the crew, newest first: turns started and finished, questions, requests, failures, and what you and the person did. Filter to one agent or session with subject_id.",
             "crew.account" => "What one session (session_id) is for, who asked, its plan, what it has done (with its PRs, tickets, commits and deploys), what it is doing now, what it waits on, what comes next and the choices it made: its running account, brought up to date first when it is stale, with the time it is as of. Read it before you say anything of a session. With question, also the answer its own recent conversation gives to something the account doesn't say (which key, which file, what error).",
             "crew.ask_session" => "Ask a session (session_id) a question about its work, as Desk's status question on its line, without derailing it: one that is working gets it once its turn ends, never typed in over what it is doing. Use it only when crew.account, with a question, can't answer; then answer the person now from what you have and say you asked. It asks for words only and never changes what the session does: to have it wait, hold or change course, tell it so with crew.nudge.",
@@ -919,14 +1038,16 @@ pub(crate) fn describe(name: &str) -> &'static str {
             "crew.interrupt" => "End the turn a working session is on, as Esc in its terminal: it, and the terminal it runs in, keep running, and the shell stays the person's. Works for sessions started in a Desk terminal too.",
             "crew.resume" => "Resume a stopped session, optionally with a prompt. A session in another terminal can only be resumed once it has ended there.",
             "crew.restart" => "Stop a session and resume it with a new prompt, e.g. to get it unstuck.",
-            "crew.start_session" => "Start a real, visible session (Claude Code, Codex) in a project folder with a goal: it shows on the person's Floor and sidebar, they can watch it, type into it and take it over, and you run it from the start (its turn ends wake you). It runs on the person's default engine and model: omit engine and model unless the person named one for this work, in this conversation or its ticket; never pick one yourself. worktree names a new branch to work on in a worktree of its own. You run at most your limit of sessions starting or working at once (crew.overview's slots). When you always work in real sessions, a session already there in that folder (or another worktree of its repository) that's idle or on this goal gets the work instead, and you're told which; pass new: true only when the person asked for a new session.",
+            "crew.start_session" => "Start a real, visible session (Claude Code, Codex) in a project folder with a goal: it shows on the person's Floor and sidebar, they can watch it, type into it and take it over, and you run it from the start (its turn ends wake you). It runs on the person's default engine and model: omit engine and model unless the person named one for this work, in this conversation or its ticket; never pick one yourself. worktree names a new branch to work on in a worktree of its own. You run at most your limit of sessions starting or working at once (crew.overview's slots). When you work in real sessions (Only in sessions or Prefer sessions), a session already there in that folder (or another worktree of its repository) that's idle or on this goal gets the work instead, and you're told which; pass new: true only when the person asked for a new session.",
             "crew.assign" => "Hand a task to one of the crew's agents, in its DM.",
             "crew.assign_ticket" => "Hand a ticket on the board (ticket, its key like ACM-12) to a session (to: { \"session\": id }), an agent (to: { \"agent\": id }) or a new session started for it, which you run (to: { \"newSession\": { \"folder\": path, \"engine\": optional } }). The ticket moves to Doing and its holder is told. Only a ready ticket can be handed out (crew.board); a new session counts against your limit of sessions at once. Handing out work is for what the person has let you hand out.",
-            "crew.move_ticket" => "Move a ticket on the board (ticket, its key like ACM-12) to a column (state): backlog, todo, doing, review or done. Dropping a ticket is always the person's call, so it becomes a suggestion for them.",
+            "crew.move_ticket" => "Move a ticket on the board (ticket, its key like ACM-12) to a column (state): backlog, todo, doing, review or done. Dropping a ticket is always the person's call, so it becomes a suggestion for them. Read a ticket in full with crew.ticket; change its words with crew.edit_ticket, comment with crew.comment_ticket.",
             "crew.take_on" => "Run a session for the person (session_id): it wakes you each time its turn ends, so you can tell it the next step. You take it on yourself only when the person lets you take on every session; otherwise this offers it to them. The person can take over any time by typing in it; it is theirs while they are active there (a couple of minutes after their last input, unless they pin it), and your messages wait until then.",
             "crew.release" => "Let a session you run go (session_id): the person runs it on their own, and its turn ends no longer wake you. Say why in reason.",
+            LOGINS => "The person's logins for each engine (their Claude accounts, as Desk keeps them): each one's name, provider, id, whether it is the default, whether its sign-in can be used, how far into its plan's windows it was last read and when they reset, whether it is at its limit or turned away by the provider (and why, and until when), and which sessions run on it. Name a login by its name or id in crew.switch_login and crew.handoff.",
+            SWITCH_LOGIN => "Move a Desk session (session_id) to another of the person's logins of the same provider (login: its name or id from crew.logins), its conversation kept: Desk checks first that the login serves, then starts the session again in place on it (one whose turn stopped on its old login's limit is told why and carries on; one working moves once its turn and the work it left running end). Use it when a session's login is at its limit or turned away and Desk hasn't moved it already; Desk never moves a session to another provider's login. Say why in reason.",
             "crew.set_mode" => "Change a Desk session's permission mode (session_id, mode): default (manual: it asks), acceptEdits, plan, auto (it decides what is safe) or bypassPermissions (it asks for nothing). Desk starts it again in place in that mode, its conversation kept, and says the mode it now runs in. Set it between turns, never while it works or waits on an answer: auto before routine work, default before work that will need your judgement. auto and bypassPermissions are for an unbound overseer only, on a session it runs (take it on first), and end with unbound: once you aren't unbound or don't run it, it starts in its own mode again, as it does when the person resumes it. Below unbound, only default, acceptEdits and plan, where the person switched it on.",
-            "crew.handoff" => "Suggest the person continue a session's work in another engine (session_id; engine: claude or codex; account optional): Desk starts a session of that engine in the same folder and group with a brief of the work, and the two become one piece of work. It is only ever a suggestion the person accepts, because the brief goes to that engine's vendor, and only when they have switched it on for you.",
+            "crew.handoff" => "Suggest the person continue a session's work in another engine (session_id; engine: claude or codex; account optional: a login's name or id from crew.logins): Desk starts a session of that engine in the same folder and group with a brief of the work, and the two become one piece of work. It is only ever a suggestion the person accepts, because the brief goes to that engine's vendor, and only when they have switched it on for you.",
             _ => "",
         }
 }
@@ -951,6 +1072,7 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
             super::github::schema(name)
         }
         super::decisions::NAME => super::decisions::schema(),
+        super::watches::WATCH | super::watches::WATCHES => super::watches::schema(name),
         super::items::ASK
         | super::items::CLOSE
         | super::items::OPEN
@@ -963,6 +1085,15 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
         super::cadence_tool::NAME => super::cadence_tool::schema(),
         super::board::NAME => super::board::schema(),
         super::find::NAME => super::find::schema(),
+        super::tickets::READ => super::tickets::read_schema(),
+        super::tickets::EDIT
+        | super::tickets::COMMENT
+        | super::tickets::LINK
+        | super::tickets::CREATE
+        | super::tickets::DELETE => {
+            let (p, required) = super::tickets::properties(name);
+            act(props(p), required)
+        }
         super::plan::NAME => super::plan::schema(),
         super::plan::UPDATE => super::plan::update_schema(),
         super::plan::BOARD_CREATE => super::plan::board_create_schema(),
@@ -1043,6 +1174,14 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
             .collect(),
             &["session_id"],
         ),
+        LOGINS => json!({ "type": "object", "properties": {} }),
+        SWITCH_LOGIN => act(
+            props(json!({
+                "session_id": session_schema(),
+                "login": { "type": "string", "description": "The login to move it to: its name (\"Kingsley Gmail\", case aside) or id, from crew.logins" }
+            })),
+            &["session_id", "login"],
+        ),
         "crew.set_mode" => act(
             props(json!({
                 "session_id": session_schema(),
@@ -1054,7 +1193,7 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
             props(json!({
                 "session_id": session_schema(),
                 "engine": { "type": "string", "enum": ["claude", "codex"], "description": "The engine to continue in" },
-                "account": { "type": "string", "description": "Optional: an account's id from crew.overview, or \"own\" for the engine's own sign-in on this computer; the engine's default when left out" }
+                "account": { "type": "string", "description": "Optional: a login's name or id from crew.logins, or \"own\" for the engine's own sign-in on this computer; the engine's default when left out" }
             })),
             &["session_id", "engine"],
         ),
@@ -1179,7 +1318,17 @@ impl Tool for CrewTool {
         } else if self.name == super::assignments::CLOSE {
             crew.assignment_tool(&bound, &input).await
         } else {
-            self.act(&crew, &bound, &input).await
+            // A ticket of an open plan changes through its plan; any other
+            // change is the board's, gated as every action is.
+            let through = match self.name == super::tickets::EDIT {
+                true => crew.edit_by_plan_boxed(&bound, &input).await,
+                false => Ok(None),
+            };
+            match through {
+                Ok(Some(done)) => Ok(done),
+                Ok(None) => self.act(&crew, &bound, &input).await,
+                Err(why) => Err(why),
+            }
         };
         Ok(match result {
             Ok(v) => ToolResult::success(v, ms()),
@@ -1204,6 +1353,7 @@ mod tests {
             group_id: group.map(Into::into),
             engine: Some(Engine::Claude),
             origin: Some(Origin::Desk),
+            login: Some("Kingsley Gmail".into()),
             state: ItemState::Working,
             task: None,
             detail: None,
@@ -1240,5 +1390,11 @@ mod tests {
         assert!(t[rest..].contains("| auth-fix (in /Users/k/dev/monorepo) |"));
         assert!(t.contains("| yes · the person is driving |\n"), "{t}");
         assert!(t[rest..].trim_end().ends_with("|  |"), "{t}");
+        // Each session's login, by its name.
+        assert!(t.contains("| Login |"), "{t}");
+        assert!(
+            t.contains("| id-auth-fix | Kingsley Gmail | working |"),
+            "{t}"
+        );
     }
 }

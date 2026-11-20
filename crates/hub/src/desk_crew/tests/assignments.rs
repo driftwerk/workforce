@@ -23,7 +23,7 @@ use workforce_desk::LineSender;
 
 use super::super::actions::{Action, Target};
 use super::super::assignments::{Declared, Order};
-use super::decides_at_once::{calls_about, decides, said, THEIRS};
+use super::decides_at_once::{calls_about, decides, THEIRS};
 use super::*;
 
 const ACT: &str = "[oversight]\nenabled = true\nlevel = \"act\"\nact = { nudge = true }\n";
@@ -635,12 +635,14 @@ async fn the_bosss_turns_read_its_open_assignments_and_it_closes_them() {
     .await;
 }
 
+/// At Act fully only budget, audit and Stop hold the boss back: a request
+/// on a release another session holds is the boss's to allow, and it is.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_request_on_a_release_another_session_holds_is_the_persons_to_allow() {
+async fn a_request_on_a_release_another_session_holds_is_allowed_at_act_fully() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
-        let (overseer, crew, d, llm) = overseeing(&base, pool, "ok", THEIRS, &[]).await;
+        let (_overseer, crew, d, llm) = overseeing(&base, pool, "ok", THEIRS, &[]).await;
         d.boss_bounds_with(workforce_desk::charge::Bounds {
             home: base.clone(),
             ..Default::default()
@@ -664,31 +666,18 @@ async fn a_request_on_a_release_another_session_holds_is_the_persons_to_allow() 
         let body = json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash",
             "tool_input": {"command": command}});
         let ask = tokio::spawn(async move { hook(&url, body).await });
-        eventually("the DM to say why it is the person's", async || {
-            (said(&overseer, &["harbor-release-3 holds", "run it twice"]) > 0).then_some(())
-        })
-        .await;
+        let decided = tokio::time::timeout(Duration::from_secs(30), ask)
+            .await
+            .expect("the boss decided it")
+            .unwrap();
+        assert_eq!(
+            decided["hookSpecificOutput"]["decision"]["behavior"], "allow",
+            "{decided}"
+        );
         assert_eq!(
             calls_about(&llm, "release=4").await.len(),
             1,
             "the boss was asked"
-        );
-        let p = d
-            .view(other.id)
-            .unwrap()
-            .pending
-            .expect("the person's to answer");
-        assert!(!ask.is_finished(), "nothing allowed it");
-        d.decide(
-            other.id,
-            p.id,
-            workforce_desk::model::Decision::Deny,
-            Some(By::you()),
-        )
-        .unwrap();
-        assert_eq!(
-            ask.await.unwrap()["hookSpecificOutput"]["decision"]["behavior"],
-            "deny"
         );
     })
     .await;

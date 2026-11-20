@@ -96,6 +96,18 @@ impl LimitHit {
     }
 }
 
+/// The `error` Desk keeps for a turn the provider ended by refusing the
+/// login's account itself (Claude Code's `oauth_org_not_allowed`, a 403
+/// `permission_error`, or its words for an account on hold): the login
+/// can't serve until it is put right, whatever its plan's room.
+pub const ACCOUNT_REFUSED: &str = "account_refused";
+
+/// Claude Code's own codes for a refusal of the account itself.
+const REFUSAL_CODES: &[&str] = &[
+    "oauth_org_not_allowed",
+    "oauth_not_allowed_for_organization",
+];
+
 impl TurnFailure {
     pub fn limit(&self) -> Option<&LimitHit> {
         match self {
@@ -103,6 +115,19 @@ impl TurnFailure {
             TurnFailure::Failed(_) => None,
         }
     }
+
+    /// Whether the provider refused the login's account itself.
+    pub fn refused(&self) -> bool {
+        matches!(self, TurnFailure::Failed(e) if e == ACCOUNT_REFUSED)
+    }
+}
+
+/// Why the provider refused a login, in plain words, from what the turn
+/// said: its words when they name it, else the organisation's switch (the
+/// refusal Claude Code's codes stand for).
+pub fn refusal_reason(said: Option<&str>) -> &'static str {
+    said.and_then(workforce_common::usage::claude_account_refusal)
+        .unwrap_or("its organisation has turned off Claude Code access")
 }
 
 /// What a `StopFailure` says: its `error`, and the message it showed.
@@ -110,6 +135,12 @@ pub fn of_stop_failure(error: &str, said: Option<&str>) -> TurnFailure {
     match error {
         "rate_limit" if said.is_some_and(|s| says_plan_limit(s) || says_extra_usage(s)) => {
             TurnFailure::Limit(LimitHit::in_words(said.unwrap_or_default()))
+        }
+        _ if REFUSAL_CODES.contains(&error)
+            || said
+                .is_some_and(|s| workforce_common::usage::claude_account_refusal(s).is_some()) =>
+        {
+            TurnFailure::Failed(ACCOUNT_REFUSED.into())
         }
         _ => TurnFailure::Failed(error.to_string()),
     }
@@ -145,7 +176,15 @@ pub fn in_transcript_line(v: &Value) -> Option<TurnFailure> {
         || quota.is_some_and(|q| q.get("status").and_then(Value::as_str) == Some("rejected"));
     if !plan {
         let error = v.get("error").and_then(Value::as_str).unwrap_or("unknown");
-        return Some(TurnFailure::Failed(error.to_string()));
+        let code = v.get("apiErrorCode").and_then(Value::as_str);
+        let said = v.pointer("/message/content/0/text").and_then(Value::as_str);
+        let refused = REFUSAL_CODES.contains(&error)
+            || code.is_some_and(|c| REFUSAL_CODES.contains(&c))
+            || said.is_some_and(|s| workforce_common::usage::claude_account_refusal(s).is_some());
+        return Some(TurnFailure::Failed(match refused {
+            true => ACCOUNT_REFUSED.to_string(),
+            false => error.to_string(),
+        }));
     }
     let field = |k: &str| [info, quota].into_iter().flatten().find_map(|o| o.get(k));
     Some(TurnFailure::Limit(LimitHit {
@@ -166,6 +205,46 @@ pub fn in_transcript_line(v: &Value) -> Option<TurnFailure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refusal_of_the_account_itself_is_told_from_a_limit_and_other_failures() {
+        // The line Claude Code wrote at 18:53 on 19 Nov, as it stands.
+        let line: Value = serde_json::from_str(
+            r#"{"type":"assistant","timestamp":"2026-11-19T18:53:01.765Z","message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access"}]},"error":"oauth_org_not_allowed","isApiErrorMessage":true,"apiErrorStatus":403,"apiErrorCode":"oauth_not_allowed_for_organization","apiErrorType":"permission_error"}"#,
+        )
+        .unwrap();
+        let f = in_transcript_line(&line).unwrap();
+        assert!(f.refused(), "{f:?}");
+        assert!(f.limit().is_none());
+        // Its code alone, and its words alone, say the same.
+        assert!(of_stop_failure("oauth_org_not_allowed", None).refused());
+        assert!(of_stop_failure(
+            "unknown",
+            Some("Your organization has disabled Claude subscription access for Claude Code")
+        )
+        .refused());
+        assert_eq!(
+            refusal_reason(Some("Your account is on hold")),
+            "the account is on hold"
+        );
+        assert_eq!(
+            refusal_reason(None),
+            "its organisation has turned off Claude Code access"
+        );
+        // A server error, and narration that quotes a refusal, aren't one.
+        assert!(!of_stop_failure("server_error", None).refused());
+        assert!(!of_stop_failure(
+            "server_error",
+            Some("Earlier it said: your organization has disabled claude subscription access")
+        )
+        .refused());
+        // The plan's own limit stays the limit.
+        assert!(
+            of_stop_failure("rate_limit", Some("You've hit your weekly limit"))
+                .limit()
+                .is_some()
+        );
+    }
 
     #[test]
     fn only_the_plans_own_windows_have_a_length() {

@@ -144,10 +144,14 @@ pub(super) struct Changed {
     repo: Option<String>,
     /// Its account as the update tells of it ([`update::as_told`]).
     account: Account,
-    new: Vec<Done>,
+    pub new: Vec<Done>,
     /// What its work is, from facts: its goal and its tickets' and PRs'
     /// titles.
     pub work: Work,
+    /// What its account says it waits on and is doing now, as it is (not
+    /// only as news): who moves a stall is read from them.
+    pub waiting_on: Option<String>,
+    pub doing: String,
 }
 
 impl Changed {
@@ -181,6 +185,12 @@ pub(super) struct Batch {
     /// Suggestions its quiet check-ins made, or notes on finished
     /// sessions, wait for the next update.
     noted: bool,
+    /// Every item of the boss's not closed: who already has a stall.
+    pub open: Vec<OpenItem>,
+    /// The person's word the boss holds for each changed session (its
+    /// orders covering it, [`super::held::held_for`]): never said to be
+    /// missing.
+    pub held: HashMap<Uuid, Vec<OpenItem>>,
 }
 
 impl Batch {
@@ -261,6 +271,8 @@ impl Batch {
             restated,
             told,
             noted: self.noted && needs,
+            open: self.open,
+            held: self.held,
         }
     }
 }
@@ -345,6 +357,13 @@ impl CrewHub {
                 account: update::as_told(was, a),
                 new,
                 work,
+                waiting_on: a
+                    .waiting_on
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|w| !w.is_empty())
+                    .map(str::to_string),
+                doing: a.now.trim().to_string(),
             });
         }
         // Since what was last said, or left for the roundup.
@@ -382,17 +401,30 @@ impl CrewHub {
             false => Vec::new(),
         };
         let gap = self.answer_gap(o);
-        let open: Vec<OpenItem> = store
-            .items_not_closed(Some(boss))
-            .await
-            .unwrap_or_default()
-            .into_iter()
+        let all_open: Vec<OpenItem> = store.items_not_closed(Some(boss)).await.unwrap_or_default();
+        // What it holds of the person's word, for each session that waits
+        // on it: never one that says it waits outside the crew.
+        let held: HashMap<Uuid, Vec<OpenItem>> = sessions
+            .iter()
+            .filter(|s| !self.waits_outside(boss, s))
+            .map(|s| {
+                let h: Vec<OpenItem> = super::held::held_for(&all_open, s.id, &s.work)
+                    .into_iter()
+                    .cloned()
+                    .collect();
+                (s.id, h)
+            })
+            .filter(|(_, h)| !h.is_empty())
+            .collect();
+        let open: Vec<OpenItem> = all_open
+            .iter()
             // The person in that session now: theirs, nothing said of it,
             // nor counted as said again.
             .filter(|i| {
                 !matches!(i.kind, OpenKind::Ask | OpenKind::Confirm)
                     || i.session.is_none_or(|s| !self.person_in_for(s, i.opened_at, gap))
             })
+            .cloned()
             .collect();
         let restated: Vec<(Uuid, bool)> = match composed {
             true => self
@@ -442,6 +474,8 @@ impl CrewHub {
             restated,
             told,
             noted,
+            open: all_open,
+            held,
         }
     }
 
@@ -492,6 +526,12 @@ impl CrewHub {
                 let works: Vec<(Uuid, &Work)> =
                     b.sessions.iter().map(|s| (s.id, &s.work)).collect();
                 user.push_str(&update::composer_work(&works));
+                let held: Vec<(Uuid, Vec<String>)> = b
+                    .held
+                    .iter()
+                    .map(|(id, items)| (*id, items.iter().map(|i| i.text.clone()).collect()))
+                    .collect();
+                user.push_str(&update::composer_held(&held));
                 user.push_str(&update::composer_decisions(&acted));
                 let made = writer
                     .write_billed(boss, owner, update::COMPOSER_SYSTEM, &user)
@@ -583,6 +623,7 @@ impl CrewHub {
                     did: vec![],
                     at: None,
                     decisions: None,
+                    moves: None,
                 })
             };
             if let Some(h) = w.headline.as_deref() {
@@ -664,7 +705,7 @@ impl CrewHub {
     }
 
     /// `b` written as an update for `owner`: its extras and its text.
-    async fn written(
+    pub(super) async fn written(
         &self,
         boss: &str,
         owner: &str,
@@ -745,6 +786,29 @@ impl CrewHub {
             let kind = write::kind_of(&[], &did);
             said.push(write::plain_said(&work, &[], "", None, did, kind));
         }
+        // Every one about blocked or stalled work says who moves it next,
+        // and that is done: never a stall left with nobody on it.
+        self.own_stalls(boss, o, b, &mut said, now).await;
+        // What is sent as text (the chat, notifications, a check-in's
+        // post) says each owned stall as its item does: never the
+        // composer's paragraph or headline that it is missing, or stuck
+        // with nobody on it.
+        let mut sessions = sessions;
+        for i in said.iter().filter(|i| i.moves.is_some()) {
+            let Some(id) = i.session.as_ref().map(|l| l.session_id.as_str()) else {
+                continue;
+            };
+            if let Some(p) = sessions.iter_mut().find(|p| p.session_id == id) {
+                p.text = [i.headline.trim(), i.body.trim()]
+                    .into_iter()
+                    .filter(|t| !t.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+            }
+        }
+        let owned = said.iter().any(|i| i.moves.is_some());
+        let headline =
+            headline.filter(|h| !(owned && (write::says_missing(h) || write::says_stall(h))));
         // The finished sessions it closed, would close, or left open: one
         // line each.
         let notes = self.closing_notes(boss, now);
@@ -1026,6 +1090,7 @@ impl CrewHub {
                     did: vec![],
                     at: None,
                     decisions: None,
+                    moves: None,
                 },
             ));
         }
@@ -1087,6 +1152,67 @@ impl CrewHub {
                     did: vec![],
                     at: None,
                     decisions: None,
+                    moves: None,
+                },
+            ));
+        }
+        // What background work used of the person's plans, when a notable
+        // share: said in words, worth knowing.
+        // Since the last roundup, at most a day, said once: what the person
+        // paid for, and, on the hub they hold, what this boss and its crew
+        // ran on its own logins (an install pool, an agent's own). Never
+        // another person's: on a shared hub those logins carry other
+        // people's jobs too, so only the person's own are read. Each read is
+        // narrowed in the store, by payer or by agent.
+        let notable = service.config.budget.plan.notable_daily_percent;
+        let store = Arc::clone(&service.telemetry_store);
+        let from = since.max(now - Duration::hours(24));
+        let seen = self.desk.seen_by(&o.scope);
+        let holds =
+            crate::desk_floor::holds_the_hub(self.state.identity_store.as_ref(), true, Some(owner));
+        let mut crew: Vec<String> = Vec::new();
+        if holds {
+            crew.push(boss.to_string());
+            crew.extend(
+                self.services()
+                    .iter()
+                    .map(|s| s.agent_id.as_str().to_string())
+                    .filter(|id| id != boss && self.agent_in(id, &seen)),
+            );
+        }
+        let person = owner.to_string();
+        let rows: Vec<_> = tokio::task::spawn_blocking(move || {
+            let mut rows = store
+                .work_use_rows(from, now, Some(&person), None, None)
+                .unwrap_or_default();
+            for agent in &crew {
+                rows.extend(
+                    store
+                        .work_use_rows(from, now, None, None, Some(agent))
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|r| !r.payer.as_deref().is_some_and(is_person)),
+                );
+            }
+            rows
+        })
+        .await
+        .unwrap_or_default();
+        let at = from.with_timezone(&self.desk.timezone()).format("%H:%M");
+        if let Some(headline) = background_plan_use(rows, notable, &format!("since {at}")) {
+            lines.push((
+                SectionKey::WorthKnowing,
+                Said {
+                    kind: EventKind::Problem,
+                    headline,
+                    body: String::new(),
+                    ids: vec![],
+                    not_checked: None,
+                    session: None,
+                    did: vec![],
+                    at: None,
+                    decisions: None,
+                    moves: None,
                 },
             ));
         }
@@ -1568,6 +1694,82 @@ impl CrewHub {
     }
 }
 
+/// Whether `payer` is a person (a user id), not one of the hub's own
+/// logins (an install pool, an agent's or a team's).
+fn is_person(payer: &str) -> bool {
+    payer.parse::<Uuid>().is_ok()
+}
+
+/// The roundup's line on background work's use of the person's plans
+/// (`when`: "since 09:00"), when it used at least `notable` points of a
+/// plan's longest window: how much in all, and the most of it, by name.
+/// `None` under that.
+fn background_plan_use(
+    rows: Vec<workforce_common::work_use::WorkUseRow>,
+    notable: f64,
+    when: &str,
+) -> Option<String> {
+    use crate::plan_guard::{plan_words, window_words};
+    let works = workforce_common::work_use::fold(rows);
+    // By plan and window, the longest each plan reported.
+    let mut totals: Vec<(String, u32, f64)> = Vec::new();
+    for w in &works {
+        for s in &w.shares {
+            match totals
+                .iter_mut()
+                .find(|t| t.0 == s.plan && t.1 == s.window_minutes)
+            {
+                Some(t) => t.2 += s.share,
+                None => totals.push((s.plan.clone(), s.window_minutes, s.share)),
+            }
+        }
+    }
+    let (plan, minutes, total) = totals
+        .iter()
+        .filter(|t| !totals.iter().any(|o| o.0 == t.0 && o.1 > t.1))
+        .max_by(|a, b| a.2.total_cmp(&b.2))
+        .cloned()?;
+    if total < notable.max(0.1) {
+        return None;
+    }
+    let mut most: Vec<(&str, f64)> = works
+        .iter()
+        .filter_map(|w| {
+            w.shares
+                .iter()
+                .find(|s| s.plan == plan && s.window_minutes == minutes)
+                .map(|s| (w.label.as_str(), s.share))
+        })
+        .filter(|(_, share)| *share >= 0.5)
+        .collect();
+    most.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let named = most
+        .iter()
+        .take(3)
+        .map(|(label, share)| format!("'{label}' {share:.0}%"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let plan = match plan.as_str() {
+        "claude" => plan_words(workforce_common::usage::PlanKind::Claude),
+        "chatgpt" => plan_words(workforce_common::usage::PlanKind::Chatgpt),
+        _ => "",
+    };
+    let mut line = format!(
+        "Background work used about {total:.0}% of your {} {plan}plan {when}",
+        window_words(minutes),
+        plan = if plan.is_empty() {
+            String::new()
+        } else {
+            format!("{plan} ")
+        },
+    );
+    if !named.is_empty() {
+        line.push_str(&format!(", most of it {named}"));
+    }
+    line.push('.');
+    Some(line)
+}
+
 /// What a check-in's prompt names a handed update by.
 fn marker(p: &Pending) -> String {
     format!("update {}", p.id)
@@ -1620,5 +1822,32 @@ pub(super) async fn updates_loop(crew: Arc<CrewHub>, cancel: CancellationToken) 
                 crew.release_monitor_holds().await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod plan_use_tests {
+    use super::background_plan_use;
+    use workforce_common::work_use::{Work, WorkUseRow};
+
+    #[test]
+    fn the_roundup_names_background_works_plan_use_only_when_notable() {
+        let now = chrono::Utc::now();
+        let email = Work::job("atlas", "j1", "email check");
+        let boss = Work::boss("atlas", "p", "Atlas");
+        let quiet = vec![WorkUseRow::share(&email, None, "claude", 10_080, 2.0, now)];
+        assert_eq!(background_plan_use(quiet, 5.0, "since 09:00"), None);
+        let rows = vec![
+            WorkUseRow::share(&email, None, "claude", 10_080, 6.0, now),
+            WorkUseRow::share(&email, None, "claude", 300, 40.0, now),
+            WorkUseRow::share(&boss, None, "claude", 10_080, 1.2, now),
+        ];
+        assert_eq!(
+            background_plan_use(rows, 5.0, "since 09:00").as_deref(),
+            Some(
+                "Background work used about 7% of your weekly Claude plan since 09:00, \
+                 most of it 'email check' 6%, 'Atlas's own turns' 1%."
+            )
+        );
     }
 }

@@ -150,12 +150,16 @@ impl Login {
         self.owner.payer(agent_id)
     }
 
-    /// What a call this login pays for records on its cost row.
+    /// What a call this login pays for records on its cost row. What the
+    /// call moved its plan's windows by is counted toward the background
+    /// work it was for ([`crate::hub_core::plan_guard`]).
     pub fn served(&self, route: SubscriptionRoute, agent_id: &str) -> Served {
+        let payer = self.payer(agent_id);
+        crate::hub_core::plan_guard::PlanGuard::global().served(self, &payer);
         Served {
             route,
             tier: self.tier,
-            payer: self.payer(agent_id),
+            payer,
         }
     }
 

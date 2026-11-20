@@ -102,7 +102,8 @@ impl CrewHub {
             | Action::TakeOn { session }
             | Action::Release { session }
             | Action::Handoff { session, .. }
-            | Action::SetMode { session, .. } => self.session_seen(*session, seen),
+            | Action::SetMode { session, .. }
+            | Action::SwitchLogin { session, .. } => self.session_seen(*session, seen),
             Action::Assign { agent, .. } => self.agent_seen(agent, seen).map(drop),
             Action::AssignTicket { to, .. } => match to {
                 Handout::Session(s) => self.session_seen(*s, seen),
@@ -111,7 +112,10 @@ impl CrewHub {
                 Handout::NewSession { .. } => Ok(()),
             },
             // Started in the overseer's own group; its ticket is read below.
-            Action::StartSession { .. } | Action::MoveTicket { .. } => Ok(()),
+            Action::StartSession { .. }
+            | Action::MoveTicket { .. }
+            | Action::ChangeTicket { .. }
+            | Action::CreateTicket { .. } => Ok(()),
             // Only ever its own settings ([`super::tools`] names it).
             Action::ChangeOversight { .. } => Ok(()),
         }

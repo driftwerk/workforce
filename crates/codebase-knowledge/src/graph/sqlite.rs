@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use rusqlite::{Connection, OptionalExtension};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -20,7 +20,10 @@ use super::relationships::Relationship;
 use super::schema::Schema;
 use super::vectors::{summary_cursor, FillStage, PendingFile, StoredSummary, VectorFill};
 use super::{GraphStats, IndexState, RepoLineage, RepositoryRow};
-use crate::lease::{now_ms, AcquireOutcome, IndexLease, IndexPhase, STALE_THRESHOLD};
+use crate::lease::{
+    acquire_lease_sql, now_ms, AcquireOutcome, IndexLease, IndexPhase, LEASE_COLUMNS,
+    STALE_THRESHOLD,
+};
 use std::str::FromStr;
 
 /// SQLite-backed code graph.
@@ -785,21 +788,32 @@ impl CodeGraphBackend for SqliteCodeGraphBackend {
         backends: &[&str],
         repo_id: &str,
         files: &[String],
-    ) -> Result<()> {
+    ) -> Result<i64> {
+        let files: BTreeSet<&String> = files.iter().collect();
+        if backends.is_empty() || files.is_empty() {
+            return Ok(0);
+        }
         let conn = self.conn.lock().await;
         let tx = conn.unchecked_transaction()?;
-        for backend in backends {
-            for file in files {
-                tx.execute(
-                    "INSERT INTO vector_pending (backend, repo_id, file_path) VALUES (?1, ?2, ?3)
-                     ON CONFLICT (backend, repo_id, file_path)
-                     DO UPDATE SET seq = vector_pending.seq + 1",
-                    rusqlite::params![backend, repo_id, file],
-                )?;
+        let mark: i64 = tx.query_row(
+            "UPDATE vector_note_mark SET last = last + 1 RETURNING last",
+            [],
+            |row| row.get(0),
+        )?;
+        {
+            let mut noting = tx.prepare(
+                "INSERT INTO vector_pending (backend, repo_id, file_path, seq)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (backend, repo_id, file_path) DO UPDATE SET seq = excluded.seq",
+            )?;
+            for backend in backends {
+                for file in &files {
+                    noting.execute(rusqlite::params![backend, repo_id, file, mark])?;
+                }
             }
         }
         tx.commit()?;
-        Ok(())
+        Ok(mark)
     }
 
     async fn vectors_pending(
@@ -835,14 +849,16 @@ impl CodeGraphBackend for SqliteCodeGraphBackend {
         &self,
         backend: &str,
         repo_id: &str,
-        file_path: &str,
+        files: &[String],
         seq: i64,
     ) -> Result<()> {
+        let files = serde_json::to_string(files)?;
         let conn = self.conn.lock().await;
         conn.execute(
             "DELETE FROM vector_pending
-             WHERE backend = ?1 AND repo_id = ?2 AND file_path = ?3 AND seq = ?4",
-            rusqlite::params![backend, repo_id, file_path, seq],
+             WHERE backend = ?1 AND repo_id = ?2 AND seq = ?4
+               AND file_path IN (SELECT value FROM json_each(?3))",
+            rusqlite::params![backend, repo_id, files, seq],
         )?;
         Ok(())
     }
@@ -910,21 +926,11 @@ impl CodeGraphBackend for SqliteCodeGraphBackend {
         target_commit: Option<&str>,
         phase: IndexPhase,
     ) -> Result<AcquireOutcome> {
-        let conn = self.conn.lock().await;
-        let tx = conn.unchecked_transaction()?;
         let now = now_ms();
         let stale_cutoff = now - (STALE_THRESHOLD.as_millis() as i64);
-
-        // Steal stale leases atomically: only take ownership if the
-        // current row is stale enough that another acquirer should
-        // assume the original worker is gone.
-        let stolen = tx.execute(
-            "UPDATE index_lease
-             SET worker_id = ?2, target_commit = ?3, phase = ?4,
-                 acquired_at_ms = ?5, last_heartbeat_at_ms = ?5,
-                 entities_total = NULL, entities_processed = NULL,
-                 summaries_total = NULL, summaries_processed = NULL
-             WHERE repo_id = ?1 AND last_heartbeat_at_ms < ?6",
+        let conn = self.conn.lock().await;
+        let lease = conn.query_row(
+            &acquire_lease_sql(|n| format!("?{n}")),
             rusqlite::params![
                 repo_id,
                 worker_id,
@@ -933,41 +939,12 @@ impl CodeGraphBackend for SqliteCodeGraphBackend {
                 now,
                 stale_cutoff
             ],
+            row_to_lease,
         )?;
-        if stolen > 0 {
-            tx.commit()?;
-            info!(repo_id, worker_id, "Stole stale indexing lease");
-            return Ok(AcquireOutcome::Acquired);
-        }
-
-        // Try to insert a fresh lease. If a row already exists (any
-        // freshness), `INSERT OR IGNORE` does nothing and we report it
-        // back as Held.
-        let inserted = tx.execute(
-            "INSERT OR IGNORE INTO index_lease
-             (repo_id, worker_id, target_commit, phase,
-              acquired_at_ms, last_heartbeat_at_ms,
-              entities_total, entities_processed,
-              summaries_total, summaries_processed)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5, NULL, NULL, NULL, NULL)",
-            rusqlite::params![repo_id, worker_id, target_commit, phase.as_str(), now],
-        )?;
-        if inserted > 0 {
-            tx.commit()?;
-            return Ok(AcquireOutcome::Acquired);
-        }
-
-        // Row exists and was fresh — read it back so the caller can
-        // surface the holder's identity.
-        let held = read_lease(&tx, repo_id)?;
-        tx.commit()?;
-        Ok(match held {
-            Some(l) => AcquireOutcome::Held(l),
-            // Race: someone released between our INSERT OR IGNORE failing
-            // and our SELECT. Treat as a successful acquisition — the
-            // table is now empty for this repo and the caller's first
-            // heartbeat will recreate the row.
-            None => AcquireOutcome::Acquired,
+        Ok(if lease.worker_id == worker_id {
+            AcquireOutcome::Acquired
+        } else {
+            AcquireOutcome::Held(lease)
         })
     }
 
@@ -1208,30 +1185,11 @@ impl CodeGraphBackend for SqliteCodeGraphBackend {
 
     async fn list_active_leases(&self) -> Result<Vec<IndexLease>> {
         let conn = self.conn.lock().await;
-        let mut stmt = conn.prepare(
-            "SELECT repo_id, worker_id, target_commit, phase,
-                    acquired_at_ms, last_heartbeat_at_ms,
-                    entities_total, entities_processed,
-                    summaries_total, summaries_processed
-             FROM index_lease
-             ORDER BY acquired_at_ms ASC",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {LEASE_COLUMNS} FROM index_lease ORDER BY acquired_at_ms ASC"
+        ))?;
         let rows = stmt
-            .query_map([], |row| {
-                Ok(IndexLease {
-                    repo_id: row.get(0)?,
-                    worker_id: row.get(1)?,
-                    target_commit: row.get(2)?,
-                    phase: IndexPhase::parse(&row.get::<_, String>(3)?)
-                        .unwrap_or(IndexPhase::Crawling),
-                    acquired_at_ms: row.get(4)?,
-                    last_heartbeat_at_ms: row.get(5)?,
-                    entities_total: row.get::<_, Option<i64>>(6)?.map(|n| n as u64),
-                    entities_processed: row.get::<_, Option<i64>>(7)?.map(|n| n as u64),
-                    summaries_total: row.get::<_, Option<i64>>(8)?.map(|n| n as u64),
-                    summaries_processed: row.get::<_, Option<i64>>(9)?.map(|n| n as u64),
-                })
-            })?
+            .query_map([], row_to_lease)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -1352,36 +1310,32 @@ fn row_to_repository(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepositoryRow>
     })
 }
 
-/// Read a lease row by `repo_id`. Accepts both `&Connection` and
-/// `&Transaction` since the latter derefs to the former.
+/// Read a lease row by `repo_id`.
 fn read_lease(conn: &Connection, repo_id: &str) -> Result<Option<IndexLease>> {
-    let result = conn.query_row(
-        "SELECT repo_id, worker_id, target_commit, phase,
-                acquired_at_ms, last_heartbeat_at_ms,
-                entities_total, entities_processed,
-                summaries_total, summaries_processed
-         FROM index_lease WHERE repo_id = ?1",
-        rusqlite::params![repo_id],
-        |row| {
-            Ok(IndexLease {
-                repo_id: row.get(0)?,
-                worker_id: row.get(1)?,
-                target_commit: row.get(2)?,
-                phase: IndexPhase::parse(&row.get::<_, String>(3)?).unwrap_or(IndexPhase::Crawling),
-                acquired_at_ms: row.get(4)?,
-                last_heartbeat_at_ms: row.get(5)?,
-                entities_total: row.get::<_, Option<i64>>(6)?.map(|n| n as u64),
-                entities_processed: row.get::<_, Option<i64>>(7)?.map(|n| n as u64),
-                summaries_total: row.get::<_, Option<i64>>(8)?.map(|n| n as u64),
-                summaries_processed: row.get::<_, Option<i64>>(9)?.map(|n| n as u64),
-            })
-        },
-    );
-    match result {
-        Ok(l) => Ok(Some(l)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(e.into()),
-    }
+    Ok(conn
+        .query_row(
+            &format!("SELECT {LEASE_COLUMNS} FROM index_lease WHERE repo_id = ?1"),
+            rusqlite::params![repo_id],
+            row_to_lease,
+        )
+        .optional()?)
+}
+
+/// Map a row of [`LEASE_COLUMNS`] to an [`IndexLease`].
+fn row_to_lease(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexLease> {
+    Ok(IndexLease {
+        repo_id: row.get(0)?,
+        worker_id: row.get(1)?,
+        target_commit: row.get(2)?,
+        phase: IndexPhase::parse(&row.get::<_, String>(3)?).unwrap_or(IndexPhase::Crawling),
+        acquired_at_ms: row.get(4)?,
+        last_heartbeat_at_ms: row.get(5)?,
+        entities_total: row.get::<_, Option<i64>>(6)?.map(|n| n as u64),
+        entities_processed: row.get::<_, Option<i64>>(7)?.map(|n| n as u64),
+        summaries_total: row.get::<_, Option<i64>>(8)?.map(|n| n as u64),
+        summaries_processed: row.get::<_, Option<i64>>(9)?.map(|n| n as u64),
+        noted_from: row.get(10)?,
+    })
 }
 
 #[cfg(test)]
@@ -1546,6 +1500,62 @@ mod lease_tests {
         assert_eq!(leases[0].repo_id, "c");
         assert_eq!(leases[1].repo_id, "a");
         assert_eq!(leases[2].repo_id, "b");
+    }
+
+    #[tokio::test]
+    async fn leases_record_the_mark_they_are_taken_at() {
+        let backend = Arc::new(SqliteCodeGraphBackend::open_in_memory().unwrap());
+        let graph = crate::graph::CodeGraph::from_backend(backend.clone());
+        crate::graph::tests::leases_record_the_mark_they_are_taken_at(&graph, |repo| async move {
+            let stale = now_ms() - (STALE_THRESHOLD.as_millis() as i64) - 5_000;
+            backend
+                .conn
+                .lock()
+                .await
+                .execute(
+                    "UPDATE index_lease SET last_heartbeat_at_ms = ?2 WHERE repo_id = ?1",
+                    rusqlite::params![repo, stale],
+                )
+                .unwrap();
+        })
+        .await;
+    }
+
+    /// The copy is what `VACUUM INTO` writes, as `sqlite3 .backup` would.
+    #[tokio::test]
+    async fn a_copy_tells_a_runs_notes_by_its_lease() {
+        let backend = Arc::new(SqliteCodeGraphBackend::open_in_memory().unwrap());
+        let graph = crate::graph::CodeGraph::from_backend(backend.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("copy.db");
+        crate::graph::tests::a_copy_tells_a_runs_notes_by_its_lease(&graph, |repo| async move {
+            backend
+                .conn
+                .lock()
+                .await
+                .execute("VACUUM INTO ?1", [path.to_string_lossy()])
+                .unwrap();
+            let copy = Connection::open(&path).unwrap();
+            let noted_from = copy
+                .query_row(
+                    "SELECT noted_from FROM index_lease WHERE repo_id = ?1",
+                    [repo],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let pending = copy
+                .prepare(
+                    "SELECT file_path, seq FROM vector_pending
+                     WHERE backend = 'vellev' AND repo_id = ?1 ORDER BY file_path",
+                )
+                .unwrap()
+                .query_map([repo], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            (noted_from, pending)
+        })
+        .await;
     }
 }
 

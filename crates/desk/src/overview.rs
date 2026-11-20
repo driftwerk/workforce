@@ -40,6 +40,7 @@ fn session_item(
     now: DateTime<Utc>,
     midnight: DateTime<Utc>,
     quiet_minutes: u32,
+    tz: &chrono_tz::Tz,
 ) -> Item {
     let waiting = v.waiting_on() > 0;
     let mut state = match waiting {
@@ -56,7 +57,22 @@ fn session_item(
         .filter(|g| !g.is_empty())
         .map(str::to_string)
         .or_else(|| v.last_prompt.as_deref().map(|p| crew::one_line(p, 120)));
+    // Restarted with work of its own running, which stopped: it is told,
+    // and on that, never on what it ran before.
+    let restarted = v.restarted.filter(|_| {
+        matches!(
+            v.state,
+            SessionState::Starting | SessionState::Working | SessionState::Blocked
+        )
+    });
     let detail = match (v.state, v.background) {
+        _ if restarted.is_some() => restarted.map(|r| {
+            let w = r.words(tz);
+            let mut c = w.chars();
+            c.next()
+                .map(|f| f.to_uppercase().chain(c).collect())
+                .unwrap_or(w)
+        }),
         (SessionState::Done, Some(b)) if waiting => Some(match b.count {
             1 => "Waiting on 1 background task".to_string(),
             n => format!("Waiting on {n} background tasks"),
@@ -84,6 +100,17 @@ fn session_item(
         group_id: v.group.as_ref().map(|g| g.id.clone()),
         engine: Some(v.engine),
         origin: Some(v.origin),
+        login: match (&v.account, &v.switching_to) {
+            (Some(a), Some(to)) => {
+                Some(format!("{} (moves to {} after this turn)", a.name, to.name))
+            }
+            (None, Some(to)) => Some(format!(
+                "this computer's sign-in (moves to {} after this turn)",
+                to.name
+            )),
+            (Some(a), None) => Some(a.name.clone()),
+            (None, None) => None,
+        },
         state,
         task,
         detail,
@@ -107,7 +134,14 @@ fn session_item(
 #[cfg(test)]
 pub(crate) fn session_item_of(v: &SessionView) -> Item {
     let now = Utc::now();
-    session_item(v, None, now, now - Duration::days(1), DEFAULT_QUIET_MINUTES)
+    session_item(
+        v,
+        None,
+        now,
+        now - Duration::days(1),
+        DEFAULT_QUIET_MINUTES,
+        &chrono_tz::UTC,
+    )
 }
 
 fn text_of(detail: Option<&Value>, key: &str) -> Option<String> {
@@ -135,6 +169,7 @@ fn agent_item(
         group_id: None,
         engine: None,
         origin: None,
+        login: None,
         state: ItemState::Idle,
         task: None,
         detail: None,
@@ -339,10 +374,11 @@ impl Desk {
             .as_ref()
             .map_or(DEFAULT_QUIET_MINUTES, |o| o.quiet_minutes);
         let midnight = crew.midnight();
+        let tz = self.timezone();
         let mut items: Vec<Item> = self
             .list()
             .iter()
-            .map(|v| session_item(v, self.state_since(v.id), now, midnight, quiet))
+            .map(|v| session_item(v, self.state_since(v.id), now, midnight, quiet, &tz))
             .collect();
         let latest = self.store().latest_turn_events().await?;
         let layout = self.layout();
@@ -523,6 +559,7 @@ mod tests {
             group_id: None,
             engine: None,
             origin: None,
+            login: None,
             state,
             task: None,
             detail: None,
