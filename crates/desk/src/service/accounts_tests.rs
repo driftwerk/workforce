@@ -75,7 +75,7 @@ fn claude(dir: &Path) -> PathBuf {
                env > '{d}/envtmp-'$$\n\
                echo \"TOKEN_ON_FD=$t\" >> '{d}/envtmp-'$$; echo \"CHILD_READ=$again\" >> '{d}/envtmp-'$$\n\
                mv '{d}/envtmp-'$$ '{d}/env-'$$\n\
-               echo \"$@\" > '{d}/args-'$$; exec sleep 60 ;;\n\
+               echo \"$@\" > '{d}/args-'$$; [ -n \"$IGNORE_HUP\" ] && trap '' HUP; exec sleep 60 ;;\n\
              esac\n"
         ),
     )
@@ -5196,6 +5196,110 @@ async fn with_moves_turned_off_a_login_at_its_limit_moves_nothing() {
         stops_on_its_limit(&d, a);
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(d.view(a).unwrap().account.map(|x| x.id), Some(apple));
+    })
+    .await;
+}
+
+/// Sessions whose link to the holder ended before their processes did, deaf
+/// to a hang-up: some wait at their login's limit (one's record already
+/// names the login it is moved to), others were cut off mid-turn. Moved,
+/// each process is ended and the same conversation goes on on that login,
+/// told to carry on only when its login stopped it.
+#[tokio::test]
+async fn a_switch_ends_the_process_the_holder_kept_and_goes_on_there() {
+    with_test_pool(build_pool, |pool| async move {
+        let (_hdir, socket, holder_cancel) = crate::holder::tests::holder().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut o = account_options(dir.path(), Arc::new(MemoryKeys::default()));
+        o.holder = Some(super::HolderOptions {
+            socket,
+            token: crate::holder::tests::TOKEN.into(),
+        });
+        o.env.insert("IGNORE_HUP".into(), "1".into());
+        let d = desk(pool, o).await;
+        paste(&d, "Kingsley Gmail", GOOD, true).await;
+        let star = paste(&d, "Kingsley Starmoire", OTHER, false).await;
+        let limit = "You’ve hit your weekly limit · resets 4pm (Europe/London)";
+        for (state, reply, named_there) in [
+            (SessionState::Stopped, Some(limit), false),
+            (SessionState::Stopped, Some(limit), true),
+            (SessionState::Interrupted, None, false),
+            (SessionState::Working, None, false),
+        ] {
+            let s = d.create(session(dir.path(), None), None).await.unwrap();
+            started(dir.path(), s.id, 0).await;
+            let pid = d.attach(s.id).unwrap().pid().unwrap();
+            let cli = d
+                .record(s.id)
+                .unwrap()
+                .cli_session_id
+                .expect("its conversation");
+            d.change(s.id, |r, _| {
+                r.state = state;
+                r.last_reply = reply.map(Into::into);
+                if named_there {
+                    r.account = Some(star);
+                }
+            });
+            drop(d.0.state.lock().live.remove(&s.id));
+            assert!(d.held_untaken(s.id).await);
+
+            d.switch_account(
+                s.id,
+                Some(star),
+                Some(crate::crew::By::desk("the boss moved it")),
+            )
+            .await
+            .unwrap();
+            let (env, args) = started(dir.path(), s.id, 1).await;
+            assert_eq!(env["TOKEN_ON_FD"], OTHER, "on the other login");
+            assert!(args.starts_with(&format!("--resume {cli}")), "{args}");
+            assert_eq!(
+                d.record(s.id).unwrap().last_prompt.as_deref()
+                    == Some(crate::engine_accounts::CONTINUE),
+                reply.is_some(),
+                "{state:?}"
+            );
+            // SAFETY: kill with no signal only asks.
+            assert_ne!(
+                unsafe { libc::kill(pid as i32, 0) },
+                0,
+                "the kept process ended"
+            );
+            assert!(!d.held_untaken(s.id).await);
+            let v = d.view(s.id).unwrap();
+            assert_eq!((v.account.map(|a| a.id), v.live), (Some(star), true));
+        }
+        holder_cancel.cancel();
+    })
+    .await;
+}
+
+/// A switch whose restart fails leaves the session on the login its
+/// process ran on, never named for the one it was moving to.
+#[tokio::test]
+async fn a_switch_that_cant_start_it_again_keeps_it_on_its_own_login() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(
+            pool,
+            account_options(dir.path(), Arc::new(MemoryKeys::default())),
+        )
+        .await;
+        let gmail = paste(&d, "Kingsley Gmail", GOOD, true).await;
+        let star = paste(&d, "Kingsley Starmoire", OTHER, false).await;
+        let s = d.create(session(dir.path(), None), None).await.unwrap();
+        started(dir.path(), s.id, 0).await;
+        d.change(s.id, |r, _| {
+            r.state = SessionState::Idle;
+            r.cli_session_id = None;
+        });
+        assert!(d.switch_account(s.id, Some(star), None).await.is_err());
+        let v = d.view(s.id).unwrap();
+        assert_eq!(
+            (v.account.map(|a| a.id), v.switching_to),
+            (Some(gmail), None)
+        );
     })
     .await;
 }

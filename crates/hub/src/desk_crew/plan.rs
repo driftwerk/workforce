@@ -15,7 +15,7 @@
 //! down. Its sessions' own turn ends wake it as `[Desk work]` turns
 //! ([`super::work`]), as for any session it runs.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -676,6 +676,118 @@ fn fill_model(
             t.model = Some(model.to_string());
         }
     }
+}
+
+/// Where `brief` names `prefix` as a path's start, not inside another path.
+fn paths_at<'a>(brief: &'a str, prefix: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+    brief.match_indices(prefix).filter_map(move |(at, _)| {
+        let inside = brief[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '~' | '$'));
+        (!inside).then(|| &brief[at + prefix.len()..])
+    })
+}
+
+/// The roots of the paths in `brief` only this computer has: its `home`,
+/// and each volume mounted on it (`/Volumes/<name>`, a name of up to three
+/// words when a path goes on past it).
+fn local_roots(brief: &str, home: &str) -> BTreeSet<String> {
+    const VOLUMES: &str = "/Volumes/";
+    const WORDS: usize = 3;
+    let home = home.trim_end_matches('/');
+    let home_prefix = format!("{home}/");
+    let in_home = (!home.is_empty())
+        .then(|| {
+            paths_at(brief, &home_prefix)
+                .next()
+                .map(|_| home.to_string())
+        })
+        .flatten();
+    let volumes = paths_at(brief, VOLUMES).filter_map(|rest| {
+        let said: String = rest
+            .chars()
+            .take_while(|c| {
+                !matches!(
+                    c,
+                    '\n' | '\r' | '\t' | '`' | '\'' | '"' | '<' | '>' | '(' | ')' | '[' | ']'
+                )
+            })
+            .collect();
+        let spaced = said.split_once('/').map(|(name, _)| name).filter(|name| {
+            !name.ends_with(char::is_whitespace) && name.split_whitespace().count() <= WORDS
+        });
+        let name = spaced.unwrap_or_else(|| {
+            said.split(|c: char| c.is_whitespace() || c == '/')
+                .next()
+                .unwrap_or_default()
+        });
+        let name = name.trim_end_matches(['.', ',', ':', ';']);
+        (!name.is_empty() && !name.starts_with(char::is_whitespace))
+            .then(|| format!("{VOLUMES}{name}"))
+    });
+    in_home.into_iter().chain(volumes).collect()
+}
+
+/// `items` said as a list: "a", "a and b", "a, b and c".
+fn listed(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// Tickets a boss is told of at most, the rest counted.
+const UNSEEN_SAID: usize = 5;
+
+/// What a boss is told of the tickets the newest revision of `now`
+/// (applied or proposed) puts on a machine `was`'s didn't, whose briefs
+/// name paths only this computer has (under `home`, or on a volume mounted
+/// here).
+fn unseen_on_machines(was: &PlanDetail, now: &PlanDetail, home: &str) -> Option<String> {
+    fn newest(p: &PlanDetail) -> Option<&workforce_desk::plan::Snapshot> {
+        p.revisions.last().map(|r| &r.snapshot)
+    }
+    let (before, after) = (newest(was)?, newest(now)?);
+    let lines: Vec<String> = after
+        .tickets
+        .iter()
+        .filter_map(|t| {
+            let machine = t.machine.as_deref()?;
+            let roots: Vec<String> = local_roots(&t.body, home).into_iter().collect();
+            let was_on = before.ticket(t.id).and_then(|b| b.machine.as_deref());
+            (was_on != Some(machine) && !roots.is_empty()).then(|| {
+                let key = now
+                    .tickets
+                    .iter()
+                    .find(|v| v.ticket.ticket.id == t.id)
+                    .and_then(|v| v.ticket.key.as_deref())
+                    .unwrap_or(t.title.as_str());
+                format!(
+                    "{key}'s brief names {} on this computer, which {machine} may not have",
+                    listed(&roots)
+                )
+            })
+        })
+        .collect();
+    let more = lines.len().saturating_sub(UNSEEN_SAID);
+    let said = lines
+        .into_iter()
+        .take(UNSEEN_SAID)
+        .collect::<Vec<_>>()
+        .join("; ");
+    let more = if more > 0 {
+        format!("; and {more} more tickets' briefs do too")
+    } else {
+        String::new()
+    };
+    (!said.is_empty()).then(|| {
+        format!(
+            "{said}{more}. For each, have its session copy what it needs onto that machine first, \
+             or rewrite its brief with tickets_edit."
+        )
+    })
 }
 
 /// The machine every session of a sidebar's `group` (none: Ungrouped) is on,
@@ -1359,10 +1471,20 @@ impl CrewHub {
             (None, Some(c)) => c.plan,
             (None, None) => return Err("Say what to change, or which board to move it to.".into()),
         };
-        // A draft started on the person's word, by an unbound boss.
+        let home = self.desk.home_folder().unwrap_or_default();
+        let unseen = unseen_on_machines(&detail, &now, &home.to_string_lossy());
+        if let Some(unseen) = &unseen {
+            note = format!("{note} {unseen}").trim().to_string();
+        }
+        // A draft started on the person's word, by an unbound boss, once
+        // its briefs name nothing its machines can't see.
         if let Some(said) = start_now {
             let draft = now.summary.plan.approved_revision.is_none();
-            if draft && self.unbound_given(b.service.agent_id.as_str(), o) {
+            if draft && unseen.is_some() {
+                note = format!(
+                    "{note} So it isn't started yet: once those briefs are fixed, start it with the person's words again."
+                );
+            } else if draft && self.unbound_given(b.service.agent_id.as_str(), o) {
                 let approved = self.approve_said(b, &now, &said).await?;
                 return Ok(json!({
                     "plan": plan_out(&approved),
@@ -2535,6 +2657,27 @@ pub(super) async fn plan_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_brief_names_the_paths_only_this_computer_has_by_their_roots() {
+        let roots = |brief: &str| local_roots(brief, "/Users/kim/");
+        assert_eq!(
+            roots("Read /Users/kim/Library/Application Support/Desk/notes.md, then `/Volumes/T9/data/x.csv` and /Volumes/T9.\nSee (/Volumes/Backup Disk/old) and /Volumes/X then /Volumes/Y/z."),
+            BTreeSet::from([
+                "/Users/kim".to_string(),
+                "/Volumes/Backup Disk".into(),
+                "/Volumes/T9".into(),
+                "/Volumes/X".into(),
+                "/Volumes/Y".into(),
+            ])
+        );
+        assert!(roots("Work in ~/projects/vellev, $HOME/x and /home/dev/vellev.").is_empty());
+        assert!(roots("/Users/kimberly/x, /mnt/Users/kim/x and /Volumes/ alone").is_empty());
+        assert!(roots("/srv/Volumes/T9/x").is_empty());
+        assert!(local_roots("/x/y", "").is_empty());
+        assert!(local_roots("/x/y", "/").is_empty());
+        assert_eq!(listed(&["a".into(), "b".into(), "c".into()]), "a, b and c");
+    }
 
     #[test]
     fn a_ticket_on_the_persons_default_engine_runs_their_default_model() {
