@@ -22,7 +22,8 @@ use workforce_desk::crew::Crew as _;
 use workforce_desk::crew::{
     self, Event, ItemKind, ItemState, Kind, MentionedApproval, Party, PartyKind,
 };
-use workforce_desk::model::{DeskEvent, Origin};
+use workforce_desk::line::LineMessage;
+use workforce_desk::model::{DeskEvent, Origin, SessionState};
 use workforce_desk::CheckIn;
 
 use super::github::CHECK_GITHUB;
@@ -568,6 +569,8 @@ impl CrewHub {
         };
         let mut holding = HashSet::new();
         let mut out = Vec::new();
+        let waiting = self.waiting_from(overseer).await;
+        let stall = minute * o.work.stall_minutes as i32;
         for item in &overview.items {
             if item.id == overseer {
                 continue;
@@ -624,6 +627,14 @@ impl CrewHub {
                     })
             {
                 continue;
+            }
+            if let Some((key, trigger)) =
+                self.undelivered(item, &party, waiting.get(&item.id), now, stall)
+            {
+                holding.insert(key.clone());
+                if noted.insert(key) {
+                    out.push(trigger);
+                }
             }
             let (key, trigger) = match item.state {
                 ItemState::NeedsYou if past(item.since, o.wake.waiting_minutes) => {
@@ -711,6 +722,76 @@ impl CrewHub {
         }
         noted.retain(|k| holding.contains(k));
         out
+    }
+
+    /// `overseer`'s own messages still waiting to go into each session, by
+    /// session id, oldest first.
+    async fn waiting_from(&self, overseer: &str) -> HashMap<String, Vec<LineMessage>> {
+        let rows = match self.desk.store().line_waiting().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(error = %e, "the boss's waiting messages couldn't be read");
+                return HashMap::new();
+            }
+        };
+        rows.into_iter()
+            .filter(|m| m.from.kind == PartyKind::Manager && m.from.id == overseer)
+            .fold(HashMap::new(), |mut by, m| {
+                by.entry(m.to.id.clone()).or_insert_with(Vec::new).push(m);
+                by
+            })
+    }
+
+    /// A session the boss's messages haven't reached for `stall`, with no
+    /// progress of its own for as long (20 Nov: Cufflink Migration held
+    /// the boss's go for step 12 from 02:46 until 06:44), unless someone
+    /// stopped or closed it: the boss is woken once a stall, keyed by its
+    /// oldest message, to read where it stands and move it.
+    fn undelivered(
+        &self,
+        item: &crew::Item,
+        party: &Party,
+        waiting: Option<&Vec<LineMessage>>,
+        now: DateTime<Utc>,
+        stall: chrono::Duration,
+    ) -> Option<(String, Trigger)> {
+        let oldest = waiting?.first()?;
+        let quiet = item.last_activity.is_none_or(|at| now - at >= stall);
+        if stall <= chrono::Duration::zero() || now - oldest.at < stall || !quiet {
+            return None;
+        }
+        let state = self.desk.view(item.id.parse().ok()?).ok()?.state;
+        if matches!(state, SessionState::Stopped | SessionState::Closed) {
+            return None;
+        }
+        let at = oldest
+            .at
+            .with_timezone(&self.desk.timezone())
+            .format("%H:%M");
+        let minutes = (now - oldest.at).num_minutes();
+        let line = format!(
+            "{} hasn't taken your message of {at} in {minutes} min ({} waiting, the oldest “{}”) \
+             and has shown no progress meanwhile; it reads as {}. Read where it stands yourself \
+             (crew.history) and move it now: answer what it waits on, restart it (crew.restart), \
+             start a fresh session on the work (crew.start_session), or do the step yourself. \
+             Tell the person only if none of those can work.",
+            who(party),
+            waiting.map_or(0, Vec::len),
+            crew::words(&oldest.text, 20),
+            state.as_str(),
+        );
+        Some((
+            format!("undelivered:{}:{}", item.id, oldest.id),
+            Trigger {
+                line,
+                approvals: vec![],
+                hop: 0,
+                about: None,
+                group: item.group_id.clone(),
+                handed: None,
+                routine: false,
+            },
+        ))
     }
 
     /// What an unbound overseer is told each time it wakes: be the boss.

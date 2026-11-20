@@ -537,3 +537,58 @@ async fn a_stall_set_aside_is_left_and_one_answered_anywhere_is_settled() {
     })
     .await;
 }
+
+/// What the boss tells a session it runs that never reaches it, the
+/// session showing no progress meanwhile (20 Nov: Cufflink Migration held
+/// "Go ahead… run step 12 now" from 02:46 until 06:44), wakes the boss
+/// once, past `stall_minutes`, to read where it stands and move it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_that_never_reaches_a_session_wakes_its_boss_once() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "I'll read its history.",
+            "[oversight]\nenabled = true\nlevel = \"act\"\nact = { nudge = true }\n\
+             updates = { enabled = false }\nwake = { quiet_minutes = 0 }\nwork = { stall_minutes = 5 }\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, dir.path(), "Cufflink Migration").await;
+        let url = hook_url(dir.path(), s.id).await;
+        hook(&url, json!({"hook_event_name": "SessionStart", "session_id": s.id.to_string()})).await;
+        hook(&url, json!({"hook_event_name": "UserPromptSubmit", "prompt": "Wait for the step 12 timer."})).await;
+        let sent = crew
+            .perform(
+                &super::super::actions::Action::Nudge {
+                    to: super::super::actions::Target::Session(s.id),
+                    message: "Go ahead: run step 12 now.".into(),
+                    reply_to: None,
+                },
+                crew.by_overseer("Its timer went off.").unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(sent.starts_with("told Cufflink Migration"), "{sent}");
+        let woke = eventually("the boss woken", async || {
+            d.store()
+                .latest_check_in("desk")
+                .await
+                .unwrap()
+                .filter(|c| c.prompt.contains("hasn't taken your message"))
+        })
+        .await;
+        assert!(woke.prompt.contains("Go ahead: run step 12 now."), "{}", woke.prompt);
+        assert!(woke.prompt.contains("crew.restart"), "{}", woke.prompt);
+        // Once a stall: the same waiting message wakes it no more.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let latest = d.store().latest_check_in("desk").await.unwrap().unwrap();
+        assert!(
+            latest.id == woke.id || !latest.prompt.contains("hasn't taken your message"),
+            "woken again: {}",
+            latest.prompt
+        );
+    })
+    .await;
+}
