@@ -110,9 +110,10 @@ impl Desk {
     }
 
     /// Whether `m`, a boss's message waiting to go into its session, was
-    /// overtaken by the person's own words there since it was written: it
-    /// is withdrawn, never delivered, and the boss decides again on what
-    /// they said (its picture has it).
+    /// overtaken there since it was written: by the person's own words, or,
+    /// for its answer to the question a turn ended on, by that question
+    /// passing. It is withdrawn, never delivered, and the boss decides
+    /// again (its picture has it).
     pub(super) async fn line_overtaken(&self, m: &crate::line::LineMessage) -> bool {
         let Some(s) = m.to_session() else {
             return false;
@@ -120,13 +121,14 @@ impl Desk {
         let said = m.kind == crate::line::LineKind::Tell || m.answers_turn();
         if m.from.kind != crate::crew::PartyKind::Manager
             || !said
-            || !self.0.picture.lock().person_since(s, m.at)
+            || !(self.0.picture.lock().person_since(s, m.at)
+                || (m.answers_turn() && !self.still_asks(s, m)))
         {
             return false;
         }
         match self.line_withdraw(m.id).await {
             Ok(Some(_)) => {
-                tracing::info!(session = %s, message = %m.id, "a boss's message the person's own words overtook was withdrawn");
+                tracing::info!(session = %s, message = %m.id, "a boss's message overtaken before it went in was withdrawn");
                 // Its boss knows it never went in.
                 self.picture_note(
                     Note::new(What::Withdrawn, m.text.clone())
@@ -141,6 +143,16 @@ impl Desk {
                 false
             }
         }
+    }
+
+    /// Whether session `s` still asks what turn-answer `m` answers: its
+    /// turn ended on that question, with no dialog on its screen.
+    fn still_asks(&self, s: Uuid, m: &crate::line::LineMessage) -> bool {
+        self.view(s).is_ok_and(|v| {
+            v.state == crate::model::SessionState::Asking
+                && v.pending.is_none()
+                && v.asked.as_ref().map(|a| &a.ask) == m.about.as_ref()
+        })
     }
 
     /// The person's own words into session `id` (a prompt, a message from

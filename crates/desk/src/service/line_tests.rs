@@ -1165,6 +1165,52 @@ async fn ends_asking(d: &Desk, id: Uuid, reply: &str, prompted: bool) {
 }
 
 #[tokio::test]
+async fn a_bosss_answer_to_a_question_its_session_no_longer_asks_is_withdrawn() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let by = sarah_bosses(&d);
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        ends_asking(&d, s.id, "The replica is ready. Should I switch reads to it?", false).await;
+        let asks = d.view(s.id).unwrap().asked.expect("its question").ask;
+        let answer = d
+            .line_send(
+                Sender::Overseer(by),
+                Send::Answer {
+                    to: s.id,
+                    text: "Yes, switch them.".into(),
+                    asks,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer.about.as_deref(), Some(d.view(s.id).unwrap().asked.unwrap().ask.as_str()));
+        // Before it went in, its turn ended on another question.
+        hook(
+            &d,
+            s.id,
+            json!({"hook_event_name": "Stop", "last_assistant_message": "Reads moved. Should I drop the old table?"}),
+        )
+        .await;
+        until(|| {
+            d.view(s.id)
+                .is_ok_and(|v| v.asked.is_some_and(|a| a.ask.contains("drop the old table")))
+        })
+        .await;
+        let _ = d.line_next(s.id, Duration::from_millis(300)).await;
+        assert_eq!(row(&d, answer.id).await.delivery, Delivery::Withdrawn);
+        assert!(
+            d.picture_recent("sarah", s.id, 10)
+                .iter()
+                .any(|h| h.what == crate::picture::What::Withdrawn && h.text == "Yes, switch them."),
+            "its boss hears it never went in"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn its_bosss_answer_goes_in_when_its_turn_ended_on_a_question_and_nothing_else_of_its() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
@@ -1181,6 +1227,7 @@ async fn its_bosss_answer_goes_in_when_its_turn_ended_on_a_question_and_nothing_
         )
         .await;
         let v = d.view(s.id).unwrap();
+        let asks = v.asked.clone().expect("its question").ask;
         let peer = new_session(&d, dir.path()).await;
         idle(&d, peer.id).await;
         let theirs = d
@@ -1198,7 +1245,8 @@ async fn its_bosss_answer_goes_in_when_its_turn_ended_on_a_question_and_nothing_
                 Sender::Session(peer.id),
                 Send::Answer {
                     to: s.id,
-                    text: "ship it".into()
+                    text: "ship it".into(),
+                    asks: asks.clone(),
                 },
             )
             .await,
@@ -1211,6 +1259,7 @@ async fn its_bosss_answer_goes_in_when_its_turn_ended_on_a_question_and_nothing_
                 Send::Answer {
                     to: s.id,
                     text: "Yes, ship it.".into(),
+                    asks: asks.clone(),
                 },
             )
             .await
@@ -1278,6 +1327,7 @@ async fn its_bosss_answer_goes_in_when_its_turn_ended_on_a_question_and_nothing_
                 Send::Answer {
                     to: theirs.id,
                     text: "Yes, drop it.".into(),
+                    asks: d.view(theirs.id).unwrap().asked.expect("its question").ask,
                 },
             )
             .await

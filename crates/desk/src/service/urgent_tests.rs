@@ -254,6 +254,7 @@ async fn a_session_that_cant_take_words_mid_turn_gets_them_at_its_end_and_the_bo
         assert_eq!(d.view(t).unwrap().state, SessionState::Blocked);
         let (_, rushed) = urgent(&d, t, "Stop.", Urgency::Order).await;
         assert_eq!(rushed, Rushed::CantSteer(Unsteerable::Dialog));
+        assert_eq!(rushed.said(), None, "said as the dialog it waits on");
 
         // Not working: it goes in now, as any message.
         let idle = new_session(&d, dir.path()).await;
@@ -310,11 +311,10 @@ fn only_claude_code_devin_and_codex_take_a_bosss_words_mid_turn() {
         mid_turn(Engine::Claude, SessionState::Blocked, true, false),
         Err(Unsteerable::Dialog)
     );
-    // A turn that ended on a question is over: it takes them as any
-    // message, as `line::deliverable` gives it.
+    // A dialog holds them in any state, as in `line::deliverable`.
     assert_eq!(
         mid_turn(Engine::Claude, SessionState::Asking, true, true),
-        Ok(None)
+        Err(Unsteerable::Dialog)
     );
     for s in [
         SessionState::Asking,

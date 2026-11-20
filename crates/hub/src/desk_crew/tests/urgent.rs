@@ -142,7 +142,7 @@ async fn an_urgent_nudge_a_session_cant_take_mid_turn_or_past_the_limit_waits_an
         let out = nudge(&overseer, s, "Stop: don't start release 4.", true).await;
         assert_eq!(
             out["done"],
-            "told user-flip; it gets it once its turn ends: it can't take words mid-turn",
+            "told user-flip; a dialog in its terminal waits on an answer: it gets it once that is answered and its turn ends",
             "{out}"
         );
 

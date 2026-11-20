@@ -655,7 +655,9 @@ impl Desk {
             Send::Answer { .. } if matches!(from, Sender::Session(_)) => {
                 return Err(Refusal::NotYours.into())
             }
-            Send::Answer { to, text } => (Target::Session(to), text, LineKind::Answer, When::Queue),
+            Send::Answer { to, text, .. } => {
+                (Target::Session(to), text, LineKind::Answer, When::Queue)
+            }
         };
         let text = line::typable(&text).trim().to_string();
         if text.is_empty() {
@@ -766,6 +768,9 @@ impl Desk {
         m.in_reply_to = in_reply_to;
         // The person's and the overseer's to a session are its group's.
         m.group = group.or_else(|| self.line_group(&m));
+        if let Send::Answer { asks, .. } = &hop_send {
+            m.about = Some(asks.clone());
+        }
         if let Send::Ask { chose, parts, .. } = &hop_send {
             let clean = |v: &Option<String>| {
                 v.as_deref()
@@ -1615,8 +1620,8 @@ impl Desk {
     /// Why `m` mustn't go into `view` now, whatever its engine could take:
     /// a session Desk's breaker paused takes only the person's own
     /// messages; one the person drives, none of its boss's; one whose turn
-    /// ended asking the person something, only theirs, or a boss's that
-    /// runs it or gives its answer ([`Send::Answer`]): those go in as the
+    /// ended asking the person something, only theirs, a boss's that runs
+    /// it, or a boss's answer ([`Send::Answer`]), which goes in as the
     /// answer. A dialog on its screen holds every message earlier, in
     /// [`line::deliverable`], until it is answered and its turn ends.
     pub(super) fn line_gate(&self, view: &SessionView, m: &LineMessage) -> Option<Wait> {
@@ -1637,7 +1642,7 @@ impl Desk {
         if boss && (m.kind == LineKind::Tell || m.answers_turn()) && driving {
             return Some(Wait::PersonDriving);
         }
-        // A boss's ask, while the person drives, waits on their answer too.
+        // While the person drives, its boss's asks wait on their answer.
         let may_answer = boss
             && (m.answers_turn()
                 || (!driving

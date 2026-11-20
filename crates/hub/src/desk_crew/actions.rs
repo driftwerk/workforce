@@ -1082,22 +1082,9 @@ impl CrewHub {
 
     /// What the boss is told of its message `m` to session `name`, as
     /// `did` ("told", "answered"): what, if anything, it waits on.
-    fn nudge_said(
-        d: &workforce_desk::Desk,
-        name: &str,
-        did: &str,
-        m: &workforce_desk::line::LineMessage,
-    ) -> String {
+    fn nudge_said(&self, name: &str, did: &str, m: &workforce_desk::line::LineMessage) -> String {
         use workforce_desk::line::Wait;
-        // The person's wheel holds it past whatever else does.
-        let driving = m
-            .to_session()
-            .is_some_and(|s| d.wheel_of(s).is_some_and(|w| w.person()));
-        let wait = match driving {
-            true => Some(Wait::PersonDriving),
-            false => d.line_waits(m),
-        };
-        let why = match wait {
+        let why = match self.desk.line_waits(m) {
             None => return format!("{did} {name}"),
             Some(Wait::Stopped) => "it is stopped and gets it when it runs again",
             Some(Wait::Working) => "it gets it once its turn ends",
@@ -2108,13 +2095,14 @@ impl CrewHub {
                                 workforce_desk::line::Send::Answer {
                                     to: *s,
                                     text: message.clone(),
+                                    asks: order.answers.clone().unwrap_or_default(),
                                 },
                                 None,
                             )
                             .await
                             .map_err(line)?;
                         done.line = Some((answer.id, answer.delivery));
-                        Ok(Self::nudge_said(d, &name, "answered", &answer))
+                        Ok(self.nudge_said(&name, "answered", &answer))
                     }
                     // It asks something else now: never a plain message
                     // in its place.
@@ -2143,7 +2131,7 @@ impl CrewHub {
                         if let Some(said) = super::urgent::told(&name, rushed) {
                             return Ok(said);
                         }
-                        Ok(Self::nudge_said(d, &name, "told", &told))
+                        Ok(self.nudge_said(&name, "told", &told))
                     }
                 }
             }

@@ -170,6 +170,7 @@ impl Rushed {
         Some(match self {
             Self::Steered => "it reads it with its next tool call's result".into(),
             Self::SaidIn => "it was said into its running turn".into(),
+            Self::CantSteer(Unsteerable::Dialog) => return None,
             Self::CantSteer(_) => {
                 "it gets it once its turn ends: it can't take words mid-turn".into()
             }
@@ -197,6 +198,7 @@ pub fn mid_turn(
     match state {
         SessionState::Working if !dialog => {}
         SessionState::Working | SessionState::Blocked => return Err(Unsteerable::Dialog),
+        _ if dialog => return Err(Unsteerable::Dialog),
         SessionState::Starting
         | SessionState::Asking
         | SessionState::Idle
@@ -291,7 +293,8 @@ pub struct LineMessage {
     /// comes in time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chose: Option<String>,
-    /// An ask's short work-item label ("W7 · PR 2").
+    /// An ask's short work-item label ("W7 · PR 2"); a turn-answer's
+    /// question it answers ([`Send::Answer`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub about: Option<String>,
     /// An ask's one line on why it asks.
@@ -684,11 +687,13 @@ pub enum Send {
         to: Uuid,
         text: String,
     },
-    /// The answer to the question session `to`'s turn ended on: only its
-    /// boss or the person gives one.
+    /// The answer to the question session `to`'s turn ended on (`asks`,
+    /// as it asked it): no session gives one. It goes in only while that is
+    /// still what it asks.
     Answer {
         to: Uuid,
         text: String,
+        asks: String,
     },
 }
 
@@ -921,11 +926,11 @@ pub fn stalled_why(r: &Refusal) -> Option<String> {
     Some(format!("stopped: {why}. Reply to let it carry on."))
 }
 
-/// Why a message waits for `recipient`'s turn: a dialog on its screen
-/// (one only its terminal answers, too), or its work.
+/// Why a message waits for `recipient`'s turn: a dialog only its terminal
+/// answers, or its work.
 fn turn_wait(recipient: &SessionView) -> Wait {
-    match (recipient.state, &recipient.pending) {
-        (SessionState::Blocked, _) | (_, Some(_)) => Wait::Dialog,
+    match recipient.state {
+        SessionState::Blocked => Wait::Dialog,
         _ => Wait::Working,
     }
 }
@@ -938,6 +943,9 @@ fn turn_wait(recipient: &SessionView) -> Wait {
 pub fn deliverable(recipient: &SessionView, typed: bool, plugin: bool) -> Result<Deliver, Wait> {
     if !recipient.live {
         return Err(Wait::Stopped);
+    }
+    if recipient.pending.is_some() {
+        return Err(Wait::Dialog);
     }
     match recipient.caps.line {
         // Inside a turn Desk keeps it: handed to the plugin then, Claude
@@ -1947,6 +1955,20 @@ mod tests {
         });
         assert_eq!(deliverable(&claude, false, true), Err(Wait::Dialog));
         assert_eq!(deliverable(&claude, false, false), Err(Wait::Dialog));
+        for state in [SessionState::Asking, SessionState::Idle] {
+            claude.state = state;
+            assert_eq!(
+                deliverable(&claude, false, true),
+                Err(Wait::Dialog),
+                "{state:?}"
+            );
+            assert_eq!(
+                deliverable(&claude, false, false),
+                Err(Wait::Dialog),
+                "{state:?}"
+            );
+        }
+        claude.state = SessionState::Working;
         claude.pending = None;
         claude.state = SessionState::Idle;
         assert_eq!(deliverable(&claude, true, true), Ok(Deliver::Submit));
