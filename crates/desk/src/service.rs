@@ -2189,7 +2189,7 @@ impl Desk {
     /// hub doesn't hold, nor is starting: one it couldn't take back as it
     /// started, or whose link ended before the process did. Resuming beside
     /// it would start a second engine on the same conversation.
-    async fn held_untaken(&self, id: Uuid) -> bool {
+    pub(super) async fn held_untaken(&self, id: Uuid) -> bool {
         {
             let st = self.0.state.lock();
             if st.live.contains_key(&id) || st.starting.contains(&id) {
@@ -2213,7 +2213,7 @@ impl Desk {
     /// forgets them once they have ended. Each is held ([`crate::leader`])
     /// only once the holder, its parent, lists it again unreaped, so its
     /// number can't have been another's.
-    async fn end_held(&self, id: Uuid) -> Result<(), DeskError> {
+    pub(super) async fn end_held(&self, id: Uuid) -> Result<(), DeskError> {
         let Some(holder) = self.holder().await else {
             return Ok(());
         };
@@ -3822,7 +3822,7 @@ impl Desk {
     /// to it ended. It is held from now ([`crate::leader`]), and signalled by
     /// the hub itself, so a holder started by an older Desk, which only
     /// hangs up, ends it too.
-    fn stop_firmly(&self, id: Uuid, pty: &Arc<Pty>) {
+    pub(super) fn stop_firmly(&self, id: Uuid, pty: &Arc<Pty>) {
         let Some(pid) = pty.pid() else {
             return;
         };
@@ -9117,8 +9117,9 @@ mod tests {
     /// the holder ended first): a resume never starts a second engine beside
     /// a turn that may still run, and says what is true; a restart, or a
     /// resume once its turn had ended or it was stopped, ends that process
-    /// (deaf to a hang-up) and starts again. One being started is never
-    /// taken for one lost.
+    /// (deaf to a hang-up) and starts again; ending it ends that process,
+    /// as it does one the hub holds that is deaf to a hang-up. One being
+    /// started is never taken for one lost.
     #[tokio::test]
     async fn a_process_that_outlived_the_hubs_hold_is_ended_before_its_session_goes_on() {
         with_test_pool(build_pool, |pool| async move {
@@ -9188,6 +9189,25 @@ mod tests {
                 assert!(gone(kept).await);
                 assert!(!d.held_untaken(s.id).await);
             }
+
+            // Ended (closed) by the person: the process it left is ended,
+            // and so is one deaf to the hang-up it is ended with.
+            let kept = lose(SessionState::Stopped);
+            let ended = d.end(s.id, Some(By::you())).await.unwrap();
+            assert_eq!(ended.state, SessionState::Closed);
+            assert!(gone(kept).await, "an ended session's kept process ended");
+            assert!(!d.held_untaken(s.id).await);
+            assert!(d.restart(s.id, None, By::you()).await.unwrap().live);
+            let deaf = d.attach(s.id).unwrap().pid().unwrap();
+            assert_eq!(
+                d.end(s.id, Some(By::you())).await.unwrap().state,
+                SessionState::Closed
+            );
+            assert!(
+                gone(deaf).await,
+                "an ended session's process deaf to a hang-up ended"
+            );
+            assert!(d.restart(s.id, None, By::you()).await.unwrap().live);
 
             // Stopped as its link ends before its process: still ended.
             let third = d.attach(s.id).unwrap().pid().unwrap();
