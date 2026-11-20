@@ -95,15 +95,16 @@ struct Undelivered {
     behind_person: bool,
 }
 
-/// What `item` going quiet is noted by: once each time it stops moving.
+/// When `item` last moved, as the keys of what is said of its stopping
+/// carry it: each is said once each time it stops.
+fn moved_at(item: &crew::Item) -> i64 {
+    item.last_activity
+        .map(|t| t.timestamp_millis())
+        .unwrap_or_default()
+}
+
 fn quiet_key(item: &crew::Item) -> String {
-    format!(
-        "quiet:{}:{}",
-        item.id,
-        item.last_activity
-            .map(|t| t.timestamp_millis())
-            .unwrap_or(0)
-    )
+    format!("quiet:{}:{}", item.id, moved_at(item))
 }
 
 /// One thing worth waking the overseer for.
@@ -611,26 +612,20 @@ impl CrewHub {
                 continue;
             }
             // What the boss sent that never reached it is the boss's to move:
-            // said instead of its quiet, and beside what it asks the person.
-            // Kept while they wait and it hasn't moved, so a pause in a hold
-            // (the person typing a moment) never wakes the boss again.
+            // once said, said instead of its quiet (which may have come
+            // first), and beside what it asks the person. Kept while they
+            // wait and it hasn't moved, so a pause in a hold (the person
+            // typing a moment) never wakes the boss again.
             let waits = waiting.get(&item.id).map(Vec::as_slice).unwrap_or_default();
             if let Some(oldest) = waits.first() {
-                let key = format!(
-                    "undelivered:{}:{}:{}",
-                    item.id,
-                    oldest.id,
-                    item.last_activity
-                        .map(|at| at.timestamp_millis())
-                        .unwrap_or_default()
-                );
+                let key = format!("undelivered:{}:{}:{}", item.id, oldest.id, moved_at(item));
                 holding.insert(key.clone());
-                // Nor its quiet, once said.
                 holding.insert(quiet_key(item));
                 if let Some(found) =
                     self.undelivered(overseer, item, &party, waits, now, o.work.stall_minutes)
                 {
                     if noted.insert(key) {
+                        noted.insert(quiet_key(item));
                         out.push(found.trigger);
                     }
                     // Behind what it asks the person: that is still raised
@@ -761,11 +756,14 @@ impl CrewHub {
     /// `overseer`'s own messages still waiting to go into each session, by
     /// session id, oldest first.
     async fn waiting_from(&self, overseer: &str) -> HashMap<String, Vec<LineMessage>> {
-        match self.desk.store().line_waiting_from(overseer).await {
-            Ok(rows) => rows.into_iter().fold(HashMap::new(), |mut by, m| {
-                by.entry(m.to.id.clone()).or_default().push(m);
-                by
-            }),
+        match self.desk.store().line_waiting().await {
+            Ok(rows) => rows
+                .into_iter()
+                .filter(|m| m.from.kind == PartyKind::Manager && m.from.id == overseer)
+                .fold(HashMap::new(), |mut by, m| {
+                    by.entry(m.to.id.clone()).or_default().push(m);
+                    by
+                }),
             Err(e) => {
                 tracing::warn!(error = %e, "the boss's waiting messages couldn't be read");
                 HashMap::new()
