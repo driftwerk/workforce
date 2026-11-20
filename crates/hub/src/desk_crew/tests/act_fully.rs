@@ -2,6 +2,8 @@
 //! not, Desk allows what merges, tags, promotes and deploys the moment a
 //! session asks; only its budget, Stop and the activity log hold it.
 
+use super::super::CrewHub;
+use super::unbound::UNBOUND;
 use super::*;
 use workforce_common::oversight::{Level, Oversight};
 
@@ -166,37 +168,32 @@ async fn act_fully_needs_no_repositories_and_falls_back_to_act_only_over_its_bud
     .await;
 }
 
-/// At Act fully the boss is told, wherever it decides (its wake-ups, its
-/// own conversation and its DM), to aim at the end state the person
-/// ordered, run independent steps side by side, and never hold the
-/// deliverable behind polish.
-#[test]
-fn act_fully_aims_at_the_end_state_in_parallel_without_polish_first() {
-    let o = Oversight {
-        enabled: true,
-        level: Level::Full,
-        ..Oversight::default()
-    };
-    let said = [
-        super::super::CrewHub::boss_hint(&o),
-        super::super::CrewHub::dm_hint(Level::Full, &o, true),
-        super::super::CrewHub::dm_hint(Level::Full, &o, false),
-        super::super::CrewHub::level_hint(Level::Full, &o),
-    ];
-    for hint in &said {
-        assert!(
-            hint.contains("Aim straight at the end state an order names"),
-            "{hint}"
-        );
-        assert!(
-            hint.contains("don't depend on each other at once"),
-            "{hint}"
-        );
-        assert!(
-            hint.contains("Never hold the deliverable behind optional polish"),
-            "{hint}"
-        );
-    }
-    let act = super::super::CrewHub::level_hint(Level::Act, &o);
-    assert!(!act.contains("end state"), "{act}");
+/// Act fully's every prompt carries the end-state rule; Act's doesn't.
+#[tokio::test(flavor = "multi_thread")]
+async fn act_fully_aims_at_the_end_state_in_parallel_without_polish_first() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", UNBOUND, &[]).await;
+        let s = new_session(&d, dir.path(), "Legacy removal").await;
+        let (_, o) = crew.overseer_service().unwrap();
+        assert!(crew.unbound(&o));
+        let ended = ["Turn ended.".to_string()];
+        let said = [
+            CrewHub::boss_hint(&o),
+            CrewHub::dm_hint(Level::Full, &o, true),
+            crew.line_prompt(s.id, &[], &ended, &o),
+        ];
+        for hint in &said {
+            for rule in [
+                "aim straight at the end state an order names",
+                "Run steps that don't depend on each other at once",
+                "Never hold the deliverable behind polish their instructions don't ask for",
+            ] {
+                assert!(hint.contains(rule), "{rule}: {hint}");
+            }
+        }
+        let act = CrewHub::level_hint(Level::Act, &o);
+        assert!(!act.contains("end state"), "{act}");
+    })
+    .await;
 }
