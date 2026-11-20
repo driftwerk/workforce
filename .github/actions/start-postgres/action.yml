@@ -1,0 +1,33 @@
+name: Start Postgres
+description: >-
+  A Postgres 17 for a job's tests, on the runner's network as 127.0.0.1:5432,
+  started by hand rather than as a service so it can take more than the
+  default 100 connections: tests run in parallel, each on a database of its
+  own. fsync is off, which is fine for a server that lives as long as the
+  job. DDL is logged, so a job can tell from `docker logs <name>` that its
+  tests made their databases.
+inputs:
+  name:
+    description: The container's name.
+    required: true
+  user:
+    description: The superuser, whose password is the same.
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        NAME: ${{ inputs.name }}
+        PG_USER: ${{ inputs.user }}
+      run: |
+        set -euo pipefail
+        docker run -d --name "$NAME" --network host \
+          -e POSTGRES_USER="$PG_USER" -e POSTGRES_PASSWORD="$PG_USER" -e POSTGRES_DB=postgres \
+          postgres:17 -c max_connections=1000 -c fsync=off -c synchronous_commit=off -c full_page_writes=off \
+          -c log_statement=ddl
+        for _ in $(seq 1 60); do
+          docker exec "$NAME" pg_isready -U "$PG_USER" && ready=1 && break
+          sleep 1
+        done
+        if [ "${ready:-}" != 1 ]; then docker logs "$NAME" | tail -n 50; exit 1; fi
