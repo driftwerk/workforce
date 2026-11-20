@@ -1259,6 +1259,7 @@ impl Desk {
                     id: m.id,
                     machine: Some(m.machine),
                     name: m.name,
+                    note: None,
                 };
                 self.assign_machine_session(t, &key, &started, by).await
             }

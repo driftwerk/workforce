@@ -10,7 +10,9 @@
 //!   and waits for its answer, as a remote boss's does on its uplink
 //!   ([`super::remote_decide`]).
 //! - **On the Mac**, while Act fully is in force for the overseer there, its
-//!   pump relays [`TAKE`] to each machine of its group every second. Each
+//!   pump relays [`TAKE`] under each of its grants on each machine (its
+//!   group's, or each of its plans', [`CrewHub::machine_grants_of`]) every
+//!   second. Each
 //!   take hands back what waits, once, and says the home holds it at Act
 //!   fully. The Mac makes one decision call on the overseer's own model for
 //!   each, as for a local boss, and relays [`DECIDED`] with its text.
@@ -93,7 +95,7 @@ pub(crate) fn relayed_party(party: &str) -> bool {
 
 /// The home's last word that Act fully is in force for a boss and group,
 /// with what its one daily budget counts (designs/act-fully-machines-design.md).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Home {
     /// When the home sent it.
     at: Instant,
@@ -104,6 +106,26 @@ struct Home {
     here: f64,
     /// What the home said was spent everywhere else since `from`.
     elsewhere: f64,
+    /// What the home counted of each of the boss's other grants here, by
+    /// group: in `elsewhere`, and perhaps behind what they said since.
+    others: HashMap<String, f64>,
+}
+
+/// The most any of a boss's fresh words, by grant, counts as spent: its
+/// grant's spend here, what the home counted everywhere else, and what each
+/// of its other grants here spent past what that word counted of it.
+fn most_spent(fresh: &[(&str, &Home)]) -> Option<f64> {
+    fresh
+        .iter()
+        .map(|(g, h)| {
+            let ahead: f64 = fresh
+                .iter()
+                .filter(|(o, _)| o != g)
+                .map(|(o, x)| (x.here - h.others.get(*o).copied().unwrap_or(0.0)).max(0.0))
+                .sum();
+            h.here + h.elsewhere + ahead
+        })
+        .reduce(f64::max)
 }
 
 /// What a machine holds of its relayed bosses' decisions.
@@ -210,19 +232,20 @@ impl CrewHub {
     }
 
     /// What Act fully's one budget counts as spent today for `party`
-    /// (`home/<agent>`), by its home's word that is still fresh: its
-    /// sessions' spend here and everywhere else. None without one, so it
-    /// doesn't act fully.
+    /// (`home/<agent>`), by its home's words that are still fresh: each is
+    /// one grant's sessions' spend here and what the home counts everywhere
+    /// else, its other grants here included, with what those have spent
+    /// here past what the home last counted of them; so the most of them.
+    /// None without one, so it doesn't act fully.
     pub(crate) fn relayed_spent(&self, party: &str) -> Option<f64> {
         let out = self.relayed.lock();
-        let fresh: Vec<&Home> = out
+        let fresh: Vec<(&str, &Home)> = out
             .homes
             .iter()
             .filter(|((p, _), h)| p == party && h.at.elapsed() < FRESH)
-            .map(|(_, h)| h)
+            .map(|((_, g), h)| (g.as_str(), h))
             .collect();
-        let elsewhere = fresh.iter().map(|h| h.elsewhere).reduce(f64::max)?;
-        Some(fresh.iter().map(|h| h.here).sum::<f64>() + elsewhere)
+        most_spent(&fresh)
     }
 
     /// What `group`'s sessions here spent since `from` in real money (calls
@@ -325,9 +348,9 @@ impl CrewHub {
     /// The home's take for `boss`'s decisions in `group` ([`TAKE`]): it
     /// says whether Act fully is in force for it there (`inForce`, at the
     /// level `ceiling` says), where today's count starts there
-    /// (`countFrom`) and what was spent everywhere else
+    /// (`countFrom`) and what was spent everywhere but this grant here
     /// (`spentElsewhereUsd`), and is handed what waits, each once. Its
-    /// answer says what the group's sessions here spent since `countFrom`
+    /// answer says what the grant's sessions here spent since `countFrom`
     /// (`spentUsd`), for the home to count ([`super::shared_budget`]).
     pub(crate) async fn take_relayed(
         &self,
@@ -367,6 +390,14 @@ impl CrewHub {
             _ => None,
         };
         let elsewhere = super::shared_budget::usd_of(&input["spentElsewhereUsd"]);
+        // A count that can't be read is none: what that grant spent here
+        // is then all counted again, never left out.
+        let others: HashMap<String, f64> = input["grantsUsd"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(g, v)| Some((g.clone(), super::shared_budget::usd_of(v)?)))
+            .collect();
         let in_force = ours
             && ceiling.level == Level::Full
             && input["inForce"].as_bool() == Some(true)
@@ -406,6 +437,7 @@ impl CrewHub {
                             from,
                             here,
                             elsewhere,
+                            others,
                         },
                     );
                 }
@@ -602,9 +634,9 @@ impl CrewHub {
     }
 }
 
-/// The Mac's pump: while Desk relays, each overseer of a group with
-/// machine sessions takes its decisions from each machine, as the module
-/// says, and says so when Act fully ends.
+/// The Mac's pump: while Desk relays, each overseer with grants on the
+/// person's machines takes its decisions under each, as the module says,
+/// and says so when Act fully ends.
 pub(crate) async fn pump_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     let pumps: Pumps = Arc::default();
     let mut tick = tokio::time::interval(TAKE_EVERY / 4);
@@ -620,13 +652,13 @@ pub(crate) async fn pump_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
         }
         let mut seen = HashSet::new();
         for (service, o) in crew.overseers() {
-            let Some(group) = o.scope.group().map(str::to_string) else {
-                continue;
-            };
             let agent = service.agent_id.as_str().to_string();
+            let grants = crew.machine_grants_of(&agent, &o);
+            if grants.is_empty() {
+                continue;
+            }
             let in_force = crew.relay_in_force(&agent, &o);
-            for machine in crew.machines_in(&group) {
-                let k = (machine.clone(), group.clone());
+            for k in grants {
                 seen.insert(k.clone());
                 {
                     let mut p = pumps.lock();
@@ -646,14 +678,14 @@ pub(crate) async fn pump_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 ));
             }
         }
-        // A machine's group no overseer here takes from now: dropped. Its
+        // A machine's grant no overseer here takes from now: dropped. Its
         // machine stops holding it within [`FRESH`].
         pumps.lock().retain(|k, p| seen.contains(k) || p.busy);
     }
 }
 
-/// One take from `k`'s machine for its group, and the decisions it hands
-/// back, each decided and answered.
+/// One take from `k`'s machine under its grant, and the decisions it
+/// hands back, each decided and answered.
 async fn take(
     crew: Arc<CrewHub>,
     service: Arc<AgentService>,
@@ -667,9 +699,11 @@ async fn take(
     let ceiling = crew.ceiling_now(&agent, &o);
     let started = Instant::now();
     // One budget across this Mac and every machine: where today's count
-    // starts here, and what was spent everywhere but this machine.
+    // starts here, what was spent everywhere but this grant there, and what
+    // of that is the boss's other grants there.
     let from = crew.count_from(&o);
-    let elsewhere = from.and_then(|f| crew.spent_elsewhere(&agent, machine, f));
+    let elsewhere = from.and_then(|f| crew.spent_elsewhere(&agent, machine, group, f));
+    let others = from.map(|f| crew.grants_spent_on(&agent, machine, group, f));
     // As many as there is room to decide now: none is refused for pace.
     // In force there only once the machine said it counts this budget, so
     // an engine that counts only its own spend never acts fully.
@@ -693,6 +727,9 @@ async fn take(
     if let Some(e) = elsewhere {
         input["spentElsewhereUsd"] = json!(e);
     }
+    if let Some(o) = others {
+        input["grantsUsd"] = json!(o);
+    }
     let got = crew
         .relay(machine, group, TAKE, input, &agent, &ceiling)
         .await;
@@ -714,7 +751,7 @@ async fn take(
         _ => None,
     };
     if let Some((f, usd)) = reported {
-        crew.machine_reported(&agent, machine, f, usd).await;
+        crew.machine_reported(&agent, machine, group, f, usd).await;
     }
     {
         let mut p = pumps.lock();
@@ -855,5 +892,47 @@ async fn decide_one(
         .await
     {
         tracing::warn!(%machine, %group, why, "a relayed decision's answer didn't reach its machine");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn home(here: f64, elsewhere: f64, others: &[(&str, f64)]) -> Home {
+        Home {
+            at: Instant::now(),
+            from: chrono::Utc::now(),
+            here,
+            elsewhere,
+            others: others.iter().map(|(g, u)| (g.to_string(), *u)).collect(),
+        }
+    }
+
+    /// A word that counted its boss's other grant here before that grant
+    /// spent more is never behind it: what it spent since is added, once.
+    #[test]
+    fn a_grants_spend_since_its_homes_last_word_of_it_is_never_left_out() {
+        // The home counted plan B's $4 in plan A's word, and B's $4 in its
+        // own; B has spent $3 more since A's word.
+        let a = home(3.0, 4.0, &[("plan-b", 4.0)]);
+        let b = home(7.0, 3.0, &[("plan-a", 3.0)]);
+        assert_eq!(most_spent(&[("plan-a", &a), ("plan-b", &b)]), Some(10.0));
+        // A's word, B's own gone stale: A alone, as the home last said.
+        assert_eq!(most_spent(&[("plan-a", &a)]), Some(7.0));
+        // A word that says nothing of B counts all B spent here again,
+        // never less.
+        let blind = home(3.0, 4.0, &[]);
+        assert_eq!(
+            most_spent(&[("plan-a", &blind), ("plan-b", &b)]),
+            Some(14.0)
+        );
+        // A count of B past what B says (B read before) adds nothing.
+        let ahead = home(3.0, 9.0, &[("plan-b", 9.0)]);
+        assert_eq!(
+            most_spent(&[("plan-a", &ahead), ("plan-b", &b)]),
+            Some(12.0)
+        );
+        assert_eq!(most_spent(&[]), None);
     }
 }

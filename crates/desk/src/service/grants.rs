@@ -232,6 +232,24 @@ impl Desk {
         group: &str,
         id: Uuid,
     ) -> Result<crate::crew::Party, Option<String>> {
+        let (g, party) = self.grant_boss(group)?;
+        // The grant that holds it is this one, as letting go of it judges.
+        if self.grant_group_of(id).as_deref() != Some(group) {
+            return Err(Some(format!(
+                "{} isn't one of the sessions {} may run in {}.",
+                self.view(id)
+                    .map_or_else(|_| "It".into(), |v| v.label().to_string()),
+                party.name,
+                g.name
+            )));
+        }
+        Ok(party)
+    }
+
+    /// `group`'s live grant, and the boss it names as a party, when its
+    /// level does more than watch ([`Self::grant_boss_for`]'s, whichever
+    /// session).
+    fn grant_boss(&self, group: &str) -> Result<(Grant, crate::crew::Party), Option<String>> {
         let g = match self.grant_live(group) {
             Ok(g) => g,
             Err(why) => {
@@ -248,26 +266,78 @@ impl Desk {
         let Some(boss) = g.boss.as_ref().filter(|b| b.servable()) else {
             return Err(None);
         };
-        let name = match boss {
-            grant::BossRef::Local { agent } => agent.clone(),
-            grant::BossRef::Remote { hub, agent } => format!("{agent} ({hub})"),
-        };
+        let name = boss.name();
         if g.level == grant::Level::Watch {
             return Err(Some(format!(
                 "{name} only watches {}; set them to Act to run work.",
                 g.name
             )));
         }
-        // The grant that holds it is this one, as letting go of it judges.
-        if self.grant_group_of(id).as_deref() != Some(group) {
-            return Err(Some(format!(
-                "{} isn't one of the sessions {name} may run in {}.",
-                self.view(id)
-                    .map_or_else(|_| "It".into(), |v| v.label().to_string()),
-                g.name
+        let party = crate::crew::Party::manager(&boss.party_id(), &name);
+        Ok((g, party))
+    }
+
+    /// Starts `new`, a plan's ticket the person approved, for the boss of
+    /// its plan's grant here (`boss`, as the grant names it): run by it from
+    /// launch, as handing it over at once would, so its first call is the
+    /// boss's. Only in a plan's grant ([`grant::plan_of`]), live, naming
+    /// that boss from this computer's home, at more than Watch, and on an
+    /// engine Desk checks every call of; the boss is the grant's, never the
+    /// caller's word. A grant not here yet, or not for that boss, is
+    /// [`grant::NOT_HELD`]: the start waits for it. Under `id`, the session
+    /// id its plan gave it, a start sent again is the one already started
+    /// in that grant, as it is now (the person may have it): never a second.
+    pub async fn create_held(
+        &self,
+        new: crate::model::NewSession,
+        boss: &str,
+        id: Option<Uuid>,
+    ) -> Result<crate::model::SessionView, DeskError> {
+        let Some(group) = new.group.clone().filter(|g| grant::plan_of(g).is_some()) else {
+            return Err(DeskError::Invalid(
+                "Only a plan's ticket starts for its boss, in its plan's grant.".into(),
+            ));
+        };
+        if !crate::engine::boss_safe(new.engine) {
+            return Err(DeskError::Invalid(format!(
+                "A plan's boss runs only sessions Desk checks every call of from launch, so not {}.",
+                new.engine.title()
             )));
         }
-        Ok(crate::crew::Party::manager(&boss.party_id(), &name))
+        self.grants_loaded().await?;
+        let not_held = |why: Option<String>| {
+            let held = "This machine doesn't hold its plan's grant for that boss yet";
+            DeskError::NotHeld(match why {
+                Some(why) => format!("{held}: {why}"),
+                None => format!("{held}."),
+            })
+        };
+        let (g, party) = self.grant_boss(&group).map_err(not_held)?;
+        let named = g
+            .boss
+            .as_ref()
+            .filter(|b| matches!(b, grant::BossRef::Local { .. }));
+        if named.map(grant::BossRef::key).as_deref() != Some(boss) {
+            return Err(not_held(None));
+        }
+        // Started already, under the id its plan gave it: that one, as it
+        // is now, never a second.
+        if let Some(there) = id.and_then(|id| self.view(id).ok()) {
+            return match there.group.as_ref().is_some_and(|g| g.id == group) {
+                true => Ok(there),
+                false => Err(DeskError::Conflict(format!(
+                    "the session {} has started already",
+                    there.id
+                ))),
+            };
+        }
+        let by = crate::crew::By::manager(
+            &party.id,
+            &party.name,
+            "The person approved its plan; Desk started its ticket for it.",
+        );
+        self.start_session(new, id, Some(&party), Some(by), true)
+            .await
     }
 
     /// Every grant here that names a boss, with why it doesn't serve its

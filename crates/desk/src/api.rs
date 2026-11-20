@@ -94,6 +94,13 @@ impl IntoResponse for DeskError {
                 )
                     .into_response()
             }
+            DeskError::NotHeld(_) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({ "error": self.to_string(), "code": crate::grant::NOT_HELD })),
+                )
+                    .into_response()
+            }
             DeskError::Invalid(_) => StatusCode::BAD_REQUEST,
             DeskError::TooLong { most, .. } => {
                 let most = *most;
@@ -758,9 +765,31 @@ async fn switch_account(
         .into_response()
 }
 
-async fn create(State(s): S, h: HeaderMap, Query(q): Q, Json(new): Json<NewSession>) -> Response {
+/// A start as New session asks it, or as a plan's ticket on this machine
+/// for its plan's boss (`boss`, `local:<agent>`), run by it from launch,
+/// under the session id its plan gave it (`id`), so a start sent again is
+/// the same one ([`Desk::create_held`]).
+#[derive(Deserialize)]
+struct Start {
+    #[serde(flatten)]
+    new: NewSession,
+    #[serde(default)]
+    boss: Option<String>,
+    #[serde(default)]
+    id: Option<Uuid>,
+}
+
+async fn create(State(s): S, h: HeaderMap, Query(q): Q, Json(start): Json<Start>) -> Response {
     guarded!(s, h, q);
-    s.desk.create_chosen(new).await.map(Json).into_response()
+    match (start.boss, start.id) {
+        (Some(boss), id) => s.desk.create_held(start.new, &boss, id).await,
+        (None, None) => s.desk.create_chosen(start.new).await,
+        (None, Some(_)) => Err(DeskError::Invalid(
+            "Only a plan's ticket started for its boss names its session.".into(),
+        )),
+    }
+    .map(Json)
+    .into_response()
 }
 
 async fn update(
