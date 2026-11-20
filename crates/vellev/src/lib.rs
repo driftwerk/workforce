@@ -257,6 +257,62 @@ pub mod testing {
         }
     }
 
+    /// An embedder with no model behind it: each text's vector is made
+    /// from its hash, the same for the same text, of `dimensions`. It
+    /// counts the texts it is asked for, which is what was written whole.
+    pub struct Counted {
+        pub dimensions: usize,
+        pub asked: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Counted {
+        pub fn new(dimensions: usize) -> Self {
+            Self {
+                dimensions,
+                asked: Default::default(),
+            }
+        }
+
+        pub fn asked(&self) -> usize {
+            self.asked.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// A unit vector of `dimensions` made from `text`'s hash.
+    fn hashed(text: &str, dimensions: usize) -> Vec<f32> {
+        use std::hash::{Hash, Hasher};
+        let spread: Vec<f32> = (0..dimensions)
+            .map(|at| {
+                let mut hasher = std::hash::DefaultHasher::new();
+                (text, at).hash(&mut hasher);
+                (hasher.finish() % 2_000) as f32 / 1_000.0 - 1.0
+            })
+            .collect();
+        let norm = spread
+            .iter()
+            .map(|x| x * x)
+            .sum::<f32>()
+            .sqrt()
+            .max(f32::EPSILON);
+        spread.into_iter().map(|x| x / norm).collect()
+    }
+
+    #[async_trait::async_trait]
+    impl seeding::DocumentEmbedder for Counted {
+        fn name(&self) -> String {
+            "a hash of each text".to_string()
+        }
+
+        async fn documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.asked
+                .fetch_add(texts.len(), std::sync::atomic::Ordering::SeqCst);
+            Ok(texts
+                .iter()
+                .map(|text| hashed(text, self.dimensions))
+                .collect())
+        }
+    }
+
     /// The model tests of a configured code model embed with, as a node
     /// under test allows it.
     pub const SMALL: &str = "BAAI/bge-small-en-v1.5";

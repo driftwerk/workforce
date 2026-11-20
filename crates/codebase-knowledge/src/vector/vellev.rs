@@ -33,11 +33,12 @@ use workforce_vellev::{
 
 use super::health::{InsertErrorSink, InsertErrorSlot};
 use super::{
-    entity_text, search_result, search_text, summary_text, vectorizable, CodeVectorStore,
-    DeleteOutcome, Differing, VectorCodeEntity, VectorCodeSummary, VectorSearchResult,
-    CODE_ENTITY_COLLECTION, CODE_SUMMARY_COLLECTION, VERIFY_PAGE,
+    count_embedded, entity_text, search_result, search_text, summary_text, vectorizable,
+    CodeVectorStore, DeleteOutcome, Differing, HeldRecord, VectorCodeEntity, VectorCodeSummary,
+    VectorSearchResult, CODE_ENTITY_COLLECTION, CODE_SUMMARY_COLLECTION, VERIFY_PAGE,
 };
 use crate::graph::entities::EntityKind;
+use crate::graph::VectorKeys;
 
 /// Records per delete, or per patch of their fills, each one atomic step.
 const INDEX_BATCH: usize = 50;
@@ -299,6 +300,7 @@ impl VellevCodeVectorStore {
             let stored = apply_embedded(&self.tenants, collection.wanted(), seeding, changes)
                 .await
                 .map_err(told)?;
+            count_embedded(VectorKeys::VELLEV, stored);
             debug!(
                 what,
                 count = stored,
@@ -316,6 +318,7 @@ impl VellevCodeVectorStore {
                 })
                 .await;
             applied.map_err(told)?;
+            count_embedded(VectorKeys::VELLEV, size);
             stored += size;
             debug!(
                 what,
@@ -431,10 +434,12 @@ impl VellevCodeVectorStore {
         Ok((refilled, refused))
     }
 
-    /// The places in `wanted`, `(key, hash)` pairs of one repo, of those
-    /// `collection` lacks, holds otherwise, or holds an earlier version of
-    /// besides: told by counting where all are held (see
-    /// [`workforce_vellev::unmatched`]).
+    /// How `wanted`, `(key, hash)` pairs of one repo, differs from what
+    /// `collection` holds: told by counting where all are held (see
+    /// [`workforce_vellev::unmatched`]), [`VERIFY_PAGE`] pairs at a time.
+    /// Every id held under a wanted key beside the one that matches is
+    /// [`Differing::stale`], the wanted records' own ids among them until
+    /// the caller drops those ([`without_own`]).
     async fn differing(
         &self,
         collection: &Ensured,
@@ -443,32 +448,47 @@ impl VellevCodeVectorStore {
         wanted: &[(String, String)],
     ) -> Result<Differing> {
         let scope = of_repo(repo_id);
-        let found = collection
-            .run(|| {
-                workforce_vellev::unmatched(
-                    collection.collection(),
-                    Some(&scope),
-                    (key, HASH),
-                    wanted,
-                    &self.cap,
-                )
-            })
-            .await?;
-        // An earlier version held beside the wanted one differs too.
-        let keys: std::collections::HashSet<&String> = found
-            .differing
-            .iter()
-            .chain(found.stale.iter().map(|(_, key)| key))
-            .collect();
-        Ok(Differing {
-            places: wanted
-                .iter()
-                .enumerate()
-                .filter(|(_, (key, _))| keys.contains(key))
-                .map(|(at, _)| at)
-                .collect(),
-            held: usize::try_from(found.held)?,
-        })
+        let mut differing = Differing::default();
+        for (page, chunk) in wanted.chunks(VERIFY_PAGE).enumerate() {
+            let found = collection
+                .run(|| {
+                    workforce_vellev::unmatched(
+                        collection.collection(),
+                        Some(&scope),
+                        (key, HASH),
+                        chunk,
+                        &self.cap,
+                    )
+                })
+                .await?;
+            let missing: HashSet<&String> = found.differing.iter().collect();
+            // An earlier version held beside the wanted one differs too.
+            let besides: HashSet<&String> = found.stale.iter().map(|(_, key)| key).collect();
+            let offset = page * VERIFY_PAGE;
+            for (at, (key, _)) in chunk.iter().enumerate() {
+                let lacked = missing.contains(key);
+                if lacked || besides.contains(key) {
+                    differing.places.push(offset + at);
+                }
+                if lacked {
+                    differing.missing.push(offset + at);
+                }
+            }
+            differing
+                .stale
+                .extend(found.stale.iter().map(|(id, _)| id.0.to_string()));
+            differing.held += usize::try_from(found.held)?;
+        }
+        Ok(differing)
+    }
+
+    /// The collection of entities, or `summaries`, and the property each
+    /// of its records is told apart by.
+    fn keyed(&self, summaries: bool) -> (&Ensured, &'static str) {
+        match summaries {
+            true => (&self.summaries, SUMMARY_KEY),
+            false => (&self.entities, ENTITY_KEY),
+        }
     }
 
     /// Delete the objects with `ids` from `collection`, as one step each
@@ -509,6 +529,25 @@ impl VellevCodeVectorStore {
             failed: 0,
         })
     }
+}
+
+/// `differing` with the ids of the records wanted, `own`, left out of what
+/// is stale: the record as it is wanted is never removed for another.
+fn without_own(differing: Differing, own: impl IntoIterator<Item = ObjectId>) -> Differing {
+    let own: HashSet<String> = own.into_iter().map(|id| id.0.to_string()).collect();
+    Differing {
+        stale: differing
+            .stale
+            .into_iter()
+            .filter(|id| !own.contains(id))
+            .collect(),
+        ..differing
+    }
+}
+
+/// `ids` as object ids.
+fn object_ids(ids: &[String]) -> Result<Vec<ObjectId>> {
+    ids.iter().map(|id| Ok(ObjectId(id.parse()?))).collect()
 }
 
 /// The two code collections in the tenant, embedding as `local` does.
@@ -912,8 +951,10 @@ impl CodeVectorStore for VellevCodeVectorStore {
         repo_id: &str,
         entities: &[VectorCodeEntity],
     ) -> Result<Differing> {
-        self.differing(&self.entities, repo_id, ENTITY_KEY, &entity_keys(entities))
-            .await
+        let differing = self
+            .differing(&self.entities, repo_id, ENTITY_KEY, &entity_keys(entities))
+            .await?;
+        Ok(without_own(differing, entities.iter().map(entity_id)))
     }
 
     async fn differing_summaries(
@@ -925,8 +966,10 @@ impl CodeVectorStore for VellevCodeVectorStore {
             .iter()
             .map(|summary| (summary.key(), summary.record_hash()))
             .collect();
-        self.differing(&self.summaries, repo_id, SUMMARY_KEY, &wanted)
-            .await
+        let differing = self
+            .differing(&self.summaries, repo_id, SUMMARY_KEY, &wanted)
+            .await?;
+        Ok(without_own(differing, summaries.iter().map(summary_id)))
     }
 
     async fn held_after(
@@ -935,11 +978,8 @@ impl CodeVectorStore for VellevCodeVectorStore {
         summaries: bool,
         after: Option<String>,
         limit: usize,
-    ) -> Result<(Vec<(String, String)>, Option<String>)> {
-        let (collection, key) = match summaries {
-            true => (&self.summaries, SUMMARY_KEY),
-            false => (&self.entities, ENTITY_KEY),
-        };
+    ) -> Result<(Vec<HeldRecord>, Option<String>)> {
+        let (collection, key) = self.keyed(summaries);
         let after = match after {
             Some(after) => Some(ObjectId(after.parse()?)),
             None => None,
@@ -962,10 +1002,63 @@ impl CodeVectorStore for VellevCodeVectorStore {
                     let value = object.properties.get(name).and_then(|value| value.as_str());
                     value.unwrap_or_default().to_string()
                 };
-                (property(key), property("filePath"))
+                HeldRecord {
+                    id: object.id.0.to_string(),
+                    key: property(key),
+                    file_path: property("filePath"),
+                }
             })
             .collect();
         Ok((held, listed.next.map(|next| next.0.to_string())))
+    }
+
+    async fn remove_held(&self, summaries: bool, ids: &[String]) -> Result<()> {
+        let (collection, _) = self.keyed(summaries);
+        self.delete_ids(collection, object_ids(ids)?).await
+    }
+
+    /// One object of each collection is listed, of any repo but these:
+    /// what holds no repo at all is never one.
+    async fn held_outside(&self, repos: &[String]) -> Result<Option<String>> {
+        let outside = Filter::And(
+            std::iter::once(Filter::Not(Box::new(Filter::IsNull {
+                property: "repoId".to_string(),
+            })))
+            .chain(repos.iter().map(|repo| Filter::Ne {
+                property: "repoId".to_string(),
+                value: repo.as_str().into(),
+            }))
+            .collect(),
+        );
+        for collection in [&self.entities, &self.summaries] {
+            let listed = collection
+                .run(|| {
+                    let page = Page::new(1).filter(outside.clone());
+                    async move { collection.collection().list(&page).await }
+                })
+                .await?;
+            let repo = listed
+                .objects
+                .first()
+                .and_then(|object| object.properties.get("repoId"))
+                .and_then(Value::as_str);
+            if let Some(repo) = repo {
+                return Ok(Some(repo.to_string()));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn file_held(&self, repo_id: &str, file_path: &str) -> Result<usize> {
+        let filter = of_file(repo_id, file_path);
+        let mut held = 0;
+        for collection in [&self.entities, &self.summaries] {
+            let counted = collection
+                .run(|| collection.collection().count(Some(&filter)))
+                .await?;
+            held += usize::try_from(counted)?;
+        }
+        Ok(held)
     }
 
     async fn remove_entities(&self, entities: &[VectorCodeEntity]) -> Result<()> {
@@ -1017,38 +1110,39 @@ impl CodeVectorStore for VellevCodeVectorStore {
     }
 }
 
+/// `CodeEntity` as the hub made it before the slim shape: every
+/// property stored, those since left out among them, and its text
+/// indexed for keywords.
+#[cfg(any(test, feature = "testing"))]
+pub fn pre_w4_entity_collection() -> Collection {
+    collection(
+        CollectionName::new(CODE_ENTITY_COLLECTION).unwrap(),
+        vec![
+            searched("searchableContent"),
+            filtered("entityId"),
+            filtered("repoId"),
+            searched("qualifiedName"),
+            searched("name"),
+            filtered("kind"),
+            filtered("filePath"),
+            filtered("language"),
+            searched("signature"),
+            searched("docComment"),
+            searched("summary"),
+            Property::new("startLine", DataType::Int),
+            Property::new("endLine", DataType::Int),
+            filtered(FILL),
+            filtered(HASH),
+        ],
+        local_embedding(&["searchableContent"]),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use workforce_vellev::testing::{ByNode, Node};
 
     use super::*;
-
-    /// `CodeEntity` as the hub made it before the slim shape: every
-    /// property stored, those since left out among them, and its text
-    /// indexed for keywords.
-    fn pre_w4_entity_collection() -> Collection {
-        collection(
-            CollectionName::new(CODE_ENTITY_COLLECTION).unwrap(),
-            vec![
-                searched("searchableContent"),
-                filtered("entityId"),
-                filtered("repoId"),
-                searched("qualifiedName"),
-                searched("name"),
-                filtered("kind"),
-                filtered("filePath"),
-                filtered("language"),
-                searched("signature"),
-                searched("docComment"),
-                searched("summary"),
-                Property::new("startLine", DataType::Int),
-                Property::new("endLine", DataType::Int),
-                filtered(FILL),
-                filtered(HASH),
-            ],
-            local_embedding(&["searchableContent"]),
-        )
-    }
 
     /// Vectors copied from Weaviate, which the node cannot embed queries
     /// to match.
@@ -1491,7 +1585,7 @@ mod tests {
         // Listed and compared within the repo.
         let (held, _) = store.held_after("ours", false, None, 100).await.unwrap();
         assert_eq!(held.len(), 3);
-        assert!(held.iter().all(|(key, _)| key.starts_with("ours-")));
+        assert!(held.iter().all(|held| held.key.starts_with("ours-")));
         let (held, _) = store.held_after("ours", true, None, 100).await.unwrap();
         assert_eq!(held.len(), 3);
         let elsewhere = store.differing_entities("ours", &theirs).await.unwrap();
@@ -1616,6 +1710,183 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((found.places, found.held), (vec![1], 2));
+    }
+
+    /// A store seeded by vectors made from each text's hash, counting
+    /// them: no model is run, and what is written whole is counted.
+    fn counted(
+        node: &Node,
+    ) -> (
+        VellevCodeVectorStore,
+        Arc<workforce_vellev::testing::Counted>,
+    ) {
+        let store = VellevCodeVectorStore::new(&node.url, &node.key, &node.tenant).unwrap();
+        let dimensions = store.embedded_as().1.dimensions as usize;
+        let counted = Arc::new(workforce_vellev::testing::Counted::new(dimensions));
+        let store = store.seeded_by(Seeding::new(counted.clone(), 200, 2));
+        (store, counted)
+    }
+
+    /// An earlier version held beside a record wanted is stale, and the
+    /// record is not missing; the wanted record's own id is never stale,
+    /// whatever it holds. A summary has no other id to be held at.
+    #[tokio::test]
+    async fn earlier_versions_are_stale_but_the_wanted_id_never_is() {
+        let Some(node) = Node::embedding().await else {
+            return;
+        };
+        let (store, _) = counted(&node);
+        let now = entity(
+            "repo",
+            "Config",
+            "src/config.rs",
+            "Struct",
+            "the configuration",
+        );
+        let before = VectorCodeEntity {
+            start_line: 40,
+            ..now.clone()
+        };
+        store
+            .index_entities(&[now.clone(), before.clone()])
+            .await
+            .unwrap();
+        let earlier = vec![entity_id(&before).0.to_string()];
+        let found = store
+            .differing_entities("repo", std::slice::from_ref(&now))
+            .await
+            .unwrap();
+        assert_eq!((found.places, found.missing), (vec![0], vec![]));
+        assert_eq!(found.stale, earlier);
+        let changed = VectorCodeEntity {
+            end_line: 30,
+            ..now.clone()
+        };
+        let found = store
+            .differing_entities("repo", std::slice::from_ref(&changed))
+            .await
+            .unwrap();
+        assert_eq!((found.places, found.missing), (vec![0], vec![0]));
+        assert_eq!(found.stale, earlier, "its own id is not stale");
+
+        let held = summary("repo", "src/config.rs", "src/config.rs", "Configures.");
+        store
+            .index_summaries(std::slice::from_ref(&held))
+            .await
+            .unwrap();
+        let rewritten = VectorCodeSummary {
+            summary_text: "Configures, and checks.".into(),
+            ..held.clone()
+        };
+        let found = store
+            .differing_summaries("repo", std::slice::from_ref(&rewritten))
+            .await
+            .unwrap();
+        assert_eq!((found.places, found.missing), (vec![0], vec![0]));
+        assert!(found.stale.is_empty(), "{:?}", found.stale);
+    }
+
+    /// A file's records are counted in both collections, and no other
+    /// file's or repo's; a compare of more than a page is asked a page at
+    /// a time, and finds what a compare of each page does.
+    #[tokio::test]
+    async fn what_a_file_holds_is_counted_in_both_collections() {
+        let Some(node) = Node::embedding().await else {
+            return;
+        };
+        let (store, _) = counted(&node);
+        let many: Vec<VectorCodeEntity> = (0..250)
+            .map(|n| {
+                let id = format!("e{n:03}");
+                entity(
+                    "repo",
+                    &id,
+                    "src/many.rs",
+                    "Function",
+                    &format!("does {id}"),
+                )
+            })
+            .collect();
+        let others = [
+            entity("repo", "other", "src/other.rs", "Function", "does another"),
+            entity("elsewhere", "e000", "src/many.rs", "Function", "does e000"),
+        ];
+        store.index_entities(&many).await.unwrap();
+        store.index_entities(&others).await.unwrap();
+        store
+            .index_summaries(&[
+                summary("repo", "e000", "src/many.rs", "Does many things."),
+                summary("elsewhere", "e000", "src/many.rs", "Does many things."),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(store.file_held("repo", "src/many.rs").await.unwrap(), 251);
+        assert_eq!(store.file_held("repo", "src/other.rs").await.unwrap(), 1);
+        assert_eq!(store.file_held("repo", "src/none.rs").await.unwrap(), 0);
+
+        let mut wanted = many.clone();
+        for at in [0, 120, 249] {
+            wanted[at].doc_comment = "changed".into();
+        }
+        let whole = store.differing_entities("repo", &wanted).await.unwrap();
+        assert_eq!(whole.places, [0, 120, 249]);
+        assert_eq!(whole.held, 250);
+        let mut paged = Vec::new();
+        for (page, chunk) in wanted.chunks(VERIFY_PAGE).enumerate() {
+            let found = store.differing_entities("repo", chunk).await.unwrap();
+            paged.extend(found.places.iter().map(|at| page * VERIFY_PAGE + at));
+        }
+        assert_eq!(whole.places, paged);
+    }
+
+    /// Of every repo but those listed, what the store holds is found, and
+    /// a record of no repo never is.
+    #[tokio::test]
+    async fn held_outside_finds_a_dropped_repo_and_never_a_record_with_none() {
+        let Some(node) = Node::embedding().await else {
+            return;
+        };
+        let (store, _) = counted(&node);
+        let repos = |repos: &[&str]| repos.iter().map(|r| r.to_string()).collect::<Vec<_>>();
+        store
+            .index_entities(&[entity("kept", "a", "src/a.rs", "Function", "does a")])
+            .await
+            .unwrap();
+        store
+            .index_summaries(&[summary("dropped", "b", "src/b.rs", "Does b.")])
+            .await
+            .unwrap();
+        let mut unowned = entity_properties(&entity("x", "c", "src/c.rs", "Function", "does c"));
+        unowned.remove("repoId");
+        let vector = vec![0.5_f32; store.embedded_as().1.dimensions as usize];
+        let written = Change::upsert(
+            CollectionName::new(CODE_ENTITY_COLLECTION).unwrap(),
+            ObjectId(Uuid::new_v4()),
+            Content::new(unowned).vector(vector),
+        );
+        store.tenants.writes.apply(vec![written]).await.unwrap();
+
+        assert_eq!(
+            store
+                .held_outside(&repos(&["kept", "dropped"]))
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .held_outside(&repos(&["kept"]))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("dropped")
+        );
+        store.delete_repo_summaries("dropped").await.unwrap();
+        assert_eq!(store.held_outside(&repos(&["kept"])).await.unwrap(), None);
+        assert_eq!(
+            store.held_outside(&[]).await.unwrap().as_deref(),
+            Some("kept")
+        );
     }
 
     /// The node holds `CodeEntity` as wanted: its searchable content

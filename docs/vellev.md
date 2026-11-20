@@ -620,3 +620,47 @@ right:
 3. `workforce code reindex-vectors` does the same at once, with
    `--embed-url` to a server of the configured model for speed (it asks
    the endpoint for that model unless `--embed-model` names another).
+
+## Adopting a prebuilt code tenant
+
+A code tenant built elsewhere from a copy of this hub's code graph is
+adopted, not filled again. The first time a repo is found without its
+vectors recorded complete, and the store already holds anything of it,
+its entities and then its summaries are compared with the store a page at
+a time: only what differs is embedded, what the store holds besides is
+removed, and the repo is recorded complete in the collections it was
+compared with. A repo the store holds nothing of is filled as before.
+
+- **The claim.** The tenant must be claimed under this graph's identity
+  (the build's graph is a copy of this one, so it is). One claimed for
+  another graph is refused, with nothing compared or written; `workforce
+  code reindex-vectors --take-over` fills it again instead.
+- **The shape.** Both collections are looked at afresh before an adoption
+  begins and again before it finishes: one of another model, size or
+  prefix is refused as any other is (above), and one made again meanwhile
+  is never recorded complete. A collection that keeps
+  `searchableContent` is said at the start ("keeps text the slim shape
+  does not") and used; dropping it on a node that writes format 2 makes
+  it slim.
+- **Searched meanwhile.** A repo being adopted is answered from its
+  vectors throughout, while the store has the collection it is being
+  compared with. A repo the store held only part of is adopted too, and
+  answered from what it holds until the adoption ends.
+- **`vector_health`** reads `"state": "adopting"` while any repo is being
+  adopted, with `complete` of `repos` recorded complete; a failure
+  outranks it. `/health`'s `code_vectors` gives `adopting`, `compared`
+  and `to_compare`.
+- **Pending files** the store already holds exactly as the graph has them
+  are settled with two counts and a compare, and nothing written; the
+  rest are written again as before. While a fill that sweeps is under way
+  they are written again regardless.
+- **What is embedded** is counted in
+  `workforce_code_vectors_embedded_total{backend, reason}` on the hub's
+  `/metrics`: `adopt` for an adoption's mending, `refill` for a fill,
+  `pending` for pending files, and `index` for an index run's own
+  writes. Patches and compares are not counted.
+- **Repos the graph no longer has** are removed from the tenant once per
+  collection by the first fill pass.
+- **`--force`** is the explicit full refill. A seeding run
+  (`reindex-vectors`) over a tenant that holds a repo adopts it too; one
+  that would mostly embed should pass `--force`.

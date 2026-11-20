@@ -222,9 +222,14 @@ fn code_vectors_outline(repos: &[workforce_knowledge_service::RepoVectors]) -> s
     }
     let filling: Vec<_> = repos
         .iter()
-        .filter(|repo| !repo.complete)
+        .filter(|repo| !repo.complete && !repo.adopting())
         .filter_map(|repo| repo.fill.as_ref())
         .filter(|fill| fill.stage != FillStage::Done)
+        .collect();
+    let adopting: Vec<_> = repos
+        .iter()
+        .filter(|repo| repo.adopting())
+        .filter_map(|repo| repo.fill.as_ref())
         .collect();
     serde_json::json!({
         "repos": repos.len(),
@@ -232,6 +237,11 @@ fn code_vectors_outline(repos: &[workforce_knowledge_service::RepoVectors]) -> s
         "filling": filling.len(),
         "stored": filling.iter().map(|fill| fill.done).sum::<u64>(),
         "to_store": filling.iter().map(|fill| fill.total).sum::<u64>(),
+        // Repos whose vectors the store already held being compared with
+        // the graph, and how far that has got.
+        "adopting": adopting.len(),
+        "compared": adopting.iter().map(|fill| fill.done).sum::<u64>(),
+        "to_compare": adopting.iter().map(|fill| fill.total).sum::<u64>(),
         "pending_files": repos.iter().map(|repo| repo.pending_files).sum::<usize>(),
         "errors": repos.iter().filter(|repo| repo.last_error.is_some()).count(),
         // Repos not compared with the graph, entity by entity, since this
@@ -3283,6 +3293,9 @@ mod code_vectors_tests {
                 "filling": 1,
                 "stored": 1_000_000,
                 "to_store": 4_200_000,
+                "adopting": 0,
+                "compared": 0,
+                "to_compare": 0,
                 "pending_files": 3,
                 "errors": 1,
                 "uncompared": 1,
@@ -3296,6 +3309,44 @@ mod code_vectors_tests {
         assert_eq!(super::code_vectors_outline(&[]), serde_json::Value::Null);
         let whole = serde_json::json!(repos).to_string();
         assert!(whole.contains("payroll") && whole.contains("refused tenant acme"));
+    }
+
+    /// A repo whose vectors the store already held is counted as being
+    /// compared, never as being filled.
+    #[test]
+    fn the_health_outline_counts_adoptions_apart_from_fills() {
+        let repo = |id: &str, complete, stage, done| RepoVectors {
+            repo_id: id.into(),
+            name: id.into(),
+            complete,
+            fill: Some(VectorFill {
+                generation: "g".into(),
+                collection: "c".into(),
+                stage,
+                cursor: String::new(),
+                done,
+                total: 1_000,
+            }),
+            pending_files: 0,
+            last_error: None,
+            compared_secs_ago: None,
+        };
+        let repos = [
+            repo("filled", false, FillStage::Summaries, 700),
+            repo("adopted", false, FillStage::AdoptSummaries, 300),
+            repo("whole", true, FillStage::Done, 1_000),
+        ];
+        let outline = super::code_vectors_outline(&repos);
+        let counted = |key: &str| outline[key].as_u64().unwrap();
+        assert_eq!(
+            ["adopting", "compared", "to_compare"].map(counted),
+            [1, 300, 1_000]
+        );
+        assert_eq!(
+            ["filling", "stored", "to_store"].map(counted),
+            [1, 700, 1_000]
+        );
+        assert_eq!(counted("complete"), 1);
     }
 }
 

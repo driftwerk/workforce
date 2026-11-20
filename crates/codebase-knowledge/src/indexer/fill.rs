@@ -18,8 +18,18 @@
 //! with here. Several workers may fill one repo: each page moves the
 //! recorded cursor only from where the worker found it, so a worker that
 //! lost the race takes up from where the other got to.
+//!
+//! A repo the store already holds when it is first found incomplete, as
+//! one built elsewhere and adopted whole, is not filled but adopted: its
+//! entities, then its summaries, are compared with the store a page at a
+//! time, and only what differs is written, what is held besides removed,
+//! and, where the store then holds another number of the repo's records
+//! than the graph has, what it holds that the graph has not. Its vectors
+//! are searched meanwhile, and recorded complete in the collection they
+//! were compared with once it ends.
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::sync::Arc;
 
 use eyre::{eyre, Result};
@@ -28,7 +38,10 @@ use tracing::{info, warn};
 use crate::graph::entities::EntityId;
 use crate::graph::vectors::{FillStage, StoredSummary, VectorFill};
 use crate::graph::CodeGraph;
-use crate::vector::{CodeVectorStore, VectorCodeEntity, VectorCodeSummary, VERIFY_PAGE};
+use crate::vector::{
+    embedding_for, CodeVectorStore, Differing, EmbedReason, HeldRecord, VectorCodeEntity,
+    VectorCodeSummary, VERIFY_PAGE,
+};
 use workforce_common::vectorizable::VectorizableText;
 
 /// Entities or summaries per page of a fill.
@@ -44,6 +57,121 @@ const CHECK_LIMIT: usize = 100_000;
 
 /// Files put right per call of [`VectorFiller::settle_pending`].
 const PENDING_PAGE: usize = 200;
+
+/// Whether `text` is anything a store embeds.
+fn embeddable(text: &str) -> bool {
+    VectorizableText::try_new(text).is_ok()
+}
+
+/// Whether the store, holding `held` of a repo's records once `compared`
+/// of the graph's were mended, may hold some the graph has not: each
+/// mended record is held once, so only then is the count another.
+fn strays_held(held: usize, compared: u64) -> bool {
+    held as u64 != compared
+}
+
+/// A page of the graph compared with the store: what the graph has after
+/// `from` up to `upto`, `rows` in all, those with text to embed as the
+/// store is to hold them, and how the store differs from them.
+struct ComparedPage<T> {
+    from: String,
+    upto: String,
+    rows: u64,
+    wanted: Vec<T>,
+    differing: Differing,
+}
+
+impl<T: Kept> ComparedPage<T> {
+    /// The files of the records at `places`.
+    fn files<'a>(&'a self, places: &'a [usize]) -> impl Iterator<Item = String> + 'a {
+        places.iter().map(|at| self.wanted[*at].file().to_string())
+    }
+}
+
+/// What a store keeps of the graph, entities or summaries, as an adoption
+/// compares and mends it.
+trait Kept: Clone + Send + Sync + Sized + 'static {
+    /// Whether these are summaries, as the store lists and removes them.
+    const SUMMARIES: bool;
+
+    fn file(&self) -> &str;
+
+    /// As written in or since the fill or adoption `generation`.
+    fn stamped(self, generation: &str) -> Self;
+
+    /// The graph's page after `from`, or read again up to `upto`, compared
+    /// with the store; `None` if the graph has nothing there.
+    fn compared<'a>(
+        filler: &'a VectorFiller,
+        repo_id: &'a str,
+        from: &'a str,
+        upto: Option<&'a str>,
+    ) -> impl Future<Output = Result<Option<ComparedPage<Self>>>> + Send + 'a;
+
+    fn written<'a>(
+        store: &'a dyn CodeVectorStore,
+        records: &'a [Self],
+    ) -> impl Future<Output = Result<usize>> + Send + 'a;
+}
+
+impl Kept for VectorCodeEntity {
+    const SUMMARIES: bool = false;
+
+    fn file(&self) -> &str {
+        &self.file_path
+    }
+
+    fn stamped(self, generation: &str) -> Self {
+        self.of_generation(generation)
+    }
+
+    fn compared<'a>(
+        filler: &'a VectorFiller,
+        repo_id: &'a str,
+        from: &'a str,
+        upto: Option<&'a str>,
+    ) -> impl Future<Output = Result<Option<ComparedPage<Self>>>> + Send + 'a {
+        filler.entities_compared(repo_id, from, upto)
+    }
+
+    fn written<'a>(
+        store: &'a dyn CodeVectorStore,
+        records: &'a [Self],
+    ) -> impl Future<Output = Result<usize>> + Send + 'a {
+        store.index_entities(records)
+    }
+}
+
+impl Kept for VectorCodeSummary {
+    const SUMMARIES: bool = true;
+
+    fn file(&self) -> &str {
+        &self.file_path
+    }
+
+    fn stamped(self, generation: &str) -> Self {
+        Self {
+            generation: generation.to_string(),
+            ..self
+        }
+    }
+
+    fn compared<'a>(
+        filler: &'a VectorFiller,
+        repo_id: &'a str,
+        from: &'a str,
+        upto: Option<&'a str>,
+    ) -> impl Future<Output = Result<Option<ComparedPage<Self>>>> + Send + 'a {
+        filler.summaries_compared(repo_id, from, upto)
+    }
+
+    fn written<'a>(
+        store: &'a dyn CodeVectorStore,
+        records: &'a [Self],
+    ) -> impl Future<Output = Result<usize>> + Send + 'a {
+        store.index_summaries(records)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VerifyStage {
@@ -215,19 +343,16 @@ impl VectorFiller {
     }
 
     /// Whether the graph records the repo's vectors as complete in the
-    /// collection the store has now, looked at afresh when `afresh`.
+    /// collection the store has now, looked at afresh when `afresh`: so it
+    /// is, whatever is recorded, before a fill or adoption goes on.
     pub async fn complete(&self, repo_id: &str, afresh: bool) -> Result<bool> {
+        let held = self.store.identity(afresh).await?;
         let recorded = self.graph.vectors_complete_in(repo_id).await?;
-        Ok(match recorded {
-            Some(recorded) => recorded == self.store.identity(afresh).await?,
-            None => false,
-        })
+        Ok(recorded.is_some_and(|recorded| recorded == held))
     }
 
-    /// The fill of `repo_id` under way in the collection the store has
-    /// now, or a new one begun: the repo's vectors are recorded incomplete,
-    /// and every vector written for it from now carries the new
-    /// generation.
+    /// The fill or adoption of `repo_id` under way in the collection the
+    /// store has now, or a new one begun ([`Self::begun`]).
     async fn under_way(&self, repo_id: &str) -> Result<VectorFill> {
         let collection = self.store.identity(false).await?;
         let found = self.graph.vector_fill(repo_id).await?;
@@ -254,7 +379,60 @@ impl VectorFiller {
             }
             _ => {}
         }
-        self.begin(repo_id, false).await
+        self.begun(repo_id).await
+    }
+
+    /// Begin what brings the store in line with the graph about a repo it
+    /// is not recorded complete in. The tenant's vectors are first made
+    /// sure of as this graph's, and both collections looked at afresh, so
+    /// that nothing is read or written of a collection that is another's,
+    /// or of another shape. Holding nothing of the repo, the store is
+    /// filled ([`Self::begin`]); holding anything, the repo is adopted: its
+    /// vectors are searched meanwhile, and only what differs is written.
+    async fn begun(&self, repo_id: &str) -> Result<VectorFill> {
+        let collection = self.store.identity(true).await?;
+        let held =
+            self.store.entity_count(repo_id).await? + self.store.summary_count(repo_id).await?;
+        if held == 0 {
+            return self.begin(repo_id, false).await;
+        }
+        let adopting = VectorFill {
+            generation: uuid::Uuid::new_v4().simple().to_string(),
+            collection,
+            stage: FillStage::AdoptEntities,
+            cursor: String::new(),
+            done: 0,
+            total: self.total(repo_id).await?,
+        };
+        if !self
+            .graph
+            .advance_vector_fill(repo_id, None, &adopting)
+            .await?
+        {
+            return self.begun_elsewhere(repo_id).await;
+        }
+        info!(
+            repo_id,
+            collection = %adopting.collection,
+            held,
+            "adopting the code vectors the store already holds of the repo"
+        );
+        Ok(adopting)
+    }
+
+    /// Entities and summaries the graph has of the repo.
+    async fn total(&self, repo_id: &str) -> Result<u64> {
+        let stats = self.graph.get_stats(repo_id).await?;
+        let summaries = self.graph.count_summaries_present(repo_id).await?;
+        Ok(stats.entity_count as u64 + summaries)
+    }
+
+    /// The fill another worker began first.
+    async fn begun_elsewhere(&self, repo_id: &str) -> Result<VectorFill> {
+        self.graph
+            .vector_fill(repo_id)
+            .await?
+            .ok_or_else(|| eyre!("the fill of '{repo_id}' could not be begun"))
     }
 
     /// Begin a fill of `repo_id` afresh, whatever fill there was: every
@@ -268,15 +446,13 @@ impl VectorFiller {
     /// began first.
     pub async fn begin(&self, repo_id: &str, keep_complete: bool) -> Result<VectorFill> {
         self.graph.clear_vector_fill(repo_id).await?;
-        let stats = self.graph.get_stats(repo_id).await?;
-        let summaries = self.graph.count_summaries_present(repo_id).await?;
         let begun = VectorFill {
             generation: uuid::Uuid::new_v4().simple().to_string(),
             collection: self.store.identity(true).await?,
             stage: FillStage::Entities,
             cursor: String::new(),
             done: 0,
-            total: stats.entity_count as u64 + summaries,
+            total: self.total(repo_id).await?,
         };
         if !keep_complete {
             self.graph.set_vectors_complete_in(repo_id, None).await?;
@@ -294,11 +470,7 @@ impl VectorFiller {
             );
             return Ok(begun);
         }
-        // Another worker began one first.
-        self.graph
-            .vector_fill(repo_id)
-            .await?
-            .ok_or_else(|| eyre!("the fill of '{repo_id}' could not be begun"))
+        self.begun_elsewhere(repo_id).await
     }
 
     /// Whether a fill of the repo is under way: begun and not finished.
@@ -326,52 +498,28 @@ impl VectorFiller {
     /// one restored to an earlier state may be: the repo's vectors are
     /// recorded incomplete and a fill begun ([`Verified::Refilling`]).
     pub async fn verify_step(&self, repo_id: &str, at: &mut Verifying) -> Result<Verified> {
-        let embeddable = |text: &str| VectorizableText::try_new(text).is_ok();
         let mut files: Vec<String> = Vec::new();
         let mut compared = 0;
         match at.stage {
-            VerifyStage::Entities => {
-                let page = self
-                    .graph
-                    .entities_page(repo_id, &at.cursor, None, VERIFY_PAGE)
-                    .await?;
-                match page.last() {
-                    Some(last) => {
-                        at.cursor = last.id.as_str().to_string();
-                        let wanted: Vec<VectorCodeEntity> = page
-                            .iter()
-                            .map(|entity| VectorCodeEntity::from_code_entity(entity, repo_id, None))
-                            .filter(|entity| embeddable(&entity.searchable_content))
-                            .collect();
-                        at.entities += wanted.len();
-                        compared = wanted.len();
-                        let differing = self.store.differing_entities(repo_id, &wanted).await?;
-                        at.entities_held += differing.held;
-                        let places = differing.places.iter();
-                        files.extend(places.map(|at| wanted[*at].file_path.clone()));
-                    }
-                    None => at.turn_to(VerifyStage::Summaries),
+            VerifyStage::Entities => match self.entities_compared(repo_id, &at.cursor, None).await?
+            {
+                Some(page) => {
+                    at.cursor = page.upto.clone();
+                    at.entities += page.wanted.len();
+                    compared = page.wanted.len();
+                    at.entities_held += page.differing.held;
+                    files.extend(page.files(&page.differing.places));
                 }
-            }
+                None => at.turn_to(VerifyStage::Summaries),
+            },
             VerifyStage::Summaries => {
-                let page = self
-                    .graph
-                    .summaries_page(repo_id, &at.cursor, None, VERIFY_PAGE)
-                    .await?;
-                match page.last() {
-                    Some(last) => {
-                        at.cursor = last.cursor();
-                        let wanted: Vec<VectorCodeSummary> = page
-                            .iter()
-                            .filter(|summary| embeddable(&summary.text))
-                            .map(|summary| VectorCodeSummary::of(summary, repo_id, ""))
-                            .collect();
-                        at.summaries += wanted.len();
-                        compared = wanted.len();
-                        let differing = self.store.differing_summaries(repo_id, &wanted).await?;
-                        at.summaries_held += differing.held;
-                        let places = differing.places.iter();
-                        files.extend(places.map(|at| wanted[*at].file_path.clone()));
+                match self.summaries_compared(repo_id, &at.cursor, None).await? {
+                    Some(page) => {
+                        at.cursor = page.upto.clone();
+                        at.summaries += page.wanted.len();
+                        compared = page.wanted.len();
+                        at.summaries_held += page.differing.held;
+                        files.extend(page.files(&page.differing.places));
                     }
                     None => {
                         // More held of the repo than is held under what
@@ -391,16 +539,9 @@ impl VectorFiller {
             VerifyStage::StrayEntities | VerifyStage::StraySummaries => {
                 let summaries = at.stage == VerifyStage::StraySummaries;
                 let after = (!at.cursor.is_empty()).then(|| at.cursor.clone());
-                let (held, next) = self
-                    .store
-                    .held_after(repo_id, summaries, after, VERIFY_PAGE)
-                    .await?;
-                for (key, file_path) in held {
-                    if !self.in_graph(&key, summaries).await? {
-                        at.strays += 1;
-                        files.push(file_path);
-                    }
-                }
+                let (strays, next) = self.strays(repo_id, summaries, after).await?;
+                at.strays += strays.len();
+                files.extend(strays.into_iter().map(|stray| stray.file_path));
                 match (next, summaries) {
                     (Some(next), _) => at.cursor = next,
                     (None, false) => at.turn_to(VerifyStage::StraySummaries),
@@ -416,6 +557,7 @@ impl VectorFiller {
         if !files.is_empty() {
             self.graph.note_vectors_pending(repo_id, &files).await?;
         }
+        // The verify's alone: an adoption mends whatever share differs.
         if at.compared >= VERIFY_PAGE && at.differing * 10 > at.compared {
             warn!(
                 repo_id,
@@ -448,6 +590,106 @@ impl VectorFiller {
             .get_summary(&entity, granularity)
             .await?
             .is_some())
+    }
+
+    /// How many a page of the graph after `from` is read as: a page, or,
+    /// read again up to where it ended, as many as may have come into it.
+    fn read_limit(&self, upto: Option<&str>) -> usize {
+        upto.map_or(VERIFY_PAGE, |_| self.check_limit())
+    }
+
+    /// The graph's entities after `from` (up to `upto`, if read again)
+    /// compared with the store; `None` if the graph has none there.
+    async fn entities_compared(
+        &self,
+        repo_id: &str,
+        from: &str,
+        upto: Option<&str>,
+    ) -> Result<Option<ComparedPage<VectorCodeEntity>>> {
+        let limit = self.read_limit(upto);
+        let page = self.graph.entities_page(repo_id, from, upto, limit).await?;
+        if let Some(upto) = upto {
+            Self::all_read(repo_id, upto, page.len(), limit)?;
+        }
+        let Some(last) = page.last() else {
+            return Ok(None);
+        };
+        let upto = upto.map_or_else(|| last.id.as_str().to_string(), str::to_string);
+        let wanted: Vec<VectorCodeEntity> = page
+            .iter()
+            .map(|entity| VectorCodeEntity::from_code_entity(entity, repo_id, None))
+            .filter(|entity| embeddable(&entity.searchable_content))
+            .collect();
+        let differing = match wanted.is_empty() {
+            true => Differing::default(),
+            false => self.store.differing_entities(repo_id, &wanted).await?,
+        };
+        Ok(Some(ComparedPage {
+            from: from.to_string(),
+            upto,
+            rows: page.len() as u64,
+            wanted,
+            differing,
+        }))
+    }
+
+    /// As [`Self::entities_compared`], of summaries.
+    async fn summaries_compared(
+        &self,
+        repo_id: &str,
+        from: &str,
+        upto: Option<&str>,
+    ) -> Result<Option<ComparedPage<VectorCodeSummary>>> {
+        let limit = self.read_limit(upto);
+        let page = self
+            .graph
+            .summaries_page(repo_id, from, upto, limit)
+            .await?;
+        if let Some(upto) = upto {
+            Self::all_read(repo_id, upto, page.len(), limit)?;
+        }
+        let Some(last) = page.last() else {
+            return Ok(None);
+        };
+        let upto = upto.map_or_else(|| last.cursor(), str::to_string);
+        let wanted: Vec<VectorCodeSummary> = page
+            .iter()
+            .filter(|summary| embeddable(&summary.text))
+            .map(|summary| VectorCodeSummary::of(summary, repo_id, ""))
+            .collect();
+        let differing = match wanted.is_empty() {
+            true => Differing::default(),
+            false => self.store.differing_summaries(repo_id, &wanted).await?,
+        };
+        Ok(Some(ComparedPage {
+            from: from.to_string(),
+            upto,
+            rows: page.len() as u64,
+            wanted,
+            differing,
+        }))
+    }
+
+    /// A page of what the store holds of the repo's entities, or
+    /// `summaries`, after `after`: those of it the graph has not, and where
+    /// the next page starts.
+    async fn strays(
+        &self,
+        repo_id: &str,
+        summaries: bool,
+        after: Option<String>,
+    ) -> Result<(Vec<HeldRecord>, Option<String>)> {
+        let (held, next) = self
+            .store
+            .held_after(repo_id, summaries, after, VERIFY_PAGE)
+            .await?;
+        let mut strays = Vec::new();
+        for record in held {
+            if !self.in_graph(&record.key, summaries).await? {
+                strays.push(record);
+            }
+        }
+        Ok((strays, next))
     }
 
     /// Do one page of the repo's fill, beginning one if none is under way,
@@ -520,38 +762,201 @@ impl VectorFiller {
             }
             FillStage::Sweep => {
                 let swept = self.store.sweep(repo_id, &fill.generation).await?;
-                // Looked at afresh: lost and made again meanwhile, the
-                // collection holds only what was written since.
-                if self.store.identity(true).await? != fill.collection {
-                    self.graph.clear_vector_fill(repo_id).await?;
-                    return Err(eyre!(
-                        "the collection the code vectors of '{repo_id}' were being stored in was made again meanwhile; the fill starts again"
-                    ));
-                }
-                // Recorded complete before the fill is recorded finished, so
-                // that a worker that finds it finished finds the vectors
-                // complete, and begins no fill of its own.
-                self.graph
-                    .set_vectors_complete_in(repo_id, Some(&fill.collection))
-                    .await?;
                 next.stage = FillStage::Done;
-                if !self
-                    .graph
-                    .advance_vector_fill(repo_id, Some(&fill), &next)
-                    .await?
-                {
-                    return self.moved(repo_id).await;
-                }
+                let finished = self.finish(repo_id, &fill, next).await?;
                 info!(
                     repo_id,
                     stored = fill.done,
                     swept,
                     "code vectors filled from the graph"
                 );
-                Ok(next)
+                Ok(finished)
             }
             FillStage::Done => Ok(fill),
+            FillStage::AdoptEntities
+            | FillStage::AdoptStrayEntities
+            | FillStage::AdoptSummaries
+            | FillStage::AdoptStraySummaries => {
+                embedding_for(EmbedReason::Adopt, self.adopted(repo_id, &fill)).await
+            }
         }
+    }
+
+    /// Record the repo's vectors complete in the collection of `fill`, and
+    /// `fill` moved on to `done`, if the store has that collection still,
+    /// looked at afresh: lost and made again meanwhile, the collection holds
+    /// only what was written since, and what `fill` did is begun again.
+    async fn finish(
+        &self,
+        repo_id: &str,
+        fill: &VectorFill,
+        done: VectorFill,
+    ) -> Result<VectorFill> {
+        if self.store.identity(true).await? != fill.collection {
+            self.graph.clear_vector_fill(repo_id).await?;
+            return Err(eyre!(
+                "the collection the code vectors of '{repo_id}' were being stored in was made again meanwhile; they are begun again"
+            ));
+        }
+        // Recorded complete before the fill is recorded finished, so
+        // that a worker that finds it finished finds the vectors
+        // complete, and begins no fill of its own.
+        self.graph
+            .set_vectors_complete_in(repo_id, Some(&fill.collection))
+            .await?;
+        if !self
+            .graph
+            .advance_vector_fill(repo_id, Some(fill), &done)
+            .await?
+        {
+            return self.moved(repo_id).await;
+        }
+        Ok(done)
+    }
+
+    /// One page of an adoption, or the turn to its next stage, or its
+    /// finish once there is nothing left to compare: how it then stands.
+    async fn adopted(&self, repo_id: &str, fill: &VectorFill) -> Result<VectorFill> {
+        let next = match fill.stage {
+            FillStage::AdoptEntities => self.adopt_page::<VectorCodeEntity>(repo_id, fill).await?,
+            FillStage::AdoptSummaries => {
+                self.adopt_page::<VectorCodeSummary>(repo_id, fill).await?
+            }
+            stage => {
+                let summaries = stage == FillStage::AdoptStraySummaries;
+                self.adopt_strays(repo_id, fill, summaries).await?
+            }
+        };
+        if next.stage == FillStage::Done {
+            let finished = self.finish(repo_id, fill, next).await?;
+            info!(
+                repo_id,
+                compared = fill.done,
+                "code vectors adopted from what the store held of the repo"
+            );
+            return Ok(finished);
+        }
+        if !self
+            .graph
+            .advance_vector_fill(repo_id, Some(fill), &next)
+            .await?
+        {
+            return self.moved(repo_id).await;
+        }
+        Ok(next)
+    }
+
+    /// Compare the graph's page after where the adoption has got with the
+    /// store and mend it; at the graph's end, turn to what the store may
+    /// hold besides, if its count says it may.
+    async fn adopt_page<T: Kept>(&self, repo_id: &str, fill: &VectorFill) -> Result<VectorFill> {
+        let Some(page) = T::compared(self, repo_id, &fill.cursor, None).await? else {
+            let mut held = self.store.entity_count(repo_id).await?;
+            if T::SUMMARIES {
+                held += self.store.summary_count(repo_id).await?;
+            }
+            return Ok(VectorFill {
+                stage: after_adopting(fill.stage, strays_held(held, fill.done)),
+                cursor: String::new(),
+                ..fill.clone()
+            });
+        };
+        let (upto, rows) = (page.upto.clone(), page.rows);
+        self.mend(repo_id, &fill.generation, page).await?;
+        Ok(VectorFill {
+            cursor: upto,
+            done: fill.done + rows,
+            ..fill.clone()
+        })
+    }
+
+    /// Bring the store in line with a compared page: what it lacks is
+    /// written, stamped with `generation`, and only then what it holds
+    /// besides removed, so that nothing of the page goes unsearchable;
+    /// then the page is read and compared again, until it agrees.
+    async fn mend<T: Kept>(
+        &self,
+        repo_id: &str,
+        generation: &str,
+        page: ComparedPage<T>,
+    ) -> Result<()> {
+        let (from, upto) = (page.from.clone(), page.upto.clone());
+        let mut page = Some(page);
+        for _ in 0..SETTLE_TRIES {
+            let Some(compared) = page.filter(|page| !page.differing.places.is_empty()) else {
+                return Ok(());
+            };
+            let missing: Vec<T> = compared
+                .differing
+                .missing
+                .iter()
+                .map(|at| compared.wanted[*at].clone().stamped(generation))
+                .collect();
+            if !missing.is_empty() {
+                T::written(self.store.as_ref(), &missing).await?;
+            }
+            if !compared.differing.stale.is_empty() {
+                self.store
+                    .remove_held(T::SUMMARIES, &compared.differing.stale)
+                    .await?;
+            }
+            page = T::compared(self, repo_id, &from, Some(&upto)).await?;
+        }
+        Err(eyre!(
+            "the code vectors of '{repo_id}' up to '{upto}' kept changing while they were adopted"
+        ))
+    }
+
+    /// Remove a page of what the store holds of the repo that the graph
+    /// has not, and move the adoption on past it.
+    async fn adopt_strays(
+        &self,
+        repo_id: &str,
+        fill: &VectorFill,
+        summaries: bool,
+    ) -> Result<VectorFill> {
+        let after = (!fill.cursor.is_empty()).then(|| fill.cursor.clone());
+        let (strays, next) = self.strays(repo_id, summaries, after).await?;
+        self.removed_strays(repo_id, summaries, &strays).await?;
+        Ok(match next {
+            Some(next) => VectorFill {
+                cursor: next,
+                ..fill.clone()
+            },
+            None => VectorFill {
+                stage: after_adopting(fill.stage, false),
+                cursor: String::new(),
+                ..fill.clone()
+            },
+        })
+    }
+
+    /// Remove `strays`, then look each up in the graph again: an index run
+    /// may have added one since, and its own write been what was removed,
+    /// so its file is noted as pending, to be written back.
+    async fn removed_strays(
+        &self,
+        repo_id: &str,
+        summaries: bool,
+        strays: &[HeldRecord],
+    ) -> Result<()> {
+        if strays.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<String> = strays.iter().map(|stray| stray.id.clone()).collect();
+        self.store.remove_held(summaries, &ids).await?;
+        let mut back: Vec<String> = Vec::new();
+        for stray in strays {
+            if self.in_graph(&stray.key, summaries).await? {
+                back.push(stray.file_path.clone());
+            }
+        }
+        back.sort();
+        back.dedup();
+        if !back.is_empty() {
+            self.graph.note_vectors_pending(repo_id, &back).await?;
+        }
+        Ok(())
     }
 
     /// Give up the pages of the repo being stored ahead of where its fill
@@ -603,11 +1008,11 @@ impl VectorFiller {
                 let upto = last.id.as_str().to_string();
                 let read = pages.as_stored(&repo, &generation, &page);
                 let to = upto.clone();
-                let storing = tokio::spawn(async move {
+                let storing = tokio::spawn(embedding_for(EmbedReason::Refill, async move {
                     pages
                         .store_entities(&repo, &generation, &after, &to, read)
                         .await
-                });
+                }));
                 (upto, page.len(), storing)
             }
             _ => {
@@ -621,11 +1026,11 @@ impl VectorFiller {
                 let upto = last.cursor();
                 let read = Pages::summaries_as_stored(&repo, &generation, &page);
                 let to = upto.clone();
-                let storing = tokio::spawn(async move {
+                let storing = tokio::spawn(embedding_for(EmbedReason::Refill, async move {
                     pages
                         .store_summaries(&repo, &generation, &after, &to, read)
                         .await
-                });
+                }));
                 (upto, page.len(), storing)
             }
         };
@@ -668,7 +1073,6 @@ impl VectorFiller {
     /// graph a page at a time, and what it does hold: every entity and
     /// summary with text to embed, which is what a store embeds.
     pub async fn confirm(&self, repo_id: &str) -> Result<Confirmed> {
-        let embeddable = |text: &str| VectorizableText::try_new(text).is_ok();
         let mut confirmed = Confirmed::default();
         let mut after = String::new();
         loop {
@@ -711,10 +1115,15 @@ impl VectorFiller {
 
     /// Bring the store in line with the graph about one file: drop what it
     /// holds of the file, store the file's entities and summaries as the
-    /// graph has them, and go on until the graph read again agrees.
+    /// graph has them, and go on until the graph read again agrees. A file
+    /// a store that keeps track already holds exactly as the graph has it
+    /// is left as it is, unless a fill is under way that sweeps what it
+    /// did not write.
     async fn settle_file(&self, repo_id: &str, file_path: &str) -> Result<()> {
         let held = || async {
-            let generation = Self::generation(&self.graph, repo_id).await?;
+            let fill = self.graph.vector_fill(repo_id).await?;
+            let sweeping = fill.as_ref().is_some_and(|fill| fill.stage.sweeps());
+            let generation = fill.map(|fill| fill.generation).unwrap_or_default();
             let entities = self.graph.find_entities_in_file(repo_id, file_path).await?;
             let entities: Vec<VectorCodeEntity> = entities
                 .iter()
@@ -728,25 +1137,77 @@ impl VectorFiller {
                 .iter()
                 .map(|summary| VectorCodeSummary::of(summary, repo_id, &generation))
                 .collect();
-            eyre::Ok((entities, summaries))
+            eyre::Ok((sweeping, entities, summaries))
         };
-        for _ in 0..SETTLE_TRIES {
-            let (entities, summaries) = held().await?;
-            self.store
-                .delete_entities_by_file(repo_id, file_path)
-                .await?;
-            self.store
-                .delete_summaries_by_file(repo_id, file_path)
-                .await?;
-            self.store.index_entities(&entities).await?;
-            self.store.index_summaries(&summaries).await?;
-            if held().await? == (entities, summaries) {
-                return Ok(());
+        embedding_for(EmbedReason::Pending, async {
+            for _ in 0..SETTLE_TRIES {
+                let (sweeping, entities, summaries) = held().await?;
+                let skipped = self.store.tracks_completeness()
+                    && !sweeping
+                    && self
+                        .held_exactly(repo_id, file_path, &entities, &summaries)
+                        .await?;
+                if !skipped {
+                    self.store
+                        .delete_entities_by_file(repo_id, file_path)
+                        .await?;
+                    self.store
+                        .delete_summaries_by_file(repo_id, file_path)
+                        .await?;
+                    self.store.index_entities(&entities).await?;
+                    self.store.index_summaries(&summaries).await?;
+                }
+                if held().await? == (sweeping, entities, summaries) {
+                    return Ok(());
+                }
             }
+            Err(eyre!(
+                "'{file_path}' of '{repo_id}' kept changing while its vectors were stored"
+            ))
+        })
+        .await
+    }
+
+    /// Whether the store holds one file's `entities` and `summaries`, as
+    /// the graph has them, and nothing else of it: each with text to embed
+    /// held once as it is, and as many held of the file as those.
+    async fn held_exactly(
+        &self,
+        repo_id: &str,
+        file_path: &str,
+        entities: &[VectorCodeEntity],
+        summaries: &[VectorCodeSummary],
+    ) -> Result<bool> {
+        let entities: Vec<VectorCodeEntity> = entities
+            .iter()
+            .filter(|entity| embeddable(&entity.searchable_content))
+            .cloned()
+            .collect();
+        let summaries: Vec<VectorCodeSummary> = summaries
+            .iter()
+            .filter(|summary| embeddable(&summary.summary_text))
+            .cloned()
+            .collect();
+        if self.store.file_held(repo_id, file_path).await? != entities.len() + summaries.len() {
+            return Ok(false);
         }
-        Err(eyre!(
-            "'{file_path}' of '{repo_id}' kept changing while its vectors were stored"
-        ))
+        let entities_differ = !entities.is_empty()
+            && !self
+                .store
+                .differing_entities(repo_id, &entities)
+                .await?
+                .places
+                .is_empty();
+        if entities_differ {
+            return Ok(false);
+        }
+        Ok(summaries.is_empty()
+            || self
+                .store
+                .differing_summaries(repo_id, &summaries)
+                .await?
+                .places
+                .is_empty())
     }
 
     /// Put the store right about the repo's files noted as pending (see
@@ -881,6 +1342,19 @@ impl Pages {
         Err(eyre!(
             "the summaries of '{repo_id}' up to '{upto}' kept changing while they were stored"
         ))
+    }
+}
+
+/// The stage of an adoption after `stage`'s last page, where the store may
+/// hold `strays` of the repo besides what was compared.
+fn after_adopting(stage: FillStage, strays: bool) -> FillStage {
+    match (stage, strays) {
+        (FillStage::AdoptEntities, true) => FillStage::AdoptStrayEntities,
+        (FillStage::AdoptEntities, false) | (FillStage::AdoptStrayEntities, _) => {
+            FillStage::AdoptSummaries
+        }
+        (FillStage::AdoptSummaries, true) => FillStage::AdoptStraySummaries,
+        _ => FillStage::Done,
     }
 }
 

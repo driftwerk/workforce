@@ -5,13 +5,12 @@
 //! store kept in memory that fails, and changes the graph under a page,
 //! as told.
 
-use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use eyre::{eyre, Result};
+use eyre::Result;
 use workforce_codebase_knowledge::graph::entities::{EntityId, EntityKind};
 use workforce_codebase_knowledge::graph::vectors::FillStage;
 use workforce_codebase_knowledge::graph::{CodeGraph, VectorKeys};
@@ -21,412 +20,15 @@ use workforce_codebase_knowledge::indexer::summary_generator::{SummaryGenerator,
 use workforce_codebase_knowledge::indexer::{IndexingConfig, IndexingPipeline, RunOptions};
 use workforce_codebase_knowledge::query::natural_language::QueryPlanner;
 use workforce_codebase_knowledge::query::{QueryEngine, VectorWait};
+use workforce_codebase_knowledge::testing::{
+    entity_key, summary_key, Counting, Failing, Held, Meanwhile, RECORDED, REPO,
+};
 use workforce_codebase_knowledge::vector::{
-    health::InsertErrorSink, CodeVectorStore, DeleteOutcome, Differing, VectorCodeEntity,
-    VectorCodeSummary, VectorSearchResult,
+    health::InsertErrorSink, CodeVectorStore, DeleteOutcome, VectorCodeEntity, VectorCodeSummary,
+    VectorSearchResult,
 };
 use workforce_vellev::testing::{logged, NotServing};
-
-const REPO: &str = "repo";
 const QUESTION: &str = "how is `parse_config` used";
-
-/// What a [`Held`] store does to the graph, as an index run would, as a
-/// write of entities comes in and before it lands.
-enum Meanwhile {
-    /// A file's entities leave the graph, and its vectors the store.
-    FileDeleted(&'static str),
-    /// The collection is lost with all it holds.
-    Lost,
-}
-
-/// Vectors kept in memory, each under what a real store makes its id from.
-/// It counts what it is asked to embed and to purge, fails what is
-/// switched on, and does a [`Meanwhile`] once.
-#[derive(Default)]
-struct Held {
-    entities: Mutex<BTreeMap<String, VectorCodeEntity>>,
-    summaries: Mutex<BTreeMap<String, VectorCodeSummary>>,
-    /// How many times the collection was made.
-    made: AtomicUsize,
-    /// Entities and summaries embedded, in all.
-    embedded: AtomicUsize,
-    /// Whole-repo purges asked for.
-    repo_purges: AtomicUsize,
-    fail_index: AtomicBool,
-    fail_file_purge: AtomicBool,
-    /// A search is accepted and never answered.
-    hang_search: AtomicBool,
-    /// Keeps no track of what it holds of a repo, as Weaviate's store.
-    untracked: AtomicBool,
-    /// What a search finds.
-    found: Mutex<Vec<VectorSearchResult>>,
-    /// Pages of what is held that were listed.
-    listed: AtomicUsize,
-    /// Writes of entities that succeed before every later one fails.
-    writes_left: Mutex<Option<usize>>,
-    meanwhile: Mutex<Option<Meanwhile>>,
-    /// Entities that come into the graph as the next write of entities
-    /// comes in: an index run's, between a page's two reads.
-    crowd: Mutex<Vec<workforce_codebase_knowledge::graph::entities::CodeEntity>>,
-    graph: Mutex<Option<Arc<CodeGraph>>>,
-    /// Tell which collection is held from what was last looked at afresh,
-    /// as a real store does between its looks.
-    remembering: AtomicBool,
-    remembered: AtomicUsize,
-    /// A write of entities waits here for leave to go on, if set: one
-    /// permit lets one write through.
-    gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
-    /// As many writes of entities as this has permits are with the store
-    /// at once, if set, as with an embedder that takes so many requests:
-    /// the others wait their turn before they come to the gate.
-    room: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
-    /// Writes of entities that have had their turn.
-    entered: AtomicUsize,
-    /// Writes of entities come in and not yet gone, however they go:
-    /// stored, failed, or dropped where they wait.
-    writing: Arc<AtomicUsize>,
-}
-
-/// One write counted as under way until this is dropped.
-struct Writing(Arc<AtomicUsize>);
-
-impl Writing {
-    fn begun(under_way: &Arc<AtomicUsize>) -> Self {
-        under_way.fetch_add(1, Ordering::SeqCst);
-        Self(Arc::clone(under_way))
-    }
-}
-
-impl Drop for Writing {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-fn entity_key(entity: &VectorCodeEntity) -> String {
-    format!(
-        "{}|{}|{}|{}|{}",
-        entity.repo_id,
-        entity.entity_id,
-        entity.qualified_name,
-        entity.signature,
-        entity.start_line
-    )
-}
-
-fn summary_key(summary: &VectorCodeSummary) -> String {
-    format!(
-        "{}|{}|{}",
-        summary.repo_id, summary.granularity, summary.entity_id
-    )
-}
-
-impl Held {
-    /// The graph ids of the entities held.
-    fn ids(&self) -> Vec<String> {
-        let held = self.entities.lock().unwrap();
-        let mut ids: Vec<String> = held.values().map(|e| e.entity_id.clone()).collect();
-        ids.sort();
-        ids
-    }
-
-    fn files(&self) -> Vec<String> {
-        let held = self.entities.lock().unwrap();
-        let mut files: Vec<String> = held.values().map(|e| e.file_path.clone()).collect();
-        files.sort();
-        files.dedup();
-        files
-    }
-
-    fn generations(&self) -> Vec<String> {
-        let held = self.entities.lock().unwrap();
-        let mut generations: Vec<String> = held.values().map(|e| e.generation.clone()).collect();
-        generations.sort();
-        generations.dedup();
-        generations
-    }
-
-    fn embedded(&self) -> usize {
-        self.embedded.load(Ordering::SeqCst)
-    }
-
-    /// Lose the collection with all it holds, as a restored backup that
-    /// left it out does: made again, it is another.
-    fn lose(&self) {
-        self.entities.lock().unwrap().clear();
-        self.summaries.lock().unwrap().clear();
-        self.made.fetch_add(1, Ordering::SeqCst);
-    }
-
-    fn refuse(&self, switch: &AtomicBool, what: &str) -> Result<()> {
-        if switch.load(Ordering::SeqCst) {
-            return Err(eyre!("the vector store refuses to {what}"));
-        }
-        Ok(())
-    }
-
-    /// Hold a vector of an entity the graph does not have.
-    fn hold_stale(&self, id: &str) {
-        let stale = VectorCodeEntity {
-            entity_id: id.to_string(),
-            repo_id: REPO.to_string(),
-            qualified_name: id.to_string(),
-            name: id.to_string(),
-            kind: "Function".into(),
-            file_path: "src/gone.rs".into(),
-            language: "Rust".into(),
-            signature: String::new(),
-            doc_comment: String::new(),
-            summary: String::new(),
-            searchable_content: id.to_string(),
-            start_line: 1,
-            end_line: 2,
-            generation: String::new(),
-        };
-        self.entities
-            .lock()
-            .unwrap()
-            .insert(entity_key(&stale), stale);
-    }
-}
-
-#[async_trait]
-impl CodeVectorStore for Held {
-    fn backend(&self) -> &'static str {
-        VectorKeys::VELLEV
-    }
-    async fn ensure_collections(&self) -> Result<()> {
-        Ok(())
-    }
-
-    async fn health_check(&self) -> Result<bool> {
-        Ok(true)
-    }
-
-    fn base_url(&self) -> &str {
-        "memory"
-    }
-
-    fn set_insert_error_sink(&self, _sink: Arc<dyn InsertErrorSink>) {}
-
-    async fn index_entities(&self, entities: &[VectorCodeEntity]) -> Result<usize> {
-        self.refuse(&self.fail_index, "index")?;
-        if entities.is_empty() {
-            return Ok(0);
-        }
-        let _writing = Writing::begun(&self.writing);
-        let room = self.room.lock().unwrap().clone();
-        let _turn = match room {
-            Some(room) => Some(room.acquire_owned().await.expect("open")),
-            None => None,
-        };
-        self.entered.fetch_add(1, Ordering::SeqCst);
-        let gate = self.gate.lock().unwrap().clone();
-        if let Some(gate) = gate {
-            gate.acquire().await.expect("open").forget();
-        }
-        if let Some(left) = self.writes_left.lock().unwrap().as_mut() {
-            if *left == 0 {
-                return Err(eyre!("the vector store went away"));
-            }
-            *left -= 1;
-        }
-        let crowd = std::mem::take(&mut *self.crowd.lock().unwrap());
-        if !crowd.is_empty() {
-            let graph = self.graph.lock().unwrap().clone().expect("a graph");
-            graph.upsert_entities(&crowd).await?;
-        }
-        let meanwhile = self.meanwhile.lock().unwrap().take();
-        match meanwhile {
-            Some(Meanwhile::FileDeleted(file)) => {
-                let graph = self.graph.lock().unwrap().clone().expect("a graph");
-                graph.delete_file_entities(REPO, file).await?;
-                let mut held = self.entities.lock().unwrap();
-                held.retain(|_, entity| entity.file_path != file);
-            }
-            Some(Meanwhile::Lost) => self.lose(),
-            None => {}
-        }
-        let mut held = self.entities.lock().unwrap();
-        for entity in entities {
-            held.insert(entity_key(entity), entity.clone());
-        }
-        self.embedded.fetch_add(entities.len(), Ordering::SeqCst);
-        Ok(entities.len())
-    }
-
-    async fn search_entities(
-        &self,
-        _query: &str,
-        _repo_id: Option<&str>,
-        _kind: Option<EntityKind>,
-        _limit: usize,
-    ) -> Result<Vec<VectorSearchResult>> {
-        if self.hang_search.load(Ordering::SeqCst) {
-            std::future::pending::<()>().await;
-        }
-        Ok(self.found.lock().unwrap().clone())
-    }
-
-    async fn differing_entities(
-        &self,
-        _repo_id: &str,
-        entities: &[VectorCodeEntity],
-    ) -> Result<Differing> {
-        let held = self.entities.lock().unwrap();
-        let of = |wanted: &VectorCodeEntity| -> Vec<&VectorCodeEntity> {
-            let all = held.values();
-            all.filter(|held| held.entity_id == wanted.entity_id)
-                .collect()
-        };
-        let differs = |wanted: &VectorCodeEntity| {
-            let of_it = of(wanted);
-            of_it.len() != 1 || of_it[0].record_hash() != wanted.record_hash()
-        };
-        let all = entities.iter().enumerate();
-        Ok(Differing {
-            places: all.filter(|(_, e)| differs(e)).map(|(at, _)| at).collect(),
-            held: entities.iter().map(|wanted| of(wanted).len()).sum(),
-        })
-    }
-
-    async fn differing_summaries(
-        &self,
-        _repo_id: &str,
-        summaries: &[VectorCodeSummary],
-    ) -> Result<Differing> {
-        let held = self.summaries.lock().unwrap();
-        let of = |wanted: &VectorCodeSummary| -> Vec<&VectorCodeSummary> {
-            let all = held.values();
-            all.filter(|held| held.key() == wanted.key()).collect()
-        };
-        let differs = |wanted: &VectorCodeSummary| {
-            let of_it = of(wanted);
-            of_it.len() != 1 || of_it[0].record_hash() != wanted.record_hash()
-        };
-        let all = summaries.iter().enumerate();
-        Ok(Differing {
-            places: all.filter(|(_, s)| differs(s)).map(|(at, _)| at).collect(),
-            held: summaries.iter().map(|wanted| of(wanted).len()).sum(),
-        })
-    }
-
-    async fn held_after(
-        &self,
-        _repo_id: &str,
-        summaries: bool,
-        after: Option<String>,
-        limit: usize,
-    ) -> Result<(Vec<(String, String)>, Option<String>)> {
-        self.listed.fetch_add(1, Ordering::SeqCst);
-        let all: Vec<(String, (String, String))> = if summaries {
-            let held = self.summaries.lock().unwrap();
-            held.iter()
-                .map(|(at, s)| (at.clone(), (s.key(), s.file_path.clone())))
-                .collect()
-        } else {
-            let held = self.entities.lock().unwrap();
-            held.iter()
-                .map(|(at, e)| (at.clone(), (e.entity_id.clone(), e.file_path.clone())))
-                .collect()
-        };
-        let rest: Vec<_> = all
-            .into_iter()
-            .filter(|(at, _)| after.as_ref().is_none_or(|after| at > after))
-            .collect();
-        let next = (rest.len() > limit).then(|| rest[limit - 1].0.clone());
-        let page = rest.into_iter().take(limit).map(|(_, held)| held).collect();
-        Ok((page, next))
-    }
-
-    async fn delete_repo_entities(&self, _repo_id: &str) -> Result<DeleteOutcome> {
-        self.repo_purges.fetch_add(1, Ordering::SeqCst);
-        self.entities.lock().unwrap().clear();
-        Ok(DeleteOutcome::default())
-    }
-
-    async fn delete_entities_by_file(
-        &self,
-        _repo_id: &str,
-        file_path: &str,
-    ) -> Result<DeleteOutcome> {
-        self.refuse(&self.fail_file_purge, "purge the file")?;
-        let mut held = self.entities.lock().unwrap();
-        held.retain(|_, entity| entity.file_path != file_path);
-        Ok(DeleteOutcome::default())
-    }
-
-    async fn index_summaries(&self, summaries: &[VectorCodeSummary]) -> Result<usize> {
-        self.refuse(&self.fail_index, "index")?;
-        let mut held = self.summaries.lock().unwrap();
-        for summary in summaries {
-            held.insert(summary_key(summary), summary.clone());
-        }
-        self.embedded.fetch_add(summaries.len(), Ordering::SeqCst);
-        Ok(summaries.len())
-    }
-
-    async fn delete_repo_summaries(&self, _repo_id: &str) -> Result<DeleteOutcome> {
-        self.summaries.lock().unwrap().clear();
-        Ok(DeleteOutcome::default())
-    }
-
-    async fn delete_summaries_by_file(
-        &self,
-        _repo_id: &str,
-        file_path: &str,
-    ) -> Result<DeleteOutcome> {
-        self.refuse(&self.fail_file_purge, "purge the file")?;
-        let mut held = self.summaries.lock().unwrap();
-        held.retain(|_, summary| summary.file_path != file_path);
-        Ok(DeleteOutcome::default())
-    }
-
-    async fn entity_count(&self, _repo_id: &str) -> Result<usize> {
-        Ok(self.entities.lock().unwrap().len())
-    }
-
-    async fn summary_count(&self, _repo_id: &str) -> Result<usize> {
-        Ok(self.summaries.lock().unwrap().len())
-    }
-
-    fn tracks_completeness(&self) -> bool {
-        !self.untracked.load(Ordering::SeqCst)
-    }
-
-    async fn identity(&self, afresh: bool) -> Result<String> {
-        let made = self.made.load(Ordering::SeqCst);
-        if afresh || !self.remembering.load(Ordering::SeqCst) {
-            self.remembered.store(made, Ordering::SeqCst);
-        }
-        Ok(format!("making-{}", self.remembered.load(Ordering::SeqCst)))
-    }
-
-    async fn remove_entities(&self, entities: &[VectorCodeEntity]) -> Result<()> {
-        let mut held = self.entities.lock().unwrap();
-        for entity in entities {
-            held.remove(&entity_key(entity));
-        }
-        Ok(())
-    }
-
-    async fn remove_summaries(&self, summaries: &[VectorCodeSummary]) -> Result<()> {
-        let mut held = self.summaries.lock().unwrap();
-        for summary in summaries {
-            held.remove(&summary_key(summary));
-        }
-        Ok(())
-    }
-
-    async fn sweep(&self, _repo_id: &str, generation: &str) -> Result<usize> {
-        let mut entities = self.entities.lock().unwrap();
-        let mut summaries = self.summaries.lock().unwrap();
-        let before = entities.len() + summaries.len();
-        entities.retain(|_, entity| entity.generation == generation);
-        summaries.retain(|_, summary| summary.generation == generation);
-        Ok(before - entities.len() - summaries.len())
-    }
-}
 
 /// A store that keeps no track, as Weaviate's: another store than `Held`.
 struct Untracked;
@@ -774,11 +376,10 @@ async fn a_fill_stopped_part_of_the_way_goes_on_from_where_it_stopped() {
 async fn a_fill_replaces_what_is_held_and_removes_what_is_stale_at_the_end() {
     let repo = Repo::filled().await;
     repo.held.hold_stale("gone::long_ago");
-    repo.graph
-        .set_vectors_complete_in(REPO, None)
-        .await
-        .unwrap();
     let filler = repo.filler();
+    // Filled again at an operator's word: a store holding the repo is
+    // otherwise adopted.
+    filler.begin(REPO, false).await.unwrap();
     filler.step(REPO).await.unwrap();
     assert!(
         repo.held.ids().contains(&"gone::long_ago".to_string()),
@@ -2184,143 +1785,6 @@ async fn methods_of_one_name_in_one_file_are_two_entities_and_stay_so() {
     assert_eq!(news().await, named(&[("C::new", &id_of("new"))]));
 }
 
-/// How a [`Counting`] store fails, where it does.
-#[derive(Clone, Copy, PartialEq)]
-enum Failing {
-    Not,
-    Misrouted,
-    Otherwise,
-}
-
-/// A store that counts every call made of it, keeping track of what it
-/// holds or not, and failing which way it is told to where a question
-/// asks it first, once `spared` such askings have not: `identity` when it
-/// keeps track, the search when not.
-struct Counting {
-    calls: AtomicUsize,
-    tracked: bool,
-    failing: Failing,
-    spared: AtomicUsize,
-}
-
-impl Counting {
-    fn new(tracked: bool, failing: Failing) -> Arc<Self> {
-        Self::sparing(tracked, failing, 0)
-    }
-
-    fn sparing(tracked: bool, failing: Failing, spared: usize) -> Arc<Self> {
-        Arc::new(Self {
-            calls: AtomicUsize::new(0),
-            tracked,
-            failing,
-            spared: AtomicUsize::new(spared),
-        })
-    }
-
-    fn called(&self) -> usize {
-        self.calls.load(Ordering::SeqCst)
-    }
-
-    fn call(&self) {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-    }
-
-    fn asked(&self) -> Result<()> {
-        self.call();
-        let spare = |left: usize| left.checked_sub(1);
-        if self
-            .spared
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, spare)
-            .is_ok()
-        {
-            return Ok(());
-        }
-        match self.failing {
-            Failing::Not => Ok(()),
-            Failing::Misrouted => Err(eyre::Report::new(workforce_vellev::Unusable::Misrouted {
-                tenant: "code".into(),
-                node: "http://code-node:18080".into(),
-            })),
-            Failing::Otherwise => Err(eyre!("the node went away")),
-        }
-    }
-}
-
-#[async_trait]
-impl CodeVectorStore for Counting {
-    fn backend(&self) -> &'static str {
-        self.call();
-        VectorKeys::VELLEV
-    }
-    async fn ensure_collections(&self) -> Result<()> {
-        self.call();
-        Ok(())
-    }
-    async fn health_check(&self) -> Result<bool> {
-        self.call();
-        Ok(true)
-    }
-    fn base_url(&self) -> &str {
-        self.call();
-        "http://code-node:18080"
-    }
-    fn set_insert_error_sink(&self, _sink: Arc<dyn InsertErrorSink>) {
-        self.call();
-    }
-    async fn index_entities(&self, entities: &[VectorCodeEntity]) -> Result<usize> {
-        self.call();
-        Ok(entities.len())
-    }
-    async fn search_entities(
-        &self,
-        _query: &str,
-        _repo_id: Option<&str>,
-        _kind: Option<EntityKind>,
-        _limit: usize,
-    ) -> Result<Vec<VectorSearchResult>> {
-        if self.tracked {
-            self.call();
-            return Ok(Vec::new());
-        }
-        self.asked().map(|()| Vec::new())
-    }
-    async fn delete_repo_entities(&self, _repo_id: &str) -> Result<DeleteOutcome> {
-        self.call();
-        Ok(DeleteOutcome::default())
-    }
-    async fn delete_entities_by_file(&self, _: &str, _: &str) -> Result<DeleteOutcome> {
-        self.call();
-        Ok(DeleteOutcome::default())
-    }
-    async fn index_summaries(&self, summaries: &[VectorCodeSummary]) -> Result<usize> {
-        self.call();
-        Ok(summaries.len())
-    }
-    async fn delete_repo_summaries(&self, _repo_id: &str) -> Result<DeleteOutcome> {
-        self.call();
-        Ok(DeleteOutcome::default())
-    }
-    async fn delete_summaries_by_file(&self, _: &str, _: &str) -> Result<DeleteOutcome> {
-        self.call();
-        Ok(DeleteOutcome::default())
-    }
-    async fn entity_count(&self, _repo_id: &str) -> Result<usize> {
-        self.call();
-        Ok(0)
-    }
-    fn tracks_completeness(&self) -> bool {
-        self.call();
-        self.tracked
-    }
-    async fn identity(&self, _afresh: bool) -> Result<String> {
-        self.asked().map(|()| RECORDED.to_string())
-    }
-}
-
-/// What the graph records the repo's vectors complete in, for a store
-/// that keeps track.
-const RECORDED: &str = "recorded";
-
 /// A repo indexed, its vectors recorded complete in [`RECORDED`].
 async fn recorded() -> Repo {
     let repo = Repo::new();
@@ -2504,4 +1968,449 @@ async fn two_questions_of_a_misrouted_store_within_the_recheck_cost_one_request(
         );
     }
     assert_eq!(node.asked(), 1);
+}
+
+impl Repo {
+    /// What the graph has of the repo, as a store holds it.
+    async fn as_held(&self) -> (Vec<VectorCodeEntity>, Vec<VectorCodeSummary>) {
+        let entities = self.graph.all_entities(REPO).await.unwrap();
+        let summaries = self
+            .graph
+            .summaries_page(REPO, "", None, 100_000)
+            .await
+            .unwrap();
+        (
+            entities
+                .iter()
+                .map(|entity| VectorCodeEntity::from_code_entity(entity, REPO, None))
+                .collect(),
+            summaries
+                .iter()
+                .map(|summary| VectorCodeSummary::of(summary, REPO, ""))
+                .collect(),
+        )
+    }
+
+    /// A repo of `functions` functions indexed in full, the store holding
+    /// it as the graph has it though it is recorded complete nowhere: as a
+    /// tenant built elsewhere and adopted whole.
+    async fn prebuilt(functions: usize) -> Self {
+        let repo = Self::of(functions);
+        repo.index().await;
+        let (entities, summaries) = repo.as_held().await;
+        repo.held.hold(&entities);
+        repo.held.hold_summaries(&summaries);
+        repo
+    }
+
+    /// Whether the store holds the repo's entities and summaries exactly as
+    /// the graph has them.
+    async fn held_as_graph(&self) -> bool {
+        let (entities, summaries) = self.as_held().await;
+        let mut wanted: Vec<String> = entities.iter().map(entity_key).collect();
+        wanted.extend(summaries.iter().map(summary_key));
+        let mut held: Vec<String> = self.held.entities.lock().unwrap().keys().cloned().collect();
+        held.extend(self.held.summaries.lock().unwrap().keys().cloned());
+        wanted.sort();
+        held.sort();
+        let filler = self.filler();
+        let confirmed = filler.confirm(REPO).await.unwrap();
+        let differing = self
+            .store()
+            .differing_entities(REPO, &entities)
+            .await
+            .unwrap();
+        wanted == held && confirmed.agrees() && differing.places.is_empty()
+    }
+
+    /// Change the entities named `names` in the store, as a store holding
+    /// an earlier text of them does: one more line each.
+    fn held_otherwise(&self, names: &[&str]) {
+        let mut held = self.held.entities.lock().unwrap();
+        for entity in held
+            .values_mut()
+            .filter(|e| names.contains(&e.name.as_str()))
+        {
+            entity.end_line += 1;
+        }
+    }
+}
+
+/// Step the adoption of the repo until it is done, saying every stage it
+/// was at.
+async fn adopted(filler: &VectorFiller) -> Vec<FillStage> {
+    let mut stages = Vec::new();
+    for _ in 0..1000 {
+        let fill = filler.step(REPO).await.unwrap();
+        stages.push(fill.stage);
+        if fill.stage == FillStage::Done {
+            return stages;
+        }
+    }
+    panic!("the adoption did not end");
+}
+
+/// A repo being adopted is served from its vectors, and found empty it is
+/// not suspected: it is being compared already. One recorded complete and
+/// found empty is.
+#[tokio::test]
+async fn an_adopting_repo_found_empty_is_not_suspected_but_a_complete_one_is() {
+    let repo = Repo::prebuilt(12).await;
+    let fill = repo.filler().step(REPO).await.unwrap();
+    assert_eq!(fill.stage, FillStage::AdoptEntities);
+    let engine = QueryEngine::with_vector_store(Arc::clone(&repo.graph), repo.store());
+    let found = VectorSearchResult {
+        entity_id: repo.graph_ids().await[0].clone(),
+        repo_id: REPO.to_string(),
+        qualified_name: String::new(),
+        kind: "Function".to_string(),
+        file_path: String::new(),
+        start_line: 1,
+        end_line: 2,
+        score: 0.9,
+    };
+    *repo.held.found.lock().unwrap() = vec![found];
+    let answer = engine.ask(REPO, QUESTION, None, false).await.unwrap();
+    assert_eq!(answer.vectors_skipped, None, "served while it is adopted");
+    repo.held.found.lock().unwrap().clear();
+    let answer = engine.ask(REPO, QUESTION, None, false).await.unwrap();
+    assert_eq!(answer.vectors_skipped, None);
+    assert!(engine.vectors_suspected().lock().unwrap().is_empty());
+
+    adopted(&repo.filler()).await;
+    engine.ask(REPO, QUESTION, None, false).await.unwrap();
+    assert!(engine.vectors_suspected().lock().unwrap().contains(REPO));
+}
+
+/// A page mended writes only what the store lacks as it is: a record held
+/// right with an earlier version beside it costs no embed, and a record
+/// that moved is searchable throughout, written before its old place goes.
+#[tokio::test]
+async fn a_page_with_an_earlier_version_beside_a_right_record_embeds_nothing() {
+    let repo = Repo::prebuilt(12).await;
+    let (entities, _) = repo.as_held().await;
+    let named = |name: &str| entities.iter().find(|e| e.name == name).unwrap().clone();
+    let beside = VectorCodeEntity {
+        start_line: named("thing_0").start_line + 40,
+        ..named("thing_0")
+    };
+    let moved = named("thing_2");
+    repo.held.hold(&[beside]);
+    repo.held_otherwise(&["thing_1"]);
+    repo.held
+        .entities
+        .lock()
+        .unwrap()
+        .remove(&entity_key(&moved));
+    repo.held.hold(&[VectorCodeEntity {
+        start_line: moved.start_line + 5,
+        ..moved.clone()
+    }]);
+    repo.held.hold_stale("gone::long_ago");
+    *repo.held.kept.lock().unwrap() = Some(moved.entity_id.clone());
+
+    adopted(&repo.filler()).await;
+    assert!(repo.held_as_graph().await);
+    assert_eq!(repo.held.embedded(), 2, "the changed one and the moved one");
+    assert!(
+        !repo.held.unkept.load(Ordering::SeqCst),
+        "the moved one was held at every write"
+    );
+    assert!(repo.complete().await);
+}
+
+/// An adoption stopped between a page's write and its record goes on from
+/// where it was recorded: the page written is found agreeing, and nothing
+/// is embedded twice or compared again.
+#[tokio::test]
+async fn an_adoption_stopped_mid_way_goes_on_without_embedding_twice() {
+    let repo = Repo::prebuilt(400).await;
+    let mut ids = repo.graph_ids().await;
+    ids.sort();
+    let (entities, _) = repo.as_held().await;
+    let changed: Vec<&str> = ids
+        .chunks(100)
+        .map(|page| {
+            let entity = entities.iter().find(|e| e.entity_id == page[0]).unwrap();
+            entity.name.as_str()
+        })
+        .collect();
+    repo.held_otherwise(&changed);
+    *repo.held.park_after.lock().unwrap() = Some(3);
+    let filler = repo.filler();
+    let stopped = async {
+        loop {
+            filler.step(REPO).await.unwrap();
+        }
+    };
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(2), stopped).await;
+    assert!(stopped.is_err(), "parked on the third page's write");
+    assert_eq!(repo.held.embedded(), 3);
+
+    adopted(&repo.filler()).await;
+    assert!(repo.held_as_graph().await);
+    assert_eq!(repo.held.embedded(), changed.len(), "each once");
+    let compared = repo.held.compared_from.lock().unwrap().clone();
+    for page in ids.chunks(100) {
+        let times = compared.iter().filter(|first| **first == page[0]).count();
+        assert_eq!(times, 2, "compared, then read again or gone on with");
+    }
+}
+
+/// A page whose graph changes while it is mended is mended again until it
+/// agrees; one that never stops changing fails, keeping its place.
+#[tokio::test]
+async fn a_page_changed_while_it_is_mended_ends_as_the_graph_has_it() {
+    let repo = Repo::prebuilt(12).await;
+    repo.held_otherwise(&["thing_3"]);
+    let entity = repo.graph.all_entities(REPO).await.unwrap();
+    let thing = entity.iter().find(|e| e.name == "thing_5").unwrap();
+    let changed = workforce_codebase_knowledge::graph::entities::CodeEntity {
+        doc_comment: Some("Does thing 5, and more.".into()),
+        ..thing.clone()
+    };
+    *repo.held.crowd.lock().unwrap() = vec![changed];
+    adopted(&repo.filler()).await;
+    assert!(repo.held_as_graph().await);
+
+    let repo = Repo::prebuilt(12).await;
+    repo.held_otherwise(&["thing_3"]);
+    let entity = repo.graph.all_entities(REPO).await.unwrap();
+    *repo.held.restless.lock().unwrap() = entity.iter().find(|e| e.name == "thing_5").cloned();
+    let filler = repo.filler();
+    let begun = filler.step(REPO).await.unwrap_err().to_string();
+    assert!(
+        begun.contains("kept changing while they were adopted"),
+        "{begun}"
+    );
+    let fill = repo.graph.vector_fill(REPO).await.unwrap().unwrap();
+    assert_eq!(
+        (fill.stage, fill.cursor.as_str()),
+        (FillStage::AdoptEntities, "")
+    );
+}
+
+/// A store holding nothing of the repo is filled as it always was.
+#[tokio::test]
+async fn an_empty_store_is_filled_as_before() {
+    let repo = Repo::new();
+    repo.index().await;
+    let stages = adopted(&repo.filler()).await;
+    assert!(stages.iter().all(|stage| !stage.adopting()), "{stages:?}");
+    assert!(stages.contains(&FillStage::Sweep));
+    assert_eq!(repo.held.embedded(), repo.graph_ids().await.len());
+    assert!(repo.complete().await && repo.agrees().await);
+}
+
+/// A full index during an adoption drops it; the next one finds what was
+/// mended agreeing, and embeds only what still differed.
+#[tokio::test]
+async fn a_full_index_during_an_adoption_begins_it_again_and_embeds_nothing_twice() {
+    let repo = Repo::prebuilt(250).await;
+    let mut ids = repo.graph_ids().await;
+    ids.sort();
+    let (entities, _) = repo.as_held().await;
+    let changed: Vec<&str> = ids
+        .chunks(100)
+        .map(|page| {
+            let entity = entities.iter().find(|e| e.entity_id == page[0]).unwrap();
+            entity.name.as_str()
+        })
+        .collect();
+    repo.held_otherwise(&changed);
+    let filler = repo.filler();
+    filler.step(REPO).await.unwrap();
+    filler.step(REPO).await.unwrap();
+    repo.index().await;
+    assert_eq!(repo.graph.vector_fill(REPO).await.unwrap(), None);
+    let stages = adopted(&filler).await;
+    assert_eq!(stages[0], FillStage::AdoptEntities, "adopted again");
+    assert!(repo.held_as_graph().await);
+    assert_eq!(repo.held.embedded(), changed.len());
+}
+
+/// An operator's refill during an adoption fills, and sweeps.
+#[tokio::test]
+async fn forcing_a_refill_during_an_adoption_fills() {
+    let repo = Repo::prebuilt(12).await;
+    repo.held.hold_stale("gone::long_ago");
+    let filler = repo.filler();
+    assert!(filler.step(REPO).await.unwrap().stage.adopting());
+    let forced = filler.begin(REPO, false).await.unwrap();
+    assert_eq!(forced.stage, FillStage::Entities);
+    let stages = adopted(&filler).await;
+    assert!(stages.contains(&FillStage::Sweep), "{stages:?}");
+    assert!(stages.iter().all(|stage| !stage.adopting()));
+    assert!(repo.agrees().await);
+    assert_eq!(repo.held.generations(), [forced.generation]);
+}
+
+/// Records an index run deletes after their page was compared leave the
+/// store holding fewer than were compared: that too has what it holds
+/// gone through, and a stray found.
+#[tokio::test]
+async fn the_stray_rule_walks_when_a_run_deletes_what_was_compared() {
+    let repo = Repo::prebuilt(12).await;
+    repo.held.hold_stale("gone::long_ago");
+    let filler = repo.filler();
+    filler.step(REPO).await.unwrap();
+    for file in ["src/config.rs", "src/mail.rs"] {
+        repo.graph.delete_file_entities(REPO, file).await.unwrap();
+        repo.store()
+            .delete_entities_by_file(REPO, file)
+            .await
+            .unwrap();
+    }
+    let stages = adopted(&filler).await;
+    assert!(
+        stages.contains(&FillStage::AdoptStrayEntities),
+        "{stages:?}"
+    );
+    assert!(repo.held_as_graph().await, "the stray removed");
+}
+
+/// A record an index run writes back while it is removed as a stray is
+/// noted, and written back by the settle after the adoption.
+#[tokio::test]
+async fn a_key_added_while_strays_are_removed_is_written_back() {
+    let repo = Repo::prebuilt(12).await;
+    let mail = repo
+        .graph
+        .find_entities_in_file(REPO, "src/mail.rs")
+        .await
+        .unwrap();
+    repo.graph
+        .delete_file_entities(REPO, "src/mail.rs")
+        .await
+        .unwrap();
+    *repo.held.on_remove.lock().unwrap() = mail.clone();
+    adopted(&repo.filler()).await;
+    assert_eq!(repo.pending().await, ["src/mail.rs"]);
+    assert_eq!(repo.filler().settle_pending(REPO).await.unwrap(), 0);
+    assert!(repo.held.ids().contains(&mail[0].id.as_str().to_string()));
+    assert!(repo.held_as_graph().await);
+}
+
+/// A pending file the store holds exactly as the graph has it is taken
+/// off with nothing deleted or written; one it lacks a record of, holds
+/// another hash of, or holds a record besides of, is written again.
+#[tokio::test]
+async fn a_pending_file_held_exactly_is_settled_without_a_write() {
+    let repo = Repo::filled().await;
+    let writes = || {
+        (
+            repo.held.file_purges.load(Ordering::SeqCst),
+            repo.held.writes.load(Ordering::SeqCst),
+        )
+    };
+    repo.graph
+        .note_vectors_pending(REPO, &["src/many.rs".to_string()])
+        .await
+        .unwrap();
+    let before = writes();
+    assert_eq!(repo.filler().settle_pending(REPO).await.unwrap(), 0);
+    assert_eq!(writes(), before, "nothing deleted or written");
+
+    let (entities, _) = repo.as_held().await;
+    let config = entities.iter().find(|e| e.name == "parse_config").unwrap();
+    repo.held
+        .entities
+        .lock()
+        .unwrap()
+        .remove(&entity_key(config));
+    repo.held_otherwise(&["send_email"]);
+    let thing = entities.iter().find(|e| e.name == "thing_0").unwrap();
+    repo.held.hold(&[VectorCodeEntity {
+        entity_id: "besides".into(),
+        ..thing.clone()
+    }]);
+    let files = ["src/config.rs", "src/mail.rs", "src/many.rs"].map(str::to_string);
+    repo.graph.note_vectors_pending(REPO, &files).await.unwrap();
+    let before = writes();
+    assert_eq!(repo.filler().settle_pending(REPO).await.unwrap(), 0);
+    assert_eq!(writes().0, before.0 + 6, "each file's purged");
+    assert!(repo.held_as_graph().await, "the one besides is gone");
+}
+
+/// A store that keeps no track says it holds nothing of a file, so a file
+/// the graph no longer has is purged from it, as any changed file is.
+#[tokio::test]
+async fn a_file_deleted_from_the_graph_is_purged_from_a_store_that_keeps_no_track() {
+    let repo = Repo::new();
+    repo.index().await;
+    let store = Counting::new(false, Failing::Not);
+    let filler = VectorFiller::new(Arc::clone(&repo.graph), store.clone());
+    for file in ["src/gone.rs", "src/mail.rs"] {
+        let before = store.purged();
+        repo.graph
+            .note_vectors_pending(REPO, &[file.to_string()])
+            .await
+            .unwrap();
+        assert_eq!(filler.settle_pending(REPO).await.unwrap(), 0);
+        assert_eq!(store.purged(), before + 2, "{file}");
+    }
+}
+
+/// A file changed in the graph after its page was compared, and noted with
+/// nothing written, as by a run whose lease was taken from it, is settled
+/// after the adoption: written again, and only it.
+#[tokio::test]
+async fn a_file_changed_after_its_page_was_compared_is_settled_after_the_finish() {
+    let repo = Repo::prebuilt(12).await;
+    let filler = repo.filler();
+    filler.step(REPO).await.unwrap();
+    let mail = repo
+        .graph
+        .find_entities_in_file(REPO, "src/mail.rs")
+        .await
+        .unwrap();
+    let changed: Vec<_> = mail
+        .into_iter()
+        .map(
+            |entity| workforce_codebase_knowledge::graph::entities::CodeEntity {
+                doc_comment: Some("Sends a message, and bounces.".into()),
+                ..entity
+            },
+        )
+        .collect();
+    repo.graph.upsert_entities(&changed).await.unwrap();
+    repo.graph
+        .note_vectors_pending(REPO, &["src/mail.rs".to_string()])
+        .await
+        .unwrap();
+    adopted(&filler).await;
+    assert_eq!(
+        repo.held.embedded(),
+        0,
+        "the adoption found its page agreeing"
+    );
+    assert_eq!(filler.settle_pending(REPO).await.unwrap(), 0);
+    assert_eq!(repo.held.embedded(), changed.len());
+    assert!(repo.held_as_graph().await);
+}
+
+/// During a fill that sweeps, a pending file held right but under an
+/// earlier generation is written again, under the fill's: skipped, the
+/// sweep would remove it.
+#[tokio::test]
+async fn a_file_settled_during_a_fill_is_rewritten_not_skipped() {
+    let repo = Repo::filled().await;
+    let before = repo.held.generations();
+    let filler = repo.filler();
+    let fill = filler.begin(REPO, true).await.unwrap();
+    stepped_to(&filler, FillStage::Summaries).await;
+    {
+        let mut held = repo.held.entities.lock().unwrap();
+        let mail = held.values_mut().find(|e| e.name == "send_email").unwrap();
+        mail.generation = before[0].clone();
+    }
+    repo.graph
+        .note_vectors_pending(REPO, &["src/mail.rs".to_string()])
+        .await
+        .unwrap();
+    assert!(repo.complete().await, "kept complete, so settled meanwhile");
+    assert_eq!(filler.settle_pending(REPO).await.unwrap(), 0);
+    stepped_to(&filler, FillStage::Done).await;
+    assert!(repo.agrees().await, "nothing swept that the graph has");
+    assert_eq!(repo.held.generations(), [fill.generation]);
 }

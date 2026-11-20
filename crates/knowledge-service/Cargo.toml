@@ -26,6 +26,10 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+workforce-codebase-knowledge = { path = "../codebase-knowledge", features = ["testing"] }
+metrics-util = { version = "0.19", default-features = false, features = ["debugging"] }
+metrics = { workspace = true }
+vellev-client = { workspace = true }
 vellev-core = { workspace = true }
 workforce-vellev = { workspace = true, features = ["testing"] }
 tempfile = "3"

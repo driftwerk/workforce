@@ -101,6 +101,9 @@ pub struct KnowledgeService {
     reconcile: Duration,
     /// Why each repo's last fill pass left something undone.
     fill_errors: dashmap::DashMap<String, String>,
+    /// The collection the store held the vectors of repos the graph no
+    /// longer has in, and which were removed from it ([`Self::sweep_dropped`]).
+    swept: std::sync::Mutex<Option<String>>,
     /// How each repo's vectors stood when a pass last looked: what status
     /// reports read, so that reading them asks nothing of the vector
     /// store or the graph.
@@ -152,6 +155,14 @@ pub struct RepoVectors {
     /// How long ago the store was last compared with the graph, entity by
     /// entity, or filled from it; `None` if not since this process began.
     pub compared_secs_ago: Option<u64>,
+}
+
+impl RepoVectors {
+    /// Whether what the store already held of the repo is being adopted:
+    /// compared with the graph and mended, searched meanwhile.
+    pub fn adopting(&self) -> bool {
+        !self.complete && self.fill.as_ref().is_some_and(|fill| fill.stage.adopting())
+    }
 }
 
 /// How a repo's vectors stood when the store was last compared with the
@@ -487,6 +498,7 @@ impl KnowledgeService {
             compared: dashmap::DashMap::new(),
             reconcile: Duration::from_secs(config.vector_reconcile_secs.max(1)),
             fill_errors: dashmap::DashMap::new(),
+            swept: std::sync::Mutex::default(),
             vector_status: std::sync::Mutex::new(Vec::new()),
             fill_pace: FillPace::at(config.vector_backfill_per_sec),
             keeping: std::sync::atomic::AtomicBool::new(false),
@@ -530,6 +542,7 @@ impl KnowledgeService {
             compared: dashmap::DashMap::new(),
             reconcile: Duration::from_secs(21_600),
             fill_errors: dashmap::DashMap::new(),
+            swept: std::sync::Mutex::default(),
             vector_status: std::sync::Mutex::new(Vec::new()),
             fill_pace: FillPace::default(),
             keeping: std::sync::atomic::AtomicBool::new(false),
@@ -817,10 +830,15 @@ impl KnowledgeService {
         if !complete || filler.filling(&repo_id).await? {
             let began = Instant::now();
             let before = self.graph.vector_fill(&repo_id).await?;
-            let before = before.map_or(0, |fill| fill.done);
             let fill = tokio::time::timeout(pace.page_timeout, filler.step(&repo_id))
                 .await
                 .map_err(timed("stored"))??;
+            // An adoption is a comparison, paced as one, that leaves the
+            // repo compared.
+            let adopting = fill.stage.adopting()
+                || before
+                    .as_ref()
+                    .is_some_and(|before| before.stage.adopting());
             progress(&repo_id, &fill);
             {
                 let mut seen = self.vector_status.lock().unwrap_or_else(|e| e.into_inner());
@@ -837,10 +855,19 @@ impl KnowledgeService {
                 // still landing as this one went, would have put an
                 // earlier vector over one of this fill's, which its sweep
                 // then took for stale and removed.
-                job.comparing = Some(Verifying::default());
+                match adopting {
+                    true => job.compared = true,
+                    false => job.comparing = Some(Verifying::default()),
+                }
                 return Ok(true);
             }
-            let stored = fill.done.saturating_sub(before);
+            if adopting {
+                if pace.per_sec > 0 {
+                    tokio::time::sleep(COMPARE_PAUSE).await;
+                }
+                return Ok(true);
+            }
+            let stored = fill.done.saturating_sub(before.map_or(0, |fill| fill.done));
             if pace.per_sec > 0 && stored > 0 {
                 let due = Duration::from_secs_f64(stored as f64 / f64::from(pace.per_sec));
                 tokio::time::sleep(due.saturating_sub(began.elapsed())).await;
@@ -990,6 +1017,9 @@ impl KnowledgeService {
             if scanned.is_none_or(|at| at.elapsed() >= run.rescan) {
                 self.jobs(&filler, &mut jobs, only, &run, scanned.is_none())
                     .await?;
+                if scanned.is_none() {
+                    self.sweep_dropped().await;
+                }
                 self.see_vector_status().await;
                 scanned = Some(Instant::now());
             }
@@ -1031,6 +1061,57 @@ impl KnowledgeService {
             }
         }
         Ok(pass)
+    }
+
+    /// Remove from the store what it holds of repos the graph no longer
+    /// has, once for each collection it has: the tenant's code vectors are
+    /// this graph's alone, so whatever repo they hold that the graph has
+    /// not was dropped. A repo registered meanwhile is left. A sweep that
+    /// fails is said, and tried again by the next pass; the pass goes on.
+    async fn sweep_dropped(&self) {
+        let Some(store) = self
+            .vector_store
+            .as_ref()
+            .filter(|store| store.tracks_completeness())
+        else {
+            return;
+        };
+        let sweep = async {
+            let collection = store.identity(false).await?;
+            let swept = self.swept.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if swept.as_deref() == Some(collection.as_str()) {
+                return eyre::Ok(());
+            }
+            let mut removed: Vec<String> = Vec::new();
+            loop {
+                let repos: Vec<String> = self.graph.list_repos().await?;
+                let Some(dropped) = store.held_outside(&repos).await? else {
+                    break;
+                };
+                if self.graph.list_repos().await?.contains(&dropped) {
+                    break;
+                }
+                if removed.contains(&dropped) {
+                    return Err(eyre::eyre!(
+                        "the code vectors of '{dropped}', a repo the code graph no longer has, were not removed"
+                    ));
+                }
+                let entities = store.delete_repo_entities(&dropped).await?;
+                let summaries = store.delete_repo_summaries(&dropped).await?;
+                info!(
+                    repo_id = %dropped,
+                    entities = entities.successful,
+                    summaries = summaries.successful,
+                    "removed the code vectors of a repo the code graph no longer has"
+                );
+                removed.push(dropped);
+            }
+            *self.swept.lock().unwrap_or_else(|e| e.into_inner()) = Some(collection);
+            Ok(())
+        };
+        if let Err(e) = sweep.await {
+            warn!("the code vectors of repos the code graph no longer has were not removed: {e:#}");
+        }
     }
 
     /// [`Self::fill`] of every repo, or of `only`, at `pace`: nothing is
@@ -3782,11 +3863,10 @@ mod tests {
         repo: &str,
         summaries: bool,
     ) -> Vec<(String, String)> {
-        store
-            .held_after(repo, summaries, None, 1000)
-            .await
-            .unwrap()
-            .0
+        let (held, _) = store.held_after(repo, summaries, None, 1000).await.unwrap();
+        held.into_iter()
+            .map(|held| (held.key, held.file_path))
+            .collect()
     }
 
     /// A repo dropped everywhere leaves the code tenant, entities and
