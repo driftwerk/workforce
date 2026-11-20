@@ -207,6 +207,17 @@ impl MonitorRuntime {
         let _ = self.agents.set(agents);
     }
 
+    /// Whether `agent` is one of this hub's agents, as a save checks it.
+    pub fn knows_agent(&self, agent: &str) -> bool {
+        !self.is_unknown_agent(Some(agent))
+    }
+
+    /// The agent a monitor naming none is watched by, when the hub's agents
+    /// are known.
+    pub fn default_agent_id(&self) -> Option<String> {
+        self.agents.get().map(|a| a.default_id.clone())
+    }
+
     /// The agent `def` resolves to, when the hub's agents are known.
     fn watcher_of(&self, def: &MonitorDefinition) -> Option<String> {
         def.monitor

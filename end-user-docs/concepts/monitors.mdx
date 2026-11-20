@@ -60,8 +60,10 @@ workflow = "release-note"
 
 - `[monitor]` needs `id` and `name`. `description` is optional, `enabled` defaults to
   true, and `agent` names the agent whose engine runs the monitor — its bot watches a
-  channel, its tools read a source — omit it and the action's agent runs it, or the
-  hub's default agent when the action names none. `once = true` stops the monitor
+  channel, its tools read a source — omit it and the action's agent runs it; when the
+  action names none either, an agent saving it puts its own name in (it is that
+  agent's monitor, and it tells you in that agent's DM), and a monitor saved any other
+  way is run by the hub's default agent. `once = true` stops the monitor
   after its first dispatch completes, and `expires_at` (a quoted RFC 3339 instant)
   stops it then whether or not it fired, telling you so; both are how an agent answers
   "tell me when the build goes green" with a monitor that cleans itself up. A save is
@@ -371,6 +373,16 @@ A monitor's status is one of:
 | `awaiting_owner` | Someone other than the owner last edited it (see below). |
 | `unknown_agent` | It names an agent this hub does not run. |
 | `failing` | Its source's last poll failed; the error is shown with it. |
+
+**A source's tool must be one its agent can call for you.** A save checks the tool on
+the agent that will poll it, as you. A tool that agent has not loaded yet is loaded
+the way the agent would load it itself: the save enables the skill that provides it,
+as you, and says so; when you may not enable it, or it loads without that tool (an
+email skill with no account of yours, say), the save is refused with the reason and
+the fix. A poll does the same, so a hub that has just restarted loads the tool at the
+first poll. A poll that still cannot find its tool shows the monitor as `failing` with
+the reason and tells you once; it is polled again as soon as the agent's tools change
+(the skill enabled, a tool installed), with no need to save it again.
 
 A channel that keeps failing to read for some reason other than a missing invite — a
 channel that has been deleted, say — is eventually given up on: after 30 consecutive

@@ -11875,7 +11875,7 @@ async fn monitor_put(
 
     if let Some(def) = &parsed {
         engine
-            .preflight(def)
+            .preflight(def, ctx.owner.as_deref())
             .await
             .map_err(|refused| (StatusCode::BAD_REQUEST, refused))?;
         gate_monitor_binding(&state, engine.as_ref(), &caller, def, previous.as_ref()).await?;
@@ -12033,7 +12033,7 @@ async fn monitor_revision_restore(
     let parsed = workforce_orchestrator::monitor::MonitorDefinition::from_toml(&content).ok();
     if let Some(def) = &parsed {
         engine
-            .preflight(def)
+            .preflight(def, ctx.owner.as_deref())
             .await
             .map_err(|refused| (StatusCode::BAD_REQUEST, refused))?;
         gate_monitor_binding(&state, engine.as_ref(), &caller, def, previous.as_ref()).await?;

@@ -41,6 +41,9 @@ pub struct MonitorTool {
     /// The membership gate every monitor write passes through. The default
     /// can answer for nobody, so a non-admin human's bind fails closed.
     access: BindingAccess,
+    /// The agent whose tool this is: a monitor it saves naming no agent is
+    /// its own, and its writes are recorded as made through it.
+    agent: Option<EngineAgent>,
 }
 
 impl MonitorTool {
@@ -50,7 +53,39 @@ impl MonitorTool {
             engine,
             write_auth: TurnDefWriteAuth::default().with_admin_policy(always_admin()),
             access: BindingAccess::default(),
+            agent: None,
         }
+    }
+
+    /// The agent this tool is registered for.
+    pub fn with_agent(mut self, agent: EngineAgent) -> Self {
+        self.agent = Some(agent);
+        self
+    }
+
+    /// How this tool's writes are recorded: `agent_tool:<agent>`, naming
+    /// the agent that made them when it is known.
+    fn edited_via(&self) -> String {
+        match &self.agent {
+            Some(agent) => format!("agent_tool:{}", agent.id),
+            None => "agent_tool".to_string(),
+        }
+    }
+
+    /// `toml` with `agent = "<this agent>"` added when it names no watching
+    /// agent and this agent is not the hub's default: a monitor an agent
+    /// saves is its own, polled with its tools and telling the person in its
+    /// DM, rather than the default agent's. `None` when nothing is added.
+    fn own_monitor(&self, toml: &str, def: &MonitorDefinition) -> Option<String> {
+        let agent = self.agent.as_ref().filter(|a| !a.is_default)?;
+        if def.monitor.watcher().is_some() || !self.runtime.knows_agent(&agent.id) {
+            return None;
+        }
+        let mut doc = toml.parse::<toml_edit::DocumentMut>().ok()?;
+        doc.get_mut("monitor")?
+            .as_table_like_mut()?
+            .insert("agent", toml_edit::value(agent.id.as_str()));
+        Some(doc.to_string())
     }
 
     pub fn with_admin_policy(mut self, is_admin: IsAdminFn) -> Self {
@@ -451,7 +486,24 @@ impl MonitorTool {
         let Some(toml_content) = input.toml_content.filter(|s| !s.is_empty()) else {
             return Ok(missing("toml_content", "the monitor TOML to save.", start));
         };
-        let parsed = MonitorDefinition::from_toml(&toml_content).ok();
+        let mut parsed = MonitorDefinition::from_toml(&toml_content).ok();
+        let owned = parsed
+            .as_ref()
+            .and_then(|def| self.own_monitor(&toml_content, def))
+            .and_then(|toml| Some((MonitorDefinition::from_toml(&toml).ok()?, toml)));
+        let mut notes = Vec::new();
+        let toml_content = match owned {
+            Some((def, toml)) => {
+                notes.push(format!(
+                    "Added agent = \"{}\": a monitor an agent saves is its own, polled with its \
+                     tools and telling you in its DM.",
+                    def.monitor.agent.as_deref().unwrap_or_default()
+                ));
+                parsed = Some(def);
+                toml
+            }
+            None => toml_content,
+        };
         // A monitor that tells someone in Desk is theirs: it reads their
         // accounts and tells them in their DM. Unnamed, it is the caller's
         // own, an administrator's too (the person at a Desk is the hub's).
@@ -482,18 +534,22 @@ impl MonitorTool {
             .await;
         if let Some(def) = &parsed {
             let checked = match &self.engine {
-                Some(engine) => engine.preflight(def).await,
+                Some(engine) => engine.preflight(def, grant.owner.as_deref()).await,
                 None => self
                     .runtime
                     .check_definition(def)
                     .await
+                    .map(|()| Vec::new())
                     .map_err(|e| e.to_string()),
             };
-            if let Err(refused) = checked {
-                return Ok(ToolResult::failure(
-                    refused,
-                    start.elapsed().as_millis() as u64,
-                ));
+            match checked {
+                Ok(done) => notes.extend(done),
+                Err(refused) => {
+                    return Ok(ToolResult::failure(
+                        refused,
+                        start.elapsed().as_millis() as u64,
+                    ));
+                }
             }
             // Membership gate: a non-admin may only point a monitor at a channel
             // they can reach themselves — otherwise a member could bind a
@@ -531,7 +587,7 @@ impl MonitorTool {
                 &toml_content,
                 grant.owner.as_deref(),
                 visibility,
-                EditContext::new("agent_tool", grant.actor.as_deref()),
+                EditContext::new(&self.edited_via(), grant.actor.as_deref()),
             )
             .await
         {
@@ -552,6 +608,9 @@ impl MonitorTool {
                     engine.reconcile_personas().await;
                 }
                 let mut output = serde_json::json!({ "saved": true, "monitor_id": id });
+                if !notes.is_empty() {
+                    output["notes"] = serde_json::json!(notes);
+                }
                 merge(
                     &mut output,
                     self.watch_report(&id, grant.owner.as_deref()).await,
@@ -594,7 +653,7 @@ impl MonitorTool {
                 &id,
                 owner.as_deref(),
                 enabled,
-                EditContext::new("agent_tool", grant.actor.as_deref()),
+                EditContext::new(&self.edited_via(), grant.actor.as_deref()),
             )
             .await;
         match result {
@@ -641,7 +700,8 @@ impl MonitorTool {
             Err(refused) => return Ok(refused),
         };
         let owner = grant.owner;
-        let edit = EditContext::new("agent_tool", grant.actor.as_deref());
+        let via = self.edited_via();
+        let edit = EditContext::new(&via, grant.actor.as_deref());
         let deleted = match &self.engine {
             Some(engine) => engine.delete_monitor(&id, owner.as_deref(), edit).await,
             None => {
@@ -709,7 +769,7 @@ name = "Invoices from Acme"
 description = "File each new invoice email."
 enabled = true
 # agent = "lynx"                   # optional: whose engine runs it (its bot / its tools) — defaults
-#                                  # to the action's agent, else the hub's default agent
+#                                  # to the action's agent, else you (the agent saving it)
 # once = true                      # optional: stop after the first successful fire
 # expires_at = "2026-10-20T09:00:00Z"   # optional: stop then, telling the owner
 
@@ -999,6 +1059,65 @@ input = { id = "{{id}}" }
         assert_eq!(entry["source"], serde_json::json!("google.gmail.search"));
         assert_eq!(entry["filter"], serde_json::json!("always"));
         assert!(entry.get("channel").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A monitor an agent other than the default saves, naming no agent,
+    /// is its own: polled with its tools, telling the person in its DM. The
+    /// default agent's, one naming an agent, and one this hub does not run
+    /// are left as written.
+    #[tokio::test]
+    async fn a_monitor_an_agent_saves_naming_no_agent_is_its_own() {
+        let dir = std::env::temp_dir().join(format!("montool-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runtime = Arc::new(MonitorRuntime::new(dir.clone()));
+        runtime.set_agents(crate::monitor::KnownAgents {
+            default_id: "desk".into(),
+            ids: vec!["desk".into(), "kat".into()],
+        });
+        let as_agent = |id: &str, is_default: bool| {
+            MonitorTool::new(Arc::clone(&runtime), None).with_agent(EngineAgent {
+                id: id.into(),
+                name: id.into(),
+                is_default,
+            })
+        };
+        let kat = as_agent("kat", false);
+        assert_eq!(kat.edited_via(), "agent_tool:kat");
+
+        let saved = kat
+            .execute(input("save", Some("invoices"), Some(SOURCE), None))
+            .await
+            .unwrap();
+        assert!(saved.success, "{saved:?}");
+        assert!(
+            saved.output["notes"][0]
+                .as_str()
+                .is_some_and(|n| n.contains("agent = \"kat\"")),
+            "{saved:?}"
+        );
+        assert_eq!(saved.output["agent"], serde_json::json!("kat"));
+        let got = kat
+            .execute(input("get", Some("invoices"), None, None))
+            .await
+            .unwrap();
+        let toml = got.output["toml"].as_str().unwrap();
+        let def = MonitorDefinition::from_toml(toml).unwrap();
+        assert_eq!(def.monitor.watcher(), Some("kat"), "{toml}");
+        assert!(
+            toml.contains("tool = \"google.gmail.search\""),
+            "the rest is kept: {toml}"
+        );
+
+        let parsed = MonitorDefinition::from_toml(SOURCE).unwrap();
+        assert_eq!(as_agent("desk", true).own_monitor(SOURCE, &parsed), None);
+        assert_eq!(as_agent("quill", false).own_monitor(SOURCE, &parsed), None);
+        let named = SOURCE.replace(
+            "name = \"Invoices\"",
+            "name = \"Invoices\"\nagent = \"desk\"",
+        );
+        let named_def = MonitorDefinition::from_toml(&named).unwrap();
+        assert_eq!(kat.own_monitor(&named, &named_def), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

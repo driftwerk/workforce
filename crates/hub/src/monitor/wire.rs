@@ -75,6 +75,7 @@ pub(crate) async fn wire(
             .unwrap_or_else(|| own_id.clone()),
         id: own_id,
     };
+    let tool_agent = engine_agent.clone();
 
     // A hub that serves no agents (a machine's) watches nothing: no monitor
     // runs there on anyone's plan.
@@ -204,6 +205,7 @@ pub(crate) async fn wire(
     // would watch, and wherever its action would deliver.
     service.register_tool(Arc::new(
         super::MonitorTool::new(Arc::clone(&monitor_runtime), durable)
+            .with_agent(tool_agent)
             .with_write_auth(def_write_auth.clone())
             .with_binding_access(super::BindingAccess::new(
                 Some(Arc::clone(&service.surface_registry)),

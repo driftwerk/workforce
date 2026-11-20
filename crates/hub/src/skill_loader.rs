@@ -2304,6 +2304,20 @@ pub fn static_skill_tool_names(skill_name: &str) -> Vec<&'static str> {
     }
 }
 
+/// The built-in skill that provides `tool`: the one whose tools name it,
+/// else the one its family (`email` of `email.inbox`) is named after.
+pub fn skill_of_tool(tool: &str) -> Option<&'static str> {
+    let catalog = builtin_skill_catalog();
+    let loadable = || catalog.iter().filter(|meta| meta.name != "slack");
+    loadable()
+        .find(|meta| static_skill_tool_names(meta.name).contains(&tool))
+        .or_else(|| {
+            let family = tool.split_once('.')?.0;
+            loadable().find(|meta| meta.tool_prefix == family)
+        })
+        .map(|meta| meta.name)
+}
+
 /// Load a specific skill's tools using vault credentials.
 pub fn load_skill_from_vault(
     skill_name: &str,

@@ -375,8 +375,14 @@ pub trait MonitorHost: Send + Sync {
     async fn sweep_all(&self);
     fn personas(&self) -> Arc<PersonaOverrides>;
     async fn reconcile_personas(&self);
-    /// Whether this engine could run `def`; why not, in the operator's terms.
-    async fn preflight(&self, def: &MonitorDefinition) -> Result<(), String>;
+    /// Whether the engine that watches `def` could run it for `owner`; why
+    /// not, in the operator's terms. What the check did on the way (a skill
+    /// it enabled for the owner), for the author.
+    async fn preflight(
+        &self,
+        def: &MonitorDefinition,
+        owner: Option<&str>,
+    ) -> Result<Vec<String>, String>;
     /// This engine's reading of `def`'s channel, for the operator.
     async fn probe(&self, def: &MonitorDefinition, owner: Option<&str>) -> Option<Probe>;
     async fn list_visible(&self, listing: &DefListing) -> Vec<MonitorSummary>;
@@ -395,7 +401,11 @@ pub trait MonitorHost: Send + Sync {
         previous: Option<&MonitorDefinition>,
     );
     /// Whether this engine could run `def`, for a peer deciding where it runs.
-    async fn preflight_here(&self, def: &MonitorDefinition) -> Result<(), String>;
+    async fn preflight_here(
+        &self,
+        def: &MonitorDefinition,
+        owner: Option<&str>,
+    ) -> Result<Vec<String>, String>;
     /// This engine's reading of `def`'s channel, for a peer that does not watch it.
     async fn probe_here(&self, def: &MonitorDefinition, owner: Option<&str>) -> Option<Probe>;
 }

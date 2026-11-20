@@ -69,6 +69,9 @@ pub struct MonitorEngineConfig {
     /// This hub runs Desk (`[desk] enabled`): a monitor may tell its owner
     /// there. A server hub refuses `surface = "desk"`.
     pub desk: bool,
+    /// The soonest a source whose tool was missing is polled again after
+    /// its agent's tools change, however often they change.
+    pub missing_tool_retry: Duration,
 }
 
 impl MonitorEngineConfig {
@@ -111,6 +114,7 @@ impl Default for MonitorEngineConfig {
             poll_tick: Duration::from_secs(monitor.poll_tick_secs),
             max_items: monitor.max_items,
             desk: false,
+            missing_tool_retry: Duration::from_secs(30),
         }
     }
 }
@@ -458,6 +462,8 @@ impl WorkflowNotifySink {
         match self.invoker.invoke(call).await {
             Ok(_) => ActionOutcome::Done(None),
             Err(InvokeError::RateLimited(e)) => ActionOutcome::Transient(format!("run_skill: {e}")),
+            // Its tool may register yet (a skill enabled, a hub restarting).
+            Err(InvokeError::Unavailable(e)) => ActionOutcome::Transient(format!("run_skill: {e}")),
             Err(e) => ActionOutcome::Terminal(format!("run_skill: {}", e.message())),
         }
     }
@@ -657,6 +663,16 @@ fn reenable_command(def: &MonitorDefinition) -> String {
     )
 }
 
+/// What an owner is told when their monitor's tool can't be found or
+/// loaded: why, and that it is tried again by itself.
+fn missing_tool_notice(def: &MonitorDefinition, error: &str) -> String {
+    format!(
+        "Monitor \"{}\" can't poll: {error}. It is tried again by itself as soon as the tool \
+         is loaded, and at its usual cadence until then — no need to save it again.",
+        def.monitor.name
+    )
+}
+
 /// The owner-facing message for an auto-disable: names the monitor, what
 /// failed, the last error, and the re-enable command.
 fn auto_disable_notice(def: &MonitorDefinition, what: &str, streak: u32, error: &str) -> String {
@@ -822,8 +838,13 @@ struct Unwired;
 
 #[async_trait::async_trait]
 impl ToolInvoke for Unwired {
-    fn resolves(&self, _: &str) -> bool {
-        false
+    async fn resolve(
+        &self,
+        _: &str,
+        _: Option<&str>,
+        _: &str,
+    ) -> std::result::Result<super::invoke::Resolved, String> {
+        Err("this hub runs no tools for monitors".to_string())
     }
 
     async fn invoke(&self, _: ToolCall<'_>) -> std::result::Result<serde_json::Value, InvokeError> {
@@ -872,6 +893,11 @@ pub struct MonitorEngine {
     /// design: a restart resets the count, and a genuinely dead channel just
     /// re-earns it. A source's count is durable, in its state row.
     sweep_failures: Mutex<HashMap<(String, String), u32>>,
+    /// Sources whose last poll found their tool missing: the agent's tool
+    /// generation after that poll, and when. One is tried again, ahead of
+    /// its cadence, once the agent's tools have changed since. In-memory: a
+    /// restart polls it on its cadence, loading the tool as its owner then.
+    missing_tools: Mutex<HashMap<MonitorKey, (u64, std::time::Instant)>>,
     peers: PeerEngines,
     config: MonitorEngineConfig,
 }
@@ -896,6 +922,7 @@ impl MonitorEngine {
             self_ids: RwLock::new(HashMap::new()),
             personas: Arc::new(PersonaOverrides::new()),
             sweep_failures: Mutex::new(HashMap::new()),
+            missing_tools: Mutex::new(HashMap::new()),
             peers: Arc::new(|_| None),
             config,
         }
@@ -920,12 +947,19 @@ impl MonitorEngine {
         self
     }
 
-    /// The engine that watches `def` when it is not this one.
+    /// The engine that watches `def` when it is not this one: the agent it
+    /// names, else the hub's default agent — the partition the polls and the
+    /// sweep use, so a save is checked where it will run.
     fn peer_for(&self, def: &MonitorDefinition) -> Option<Arc<dyn crate::hosts::MonitorHost>> {
-        def.monitor
+        if self.agent.watches_def(def) {
+            return None;
+        }
+        let watcher = def
+            .monitor
             .watcher()
-            .filter(|watcher| *watcher != self.agent.id)
-            .and_then(|watcher| (self.peers)(watcher))
+            .map(str::to_string)
+            .or_else(|| self.runtime.default_agent_id())?;
+        (self.peers)(&watcher)
     }
 
     /// The agent this engine watches for.
@@ -1008,15 +1042,27 @@ impl MonitorEngine {
     /// Everything a save must satisfy beyond the TOML's own validation: the
     /// persona slot, a source's tool and cadence, a skill action's tool, the
     /// decide gate's backend, and a deliverable surface. One rule for every
-    /// surface that writes a monitor.
-    pub async fn preflight(&self, def: &MonitorDefinition) -> std::result::Result<(), String> {
+    /// surface that writes a monitor. It is checked on the engine that will
+    /// watch it, with `owner`'s tools there: a tool that agent has not loaded
+    /// is loaded as `owner` would load it. What the check did on the way
+    /// (a skill it enabled), for the author.
+    pub async fn preflight(
+        &self,
+        def: &MonitorDefinition,
+        owner: Option<&str>,
+    ) -> std::result::Result<Vec<String>, String> {
         match self.peer_for(def) {
-            Some(peer) => peer.preflight_here(def).await,
-            None => self.preflight_here(def).await,
+            Some(peer) => peer.preflight_here(def, owner).await,
+            None => self.preflight_here(def, owner).await,
         }
     }
 
-    async fn preflight_here(&self, def: &MonitorDefinition) -> std::result::Result<(), String> {
+    async fn preflight_here(
+        &self,
+        def: &MonitorDefinition,
+        owner: Option<&str>,
+    ) -> std::result::Result<Vec<String>, String> {
+        let mut notes = Vec::new();
         self.runtime
             .check_definition(def)
             .await
@@ -1029,7 +1075,7 @@ impl MonitorEngine {
             ));
         }
         if let Some(source) = m.source() {
-            self.callable(&source.tool)?;
+            notes.extend(self.callable(&source.tool, owner, &m.id).await?);
             if source.every_secs() < self.config.min_poll_secs {
                 return Err(format!(
                     "every_secs {} is below this hub's minimum of {} ([monitor] min_poll_secs)",
@@ -1039,7 +1085,7 @@ impl MonitorEngine {
             }
         }
         if let Action::RunSkill { tool, .. } = &m.action {
-            self.callable(tool)?;
+            notes.extend(self.callable(tool, owner, &m.id).await?);
         }
         if m.decide.is_some() && !self.decide.available() {
             return Err(
@@ -1061,17 +1107,24 @@ impl MonitorEngine {
                 );
             }
         }
-        Ok(())
+        Ok(notes)
     }
 
-    fn callable(&self, tool: &str) -> std::result::Result<(), String> {
+    /// Whether this engine's agent can call `tool` for `owner`, loading it
+    /// as `owner` when it can; what that did, for the author.
+    async fn callable(
+        &self,
+        tool: &str,
+        owner: Option<&str>,
+        monitor_id: &str,
+    ) -> std::result::Result<Option<String>, String> {
         if let Some(reason) = denied_tool(tool) {
             return Err(reason);
         }
-        if !self.invoker.resolves(tool) {
-            return Err(format!("no tool named '{tool}' is registered on this hub"));
-        }
-        Ok(())
+        self.invoker
+            .resolve(tool, owner, &actor_name(owner, monitor_id))
+            .await
+            .map(|resolved| resolved.note(tool))
     }
 
     /// Register a surface's own identifiers (bot id, bot user id) for the loop guard.
@@ -1481,6 +1534,7 @@ impl MonitorEngine {
             return;
         }
         let keys: Vec<MonitorKey> = mons.iter().map(|mon| mon.monitor_key()).collect();
+        self.bring_forward_registered(&keys).await;
         let states = match self.store.source_states(&keys).await {
             Ok(states) => states,
             Err(e) => {
@@ -1499,6 +1553,38 @@ impl MonitorEngine {
                 .await;
         })
         .await;
+    }
+
+    /// Make due now each of `keys` whose last poll found its tool missing,
+    /// when the agent's tools have changed since (a skill enabled, a tool
+    /// registered): it need not wait out its cadence, nor be re-saved.
+    async fn bring_forward_registered(&self, keys: &[MonitorKey]) {
+        let generation = self.invoker.generation();
+        let retry: Vec<MonitorKey> = {
+            let mut missing = self.missing_tools.lock().unwrap_or_else(|e| e.into_inner());
+            missing.retain(|key, _| keys.contains(key));
+            missing
+                .iter_mut()
+                .filter(|(_, (seen, at))| {
+                    *seen != generation && at.elapsed() >= self.config.missing_tool_retry
+                })
+                .map(|(key, (seen, _))| {
+                    *seen = generation;
+                    key.clone()
+                })
+                .collect()
+        };
+        for key in retry {
+            match self.store.bring_forward_failing(&key).await {
+                Ok(true) => {
+                    tracing::info!(monitor = %key.monitor_id, "the agent's tools changed: polling a monitor whose tool was missing again")
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(monitor = %key.monitor_id, error = %e, "bringing a monitor's poll forward failed")
+                }
+            }
+        }
     }
 
     /// When the next poll of `mon` is due at `now`.
@@ -1561,8 +1647,28 @@ impl MonitorEngine {
             })
             .await;
         let output = match read {
-            Ok(output) => output,
-            Err(e) => return self.poll_failed(mon, &key, e.message(), next_due).await,
+            Ok(output) => {
+                self.missing_tools
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&key);
+                output
+            }
+            Err(InvokeError::Unavailable(e)) => {
+                self.missing_tools
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        key.clone(),
+                        (self.invoker.generation(), std::time::Instant::now()),
+                    );
+                return self.poll_failed(mon, &key, state, &e, next_due, true).await;
+            }
+            Err(e) => {
+                return self
+                    .poll_failed(mon, &key, state, e.message(), next_due, false)
+                    .await
+            }
         };
         let outcome = match observe(
             source,
@@ -1573,7 +1679,11 @@ impl MonitorEngine {
             self.config.max_items,
         ) {
             Ok(outcome) => outcome,
-            Err(e) => return self.poll_failed(mon, &key, &e, next_due).await,
+            Err(e) => {
+                return self
+                    .poll_failed(mon, &key, state, &e, next_due, false)
+                    .await
+            }
         };
         if outcome.truncated || outcome.skipped > 0 {
             warn!(monitor = %id, tool = %source.tool, seen = outcome.seen, skipped = outcome.skipped,
@@ -1593,7 +1703,9 @@ impl MonitorEngine {
         if let Err(e) = self.store.record_poll(&key, &outcome.state, next_due).await {
             let error = format!("poll state write failed: {e}");
             self.close_claims(id, &won, &error).await;
-            return self.poll_failed(mon, &key, &error, next_due).await;
+            return self
+                .poll_failed(mon, &key, state, &error, next_due, false)
+                .await;
         }
         let fired = won.len();
         let mut remaining = won.iter();
@@ -1622,17 +1734,31 @@ impl MonitorEngine {
         }
     }
 
-    /// Count a failed poll durably; at the threshold the monitor is disabled
-    /// and its owner told.
+    /// Count a failed poll durably, where its status shows it failing and
+    /// why; at the threshold the monitor is disabled and its owner told. A
+    /// failure is logged when it starts or changes, not on every poll, and
+    /// one whose tool is `missing` tells its owner as it starts: nothing
+    /// they or their agent can see would say so otherwise.
     async fn poll_failed(
         &self,
         mon: &OwnedMonitor,
         key: &MonitorKey,
+        previous: Option<&SourceState>,
         error: &str,
         next_due: DateTime<Utc>,
+        missing: bool,
     ) -> PollReport {
         let id = mon.def.monitor.id.as_str();
-        warn!(monitor = %id, error, "monitor poll failed");
+        let fresh = previous.and_then(|s| s.error.as_deref()) != Some(error);
+        if fresh {
+            warn!(monitor = %id, error, "monitor poll failed");
+        } else {
+            tracing::debug!(monitor = %id, error, "monitor poll failed again");
+        }
+        if missing && fresh {
+            self.tell_owner(mon, "tool_missing", &missing_tool_notice(&mon.def, error))
+                .await;
+        }
         let failures = match self.store.record_poll_failure(key, error, next_due).await {
             Ok(failures) => failures,
             Err(e) => {
@@ -2031,8 +2157,12 @@ impl crate::hosts::MonitorHost for MonitorEngine {
         MonitorEngine::surfaces(self)
     }
 
-    async fn preflight(&self, def: &MonitorDefinition) -> std::result::Result<(), String> {
-        MonitorEngine::preflight(self, def).await
+    async fn preflight(
+        &self,
+        def: &MonitorDefinition,
+        owner: Option<&str>,
+    ) -> std::result::Result<Vec<String>, String> {
+        MonitorEngine::preflight(self, def, owner).await
     }
 
     async fn probe(&self, def: &MonitorDefinition, owner: Option<&str>) -> Option<Probe> {
@@ -2084,8 +2214,12 @@ impl crate::hosts::MonitorHost for MonitorEngine {
         MonitorEngine::reconcile_personas(self).await
     }
 
-    async fn preflight_here(&self, def: &MonitorDefinition) -> std::result::Result<(), String> {
-        MonitorEngine::preflight_here(self, def).await
+    async fn preflight_here(
+        &self,
+        def: &MonitorDefinition,
+        owner: Option<&str>,
+    ) -> std::result::Result<Vec<String>, String> {
+        MonitorEngine::preflight_here(self, def, owner).await
     }
 
     async fn probe_here(&self, def: &MonitorDefinition, owner: Option<&str>) -> Option<Probe> {
@@ -2312,9 +2446,17 @@ mod tests {
         outputs: std::sync::Mutex<VecDeque<std::result::Result<Value, InvokeError>>>,
         calls: std::sync::Mutex<Vec<(Option<String>, String, Value)>>,
         known: std::sync::Mutex<HashSet<String>>,
+        generation: std::sync::atomic::AtomicU64,
     }
 
     impl FakeInvoker {
+        /// A tool registers on the agent.
+        fn register(&self, tool: &str) {
+            self.known.lock().unwrap().insert(tool.to_string());
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
         fn knowing(tools: &[&str]) -> Arc<Self> {
             let fake = Self::default();
             fake.known
@@ -2335,8 +2477,20 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ToolInvoke for FakeInvoker {
-        fn resolves(&self, tool: &str) -> bool {
-            self.known.lock().unwrap().contains(tool)
+        async fn resolve(
+            &self,
+            tool: &str,
+            _: Option<&str>,
+            _: &str,
+        ) -> std::result::Result<crate::monitor::invoke::Resolved, String> {
+            match self.known.lock().unwrap().contains(tool) {
+                true => Ok(crate::monitor::invoke::Resolved::Loaded),
+                false => Err(format!("no tool named '{tool}' is registered")),
+            }
+        }
+
+        fn generation(&self) -> u64 {
+            self.generation.load(std::sync::atomic::Ordering::Relaxed)
         }
 
         async fn invoke(&self, call: ToolCall<'_>) -> std::result::Result<Value, InvokeError> {
@@ -3807,6 +3961,145 @@ template = "x"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A poll whose tool is missing shows the monitor failing with the
+    /// reason, tells its owner once, and is polled again as soon as the
+    /// agent's tools change — not a cadence later, and with no re-save.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_monitor_whose_tool_was_missing_recovers_once_it_registers_without_a_resave() {
+        let dir = temp_dir("monsrcmissing");
+        let sink = Arc::new(FakeSink::default());
+        let invoker = FakeInvoker::knowing(&["books.file"]);
+        let missing = "jira.search isn't loaded for agent 'atlas': enabling the jira skill as \
+                       user alice didn't add it";
+
+        workforce_postgres::test_support::with_test_pool(MonitorStore::build_pool, {
+            let dir = dir.clone();
+            let sink = Arc::clone(&sink);
+            let invoker = Arc::clone(&invoker);
+            |pool| async move {
+                let defs = workforce_orchestrator::workflow_store::WorkflowStore::new(pool.clone())
+                    .await
+                    .unwrap();
+                let runtime = Arc::new(MonitorRuntime::new(dir));
+                runtime.set_store(defs);
+                runtime
+                    .save_definition_source(
+                        "src",
+                        SOURCE_TOML,
+                        Some("alice"),
+                        workforce_core::access::Visibility::Private,
+                        EditContext::new("agent_tool", Some("alice")),
+                    )
+                    .await
+                    .unwrap();
+                let store = Arc::new(MonitorStore::new(pool).await.unwrap());
+                let engine = MonitorEngine::new(
+                    runtime,
+                    Arc::clone(&store),
+                    Arc::new(RwLock::new(SurfaceRegistry::new())),
+                    sink.clone() as Arc<dyn ActionSink>,
+                    agent("atlas", true),
+                    MonitorEngineConfig {
+                        missing_tool_retry: Duration::ZERO,
+                        ..MonitorEngineConfig::default()
+                    },
+                )
+                .with_invoker(invoker.clone());
+
+                invoker.answer(Err(InvokeError::Unavailable(missing.into())));
+                engine.poll_due().await;
+                assert_eq!(invoker.calls().len(), 1, "the first poll is due at once");
+                let summary = engine.summary_of("src", Some("alice")).await.unwrap();
+                assert_eq!(summary.status, crate::monitor::MonitorStatus::Failing);
+                assert_eq!(
+                    summary.poll.as_ref().unwrap().error.as_deref(),
+                    Some(missing),
+                    "the reason is where the monitor's state is read"
+                );
+                let told = sink.notices();
+                assert_eq!(told.len(), 1, "{told:?}");
+                assert!(told[0].2.contains(missing), "{told:?}");
+                assert!(told[0].2.contains("no need to save it again"), "{told:?}");
+
+                engine.poll_due().await;
+                assert_eq!(
+                    invoker.calls().len(),
+                    1,
+                    "nothing changed: it keeps its cadence"
+                );
+
+                // The skill is enabled: the agent's tools change.
+                invoker.register("jira.search");
+                invoker.answer(Ok(issues(&[("A-1", "open")])));
+                engine.poll_due().await;
+                assert_eq!(invoker.calls().len(), 2, "polled again at once");
+                let summary = engine.summary_of("src", Some("alice")).await.unwrap();
+                assert_eq!(summary.status, crate::monitor::MonitorStatus::Active);
+                assert_eq!(summary.poll.as_ref().unwrap().error, None);
+                assert_eq!(sink.notices().len(), 1, "told once");
+            }
+        })
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A monitor naming no agent is checked by the engine that polls it —
+    /// the default agent's — not by the engine of whoever saved it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unnamed_monitor_is_checked_on_the_default_agents_engine() {
+        let dir = temp_dir("monunnamed");
+        let sink = Arc::new(FakeSink::default());
+        let kats = FakeInvoker::knowing(&["jira.search", "books.file"]);
+        let desks = FakeInvoker::knowing(&["books.file"]);
+
+        workforce_postgres::test_support::with_test_pool(MonitorStore::build_pool, {
+            let dir = dir.clone();
+            let sink = Arc::clone(&sink);
+            let (kats, desks) = (Arc::clone(&kats), Arc::clone(&desks));
+            |pool| async move {
+                let store = Arc::new(MonitorStore::new(pool).await.unwrap());
+                let runtime = |dir: &std::path::Path| {
+                    let runtime = Arc::new(MonitorRuntime::new(dir.to_path_buf()));
+                    runtime.set_agents(crate::monitor::KnownAgents {
+                        default_id: "desk".into(),
+                        ids: vec!["desk".into(), "kat".into()],
+                    });
+                    runtime
+                };
+                let engine = |who: EngineAgent, invoker: Arc<FakeInvoker>| {
+                    MonitorEngine::new(
+                        runtime(&dir),
+                        Arc::clone(&store),
+                        Arc::new(RwLock::new(SurfaceRegistry::new())),
+                        Arc::clone(&sink) as Arc<dyn ActionSink>,
+                        who,
+                        MonitorEngineConfig::default(),
+                    )
+                    .with_invoker(invoker)
+                };
+                let desk: Arc<dyn crate::hosts::MonitorHost> =
+                    Arc::new(engine(agent("desk", true), desks.clone()));
+                let kat =
+                    engine(agent("kat", false), kats.clone()).with_peers(Arc::new(move |name| {
+                        (name == "desk").then(|| Arc::clone(&desk))
+                    }));
+                let unnamed = MonitorDefinition::from_toml(SOURCE_TOML).unwrap();
+                let refused = kat.preflight(&unnamed, None).await.unwrap_err();
+                assert!(
+                    refused.contains("no tool named 'jira.search'"),
+                    "desk polls it, and desk has no jira: {refused}"
+                );
+                let kats_own = MonitorDefinition::from_toml(
+                    &SOURCE_TOML.replace("name = \"Src\"", "name = \"Src\"\nagent = \"kat\""),
+                )
+                .unwrap();
+                assert!(kat.preflight(&kats_own, None).await.is_ok());
+            }
+        })
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failing_source_counts_durably_shows_as_failing_and_auto_disables_with_a_notice() {
         let dir = temp_dir("monsrcfail");
@@ -4376,7 +4669,10 @@ template = "x"
                 );
                 let def = MonitorDefinition::from_toml(&candys_toml).unwrap();
 
-                assert!(atlas.preflight(&def).await.is_ok(), "candy's tools answer");
+                assert!(
+                    atlas.preflight(&def, None).await.is_ok(),
+                    "candy's tools answer"
+                );
                 candys.answer(Ok(issues(&[("A-1", "open")])));
                 assert_eq!(
                     atlas.probe(&def, None).await,
@@ -4394,7 +4690,7 @@ template = "x"
                 .unwrap();
                 assert!(
                     atlas
-                        .preflight(&unknown)
+                        .preflight(&unknown, None)
                         .await
                         .unwrap_err()
                         .contains("no tool named"),
@@ -4484,28 +4780,28 @@ template = "x"
                     let engine = &engine;
                     async move {
                         engine
-                            .preflight(&MonitorDefinition::from_toml(&toml).unwrap())
+                            .preflight(&MonitorDefinition::from_toml(&toml).unwrap(), None)
                             .await
                             .unwrap_err()
                     }
                 };
 
-                assert!(engine.preflight(&MonitorDefinition::from_toml(SOURCE_TOML).unwrap()).await.is_ok());
+                assert!(engine.preflight(&MonitorDefinition::from_toml(SOURCE_TOML).unwrap(), None).await.is_ok());
                 assert!(refusal(SOURCE_TOML.replace("jira.search", "jira.nothing")).await.contains("no tool named 'jira.nothing'"));
                 assert!(refusal(SOURCE_TOML.replace("jira.search", "vault.get")).await.contains("never call"));
                 assert!(refusal(SOURCE_TOML.replace("books.file", "exec.run")).await.contains("never call"));
                 assert!(refusal(SOURCE_TOML.replace("every_secs = 60", "every_secs = 5")).await.contains("below this hub's minimum of 60"));
                 assert!(refusal(SOURCE_TOML.replace("name = \"Src\"", "name = \"Src\"\nexpires_at = \"2001-01-01T00:00:00Z\"")).await.contains("has already passed"));
-                assert!(engine.preflight(&MonitorDefinition::from_toml(&SOURCE_TOML.replace("name = \"Src\"", "name = \"Src\"\nenabled = false\nexpires_at = \"2001-01-01T00:00:00Z\"")).unwrap()).await.is_ok(), "a paused monitor may keep its past expiry");
+                assert!(engine.preflight(&MonitorDefinition::from_toml(&SOURCE_TOML.replace("name = \"Src\"", "name = \"Src\"\nenabled = false\nexpires_at = \"2001-01-01T00:00:00Z\"")).unwrap(), None).await.is_ok(), "a paused monitor may keep its past expiry");
                 assert!(refusal(format!("{SOURCE_TOML}\n[monitor.decide]\nquestion = \"q\"\n")).await.contains("decision backend"));
                 let notify = SOURCE_TOML.replace(
                     "type = \"run_skill\"\ntool = \"books.file\"\ninput = { key = \"{{id}}\", status = \"{{value}}\", was = \"{{previous}}\" }",
                     "type = \"notify\"\ntarget = \"C2\"\ntemplate = \"x\"",
                 );
                 assert!(refusal(notify.clone()).await.contains("name the surface"));
-                assert!(engine.preflight(&MonitorDefinition::from_toml(&format!("{notify}surface = \"slack\"\n")).unwrap()).await.is_ok());
+                assert!(engine.preflight(&MonitorDefinition::from_toml(&format!("{notify}surface = \"slack\"\n")).unwrap(), None).await.is_ok());
                 assert!(refusal(PERSONA_TOML.replace("id = \"p1\"", "id = \"p2\"")).await.contains("already has a persona monitor 'p1'"));
-                assert!(engine.preflight(&MonitorDefinition::from_toml(MONITOR_TOML).unwrap()).await.is_ok(), "a channel monitor's delivery rides its own surface");
+                assert!(engine.preflight(&MonitorDefinition::from_toml(MONITOR_TOML).unwrap(), None).await.is_ok(), "a channel monitor's delivery rides its own surface");
             }
         })
         .await;
