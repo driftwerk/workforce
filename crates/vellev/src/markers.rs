@@ -106,7 +106,7 @@ impl Kept {
     }
 
     /// Make the collection, unless the node holds it already.
-    async fn made(self, at: &Tenants) -> Result<vellev_client::Records> {
+    async fn made(self, at: &Tenants) -> Result<()> {
         let records = self.records(at)?;
         if records
             .schema()
@@ -119,7 +119,7 @@ impl Kept {
                 _ => {}
             }
         }
-        Ok(records)
+        Ok(())
     }
 
     /// Insert `value` under `what`, unless something is recorded there
@@ -159,15 +159,21 @@ impl Kept {
     }
 
     /// What is recorded under `what`; none in a tenant that is there, and
-    /// an error in one that is not.
+    /// an error in one that is not, or for a marker that records no owner.
     async fn claimed(self, at: &Tenants, what: &str) -> Result<Option<String>> {
         let held = self.records(at)?.get(ObjectId(marker_id(what))).await;
         match held.map_err(|e| classified(e, at))? {
-            Some(held) => Ok(held
+            Some(held) => match held
                 .properties
                 .get("collection")
                 .and_then(|owner| owner.as_str())
-                .map(str::to_string)),
+            {
+                Some(owner) => Ok(Some(owner.to_string())),
+                None => Err(eyre::eyre!(
+                    "the marker of '{what}' in tenant '{}' records no owner",
+                    at.reads.id()
+                )),
+            },
             None => at
                 .reads
                 .collections()

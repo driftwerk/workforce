@@ -20,7 +20,7 @@ use uuid::Uuid;
 use vellev_client::api::{Change, Content, Page};
 use vellev_core::{Collection, CollectionName, DataType, Embedding, ObjectId, Property};
 
-use crate::{classified, collection, Cap, Tenants};
+use crate::{classified, collection, failure, Asked, Cap, Tenants};
 
 /// Makes the vectors of documents, outside the node.
 #[async_trait]
@@ -218,15 +218,22 @@ struct Probe {
 }
 
 impl Probe {
-    async fn dropped(mut self) -> Result<()> {
+    /// Drop the probe from the tenant `at`, where it embeds with `model`.
+    async fn dropped(mut self, at: &Tenants, model: &str) -> Result<()> {
         let Some(records) = self.records.take() else {
             return Ok(());
         };
         match records.drop().await {
-            Err(e) if !e.is_not_found() => Err(eyre::Report::new(e).wrap_err(format!(
-                "the collection made to embed with the node, '{}', was not dropped",
-                self.name
-            ))),
+            Err(e) if !e.is_not_found() => {
+                let asked = Asked::Request {
+                    name: &self.name,
+                    model,
+                };
+                Err(failure(e, at, asked).wrap_err(format!(
+                    "the collection made to embed with the node, '{}', was not dropped",
+                    self.name
+                )))
+            }
             _ => Ok(()),
         }
     }
@@ -374,7 +381,7 @@ impl DocumentEmbedder for NodeEmbedder {
         };
         match (
             self.made(&probe, &records, texts).await,
-            made.dropped().await,
+            made.dropped(&self.tenants, &self.embedding.model).await,
         ) {
             (Ok(vectors), Ok(())) => Ok(vectors),
             (Err(e), Ok(())) | (Ok(_), Err(e)) => Err(e),

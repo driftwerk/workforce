@@ -343,7 +343,8 @@ pub trait SearchedByVector: Send + Sync {
     async fn nearest(&self, to: NearestTo<'_>, repo_id: &str, limit: usize) -> Result<Vec<Near>>;
     /// For each vector, its `limit` nearest entities of `repo_id` by a scan of every
     /// one, in the node's order (distance, then object), and its distance to the
-    /// object named beside it. With no vector asked, nothing is listed.
+    /// object named beside it. With no vector asked, nothing is listed; with a
+    /// `limit` of 0, every entity is still listed, so that `held` is counted.
     async fn nearest_exactly(
         &self,
         asked: &[(&[f32], Option<&str>)],

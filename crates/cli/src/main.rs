@@ -463,7 +463,8 @@ enum Commands {
         config: PathBuf,
         /// SQLite source `codegraph.db`. Defaults to the code graph under
         /// `[knowledge] data_dir`, else `root`, else `hub.data_dir`, as the
-        /// hub's shared (multi-agent) knowledge service keeps it.
+        /// hub's shared (multi-agent) knowledge service keeps it. An agent
+        /// whose own `[knowledge]` overrides these needs `--from`.
         #[arg(long)]
         from: Option<PathBuf>,
     },
