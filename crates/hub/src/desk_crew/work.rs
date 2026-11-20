@@ -244,12 +244,14 @@ impl CrewHub {
     /// Spends one of the hour's work turns of the overseer that runs
     /// `session` if it has one left: each overseer's are its own. When none
     /// is, when the next frees, and the person is told once that the
-    /// overseer is pacing itself.
+    /// overseer is pacing itself. With no overseer over it there is no
+    /// hour to spend from: its turn goes on, and finds no boss to answer
+    /// it (the person is given what it asks).
     pub(crate) fn spend_work_turn(&self, session: Uuid) -> Result<(), Instant> {
         let hour = self.timing.minute * 60;
         let now = Instant::now();
         let Some((service, o)) = self.overseer_of_session(session) else {
-            return Err(now + hour);
+            return Ok(());
         };
         // At Act fully in force no count of turns holds it back: its
         // budget, the audit and Stop do.
@@ -261,8 +263,7 @@ impl CrewHub {
         let run = runs
             .entry(service.agent_id.as_str().to_string())
             .or_default();
-        if spend(&mut run.turns, now, hour, max) {
-            run.told = false;
+        if spend_run(run, now, hour, max) {
             return Ok(());
         }
         let frees = run.turns.first().copied().unwrap_or(now) + hour;

@@ -1892,6 +1892,96 @@ async fn a_sessions_reports_to_the_boss_that_runs_it_are_never_refused_nor_count
 }
 
 #[tokio::test]
+async fn reports_to_a_boss_that_only_watches_the_session_it_holds_are_counted() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        d.set_bosses(vec![crate::service::Boss {
+            agent: "sarah".into(),
+            name: "Sarah".into(),
+            scope: crate::scope::Scope::Ungrouped,
+            level: "watch".into(),
+        }]);
+        let crew: Arc<dyn crate::crew::Crew> = Arc::new(Answering);
+        d.answer_lines_with(&crew);
+        std::mem::forget(crew);
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        d.take_on(
+            s.id,
+            &Party::manager("sarah", "Sarah"),
+            crate::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        assert!(!d.its_acting_boss(s.id, &Party::manager("sarah", "Sarah")));
+        for i in 0..crate::rooms::TURN_BUDGET {
+            tell_desk(&d, s.id, &format!("report {i}")).await.unwrap();
+        }
+        assert_eq!(
+            tell_desk(&d, s.id, "one more").await,
+            Err(Refusal::Budget.to_string()),
+            "a boss that only watches it has no turns that pace it"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn reports_and_the_answers_of_the_boss_that_runs_it_never_climb_the_hop() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let by = sarah_bosses(&d);
+        let crew: Arc<dyn crate::crew::Crew> = Arc::new(Answering);
+        d.answer_lines_with(&crew);
+        std::mem::forget(crew);
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        d.take_on(
+            s.id,
+            &Party::manager("sarah", "Sarah"),
+            crate::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        // Report, its boss's answer a hop on, taken in: round after round,
+        // well past the hops a chain may run.
+        for round in 0..crate::rooms::MAX_HOPS * 3 {
+            let sent = tell_desk(&d, s.id, &format!("step {round} done"))
+                .await
+                .unwrap_or_else(|e| panic!("report {round} refused: {e}"));
+            let report = row(&d, serde_json::from_value(sent["id"].clone()).unwrap()).await;
+            assert_eq!(report.hop, 1, "round {round}");
+            let mut answer = by.clone();
+            answer.hop = report.hop + 1;
+            let told = d
+                .line_send(Sender::Overseer(answer), tell(s.id, "Go on."))
+                .await
+                .unwrap();
+            let next = d.line_next(s.id, Duration::from_secs(2)).await.unwrap();
+            assert_eq!(next["id"], json!(told.id));
+            d.line_ack(s.id, told.id, true).await.unwrap();
+        }
+        // A peer's words still lengthen its chain.
+        let peer = new_session(&d, dir.path()).await;
+        idle(&d, peer.id).await;
+        let from_peer = d
+            .line_send(Sender::Session(peer.id), tell(s.id, "Rebased."))
+            .await
+            .unwrap();
+        d.line_next(s.id, Duration::from_secs(2)).await.unwrap();
+        d.line_ack(s.id, from_peer.id, true).await.unwrap();
+        assert_eq!(d.line_run(s.id).cause, from_peer.hop);
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn a_session_its_boss_answers_goes_on_past_the_budget_up_to_the_ceiling() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();

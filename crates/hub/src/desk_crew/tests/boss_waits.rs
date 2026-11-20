@@ -440,3 +440,164 @@ async fn past_the_hours_turns_a_question_desk_only_watches_still_reaches_the_per
     })
     .await;
 }
+
+/// A session the boss runs, its turns for the hour spent.
+async fn paced_session(
+    max: u32,
+    reply: &str,
+    pool: workforce_postgres::PostgresPool,
+    dir: &std::path::Path,
+) -> (Arc<AgentService>, Arc<CrewHub>, Desk, uuid::Uuid) {
+    let (overseer, crew, d, _llm) = overseeing(
+        dir,
+        pool,
+        reply,
+        &format!(
+            "[oversight]\nenabled = true\nlevel = \"act\"\nact = {{ nudge = true }}\n\
+             work = {{ max_turns_per_hour = {max} }}\n"
+        ),
+        &[],
+    )
+    .await;
+    let s = new_session(&d, dir, "Legacy removal").await;
+    d.take_on(
+        s.id,
+        &workforce_desk::crew::Party::manager("desk", &super::super::name_of(&overseer)),
+        workforce_desk::charge::How::Handed,
+        &Default::default(),
+        &By::you(),
+    )
+    .await
+    .unwrap();
+    (overseer, crew, d, s.id)
+}
+
+/// The line turns `overseer` had for session `s`.
+fn line_turns(overseer: &AgentService, s: uuid::Uuid) -> usize {
+    overseer
+        .sessions
+        .find(&super::super::line::line_channel(s), PERSON)
+        .unwrap()
+        .map_or(0, |l| {
+            l.messages
+                .iter()
+                .filter(|m| m.content.starts_with(super::super::line::LINE))
+                .count()
+        })
+}
+
+/// A question from a session whose reports wait for its boss's next hour
+/// is never held with them: it is answered at once, the reports with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_question_behind_reports_waiting_for_the_next_hour_is_answered_at_once() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _crew, d, s) = paced_session(1, "Yes, drop it.", pool, dir.path()).await;
+        let tell = |text: &'static str| {
+            let d = d.clone();
+            async move {
+                d.line_call(s, "tell", &json!({"to": "desk", "text": text}), None)
+                    .await
+                    .unwrap();
+            }
+        };
+        tell("Inventory done: 14 legacy services on staging.").await;
+        eventually("its first report taken", async || {
+            (line_turns(&overseer, s) == 1).then_some(())
+        })
+        .await;
+        tell("Step 12 done: the queue is drained.").await;
+        eventually("the next report waiting for the next hour", async || {
+            (d.store().line_waiting_for_bosses().await.unwrap().len() == 1).then_some(())
+        })
+        .await;
+        let asked_at = std::time::Instant::now();
+        let asked = d
+            .line_call(
+                s,
+                "ask",
+                &json!({"to": "desk", "text": "Drop the legacy queue table?", "wait_seconds": 60}),
+                Some(std::time::Duration::from_millis(10)),
+            )
+            .await
+            .unwrap();
+        let ask: uuid::Uuid = serde_json::from_value(asked["id"].clone()).unwrap();
+        let q = eventually("its question answered", async || {
+            d.store()
+                .line_message(ask)
+                .await
+                .unwrap()
+                .filter(|q| q.asked != Some(workforce_desk::line::Asked::Open))
+        })
+        .await;
+        assert_eq!(
+            q.asked,
+            Some(workforce_desk::line::Asked::Answered),
+            "{q:?}"
+        );
+        assert!(
+            asked_at.elapsed() < std::time::Duration::from_secs(2),
+            "at once, not at the next hour nor the next look: {:?}",
+            asked_at.elapsed()
+        );
+        assert_eq!(
+            d.store().line_waiting_for_bosses().await.unwrap().len(),
+            0,
+            "the waiting report went with it"
+        );
+    })
+    .await;
+}
+
+/// Round after round of report and answer between a session and the boss
+/// that runs it: every report reaches the boss's turn, however many rounds
+/// (the chain never climbs to the hops that hand it to the person).
+#[tokio::test(flavor = "multi_thread")]
+async fn every_report_in_rounds_with_the_boss_that_runs_it_reaches_its_turn() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, s) = paced_session(50, "Noted.", pool, dir.path()).await;
+        let rounds = usize::try_from(workforce_desk::rooms::MAX_HOPS).unwrap() * 3;
+        for round in 1..=rounds {
+            let sent = d
+                .line_call(
+                    s,
+                    "tell",
+                    &json!({"to": "desk", "text": format!("Step {round} done.")}),
+                    None,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("report {round} refused: {e}"));
+            let report: uuid::Uuid = serde_json::from_value(sent["id"].clone()).unwrap();
+            eventually("its report taken by a turn", async || {
+                (line_turns(&overseer, s) == round).then_some(())
+            })
+            .await;
+            let hop = d.store().line_message(report).await.unwrap().unwrap().hop;
+            // The boss's answer, a hop on as its turn's is, taken in.
+            let mut by = crew.by_overseer("It reported.").unwrap();
+            by.hop = hop + 1;
+            crew.perform(
+                &nudge(s, &format!("Go on to step {}.", round + 1), None),
+                by,
+            )
+            .await
+            .unwrap();
+            let next = eventually("the answer on its line", async || {
+                d.line_next(s, std::time::Duration::from_millis(200)).await
+            })
+            .await;
+            let id: uuid::Uuid = serde_json::from_value(next["id"].clone()).unwrap();
+            d.line_ack(s, id, true).await.unwrap();
+        }
+        let channel = super::super::line::line_channel(s);
+        let line = overseer.sessions.find(&channel, PERSON).unwrap().unwrap();
+        assert!(
+            line.messages
+                .iter()
+                .any(|m| m.content.contains(&format!("Step {rounds} done."))),
+            "the last report reached its turn"
+        );
+    })
+    .await;
+}

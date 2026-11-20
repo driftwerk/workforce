@@ -93,6 +93,25 @@ pub(crate) fn straight_to_person(o: &Oversight, hop: i16, unbound: bool) -> Opti
     None
 }
 
+/// What of `messages` a line turn shows in full, in order: every question
+/// and its newest [`REPORTS_SHOWN`] reports; and the ids of the reports
+/// before them, said by id alone.
+fn shown_reports(messages: &[LineMessage]) -> (Vec<&LineMessage>, Vec<Uuid>) {
+    let reports = messages.iter().filter(|m| m.kind != LineKind::Ask).count();
+    let mut hidden = reports.saturating_sub(REPORTS_SHOWN);
+    messages
+        .iter()
+        .fold((Vec::new(), Vec::new()), |(mut shown, mut earlier), m| {
+            if hidden > 0 && m.kind != LineKind::Ask {
+                hidden -= 1;
+                earlier.push(m.id);
+            } else {
+                shown.push(m);
+            }
+            (shown, earlier)
+        })
+}
+
 impl CrewHub {
     /// Keeps the words of the question `action` answers, for the gate.
     pub(crate) async fn know_question(&self, action: &Action) {
@@ -679,16 +698,9 @@ impl CrewHub {
         };
         // Its newest reports in full, with every question; what it said
         // before them, by id.
-        let reports = messages.iter().filter(|m| m.kind != LineKind::Ask).count();
-        let earlier: Vec<Uuid> = messages
-            .iter()
-            .filter(|m| m.kind != LineKind::Ask)
-            .take(reports.saturating_sub(REPORTS_SHOWN))
-            .map(|m| m.id)
-            .collect();
-        let lines: Vec<String> = messages
-            .iter()
-            .filter(|m| !earlier.contains(&m.id))
+        let (shown, earlier) = shown_reports(messages);
+        let lines: Vec<String> = shown
+            .into_iter()
             .map(|m| {
                 let kind = match (m.kind, m.in_reply_to) {
                     (LineKind::Ask, _) => "asks".to_string(),
@@ -774,45 +786,51 @@ impl CrewHub {
         }
     }
 
-    /// Questions asked of an overseer that is gone, or never got their
-    /// turn (the hub stopped first): taken up by the overseer of the
-    /// session's scope now, or given to the person when there is none. One
-    /// asked in another scope than the session's now is never re-pointed
-    /// to this one's overseer: it goes to the person.
     /// Whether `messages` from `session` would start a line turn of their
-    /// own that its boss's hour of turns paces: reports, no question, from
-    /// a session it runs and is set to hear.
+    /// own that its boss's hour of turns paces: reports alone, each to the
+    /// boss that runs it at a level that gives it turns. The same test that
+    /// keeps them out of the loop guard's counts
+    /// ([`workforce_desk::Desk::its_acting_boss`]): what isn't counted
+    /// there is paced here.
     fn reports_paced(&self, session: Uuid, messages: &[LineMessage]) -> bool {
         !messages.is_empty()
-            && messages.iter().all(|m| m.kind != LineKind::Ask)
-            && self.still_works(session)
-            && self.overseer_of_session(session).is_some_and(|(s, o)| {
-                let hop = messages.iter().map(|m| m.hop).max().unwrap_or(0);
-                straight_to_person(&o, hop, self.unbound(&o)).is_none()
-                    && self.person(Some(&s)).is_some()
-            })
+            && messages
+                .iter()
+                .all(|m| m.kind == LineKind::Tell && self.desk.its_acting_boss(session, &m.to))
     }
 
     /// Keeps the reports `waiting` for their boss's next turn as waiting:
-    /// a restart before it gathers them again.
+    /// a restart before it gathers them again. One statement for them all.
     async fn wait_for_next_turn(&self, waiting: &mut [LineMessage]) {
-        for m in waiting.iter_mut().filter(|m| m.kind == LineKind::Tell) {
-            match self.desk.store().line_wait_for_boss(m.id).await {
-                Ok(true) => m.delivery = Delivery::Queued,
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::warn!(message = %m.id, error = %e, "a report couldn't be kept waiting")
-                }
-            }
+        let heard: Vec<Uuid> = waiting
+            .iter()
+            .filter(|m| m.kind == LineKind::Tell && m.delivery == Delivery::Delivered)
+            .map(|m| m.id)
+            .collect();
+        if heard.is_empty() {
+            return;
+        }
+        match self.desk.store().line_wait_for_boss(&heard).await {
+            Ok(moved) => waiting
+                .iter_mut()
+                .filter(|m| moved.contains(&m.id))
+                .for_each(|m| m.delivery = Delivery::Queued),
+            Err(e) => tracing::warn!(error = %e, "reports couldn't be kept waiting"),
         }
     }
 
     /// The reports in `messages` that waited for this turn, taken.
     async fn reports_taken(&self, messages: &[LineMessage]) {
-        for m in messages.iter().filter(|m| m.delivery == Delivery::Queued) {
-            if let Err(e) = self.desk.store().line_take(m.id, Delivery::Delivered).await {
-                tracing::warn!(message = %m.id, error = %e, "a report taken wasn't marked");
-            }
+        let waited: Vec<Uuid> = messages
+            .iter()
+            .filter(|m| m.kind == LineKind::Tell && m.delivery == Delivery::Queued)
+            .map(|m| m.id)
+            .collect();
+        if waited.is_empty() {
+            return;
+        }
+        if let Err(e) = self.desk.store().line_reports_taken(&waited).await {
+            tracing::warn!(error = %e, "reports taken weren't marked");
         }
     }
 
@@ -834,6 +852,11 @@ impl CrewHub {
         })
     }
 
+    /// Questions asked of an overseer that is gone, or never got their
+    /// turn (the hub stopped first): taken up by the overseer of the
+    /// session's scope now, or given to the person when there is none. One
+    /// asked in another scope than the session's now is never re-pointed
+    /// to this one's overseer: it goes to the person.
     async fn take_up_open_asks(&self) -> HashMap<Uuid, Vec<LineMessage>> {
         let mut by_session: HashMap<Uuid, Vec<LineMessage>> = HashMap::new();
         let asks = match self.desk.store().line_open_asks(None).await {
@@ -952,6 +975,7 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     let mut asked_at: Option<Instant> = None;
     loop {
         let mut look = false;
+        let mut lagged = false;
         tokio::select! {
             () = cancel.cancelled() => return,
             received = events.recv() => match received {
@@ -992,7 +1016,13 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 Ok(DeskEvent::Session { .. }) => {
                     look = looked.is_none_or(|at| at.elapsed() >= Duration::from_secs(1));
                 }
-                Ok(_) | Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Lagged(missed)) => {
+                    // Its questions are read again from the store: none
+                    // missed is left unanswered.
+                    tracing::warn!(missed, "the line loop fell behind Desk's events");
+                    lagged = true;
+                }
+                Ok(_) => {}
                 Err(RecvError::Closed) => return,
             },
             // A turn's end the boss's fast call handed to its full turn.
@@ -1005,6 +1035,19 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 }
             }
             _ = tick.tick() => {}
+        }
+        // A session's turn running now has its questions: only the others'
+        // are taken up again.
+        if lagged {
+            let asked = crew.take_up_open_asks().await;
+            for (session, asks) in asked.into_iter().filter(|(s, _)| !running.contains_key(s)) {
+                let g = gathering.entry(session).or_insert_with(Gathered::new);
+                for ask in asks {
+                    if !g.messages.iter().any(|m| m.id == ask.id) {
+                        g.messages.push(ask);
+                    }
+                }
+            }
         }
         // What the sessions a boss runs ask Desk to allow, at most twice a
         // second: each open request it can answer and hasn't been given.
@@ -1031,7 +1074,8 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
             .iter()
             .filter(|(s, g)| {
                 g.since.elapsed() >= GATHER
-                    && g.retry.is_none_or(|at| at <= Instant::now())
+                    && (g.retry.is_none_or(|at| at <= Instant::now())
+                        || g.messages.iter().any(|m| m.kind == LineKind::Ask))
                     && !running.contains_key(s)
             })
             .map(|(s, g)| (*s, g.since))
@@ -1097,7 +1141,10 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                         session,
                         Gathered {
                             since,
-                            retry: Some(frees),
+                            // Looked at again soon, not only when the hour
+                            // frees one: the person may raise the cap or
+                            // turn on Act fully meanwhile.
+                            retry: Some(frees.min(Instant::now() + GATHER)),
                             messages: waiting,
                             ended: std::mem::take(&mut ended),
                             asks: std::mem::take(&mut asks),
@@ -1157,6 +1204,47 @@ mod tests {
             .iter()
             .all(|s| matches!(s, Settle::Escalate(_))));
         assert!(settle(Ok("done"), 0).is_empty(), "the tools answered");
+    }
+
+    #[test]
+    fn a_turn_shows_every_question_and_its_newest_reports_and_the_rest_by_id() {
+        let from = crew::Party {
+            kind: PartyKind::Session,
+            id: Uuid::new_v4().to_string(),
+            name: "Legacy removal".into(),
+            engine: None,
+            origin: None,
+        };
+        let to = crew::Party::manager("desk", "Desk");
+        let said = |kind, text: String| LineMessage::new(from.clone(), to.clone(), kind, text, 1);
+        let mut messages: Vec<LineMessage> = (0..REPORTS_SHOWN + 5)
+            .map(|i| said(LineKind::Tell, format!("step {i} done")))
+            .collect();
+        messages.insert(2, said(LineKind::Ask, "Drop the queue table?".into()));
+        let (shown, earlier) = shown_reports(&messages);
+        assert_eq!(
+            earlier,
+            messages
+                .iter()
+                .filter(|m| m.kind == LineKind::Tell)
+                .take(5)
+                .map(|m| m.id)
+                .collect::<Vec<_>>(),
+            "the oldest reports, by id"
+        );
+        assert_eq!(shown.len(), REPORTS_SHOWN + 1);
+        assert_eq!(
+            shown[0].text, "Drop the queue table?",
+            "every question, in its place"
+        );
+        assert_eq!(shown[1].text, "step 5 done");
+        assert_eq!(
+            shown[REPORTS_SHOWN].text,
+            format!("step {} done", REPORTS_SHOWN + 4)
+        );
+        let few = &messages[..4];
+        assert_eq!(shown_reports(few).0.len(), 4);
+        assert!(shown_reports(few).1.is_empty());
     }
 
     #[test]

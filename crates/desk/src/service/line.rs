@@ -312,13 +312,31 @@ impl Desk {
             .map(|c| c.boss)
     }
 
-    /// Whether `to` is the boss that runs `id`, at a level that gives it
-    /// turns of its own for `id`'s line: what `id` tells it then is paced
-    /// by those turns, never refused by the loop guard's counts.
-    fn reports_to_its_boss(&self, id: Uuid, to: &Party) -> bool {
-        to.kind == PartyKind::Manager
-            && self.running_boss(id).is_some_and(|b| b == to.id)
-            && self.boss_acts(&to.id)
+    /// Whether `boss` is the boss that runs `id`, at a level that gives it
+    /// turns of its own for `id`'s line. What `id` tells it then is paced
+    /// by those turns (the hub's `reports_paced` asks the same), never
+    /// refused by the loop guard's counts; and their exchange is the work,
+    /// not a chain handed on: what it says to `id` doesn't climb the hop.
+    pub fn its_acting_boss(&self, id: Uuid, boss: &Party) -> bool {
+        boss.kind == PartyKind::Manager
+            && self.running_boss(id).is_some_and(|b| b == boss.id)
+            && self.boss_acts(&boss.id)
+    }
+
+    /// `m` went into `id`: its run's chain is as long as `m`'s hop, unless
+    /// `m` is from the boss that runs it ([`Self::its_acting_boss`]).
+    fn run_heard(&self, id: Uuid, m: &LineMessage) {
+        if self.its_acting_boss(id, &m.from) {
+            return;
+        }
+        self.0
+            .state
+            .lock()
+            .lines
+            .runs
+            .entry(id)
+            .or_default()
+            .delivered(m.hop);
     }
 
     /// Whether `boss` is `id`'s own boss.
@@ -696,7 +714,7 @@ impl Desk {
                     self.line_reach(),
                     &bossed,
                 )?;
-                let to_its_boss = self.reports_to_its_boss(me.id, &recipient);
+                let to_its_boss = self.its_acting_boss(me.id, &recipient);
                 if let Err(r) = line::guard(checked, &run, &recipient, to_its_boss) {
                     // Only the budget its boss's answers renew is lifted
                     // by them.
@@ -838,7 +856,7 @@ impl Desk {
         }
         match &from {
             Sender::Session(id) => {
-                let to_its_boss = self.reports_to_its_boss(*id, &m.to);
+                let to_its_boss = self.its_acting_boss(*id, &m.to);
                 self.0
                     .state
                     .lock()
@@ -1086,7 +1104,7 @@ impl Desk {
                 self.person_spoke(v.id)
             }
             (Sender::Session(id), _) => {
-                let to_its_boss = self.reports_to_its_boss(*id, &question.from);
+                let to_its_boss = self.its_acting_boss(*id, &question.from);
                 self.0
                     .state
                     .lock()
@@ -1161,14 +1179,7 @@ impl Desk {
                 .await?
             {
                 if let Some(asker) = taken.to_session() {
-                    self.0
-                        .state
-                        .lock()
-                        .lines
-                        .runs
-                        .entry(asker)
-                        .or_default()
-                        .delivered(taken.hop);
+                    self.run_heard(asker, &taken);
                 }
                 self.line_announce(&taken);
                 return Ok(Some(taken));
@@ -1569,14 +1580,7 @@ impl Desk {
     }
 
     pub(super) fn line_delivered_into(&self, id: Uuid, m: &LineMessage) {
-        self.0
-            .state
-            .lock()
-            .lines
-            .runs
-            .entry(id)
-            .or_default()
-            .delivered(m.hop);
+        self.run_heard(id, m);
         self.line_announce(m);
     }
 
@@ -1768,16 +1772,7 @@ impl Desk {
     /// in, at its hop.
     pub(super) async fn line_heard(&self, id: Uuid, mark: &str) {
         match self.0.store.line_marked(&id.to_string(), mark).await {
-            Ok(Some(m)) => {
-                self.0
-                    .state
-                    .lock()
-                    .lines
-                    .runs
-                    .entry(id)
-                    .or_default()
-                    .delivered(m.hop);
-            }
+            Ok(Some(m)) => self.run_heard(id, &m),
             Ok(None) => {}
             Err(e) => {
                 tracing::warn!(session = %id, error = %e, "couldn't read a line message back")

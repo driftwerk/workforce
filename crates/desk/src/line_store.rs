@@ -580,20 +580,36 @@ impl DeskStore {
             .get(0))
     }
 
-    /// Holds a session's report its boss heard for the boss's next turn:
-    /// waiting again, so a restart before that turn gathers it again.
-    /// Whether it moved.
-    pub async fn line_wait_for_boss(&self, id: Uuid) -> Result<bool> {
+    /// Holds the sessions' reports `ids` their boss heard for the boss's
+    /// next turn: waiting again, so a restart before that turn gathers
+    /// them again. The ids of those that moved.
+    pub async fn line_wait_for_boss(&self, ids: &[Uuid]) -> Result<Vec<Uuid>> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .query(
+                "UPDATE line_messages SET delivery = 'queued', delivered_at = NULL, \
+                 updated_at = now() WHERE id = ANY($1) AND delivery = 'delivered' \
+                 AND kind = 'tell' AND recipient ->> 'kind' = 'manager' RETURNING id",
+                &[&ids],
+            )
+            .await?
+            .iter()
+            .map(|r| r.get(0))
+            .collect())
+    }
+
+    /// The reports `ids` that waited for their boss's turn, taken by it:
+    /// delivered.
+    pub async fn line_reports_taken(&self, ids: &[Uuid]) -> Result<u64> {
         let client = self.pool().get().await?;
         Ok(client
             .execute(
-                "UPDATE line_messages SET delivery = 'queued', delivered_at = NULL, \
-                 updated_at = now() WHERE id = $1 AND delivery = 'delivered' AND kind = 'tell' \
-                 AND recipient ->> 'kind' = 'manager'",
-                &[&id],
+                "UPDATE line_messages SET delivery = 'delivered', delivered_at = now(), \
+                 updated_at = now() WHERE id = ANY($1) AND delivery = 'queued' \
+                 AND kind = 'tell' AND recipient ->> 'kind' = 'manager'",
+                &[&ids],
             )
-            .await?
-            > 0)
+            .await?)
     }
 
     /// The sessions' reports that wait for their boss's next turn, oldest
@@ -860,20 +876,23 @@ mod tests {
             s.put_line(&m).await.unwrap();
             s.put_line(&to_you).await.unwrap();
             assert!(s.line_waiting_for_bosses().await.unwrap().is_empty());
-            assert!(s.line_wait_for_boss(m.id).await.unwrap());
-            assert!(!s.line_wait_for_boss(m.id).await.unwrap(), "once");
-            assert!(
-                !s.line_wait_for_boss(to_you.id).await.unwrap(),
+            assert_eq!(
+                s.line_wait_for_boss(&[m.id, to_you.id]).await.unwrap(),
+                [m.id],
                 "only a report to a boss"
+            );
+            assert!(
+                s.line_wait_for_boss(&[m.id]).await.unwrap().is_empty(),
+                "once"
             );
             let waiting = s.line_waiting_for_bosses().await.unwrap();
             assert_eq!(waiting.iter().map(|w| w.id).collect::<Vec<_>>(), [m.id]);
             assert_eq!(waiting[0].delivered_at, None);
-            s.line_take(m.id, Delivery::Delivered)
-                .await
-                .unwrap()
-                .unwrap();
+            assert_eq!(s.line_reports_taken(&[m.id, to_you.id]).await.unwrap(), 1);
             assert!(s.line_waiting_for_bosses().await.unwrap().is_empty());
+            let taken = s.line_message(m.id).await.unwrap().unwrap();
+            assert_eq!(taken.delivery, Delivery::Delivered);
+            assert!(taken.delivered_at.is_some());
         })
         .await;
     }
