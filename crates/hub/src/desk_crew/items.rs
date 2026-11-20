@@ -956,9 +956,11 @@ impl CrewHub {
                 }
                 continue;
             }
-            let chase_on = i
-                .session
-                .filter(|_| i.chased_at.is_none() && self.level_now(&i.boss, &o).0.acts());
+            let chase_on = i.session.filter(|s| {
+                i.chased_at.is_none()
+                    && !self.session_ended(*s)
+                    && self.level_now(&i.boss, &o).0.acts()
+            });
             let next = chase_on.map(|_| now + self.crew_minutes(OWED_MINUTES));
             match self
                 .desk

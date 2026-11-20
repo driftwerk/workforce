@@ -927,6 +927,39 @@ async fn a_due_promise_whose_session_ended_is_said_once() {
     .await;
 }
 
+/// At Act, a due promise whose session ended wakes no one: there is no
+/// session to read. It is said once, as still owed and no longer tracked.
+#[tokio::test(flavor = "multi_thread")]
+async fn at_act_a_due_promise_whose_session_ended_is_said_once_and_wakes_no_one() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        let s = new_session(&d, dir.path(), "Legacy removal").await;
+        let since = chrono::Utc::now();
+        d.forget(s.id).await.unwrap();
+        let p = NewItem::promise(
+            "desk",
+            s.id,
+            "Bring you the partner-docs differences",
+            "brought",
+        )
+        .due(Some(since));
+        let opened = match d.store().item_open(&p).await.unwrap() {
+            workforce_desk::open_item_store::Opened::New(i)
+            | workforce_desk::open_item_store::Opened::Again(i) => i,
+        };
+        let told = eventually("the person told", async || {
+            said(&overseer, "Still owed to you: ")
+        })
+        .await;
+        assert!(told.ends_with("so I'm no longer tracking it."), "{told}");
+        let closed = d.store().open_item(opened.id).await.unwrap().unwrap();
+        assert_eq!(closed.closed_by, Some(ClosedBy::Lapsed));
+        assert_eq!(d.store().wake_ups_since("desk", since).await.unwrap(), 0);
+    })
+    .await;
+}
+
 /// A chase moves only the due time it read: never one chased, asked afresh
 /// or closed since; asking afresh starts its chase over.
 #[tokio::test(flavor = "multi_thread")]
