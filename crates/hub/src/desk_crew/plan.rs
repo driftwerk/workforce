@@ -1268,15 +1268,7 @@ impl CrewHub {
             .ok_or("Say why: the person reads it.")?;
         // Only its own, in its scope: any other is refused as one that
         // isn't there.
-        let detail = match self.desk.plan(id).await {
-            Ok(p)
-                if p.summary.plan.boss == b.service.agent_id.as_str()
-                    && b.seen.sees(p.summary.plan.group.as_deref()) =>
-            {
-                p
-            }
-            _ => return Err(self.not_ours(&o.scope)),
-        };
+        let detail = self.own_plan(b, id).await?;
         let known: HashMap<String, Uuid> = detail
             .tickets
             .iter()

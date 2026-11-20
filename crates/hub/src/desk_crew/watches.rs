@@ -150,8 +150,7 @@ impl CrewHub {
         input: &Value,
     ) -> Result<Value, String> {
         let boss = b.service.agent_id.as_str();
-        // What a wait is for is its own scope's, refused before anything
-        // else is looked at, as every crew tool refuses one outside it.
+        // Its scope is checked first.
         let (session, plan) = match name == WATCH {
             true => self.watched_for(b, input).await?,
             false => (None, None),
@@ -263,12 +262,7 @@ impl CrewHub {
                     .trim()
                     .parse::<Uuid>()
                     .map_err(|_| "plan_id is a plan's id.")?;
-                match self.desk.plan(id).await {
-                    Ok(p)
-                        if p.summary.plan.boss == b.service.agent_id.as_str()
-                            && b.seen.sees(p.summary.plan.group.as_deref()) => {}
-                    _ => return Err(self.not_ours(&b.oversight.scope)),
-                }
+                self.own_plan(b, id).await?;
                 Some(id)
             }
             None => None,
