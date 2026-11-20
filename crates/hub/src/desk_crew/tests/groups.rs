@@ -557,11 +557,21 @@ fn pointed_at(name: &str, mine: Option<&str>, other: &Client, dir: &Path) -> Vec
             }
             cases
         }
+        // A wait is for a session in its scope or a plan of its own there,
+        // refused before anything else is looked at.
+        super::super::watches::WATCH => vec![
+            (json!({ "minutes": 5, "session_id": s, "note": r }), true),
+            (
+                json!({ "minutes": 5, "plan_id": other.plan.to_string(), "note": r }),
+                true,
+            ),
+        ],
+        // Its own waits alone, kept by boss and person.
+        super::super::watches::WATCHES => vec![(json!({}), false)],
         // Always the person's yes, and even then never another scope's.
-        super::super::tickets::DELETE => vec![(
-            json!({ "ticket": other.ticket, "reason": r }),
-            true,
-        )],
+        super::super::tickets::DELETE => {
+            vec![(json!({ "ticket": other.ticket, "reason": r }), true)]
+        }
         other => {
             panic!("{other} is a crew tool with no case here: say how it is kept to its scope")
         }

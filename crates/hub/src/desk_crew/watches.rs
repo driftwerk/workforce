@@ -150,6 +150,12 @@ impl CrewHub {
         input: &Value,
     ) -> Result<Value, String> {
         let boss = b.service.agent_id.as_str();
+        // What a wait is for is its own scope's, refused before anything
+        // else is looked at, as every crew tool refuses one outside it.
+        let (session, plan) = match name == WATCH {
+            true => self.watched_for(b, input).await?,
+            false => (None, None),
+        };
         let person = workforce_agent::runner::CURRENT_USER_ID
             .try_with(Clone::clone)
             .ok()
@@ -197,25 +203,6 @@ impl CrewHub {
         if note.is_empty() {
             return Err("Say in note why you wait and what you'll do when it ends.".into());
         }
-        let session = match input["session_id"].as_str() {
-            Some(s) => {
-                let id: Uuid = s
-                    .trim()
-                    .parse()
-                    .map_err(|_| "session_id is a session's id from crew.overview.")?;
-                self.session_seen(id, &b.seen)?;
-                Some(id)
-            }
-            None => None,
-        };
-        let plan = match input["plan_id"].as_str() {
-            Some(p) => Some(
-                p.trim()
-                    .parse::<Uuid>()
-                    .map_err(|_| "plan_id is a plan's id.")?,
-            ),
-            None => None,
-        };
         let hours = input["hours"]
             .as_i64()
             .unwrap_or(DEFAULT_HOURS)
@@ -249,6 +236,44 @@ impl CrewHub {
                 open.iter().map(|w| format!("{} ({})", w.what(), w.id)).collect::<Vec<_>>().join("; ")
             )),
         }
+    }
+
+    /// The session and the plan a wait is for, when it names them: a session
+    /// in `b`'s scope, and a plan of its own there. Any other is refused in
+    /// the words one that isn't there is.
+    async fn watched_for(
+        &self,
+        b: &Bound,
+        input: &Value,
+    ) -> Result<(Option<Uuid>, Option<Uuid>), String> {
+        let session = match input["session_id"].as_str() {
+            Some(s) => {
+                let id: Uuid = s
+                    .trim()
+                    .parse()
+                    .map_err(|_| "session_id is a session's id from crew.overview.")?;
+                self.session_seen(id, &b.seen)?;
+                Some(id)
+            }
+            None => None,
+        };
+        let plan = match input["plan_id"].as_str() {
+            Some(p) => {
+                let id = p
+                    .trim()
+                    .parse::<Uuid>()
+                    .map_err(|_| "plan_id is a plan's id.")?;
+                match self.desk.plan(id).await {
+                    Ok(p)
+                        if p.summary.plan.boss == b.service.agent_id.as_str()
+                            && b.seen.sees(p.summary.plan.group.as_deref()) => {}
+                    _ => return Err(self.not_ours(&b.oversight.scope)),
+                }
+                Some(id)
+            }
+            None => None,
+        };
+        Ok((session, plan))
     }
 
     /// `m` minutes as the crew counts them (shorter in tests).
