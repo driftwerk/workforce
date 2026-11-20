@@ -56,6 +56,27 @@ pub const READ: [&str; 27] = [
     super::watches::WATCH,
     super::watches::WATCHES,
 ];
+/// The tools that only look: a turn that called nothing else did nothing.
+const LOOKS: [&str; 18] = [
+    "crew.overview",
+    LOGINS,
+    "crew.activity",
+    "crew.account",
+    super::decisions::NAME,
+    "crew.history",
+    super::spend::NAME,
+    super::board::NAME,
+    super::find::NAME,
+    super::tickets::READ,
+    super::items::OPEN,
+    super::github::PR,
+    super::github::BRANCH,
+    super::github::CI,
+    super::assignments::LIST,
+    super::machines::MACHINES,
+    super::machines::FOLDERS,
+    super::watches::WATCHES,
+];
 pub const ACT: [&str; 32] = [
     "crew.nudge",
     "crew.ask_session",
@@ -1352,6 +1373,9 @@ impl Tool for CrewTool {
                 Err(why) => Err(why),
             }
         };
+        if result.is_ok() && !LOOKS.contains(&self.name) {
+            crew.acted_on(bound.service.agent_id.as_str(), None);
+        }
         Ok(match result {
             Ok(v) => ToolResult::success(v, ms()),
             Err(e) => ToolResult::failure(e, ms()),

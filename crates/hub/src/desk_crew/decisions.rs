@@ -287,17 +287,6 @@ impl CrewHub {
         )
     }
 
-    /// How many things `boss` has done (decisions and suggestions), about
-    /// any session or none.
-    pub(crate) fn acted_by(&self, boss: &str) -> u64 {
-        self.acted
-            .lock()
-            .iter()
-            .filter(|((b, _), _)| b == boss)
-            .map(|(_, n)| n)
-            .sum()
-    }
-
     /// `boss` did something about `session` (a decision, or a suggestion).
     pub(crate) fn acted_on(&self, boss: &str, session: Option<Uuid>) {
         *self
@@ -596,8 +585,6 @@ impl CrewHub {
             d.undo = Undo::Reverse;
             d.action = UndoPlan::GoAhead { session }.value();
         }
-        // Not something it did: a turn that left a session alone stays one
-        // that did nothing.
         self.keep_logged(&mut d).await;
     }
 

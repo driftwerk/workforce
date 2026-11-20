@@ -640,13 +640,14 @@ impl CrewHub {
             }
         }
         // A turn that did nothing, and suggested nothing, is a decision
-        // too: recorded here, never read from what it said.
-        if let Ok((_, reply)) = &ran {
-            if self.acted_mark(&boss, session) == mark {
-                self.record_nothing(&boss, session, !ended.is_empty(), reply)
-                    .await;
-            }
+        // too: recorded here, never read from what it said, and kept out
+        // of Activity.
+        let acted = self.acted_mark(&boss, session) != mark;
+        if let (Ok((_, reply)), false) = (&ran, acted) {
+            self.record_nothing(&boss, session, !ended.is_empty(), reply)
+                .await;
         }
+        self.turn_end_said(&boss, &line_channel(session), acted || ran.is_err());
         ran.is_ok()
     }
 

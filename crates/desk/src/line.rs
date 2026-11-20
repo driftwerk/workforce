@@ -114,14 +114,14 @@ pub fn in_turn(state: SessionState) -> bool {
 pub fn unstamped(text: &str) -> &str {
     let lead = text.trim_start();
     let past = lead.split_once(", ").and_then(|(who, rest)| {
-        let named = !who.is_empty()
-            && who.split(' ').count() <= 3
-            && who.chars().all(|c| c.is_alphanumeric() || c == ' ');
+        let words = who.split(' ').collect::<Vec<_>>();
+        let named = (1..=3).contains(&words.len())
+            && words
+                .iter()
+                .all(|w| !w.is_empty() && w.chars().all(char::is_alphanumeric));
         let (time, after) = rest.split_once('.')?;
-        let (h, m) = time.strip_suffix(" UTC").unwrap_or(time).split_once(':')?;
-        let clock = (1..=2).contains(&h.len())
-            && m.len() == 2
-            && h.chars().chain(m.chars()).all(|c| c.is_ascii_digit());
+        let time = time.strip_suffix(" UTC").unwrap_or(time);
+        let clock = chrono::NaiveTime::parse_from_str(time, "%H:%M").is_ok();
         let said = after.trim_start();
         (named && clock && after.starts_with(char::is_whitespace) && !said.is_empty())
             .then_some(said)
@@ -1911,6 +1911,8 @@ mod tests {
             "Desk, 00:21.5 is the version.",
             "Staging, then production, 02:45. Go.",
             "Watch #744, then report.",
+            "Desk, 25:99. Go.",
+            "Desk  Bot, 00:21. Go.",
         ] {
             assert_eq!(unstamped(kept), kept);
         }

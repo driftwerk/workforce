@@ -48,10 +48,9 @@ pub(super) struct Track {
     /// answers, stamped on each of its events.
     place: Option<Place>,
     message: Option<uuid::Uuid>,
-    /// A boss's turn on what woke it (a session's line or turn end, a
-    /// plan): how many things it had done before, so a turn that did
-    /// nothing is kept out of Activity.
-    quiet: Option<u64>,
+    /// A boss's line or work turn: its end is held, by boss and channel,
+    /// for its caller to say once it knows whether the turn did anything.
+    held: Option<(String, String)>,
     done: bool,
 }
 
@@ -143,14 +142,14 @@ impl CrewHub {
                 _person: person,
                 place,
                 message: asked,
-                quiet: None,
+                held: None,
                 done: false,
             });
         }
         if message.starts_with(CHECK_IN) {
             return None;
         }
-        let quiet = (overseer && woken(message)).then(|| self.acted_by(&agent_id));
+        let held = (overseer && woken(message)).then(|| (agent_id.clone(), channel.to_string()));
         // Its reply in the DM is running: what it would post there on its
         // own waits, so nothing lands in the middle of it.
         let dm_session = session_id
@@ -177,7 +176,7 @@ impl CrewHub {
                 last_activity: now,
             },
         );
-        if quiet.is_none() {
+        if held.is_none() {
             self.desk.note(
                 Event::new(
                     Kind::Started,
@@ -205,7 +204,7 @@ impl CrewHub {
             _person: None,
             place,
             message: asked,
-            quiet,
+            held,
             done: false,
         })
     }
@@ -255,13 +254,6 @@ impl Track {
         }
         let (ended, answer, question) =
             crew::outcome_of(outcome.as_deref().map_err(String::as_str));
-        if ended == Outcome::Finished
-            && self
-                .quiet
-                .is_some_and(|before| crew.acted_by(&self.party.id) == before)
-        {
-            return;
-        }
         let text = match (ended, &answer, &question) {
             (Outcome::Limit, _, _) => "hit a usage limit".to_string(),
             (Outcome::Asked, _, Some(q)) => format!("asked “{}”", q.text),
@@ -276,8 +268,28 @@ impl Track {
             text,
         )
         .detail(json!({ "task": self.task, "answer": answer, "question": question }))
-        .at_place(self.place.clone(), self.message);
-        crew.desk.note(event.hop(self.hop));
+        .at_place(self.place.clone(), self.message)
+        .hop(self.hop);
+        match self.held.take().filter(|_| ended == Outcome::Finished) {
+            Some(key) => {
+                crew.quiet_ends.lock().insert(key, event);
+            }
+            None => crew.desk.note(event),
+        }
+    }
+}
+
+impl CrewHub {
+    /// Says the end of `boss`'s line or work turn on `channel` once its
+    /// caller has settled what the turn did: only when it did something.
+    pub(super) fn turn_end_said(&self, boss: &str, channel: &str, acted: bool) {
+        let end = self
+            .quiet_ends
+            .lock()
+            .remove(&(boss.to_string(), channel.to_string()));
+        if let Some(event) = end.filter(|_| acted) {
+            self.desk.note(event);
+        }
     }
 }
 
@@ -313,10 +325,10 @@ impl Drop for Track {
     }
 }
 
-/// Whether `message` woke a boss on its own work (a session's line or turn
-/// end, a plan), not the person asking it something.
+/// Whether `message` woke a boss on a session's line or turn end, which
+/// its caller settles ([`CrewHub::turn_end_said`]).
 fn woken(message: &str) -> bool {
-    [super::line::LINE, super::work::WORK, super::plan::PLAN]
+    [super::line::LINE, super::work::WORK]
         .iter()
         .any(|p| message.starts_with(p))
 }

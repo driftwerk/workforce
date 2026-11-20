@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use workforce_common::channels::DESK_CHANNEL;
 use workforce_common::oversight::{Level, Oversight, Scope};
 use workforce_common::settings::AgentWorkspaceConfig;
-use workforce_desk::crew::{By, Crew, CrewAgent, LiveTurn, Overseer, Party, Suggestion};
+use workforce_desk::crew::{By, Crew, CrewAgent, Event, LiveTurn, Overseer, Party, Suggestion};
 use workforce_desk::floor::Need;
 use workforce_desk::Desk;
 
@@ -215,9 +215,13 @@ pub struct CrewHub {
     /// answer, by message: an answer is gated by what was asked as well as
     /// by what it says. One not known here is the person's.
     questions: Mutex<HashMap<uuid::Uuid, String>>,
-    /// How many decisions (and suggestions) each boss made, by the session
-    /// they were about: a line or work turn that moved none let it wait.
+    /// How many things each boss did (decisions, suggestions, its tools'
+    /// changes), by the session they were about: a line or work turn that
+    /// moved none let it wait.
     acted: Mutex<HashMap<(String, Option<uuid::Uuid>), u64>>,
+    /// The ends of line and work turns, by boss and channel, until their
+    /// caller knows whether the turn did anything ([`Self::turn_end_said`]).
+    quiet_ends: Mutex<HashMap<(String, String), Event>>,
     /// When each boss last asked the person with `crew.ask_person`: its
     /// turn's reply then isn't also kept as a question of its own.
     asked_person: Mutex<HashMap<String, DateTime<Utc>>>,
@@ -735,6 +739,7 @@ impl CrewHub {
             refused_steps: Mutex::default(),
             questions: Mutex::default(),
             acted: Mutex::default(),
+            quiet_ends: Mutex::default(),
             asked_person: Mutex::default(),
             asks_checked: Mutex::default(),
             turn_acts: Mutex::default(),
