@@ -3284,7 +3284,6 @@ pub(crate) mod tests {
             /// fragment that may read `$dir` and the run's number `$n`, and
             /// replying `default` unless scripted otherwise.
             pub(crate) fn new(name: &'static str, records: &str, default: &str) -> Self {
-                use std::os::unix::fs::PermissionsExt;
                 let dir = tempfile::tempdir().unwrap();
                 let script = format!(
                     r#"#!/bin/sh
@@ -3302,8 +3301,7 @@ pub(crate) mod tests {
                     dir.path().display()
                 );
                 let path = dir.path().join(name);
-                std::fs::write(&path, script).unwrap();
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+                workforce_common::executable::write(&path, script).unwrap();
                 let cli = Self { dir, name };
                 cli.script(None, default);
                 cli

@@ -2726,18 +2726,16 @@ mod tests {
 
     #[tokio::test]
     async fn an_accounts_sign_in_is_handed_over_to_the_admin_alone_and_never_kept() {
-        use std::os::unix::fs::PermissionsExt;
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
             // A Claude Code that signs in by a "good" token.
             let cli = dir.path().join("claude");
-            std::fs::write(
+            workforce_common::executable::write(
                 &cli,
                 "#!/bin/sh\ncase \"$1 $2\" in\n'--version ') echo '2.1.300 (Claude Code)' ;;\n\
                  'auth status') t=$(cat <&3 2>/dev/null); case \"$t\" in sk-ant-oat01-good*) echo '{\"loggedIn\":true,\"authMethod\":\"oauth_token\"}' ;; *) echo '{\"loggedIn\":false}' ;; esac ;;\nesac\n",
             )
             .unwrap();
-            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
             DeskStore::migrate(&pool).await.unwrap();
             let mut opts = options(dir.path());
             opts.programs.insert(crate::engine::Engine::Claude, cli);

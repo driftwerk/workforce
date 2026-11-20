@@ -31,9 +31,8 @@ const GLOBEX: &str = "g-globex";
 /// A stand-in program that keeps what it was started with, each start on
 /// its own line, and says where a Codex app-server was told to listen.
 fn fake_cli(dir: &Path, name: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join(format!("fake-{name}"));
-    std::fs::write(
+    workforce_common::executable::write(
         &path,
         format!(
             "#!/bin/sh\nif [ \"$1\" = app-server ]; then echo \"${{3#unix://}}\" > '{d}/listen'; else echo \"$@\" >> '{d}/{name}-args'; fi\nexec sleep 60\n",
@@ -41,7 +40,6 @@ fn fake_cli(dir: &Path, name: &str) -> PathBuf {
         ),
     )
     .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
 }
 
