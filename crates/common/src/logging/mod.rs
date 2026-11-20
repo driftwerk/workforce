@@ -649,4 +649,19 @@ mod tests {
         assert_eq!(parse_sampler_ratio(Some("1.5")), 1.0);
         assert_eq!(parse_sampler_ratio(Some("100")), 1.0);
     }
+
+    #[cfg(feature = "prometheus")]
+    #[test]
+    fn a_counter_increased_five_times_renders_five() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            (0..5).for_each(|_| metrics::counter!("rendered_total", "tenant" => "t").increment(1));
+        });
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(r#"rendered_total{tenant="t"} 5"#),
+            "{rendered}"
+        );
+    }
 }
