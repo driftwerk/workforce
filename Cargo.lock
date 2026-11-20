@@ -11826,7 +11826,6 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tracing",
- "tracing-subscriber",
  "tree-sitter",
  "tree-sitter-go",
  "tree-sitter-javascript",

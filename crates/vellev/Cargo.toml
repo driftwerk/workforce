@@ -23,7 +23,6 @@ vellev-core = { workspace = true }
 vellev-index = { workspace = true }
 
 [dev-dependencies]
-axum = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 workforce-vellev = { path = ".", features = ["testing"] }
 

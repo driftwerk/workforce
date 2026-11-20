@@ -1652,10 +1652,11 @@ mod tests {
         (root, service)
     }
 
-    /// A store like Weaviate's, keeping no track of its vectors'
-    /// completeness, that records what is put right in it, file by file.
+    /// A store that records what is put right in it, file by file. Like
+    /// Weaviate's it keeps no track of its vectors' completeness, unless
+    /// `misrouted`.
     #[derive(Default)]
-    struct Untracked {
+    struct Recording {
         dropped: std::sync::Mutex<Vec<String>>,
         indexed: std::sync::atomic::AtomicUsize,
         searched: std::sync::atomic::AtomicUsize,
@@ -1678,7 +1679,7 @@ mod tests {
         asked: std::sync::Mutex<std::collections::BTreeMap<&'static str, usize>>,
     }
 
-    impl Untracked {
+    impl Recording {
         fn refused(&self, method: &'static str) -> Result<()> {
             if !self.misrouted {
                 return Ok(());
@@ -1702,7 +1703,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl CodeVectorStore for Untracked {
+    impl CodeVectorStore for Recording {
         fn backend(&self) -> &'static str {
             self.named.unwrap_or(VectorKeys::WEAVIATE)
         }
@@ -1898,7 +1899,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_runs_notes_are_above_the_mark_its_lease_was_taken_at() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Untracked::default());
+        let store = Arc::new(Recording::default());
         let (root, service) = service_on(
             dir.path(),
             Arc::clone(&store) as Arc<dyn CodeVectorStore>,
@@ -1960,7 +1961,7 @@ mod tests {
     async fn each_run_holds_the_lease_under_its_own_id() {
         use std::sync::atomic::Ordering;
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Untracked::default());
+        let store = Arc::new(Recording::default());
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         *store.gate.lock().unwrap() = Some(Arc::clone(&gate));
         let (root, service) = service_on(
@@ -2078,7 +2079,7 @@ mod tests {
         };
         let (root, service) = service_with(
             dir.path(),
-            Arc::new(Untracked::default()),
+            Arc::new(Recording::default()),
             &config,
             Some(Arc::new(model.clone())),
         )
@@ -2153,16 +2154,16 @@ mod tests {
     async fn the_graph_keeps_vector_state_for_the_database_in_use_and_its_standby() {
         let dir = tempfile::tempdir().unwrap();
         let (_, service) =
-            service_on(dir.path(), Arc::new(Untracked::default()), "vellev").unwrap();
+            service_on(dir.path(), Arc::new(Recording::default()), "vellev").unwrap();
         let keys = service.graph().vector_keys();
         assert_eq!(
             (keys.active(), keys.standby()),
             ("weaviate", Some("vellev"))
         );
-        let (_, service) = service_on(dir.path(), Arc::new(Untracked::default()), " ").unwrap();
+        let (_, service) = service_on(dir.path(), Arc::new(Recording::default()), " ").unwrap();
         assert_eq!(service.graph().vector_keys().standby(), None);
         for refused in ["weaviate", "qdrant"] {
-            let made = service_on(dir.path(), Arc::new(Untracked::default()), refused);
+            let made = service_on(dir.path(), Arc::new(Recording::default()), refused);
             let error = format!("{:#}", made.err().expect("refused"));
             assert!(error.contains("vector_standby"), "{error}");
         }
@@ -2174,9 +2175,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_given_store_is_keyed_as_the_database_it_names() {
         let dir = tempfile::tempdir().unwrap();
-        let named = Untracked {
+        let named = Recording {
             named: Some(VectorKeys::VELLEV),
-            ..Untracked::default()
+            ..Recording::default()
         };
         assert!(!named.tracks_completeness());
         let (_, service) = service_on(dir.path(), Arc::new(named), "weaviate").unwrap();
@@ -2193,7 +2194,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn the_files_noted_for_a_store_that_keeps_no_track_are_put_right_in_it() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Untracked::default());
+        let store = Arc::new(Recording::default());
         let (root, service) = service_on(
             dir.path(),
             Arc::clone(&store) as Arc<dyn CodeVectorStore>,
@@ -3557,7 +3558,7 @@ mod tests {
         use workforce_codebase_knowledge::vector::CodeSearchUnavailable;
         for enabled in [false, true] {
             let dir = tempfile::tempdir().unwrap();
-            let store = Arc::new(Untracked::default());
+            let store = Arc::new(Recording::default());
             let config = KnowledgeConfig {
                 code_search_enabled: enabled,
                 ..KnowledgeConfig::default()
@@ -3590,10 +3591,10 @@ mod tests {
     #[tokio::test]
     async fn a_misrouted_fill_stops_the_repos_turn_and_keeps_its_pending_files() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Untracked {
+        let store = Arc::new(Recording {
             named: Some(VectorKeys::VELLEV),
             misrouted: true,
-            ..Untracked::default()
+            ..Recording::default()
         });
         let given = Arc::clone(&store) as Arc<dyn CodeVectorStore>;
         let (root, service) = service_on(dir.path(), given, "").unwrap();
