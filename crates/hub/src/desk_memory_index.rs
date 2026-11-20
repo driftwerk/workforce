@@ -446,19 +446,42 @@ mod tests {
         assert_ne!(object_id("a#0"), object_id("a#1"));
     }
 
-    /// A purge on a node that does not serve the tenant is told so.
+    /// A purge, of a collection the node says it holds, that the node
+    /// then does not serve is told so, by the drop and the deletion alike.
     #[tokio::test]
     async fn a_purge_the_node_does_not_serve_is_misrouted() {
-        let node = workforce_vellev::testing::NotServing::up().await;
-        let index = VellevDeskIndex::new(&node.url, "key", "harbor", Vec::new()).unwrap();
+        use axum::response::IntoResponse;
         let name = collection_of(None);
-        for purge in [Purge::All, Purge::Refs { refs: Vec::new() }] {
+        let held = memory_collection(&name).unwrap();
+        let schema = format!("/collections/{name}");
+        let app = axum::Router::new().fallback(
+            move |method: axum::http::Method, uri: axum::http::Uri| {
+                let read = method == axum::http::Method::GET && uri.path().ends_with(&schema);
+                let found = read.then(|| held.clone());
+                async move {
+                    found.map_or_else(workforce_vellev::testing::not_served_here, |held| {
+                        axum::Json(held).into_response()
+                    })
+                }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let index = VellevDeskIndex::new(&url, "key", "harbor", Vec::new()).unwrap();
+        let misrouted = workforce_vellev::Unusable::Misrouted {
+            tenant: "harbor".into(),
+            node: url.clone(),
+        };
+        for purge in [
+            Purge::All,
+            Purge::Refs {
+                refs: vec![uuid::Uuid::new_v4()],
+            },
+        ] {
             let refused = index.purge(&name, &purge).await.unwrap_err();
-            assert_eq!(
-                refused.downcast_ref(),
-                Some(&node.misrouted("harbor")),
-                "{refused:?}"
-            );
+            assert_eq!(refused.downcast_ref(), Some(&misrouted), "{refused:?}");
+            assert!(format!("{refused:#}").contains("misrouted"), "{refused:#}");
         }
     }
 

@@ -11867,13 +11867,13 @@ impl WorkforceConfig {
         }
         // Only the prefixed names: vellev's own CLI reads VELLEV_API_KEY as
         // an admin key, which must not reach the hub by accident.
-        if let Ok(v) = var("WORKFORCE_VELLEV_URL") {
+        if let Ok(v) = var(VELLEV_URL.variable) {
             self.vellev.url = v;
         }
-        if let Ok(v) = var("WORKFORCE_VELLEV_API_KEY") {
+        if let Ok(v) = var(VELLEV_API_KEY.variable) {
             self.vellev.api_key = Some(v);
         }
-        if let Ok(v) = var("WORKFORCE_VELLEV_TENANT") {
+        if let Ok(v) = var(VELLEV_TENANT.variable) {
             self.vellev.tenant = v;
         }
         let code = &mut self.vellev.code;
