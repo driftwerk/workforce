@@ -1991,6 +1991,7 @@ mod one_mind;
 mod one_picture;
 mod preferences;
 mod promises;
+mod quiet_turns;
 mod repeats;
 mod silent_waits;
 mod stalls;

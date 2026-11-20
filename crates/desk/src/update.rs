@@ -1826,6 +1826,8 @@ mod tests {
             layout: Default::default(),
             prefer_scope: None,
             cant_decide: None,
+            due_at: None,
+            chased_at: None,
         }
     }
 
@@ -2019,6 +2021,8 @@ mod tests {
             layout: Default::default(),
             prefer_scope: None,
             cant_decide: None,
+            due_at: None,
+            chased_at: None,
         };
         // Plainly: its first sentence, no points, nothing recommended.
         let plain = NeedsYou::of(&i, now, false);

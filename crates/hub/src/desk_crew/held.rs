@@ -341,6 +341,8 @@ mod tests {
             closed_why: None,
             layout: Default::default(),
             cant_decide: None,
+            due_at: None,
+            chased_at: None,
         }
     }
 

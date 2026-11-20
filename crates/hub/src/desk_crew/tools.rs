@@ -56,6 +56,68 @@ pub const READ: [&str; 27] = [
     super::watches::WATCH,
     super::watches::WATCHES,
 ];
+/// The tools of [`READ`] that can change something (what the boss owes,
+/// what it was told, how it is run): every other one only looks.
+const KEEPS: [&str; 10] = [
+    super::items::ASK,
+    super::items::CLOSE,
+    super::items::PROMISE,
+    super::items::ORDER,
+    super::preferences::PREFER,
+    super::preferences::PREFERENCES,
+    super::directives::NAME,
+    super::cadence_tool::NAME,
+    super::watches::WATCH,
+    super::watches::WATCHES,
+];
+/// What `memory` does that only looks.
+const RECALLS: [&str; 5] = ["recall", "count", "overview", "timeline", "fetch_source"];
+
+/// Whether the call of `keeps`, one of [`KEEPS`], with `input` only read.
+fn only_reads(keeps: &str, input: &Value) -> bool {
+    match keeps {
+        super::preferences::PREFERENCES | super::directives::NAME => matches!(
+            input["action"].as_str().map(str::trim).unwrap_or_default(),
+            "" | "list"
+        ),
+        super::cadence_tool::NAME => {
+            super::cadence_tool::changes(input).is_ok_and(|c| c.is_empty())
+        }
+        super::watches::WATCHES => input["end"].is_null(),
+        _ => false,
+    }
+}
+
+/// Whether a call of `tool` with `input` only looked: a turn whose calls
+/// all did is one that did nothing. A tool not known to only look (a
+/// command run, a file written, a request that changes something) did
+/// something. Names match dotted or underscored, as the model calls them.
+pub(super) fn only_looks(tool: &str, input: &Value) -> bool {
+    let called = tool.replace('.', "_");
+    let named = |known: &str| known.replace('.', "_") == called;
+    if READ.iter().any(|t| named(t)) {
+        return KEEPS
+            .iter()
+            .find(|k| named(k))
+            .is_none_or(|k| only_reads(k, input));
+    }
+    // A node's tool, called by its underscored name: `node_<id>_<tool>`.
+    let node = || {
+        tool.strip_prefix("node_")
+            .and_then(|rest| rest.split_once('_'))
+            .map(|(id, rest)| format!("node.{id}.{rest}"))
+    };
+    crate::serve::CURATION_TOOL_PATTERNS
+        .iter()
+        .chain(crate::serve::CURATION_DATABASE_READ_TOOLS)
+        .chain(&workforce_skills::adapters::read_only_adapter_tools())
+        .any(|t| named(t))
+        || (named("memory")
+            && RECALLS.contains(&input["action"].as_str().map(str::trim).unwrap_or_default()))
+        || (named("http.request") && !workforce_agent::tools::http::is_mutating_request(input))
+        || crate::local_agent_registry::is_read_only_tool(tool)
+        || node().is_some_and(|n| crate::local_agent_registry::is_read_only_tool(&n))
+}
 pub const ACT: [&str; 32] = [
     "crew.nudge",
     "crew.ask_session",
@@ -1369,6 +1431,63 @@ impl Tool for CrewTool {
 mod tests {
     use super::*;
     use workforce_desk::model::{Engine, Origin};
+
+    #[test]
+    fn the_crew_reads_that_only_look_and_those_that_keep_something_are_every_read() {
+        let looks: Vec<&str> = READ
+            .iter()
+            .copied()
+            .filter(|t| {
+                only_looks(
+                    t,
+                    &json!({"action": "set", "end": "w1", "preset": "balanced"}),
+                )
+            })
+            .collect();
+        assert_eq!(
+            looks,
+            [
+                "crew.overview",
+                LOGINS,
+                "crew.activity",
+                "crew.account",
+                super::super::decisions::NAME,
+                "crew.history",
+                super::super::spend::NAME,
+                super::super::board::NAME,
+                super::super::find::NAME,
+                super::super::tickets::READ,
+                super::super::items::OPEN,
+                super::super::github::PR,
+                super::super::github::BRANCH,
+                super::super::github::CI,
+                super::super::assignments::LIST,
+                super::super::machines::MACHINES,
+                super::super::machines::FOLDERS,
+            ],
+            "a crew read that can change something is in KEEPS"
+        );
+        assert!(KEEPS.iter().all(|t| READ.contains(t)));
+        assert!(only_looks("crew.watches", &json!({})));
+        assert!(only_looks("crew.updates_cadence", &json!({})));
+        // Named as the model calls them, dotted or not.
+        assert!(only_looks("crew_overview", &json!({})));
+        assert!(!only_looks("crew_promise", &json!({})));
+        // A list of what the person said only looks; a change keeps it.
+        assert!(only_looks("crew_directives", &json!({})));
+        assert!(only_looks("crew.preferences", &json!({"action": "list"})));
+        assert!(!only_looks("crew.directives", &json!({"action": "add"})));
+        // Any other tool did something, unless it is known only to look.
+        assert!(only_looks("filesystem_read", &json!({"path": "a"})));
+        assert!(only_looks("jira.search", &json!({})));
+        assert!(only_looks("memory", &json!({"action": "recall"})));
+        assert!(!only_looks("memory", &json!({"action": "remember"})));
+        assert!(!only_looks("filesystem.write", &json!({"path": "a"})));
+        assert!(!only_looks("exec.run", &json!({"command": "ls"})));
+        assert!(only_looks("http.request", &json!({"method": "GET"})));
+        assert!(!only_looks("http.request", &json!({"method": "POST"})));
+        assert!(!only_looks("ssh.run", &json!({})));
+    }
 
     fn item(name: &str, hub_name: Option<&str>, group: Option<&str>) -> Item {
         Item {
