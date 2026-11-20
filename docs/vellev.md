@@ -659,3 +659,63 @@ compared with. A repo the store holds nothing of is filled as before.
 - **`--force`** is the explicit full refill. A seeding run
   (`reindex-vectors`) over a tenant that holds a repo adopts it too; one
   that would mostly embed should pass `--force`.
+
+## Comparing code search before a switch
+
+`workforce code compare run` measures whether code search on vellev finds
+what Weaviate's finds, on both stores directly and never through the
+question pipeline, before `[knowledge] vector_backend` is switched:
+
+```
+workforce code compare run --config workforce.toml \
+    --weaviate-url http://localhost:8080 \
+    --node-metrics http://localhost:9090/metrics \
+    --seed 7 --out runs/compare-1
+```
+
+- **What it measures.** Known items sampled from the code graph, by kind:
+  each entity's name, its doc's first sentence, and its summary's when
+  the summary is fresh (counted twice, since a summary's words are not in
+  what is embedded). Each is asked of both stores as the product asks it
+  (one repo, 20 results) and judged as the product shows the answer (each
+  result resolved to the graph's entity, repeats and entities the graph
+  does not hold dropped, the first 10 judged). `D`, vellev's hits less
+  Weaviate's, comes with a bootstrap interval that resamples entities
+  within kinds.
+- **Against what.** `--weaviate-url` names the Weaviate to compare with,
+  and is never `[weaviate] url`: point it at one restored from a backup
+  taken with the graph copy, so both describe the same moment.
+  `[weaviate] api_key` is read.
+- **Before it runs.** The vellev node must be idle (no fill, no other
+  client), because the node's own metrics tell whether a search
+  shortlisted, and its vellev backup must already be taken. Both code
+  collections must exist in the configured shape with an identity, and be
+  claimed for this graph; nothing is made or adopted, and a node that does
+  not serve the tenant fails at the first request. A SQLite graph is
+  hashed first; one whose `-wal` holds pages is refused.
+- **The probe.** To have the node make the query vectors, a collection
+  `WorkforceEmbedProbe…` is made in the tenant, written one text at a
+  time, and dropped. A probe that cannot be dropped fails the run, naming
+  it. Nothing else is written.
+- **The files**, under `--out` (made from `<out>.partial` once complete):
+  `queries.jsonl`, `vectors.jsonl`, `answers.jsonl`, `recall.jsonl`,
+  `report.json` and `SHA256SUMS`, which `shasum -a 256 -c SHA256SUMS`
+  verifies anywhere. An existing `--out`, or a `.partial` left by a run
+  that failed, is refused and never removed.
+- **The gates.** The lower bound of `D` must be at least −0.02 overall
+  and −0.05 for each kind of 300 queries or more. Every same query's
+  answer by its saved vector (the `--same-queries` a later check 4 asks
+  again) must be its text answer, and the node must
+  be seen applying its query prefix (`--no-prefix` says the model has
+  none, on purpose). Recall at 10 against an exact scan, over the
+  questions the node shortlisted, must be at least 0.97; with none
+  shortlisted it is reported exhaustive. A run with a failed gate still
+  writes its files, and exits non-zero naming the gate.
+- **Siblings.** Methods of one name in one file share an id in the
+  graph, which keeps one of them; Weaviate holds both. The report gives
+  `D_raw` (each store's answers as they came) and the share of targets
+  whose Weaviate answer holds a sibling the graph dropped, with the
+  graph's and each store's entity counts by repo in the manifest.
+- **Check 4.** `vectors.jsonl` and `answers.jsonl` hold the query vectors
+  and the node's answers to them, summed with the rest, so that the
+  serving node can be asked the same vectors before a switch.

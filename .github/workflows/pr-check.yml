@@ -435,6 +435,8 @@ jobs:
       # `vellev-node-tests.sh` requires to have run and passed.
       WORKFORCE_TEST_WEAVIATE_REQUIRED: "1"
       VELLEV_TEST_URL: http://127.0.0.1:8080
+      # The node's metrics, which the code comparison's recall tests read.
+      VELLEV_TEST_METRICS_URL: http://127.0.0.1:9090/metrics
       WORKFORCE_TEST_POSTGRES_URL: postgres://vellev:vellev@127.0.0.1:5432/vellev
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -459,6 +461,7 @@ jobs:
           chmod 0777 ~/vellev-models "$RUNNER_TEMP/vellev-data"
           docker run -d --name vellev --network host \
             -e VELLEV_LISTEN=127.0.0.1:8080 \
+            -e VELLEV_METRICS_LISTEN=127.0.0.1:9090 \
             -e VELLEV_DATABASE_URL=postgres://vellev:vellev@127.0.0.1:5432/vellev \
             -e VELLEV_STORE=file:///data/store \
             -e VELLEV_CACHE_DIR=/data/cache \

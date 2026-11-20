@@ -1924,6 +1924,80 @@ enum CodeCommand {
         #[command(flatten)]
         embed: EmbedArgs,
     },
+    /// Measure whether code search on vellev finds what Weaviate's finds,
+    /// on both stores directly, before a switch.
+    Compare {
+        #[command(subcommand)]
+        command: CompareCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CompareCommand {
+    /// Check 1: known items sampled from the code graph, asked of both
+    /// stores as the product asks them and judged as it shows them, with a
+    /// bootstrap interval of the difference. Check 2: the recall of vellev's
+    /// index against an exact scan. And whether the node applies its query
+    /// prefix. The node must be idle while it runs, and its backup taken
+    /// first: the one write is a collection the node embeds the questions
+    /// in, dropped at the end. A failed gate still writes the files and
+    /// their SHA256SUMS to --out, and exits non-zero naming it.
+    Run {
+        /// Workforce config file (reads `[knowledge]`, `[codegraph]`,
+        /// `[postgres]`, `[vellev]` and `[weaviate] api_key`).
+        #[arg(short, long, default_value = "workforce.toml")]
+        config: PathBuf,
+        /// The directory the code graph is kept under, instead of
+        /// `[knowledge] data_dir`.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        #[command(flatten)]
+        args: CompareArgs,
+    },
+}
+
+#[derive(clap::Args, Debug, Clone, PartialEq)]
+struct CompareArgs {
+    /// The Weaviate to compare with: the one restored for the purpose,
+    /// never `[weaviate] url`.
+    #[arg(long)]
+    weaviate_url: String,
+    /// The node's metrics (`VELLEV_METRICS_LISTEN`, `/metrics`).
+    #[arg(long)]
+    node_metrics: String,
+    /// Every random choice is made from it.
+    #[arg(long)]
+    seed: u64,
+    /// Where the run's files go; it must not exist.
+    #[arg(long)]
+    out: PathBuf,
+    #[arg(long, default_value_t = 2000)]
+    entities: usize,
+    #[arg(long, default_value_t = 500)]
+    recall_queries: usize,
+    #[arg(long, default_value_t = 200)]
+    same_queries: usize,
+    #[arg(long, default_value_t = 10000)]
+    resamples: usize,
+    /// The code model has no query prefix, on purpose.
+    #[arg(long)]
+    no_prefix: bool,
+}
+
+impl From<CompareArgs> for workforce_hub::code_compare::CompareOptions {
+    fn from(args: CompareArgs) -> Self {
+        Self {
+            seed: args.seed,
+            entities: args.entities,
+            recall_queries: args.recall_queries,
+            same_queries: args.same_queries,
+            resamples: args.resamples,
+            weaviate_url: args.weaviate_url,
+            node_metrics: args.node_metrics,
+            no_prefix: args.no_prefix,
+            out: args.out,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -12038,6 +12112,32 @@ Describe what you should do in this step and what to discuss with the user.
                 began.elapsed().as_secs_f64()
             );
         }
+        Commands::Code {
+            command:
+                CodeCommand::Compare {
+                    command:
+                        CompareCommand::Run {
+                            config,
+                            data_dir,
+                            args,
+                        },
+                },
+        } => {
+            let wf_config = workforce_common::settings::WorkforceConfig::load(&config)?;
+            let run = workforce_hub::code_compare::compare_code_search(
+                &wf_config,
+                data_dir.as_deref(),
+                args.into(),
+                &|said| println!("  {said}"),
+            )
+            .await?;
+            println!("{run}");
+            run.passed()?;
+            println!(
+                "{} code search on vellev passed every gate",
+                style("✓").green().bold()
+            );
+        }
         Commands::Permissions { command } => {
             handle_permissions_command(command).await?;
         }
@@ -13440,6 +13540,62 @@ mod tests {
         assert!(odd.seeding(workforce_vellev::LOCAL_MODEL).is_err());
     }
     use std::io::Write;
+
+    #[test]
+    fn code_search_is_compared_by_its_own_commands() {
+        let cli = Cli::try_parse_from([
+            "workforce",
+            "code",
+            "compare",
+            "run",
+            "--weaviate-url",
+            "http://localhost:8080",
+            "--node-metrics",
+            "http://localhost:9090/metrics",
+            "--seed",
+            "7",
+            "--out",
+            "runs/one",
+        ])
+        .unwrap();
+        let Commands::Code {
+            command:
+                CodeCommand::Compare {
+                    command:
+                        CompareCommand::Run {
+                            config,
+                            data_dir,
+                            args,
+                        },
+                },
+        } = cli.command
+        else {
+            panic!("the compare run command");
+        };
+        assert_eq!(
+            (config.as_path(), data_dir),
+            (std::path::Path::new("workforce.toml"), None)
+        );
+        assert_eq!(
+            args,
+            CompareArgs {
+                weaviate_url: "http://localhost:8080".to_string(),
+                node_metrics: "http://localhost:9090/metrics".to_string(),
+                seed: 7,
+                out: PathBuf::from("runs/one"),
+                entities: 2000,
+                recall_queries: 500,
+                same_queries: 200,
+                resamples: 10000,
+                no_prefix: false,
+            }
+        );
+        let options: workforce_hub::code_compare::CompareOptions = args.into();
+        assert_eq!((options.seed, options.out), (7, PathBuf::from("runs/one")));
+        assert!(
+            Cli::try_parse_from(["workforce", "code", "compare", "run", "--seed", "7"]).is_err()
+        );
+    }
 
     /// The scaffolded AGENTS.md becomes an agent's operational prompt, so it
     /// must document action-dispatch tools in the callable `tool(action="…")`

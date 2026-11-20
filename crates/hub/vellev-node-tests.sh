@@ -20,11 +20,31 @@ for name in "${names[@]}"; do
   fi
   paths+=("$found")
 done
+# Tests that read the node's own counters run after the rest, each with
+# the node to itself, so that no other test's search is counted with theirs.
+alone=(shortlisted_queries_are_told_by_the_node)
+together=()
+apart=()
+for path in "${paths[@]}"; do
+  case " ${alone[*]} " in
+    *" ${path##*::} "*) apart+=("$path") ;;
+    *) together+=("$path") ;;
+  esac
+done
 out="$(mktemp)"
 trap 'rm -f "$out"' EXIT
-cargo test "$@" -p workforce-hub --lib -- --exact "${paths[@]}" | tee "$out"
-want="test result: ok. ${#paths[@]} passed; 0 failed; 0 ignored;"
-if ! grep -qF "$want" "$out"; then
-  echo "::error::expected '${want}' of the hub's node tests"
-  exit 1
-fi
+ran() {
+  local count="$1"
+  shift
+  cargo test ${args[@]+"${args[@]}"} -p workforce-hub --lib -- --exact "$@" | tee "$out"
+  want="test result: ok. ${count} passed; 0 failed; 0 ignored;"
+  if ! grep -qF "$want" "$out"; then
+    echo "::error::expected '${want}' of the hub's node tests"
+    exit 1
+  fi
+}
+args=("$@")
+ran "${#together[@]}" "${together[@]}"
+for path in ${apart[@]+"${apart[@]}"}; do
+  ran 1 "$path"
+done

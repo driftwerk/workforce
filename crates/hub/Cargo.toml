@@ -75,6 +75,7 @@ base64 = { workspace = true }
 aes-gcm = { workspace = true }
 argon2 = { workspace = true }
 rand = { workspace = true }
+rand_chacha = "0.3"
 hex = "0.4"
 hkdf = "0.12"
 hmac = "0.12"
