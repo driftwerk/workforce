@@ -88,6 +88,7 @@ impl CrewHub {
             Some(theirs),
         )
         .await
+        .map(Ran::said)
     }
 
     /// [`Self::run_dm_turn`] in `service`'s conversation on `channel`: the
@@ -107,12 +108,15 @@ impl CrewHub {
     ) -> Result<(String, String)> {
         self.run_turn_with(service, owner, channel, prompt, hop, listed, author, None)
             .await
+            .map(Ran::said)
     }
 
     /// [`Self::run_turn`], answering `theirs` (the person's words a boss
-    /// sent on) when it is an overseer's message in the DM.
+    /// sent on) when it is an overseer's message in the DM, and saying too
+    /// whether the turn did something: a call of a tool not known only to
+    /// look ([`super::tools::only_looks`]).
     #[allow(clippy::too_many_arguments)]
-    async fn run_turn_with(
+    pub(super) async fn run_turn_with(
         &self,
         service: &Arc<AgentService>,
         owner: &str,
@@ -122,7 +126,7 @@ impl CrewHub {
         listed: Option<Vec<MentionedApproval>>,
         author: Option<Speaker>,
         theirs: Option<String>,
-    ) -> Result<(String, String)> {
+    ) -> Result<Ran> {
         let agent_id = service.agent_id.as_str();
         let in_dm = channel == DESK_CHANNEL;
         // The session a DM already open is on: not rolled over here, or an
@@ -270,6 +274,13 @@ impl CrewHub {
             move |rx| crate::gateway::forward_local_progress(rx, tx, sid, false, mentions, None)
         };
         let conducted = crate::live_turns::conduct(&mut live, service, progress, forward).await;
+        let acted = match &conducted.ending {
+            Ending::Finished(Ok(result)) => result
+                .tool_invocations
+                .iter()
+                .any(|t| ran_call(t) && !super::tools::only_looks(&t.tool_name, &t.input)),
+            _ => false,
+        };
         let answer = match &conducted.ending {
             Ending::Finished(Ok(result)) => Ok(result.response.clone()),
             Ending::Finished(Err(e)) => Err(eyre::eyre!("{e:#}")),
@@ -286,7 +297,11 @@ impl CrewHub {
             let _ = tx.send(message);
         }
         drop(live);
-        Ok((session_id, answer?))
+        Ok(Ran {
+            session_id,
+            answer: answer?,
+            acted,
+        })
     }
 }
 
@@ -480,4 +495,24 @@ impl CrewHub {
         // What it decides on goes with it.
         self.picture_turn_rolled(old, new);
     }
+}
+
+/// A turn [`CrewHub::run_turn_with`] ran: the session it ran in, its
+/// answer, and whether it did something.
+pub(super) struct Ran {
+    pub(super) session_id: String,
+    pub(super) answer: String,
+    pub(super) acted: bool,
+}
+
+impl Ran {
+    fn said(self) -> (String, String) {
+        (self.session_id, self.answer)
+    }
+}
+
+/// Whether `call` was let run: one that failed may still have changed
+/// something on its way.
+fn ran_call(call: &workforce_agent::runner::ToolInvocation) -> bool {
+    call.success || (call.policy_decision != "deny" && call.denial_reason.is_none())
 }

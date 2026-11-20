@@ -296,9 +296,14 @@ impl CrewHub {
             .or_default() += 1;
     }
 
-    /// Keeps `d`. A write that fails is logged, never the action's failure.
+    /// Keeps `d`, counted as something its boss did. A write that fails is
+    /// logged, never the action's failure.
     pub(crate) async fn record(&self, d: &mut BossDecision) {
         self.acted_on(&d.boss, d.session);
+        self.keep_logged(d).await;
+    }
+
+    async fn keep_logged(&self, d: &mut BossDecision) {
         if let Err(e) = self.keep(d).await {
             tracing::warn!(boss = %d.boss, error = %e, "a boss's decision wasn't kept");
         }
@@ -549,7 +554,13 @@ impl CrewHub {
         let what = format!(
             "gave you {}'s question “{}”",
             q.from.name,
-            crew::one_line(&workforce_desk::line::without_marks(q.headline()), 160)
+            crew::one_line(
+                &workforce_desk::line::without_marks(workforce_desk::line::unstamped(
+                    q.headline(),
+                    &q.from.name
+                )),
+                160
+            )
         );
         let mut d = BossDecision::new(&boss, Need::Question, &what, why, How::Escalated)
             .briefly(&format!("Gave you {}'s question.", q.from.name), None);
@@ -579,7 +590,7 @@ impl CrewHub {
             d.undo = Undo::Reverse;
             d.action = UndoPlan::GoAhead { session }.value();
         }
-        self.record(&mut d).await;
+        self.keep_logged(&mut d).await;
     }
 
     pub(crate) fn name_of_session(&self, id: Uuid) -> String {

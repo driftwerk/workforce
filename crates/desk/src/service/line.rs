@@ -606,7 +606,7 @@ impl Desk {
     }
 
     fn line_noted(&self, m: &LineMessage) {
-        let what = crew::one_line(m.headline(), 120);
+        let what = crew::one_line(line::unstamped(m.headline(), &m.from.name), 120);
         let (kind, text) = match m.kind {
             LineKind::Ask => (Kind::Asked, format!("asked {} “{what}”", m.to.name)),
             LineKind::Tell => (Kind::Told, format!("told {} “{what}”", m.to.name)),
@@ -1995,7 +1995,7 @@ impl Desk {
                 format!(
                     "{} has ended, so your question “{}” to it is withdrawn.",
                     gone.label(),
-                    crew::one_line(ask.headline(), 120)
+                    crew::one_line(line::unstamped(ask.headline(), &ask.from.name), 120)
                 ),
                 ask.hop,
             );
@@ -2291,7 +2291,7 @@ impl Desk {
                 format!(
                     "gave you {}'s question “{}”",
                     q.from.name,
-                    crew::one_line(q.headline(), 120)
+                    crew::one_line(line::unstamped(q.headline(), &q.from.name), 120)
                 ),
             )
             .reason(why)
