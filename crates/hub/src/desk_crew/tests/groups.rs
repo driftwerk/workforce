@@ -260,8 +260,9 @@ async fn clients(dir: &Path, pool: workforce_postgres::PostgresPool) -> Clients 
 /// Every way a crew tool can be pointed at `other`'s scope, and whether it
 /// must be refused (an id outside) or only read nothing of it (no id). A
 /// tool this doesn't know fails the test: a new one needs its case here.
-/// A ticket of another scope's is refused as one that isn't there.
-fn pointed_at(name: &str, other: &Client, dir: &Path) -> Vec<(Value, bool)> {
+/// A ticket of another scope's is refused as one that isn't there. `mine`
+/// is a ticket of the boss's own scope, when it has one.
+fn pointed_at(name: &str, mine: Option<&str>, other: &Client, dir: &Path) -> Vec<(Value, bool)> {
     let s = other.session.id.to_string();
     let r = "For the test.";
     match name {
@@ -493,6 +494,74 @@ fn pointed_at(name: &str, other: &Client, dir: &Path) -> Vec<(Value, bool)> {
             json!({ "machine": "devbox", "command": "ls", "reason": r }),
             false,
         )],
+        // A ticket is looked up only on the boards its scope sees: another
+        // scope's, by its key in any case, is as one that isn't there.
+        super::super::tickets::READ => vec![
+            (json!({ "ticket": other.ticket }), true),
+            (json!({ "ticket": other.ticket.to_lowercase() }), true),
+        ],
+        // Read the same way before anything changes, through a plan or the
+        // board.
+        super::super::tickets::EDIT => vec![
+            (
+                json!({ "ticket": other.ticket, "title": "Mine now", "reason": r }),
+                true,
+            ),
+            (
+                json!({ "ticket": other.ticket, "append": "Mine now.", "reason": r }),
+                true,
+            ),
+            (
+                json!({ "ticket": other.ticket, "machine": "devbox", "reason": r }),
+                true,
+            ),
+        ],
+        super::super::tickets::COMMENT => vec![(
+            json!({ "ticket": other.ticket, "comment": "Mine now.", "reason": r }),
+            true,
+        )],
+        // Both ends: another's ticket made to need anything, and its own
+        // made to need another's.
+        super::super::tickets::LINK => {
+            let mut cases = vec![(
+                json!({ "ticket": other.ticket, "needs": other.ticket, "reason": r }),
+                true,
+            )];
+            if let Some(mine) = mine {
+                cases.push((
+                    json!({ "ticket": mine, "needs": other.ticket, "reason": r }),
+                    true,
+                ));
+                cases.push((
+                    json!({ "ticket": mine, "needs": other.ticket, "unlink": true, "reason": r }),
+                    true,
+                ));
+            }
+            cases
+        }
+        // Made only on a board its scope sees, needing only tickets there.
+        super::super::tickets::CREATE => {
+            let mut cases = vec![(
+                json!({
+                    "board": other.ticket.split('-').next().unwrap_or_default(),
+                    "title": "Mine now",
+                    "reason": r,
+                }),
+                true,
+            )];
+            if mine.is_some() {
+                cases.push((
+                    json!({ "title": "Mine now", "needs": [other.ticket], "reason": r }),
+                    true,
+                ));
+            }
+            cases
+        }
+        // Always the person's yes, and even then never another scope's.
+        super::super::tickets::DELETE => vec![(
+            json!({ "ticket": other.ticket, "reason": r }),
+            true,
+        )],
         other => {
             panic!("{other} is a crew tool with no case here: say how it is kept to its scope")
         }
@@ -502,13 +571,20 @@ fn pointed_at(name: &str, other: &Client, dir: &Path) -> Vec<(Value, bool)> {
 /// Points every crew tool `boss` has at `other`'s scope: each one aimed at
 /// an id there is refused in `refusal`'s words, before it does anything,
 /// and no answer says `secret`.
-async fn kept_out(boss: &AgentService, other: &Client, secret: &str, refusal: &str, dir: &Path) {
+async fn kept_out(
+    boss: &AgentService,
+    mine: Option<&str>,
+    other: &Client,
+    secret: &str,
+    refusal: &str,
+    dir: &Path,
+) {
     for name in READ.iter().chain(ACT.iter()) {
         let tool = boss
             .tools
             .get(name)
             .unwrap_or_else(|| panic!("{} has no {name}", boss.agent_id));
-        for (input, refused) in pointed_at(name, other, dir) {
+        for (input, refused) in pointed_at(name, mine, other, dir) {
             let r = tool.execute(input.clone()).await.unwrap();
             let said = format!("{:?} {}", r.error, r.output);
             assert!(
@@ -530,7 +606,15 @@ async fn kept_out(boss: &AgentService, other: &Client, secret: &str, refusal: &s
                 // one, and a group that isn't which to name, after the same
                 // words.
                 let said = r.error.as_deref().unwrap_or_default();
-                if input.get("board").is_some() {
+                // A new ticket's board it doesn't see is one it hasn't got;
+                // a ticket it needs there is as none.
+                if *name == super::super::tickets::CREATE {
+                    let words = match input["board"].as_str() {
+                        Some(b) => format!("You have no board called {b:?}."),
+                        None => format!("There's no {}.", other.ticket),
+                    };
+                    assert_eq!(said, words, "{} {name} {input}", boss.agent_id);
+                } else if input.get("board").is_some() {
                     assert!(
                         said.starts_with(&words) && said.contains("new_board"),
                         "{} {name} {input}: {said}",
@@ -561,6 +645,7 @@ async fn each_boss_reads_and_acts_only_inside_its_own_group_through_every_crew_t
 
         kept_out(
             &c.sarah,
+            Some(&c.acme.ticket),
             &c.atlas,
             ATLAS_SECRET,
             "That isn't one of Acme's.",
@@ -569,6 +654,7 @@ async fn each_boss_reads_and_acts_only_inside_its_own_group_through_every_crew_t
         .await;
         kept_out(
             &c.mia,
+            Some(&c.atlas.ticket),
             &c.acme,
             ACME_SECRET,
             "That isn't one of Atlas's.",
@@ -576,8 +662,8 @@ async fn each_boss_reads_and_acts_only_inside_its_own_group_through_every_crew_t
         )
         .await;
         let main = "That isn't one of yours.";
-        kept_out(&c.desk, &c.acme, ACME_SECRET, main, dir.path()).await;
-        kept_out(&c.desk, &c.atlas, ATLAS_SECRET, main, dir.path()).await;
+        kept_out(&c.desk, None, &c.acme, ACME_SECRET, main, dir.path()).await;
+        kept_out(&c.desk, None, &c.atlas, ATLAS_SECRET, main, dir.path()).await;
 
         // Nothing it was refused became a suggestion, a message or a move;
         // asking for settings asked for its own.
