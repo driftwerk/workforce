@@ -534,6 +534,58 @@ async fn a_boss_keeps_its_plan_current_and_a_change_of_scope_waits_for_the_perso
     .await;
 }
 
+/// Tickets moved to a machine whose briefs name paths only this computer
+/// has: the boss is told which, so it copies or rewrites them, and the move
+/// is made all the same.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_boss_moving_tickets_to_a_machine_is_told_of_paths_in_briefs_only_this_computer_has() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
+        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("the plan tools", async || overseer.tools.has("crew.plan").then_some(())).await;
+        let folder = dir.path().to_string_lossy().into_owned();
+        let home = d.home_folder().unwrap().to_string_lossy().trim_end_matches('/').to_string();
+        let made = overseer
+            .tools
+            .get("crew.plan")
+            .unwrap()
+            .execute(json!({ "goal": "Faster reads", "tickets": [
+                { "title": "Add the cache", "body": format!("Read {home}/Library/Desk/notes.md and /Volumes/T9/data/x.csv."), "folder": folder },
+                { "title": "Use the cache", "body": "Read through the cache.", "folder": folder },
+            ] }))
+            .await
+            .unwrap();
+        let plan = &made.output["proposed"];
+        let id = plan["plan_id"].as_str().unwrap().to_string();
+        let key = |i: usize| plan["tickets"][i]["key"].as_str().unwrap().to_string();
+        let update = overseer.tools.get("crew.plan_update").unwrap();
+        let moved = |machine: &str| {
+            json!({ "plan_id": id, "why": "The person wants it there.", "tickets_edit": [
+                { "key": key(0), "machine": machine, "folder": "/home/dev/vellev" },
+                { "key": key(1), "machine": machine, "folder": "/home/dev/vellev" },
+            ] })
+        };
+        let r = update.execute(moved("devbox")).await.unwrap();
+        assert!(r.success, "{r:?}");
+        let note = r.output["note"].as_str().unwrap();
+        assert!(
+            note.contains(&format!("{}'s brief names /Volumes/T9 and {home} on this computer, which devbox can't see", key(0))),
+            "{note}"
+        );
+        assert!(!note.contains(&key(1)), "{note}");
+        let rows = d.plan(id.parse().unwrap()).await.unwrap().tickets;
+        assert!(rows.iter().all(|t| t.machine.as_deref() == Some("devbox")));
+        // Already there: nothing more is said.
+        let r = update
+            .execute(json!({ "plan_id": id, "why": "Its goal.", "goal": "Faster reads, soon" }))
+            .await
+            .unwrap();
+        assert!(!r.output["note"].as_str().unwrap_or_default().contains("can't see"), "{r:?}");
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_boss_moves_tickets_by_key_keeping_their_briefs_and_reads_them_back() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
