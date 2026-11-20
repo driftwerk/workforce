@@ -141,7 +141,7 @@ pub fn schema(name: &str) -> Value {
             "session_id": { "type": "string" },
             "text": { "type": "string", "description": "What you promised, in full" },
             "done_when": { "type": "string", "description": "merged, in production, PR open, or your own words" },
-            "due_minutes": { "type": "integer", "description": "For something you will bring the person: by when, in minutes from now" }
+            "due_minutes": { "type": "integer", "description": "For something you will bring the person: by when, in minutes from now (1 to 4320, three days)" }
         }, "required": ["session_id", "text", "done_when"] }),
         ORDER => json!({ "type": "object", "properties": {
             "text": { "type": "string", "description": "The person's order, in their words" },
@@ -251,9 +251,22 @@ fn restatements<'a>(due: &[&'a OpenItem], now: DateTime<Utc>) -> Vec<(&'a OpenIt
         .collect()
 }
 
-/// `due_minutes` as given: a whole number of minutes (a rounded number, or
-/// one written as text, is taken too), or none.
+/// The longest a promise may be due in, in minutes: three days.
+const DUE_MAX: i64 = 72 * 60;
+
+/// `due_minutes` as given: a whole number of minutes from 1 to [`DUE_MAX`]
+/// (a rounded number, or one written as text, is taken too), or none.
 fn due_minutes(v: &Value) -> Result<Option<i64>, String> {
+    let minutes = whole_minutes(v)?;
+    match minutes {
+        Some(m) if !(1..=DUE_MAX).contains(&m) => Err(format!(
+            "due_minutes must be from 1 to {DUE_MAX} (three days); {m} isn't."
+        )),
+        _ => Ok(minutes),
+    }
+}
+
+fn whole_minutes(v: &Value) -> Result<Option<i64>, String> {
     let refused = || "due_minutes must be a whole number of minutes.".to_string();
     match v {
         Value::Null => Ok(None),
@@ -579,15 +592,13 @@ impl CrewHub {
             Opened::New(i) => format!(
                 "Kept as item {}: it is tracked until it is done, and in every turn of yours till then{}.",
                 i.id,
-                i.due_at.map_or_else(String::new, |at| format!(
-                    "; due by {}",
-                    at.with_timezone(&self.desk.timezone()).format("%H:%M")
-                ))
+                self.due_said(&i)
             ),
             Opened::Again(i) => format!(
-                "That is already kept as item {} (“{}”): it is one item, its sessions joined.",
+                "That is already kept as item {} (“{}”): it is one item, its sessions joined{}.",
                 i.id,
-                crew::one_line(&i.text, 120)
+                crew::one_line(&i.text, 120),
+                self.due_said(&i)
             ),
         }))
     }
@@ -941,17 +952,26 @@ impl CrewHub {
             let Some(was) = i.due_at else {
                 continue;
             };
+            // Its boss isn't served now (between reloads, or its scope
+            // moved): looked at again once it is, as resurfacing does.
             let Some((_, o)) = self.overseer_named(&i.boss) else {
-                // Its boss is gone: no one is left to chase it, and it
-                // isn't read again each minute.
-                if let Err(e) = self.desk.store().item_chased(i.id, was, None, None).await {
-                    tracing::warn!(error = %e, "a due promise of a boss gone couldn't be let go");
-                }
                 continue;
             };
-            // A question its boss asked the session that hasn't gone in
-            // yet is chased as an undelivered message, not as owed twice.
+            // A question its boss asked the session that hasn't gone in yet:
+            // its due time moves on by as long again, so what is owed is
+            // still chased once it goes in (or told to the person, if it
+            // never does), and the boss isn't woken for it twice meanwhile
+            // ([`super::watcher`] chases an undelivered message).
             if i.done_when.as_deref() == Some(REPLIED) && self.ask_still_waits(i).await {
+                let next = now + self.crew_minutes(OWED_MINUTES);
+                if let Err(e) = self
+                    .desk
+                    .store()
+                    .item_chased(i.id, was, None, Some(next))
+                    .await
+                {
+                    tracing::warn!(error = %e, "a due promise's time couldn't be moved on");
+                }
                 continue;
             }
             let chase_on = i
@@ -1004,6 +1024,20 @@ impl CrewHub {
                     .await
                 }
             }
+        }
+    }
+
+    /// When `i` is due, as its reply says it: "; due by 14:30", with its day
+    /// when that isn't today; nothing when it isn't due.
+    fn due_said(&self, i: &OpenItem) -> String {
+        let Some(at) = i.due_at else {
+            return String::new();
+        };
+        let tz = self.desk.timezone();
+        let at = at.with_timezone(&tz);
+        match at.date_naive() == Utc::now().with_timezone(&tz).date_naive() {
+            true => format!("; due by {}", at.format("%H:%M")),
+            false => format!("; due by {}", at.format("%a %-d %b, %H:%M")),
         }
     }
 
@@ -2020,6 +2054,23 @@ mod tests {
         assert_eq!(due_minutes(&json!(29.6)), Ok(Some(30)));
         assert_eq!(due_minutes(&json!("30")), Ok(Some(30)));
         assert_eq!(due_minutes(&json!(" 45 ")), Ok(Some(45)));
+        for (bad, why) in [
+            (
+                json!(0),
+                "due_minutes must be from 1 to 4320 (three days); 0 isn't.",
+            ),
+            (
+                json!(-5),
+                "due_minutes must be from 1 to 4320 (three days); -5 isn't.",
+            ),
+            (
+                json!(4321),
+                "due_minutes must be from 1 to 4320 (three days); 4321 isn't.",
+            ),
+        ] {
+            assert_eq!(due_minutes(&bad), Err(why.into()), "{bad}");
+        }
+        assert_eq!(due_minutes(&json!(4320)), Ok(Some(4320)));
         for bad in [json!("soon"), json!(true), json!([30])] {
             assert_eq!(
                 due_minutes(&bad),

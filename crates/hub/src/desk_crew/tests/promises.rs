@@ -622,6 +622,13 @@ async fn an_unanswered_promise_is_chased_by_the_boss_then_told_to_the_person() {
             "chased while its question waits"
         );
         assert_eq!(said(&overseer, "Still owed to you: "), None);
+        let moved = d.store().open_item(promise.id).await.unwrap().unwrap();
+        assert!(
+            moved.due_at > promise.due_at && moved.chased_at.is_none(),
+            "its due time moves on while its question waits: {:?} after {:?}",
+            moved.due_at,
+            promise.due_at
+        );
         d.store()
             .line_set_waiting(asked, workforce_desk::line::Delivery::Delivered)
             .await
