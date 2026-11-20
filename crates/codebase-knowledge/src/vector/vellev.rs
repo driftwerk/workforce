@@ -1802,8 +1802,8 @@ mod tests {
     }
 
     /// A second object of a record's text, at an id not the record's own,
-    /// is stale whichever of the two is listed first, and once it is
-    /// removed the record agrees.
+    /// is stale whether it is listed before the record or after it, and
+    /// once it is removed the record agrees.
     #[tokio::test]
     async fn a_second_copy_of_a_records_text_is_stale() {
         let Some(node) = Node::embedding().await else {
@@ -1821,24 +1821,25 @@ mod tests {
             .index_entities(std::slice::from_ref(&wanted))
             .await
             .unwrap();
-        let first = ObjectId(Uuid::nil());
         let vector = vec![0.5_f32; store.embedded_as().1.dimensions as usize];
-        let copy = Change::upsert(
-            CollectionName::new(CODE_ENTITY_COLLECTION).unwrap(),
-            first,
-            Content::new(entity_properties(&wanted)).vector(vector),
-        );
-        store.tenants.writes.apply(vec![copy]).await.unwrap();
-        let wanted = std::slice::from_ref(&wanted);
-        let found = store.differing_entities("repo", wanted).await.unwrap();
-        assert_eq!((found.places, found.missing), (vec![0], vec![]));
-        assert_eq!(found.stale, [first.0.to_string()]);
-        store.remove_held(false, &found.stale).await.unwrap();
-        let found = store.differing_entities("repo", wanted).await.unwrap();
-        assert!(
-            found.places.is_empty() && found.stale.is_empty(),
-            "{found:?}"
-        );
+        let wanted_page = std::slice::from_ref(&wanted);
+        for copy in [Uuid::nil(), Uuid::max()].map(ObjectId) {
+            let held = Change::upsert(
+                CollectionName::new(CODE_ENTITY_COLLECTION).unwrap(),
+                copy,
+                Content::new(entity_properties(&wanted)).vector(vector.clone()),
+            );
+            store.tenants.writes.apply(vec![held]).await.unwrap();
+            let found = store.differing_entities("repo", wanted_page).await.unwrap();
+            assert_eq!((found.places, found.missing), (vec![0], vec![]), "{copy:?}");
+            assert_eq!(found.stale, [copy.0.to_string()]);
+            store.remove_held(false, &found.stale).await.unwrap();
+            let found = store.differing_entities("repo", wanted_page).await.unwrap();
+            assert!(
+                found.places.is_empty() && found.stale.is_empty(),
+                "{copy:?}: {found:?}"
+            );
+        }
     }
 
     /// A file's records are counted in both collections, and no other

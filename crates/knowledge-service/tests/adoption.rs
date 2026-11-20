@@ -983,8 +983,8 @@ async fn two_workers_adopting_one_repo_end_agreeing() {
 
 /// What the store holds of a repo the graph no longer has is removed by
 /// the first pass, and only then; one registered meanwhile is left while
-/// the rest are swept, as is a record of no repo left. A sweep that fails leaves the pass to go on, and
-/// the next sweeps.
+/// the rest are swept, and a record of no repo is left too. A sweep that
+/// fails leaves the pass to go on, and the next sweeps.
 #[tokio::test]
 async fn a_dropped_repos_vectors_are_swept_once_and_a_new_one_kept() {
     let hub = Hub::prebuilt(12).await;

@@ -638,7 +638,7 @@ compared with. A repo the store holds nothing of is filled as before.
 - **The shape.** A collection of another model, size or prefix is
   refused as any other is (above); one made again meanwhile is never
   recorded complete. One that keeps `searchableContent` is said at the
-  start and used.
+  start and used; dropping it on a node that writes format 2 makes it slim.
 - **Searched meanwhile.** A repo being adopted is answered from its
   vectors throughout, while the store has the collection it is being
   compared with. A repo the store held only part of is adopted too, and

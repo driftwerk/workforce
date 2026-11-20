@@ -21,13 +21,14 @@ use workforce_codebase_knowledge::indexer::{IndexingConfig, IndexingPipeline, Ru
 use workforce_codebase_knowledge::query::natural_language::QueryPlanner;
 use workforce_codebase_knowledge::query::{QueryEngine, VectorWait};
 use workforce_codebase_knowledge::testing::{
-    as_held, entity_key, stepped, summary_key, Counting, Failing, Held, Meanwhile, RECORDED, REPO,
+    as_held, entity_key, stepped, summary_key, Counting, Failing, Held, Meanwhile, RECORDED,
 };
 use workforce_codebase_knowledge::vector::{
     health::InsertErrorSink, CodeVectorStore, DeleteOutcome, VectorCodeEntity, VectorCodeSummary,
     VectorSearchResult,
 };
 use workforce_vellev::testing::{logged, NotServing};
+const REPO: &str = "repo";
 const QUESTION: &str = "how is `parse_config` used";
 
 /// A store that keeps no track, as Weaviate's: another store than `Held`.

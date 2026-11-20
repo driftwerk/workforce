@@ -26,9 +26,6 @@ use crate::vector::{
     VectorCodeEntity, VectorCodeSummary, VectorSearchResult, VellevCodeVectorStore,
 };
 
-/// The repo of the tests that have one.
-pub const REPO: &str = "repo";
-
 /// What `graph` has of the repo, as a store holds it.
 pub async fn as_held(
     graph: &CodeGraph,
