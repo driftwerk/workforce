@@ -99,7 +99,7 @@ pub fn artifact_query(seed: u64, artifact: &ArtifactText) -> Option<String> {
 pub struct ArtifactDraw {
     seed: u64,
     settled_before: DateTime<Utc>,
-    kept: Smallest<String>,
+    kept: Smallest<(u64, String), String>,
     drawn: KnownItemsDrawn,
 }
 

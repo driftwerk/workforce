@@ -324,10 +324,10 @@ impl Worked for Counters {
 fn options(out: &Path) -> CompareOptions {
     CompareOptions {
         seed: 7,
-        entities: 40,
+        entities: NonZeroUsize::new(40).unwrap(),
         recall_queries: 5,
         same_queries: 10,
-        resamples: 200,
+        resamples: NonZeroUsize::new(200).unwrap(),
         weaviate_url: "http://localhost:8080".to_string(),
         node_metrics: "http://localhost:9090/metrics".to_string(),
         no_prefix: false,
@@ -380,6 +380,10 @@ async fn ran(
     .await
 }
 
+fn partial(out: &Path) -> std::path::PathBuf {
+    placed(out).unwrap().1
+}
+
 fn first(entity: &CodeEntity) -> Vec<&CodeEntity> {
     vec![entity]
 }
@@ -404,13 +408,12 @@ fn gate<'a>(run: &'a Run, name: &str) -> &'a Gate {
         .unwrap()
 }
 
-/// Two graphs of the same entities, inserted in opposite orders, give the
-/// same questions for a seed, and another seed gives others.
+/// A seed gives the same questions each time and another seed others, of
+/// the entities of the lowest keys.
 #[tokio::test]
 async fn the_sample_depends_on_the_seed_alone() {
     let entities = [functions("a", 30), functions("b", 30)].concat();
-    let reversed: Vec<CodeEntity> = entities.iter().rev().cloned().collect();
-    let (forwards, backwards) = (graph_of(&entities).await, graph_of(&reversed).await);
+    let graph = graph_of(&entities).await;
     let questions = |sample: Sample| -> String {
         sample
             .targets
@@ -420,12 +423,12 @@ async fn the_sample_depends_on_the_seed_alone() {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let one = questions(sampled(&forwards, 1, 10).await.unwrap());
-    assert_eq!(one, questions(sampled(&backwards, 1, 10).await.unwrap()));
-    assert_ne!(one, questions(sampled(&forwards, 2, 10).await.unwrap()));
+    let one = questions(sampled(&graph, 1, 10).await.unwrap());
+    assert_eq!(one, questions(sampled(&graph, 1, 10).await.unwrap()));
+    assert_ne!(one, questions(sampled(&graph, 2, 10).await.unwrap()));
     assert_eq!(one.lines().count(), 20);
 
-    let taken: Vec<(String, String)> = sampled(&forwards, 1, 10)
+    let taken: Vec<(String, String)> = sampled(&graph, 1, 10)
         .await
         .unwrap()
         .targets
@@ -611,12 +614,14 @@ async fn a_hit_is_judged_on_the_entity_the_product_shows() {
     assert!(weaviate.hit);
     assert!(!weaviate.hit_raw);
     assert_eq!(weaviate.siblings, Some(vec![1]));
+    assert_eq!(weaviate.moved, 0);
 
     let mut moved = answer(&target.entity);
     moved.found.start_line = 40;
     let vellev = judge.side(&target, vec![moved], false).await.unwrap();
     assert!(vellev.hit && vellev.hit_raw);
     assert_eq!(vellev.siblings, None);
+    assert_eq!(vellev.moved, 1);
 
     let twin = CodeEntity {
         id: EntityId("r-twin".to_string()),
@@ -877,6 +882,40 @@ async fn a_misrouted_node_fails_before_the_sample() {
     assert!(!out.exists() && !partial(&out).exists());
 }
 
+/// An unhealthy Weaviate is refused before the node is asked anything.
+#[tokio::test]
+async fn an_unhealthy_weaviate_is_refused_before_the_node() {
+    let node = NotServing::up().await;
+    let vellev = VellevCodeVectorStore::new(&node.url, "key", "code").unwrap();
+    let entities = functions("r", 3);
+    let opened = Opened {
+        graph: graph_of(&entities).await,
+        about: GraphAbout {
+            identity: "graph".to_string(),
+            backend: "sqlite".to_string(),
+            sha256: String::new(),
+        },
+    };
+    let weaviate = weaviate_of(&entities, first);
+    weaviate.unhealthy.store(true, Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("run");
+    let failed = compared(
+        &opened,
+        &weaviate,
+        &vellev,
+        &Counters::shortlisting(),
+        &options(&out),
+        &|_| {},
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert_eq!(failed, "Weaviate at memory is not healthy");
+    assert_eq!(node.asked(), 0);
+    assert!(!out.exists() && !partial(&out).exists());
+}
+
 /// A repo one store holds nothing of misses on that side, and its count
 /// in the manifest shows the store holds none of it.
 #[tokio::test]
@@ -954,6 +993,78 @@ async fn the_files_are_summed_as_they_lie_on_disk() {
     let refused = refused_if_there(&half).unwrap_err().to_string();
     assert!(refused.contains("half.partial exists"), "{refused}");
     assert!(partial(&half).exists() && !half.exists());
+}
+
+/// An out ending in a separator is moved into as the directory it names,
+/// one with no name is refused, and one made while the run measured is
+/// never written over.
+#[tokio::test]
+async fn the_run_is_moved_into_out_alone() {
+    let entities = functions("r", 12);
+    let graph = graph_of(&entities).await;
+    let dir = tempfile::tempdir().unwrap();
+    let run = |out: std::path::PathBuf, meanwhile: bool| {
+        let (weaviate, vellev) = (
+            weaviate_of(&entities, first),
+            Searched::of(&entities, first),
+        );
+        let graph = &graph;
+        async move {
+            let options = options(&out);
+            recorded(&out, async {
+                let measured = measured(
+                    graph,
+                    &weaviate,
+                    &vellev,
+                    &Counters::shortlisting(),
+                    &options,
+                    &|_| {},
+                )
+                .await?;
+                if meanwhile {
+                    std::fs::create_dir(&out)?;
+                }
+                let manifest = manifest(graph, &options, &measured);
+                Ok((measured, manifest))
+            })
+            .await
+        }
+    };
+
+    let ran = run(dir.path().join("slashed").join(""), false)
+        .await
+        .unwrap();
+    assert_eq!(ran.dir, dir.path().join("slashed"));
+    assert!(ran.dir.join(SUMS).is_file());
+    assert!(!dir.path().join("slashed.partial").exists());
+
+    let refused = refused_if_there(Path::new("..")).unwrap_err().to_string();
+    assert!(refused.contains("names no directory"), "{refused}");
+
+    let out = dir.path().join("meanwhile");
+    let failed = format!("{:#}", run(out.clone(), true).await.unwrap_err());
+    assert!(failed.contains("never writes over"), "{failed}");
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
+}
+
+/// A graph with nothing to ask fails the overall gate, saying so.
+#[tokio::test]
+async fn a_run_that_asks_nothing_fails() {
+    let graph = graph_of(&[]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let run = ran(
+        &graph,
+        &weaviate_of(&[], first),
+        &Searched::of(&[], first),
+        &Counters::shortlisting(),
+        &options(&dir.path().join("run")),
+    )
+    .await
+    .unwrap();
+    let overall = gate(&run, "overall");
+    assert!(!overall.passed);
+    assert_eq!(overall.said, "no query was asked");
+    assert_eq!(run.report.findings.verdict, "fail");
 }
 
 /// vellev missing a twentieth of the targets Weaviate finds fails the
@@ -1221,6 +1332,65 @@ async fn a_collection_dropped_during_a_run_is_never_made_again() {
         .all(|(name, ..)| name != "CodeEntity"));
 }
 
+/// A code collection replaced while a run measures fails it at the end,
+/// naming both identities.
+#[tokio::test]
+async fn a_collection_replaced_during_a_run_fails_it() {
+    let Some(node) = Node::embedding().await else {
+        return;
+    };
+    let config = configured(&node, workforce_vellev::LOCAL_QUERY_PREFIX);
+    let entities = documented();
+    let opened = built(&config, &entities).await;
+    let vellev = VellevCodeVectorStore::configured(&config.vellev).unwrap();
+    let before = vellev.found_as_wanted().await.unwrap();
+    let (tenant, wanted, graph) = (
+        node.tenant(),
+        config.vellev.clone(),
+        opened.graph.identity().to_string(),
+    );
+    let replacing: Hook = Arc::new(move || {
+        let (tenant, wanted, graph) = (tenant.clone(), wanted.clone(), graph.clone());
+        Box::pin(async move {
+            for collection in tenant.collections().await.unwrap() {
+                if collection.name.as_str() == "CodeSummary" {
+                    tenant.collection(&collection.name).drop().await.unwrap();
+                }
+            }
+            VellevCodeVectorStore::configured(&wanted)
+                .unwrap()
+                .for_graph(&graph)
+                .ensure_collections()
+                .await
+                .unwrap();
+        })
+    });
+    let weaviate = weaviate_of(&entities, first);
+    *weaviate.after_search.lock().unwrap() = Some((2, replacing));
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("run");
+    let failed = compared(
+        &opened,
+        &weaviate,
+        &vellev,
+        &Counters::shortlisting(),
+        &options(&out),
+        &|_| {},
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    let after = vellev.found_as_wanted().await.unwrap();
+    assert_ne!(after, before);
+    assert!(
+        failed.contains("collection replaced during the run")
+            && failed.contains(&before)
+            && failed.contains(&after),
+        "{failed}"
+    );
+    assert!(!out.exists() && !partial(&out).join(SUMS).exists());
+}
+
 /// A tenant claimed for another graph, or for none, is refused before the
 /// sample, and left as it was.
 #[tokio::test]
@@ -1469,12 +1639,17 @@ async fn shortlisted_queries_are_told_by_the_node() {
         })
         .collect();
     let asked: Vec<(&Query, &Vectors)> = queries.iter().zip(&vectors).collect();
-    let told = |rows: Vec<Recalled>| -> Vec<bool> {
+    let told = |rows: Vec<Recalled>| -> BTreeMap<String, bool> {
         assert!(rows.iter().all(|row| row.self_check), "{rows:?}");
-        rows.into_iter().map(|row| row.shortlisted).collect()
+        rows.into_iter()
+            .map(|row| (row.repo_id, row.shortlisted))
+            .collect()
     };
     let rows = recalled(&asked, &vellev, &work, &|_| {}).await.unwrap();
-    assert_eq!(told(rows), [false, true]);
+    assert_eq!(
+        told(rows),
+        BTreeMap::from([("big".to_string(), true), ("small".to_string(), false)])
+    );
 
     for part in 0..15 {
         store
@@ -1486,5 +1661,5 @@ async fn shortlisted_queries_are_told_by_the_node() {
         .await
         .unwrap();
     assert_eq!(rows[0].held, 3_500);
-    assert_eq!(told(rows), [false]);
+    assert_eq!(told(rows), BTreeMap::from([("big".to_string(), false)]));
 }

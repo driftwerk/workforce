@@ -116,6 +116,8 @@ pub struct Held {
     /// Writes of entities or summaries asked for, however many each held.
     pub writes: AtomicUsize,
     pub fail_index: AtomicBool,
+    /// Its health check says it is unhealthy.
+    pub unhealthy: AtomicBool,
     pub fail_file_purge: AtomicBool,
     /// The next look for a repo held besides the graph's fails.
     pub fail_held_outside: AtomicBool,
@@ -363,7 +365,7 @@ impl CodeVectorStore for Held {
     }
 
     async fn health_check(&self) -> Result<bool> {
-        Ok(true)
+        Ok(!self.unhealthy.load(Ordering::SeqCst))
     }
 
     fn base_url(&self) -> &str {

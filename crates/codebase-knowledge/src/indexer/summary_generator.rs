@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use eyre::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::graph::entities::EntityId;
+use crate::graph::entities::{EntityId, EntityKind};
 
 /// LLM backend for the summary generator.
 #[async_trait]
@@ -34,6 +34,17 @@ pub enum SummaryGranularity {
 }
 
 impl SummaryGranularity {
+    /// The granularity an entity of `kind` is summarised at; `None` for a
+    /// kind that is never summarised.
+    pub fn of(kind: &EntityKind) -> Option<Self> {
+        match kind {
+            EntityKind::Function | EntityKind::Method => Some(Self::Function),
+            EntityKind::File => Some(Self::File),
+            EntityKind::Module => Some(Self::Module),
+            _ => None,
+        }
+    }
+
     pub fn as_str(&self) -> &str {
         match self {
             Self::Function => "function",
@@ -94,5 +105,20 @@ impl SummaryGenerator {
                 entity_source
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_kind_is_summarised_at_one_granularity_or_none() {
+        let of = |kind: EntityKind| SummaryGranularity::of(&kind);
+        assert_eq!(of(EntityKind::Function), Some(SummaryGranularity::Function));
+        assert_eq!(of(EntityKind::Method), Some(SummaryGranularity::Function));
+        assert_eq!(of(EntityKind::File), Some(SummaryGranularity::File));
+        assert_eq!(of(EntityKind::Module), Some(SummaryGranularity::Module));
+        assert_eq!(of(EntityKind::Struct), None);
     }
 }

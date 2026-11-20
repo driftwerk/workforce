@@ -1971,14 +1971,14 @@ struct CompareArgs {
     /// Where the run's files go; it must not exist.
     #[arg(long)]
     out: PathBuf,
-    #[arg(long, default_value_t = 2000)]
-    entities: usize,
+    #[arg(long, default_value = "2000")]
+    entities: std::num::NonZeroUsize,
     #[arg(long, default_value_t = 500)]
     recall_queries: usize,
     #[arg(long, default_value_t = 200)]
     same_queries: usize,
-    #[arg(long, default_value_t = 10000)]
-    resamples: usize,
+    #[arg(long, default_value = "10000")]
+    resamples: std::num::NonZeroUsize,
     /// The code model has no query prefix, on purpose.
     #[arg(long)]
     no_prefix: bool,
@@ -13583,10 +13583,10 @@ mod tests {
                 node_metrics: "http://localhost:9090/metrics".to_string(),
                 seed: 7,
                 out: PathBuf::from("runs/one"),
-                entities: 2000,
+                entities: std::num::NonZeroUsize::new(2000).unwrap(),
                 recall_queries: 500,
                 same_queries: 200,
-                resamples: 10000,
+                resamples: std::num::NonZeroUsize::new(10000).unwrap(),
                 no_prefix: false,
             }
         );
@@ -13595,6 +13595,25 @@ mod tests {
         assert!(
             Cli::try_parse_from(["workforce", "code", "compare", "run", "--seed", "7"]).is_err()
         );
+        for none in ["--entities", "--resamples"] {
+            let asked = [
+                "workforce",
+                "code",
+                "compare",
+                "run",
+                "--weaviate-url",
+                "http://localhost:8080",
+                "--node-metrics",
+                "http://localhost:9090/metrics",
+                "--seed",
+                "7",
+                "--out",
+                "runs/one",
+                none,
+                "0",
+            ];
+            assert!(Cli::try_parse_from(asked).is_err(), "{none} 0");
+        }
     }
 
     /// The scaffolded AGENTS.md becomes an agent's operational prompt, so it

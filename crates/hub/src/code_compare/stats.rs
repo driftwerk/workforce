@@ -253,11 +253,11 @@ pub(super) fn first_agrees(first: Option<&Answer>, scanned: Option<f32>) -> bool
     })
 }
 
-/// Whether `other`'s first `depth` are the Mac's but for order among
-/// results within `within` of the next: each is among the Mac's, in the
-/// same run of near-equal distances as the Mac's at its place.
-pub(super) fn same_top(mac: &[Answer], other: &[Answer], depth: usize, within: f32) -> bool {
-    let runs: Vec<usize> = mac
+/// Whether `other`'s first `depth` are `reference`'s but for order among
+/// results within `within` of the next: each is among `reference`'s, in the
+/// same run of near-equal distances as `reference`'s at its place.
+pub(super) fn same_top(reference: &[Answer], other: &[Answer], depth: usize, within: f32) -> bool {
+    let runs: Vec<usize> = reference
         .iter()
         .scan((0usize, None::<f32>), |(run, last), hit| {
             if last.is_some_and(|last| distance(hit) - last > within) {
@@ -268,11 +268,12 @@ pub(super) fn same_top(mac: &[Answer], other: &[Answer], depth: usize, within: f
         })
         .collect();
     let run_of = |object: &Option<String>| {
-        mac.iter()
+        reference
+            .iter()
             .position(|hit| hit.object == *object)
             .map(|at| runs[at])
     };
-    mac.len().min(depth) == other.len().min(depth)
+    reference.len().min(depth) == other.len().min(depth)
         && other
             .iter()
             .zip(&runs)
@@ -359,8 +360,16 @@ pub(super) fn gates(
         "{} of {} same queries' vector answers are their text answers",
         agreement.same_agreed, agreement.same
     );
-    let overall = format!("the lower bound of D is {lower:.4}, and {OVERALL_FLOOR} is needed");
-    std::iter::once(gate("overall", lower >= OVERALL_FLOOR, overall))
+    let asked: usize = check1.kinds.values().map(|(queries, _)| queries).sum();
+    let overall = match asked {
+        0 => gate("overall", false, "no query was asked".to_string()),
+        _ => gate(
+            "overall",
+            lower >= OVERALL_FLOOR,
+            format!("the lower bound of D is {lower:.4}, and {OVERALL_FLOOR} is needed"),
+        ),
+    };
+    std::iter::once(overall)
         .chain(kinds)
         .chain([
             gate("agreement", agreement.same_agreed == agreement.same, agreed),
@@ -575,11 +584,12 @@ mod tests {
                 lower,
                 ..Estimate::default()
             },
-            ..Check1::default()
+            ..check1_with_kind(10, 0.0)
         };
         assert!(failed(&at(-0.0199)).is_empty());
         assert!(failed(&at(-0.02)).is_empty());
         assert_eq!(failed(&at(-0.0201)), ["overall"]);
+        assert_eq!(failed(&Check1::default()), ["overall"]);
     }
 
     #[test]
@@ -656,29 +666,29 @@ mod tests {
 
     #[test]
     fn same_top_tolerates_near_ties_only() {
-        let mac: Vec<Answer> = (0..20)
+        let reference: Vec<Answer> = (0..20)
             .map(|n| hit(&format!("o{n}"), n as f32 * 0.01))
             .collect();
-        assert!(same_top(&mac, &mac, 10, 1e-3));
+        assert!(same_top(&reference, &reference, 10, 1e-3));
         let near = |gap: f32| {
-            let mut mac = mac.clone();
-            mac[4].distance = mac[3].distance.map(|distance| distance + gap);
-            let mut other = mac.clone();
+            let mut reference = reference.clone();
+            reference[4].distance = reference[3].distance.map(|distance| distance + gap);
+            let mut other = reference.clone();
             other.swap(3, 4);
-            (mac, other)
+            (reference, other)
         };
         let (close, swapped) = near(5e-4);
         assert!(same_top(&close, &swapped, 10, 1e-3));
         let (apart, swapped) = near(2e-3);
         assert!(!same_top(&apart, &swapped, 10, 1e-3));
-        let mut boundary = mac.clone();
+        let mut boundary = reference.clone();
         boundary[10].distance = boundary[9].distance.map(|distance| distance + 5e-4);
         let mut other = boundary.clone();
         other.swap(9, 10);
         assert!(same_top(&boundary, &other, 10, 1e-3));
-        let mut stranger = mac.clone();
+        let mut stranger = reference.clone();
         stranger[2].object = Some("absent".to_string());
-        assert!(!same_top(&mac, &stranger, 10, 1e-3));
+        assert!(!same_top(&reference, &stranger, 10, 1e-3));
     }
 
     #[test]

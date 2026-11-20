@@ -230,8 +230,8 @@ pub struct Draw {
     /// By key and memory id, the smallest kept: a memory's key is its
     /// own, so two objects of it meet here, the smaller object id kept.
     /// Memories filed under an identity, and those under none, apart.
-    scoped: Smallest<Kept>,
-    unscoped: Smallest<Kept>,
+    scoped: Smallest<(u64, String), Kept>,
+    unscoped: Smallest<(u64, String), Kept>,
     drawn: KnownItemsDrawn,
 }
 
@@ -854,13 +854,13 @@ where
     })
 }
 
-/// The `n` entries with the smallest `(key, id)` offered, each id once.
-pub(crate) struct Smallest<V> {
+/// The `n` entries with the smallest keys offered, each key once.
+pub(crate) struct Smallest<K, V> {
     n: usize,
-    kept: BTreeMap<(u64, String), V>,
+    kept: BTreeMap<K, V>,
 }
 
-impl<V> Smallest<V> {
+impl<K: Ord, V> Smallest<K, V> {
     pub(crate) fn new(n: usize) -> Self {
         Self {
             n,
@@ -868,15 +868,10 @@ impl<V> Smallest<V> {
         }
     }
 
-    /// Offer `value` under `(key, id)`. One held already under it is
-    /// replaced only when `replaces` says so of it: a key is its id's own,
-    /// so a second offer is the same item again, from another place.
-    pub(crate) fn offer(
-        &mut self,
-        entry: (u64, String),
-        value: V,
-        replaces: impl FnOnce(&V) -> bool,
-    ) {
+    /// Offer `value` under `entry`. One held already under it is replaced
+    /// only when `replaces` says so of it: a key is its item's own, so a
+    /// second offer is the same item again, from another place.
+    pub(crate) fn offer(&mut self, entry: K, value: V, replaces: impl FnOnce(&V) -> bool) {
         if self.n == 0 {
             return;
         }
@@ -903,7 +898,7 @@ impl<V> Smallest<V> {
     }
 
     /// What was kept, in order of key.
-    pub(crate) fn into_values(self) -> impl Iterator<Item = ((u64, String), V)> {
+    pub(crate) fn into_values(self) -> impl Iterator<Item = (K, V)> {
         self.kept.into_iter()
     }
 }

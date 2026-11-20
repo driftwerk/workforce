@@ -16,6 +16,7 @@ mod tests;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -23,8 +24,9 @@ use eyre::{eyre, Result, WrapErr};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use vellev_core::Distance;
-use workforce_codebase_knowledge::graph::entities::{CodeEntity, EntityId, EntityKind};
+use workforce_codebase_knowledge::graph::entities::{CodeEntity, EntityId};
 use workforce_codebase_knowledge::graph::CodeGraph;
+use workforce_codebase_knowledge::indexer::summary_generator::SummaryGranularity;
 use workforce_codebase_knowledge::vector::{
     CodeVectorStore, Near, NearestTo, SearchedByVector, VectorCodeEntity, VectorSearchResult,
     VellevCodeVectorStore, WeaviateCodeVectorStore,
@@ -32,6 +34,7 @@ use workforce_codebase_knowledge::vector::{
 use workforce_common::settings::WorkforceConfig;
 use workforce_common::vectorizable::VectorizableText;
 
+use crate::known_items::Smallest;
 use stats::{Applying, Estimate, Form, Sum, Unit};
 
 const LIMIT: usize = 20;
@@ -57,10 +60,10 @@ const NO_QUERY: &str = "no question to ask";
 #[derive(Debug, Clone, Serialize)]
 pub struct CompareOptions {
     pub seed: u64,
-    pub entities: usize,
+    pub entities: NonZeroUsize,
     pub recall_queries: usize,
     pub same_queries: usize,
-    pub resamples: usize,
+    pub resamples: NonZeroUsize,
     pub weaviate_url: String,
     pub node_metrics: String,
     pub no_prefix: bool,
@@ -155,13 +158,11 @@ async fn summarised(
     graph: &CodeGraph,
     entity: &CodeEntity,
 ) -> Result<(Option<(Form, String)>, bool)> {
-    let granularity = match entity.kind {
-        EntityKind::Function | EntityKind::Method => "function",
-        EntityKind::File => "file",
-        EntityKind::Module => "module",
-        _ => return Ok((None, false)),
+    let Some(granularity) = SummaryGranularity::of(&entity.kind) else {
+        return Ok((None, false));
     };
-    Ok(match graph.get_summary(&entity.id, granularity).await? {
+    let summary = graph.get_summary(&entity.id, granularity.as_str()).await?;
+    Ok(match summary {
         Some((_, true)) => (None, true),
         Some((text, false)) => (asked(Form::Summary, stats::first_sentence(&text)), false),
         None => (None, false),
@@ -196,7 +197,7 @@ async fn eligible(
 /// text and question, those of the lowest keys: one pass a page at a time.
 async fn sampled(graph: &CodeGraph, seed: u64, entities: usize) -> Result<Sample> {
     let mut population = Population::default();
-    let mut lowest: BTreeMap<String, BTreeMap<([u8; 32], String, String), CodeEntity>> =
+    let mut lowest: BTreeMap<String, Smallest<([u8; 32], String, String), CodeEntity>> =
         BTreeMap::new();
     let mut repos: Vec<String> = graph
         .list_repositories()
@@ -219,11 +220,11 @@ async fn sampled(graph: &CodeGraph, seed: u64, entities: usize) -> Result<Sample
                 let kind = format!("{:?}", entity.kind);
                 *population.eligible.entry(kind.clone()).or_default() += 1;
                 let key = stats::key(seed, "sample", &[&entity.repo_id, &entity.id.0]);
-                let kept = lowest.entry(kind).or_default();
-                kept.insert((key, entity.repo_id.clone(), entity.id.0.clone()), entity);
-                if kept.len() > entities {
-                    kept.pop_last();
-                }
+                let entry = (key, entity.repo_id.clone(), entity.id.0.clone());
+                lowest
+                    .entry(kind)
+                    .or_insert_with(|| Smallest::new(entities))
+                    .offer(entry, entity, |_| false);
             }
             after = last;
         }
@@ -239,7 +240,7 @@ async fn sampled(graph: &CodeGraph, seed: u64, entities: usize) -> Result<Sample
     for (kind, kept) in lowest {
         let taken = population.allocated[&kind];
         let stratum_weight = stats::stratum_weight(population.eligible[&kind], taken);
-        for entity in kept.into_values().take(taken) {
+        for (_, entity) in kept.into_values().take(taken) {
             let (summary, stale) = summarised(graph, &entity).await?;
             population.summary_stale += usize::from(stale);
             let queries = unsummarised(&entity)
@@ -310,6 +311,7 @@ struct Side {
     results: Vec<Answer>,
     hit: bool,
     hit_raw: bool,
+    moved: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     siblings: Option<Vec<usize>>,
 }
@@ -376,6 +378,7 @@ struct Recalled {
 #[derive(Clone)]
 struct Held {
     qualified_name: String,
+    start_line: u32,
     text: String,
 }
 
@@ -397,6 +400,7 @@ impl Judge<'_> {
             .await?;
         let held = entity.map(|entity| Held {
             qualified_name: entity.qualified_name.clone(),
+            start_line: entity.start_line as u32,
             text: record_text(&entity),
         });
         self.held.insert(entity_id.to_string(), held.clone());
@@ -404,15 +408,16 @@ impl Judge<'_> {
     }
 
     /// `hit`: among the first [`DEPTH`] distinct entities the graph holds of
-    /// `results`, the target's text. `hit_raw`: among the first [`DEPTH`] as
-    /// they came, held under their own qualified name, the target's text.
+    /// `results`, the target's text; `moved`, those of them at another line.
+    /// `hit_raw`: among the first [`DEPTH`] as they came, held under their
+    /// own qualified name, the target's text.
     async fn side(
         &mut self,
         target: &Target,
         results: Vec<Answer>,
         weaviate: bool,
     ) -> Result<Side> {
-        let (mut seen, mut hit, mut hit_raw) = (HashSet::new(), false, false);
+        let (mut seen, mut hit, mut hit_raw, mut moved) = (HashSet::new(), false, false, 0);
         for (at, result) in results.iter().enumerate() {
             let Some(held) = self.held(&result.found.entity_id).await? else {
                 continue;
@@ -420,6 +425,7 @@ impl Judge<'_> {
             let is_target = held.text == target.text;
             if seen.len() < DEPTH && seen.insert(result.found.entity_id.clone()) {
                 hit |= is_target;
+                moved += usize::from(result.found.start_line != held.start_line);
             }
             if at < DEPTH && held.qualified_name == result.found.qualified_name {
                 hit_raw |= is_target;
@@ -428,6 +434,7 @@ impl Judge<'_> {
         Ok(Side {
             hit,
             hit_raw,
+            moved,
             siblings: weaviate.then(|| siblings(&target.entity, &results)),
             results,
         })
@@ -448,8 +455,8 @@ fn siblings(target: &CodeEntity, results: &[Answer]) -> Vec<usize> {
         .collect()
 }
 
-fn failed_on(side: &str, id: &str) -> impl FnOnce(eyre::Report) -> eyre::Report {
-    let said = format!("{side} failed on query {id}");
+fn failed_on(side: &str, on: &str, id: &str) -> impl FnOnce(eyre::Report) -> eyre::Report {
+    let said = format!("{side} failed on {on} {id}");
     move |e| e.wrap_err(said)
 }
 
@@ -474,7 +481,7 @@ async fn nearest(
 ) -> Result<Vec<Answer>> {
     let found = vellev.nearest(to, &query.repo_id, LIMIT).await;
     Ok(found
-        .map_err(failed_on(side, &query.id))?
+        .map_err(failed_on(side, "query", &query.id))?
         .into_iter()
         .map(Answer::from)
         .collect())
@@ -490,7 +497,7 @@ async fn answered(
     let from_weaviate = weaviate
         .search_entities(&query.text, Some(&query.repo_id), None, LIMIT)
         .await
-        .map_err(failed_on("weaviate", &query.id))?;
+        .map_err(failed_on("weaviate", "query", &query.id))?;
     let by_text = nearest(vellev, NearestTo::Text(&query.text), query, "vellev").await?;
     let prefixed = NearestTo::Vector(&vectors.prefixed);
     let by_vector = nearest(vellev, prefixed, query, "vellev vector").await?;
@@ -568,7 +575,7 @@ async fn measured(
     let Sample {
         targets,
         population,
-    } = sampled(graph, options.seed, options.entities).await?;
+    } = sampled(graph, options.seed, options.entities.get()).await?;
     note(&format!(
         "{} entities eligible, of {} kinds; {} left out; {} sampled",
         population.eligible.values().sum::<usize>(),
@@ -634,11 +641,11 @@ async fn measured(
             weaviate: weaviate
                 .entity_count(repo)
                 .await
-                .map_err(failed_on("weaviate", repo))?,
+                .map_err(failed_on("weaviate", "repo", repo))?,
             vellev: vellev
                 .counted(repo)
                 .await
-                .map_err(failed_on("vellev", repo))?,
+                .map_err(failed_on("vellev", "repo", repo))?,
         };
         repos.insert(repo.to_string(), counts);
     }
@@ -676,13 +683,13 @@ async fn recalled(
         let before = work
             .scored()
             .await
-            .map_err(failed_on("node metrics", &query.id))?;
+            .map_err(failed_on("node metrics", "query", &query.id))?;
         let to = NearestTo::Vector(&vectors.prefixed);
         let index = nearest(vellev, to, query, "vellev vector").await?;
         let after = work
             .scored()
             .await
-            .map_err(failed_on("node metrics", &query.id))?;
+            .map_err(failed_on("node metrics", "query", &query.id))?;
         by_repo.entry(query.repo_id.as_str()).or_default().push((
             *query,
             *vectors,
@@ -706,7 +713,7 @@ async fn recalled(
         let scanned = vellev
             .nearest_exactly(&wanted, repo, DEPTH)
             .await
-            .map_err(failed_on("exact scan", repo))?;
+            .map_err(failed_on("exact scan", "repo", repo))?;
         let held = scanned.held;
         let scans = scanned.nearest.into_iter().zip(scanned.named);
         for ((query, _, index, scored), (exact, first)) in asked.into_iter().zip(scans) {
@@ -788,6 +795,12 @@ struct Collided {
     colliding: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+struct Moved {
+    weaviate: usize,
+    vellev: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct Gate {
     name: String,
@@ -799,6 +812,7 @@ struct Gate {
 struct Findings {
     sample: Population,
     check1: Check1,
+    moved: Moved,
     siblings: Siblings,
     prefix: Prefix,
     check2: Check2,
@@ -812,6 +826,7 @@ struct Findings {
 struct Tally {
     units: Vec<Unit>,
     siblings: BTreeMap<String, Collided>,
+    moved: Moved,
     agreement: Agreement,
     applied: bool,
 }
@@ -851,6 +866,8 @@ fn found(
             repo.holding += usize::from(colliding > 0);
             repo.colliding += colliding;
             for one in queries {
+                tally.moved.weaviate += one.answers.weaviate.moved;
+                tally.moved.vellev += one.answers.vellev.moved;
                 let agreed = agrees(&one.answers, &one.answers.vellev_vector);
                 let (count, agreeing) = match same_queries.contains(&one.query.id) {
                     true => (&mut tally.agreement.same, &mut tally.agreement.same_agreed),
@@ -866,7 +883,7 @@ fn found(
             }
             tally
         });
-    let replicates = stats::bootstrap(&tally.units, options.resamples, options.seed);
+    let replicates = stats::bootstrap(&tally.units, options.resamples.get(), options.seed);
     let total = tally.units.iter().map(|unit| unit.sum).sum::<Sum>();
     let estimate = |measure: fn(&Sum) -> f64| Estimate::of(total, &replicates.overall, measure);
     let kinds = stats::strata(&tally.units)
@@ -919,6 +936,7 @@ fn found(
     Findings {
         sample,
         check1,
+        moved: tally.moved,
         siblings: Siblings {
             share: holding as f64 / targets.max(1) as f64,
             repos: tally.siblings,
@@ -1029,6 +1047,11 @@ impl std::fmt::Display for Run {
             "  D_raw: {}; Weaviate holds a dropped sibling for {share:.4} of targets",
             estimate(&check1.d_raw)
         )?;
+        writeln!(
+            f,
+            "  judged results at another line: weaviate {}, vellev {}",
+            found.moved.weaviate, found.moved.vellev
+        )?;
         match &found.prefix.d_prefix {
             Some(e) => writeln!(
                 f,
@@ -1064,14 +1087,19 @@ impl std::fmt::Display for Run {
     }
 }
 
-fn partial(out: &Path) -> PathBuf {
-    let mut name = out.as_os_str().to_owned();
-    name.push(".partial");
-    PathBuf::from(name)
+fn placed(out: &Path) -> Result<(PathBuf, PathBuf)> {
+    let name = out
+        .file_name()
+        .ok_or_else(|| eyre!("--out {} names no directory to make", out.display()))?;
+    let parent = out.parent().unwrap_or(Path::new(""));
+    let mut partial = name.to_owned();
+    partial.push(".partial");
+    Ok((parent.join(name), parent.join(partial)))
 }
 
 fn refused_if_there(out: &Path) -> Result<()> {
-    match [out.to_path_buf(), partial(out)].into_iter().find(|there| there.exists()) {
+    let (out, partial) = placed(out)?;
+    match [out, partial].into_iter().find(|there| there.exists()) {
         Some(there) => Err(eyre!(
             "{} exists: a run never writes over one; keep it to look into, or remove it, and run again",
             there.display()
@@ -1089,6 +1117,22 @@ fn wrote(path: &Path, write: impl FnOnce(&mut BufWriter<File>) -> Result<()>) ->
         .map_err(|e| e.into_error())?
         .sync_all()?;
     sha256_of(path)
+}
+
+#[cfg(unix)]
+fn synced(dir: &Path) -> Result<()> {
+    let dir = match dir.as_os_str().is_empty() {
+        true => Path::new("."),
+        false => dir,
+    };
+    File::open(dir)
+        .and_then(|dir| dir.sync_all())
+        .wrap_err_with(|| format!("syncing {}", dir.display()))
+}
+
+#[cfg(not(unix))]
+fn synced(_dir: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn sha256_of(path: &Path) -> Result<String> {
@@ -1110,14 +1154,16 @@ fn lines<T: Serialize>(
 }
 
 /// Make `out`'s `.partial`, measure into it, write the files and then their
-/// sums, and move them to `out`. A failure leaves `.partial` with no sums.
+/// sums, and move them to `out`, made empty for them so that nothing else
+/// there is written over. A failure leaves `.partial` with no sums.
 async fn recorded(
     out: &Path,
     measure: impl std::future::Future<Output = Result<(Measured, Manifest)>>,
 ) -> Result<Run> {
     refused_if_there(out)?;
-    let partial = partial(out);
-    std::fs::create_dir_all(partial.parent().unwrap_or(Path::new(".")))?;
+    let (out, partial) = placed(out)?;
+    let parent = out.parent().unwrap_or(Path::new(""));
+    std::fs::create_dir_all(parent)?;
     std::fs::create_dir(&partial).wrap_err_with(|| format!("making {}", partial.display()))?;
     let (measured, manifest) = measure.await?;
     let report = Report {
@@ -1141,12 +1187,20 @@ async fn recorded(
         .map(|(name, sum)| format!("{sum}  {name}\n"))
         .collect();
     wrote(&at(SUMS), |writer| Ok(writer.write_all(listed.as_bytes())?))?;
-    std::fs::rename(&partial, out)
+    synced(&partial)?;
+    std::fs::create_dir(&out).wrap_err_with(|| {
+        format!(
+            "making {}, which a run moves its files into and never writes over",
+            out.display()
+        )
+    })?;
+    std::fs::rename(&partial, &out)
+        .inspect_err(|_| {
+            let _ = std::fs::remove_dir(&out);
+        })
         .wrap_err_with(|| format!("moving {} to {}", partial.display(), out.display()))?;
-    Ok(Run {
-        dir: out.to_path_buf(),
-        report,
-    })
+    synced(parent)?;
+    Ok(Run { dir: out, report })
 }
 
 struct Opened {
@@ -1229,6 +1283,9 @@ async fn compared(
     options: &CompareOptions,
     note: &(dyn Fn(&str) + Send + Sync),
 ) -> Result<Run> {
+    if !weaviate.health_check().await? {
+        return Err(eyre!("Weaviate at {} is not healthy", weaviate.base_url()));
+    }
     let started = chrono::Utc::now().to_rfc3339();
     let identity_start = vellev.found_as_wanted().await?;
     let (graph, tenant) = (opened.graph.identity(), vellev.tenant().unwrap_or_default());
@@ -1241,9 +1298,6 @@ async fn compared(
         return Err(eyre!(
             "the code vectors of vellev tenant '{tenant}' are claimed for {claimed}, not this one ({graph}): a run measures a tenant built from the graph it is given"
         ));
-    }
-    if !weaviate.health_check().await? {
-        return Err(eyre!("Weaviate at {} is not healthy", weaviate.base_url()));
     }
     let measure = async {
         let measured = measured(&opened.graph, weaviate, vellev, work, options, note).await?;
