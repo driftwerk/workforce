@@ -48,6 +48,10 @@ pub(super) struct Track {
     /// answers, stamped on each of its events.
     place: Option<Place>,
     message: Option<uuid::Uuid>,
+    /// A boss's turn on what woke it (a session's line or turn end, a
+    /// plan): how many things it had done before, so a turn that did
+    /// nothing is kept out of Activity.
+    quiet: Option<u64>,
     done: bool,
 }
 
@@ -139,12 +143,14 @@ impl CrewHub {
                 _person: person,
                 place,
                 message: asked,
+                quiet: None,
                 done: false,
             });
         }
         if message.starts_with(CHECK_IN) {
             return None;
         }
+        let quiet = (overseer && woken(message)).then(|| self.acted_by(&agent_id));
         // Its reply in the DM is running: what it would post there on its
         // own waits, so nothing lands in the middle of it.
         let dm_session = session_id
@@ -171,20 +177,22 @@ impl CrewHub {
                 last_activity: now,
             },
         );
-        self.desk.note(
-            Event::new(
-                Kind::Started,
-                party.clone(),
-                Some(party.clone()),
-                match &task {
-                    Some(t) => format!("started “{t}”"),
-                    None => "started".to_string(),
-                },
-            )
-            .hop(hop)
-            .detail(json!({ "task": task }))
-            .at_place(place.clone(), asked),
-        );
+        if quiet.is_none() {
+            self.desk.note(
+                Event::new(
+                    Kind::Started,
+                    party.clone(),
+                    Some(party.clone()),
+                    match &task {
+                        Some(t) => format!("started “{t}”"),
+                        None => "started".to_string(),
+                    },
+                )
+                .hop(hop)
+                .detail(json!({ "task": task }))
+                .at_place(place.clone(), asked),
+            );
+        }
         Some(Track {
             crew: self.me(),
             key,
@@ -197,6 +205,7 @@ impl CrewHub {
             _person: None,
             place,
             message: asked,
+            quiet,
             done: false,
         })
     }
@@ -246,6 +255,13 @@ impl Track {
         }
         let (ended, answer, question) =
             crew::outcome_of(outcome.as_deref().map_err(String::as_str));
+        if ended == Outcome::Finished
+            && self
+                .quiet
+                .is_some_and(|before| crew.acted_by(&self.party.id) == before)
+        {
+            return;
+        }
         let text = match (ended, &answer, &question) {
             (Outcome::Limit, _, _) => "hit a usage limit".to_string(),
             (Outcome::Asked, _, Some(q)) => format!("asked “{}”", q.text),
@@ -295,6 +311,14 @@ impl Drop for Track {
             .at_place(self.place.clone(), self.message),
         );
     }
+}
+
+/// Whether `message` woke a boss on its own work (a session's line or turn
+/// end, a plan), not the person asking it something.
+fn woken(message: &str) -> bool {
+    [super::line::LINE, super::work::WORK, super::plan::PLAN]
+        .iter()
+        .any(|p| message.starts_with(p))
 }
 
 /// The room a turn was asked in, or that an unattended run answers to,

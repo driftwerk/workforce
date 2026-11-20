@@ -109,6 +109,26 @@ pub fn in_turn(state: SessionState) -> bool {
     matches!(state, SessionState::Working | SessionState::Blocked)
 }
 
+/// `text` past a leading stamp of who wrote it and when ("Desk, 00:21."),
+/// which says nothing on its own; all of it when the stamp is all it says.
+pub fn unstamped(text: &str) -> &str {
+    let lead = text.trim_start();
+    let past = lead.split_once(", ").and_then(|(who, rest)| {
+        let named = !who.is_empty()
+            && who.split(' ').count() <= 3
+            && who.chars().all(|c| c.is_alphanumeric() || c == ' ');
+        let (time, after) = rest.split_once('.')?;
+        let (h, m) = time.strip_suffix(" UTC").unwrap_or(time).split_once(':')?;
+        let clock = (1..=2).contains(&h.len())
+            && m.len() == 2
+            && h.chars().chain(m.chars()).all(|c| c.is_ascii_digit());
+        let said = after.trim_start();
+        (named && clock && after.starts_with(char::is_whitespace) && !said.is_empty())
+            .then_some(said)
+    });
+    past.unwrap_or(text)
+}
+
 /// Which turn of a session's run something was sent in: an escalation
 /// interrupts that turn alone, never one begun since. `run` is the run's
 /// own: its counters start again with each Desk, so a mark from before a
@@ -1874,6 +1894,26 @@ mod tests {
         }
         assert_eq!(guard(1, &run, true), Err(Refusal::Peers));
         assert_eq!(guard(1, &run, false), Ok(()), "Desk still hears it");
+    }
+
+    #[test]
+    fn a_stamp_of_who_and_when_is_read_past() {
+        assert_eq!(
+            unstamped("Desk, 00:21. Update: run 4464 is already fixed."),
+            "Update: run 4464 is already fixed."
+        );
+        assert_eq!(
+            unstamped("Desk, 3:12 UTC.  Go: run step 12."),
+            "Go: run step 12."
+        );
+        for kept in [
+            "Desk, 00:21.",
+            "Desk, 00:21.5 is the version.",
+            "Staging, then production, 02:45. Go.",
+            "Watch #744, then report.",
+        ] {
+            assert_eq!(unstamped(kept), kept);
+        }
     }
 
     #[test]

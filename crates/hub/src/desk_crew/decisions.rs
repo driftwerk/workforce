@@ -287,6 +287,17 @@ impl CrewHub {
         )
     }
 
+    /// How many things `boss` has done (decisions and suggestions), about
+    /// any session or none.
+    pub(crate) fn acted_by(&self, boss: &str) -> u64 {
+        self.acted
+            .lock()
+            .iter()
+            .filter(|((b, _), _)| b == boss)
+            .map(|(_, n)| n)
+            .sum()
+    }
+
     /// `boss` did something about `session` (a decision, or a suggestion).
     pub(crate) fn acted_on(&self, boss: &str, session: Option<Uuid>) {
         *self
@@ -296,9 +307,15 @@ impl CrewHub {
             .or_default() += 1;
     }
 
-    /// Keeps `d`. A write that fails is logged, never the action's failure.
+    /// Keeps `d`, counted as something its boss did. A write that fails is
+    /// logged, never the action's failure.
     pub(crate) async fn record(&self, d: &mut BossDecision) {
         self.acted_on(&d.boss, d.session);
+        self.keep_logged(d).await;
+    }
+
+    /// Keeps `d`, logging a write that fails.
+    async fn keep_logged(&self, d: &mut BossDecision) {
         if let Err(e) = self.keep(d).await {
             tracing::warn!(boss = %d.boss, error = %e, "a boss's decision wasn't kept");
         }
@@ -579,7 +596,9 @@ impl CrewHub {
             d.undo = Undo::Reverse;
             d.action = UndoPlan::GoAhead { session }.value();
         }
-        self.record(&mut d).await;
+        // Not something it did: a turn that left a session alone stays one
+        // that did nothing.
+        self.keep_logged(&mut d).await;
     }
 
     pub(crate) fn name_of_session(&self, id: Uuid) -> String {
