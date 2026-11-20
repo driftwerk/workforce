@@ -54,6 +54,11 @@ fn denied(v: &Value) -> bool {
 
 /// Spend `usd` kept for `session` now.
 async fn spent(d: &Desk, session: Uuid, usd: f64) {
+    spent_on(d, session, usd, Billing::Key).await
+}
+
+/// `usd` of spend in `session`, paid as `billing` says.
+async fn spent_on(d: &Desk, session: Uuid, usd: f64, billing: Billing) {
     let spend = Spend {
         key: Uuid::new_v4().to_string(),
         at: Utc::now(),
@@ -74,7 +79,7 @@ async fn spent(d: &Desk, session: Uuid, usd: f64) {
             None,
             &[Kept {
                 spend,
-                billing: Billing::Plan,
+                billing,
                 account: None,
             }],
         )
@@ -186,6 +191,31 @@ async fn a_session_taken_back_mid_turn_while_held_finishes_that_turn() {
         post(&d, s.id, stop()).await;
         post(&d, s.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "<task-notification>x</task-notification>"})).await;
         assert!(denied(&post(&d, s.id, tool("ls")).await), "the next is held");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_session_on_the_persons_plan_is_never_held_by_a_dollar_budget() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        d.put_budget(budget(BudgetScope::Session(s.id), 1.0), By::you())
+            .await
+            .unwrap();
+        post(&d, s.id, prompt()).await;
+        // $40 of plan use is no money: the session goes on.
+        spent_on(&d, s.id, 40.0, Billing::Plan).await;
+        d.breaker_spend(Some(vec![s.id])).await;
+        assert!(d.breaker_needs().is_empty());
+        assert!(!denied(&post(&d, s.id, tool("ls")).await));
+        post(&d, s.id, stop()).await;
+        d.prompt(s.id, "next", Some(agent())).unwrap();
+        // A key's dollars are: past the budget, it waits.
+        spent_on(&d, s.id, 1.2, Billing::Key).await;
+        d.breaker_spend(Some(vec![s.id])).await;
+        assert_eq!(d.breaker_needs().len(), 1);
     })
     .await;
 }

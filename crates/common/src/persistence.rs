@@ -463,6 +463,26 @@ impl SqliteStore {
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_cost_billing_ts ON cost_records(billing, timestamp);",
         )?;
+        // Mirrors telemetry V035: what background work used of a plan.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS work_use (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 at TEXT NOT NULL,
+                 work TEXT NOT NULL,
+                 label TEXT NOT NULL,
+                 agent_id TEXT NOT NULL,
+                 payer TEXT,
+                 plan TEXT,
+                 window_minutes INTEGER,
+                 share REAL NOT NULL DEFAULT 0,
+                 turns INTEGER NOT NULL DEFAULT 0,
+                 tokens INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE INDEX IF NOT EXISTS idx_work_use_at ON work_use(at);
+             CREATE INDEX IF NOT EXISTS idx_work_use_work_at ON work_use(work, at);
+             CREATE INDEX IF NOT EXISTS idx_work_use_payer_at ON work_use(payer, at);
+             CREATE INDEX IF NOT EXISTS idx_work_use_agent_at ON work_use(agent_id, at);",
+        )?;
         // Mirrors telemetry V022: a call recorded again under its ledger key
         // (a durable round collected after a restart) is kept once.
         let _ = conn.execute_batch("ALTER TABLE cost_records ADD COLUMN ledger_key TEXT;");
@@ -1062,19 +1082,165 @@ impl SqliteStore {
         let mut stmt = conn.prepare(
             "SELECT agent_id, COALESCE(SUM(cost_usd), 0), \
                COALESCE(SUM(input_tokens + output_tokens + cache_creation_input_tokens \
-                 + cache_read_input_tokens), 0) \
+                 + cache_read_input_tokens), 0), \
+               COALESCE(SUM(CASE WHEN billing = ?3 THEN cost_usd ELSE 0 END), 0) \
              FROM cost_records WHERE timestamp >= ?1 AND timestamp <= ?2 GROUP BY agent_id",
         )?;
         let rows = stmt
-            .query_map(params![from.to_rfc3339(), to.to_rfc3339()], |row| {
-                Ok(AgentUse {
-                    agent_id: row.get(0)?,
-                    cost_usd: row.get(1)?,
-                    tokens: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
-                })
-            })?
+            .query_map(
+                params![
+                    from.to_rfc3339(),
+                    to.to_rfc3339(),
+                    Billing::Metered.as_str()
+                ],
+                |row| {
+                    Ok(AgentUse {
+                        agent_id: row.get(0)?,
+                        cost_usd: row.get(1)?,
+                        tokens: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
+                        metered_usd: row.get(3)?,
+                    })
+                },
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Keep one row of what background work used.
+    pub fn record_work_use(&self, row: &crate::work_use::WorkUseRow) -> Result<()> {
+        self.conn
+            .lock()
+            .map_err(|e| eyre::eyre!("Lock poisoned: {}", e))?
+            .execute(
+                "INSERT INTO work_use (at, work, label, agent_id, payer, plan, window_minutes, share, turns, tokens)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    row.at.to_rfc3339(),
+                    row.work,
+                    row.label,
+                    row.agent_id,
+                    row.payer,
+                    row.plan,
+                    row.window_minutes,
+                    row.share,
+                    row.turns,
+                    i64::try_from(row.tokens).unwrap_or(i64::MAX),
+                ],
+            )?;
+        Ok(())
+    }
+
+    /// The rows of what background work used from `from` to `to`, of
+    /// `payer`'s plans and budgets alone when one is named, of `work` alone
+    /// when it is named.
+    pub fn work_use_rows(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        payer: Option<&str>,
+        work: Option<&str>,
+        agent: Option<&str>,
+    ) -> Result<Vec<crate::work_use::WorkUseRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| eyre::eyre!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT at, work, label, agent_id, payer, plan, window_minutes, share, turns, tokens
+             FROM work_use
+             WHERE at >= ?1 AND at <= ?2 AND (?3 IS NULL OR payer = ?3) AND (?4 IS NULL OR work = ?4)
+               AND (?5 IS NULL OR agent_id = ?5)
+             ORDER BY at",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![from.to_rfc3339(), to.to_rfc3339(), payer, work, agent],
+                |row| {
+                    let at: String = row.get(0)?;
+                    Ok(crate::work_use::WorkUseRow {
+                        at: DateTime::parse_from_rfc3339(&at)
+                            .map(|t| t.to_utc())
+                            .unwrap_or_default(),
+                        work: row.get(1)?,
+                        label: row.get(2)?,
+                        agent_id: row.get(3)?,
+                        payer: row.get(4)?,
+                        plan: row.get(5)?,
+                        window_minutes: row.get(6)?,
+                        share: row.get(7)?,
+                        turns: row.get(8)?,
+                        tokens: u64::try_from(row.get::<_, i64>(9)?).unwrap_or(0),
+                    })
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// What background work used from `from` to `to`, summed by work and
+    /// plan window ([`crate::telemetry::TelemetryStore::work_use_sums`]).
+    pub fn work_use_sums(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        work: Option<&str>,
+        agent: Option<&str>,
+        payer: Option<&str>,
+    ) -> Result<Vec<crate::work_use::WorkUseSum>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| eyre::eyre!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT MIN(at), work, MAX(label), MAX(agent_id), plan, window_minutes,
+                    SUM(share), SUM(turns), SUM(tokens), COUNT(DISTINCT substr(at, 1, 13))
+             FROM work_use
+             WHERE at >= ?1 AND at <= ?2 AND (?3 IS NULL OR work = ?3) AND (?4 IS NULL OR agent_id = ?4)
+               AND (?5 IS NULL OR payer = ?5)
+             GROUP BY work, plan, window_minutes",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![from.to_rfc3339(), to.to_rfc3339(), work, agent, payer],
+                |row| {
+                    let at: String = row.get(0)?;
+                    Ok(crate::work_use::WorkUseSum {
+                        row: crate::work_use::WorkUseRow {
+                            at: DateTime::parse_from_rfc3339(&at)
+                                .map(|t| t.to_utc())
+                                .unwrap_or_default(),
+                            work: row.get(1)?,
+                            label: row.get(2)?,
+                            agent_id: row.get(3)?,
+                            payer: None,
+                            plan: row.get(4)?,
+                            window_minutes: row.get(5)?,
+                            share: row.get(6)?,
+                            turns: u32::try_from(row.get::<_, i64>(7)?).unwrap_or(u32::MAX),
+                            tokens: u64::try_from(row.get::<_, i64>(8)?).unwrap_or(0),
+                        },
+                        hours: u32::try_from(row.get::<_, i64>(9)?).unwrap_or(0),
+                    })
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Delete what background work used before `before`.
+    pub fn prune_work_use(&self, before: DateTime<Utc>) -> Result<usize> {
+        let before = before.to_rfc3339();
+        crate::telemetry::prune_in_batches(|| {
+            Ok(self
+                .conn
+                .lock()
+                .map_err(|e| eyre::eyre!("Lock poisoned: {}", e))?
+                .execute(
+                    "DELETE FROM work_use WHERE id IN (
+                         SELECT id FROM work_use WHERE at < ?1 ORDER BY at LIMIT ?2)",
+                    params![before, crate::telemetry::PRUNE_BATCH as i64],
+                )?)
+        })
     }
 
     pub fn metered_spend(
@@ -3607,6 +3773,9 @@ pub struct MeteredSpend {
 pub struct AgentUse {
     pub agent_id: String,
     pub cost_usd: f64,
+    /// The part of `cost_usd` that was money: calls an API key, Bedrock or
+    /// Vertex paid for. What a dollar budget counts.
+    pub metered_usd: f64,
     pub tokens: u64,
 }
 

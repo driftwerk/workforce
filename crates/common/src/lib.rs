@@ -86,3 +86,4 @@ pub mod trust;
 pub mod usage;
 pub mod vault_scope;
 pub mod vectorizable;
+pub mod work_use;

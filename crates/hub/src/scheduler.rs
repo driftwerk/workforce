@@ -515,6 +515,9 @@ impl Scheduler {
             deliver_to,
             edited_by: automated_origin(),
             paused_by_suspension: false,
+            paused_by_plan: false,
+            plan_resumed_at: None,
+            plan_hourly_limit: None,
         };
 
         let id = job.id.clone();
@@ -719,12 +722,67 @@ impl Scheduler {
         .await
         .unwrap_or_else(|_| crate::cost_forecast::CostForecast::default_estimate());
         let projected = per_run.recurring(runs_per_day(schedule, &Utc::now(), self.default_tz));
+        // On the person's plan a run costs no money: only keeping a session
+        // asks; what it would use of the plan is said instead.
+        let on_plan = crate::turn_loop::route_login(&service, Some(&model))
+            .await
+            .is_some();
         Some(RecurringCost {
             pins,
             per_run,
             projected,
-            threshold_usd: budget.confirm_recurring_daily_usd,
+            threshold_usd: match on_plan {
+                true => f64::INFINITY,
+                false => budget.confirm_recurring_daily_usd,
+            },
         })
+    }
+
+    /// What a recurring job on `schedule` would use of the person's plan,
+    /// from its own past runs (`job_id`), else the agent's other jobs'.
+    /// `None` when it would not run on a plan, or runs once.
+    pub async fn plan_estimate(
+        &self,
+        schedule: &Schedule,
+        model: Option<&str>,
+        job_id: Option<&str>,
+    ) -> Option<crate::plan_guard::PlanEstimate> {
+        if matches!(schedule, Schedule::At { .. }) {
+            return None;
+        }
+        let service = self.service();
+        let login = crate::turn_loop::route_login(&service, model).await?;
+        let plan = crate::plan_guard::plan_of(login.kind);
+        // A week of this agent's jobs on this person's plans, summed in the
+        // store.
+        let store = Arc::clone(&service.telemetry_store);
+        let now = Utc::now();
+        let agent = service.agent_id.to_string();
+        let payer = crate::user_config::current_billing_identity_id();
+        let rows: Vec<_> = tokio::task::spawn_blocking(move || {
+            store.work_use_sums(
+                now - chrono::Duration::days(7),
+                now,
+                None,
+                Some(&agent),
+                payer.as_deref(),
+            )
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|sum| sum.row)
+        .collect();
+        Some(crate::plan_guard::PlanEstimate::of(
+            &rows,
+            plan,
+            service.agent_id.as_str(),
+            job_id,
+            runs_per_day(schedule, &now, self.default_tz),
+            service.config.budget.plan.notable_daily_percent,
+        ))
     }
 
     /// The approval `edit` needs before it is applied to `job`: it pins a
@@ -1504,6 +1562,61 @@ impl Scheduler {
             .map(|spent| format!("it reached its ${budget:.2} budget (${spent:.2} spent)"))
     }
 
+    /// Switch `job` off as the plan guard's runaway, and tell its owner once:
+    /// only as it is switched off, never while it already is.
+    async fn stop_as_runaway(&self, job: &ScheduledJob, why: &str) {
+        let mut jobs = self.jobs.write().await;
+        let Some(j) = jobs.iter_mut().find(|j| j.id == job.id && j.enabled) else {
+            return;
+        };
+        let fields = j.stop_as_runaway();
+        let stopped = j.clone();
+        self.persist_change(
+            &jobs,
+            crate::scheduler_store::JobChange::Fields(&stopped, fields),
+        )
+        .await;
+        drop(jobs);
+        warn!(job_id = %job.id, name = %job.name, %why, "Scheduled job stopped as a runaway");
+        let work = stopped.work(self.service().agent_id.as_str());
+        let text = format!("{why} {}", crate::plan_guard::stopped_choices(&work));
+        self.tell_owner(&stopped, &text).await;
+    }
+
+    /// Tell `job`'s owner `text`: in Desk when the job is Desk's, else in
+    /// their Slack DM.
+    async fn tell_owner(&self, job: &ScheduledJob, text: &str) {
+        if desk_targeted(job) {
+            if !self.deliver_via_desk(job, DeliveryKind::Job, text).await {
+                warn!(job_id = %job.id, "Telling the job's owner in Desk failed");
+            }
+            return;
+        }
+        let Some(owner) = job.creator_identity_id.as_deref() else {
+            return;
+        };
+        let Some(slack_uid) = self.slack_user_for_dm(owner) else {
+            return;
+        };
+        let service = self.service();
+        let registry = service.surface_registry.read().await;
+        let Ok((_, dm_channel)) = registry
+            .resolve_user_dm(
+                "slack",
+                &slack_uid,
+                workforce_common::channels::ChannelHint::default(),
+            )
+            .await
+        else {
+            return;
+        };
+        for surface in registry.all() {
+            let _ = surface
+                .send_message(&OutboundMessage::text(dm_channel.clone(), text.to_string()))
+                .await;
+        }
+    }
+
     async fn disable_with_notice(&self, job_id: &str, reason: &str) {
         let mut jobs = self.jobs.write().await;
         let Some(j) = jobs.iter_mut().find(|j| j.id == job_id) else {
@@ -1847,7 +1960,17 @@ impl Scheduler {
                     relayed: false,
                 },
             );
-        workforce_agent::runner::with_desk(desk, self.execute_job_as(job)).await
+        let run = workforce_agent::runner::with_desk(desk, self.execute_job_as(job));
+        // An agent's turn on a schedule is background work: the plan guard
+        // holds it while the person's plan is nearly full, and counts what
+        // it uses toward the job.
+        match &job.payload {
+            JobPayload::AgentTurn { .. } => {
+                let work = job.work(self.service().agent_id.as_str());
+                workforce_common::work_use::within(work, run).await
+            }
+            _ => run.await,
+        }
     }
 
     /// [`Self::execute_job`] as the job's `run_as_identity_id` or
@@ -1926,10 +2049,41 @@ impl Scheduler {
                 // FAILURE (feeding the consecutive-failure auto-disable)
                 // instead of delivering the same refusal to its channel on
                 // every fire. `process_message` still backstops this.
-                match service
-                    .cost_governor
-                    .preflight(service.agent_id.as_str(), job.effective_billing_identity())
-                {
+                let on_plan = crate::turn_loop::plan_login(&service, model.as_deref()).await;
+                match service.cost_governor.preflight_on(
+                    service.agent_id.as_str(),
+                    job.effective_billing_identity(),
+                    crate::cost_governor::OnPlan {
+                        login: on_plan.as_ref(),
+                    },
+                ) {
+                    // Using far more of the person's plan than it usually
+                    // does: switched off, and its owner told once, as it is
+                    // switched off.
+                    crate::cost_governor::Admission::Stopped { why: reason, .. } => {
+                        self.stop_as_runaway(job, &reason).await;
+                        return self.finish_record(
+                            job,
+                            started_at,
+                            start,
+                            true,
+                            format!("{SKIPPED_PREFIX} stopped by the plan guard: {reason}"),
+                            true,
+                        );
+                    }
+                    // The person's plan is nearly full: the job waits, as
+                    // under a hold, and goes on once the plan has room.
+                    crate::cost_governor::Admission::Waits(reason) => {
+                        info!(job_id = %job.id, name = %job.name, %reason, "Job run waits on the person's plan");
+                        return self.finish_record(
+                            job,
+                            started_at,
+                            start,
+                            true,
+                            format!("{SKIPPED_PREFIX} waiting on the plan: {reason}"),
+                            true,
+                        );
+                    }
                     crate::cost_governor::Admission::Deny(reason) => {
                         warn!(job_id = %job.id, name = %job.name, %reason, "Job run denied by budget");
                         return self.finish_record(job, started_at, start, false, reason, false);
@@ -1951,6 +2105,34 @@ impl Scheduler {
                     crate::cost_governor::Admission::Proceed
                     | crate::cost_governor::Admission::Warn(_) => {}
                 }
+
+                // On the person's plan, a run takes at most `[budget.plan]
+                // run_max_rounds` rounds (never more than it would anyway)
+                // and `run_max_minutes` in all. Paid runs keep their own.
+                let caps = service.config.budget.plan.clone();
+                let capped = caps.enabled && on_plan.is_some();
+                let max_rounds = match capped && caps.run_max_rounds > 0 {
+                    true => Some(
+                        crate::turn_loop::records::resolve_max_rounds(
+                            *max_rounds,
+                            *service.active_max_rounds.read(),
+                            crate::turn_loop::records::origin_default_max_rounds(
+                                "scheduler",
+                                &service.effective_llm,
+                            ),
+                        )
+                        .min(caps.run_max_rounds),
+                    ),
+                    false => *max_rounds,
+                };
+                let max_rounds = &max_rounds;
+                // A job keeping its own session is never cut off mid-turn,
+                // which would leave its conversation half written: its
+                // rounds bound it.
+                let run_minutes = match capped && session.is_none() {
+                    true => caps.run_max_minutes,
+                    false => 0,
+                };
 
                 // Always deliver to DM via open_conversation for reliability.
                 // Resolve DM channel up front so we can pass it to process_message.
@@ -2012,35 +2194,42 @@ impl Scheduler {
                 // task-local, so a job delivering to a shared channel, or one
                 // anybody but its run_as identity is in charge of, never loads
                 // that identity's private context.
-                let process_result = workforce_agent::runner::CURRENT_CHANNEL_ID
-                    .scope(
-                        effective_cid.clone().unwrap_or_default(),
-                        workforce_agent::runner::with_tool_whitelist(
-                            tools.as_deref().map(|tools| match session {
-                                Some(_) => workforce_agent::runner::ToolWhitelist::for_turn(tools),
-                                None => {
-                                    workforce_agent::runner::ToolWhitelist::for_own_session(tools)
-                                }
-                            }),
-                            service.process_turn(
-                                ch,
-                                "scheduler",
-                                message,
-                                None,
-                                None,
-                                effective_cid.as_deref(),
-                                None, // Always top-level DM, not thread
-                                None,
-                                *max_rounds,
-                                model.as_deref(),
-                                Some(&task_id),
-                                None,
-                                job.effective_run_as_identity(),
-                                author,
-                            ),
+                let turn = workforce_agent::runner::CURRENT_CHANNEL_ID.scope(
+                    effective_cid.clone().unwrap_or_default(),
+                    workforce_agent::runner::with_tool_whitelist(
+                        tools.as_deref().map(|tools| match session {
+                            Some(_) => workforce_agent::runner::ToolWhitelist::for_turn(tools),
+                            None => workforce_agent::runner::ToolWhitelist::for_own_session(tools),
+                        }),
+                        service.process_turn(
+                            ch,
+                            "scheduler",
+                            message,
+                            None,
+                            None,
+                            effective_cid.as_deref(),
+                            None, // Always top-level DM, not thread
+                            None,
+                            *max_rounds,
+                            model.as_deref(),
+                            Some(&task_id),
+                            None,
+                            job.effective_run_as_identity(),
+                            author,
                         ),
-                    )
-                    .await;
+                    ),
+                );
+                let process_result = match run_capped(turn, run_minutes).await {
+                    Some(result) => result,
+                    // Cut off, as a skip: a long run is not a failing job.
+                    None => {
+                        let reason = format!(
+                            "{SKIPPED_PREFIX} stopped after {run_minutes} minutes, the most one scheduled run on your plan may take ([budget.plan] run_max_minutes)"
+                        );
+                        warn!(job_id = %job.id, name = %job.name, %reason, "Job run cut off");
+                        return self.finish_record(job, started_at, start, true, reason, false);
+                    }
+                };
                 let process_result = match process_result {
                     Ok(crate::serve::TurnOutcome::Answered(response)) => Ok((response, true)),
                     Ok(crate::serve::TurnOutcome::Stopped(stop)) => {
@@ -2059,6 +2248,26 @@ impl Scheduler {
                                 )
                             }
                         }
+                    }
+                    // Held by the plan guard at the turn itself (its plan
+                    // filled, or it ran away, after the check above): a
+                    // skip, never a failure; a runaway is stopped and told.
+                    Ok(crate::serve::TurnOutcome::Skipped(crate::serve::Skip::Denied(reason)))
+                        if reason.starts_with(crate::plan_guard::WAITS_PREFIX)
+                            || crate::plan_guard::PlanGuard::global()
+                                .is_stopped(&format!("job:{}", job.id)) =>
+                    {
+                        if !reason.starts_with(crate::plan_guard::WAITS_PREFIX) {
+                            self.stop_as_runaway(job, &reason).await;
+                        }
+                        return self.finish_record(
+                            job,
+                            started_at,
+                            start,
+                            true,
+                            format!("{SKIPPED_PREFIX} held by the plan guard: {reason}"),
+                            true,
+                        );
                     }
                     Ok(crate::serve::TurnOutcome::Skipped(skip)) => {
                         warn!(
@@ -2722,6 +2931,19 @@ impl crate::hosts::SchedulerHost for Scheduler {
     async fn run(self: Arc<Self>, cancel: tokio_util::sync::CancellationToken) {
         Scheduler::run(self, cancel).await
     }
+}
+
+/// `turn`, cut off after `minutes` (0: never). `None` when it was.
+async fn run_capped<F: std::future::Future>(turn: F, minutes: u32) -> Option<F::Output> {
+    if minutes == 0 {
+        return Some(turn.await);
+    }
+    tokio::time::timeout(
+        std::time::Duration::from_secs(u64::from(minutes) * 60),
+        turn,
+    )
+    .await
+    .ok()
 }
 
 #[cfg(test)]
@@ -3653,6 +3875,69 @@ mod tests {
             every_secs: 3600,
             anchor: None,
         }
+    }
+
+    #[tokio::test]
+    async fn a_looping_job_is_stopped_as_a_runaway_once_and_resumes_when_turned_back_on() {
+        let sched = test_scheduler().await;
+        let service = sched.service();
+        // The hub's one store: in a test process, the first composed.
+        let guard = crate::plan_guard::PlanGuard::global();
+        guard.keep_in(Arc::clone(&service.telemetry_store));
+        let store = guard.store().unwrap();
+        let id = sched
+            .add_job("email check", hourly(), turn_payload())
+            .await
+            .unwrap();
+        let job = sched.get_job(&id).await.unwrap();
+        // It began 370 turns in the last hour, from nothing before.
+        let work = job.work(service.agent_id.as_str());
+        for _ in 0..370 {
+            store
+                .record_work_use(&workforce_common::work_use::WorkUseRow::turn(
+                    &work,
+                    None,
+                    Utc::now(),
+                ))
+                .unwrap();
+        }
+        let first = Box::pin(sched.execute_job(&job)).await;
+        // A skip, never a failure: it doesn't feed the failure count.
+        assert!(first.success, "{first:?}");
+        assert!(
+            first.output.contains(
+                "skipped: stopped by the plan guard: Your 'email check' job began 370 turns \
+                 in the last hour. I've paused it."
+            ),
+            "{}",
+            first.output
+        );
+        let stopped = sched.get_job(&id).await.unwrap();
+        assert!(!stopped.enabled && stopped.paused_by_plan, "{stopped:?}");
+        // A fire already under way when it stopped: skipped, the job left
+        // as it is (no second notice).
+        let again = Box::pin(sched.execute_job(&job)).await;
+        assert!(
+            again.output.contains("stopped by the plan guard"),
+            "{}",
+            again.output
+        );
+        assert!(!sched.get_job(&id).await.unwrap().enabled);
+        // Turned back on: what it did before is not held against it.
+        let edit = JobEdit {
+            enabled: Some(true),
+            ..Default::default()
+        };
+        let resumed = sched.update_job(&id, edit, "admin").await.unwrap().unwrap();
+        assert!(resumed.enabled && !resumed.paused_by_plan);
+        assert!(resumed.plan_resumed_at.is_some());
+        let verdict = crate::plan_guard::PlanGuard::global().check(
+            &service.config.budget.plan,
+            &resumed.work(service.agent_id.as_str()),
+            None,
+            Utc::now(),
+        );
+        assert_eq!(verdict, crate::plan_guard::Verdict::Proceed);
     }
 
     /// A stored job as the tool once created it: pinned to a session named
@@ -5224,6 +5509,9 @@ mod tests {
             deliver_to: None,
             edited_by: None,
             paused_by_suspension: false,
+            paused_by_plan: false,
+            plan_resumed_at: None,
+            plan_hourly_limit: None,
         };
 
         let json = serde_json::to_string(&job).unwrap();
@@ -5271,6 +5559,9 @@ mod tests {
             deliver_to: None,
             edited_by: None,
             paused_by_suspension: false,
+            paused_by_plan: false,
+            plan_resumed_at: None,
+            plan_hourly_limit: None,
         }
     }
 

@@ -58,6 +58,9 @@ impl Prune {
     }
 }
 
+/// How long what background work used of a plan is kept.
+const WORK_USE_RETENTION_DAYS: u32 = 35;
+
 /// The prunes the install's configuration asks for, over `telemetry` and,
 /// when routed approvals are in use, their store, and when a store is
 /// shadowed, the shadow tables.
@@ -68,6 +71,7 @@ pub fn prunes(
     shadow: Option<Arc<ShadowStore>>,
 ) -> Vec<Prune> {
     let activity = Arc::clone(&telemetry);
+    let costs = Arc::clone(&telemetry);
     let mut prunes = vec![
         Prune::new(
             "task telemetry",
@@ -77,7 +81,14 @@ pub fn prunes(
         Prune::new(
             "cost records",
             config.telemetry.cost_retention_days,
-            move |before| telemetry.prune_costs(before),
+            move |before| costs.prune_costs(before),
+        ),
+        // A week's usual is all the plan guard reads; a month is kept for
+        // the person to look back on.
+        Prune::new(
+            "background work's use",
+            WORK_USE_RETENTION_DAYS,
+            move |before| telemetry.prune_work_use(before),
         ),
     ];
     prunes.extend(approvals.map(|store| {
@@ -249,12 +260,13 @@ mod tests {
             [
                 ("task telemetry", 0),
                 ("cost records", 0),
+                ("background work's use", 35),
                 ("resolved approvals", 30)
             ]
         );
         assert_eq!(
             windows(None).len(),
-            2,
+            3,
             "no approvals store, nothing to prune"
         );
     }
@@ -281,7 +293,7 @@ mod tests {
                         .collect::<Vec<_>>()
                 };
                 assert_eq!(
-                    windows(Some(Arc::clone(&shadow)))[2..],
+                    windows(Some(Arc::clone(&shadow)))[3..],
                     [
                         ("shadow comparisons", 14),
                         ("shadow verdicts", 180),
@@ -290,7 +302,7 @@ mod tests {
                         ("shadow known items", 180)
                     ]
                 );
-                assert_eq!(windows(None).len(), 2, "nothing shadowed, nothing to prune");
+                assert_eq!(windows(None).len(), 3, "nothing shadowed, nothing to prune");
 
                 let conn = pool.get().await.unwrap();
                 let old = Utc::now() - chrono::Duration::days(20);

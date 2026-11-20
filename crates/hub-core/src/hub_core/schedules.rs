@@ -83,6 +83,39 @@ pub struct ScheduledJob {
     /// store's field merge clears it as well as sets it.
     #[serde(default)]
     pub paused_by_suspension: bool,
+    /// Switched off by the plan guard as a runaway: it used far more of the
+    /// person's plan than it usually does. `enabled` carries the pause; a
+    /// resume clears it and stamps [`Self::plan_resumed_at`].
+    #[serde(default)]
+    pub paused_by_plan: bool,
+    /// When the person last resumed it after the plan guard stopped it: what
+    /// it did before is not held against it. Always written, as the pauses
+    /// are, so a shared store's field merge clears it too.
+    #[serde(default)]
+    pub plan_resumed_at: Option<DateTime<Utc>>,
+    /// The share of the plan's longest window (points of it) the person
+    /// allows it an hour, in place of being held to its usual.
+    #[serde(default)]
+    pub plan_hourly_limit: Option<f64>,
+}
+
+impl ScheduledJob {
+    /// The background work its runs are, as the plan guard reads them.
+    pub fn work(&self, agent_id: &str) -> workforce_common::work_use::Work {
+        workforce_common::work_use::Work::job(agent_id, &self.id, &self.name).allowing(
+            workforce_common::work_use::Allowed {
+                hourly_limit: self.plan_hourly_limit,
+                resumed_at: self.plan_resumed_at,
+            },
+        )
+    }
+
+    /// Switch the job off as a runaway. Returns the fields it changed.
+    pub fn stop_as_runaway(&mut self) -> &'static [&'static str] {
+        self.enabled = false;
+        self.paused_by_plan = true;
+        &["enabled", "paused_by_plan"]
+    }
 }
 
 pub use workforce_common::delivery::{
@@ -290,6 +323,10 @@ pub struct JobEdit {
     /// agent's full surface.
     #[serde(default)]
     pub tools: Option<Vec<String>>,
+    /// The share of the plan's longest window it may use an hour, which
+    /// the plan guard holds it to in place of its usual; 0 clears it.
+    #[serde(default)]
+    pub plan_hourly_limit: Option<f64>,
     /// The user has seen what the edit is forecast to cost and approved it.
     #[serde(default)]
     pub confirmed: bool,
@@ -392,7 +429,16 @@ impl JobEdit {
         [
             (self.name.is_some(), &["name"][..]),
             (self.schedule.is_some(), &["schedule", "next_run"]),
-            (self.enabled.is_some(), &["enabled", "paused_by_suspension"]),
+            (
+                self.enabled.is_some(),
+                &[
+                    "enabled",
+                    "paused_by_suspension",
+                    "paused_by_plan",
+                    "plan_resumed_at",
+                ],
+            ),
+            (self.plan_hourly_limit.is_some(), &["plan_hourly_limit"]),
             (self.visibility.is_some(), &["visibility"]),
             (self.session.is_some() || self.tools.is_some(), &["payload"]),
         ]
@@ -413,8 +459,18 @@ impl JobEdit {
             job.schedule = schedule;
         }
         if let Some(enabled) = self.enabled {
+            // Turned back on after the plan guard stopped it: what it did
+            // before is not held against it. Any other resume keeps its
+            // usual.
+            if enabled && job.paused_by_plan {
+                job.plan_resumed_at = Some(*now);
+            }
             job.enabled = enabled;
             job.paused_by_suspension = false;
+            job.paused_by_plan = false;
+        }
+        if let Some(limit) = self.plan_hourly_limit {
+            job.plan_hourly_limit = (limit.is_finite() && limit > 0.0).then_some(limit);
         }
         if let Some(visibility) = self.visibility {
             job.visibility = Some(visibility);

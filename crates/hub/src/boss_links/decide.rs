@@ -189,7 +189,10 @@ pub async fn decide(
         .cost_governor
         .preflight(service.agent_id.as_str(), Some(&person))
     {
-        Admission::Deny(why) | Admission::Held(why) => {
+        Admission::Deny(why)
+        | Admission::Held(why)
+        | Admission::Waits(why)
+        | Admission::Stopped { why, .. } => {
             tracing::info!(link = %live.link.link_id, why, "a boss's decision wasn't made: its budget holds it");
             return Err(Refused::new(
                 Code::Budget,

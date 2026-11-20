@@ -94,6 +94,10 @@ struct SchedulerInput {
     /// Pause or resume the job (update)
     #[serde(default)]
     enabled: Option<bool>,
+    /// How much of the person's plan the job may use an hour, in points of
+    /// its longest window (update); 0 goes back to its usual.
+    #[serde(default)]
+    plan_limit_percent_per_hour: Option<f64>,
     /// "private" or "global" (update)
     #[serde(default)]
     visibility: Option<String>,
@@ -204,6 +208,10 @@ fn job_summary(job: &ScheduledJob) -> serde_json::Value {
         "next_run": job.next_run.map(|t| t.to_rfc3339()),
         "last_run": job.last_run.map(|t| t.to_rfc3339()),
         "run_count": job.run_count,
+        // Why it is off, when the plan guard stopped it, and the limit the
+        // person raised it to.
+        "paused_by_plan": job.paused_by_plan,
+        "plan_limit_percent_per_hour": job.plan_hourly_limit,
         // Present only on jobs created by voice. Surfaced so
         // "why did my 8am summary stop reaching Slack?" is
         // answerable without reading the job store.
@@ -311,7 +319,9 @@ impl Tool for SchedulerTool {
          `expires_in` for anything that watches for a condition. Recurring intervals have a \
          configured floor; a create or update projected above the configured daily cost returns \
          a `needs_confirmation` estimate that the USER must approve before you re-call with \
-         `confirmed: true`. `context: \"isolated\"` (the default) runs the job in a fresh \
+         `confirmed: true`. On the person's Claude or ChatGPT plan there is no dollar cost: \
+         the reply's `plan_estimate` says what it would use of the plan; when its `expensive` \
+         is true, tell the person its `text` in your reply. `context: \"isolated\"` (the default) runs the job in a fresh \
          session every time: no run sees an earlier one and every run costs about the same. \
          `context: \"conversation\"` keeps one session that belongs to the job alone and \
          starts empty (it is NOT this conversation): every run replays the job's earlier runs, \
@@ -374,6 +384,12 @@ impl Tool for SchedulerTool {
                 "enabled": {
                     "type": "boolean",
                     "description": "Pause (false) or resume (true) the job (for update)"
+                },
+                "plan_limit_percent_per_hour": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "For update, when the person raises a job's limit after it was paused for using too much of their Claude or ChatGPT plan: how many points of the plan's longest window (its weekly one, where it has one) the job may use an hour. 0 clears it, so the job is held to its usual again. Resume it with enabled: true."
                 },
                 "visibility": {
                     "type": "string",
@@ -561,6 +577,11 @@ impl SchedulerTool {
                 start.elapsed().as_millis() as u64,
             ));
         }
+        // On the person's plan: what it would use of it, said back.
+        let plan_estimate = self
+            .scheduler
+            .plan_estimate(&schedule, input.model.as_deref(), None)
+            .await;
 
         // Capture user_id for DM channel recovery after token rotation.
         let resolved_user_id = workforce_agent::runner::CURRENT_USER_ID
@@ -641,7 +662,11 @@ impl SchedulerTool {
                 "max_runs": job.as_ref().and_then(|j| j.max_runs),
                 "budget_usd": job.as_ref().and_then(|j| j.budget_usd),
                 "expires_at": job.as_ref().and_then(|j| j.expires_at).map(|t| t.to_rfc3339()),
-                "estimated_per_day_usd": estimate.as_ref().map(|cost| round2(cost.projected.per_day_usd)),
+                "estimated_per_day_usd": estimate
+                    .as_ref()
+                    .filter(|_| plan_estimate.is_none())
+                    .map(|cost| round2(cost.projected.per_day_usd)),
+                "plan_estimate": plan_estimate,
                 "status": "created"
             }),
             start.elapsed().as_millis() as u64,
@@ -694,6 +719,30 @@ impl SchedulerTool {
             Ok(schedule) => schedule,
             Err(e) => return Ok(ToolResult::failure(e, elapsed())),
         };
+        // Raising what of the plan a job may use, or turning back on one the
+        // plan guard stopped, is the person's call: asked, never assumed.
+        let plan_ask = match (input.plan_limit_percent_per_hour, input.enabled) {
+            (Some(limit), _) => Some(format!(
+                "Let '{}' use up to {limit}% of the plan an hour?",
+                job.name
+            )),
+            (None, Some(true)) if job.paused_by_plan => Some(format!(
+                "Turn '{}' back on? The plan guard stopped it for using far more of the plan than usual.",
+                job.name
+            )),
+            _ => None,
+        };
+        if let (Some(ask), false) = (plan_ask, input.confirmed == Some(true)) {
+            return Ok(ToolResult::success(
+                serde_json::json!({
+                    "status": "needs_confirmation",
+                    "reason": ask,
+                    "instructions": "Ask the user. Re-call with `confirmed: true` ONLY if the user explicitly approves; never confirm on their behalf.",
+                }),
+                elapsed(),
+            ));
+        }
+        let rescheduled = schedule.is_some();
         let edit = JobEdit {
             name: input.name,
             schedule,
@@ -701,6 +750,7 @@ impl SchedulerTool {
             visibility: input.visibility,
             session: input.context,
             tools: input.tools,
+            plan_hourly_limit: input.plan_limit_percent_per_hour,
             confirmed: input.confirmed == Some(true),
         };
         Ok(
@@ -708,6 +758,17 @@ impl SchedulerTool {
                 Ok(Some(job)) => {
                     let mut summary = job_summary(&job);
                     summary["status"] = serde_json::json!("updated");
+                    if rescheduled {
+                        let model = match &job.payload {
+                            JobPayload::AgentTurn { model, .. } => model.clone(),
+                            _ => None,
+                        };
+                        summary["plan_estimate"] = serde_json::json!(
+                            self.scheduler
+                                .plan_estimate(&job.schedule, model.as_deref(), Some(&job.id))
+                                .await
+                        );
+                    }
                     ToolResult::success(summary, elapsed())
                 }
                 Ok(None) => ToolResult::failure(NOT_YOURS, elapsed()),

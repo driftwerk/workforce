@@ -106,6 +106,11 @@ impl Default for MonitorEngineConfig {
     }
 }
 
+/// The plan guard's key for `mon`'s agent task.
+fn work_key(mon: &OwnedMonitor) -> String {
+    format!("monitor:{}", mon.def.monitor.id)
+}
+
 /// The result of executing a monitor action.
 pub enum ActionOutcome {
     /// Done — optional workflow instance id.
@@ -114,6 +119,9 @@ pub enum ActionOutcome {
     Transient(String),
     /// Never retry (e.g. the target workflow or owner is gone for good).
     Terminal(String),
+    /// Its agent task used far more of the person's plan than it usually
+    /// does: the monitor is turned off and its owner told.
+    Runaway(String),
 }
 
 /// Executes a monitor's action and carries its owner notices. Behind a trait
@@ -289,6 +297,28 @@ impl WorkflowNotifySink {
         if let Some(person) = owner.and_then(|owner| svc.suspended(owner)) {
             return ActionOutcome::Terminal(crate::standing::refusal(&person));
         }
+        // The person's plan nearly full: the event waits, retried as any
+        // passing failure is. A runaway is stopped, its owner told once.
+        let payer = svc.background_payer(Some(owner.unwrap_or("monitor")));
+        let billed = payer.map(|p| p.to_string());
+        let admitted = crate::user_config::billed_to(payer, async {
+            let on_plan = crate::turn_loop::plan_login(&svc, None).await;
+            svc.cost_governor.preflight_on(
+                svc.agent_id.as_str(),
+                billed.as_deref(),
+                crate::cost_governor::OnPlan {
+                    login: on_plan.as_ref(),
+                },
+            )
+        })
+        .await;
+        match admitted {
+            crate::cost_governor::Admission::Waits(why) => return ActionOutcome::Transient(why),
+            crate::cost_governor::Admission::Stopped { why, .. } => {
+                return ActionOutcome::Runaway(why);
+            }
+            _ => {}
+        }
         let from = self.resolve_author(ev).await;
         let task = build_agent_task_prompt(prompt, ev, &from, deliver_to);
         let session = format!("monitor:{monitor_id}:{}", ev.dispatch_id());
@@ -315,7 +345,6 @@ impl WorkflowNotifySink {
             owner,
             crate::serve::RunAuthor::Other,
         );
-        let payer = svc.background_payer(Some(owner.unwrap_or("monitor")));
         match crate::user_config::billed_to(payer, run).await {
             // Told where the monitor delivers, as the agent would have
             // posted its result; retrying would be refused the same way.
@@ -1174,18 +1203,53 @@ impl MonitorEngine {
                 let _ = self.store.fail(key, &err, false).await;
                 false
             }
+            // Turned off as a job is, and its owner told once: only the
+            // stop that turns it off tells. Turned back on, it starts afresh.
+            ActionOutcome::Runaway(why) => {
+                let _ = self.store.fail(key, &format!("skipped: {why}"), true).await;
+                // Released once it is off: turned back on, it starts afresh.
+                // Not turned off (already off, or the flip failed), the
+                // guard's own hold stays.
+                if self.stop(mon, "plan_runaway").await {
+                    let work = self.work_of(mon);
+                    let notice = format!("{why} {}", crate::plan_guard::stopped_choices(&work));
+                    self.tell_owner(mon, "plan_runaway", &notice).await;
+                    crate::plan_guard::PlanGuard::global().release(&work_key(mon));
+                }
+                false
+            }
         }
     }
 
+    /// The background work `mon`'s agent task is.
+    fn work_of(&self, mon: &OwnedMonitor) -> workforce_common::work_use::Work {
+        let agent = match &mon.def.monitor.action {
+            Action::AgentTask { agent, .. } => agent.as_deref(),
+            _ => None,
+        };
+        workforce_common::work_use::Work::monitor(
+            agent.unwrap_or(&self.agent.id),
+            &mon.def.monitor.id,
+            &mon.def.monitor.name,
+        )
+    }
+
     async fn perform_action(&self, mon: &OwnedMonitor, ev: &MonitorEvent) -> ActionOutcome {
-        self.sink
-            .dispatch(
-                &mon.def.monitor.action,
-                mon.owner.as_deref(),
-                &mon.def.monitor.id,
-                ev,
-            )
-            .await
+        let dispatch = self.sink.dispatch(
+            &mon.def.monitor.action,
+            mon.owner.as_deref(),
+            &mon.def.monitor.id,
+            ev,
+        );
+        // A monitor's agent task is background work: the plan guard holds
+        // it while the person's plan is nearly full, and counts what it uses
+        // toward the monitor.
+        match &mon.def.monitor.action {
+            Action::AgentTask { .. } => {
+                workforce_common::work_use::within(self.work_of(mon), dispatch).await
+            }
+            _ => dispatch.await,
+        }
     }
 
     /// Disable a monitor by the hub's own hand, through the one flip path, so
@@ -1700,7 +1764,9 @@ impl MonitorEngine {
             .or(m.action.delivery().and_then(|(_, surface)| surface));
         match self.sink.tell(owner, surface, reason, notice).await {
             ActionOutcome::Done(_) => {}
-            ActionOutcome::Transient(e) | ActionOutcome::Terminal(e) => {
+            ActionOutcome::Transient(e)
+            | ActionOutcome::Terminal(e)
+            | ActionOutcome::Runaway(e) => {
                 warn!(monitor = %id, %owner, reason, error = %e, "monitor owner DM failed: {notice}")
             }
         }

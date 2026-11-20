@@ -14915,6 +14915,9 @@ mod schedule_auth_tests {
             deliver_to: None,
             edited_by: None,
             paused_by_suspension: false,
+            paused_by_plan: false,
+            plan_resumed_at: None,
+            plan_hourly_limit: None,
         }
     }
 
