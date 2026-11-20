@@ -15,6 +15,14 @@ async fn bosss_turn_rows(d: &Desk) -> Vec<workforce_desk::crew::Event> {
         .collect()
 }
 
+/// Until the boss's turns have all returned to their callers.
+async fn settled(crew: &CrewHub) {
+    eventually("the boss's turns returned", async || {
+        (crew.quiet_ends.lock().is_empty() && crew.running.lock().is_empty()).then_some(())
+    })
+    .await;
+}
+
 async fn finished(d: &Desk, n: usize) -> Vec<workforce_desk::crew::Event> {
     eventually("the boss's turns said", async || {
         let rows = bosss_turn_rows(d).await;
@@ -27,7 +35,7 @@ async fn finished(d: &Desk, n: usize) -> Vec<workforce_desk::crew::Event> {
 async fn a_line_turn_that_did_nothing_is_kept_out_of_activity_and_one_that_acted_is_said() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let (_overseer, _crew, d, llm) = overseeing(dir.path(), pool, "5433", ACT, &[]).await;
+        let (_overseer, crew, d, llm) = overseeing(dir.path(), pool, "5433", ACT, &[]).await;
         let s = new_session(&d, dir.path(), "acme-web").await;
         let tell = async |text: &str| {
             d.line_call(s.id, "tell", &json!({"to": "desk", "text": text}), None)
@@ -45,7 +53,7 @@ async fn a_line_turn_that_did_nothing_is_kept_out_of_activity_and_one_that_acted
                 .find(|x| x.kind == workforce_desk::decision::DecisionKind::LeftAlone)
         })
         .await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        settled(&crew).await;
         let rows = bosss_turn_rows(&d).await;
         assert!(rows.is_empty(), "{rows:?}");
 
@@ -105,6 +113,70 @@ async fn a_line_turn_that_did_nothing_is_kept_out_of_activity_and_one_that_acted
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_work_turn_that_only_looked_lets_the_session_wait_out_of_activity() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, llm) = overseeing(
+            dir.path(),
+            pool,
+            "CI is still running, so it should wait.",
+            "[oversight]\nenabled = true\nlevel = \"act\"\nupdates = { enabled = false }\n",
+            &[],
+        )
+        .await;
+        calls_tool_once(
+            &llm,
+            "Pushed; CI is running.",
+            "crew_overview",
+            json!({"reason": "see where acme-web stands"}),
+        )
+        .await;
+        let s = new_session(&d, dir.path(), "acme-web").await;
+        let url = hook_url(dir.path(), s.id).await;
+        hook(
+            &url,
+            json!({"hook_event_name": "SessionStart", "session_id": s.id.to_string()}),
+        )
+        .await;
+        hook(
+            &url,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "Upgrade the date picker"}),
+        )
+        .await;
+        let boss = workforce_desk::crew::Party::manager("desk", &super::super::name_of(&overseer));
+        d.take_on(
+            s.id,
+            &boss,
+            workforce_desk::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        hook(
+            &url,
+            json!({"hook_event_name": "Stop", "last_assistant_message": "Pushed; CI is running."}),
+        )
+        .await;
+        let waited = eventually("its decision to let it wait", async || {
+            d.store()
+                .decisions_since("desk", chrono::Utc::now() - chrono::Duration::hours(1), 10)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|x| x.need == workforce_desk::decision::Need::TurnEnd)
+        })
+        .await;
+        assert_eq!(waited.what, "let acme-web wait");
+        assert_eq!(waited.button(), Some("undo"));
+        settled(&crew).await;
+        let rows = bosss_turn_rows(&d).await;
+        assert!(rows.is_empty(), "{rows:?}");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn an_end_held_from_an_earlier_turn_is_never_said_for_a_later_one() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
@@ -119,20 +191,22 @@ async fn an_end_held_from_an_earlier_turn_is_never_said_for_a_later_one() {
             )
         };
         let key = ("desk".to_string(), "desk:line:s".to_string());
-        // A turn that finished after its caller had settled it.
-        let began = chrono::Utc::now() - chrono::Duration::seconds(5);
+        // A turn that finished after its caller had settled it, here and
+        // on another session's line.
+        let other = ("desk".to_string(), "desk:line:t".to_string());
         crew.quiet_ends
             .lock()
-            .insert(key.clone(), (began, end("finished · the stale one")));
-        crew.turn_end_said("desk", &key.1, chrono::Utc::now(), true);
+            .insert(key.clone(), (0, end("finished · the stale one")));
+        crew.quiet_ends
+            .lock()
+            .insert(other, (0, end("finished · another stale one")));
+        crew.turn_end_said("desk", &key.1, 1, true);
         assert!(crew.quiet_ends.lock().is_empty(), "dropped");
         // This turn's own end is said.
-        let since = chrono::Utc::now();
-        crew.quiet_ends.lock().insert(
-            key.clone(),
-            (chrono::Utc::now(), end("finished · this one")),
-        );
-        crew.turn_end_said("desk", &key.1, since, true);
+        crew.quiet_ends
+            .lock()
+            .insert(key.clone(), (1, end("finished · this one")));
+        crew.turn_end_said("desk", &key.1, 1, true);
         let rows = finished(&d, 1).await;
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert!(rows[0].text.contains("this one"), "{rows:?}");

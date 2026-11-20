@@ -88,6 +88,7 @@ impl CrewHub {
             Some(theirs),
         )
         .await
+        .map(|(sid, answer, _)| (sid, answer))
     }
 
     /// [`Self::run_dm_turn`] in `service`'s conversation on `channel`: the
@@ -105,6 +106,24 @@ impl CrewHub {
         listed: Option<Vec<MentionedApproval>>,
         author: Option<Speaker>,
     ) -> Result<(String, String)> {
+        self.run_turn_acting(service, owner, channel, prompt, hop, listed, author)
+            .await
+            .map(|(sid, answer, _)| (sid, answer))
+    }
+
+    /// [`Self::run_turn`], saying too whether the turn did something: a
+    /// call of a tool not known only to look ([`super::tools::only_looks`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn run_turn_acting(
+        &self,
+        service: &Arc<AgentService>,
+        owner: &str,
+        channel: &str,
+        prompt: &str,
+        hop: i16,
+        listed: Option<Vec<MentionedApproval>>,
+        author: Option<Speaker>,
+    ) -> Result<(String, String, bool)> {
         self.run_turn_with(service, owner, channel, prompt, hop, listed, author, None)
             .await
     }
@@ -122,7 +141,7 @@ impl CrewHub {
         listed: Option<Vec<MentionedApproval>>,
         author: Option<Speaker>,
         theirs: Option<String>,
-    ) -> Result<(String, String)> {
+    ) -> Result<(String, String, bool)> {
         let agent_id = service.agent_id.as_str();
         let in_dm = channel == DESK_CHANNEL;
         // The session a DM already open is on: not rolled over here, or an
@@ -270,18 +289,13 @@ impl CrewHub {
             move |rx| crate::gateway::forward_local_progress(rx, tx, sid, false, mentions, None)
         };
         let conducted = crate::live_turns::conduct(&mut live, service, progress, forward).await;
-        // A call that did something (a crew action, a command, a file
-        // written, a change made anywhere) is the boss acting, whichever
-        // tool made it: its line or work turn didn't let the session wait.
-        if let Ending::Finished(Ok(result)) = &conducted.ending {
-            if result
+        let acted = match &conducted.ending {
+            Ending::Finished(Ok(result)) => result
                 .tool_invocations
                 .iter()
-                .any(|t| t.success && !super::tools::only_looks(&t.tool_name, &t.input))
-            {
-                self.acted_on(agent_id, None);
-            }
-        }
+                .any(|t| t.success && !super::tools::only_looks(&t.tool_name, &t.input)),
+            _ => false,
+        };
         let answer = match &conducted.ending {
             Ending::Finished(Ok(result)) => Ok(result.response.clone()),
             Ending::Finished(Err(e)) => Err(eyre::eyre!("{e:#}")),
@@ -298,7 +312,7 @@ impl CrewHub {
             let _ = tx.send(message);
         }
         drop(live);
-        Ok((session_id, answer?))
+        Ok((session_id, answer?, acted))
     }
 }
 

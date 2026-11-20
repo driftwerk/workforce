@@ -4,6 +4,7 @@
 //! failure), from the digest helpers — no model call of its own. Turns of a
 //! hub without the desk pass straight through.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -49,9 +50,9 @@ pub(super) struct Track {
     place: Option<Place>,
     message: Option<uuid::Uuid>,
     /// A boss's line or work turn: its end is held, by boss and channel
-    /// with when the turn began, for its caller to say once it knows
-    /// whether the turn did anything.
-    held: Option<(String, String, DateTime<Utc>)>,
+    /// with the turn's place among the turns begun, for its caller to say
+    /// once it knows whether the turn did anything.
+    held: Option<(String, String, u64)>,
     done: bool,
 }
 
@@ -150,9 +151,10 @@ impl CrewHub {
         if message.starts_with(CHECK_IN) {
             return None;
         }
-        let began = Utc::now();
-        let held =
-            (overseer && woken(message)).then(|| (agent_id.clone(), channel.to_string(), began));
+        let held = (overseer && woken(message)).then(|| {
+            let began = self.turns_begun.fetch_add(1, Ordering::SeqCst);
+            (agent_id.clone(), channel.to_string(), began)
+        });
         // Its reply in the DM is running: what it would post there on its
         // own waits, so nothing lands in the middle of it.
         let dm_session = session_id
@@ -273,7 +275,11 @@ impl Track {
         .detail(json!({ "task": self.task, "answer": answer, "question": question }))
         .at_place(self.place.clone(), self.message)
         .hop(self.hop);
-        match self.held.take().filter(|_| ended == Outcome::Finished) {
+        match self
+            .held
+            .take()
+            .filter(|_| matches!(ended, Outcome::Finished | Outcome::Asked))
+        {
             Some((boss, channel, began)) => {
                 crew.quiet_ends
                     .lock()
@@ -285,22 +291,24 @@ impl Track {
 }
 
 impl CrewHub {
-    /// Says the end of `boss`'s line or work turn on `channel`, which its
-    /// caller began at `since`, once the caller has settled what the turn
-    /// did: only when it did something. An end held from an earlier turn
-    /// (one that finished after its caller had already settled it) is
-    /// dropped here, never said for this one.
-    pub(super) fn turn_end_said(
-        &self,
-        boss: &str,
-        channel: &str,
-        since: DateTime<Utc>,
-        acted: bool,
-    ) {
-        let end = self
-            .quiet_ends
-            .lock()
-            .remove(&(boss.to_string(), channel.to_string()));
+    /// Where the next turn begun stands among them: a line or work turn
+    /// its caller starts from here is at or past it.
+    pub(super) fn turns_begun(&self) -> u64 {
+        self.turns_begun.load(Ordering::SeqCst)
+    }
+
+    /// Says the end of `boss`'s line or work turn on `channel`, begun at or
+    /// past `since` ([`Self::turns_begun`]), once its caller has settled
+    /// what the turn did: only when it did something. An end held from an
+    /// earlier turn of the boss's (one that ended after its caller had
+    /// settled it) is dropped, never said for this one.
+    pub(super) fn turn_end_said(&self, boss: &str, channel: &str, since: u64, acted: bool) {
+        let end = {
+            let mut held = self.quiet_ends.lock();
+            let end = held.remove(&(boss.to_string(), channel.to_string()));
+            held.retain(|(b, _), (began, _)| b != boss || *began >= since);
+            end
+        };
         if let Some((_, event)) = end.filter(|(began, _)| acted && *began >= since) {
             self.desk.note(event);
         }

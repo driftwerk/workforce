@@ -69,32 +69,29 @@ const KEEPS: [&str; 9] = [
     super::cadence_tool::NAME,
     super::watches::WATCH,
 ];
-/// The boss's tools besides the crew's known to only look.
-const OTHER_LOOKS: [&str; 12] = [
-    "filesystem.read",
-    "filesystem.list",
-    "filesystem.glob",
-    "filesystem.grep",
-    "web.search",
-    "web.fetch",
-    "code.read",
-    "code.search",
-    "repo.read",
-    "repo.list",
-    "github.get_pull",
-    "github.ci_status",
-];
+/// The tools of [`KEEPS`] that only look when asked to list.
+const LISTS: [&str; 2] = [super::preferences::PREFERENCES, super::directives::NAME];
+/// What `memory` does that only looks.
+const RECALLS: [&str; 4] = ["recall", "count", "overview", "timeline"];
 
 /// Whether a call of `tool` with `input` only looked: a turn whose calls
 /// all did is one that did nothing. A tool not known to only look (a
-/// command run, a file written, a request that changes something, any
-/// other skill's) did something. Names match dotted or underscored, as
-/// the model calls them.
+/// command run, a file written, a request that changes something) did
+/// something. Names match dotted or underscored, as the model calls them.
 pub(super) fn only_looks(tool: &str, input: &Value) -> bool {
-    let named = |known: &&str| known.replace('.', "_") == tool.replace('.', "_");
-    (READ.iter().any(named) && !KEEPS.iter().any(named))
-        || OTHER_LOOKS.iter().any(named)
-        || (named(&"http.request") && !workforce_agent::tools::http::is_mutating_request(input))
+    let named = |known: &str| known.replace('.', "_") == tool.replace('.', "_");
+    let action = input["action"].as_str().map(str::trim).unwrap_or_default();
+    let crew = READ.iter().any(|t| named(t))
+        && (!KEEPS.iter().any(|t| named(t))
+            || (LISTS.iter().any(|t| named(t)) && matches!(action, "" | "list")));
+    crew || crate::serve::CURATION_TOOL_PATTERNS
+        .iter()
+        .chain(crate::serve::CURATION_DATABASE_READ_TOOLS)
+        .chain(&workforce_skills::adapters::read_only_adapter_tools())
+        .any(|t| named(t))
+        || (named("memory") && RECALLS.contains(&action))
+        || (named("http.request") && !workforce_agent::tools::http::is_mutating_request(input))
+        || crate::local_agent_registry::is_read_only_tool(tool)
 }
 pub const ACT: [&str; 32] = [
     "crew.nudge",
@@ -1406,10 +1403,11 @@ mod tests {
 
     #[test]
     fn the_crew_reads_that_only_look_and_those_that_keep_something_are_every_read() {
+        let change = json!({"action": "set"});
         let mut both: Vec<&str> = READ
             .iter()
             .copied()
-            .filter(|t| only_looks(t, &json!({})))
+            .filter(|t| only_looks(t, &change))
             .chain(KEEPS)
             .collect();
         both.sort_unstable();
@@ -1419,14 +1417,20 @@ mod tests {
             both, read,
             "every read is either one that looks or one that keeps"
         );
-        assert!(KEEPS
-            .iter()
-            .all(|t| READ.contains(t) && !only_looks(t, &json!({}))));
+        assert!(KEEPS.iter().all(|t| READ.contains(t)));
+        assert!(LISTS.iter().all(|t| KEEPS.contains(t)));
         // Named as the model calls them, dotted or not.
         assert!(only_looks("crew_overview", &json!({})));
         assert!(!only_looks("crew_promise", &json!({})));
+        // A list of what the person said only looks; a change keeps it.
+        assert!(only_looks("crew_directives", &json!({})));
+        assert!(only_looks("crew.preferences", &json!({"action": "list"})));
+        assert!(!only_looks("crew.directives", &json!({"action": "add"})));
         // Any other tool did something, unless it is known only to look.
         assert!(only_looks("filesystem_read", &json!({"path": "a"})));
+        assert!(only_looks("jira.search", &json!({})));
+        assert!(only_looks("memory", &json!({"action": "recall"})));
+        assert!(!only_looks("memory", &json!({"action": "remember"})));
         assert!(!only_looks("filesystem.write", &json!({"path": "a"})));
         assert!(!only_looks("exec.run", &json!({"command": "ls"})));
         assert!(only_looks("http.request", &json!({"method": "GET"})));

@@ -606,7 +606,7 @@ impl Desk {
     }
 
     fn line_noted(&self, m: &LineMessage) {
-        let what = crew::one_line(line::unstamped(m.headline()), 120);
+        let what = crew::one_line(line::unstamped(m.headline(), &m.from.name), 120);
         let (kind, text) = match m.kind {
             LineKind::Ask => (Kind::Asked, format!("asked {} “{what}”", m.to.name)),
             LineKind::Tell => (Kind::Told, format!("told {} “{what}”", m.to.name)),
