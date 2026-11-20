@@ -184,6 +184,21 @@ async fn asked_handover(d: &Desk, session: &SessionView, group: &str, boss: &str
 }
 
 async fn clients(dir: &Path, pool: workforce_postgres::PostgresPool) -> Clients {
+    clients_at(dir, pool, ACTS).await
+}
+
+/// The bosses at Act fully: what a crew tool reads first there (the
+/// person's standing words, an ask's first check) is read only of its own.
+fn act_fully() -> String {
+    format!(
+        "{}[oversight.full]\nbudget_usd_per_day = 25\n",
+        ACTS.replace("level = \"act\"", "level = \"full\"")
+    )
+}
+
+/// The three bosses and their groups, each boss at `level` (its
+/// `[oversight]` settings past `enabled` and `group`).
+async fn clients_at(dir: &Path, pool: workforce_postgres::PostgresPool, level: &str) -> Clients {
     let (desk_boss, l1) = agent(dir, "desk", "ok").await;
     let (sarah, l2) = agent(dir, "sarah", "ok").await;
     let (mia, l3) = agent(dir, "mia", "ok").await;
@@ -220,14 +235,14 @@ async fn clients(dir: &Path, pool: workforce_postgres::PostgresPool) -> Clients 
     })
     .await
     .unwrap();
-    write_config(&desk_boss, &format!("[oversight]\nenabled = true\n{ACTS}"));
+    write_config(&desk_boss, &format!("[oversight]\nenabled = true\n{level}"));
     write_config(
         &sarah,
-        &format!("[oversight]\nenabled = true\ngroup = \"acme\"\n{ACTS}"),
+        &format!("[oversight]\nenabled = true\ngroup = \"acme\"\n{level}"),
     );
     write_config(
         &mia,
-        &format!("[oversight]\nenabled = true\ngroup = \"atlas\"\n{ACTS}"),
+        &format!("[oversight]\nenabled = true\ngroup = \"atlas\"\n{level}"),
     );
     let all = [&desk_boss, &sarah, &mia, &scout, &ada];
     let state = hub(&all.iter().map(|s| Arc::clone(s)).collect::<Vec<_>>());
@@ -328,10 +343,18 @@ fn pointed_at(name: &str, mine: Option<&str>, other: &Client, dir: &Path) -> Vec
             true,
         )],
         "crew.order" => vec![(json!({ "text": "Ship it", "session_ids": [s] }), true)],
-        "crew.ask_person" => vec![(
-            json!({ "text": "Shall I merge it?", "session_id": s }),
-            true,
-        )],
+        // At Act fully also with why it can't decide: nothing of the
+        // session is read for the person's standing words first.
+        "crew.ask_person" => vec![
+            (
+                json!({ "text": "Shall I merge it?", "session_id": s }),
+                true,
+            ),
+            (
+                json!({ "text": "Shall I merge it?", "session_id": s, "cant_decide": "Their orders say nothing of it." }),
+                true,
+            ),
+        ],
         // Only its own items: another's is refused as one that isn't there.
         "crew.close_item" => vec![(
             json!({ "item_id": uuid::Uuid::new_v4().to_string(), "why": "Settled." }),
@@ -644,6 +667,46 @@ async fn kept_out(
             }
         }
     }
+}
+
+/// The same at Act fully, where some tools read more before they act.
+#[tokio::test(flavor = "multi_thread")]
+async fn at_act_fully_each_boss_reads_and_acts_only_inside_its_own_group_too() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let c = clients_at(dir.path(), pool, &act_fully()).await;
+        for boss in [&c.desk, &c.sarah, &c.mia] {
+            let (_, o) = c.crew.overseer_named(boss.agent_id.as_str()).unwrap();
+            assert_eq!(
+                c.crew.level_now(boss.agent_id.as_str(), &o).0,
+                workforce_common::oversight::Level::Full,
+                "{}",
+                boss.agent_id
+            );
+        }
+        kept_out(
+            &c.sarah,
+            Some(&c.acme.ticket),
+            &c.atlas,
+            ATLAS_SECRET,
+            "That isn't one of Acme's.",
+            dir.path(),
+        )
+        .await;
+        kept_out(
+            &c.mia,
+            Some(&c.atlas.ticket),
+            &c.acme,
+            ACME_SECRET,
+            "That isn't one of Atlas's.",
+            dir.path(),
+        )
+        .await;
+        let main = "That isn't one of yours.";
+        kept_out(&c.desk, None, &c.acme, ACME_SECRET, main, dir.path()).await;
+        kept_out(&c.desk, None, &c.atlas, ATLAS_SECRET, main, dir.path()).await;
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

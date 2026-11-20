@@ -298,6 +298,18 @@ impl CrewHub {
                 .map(str::to_string)
         };
         let cant_decide = some_of("cant_decide");
+        // The session it is about is in its scope, checked before anything
+        // is read of it.
+        let session = match input["session_id"].as_str() {
+            Some(s) => {
+                let id: Uuid = s
+                    .parse()
+                    .map_err(|_| "That isn’t a session id from crew.overview.".to_string())?;
+                self.session_seen(id, &b.seen)?;
+                Some(id)
+            }
+            None => None,
+        };
         // At Act fully the boss decides and acts by the person's own
         // instructions; it asks only what they don't cover and it truly
         // can't decide, and says why. Before its first ask of a matter it
@@ -309,7 +321,7 @@ impl CrewHub {
             });
             at_full = full.is_some();
             if let Some((_, o)) = full {
-                let about: Option<Uuid> = input["session_id"].as_str().and_then(|s| s.parse().ok());
+                let about = session;
                 let standing = self.standing_words(boss, &o, about).await;
                 let words = |lead: &str| match standing.is_empty() {
                     true => lead.to_string(),
@@ -348,16 +360,6 @@ impl CrewHub {
                 ));
             }
         }
-        let session = match input["session_id"].as_str() {
-            Some(s) => {
-                let id: Uuid = s
-                    .parse()
-                    .map_err(|_| "That isn’t a session id from crew.overview.".to_string())?;
-                self.session_seen(id, &b.seen)?;
-                Some(id)
-            }
-            None => None,
-        };
         let some = |k: &str| {
             input[k]
                 .as_str()
