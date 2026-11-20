@@ -1,678 +1,678 @@
-name: PR Check
-
-# Runs on every pull request and on main. Everything here runs on
-# GitHub-hosted runners with a read-only token and no repository secrets:
-# a pull request can run its own code here, so nothing here may be able to
-# publish, deploy or read anything private. Building and deploying releases
-# happens elsewhere, from merged commits only.
-
-concurrency:
-  group: pr-check-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
-on:
-  pull_request:
-    branches: [main]
-  push:
-    branches: [main]
-
-permissions: {}
-
-env:
-  # vite's MDX UI build needs more than Node's ~2GB default old-space.
-  NODE_OPTIONS: --max-old-space-size=6144
-  CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: 0
-  RUST_BACKTRACE: 1
-  POSTGRESQL_VERSION: "=17.9.0"
-  # The vellev node the `vellev-node` job tests against, by digest so a
-  # re-pushed tag can't change what is tested.
-  VELLEV_IMAGE: kingsleyh/vellev:sha-ada7a63ef132d18049d3c7342f6076a249a69979@sha256:e2e1d95ba0b733737a03ac6ebf47119e6356e8b6f49eb03fe1aa2de5a72ca080
-  # The Weaviate the `vellev-node` job runs the memory shadow's end-to-end
-  # test against, as Weaviate's release archive for linux-amd64, pinned by
-  # the sha256 Weaviate publishes beside it. Moving it is these two lines.
-  WEAVIATE_VERSION: "1.28.4"
-  WEAVIATE_SHA256: 0892f23d1802872ddca3a7c489fe9eab17c76de3dc1058d21d51d3f741aa9a18
-
-jobs:
-  # A change outside end-user-docs/ is code and runs the full gate; a
-  # docs-only change runs just the tests that read the embedded pages.
-  changes:
-    name: Detect changes
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    outputs:
-      code: ${{ steps.filter.outputs.code }}
-      docs: ${{ steps.filter.outputs.docs }}
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - id: filter
-        env:
-          EVENT: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          if [ "$EVENT" != pull_request ]; then
-            echo "code=true" >> "$GITHUB_OUTPUT"; echo "docs=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          changed=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
-          code=false; docs=false
-          if grep -qvE '^end-user-docs/' <<<"$changed"; then code=true; fi
-          if grep -qE '^end-user-docs/' <<<"$changed"; then docs=true; fi
-          echo "code=$code" >> "$GITHUB_OUTPUT"
-          echo "docs=$docs" >> "$GITHUB_OUTPUT"
-
-  # Known secret formats in what a pull request or push adds. A required
-  # check through CI OK.
-  secrets:
-    name: Secrets
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    env:
-      GITLEAKS_VERSION: 8.30.1
-      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - env:
-          RANGE: ${{ github.event_name == 'pull_request' && format('{0}..{1}', github.event.pull_request.base.sha, github.event.pull_request.head.sha) || format('{0}..{1}', github.event.before, github.sha) }}
-        run: |
-          set -euo pipefail
-          archive="$RUNNER_TEMP/gitleaks.tar.gz"
-          curl -fsSL -o "$archive" "https://github.com/gitleaks/gitleaks/releases/download/v$GITLEAKS_VERSION/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-          echo "$GITLEAKS_SHA256  $archive" | sha256sum -c -
-          tar -xzf "$archive" -C "$RUNNER_TEMP" gitleaks
-          case "$RANGE" in 0000000000000000000000000000000000000000..*) RANGE=${RANGE#*..} ;; esac
-          "$RUNNER_TEMP/gitleaks" git --no-banner --redact --config .gitleaks.toml --log-opts="$RANGE" .
-
-  ui:
-    name: UI
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 22
-      - name: Type-check, test and build
-        run: |
-          npm --prefix ui ci
-          (cd ui && npx tsc --noEmit)
-          npm --prefix ui test
-          npm --prefix ui run build
-
-  fmt:
-    name: Format
-    needs: [changes]
-    if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with:
-          persist-credentials: false
-      - run: cargo fmt --all -- --check
-      # A manifest change must carry its Cargo.lock: release builds use --locked.
-      - run: cargo metadata --locked --offline --format-version 1 > /dev/null || cargo metadata --locked --format-version 1 > /dev/null
-
-  licenses:
-    name: Dependency licences
-    needs: [changes]
-    if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with:
-          persist-credentials: false
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
-        with:
-          tool: cargo-deny@0.20.2
-      - run: cargo deny check licenses
-
-  clippy:
-    name: Clippy
-    needs: [changes]
-    if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    env:
-      # The embedded-Postgres build script calls the GitHub API; the job's own
-      # read-only token keeps it off the anonymous rate limit.
-      GITHUB_TOKEN: ${{ github.token }}
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with:
-          persist-credentials: false
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          shared-key: clippy
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo clippy --all-targets --all-features --no-deps -- -D warnings
-
-  # The hub test suite is built once here and run in parallel partitions
-  # below (`test-run`), with the doctests in their own job (`test-doc`).
-  # Together they run exactly what one `cargo nextest run --all-features`
-  # plus `cargo test --all-features --doc` ran; `test-count` fails the
-  # run if the partitions' tests don't add up to every test in the archive.
-  test-build:
-    name: Test build
-    needs: [changes]
-    if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    # A warm cache builds in about 30 minutes; a cold one (the cache is saved
-    # only from main, so after a red main or a lockfile change) takes over 60.
-    timeout-minutes: 100
-    permissions:
-      contents: read
-    env:
-      WORKFORCE_SKIP_POSTGRES_TESTS: "1"
-      GITHUB_TOKEN: ${{ github.token }}
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with:
-          persist-credentials: false
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          shared-key: test
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
-        with:
-          tool: cargo-nextest
-      # The hub's build script creates ui/dist when it is absent, which makes
-      # the directory newer than the script's last run and so rebuilds the
-      # hub (and what depends on it) on every later cargo command. Create it
-      # first so each crate is built once.
-      - run: mkdir -p ui/dist
-      # The hub's library and its tests are each a rustc of about 9 GB, and
-      # they build at once: with the rest of the workspace that can pass the
-      # runner's 16 GB, and the runner is then killed (exit 143, "lost
-      # communication"). Swap lets such a moment pass, a little slower,
-      # instead of losing the job.
-      - name: Give the build room to swap
-        run: |
-          free -h
-          # Only a mitigation: without room on the scratch disk, build as
-          # before.
-          if [ ! -d /mnt ] || [ "$(df --output=avail -BG /mnt | tail -1 | tr -dc 0-9)" -lt 24 ]; then
-            echo "No room on /mnt for swap: building with the runner's own."
-            exit 0
-          fi
-          sudo swapoff -a
-          sudo fallocate -l 16G /mnt/test-build.swap
-          sudo chmod 600 /mnt/test-build.swap
-          sudo mkswap /mnt/test-build.swap >/dev/null
-          sudo swapon /mnt/test-build.swap
-          # Swap only under real pressure, so the runner itself isn't starved.
-          sudo sysctl -q vm.swappiness=10
-          free -h
-      - name: Build every test binary
-        run: cargo nextest archive --all-features --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst"
-      # Every test the archive holds that a plain run would run (not
-      # #[ignore]d), for `test-count` to hold the partitions to.
-      - name: Count the tests
-        run: |
-          set -euo pipefail
-          cargo nextest list --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst" --workspace-remap . --message-format json \
-            | jq '[.["rust-suites"][].testcases | to_entries[] | select(.value.ignored == false and .value["filter-match"].status == "matches")] | length' \
-            > "$RUNNER_TEMP/expected-tests"
-          echo "tests to run: $(cat "$RUNNER_TEMP/expected-tests")"
-          cp "$RUNNER_TEMP/expected-tests" expected-tests
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: nextest-archive
-          path: ${{ runner.temp }}/nextest-archive.tar.zst
-          # Already zstd-compressed.
-          compression-level: 0
-          retention-days: 1
-          overwrite: true
-          if-no-files-found: error
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: expected-tests
-          path: expected-tests
-          retention-days: 1
-          overwrite: true
-          if-no-files-found: error
-
-  test-run:
-    name: Test (${{ matrix.partition }}/6)
-    needs: [changes, test-build]
-    if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        partition: [1, 2, 3, 4, 5, 6]
-    env:
-      WORKFORCE_SKIP_POSTGRES_TESTS: "1"
-      GITHUB_TOKEN: ${{ github.token }}
-    steps:
-      # The checkout is for the files tests read at run time (fixtures,
-      # docs, migrations); the binaries come from the archive. It sits at
-      # the same path as in `test-build`, which is what the paths compiled
-      # into the tests expect.
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with:
-          persist-credentials: false
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
-        with:
-          tool: cargo-nextest
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: nextest-archive
-          path: ${{ runner.temp }}
-      - run: mkdir -p ui/dist
-      - name: Run partition ${{ matrix.partition }} of 6
-        run: |
-          cargo nextest run --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst" --workspace-remap . \
-            --partition count:${{ matrix.partition }}/6 --profile ci
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: always()
-        with:
-          name: junit-${{ matrix.partition }}
-          path: target/nextest/ci/junit.xml
-          retention-days: 1
-          overwrite: true
-          if-no-files-found: warn
-
-  # Fails unless the partitions together ran every test in the archive, so a
-  # partition that is dropped from the matrix, or that runs nothing, can't
-  # shrink the suite unseen.
-  test-count:
-    name: Test count
-    needs: [test-build, test-run]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: junit-*
-          path: parts
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: expected-tests
-          path: parts/expected-tests
-      - run: |
-          set -euo pipefail
-          want="$(cat parts/expected-tests/expected-tests)"
-          total=0
-          for f in parts/junit-*/junit.xml; do
-            n="$(grep -o -m1 '<testsuites [^>]*' "$f" | grep -o ' tests="[0-9]*"' | grep -o '[0-9]*')"
-            echo "$f: $n tests"
-            total=$((total + n))
-          done
-          echo "partitions ran $total tests; the archive holds $want"
-          if [ "$total" != "$want" ]; then
-            echo "::error::the partitions ran $total tests, the archive holds $want"
-            exit 1
-          fi
-
-  test-doc:
-    name: Doctests
-    needs: [changes]
-    if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    env:
-      WORKFORCE_SKIP_POSTGRES_TESTS: "1"
-      GITHUB_TOKEN: ${{ github.token }}
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with:
-          persist-credentials: false
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          shared-key: test
-          save-if: false
-      - run: mkdir -p ui/dist
-      - run: cargo test --all-features --doc
-
-  # The tests that need a real vellev node and Postgres. Elsewhere these skip
-  # themselves; VELLEV_TEST_REQUIRED makes a skip a failure here, so a green
-  # job means they ran.
-  # Desk's Postgres tests (its sessions, rooms, ledger, plans, memory) need a
-  # real server, which `test-run` doesn't give them (it sets
-  # WORKFORCE_SKIP_POSTGRES_TESTS), so they run here against one. Postgres
-  # is started by hand rather than as a service so it can be given more
-  # connections than the default 100: desk's tests run in parallel, each on
-  # a database of its own, and run out of them otherwise. `fsync=off` is fine
-  # for a server that lives as long as the job.
-  desk-postgres:
-    name: Desk Postgres tests
-    needs: [changes]
-    if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    env:
-      GITHUB_TOKEN: ${{ github.token }}
-      WORKFORCE_TEST_POSTGRES_URL: postgres://desk:desk@127.0.0.1:5432/postgres
-    steps:
-      - name: Start Postgres
-        run: |
-          set -euo pipefail
-          docker run -d --name desk-postgres --network host \
-            -e POSTGRES_USER=desk -e POSTGRES_PASSWORD=desk -e POSTGRES_DB=postgres \
-            postgres:17 -c max_connections=1000 -c fsync=off -c synchronous_commit=off -c full_page_writes=off
-          for _ in $(seq 1 60); do
-            docker exec desk-postgres pg_isready -U desk && ready=1 && break
-            sleep 1
-          done
-          if [ "${ready:-}" != 1 ]; then docker logs desk-postgres | tail -n 50; exit 1; fi
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with:
-          persist-credentials: false
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          shared-key: desk-postgres
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      # A skipped test passes, so the run is told not to skip, and the log
-      # must show the tests ran.
-      - run: |
-          set -o pipefail
-          cargo test -p workforce-desk 2>&1 | tee "$RUNNER_TEMP/desk-test.log"
-      - run: |
-          set -euo pipefail
-          if grep -q 'WORKFORCE_SKIP_POSTGRES_TESTS set' "$RUNNER_TEMP/desk-test.log"; then
-            echo "::error::desk's Postgres tests were skipped"; exit 1
-          fi
-
-  vellev-node:
-    name: vellev node tests (${{ matrix.leg }})
-    needs: [changes]
-    if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    permissions:
-      contents: read
-    # Two legs on two runners, each with its own node: the hub's tests (one
-    # long compile) beside the other crates' tests, instead of one after the
-    # other. Between them they run what the single job ran.
-    strategy:
-      fail-fast: false
-      matrix:
-        leg: [crates, hub]
-    services:
-      postgres:
-        image: postgres:17
-        env:
-          POSTGRES_USER: vellev
-          POSTGRES_PASSWORD: vellev
-          POSTGRES_DB: vellev
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U vellev" --health-interval 5s
-          --health-timeout 5s --health-retries 20
-    env:
-      GITHUB_TOKEN: ${{ github.token }}
-      VELLEV_TEST_KEY: ci-key
-      VELLEV_TEST_LOCAL_EMBED: "1"
-      VELLEV_TEST_REQUIRED: "1"
-      # The tests that need a Weaviate fail without one rather than skip:
-      # a skipped test passes, and would count among the node tests that
-      # `vellev-node-tests.sh` requires to have run and passed.
-      WORKFORCE_TEST_WEAVIATE_REQUIRED: "1"
-      VELLEV_TEST_URL: http://127.0.0.1:8080
-      WORKFORCE_TEST_POSTGRES_URL: postgres://vellev:vellev@127.0.0.1:5432/vellev
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with:
-          persist-credentials: false
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          shared-key: vellev-node
-          save-if: ${{ github.ref == 'refs/heads/main' && matrix.leg == 'hub' }}
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: ~/vellev-models
-          key: vellev-models-bge-base-bge-small-en-v1.5
-          restore-keys: vellev-models-
-      - name: Start a vellev node
-        timeout-minutes: 30
-        run: |
-          set -euo pipefail
-          # The image runs as its own user; give it writable host directories
-          # for its store and cache, and the cached models.
-          mkdir -p ~/vellev-models "$RUNNER_TEMP/vellev-data"
-          chmod 0777 ~/vellev-models "$RUNNER_TEMP/vellev-data"
-          docker run -d --name vellev --network host \
-            -e VELLEV_LISTEN=127.0.0.1:8080 \
-            -e VELLEV_DATABASE_URL=postgres://vellev:vellev@127.0.0.1:5432/vellev \
-            -e VELLEV_STORE=file:///data/store \
-            -e VELLEV_CACHE_DIR=/data/cache \
-            -e VELLEV_MODEL_DIR=/models \
-            -e VELLEV_API_KEYS="$VELLEV_TEST_KEY" \
-            -e VELLEV_MAX_FORMAT=2 \
-            -e VELLEV_LOCAL_MODELS_ALLOWED=BAAI/bge-small-en-v1.5 \
-            -v "$RUNNER_TEMP/vellev-data:/data" \
-            -v "$HOME/vellev-models:/models" \
-            "$VELLEV_IMAGE" serve
-          for _ in $(seq 1 120); do
-            curl -fsS -o /dev/null "$VELLEV_TEST_URL/health/ready" && ready=1 && break
-            sleep 1
-          done
-          if [ "${ready:-}" != 1 ]; then docker logs vellev | tail -n 100; exit 1; fi
-          # Embed once with each model the tests use, the node's own and the
-          # code tests' bge-small, so neither download is charged to a
-          # test's timeout, into collections that do not store what they
-          # embed: the node raises its format to 2 in the background, after
-          # it is ready, and until then refuses such a collection naming
-          # VELLEV_MAX_FORMAT.
-          call() { curl -sS -H "authorization: Bearer $VELLEV_TEST_KEY" -H 'content-type: application/json' "$@"; }
-          probe="$VELLEV_TEST_URL/v1/tenants/ci-probe"
-          call -f -X PUT "$probe"
-          warm() {
-            local name=$1 model=$2 dimensions=$3 created='' answer
-            for _ in $(seq 1 90); do
-              if [ -z "$created" ]; then
-                answer=$(call -w '\n%{http_code}' -X PUT "$probe/collections/$name" -d '{"name":"'"$name"'","properties":[{"name":"text","data_type":"text","stored":false,"filterable":false}],"embedding":{"provider":"local","model":"'"$model"'","dimensions":'"$dimensions"',"properties":["text"]}}')
-                case "${answer##*$'\n'}" in
-                  2??) created=1 ;;
-                  400) grep -q VELLEV_MAX_FORMAT <<<"$answer" || break ;;
-                  *) break ;;
-                esac
-              fi
-              if [ -n "$created" ]; then
-                code=$(call -o /dev/null -w '%{http_code}' -X PUT "$probe/collections/$name/objects/00000000-0000-0000-0000-000000000001" -d '{"properties":{"text":"warm up"}}')
-                [ "$code" = 200 ] && return 0
-              fi
-              sleep 10
-            done
-            echo "$name: ${answer:-}"
-            return 1
-          }
-          warmed=1
-          warm Probe BAAI/bge-base-en-v1.5 768 && warm ProbeSmall BAAI/bge-small-en-v1.5 384 || warmed=''
-          call -X DELETE "$probe" || true
-          if [ -z "$warmed" ]; then docker logs vellev | tail -n 100; exit 1; fi
-      # A Weaviate, for the memory shadow's end-to-end test, which moves
-      # memories from one. Its release binary, pinned by sha256 (see
-      # WEAVIATE_SHA256). The collection memories are moved from names the
-      # `text2vec-transformers` module, so the module
-      # is on; nothing is vectorized by Weaviate here, so its inference
-      # service is a stand-in that answers only what Weaviate asks of it at
-      # start: `/.well-known/ready`, and `/meta`.
-      - name: Start Weaviate
-        timeout-minutes: 10
-        run: |
-          set -euo pipefail
-          work="$RUNNER_TEMP/weaviate"
-          mkdir -p "$work"
-          free_port() {
-            python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
-          }
-          # Two free ports in a row: Weaviate's cluster data port must be
-          # the one after its gossip port. Prints the first.
-          free_pair() {
-            python3 -c '
-          import socket
-          for _ in range(100):
-              a = socket.socket(); a.bind(("127.0.0.1", 0)); port = a.getsockname()[1]
-              b = socket.socket()
-              try:
-                  b.bind(("127.0.0.1", port + 1))
-              except OSError:
-                  continue
-              finally:
-                  a.close(); b.close()
-              print(port); break
-          else:
-              raise SystemExit("no two free ports in a row")
-          '
-          }
-          weaviate="$(.github/scripts/fetch-weaviate-binary.sh "$WEAVIATE_VERSION" "$WEAVIATE_SHA256" "$work/weaviate-bin")"
-
-          stub="$work/inference"
-          mkdir -p "$stub/.well-known"
-          : > "$stub/.well-known/ready"
-          echo '{}' > "$stub/meta"
-          stubport="$(free_port)"
-          nohup python3 -m http.server "$stubport" --bind 127.0.0.1 --directory "$stub" \
-            > "$work/inference.log" 2>&1 &
-          echo $! > "$work/inference.pid"
-          for _ in $(seq 1 30); do
-            curl -fsS -o /dev/null "http://127.0.0.1:$stubport/.well-known/ready" && stubbed=1 && break
-            sleep 1
-          done
-          if [ "${stubbed:-}" != 1 ]; then
-            cat "$work/inference.log"
-            echo "::error::the inference stand-in never answered"
-            exit 1
-          fi
-
-          port="$(free_port)"
-          gossip="$(free_pair)"
-          env \
-            PERSISTENCE_DATA_PATH="$work/weaviate-data" \
-            AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED=true \
-            DEFAULT_VECTORIZER_MODULE=none \
-            ENABLE_MODULES=text2vec-transformers \
-            TRANSFORMERS_INFERENCE_API="http://127.0.0.1:$stubport" \
-            DISABLE_TELEMETRY=true \
-            CLUSTER_HOSTNAME=node1 \
-            CLUSTER_ADVERTISE_ADDR=127.0.0.1 \
-            CLUSTER_GOSSIP_BIND_PORT="$gossip" \
-            CLUSTER_DATA_BIND_PORT="$((gossip + 1))" \
-            RAFT_PORT="$(free_port)" \
-            RAFT_INTERNAL_RPC_PORT="$(free_port)" \
-            RAFT_BOOTSTRAP_EXPECT=1 \
-            GRPC_PORT="$(free_port)" \
-            nohup "$weaviate" --host 127.0.0.1 --port "$port" --scheme http \
-            > "$work/weaviate.log" 2>&1 &
-          echo $! > "$work/weaviate.pid"
-          url="http://127.0.0.1:$port"
-          for _ in $(seq 1 120); do
-            curl -fsS -o /dev/null "$url/v1/.well-known/ready" && ready=1 && break
-            kill -0 "$(cat "$work/weaviate.pid")" 2>/dev/null || break
-            sleep 1
-          done
-          if [ "${ready:-}" != 1 ]; then
-            tail -n 100 "$work/weaviate.log"
-            echo "::error::Weaviate never became ready"
-            exit 1
-          fi
-          # The version asked for, with the module on.
-          meta="$(curl -fsS "$url/v1/meta")"
-          python3 - "$meta" "$WEAVIATE_VERSION" <<'PY'
-          import json, sys
-          meta, want = json.loads(sys.argv[1]), sys.argv[2]
-          if meta.get("version") != want:
-              sys.exit(f"::error::Weaviate says it is {meta.get('version')}, not {want}")
-          module = meta.get("modules", {}).get("text2vec-transformers")
-          if module is None:
-              sys.exit("::error::Weaviate has no text2vec-transformers module")
-          # Weaviate starts with a module whose inference service it could
-          # not ask, and says so only here.
-          if "error" in module:
-              sys.exit(f"::error::Weaviate's text2vec-transformers module: {module['error']}")
-          PY
-          echo "Weaviate $WEAVIATE_VERSION at $url"
-          echo "WORKFORCE_TEST_WEAVIATE_URL=$url" >> "$GITHUB_ENV"
-      # See test-build: the hub's build script makes ui/dist, and the
-      # directory is newer than its last run, so without this every cargo
-      # command rebuilds the hub.
-      - run: mkdir -p ui/dist
-      - name: Run the tests against the node
-        timeout-minutes: 60
-        env:
-          LEG: ${{ matrix.leg }}
-        run: |
-          set -euo pipefail
-          if [ "$LEG" = crates ]; then
-            cargo test --all-features \
-              -p workforce-vellev \
-              -p workforce-memory \
-              -p workforce-codebase-knowledge \
-              -p workforce-knowledge-service
-            cargo test --all-features -p workforce-orchestrator --lib -- artifact_store
-          else
-            crates/hub/vellev-node-tests.sh --all-features
-          fi
-      - name: Node logs
-        if: always()
-        run: docker logs vellev 2>&1 | tail -n 200 || true
-      - name: Stop Weaviate
-        if: always()
-        run: |
-          work="$RUNNER_TEMP/weaviate"
-          for name in weaviate inference; do
-            [ -f "$work/$name.pid" ] && kill "$(cat "$work/$name.pid")" 2>/dev/null || true
-          done
-          [ -f "$work/weaviate.log" ] && tail -n 50 "$work/weaviate.log" || true
-
-  docs-embed:
-    name: Docs embed
-    needs: [changes]
-    if: needs.changes.outputs.docs == 'true' && needs.changes.outputs.code != 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    env:
-      GITHUB_TOKEN: ${{ github.token }}
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with:
-          persist-credentials: false
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          shared-key: test
-          save-if: false
-      - run: cargo test -p workforce-hub --lib -- remote_mcp::help
-
-  # The one check branch protection requires: path- and lane-skipped jobs
-  # never report, so this always does, and fails if anything that ran failed.
-  ci-ok:
-    name: CI OK
-    if: always()
-    needs: [changes, secrets, ui, fmt, licenses, clippy, test-build, test-run, test-count, test-doc, desk-postgres, vellev-node, docs-embed]
-    runs-on: ubuntu-latest
-    permissions: {}
-    steps:
-      - env:
-          RESULTS: ${{ join(needs.*.result, ' ') }}
-        run: |
-          for r in $RESULTS; do
-            case "$r" in success|skipped) ;; *) echo "a required job ended: $r"; exit 1 ;; esac
-          done
+cargo metadata --locked --format-version 1 > /dev/nullname: PR Check
+cargo metadata --locked --format-version 1 > /dev/null
+cargo metadata --locked --format-version 1 > /dev/null# Runs on every pull request and on main. Everything here runs on
+cargo metadata --locked --format-version 1 > /dev/null# GitHub-hosted runners with a read-only token and no repository secrets:
+cargo metadata --locked --format-version 1 > /dev/null# a pull request can run its own code here, so nothing here may be able to
+cargo metadata --locked --format-version 1 > /dev/null# publish, deploy or read anything private. Building and deploying releases
+cargo metadata --locked --format-version 1 > /dev/null# happens elsewhere, from merged commits only.
+cargo metadata --locked --format-version 1 > /dev/null
+cargo metadata --locked --format-version 1 > /dev/nullconcurrency:
+cargo metadata --locked --format-version 1 > /dev/null  group: pr-check-${{ github.event.pull_request.number || github.ref }}
+cargo metadata --locked --format-version 1 > /dev/null  cancel-in-progress: true
+cargo metadata --locked --format-version 1 > /dev/null
+cargo metadata --locked --format-version 1 > /dev/nullon:
+cargo metadata --locked --format-version 1 > /dev/null  pull_request:
+cargo metadata --locked --format-version 1 > /dev/null    branches: [main]
+cargo metadata --locked --format-version 1 > /dev/null  push:
+cargo metadata --locked --format-version 1 > /dev/null    branches: [main]
+cargo metadata --locked --format-version 1 > /dev/null
+cargo metadata --locked --format-version 1 > /dev/nullpermissions: {}
+cargo metadata --locked --format-version 1 > /dev/null
+cargo metadata --locked --format-version 1 > /dev/nullenv:
+cargo metadata --locked --format-version 1 > /dev/null  # vite's MDX UI build needs more than Node's ~2GB default old-space.
+cargo metadata --locked --format-version 1 > /dev/null  NODE_OPTIONS: --max-old-space-size=6144
+cargo metadata --locked --format-version 1 > /dev/null  CARGO_TERM_COLOR: always
+cargo metadata --locked --format-version 1 > /dev/null  CARGO_INCREMENTAL: 0
+cargo metadata --locked --format-version 1 > /dev/null  RUST_BACKTRACE: 1
+cargo metadata --locked --format-version 1 > /dev/null  POSTGRESQL_VERSION: "=17.9.0"
+cargo metadata --locked --format-version 1 > /dev/null  # The vellev node the `vellev-node` job tests against, by digest so a
+cargo metadata --locked --format-version 1 > /dev/null  # re-pushed tag can't change what is tested.
+cargo metadata --locked --format-version 1 > /dev/null  VELLEV_IMAGE: kingsleyh/vellev:sha-ada7a63ef132d18049d3c7342f6076a249a69979@sha256:e2e1d95ba0b733737a03ac6ebf47119e6356e8b6f49eb03fe1aa2de5a72ca080
+cargo metadata --locked --format-version 1 > /dev/null  # The Weaviate the `vellev-node` job runs the memory shadow's end-to-end
+cargo metadata --locked --format-version 1 > /dev/null  # test against, as Weaviate's release archive for linux-amd64, pinned by
+cargo metadata --locked --format-version 1 > /dev/null  # the sha256 Weaviate publishes beside it. Moving it is these two lines.
+cargo metadata --locked --format-version 1 > /dev/null  WEAVIATE_VERSION: "1.28.4"
+cargo metadata --locked --format-version 1 > /dev/null  WEAVIATE_SHA256: 0892f23d1802872ddca3a7c489fe9eab17c76de3dc1058d21d51d3f741aa9a18
+cargo metadata --locked --format-version 1 > /dev/null
+cargo metadata --locked --format-version 1 > /dev/nulljobs:
+cargo metadata --locked --format-version 1 > /dev/null  # A change outside end-user-docs/ is code and runs the full gate; a
+cargo metadata --locked --format-version 1 > /dev/null  # docs-only change runs just the tests that read the embedded pages.
+cargo metadata --locked --format-version 1 > /dev/null  changes:
+cargo metadata --locked --format-version 1 > /dev/null    name: Detect changes
+cargo metadata --locked --format-version 1 > /dev/null    runs-on: ubuntu-latest
+cargo metadata --locked --format-version 1 > /dev/null    permissions:
+cargo metadata --locked --format-version 1 > /dev/null      contents: read
+cargo metadata --locked --format-version 1 > /dev/null    outputs:
+cargo metadata --locked --format-version 1 > /dev/null      code: ${{ steps.filter.outputs.code }}
+cargo metadata --locked --format-version 1 > /dev/null      docs: ${{ steps.filter.outputs.docs }}
+cargo metadata --locked --format-version 1 > /dev/null    steps:
+cargo metadata --locked --format-version 1 > /dev/null      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+cargo metadata --locked --format-version 1 > /dev/null        with:
+cargo metadata --locked --format-version 1 > /dev/null          fetch-depth: 0
+cargo metadata --locked --format-version 1 > /dev/null          persist-credentials: false
+cargo metadata --locked --format-version 1 > /dev/null      - id: filter
+cargo metadata --locked --format-version 1 > /dev/null        env:
+cargo metadata --locked --format-version 1 > /dev/null          EVENT: ${{ github.event_name }}
+cargo metadata --locked --format-version 1 > /dev/null          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+cargo metadata --locked --format-version 1 > /dev/null          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+cargo metadata --locked --format-version 1 > /dev/null        run: |
+cargo metadata --locked --format-version 1 > /dev/null          set -euo pipefail
+cargo metadata --locked --format-version 1 > /dev/null          if [ "$EVENT" != pull_request ]; then
+cargo metadata --locked --format-version 1 > /dev/null            echo "code=true" >> "$GITHUB_OUTPUT"; echo "docs=true" >> "$GITHUB_OUTPUT"; exit 0
+cargo metadata --locked --format-version 1 > /dev/null          fi
+cargo metadata --locked --format-version 1 > /dev/null          changed=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
+cargo metadata --locked --format-version 1 > /dev/null          code=false; docs=false
+cargo metadata --locked --format-version 1 > /dev/null          if grep -qvE '^end-user-docs/' <<<"$changed"; then code=true; fi
+cargo metadata --locked --format-version 1 > /dev/null          if grep -qE '^end-user-docs/' <<<"$changed"; then docs=true; fi
+cargo metadata --locked --format-version 1 > /dev/null          echo "code=$code" >> "$GITHUB_OUTPUT"
+cargo metadata --locked --format-version 1 > /dev/null          echo "docs=$docs" >> "$GITHUB_OUTPUT"
+cargo metadata --locked --format-version 1 > /dev/null
+cargo metadata --locked --format-version 1 > /dev/null  # Known secret formats in what a pull request or push adds. A required
+cargo metadata --locked --format-version 1 > /dev/null  # check through CI OK.
+cargo metadata --locked --format-version 1 > /dev/null  secrets:
+cargo metadata --locked --format-version 1 > /dev/null    name: Secrets
+cargo metadata --locked --format-version 1 > /dev/null    runs-on: ubuntu-latest
+cargo metadata --locked --format-version 1 > /dev/null    permissions:
+cargo metadata --locked --format-version 1 > /dev/null      contents: read
+cargo metadata --locked --format-version 1 > /dev/null    env:
+cargo metadata --locked --format-version 1 > /dev/null      GITLEAKS_VERSION: 8.30.1
+cargo metadata --locked --format-version 1 > /dev/null      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+cargo metadata --locked --format-version 1 > /dev/null    steps:
+cargo metadata --locked --format-version 1 > /dev/null      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+cargo metadata --locked --format-version 1 > /dev/null        with:
+cargo metadata --locked --format-version 1 > /dev/null          fetch-depth: 0
+cargo metadata --locked --format-version 1 > /dev/null          persist-credentials: false
+cargo metadata --locked --format-version 1 > /dev/null      - env:
+cargo metadata --locked --format-version 1 > /dev/null          RANGE: ${{ github.event_name == 'pull_request' && format('{0}..{1}', github.event.pull_request.base.sha, github.event.pull_request.head.sha) || format('{0}..{1}', github.event.before, github.sha) }}
+cargo metadata --locked --format-version 1 > /dev/null        run: |
+cargo metadata --locked --format-version 1 > /dev/null          set -euo pipefail
+cargo metadata --locked --format-version 1 > /dev/null          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+cargo metadata --locked --format-version 1 > /dev/null          curl -fsSL -o "$archive" "https://github.com/gitleaks/gitleaks/releases/download/v$GITLEAKS_VERSION/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+cargo metadata --locked --format-version 1 > /dev/null          echo "$GITLEAKS_SHA256  $archive" | sha256sum -c -
+cargo metadata --locked --format-version 1 > /dev/null          tar -xzf "$archive" -C "$RUNNER_TEMP" gitleaks
+cargo metadata --locked --format-version 1 > /dev/null          case "$RANGE" in 0000000000000000000000000000000000000000..*) RANGE=${RANGE#*..} ;; esac
+cargo metadata --locked --format-version 1 > /dev/null          "$RUNNER_TEMP/gitleaks" git --no-banner --redact --config .gitleaks.toml --log-opts="$RANGE" .
+cargo metadata --locked --format-version 1 > /dev/null
+cargo metadata --locked --format-version 1 > /dev/null  ui:
+cargo metadata --locked --format-version 1 > /dev/null    name: UI
+cargo metadata --locked --format-version 1 > /dev/null    runs-on: ubuntu-latest
+cargo metadata --locked --format-version 1 > /dev/null    permissions:
+cargo metadata --locked --format-version 1 > /dev/null      contents: read
+cargo metadata --locked --format-version 1 > /dev/null    steps:
+cargo metadata --locked --format-version 1 > /dev/null      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+cargo metadata --locked --format-version 1 > /dev/null        with:
+cargo metadata --locked --format-version 1 > /dev/null          persist-credentials: false
+cargo metadata --locked --format-version 1 > /dev/null      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+cargo metadata --locked --format-version 1 > /dev/null        with:
+cargo metadata --locked --format-version 1 > /dev/null          node-version: 22
+cargo metadata --locked --format-version 1 > /dev/null      - name: Type-check, test and build
+cargo metadata --locked --format-version 1 > /dev/null        run: |
+cargo metadata --locked --format-version 1 > /dev/null          npm --prefix ui ci
+cargo metadata --locked --format-version 1 > /dev/null          (cd ui && npx tsc --noEmit)
+cargo metadata --locked --format-version 1 > /dev/null          npm --prefix ui test
+cargo metadata --locked --format-version 1 > /dev/null          npm --prefix ui run build
+cargo metadata --locked --format-version 1 > /dev/null
+cargo metadata --locked --format-version 1 > /dev/null  fmt:
+cargo metadata --locked --format-version 1 > /dev/null    name: Format
+cargo metadata --locked --format-version 1 > /dev/null    needs: [changes]
+cargo metadata --locked --format-version 1 > /dev/null    if: needs.changes.outputs.code == 'true'
+cargo metadata --locked --format-version 1 > /dev/null    runs-on: ubuntu-latest
+cargo metadata --locked --format-version 1 > /dev/null    permissions:
+cargo metadata --locked --format-version 1 > /dev/null      contents: read
+cargo metadata --locked --format-version 1 > /dev/null    steps:
+cargo metadata --locked --format-version 1 > /dev/null      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+cargo metadata --locked --format-version 1 > /dev/null        with:
+cargo metadata --locked --format-version 1 > /dev/null          persist-credentials: false
+cargo metadata --locked --format-version 1 > /dev/null      - run: cargo fmt --all -- --check
+cargo metadata --locked --format-version 1 > /dev/null      # A manifest change must carry its Cargo.lock: release builds use --locked.
+cargo metadata --locked --format-version 1 > /dev/null      - run: cargo metadata --locked --offline --format-version 1 > /dev/null || cargo metadata --locked --format-version 1 > /dev/null
+cargo metadata --locked --format-version 1 > /dev/null
+cargo metadata --locked --format-version 1 > /dev/null  licenses:
+cargo metadata --locked --format-version 1 > /dev/null    name: Dependency licences
+cargo metadata --locked --format-version 1 > /dev/null    needs: [changes]
+cargo metadata --locked --format-version 1 > /dev/null    if: needs.changes.outputs.code == 'true'
+cargo metadata --locked --format-version 1 > /dev/null    runs-on: ubuntu-latest
+cargo metadata --locked --format-version 1 > /dev/null    permissions:
+cargo metadata --locked --format-version 1 > /dev/null      contents: read
+cargo metadata --locked --format-version 1 > /dev/null    steps:
+cargo metadata --locked --format-version 1 > /dev/null      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+cargo metadata --locked --format-version 1 > /dev/null        with:
+cargo metadata --locked --format-version 1 > /dev/null          persist-credentials: false
+cargo metadata --locked --format-version 1 > /dev/null      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
+cargo metadata --locked --format-version 1 > /dev/null        with:
+cargo metadata --locked --format-version 1 > /dev/null          tool: cargo-deny@0.20.2
+cargo metadata --locked --format-version 1 > /dev/null      - run: cargo deny check licenses
+cargo metadata --locked --format-version 1 > /dev/null
+cargo metadata --locked --format-version 1 > /dev/null  clippy:
+cargo metadata --locked --format-version 1 > /dev/null    name: Clippy
+cargo metadata --locked --format-version 1 > /dev/null    needs: [changes]
+cargo metadata --locked --format-version 1 > /dev/null    if: needs.changes.outputs.code == 'true'
+cargo metadata --locked --format-version 1 > /dev/null    runs-on: ubuntu-latest
+cargo metadata --locked --format-version 1 > /dev/null    permissions:
+cargo metadata --locked --format-version 1 > /dev/null      contents: read
+cargo metadata --locked --format-version 1 > /dev/null    env:
+cargo metadata --locked --format-version 1 > /dev/null      # The embedded-Postgres build script calls the GitHub API; the job's own
+cargo metadata --locked --format-version 1 > /dev/null      # read-only token keeps it off the anonymous rate limit.
+cargo metadata --locked --format-version 1 > /dev/null      GITHUB_TOKEN: ${{ github.token }}
+cargo metadata --locked --format-version 1 > /dev/null    steps:
+cargo metadata --locked --format-version 1 > /dev/null      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+cargo metadata --locked --format-version 1 > /dev/null        with:
+cargo metadata --locked --format-version 1 > /dev/null          persist-credentials: false
+cargo metadata --locked --format-version 1 > /dev/null      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+cargo metadata --locked --format-version 1 > /dev/null        with:
+cargo metadata --locked --format-version 1 > /dev/null          shared-key: clippy
+cargo metadata --locked --format-version 1 > /dev/null          save-if: ${{ github.ref == 'refs/heads/main' }}
+cargo metadata --locked --format-version 1 > /dev/null      - run: cargo clippy --all-targets --all-features --no-deps -- -D warnings
+cargo metadata --locked --format-version 1 > /dev/null
+cargo metadata --locked --format-version 1 > /dev/null  # The hub test suite is built once here and run in parallel partitions
+cargo metadata --locked --format-version 1 > /dev/null  # below (`test-run`), with the doctests in their own job (`test-doc`).
+cargo metadata --locked --format-version 1 > /dev/null  # Together they run exactly what one `cargo nextest run --all-features`
+cargo metadata --locked --format-version 1 > /dev/null  # plus `cargo test --all-features --doc` ran; `test-count` fails the
+cargo metadata --locked --format-version 1 > /dev/null  # run if the partitions' tests don't add up to every test in the archive.
+cargo metadata --locked --format-version 1 > /dev/null  test-build:
+cargo metadata --locked --format-version 1 > /dev/null    name: Test build
+cargo metadata --locked --format-version 1 > /dev/null    needs: [changes]
+cargo metadata --locked --format-version 1 > /dev/null    if: needs.changes.outputs.code == 'true'
+cargo metadata --locked --format-version 1 > /dev/null    runs-on: ubuntu-latest
+cargo metadata --locked --format-version 1 > /dev/null    # A warm cache builds in about 30 minutes; a cold one (the cache is saved
+cargo metadata --locked --format-version 1 > /dev/null    # only from main, so after a red main or a lockfile change) takes over 60.
+cargo metadata --locked --format-version 1 > /dev/null    timeout-minutes: 100
+cargo metadata --locked --format-version 1 > /dev/null    permissions:
+cargo metadata --locked --format-version 1 > /dev/null      contents: read
+cargo metadata --locked --format-version 1 > /dev/null    env:
+cargo metadata --locked --format-version 1 > /dev/null      WORKFORCE_SKIP_POSTGRES_TESTS: "1"
+cargo metadata --locked --format-version 1 > /dev/null      GITHUB_TOKEN: ${{ github.token }}
+cargo metadata --locked --format-version 1 > /dev/null    steps:
+cargo metadata --locked --format-version 1 > /dev/null      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+cargo metadata --locked --format-version 1 > /dev/null        with:
+cargo metadata --locked --format-version 1 > /dev/null          persist-credentials: false
+cargo metadata --locked --format-version 1 > /dev/null      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+cargo metadata --locked --format-version 1 > /dev/null        with:
+cargo metadata --locked --format-version 1 > /dev/null          shared-key: test
+cargo metadata --locked --format-version 1 > /dev/null          save-if: ${{ github.ref == 'refs/heads/main' }}
+cargo metadata --locked --format-version 1 > /dev/null      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
+cargo metadata --locked --format-version 1 > /dev/null        with:
+cargo metadata --locked --format-version 1 > /dev/null          tool: cargo-nextest
+cargo metadata --locked --format-version 1 > /dev/null      # The hub's build script creates ui/dist when it is absent, which makes
+cargo metadata --locked --format-version 1 > /dev/null      # the directory newer than the script's last run and so rebuilds the
+cargo metadata --locked --format-version 1 > /dev/null      # hub (and what depends on it) on every later cargo command. Create it
+cargo metadata --locked --format-version 1 > /dev/null      # first so each crate is built once.
+cargo metadata --locked --format-version 1 > /dev/null      - run: mkdir -p ui/dist
+cargo metadata --locked --format-version 1 > /dev/null      # The hub's library and its tests are each a rustc of about 9 GB, and
+cargo metadata --locked --format-version 1 > /dev/null      # they build at once: with the rest of the workspace that can pass the
+cargo metadata --locked --format-version 1 > /dev/null      # runner's 16 GB, and the runner is then killed (exit 143, "lost
+cargo metadata --locked --format-version 1 > /dev/null      # communication"). Swap lets such a moment pass, a little slower,
+cargo metadata --locked --format-version 1 > /dev/null      # instead of losing the job.
+cargo metadata --locked --format-version 1 > /dev/null      - name: Give the build room to swap
+cargo metadata --locked --format-version 1 > /dev/null        run: |
+cargo metadata --locked --format-version 1 > /dev/null          free -h
+cargo metadata --locked --format-version 1 > /dev/null          # Only a mitigation: without room on the scratch disk, build as
+cargo metadata --locked --format-version 1 > /dev/null          # before.
+cargo metadata --locked --format-version 1 > /dev/null          if [ ! -d /mnt ] || [ "$(df --output=avail -BG /mnt | tail -1 | tr -dc 0-9)" -lt 24 ]; then
+cargo metadata --locked --format-version 1 > /dev/null            echo "No room on /mnt for swap: building with the runner's own."
+cargo metadata --locked --format-version 1 > /dev/null            exit 0
+cargo metadata --locked --format-version 1 > /dev/null          fi
+cargo metadata --locked --format-version 1 > /dev/null          sudo swapoff -a
+cargo metadata --locked --format-version 1 > /dev/null          sudo fallocate -l 16G /mnt/test-build.swap
+cargo metadata --locked --format-version 1 > /dev/null          sudo chmod 600 /mnt/test-build.swap
+cargo metadata --locked --format-version 1 > /dev/null          sudo mkswap /mnt/test-build.swap >/dev/null
+cargo metadata --locked --format-version 1 > /dev/null          sudo swapon /mnt/test-build.swap
+cargo metadata --locked --format-version 1 > /dev/null          # Swap only under real pressure, so the runner itself isn't starved.
+cargo metadata --locked --format-version 1 > /dev/null          sudo sysctl -q vm.swappiness=10
+cargo metadata --locked --format-version 1 > /dev/null          free -h
+cargo metadata --locked --format-version 1 > /dev/null      - name: Build every test binary
+cargo metadata --locked --format-version 1 > /dev/null        run: cargo nextest archive --all-features --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst"
+cargo metadata --locked --format-version 1 > /dev/null      # Every test the archive holds that a plain run would run (not
+cargo metadata --locked --format-version 1 > /dev/null      # #[ignore]d), for `test-count` to hold the partitions to.
+cargo metadata --locked --format-version 1 > /dev/null      - name: Count the tests
+cargo metadata --locked --format-version 1 > /dev/null        run: |
+cargo metadata --locked --format-version 1 > /dev/null          set -euo pipefail
+cargo metadata --locked --format-version 1 > /dev/null          cargo nextest list --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst" --workspace-remap . --message-format json \
+cargo metadata --locked --format-version 1 > /dev/null            | jq '[.["rust-suites"][].testcases | to_entries[] | select(.value.ignored == false and .value["filter-match"].status == "matches")] | length' \
+cargo metadata --locked --format-version 1 > /dev/null            > "$RUNNER_TEMP/expected-tests"
+cargo metadata --locked --format-version 1 > /dev/null          echo "tests to run: $(cat "$RUNNER_TEMP/expected-tests")"
+cargo metadata --locked --format-version 1 > /dev/null          cp "$RUNNER_TEMP/expected-tests" expected-tests
+cargo metadata --locked --format-version 1 > /dev/null      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+cargo metadata --locked --format-version 1 > /dev/null        with:
+cargo metadata --locked --format-version 1 > /dev/null          name: nextest-archive
+cargo metadata --locked --format-version 1 > /dev/null          path: ${{ runner.temp }}/nextest-archive.tar.zst
+cargo metadata --locked --format-version 1 > /dev/null          # Already zstd-compressed.
+cargo metadata --locked --format-version 1 > /dev/null          compression-level: 0
+cargo metadata --locked --format-version 1 > /dev/null          retention-days: 1
+cargo metadata --locked --format-version 1 > /dev/null          overwrite: true
+cargo metadata --locked --format-version 1 > /dev/null          if-no-files-found: error
+cargo metadata --locked --format-version 1 > /dev/null      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+cargo metadata --locked --format-version 1 > /dev/null        with:
+cargo metadata --locked --format-version 1 > /dev/null          name: expected-tests
+cargo metadata --locked --format-version 1 > /dev/null          path: expected-tests
+cargo metadata --locked --format-version 1 > /dev/null          retention-days: 1
+cargo metadata --locked --format-version 1 > /dev/null          overwrite: true
+cargo metadata --locked --format-version 1 > /dev/null          if-no-files-found: error
+cargo metadata --locked --format-version 1 > /dev/null
+cargo metadata --locked --format-version 1 > /dev/null  test-run:
+cargo metadata --locked --format-version 1 > /dev/null    name: Test (${{ matrix.partition }}/6)
+cargo metadata --locked --format-version 1 > /dev/null    needs: [changes, test-build]
+cargo metadata --locked --format-version 1 > /dev/null    if: needs.changes.outputs.code == 'true'
+cargo metadata --locked --format-version 1 > /dev/null    runs-on: ubuntu-latest
+cargo metadata --locked --format-version 1 > /dev/null    timeout-minutes: 60
+cargo metadata --locked --format-version 1 > /dev/null    permissions:
+cargo metadata --locked --format-version 1 > /dev/null      contents: read
+cargo metadata --locked --format-version 1 > /dev/null    strategy:
+cargo metadata --locked --format-version 1 > /dev/null      fail-fast: false
+cargo metadata --locked --format-version 1 > /dev/null      matrix:
+cargo metadata --locked --format-version 1 > /dev/null        partition: [1, 2, 3, 4, 5, 6]
+cargo metadata --locked --format-version 1 > /dev/null    env:
+cargo metadata --locked --format-version 1 > /dev/null      WORKFORCE_SKIP_POSTGRES_TESTS: "1"
+cargo metadata --locked --format-version 1 > /dev/null      GITHUB_TOKEN: ${{ github.token }}
+cargo metadata --locked --format-version 1 > /dev/null    steps:
+cargo metadata --locked --format-version 1 > /dev/null      # The checkout is for the files tests read at run time (fixtures,
+cargo metadata --locked --format-version 1 > /dev/null      # docs, migrations); the binaries come from the archive. It sits at
+cargo metadata --locked --format-version 1 > /dev/null      # the same path as in `test-build`, which is what the paths compiled
+cargo metadata --locked --format-version 1 > /dev/null      # into the tests expect.
+cargo metadata --locked --format-version 1 > /dev/null      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+cargo metadata --locked --format-version 1 > /dev/null        with:
+cargo metadata --locked --format-version 1 > /dev/null          persist-credentials: false
+cargo metadata --locked --format-version 1 > /dev/null      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
+cargo metadata --locked --format-version 1 > /dev/null        with:
+cargo metadata --locked --format-version 1 > /dev/null          tool: cargo-nextest
+cargo metadata --locked --format-version 1 > /dev/null      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+cargo metadata --locked --format-version 1 > /dev/null        with:
+cargo metadata --locked --format-version 1 > /dev/null          name: nextest-archive
+cargo metadata --locked --format-version 1 > /dev/null          path: ${{ runner.temp }}
+cargo metadata --locked --format-version 1 > /dev/null      - run: mkdir -p ui/dist
+cargo metadata --locked --format-version 1 > /dev/null      - name: Run partition ${{ matrix.partition }} of 6
+cargo metadata --locked --format-version 1 > /dev/null        run: |
+cargo metadata --locked --format-version 1 > /dev/null          cargo nextest run --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst" --workspace-remap . \
+cargo metadata --locked --format-version 1 > /dev/null            --partition count:${{ matrix.partition }}/6 --profile ci
+cargo metadata --locked --format-version 1 > /dev/null      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+cargo metadata --locked --format-version 1 > /dev/null        if: always()
+cargo metadata --locked --format-version 1 > /dev/null        with:
+cargo metadata --locked --format-version 1 > /dev/null          name: junit-${{ matrix.partition }}
+cargo metadata --locked --format-version 1 > /dev/null          path: target/nextest/ci/junit.xml
+cargo metadata --locked --format-version 1 > /dev/null          retention-days: 1
+cargo metadata --locked --format-version 1 > /dev/null          overwrite: true
+cargo metadata --locked --format-version 1 > /dev/null          if-no-files-found: warn
+cargo metadata --locked --format-version 1 > /dev/null
+cargo metadata --locked --format-version 1 > /dev/null  # Fails unless the partitions together ran every test in the archive, so a
+cargo metadata --locked --format-version 1 > /dev/null  # partition that is dropped from the matrix, or that runs nothing, can't
+cargo metadata --locked --format-version 1 > /dev/null  # shrink the suite unseen.
+cargo metadata --locked --format-version 1 > /dev/null  test-count:
+cargo metadata --locked --format-version 1 > /dev/null    name: Test count
+cargo metadata --locked --format-version 1 > /dev/null    needs: [test-build, test-run]
+cargo metadata --locked --format-version 1 > /dev/null    runs-on: ubuntu-latest
+cargo metadata --locked --format-version 1 > /dev/null    permissions:
+cargo metadata --locked --format-version 1 > /dev/null      contents: read
+cargo metadata --locked --format-version 1 > /dev/null    steps:
+cargo metadata --locked --format-version 1 > /dev/null      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+cargo metadata --locked --format-version 1 > /dev/null        with:
+cargo metadata --locked --format-version 1 > /dev/null          pattern: junit-*
+cargo metadata --locked --format-version 1 > /dev/null          path: parts
+cargo metadata --locked --format-version 1 > /dev/null      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+cargo metadata --locked --format-version 1 > /dev/null        with:
+cargo metadata --locked --format-version 1 > /dev/null          name: expected-tests
+cargo metadata --locked --format-version 1 > /dev/null          path: parts/expected-tests
+cargo metadata --locked --format-version 1 > /dev/null      - run: |
+cargo metadata --locked --format-version 1 > /dev/null          set -euo pipefail
+cargo metadata --locked --format-version 1 > /dev/null          want="$(cat parts/expected-tests/expected-tests)"
+cargo metadata --locked --format-version 1 > /dev/null          total=0
+cargo metadata --locked --format-version 1 > /dev/null          for f in parts/junit-*/junit.xml; do
+cargo metadata --locked --format-version 1 > /dev/null            n="$(grep -o -m1 '<testsuites [^>]*' "$f" | grep -o ' tests="[0-9]*"' | grep -o '[0-9]*')"
+cargo metadata --locked --format-version 1 > /dev/null            echo "$f: $n tests"
+cargo metadata --locked --format-version 1 > /dev/null            total=$((total + n))
+cargo metadata --locked --format-version 1 > /dev/null          done
+cargo metadata --locked --format-version 1 > /dev/null          echo "partitions ran $total tests; the archive holds $want"
+cargo metadata --locked --format-version 1 > /dev/null          if [ "$total" != "$want" ]; then
+cargo metadata --locked --format-version 1 > /dev/null            echo "::error::the partitions ran $total tests, the archive holds $want"
+cargo metadata --locked --format-version 1 > /dev/null            exit 1
+cargo metadata --locked --format-version 1 > /dev/null          fi
+cargo metadata --locked --format-version 1 > /dev/null
+cargo metadata --locked --format-version 1 > /dev/null  test-doc:
+cargo metadata --locked --format-version 1 > /dev/null    name: Doctests
+cargo metadata --locked --format-version 1 > /dev/null    needs: [changes]
+cargo metadata --locked --format-version 1 > /dev/null    if: needs.changes.outputs.code == 'true'
+cargo metadata --locked --format-version 1 > /dev/null    runs-on: ubuntu-latest
+cargo metadata --locked --format-version 1 > /dev/null    timeout-minutes: 60
+cargo metadata --locked --format-version 1 > /dev/null    permissions:
+cargo metadata --locked --format-version 1 > /dev/null      contents: read
+cargo metadata --locked --format-version 1 > /dev/null    env:
+cargo metadata --locked --format-version 1 > /dev/null      WORKFORCE_SKIP_POSTGRES_TESTS: "1"
+cargo metadata --locked --format-version 1 > /dev/null      GITHUB_TOKEN: ${{ github.token }}
+cargo metadata --locked --format-version 1 > /dev/null    steps:
+cargo metadata --locked --format-version 1 > /dev/null      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+cargo metadata --locked --format-version 1 > /dev/null        with:
+cargo metadata --locked --format-version 1 > /dev/null          persist-credentials: false
+cargo metadata --locked --format-version 1 > /dev/null      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+cargo metadata --locked --format-version 1 > /dev/null        with:
+cargo metadata --locked --format-version 1 > /dev/null          shared-key: test
+cargo metadata --locked --format-version 1 > /dev/null          save-if: false
+cargo metadata --locked --format-version 1 > /dev/null      - run: mkdir -p ui/dist
+cargo metadata --locked --format-version 1 > /dev/null      - run: cargo test --all-features --doc
+cargo metadata --locked --format-version 1 > /dev/null
+cargo metadata --locked --format-version 1 > /dev/null  # The tests that need a real vellev node and Postgres. Elsewhere these skip
+cargo metadata --locked --format-version 1 > /dev/null  # themselves; VELLEV_TEST_REQUIRED makes a skip a failure here, so a green
+cargo metadata --locked --format-version 1 > /dev/null  # job means they ran.
+cargo metadata --locked --format-version 1 > /dev/null  # Desk's Postgres tests (its sessions, rooms, ledger, plans, memory) need a
+cargo metadata --locked --format-version 1 > /dev/null  # real server, which `test-run` doesn't give them (it sets
+cargo metadata --locked --format-version 1 > /dev/null  # WORKFORCE_SKIP_POSTGRES_TESTS), so they run here against one. Postgres
+cargo metadata --locked --format-version 1 > /dev/null  # is started by hand rather than as a service so it can be given more
+cargo metadata --locked --format-version 1 > /dev/null  # connections than the default 100: desk's tests run in parallel, each on
+cargo metadata --locked --format-version 1 > /dev/null  # a database of its own, and run out of them otherwise. `fsync=off` is fine
+cargo metadata --locked --format-version 1 > /dev/null  # for a server that lives as long as the job.
+cargo metadata --locked --format-version 1 > /dev/null  desk-postgres:
+cargo metadata --locked --format-version 1 > /dev/null    name: Desk Postgres tests
+cargo metadata --locked --format-version 1 > /dev/null    needs: [changes]
+cargo metadata --locked --format-version 1 > /dev/null    if: needs.changes.outputs.code == 'true'
+cargo metadata --locked --format-version 1 > /dev/null    runs-on: ubuntu-latest
+cargo metadata --locked --format-version 1 > /dev/null    timeout-minutes: 60
+cargo metadata --locked --format-version 1 > /dev/null    permissions:
+cargo metadata --locked --format-version 1 > /dev/null      contents: read
+cargo metadata --locked --format-version 1 > /dev/null    env:
+cargo metadata --locked --format-version 1 > /dev/null      GITHUB_TOKEN: ${{ github.token }}
+cargo metadata --locked --format-version 1 > /dev/null      WORKFORCE_TEST_POSTGRES_URL: postgres://desk:desk@127.0.0.1:5432/postgres
+cargo metadata --locked --format-version 1 > /dev/null    steps:
+cargo metadata --locked --format-version 1 > /dev/null      - name: Start Postgres
+cargo metadata --locked --format-version 1 > /dev/null        run: |
+cargo metadata --locked --format-version 1 > /dev/null          set -euo pipefail
+cargo metadata --locked --format-version 1 > /dev/null          docker run -d --name desk-postgres --network host \
+cargo metadata --locked --format-version 1 > /dev/null            -e POSTGRES_USER=desk -e POSTGRES_PASSWORD=desk -e POSTGRES_DB=postgres \
+cargo metadata --locked --format-version 1 > /dev/null            postgres:17 -c max_connections=1000 -c fsync=off -c synchronous_commit=off -c full_page_writes=off
+cargo metadata --locked --format-version 1 > /dev/null          for _ in $(seq 1 60); do
+cargo metadata --locked --format-version 1 > /dev/null            docker exec desk-postgres pg_isready -U desk && ready=1 && break
+cargo metadata --locked --format-version 1 > /dev/null            sleep 1
+cargo metadata --locked --format-version 1 > /dev/null          done
+cargo metadata --locked --format-version 1 > /dev/null          if [ "${ready:-}" != 1 ]; then docker logs desk-postgres | tail -n 50; exit 1; fi
+cargo metadata --locked --format-version 1 > /dev/null      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+cargo metadata --locked --format-version 1 > /dev/null        with:
+cargo metadata --locked --format-version 1 > /dev/null          persist-credentials: false
+cargo metadata --locked --format-version 1 > /dev/null      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+cargo metadata --locked --format-version 1 > /dev/null        with:
+cargo metadata --locked --format-version 1 > /dev/null          shared-key: desk-postgres
+cargo metadata --locked --format-version 1 > /dev/null          save-if: ${{ github.ref == 'refs/heads/main' }}
+cargo metadata --locked --format-version 1 > /dev/null      # A skipped test passes, so the run is told not to skip, and the log
+cargo metadata --locked --format-version 1 > /dev/null      # must show the tests ran.
+cargo metadata --locked --format-version 1 > /dev/null      - run: |
+cargo metadata --locked --format-version 1 > /dev/null          set -o pipefail
+cargo metadata --locked --format-version 1 > /dev/null          cargo test -p workforce-desk 2>&1 | tee "$RUNNER_TEMP/desk-test.log"
+cargo metadata --locked --format-version 1 > /dev/null      - run: |
+cargo metadata --locked --format-version 1 > /dev/null          set -euo pipefail
+cargo metadata --locked --format-version 1 > /dev/null          if grep -q 'WORKFORCE_SKIP_POSTGRES_TESTS set' "$RUNNER_TEMP/desk-test.log"; then
+cargo metadata --locked --format-version 1 > /dev/null            echo "::error::desk's Postgres tests were skipped"; exit 1
+cargo metadata --locked --format-version 1 > /dev/null          fi
+cargo metadata --locked --format-version 1 > /dev/null
+cargo metadata --locked --format-version 1 > /dev/null  vellev-node:
+cargo metadata --locked --format-version 1 > /dev/null    name: vellev node tests (${{ matrix.leg }})
+cargo metadata --locked --format-version 1 > /dev/null    needs: [changes]
+cargo metadata --locked --format-version 1 > /dev/null    if: needs.changes.outputs.code == 'true'
+cargo metadata --locked --format-version 1 > /dev/null    runs-on: ubuntu-latest
+cargo metadata --locked --format-version 1 > /dev/null    timeout-minutes: 90
+cargo metadata --locked --format-version 1 > /dev/null    permissions:
+cargo metadata --locked --format-version 1 > /dev/null      contents: read
+cargo metadata --locked --format-version 1 > /dev/null    # Two legs on two runners, each with its own node: the hub's tests (one
+cargo metadata --locked --format-version 1 > /dev/null    # long compile) beside the other crates' tests, instead of one after the
+cargo metadata --locked --format-version 1 > /dev/null    # other. Between them they run what the single job ran.
+cargo metadata --locked --format-version 1 > /dev/null    strategy:
+cargo metadata --locked --format-version 1 > /dev/null      fail-fast: false
+cargo metadata --locked --format-version 1 > /dev/null      matrix:
+cargo metadata --locked --format-version 1 > /dev/null        leg: [crates, hub]
+cargo metadata --locked --format-version 1 > /dev/null    services:
+cargo metadata --locked --format-version 1 > /dev/null      postgres:
+cargo metadata --locked --format-version 1 > /dev/null        image: postgres:17
+cargo metadata --locked --format-version 1 > /dev/null        env:
+cargo metadata --locked --format-version 1 > /dev/null          POSTGRES_USER: vellev
+cargo metadata --locked --format-version 1 > /dev/null          POSTGRES_PASSWORD: vellev
+cargo metadata --locked --format-version 1 > /dev/null          POSTGRES_DB: vellev
+cargo metadata --locked --format-version 1 > /dev/null        ports: ["5432:5432"]
+cargo metadata --locked --format-version 1 > /dev/null        options: >-
+cargo metadata --locked --format-version 1 > /dev/null          --health-cmd "pg_isready -U vellev" --health-interval 5s
+cargo metadata --locked --format-version 1 > /dev/null          --health-timeout 5s --health-retries 20
+cargo metadata --locked --format-version 1 > /dev/null    env:
+cargo metadata --locked --format-version 1 > /dev/null      GITHUB_TOKEN: ${{ github.token }}
+cargo metadata --locked --format-version 1 > /dev/null      VELLEV_TEST_KEY: ci-key
+cargo metadata --locked --format-version 1 > /dev/null      VELLEV_TEST_LOCAL_EMBED: "1"
+cargo metadata --locked --format-version 1 > /dev/null      VELLEV_TEST_REQUIRED: "1"
+cargo metadata --locked --format-version 1 > /dev/null      # The tests that need a Weaviate fail without one rather than skip:
+cargo metadata --locked --format-version 1 > /dev/null      # a skipped test passes, and would count among the node tests that
+cargo metadata --locked --format-version 1 > /dev/null      # `vellev-node-tests.sh` requires to have run and passed.
+cargo metadata --locked --format-version 1 > /dev/null      WORKFORCE_TEST_WEAVIATE_REQUIRED: "1"
+cargo metadata --locked --format-version 1 > /dev/null      VELLEV_TEST_URL: http://127.0.0.1:8080
+cargo metadata --locked --format-version 1 > /dev/null      WORKFORCE_TEST_POSTGRES_URL: postgres://vellev:vellev@127.0.0.1:5432/vellev
+cargo metadata --locked --format-version 1 > /dev/null    steps:
+cargo metadata --locked --format-version 1 > /dev/null      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+cargo metadata --locked --format-version 1 > /dev/null        with:
+cargo metadata --locked --format-version 1 > /dev/null          persist-credentials: false
+cargo metadata --locked --format-version 1 > /dev/null      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+cargo metadata --locked --format-version 1 > /dev/null        with:
+cargo metadata --locked --format-version 1 > /dev/null          shared-key: vellev-node
+cargo metadata --locked --format-version 1 > /dev/null          save-if: ${{ github.ref == 'refs/heads/main' && matrix.leg == 'hub' }}
+cargo metadata --locked --format-version 1 > /dev/null      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+cargo metadata --locked --format-version 1 > /dev/null        with:
+cargo metadata --locked --format-version 1 > /dev/null          path: ~/vellev-models
+cargo metadata --locked --format-version 1 > /dev/null          key: vellev-models-bge-base-bge-small-en-v1.5
+cargo metadata --locked --format-version 1 > /dev/null          restore-keys: vellev-models-
+cargo metadata --locked --format-version 1 > /dev/null      - name: Start a vellev node
+cargo metadata --locked --format-version 1 > /dev/null        timeout-minutes: 30
+cargo metadata --locked --format-version 1 > /dev/null        run: |
+cargo metadata --locked --format-version 1 > /dev/null          set -euo pipefail
+cargo metadata --locked --format-version 1 > /dev/null          # The image runs as its own user; give it writable host directories
+cargo metadata --locked --format-version 1 > /dev/null          # for its store and cache, and the cached models.
+cargo metadata --locked --format-version 1 > /dev/null          mkdir -p ~/vellev-models "$RUNNER_TEMP/vellev-data"
+cargo metadata --locked --format-version 1 > /dev/null          chmod 0777 ~/vellev-models "$RUNNER_TEMP/vellev-data"
+cargo metadata --locked --format-version 1 > /dev/null          docker run -d --name vellev --network host \
+cargo metadata --locked --format-version 1 > /dev/null            -e VELLEV_LISTEN=127.0.0.1:8080 \
+cargo metadata --locked --format-version 1 > /dev/null            -e VELLEV_DATABASE_URL=postgres://vellev:vellev@127.0.0.1:5432/vellev \
+cargo metadata --locked --format-version 1 > /dev/null            -e VELLEV_STORE=file:///data/store \
+cargo metadata --locked --format-version 1 > /dev/null            -e VELLEV_CACHE_DIR=/data/cache \
+cargo metadata --locked --format-version 1 > /dev/null            -e VELLEV_MODEL_DIR=/models \
+cargo metadata --locked --format-version 1 > /dev/null            -e VELLEV_API_KEYS="$VELLEV_TEST_KEY" \
+cargo metadata --locked --format-version 1 > /dev/null            -e VELLEV_MAX_FORMAT=2 \
+cargo metadata --locked --format-version 1 > /dev/null            -e VELLEV_LOCAL_MODELS_ALLOWED=BAAI/bge-small-en-v1.5 \
+cargo metadata --locked --format-version 1 > /dev/null            -v "$RUNNER_TEMP/vellev-data:/data" \
+cargo metadata --locked --format-version 1 > /dev/null            -v "$HOME/vellev-models:/models" \
+cargo metadata --locked --format-version 1 > /dev/null            "$VELLEV_IMAGE" serve
+cargo metadata --locked --format-version 1 > /dev/null          for _ in $(seq 1 120); do
+cargo metadata --locked --format-version 1 > /dev/null            curl -fsS -o /dev/null "$VELLEV_TEST_URL/health/ready" && ready=1 && break
+cargo metadata --locked --format-version 1 > /dev/null            sleep 1
+cargo metadata --locked --format-version 1 > /dev/null          done
+cargo metadata --locked --format-version 1 > /dev/null          if [ "${ready:-}" != 1 ]; then docker logs vellev | tail -n 100; exit 1; fi
+cargo metadata --locked --format-version 1 > /dev/null          # Embed once with each model the tests use, the node's own and the
+cargo metadata --locked --format-version 1 > /dev/null          # code tests' bge-small, so neither download is charged to a
+cargo metadata --locked --format-version 1 > /dev/null          # test's timeout, into collections that do not store what they
+cargo metadata --locked --format-version 1 > /dev/null          # embed: the node raises its format to 2 in the background, after
+cargo metadata --locked --format-version 1 > /dev/null          # it is ready, and until then refuses such a collection naming
+cargo metadata --locked --format-version 1 > /dev/null          # VELLEV_MAX_FORMAT.
+cargo metadata --locked --format-version 1 > /dev/null          call() { curl -sS -H "authorization: Bearer $VELLEV_TEST_KEY" -H 'content-type: application/json' "$@"; }
+cargo metadata --locked --format-version 1 > /dev/null          probe="$VELLEV_TEST_URL/v1/tenants/ci-probe"
+cargo metadata --locked --format-version 1 > /dev/null          call -f -X PUT "$probe"
+cargo metadata --locked --format-version 1 > /dev/null          warm() {
+cargo metadata --locked --format-version 1 > /dev/null            local name=$1 model=$2 dimensions=$3 created='' answer
+cargo metadata --locked --format-version 1 > /dev/null            for _ in $(seq 1 90); do
+cargo metadata --locked --format-version 1 > /dev/null              if [ -z "$created" ]; then
+cargo metadata --locked --format-version 1 > /dev/null                answer=$(call -w '\n%{http_code}' -X PUT "$probe/collections/$name" -d '{"name":"'"$name"'","properties":[{"name":"text","data_type":"text","stored":false,"filterable":false}],"embedding":{"provider":"local","model":"'"$model"'","dimensions":'"$dimensions"',"properties":["text"]}}')
+cargo metadata --locked --format-version 1 > /dev/null                case "${answer##*$'\n'}" in
+cargo metadata --locked --format-version 1 > /dev/null                  2??) created=1 ;;
+cargo metadata --locked --format-version 1 > /dev/null                  400) grep -q VELLEV_MAX_FORMAT <<<"$answer" || break ;;
+cargo metadata --locked --format-version 1 > /dev/null                  *) break ;;
+cargo metadata --locked --format-version 1 > /dev/null                esac
+cargo metadata --locked --format-version 1 > /dev/null              fi
+cargo metadata --locked --format-version 1 > /dev/null              if [ -n "$created" ]; then
+cargo metadata --locked --format-version 1 > /dev/null                code=$(call -o /dev/null -w '%{http_code}' -X PUT "$probe/collections/$name/objects/00000000-0000-0000-0000-000000000001" -d '{"properties":{"text":"warm up"}}')
+cargo metadata --locked --format-version 1 > /dev/null                [ "$code" = 200 ] && return 0
+cargo metadata --locked --format-version 1 > /dev/null              fi
+cargo metadata --locked --format-version 1 > /dev/null              sleep 10
+cargo metadata --locked --format-version 1 > /dev/null            done
+cargo metadata --locked --format-version 1 > /dev/null            echo "$name: ${answer:-}"
+cargo metadata --locked --format-version 1 > /dev/null            return 1
+cargo metadata --locked --format-version 1 > /dev/null          }
+cargo metadata --locked --format-version 1 > /dev/null          warmed=1
+cargo metadata --locked --format-version 1 > /dev/null          warm Probe BAAI/bge-base-en-v1.5 768 && warm ProbeSmall BAAI/bge-small-en-v1.5 384 || warmed=''
+cargo metadata --locked --format-version 1 > /dev/null          call -X DELETE "$probe" || true
+cargo metadata --locked --format-version 1 > /dev/null          if [ -z "$warmed" ]; then docker logs vellev | tail -n 100; exit 1; fi
+cargo metadata --locked --format-version 1 > /dev/null      # A Weaviate, for the memory shadow's end-to-end test, which moves
+cargo metadata --locked --format-version 1 > /dev/null      # memories from one. Its release binary, pinned by sha256 (see
+cargo metadata --locked --format-version 1 > /dev/null      # WEAVIATE_SHA256). The collection memories are moved from names the
+cargo metadata --locked --format-version 1 > /dev/null      # `text2vec-transformers` module, so the module
+cargo metadata --locked --format-version 1 > /dev/null      # is on; nothing is vectorized by Weaviate here, so its inference
+cargo metadata --locked --format-version 1 > /dev/null      # service is a stand-in that answers only what Weaviate asks of it at
+cargo metadata --locked --format-version 1 > /dev/null      # start: `/.well-known/ready`, and `/meta`.
+cargo metadata --locked --format-version 1 > /dev/null      - name: Start Weaviate
+cargo metadata --locked --format-version 1 > /dev/null        timeout-minutes: 10
+cargo metadata --locked --format-version 1 > /dev/null        run: |
+cargo metadata --locked --format-version 1 > /dev/null          set -euo pipefail
+cargo metadata --locked --format-version 1 > /dev/null          work="$RUNNER_TEMP/weaviate"
+cargo metadata --locked --format-version 1 > /dev/null          mkdir -p "$work"
+cargo metadata --locked --format-version 1 > /dev/null          free_port() {
+cargo metadata --locked --format-version 1 > /dev/null            python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
+cargo metadata --locked --format-version 1 > /dev/null          }
+cargo metadata --locked --format-version 1 > /dev/null          # Two free ports in a row: Weaviate's cluster data port must be
+cargo metadata --locked --format-version 1 > /dev/null          # the one after its gossip port. Prints the first.
+cargo metadata --locked --format-version 1 > /dev/null          free_pair() {
+cargo metadata --locked --format-version 1 > /dev/null            python3 -c '
+cargo metadata --locked --format-version 1 > /dev/null          import socket
+cargo metadata --locked --format-version 1 > /dev/null          for _ in range(100):
+cargo metadata --locked --format-version 1 > /dev/null              a = socket.socket(); a.bind(("127.0.0.1", 0)); port = a.getsockname()[1]
+cargo metadata --locked --format-version 1 > /dev/null              b = socket.socket()
+cargo metadata --locked --format-version 1 > /dev/null              try:
+cargo metadata --locked --format-version 1 > /dev/null                  b.bind(("127.0.0.1", port + 1))
+cargo metadata --locked --format-version 1 > /dev/null              except OSError:
+cargo metadata --locked --format-version 1 > /dev/null                  continue
+cargo metadata --locked --format-version 1 > /dev/null              finally:
+cargo metadata --locked --format-version 1 > /dev/null                  a.close(); b.close()
+cargo metadata --locked --format-version 1 > /dev/null              print(port); break
+cargo metadata --locked --format-version 1 > /dev/null          else:
+cargo metadata --locked --format-version 1 > /dev/null              raise SystemExit("no two free ports in a row")
+cargo metadata --locked --format-version 1 > /dev/null          '
+cargo metadata --locked --format-version 1 > /dev/null          }
+cargo metadata --locked --format-version 1 > /dev/null          weaviate="$(.github/scripts/fetch-weaviate-binary.sh "$WEAVIATE_VERSION" "$WEAVIATE_SHA256" "$work/weaviate-bin")"
+cargo metadata --locked --format-version 1 > /dev/null
+cargo metadata --locked --format-version 1 > /dev/null          stub="$work/inference"
+cargo metadata --locked --format-version 1 > /dev/null          mkdir -p "$stub/.well-known"
+cargo metadata --locked --format-version 1 > /dev/null          : > "$stub/.well-known/ready"
+cargo metadata --locked --format-version 1 > /dev/null          echo '{}' > "$stub/meta"
+cargo metadata --locked --format-version 1 > /dev/null          stubport="$(free_port)"
+cargo metadata --locked --format-version 1 > /dev/null          nohup python3 -m http.server "$stubport" --bind 127.0.0.1 --directory "$stub" \
+cargo metadata --locked --format-version 1 > /dev/null            > "$work/inference.log" 2>&1 &
+cargo metadata --locked --format-version 1 > /dev/null          echo $! > "$work/inference.pid"
+cargo metadata --locked --format-version 1 > /dev/null          for _ in $(seq 1 30); do
+cargo metadata --locked --format-version 1 > /dev/null            curl -fsS -o /dev/null "http://127.0.0.1:$stubport/.well-known/ready" && stubbed=1 && break
+cargo metadata --locked --format-version 1 > /dev/null            sleep 1
+cargo metadata --locked --format-version 1 > /dev/null          done
+cargo metadata --locked --format-version 1 > /dev/null          if [ "${stubbed:-}" != 1 ]; then
+cargo metadata --locked --format-version 1 > /dev/null            cat "$work/inference.log"
+cargo metadata --locked --format-version 1 > /dev/null            echo "::error::the inference stand-in never answered"
+cargo metadata --locked --format-version 1 > /dev/null            exit 1
+cargo metadata --locked --format-version 1 > /dev/null          fi
+cargo metadata --locked --format-version 1 > /dev/null
+cargo metadata --locked --format-version 1 > /dev/null          port="$(free_port)"
+cargo metadata --locked --format-version 1 > /dev/null          gossip="$(free_pair)"
+cargo metadata --locked --format-version 1 > /dev/null          env \
+cargo metadata --locked --format-version 1 > /dev/null            PERSISTENCE_DATA_PATH="$work/weaviate-data" \
+cargo metadata --locked --format-version 1 > /dev/null            AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED=true \
+cargo metadata --locked --format-version 1 > /dev/null            DEFAULT_VECTORIZER_MODULE=none \
+cargo metadata --locked --format-version 1 > /dev/null            ENABLE_MODULES=text2vec-transformers \
+cargo metadata --locked --format-version 1 > /dev/null            TRANSFORMERS_INFERENCE_API="http://127.0.0.1:$stubport" \
+cargo metadata --locked --format-version 1 > /dev/null            DISABLE_TELEMETRY=true \
+cargo metadata --locked --format-version 1 > /dev/null            CLUSTER_HOSTNAME=node1 \
+cargo metadata --locked --format-version 1 > /dev/null            CLUSTER_ADVERTISE_ADDR=127.0.0.1 \
+cargo metadata --locked --format-version 1 > /dev/null            CLUSTER_GOSSIP_BIND_PORT="$gossip" \
+cargo metadata --locked --format-version 1 > /dev/null            CLUSTER_DATA_BIND_PORT="$((gossip + 1))" \
+cargo metadata --locked --format-version 1 > /dev/null            RAFT_PORT="$(free_port)" \
+cargo metadata --locked --format-version 1 > /dev/null            RAFT_INTERNAL_RPC_PORT="$(free_port)" \
+cargo metadata --locked --format-version 1 > /dev/null            RAFT_BOOTSTRAP_EXPECT=1 \
+cargo metadata --locked --format-version 1 > /dev/null            GRPC_PORT="$(free_port)" \
+cargo metadata --locked --format-version 1 > /dev/null            nohup "$weaviate" --host 127.0.0.1 --port "$port" --scheme http \
+cargo metadata --locked --format-version 1 > /dev/null            > "$work/weaviate.log" 2>&1 &
+cargo metadata --locked --format-version 1 > /dev/null          echo $! > "$work/weaviate.pid"
+cargo metadata --locked --format-version 1 > /dev/null          url="http://127.0.0.1:$port"
+cargo metadata --locked --format-version 1 > /dev/null          for _ in $(seq 1 120); do
+cargo metadata --locked --format-version 1 > /dev/null            curl -fsS -o /dev/null "$url/v1/.well-known/ready" && ready=1 && break
+cargo metadata --locked --format-version 1 > /dev/null            kill -0 "$(cat "$work/weaviate.pid")" 2>/dev/null || break
+cargo metadata --locked --format-version 1 > /dev/null            sleep 1
+cargo metadata --locked --format-version 1 > /dev/null          done
+cargo metadata --locked --format-version 1 > /dev/null          if [ "${ready:-}" != 1 ]; then
+cargo metadata --locked --format-version 1 > /dev/null            tail -n 100 "$work/weaviate.log"
+cargo metadata --locked --format-version 1 > /dev/null            echo "::error::Weaviate never became ready"
+cargo metadata --locked --format-version 1 > /dev/null            exit 1
+cargo metadata --locked --format-version 1 > /dev/null          fi
+cargo metadata --locked --format-version 1 > /dev/null          # The version asked for, with the module on.
+cargo metadata --locked --format-version 1 > /dev/null          meta="$(curl -fsS "$url/v1/meta")"
+cargo metadata --locked --format-version 1 > /dev/null          python3 - "$meta" "$WEAVIATE_VERSION" <<'PY'
+cargo metadata --locked --format-version 1 > /dev/null          import json, sys
+cargo metadata --locked --format-version 1 > /dev/null          meta, want = json.loads(sys.argv[1]), sys.argv[2]
+cargo metadata --locked --format-version 1 > /dev/null          if meta.get("version") != want:
+cargo metadata --locked --format-version 1 > /dev/null              sys.exit(f"::error::Weaviate says it is {meta.get('version')}, not {want}")
+cargo metadata --locked --format-version 1 > /dev/null          module = meta.get("modules", {}).get("text2vec-transformers")
+cargo metadata --locked --format-version 1 > /dev/null          if module is None:
+cargo metadata --locked --format-version 1 > /dev/null              sys.exit("::error::Weaviate has no text2vec-transformers module")
+cargo metadata --locked --format-version 1 > /dev/null          # Weaviate starts with a module whose inference service it could
+cargo metadata --locked --format-version 1 > /dev/null          # not ask, and says so only here.
+cargo metadata --locked --format-version 1 > /dev/null          if "error" in module:
+cargo metadata --locked --format-version 1 > /dev/null              sys.exit(f"::error::Weaviate's text2vec-transformers module: {module['error']}")
+cargo metadata --locked --format-version 1 > /dev/null          PY
+cargo metadata --locked --format-version 1 > /dev/null          echo "Weaviate $WEAVIATE_VERSION at $url"
+cargo metadata --locked --format-version 1 > /dev/null          echo "WORKFORCE_TEST_WEAVIATE_URL=$url" >> "$GITHUB_ENV"
+cargo metadata --locked --format-version 1 > /dev/null      # See test-build: the hub's build script makes ui/dist, and the
+cargo metadata --locked --format-version 1 > /dev/null      # directory is newer than its last run, so without this every cargo
+cargo metadata --locked --format-version 1 > /dev/null      # command rebuilds the hub.
+cargo metadata --locked --format-version 1 > /dev/null      - run: mkdir -p ui/dist
+cargo metadata --locked --format-version 1 > /dev/null      - name: Run the tests against the node
+cargo metadata --locked --format-version 1 > /dev/null        timeout-minutes: 60
+cargo metadata --locked --format-version 1 > /dev/null        env:
+cargo metadata --locked --format-version 1 > /dev/null          LEG: ${{ matrix.leg }}
+cargo metadata --locked --format-version 1 > /dev/null        run: |
+cargo metadata --locked --format-version 1 > /dev/null          set -euo pipefail
+cargo metadata --locked --format-version 1 > /dev/null          if [ "$LEG" = crates ]; then
+cargo metadata --locked --format-version 1 > /dev/null            cargo test --all-features \
+cargo metadata --locked --format-version 1 > /dev/null              -p workforce-vellev \
+cargo metadata --locked --format-version 1 > /dev/null              -p workforce-memory \
+cargo metadata --locked --format-version 1 > /dev/null              -p workforce-codebase-knowledge \
+cargo metadata --locked --format-version 1 > /dev/null              -p workforce-knowledge-service
+cargo metadata --locked --format-version 1 > /dev/null            cargo test --all-features -p workforce-orchestrator --lib -- artifact_store
+cargo metadata --locked --format-version 1 > /dev/null          else
+cargo metadata --locked --format-version 1 > /dev/null            crates/hub/vellev-node-tests.sh --all-features
+cargo metadata --locked --format-version 1 > /dev/null          fi
+cargo metadata --locked --format-version 1 > /dev/null      - name: Node logs
+cargo metadata --locked --format-version 1 > /dev/null        if: always()
+cargo metadata --locked --format-version 1 > /dev/null        run: docker logs vellev 2>&1 | tail -n 200 || true
+cargo metadata --locked --format-version 1 > /dev/null      - name: Stop Weaviate
+cargo metadata --locked --format-version 1 > /dev/null        if: always()
+cargo metadata --locked --format-version 1 > /dev/null        run: |
+cargo metadata --locked --format-version 1 > /dev/null          work="$RUNNER_TEMP/weaviate"
+cargo metadata --locked --format-version 1 > /dev/null          for name in weaviate inference; do
+cargo metadata --locked --format-version 1 > /dev/null            [ -f "$work/$name.pid" ] && kill "$(cat "$work/$name.pid")" 2>/dev/null || true
+cargo metadata --locked --format-version 1 > /dev/null          done
+cargo metadata --locked --format-version 1 > /dev/null          [ -f "$work/weaviate.log" ] && tail -n 50 "$work/weaviate.log" || true
+cargo metadata --locked --format-version 1 > /dev/null
+cargo metadata --locked --format-version 1 > /dev/null  docs-embed:
+cargo metadata --locked --format-version 1 > /dev/null    name: Docs embed
+cargo metadata --locked --format-version 1 > /dev/null    needs: [changes]
+cargo metadata --locked --format-version 1 > /dev/null    if: needs.changes.outputs.docs == 'true' && needs.changes.outputs.code != 'true'
+cargo metadata --locked --format-version 1 > /dev/null    runs-on: ubuntu-latest
+cargo metadata --locked --format-version 1 > /dev/null    permissions:
+cargo metadata --locked --format-version 1 > /dev/null      contents: read
+cargo metadata --locked --format-version 1 > /dev/null    env:
+cargo metadata --locked --format-version 1 > /dev/null      GITHUB_TOKEN: ${{ github.token }}
+cargo metadata --locked --format-version 1 > /dev/null    steps:
+cargo metadata --locked --format-version 1 > /dev/null      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+cargo metadata --locked --format-version 1 > /dev/null        with:
+cargo metadata --locked --format-version 1 > /dev/null          persist-credentials: false
+cargo metadata --locked --format-version 1 > /dev/null      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+cargo metadata --locked --format-version 1 > /dev/null        with:
+cargo metadata --locked --format-version 1 > /dev/null          shared-key: test
+cargo metadata --locked --format-version 1 > /dev/null          save-if: false
+cargo metadata --locked --format-version 1 > /dev/null      - run: cargo test -p workforce-hub --lib -- remote_mcp::help
+cargo metadata --locked --format-version 1 > /dev/null
+cargo metadata --locked --format-version 1 > /dev/null  # The one check branch protection requires: path- and lane-skipped jobs
+cargo metadata --locked --format-version 1 > /dev/null  # never report, so this always does, and fails if anything that ran failed.
+cargo metadata --locked --format-version 1 > /dev/null  ci-ok:
+cargo metadata --locked --format-version 1 > /dev/null    name: CI OK
+cargo metadata --locked --format-version 1 > /dev/null    if: always()
+cargo metadata --locked --format-version 1 > /dev/null    needs: [changes, secrets, ui, fmt, licenses, clippy, test-build, test-run, test-count, test-doc, desk-postgres, vellev-node, docs-embed]
+cargo metadata --locked --format-version 1 > /dev/null    runs-on: ubuntu-latest
+cargo metadata --locked --format-version 1 > /dev/null    permissions: {}
+cargo metadata --locked --format-version 1 > /dev/null    steps:
+cargo metadata --locked --format-version 1 > /dev/null      - env:
+cargo metadata --locked --format-version 1 > /dev/null          RESULTS: ${{ join(needs.*.result, ' ') }}
+cargo metadata --locked --format-version 1 > /dev/null        run: |
+cargo metadata --locked --format-version 1 > /dev/null          for r in $RESULTS; do
+cargo metadata --locked --format-version 1 > /dev/null            case "$r" in success|skipped) ;; *) echo "a required job ended: $r"; exit 1 ;; esac
+cargo metadata --locked --format-version 1 > /dev/null          done
