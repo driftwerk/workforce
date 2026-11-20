@@ -197,6 +197,7 @@ pub fn mid_turn(
     match state {
         SessionState::Working if !dialog => {}
         SessionState::Working | SessionState::Blocked => return Err(Unsteerable::Dialog),
+        SessionState::Asking if dialog => return Err(Unsteerable::Dialog),
         // Its turn ended on a question: it is at its prompt, no dialog on
         // screen, and the words go in as the next prompt.
         SessionState::Starting

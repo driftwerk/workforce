@@ -215,9 +215,6 @@ pub struct CrewHub {
     /// answer, by message: an answer is gated by what was asked as well as
     /// by what it says. One not known here is the person's.
     questions: Mutex<HashMap<uuid::Uuid, String>>,
-    /// The question each session's turn ended on that its boss is giving
-    /// the answer to now (`answer`): its message goes in as that answer.
-    turn_answers: Mutex<HashMap<uuid::Uuid, String>>,
     /// How many decisions (and suggestions) each boss made, by the session
     /// they were about: a line or work turn that moved none let it wait.
     acted: Mutex<HashMap<(String, Option<uuid::Uuid>), u64>>,
@@ -737,7 +734,6 @@ impl CrewHub {
             rework: tokio::sync::broadcast::channel(64).0,
             refused_steps: Mutex::default(),
             questions: Mutex::default(),
-            turn_answers: Mutex::default(),
             acted: Mutex::default(),
             asked_person: Mutex::default(),
             asks_checked: Mutex::default(),

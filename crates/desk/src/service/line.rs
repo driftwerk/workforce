@@ -1643,8 +1643,10 @@ impl Desk {
             return Some(Wait::PersonDriving);
         }
         let boss_runs = || {
-            self.charge_of(view.id)
-                .is_some_and(|c| c.live() && c.boss == m.from.id)
+            !self.person_driving(view.id)
+                && self
+                    .charge_of(view.id)
+                    .is_some_and(|c| c.live() && c.boss == m.from.id)
         };
         let answered = m.from.kind == PartyKind::Manager && (answers || boss_runs());
         (view.state == SessionState::Asking && !answered).then_some(Wait::Asking)
@@ -2062,7 +2064,7 @@ impl Desk {
                 Delivery::Queued if self.steered(id, m.id) => Some(Wait::NextCall),
                 Delivery::Queued => match line::deliverable(&view, typed, plugin) {
                     // A turn Esc ended: the plugin takes it now.
-                    Err(Wait::Working)
+                    Err(Wait::Working | Wait::Dialog)
                         if plugin
                             && view.caps.line == Deliver::Submit
                             && !self.in_a_turn(&view) =>

@@ -431,10 +431,14 @@ impl CrewHub {
                     message: text,
                     reply_to: None,
                 };
-                self.turn_answers.lock().insert(view.id, q.ask.clone());
-                let performed = self.perform(&action, By::manager(boss, &name, &why)).await;
-                self.turn_answers.lock().remove(&view.id);
-                match performed {
+                let order = super::assignments::Order {
+                    answers: Some(q.ask.clone()),
+                    ..Default::default()
+                };
+                match self
+                    .perform_with(&action, By::manager(boss, &name, &why), &order)
+                    .await
+                {
                     Ok(done) => {
                         tracing::info!(session = %view.id, %boss, %done, "the boss answered a question itself");
                     }

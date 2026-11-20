@@ -1248,11 +1248,61 @@ async fn its_bosss_answer_goes_in_when_its_turn_ended_on_a_question_and_nothing_
         )
         .await;
         let go = d
-            .line_send(Sender::Overseer(by), tell(run.id, "Yes, switch them."))
+            .line_send(
+                Sender::Overseer(by.clone()),
+                tell(run.id, "Yes, switch them."),
+            )
             .await
             .unwrap();
         let next = d.line_next(run.id, Duration::from_secs(1)).await.unwrap();
         assert_eq!(next["id"], json!(go.id));
+
+        // The person at its wheel, its turn ended on their question: its
+        // boss's answer waits for the wheel, as its words and asks do.
+        let theirs = new_session(&d, dir.path()).await;
+        idle(&d, theirs.id).await;
+        d.take_on(
+            theirs.id,
+            &by.party,
+            crate::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        ends_asking(&d, theirs.id, "Should I drop the old index?", true).await;
+        assert!(d.person_driving(theirs.id), "they prompted it");
+        let answer = d
+            .line_send(
+                Sender::Overseer(by.clone()),
+                Send::Answer {
+                    to: theirs.id,
+                    text: "Yes, drop it.".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let ask = d
+            .line_send(
+                Sender::Overseer(by),
+                Send::Ask {
+                    to: Target::Session(theirs.id),
+                    text: "Which index?".into(),
+                    wait: Duration::from_secs(60),
+                    chose: None,
+                    parts: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let thread = d.line_thread(theirs.id, None, None).await.unwrap();
+        let waiting = |id| thread.iter().find(|m| m.id == id).unwrap().waiting;
+        assert_eq!(waiting(answer.id), Some(Wait::PersonDriving));
+        assert_eq!(
+            waiting(ask.id),
+            Some(Wait::Asking),
+            "its question is theirs"
+        );
     })
     .await;
 }
