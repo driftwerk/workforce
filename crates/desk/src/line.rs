@@ -689,9 +689,9 @@ pub struct AskParts {
 pub enum Refusal {
     #[error("Loop guard: this has been handed on {MAX_HOPS} times already. Desk has told the person; if you need an answer, ask them (to: \"you\"), else stop here and wait for them.")]
     Hops,
-    #[error("Loop guard: you have sent {TURN_BUDGET} messages since the person or your boss last spoke to you. Desk has told the person. Stop here and wait: their reply comes to you as a message. Don't send again until then; it is refused the same way.")]
+    #[error("Loop guard: you have sent {TURN_BUDGET} messages since the person or your boss last spoke to you. Desk has told the person. Stop messaging the person and other sessions and wait: their reply comes to you as a message. What you tell your boss, if one runs you, still goes.")]
     Budget,
-    #[error("Loop guard: you have sent {BOSS_RUN_CEILING} messages since the person last spoke to you. Desk has told the person. Stop here and wait: their reply comes to you as a message. Don't send again until then; it is refused the same way.")]
+    #[error("Loop guard: you have sent {BOSS_RUN_CEILING} messages since the person last spoke to you. Desk has told the person. Stop messaging the person and other sessions and wait: their reply comes to you as a message. What you tell your boss, if one runs you, still goes.")]
     Ceiling,
     #[error("Loop guard: you have sent {TURN_BUDGET} messages to other sessions since the person last spoke to you. Desk has told the person. Stop messaging sessions and wait for them; you can still tell Desk how it stands.")]
     Peers,
@@ -898,20 +898,29 @@ pub fn guard(hop: i16, run: &LineRun, to: &Party) -> Result<(), Refusal> {
 /// What the person is told when the loop guard stops a session, after its
 /// name, in plain words; none for a refusal that isn't the loop guard's.
 pub fn stalled_why(r: &Refusal) -> Option<String> {
-    let why = match r {
-        Refusal::Budget => {
-            format!("it has sent {TURN_BUDGET} messages without hearing from you")
-        }
-        Refusal::Ceiling => {
-            format!("it has sent {BOSS_RUN_CEILING} messages without hearing from you")
-        }
-        Refusal::Peers => {
-            format!("it has sent {TURN_BUDGET} messages to other sessions without hearing from you")
-        }
-        Refusal::Hops => format!("its messages were handed on {MAX_HOPS} times without you"),
+    const WAITING: &str = "is waiting for you";
+    let (how, why) = match r {
+        Refusal::Budget => (
+            WAITING,
+            format!("it has sent {TURN_BUDGET} messages without hearing from you"),
+        ),
+        Refusal::Ceiling => (
+            WAITING,
+            format!("it has sent {BOSS_RUN_CEILING} messages without hearing from you"),
+        ),
+        Refusal::Peers => (
+            WAITING,
+            format!(
+                "it has sent {TURN_BUDGET} messages to other sessions without hearing from you"
+            ),
+        ),
+        Refusal::Hops => (
+            "stopped",
+            format!("its messages were handed on {MAX_HOPS} times without you"),
+        ),
         _ => return None,
     };
-    Some(format!("stopped: {why}. Reply to let it carry on."))
+    Some(format!("{how}: {why}. Reply to let it carry on."))
 }
 
 /// How a message reaches `recipient` now, or why it must wait. `typed` is
@@ -1912,7 +1921,7 @@ mod tests {
     fn a_stall_is_said_in_plain_words() {
         assert_eq!(
             stalled_why(&Refusal::Budget).unwrap(),
-            format!("stopped: it has sent {TURN_BUDGET} messages without hearing from you. Reply to let it carry on.")
+            format!("is waiting for you: it has sent {TURN_BUDGET} messages without hearing from you. Reply to let it carry on.")
         );
         assert!(stalled_why(&Refusal::Answered).is_none());
     }

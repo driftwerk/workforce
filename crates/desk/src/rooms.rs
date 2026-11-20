@@ -28,7 +28,8 @@ pub const TURN_BUDGET: i64 = 12;
 /// Each answer from its own boss starts [`TURN_BUDGET`] again; this caps
 /// the whole run, and one reply from the person lifts it. What it tells
 /// its boss is never counted ([`crate::line::guard`]): that is the work,
-/// paced by the boss's own turns.
+/// paced by its boss's turns an hour (`work.max_turns_per_hour`; none at
+/// Act fully).
 pub const BOSS_RUN_CEILING: i64 = 60;
 /// What Desk calls the hub on its own Mac, in member keys and sources.
 pub const LOCAL_HUB: &str = "local";

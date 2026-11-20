@@ -960,7 +960,7 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 }
             }
             let Some(Gathered {
-                messages,
+                mut messages,
                 mut ended,
                 mut asks,
                 mut handed,
@@ -992,21 +992,23 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                     continue;
                 }
             }
-            // Out of work turns for the hour: its turn's end waits for the
-            // next, and what it asked goes on.
-            if work && !crew.spend_work_turn(session) {
+            // Out of its boss's turns for the hour: what it said, its turn's
+            // end and what it asked wait for the next, gathered as one. The
+            // line never refuses a session's report to its boss; this paces
+            // the exchange instead.
+            let paced = work || (boss.is_some() && !messages.is_empty());
+            if paced && !crew.spend_work_turn(session) {
                 gathering.insert(
                     session,
                     Gathered {
+                        messages: std::mem::take(&mut messages),
                         ended: std::mem::take(&mut ended),
                         asks: std::mem::take(&mut asks),
                         handed: std::mem::take(&mut handed),
                         ..Gathered::new()
                     },
                 );
-                if messages.is_empty() {
-                    continue;
-                }
+                continue;
             }
             ended.extend(asks.iter().map(|(_, line)| line.clone()));
             if let Some(b) = &boss {

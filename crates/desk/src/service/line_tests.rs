@@ -303,23 +303,9 @@ async fn the_loop_guard_holds_a_session_to_its_budget_until_the_person_speaks_an
         let a = new_session(&d, dir.path()).await;
         idle(&d, a.id).await;
         for i in 0..crate::rooms::TURN_BUDGET {
-            d.line_call(
-                a.id,
-                "tell",
-                &json!({"to": "you", "text": format!("step {i}")}),
-                None,
-            )
-            .await
-            .unwrap();
+            tell_you(&d, a.id, &format!("step {i}")).await.unwrap();
         }
-        let refused = d
-            .line_call(
-                a.id,
-                "tell",
-                &json!({"to": "you", "text": "one more"}),
-                None,
-            )
-            .await;
+        let refused = tell_you(&d, a.id, "one more").await;
         assert_eq!(refused, Err(Refusal::Budget.to_string()));
         // A message Desk's plugin submitted is not the person speaking.
         let m = d
@@ -1840,9 +1826,10 @@ async fn a_sessions_reports_to_its_boss_are_never_refused_nor_counted() {
         sarah_bosses(&d);
         let crew: Arc<dyn crate::crew::Crew> = Arc::new(Answering);
         d.answer_lines_with(&crew);
+        // Kept alive by the test: the desk holds it weakly.
+        std::mem::forget(crew);
         let s = new_session(&d, dir.path()).await;
         idle(&d, s.id).await;
-        // A night of reports with no word from its boss or the person.
         for i in 0..crate::rooms::BOSS_RUN_CEILING * 4 {
             tell_desk(&d, s.id, &format!("report {i}"))
                 .await
@@ -1859,12 +1846,21 @@ async fn a_sessions_reports_to_its_boss_are_never_refused_nor_counted() {
             tell_you(&d, s.id, "one more").await,
             Err(Refusal::Budget.to_string())
         );
+        // Who it can't reach is said first, and stops nothing more.
+        let needs = d.line_needs().len();
+        let nobody = d
+            .line_call(s.id, "tell", &json!({"to": "nobody", "text": "hi"}), None)
+            .await;
+        assert_eq!(
+            nobody,
+            Err(Refusal::NoSuchSession("nobody".into()).to_string())
+        );
+        assert_eq!(d.line_needs().len(), needs);
         let last = tell_desk(&d, s.id, "and its boss still hears it")
             .await
             .unwrap();
         let last: Uuid = serde_json::from_value(last["id"].clone()).unwrap();
         assert_eq!(row(&d, last).await.to, Party::manager("sarah", "Sarah"));
-        drop(crew);
     })
     .await;
 }
@@ -1984,7 +1980,7 @@ async fn a_stopped_session_is_one_need_of_the_persons_until_they_speak_to_it() {
         assert_eq!(
             needs[0].ask,
             format!(
-                "{name} stopped: it has sent {} messages without hearing from you. Reply to let it carry on.",
+                "{name} is waiting for you: it has sent {} messages without hearing from you. Reply to let it carry on.",
                 crate::rooms::TURN_BUDGET
             )
         );

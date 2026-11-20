@@ -258,3 +258,72 @@ async fn a_reply_to_a_report_keeps_the_gates_of_a_message() {
     })
     .await;
 }
+
+/// Below Act fully, a session's reports to its boss are never refused:
+/// past the boss's turns for the hour they wait, gathered, for the next
+/// (20 Nov: Legacy removal's 02:32 and 03:24 reports were refused by the
+/// line's message limit and lost).
+#[tokio::test(flavor = "multi_thread")]
+async fn reports_past_the_bosss_turns_for_the_hour_wait_for_the_next_and_none_is_lost() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "Noted.",
+            "[oversight]\nenabled = true\nlevel = \"act\"\nact = { nudge = true }\n\
+             work = { max_turns_per_hour = 1 }\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, dir.path(), "Legacy removal").await;
+        let channel = super::super::line::line_channel(s.id);
+        let turns = || {
+            overseer
+                .sessions
+                .find(&channel, PERSON)
+                .unwrap()
+                .map_or(0, |l| {
+                    l.messages
+                        .iter()
+                        .filter(|m| m.content.starts_with(super::super::line::LINE))
+                        .count()
+                })
+        };
+        let tell = |text: &'static str| {
+            let d = d.clone();
+            async move {
+                d.line_call(s.id, "tell", &json!({"to": "desk", "text": text}), None)
+                    .await
+                    .unwrap();
+            }
+        };
+        tell("Inventory done: 14 legacy services on staging.").await;
+        eventually("its first report taken", async || {
+            (turns() == 1).then_some(())
+        })
+        .await;
+        tell("Step 12 done: the queue is drained.").await;
+        tell("Step 13 done: the old workers are stopped.").await;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        assert_eq!(turns(), 1, "the hour's one turn is spent");
+        let next = eventually("the next hour's turn", async || {
+            overseer
+                .sessions
+                .find(&channel, PERSON)
+                .unwrap()?
+                .messages
+                .into_iter()
+                .filter(|m| m.content.starts_with(super::super::line::LINE))
+                .nth(1)
+        })
+        .await;
+        assert!(
+            next.content.contains("the queue is drained")
+                && next.content.contains("the old workers are stopped"),
+            "both reports, gathered as one turn: {}",
+            next.content
+        );
+    })
+    .await;
+}
