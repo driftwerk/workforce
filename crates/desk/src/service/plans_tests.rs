@@ -623,7 +623,11 @@ async fn a_ticket_is_held_back_only_while_its_own_session_has_it_and_until_someo
         let dir = tempfile::tempdir().unwrap();
         let d = desk(pool, dir.path()).await;
         let p = d
-            .propose_plan(new_plan(dir.path(), &[("a", &[]), ("b", &[])]), &sarah(), &by_sarah())
+            .propose_plan(
+                new_plan(dir.path(), &[("a", &[]), ("b", &[])]),
+                &sarah(),
+                &by_sarah(),
+            )
             .await
             .unwrap();
         let id = p.summary.plan.id;
@@ -639,10 +643,19 @@ async fn a_ticket_is_held_back_only_while_its_own_session_has_it_and_until_someo
         d.0.store.put_ticket(&mut t).await.unwrap();
         let why = "its session ended as it started (exit 1)";
         let held_back = async || d.plan(id).await.unwrap().tickets[0].held_back.clone();
-        let starts = async || next(&d, id).await.into_iter().map(|s| s.ticket).collect::<Vec<_>>();
+        let starts = async || {
+            next(&d, id)
+                .await
+                .into_iter()
+                .map(|s| s.ticket)
+                .collect::<Vec<_>>()
+        };
         let b = p.tickets[1].ticket.ticket.id;
 
-        assert!(!d.hold_back_ticket(id, a, "devbox/s2", why).await.unwrap(), "another session's");
+        assert!(
+            !d.hold_back_ticket(id, a, "devbox/s2", why).await.unwrap(),
+            "another session's"
+        );
         assert_eq!(d.ticket(a).await.unwrap().ticket.state, TicketState::Doing);
 
         assert!(d.hold_back_ticket(id, a, "devbox/s1", why).await.unwrap());
@@ -650,7 +663,10 @@ async fn a_ticket_is_held_back_only_while_its_own_session_has_it_and_until_someo
         assert_eq!((now.state, now.assignee), (TicketState::Todo, None));
         assert_eq!(held_back().await.as_deref(), Some(why));
         assert_eq!(starts().await, vec![b], "never started by itself");
-        assert!(!d.hold_back_ticket(id, a, "devbox/s1", why).await.unwrap(), "held once");
+        assert!(
+            !d.hold_back_ticket(id, a, "devbox/s1", why).await.unwrap(),
+            "held once"
+        );
 
         for state in [TicketState::Backlog, TicketState::Todo] {
             let mv = Move {

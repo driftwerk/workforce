@@ -1632,12 +1632,11 @@ impl CrewHub {
                 };
                 let key = || t.ticket.key.clone().unwrap_or_else(|| row.id.to_string());
                 let Some((machine, _)) = super::relay::machine_session(&a.id) else {
-                    let died = a
-                        .id
-                        .parse()
-                        .ok()
-                        .filter(|_| row.state == TicketState::Doing)
-                        .and_then(|session| self.ended_as_started_here(session));
+                    let died =
+                        a.id.parse()
+                            .ok()
+                            .filter(|_| row.state == TicketState::Doing)
+                            .and_then(|session| self.ended_as_started_here(session));
                     if let Some(e) = died {
                         self.hold_back_died(s.plan.id, row.id, key(), a.id.clone(), None, e);
                     }
@@ -2367,10 +2366,12 @@ impl CrewHub {
         let store = self.desk.store();
         let linked = store.linked_tickets(&[session]).await.ok()?;
         let starting = store.starting().await.unwrap_or_default();
-        let tickets = linked
-            .iter()
-            .map(|t| t.id)
-            .chain(starting.iter().filter(|s| s.session == session).map(|s| s.ticket));
+        let tickets = linked.iter().map(|t| t.id).chain(
+            starting
+                .iter()
+                .filter(|s| s.session == session)
+                .map(|s| s.ticket),
+        );
         for ticket in tickets {
             if let Ok(Some(plan)) = store.plan_of_ticket(ticket).await {
                 let key = self
