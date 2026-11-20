@@ -489,10 +489,8 @@ pub fn lapsed(
     after: Duration,
     ended: impl Fn(Uuid) -> bool,
 ) -> Option<String> {
-    // A promise with a time is chased once due before it may lapse.
-    if !matches!(i.kind, OpenKind::Promise | OpenKind::Order)
-        || (i.due_at.is_some() && i.chased_at.is_none())
-    {
+    // A promise is chased to its end while it has a due time.
+    if !matches!(i.kind, OpenKind::Promise | OpenKind::Order) || i.due_at.is_some() {
         return None;
     }
     let linked = i.linked();
@@ -518,9 +516,12 @@ pub fn ask_key(session: Option<Uuid>, generalizes: Option<&str>, text: &str) -> 
 
 impl OpenItem {
     /// When it is due, at `now` in `tz`: "due by 14:30", with its day when
-    /// that isn't today.
+    /// that isn't today; none once it is chased.
     pub fn due_by(&self, now: DateTime<Utc>, tz: &chrono_tz::Tz) -> Option<String> {
-        let at = self.due_at?.with_timezone(tz);
+        let at = self
+            .due_at
+            .filter(|_| self.chased_at.is_none())?
+            .with_timezone(tz);
         Some(
             match at.date_naive() == now.with_timezone(tz).date_naive() {
                 true => format!("due by {}", at.format("%H:%M")),
@@ -981,6 +982,12 @@ mod tests {
             "due and not chased yet: chased first"
         );
         p.chased_at = Some(now);
+        assert_eq!(
+            lapsed(&p, now, LAPSE_AFTER, |_| true),
+            None,
+            "nor while chased"
+        );
+        p.due_at = None;
         assert!(lapsed(&p, now, LAPSE_AFTER, |_| true).is_some());
         let ask = item(10, 1, None);
         assert_eq!(

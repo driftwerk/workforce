@@ -867,6 +867,66 @@ async fn below_act_a_due_promise_is_told_to_the_person_once() {
     .await;
 }
 
+/// A due promise whose session ended is said once, as still owed and no
+/// longer tracked: it never lapses before it is chased, nor again after.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_due_promise_whose_session_ended_is_said_once() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"watch\"\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, dir.path(), "Legacy removal").await;
+        let p = NewItem::promise(
+            "desk",
+            s.id,
+            "Bring you the partner-docs differences",
+            "brought",
+        )
+        .due(Some(chrono::Utc::now() + chrono::Duration::hours(1)));
+        d.store().item_open(&p).await.unwrap();
+        d.forget(s.id).await.unwrap();
+        crew.look_at_items().await;
+        assert!(
+            d.store()
+                .items_not_closed(Some("desk"))
+                .await
+                .unwrap()
+                .iter()
+                .any(|i| i.kind == OpenKind::Promise),
+            "not lapsed before it is due"
+        );
+        let due = d
+            .store()
+            .items_not_closed(Some("desk"))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|i| i.kind == OpenKind::Promise)
+            .unwrap();
+        d.store()
+            .item_chased(due.id, due.due_at.unwrap(), None, Some(chrono::Utc::now()))
+            .await
+            .unwrap();
+        let told = eventually("the person told", async || {
+            said(&overseer, "Still owed to you: ")
+        })
+        .await;
+        assert!(told.ends_with("so I'm no longer tracking it."), "{told}");
+        let closed = d.store().open_item(due.id).await.unwrap().unwrap();
+        assert_eq!(closed.closed_by, Some(ClosedBy::Lapsed));
+        crew.look_at_items().await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(said(&overseer, "I'm no longer tracking"), None, "said once");
+    })
+    .await;
+}
+
 /// A chase moves only the due time it read: never one chased, asked afresh
 /// or closed since; asking afresh starts its chase over.
 #[tokio::test(flavor = "multi_thread")]

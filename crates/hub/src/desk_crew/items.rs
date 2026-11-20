@@ -85,6 +85,10 @@ const REPORT_BACK: &str = "Report back ";
 /// time moves on while its question is still on its way in.
 const OWED_MINUTES: i64 = 10;
 
+/// The longest a promise may be due in, in minutes: as long as a watch
+/// lasts.
+const DUE_MAX: i64 = workforce_desk::boss_watch::MAX_HOURS * 60;
+
 /// The most of a session's reply said to the person, in characters.
 const REPLY_CHARS: usize = 400;
 
@@ -252,16 +256,15 @@ fn restatements<'a>(due: &[&'a OpenItem], now: DateTime<Utc>) -> Vec<(&'a OpenIt
         .collect()
 }
 
-/// The longest a promise may be due in, in minutes: as long as a watch
-/// lasts.
-const DUE_MAX: i64 = workforce_desk::boss_watch::MAX_HOURS * 60;
-
 /// `due_minutes` as given: a whole number of minutes from 1 to [`DUE_MAX`],
 /// or none.
 fn due_minutes(v: &Value) -> Result<Option<i64>, String> {
     match v {
         Value::Null => Ok(None),
-        v => match v.as_i64() {
+        v => match v
+            .as_i64()
+            .or_else(|| v.as_f64().filter(|f| f.fract() == 0.0).map(|f| f as i64))
+        {
             Some(m) if (1..=DUE_MAX).contains(&m) => Ok(Some(m)),
             Some(m) => Err(format!(
                 "due_minutes must be from 1 to {DUE_MAX}; {m} isn't."
@@ -938,7 +941,10 @@ impl CrewHub {
                 continue;
             };
             // Its question still on its way in is chased as undelivered.
-            if i.done_when.as_deref() == Some(REPLIED) && self.ask_still_queued(i).await {
+            if i.done_when.as_deref() == Some(REPLIED)
+                && i.session.is_some_and(|s| !self.session_ended(s))
+                && self.ask_still_queued(i).await
+            {
                 let next = now + self.crew_minutes(OWED_MINUTES);
                 if let Err(e) = self
                     .desk
@@ -967,9 +973,10 @@ impl CrewHub {
                     continue;
                 }
             }
-            let reported = (i.done_when.as_deref() == Some(REPLIED))
-                .then(|| i.text.strip_prefix(REPORT_BACK))
-                .flatten();
+            let reported = i
+                .text
+                .strip_prefix(REPORT_BACK)
+                .filter(|_| i.done_when.as_deref() == Some(REPLIED));
             let what = reported.map_or_else(|| crew::one_line(&i.text, 200), str::to_string);
             match chase_on {
                 Some(s) => self.wake_on(
@@ -990,6 +997,24 @@ impl CrewHub {
                     format!("owed:{}", i.id),
                     "a promise due",
                 ),
+                // Its sessions ended: said once, and no longer tracked.
+                None if !i.linked().is_empty()
+                    && i.linked().iter().all(|s| self.session_ended(*s)) =>
+                {
+                    if let Err(e) = self
+                        .desk
+                        .store()
+                        .item_close(i.id, ClosedBy::Lapsed, "its session ended")
+                        .await
+                    {
+                        tracing::warn!(error = %e, "an owed promise couldn't be closed");
+                    }
+                    self.say(
+                        &i.boss,
+                        format!("Still owed to you: {what}. It isn't in yet, and its session ended, so I'm no longer tracking it."),
+                    )
+                    .await
+                }
                 None => {
                     self.say(
                         &i.boss,
@@ -998,6 +1023,16 @@ impl CrewHub {
                     .await
                 }
             }
+        }
+    }
+
+    /// Whether session `s` ended: gone or closed. A view that failed says
+    /// nothing.
+    fn session_ended(&self, s: Uuid) -> bool {
+        match self.desk.view(s) {
+            Ok(v) => v.state == SessionState::Closed,
+            Err(workforce_desk::DeskError::NotFound) => true,
+            Err(_) => false,
         }
     }
 
@@ -1653,13 +1688,8 @@ impl CrewHub {
             }
             let minute = chrono::Duration::from_std(self.timing.minute).unwrap_or_default();
             let after = minute * LAPSE_AFTER.num_minutes() as i32;
-            // Gone or closed ended it; a view that failed says nothing.
-            let ended = |s: Uuid| match self.desk.view(s) {
-                Ok(v) => v.state == SessionState::Closed,
-                Err(workforce_desk::DeskError::NotFound) => true,
-                Err(_) => false,
-            };
-            return open_item::lapsed(i, now, after, ended).map(|why| (ClosedBy::Lapsed, why));
+            return open_item::lapsed(i, now, after, |s| self.session_ended(s))
+                .map(|why| (ClosedBy::Lapsed, why));
         }
         let view = match i.session {
             Some(s) => match self.desk.view(s) {
@@ -2024,6 +2054,7 @@ mod tests {
             assert_eq!(due_minutes(&bad), Err(why.into()), "{bad}");
         }
         assert_eq!(due_minutes(&json!(4320)), Ok(Some(4320)));
+        assert_eq!(due_minutes(&json!(30.0)), Ok(Some(30)));
         for bad in [
             json!("30"),
             json!(29.6),
