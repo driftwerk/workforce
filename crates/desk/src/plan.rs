@@ -1479,7 +1479,10 @@ pub fn describe(before: &Snapshot, after: &Snapshot) -> String {
             said.push(format!("moved {} to {}", q(t), t.engine.title()));
         }
         if was.folder != t.folder || was.view != t.view {
-            said.push(format!("moved {} to {}", q(t), t.folder));
+            said.push(match t.folder.trim() {
+                "" => format!("left the folder of {} for Desk to find", q(t)),
+                f => format!("moved {} to {f}", q(t)),
+            });
         }
         if was.repo != t.repo {
             said.push(match &t.repo {

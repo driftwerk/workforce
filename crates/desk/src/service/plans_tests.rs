@@ -2320,3 +2320,110 @@ async fn a_found_checkout_is_found_again_each_start_and_one_gone_is_never_kept()
     })
     .await;
 }
+
+#[tokio::test]
+async fn a_folder_the_plan_takes_away_goes_from_its_row_and_its_checkout_is_found_afresh() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let home = home.canonicalize().unwrap();
+        let named = home.join("work/other");
+        std::fs::create_dir_all(&named).unwrap();
+        let checkout = home.join("code/vellev");
+        std::fs::create_dir_all(checkout.join(".git")).unwrap();
+        std::fs::write(
+            checkout.join(".git/config"),
+            "[remote \"origin\"]\n\turl = git@github.com:driftwerk/vellev.git\n",
+        )
+        .unwrap();
+        crate::store::DeskStore::migrate(&pool).await.unwrap();
+        let mut opts = super::super::tests::options(dir.path());
+        opts.env
+            .insert("HOME".into(), home.to_string_lossy().into_owned());
+        let d = Desk::start(
+            crate::store::DeskStore::from_pool(pool),
+            opts,
+            Default::default(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let mut plan = new_plan(&named, &[("Add the cache", &[])]);
+        plan.draft.tickets[0].repo = Some("driftwerk/vellev".into());
+        let p = d.propose_plan(plan, &sarah(), &by_sarah()).await.unwrap();
+        let id = p.summary.plan.id;
+        let ran = d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let t = ran.tickets[0].ticket.ticket.id;
+        let folder = |d: &Desk| {
+            let d = d.clone();
+            async move {
+                d.0.store
+                    .plan_runs(id)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|(i, _)| *i == t)
+                    .and_then(|(_, r)| r.folder)
+            }
+        };
+        let refused = d
+            .plan_prepare(&ran.summary.plan, t, &sarah())
+            .await
+            .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("is there already and isn't a checkout of github.com/driftwerk/vellev"),
+            "{refused}"
+        );
+        let edit = |e: TicketEdit| PlanEdit {
+            ticket_edits: Some(vec![e]),
+            ..Default::default()
+        };
+        let left = d
+            .change_plan(
+                id,
+                edit(TicketEdit {
+                    id: t,
+                    folder: Some(String::new()),
+                    ..Default::default()
+                }),
+                Engine::Claude,
+                false,
+                &By::you(),
+            )
+            .await
+            .unwrap();
+        assert!(left.applied);
+        assert_eq!(
+            left.summary,
+            "Left the folder of “Add the cache” for Desk to find"
+        );
+        assert_eq!(
+            folder(&d).await.as_deref(),
+            Some(""),
+            "the folder said goes from its row"
+        );
+        let plan = d.plan(id).await.unwrap().summary.plan;
+        d.plan_prepare(&plan, t, &sarah()).await.unwrap();
+        let found = Some(checkout.to_string_lossy().into_owned());
+        assert_eq!(folder(&d).await, found);
+        // Left for its repository to say before too: what a start found stays.
+        d.change_plan(
+            id,
+            edit(TicketEdit {
+                id: t,
+                model: Some("claude-opus-5-5".into()),
+                ..Default::default()
+            }),
+            Engine::Claude,
+            false,
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(folder(&d).await, found);
+    })
+    .await;
+}

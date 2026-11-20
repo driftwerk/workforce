@@ -353,15 +353,16 @@ impl DeskStore {
     /// Writes where `ticket` runs, and which plan it is in. The ticket's
     /// version moves on: a start read before is refused. One taken on that
     /// is no longer the plan's (let go, or another plan's now) is left as
-    /// it is: only a claim takes it again.
-    pub async fn put_runs(&self, ticket: Uuid, runs: &Runs) -> Result<()> {
+    /// it is: only a claim takes it again. A folder left empty keeps the
+    /// checkout a start found only when `found_kept`.
+    pub async fn put_runs(&self, ticket: Uuid, runs: &Runs, found_kept: bool) -> Result<()> {
         let client = self.pool().get().await?;
         client
             .execute(
                 // A folder left empty for its repository to say keeps the
                 // checkout a start found, while the repository is the same.
                 "UPDATE tickets SET plan = $2, engine = $3, \
-                 folder = CASE WHEN $4 = '' AND repo IS NOT DISTINCT FROM $8 AND machine IS NOT DISTINCT FROM $6 \
+                 folder = CASE WHEN $4 = '' AND $9 AND repo IS NOT DISTINCT FROM $8 AND machine IS NOT DISTINCT FROM $6 \
                  THEN folder ELSE $4 END, view = $5, \
                  machine = $6, model = $7, repo = $8, version = version + 1 \
                  WHERE id = $1 AND (plan = $2 OR (plan IS NULL AND NOT adopted))",
@@ -374,6 +375,7 @@ impl DeskStore {
                     &runs.machine,
                     &runs.model,
                     &runs.repo,
+                    &found_kept,
                 ],
             )
             .await?;
@@ -856,7 +858,7 @@ mod tests {
                 adopted: false,
                 held_back: None,
             };
-            s.put_runs(t.id, &runs).await.unwrap();
+            s.put_runs(t.id, &runs, true).await.unwrap();
             assert_eq!(s.plan_runs(p.id).await.unwrap(), vec![(t.id, runs)]);
             assert_eq!(s.plan_of_ticket(t.id).await.unwrap(), Some(p.id));
         })
@@ -883,6 +885,7 @@ mod tests {
                 adopted: false,
                 held_back: None,
             },
+            true,
         )
         .await
         .unwrap();
@@ -957,6 +960,7 @@ mod tests {
                     adopted: false,
                     held_back: None,
                 },
+                true,
             )
             .await
             .unwrap();
@@ -1064,6 +1068,7 @@ mod tests {
                     plan: Some(p.id),
                     ..Default::default()
                 },
+                true,
             )
             .await
             .unwrap();

@@ -998,6 +998,21 @@ fn a_change_is_described_in_plain_words() {
 }
 
 #[test]
+fn a_folder_left_for_desk_to_find_is_said_so_never_as_a_move_to_nothing() {
+    let a = base();
+    let mut left = base();
+    left.tickets[0].folder = String::new();
+    assert_eq!(
+        describe(&a, &left),
+        "Left the folder of “Add the cart API” for Desk to find"
+    );
+    assert_eq!(
+        describe(&left, &a),
+        "Moved “Add the cart API” to /work/acme-web"
+    );
+}
+
+#[test]
 fn a_snapshot_reads_back_as_written() {
     let s = base();
     let v = serde_json::to_value(&s).unwrap();

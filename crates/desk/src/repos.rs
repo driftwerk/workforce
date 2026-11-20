@@ -6,19 +6,20 @@
 //!   letters, digits, `.`, `-` and `_`, none starting with `.` or `-`;
 //!   `owner/name` is GitHub's. Nothing else is ever cloned.
 //! - **Found by its remote:** the folder asked for when it is a checkout
-//!   of it; else the first under the home, a breadth-first walk of at
-//!   most [`MOST_DEEP`] folders down and [`MOST_SEEN`] folders in all,
-//!   that never follows a link, opens a hidden folder or goes into
-//!   `node_modules`, `target` or a repository; main checkouts before
-//!   worktrees, then the shortest path.
-//! - **Cloned** when there's none: into `<root>/<owner>/<name>`, `root`
-//!   inside the home (`[desk] projects_root`, `~/projects` when not set),
-//!   in the background, with the computer's own `gh` (for github.com,
-//!   when it is installed) or `git`. Each is given its words as an argv
-//!   list after `--`, never through a shell, with no prompts and a
-//!   cleared environment but what finds the person's own credentials. A
-//!   clone is made into a folder of its own beside its place and moved
-//!   there once whole, so a clone cut off never looks like a checkout.
+//!   of it (refused when something else is there); else the first under
+//!   the home, a breadth-first walk of at most [`MOST_DEEP`] folders down
+//!   and [`MOST_SEEN`] folders in all, that never follows a link, opens a
+//!   hidden folder or goes into `node_modules`, `target` or a repository;
+//!   main checkouts before worktrees, then the shortest path.
+//! - **Cloned** when there's none: into the folder asked for, else into
+//!   `<root>/<owner>/<name>`, `root` inside the home (`[desk]
+//!   projects_root`, `~/projects` when not set), in the background, with
+//!   the computer's own `gh` (for github.com, when it is installed) or
+//!   `git`. Each is given its words as an argv list after `--`, never
+//!   through a shell, with no prompts and a cleared environment but what
+//!   finds the person's own credentials. A clone is made into a folder of
+//!   its own beside its place and moved there once whole, so a clone cut
+//!   off never looks like a checkout.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -232,10 +233,61 @@ pub struct Cloner {
     clones: Arc<Mutex<HashMap<PathBuf, Run>>>,
 }
 
+/// Where a checkout of a repository is, or is to be cloned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Place {
+    There(String),
+    Clone(PathBuf),
+}
+
+/// Where the checkout of `repo` goes, as the module says: `folder` when one
+/// is said (the person's, as they said it), else `<root>/<owner>/<name>`.
+fn target<'a>(
+    repo: &Repo,
+    folder: Option<&'a str>,
+    root: &str,
+    home: &Path,
+) -> Result<(PathBuf, Option<&'a str>), String> {
+    match folder.map(str::trim).filter(|f| !f.is_empty()) {
+        Some(f) => root_in(f, home)
+            .map(|at| (at, Some(f)))
+            .ok_or_else(|| format!("{f} isn't inside the home folder")),
+        None => root_in(root, home)
+            .map(|r| (r.join(&repo.owner).join(&repo.name), None))
+            .ok_or_else(|| format!("its projects folder {root} isn't inside the home folder")),
+    }
+}
+
+/// The checkout of `repo` at `at` ([`target`]'s), else one under `home`
+/// when no folder was `said`; or `at` to clone into while nothing is there.
+/// A folder said is used, cloned into or refused, never replaced by another.
+fn place(repo: &Repo, at: &Path, said: Option<&str>, home: &Path) -> Result<Place, String> {
+    let shown = || at.to_string_lossy().into_owned();
+    if is_checkout(at, repo, home) {
+        return Ok(Place::There(said.map_or_else(shown, str::to_string)));
+    }
+    if let Some(c) = said
+        .is_none()
+        .then(|| find(repo, home))
+        .and_then(|f| f.into_iter().next())
+    {
+        return Ok(Place::There(c.path));
+    }
+    match (at.exists(), said) {
+        (false, _) => Ok(Place::Clone(at.to_path_buf())),
+        (true, Some(f)) => Err(format!(
+            "{f} is there already and isn't a checkout of {repo}; give it that folder's checkout, or leave its folder for Desk to find"
+        )),
+        (true, None) => Err(format!(
+            "{} is there already and isn't a checkout of {repo}",
+            at.display()
+        )),
+    }
+}
+
 impl Cloner {
-    /// The checkout of `repo` for a session: `folder` when it is one, else
-    /// one under `home`, else a clone into `root` begun now (or under
-    /// way), as the module says.
+    /// The checkout of `repo` for a session where [`target`] and [`place`]
+    /// say, a clone into it begun now (or under way) when it isn't there.
     pub fn checkout(
         &self,
         repo: &Repo,
@@ -248,75 +300,53 @@ impl Cloner {
         let Some(home) = home.and_then(|h| h.canonicalize().ok()) else {
             return failed("this computer has no home folder to look in".into());
         };
-        // A folder said is the person's: it is used, or said not to be a
-        // checkout, never replaced by another.
-        if let Some(f) = folder.map(str::trim).filter(|f| !f.is_empty()) {
-            return match is_checkout(Path::new(f), repo, &home) {
-                true => Got::Ready {
-                    path: f.to_string(),
-                },
-                false => failed(format!(
-                    "{f} isn't a checkout of {repo} inside the home folder; give it that folder's checkout, or leave its folder for Desk to find"
-                )),
-            };
-        }
-        let Some(root) = root_in(root, &home) else {
-            return failed(format!(
-                "its projects folder {root} isn't inside the home folder"
-            ));
+        let (at, said) = match target(repo, folder, root, &home) {
+            Ok(t) => t,
+            Err(why) => return failed(why),
         };
-        let dest = root.join(&repo.owner).join(&repo.name);
         // One clone to a place, however its name is spelled.
-        let place = PathBuf::from(dest.to_string_lossy().to_lowercase());
+        let key = PathBuf::from(at.to_string_lossy().to_lowercase());
         let mut clones = self.clones.lock().unwrap_or_else(|e| e.into_inner());
-        match clones.get(&place).cloned() {
+        match clones.get(&key).cloned() {
             Some(Run::Running) => {
                 return Got::Cloning {
-                    path: dest.to_string_lossy().into_owned(),
+                    path: at.to_string_lossy().into_owned(),
                 }
             }
             // Said once; the next ask tries again.
             Some(Run::Failed(why)) => {
-                clones.remove(&place);
+                clones.remove(&key);
                 return failed(why);
             }
             None => {}
         }
-        // Where Desk clones it, first: deeper than a look reaches, too.
-        if is_checkout(&dest, repo, &home) {
-            return Got::Ready {
-                path: dest.to_string_lossy().into_owned(),
-            };
-        }
-        if let Some(c) = find(repo, &home).into_iter().next() {
-            return Got::Ready { path: c.path };
-        }
-        if dest.exists() {
-            return failed(format!(
-                "{} is there already and isn't a checkout of {repo}",
-                dest.display()
-            ));
-        }
-        // Its owner's folder, inside the home only.
-        if let Err(e) = folders::make(&root.join(&repo.owner).to_string_lossy(), Some(&home)) {
+        let dest = match place(repo, &at, said, &home) {
+            Ok(Place::There(path)) => return Got::Ready { path },
+            Ok(Place::Clone(dest)) => dest,
+            Err(why) => return failed(why),
+        };
+        // The folder it goes in, inside the home only.
+        let parent = dest.parent().unwrap_or(&home).to_string_lossy();
+        if let Err(e) = folders::make(&parent, Some(&home)) {
             return failed(match e {
-                FolderError::OutsideHome => {
-                    "its projects folder isn't inside the home folder".into()
-                }
+                FolderError::OutsideHome => "its folder isn't inside the home folder".into(),
                 e => format!("its folder couldn't be made: {e}"),
             });
         }
-        clones.insert(place.clone(), Run::Running);
+        clones.insert(key.clone(), Run::Running);
         drop(clones);
         let me = self.clone();
         let (repo, at) = (repo.clone(), dest.clone());
         let env = kept_env(login);
         tokio::spawn(async move {
             let ended = clone_into(&repo, &at, &home, &env).await;
+            if let Err(why) = &ended {
+                tracing::warn!(repo = %repo, folder = %at.display(), error = %why, "a checkout couldn't be cloned");
+            }
             let mut clones = me.clones.lock().unwrap_or_else(|e| e.into_inner());
             match ended {
-                Ok(()) => clones.remove(&place),
-                Err(why) => clones.insert(place, Run::Failed(why)),
+                Ok(()) => clones.remove(&key),
+                Err(why) => clones.insert(key, Run::Failed(why)),
             };
         });
         Got::Cloning {
@@ -708,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn a_folder_said_is_used_or_refused_never_replaced() {
+    fn a_folder_said_is_used_cloned_into_or_refused_never_replaced() {
         let home = tempfile::tempdir().unwrap();
         let home = home.path().canonicalize().unwrap();
         let repo = repo_of("driftwerk/vellev").unwrap();
@@ -732,7 +762,30 @@ mod tests {
                 path: mine.to_string_lossy().into_owned()
             }
         );
-        assert!(matches!(at(&other), Got::Failed { why } if why.contains("isn't a checkout")));
+        assert!(
+            matches!(at(&other), Got::Failed { why } if why.contains("is there already and isn't a checkout"))
+        );
+        // One not there yet is cloned into, never one found elsewhere.
+        let placed = |f: &str| {
+            let (at, said) = target(&repo, Some(f), "~/projects", &home)?;
+            place(&repo, &at, said, &home)
+        };
+        let missing = home.join("projects/mantis/monorepo");
+        assert_eq!(
+            placed(&missing.to_string_lossy()),
+            Ok(Place::Clone(missing))
+        );
+        assert_eq!(
+            placed("~/projects/vellev"),
+            Ok(Place::Clone(home.join("projects/vellev")))
+        );
+        for outside in ["/etc/vellev", "work/vellev", "~/../vellev"] {
+            assert_eq!(
+                placed(outside),
+                Err(format!("{outside} isn't inside the home folder")),
+                "{outside}"
+            );
+        }
         // Where Desk clones it is looked at first, however deep.
         let deep = home.join("a/b/c/d/e/f/projects");
         checkout_at(

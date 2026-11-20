@@ -1359,7 +1359,7 @@ impl Desk {
             };
             rank += RANK_STEP;
             self.0.store.add_ticket(&mut row).await.map_err(internal)?;
-            self.put_runs(p, t).await?;
+            self.put_runs(p, t, None).await?;
         }
         for id in after.dropped(before) {
             let Ok(t) = self.ticket_of(id).await else {
@@ -1405,11 +1405,11 @@ impl Desk {
                 row.updated_at = crew::now();
                 self.save_ticket(&mut row).await?;
             }
-            if before.ticket(t.id).is_some_and(|w| {
+            if let Some(w) = before.ticket(t.id).filter(|w| {
                 (w.engine, &w.folder, w.view, &w.machine, &w.model, &w.repo)
                     != (t.engine, &t.folder, t.view, &t.machine, &t.model, &t.repo)
             }) {
-                self.put_runs(p, t).await?;
+                self.put_runs(p, t, Some(w)).await?;
             }
             let want: HashSet<Uuid> = t
                 .needs
@@ -1486,7 +1486,16 @@ impl Desk {
         }
     }
 
-    async fn put_runs(&self, p: &Plan, t: &Planned) -> Result<(), DeskError> {
+    /// Writes where `t` of `p` runs, `was` before: a folder said that the
+    /// plan now leaves for its repository to say goes, so the next start
+    /// finds or clones its checkout afresh.
+    async fn put_runs(
+        &self,
+        p: &Plan,
+        t: &Planned,
+        was: Option<&Planned>,
+    ) -> Result<(), DeskError> {
+        let found_kept = was.is_none_or(|w| w.folder.trim().is_empty());
         self.0
             .store
             .put_runs(
@@ -1502,6 +1511,7 @@ impl Desk {
                     adopted: t.adopted,
                     held_back: None,
                 },
+                found_kept,
             )
             .await
             .map_err(internal)
@@ -2368,7 +2378,7 @@ impl Desk {
         // start found (the plan leaves it for its repository to say) is
         // found again each start, so one gone since is never kept.
         let chosen = self
-            .newest(p)
+            .applied(p)
             .await
             .ok()
             .and_then(|s| s.ticket(t.id).map(|w| !w.folder.trim().is_empty()))
