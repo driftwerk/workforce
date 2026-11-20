@@ -303,7 +303,6 @@ impl CrewHub {
         self.keep_logged(d).await;
     }
 
-    /// Keeps `d`, logging a write that fails.
     async fn keep_logged(&self, d: &mut BossDecision) {
         if let Err(e) = self.keep(d).await {
             tracing::warn!(boss = %d.boss, error = %e, "a boss's decision wasn't kept");

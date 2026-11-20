@@ -90,7 +90,11 @@ async fn a_line_turn_that_did_nothing_is_kept_out_of_activity_and_one_that_acted
         tell("The release notes are missing.").await;
         let rows = finished(&d, 2).await;
         assert_eq!(rows.len(), 2, "its end is said: {rows:?}");
-        assert_eq!(left_alone().await, quiet, "nor is it kept as sending nothing");
+        assert_eq!(
+            left_alone().await,
+            quiet + 1,
+            "it still sent the session nothing"
+        );
 
         // A reply that answers what the session asked.
         let asked = d
@@ -112,66 +116,97 @@ async fn a_line_turn_that_did_nothing_is_kept_out_of_activity_and_one_that_acted
     .await;
 }
 
+/// A work turn on acme-web's turn end whose one call is `tool` with
+/// `arguments`: once it has returned, its decision to let the session wait.
+async fn work_turn_calling(
+    pool: workforce_postgres::PostgresPool,
+    dir: &Path,
+    tool: &str,
+    arguments: Value,
+) -> (Desk, workforce_desk::decision::BossDecision) {
+    let (overseer, crew, d, llm) = overseeing(
+        dir,
+        pool,
+        "CI is still running, so it should wait.",
+        "[oversight]\nenabled = true\nlevel = \"act\"\nupdates = { enabled = false }\n",
+        &[],
+    )
+    .await;
+    calls_tool_once(&llm, "Pushed; CI is running.", tool, arguments).await;
+    let s = new_session(&d, dir, "acme-web").await;
+    let url = hook_url(dir, s.id).await;
+    hook(
+        &url,
+        json!({"hook_event_name": "SessionStart", "session_id": s.id.to_string()}),
+    )
+    .await;
+    hook(
+        &url,
+        json!({"hook_event_name": "UserPromptSubmit", "prompt": "Upgrade the date picker"}),
+    )
+    .await;
+    let boss = workforce_desk::crew::Party::manager("desk", &super::super::name_of(&overseer));
+    d.take_on(
+        s.id,
+        &boss,
+        workforce_desk::charge::How::Handed,
+        &Default::default(),
+        &By::you(),
+    )
+    .await
+    .unwrap();
+    hook(
+        &url,
+        json!({"hook_event_name": "Stop", "last_assistant_message": "Pushed; CI is running."}),
+    )
+    .await;
+    let waited = eventually("its decision to let it wait", async || {
+        d.store()
+            .decisions_since("desk", chrono::Utc::now() - chrono::Duration::hours(1), 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|x| x.need == workforce_desk::decision::Need::TurnEnd)
+    })
+    .await;
+    settled(&crew).await;
+    (d, waited)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_work_turn_that_only_looked_lets_the_session_wait_out_of_activity() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let (overseer, crew, d, llm) = overseeing(
-            dir.path(),
+        let (d, waited) = work_turn_calling(
             pool,
-            "CI is still running, so it should wait.",
-            "[oversight]\nenabled = true\nlevel = \"act\"\nupdates = { enabled = false }\n",
-            &[],
-        )
-        .await;
-        calls_tool_once(
-            &llm,
-            "Pushed; CI is running.",
+            dir.path(),
             "crew_overview",
             json!({"reason": "see where acme-web stands"}),
         )
         .await;
-        let s = new_session(&d, dir.path(), "acme-web").await;
-        let url = hook_url(dir.path(), s.id).await;
-        hook(
-            &url,
-            json!({"hook_event_name": "SessionStart", "session_id": s.id.to_string()}),
-        )
-        .await;
-        hook(
-            &url,
-            json!({"hook_event_name": "UserPromptSubmit", "prompt": "Upgrade the date picker"}),
-        )
-        .await;
-        let boss = workforce_desk::crew::Party::manager("desk", &super::super::name_of(&overseer));
-        d.take_on(
-            s.id,
-            &boss,
-            workforce_desk::charge::How::Handed,
-            &Default::default(),
-            &By::you(),
-        )
-        .await
-        .unwrap();
-        hook(
-            &url,
-            json!({"hook_event_name": "Stop", "last_assistant_message": "Pushed; CI is running."}),
-        )
-        .await;
-        let waited = eventually("its decision to let it wait", async || {
-            d.store()
-                .decisions_since("desk", chrono::Utc::now() - chrono::Duration::hours(1), 10)
-                .await
-                .unwrap()
-                .into_iter()
-                .find(|x| x.need == workforce_desk::decision::Need::TurnEnd)
-        })
-        .await;
         assert_eq!(waited.what, "let acme-web wait");
         assert_eq!(waited.button(), Some("undo"));
-        settled(&crew).await;
         let rows = bosss_turn_rows(&d).await;
         assert!(rows.is_empty(), "{rows:?}");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_work_turn_that_took_a_step_itself_is_said_and_still_lets_the_session_wait() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, waited) = work_turn_calling(
+            pool,
+            dir.path(),
+            "filesystem_write",
+            json!({"path": "ci-notes.md", "content": "acme-web: CI running."}),
+        )
+        .await;
+        assert_eq!(waited.what, "let acme-web wait", "with its Go ahead");
+        assert_eq!(waited.button(), Some("undo"));
+        let rows = finished(&d, 1).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
     })
     .await;
 }
@@ -191,17 +226,20 @@ async fn an_end_held_from_an_earlier_turn_is_never_said_for_a_later_one() {
             )
         };
         let key = ("desk".to_string(), "desk:line:s".to_string());
-        // A turn that finished after its caller had settled it, here and
-        // on another session's line.
-        let other = ("desk".to_string(), "desk:line:t".to_string());
+        // A turn that finished after its caller had settled it.
         crew.quiet_ends
             .lock()
             .insert(key.clone(), (0, end("finished · the stale one")));
-        crew.quiet_ends
-            .lock()
-            .insert(other, (0, end("finished · another stale one")));
         crew.turn_end_said("desk", &key.1, 1, true);
         assert!(crew.quiet_ends.lock().is_empty(), "dropped");
+        // Another session's line turn, still running, keeps its own.
+        let other = ("desk".to_string(), "desk:line:t".to_string());
+        crew.quiet_ends
+            .lock()
+            .insert(other.clone(), (0, end("finished · another")));
+        crew.turn_end_said("desk", &key.1, 1, true);
+        assert!(crew.quiet_ends.lock().contains_key(&other), "kept");
+        crew.quiet_ends.lock().remove(&other);
         // This turn's own end is said.
         crew.quiet_ends
             .lock()

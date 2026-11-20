@@ -106,32 +106,17 @@ impl CrewHub {
         listed: Option<Vec<MentionedApproval>>,
         author: Option<Speaker>,
     ) -> Result<(String, String)> {
-        self.run_turn_acting(service, owner, channel, prompt, hop, listed, author)
+        self.run_turn_with(service, owner, channel, prompt, hop, listed, author, None)
             .await
             .map(|(sid, answer, _)| (sid, answer))
     }
 
-    /// [`Self::run_turn`], saying too whether the turn did something: a
-    /// call of a tool not known only to look ([`super::tools::only_looks`]).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn run_turn_acting(
-        &self,
-        service: &Arc<AgentService>,
-        owner: &str,
-        channel: &str,
-        prompt: &str,
-        hop: i16,
-        listed: Option<Vec<MentionedApproval>>,
-        author: Option<Speaker>,
-    ) -> Result<(String, String, bool)> {
-        self.run_turn_with(service, owner, channel, prompt, hop, listed, author, None)
-            .await
-    }
-
     /// [`Self::run_turn`], answering `theirs` (the person's words a boss
-    /// sent on) when it is an overseer's message in the DM.
+    /// sent on) when it is an overseer's message in the DM, and saying too
+    /// whether the turn did something: a call of a tool not known only to
+    /// look ([`super::tools::only_looks`]).
     #[allow(clippy::too_many_arguments)]
-    async fn run_turn_with(
+    pub(crate) async fn run_turn_with(
         &self,
         service: &Arc<AgentService>,
         owner: &str,

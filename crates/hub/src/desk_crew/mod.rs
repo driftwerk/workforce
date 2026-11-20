@@ -215,9 +215,8 @@ pub struct CrewHub {
     /// answer, by message: an answer is gated by what was asked as well as
     /// by what it says. One not known here is the person's.
     questions: Mutex<HashMap<uuid::Uuid, String>>,
-    /// How many things each boss did (decisions, suggestions, its tools'
-    /// changes), by the session they were about: a line or work turn that
-    /// moved none let it wait.
+    /// How many decisions (and suggestions) each boss made, by the session
+    /// they were about: a line or work turn that moved none let it wait.
     acted: Mutex<HashMap<(String, Option<uuid::Uuid>), u64>>,
     /// The ends of line and work turns, by boss and channel, with where
     /// each turn stands among those begun, until their caller knows whether

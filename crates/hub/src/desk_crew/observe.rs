@@ -275,11 +275,7 @@ impl Track {
         .detail(json!({ "task": self.task, "answer": answer, "question": question }))
         .at_place(self.place.clone(), self.message)
         .hop(self.hop);
-        match self
-            .held
-            .take()
-            .filter(|_| matches!(ended, Outcome::Finished | Outcome::Asked))
-        {
+        match self.held.take().filter(|_| ended == Outcome::Finished) {
             Some((boss, channel, began)) => {
                 crew.quiet_ends
                     .lock()
@@ -291,24 +287,22 @@ impl Track {
 }
 
 impl CrewHub {
-    /// Where the next turn begun stands among them: a line or work turn
-    /// its caller starts from here is at or past it.
+    /// How many line and work turns have begun: one its caller starts
+    /// after reading it is numbered at least this.
     pub(super) fn turns_begun(&self) -> u64 {
         self.turns_begun.load(Ordering::SeqCst)
     }
 
-    /// Says the end of `boss`'s line or work turn on `channel`, begun at or
-    /// past `since` ([`Self::turns_begun`]), once its caller has settled
+    /// Says the end of `boss`'s line or work turn on `channel`, numbered at
+    /// least `since` ([`Self::turns_begun`]), once its caller has settled
     /// what the turn did: only when it did something. An end held from an
-    /// earlier turn of the boss's (one that ended after its caller had
-    /// settled it) is dropped, never said for this one.
+    /// earlier turn there (one that ended after its caller had settled it)
+    /// is dropped, never said for this one.
     pub(super) fn turn_end_said(&self, boss: &str, channel: &str, since: u64, acted: bool) {
-        let end = {
-            let mut held = self.quiet_ends.lock();
-            let end = held.remove(&(boss.to_string(), channel.to_string()));
-            held.retain(|(b, _), (began, _)| b != boss || *began >= since);
-            end
-        };
+        let end = self
+            .quiet_ends
+            .lock()
+            .remove(&(boss.to_string(), channel.to_string()));
         if let Some((_, event)) = end.filter(|(began, _)| acted && *began >= since) {
             self.desk.note(event);
         }
