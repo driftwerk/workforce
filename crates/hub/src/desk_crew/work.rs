@@ -243,30 +243,27 @@ impl CrewHub {
 
     /// Spends one of the hour's work turns of the overseer that runs
     /// `session` if it has one left: each overseer's are its own. When none
-    /// is, when the next frees, and the person is told once that the
-    /// overseer is pacing itself. With no overseer over it there is no
-    /// hour to spend from: its turn goes on, and finds no boss to answer
-    /// it (the person is given what it asks).
-    pub(crate) fn spend_work_turn(&self, session: Uuid) -> Result<(), Instant> {
-        let hour = self.timing.minute * 60;
-        let now = Instant::now();
+    /// is, the person is told once that the overseer is pacing itself. With
+    /// no overseer over it there is no hour to spend from: its turn goes on,
+    /// and finds no boss to answer it (the person is given what it asks).
+    pub(crate) fn spend_work_turn(&self, session: Uuid) -> bool {
         let Some((service, o)) = self.overseer_of_session(session) else {
-            return Ok(());
+            return true;
         };
         // At Act fully in force no count of turns holds it back: its
         // budget, the audit and Stop do.
         if self.unbound_given(service.agent_id.as_str(), &o) {
-            return Ok(());
+            return true;
         }
         let max = o.work.max_turns_per_hour;
+        let hour = self.timing.minute * 60;
         let mut runs = self.work.lock();
         let run = runs
             .entry(service.agent_id.as_str().to_string())
             .or_default();
-        if spend_run(run, now, hour, max) {
-            return Ok(());
+        if spend_run(run, Instant::now(), hour, max) {
+            return true;
         }
-        let frees = run.turns.first().copied().unwrap_or(now) + hour;
         if !run.told {
             run.told = true;
             let me = Party::manager(service.agent_id.as_str(), &name_of(&service));
@@ -279,7 +276,7 @@ impl CrewHub {
                 ),
             ));
         }
-        Err(frees)
+        false
     }
 
     /// What the overseer reads of a session's turn ending, in a work turn.

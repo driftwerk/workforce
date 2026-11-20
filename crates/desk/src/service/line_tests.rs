@@ -1930,6 +1930,59 @@ async fn reports_to_a_boss_that_only_watches_the_session_it_holds_are_counted() 
 }
 
 #[tokio::test]
+async fn questions_to_the_boss_that_runs_it_are_counted_as_reports_are_not() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        sarah_bosses(&d);
+        let crew: Arc<dyn crate::crew::Crew> = Arc::new(Answering);
+        d.answer_lines_with(&crew);
+        std::mem::forget(crew);
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        d.take_on(
+            s.id,
+            &Party::manager("sarah", "Sarah"),
+            crate::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        let ask = |text: String| {
+            let d = d.clone();
+            async move {
+                d.line_call(
+                    s.id,
+                    "ask",
+                    &json!({"to": "desk", "text": text}),
+                    Some(Duration::from_millis(10)),
+                )
+                .await
+            }
+        };
+        let mut asked = 0;
+        let refused = loop {
+            match ask(format!("Should I proceed with step {asked}?")).await {
+                Ok(_) => asked += 1,
+                Err(e) => break e,
+            }
+            assert!(
+                asked <= crate::rooms::BOSS_RUN_CEILING,
+                "questions to its boss run on unbounded"
+            );
+        };
+        assert!(
+            [Refusal::Budget.to_string(), Refusal::Ceiling.to_string()].contains(&refused),
+            "{refused}"
+        );
+        // Its reports still go.
+        tell_desk(&d, s.id, "Step 12 done.").await.unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn reports_and_the_answers_of_the_boss_that_runs_it_never_climb_the_hop() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
@@ -1967,6 +2020,21 @@ async fn reports_and_the_answers_of_the_boss_that_runs_it_never_climb_the_hop() 
             assert_eq!(next["id"], json!(told.id));
             d.line_ack(s.id, told.id, true).await.unwrap();
         }
+        // Its boss passing on words from further along the chain (another
+        // session's, in that one's turn) lengthens it.
+        let mut relayed = by.clone();
+        relayed.hop = crate::rooms::MAX_HOPS;
+        let passed = d
+            .line_send(
+                Sender::Overseer(relayed),
+                tell(s.id, "acme-api says it is rebased."),
+            )
+            .await
+            .unwrap();
+        d.line_next(s.id, Duration::from_secs(2)).await.unwrap();
+        d.line_ack(s.id, passed.id, true).await.unwrap();
+        assert_eq!(d.line_run(s.id).cause, crate::rooms::MAX_HOPS);
+        d.person_spoke(s.id);
         // A peer's words still lengthen its chain.
         let peer = new_session(&d, dir.path()).await;
         idle(&d, peer.id).await;

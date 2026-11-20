@@ -337,7 +337,11 @@ async fn reports_past_the_bosss_turns_for_the_hour_wait_for_the_next_and_none_is
             "both reports, gathered as one turn: {}",
             next.content
         );
-        assert_eq!(waiting().await, 0, "taken by that turn");
+        // Taken once that turn is over.
+        eventually("taken by that turn", async || {
+            (waiting().await == 0).then_some(())
+        })
+        .await;
     })
     .await;
 }
@@ -367,8 +371,8 @@ async fn past_the_hours_turns_a_question_to_the_boss_that_runs_it_is_taken_at_on
         )
         .await
         .unwrap();
-        assert!(crew.spend_work_turn(s.id).is_ok(), "the hour's one turn");
-        assert!(crew.spend_work_turn(s.id).is_err(), "spent");
+        assert!(crew.spend_work_turn(s.id), "the hour's one turn");
+        assert!(!crew.spend_work_turn(s.id), "spent");
         let asked = d
             .line_call(
                 s.id,
@@ -412,8 +416,8 @@ async fn past_the_hours_turns_a_question_desk_only_watches_still_reaches_the_per
         )
         .await;
         let s = new_session(&d, dir.path(), "Legacy removal").await;
-        assert!(crew.spend_work_turn(s.id).is_ok(), "the hour's one turn");
-        assert!(crew.spend_work_turn(s.id).is_err(), "spent");
+        assert!(crew.spend_work_turn(s.id), "the hour's one turn");
+        assert!(!crew.spend_work_turn(s.id), "spent");
         let asked = d
             .line_call(
                 s.id,
@@ -448,17 +452,19 @@ async fn paced_session(
     pool: workforce_postgres::PostgresPool,
     dir: &std::path::Path,
 ) -> (Arc<AgentService>, Arc<CrewHub>, Desk, uuid::Uuid) {
-    let (overseer, crew, d, _llm) = overseeing(
-        dir,
-        pool,
-        reply,
-        &format!(
-            "[oversight]\nenabled = true\nlevel = \"act\"\nact = {{ nudge = true }}\n\
-             work = {{ max_turns_per_hour = {max} }}\n"
-        ),
-        &[],
-    )
-    .await;
+    paced_session_at(max, reply, pool, dir, FAST).await
+}
+
+/// [`paced_session`], its crew keeping `timing`.
+async fn paced_session_at(
+    max: u32,
+    reply: &str,
+    pool: workforce_postgres::PostgresPool,
+    dir: &std::path::Path,
+    timing: super::super::Timing,
+) -> (Arc<AgentService>, Arc<CrewHub>, Desk, uuid::Uuid) {
+    let (overseer, crew, d, _llm) =
+        overseeing_at(dir, pool, reply, &paced_config(max), &[], timing).await;
     let s = new_session(&d, dir, "Legacy removal").await;
     d.take_on(
         s.id,
@@ -470,6 +476,14 @@ async fn paced_session(
     .await
     .unwrap();
     (overseer, crew, d, s.id)
+}
+
+/// The boss's config for [`paced_session`]: `max` work turns an hour.
+fn paced_config(max: u32) -> String {
+    format!(
+        "[oversight]\nenabled = true\nlevel = \"act\"\nact = {{ nudge = true }}\n\
+         work = {{ max_turns_per_hour = {max} }}\n"
+    )
 }
 
 /// The line turns `overseer` had for session `s`.
@@ -598,6 +612,155 @@ async fn every_report_in_rounds_with_the_boss_that_runs_it_reaches_its_turn() {
                 .any(|m| m.content.contains(&format!("Step {rounds} done."))),
             "the last report reached its turn"
         );
+    })
+    .await;
+}
+
+/// A report from session `s` to the boss, kept waiting for its next turn.
+async fn kept_report(d: &Desk, s: uuid::Uuid, text: &str) -> workforce_desk::line::LineMessage {
+    let v = d.view(s).unwrap();
+    let mut m = workforce_desk::line::LineMessage::new(
+        workforce_desk::crew::Party::session(&v),
+        workforce_desk::crew::Party::manager("desk", "Desk"),
+        LineKind::Tell,
+        text.into(),
+        1,
+    );
+    m.delivery = Delivery::Queued;
+    d.store().put_line(&m).await.unwrap();
+    m
+}
+
+/// What waited for a boss's turn when the hub stopped is its line loop's
+/// at start: the report is taken by a turn of its boss's.
+#[tokio::test(flavor = "multi_thread")]
+async fn reports_waiting_when_the_hub_stopped_are_taken_by_a_turn_when_it_starts() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, s) = paced_session(5, "Noted.", pool, dir.path()).await;
+        let report = kept_report(&d, s, "Step 14 done: the old DNS records are gone.").await;
+        // Kept straight in the store, no event: the hub starting again, its
+        // line loop reads what waits.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        tokio::spawn(super::super::line::line_loop(
+            Arc::clone(&crew),
+            cancel.clone(),
+        ));
+        let turn = eventually("the waiting report's turn", async || {
+            overseer
+                .sessions
+                .find(&super::super::line::line_channel(s), PERSON)
+                .unwrap()?
+                .messages
+                .into_iter()
+                .find(|m| m.content.contains("the old DNS records are gone"))
+        })
+        .await;
+        assert!(turn.content.starts_with(super::super::line::LINE));
+        let taken = eventually("the report taken", async || {
+            d.store()
+                .line_message(report.id)
+                .await
+                .unwrap()
+                .filter(|m| m.delivery == Delivery::Delivered)
+        })
+        .await;
+        assert!(taken.delivered_at.is_some());
+        tokio::time::sleep(super::super::line::GATHER * 2).await;
+        assert_eq!(line_turns(&overseer, s), 1, "one turn took it");
+        cancel.cancel();
+    })
+    .await;
+}
+
+/// What the line loop reads again when it fell behind Desk's events: the
+/// questions open to a boss and the reports waiting for its turn alike.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_line_loop_behind_desks_events_reads_open_questions_and_waiting_reports_again() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, crew, d, s) = paced_session(5, "Noted.", pool, dir.path()).await;
+        let report = kept_report(&d, s, "Step 15 done.").await;
+        let v = d.view(s).unwrap();
+        let mut ask = workforce_desk::line::LineMessage::new(
+            workforce_desk::crew::Party::session(&v),
+            workforce_desk::crew::Party::manager("desk", "Desk"),
+            LineKind::Ask,
+            "Drop the legacy queue table?".into(),
+            1,
+        );
+        ask.asked = Some(workforce_desk::line::Asked::Open);
+        d.store().put_line(&ask).await.unwrap();
+        let kept = crew.line_kept().await;
+        let mut ids: Vec<uuid::Uuid> = kept[&s].iter().map(|m| m.id).collect();
+        ids.sort();
+        let mut want = vec![report.id, ask.id];
+        want.sort();
+        assert_eq!(ids, want);
+    })
+    .await;
+}
+
+/// Reports waiting for the next hour go as soon as the person raises the
+/// boss's turns for it, not when the hour frees one.
+#[tokio::test(flavor = "multi_thread")]
+async fn reports_waiting_go_as_soon_as_the_hours_turns_are_raised() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        // An hour of a minute: well past what a raised cap waits for.
+        let timing = super::super::Timing {
+            minute: std::time::Duration::from_secs(1),
+            ..FAST
+        };
+        let (overseer, crew, d, s) = paced_session_at(1, "Noted.", pool, dir.path(), timing).await;
+        d.line_call(
+            s,
+            "tell",
+            &json!({"to": "desk", "text": "Inventory done."}),
+            None,
+        )
+        .await
+        .unwrap();
+        eventually("its first report taken", async || {
+            (line_turns(&overseer, s) == 1).then_some(())
+        })
+        .await;
+        let first = std::time::Instant::now();
+        d.line_call(
+            s,
+            "tell",
+            &json!({"to": "desk", "text": "Step 12 done."}),
+            None,
+        )
+        .await
+        .unwrap();
+        eventually("the report waiting for the next hour", async || {
+            (d.store().line_waiting_for_bosses().await.unwrap().len() == 1).then_some(())
+        })
+        .await;
+        write_config(&overseer, &paced_config(5));
+        eventually("its turn once raised", async || {
+            (line_turns(&overseer, s) == 2).then_some(())
+        })
+        .await;
+        let hour = crew.timing.minute * 60;
+        assert!(
+            first.elapsed() < hour,
+            "before the hour freed one: {:?} of {hour:?}",
+            first.elapsed()
+        );
+        eventually("taken by it", async || {
+            d.store()
+                .line_waiting_for_bosses()
+                .await
+                .unwrap()
+                .is_empty()
+                .then_some(())
+        })
+        .await;
+        // Taken, it starts no turn again.
+        tokio::time::sleep(super::super::line::GATHER * 2).await;
+        assert_eq!(line_turns(&overseer, s), 2);
     })
     .await;
 }

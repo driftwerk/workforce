@@ -323,20 +323,40 @@ impl Desk {
             && self.boss_acts(&boss.id)
     }
 
+    /// Holds the reports `ids` the boss that runs their session heard for
+    /// its next turn ([`crate::store::DeskStore::line_wait_for_boss`]), said to whoever
+    /// shows them. The ids of those that moved.
+    pub async fn line_hold_for_boss(&self, ids: &[Uuid]) -> Result<Vec<Uuid>, DeskError> {
+        let moved = self.0.store.line_wait_for_boss(ids).await?;
+        Ok(self.announce_moved(&moved))
+    }
+
+    /// The reports `ids` that waited for their boss's turn, taken by it
+    /// ([`crate::store::DeskStore::line_reports_taken`]), said to whoever shows them.
+    pub async fn line_reports_taken(&self, ids: &[Uuid]) -> Result<Vec<Uuid>, DeskError> {
+        let moved = self.0.store.line_reports_taken(ids).await?;
+        Ok(self.announce_moved(&moved))
+    }
+
+    fn announce_moved(&self, moved: &[LineMessage]) -> Vec<Uuid> {
+        moved
+            .iter()
+            .inspect(|m| self.line_announce(m))
+            .map(|m| m.id)
+            .collect()
+    }
+
     /// `m` went into `id`: its run's chain is as long as `m`'s hop, unless
-    /// `m` is from the boss that runs it ([`Self::its_acting_boss`]).
+    /// `m` is the boss that runs it answering its own exchange with it (no
+    /// further along than what `id` sent it). A boss passing on another
+    /// session's words carries their hop, and that counts.
     fn run_heard(&self, id: Uuid, m: &LineMessage) {
-        if self.its_acting_boss(id, &m.from) {
-            return;
+        let answering = self.its_acting_boss(id, &m.from);
+        let mut st = self.0.state.lock();
+        let run = st.lines.runs.entry(id).or_default();
+        if !(answering && m.hop <= run.cause + 2) {
+            run.delivered(m.hop);
         }
-        self.0
-            .state
-            .lock()
-            .lines
-            .runs
-            .entry(id)
-            .or_default()
-            .delivered(m.hop);
     }
 
     /// Whether `boss` is `id`'s own boss.
@@ -714,8 +734,12 @@ impl Desk {
                     self.line_reach(),
                     &bossed,
                 )?;
-                let to_its_boss = self.its_acting_boss(me.id, &recipient);
-                if let Err(r) = line::guard(checked, &run, &recipient, to_its_boss) {
+                // Who it can't reach is said before any count: one over its
+                // budget writing to a wrong name is told that, sends
+                // nothing, and stalls on its next send that could go.
+                let report = kind == LineKind::Tell && self.its_acting_boss(me.id, &recipient);
+                let to_session = recipient.kind == PartyKind::Session;
+                if let Err(r) = line::guard(checked, &run, to_session, report) {
                     // Only the budget its boss's answers renew is lifted
                     // by them.
                     self.line_stalled(me, &r, r == Refusal::Budget).await;
@@ -856,7 +880,7 @@ impl Desk {
         }
         match &from {
             Sender::Session(id) => {
-                let to_its_boss = self.its_acting_boss(*id, &m.to);
+                let report = kind == LineKind::Tell && self.its_acting_boss(*id, &m.to);
                 self.0
                     .state
                     .lock()
@@ -864,7 +888,7 @@ impl Desk {
                     .runs
                     .entry(*id)
                     .or_default()
-                    .sent_one(&m.to, to_its_boss);
+                    .sent_one(m.to.kind == PartyKind::Session, report);
                 let what = match kind {
                     LineKind::Ask => crate::picture::What::SessionAsked,
                     _ => crate::picture::What::SessionReported,
@@ -1103,8 +1127,10 @@ impl Desk {
                 self.picture_person_answered(v.id, &a.text);
                 self.person_spoke(v.id)
             }
+            // Its answer to a question the boss that runs it asked is
+            // paced by the turns that asked it, as a report is.
             (Sender::Session(id), _) => {
-                let to_its_boss = self.its_acting_boss(*id, &question.from);
+                let report = self.its_acting_boss(*id, &question.from);
                 self.0
                     .state
                     .lock()
@@ -1112,7 +1138,7 @@ impl Desk {
                     .runs
                     .entry(*id)
                     .or_default()
-                    .sent_one(&question.from, to_its_boss);
+                    .sent_one(question.from.kind == PartyKind::Session, report);
             }
             // Its own boss's answer starts the asker's budget again; any
             // other overseer's counts against it: its budget holds the

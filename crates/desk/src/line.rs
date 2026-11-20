@@ -746,15 +746,15 @@ impl LineRun {
         self.cause = self.cause.max(hop);
     }
 
-    /// The session sent a message to `to`; `to_its_boss`: the boss that
-    /// runs it, whose turns pace what it is told.
-    pub fn sent_one(&mut self, to: &Party, to_its_boss: bool) {
-        if to_its_boss {
+    /// The session sent a message, to another session or not; `report`:
+    /// a report to the boss that runs it, whose turns pace them.
+    pub fn sent_one(&mut self, to_session: bool, report: bool) {
+        if report {
             return;
         }
         self.sent += 1;
         self.since_person += 1;
-        if to.kind == PartyKind::Session {
+        if to_session {
             self.to_sessions += 1;
         }
     }
@@ -880,19 +880,19 @@ pub fn hops(hop: i16) -> Result<(), Refusal> {
 }
 
 /// Refuses a hand-off chain run too long ([`hops`]), and a sender over its
-/// budget for `to`: [`TURN_BUDGET`] since the person or its boss last spoke
-/// to it, and as many to other sessions since the person did; and
-/// [`BOSS_RUN_CEILING`] in all since the person did. A report to the boss
-/// that runs it (`to_its_boss`) is never refused by a count: it is the
-/// work, and that boss's own turns gather what comes while one runs. To a
-/// boss that doesn't run it (one that only watches, say) the counts hold.
-pub fn guard(hop: i16, run: &LineRun, to: &Party, to_its_boss: bool) -> Result<(), Refusal> {
+/// budget: [`TURN_BUDGET`] since the person or its boss last spoke to it,
+/// and as many to other sessions (`to_session`) since the person did; and
+/// [`BOSS_RUN_CEILING`] in all since the person did. A `report` (a tell to
+/// the boss that runs it) is never refused by a count: it is the work, and
+/// that boss's own turns gather what comes while one runs. Its questions,
+/// and anything to a boss that doesn't run it, count.
+pub fn guard(hop: i16, run: &LineRun, to_session: bool, report: bool) -> Result<(), Refusal> {
     hops(hop)?;
-    if to_its_boss {
+    if report {
         Ok(())
     } else if run.since_person >= BOSS_RUN_CEILING as usize {
         Err(Refusal::Ceiling)
-    } else if to.kind == PartyKind::Session && run.to_sessions >= TURN_BUDGET as usize {
+    } else if to_session && run.to_sessions >= TURN_BUDGET as usize {
         Err(Refusal::Peers)
     } else if run.sent >= TURN_BUDGET as usize {
         Err(Refusal::Budget)
@@ -1868,29 +1868,27 @@ mod tests {
             since_person: sent,
             ..LineRun::default()
         };
-        let you = Party::you();
-        assert_eq!(guard(MAX_HOPS, &run(0), &you, false), Ok(()));
+        assert_eq!(guard(MAX_HOPS, &run(0), false, false), Ok(()));
         assert_eq!(
-            guard(MAX_HOPS + 1, &run(0), &you, false),
+            guard(MAX_HOPS + 1, &run(0), false, false),
             Err(Refusal::Hops)
         );
         assert_eq!(
-            guard(1, &run(TURN_BUDGET as usize - 1), &you, false),
+            guard(1, &run(TURN_BUDGET as usize - 1), false, false),
             Ok(())
         );
         assert_eq!(
-            guard(1, &run(TURN_BUDGET as usize), &you, false),
+            guard(1, &run(TURN_BUDGET as usize), false, false),
             Err(Refusal::Budget)
         );
     }
 
     #[test]
     fn a_report_to_the_boss_that_runs_it_is_never_counted_nor_refused_but_a_long_chain_is() {
-        let boss = Party::manager("sarah", "Sarah");
         let mut run = LineRun::default();
         for _ in 0..BOSS_RUN_CEILING * 4 {
-            assert_eq!(guard(1, &run, &boss, true), Ok(()));
-            run.sent_one(&boss, true);
+            assert_eq!(guard(1, &run, false, true), Ok(()));
+            run.sent_one(false, true);
         }
         assert_eq!(run, LineRun::default(), "none of it counted");
         let spent = LineRun {
@@ -1899,40 +1897,33 @@ mod tests {
             to_sessions: TURN_BUDGET as usize,
             ..LineRun::default()
         };
-        assert_eq!(guard(1, &spent, &boss, true), Ok(()), "over every count");
-        // A boss that doesn't run it (one that only watches, say): the counts hold.
-        assert_eq!(guard(1, &spent, &boss, false), Err(Refusal::Ceiling));
-        assert_eq!(guard(MAX_HOPS + 1, &spent, &boss, true), Err(Refusal::Hops));
-        assert_eq!(
-            guard(1, &spent, &Party::you(), false),
-            Err(Refusal::Ceiling)
-        );
+        assert_eq!(guard(1, &spent, false, true), Ok(()), "over every count");
+        assert_eq!(guard(1, &spent, false, false), Err(Refusal::Ceiling));
+        assert_eq!(guard(MAX_HOPS + 1, &spent, false, true), Err(Refusal::Hops));
     }
 
     #[test]
     fn a_bosss_answers_start_the_budget_again_up_to_the_ceiling_and_never_for_sessions() {
-        let you = Party::you();
         let mut run = LineRun::default();
         let mut sent = 0;
-        while guard(1, &run, &you, false).is_ok() {
-            run.sent_one(&you, false);
+        while guard(1, &run, false, false).is_ok() {
+            run.sent_one(false, false);
             sent += 1;
             if sent % 5 == 0 {
                 run.boss_spoke();
             }
         }
         assert_eq!(sent, BOSS_RUN_CEILING as usize, "answered by its boss");
-        assert_eq!(guard(1, &run, &you, false), Err(Refusal::Ceiling));
+        assert_eq!(guard(1, &run, false, false), Err(Refusal::Ceiling));
         // To other sessions, its boss answering it doesn't start it again.
-        let peer = Party::session(&session("acme-api", Engine::Codex));
         let mut run = LineRun::default();
         for _ in 0..TURN_BUDGET {
-            run.sent_one(&peer, false);
+            run.sent_one(true, false);
             run.boss_spoke();
         }
-        assert_eq!(guard(1, &run, &peer, false), Err(Refusal::Peers));
+        assert_eq!(guard(1, &run, true, false), Err(Refusal::Peers));
         assert_eq!(
-            guard(1, &run, &you, false),
+            guard(1, &run, false, false),
             Ok(()),
             "the person still hears it"
         );

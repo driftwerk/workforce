@@ -66,6 +66,9 @@ pub enum NotAnswered {
     Already,
 }
 
+/// A session's report to its boss, in a `line_messages` query.
+const BOSS_REPORT: &str = "kind = 'tell' AND recipient ->> 'kind' = 'manager'";
+
 impl DeskStore {
     /// Writes `m` whole, new or changed.
     pub async fn put_line(&self, m: &LineMessage) -> Result<()> {
@@ -582,34 +585,51 @@ impl DeskStore {
 
     /// Holds the sessions' reports `ids` their boss heard for the boss's
     /// next turn: waiting again, so a restart before that turn gathers
-    /// them again. The ids of those that moved.
-    pub async fn line_wait_for_boss(&self, ids: &[Uuid]) -> Result<Vec<Uuid>> {
-        let client = self.pool().get().await?;
-        Ok(client
-            .query(
-                "UPDATE line_messages SET delivery = 'queued', delivered_at = NULL, \
-                 updated_at = now() WHERE id = ANY($1) AND delivery = 'delivered' \
-                 AND kind = 'tell' AND recipient ->> 'kind' = 'manager' RETURNING id",
-                &[&ids],
-            )
-            .await?
-            .iter()
-            .map(|r| r.get(0))
-            .collect())
+    /// them again. Those that moved, as they are now.
+    pub async fn line_wait_for_boss(&self, ids: &[Uuid]) -> Result<Vec<LineMessage>> {
+        self.move_reports(
+            ids,
+            "delivery = 'queued', delivered_at = NULL",
+            Delivery::Delivered,
+        )
+        .await
     }
 
     /// The reports `ids` that waited for their boss's turn, taken by it:
-    /// delivered.
-    pub async fn line_reports_taken(&self, ids: &[Uuid]) -> Result<u64> {
+    /// delivered. Those that moved, as they are now.
+    pub async fn line_reports_taken(&self, ids: &[Uuid]) -> Result<Vec<LineMessage>> {
+        self.move_reports(
+            ids,
+            "delivery = 'delivered', delivered_at = now()",
+            Delivery::Queued,
+        )
+        .await
+    }
+
+    /// Sets `set` on the sessions' reports to their bosses among `ids`
+    /// that are `from` now.
+    async fn move_reports(
+        &self,
+        ids: &[Uuid],
+        set: &str,
+        from: Delivery,
+    ) -> Result<Vec<LineMessage>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let client = self.pool().get().await?;
-        Ok(client
-            .execute(
-                "UPDATE line_messages SET delivery = 'delivered', delivered_at = now(), \
-                 updated_at = now() WHERE id = ANY($1) AND delivery = 'queued' \
-                 AND kind = 'tell' AND recipient ->> 'kind' = 'manager'",
-                &[&ids],
+        client
+            .query(
+                &format!(
+                    "UPDATE line_messages SET {set}, updated_at = now() \
+                     WHERE id = ANY($1) AND delivery = $2 AND {BOSS_REPORT} RETURNING {COLUMNS}"
+                ),
+                &[&ids, &from.as_str()],
             )
-            .await?)
+            .await?
+            .iter()
+            .map(message)
+            .collect()
     }
 
     /// The sessions' reports that wait for their boss's next turn, oldest
@@ -620,7 +640,7 @@ impl DeskStore {
             .query(
                 &format!(
                     "SELECT {COLUMNS} FROM line_messages WHERE delivery = 'queued' \
-                     AND kind = 'tell' AND recipient ->> 'kind' = 'manager' ORDER BY at, id"
+                     AND {BOSS_REPORT} ORDER BY at, id"
                 ),
                 &[],
             )
@@ -876,8 +896,9 @@ mod tests {
             s.put_line(&m).await.unwrap();
             s.put_line(&to_you).await.unwrap();
             assert!(s.line_waiting_for_bosses().await.unwrap().is_empty());
+            let ids = |moved: Vec<LineMessage>| moved.iter().map(|m| m.id).collect::<Vec<_>>();
             assert_eq!(
-                s.line_wait_for_boss(&[m.id, to_you.id]).await.unwrap(),
+                ids(s.line_wait_for_boss(&[m.id, to_you.id]).await.unwrap()),
                 [m.id],
                 "only a report to a boss"
             );
@@ -888,7 +909,10 @@ mod tests {
             let waiting = s.line_waiting_for_bosses().await.unwrap();
             assert_eq!(waiting.iter().map(|w| w.id).collect::<Vec<_>>(), [m.id]);
             assert_eq!(waiting[0].delivered_at, None);
-            assert_eq!(s.line_reports_taken(&[m.id, to_you.id]).await.unwrap(), 1);
+            assert_eq!(
+                ids(s.line_reports_taken(&[m.id, to_you.id]).await.unwrap()),
+                [m.id]
+            );
             assert!(s.line_waiting_for_bosses().await.unwrap().is_empty());
             let taken = s.line_message(m.id).await.unwrap().unwrap();
             assert_eq!(taken.delivery, Delivery::Delivered);
