@@ -87,6 +87,14 @@ pub(super) fn unbound_timings(o: &Oversight) -> Oversight {
     o
 }
 
+/// A session's messages from the boss that never went in, as the boss is
+/// told of them.
+struct Undelivered {
+    trigger: Trigger,
+    /// They wait behind what it asks the person, which is raised too.
+    asking: bool,
+}
+
 /// One thing worth waking the overseer for.
 #[derive(Debug, Clone)]
 pub(super) struct Trigger {
@@ -592,9 +600,9 @@ impl CrewHub {
             if item.kind == ItemKind::Session && item.id.parse().is_ok_and(|s| self.taken_back(s)) {
                 continue;
             }
-            // What the boss sent that never reached it is the boss's to move,
-            // whatever it asks meanwhile: said instead of its quiet or wait.
-            if let Some((key, trigger)) = self.undelivered(
+            // What the boss sent that never reached it is the boss's to move:
+            // said instead of its quiet, and beside what it asks the person.
+            if let Some((key, found)) = self.undelivered(
                 overseer,
                 item,
                 &party,
@@ -605,9 +613,13 @@ impl CrewHub {
             ) {
                 holding.insert(key.clone());
                 if noted.insert(key) {
-                    out.push(trigger);
+                    out.push(found.trigger);
                 }
-                continue;
+                // Behind what it asks the person: that is still raised as
+                // it waits, with its approval and its reminders.
+                if !found.asking {
+                    continue;
+                }
             }
             // A session's question the person is in control of, or its Act
             // fully boss answers itself (`answer`), and a request its decision
@@ -763,7 +775,7 @@ impl CrewHub {
         now: DateTime<Utc>,
         minute: chrono::Duration,
         stall: chrono::Duration,
-    ) -> Option<(String, Trigger)> {
+    ) -> Option<(String, Undelivered)> {
         let waiting = waiting?;
         let oldest = waiting.first()?;
         let quiet = item.last_activity.is_none_or(|at| now - at >= stall);
@@ -776,10 +788,16 @@ impl CrewHub {
         {
             return None;
         }
-        let why = match self.desk.line_waits(oldest) {
+        let wait = self.desk.line_waits(oldest);
+        let why = match wait {
             Some(Wait::Stopped) => "it isn't running, so it is held until it runs again",
-            Some(Wait::Working) => "its turn hasn't ended",
-            Some(Wait::Asking) => "it is asking something, and your messages wait behind that",
+            Some(Wait::Working) => {
+                "its turn hasn't ended: it may be stuck, or in one long step (a build, a test run), \
+                 which a restart would cut off"
+            }
+            Some(Wait::Asking) => {
+                "it ended its turn asking the person something, and your messages wait behind that"
+            }
             None => "it was free to take it, and nothing took it in",
             Some(
                 Wait::Typing
@@ -797,25 +815,28 @@ impl CrewHub {
             ((now - oldest.at).num_milliseconds() / minute.num_milliseconds().max(1)).max(1);
         let line = format!(
             "{} hasn't taken your message of {at} in {minutes} min ({} waiting, the oldest “{}”) \
-             and has shown no progress meanwhile: {why}. Read where it stands yourself \
-             (crew.history) and move it now: answer what it waits on, restart it (crew.restart), \
-             start a fresh session on the work (crew.start_session), or do the step yourself; \
-             if a restart of it already failed, don't try another. Tell the person only if none \
-             of those can work.",
+             and has shown no progress meanwhile: {why}. First read where it stands \
+             (crew.history), then move it now: answer what it waits on, restart it (crew.restart) \
+             only if its history shows it stuck, start a fresh session on the work \
+             (crew.start_session), or do the step yourself; if a restart of it already failed, \
+             don't try another. Tell the person only if none of those can work.",
             who(party),
             waiting.len(),
             crew::words(&oldest.text, 20),
         );
         Some((
             format!("undelivered:{}:{}", item.id, oldest.id),
-            Trigger {
-                line,
-                approvals: vec![],
-                hop: 0,
-                about: None,
-                group: item.group_id.clone(),
-                handed: None,
-                routine: false,
+            Undelivered {
+                trigger: Trigger {
+                    line,
+                    approvals: vec![],
+                    hop: 0,
+                    about: None,
+                    group: item.group_id.clone(),
+                    handed: None,
+                    routine: false,
+                },
+                asking: wait == Some(Wait::Asking),
             },
         ))
     }

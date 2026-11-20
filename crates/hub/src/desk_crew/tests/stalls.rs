@@ -632,3 +632,144 @@ async fn a_message_that_never_reaches_a_session_wakes_its_boss_once() {
     })
     .await;
 }
+
+/// The boss's model calls whose prompt says `what`.
+async fn prompted(llm: &wiremock::MockServer, what: &str) -> Vec<String> {
+    llm.received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|r| String::from_utf8_lossy(&r.body).to_string())
+        .filter(|b| b.contains(what))
+        .collect()
+}
+
+/// A message waiting behind the question a session ended its turn on wakes
+/// its boss with why, and the question is still raised as waiting on the
+/// person, with its reminders, as any question is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_behind_a_sessions_question_still_raises_the_question() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, crew, d, llm) = overseeing(
+            dir.path(),
+            pool,
+            "I'll read its history.",
+            "[oversight]\nenabled = true\nlevel = \"act\"\nact = { nudge = true }\n\
+             updates = { enabled = false }\nwork = { stall_minutes = 5 }\n\
+             wake = { waiting_minutes = 5, hold_minutes = 2, answer_after_minutes = 2 }\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, dir.path(), "Cufflink Migration").await;
+        let url = hook_url(dir.path(), s.id).await;
+        hook(
+            &url,
+            json!({"hook_event_name": "SessionStart", "session_id": s.id.to_string()}),
+        )
+        .await;
+        hook(&url, json!({"hook_event_name": "UserPromptSubmit", "prompt": "status?"})).await;
+        hook(
+            &url,
+            json!({"hook_event_name": "Stop",
+                   "last_assistant_message": "Step 11 is done. Should I run step 12 against production now?"}),
+        )
+        .await;
+        eventually("it asks", async || {
+            (d.view(s.id).unwrap().state == workforce_desk::model::SessionState::Asking).then_some(())
+        })
+        .await;
+        crew.perform(
+            &Action::Nudge {
+                to: Target::Session(s.id),
+                message: "Go ahead: run step 12 now.".into(),
+                reply_to: None,
+            },
+            crew.by_overseer("Its timer went off.").unwrap(),
+        )
+        .await
+        .unwrap();
+        let woke = eventually("the boss woken", async || {
+            prompted(&llm, "hasn't taken your message").await.pop()
+        })
+        .await;
+        assert!(
+            woke.contains("it ended its turn asking the person something"),
+            "{woke}"
+        );
+        eventually("its question raised", async || {
+            prompted(&llm, "has waited on you").await.pop()
+        })
+        .await;
+    })
+    .await;
+}
+
+/// A message Desk holds on purpose (the person drives the session) wakes
+/// no one, however long it waits.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_held_while_the_person_drives_wakes_no_one() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, llm) = overseeing(
+            dir.path(),
+            pool,
+            "I'll read its history.",
+            "[oversight]\nenabled = true\nlevel = \"act\"\nact = { nudge = true }\n\
+             updates = { enabled = false }\nwork = { stall_minutes = 5 }\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, dir.path(), "Cufflink Migration").await;
+        let url = hook_url(dir.path(), s.id).await;
+        hook(
+            &url,
+            json!({"hook_event_name": "SessionStart", "session_id": s.id.to_string()}),
+        )
+        .await;
+        let boss = workforce_desk::crew::Party::manager("desk", &super::super::name_of(&overseer));
+        d.take_on(
+            s.id,
+            &boss,
+            workforce_desk::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        hook(
+            &url,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "I'll take step 12 myself."}),
+        )
+        .await;
+        hook(
+            &url,
+            json!({"hook_event_name": "Stop", "last_assistant_message": "Ready when you are."}),
+        )
+        .await;
+        let m = d
+            .line_send(
+                workforce_desk::LineSender::Overseer(
+                    crew.by_overseer("Its timer went off.").unwrap(),
+                ),
+                workforce_desk::line::Send::Tell {
+                    to: workforce_desk::line::Target::Session(s.id),
+                    text: "Go ahead: run step 12 now.".into(),
+                    when: workforce_desk::line::When::Queue,
+                },
+            )
+            .await
+            .unwrap();
+        let thread = d.line_thread(s.id, None, None).await.unwrap();
+        assert_eq!(
+            thread.iter().find(|r| r.id == m.id).unwrap().waiting,
+            Some(workforce_desk::line::Wait::PersonDriving)
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert!(
+            prompted(&llm, "hasn't taken your message").await.is_empty(),
+            "no one is woken for it"
+        );
+    })
+    .await;
+}
