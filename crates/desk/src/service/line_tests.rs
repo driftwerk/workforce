@@ -1257,6 +1257,47 @@ async fn a_bosss_answer_goes_in_only_while_its_session_asks_at_that_turn_end() {
 }
 
 #[tokio::test]
+async fn what_its_running_boss_said_before_the_turn_ended_on_a_question_is_not_its_answer() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let by = sarah_bosses(&d);
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        d.take_on(
+            s.id,
+            &by.party,
+            crate::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        d.change(s.id, |r, _| r.state = SessionState::Working);
+        let earlier = d
+            .line_send(
+                Sender::Overseer(by.clone()),
+                tell(s.id, "When that is done, run the linter."),
+            )
+            .await
+            .unwrap();
+        ends_asking(&d, s.id, "Should I switch reads to the replica?", false).await;
+        assert_eq!(d.line_waits(&row(&d, earlier.id).await), Some(Wait::Asking));
+        assert_eq!(d.line_next(s.id, Duration::from_millis(300)).await, None);
+        assert_eq!(row(&d, earlier.id).await.delivery, Delivery::Queued);
+        // What it says once it has read the question goes in.
+        let after = d
+            .line_send(Sender::Overseer(by), tell(s.id, "Yes, switch them."))
+            .await
+            .unwrap();
+        let next = d.line_next(s.id, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(next["id"], json!(after.id));
+        assert_eq!(row(&d, earlier.id).await.delivery, Delivery::Queued);
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn a_dialog_on_its_screen_holds_what_waits_at_its_prompt_too() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();

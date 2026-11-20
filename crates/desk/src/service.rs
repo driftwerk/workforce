@@ -290,6 +290,8 @@ pub(crate) struct Live {
     interrupted: bool,
     /// How many of its turns have ended while it ran here.
     ends: u64,
+    /// When the last of them ended.
+    ended_at: Option<DateTime<Utc>>,
     /// The turn end whose reply the hub's model is reading, while it is:
     /// its turn stays open on the floor until the model says.
     reading: Option<u64>,
@@ -2347,6 +2349,7 @@ impl Desk {
                     allowed: HashSet::new(),
                     interrupted: false,
                     ends: 0,
+                    ended_at: None,
                     reading: None,
                     closing: false,
                     codex_asks: Vec::new(),
@@ -5755,6 +5758,7 @@ impl Desk {
                 allowed: HashSet::new(),
                 interrupted: false,
                 ends: 0,
+                ended_at: None,
                 reading: None,
                 closing: false,
                 codex_asks: Vec::new(),
@@ -6939,6 +6943,7 @@ impl Desk {
             };
             if let Some(l) = l.as_deref_mut() {
                 l.ends += 1;
+                l.ended_at = Some(Utc::now());
                 l.reading = reader.as_ref().map(|_| l.ends);
                 read = l.reading;
             }
@@ -7938,6 +7943,7 @@ impl Desk {
                             };
                             if let Some(l) = l.as_deref_mut() {
                                 l.ends += 1;
+                                l.ended_at = Some(Utc::now());
                                 l.reading = reader.as_ref().map(|_| l.ends);
                                 read = l.reading;
                             }

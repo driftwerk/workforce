@@ -128,7 +128,6 @@ impl Desk {
         }
         match self.line_withdraw(m.id).await {
             Ok(Some(_)) => {
-                self.0.state.lock().lines.answers.remove(&m.id);
                 tracing::info!(session = %s, message = %m.id, "a boss's message overtaken before it went in was withdrawn");
                 // Its boss knows it never went in.
                 self.picture_note(
@@ -148,7 +147,7 @@ impl Desk {
 
     /// Whether session `s` still asks what turn-answer `m` answers, at the
     /// same turn end: none kept for it (from before a restart) never does.
-    fn still_asks(&self, s: Uuid, m: &crate::line::LineMessage) -> bool {
+    pub(super) fn still_asks(&self, s: Uuid, m: &crate::line::LineMessage) -> bool {
         let kept = self
             .0
             .state

@@ -116,15 +116,24 @@ impl Desk {
     /// ([`line::Send::Answer`]). A restart starts its counters again, so a
     /// mark from before one never matches.
     pub fn asked_mark(&self, id: Uuid) -> Option<TurnMark> {
+        self.asked_now(id).map(|(_, mark)| mark)
+    }
+
+    /// What session `id` asks now and the turn end it asks it at
+    /// ([`Self::asked_mark`]), read together: the mark is that question's.
+    pub fn asked_now(&self, id: Uuid) -> Option<(crate::asking::Asked, TurnMark)> {
         let st = self.0.state.lock();
         let view = Self::view_of(&st, st.records.get(&id)?);
-        line::open_question(&view)?;
+        let asked = line::open_question(&view)?.clone();
         let l = st.live.get(&id)?;
-        Some(TurnMark {
-            run: l.breaker.run.0,
-            ends: l.ends,
-            turns: l.breaker.turns,
-        })
+        Some((
+            asked,
+            TurnMark {
+                run: l.breaker.run.0,
+                ends: l.ends,
+                turns: l.breaker.turns,
+            },
+        ))
     }
 
     pub(super) fn mark_in(st: &super::State, id: Uuid) -> Option<TurnMark> {

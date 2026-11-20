@@ -280,8 +280,7 @@ impl CrewHub {
         let Ok(view) = self.desk.view(id) else {
             return;
         };
-        let (Some(question), Some(turn)) = (question_of(&view).cloned(), self.desk.asked_mark(id))
-        else {
+        let Some((question, turn)) = self.desk.asked_now(id) else {
             return;
         };
         let Some(boss) = self.boss_over(&view) else {
