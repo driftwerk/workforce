@@ -95,6 +95,15 @@ struct Undelivered {
     asking: bool,
 }
 
+/// Whether Desk holds a message for `wait` on purpose, which no one is
+/// woken about.
+fn held_on_purpose(wait: Wait) -> bool {
+    match wait {
+        Wait::Typing | Wait::Paused | Wait::PersonDriving | Wait::ModeEnding => true,
+        Wait::Stopped | Wait::Working | Wait::Asking | Wait::NextCall => false,
+    }
+}
+
 /// One thing worth waking the overseer for.
 #[derive(Debug, Clone)]
 pub(super) struct Trigger {
@@ -602,23 +611,30 @@ impl CrewHub {
             }
             // What the boss sent that never reached it is the boss's to move:
             // said instead of its quiet, and beside what it asks the person.
-            if let Some((key, found)) = self.undelivered(
-                overseer,
-                item,
-                &party,
-                waiting.get(&item.id).map(Vec::as_slice),
-                now,
-                minute,
-                stall,
-            ) {
+            // Kept while they wait and it hasn't moved, so a pause in a hold
+            // (the person typing a moment) never wakes the boss again.
+            let waits = waiting.get(&item.id).map(Vec::as_slice).unwrap_or_default();
+            if let Some(oldest) = waits.first() {
+                let key = format!(
+                    "undelivered:{}:{}:{}",
+                    item.id,
+                    oldest.id,
+                    item.last_activity
+                        .map(|at| at.timestamp_millis())
+                        .unwrap_or_default()
+                );
                 holding.insert(key.clone());
-                if noted.insert(key) {
-                    out.push(found.trigger);
-                }
-                // Behind what it asks the person: that is still raised as
-                // it waits, with its approval and its reminders.
-                if !found.asking {
-                    continue;
+                if let Some(found) =
+                    self.undelivered(overseer, item, &party, waits, now, minute, stall)
+                {
+                    if noted.insert(key) {
+                        out.push(found.trigger);
+                    }
+                    // Behind what it asks the person: that is still raised
+                    // as it waits, with its approval and its reminders.
+                    if !found.asking {
+                        continue;
+                    }
                 }
             }
             // A session's question the person is in control of, or its Act
@@ -760,10 +776,10 @@ impl CrewHub {
         }
     }
 
-    /// The trigger, keyed by its oldest message, for a session `overseer`'s
-    /// messages haven't reached for `stall` while it showed no progress of
-    /// its own: none while Desk holds them on purpose (the person typing,
-    /// driving or in its dialog, the breaker, a mode ending), or once
+    /// The trigger for a session `waiting`, `overseer`'s messages to it
+    /// (oldest first), haven't reached for `stall` while it showed no
+    /// progress of its own: none while Desk holds any of them on purpose
+    /// (the person typing or driving, the breaker, a mode ending), or once
     /// someone stopped or closed it.
     #[allow(clippy::too_many_arguments)]
     fn undelivered(
@@ -771,12 +787,11 @@ impl CrewHub {
         overseer: &str,
         item: &crew::Item,
         party: &Party,
-        waiting: Option<&[LineMessage]>,
+        waiting: &[LineMessage],
         now: DateTime<Utc>,
         minute: chrono::Duration,
         stall: chrono::Duration,
-    ) -> Option<(String, Undelivered)> {
-        let waiting = waiting?;
+    ) -> Option<Undelivered> {
         let oldest = waiting.first()?;
         let quiet = item.last_activity.is_none_or(|at| now - at >= stall);
         if now - oldest.at < stall || !quiet {
@@ -788,24 +803,26 @@ impl CrewHub {
         {
             return None;
         }
-        let wait = self.desk.line_waits(oldest);
+        let waits: Vec<Option<Wait>> = waiting.iter().map(|m| self.desk.line_waits(m)).collect();
+        if waits.iter().flatten().any(|w| held_on_purpose(*w)) {
+            return None;
+        }
+        let wait = waits.first().copied().flatten();
         let why = match wait {
             Some(Wait::Stopped) => "it isn't running, so it is held until it runs again",
             Some(Wait::Working) => {
                 "its turn hasn't ended: it may be stuck, or in one long step (a build, a test run), \
                  which a restart would cut off"
             }
+            Some(Wait::NextCall) => {
+                "it was told to read it with its next tool call, and hasn't made one: it may be \
+                 stuck, or in one long step (a build, a test run), which a restart would cut off"
+            }
             Some(Wait::Asking) => {
                 "it ended its turn asking the person something, and your messages wait behind that"
             }
             None => "it was free to take it, and nothing took it in",
-            Some(
-                Wait::Typing
-                | Wait::Paused
-                | Wait::PersonDriving
-                | Wait::ModeEnding
-                | Wait::NextCall,
-            ) => return None,
+            Some(_) => return None,
         };
         let at = oldest
             .at
@@ -824,21 +841,18 @@ impl CrewHub {
             waiting.len(),
             crew::words(&oldest.text, 20),
         );
-        Some((
-            format!("undelivered:{}:{}", item.id, oldest.id),
-            Undelivered {
-                trigger: Trigger {
-                    line,
-                    approvals: vec![],
-                    hop: 0,
-                    about: None,
-                    group: item.group_id.clone(),
-                    handed: None,
-                    routine: false,
-                },
-                asking: wait == Some(Wait::Asking),
+        Some(Undelivered {
+            trigger: Trigger {
+                line,
+                approvals: vec![],
+                hop: 0,
+                about: None,
+                group: item.group_id.clone(),
+                handed: None,
+                routine: false,
             },
-        ))
+            asking: wait == Some(Wait::Asking),
+        })
     }
 
     /// What an unbound overseer is told each time it wakes: be the boss.

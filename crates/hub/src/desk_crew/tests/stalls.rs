@@ -547,7 +547,7 @@ async fn a_stall_set_aside_is_left_and_one_answered_anywhere_is_settled() {
 async fn a_message_that_never_reaches_a_session_wakes_its_boss_once() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let (_overseer, crew, d, _llm) = overseeing(
+        let (_overseer, crew, d, llm) = overseeing(
             dir.path(),
             pool,
             "I'll read its history.",
@@ -577,6 +577,13 @@ async fn a_message_that_never_reaches_a_session_wakes_its_boss_once() {
         };
         let (stuck, _) = working("Cufflink Migration", "Wait for the step 12 timer.").await;
         let (busy, busy_url) = working("Legacy removal", "Remove the legacy services.").await;
+        let (steered, steered_url) = working("Ledger audit", "Audit the ledger.").await;
+        hook(
+            &steered_url,
+            json!({"hook_event_name": "PreToolUse", "tool_name": "Bash",
+            "tool_input": {"command": "./audit --all"}}),
+        )
+        .await;
         let tell = async |s: uuid::Uuid, message: &str| {
             crew.perform(
                 &Action::Nudge {
@@ -594,6 +601,21 @@ async fn a_message_that_never_reaches_a_session_wakes_its_boss_once() {
             .unwrap()
             .starts_with("told Cufflink Migration"));
         tell(busy.id, "Then stop the old workers.").await.unwrap();
+        tell(steered.id, "Check the ledger totals.").await.unwrap();
+        let row = async |s: uuid::Uuid| {
+            d.line_thread(s, None, None)
+                .await
+                .unwrap()
+                .into_iter()
+                .rfind(|m| m.from.kind == PartyKind::Manager)
+                .unwrap()
+        };
+        // Sent into its turn, whose next tool call never comes.
+        let into_turn = d.line_send_now(row(steered.id).await.id).await.unwrap();
+        assert_eq!(
+            into_turn.waiting,
+            Some(workforce_desk::line::Wait::NextCall)
+        );
         let progress = tokio::spawn(async move {
             loop {
                 hook(
@@ -605,28 +627,45 @@ async fn a_message_that_never_reaches_a_session_wakes_its_boss_once() {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         });
-        let woke = eventually("the boss woken", async || {
-            d.store()
-                .latest_check_in("desk")
-                .await
-                .unwrap()
-                .filter(|c| c.prompt.contains("hasn't taken your message"))
-        })
-        .await;
+        // What the boss was told of session `s`, from its waiting message
+        // to what it should do.
+        let untaken = |s: uuid::Uuid| format!("session {s}) hasn't taken your message");
+        let woken = async |s: uuid::Uuid| {
+            let said = untaken(s);
+            eventually("the boss woken", async || {
+                prompted(&llm, &said).await.first().and_then(|b| {
+                    let (_, rest) = b.split_once(&said)?;
+                    rest.split_once("can work.")
+                        .map(|(said, _)| said.to_string())
+                })
+            })
+            .await
+        };
+        let stuck_said = woken(stuck.id).await;
         assert!(
-            woke.prompt.contains("Cufflink Migration")
-                && woke.prompt.contains("Go ahead: run step 12 now.")
-                && woke.prompt.contains("its turn hasn't ended")
-                && woke.prompt.contains("crew.restart"),
-            "{}",
-            woke.prompt
+            stuck_said.contains("Go ahead: run step 12 now.")
+                && stuck_said.contains("its turn hasn't ended")
+                && stuck_said.contains("crew.restart"),
+            "{stuck_said}"
         );
-        assert!(!woke.prompt.contains("Legacy removal"), "{}", woke.prompt);
+        let steered_said = woken(steered.id).await;
+        assert!(
+            steered_said.contains("with its next tool call, and hasn't made one"),
+            "{steered_said}"
+        );
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         progress.abort();
+        assert!(
+            prompted(&llm, &untaken(busy.id)).await.is_empty(),
+            "none for the session at work"
+        );
         assert_eq!(
-            d.store().wake_ups_since("desk", since).await.unwrap(),
-            1,
+            row(busy.id).await.delivery,
+            workforce_desk::line::Delivery::Queued,
+            "still waiting: left to it only for its progress"
+        );
+        assert!(
+            (1..=2).contains(&d.store().wake_ups_since("desk", since).await.unwrap()),
             "one wake a stall, and none for the session at work"
         );
     })

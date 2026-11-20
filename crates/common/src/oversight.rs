@@ -441,7 +441,9 @@ pub struct Work {
     pub orphan_grace_minutes: u32,
     /// How long a plan may go without a ticket moving, while one is ready
     /// or in Doing, before the person is told; and a session without
-    /// taking the boss's message or moving, before the boss is woken.
+    /// taking the boss's message or moving, before the boss is woken. Never
+    /// off, and the same unbound: a message that never goes in is always
+    /// the boss's to move.
     pub stall_minutes: u32,
 }
 
