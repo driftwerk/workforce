@@ -95,31 +95,28 @@ fn only_reads(keeps: &str, input: &Value) -> bool {
 pub(super) fn only_looks(tool: &str, input: &Value) -> bool {
     let called = tool.replace('.', "_");
     let named = |known: &str| known.replace('.', "_") == called;
-    let crew = READ.iter().any(|t| named(t)).then(|| {
-        KEEPS
+    if READ.iter().any(|t| named(t)) {
+        return KEEPS
             .iter()
             .find(|k| named(k))
-            .is_none_or(|k| only_reads(k, input))
-    });
+            .is_none_or(|k| only_reads(k, input));
+    }
     // A node's tool, called by its underscored name: `node_<id>_<tool>`.
-    let node = tool
-        .strip_prefix("node_")
-        .and_then(|rest| rest.split_once('_'))
-        .map(|(id, rest)| format!("node.{id}.{rest}"));
-    crew.unwrap_or_else(|| {
-        crate::serve::CURATION_TOOL_PATTERNS
-            .iter()
-            .chain(crate::serve::CURATION_DATABASE_READ_TOOLS)
-            .chain(&workforce_skills::adapters::read_only_adapter_tools())
-            .any(|t| named(t))
-            || (named("memory")
-                && RECALLS.contains(&input["action"].as_str().map(str::trim).unwrap_or_default()))
-            || (named("http.request") && !workforce_agent::tools::http::is_mutating_request(input))
-            || [Some(tool.to_string()), node]
-                .into_iter()
-                .flatten()
-                .any(|t| crate::local_agent_registry::is_read_only_tool(&t))
-    })
+    let node = || {
+        tool.strip_prefix("node_")
+            .and_then(|rest| rest.split_once('_'))
+            .map(|(id, rest)| format!("node.{id}.{rest}"))
+    };
+    crate::serve::CURATION_TOOL_PATTERNS
+        .iter()
+        .chain(crate::serve::CURATION_DATABASE_READ_TOOLS)
+        .chain(&workforce_skills::adapters::read_only_adapter_tools())
+        .any(|t| named(t))
+        || (named("memory")
+            && RECALLS.contains(&input["action"].as_str().map(str::trim).unwrap_or_default()))
+        || (named("http.request") && !workforce_agent::tools::http::is_mutating_request(input))
+        || crate::local_agent_registry::is_read_only_tool(tool)
+        || node().is_some_and(|n| crate::local_agent_registry::is_read_only_tool(&n))
 }
 pub const ACT: [&str; 32] = [
     "crew.nudge",

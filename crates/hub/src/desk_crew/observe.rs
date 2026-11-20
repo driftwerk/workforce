@@ -277,14 +277,18 @@ impl Track {
         .hop(self.hop);
         match self.held.take().filter(|_| ended == Outcome::Finished) {
             Some((boss, channel, began)) => {
-                crew.quiet_ends
-                    .lock()
-                    .insert((boss, channel), (began, event));
+                let mut held = crew.quiet_ends.lock();
+                // One no caller came back for (a session gone since) is let go.
+                held.retain(|_, (_, at, _)| at.elapsed() < HELD_FOR);
+                held.insert((boss, channel), (began, std::time::Instant::now(), event));
             }
             None => crew.desk.note(event),
         }
     }
 }
+
+/// How long a held turn end waits for its caller.
+const HELD_FOR: std::time::Duration = std::time::Duration::from_secs(600);
 
 impl CrewHub {
     /// How many line and work turns have begun: one its caller starts
@@ -296,14 +300,14 @@ impl CrewHub {
     /// Says the end of `boss`'s line or work turn on `channel`, numbered at
     /// least `since` ([`Self::turns_begun`]), once its caller has settled
     /// what the turn did: only when it did something. An end held from an
-    /// earlier turn there (one that ended after its caller had settled it)
-    /// is dropped, never said for this one.
+    /// earlier turn there, whose caller was cancelled before it came back
+    /// for it, is dropped, never said for this one.
     pub(super) fn turn_end_said(&self, boss: &str, channel: &str, since: u64, acted: bool) {
         let end = self
             .quiet_ends
             .lock()
             .remove(&(boss.to_string(), channel.to_string()));
-        if let Some((_, event)) = end.filter(|(began, _)| acted && *began >= since) {
+        if let Some((_, _, event)) = end.filter(|(began, _, _)| acted && *began >= since) {
             self.desk.note(event);
         }
     }

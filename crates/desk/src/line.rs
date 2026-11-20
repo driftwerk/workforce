@@ -111,12 +111,15 @@ pub fn in_turn(state: SessionState) -> bool {
 
 /// `text` past a leading stamp of `who` wrote it and when ("Desk, 00:21."),
 /// which says nothing on its own; all of it when the stamp is all it says,
-/// or its lead isn't the sender's name.
+/// or its lead isn't the sender's name. For a one-line row that has its own
+/// sender and time: the message itself keeps it, as sent.
 pub fn unstamped<'a>(text: &'a str, who: &str) -> &'a str {
+    if who.trim().is_empty() {
+        return text;
+    }
     let past = text
         .trim_start()
         .strip_prefix(who)
-        .filter(|_| !who.trim().is_empty())
         .and_then(|rest| rest.strip_prefix(", "))
         .and_then(|rest| {
             let (time, after) = rest.split_once('.')?;

@@ -116,7 +116,7 @@ impl CrewHub {
     /// whether the turn did something: a call of a tool not known only to
     /// look ([`super::tools::only_looks`]).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn run_turn_with(
+    pub(super) async fn run_turn_with(
         &self,
         service: &Arc<AgentService>,
         owner: &str,
