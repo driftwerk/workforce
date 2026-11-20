@@ -3,14 +3,14 @@
 //! This is the one place a delete by filter is sent. vellev refuses one
 //! that matches more than [`DELETE_CAP`] objects unless it says how many it
 //! may delete (from 0.2; earlier nodes delete them all in one commit). The
-//! 0.1 client cannot say, and a node older than 0.2 refuses a request that
-//! does: so a delete that matches more than the cap is done here by id, a
-//! page at a time, which every node takes.
+//! client can say, but a node older than 0.2 refuses a request that does:
+//! so a delete that matches more than the cap is done here by id, a page
+//! at a time, which every node takes.
 //!
-//! With vellev-client 0.2, against nodes all of 0.2 or later, [`one`] is
-//! to send `limit: Some(DELETE_CAP)` under a new request id each time,
-//! and be sent again, summing the counts, until a page deletes fewer than
-//! the limit; the listing by id below then goes.
+//! Once every node is 0.2 or later, [`one`] is to send
+//! `Change::delete_up_to(.., DELETE_CAP)` under a new request id each
+//! time, and be sent again, summing the counts, until a page deletes fewer
+//! than the limit; the listing by id below then goes.
 
 use vellev_client::api::{Change, Code, Outcome, Page};
 use vellev_client::{Error, Result, Tenant};
@@ -76,12 +76,7 @@ async fn by_id(
     loop {
         let listed = cap
             .ask(usize::MAX, |limit| {
-                let page = Page {
-                    filter: Some(filter.clone()),
-                    after: None,
-                    limit,
-                    vectors: false,
-                };
+                let page = Page::new(limit).filter(filter.clone());
                 async move { records.list(&page).await }
             })
             .await?;
@@ -99,10 +94,7 @@ async fn by_id(
         let by_id = listed
             .objects
             .into_iter()
-            .map(|object| Change::Delete {
-                collection: collection.clone(),
-                id: object.id,
-            })
+            .map(|object| Change::delete(collection.clone(), object.id))
             .collect();
         let written = writes.apply(by_id).await?;
         deleted += written
@@ -119,10 +111,7 @@ async fn by_id(
 
 /// One delete by filter, of everything that passes it.
 async fn one(writes: &Tenant, collection: &CollectionName, filter: &Filter) -> Result<u64> {
-    let delete = Change::DeleteWhere {
-        collection: collection.clone(),
-        filter: filter.clone(),
-    };
+    let delete = Change::delete_where(collection.clone(), filter.clone());
     let written = writes.apply(vec![delete]).await?;
     match written.outcomes.first() {
         Some(Outcome::Deleted { count }) => Ok(*count),
@@ -134,6 +123,7 @@ async fn one(writes: &Tenant, collection: &CollectionName, filter: &Filter) -> R
 
 #[cfg(all(test, feature = "testing"))]
 mod tests {
+    use vellev_client::api::Content;
     use vellev_core::{DataType, ObjectId, Property};
 
     use super::*;
@@ -173,14 +163,18 @@ mod tests {
         records.create(&notes).await.unwrap();
         let fill = || async {
             let changes = (0..7u128)
-                .map(|n| Change::Upsert {
-                    collection: notes.name.clone(),
-                    id: ObjectId(uuid::Uuid::from_u128(n + 1)),
-                    properties: serde_json::json!({ "owner": if n < 5 { "ada" } else { "mo" } })
-                        .as_object()
-                        .cloned()
-                        .unwrap(),
-                    vector: Some(vec![1.0, 0.0]),
+                .map(|n| {
+                    Change::upsert(
+                        notes.name.clone(),
+                        ObjectId(uuid::Uuid::from_u128(n + 1)),
+                        Content::new(
+                            serde_json::json!({ "owner": if n < 5 { "ada" } else { "mo" } })
+                                .as_object()
+                                .cloned()
+                                .unwrap(),
+                        )
+                        .vector(vec![1.0, 0.0]),
+                    )
                 })
                 .collect();
             tenants.writes.apply(changes).await.unwrap();
@@ -256,9 +250,7 @@ mod tests {
                     axum::Json(written).into_response()
                 }
             });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = crate::serve(app).await;
         let tenants = connect(&url, "key", "harbor").unwrap();
         let notes = CollectionName::new("Notes").unwrap();
         let deleted = delete_where(&tenants.reads, &tenants.writes, &notes, &owned_by("ada"))
@@ -308,9 +300,7 @@ mod tests {
                     axum::Json(written).into_response()
                 }
             });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = crate::serve(app).await;
         let tenants = connect(&url, "key", "harbor").unwrap();
         let notes = CollectionName::new("Notes").unwrap();
         let ada = owned_by("ada");
@@ -368,9 +358,7 @@ mod tests {
                     axum::Json(written).into_response()
                 }
             });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = crate::serve(app).await;
         let tenants = connect(&url, "key", "harbor").unwrap();
         let notes = CollectionName::new("Notes").unwrap();
         let ada = owned_by("ada");

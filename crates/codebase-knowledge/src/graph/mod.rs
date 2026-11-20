@@ -167,6 +167,11 @@ impl VectorKeys {
     pub fn standby(&self) -> Option<&str> {
         self.standby.as_deref()
     }
+
+    /// Whether the standby is the one store whose completeness is kept.
+    pub fn standby_tracks_completeness(&self) -> bool {
+        self.standby() == Some(Self::VELLEV)
+    }
 }
 
 /// Before a graph is told otherwise its vector state is vellev's: only a
@@ -278,11 +283,13 @@ impl CodeGraph {
         self.backend.find_entities_in_file(repo_id, file_path).await
     }
 
-    /// The standby's pending files stay noted: see
+    /// The standby's vector state is kept: see
     /// [`backend::CodeGraphBackend::delete_repo_data`].
     pub async fn delete_repo_data(&self, repo_id: &str) -> Result<usize> {
         let kept: Vec<&str> = self.vectors.standby().into_iter().collect();
-        self.backend.delete_repo_data(repo_id, &kept).await
+        self.backend
+            .delete_repo_data(repo_id, &kept, self.vectors.standby_tracks_completeness())
+            .await
     }
 
     pub async fn drop_repo(&self, repo_id: &str) -> Result<usize> {
@@ -345,7 +352,13 @@ impl CodeGraph {
         total_relationships: usize,
     ) -> Result<()> {
         self.backend
-            .update_index_state_full(repo_id, commit, total_entities, total_relationships)
+            .update_index_state_full(
+                self.vectors.active(),
+                repo_id,
+                commit,
+                total_entities,
+                total_relationships,
+            )
             .await
     }
 
@@ -441,21 +454,19 @@ impl CodeGraph {
     }
 
     /// See [`backend::CodeGraphBackend::note_vectors_pending`].
-    pub async fn note_vectors_pending(&self, repo_id: &str, files: &[String]) -> Result<()> {
+    pub async fn note_vectors_pending(&self, repo_id: &str, files: &[String]) -> Result<i64> {
         self.note_vectors_pending_in(&[self.vectors.active()], repo_id, files)
             .await
     }
 
-    /// Note `files` pending in each of `backends`.
+    /// Note `files` pending in each of `backends`, under the one mark
+    /// returned (see [`backend::CodeGraphBackend::note_vectors_pending`]).
     pub async fn note_vectors_pending_in(
         &self,
         backends: &[&str],
         repo_id: &str,
         files: &[String],
-    ) -> Result<()> {
-        if backends.is_empty() || files.is_empty() {
-            return Ok(());
-        }
+    ) -> Result<i64> {
         self.backend
             .note_vectors_pending(backends, repo_id, files)
             .await
@@ -483,15 +494,28 @@ impl CodeGraph {
         self.backend.count_vectors_pending(backend, repo_id).await
     }
 
-    /// See [`backend::CodeGraphBackend::clear_vectors_pending`].
+    /// Take a file off the pending list, if its note is still the one with
+    /// the mark `seq` (see [`backend::CodeGraphBackend::clear_vectors_pending`]).
     pub async fn clear_vectors_pending(
         &self,
         repo_id: &str,
         file_path: &str,
         seq: i64,
     ) -> Result<()> {
+        self.clear_vectors_pending_at(repo_id, &[file_path.to_string()], seq)
+            .await
+    }
+
+    /// Take `files` off the pending list, each whose note is still the one
+    /// with the mark `mark`: as a run takes off what it noted.
+    pub async fn clear_vectors_pending_at(
+        &self,
+        repo_id: &str,
+        files: &[String],
+        mark: i64,
+    ) -> Result<()> {
         self.backend
-            .clear_vectors_pending(self.vectors.active(), repo_id, file_path, seq)
+            .clear_vectors_pending(self.vectors.active(), repo_id, files, mark)
             .await
     }
 
@@ -954,7 +978,7 @@ pub(crate) mod tests {
 
         // Pending files: a note renewed is another note.
         let files = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
-        graph
+        let first = graph
             .note_vectors_pending(REPO, &files(&["src/two.rs", "src/one.rs"]))
             .await
             .unwrap();
@@ -965,24 +989,27 @@ pub(crate) mod tests {
         let pending = graph.vectors_pending(REPO, 10).await.unwrap();
         assert_eq!(
             pending,
-            [("src/one.rs".to_string(), 1), ("src/two.rs".to_string(), 1)]
+            [
+                ("src/one.rs".to_string(), first),
+                ("src/two.rs".to_string(), first)
+            ]
         );
         assert_eq!(graph.vectors_pending(REPO, 1).await.unwrap().len(), 1);
-        graph
+        let again = graph
             .note_vectors_pending(REPO, &files(&["src/one.rs"]))
             .await
             .unwrap();
         graph
-            .clear_vectors_pending(REPO, "src/one.rs", 1)
+            .clear_vectors_pending(REPO, "src/one.rs", first)
             .await
             .unwrap();
         graph
-            .clear_vectors_pending(REPO, "src/two.rs", 1)
+            .clear_vectors_pending(REPO, "src/two.rs", first)
             .await
             .unwrap();
         assert_eq!(
             graph.vectors_pending(REPO, 10).await.unwrap(),
-            [("src/one.rs".to_string(), 2)],
+            [("src/one.rs".to_string(), again)],
             "noted again since, it stays"
         );
         assert_eq!(graph.count_vectors_pending(REPO).await.unwrap(), 1);
@@ -1003,8 +1030,9 @@ pub(crate) mod tests {
 
     /// Each vector database's fill and pending files are its own: noting,
     /// moving, taking off and forgetting what is one's leaves the other's
-    /// as it was; and a full index's purge keeps the pending files of the
-    /// databases it is told to.
+    /// as it was; a full index's purge keeps the vector state of the
+    /// databases it is told to; and a full index forgets only its own
+    /// database's fill.
     pub(crate) async fn vector_state_is_kept_per_backend(graph: &CodeGraph) {
         use super::vectors::{FillStage, VectorFill};
         const REPO: &str = "keyed-repo";
@@ -1061,28 +1089,30 @@ pub(crate) mod tests {
 
         // Noted in both at once; taken off in one.
         let files = ["src/a.rs".to_string(), "src/b.rs".to_string()];
-        store
+        let both = store
             .note_vectors_pending(&[vellev, weaviate], REPO, &files)
             .await
             .unwrap();
-        store
+        let again = store
             .note_vectors_pending(&[weaviate], REPO, &files[..1])
             .await
             .unwrap();
         assert_eq!(
             store.vectors_pending(vellev, REPO, 10).await.unwrap(),
-            [("src/a.rs".to_string(), 1), ("src/b.rs".to_string(), 1)]
+            [
+                ("src/a.rs".to_string(), both),
+                ("src/b.rs".to_string(), both)
+            ]
         );
         assert_eq!(
             store.vectors_pending(weaviate, REPO, 10).await.unwrap(),
-            [("src/a.rs".to_string(), 2), ("src/b.rs".to_string(), 1)]
+            [
+                ("src/a.rs".to_string(), again),
+                ("src/b.rs".to_string(), both)
+            ]
         );
         store
-            .clear_vectors_pending(vellev, REPO, "src/a.rs", 1)
-            .await
-            .unwrap();
-        store
-            .clear_vectors_pending(vellev, REPO, "src/b.rs", 1)
+            .clear_vectors_pending(vellev, REPO, &files, both)
             .await
             .unwrap();
         assert_eq!(store.count_vectors_pending(vellev, REPO).await.unwrap(), 0);
@@ -1091,7 +1121,7 @@ pub(crate) mod tests {
             2
         );
         store
-            .clear_vectors_pending(weaviate, REPO, "src/b.rs", 1)
+            .clear_vectors_pending(weaviate, REPO, &files[1..], both)
             .await
             .unwrap();
         assert_eq!(
@@ -1100,7 +1130,7 @@ pub(crate) mod tests {
         );
 
         // The graph in use keyed: its own calls are the active one's, and
-        // its purge keeps the standby's pending files, and no fill.
+        // its purge keeps the standby's vector state, and not its own.
         let keyed = CodeGraph::from_backend(Arc::clone(store))
             .keyed(VectorKeys::new(vellev, Some(weaviate)).unwrap());
         keyed.note_vectors_pending(REPO, &files[1..]).await.unwrap();
@@ -1119,7 +1149,7 @@ pub(crate) mod tests {
         assert_eq!(store.count_vectors_pending(vellev, REPO).await.unwrap(), 0);
         assert_eq!(
             store.vectors_pending(weaviate, REPO, 10).await.unwrap(),
-            [("src/a.rs".to_string(), 2)],
+            [("src/a.rs".to_string(), again)],
             "the standby's notes are kept"
         );
         // Without a standby, a purge forgets them all.
@@ -1130,6 +1160,77 @@ pub(crate) mod tests {
             store.count_vectors_pending(weaviate, REPO).await.unwrap(),
             0
         );
+
+        let begun_in_both = || async {
+            for backend in [vellev, weaviate] {
+                store.clear_vector_fill(backend, REPO).await.unwrap();
+                assert!(store
+                    .advance_vector_fill(backend, REPO, None, &fill(backend))
+                    .await
+                    .unwrap());
+            }
+            store
+                .note_vectors_pending(&[vellev, weaviate], REPO, &files)
+                .await
+                .unwrap();
+        };
+        let state = |backend: &'static str| async move {
+            (
+                store.vector_fill(backend, REPO).await.unwrap(),
+                store.count_vectors_pending(backend, REPO).await.unwrap(),
+            )
+        };
+        begun_in_both().await;
+        store
+            .update_index_state_full(weaviate, REPO, "c1", 0, 0)
+            .await
+            .unwrap();
+        assert_eq!(state(weaviate).await, (None, 2));
+        assert_eq!(state(vellev).await, (Some(fill(vellev)), 2));
+        begun_in_both().await;
+        store
+            .delete_repo_data(REPO, &[vellev], false)
+            .await
+            .unwrap();
+        assert_eq!(state(vellev).await, (Some(fill(vellev)), 2));
+        assert_eq!(state(weaviate).await, (None, 0));
+        begun_in_both().await;
+        store.delete_repo_data(REPO, &[], false).await.unwrap();
+        for backend in [vellev, weaviate] {
+            assert_eq!(state(backend).await, (None, 0));
+        }
+
+        // What vellev's vectors were complete in outlasts the purge of a
+        // graph that keeps vellev as the standby, in a state no full index
+        // has written, until one does.
+        let complete_in = || async { store.vectors_complete_in(REPO).await.unwrap() };
+        let indexed = || async { store.get_index_state(REPO).await.unwrap().is_some() };
+        let seeding = CodeGraph::from_backend(Arc::clone(store))
+            .keyed(VectorKeys::new(weaviate, Some(vellev)).unwrap());
+        for (graph, kept) in [(&keyed, false), (&seeding, true)] {
+            seeding
+                .update_index_state_full(REPO, "c2", 0, 0)
+                .await
+                .unwrap();
+            store
+                .set_vectors_complete_in(REPO, Some("making-1"))
+                .await
+                .unwrap();
+            graph.delete_repo_data(REPO).await.unwrap();
+            assert!(!indexed().await);
+            assert_eq!(
+                complete_in().await.as_deref(),
+                kept.then_some("making-1"),
+                "{}",
+                graph.vector_keys().active()
+            );
+        }
+        seeding
+            .update_index_state_full(REPO, "c3", 0, 0)
+            .await
+            .unwrap();
+        assert!(indexed().await);
+        assert_eq!(complete_in().await, None);
 
         // A repo dropped leaves no fill nor pending file in any database,
         // a standby's included: there is nothing left to put right.
@@ -1161,6 +1262,210 @@ pub(crate) mod tests {
                 "another repo's are its own"
             );
         }
+    }
+
+    /// Each call that notes files takes one mark, above every one taken
+    /// before it, and every row it notes carries it, each file once however
+    /// often it is given; a clear takes off only a note still at the mark
+    /// it is given; and a call that notes nothing takes no mark.
+    pub(crate) async fn notes_carry_their_marks(graph: &CodeGraph) {
+        const REPO: &str = "marked-repo";
+        let (vellev, weaviate) = (VectorKeys::VELLEV, VectorKeys::WEAVIATE);
+        let store = graph.backend();
+        graph
+            .register_repo(REPO, "Marked", "/tmp/marked")
+            .await
+            .unwrap();
+        let files = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        let pending = |backend: &'static str| async move {
+            store.vectors_pending(backend, REPO, 10).await.unwrap()
+        };
+        let row = |file: &str, mark: i64| (file.to_string(), mark);
+
+        // Marks rise across calls.
+        let a = graph
+            .note_vectors_pending(REPO, &files(&["src/a.rs"]))
+            .await
+            .unwrap();
+        let b = graph
+            .note_vectors_pending(REPO, &files(&["src/b.rs"]))
+            .await
+            .unwrap();
+        let c = graph
+            .note_vectors_pending(REPO, &files(&["src/a.rs"]))
+            .await
+            .unwrap();
+        assert!(a < b && b < c, "{a} {b} {c}");
+        assert_eq!(
+            pending(vellev).await,
+            [row("src/a.rs", c), row("src/b.rs", b)]
+        );
+
+        // A clear takes off only what is still at its mark.
+        graph
+            .clear_vectors_pending(REPO, "src/a.rs", a)
+            .await
+            .unwrap();
+        assert_eq!(
+            pending(vellev).await,
+            [row("src/a.rs", c), row("src/b.rs", b)],
+            "a stale mark leaves the note"
+        );
+        graph
+            .clear_vectors_pending_at(REPO, &files(&["src/a.rs", "src/b.rs"]), c)
+            .await
+            .unwrap();
+        assert_eq!(pending(vellev).await, [row("src/b.rs", b)]);
+
+        // One call, one mark, for every backend and file, each file once.
+        let d = graph
+            .note_vectors_pending_in(
+                &[vellev, weaviate],
+                REPO,
+                &files(&["src/d.rs", "src/c.rs", "src/d.rs"]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(d, c + 1);
+        assert_eq!(
+            pending(weaviate).await,
+            [row("src/c.rs", d), row("src/d.rs", d)]
+        );
+        assert_eq!(
+            pending(vellev).await,
+            [row("src/b.rs", b), row("src/c.rs", d), row("src/d.rs", d)]
+        );
+
+        // Nothing noted, no mark taken.
+        assert_eq!(
+            store
+                .note_vectors_pending(&[vellev], REPO, &[])
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .note_vectors_pending(&[], REPO, &files(&["src/e.rs"]))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(pending(weaviate).await.len(), 2);
+        let e = graph
+            .note_vectors_pending(REPO, &files(&["src/e.rs"]))
+            .await
+            .unwrap();
+        assert_eq!(e, d + 1, "the calls that noted nothing took no mark");
+    }
+
+    #[tokio::test]
+    async fn sqlite_notes_carry_their_marks() {
+        notes_carry_their_marks(&CodeGraph::open_in_memory().unwrap()).await;
+    }
+
+    /// A lease records the mark of notes as it is taken, whether on a repo
+    /// with none or stolen from a stale holder, and every note made after
+    /// is above it; a fresh holder's lease is left as it was, and the one
+    /// trying is told who holds it. `age` makes the repo's lease stale.
+    pub(crate) async fn leases_record_the_mark_they_are_taken_at<F, Fut>(graph: &CodeGraph, age: F)
+    where
+        F: FnOnce(&'static str) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        use crate::lease::{AcquireOutcome, IndexPhase};
+        const REPO: &str = "leased-repo";
+        graph
+            .register_repo(REPO, "Leased", "/tmp/leased")
+            .await
+            .unwrap();
+        let note = |file: &str| {
+            let files = [file.to_string()];
+            async move { graph.note_vectors_pending(REPO, &files).await.unwrap() }
+        };
+        let acquire = |worker: &'static str| async move {
+            graph
+                .acquire_lease(REPO, worker, Some("c1"), IndexPhase::Crawling)
+                .await
+                .unwrap()
+        };
+        let lease = || async { graph.get_lease(REPO).await.unwrap().expect("a lease row") };
+
+        let before = note("src/a.rs").await;
+        assert!(matches!(acquire("w1").await, AcquireOutcome::Acquired));
+        let taken = lease().await;
+        assert_eq!((taken.worker_id.as_str(), taken.noted_from), ("w1", before));
+        assert!(
+            graph.list_active_leases().await.unwrap().contains(&taken),
+            "listed as read"
+        );
+        let after = note("src/b.rs").await;
+        assert!(after > taken.noted_from);
+
+        match acquire("w2").await {
+            AcquireOutcome::Held(held) => assert_eq!(held, taken),
+            AcquireOutcome::Acquired => panic!("a fresh lease is held"),
+        }
+        assert_eq!(lease().await, taken, "the holder's row as it was");
+
+        age(REPO).await;
+        assert!(matches!(acquire("w3").await, AcquireOutcome::Acquired));
+        let stolen = lease().await;
+        assert_eq!(
+            (stolen.worker_id.as_str(), stolen.noted_from),
+            ("w3", after),
+            "taken anew"
+        );
+        assert!(stolen.last_heartbeat_at_ms >= taken.last_heartbeat_at_ms);
+        assert!(note("src/c.rs").await > stolen.noted_from);
+    }
+
+    /// In a consistent copy of the graph taken while a run holds a repo's
+    /// lease, the notes it made are those above its lease's mark, and the
+    /// one made before it took the lease is not. `copy` takes the copy and
+    /// reads from it the repo's lease's mark and its files pending in
+    /// vellev.
+    pub(crate) async fn a_copy_tells_a_runs_notes_by_its_lease<F, Fut>(graph: &CodeGraph, copy: F)
+    where
+        F: FnOnce(&'static str) -> Fut,
+        Fut: std::future::Future<Output = (i64, Vec<vectors::PendingFile>)>,
+    {
+        use crate::lease::{AcquireOutcome, IndexPhase};
+        const REPO: &str = "copied-repo";
+        graph
+            .register_repo(REPO, "Copied", "/tmp/copied")
+            .await
+            .unwrap();
+        let before = graph
+            .note_vectors_pending(REPO, &["src/before.rs".to_string()])
+            .await
+            .unwrap();
+        assert!(matches!(
+            graph
+                .acquire_lease(REPO, "run", None, IndexPhase::Crawling)
+                .await
+                .unwrap(),
+            AcquireOutcome::Acquired
+        ));
+        let during = graph
+            .note_vectors_pending(REPO, &["src/during.rs".to_string()])
+            .await
+            .unwrap();
+        let (noted_from, pending) = copy(REPO).await;
+        assert_eq!(
+            pending,
+            [
+                ("src/before.rs".to_string(), before),
+                ("src/during.rs".to_string(), during)
+            ]
+        );
+        assert!(before <= noted_from && noted_from < during);
+        let after_t0: Vec<&str> = pending
+            .iter()
+            .filter(|(_, mark)| *mark > noted_from)
+            .map(|(file, _)| file.as_str())
+            .collect();
+        assert_eq!(after_t0, ["src/during.rs"]);
     }
 
     #[tokio::test]

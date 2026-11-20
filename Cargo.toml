@@ -163,9 +163,9 @@ argon2 = "0.5"
 rand = "0.8"
 
 # vellev
-vellev-client = "0.1"
-vellev-core = "0.1"
-vellev-index = "0.1"
+vellev-client = { git = "https://github.com/driftwerk/vellev", rev = "ada7a63ef132d18049d3c7342f6076a249a69979" }
+vellev-core = { git = "https://github.com/driftwerk/vellev", rev = "ada7a63ef132d18049d3c7342f6076a249a69979" }
+vellev-index = { git = "https://github.com/driftwerk/vellev", rev = "ada7a63ef132d18049d3c7342f6076a249a69979" }
 workforce-vellev = { path = "crates/vellev" }
 
 # SQLite

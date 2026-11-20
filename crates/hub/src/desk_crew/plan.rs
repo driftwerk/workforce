@@ -2251,7 +2251,12 @@ impl CrewHub {
     }
 
     /// Spends one of the hour's work turns of `service`, the boss.
+    /// At Act fully in force none is counted: only budget, audit and Stop
+    /// hold it back.
     pub(super) fn spend_boss_turn(&self, service: &AgentService, o: &Oversight) -> bool {
+        if self.unbound_given(service.agent_id.as_str(), o) {
+            return true;
+        }
         let hour = self.timing.minute * 60;
         let mut runs = self.work.lock();
         let run = runs

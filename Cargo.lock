@@ -8505,6 +8505,7 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
  "digest 0.10.7",
+ "sha2-asm",
 ]
 
 [[package]]
@@ -8516,6 +8517,15 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
  "digest 0.11.2",
+]
+
+[[package]]
+name = "sha2-asm"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b845214d6175804686b2bd482bcffe96651bb2d1200742b712003504a2dac1ab"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -10275,9 +10285,8 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "vellev-api"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b8908d40d223a376877f3a705001065f0b4576cc37097bf4b8b79b61f76a656"
+version = "0.2.0"
+source = "git+https://github.com/driftwerk/vellev?rev=ada7a63ef132d18049d3c7342f6076a249a69979#ada7a63ef132d18049d3c7342f6076a249a69979"
 dependencies = [
  "chrono",
  "serde",
@@ -10289,9 +10298,8 @@ dependencies = [
 
 [[package]]
 name = "vellev-client"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e47c8df284d0a4d09fc8103105a2ebc3948cc0953484c8e0248b43b8d1af53e6"
+version = "0.2.0"
+source = "git+https://github.com/driftwerk/vellev?rev=ada7a63ef132d18049d3c7342f6076a249a69979#ada7a63ef132d18049d3c7342f6076a249a69979"
 dependencies = [
  "reqwest 0.12.28",
  "serde",
@@ -10306,25 +10314,25 @@ dependencies = [
 
 [[package]]
 name = "vellev-core"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "836cc62a7ea1547824f9e65c180bbdbba12ebfea53d1bbfea35a6af28197ba5f"
+version = "0.2.0"
+source = "git+https://github.com/driftwerk/vellev?rev=ada7a63ef132d18049d3c7342f6076a249a69979#ada7a63ef132d18049d3c7342f6076a249a69979"
 dependencies = [
  "chrono",
  "serde",
  "serde_bytes",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "uuid",
 ]
 
 [[package]]
 name = "vellev-index"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "111044b91452298f3081bb053b773897883b414c821fb3d8874e45056eb7d664"
+version = "0.2.0"
+source = "git+https://github.com/driftwerk/vellev?rev=ada7a63ef132d18049d3c7342f6076a249a69979#ada7a63ef132d18049d3c7342f6076a249a69979"
 dependencies = [
  "chrono",
+ "libc",
  "rayon",
  "roaring",
  "serde",
