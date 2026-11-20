@@ -527,6 +527,7 @@ fn delivered(kind: DeliveryKind) -> &'static str {
         DeliveryKind::Resumed => "answered after a restart",
         DeliveryKind::Update => "sent an update",
         DeliveryKind::Away => "caught you up",
+        DeliveryKind::Monitor => "told you what a monitor saw",
         DeliveryKind::Notice | DeliveryKind::Other => "sent a note",
     }
 }

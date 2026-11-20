@@ -51,6 +51,7 @@ mod logins;
 pub(crate) mod machine_grants;
 mod machines;
 mod mind;
+pub(crate) mod monitors;
 mod observe;
 mod orchestrator;
 mod own_settings;
@@ -178,6 +179,10 @@ pub struct CrewHub {
     relayed: Mutex<relayed_decide::Outbox>,
     /// When the overseer's turns in its DM started, by session.
     manager_turns: Mutex<HashMap<String, DateTime<Utc>>>,
+    /// The DM sessions of other agents whose reply is being written, with
+    /// how many turns run there: what they would post on their own (what
+    /// monitors saw) waits for them.
+    dm_turns: Mutex<HashMap<String, usize>>,
     /// Pending approvals a wake-up listed, by the overseer's DM session.
     listed: Mutex<HashMap<String, Vec<workforce_desk::crew::MentionedApproval>>>,
     /// When the overseer messaged other agents since the person last spoke.
@@ -348,6 +353,16 @@ pub(crate) fn for_service(service: &AgentService) -> Option<Arc<CrewHub>> {
             .registry
             .get(service.agent_id.as_str())
             .is_some_and(|s| std::ptr::eq(Arc::as_ptr(&s), service))
+    })
+}
+
+/// The crew of the hub `service`'s agent is on, and the agent as that hub
+/// serves it now: found by its id and workspace, so a service swapped since
+/// (a reload) or held from before is still found.
+pub(crate) fn for_agent(service: &AgentService) -> Option<(Arc<CrewHub>, Arc<AgentService>)> {
+    CREWS.lock().iter().filter_map(Weak::upgrade).find_map(|c| {
+        let now = c.state.registry.get(service.agent_id.as_str())?;
+        (now.workspace == service.workspace).then_some((c, now))
     })
 }
 
@@ -707,6 +722,7 @@ impl CrewHub {
             keeping: decisions::Kept::default(),
             relayed: Mutex::default(),
             manager_turns: Mutex::default(),
+            dm_turns: Mutex::default(),
             listed: Mutex::default(),
             sent: Mutex::default(),
             read: Mutex::default(),

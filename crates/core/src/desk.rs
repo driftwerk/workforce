@@ -656,6 +656,9 @@ pub enum DeliveryKind {
     /// A boss's catch-up when the person is back after an absence: what
     /// finished, what's open, what it decided, and what waits on them.
     Away,
+    /// What one of the person's monitors saw, told in their DM with the
+    /// agent that owns it.
+    Monitor,
     /// One a newer hub or Desk names, read by one that doesn't know it.
     #[serde(other)]
     Other,

@@ -22,6 +22,38 @@ use super::condition::{as_number, CompiledCondition};
 /// `binding.surface` value meaning "every connected surface".
 pub const SURFACE_ANY: &str = "any";
 
+/// The action surface that tells the monitor's owner in Desk, on a hub that
+/// runs Desk: in their DM with the agent (`"dm"`, the default target) or as
+/// a Desk notice there (`"notice"`).
+pub const SURFACE_DESK: &str = "desk";
+
+/// Where in Desk a monitor tells its owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeskDelivery {
+    /// A message in their DM with the agent, for them.
+    Dm,
+    /// A Desk notice in that DM: worth knowing, not for them to act on.
+    Notice,
+}
+
+impl DeskDelivery {
+    /// The target a Desk delivery names: `"dm"` or `"notice"`; none is the DM.
+    pub fn parse(target: Option<&str>) -> Option<Self> {
+        match target.map(str::trim) {
+            None | Some("") | Some("dm") => Some(Self::Dm),
+            Some("notice") => Some(Self::Notice),
+            Some(_) => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dm => "dm",
+            Self::Notice => "notice",
+        }
+    }
+}
+
 /// The default poll cadence of a source, in seconds.
 pub const DEFAULT_EVERY_SECS: u64 = 300;
 
@@ -450,11 +482,13 @@ pub enum Action {
         in_thread: bool,
     },
     /// Run a one-shot agent turn for the matching message and deliver its reply
-    /// to `deliver_to` (a `#channel` id or `@user` DM).
+    /// to `deliver_to` (a `#channel` id or `@user` DM; with `surface = "desk"`,
+    /// `"dm"`, the default, or `"notice"`).
     AgentTask {
         #[serde(default)]
         agent: Option<String>,
         prompt: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         deliver_to: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         surface: Option<String>,
@@ -480,6 +514,9 @@ impl Action {
     /// it names for it, if any. A reply in the matched message's thread
     /// delivers nowhere of its own: it posts in the watched channel.
     pub fn delivery(&self) -> Option<(&str, Option<&str>)> {
+        if let Some(desk) = self.desk() {
+            return Some((desk.as_str(), Some(SURFACE_DESK)));
+        }
         match self {
             Action::Notify {
                 target, surface, ..
@@ -490,6 +527,25 @@ impl Action {
                 ..
             } => Some((deliver_to, surface.as_deref())),
             Action::RunWorkflow { .. } | Action::RunSkill { .. } | Action::Persona { .. } => None,
+        }
+    }
+
+    /// Where in Desk a `notify` or `agent_task` with `surface = "desk"` tells
+    /// the owner; `None` for any other action or surface, or a target Desk
+    /// has no place for (which validation refuses).
+    pub fn desk(&self) -> Option<DeskDelivery> {
+        match self {
+            Action::Notify {
+                target,
+                surface: Some(surface),
+                ..
+            } if surface == SURFACE_DESK => DeskDelivery::parse(target.as_deref()),
+            Action::AgentTask {
+                deliver_to,
+                surface: Some(surface),
+                ..
+            } if surface == SURFACE_DESK => DeskDelivery::parse(Some(deliver_to)),
+            _ => None,
         }
     }
 
@@ -786,6 +842,14 @@ impl MonitorDefinition {
                 if template.trim().is_empty() {
                     return Err(needs("a template"));
                 }
+                if surface.as_deref() == Some(SURFACE_DESK) {
+                    if *in_thread {
+                        return Err(eyre::eyre!(
+                            "Monitor '{id}' notify to Desk tells the owner in their DM; drop in_thread"
+                        ));
+                    }
+                    return Self::validate_desk_target(id, target.as_deref());
+                }
                 match (target.as_deref(), in_thread) {
                     (Some(_), true) => Err(eyre::eyre!(
                         "Monitor '{id}' notify takes a target or in_thread, not both"
@@ -807,8 +871,13 @@ impl MonitorDefinition {
                 if prompt.trim().is_empty() {
                     return Err(needs("a prompt"));
                 }
+                if surface.as_deref() == Some(SURFACE_DESK) {
+                    return Self::validate_desk_target(id, Some(deliver_to));
+                }
                 if deliver_to.trim().is_empty() {
-                    return Err(needs("a deliver_to (#channel or @user)"));
+                    return Err(needs(
+                        "a deliver_to (#channel or @user, or surface = \"desk\")",
+                    ));
                 }
                 Self::validate_surface(id, surface.as_deref())
             }
@@ -838,10 +907,23 @@ impl MonitorDefinition {
 
     fn validate_surface(id: &str, surface: Option<&str>) -> Result<()> {
         match surface {
-            Some(s) if !matches!(s, "slack" | "teams") => Err(eyre::eyre!(
-                "Monitor '{id}' action surface '{s}' must be slack or teams"
+            Some(s) if !matches!(s, "slack" | "teams" | SURFACE_DESK) => Err(eyre::eyre!(
+                "Monitor '{id}' action surface '{s}' must be slack, teams or desk"
             )),
             _ => Ok(()),
+        }
+    }
+
+    /// A Desk delivery's target: none or `"dm"` (the owner's DM with the
+    /// agent), or `"notice"`.
+    fn validate_desk_target(id: &str, target: Option<&str>) -> Result<()> {
+        match DeskDelivery::parse(target) {
+            Some(_) => Ok(()),
+            None => Err(eyre::eyre!(
+                "Monitor '{id}' delivers to Desk, where its target is \"dm\" (the default: your DM \
+                 with the agent) or \"notice\", not '{}'",
+                target.unwrap_or_default()
+            )),
         }
     }
 
@@ -1385,6 +1467,69 @@ input = { id = "{{id}}" }
     fn with_action(action_toml: &str) -> String {
         let base = VALID.split("[monitor.action]").next().unwrap();
         format!("{base}{action_toml}")
+    }
+
+    #[test]
+    fn a_monitor_tells_its_owner_in_desk_in_the_dm_or_as_a_notice() {
+        // A notify to Desk names no target: the owner's DM with the agent.
+        let dm = SOURCE.replace(
+            "type = \"run_skill\"\ntool = \"books.file_invoice\"\ninput = { id = \"{{id}}\" }",
+            "type = \"notify\"\nsurface = \"desk\"\ntemplate = \"New invoice: {{json:/subject}}\"",
+        );
+        let def = MonitorDefinition::from_toml(&dm).unwrap();
+        assert_eq!(def.monitor.action.desk(), Some(DeskDelivery::Dm));
+        assert_eq!(def.monitor.action.delivery(), Some(("dm", Some("desk"))));
+        let written = toml::to_string(&def).unwrap();
+        assert!(!written.contains("target"), "nothing injected: {written}");
+        let notice = dm.replace(
+            "surface = \"desk\"",
+            "surface = \"desk\"\ntarget = \"notice\"",
+        );
+        assert_eq!(
+            MonitorDefinition::from_toml(&notice)
+                .unwrap()
+                .monitor
+                .action
+                .desk(),
+            Some(DeskDelivery::Notice)
+        );
+
+        // An agent's turn to Desk: deliver_to may be left out.
+        let task = SOURCE.replace(
+            "type = \"run_skill\"\ntool = \"books.file_invoice\"\ninput = { id = \"{{id}}\" }",
+            "type = \"agent_task\"\nprompt = \"Say who it is from and what is owed.\"\nsurface = \"desk\"",
+        );
+        let def = MonitorDefinition::from_toml(&task).unwrap();
+        assert_eq!(def.monitor.action.desk(), Some(DeskDelivery::Dm));
+        assert!(!toml::to_string(&def).unwrap().contains("deliver_to"));
+        let def =
+            MonitorDefinition::from_toml(&format!("{task}\ndeliver_to = \"notice\"\n")).unwrap();
+        assert_eq!(def.monitor.action.desk(), Some(DeskDelivery::Notice));
+
+        // Desk has no channels or users to name, and no threads to reply in.
+        let refusal = |toml: &str| MonitorDefinition::from_toml(toml).unwrap_err().to_string();
+        let named = refusal(&dm.replace(
+            "surface = \"desk\"",
+            "surface = \"desk\"\ntarget = \"C0OUT\"",
+        ));
+        assert!(
+            named.contains("\"dm\"") && named.contains("C0OUT"),
+            "{named}"
+        );
+        assert!(refusal(&format!("{task}\ndeliver_to = \"@U1\"\n")).contains("@U1"));
+        assert!(refusal(&with_action(
+            "[monitor.action]\ntype = \"notify\"\nsurface = \"desk\"\nin_thread = true\ntemplate = \"x\"\n"
+        ))
+        .contains("drop in_thread"));
+        // Off Desk, an agent's turn still needs somewhere to go.
+        assert!(
+            refusal(&task.replace("surface = \"desk\"", "surface = \"slack\""))
+                .contains("deliver_to")
+        );
+        assert!(
+            refusal(&dm.replace("surface = \"desk\"", "surface = \"email\"\ntarget = \"C1\""))
+                .contains("slack, teams or desk")
+        );
     }
 
     #[test]

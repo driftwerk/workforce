@@ -289,6 +289,9 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
         NotPersonal("who asked for a session, in words: `you` or a boss's name, with the time"),
     ),
     ("desk", "attachments", "owner", By(C::Sessions)),
+    // What a person's monitor saw, waiting to be told: its monitor's state,
+    // as its dispatches and cursors are.
+    ("desk", "monitor_held", "owner", By(C::Definitions)),
     ("desk", "connections", "person", By(C::Vault)),
     ("desk", "sync_hubs", "person", By(C::Vault)),
     (

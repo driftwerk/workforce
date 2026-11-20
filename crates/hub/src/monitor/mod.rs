@@ -4,6 +4,7 @@
 
 pub mod binding_access;
 pub mod decide;
+pub(crate) mod desk;
 pub mod engine;
 pub mod invoke;
 pub mod runtime;

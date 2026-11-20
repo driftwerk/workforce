@@ -1978,6 +1978,7 @@ mod updates;
 mod urgent;
 
 mod away;
+mod monitors;
 
 mod boss_waits;
 mod orchestrator;

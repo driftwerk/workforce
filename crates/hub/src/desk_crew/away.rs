@@ -60,9 +60,11 @@ impl CrewHub {
         self.of_minutes(away::CAP)
     }
 
-    /// The person typed in `boss`'s DM; false when it is no boss here.
+    /// The person typed in `boss`'s DM (any agent's: what it posts on its
+    /// own, a boss's updates or what monitors saw, waits); false when there
+    /// is no agent by that name here.
     pub(super) fn typing_in(&self, boss: &str) -> bool {
-        if self.overseer_named(boss).is_none() {
+        if self.state.registry.get(boss).is_none() {
             return false;
         }
         let quiet = self.quiet();
@@ -361,6 +363,14 @@ impl CrewHub {
     pub(super) fn update_held(&self, boss: &str, session: Option<&str>) -> bool {
         self.typing_release(boss).is_some()
             || session.is_some_and(|sid| self.manager_turns.lock().contains_key(sid))
+    }
+
+    /// Whether what `agent` would post on its own in the DM (`session`)
+    /// waits now, any agent's: as [`Self::update_held`], with the replies
+    /// of agents that oversee nothing.
+    pub(super) fn dm_held(&self, agent: &str, session: Option<&str>) -> bool {
+        self.update_held(agent, session)
+            || session.is_some_and(|sid| self.dm_turns.lock().contains_key(sid))
     }
 
     /// How far `owner` has read `service`'s DM: their read point, or when

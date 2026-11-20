@@ -78,6 +78,7 @@ pub mod memory_index_store;
 pub mod memory_store;
 pub mod mode;
 pub mod model;
+pub mod monitor_held_store;
 mod move_api;
 pub mod move_store;
 pub mod moves;

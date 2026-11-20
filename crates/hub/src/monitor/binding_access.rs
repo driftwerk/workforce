@@ -209,6 +209,11 @@ impl BindingAccess {
         let Some((platform, target)) = delivered(def) else {
             return Ok(());
         };
+        // Desk tells only the monitor's owner, in their own DM with the
+        // agent: no one else's conversation to reach.
+        if def.monitor.action.desk().is_some() {
+            return Ok(());
+        }
         // An empty target, the already-gated watched channel, and a target the
         // stored monitor already had all ask nothing new.
         if target.is_empty()
@@ -770,6 +775,24 @@ mod tests {
             "[monitor.action]\ntype = \"agent_task\"\nprompt = \"p\"\ndeliver_to = \"@{ALICE_SLACK}\"\nsurface = \"slack\"\n"
         ));
         assert!(access.authorize(&web(ALICE), &own_dm, None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn telling_the_owner_in_desk_reaches_no_one_elses_conversation() {
+        // A surface that can confirm nothing: Desk asks it nothing.
+        let access = gate(slack_in(&[]), "slack");
+        for action in [
+            "[monitor.action]\ntype = \"notify\"\nsurface = \"desk\"\ntemplate = \"x\"\n",
+            "[monitor.action]\ntype = \"agent_task\"\nprompt = \"p\"\nsurface = \"desk\"\ndeliver_to = \"notice\"\n",
+        ] {
+            assert!(
+                access
+                    .authorize(&web(ALICE), &source(action), None)
+                    .await
+                    .is_ok(),
+                "{action}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -36,6 +36,9 @@ pub(super) struct Track {
     /// The overseer's own turn in its DM: not activity, but what its
     /// answer mentions is kept.
     manager_session: Option<String>,
+    /// Another agent's reply in its DM, by session: kept in `dm_turns`
+    /// while it runs.
+    dm_session: Option<String>,
     /// The picture's key for this turn (`super::picture`): ended with it.
     deciding: Option<String>,
     /// The person's own turn in the boss's DM, counted while it runs: no
@@ -53,6 +56,20 @@ fn line(text: &str) -> Option<String> {
 }
 
 impl CrewHub {
+    /// One of the turns running in another agent's DM `sid` ended: what
+    /// waited on the reply may go once none runs.
+    fn dm_turn_ended(&self, sid: &str) {
+        let mut turns = self.dm_turns.lock();
+        if let Some(n) = turns.get_mut(sid) {
+            *n -= 1;
+            if *n == 0 {
+                turns.remove(sid);
+            }
+        }
+        drop(turns);
+        self.update_poke.notify_one();
+    }
+
     /// Starts recording a turn of `service`'s, unless it is one the crew
     /// leaves out.
     pub(super) fn track(
@@ -117,6 +134,7 @@ impl CrewHub {
                 task: None,
                 hop,
                 manager_session: Some(sid),
+                dm_session: None,
                 deciding,
                 _person: person,
                 place,
@@ -126,6 +144,19 @@ impl CrewHub {
         }
         if message.starts_with(CHECK_IN) {
             return None;
+        }
+        // Its reply in the DM is running: what it would post there on its
+        // own waits, so nothing lands in the middle of it.
+        let dm_session = session_id
+            .filter(|_| channel == DESK_CHANNEL)
+            .map(str::to_string);
+        if let Some(sid) = &dm_session {
+            *self.dm_turns.lock().entry(sid.clone()).or_default() += 1;
+            // The person's own message: no longer typing it. A boss's relayed
+            // turn there isn't theirs, and leaves their typing as it is.
+            if !self.relayed_turns.lock().contains(sid) {
+                self.dm_sent(&agent_id);
+            }
         }
         let task = line(message);
         let key = uuid::Uuid::new_v4().to_string();
@@ -161,6 +192,7 @@ impl CrewHub {
             task,
             hop,
             manager_session: None,
+            dm_session,
             deciding,
             _person: None,
             place,
@@ -209,6 +241,9 @@ impl Track {
             return;
         }
         crew.running.lock().remove(&self.key);
+        if let Some(sid) = self.dm_session.take() {
+            crew.dm_turn_ended(&sid);
+        }
         let (ended, answer, question) =
             crew::outcome_of(outcome.as_deref().map_err(String::as_str));
         let text = match (ended, &answer, &question) {
@@ -246,6 +281,9 @@ impl Drop for Track {
             return;
         }
         self.crew.running.lock().remove(&self.key);
+        if let Some(sid) = self.dm_session.take() {
+            self.crew.dm_turn_ended(&sid);
+        }
         self.crew.desk.note(
             Event::new(
                 Kind::Stopped,
