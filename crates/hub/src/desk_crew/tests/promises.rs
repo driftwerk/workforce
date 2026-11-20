@@ -6,7 +6,7 @@
 
 use super::super::actions::{Action, Target, STATUS_QUESTION};
 use super::*;
-use workforce_desk::open_item::{ClosedBy, OpenKind, OpenState};
+use workforce_desk::open_item::{ClosedBy, NewItem, OpenKind, OpenState};
 
 fn tool(crew: &Arc<CrewHub>, name: &str) -> super::super::tools::CrewTool {
     super::super::tools::CrewTool::for_level(crew, "desk", &Default::default(), false)
@@ -259,6 +259,80 @@ async fn a_status_question_is_a_promise_kept_by_the_sessions_reply() {
             report.contains("“Which API key did you use?”, and it says: The staging key"),
             "{report}"
         );
+    })
+    .await;
+}
+
+/// Asking a session where it is again keeps the one promise, which now
+/// reports on the newest question: a reply to that one keeps it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_status_question_moves_its_promise_onto_the_newest_question() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        let s = new_session(&d, dir.path(), "acme-web").await;
+        let ask = |q: &'static str| {
+            let crew = crew.clone();
+            async move {
+                crew.perform(
+                    &Action::Nudge {
+                        to: Target::Session(s.id),
+                        message: format!("{STATUS_QUESTION} {q}"),
+                        reply_to: None,
+                    },
+                    crew.by_overseer("The person asked.").unwrap(),
+                )
+                .await
+                .unwrap();
+            }
+        };
+        let promise = || async {
+            d.store()
+                .items_not_closed(Some("desk"))
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|i| i.kind == OpenKind::Promise)
+                .collect::<Vec<_>>()
+        };
+        ask("Which API key did you use?").await;
+        let first = promise().await.pop().expect("the promise");
+        ask("Is the migration done?").await;
+        let promises = promise().await;
+        assert_eq!(promises.len(), 1, "one promise per session");
+        let again = &promises[0];
+        assert_eq!(again.id, first.id);
+        assert!(
+            again.text.contains("Is the migration done?"),
+            "{}",
+            again.text
+        );
+        let newest = again.line_message.expect("the question it reports on");
+        assert_ne!(Some(newest), first.line_message, "the newest question");
+        let mut reply = workforce_desk::line::LineMessage::new(
+            workforce_desk::crew::Party::session(&d.view(s.id).unwrap()),
+            workforce_desk::crew::Party {
+                kind: PartyKind::Manager,
+                id: "desk".into(),
+                name: "Scout".into(),
+                engine: None,
+                origin: None,
+            },
+            workforce_desk::line::LineKind::Answer,
+            "Yes, all 20 tables moved.".into(),
+            0,
+        );
+        reply.in_reply_to = Some(newest);
+        crew.replied(&reply).await;
+        let closed = eventually("kept by the reply to the newest question", async || {
+            d.store()
+                .open_item(first.id)
+                .await
+                .unwrap()
+                .filter(|i| i.state == OpenState::Closed)
+        })
+        .await;
+        assert_eq!(closed.closed_by, Some(ClosedBy::Boss));
     })
     .await;
 }
@@ -578,6 +652,369 @@ async fn without_the_composer_what_was_done_is_said_at_once() {
             said(&overseer, "✓ Export left untouched all night")
         })
         .await;
+    })
+    .await;
+}
+
+/// What the boss owes the person is chased, never left to wait on the
+/// session (20 Nov: the partner-docs differences, owed from about 03:00,
+/// brought only at 06:51 when the person asked): past its due time the boss
+/// is woken once to get it itself from the session's transcript and files,
+/// and once as long again, the person is told it is still owed. Each once.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unanswered_promise_is_chased_by_the_boss_then_told_to_the_person() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        let s = new_session(&d, dir.path(), "Legacy removal").await;
+        crew.perform(
+            &Action::Nudge {
+                to: Target::Session(s.id),
+                message: format!("{STATUS_QUESTION} Which partner docs differ?"),
+                reply_to: None,
+            },
+            crew.by_overseer("The person asked.").unwrap(),
+        )
+        .await
+        .unwrap();
+        let promise = d
+            .store()
+            .items_not_closed(Some("desk"))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|i| i.kind == OpenKind::Promise)
+            .expect("the promise");
+        assert!(promise.due_at.is_some(), "a promise to report back is due");
+        // While the question waits to go into its running session, it is
+        // chased as a message that didn't reach it, never as owed as well.
+        let asked = promise.line_message.expect("the question it reports on");
+        let _ = d
+            .store()
+            .line_set_waiting(asked, workforce_desk::line::Delivery::Queued)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let chased = d.store().latest_check_in("desk").await.unwrap();
+        assert!(
+            chased.is_none_or(|c| !c.prompt.contains("it is due and not kept")),
+            "chased while its question waits"
+        );
+        assert_eq!(said(&overseer, "Still owed to you: "), None);
+        let moved = d.store().open_item(promise.id).await.unwrap().unwrap();
+        assert!(
+            moved.due_at > promise.due_at && moved.chased_at.is_none(),
+            "its due time moves on while its question waits: {:?} after {:?}",
+            moved.due_at,
+            promise.due_at
+        );
+        // Held while its session is stopped, nothing else chases it: it is
+        // chased as owed.
+        d.store()
+            .line_set_waiting(asked, workforce_desk::line::Delivery::Held)
+            .await
+            .unwrap()
+            .expect("it waited to go in");
+        let woke = eventually("the boss told to get it itself", async || {
+            d.store()
+                .latest_check_in("desk")
+                .await
+                .unwrap()
+                .filter(|c| c.prompt.contains("it is due and not kept"))
+        })
+        .await;
+        assert!(
+            woke.prompt.contains("Which partner docs differ?")
+                && woke.prompt.contains("crew.history")
+                && woke.prompt.contains(&promise.id.to_string()),
+            "{}",
+            woke.prompt
+        );
+        let told = eventually("the person told it is still owed", async || {
+            said(&overseer, "Still owed to you: ")
+        })
+        .await;
+        assert!(told.contains("Which partner docs differ?"), "{told}");
+        let after = d.store().open_item(promise.id).await.unwrap().unwrap();
+        assert_eq!(after.state, OpenState::Open, "still owed until kept");
+        assert_eq!(after.due_at, None, "and chased no more");
+        // Each once.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let line = overseer
+            .sessions
+            .find(DESK_CHANNEL, PERSON)
+            .unwrap()
+            .unwrap();
+        let notices = line
+            .messages
+            .iter()
+            .filter(|m| m.content.starts_with("Still owed to you: "))
+            .count();
+        assert_eq!(notices, 1);
+        let latest = d.store().latest_check_in("desk").await.unwrap().unwrap();
+        assert!(
+            latest.id == woke.id || !latest.prompt.contains("it is due and not kept"),
+            "woken again: {}",
+            latest.prompt
+        );
+    })
+    .await;
+}
+
+/// A promise the boss keeps with a due time is chased like a report back;
+/// one with no due time (a milestone, "merged") never is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_promise_with_a_due_time_is_chased_and_one_without_never_is() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        let s = new_session(&d, dir.path(), "Legacy removal").await;
+        let kept = call(
+            &crew,
+            "crew.promise",
+            json!({"session_id": s.id.to_string(), "text": "Bring you the partner-docs differences",
+                   "done_when": "brought", "due_minutes": 1}),
+        )
+        .await;
+        assert!(
+            kept.output.to_string().contains("due by"),
+            "{}",
+            kept.output
+        );
+        call(
+            &crew,
+            "crew.promise",
+            json!({"session_id": s.id.to_string(), "text": "Tell you when it merges",
+                   "done_when": "merged"}),
+        )
+        .await;
+        let items = d.store().items_not_closed(Some("desk")).await.unwrap();
+        let due = |text: &str| items.iter().find(|i| i.text == text).unwrap().clone();
+        let brought = due("Bring you the partner-docs differences");
+        assert!(brought.due_at.is_some());
+        assert_eq!(due("Tell you when it merges").due_at, None);
+        let woke = eventually("the boss told to get it itself", async || {
+            d.store()
+                .latest_check_in("desk")
+                .await
+                .unwrap()
+                .filter(|c| c.prompt.contains("it is due and not kept"))
+        })
+        .await;
+        assert!(
+            woke.prompt
+                .contains("“Bring you the partner-docs differences”")
+                && woke.prompt.contains(&brought.id.to_string()),
+            "{}",
+            woke.prompt
+        );
+        let closed = call(
+            &crew,
+            "crew.close_item",
+            json!({"item_id": brought.id.to_string(), "done": "brought the nine differences"}),
+        )
+        .await;
+        assert!(closed.success, "{:?}", closed.error);
+        assert!(
+            !woke.prompt.contains("Tell you when it merges"),
+            "{}",
+            woke.prompt
+        );
+    })
+    .await;
+}
+
+/// A boss that doesn't act (Watch) leaves what it owes to the person: told
+/// at its due time that it is still owed, once, and never woken for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn below_act_a_due_promise_is_told_to_the_person_once() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"watch\"\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, dir.path(), "Legacy removal").await;
+        let since = chrono::Utc::now();
+        let p = NewItem::promise(
+            "desk",
+            s.id,
+            "Bring you the partner-docs differences",
+            "brought",
+        )
+        .due(Some(since));
+        d.store().item_open(&p).await.unwrap();
+        let told = eventually("the person told", async || {
+            said(&overseer, "Still owed to you: ")
+        })
+        .await;
+        assert!(told.contains("partner-docs differences"), "{told}");
+        let item = d
+            .store()
+            .items_not_closed(Some("desk"))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|i| i.kind == OpenKind::Promise)
+            .unwrap();
+        assert_eq!((item.due_at, item.chased_at), (None, None));
+        assert_eq!(d.store().wake_ups_since("desk", since).await.unwrap(), 0);
+    })
+    .await;
+}
+
+/// A due promise whose session ended is said once, as still owed and no
+/// longer tracked: it never lapses before it is chased, nor again after.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_due_promise_whose_session_ended_is_said_once() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"watch\"\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, dir.path(), "Legacy removal").await;
+        let p = NewItem::promise(
+            "desk",
+            s.id,
+            "Bring you the partner-docs differences",
+            "brought",
+        )
+        .due(Some(chrono::Utc::now() + chrono::Duration::hours(1)));
+        d.store().item_open(&p).await.unwrap();
+        d.forget(s.id).await.unwrap();
+        crew.look_at_items().await;
+        assert!(
+            d.store()
+                .items_not_closed(Some("desk"))
+                .await
+                .unwrap()
+                .iter()
+                .any(|i| i.kind == OpenKind::Promise),
+            "not lapsed before it is due"
+        );
+        let due = d
+            .store()
+            .items_not_closed(Some("desk"))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|i| i.kind == OpenKind::Promise)
+            .unwrap();
+        d.store()
+            .item_chased(due.id, due.due_at.unwrap(), None, Some(chrono::Utc::now()))
+            .await
+            .unwrap();
+        let told = eventually("the person told", async || {
+            said(&overseer, "Still owed to you: ")
+        })
+        .await;
+        assert!(told.ends_with("so I'm no longer tracking it."), "{told}");
+        let closed = d.store().open_item(due.id).await.unwrap().unwrap();
+        assert_eq!(closed.closed_by, Some(ClosedBy::Lapsed));
+        crew.look_at_items().await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(said(&overseer, "I'm no longer tracking"), None, "said once");
+    })
+    .await;
+}
+
+/// At Act, a due promise whose session ended wakes no one: there is no
+/// session to read. It is said once, as still owed and no longer tracked.
+#[tokio::test(flavor = "multi_thread")]
+async fn at_act_a_due_promise_whose_session_ended_is_said_once_and_wakes_no_one() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        let s = new_session(&d, dir.path(), "Legacy removal").await;
+        let since = chrono::Utc::now();
+        d.forget(s.id).await.unwrap();
+        let p = NewItem::promise(
+            "desk",
+            s.id,
+            "Bring you the partner-docs differences",
+            "brought",
+        )
+        .due(Some(since));
+        let opened = match d.store().item_open(&p).await.unwrap() {
+            workforce_desk::open_item_store::Opened::New(i)
+            | workforce_desk::open_item_store::Opened::Again(i) => i,
+        };
+        let told = eventually("the person told", async || {
+            said(&overseer, "Still owed to you: ")
+        })
+        .await;
+        assert!(told.ends_with("so I'm no longer tracking it."), "{told}");
+        let closed = d.store().open_item(opened.id).await.unwrap().unwrap();
+        assert_eq!(closed.closed_by, Some(ClosedBy::Lapsed));
+        assert_eq!(d.store().wake_ups_since("desk", since).await.unwrap(), 0);
+    })
+    .await;
+}
+
+/// A chase moves only the due time it read: never one chased, asked afresh
+/// or closed since; asking afresh starts its chase over.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chase_moves_only_the_due_time_it_read() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, _crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"watch\"\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, dir.path(), "Legacy removal").await;
+        let store = d.store();
+        // As Postgres keeps it: to the microsecond.
+        let later =
+            chrono::SubsecRound::trunc_subsecs(chrono::Utc::now() + chrono::Duration::hours(1), 6);
+        let promise =
+            |at| NewItem::promise("desk", s.id, "Bring you the list", "brought").due(Some(at));
+        let opened = match store.item_open(&promise(later)).await.unwrap() {
+            workforce_desk::open_item_store::Opened::New(i)
+            | workforce_desk::open_item_store::Opened::Again(i) => i,
+        };
+        let was = opened.due_at.unwrap();
+        let next = later + chrono::Duration::minutes(10);
+        assert!(store
+            .item_chased(opened.id, was, Some(later), Some(next))
+            .await
+            .unwrap());
+        assert!(
+            !store
+                .item_chased(opened.id, was, Some(later), None)
+                .await
+                .unwrap(),
+            "a stale due time"
+        );
+        let chased = store.open_item(opened.id).await.unwrap().unwrap();
+        assert_eq!(chased.chased_at, Some(later));
+        let afresh = later + chrono::Duration::hours(1);
+        store.item_open(&promise(afresh)).await.unwrap();
+        let asked = store.open_item(opened.id).await.unwrap().unwrap();
+        assert_eq!((asked.due_at, asked.chased_at), (Some(afresh), None));
+        store
+            .item_close(opened.id, ClosedBy::Boss, "Settled.")
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .item_chased(opened.id, afresh, None, None)
+                .await
+                .unwrap(),
+            "closed"
+        );
     })
     .await;
 }
