@@ -187,20 +187,31 @@ async fn act_fully_aims_at_the_end_state_in_parallel_without_polish_first() {
             CrewHub::dm_hint(Level::Full, &o, false),
             CrewHub::level_hint(Level::Full, &o),
             CrewHub::bound_level_line(Level::Full),
-            // What it decides at Act fully by itself: a finished turn's next
-            // step, a session's question, a plan.
-            super::super::idle::SYSTEM.to_string(),
-            super::super::answer::SYSTEM.to_string(),
-            super::super::answer::PLAN_SYSTEM.to_string(),
+        ];
+        let end_state = [
+            "Aim straight at the end state an order names",
+            "Never hold the deliverable behind polish their instructions don't ask for",
         ];
         for hint in &said {
-            for rule in [
-                "aim straight at the end state an order names",
-                "Run steps that don't depend on each other at once",
-                "Never hold the deliverable behind polish their instructions don't ask for",
-            ] {
+            for rule in end_state
+                .iter()
+                .chain(&["Run steps that don't depend on each other at once"])
+            {
                 assert!(hint.contains(rule), "{rule}: {hint}");
             }
+        }
+        // What it decides at Act fully by itself (a finished turn's next
+        // step, a session's question, a plan) aims at the end state, with
+        // no tools to run steps of its own.
+        for decides in [
+            super::super::idle::SYSTEM,
+            super::super::answer::SYSTEM,
+            super::super::answer::PLAN_SYSTEM,
+        ] {
+            for rule in end_state {
+                assert!(decides.contains(rule), "{rule}: {decides}");
+            }
+            assert!(!decides.contains("Run steps"), "{decides}");
         }
         for act in [
             CrewHub::level_hint(Level::Act, &o),
