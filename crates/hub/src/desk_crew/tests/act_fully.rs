@@ -2,6 +2,8 @@
 //! not, Desk allows what merges, tags, promotes and deploys the moment a
 //! session asks; only its budget, Stop and the activity log hold it.
 
+use super::super::CrewHub;
+use super::unbound::UNBOUND;
 use super::*;
 use workforce_common::oversight::{Level, Oversight};
 
@@ -162,6 +164,62 @@ async fn act_fully_needs_no_repositories_and_falls_back_to_act_only_over_its_bud
             d.bosses().iter().all(|b| b.level == "full"),
             "Desk is told it acts fully"
         );
+    })
+    .await;
+}
+
+/// Act fully's every prompt carries the end-state rule; Act's doesn't.
+#[tokio::test(flavor = "multi_thread")]
+async fn act_fully_aims_at_the_end_state_in_parallel_without_polish_first() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", UNBOUND, &[]).await;
+        let s = new_session(&d, dir.path(), "Legacy removal").await;
+        let (_, o) = crew.overseer_service().unwrap();
+        assert!(crew.unbound(&o));
+        let ended = ["Turn ended.".to_string()];
+        let said = [
+            CrewHub::boss_hint(&o),
+            CrewHub::dm_hint(Level::Full, &o, true),
+            crew.line_prompt(s.id, &[], &ended, &o),
+            // Bound at Act fully (shipping in a named repository, or its
+            // DM while not unbound): the same rules.
+            CrewHub::dm_hint(Level::Full, &o, false),
+            CrewHub::level_hint(Level::Full, &o),
+            CrewHub::bound_level_line(Level::Full),
+        ];
+        let end_state = [
+            "Aim straight at the end state an order names",
+            "Never hold the deliverable behind polish their instructions don't ask for",
+        ];
+        for hint in &said {
+            for rule in end_state
+                .iter()
+                .chain(&["Run steps that don't depend on each other at once"])
+            {
+                assert!(hint.contains(rule), "{rule}: {hint}");
+            }
+        }
+        // What it decides at Act fully by itself (a finished turn's next
+        // step, a session's question, a plan) aims at the end state, with
+        // no tools to run steps of its own.
+        for decides in [
+            super::super::idle::SYSTEM,
+            super::super::answer::SYSTEM,
+            super::super::answer::PLAN_SYSTEM,
+        ] {
+            for rule in end_state {
+                assert!(decides.contains(rule), "{rule}: {decides}");
+            }
+            assert!(!decides.contains("Run steps"), "{decides}");
+        }
+        for act in [
+            CrewHub::level_hint(Level::Act, &o),
+            CrewHub::dm_hint(Level::Act, &o, false),
+            CrewHub::bound_level_line(Level::Act),
+        ] {
+            assert!(!act.contains("end state"), "{act}");
+        }
     })
     .await;
 }

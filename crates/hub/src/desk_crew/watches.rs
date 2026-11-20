@@ -277,7 +277,7 @@ impl CrewHub {
     }
 
     /// `m` minutes as the crew counts them (shorter in tests).
-    fn crew_minutes(&self, m: i64) -> chrono::Duration {
+    pub(super) fn crew_minutes(&self, m: i64) -> chrono::Duration {
         let one =
             chrono::Duration::from_std(self.timing.minute).unwrap_or(chrono::Duration::minutes(1));
         one * i32::try_from(m.clamp(1, MAX_HOURS * 60)).unwrap_or(1)

@@ -1055,6 +1055,38 @@ async fn held(d: &Desk, dir: &Path) -> Uuid {
     s.id
 }
 
+/// What Desk's breaker holds is held on purpose in the turn a message's
+/// own prompt starts too, though its thread says it waits on that turn.
+#[tokio::test]
+async fn a_breakers_hold_is_on_purpose_whatever_the_turn() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let id = held(&d, dir.path()).await;
+        d.plugin_heard_from(id);
+        let by = By::manager("sarah", "Sarah", "It should try the release build.");
+        let told = d
+            .line_send(Sender::Overseer(by), tell(id, "try --release"))
+            .await
+            .unwrap();
+        hook(
+            &d,
+            id,
+            json!({"hook_event_name": "UserPromptSubmit",
+            "prompt": format!("The desk plugin sent a message: {} x", line::marker(told.id))}),
+        )
+        .await;
+        let view = d.view(id).unwrap();
+        assert_eq!(view.state, SessionState::Working);
+        let thread = d.line_thread(id, None, None).await.unwrap();
+        let row = thread.into_iter().find(|m| m.id == told.id).unwrap();
+        assert_eq!(row.waiting, Some(Wait::Working));
+        assert_eq!(d.line_waits(&view, &[row]), None);
+        assert!(Wait::Paused.on_purpose() && !Wait::Working.on_purpose());
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn a_held_session_takes_only_the_persons_messages_and_a_delivery_never_lets_it_go_on() {
     with_test_pool(build_pool, |pool| async move {
