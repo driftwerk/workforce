@@ -671,13 +671,6 @@ impl Desk {
                     Target::Person => hop.min(crate::rooms::MAX_HOPS),
                     Target::Overseer | Target::Session(_) => hop,
                 };
-                let to_session = matches!(to, Target::Session(_));
-                if let Err(r) = line::guard(checked, &run, to_session) {
-                    // Only the budget its boss's answers renew is lifted
-                    // by them.
-                    self.line_stalled(me, &r, r == Refusal::Budget).await;
-                    return Err(r.into());
-                }
                 let overseer = self.line_overseer(me.group.as_ref().map(|g| g.id.as_str()));
                 let recipient = line::reach(
                     me,
@@ -687,6 +680,12 @@ impl Desk {
                     self.line_reach(),
                     &bossed,
                 )?;
+                if let Err(r) = line::guard(checked, &run, &recipient) {
+                    // Only the budget its boss's answers renew is lifted
+                    // by them.
+                    self.line_stalled(me, &r, r == Refusal::Budget).await;
+                    return Err(r.into());
+                }
                 (
                     Party::session(me),
                     hop,
@@ -699,7 +698,7 @@ impl Desk {
                     Sender::Overseer(by) => (by.party.clone(), by.hop.max(1)),
                     _ => (Party::you(), 0),
                 };
-                line::guard(hop, &LineRun::default(), false)?;
+                line::hops(hop)?;
                 let recipient = match to {
                     Target::Session(id) => {
                         let them = find(id).ok_or(DeskError::NotFound)?;
@@ -829,7 +828,7 @@ impl Desk {
                     .runs
                     .entry(*id)
                     .or_default()
-                    .sent_one(m.to_session().is_some());
+                    .sent_one(&m.to);
                 let what = match kind {
                     LineKind::Ask => crate::picture::What::SessionAsked,
                     _ => crate::picture::What::SessionReported,
@@ -1076,7 +1075,7 @@ impl Desk {
                     .runs
                     .entry(*id)
                     .or_default()
-                    .sent_one(question.from_session().is_some());
+                    .sent_one(&question.from);
             }
             // Its own boss's answer starts the asker's budget again; any
             // other overseer's counts against it: its budget holds the

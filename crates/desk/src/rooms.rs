@@ -23,13 +23,12 @@ use crate::store::DeskStore;
 pub const MAX_HOPS: i16 = workforce_core::desk::MAX_HOPS as i16;
 /// Agent messages allowed in a room (or thread) before you speak again.
 pub const TURN_BUDGET: i64 = 12;
-/// Messages a session in a boss's charge may send while its boss answers
-/// it, before the person speaks again. Each answer from its own boss starts
-/// [`TURN_BUDGET`] again (that is the designed conversation, not a loop);
-/// this caps the whole exchange, so two agents answering each other can't
-/// run on without the person. Five sessions' budgets: a long stretch of
-/// boss-led work (a session reports up to about five times between its
-/// boss's messages), and one reply from the person lifts it.
+/// Messages a session in a boss's charge may send to the person and other
+/// sessions while its boss answers it, before the person speaks again.
+/// Each answer from its own boss starts [`TURN_BUDGET`] again; this caps
+/// the whole run, and one reply from the person lifts it. What it tells
+/// its boss is never counted ([`crate::line::guard`]): that is the work,
+/// paced by the boss's own turns.
 pub const BOSS_RUN_CEILING: i64 = 60;
 /// What Desk calls the hub on its own Mac, in member keys and sources.
 pub const LOCAL_HUB: &str = "local";
