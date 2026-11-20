@@ -499,6 +499,7 @@ impl CrewHub {
                     ..
                 } | Action::Escalate { .. }
                     | Action::ChangeOversight { .. }
+                    | Action::MachineRun { .. }
             )
         {
             return;

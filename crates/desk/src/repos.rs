@@ -20,7 +20,7 @@
 //!   clone is made into a folder of its own beside its place and moved
 //!   there once whole, so a clone cut off never looks like a checkout.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -242,6 +242,7 @@ impl Cloner {
         folder: Option<&str>,
         root: &str,
         home: Option<&Path>,
+        login: &BTreeMap<String, String>,
     ) -> Got {
         let failed = |why: String| Got::Failed { why };
         let Some(home) = home.and_then(|h| h.canonicalize().ok()) else {
@@ -309,8 +310,9 @@ impl Cloner {
         drop(clones);
         let me = self.clone();
         let (repo, at) = (repo.clone(), dest.clone());
+        let env = kept_env(login);
         tokio::spawn(async move {
-            let ended = clone_into(&repo, &at, &home).await;
+            let ended = clone_into(&repo, &at, &home, &env).await;
             let mut clones = me.clones.lock().unwrap_or_else(|e| e.into_inner());
             match ended {
                 Ok(()) => clones.remove(&place),
@@ -325,8 +327,12 @@ impl Cloner {
 
 /// The program `name` on this computer: on its `PATH`, or where it is
 /// usually installed.
-fn program(name: &str, home: &Path) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH").unwrap_or_default();
+fn program(name: &str, home: &Path, env: &[(String, String)]) -> Option<PathBuf> {
+    let path = env
+        .iter()
+        .find(|(k, _)| k == "PATH")
+        .map(|(_, v)| std::ffi::OsString::from(v))
+        .unwrap_or_default();
     std::env::split_paths(&path)
         .chain(
             [
@@ -367,6 +373,23 @@ pub const KEPT_ENV: &[&str] = &[
     "GIT_SSL_CAINFO",
 ];
 
+/// [`KEPT_ENV`] as the person's login environment `login` says it (what
+/// their sessions get), Desk's own where it doesn't; never `HOME`, which
+/// is said where it's used.
+pub fn kept_env(login: &BTreeMap<String, String>) -> Vec<(String, String)> {
+    KEPT_ENV
+        .iter()
+        .filter(|k| **k != "HOME")
+        .filter_map(|k| {
+            login
+                .get(*k)
+                .cloned()
+                .or_else(|| std::env::var(k).ok())
+                .map(|v| ((*k).to_string(), v))
+        })
+        .collect()
+}
+
 /// Why a clone failed, in Desk's own words: what the git server says isn't
 /// said on, as it is the server's.
 fn clone_failure(said: &str) -> &'static str {
@@ -400,7 +423,12 @@ fn clone_failure(said: &str) -> &'static str {
 
 /// `repo` cloned to `dest`, whole or not at all: into a folder beside it,
 /// moved there once done.
-async fn clone_into(repo: &Repo, dest: &Path, home: &Path) -> Result<(), String> {
+async fn clone_into(
+    repo: &Repo,
+    dest: &Path,
+    home: &Path,
+    env: &[(String, String)],
+) -> Result<(), String> {
     let name = dest
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -424,7 +452,7 @@ async fn clone_into(repo: &Repo, dest: &Path, home: &Path) -> Result<(), String>
     // gh first for GitHub (the person's own sign-in), then plain git over
     // https (a public repository, or gh not signed in).
     let mut tries: Vec<(PathBuf, Vec<String>)> = Vec::new();
-    if let ("github.com", Some(gh)) = (repo.host.as_str(), program("gh", home)) {
+    if let ("github.com", Some(gh)) = (repo.host.as_str(), program("gh", home, env)) {
         tries.push((
             gh,
             vec![
@@ -435,7 +463,7 @@ async fn clone_into(repo: &Repo, dest: &Path, home: &Path) -> Result<(), String>
             ],
         ));
     }
-    if let Some(git) = program("git", home) {
+    if let Some(git) = program("git", home, env) {
         tries.push((
             git,
             vec!["clone".into(), "--".into(), repo.https(), at.clone()],
@@ -452,11 +480,7 @@ async fn clone_into(repo: &Repo, dest: &Path, home: &Path) -> Result<(), String>
             let mut cmd = tokio::process::Command::new(prog);
             cmd.args(args)
                 .env_clear()
-                .envs(
-                    KEPT_ENV
-                        .iter()
-                        .filter_map(|k| std::env::var_os(k).map(|v| (*k, v))),
-                )
+                .envs(env.iter().map(|(k, v)| (k, v)))
                 .env("HOME", home)
                 .env("GIT_TERMINAL_PROMPT", "0")
                 .env("GH_PROMPT_DISABLED", "1")
@@ -640,7 +664,8 @@ mod tests {
         assert!(is_checkout(&main, &repo, &home));
         assert!(!is_checkout(&home.join("other"), &repo, &home));
         // What it has is a checkout: none is cloned.
-        let got = Cloner::default().checkout(&repo, None, "~/projects", Some(&home));
+        let got =
+            Cloner::default().checkout(&repo, None, "~/projects", Some(&home), &BTreeMap::new());
         assert_eq!(
             got,
             Got::Ready {
@@ -649,7 +674,13 @@ mod tests {
         );
         // The folder asked for, when it is one.
         let wt_said = wt.to_string_lossy().into_owned();
-        let got = Cloner::default().checkout(&repo, Some(&wt_said), "~/projects", Some(&home));
+        let got = Cloner::default().checkout(
+            &repo,
+            Some(&wt_said),
+            "~/projects",
+            Some(&home),
+            &BTreeMap::new(),
+        );
         assert_eq!(got, Got::Ready { path: wt_said });
     }
 
@@ -686,8 +717,15 @@ mod tests {
         let other = home.join("work/other");
         checkout_at(&other, "git@github.com:driftwerk/other.git");
         let c = Cloner::default();
-        let at =
-            |f: &Path| c.checkout(&repo, Some(&f.to_string_lossy()), "~/projects", Some(&home));
+        let at = |f: &Path| {
+            c.checkout(
+                &repo,
+                Some(&f.to_string_lossy()),
+                "~/projects",
+                Some(&home),
+                &BTreeMap::new(),
+            )
+        };
         assert_eq!(
             at(&mine),
             Got::Ready {
@@ -703,7 +741,13 @@ mod tests {
         );
         std::fs::remove_dir_all(&mine).unwrap();
         assert_eq!(
-            c.checkout(&repo, None, &deep.to_string_lossy(), Some(&home)),
+            c.checkout(
+                &repo,
+                None,
+                &deep.to_string_lossy(),
+                Some(&home),
+                &BTreeMap::new()
+            ),
             Got::Ready {
                 path: deep.join("driftwerk/vellev").to_string_lossy().into_owned()
             }
@@ -720,11 +764,12 @@ mod tests {
             assert_eq!(root_in(outside, &home), None, "{outside}");
         }
         let repo = repo_of("driftwerk/vellev").unwrap();
-        let got = Cloner::default().checkout(&repo, None, "/etc", Some(&home));
+        let got = Cloner::default().checkout(&repo, None, "/etc", Some(&home), &BTreeMap::new());
         assert!(matches!(got, Got::Failed { .. }), "{got:?}");
         // Something there already that isn't it is never cloned over.
         std::fs::create_dir_all(home.join("projects/driftwerk/vellev")).unwrap();
-        let got = Cloner::default().checkout(&repo, None, "~/projects", Some(&home));
+        let got =
+            Cloner::default().checkout(&repo, None, "~/projects", Some(&home), &BTreeMap::new());
         assert!(
             matches!(&got, Got::Failed { why } if why.contains("isn't a checkout")),
             "{got:?}"

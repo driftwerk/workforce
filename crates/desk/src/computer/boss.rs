@@ -102,6 +102,11 @@ pub struct Here<'a> {
     /// Whether git tracks a file (a path, real): a release's asset is one,
     /// or lies in a build output folder.
     pub tracked: &'a dyn Fn(&Path) -> bool,
+    /// The folder it is in is the person's choice (a session's), so what
+    /// runs its own code there (its scripts, builds, tests, and the
+    /// configs and plugins its tools load) may run. A boss's check on a
+    /// machine, its folder the boss's word, has none of it.
+    pub vouched: bool,
 }
 
 /// A file a boss acting fully may attach to a release: one git tracks
@@ -1765,6 +1770,9 @@ fn one(walk: &mut Walk<'_, '_>, cmd: &Cmd, next: Option<Join>) -> Judged {
         };
         return read.iter().try_for_each(|w| walk.reads(w));
     }
+    if !walk.here.vouched && PROJECT_RUNNERS.contains(&name) {
+        return no("runs a project's own code in a folder the person didn't choose; that's the person's to allow");
+    }
     match name {
         "cd" | "pushd" => {
             let to = args.first();
@@ -2168,6 +2176,48 @@ fn sed(walk: &Walk<'_, '_>, args: &[Word]) -> Judged {
     Ok(())
 }
 
+/// `git sub rest` only reads the repository (and `fetch` only updates
+/// what it knows of its remotes): what a check in a folder the person
+/// didn't choose may run ([`Here::vouched`]). The judge reads its flags
+/// as for any git command after this.
+fn only_reads_git(sub: &str, rest: &[Word]) -> bool {
+    let words: Vec<&str> = rest.iter().map(|w| w.text.as_str()).collect();
+    let flags_only = |allowed: &[&str]| words.iter().all(|w| allowed.contains(w));
+    match sub {
+        "status" | "log" | "show" | "diff" | "shortlog" | "whatchanged" | "rev-parse"
+        | "ls-files" | "ls-remote" | "describe" | "blame" | "rev-list" | "cat-file"
+        | "merge-base" | "for-each-ref" | "show-ref" | "grep" | "fetch" => true,
+        "remote" => match words.as_slice() {
+            [] => true,
+            ["get-url", ..] | ["show", ..] => true,
+            w => w.iter().all(|w| *w == "-v" || *w == "--verbose"),
+        },
+        "branch" => flags_only(&[
+            "-a",
+            "-r",
+            "-v",
+            "-vv",
+            "--all",
+            "--remotes",
+            "--list",
+            "--show-current",
+            "--verbose",
+            "--no-color",
+        ]),
+        "tag" => flags_only(&["-l", "--list"]),
+        "stash" => matches!(words.first(), Some(&"list") | Some(&"show")),
+        "config" => matches!(
+            words.first(),
+            Some(&"--get")
+                | Some(&"--get-all")
+                | Some(&"--get-regexp")
+                | Some(&"--list")
+                | Some(&"-l")
+        ),
+        _ => false,
+    }
+}
+
 fn git(walk: &mut Walk<'_, '_>, args: &[Word]) -> Judged {
     let global = Spec {
         short: "P",
@@ -2254,6 +2304,14 @@ fn git(walk: &mut Walk<'_, '_>, args: &[Word]) -> Judged {
         "untracked-files",
         "abbrev",
     ];
+    // In a folder the person didn't choose, git only reads: a commit, a
+    // stash or a switch there changes their work, and runs the hooks it
+    // keeps (its own code).
+    if !walk.here.vouched && !only_reads_git(sub, rest) {
+        return no(format!(
+            "git {sub} changes a repository in a folder the person didn't choose; that's the person's to allow"
+        ));
+    }
     match sub {
         "status" => read(Spec {
             short: "sbuvz",
@@ -3407,11 +3465,24 @@ fn uv(walk: &mut Walk<'_, '_>, args: &[Word], next: Option<Join>) -> Judged {
 
 /// An interpreter given a script of the project's own, or a test runner;
 /// never code inline, which Desk doesn't read.
+/// The programs that run a project's own code as they work: its package
+/// scripts, build files, test suites, and the configs and plugins tools
+/// load from it ([`Here::vouched`]).
+const PROJECT_RUNNERS: &[&str] = &[
+    "cargo", "npm", "pnpm", "yarn", "bun", "make", "go", "uv", "pytest", "tsc", "eslint",
+    "prettier", "black", "mypy", "rustfmt", "gofmt", "ruff", "jest", "vitest",
+];
+
 fn script(walk: &Walk<'_, '_>, name: &str, args: &[Word]) -> Judged {
     let Some(first) = args.first() else {
         return no(CANT_READ);
     };
     match first.text.as_str() {
+        // A project's tests are its own code: the person's to run in a
+        // folder they didn't choose.
+        "-m" if name.starts_with("python") && !walk.here.vouched => no(
+            "runs a project's own code in a folder the person didn't choose; that's the person's to allow",
+        ),
         "-m" if name.starts_with("python") => match args.get(1).map(|a| a.text.as_str()) {
             Some("pytest") => pytest(walk, &args[2..]),
             Some("unittest") => walk.local(&args[2..].iter().collect::<Vec<_>>()),
@@ -3603,6 +3674,7 @@ pub(crate) mod tests {
             branches: &[],
             tip_tags: &[],
             tracked: &|_| false,
+            vouched: true,
         }
     }
 
@@ -4326,6 +4398,7 @@ pub(crate) mod tests {
             branches: &[],
             tip_tags: &[],
             tracked: &|_| false,
+            vouched: true,
         };
         let desk = format!(
             "cat '{}/library/application support/desk/x'",

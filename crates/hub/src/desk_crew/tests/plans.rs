@@ -1999,6 +1999,145 @@ async fn a_boss_finds_tickets_and_plans_on_them_as_they_are() {
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_boss_runs_a_check_on_a_machine_and_what_no_boss_does_is_the_persons() {
+    use super::super::relay::RelayAnswer;
+    use super::super::served::ServedStatus;
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("the run tool", async || overseer.tools.has("crew.machine_run").then_some(())).await;
+        let run = overseer.tools.get("crew.machine_run").unwrap();
+        let said = |r: workforce_agent::tools::ToolResult| format!("{r:?}");
+        // What it must say, and what it may not.
+        for (input, says) in [
+            (json!({ "machine": "devbox", "command": "ls" }), "Give the reason"),
+            (json!({ "machine": "devbox", "reason": "Look." }), "Say the command"),
+            (json!({ "machine": "../x", "command": "ls", "reason": "Look." }), "isn't one of the person's machines"),
+            (json!({ "machine": "devbox", "command": "ls", "timeout_secs": 60, "reason": "Look." }), "1 to 15 seconds"),
+            (json!({ "machine": "devbox", "command": "x".repeat(9000), "reason": "Look." }), "at most"),
+        ] {
+            let r = run.execute(input).await.unwrap();
+            assert!(!r.success && said(r.clone()).contains(says), "{says}: {r:?}");
+        }
+        // What no boss does is the person's: a suggestion, never sent.
+        let r = run
+            .execute(json!({ "machine": "devbox", "command": "rm -rf ~/old-checkouts", "reason": "Tidy up." }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert!(r.output["suggested"].as_str().unwrap().contains("Run on devbox"), "{r:?}");
+        let s = d.store().suggestions(10).await.unwrap();
+        let held = s.iter().find(|s| s.action["tool"] == "crew.machine_run").unwrap();
+        assert_eq!(
+            held.action["input"]["agent_id"],
+            json!(overseer.agent_id.as_str()),
+            "the boss whose check it is, kept with it"
+        );
+        // A plain check goes to the machine; with nothing carrying calls in a
+        // test, it is said, never waited on, and noted in Activity.
+        let r = run
+            .execute(json!({ "machine": "devbox", "command": "git remote -v", "cwd": "~/projects/vellev", "reason": "Which remote." }))
+            .await
+            .unwrap();
+        assert!(said(r).contains("can't be reached"));
+        eventually("the check in Activity", async || {
+            let page = d
+                .activity(workforce_desk::crew::Filter::All, None, 50)
+                .await
+                .unwrap();
+            serde_json::to_string(&page)
+                .unwrap()
+                .contains("couldn't send `git remote -v` to devbox")
+                .then_some(())
+        })
+        .await;
+
+        // Desk carrying calls: a machine that runs what's read, needs the
+        // person for a project's tests, and loses the answer to a delete.
+        *crew.relay_wait.lock() = Duration::from_secs(5);
+        let sent: Arc<parking_lot::Mutex<Vec<Value>>> = Arc::default();
+        let _poller = {
+            let (crew, sent) = (Arc::clone(&crew), Arc::clone(&sent));
+            tokio::spawn(async move {
+                loop {
+                    for c in crew.relay_take(Duration::from_millis(100)).await {
+                        // Any other tool is said in what was sent, for the
+                        // test to fail on.
+                        sent.lock().push(match c.tool.as_str() {
+                            "desk.run" => c.input.clone(),
+                            other => json!({ "tool": other }),
+                        });
+                        let command = c.input["command"].as_str().unwrap_or_default().to_string();
+                        let body = match (command.as_str(), c.input["by_person"].as_bool()) {
+                            (c, _) if c.starts_with("rm ") => continue,
+                            ("npm test", Some(false)) => {
+                                json!({"outcome": "needs_person", "why": "runs a project's own code"})
+                            }
+                            _ => json!({"outcome": "ran", "cwd": "/home/dev", "exit": 0, "timed_out": false, "stdout": "clean\n", "stderr": "", "truncated": false}),
+                        };
+                        crew.relay_answer(c.id, RelayAnswer { status: ServedStatus::Ok, body });
+                    }
+                }
+            })
+        };
+        eventually("Desk polling", async || crew.relay_polled.lock().is_some().then_some(())).await;
+        // Read: run, judged there at Act.
+        let r = run
+            .execute(json!({ "machine": "devbox", "command": "git status", "reason": "Is it clean?" }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert!(r.output["ran"].as_str().unwrap().contains("clean"), "{r:?}");
+        let first = sent.lock().last().cloned().unwrap();
+        assert_eq!(first["judged"], true);
+        assert_eq!(first["by_person"], false);
+        // What the judge there won't allow: the person's, as a suggestion.
+        let r = run
+            .execute(json!({ "machine": "devbox", "command": "npm test", "cwd": "~/projects/vellev", "reason": "Do they pass?" }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert!(r.output["suggested"].as_str().unwrap().contains("`npm test`"), "{r:?}");
+        let tests = d
+            .store()
+            .suggestions(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.action["input"]["command"] == "npm test")
+            .unwrap();
+        // The person says yes: run on their word, unjudged.
+        crew.accept(&tests).await.unwrap();
+        let theirs = sent.lock().last().cloned().unwrap();
+        assert_eq!(theirs["by_person"], true);
+        assert_eq!(theirs["judged"], false);
+        assert!(sent.lock().iter().all(|s| s.get("tool").is_none()), "{:?}", sent.lock());
+        // Its answer lost: the boss is told it may have run; the person's
+        // yes to the delete is done with, never left to be run again.
+        *crew.relay_wait.lock() = Duration::from_millis(400);
+        let r = run
+            .execute(json!({ "machine": "devbox", "command": "rm -f ~/x", "reason": "Tidy." }))
+            .await
+            .unwrap();
+        assert!(!r.success && said(r.clone()).contains("may have run"), "{r:?}");
+        crew.accept(held).await.unwrap();
+        eventually("the delete in Activity, maybe run", async || {
+            let page = d
+                .activity(workforce_desk::crew::Filter::All, None, 50)
+                .await
+                .unwrap();
+            serde_json::to_string(&page)
+                .unwrap()
+                .contains("may have run `rm -rf ~/old-checkouts` on devbox")
+                .then_some(())
+        })
+        .await;
+    })
+    .await;
+}
+
 /// crew.edit_ticket on a ticket of the boss's own open plan changes it
 /// through the plan, as crew.plan_update's tickets_edit does: where it runs
 /// moves, words added keep what its brief said.

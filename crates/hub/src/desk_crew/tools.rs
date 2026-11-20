@@ -56,7 +56,7 @@ pub const READ: [&str; 27] = [
     super::watches::WATCH,
     super::watches::WATCHES,
 ];
-pub const ACT: [&str; 31] = [
+pub const ACT: [&str; 32] = [
     "crew.nudge",
     "crew.ask_session",
     "crew.escalate",
@@ -88,6 +88,7 @@ pub const ACT: [&str; 31] = [
     super::own_settings::NAME,
     super::assignments::CLOSE,
     super::machines::MAKE_FOLDER,
+    super::machines::RUN,
 ];
 
 /// The person's logins (engine accounts), each with what runs on it.
@@ -1032,6 +1033,7 @@ pub(crate) fn describe(name: &str) -> &'static str {
             super::machines::MACHINES => super::machines::MACHINES_DESCRIPTION,
             super::machines::FOLDERS => super::machines::FOLDERS_DESCRIPTION,
             super::machines::MAKE_FOLDER => super::machines::MAKE_FOLDER_DESCRIPTION,
+            super::machines::RUN => super::machines::RUN_DESCRIPTION,
             super::watches::WATCH => super::watches::WATCH_DESCRIPTION,
             super::watches::WATCHES => super::watches::WATCHES_DESCRIPTION,
             "crew.activity" => "What happened on the crew, newest first: turns started and finished, questions, requests, failures, and what you and the person did. Filter to one agent or session with subject_id.",
@@ -1111,6 +1113,10 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
         super::machines::MACHINES | super::machines::FOLDERS | super::machines::MAKE_FOLDER => {
             super::machines::schema(name)
         }
+        super::machines::RUN => act(
+            props(super::machines::run_properties()),
+            &["machine", "command"],
+        ),
         super::assignments::LIST => json!({ "type": "object", "properties": {
             "all": { "type": "boolean", "description": "true for the last day's closed ones too" }
         }}),
@@ -1329,6 +1335,8 @@ impl Tool for CrewTool {
             crew.handover_tool(&bound, &input).await
         } else if self.name == super::machines::MAKE_FOLDER {
             crew.machine_tool(self.name, &bound, &input).await
+        } else if self.name == super::machines::RUN {
+            crew.machine_run_tool(&bound, &input).await
         } else if self.name == super::assignments::CLOSE {
             crew.assignment_tool(&bound, &input).await
         } else {
