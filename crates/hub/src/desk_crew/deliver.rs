@@ -270,6 +270,18 @@ impl CrewHub {
             move |rx| crate::gateway::forward_local_progress(rx, tx, sid, false, mentions, None)
         };
         let conducted = crate::live_turns::conduct(&mut live, service, progress, forward).await;
+        // A call that did something (a crew action, a command, a file
+        // written, a change made anywhere) is the boss acting, whichever
+        // tool made it: its line or work turn didn't let the session wait.
+        if let Ending::Finished(Ok(result)) = &conducted.ending {
+            if result
+                .tool_invocations
+                .iter()
+                .any(|t| t.success && !super::tools::only_looks(&t.tool_name, &t.input))
+            {
+                self.acted_on(agent_id, None);
+            }
+        }
         let answer = match &conducted.ending {
             Ending::Finished(Ok(result)) => Ok(result.response.clone()),
             Ending::Finished(Err(e)) => Err(eyre::eyre!("{e:#}")),

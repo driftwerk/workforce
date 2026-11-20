@@ -219,9 +219,10 @@ pub struct CrewHub {
     /// changes), by the session they were about: a line or work turn that
     /// moved none let it wait.
     acted: Mutex<HashMap<(String, Option<uuid::Uuid>), u64>>,
-    /// The ends of line and work turns, by boss and channel, until their
-    /// caller knows whether the turn did anything ([`Self::turn_end_said`]).
-    quiet_ends: Mutex<HashMap<(String, String), Event>>,
+    /// The ends of line and work turns, by boss and channel, with when each
+    /// turn began, until their caller knows whether the turn did anything
+    /// ([`Self::turn_end_said`]).
+    quiet_ends: Mutex<HashMap<(String, String), (DateTime<Utc>, Event)>>,
     /// When each boss last asked the person with `crew.ask_person`: its
     /// turn's reply then isn't also kept as a question of its own.
     asked_person: Mutex<HashMap<String, DateTime<Utc>>>,

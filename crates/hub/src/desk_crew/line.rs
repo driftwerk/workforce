@@ -537,6 +537,7 @@ impl CrewHub {
         let prompt = self.line_prompt(session, &messages, &ended, &o);
         let boss = service.agent_id.as_str().to_string();
         let mark = self.acted_mark(&boss, session);
+        let since = chrono::Utc::now();
         let ran = self
             .run_turn(
                 &service,
@@ -647,7 +648,7 @@ impl CrewHub {
             self.record_nothing(&boss, session, !ended.is_empty(), reply)
                 .await;
         }
-        self.turn_end_said(&boss, &line_channel(session), acted || ran.is_err());
+        self.turn_end_said(&boss, &line_channel(session), since, acted || ran.is_err());
         ran.is_ok()
     }
 

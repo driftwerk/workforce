@@ -56,27 +56,46 @@ pub const READ: [&str; 27] = [
     super::watches::WATCH,
     super::watches::WATCHES,
 ];
-/// The tools that only look: a turn that called nothing else did nothing.
-const LOOKS: [&str; 18] = [
-    "crew.overview",
-    LOGINS,
-    "crew.activity",
-    "crew.account",
-    super::decisions::NAME,
-    "crew.history",
-    super::spend::NAME,
-    super::board::NAME,
-    super::find::NAME,
-    super::tickets::READ,
-    super::items::OPEN,
-    super::github::PR,
-    super::github::BRANCH,
-    super::github::CI,
-    super::assignments::LIST,
-    super::machines::MACHINES,
-    super::machines::FOLDERS,
-    super::watches::WATCHES,
+/// The tools of [`READ`] that change something (what the boss owes, what
+/// it was told, how it is run): every other one only looks.
+const KEEPS: [&str; 9] = [
+    super::items::ASK,
+    super::items::CLOSE,
+    super::items::PROMISE,
+    super::items::ORDER,
+    super::preferences::PREFER,
+    super::preferences::PREFERENCES,
+    super::directives::NAME,
+    super::cadence_tool::NAME,
+    super::watches::WATCH,
 ];
+/// The boss's tools besides the crew's known to only look.
+const OTHER_LOOKS: [&str; 12] = [
+    "filesystem.read",
+    "filesystem.list",
+    "filesystem.glob",
+    "filesystem.grep",
+    "web.search",
+    "web.fetch",
+    "code.read",
+    "code.search",
+    "repo.read",
+    "repo.list",
+    "github.get_pull",
+    "github.ci_status",
+];
+
+/// Whether a call of `tool` with `input` only looked: a turn whose calls
+/// all did is one that did nothing. A tool not known to only look (a
+/// command run, a file written, a request that changes something, any
+/// other skill's) did something. Names match dotted or underscored, as
+/// the model calls them.
+pub(super) fn only_looks(tool: &str, input: &Value) -> bool {
+    let named = |known: &&str| known.replace('.', "_") == tool.replace('.', "_");
+    (READ.iter().any(named) && !KEEPS.iter().any(named))
+        || OTHER_LOOKS.iter().any(named)
+        || (named(&"http.request") && !workforce_agent::tools::http::is_mutating_request(input))
+}
 pub const ACT: [&str; 32] = [
     "crew.nudge",
     "crew.ask_session",
@@ -1373,9 +1392,6 @@ impl Tool for CrewTool {
                 Err(why) => Err(why),
             }
         };
-        if result.is_ok() && !LOOKS.contains(&self.name) {
-            crew.acted_on(bound.service.agent_id.as_str(), None);
-        }
         Ok(match result {
             Ok(v) => ToolResult::success(v, ms()),
             Err(e) => ToolResult::failure(e, ms()),
@@ -1387,6 +1403,36 @@ impl Tool for CrewTool {
 mod tests {
     use super::*;
     use workforce_desk::model::{Engine, Origin};
+
+    #[test]
+    fn the_crew_reads_that_only_look_and_those_that_keep_something_are_every_read() {
+        let mut both: Vec<&str> = READ
+            .iter()
+            .copied()
+            .filter(|t| only_looks(t, &json!({})))
+            .chain(KEEPS)
+            .collect();
+        both.sort_unstable();
+        let mut read = READ.to_vec();
+        read.sort_unstable();
+        assert_eq!(
+            both, read,
+            "every read is either one that looks or one that keeps"
+        );
+        assert!(KEEPS
+            .iter()
+            .all(|t| READ.contains(t) && !only_looks(t, &json!({}))));
+        // Named as the model calls them, dotted or not.
+        assert!(only_looks("crew_overview", &json!({})));
+        assert!(!only_looks("crew_promise", &json!({})));
+        // Any other tool did something, unless it is known only to look.
+        assert!(only_looks("filesystem_read", &json!({"path": "a"})));
+        assert!(!only_looks("filesystem.write", &json!({"path": "a"})));
+        assert!(!only_looks("exec.run", &json!({"command": "ls"})));
+        assert!(only_looks("http.request", &json!({"method": "GET"})));
+        assert!(!only_looks("http.request", &json!({"method": "POST"})));
+        assert!(!only_looks("ssh.run", &json!({})));
+    }
 
     fn item(name: &str, hub_name: Option<&str>, group: Option<&str>) -> Item {
         Item {

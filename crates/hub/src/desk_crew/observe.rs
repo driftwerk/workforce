@@ -48,9 +48,10 @@ pub(super) struct Track {
     /// answers, stamped on each of its events.
     place: Option<Place>,
     message: Option<uuid::Uuid>,
-    /// A boss's line or work turn: its end is held, by boss and channel,
-    /// for its caller to say once it knows whether the turn did anything.
-    held: Option<(String, String)>,
+    /// A boss's line or work turn: its end is held, by boss and channel
+    /// with when the turn began, for its caller to say once it knows
+    /// whether the turn did anything.
+    held: Option<(String, String, DateTime<Utc>)>,
     done: bool,
 }
 
@@ -149,7 +150,9 @@ impl CrewHub {
         if message.starts_with(CHECK_IN) {
             return None;
         }
-        let held = (overseer && woken(message)).then(|| (agent_id.clone(), channel.to_string()));
+        let began = Utc::now();
+        let held =
+            (overseer && woken(message)).then(|| (agent_id.clone(), channel.to_string(), began));
         // Its reply in the DM is running: what it would post there on its
         // own waits, so nothing lands in the middle of it.
         let dm_session = session_id
@@ -271,8 +274,10 @@ impl Track {
         .at_place(self.place.clone(), self.message)
         .hop(self.hop);
         match self.held.take().filter(|_| ended == Outcome::Finished) {
-            Some(key) => {
-                crew.quiet_ends.lock().insert(key, event);
+            Some((boss, channel, began)) => {
+                crew.quiet_ends
+                    .lock()
+                    .insert((boss, channel), (began, event));
             }
             None => crew.desk.note(event),
         }
@@ -280,14 +285,23 @@ impl Track {
 }
 
 impl CrewHub {
-    /// Says the end of `boss`'s line or work turn on `channel` once its
-    /// caller has settled what the turn did: only when it did something.
-    pub(super) fn turn_end_said(&self, boss: &str, channel: &str, acted: bool) {
+    /// Says the end of `boss`'s line or work turn on `channel`, which its
+    /// caller began at `since`, once the caller has settled what the turn
+    /// did: only when it did something. An end held from an earlier turn
+    /// (one that finished after its caller had already settled it) is
+    /// dropped here, never said for this one.
+    pub(super) fn turn_end_said(
+        &self,
+        boss: &str,
+        channel: &str,
+        since: DateTime<Utc>,
+        acted: bool,
+    ) {
         let end = self
             .quiet_ends
             .lock()
             .remove(&(boss.to_string(), channel.to_string()));
-        if let Some(event) = end.filter(|_| acted) {
+        if let Some((_, event)) = end.filter(|(began, _)| acted && *began >= since) {
             self.desk.note(event);
         }
     }
