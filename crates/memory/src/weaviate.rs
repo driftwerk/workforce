@@ -7,6 +7,7 @@ use reqwest::Client;
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
+use workforce_common::text::graphql_escape;
 use workforce_common::vectorizable::VectorizableText;
 
 use crate::admin::{
@@ -1531,27 +1532,6 @@ fn is_about(item: &serde_json::Value, owner: &AgentId, identity: &str) -> bool {
     item["owner"].as_str() == Some(owner.as_str()) && item["identityId"].as_str() == Some(identity)
 }
 
-/// Escape a dynamic string for embedding inside a double-quoted GraphQL
-/// string literal. GraphQL forbids raw control characters in strings, and
-/// they do occur in our data — the edge's external identity ids join issuer
-/// and subject with a `\u{1F}` unit separator, which unescaped makes Weaviate
-/// reject the whole query ("Invalid character within String"). Backslash
-/// first, then quote, then `\uXXXX` for controls.
-fn graphql_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04X}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-    out
-}
-
 // Weaviate `get` excludes soft-deleted rows; SQLite/InMemory `get` do not.
 // Matches the `deleted=false` predicate the previous `recall("")` path
 // implicitly applied via `build_where_filter`.
@@ -2638,9 +2618,7 @@ mod tests {
                     }
                 }),
             );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = workforce_vellev::testing::serve(app).await;
         let store = WeaviateStore::new(&url, None).in_collection("Memories");
         let tagged = store
             .add_tag(&AgentId::new("sarah"), "desk-group:acme", "desk-group:")
@@ -2680,9 +2658,7 @@ mod tests {
                 },
             ),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = workforce_vellev::testing::serve(app).await;
         let store = |class: &str| WeaviateStore::new(&url, None).in_collection(class);
         assert!(store("Here").collection_exists().await.unwrap());
         assert!(!store("Gone").collection_exists().await.unwrap());
@@ -2728,9 +2704,7 @@ mod tests {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = workforce_vellev::testing::serve(app).await;
         let object = |n: u128, content: &str| {
             serde_json::json!({
                 "id": uuid::Uuid::from_u128(n).to_string(),
@@ -2803,9 +2777,7 @@ mod tests {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = workforce_vellev::testing::serve(app).await;
         let objects: Vec<serde_json::Value> = (1..=3u128)
             .map(|n| {
                 serde_json::json!({
@@ -3286,18 +3258,6 @@ mod tests {
     }
 
     #[test]
-    fn graphql_escape_handles_backslash_quote_and_controls() {
-        let bs = '\u{5c}'; // literal backslash
-        assert_eq!(graphql_escape("plain"), "plain");
-        assert_eq!(graphql_escape("say \"hi\""), format!("say {bs}\"hi{bs}\""));
-        // Backslash escaped first, so a pre-escaped-looking input stays literal.
-        assert_eq!(graphql_escape(&format!("a{bs}b")), format!("a{bs}{bs}b"));
-        // Control characters become uXXXX escapes - GraphQL forbids them raw.
-        assert_eq!(graphql_escape("a\u{1F}b"), format!("a{bs}u001Fb"));
-        assert_eq!(graphql_escape("a\nb"), format!("a{bs}u000Ab"));
-    }
-
-    #[test]
     fn where_filter_escapes_control_chars_in_identity_id() {
         // Regression: the edge's external identity ids join issuer and subject
         // with a unit separator (U+001F); unescaped, it made Weaviate reject
@@ -3569,10 +3529,7 @@ mod embedded_tests {
             )
             .route("/v1/batch/objects", post(record))
             .with_state(fake);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        format!("http://{addr}")
+        workforce_vellev::testing::serve(app).await
     }
 
     /// Vectors from text: [length, count of 'a'], enough to tell texts apart.

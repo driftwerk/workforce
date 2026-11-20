@@ -461,8 +461,10 @@ enum Commands {
     MigrateCodegraph {
         #[arg(short, long, default_value = "workforce.toml")]
         config: PathBuf,
-        /// SQLite source `codegraph.db`. Defaults to
-        /// `{hub.data_dir}/.workforce/knowledge/codegraph.db`.
+        /// SQLite source `codegraph.db`. Defaults to the code graph under
+        /// `[knowledge] data_dir`, else `root`, else `hub.data_dir`, as the
+        /// hub's shared (multi-agent) knowledge service keeps it. An agent
+        /// whose own `[knowledge]` overrides these needs `--from`.
         #[arg(long)]
         from: Option<PathBuf>,
     },
@@ -11856,12 +11858,7 @@ Describe what you should do in this step and what to discuss with the user.
                 }
             };
 
-            let sqlite_path = from.unwrap_or_else(|| {
-                std::path::PathBuf::from(&wf_config.hub.data_dir)
-                    .join(".workforce")
-                    .join("knowledge")
-                    .join("codegraph.db")
-            });
+            let sqlite_path = from.unwrap_or_else(|| default_code_graph(&wf_config));
             if !sqlite_path.exists() {
                 eyre::bail!(
                     "source SQLite code graph database not found at {}",
@@ -12605,6 +12602,12 @@ struct RoleImportRow {
     _priority: Option<i32>,
 }
 
+fn default_code_graph(config: &workforce_common::settings::WorkforceConfig) -> PathBuf {
+    let (_, data_dir) =
+        workforce_hub::knowledge::knowledge_dirs(&config.knowledge, &config.hub.data_dir);
+    workforce_hub::knowledge::code_graph_path(&data_dir)
+}
+
 /// The URL of the store memories are kept in, to tell the operator.
 fn memory_store_url(config: &workforce_common::settings::WorkforceConfig) -> &str {
     if config.memory.is_vellev() {
@@ -13290,6 +13293,29 @@ mod tests {
         assert_eq!(cli.secrets_fd, Some(3));
         let cli = Cli::try_parse_from(["workforce", "serve", "-c", "hub.toml"]).unwrap();
         assert_eq!(cli.secrets_fd, None);
+    }
+
+    /// The codegraph migration reads, unless told otherwise, the graph the
+    /// hub's shared (multi-agent) knowledge service keeps under
+    /// `[knowledge] data_dir`, else its root, else the hub's data dir.
+    #[test]
+    fn the_code_graph_migrated_is_the_hubs() {
+        let mut config = workforce_common::settings::WorkforceConfig::default();
+        config.hub.data_dir = "hub".into();
+        let dirs = [
+            (None, None, "hub"),
+            (Some("root"), None, "root"),
+            (Some("root"), Some("data"), "data"),
+        ];
+        for (root, data_dir, kept_in) in dirs {
+            config.knowledge.root = root.map(Into::into);
+            config.knowledge.data_dir = data_dir.map(Into::into);
+            assert_eq!(
+                default_code_graph(&config),
+                workforce_hub::knowledge::code_graph_path(Path::new(kept_in)),
+                "{root:?} {data_dir:?}"
+            );
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! How a hub wires its knowledge service: construction, the tools on it,
 //! and the background work it runs.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use tracing::{info, warn};
 use workforce_common::settings::WorkforceConfig;
@@ -270,16 +270,8 @@ pub fn create_service(
         info!("Knowledge engine disabled by config");
         return None;
     }
-    let knowledge_root = knowledge_config
-        .root
-        .as_ref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(fallback_data_dir));
-    let knowledge_data_dir = knowledge_config
-        .data_dir
-        .as_ref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| knowledge_root.clone());
+    let (knowledge_root, knowledge_data_dir) =
+        super::knowledge_dirs(knowledge_config, fallback_data_dir);
 
     let summariser = knowledge_config
         .generate_summaries
