@@ -182,6 +182,11 @@ async fn act_fully_aims_at_the_end_state_in_parallel_without_polish_first() {
             CrewHub::boss_hint(&o),
             CrewHub::dm_hint(Level::Full, &o, true),
             crew.line_prompt(s.id, &[], &ended, &o),
+            // Bound at Act fully (shipping in a named repository, or its
+            // DM while not unbound): the same rules.
+            CrewHub::dm_hint(Level::Full, &o, false),
+            CrewHub::level_hint(Level::Full, &o),
+            CrewHub::bound_level_line(Level::Full),
         ];
         for hint in &said {
             for rule in [
@@ -192,8 +197,13 @@ async fn act_fully_aims_at_the_end_state_in_parallel_without_polish_first() {
                 assert!(hint.contains(rule), "{rule}: {hint}");
             }
         }
-        let act = CrewHub::level_hint(Level::Act, &o);
-        assert!(!act.contains("end state"), "{act}");
+        for act in [
+            CrewHub::level_hint(Level::Act, &o),
+            CrewHub::dm_hint(Level::Act, &o, false),
+            CrewHub::bound_level_line(Level::Act),
+        ] {
+            assert!(!act.contains("end state"), "{act}");
+        }
     })
     .await;
 }
