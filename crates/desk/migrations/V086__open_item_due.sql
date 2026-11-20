@@ -1,6 +1,5 @@
--- When a promise of the boss's to the person is chased next (`due_at`), and
--- when the boss was last told to go and get it itself (`chased_at`): a
--- promise to report what a session says is never left to wait on it.
+-- When a promise of the boss's is chased next, if still owed (`due_at`),
+-- and when its boss was told to go and get it itself (`chased_at`).
 -- Additive.
 ALTER TABLE boss_open_items ADD COLUMN IF NOT EXISTS due_at TIMESTAMPTZ;
 ALTER TABLE boss_open_items ADD COLUMN IF NOT EXISTS chased_at TIMESTAMPTZ;

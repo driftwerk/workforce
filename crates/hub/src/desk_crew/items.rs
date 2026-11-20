@@ -69,7 +69,7 @@ const CHECK_ORDERS: &str = "Not asked yet: check this against the person's own i
 const CHECKED_FOR: chrono::TimeDelta = chrono::TimeDelta::hours(1);
 
 pub const CLOSE_DESCRIPTION: &str = "Close one of your open items (item_id from crew.open_items or the open items Desk gives you): with answer when the person answered it in their own words (for a session's question, their answer goes on to the session), or with why when it no longer applies or you decided it yourself. A why is never said to the person. For a promise or one of their orders that ended in a real result they would want, say what was done in done (at most 12 words, e.g. \"Cufflink migration: 18 of 20 tables moved\"): it reaches them once as \"✓ <done>\". One that simply ended (its time or condition passed, the person came back or checked in, the morning came) or duplicated another item takes why only: nothing is said of it.";
-pub const PROMISE_DESCRIPTION: &str = "Keep a promise you made the person about a session (session_id): what you promised (text, in full) and when it is kept (done_when: \"merged\", \"in production\", \"PR open\", or your own words). Desk tracks it until the session's account shows it done, then reports it once; it lapses if the session ends or nothing changes for 3 days. Anything you tell the person you will bring them (a list, a finding, an answer) is kept here, never only said: due_minutes says by when (30 if left out), and if it isn't kept by then you are woken to get it yourself from the session's transcript and files, and the person is told it is still owed. crew.ask_session keeps its own promise to report back.";
+pub const PROMISE_DESCRIPTION: &str = "Keep a promise you made the person about a session (session_id): what you promised (text, in full) and when it is kept (done_when: \"merged\", \"in production\", \"PR open\", or your own words). Desk tracks it until the session's account shows it done, then reports it once; it lapses if the session ends or nothing changes for 3 days. Anything you tell the person you will bring them (a list, a finding, an answer) is kept here, never only said, with due_minutes: by when you will have brought it. If it isn't kept by then you are woken to get it yourself from the session's transcript and files, and if still not, the person is told it is still owed. Leave due_minutes out for a milestone with no deadline (\"merged\"). crew.ask_session keeps its own promise to report back.";
 pub const ORDER_DESCRIPTION: &str = "Keep one of the person's orders you are carrying out (text, in their words) with the sessions working on it (session_ids), and done_when if it has a clear end (\"merged\", \"in production\"). An order you act on from their message (starting, telling or handing work to a session) is kept for you; use this for one that started nothing yet (\"leave the export alone\"). It is in every turn of yours until it is done or closed with crew.close_item.";
 pub const OPEN_DESCRIPTION: &str = "What you owe the person now (\"what's open?\"): the questions you asked them, the decisions you want confirmed, your promises, their orders, and the parked ones (no longer restated; they can answer or drop them), each with its item_id, when it was opened and last said, and what it holds up.";
 
@@ -80,12 +80,9 @@ const REPLIED: &str = "replied";
 const REPORT_BACK: &str = "Report back ";
 
 /// How long a promise to report what a session says waits on its reply
-/// before its boss is told to go and get it itself, and as long again
-/// before the person is told it is still owed, in the crew's minutes.
+/// before its boss is told to go and get it itself, and how long after
+/// that the person is told it is still owed, in the crew's minutes.
 const OWED_MINUTES: i64 = 10;
-
-/// When a promise the boss keeps itself is due, if it says no time.
-const PROMISE_DUE_MINUTES: i64 = 30;
 
 /// The most of a session's reply said to the person, in characters.
 const REPLY_CHARS: usize = 400;
@@ -144,7 +141,7 @@ pub fn schema(name: &str) -> Value {
             "session_id": { "type": "string" },
             "text": { "type": "string", "description": "What you promised, in full" },
             "done_when": { "type": "string", "description": "merged, in production, PR open, or your own words" },
-            "due_minutes": { "type": "integer", "description": "By when you will have brought it, in minutes from now (30 if left out)" }
+            "due_minutes": { "type": "integer", "description": "For something you will bring the person: by when, in minutes from now" }
         }, "required": ["session_id", "text", "done_when"] }),
         ORDER => json!({ "type": "object", "properties": {
             "text": { "type": "string", "description": "The person's order, in their words" },
@@ -535,10 +532,8 @@ impl CrewHub {
                 let done_when = some("done_when").ok_or("Say when it is kept (done_when).")?;
                 let due = input["due_minutes"]
                     .as_i64()
-                    .map_or(PROMISE_DUE_MINUTES, |m| m.clamp(1, 24 * 60));
-                let mut p = NewItem::promise(boss, s, &text, &done_when);
-                p.due_at = Some(crew::now() + self.crew_minutes(due));
-                p
+                    .map(|m| crew::now() + self.crew_minutes(m));
+                NewItem::promise(boss, s, &text, &done_when).due(due)
             }
             _ => {
                 let mut sessions = Vec::new();
@@ -557,8 +552,12 @@ impl CrewHub {
         .map_err(Self::item_err)?;
         Ok(json!(match opened {
             Opened::New(i) => format!(
-                "Kept as item {}: it is tracked until it is done, and in every turn of yours till then.",
-                i.id
+                "Kept as item {}: it is tracked until it is done, and in every turn of yours till then{}.",
+                i.id,
+                i.due_at.map_or_else(String::new, |at| format!(
+                    "; due by {}",
+                    at.with_timezone(&self.desk.timezone()).format("%H:%M")
+                ))
             ),
             Opened::Again(i) => format!(
                 "That is already kept as item {} (“{}”): it is one item, its sessions joined.",
@@ -653,7 +652,7 @@ impl CrewHub {
                     REPLIED,
                 );
                 p.line_message = done.line.as_ref().map(|(id, _)| *id);
-                p.due_at = Some(now + self.crew_minutes(OWED_MINUTES));
+                let p = p.due(Some(now + self.crew_minutes(OWED_MINUTES)));
                 if let Err(e) = self.desk.store().item_open(&p).await {
                     tracing::warn!(error = %format!("{e:#}"), "keeping the promise to report back failed");
                 }
@@ -901,11 +900,9 @@ impl CrewHub {
         }
     }
 
-    /// Each promise due by now (20 Nov: the seven partner-docs differences
-    /// owed to the person from about 03:00, the boss waiting on the
-    /// session's report until 06:50): its boss, where it acts, is told to
-    /// go and get it itself, and once more as long after, the person is
-    /// told it is still owed. Never twice for one due time.
+    /// Each promise due by now: where its boss acts and hasn't been told
+    /// yet, it is told to get it itself, and due again [`OWED_MINUTES`]
+    /// later; else the person is told it is still owed, once.
     async fn chase_owed(&self) {
         let now = crew::now();
         let due = match self.desk.store().items_due(now).await {
@@ -916,15 +913,19 @@ impl CrewHub {
             }
         };
         for i in due.iter().filter(|i| i.kind == OpenKind::Promise) {
-            let Some(was) = i.due_at else {
+            let (Some(was), Some((_, o))) = (i.due_at, self.overseer_named(&i.boss)) else {
                 continue;
             };
-            let acts = self
-                .overseer_named(&i.boss)
-                .is_some_and(|(_, o)| self.level_now(&i.boss, &o).0.acts());
-            let chase = acts && i.chased_at.is_none() && i.session.is_some();
-            let next = chase.then(|| now + self.crew_minutes(OWED_MINUTES));
-            match self.desk.store().item_chased(i.id, was, now, next).await {
+            let chase_on = i
+                .session
+                .filter(|_| i.chased_at.is_none() && self.level_now(&i.boss, &o).0.acts());
+            let next = chase_on.map(|_| now + self.crew_minutes(OWED_MINUTES));
+            match self
+                .desk
+                .store()
+                .item_chased(i.id, was, chase_on.map(|_| now), next)
+                .await
+            {
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(e) => {
@@ -932,35 +933,35 @@ impl CrewHub {
                     continue;
                 }
             }
-            let asked = i
-                .opened_at
-                .with_timezone(&self.desk.timezone())
-                .format("%H:%M");
-            let (owed, what) = match i.text.strip_prefix(REPORT_BACK) {
-                Some(what) => (format!("to report {what}"), what.to_string()),
-                None => {
-                    let what = crew::one_line(&i.text, 200);
-                    (format!("“{what}”"), what)
-                }
-            };
-            match i.session.filter(|_| chase) {
+            let reported = (i.done_when.as_deref() == Some(REPLIED))
+                .then(|| i.text.strip_prefix(REPORT_BACK))
+                .flatten();
+            let what = reported.map_or_else(|| crew::one_line(&i.text, 200), str::to_string);
+            match chase_on {
                 Some(s) => self.wake_on(
                     &i.boss,
                     s,
                     format!(
-                        "You promised the person at {asked} {owed}, and it is due and not kept. \
-                         Don't wait on the session: read its transcript and files yourself now \
-                         (crew.history, crew.account, your file and machine tools), bring the \
-                         person what you find in your DM, and close this promise \
-                         (crew.close_item, item_id {}) saying what you did.",
+                        "You promised the person {}, and it is due and not kept. Don't wait on \
+                         the session: read its transcript and files yourself now (crew.history, \
+                         crew.account, your file and machine tools), bring the person what you \
+                         find in your DM, and close this promise (crew.close_item, item_id {}, \
+                         done: what you brought).",
+                        match reported {
+                            Some(what) => format!("to report {what}"),
+                            None => format!("“{what}”"),
+                        },
                         i.id
                     ),
                     format!("owed:{}", i.id),
+                    "a promise due",
                 ),
+                // Said at once, as a lapsed promise is: what is owed waits
+                // on no roundup.
                 None => {
                     self.say(
                         &i.boss,
-                        format!("Still owed to you since {asked}: {what}. It isn't in yet."),
+                        format!("Still owed to you: {what}. It isn't in yet."),
                     )
                     .await
                 }
@@ -1006,7 +1007,10 @@ impl CrewHub {
                     "done is for a promise or an order; close this with answer or why.".into(),
                 );
             }
-            if item.kind == OpenKind::Promise && item.done_when.as_deref() == Some(REPLIED) {
+            if item.kind == OpenKind::Promise
+                && item.done_when.as_deref() == Some(REPLIED)
+                && item.chased_at.is_none()
+            {
                 return Err("This promise is kept by the session's reply, said as it comes: close it with why.".into());
             }
             if crew::word_count(done) > KEPT_WORDS || done.contains('\n') {

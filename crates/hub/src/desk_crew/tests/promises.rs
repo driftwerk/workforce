@@ -6,7 +6,7 @@
 
 use super::super::actions::{Action, Target, STATUS_QUESTION};
 use super::*;
-use workforce_desk::open_item::{ClosedBy, OpenKind, OpenState};
+use workforce_desk::open_item::{ClosedBy, NewItem, OpenKind, OpenState};
 
 fn tool(crew: &Arc<CrewHub>, name: &str) -> super::super::tools::CrewTool {
     super::super::tools::CrewTool::for_level(crew, "desk", &Default::default(), false)
@@ -628,7 +628,7 @@ async fn an_unanswered_promise_is_chased_by_the_boss_then_told_to_the_person() {
             woke.prompt
         );
         let told = eventually("the person told it is still owed", async || {
-            said(&overseer, "Still owed to you since ")
+            said(&overseer, "Still owed to you: ")
         })
         .await;
         assert!(told.contains("Which partner docs differ?"), "{told}");
@@ -636,7 +636,7 @@ async fn an_unanswered_promise_is_chased_by_the_boss_then_told_to_the_person() {
         assert_eq!(after.state, OpenState::Open, "still owed until kept");
         assert_eq!(after.due_at, None, "and chased no more");
         // Each once.
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
         let line = overseer
             .sessions
             .find(DESK_CHANNEL, PERSON)
@@ -645,7 +645,7 @@ async fn an_unanswered_promise_is_chased_by_the_boss_then_told_to_the_person() {
         let notices = line
             .messages
             .iter()
-            .filter(|m| m.content.starts_with("Still owed to you since "))
+            .filter(|m| m.content.starts_with("Still owed to you: "))
             .count();
         assert_eq!(notices, 1);
         let latest = d.store().latest_check_in("desk").await.unwrap().unwrap();
@@ -653,6 +653,171 @@ async fn an_unanswered_promise_is_chased_by_the_boss_then_told_to_the_person() {
             latest.id == woke.id || !latest.prompt.contains("it is due and not kept"),
             "woken again: {}",
             latest.prompt
+        );
+    })
+    .await;
+}
+
+/// A promise the boss keeps with a due time is chased like a report back;
+/// one with no due time (a milestone, "merged") never is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_promise_with_a_due_time_is_chased_and_one_without_never_is() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        let s = new_session(&d, dir.path(), "Legacy removal").await;
+        let kept = call(
+            &crew,
+            "crew.promise",
+            json!({"session_id": s.id.to_string(), "text": "Bring you the partner-docs differences",
+                   "done_when": "brought", "due_minutes": 1}),
+        )
+        .await;
+        assert!(
+            kept.output.to_string().contains("due by"),
+            "{}",
+            kept.output
+        );
+        call(
+            &crew,
+            "crew.promise",
+            json!({"session_id": s.id.to_string(), "text": "Tell you when it merges",
+                   "done_when": "merged"}),
+        )
+        .await;
+        let items = d.store().items_not_closed(Some("desk")).await.unwrap();
+        let due = |text: &str| items.iter().find(|i| i.text == text).unwrap().clone();
+        let brought = due("Bring you the partner-docs differences");
+        assert!(brought.due_at.is_some());
+        assert_eq!(due("Tell you when it merges").due_at, None);
+        let woke = eventually("the boss told to get it itself", async || {
+            d.store()
+                .latest_check_in("desk")
+                .await
+                .unwrap()
+                .filter(|c| c.prompt.contains("it is due and not kept"))
+        })
+        .await;
+        assert!(
+            woke.prompt
+                .contains("“Bring you the partner-docs differences”")
+                && woke.prompt.contains(&brought.id.to_string()),
+            "{}",
+            woke.prompt
+        );
+        let closed = call(
+            &crew,
+            "crew.close_item",
+            json!({"item_id": brought.id.to_string(), "done": "brought the nine differences"}),
+        )
+        .await;
+        assert!(closed.success, "{:?}", closed.error);
+        assert!(
+            !woke.prompt.contains("Tell you when it merges"),
+            "{}",
+            woke.prompt
+        );
+    })
+    .await;
+}
+
+/// A boss that doesn't act (Watch) leaves what it owes to the person: told
+/// at its due time that it is still owed, once, and never woken for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn below_act_a_due_promise_is_told_to_the_person_once() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"watch\"\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, dir.path(), "Legacy removal").await;
+        let since = chrono::Utc::now();
+        let p = NewItem::promise(
+            "desk",
+            s.id,
+            "Bring you the partner-docs differences",
+            "brought",
+        )
+        .due(Some(since));
+        d.store().item_open(&p).await.unwrap();
+        let told = eventually("the person told", async || {
+            said(&overseer, "Still owed to you: ")
+        })
+        .await;
+        assert!(told.contains("partner-docs differences"), "{told}");
+        let item = d
+            .store()
+            .items_not_closed(Some("desk"))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|i| i.kind == OpenKind::Promise)
+            .unwrap();
+        assert_eq!((item.due_at, item.chased_at), (None, None));
+        assert_eq!(d.store().wake_ups_since("desk", since).await.unwrap(), 0);
+    })
+    .await;
+}
+
+/// A chase moves only the due time it read: never one chased, asked afresh
+/// or closed since; asking afresh starts its chase over.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chase_moves_only_the_due_time_it_read() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, _crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"watch\"\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, dir.path(), "Legacy removal").await;
+        let store = d.store();
+        // As Postgres keeps it: to the microsecond.
+        let later =
+            chrono::SubsecRound::trunc_subsecs(chrono::Utc::now() + chrono::Duration::hours(1), 6);
+        let promise =
+            |at| NewItem::promise("desk", s.id, "Bring you the list", "brought").due(Some(at));
+        let opened = match store.item_open(&promise(later)).await.unwrap() {
+            workforce_desk::open_item_store::Opened::New(i)
+            | workforce_desk::open_item_store::Opened::Again(i) => i,
+        };
+        let was = opened.due_at.unwrap();
+        let next = later + chrono::Duration::minutes(10);
+        assert!(store
+            .item_chased(opened.id, was, Some(later), Some(next))
+            .await
+            .unwrap());
+        assert!(
+            !store
+                .item_chased(opened.id, was, Some(later), None)
+                .await
+                .unwrap(),
+            "a stale due time"
+        );
+        let chased = store.open_item(opened.id).await.unwrap().unwrap();
+        assert_eq!(chased.chased_at, Some(later));
+        let afresh = later + chrono::Duration::hours(1);
+        store.item_open(&promise(afresh)).await.unwrap();
+        let asked = store.open_item(opened.id).await.unwrap().unwrap();
+        assert_eq!((asked.due_at, asked.chased_at), (Some(afresh), None));
+        store
+            .item_close(opened.id, ClosedBy::Boss, "Settled.")
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .item_chased(opened.id, afresh, None, None)
+                .await
+                .unwrap(),
+            "closed"
         );
     })
     .await;

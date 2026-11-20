@@ -447,8 +447,6 @@ impl DeskStore {
             .transpose()
     }
 
-    /// Closes item `id` (open or parked) as `by` says, for `why`: the item
-    /// as closed, or `None` when it was already closed.
     /// Open promises whose chase is due by `now`.
     pub async fn items_due(&self, now: DateTime<Utc>) -> Result<Vec<OpenItem>> {
         let client = self.pool().get().await?;
@@ -466,28 +464,30 @@ impl DeskStore {
             .collect()
     }
 
-    /// `id` was chased at `at` from the due time it was read with
-    /// (`was`), and is due again at `next` (none: never again). Whether
-    /// this caller moved it: an item closed, chased or asked afresh since
-    /// it was read is left as it is.
+    /// `id`, read due at `was`, was chased: its boss told to get it at
+    /// `boss` (none: the person told), and due again at `next` (none: never
+    /// again). Whether this caller moved it: an item closed, chased or
+    /// asked afresh since it was read is left as it is.
     pub async fn item_chased(
         &self,
         id: Uuid,
         was: DateTime<Utc>,
-        at: DateTime<Utc>,
+        boss: Option<DateTime<Utc>>,
         next: Option<DateTime<Utc>>,
     ) -> Result<bool> {
         let client = self.pool().get().await?;
         let n = client
             .execute(
-                "UPDATE boss_open_items SET chased_at = $3, due_at = $4 \
+                "UPDATE boss_open_items SET chased_at = COALESCE($3, chased_at), due_at = $4 \
                  WHERE id = $1 AND due_at = $2 AND state <> 'closed'",
-                &[&id, &was, &at, &next],
+                &[&id, &was, &boss, &next],
             )
             .await?;
         Ok(n == 1)
     }
 
+    /// Closes item `id` (open or parked) as `by` says, for `why`: the item
+    /// as closed, or `None` when it was already closed.
     pub async fn item_close(&self, id: Uuid, by: ClosedBy, why: &str) -> Result<Option<OpenItem>> {
         let client = self.pool().get().await?;
         client

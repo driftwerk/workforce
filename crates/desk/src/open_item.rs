@@ -166,7 +166,7 @@ pub struct OpenItem {
     /// A promise's: when it is chased next, if it is still owed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub due_at: Option<DateTime<Utc>>,
-    /// When its boss was last told to go and get it itself.
+    /// When its boss was told to go and get it itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chased_at: Option<DateTime<Utc>>,
 }
@@ -192,8 +192,7 @@ pub struct NewItem {
     pub sessions: Vec<Uuid>,
     pub layout: AskLayout,
     pub cant_decide: Option<String>,
-    /// A promise's: when it is chased if still owed. Given again, it is
-    /// chased afresh from then.
+    /// A promise's: when it is chased if still owed.
     pub due_at: Option<DateTime<Utc>>,
 }
 
@@ -266,6 +265,12 @@ impl NewItem {
             sessions,
             ..Self::ask(boss, OpenKind::Order, None, text)
         }
+    }
+
+    /// The promise, chased at `at` if still owed then.
+    pub fn due(mut self, at: Option<DateTime<Utc>>) -> Self {
+        self.due_at = at;
+        self
     }
 
     /// Keyed by the kind of case it would settle, when it says one.
