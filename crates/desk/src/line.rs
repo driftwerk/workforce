@@ -689,9 +689,9 @@ pub struct AskParts {
 pub enum Refusal {
     #[error("Loop guard: this has been handed on {MAX_HOPS} times already. Desk has told the person; if you need an answer, ask them (to: \"you\"), else stop here and wait for them.")]
     Hops,
-    #[error("Loop guard: you have sent {TURN_BUDGET} messages since the person or your boss last spoke to you. Desk has told the person. Stop messaging the person and other sessions and wait: their reply comes to you as a message. What you tell your boss, if one runs you, still goes.")]
+    #[error("Loop guard: you have sent {TURN_BUDGET} messages since the person or your boss last spoke to you. Desk has told the person. Stop messaging the person and other sessions and wait: their reply comes to you as a message. What you tell the boss that runs you, if one does, still goes; a boss that only watches you counts like anyone else.")]
     Budget,
-    #[error("Loop guard: you have sent {BOSS_RUN_CEILING} messages since the person last spoke to you. Desk has told the person. Stop messaging the person and other sessions and wait: their reply comes to you as a message. What you tell your boss, if one runs you, still goes.")]
+    #[error("Loop guard: you have sent {BOSS_RUN_CEILING} messages since the person last spoke to you. Desk has told the person. Stop messaging the person and other sessions and wait: their reply comes to you as a message. What you tell the boss that runs you, if one does, still goes; a boss that only watches you counts like anyone else.")]
     Ceiling,
     #[error("Loop guard: you have sent {TURN_BUDGET} messages to other sessions since the person last spoke to you. Desk has told the person. Stop messaging sessions and wait for them; you can still tell Desk how it stands.")]
     Peers,
@@ -888,12 +888,16 @@ pub fn hops(hop: i16) -> Result<(), Refusal> {
 /// boss that doesn't run it (one that only watches, say) the counts hold.
 pub fn guard(hop: i16, run: &LineRun, to: &Party, to_its_boss: bool) -> Result<(), Refusal> {
     hops(hop)?;
-    match to.kind {
-        _ if to_its_boss => Ok(()),
-        _ if run.since_person >= BOSS_RUN_CEILING as usize => Err(Refusal::Ceiling),
-        PartyKind::Session if run.to_sessions >= TURN_BUDGET as usize => Err(Refusal::Peers),
-        _ if run.sent >= TURN_BUDGET as usize => Err(Refusal::Budget),
-        _ => Ok(()),
+    if to_its_boss {
+        Ok(())
+    } else if run.since_person >= BOSS_RUN_CEILING as usize {
+        Err(Refusal::Ceiling)
+    } else if to.kind == PartyKind::Session && run.to_sessions >= TURN_BUDGET as usize {
+        Err(Refusal::Peers)
+    } else if run.sent >= TURN_BUDGET as usize {
+        Err(Refusal::Budget)
+    } else {
+        Ok(())
     }
 }
 

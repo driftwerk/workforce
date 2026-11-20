@@ -297,12 +297,19 @@ impl Desk {
     /// The boss that has `id` now: its charge's while one runs it, else
     /// its scope's.
     fn boss_of_session(&self, id: Uuid) -> Option<String> {
-        if let Some(c) = self.charge_of(id).filter(crate::charge::Charge::live) {
-            return Some(c.boss);
+        if let Some(boss) = self.running_boss(id) {
+            return Some(boss);
         }
         let group = self.group_of_member(&super::session_item(id));
         self.boss_of(&self.scope_of_group(group.as_deref()))
             .map(|b| b.agent)
+    }
+
+    /// The boss whose charge `id` is in now, if one's is.
+    fn running_boss(&self, id: Uuid) -> Option<String> {
+        self.charge_of(id)
+            .filter(crate::charge::Charge::live)
+            .map(|c| c.boss)
     }
 
     /// Whether `to` is the boss that runs `id`, at a level that gives it
@@ -310,17 +317,8 @@ impl Desk {
     /// by those turns, never refused by the loop guard's counts.
     fn reports_to_its_boss(&self, id: Uuid, to: &Party) -> bool {
         to.kind == PartyKind::Manager
-            && self
-                .charge_of(id)
-                .filter(crate::charge::Charge::live)
-                .is_some_and(|c| {
-                    c.boss == to.id
-                        && self
-                            .bosses()
-                            .iter()
-                            .find(|b| b.agent == c.boss)
-                            .is_none_or(|b| b.level != "watch")
-                })
+            && self.running_boss(id).is_some_and(|b| b == to.id)
+            && self.boss_acts(&to.id)
     }
 
     /// Whether `boss` is `id`'s own boss.

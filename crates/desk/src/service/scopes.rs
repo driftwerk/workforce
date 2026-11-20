@@ -372,6 +372,14 @@ impl Desk {
         self.bosses().into_iter().find(|b| b.scope == *scope)
     }
 
+    /// Whether the boss `agent` is one Desk knows that does more than watch.
+    pub(crate) fn boss_acts(&self, agent: &str) -> bool {
+        self.bosses()
+            .into_iter()
+            .find(|b| b.agent == agent)
+            .is_some_and(|b| b.level != "watch")
+    }
+
     /// The scope the overseer `agent` oversees, while it does.
     pub fn scope_of_boss(&self, agent: &str) -> Option<Scope> {
         self.bosses()

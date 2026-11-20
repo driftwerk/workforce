@@ -277,6 +277,15 @@ async fn reports_past_the_bosss_turns_for_the_hour_wait_for_the_next_and_none_is
         )
         .await;
         let s = new_session(&d, dir.path(), "Legacy removal").await;
+        d.take_on(
+            s.id,
+            &workforce_desk::crew::Party::manager("desk", &super::super::name_of(&overseer)),
+            workforce_desk::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
         let channel = super::super::line::line_channel(s.id);
         let turns = || {
             overseer
@@ -305,7 +314,11 @@ async fn reports_past_the_bosss_turns_for_the_hour_wait_for_the_next_and_none_is
         .await;
         tell("Step 12 done: the queue is drained.").await;
         tell("Step 13 done: the old workers are stopped.").await;
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let waiting = || async { d.store().line_waiting_for_bosses().await.unwrap().len() };
+        eventually("both kept waiting for the next turn", async || {
+            (waiting().await == 2).then_some(())
+        })
+        .await;
         assert_eq!(turns(), 1, "the hour's one turn is spent");
         let next = eventually("the next hour's turn", async || {
             overseer
@@ -323,6 +336,61 @@ async fn reports_past_the_bosss_turns_for_the_hour_wait_for_the_next_and_none_is
                 && next.content.contains("the old workers are stopped"),
             "both reports, gathered as one turn: {}",
             next.content
+        );
+        assert_eq!(waiting().await, 0, "taken by that turn");
+    })
+    .await;
+}
+
+/// Past its boss's turns for the hour, what a session it runs asks it
+/// still gets a turn at once: only reports wait.
+#[tokio::test(flavor = "multi_thread")]
+async fn past_the_hours_turns_a_question_to_the_boss_that_runs_it_is_taken_at_once() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "Yes, drop it.",
+            "[oversight]\nenabled = true\nlevel = \"act\"\nact = { nudge = true }\n\
+             work = { max_turns_per_hour = 1 }\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, dir.path(), "Legacy removal").await;
+        d.take_on(
+            s.id,
+            &workforce_desk::crew::Party::manager("desk", &super::super::name_of(&overseer)),
+            workforce_desk::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        assert!(crew.spend_work_turn(s.id).is_ok(), "the hour's one turn");
+        assert!(crew.spend_work_turn(s.id).is_err(), "spent");
+        let asked = d
+            .line_call(
+                s.id,
+                "ask",
+                &json!({"to": "desk", "text": "Drop the legacy queue table?", "wait_seconds": 60}),
+                Some(std::time::Duration::from_millis(10)),
+            )
+            .await
+            .unwrap();
+        let ask: uuid::Uuid = serde_json::from_value(asked["id"].clone()).unwrap();
+        let q = eventually("its question taken", async || {
+            d.store()
+                .line_message(ask)
+                .await
+                .unwrap()
+                .filter(|q| q.asked != Some(workforce_desk::line::Asked::Open))
+        })
+        .await;
+        assert_eq!(
+            q.asked,
+            Some(workforce_desk::line::Asked::Answered),
+            "{q:?}"
         );
     })
     .await;
@@ -344,8 +412,8 @@ async fn past_the_hours_turns_a_question_desk_only_watches_still_reaches_the_per
         )
         .await;
         let s = new_session(&d, dir.path(), "Legacy removal").await;
-        assert!(crew.spend_work_turn(s.id), "the hour's one turn");
-        assert!(!crew.spend_work_turn(s.id), "spent");
+        assert!(crew.spend_work_turn(s.id).is_ok(), "the hour's one turn");
+        assert!(crew.spend_work_turn(s.id).is_err(), "spent");
         let asked = d
             .line_call(
                 s.id,

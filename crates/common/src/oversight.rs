@@ -80,8 +80,9 @@
 //!
 //! `[oversight.work]` is how it runs sessions for the person: the sessions
 //! in its charge (handed to it, or every one with `take_on = "all"`) wake
-//! it at each turn's end, up to `max_turns_per_hour` such turns, and at
-//! most `parallel` of them start or work at once. With `close_finished`
+//! it at each turn's end and with their reports, up to `max_turns_per_hour`
+//! such turns (their questions always reach it), and at most `parallel` of
+//! them start or work at once. With `close_finished`
 //! (on unless said), the sessions it started, and at Act fully those
 //! handed to it, are closed once their work is done (their PR merged,
 //! their ticket finished, the session said so, or a day idle with nothing
@@ -427,7 +428,8 @@ pub struct Work {
     /// `""`) is the engine's own default. A session on another engine runs
     /// that engine's default unless a model is asked for.
     pub model: Option<String>,
-    /// Its turns for its sessions' turn ends, in any hour.
+    /// Its turns for its sessions' turn ends and reports, in any hour;
+    /// their questions reach it past them.
     pub max_turns_per_hour: u32,
     /// It closes the sessions it runs once their work is done
     /// (`desk_crew::closing`).

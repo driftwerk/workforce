@@ -580,6 +580,40 @@ impl DeskStore {
             .get(0))
     }
 
+    /// Holds a session's report its boss heard for the boss's next turn:
+    /// waiting again, so a restart before that turn gathers it again.
+    /// Whether it moved.
+    pub async fn line_wait_for_boss(&self, id: Uuid) -> Result<bool> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .execute(
+                "UPDATE line_messages SET delivery = 'queued', delivered_at = NULL, \
+                 updated_at = now() WHERE id = $1 AND delivery = 'delivered' AND kind = 'tell' \
+                 AND recipient ->> 'kind' = 'manager'",
+                &[&id],
+            )
+            .await?
+            > 0)
+    }
+
+    /// The sessions' reports that wait for their boss's next turn, oldest
+    /// first.
+    pub async fn line_waiting_for_bosses(&self) -> Result<Vec<LineMessage>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                &format!(
+                    "SELECT {COLUMNS} FROM line_messages WHERE delivery = 'queued' \
+                     AND kind = 'tell' AND recipient ->> 'kind' = 'manager' ORDER BY at, id"
+                ),
+                &[],
+            )
+            .await?
+            .iter()
+            .map(message)
+            .collect()
+    }
+
     /// Every urgent message still queued for a session, oldest first: what
     /// a restart before its steer was taken steers again.
     pub async fn line_urgent_queued(&self) -> Result<Vec<LineMessage>> {
@@ -807,6 +841,41 @@ mod tests {
             engine: Some(crate::model::Engine::Claude),
             origin: None,
         }
+    }
+
+    #[tokio::test]
+    async fn a_report_its_boss_heard_waits_again_for_its_next_turn_until_taken() {
+        with_test_pool(crate::store::build_pool, |pool| async move {
+            let s = DeskStore::with_pool(pool).await.unwrap();
+            let from = session_party(Uuid::new_v4());
+            let heard = |to: Party| {
+                let mut m =
+                    LineMessage::new(from.clone(), to, LineKind::Tell, "Step 12 done.".into(), 1);
+                m.delivery = Delivery::Delivered;
+                m.delivered_at = Some(m.at);
+                m
+            };
+            let m = heard(Party::manager("sarah", "Sarah"));
+            let to_you = heard(Party::you());
+            s.put_line(&m).await.unwrap();
+            s.put_line(&to_you).await.unwrap();
+            assert!(s.line_waiting_for_bosses().await.unwrap().is_empty());
+            assert!(s.line_wait_for_boss(m.id).await.unwrap());
+            assert!(!s.line_wait_for_boss(m.id).await.unwrap(), "once");
+            assert!(
+                !s.line_wait_for_boss(to_you.id).await.unwrap(),
+                "only a report to a boss"
+            );
+            let waiting = s.line_waiting_for_bosses().await.unwrap();
+            assert_eq!(waiting.iter().map(|w| w.id).collect::<Vec<_>>(), [m.id]);
+            assert_eq!(waiting[0].delivered_at, None);
+            s.line_take(m.id, Delivery::Delivered)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(s.line_waiting_for_bosses().await.unwrap().is_empty());
+        })
+        .await;
     }
 
     #[tokio::test]
