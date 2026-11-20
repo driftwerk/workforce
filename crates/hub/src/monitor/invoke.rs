@@ -36,6 +36,12 @@ use crate::wasm_tool_invoker::AdapterLoader;
 /// How a monitor's missing tool is loaded: the agent's own path to it.
 const ENABLE_SKILL: &str = "system.enable_skill";
 
+/// How long a load that left a tool missing is answered from memory when
+/// nothing has registered since: what fixes it may register nothing (an
+/// account added to the vault, a capability granted), so it is tried again
+/// after this however quiet the registry is.
+const FAILED_LOAD_RETRY: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Beyond the families no skill may be granted, a monitor may not author
 /// monitors.
 const MONITOR_DENIED: &[&str] = &["monitor"];
@@ -132,12 +138,15 @@ pub struct GovernedInvoker {
     access: AccessFn,
     adapters: Option<AdapterLoader>,
     /// The loads that left a tool missing, by (skill, owner): the registry's
-    /// generation after the attempt and why. While nothing has registered
-    /// since, the same load is not tried again, so two monitors missing one
-    /// tool never reload its skill in turn. Held across a load, which
-    /// serialises them.
-    failed_loads: tokio::sync::Mutex<HashMap<(String, Option<String>), (u64, String)>>,
+    /// generation after the attempt, when, and why. While nothing has
+    /// registered since and `load_retry` has not passed, the same load is
+    /// not tried again, so monitors missing one tool never reload its skill
+    /// in turn on every poll. Held across a load, which serialises them.
+    failed_loads: tokio::sync::Mutex<FailedLoads>,
+    load_retry: std::time::Duration,
 }
+
+type FailedLoads = HashMap<(String, Option<String>), (u64, std::time::Instant, String)>;
 
 impl GovernedInvoker {
     pub fn new(
@@ -154,7 +163,14 @@ impl GovernedInvoker {
             access,
             adapters,
             failed_loads: tokio::sync::Mutex::default(),
+            load_retry: FAILED_LOAD_RETRY,
         }
+    }
+
+    /// How long a failed load is answered from memory while no tool registers.
+    pub fn with_load_retry(mut self, after: std::time::Duration) -> Self {
+        self.load_retry = after;
+        self
     }
 
     /// The invoker for `service`: its registry, policy, gates and access
@@ -199,8 +215,8 @@ impl GovernedInvoker {
         if self.tools.get(tool).is_some() {
             return Ok(Resolved::Loaded);
         }
-        if let Some((generation, why)) = failed.get(&key) {
-            if *generation == self.tools.generation() {
+        if let Some((generation, at, why)) = failed.get(&key) {
+            if *generation == self.tools.generation() && at.elapsed() < self.load_retry {
                 return Err(why.clone());
             }
         }
@@ -227,7 +243,14 @@ impl GovernedInvoker {
                 failed.remove(&key);
             }
             Err(why) => {
-                failed.insert(key, (self.tools.generation(), why.clone()));
+                failed.insert(
+                    key,
+                    (
+                        self.tools.generation(),
+                        std::time::Instant::now(),
+                        why.clone(),
+                    ),
+                );
             }
         }
         result
@@ -847,10 +870,26 @@ mod tests {
         assert_eq!(enable.ran_as.lock().unwrap().len(), 2, "tried again");
     }
 
+    /// What fixes a failed load may register nothing (an account added to
+    /// the vault): it is tried again once its time is up all the same.
+    #[tokio::test]
+    async fn a_failed_load_is_tried_again_in_time_though_nothing_registers() {
+        let (invoker, enable) = enabling_invoker("carol");
+        let invoker = invoker.with_load_retry(std::time::Duration::ZERO);
+        for _ in 0..2 {
+            assert!(invoker
+                .resolve("email.inbox", Some("carol"), "monitor:test")
+                .await
+                .is_err());
+        }
+        assert_eq!(enable.ran_as.lock().unwrap().len(), 2);
+    }
+
     /// The incident on a real agent: the person's email account is theirs
-    /// alone (`users/<them>/…`), the agent has not loaded email (its hub
-    /// just restarted), and the monitor's path — the agent's own registry —
-    /// enables the skill as them, so their inbox tool is there to poll.
+    /// alone (`users/<them>/…`), the agent's email was loaded outside their
+    /// scope (setup wizard only), and the monitor's path — the agent's own
+    /// registry — enables the skill again as them, so their inbox tool is
+    /// there to poll.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_persons_own_email_account_loads_on_the_agent_for_their_monitor() {
         let tmp = tempfile::tempdir().unwrap();
@@ -869,7 +908,23 @@ mod tests {
                 )
                 .unwrap();
         }
-        assert!(service.tools.get("email.inbox").is_none(), "not loaded yet");
+        // As the hub left it: email loaded outside anyone's scope, where no
+        // account of theirs is seen, so with its setup wizard alone.
+        crate::skill_loader::load_and_track(
+            "email",
+            Arc::clone(&vault),
+            service.global_vault.clone(),
+            &service.config,
+            &service.tools,
+            &service.skill_state,
+            "vault",
+        )
+        .unwrap();
+        assert!(service.tools.get("email.setup").is_some());
+        assert!(
+            service.tools.get("email.inbox").is_none(),
+            "the incident's state"
+        );
         let invoker = GovernedInvoker::for_service(Arc::clone(&service), None);
 
         let resolved = invoker

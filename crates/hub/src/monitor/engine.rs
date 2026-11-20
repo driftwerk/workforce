@@ -462,8 +462,6 @@ impl WorkflowNotifySink {
         match self.invoker.invoke(call).await {
             Ok(_) => ActionOutcome::Done(None),
             Err(InvokeError::RateLimited(e)) => ActionOutcome::Transient(format!("run_skill: {e}")),
-            // Its tool may register yet (a skill enabled, a hub restarting).
-            Err(InvokeError::Unavailable(e)) => ActionOutcome::Transient(format!("run_skill: {e}")),
             Err(e) => ActionOutcome::Terminal(format!("run_skill: {}", e.message())),
         }
     }
@@ -4058,17 +4056,15 @@ template = "x"
             let (kats, desks) = (Arc::clone(&kats), Arc::clone(&desks));
             |pool| async move {
                 let store = Arc::new(MonitorStore::new(pool).await.unwrap());
-                let runtime = |dir: &std::path::Path| {
-                    let runtime = Arc::new(MonitorRuntime::new(dir.to_path_buf()));
-                    runtime.set_agents(crate::monitor::KnownAgents {
-                        default_id: "desk".into(),
-                        ids: vec!["desk".into(), "kat".into()],
-                    });
-                    runtime
-                };
+                // One hub: both engines read the same definitions.
+                let runtime = Arc::new(MonitorRuntime::new(dir.to_path_buf()));
+                runtime.set_agents(crate::monitor::KnownAgents {
+                    default_id: "desk".into(),
+                    ids: vec!["desk".into(), "kat".into()],
+                });
                 let engine = |who: EngineAgent, invoker: Arc<FakeInvoker>| {
                     MonitorEngine::new(
-                        runtime(&dir),
+                        Arc::clone(&runtime),
                         Arc::clone(&store),
                         Arc::new(RwLock::new(SurfaceRegistry::new())),
                         Arc::clone(&sink) as Arc<dyn ActionSink>,
@@ -4077,8 +4073,8 @@ template = "x"
                     )
                     .with_invoker(invoker)
                 };
-                let desk: Arc<dyn crate::hosts::MonitorHost> =
-                    Arc::new(engine(agent("desk", true), desks.clone()));
+                let desk_engine = Arc::new(engine(agent("desk", true), desks.clone()));
+                let desk: Arc<dyn crate::hosts::MonitorHost> = desk_engine.clone();
                 let kat =
                     engine(agent("kat", false), kats.clone()).with_peers(Arc::new(move |name| {
                         (name == "desk").then(|| Arc::clone(&desk))
@@ -4094,6 +4090,26 @@ template = "x"
                 )
                 .unwrap();
                 assert!(kat.preflight(&kats_own, None).await.is_ok());
+
+                // Kat's own monitor is polled by kat, with kat's tools: a
+                // tool registered on kat alone, never on the default agent.
+                kat.runtime
+                    .save_definition_source(
+                        "src",
+                        &SOURCE_TOML.replace("name = \"Src\"", "name = \"Src\"\nagent = \"kat\""),
+                        None,
+                        workforce_core::access::Visibility::Global,
+                        EditContext::new("agent_tool:kat", None),
+                    )
+                    .await
+                    .unwrap();
+                kats.answer(Ok(issues(&[("A-1", "open")])));
+                desk_engine.poll_due().await;
+                kat.poll_due().await;
+                assert_eq!(kats.calls().len(), 1, "kat polled it");
+                assert!(desks.calls().is_empty(), "the default agent never did");
+                let summary = kat.summary_of("src", None).await.unwrap();
+                assert_eq!(summary.status, crate::monitor::MonitorStatus::Active);
             }
         })
         .await;
