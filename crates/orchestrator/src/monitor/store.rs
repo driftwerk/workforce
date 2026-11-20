@@ -714,6 +714,34 @@ impl MonitorStore {
         Ok(row.get::<_, i32>("failures").max(0) as u32)
     }
 
+    /// Record a poll that could not find its tool: its error and when the
+    /// next is due, with the failure streak cleared — such a poll is no
+    /// failure of the source, and is never counted towards giving up on it.
+    pub async fn record_poll_unavailable(
+        &self,
+        key: &MonitorKey,
+        error: &str,
+        next_due_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let conn = self.pool.get().await?;
+        conn.execute(
+            "INSERT INTO monitor_source_state \
+             (monitor_id, owner, polled_at, next_due_at, error, failures) \
+             VALUES ($1, $2, now(), $3, $4, 0) \
+             ON CONFLICT (monitor_id, owner) DO UPDATE \
+               SET polled_at = now(), next_due_at = EXCLUDED.next_due_at, \
+                   error = EXCLUDED.error, failures = 0, updated_at = now()",
+            &[
+                &key.monitor_id,
+                &owner_col(key.owner.as_deref()),
+                &next_due_at,
+                &error,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Drop a monitor's observation state: it goes away, or starts afresh.
     pub async fn forget_source_state(&self, key: &MonitorKey) -> Result<()> {
         let conn = self.pool.get().await?;

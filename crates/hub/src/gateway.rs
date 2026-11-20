@@ -12037,10 +12037,11 @@ async fn monitor_revision_restore(
     // target: it passes the same membership gate and the same catch-up policy.
     let previous = runtime.stored_definition(&id, ctx.owner.as_deref()).await;
     let parsed = workforce_orchestrator::monitor::MonitorDefinition::from_toml(&content).ok();
+    let mut notes = Vec::new();
     if let Some(def) = &parsed {
         gate_monitor_binding(&state, engine.as_ref(), &caller, def, previous.as_ref()).await?;
         // After the gate, as it may load the tool's skill for the owner.
-        engine
+        notes = engine
             .preflight(def, ctx.owner.as_deref())
             .await
             .map_err(|refused| (StatusCode::BAD_REQUEST, refused))?;
@@ -12068,7 +12069,11 @@ async fn monitor_revision_restore(
             )
             .await;
     }
-    Ok(Json(serde_json::json!({ "restored": id, "from_rev": rev })))
+    let mut restored = serde_json::json!({ "restored": id, "from_rev": rev });
+    if !notes.is_empty() {
+        restored["notes"] = serde_json::json!(notes);
+    }
+    Ok(Json(restored))
 }
 
 /// `GET /api/monitors/{id}/activity` — recent dispatches for the monitor.

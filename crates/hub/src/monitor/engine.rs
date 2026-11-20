@@ -1743,11 +1743,12 @@ impl MonitorEngine {
     /// Count a failed poll durably, where its status shows it failing and
     /// why; at the threshold the monitor is disabled and its owner told. A
     /// failure is logged at warn when it starts or changes, at debug while it
-    /// repeats. `missing`: its tool could not be found or loaded, and this is
-    /// the first such poll (`Some(true)`) — its owner is told then, as
-    /// nothing they or their agent see would say so otherwise. Such a
-    /// failure is not counted towards the auto-disable: the monitor is
-    /// polled again as soon as its tool loads, as the notice says.
+    /// repeats. `missing`: its tool could not be found or loaded, and whether
+    /// this process saw it so before (`Some(false)`) — its owner is told as it
+    /// starts, as nothing they or their agent see would say so otherwise.
+    /// Such a poll is no failure of the source: it clears the streak rather
+    /// than counting towards the auto-disable, and the monitor is polled
+    /// again as soon as its tool loads, as the notice says.
     async fn poll_failed(
         &self,
         mon: &OwnedMonitor,
@@ -1758,14 +1759,30 @@ impl MonitorEngine {
         missing: Option<bool>,
     ) -> PollReport {
         let id = mon.def.monitor.id.as_str();
-        if previous.and_then(|s| s.error.as_deref()) != Some(error) {
+        let changed = previous.and_then(|s| s.error.as_deref()) != Some(error);
+        if changed {
             warn!(monitor = %id, error, "monitor poll failed");
         } else {
             tracing::debug!(monitor = %id, error, "monitor poll failed again");
         }
-        if missing == Some(true) {
-            self.tell_owner(mon, "tool_missing", &missing_tool_notice(&mon.def, error))
-                .await;
+        if missing.is_some() {
+            // Told when it starts: not again for the same reason after a
+            // restart, nor on every poll while it lasts.
+            if missing == Some(true) && changed {
+                self.tell_owner(mon, "tool_missing", &missing_tool_notice(&mon.def, error))
+                    .await;
+            }
+            if let Err(e) = self
+                .store
+                .record_poll_unavailable(key, error, next_due)
+                .await
+            {
+                warn!(monitor = %id, error = %e, "monitor poll failure record failed");
+            }
+            return PollReport {
+                error: Some(error.to_string()),
+                ..PollReport::default()
+            };
         }
         let failures = match self.store.record_poll_failure(key, error, next_due).await {
             Ok(failures) => failures,
@@ -1775,7 +1792,7 @@ impl MonitorEngine {
             }
         };
         let threshold = self.config.auto_disable_after_failures;
-        if missing.is_none() && threshold > 0 && failures >= threshold {
+        if threshold > 0 && failures >= threshold {
             let what = format!(
                 "polls of {}",
                 mon.def
@@ -4034,24 +4051,41 @@ template = "x"
                 assert!(told[0].2.contains(missing), "{told:?}");
                 assert!(told[0].2.contains("no need to save it again"), "{told:?}");
 
+                // A restart: a fresh engine sees the same stored reason and
+                // does not tell the owner again.
+                let restarted = MonitorEngine::new(
+                    Arc::clone(&engine.runtime),
+                    Arc::clone(&store),
+                    Arc::new(RwLock::new(SurfaceRegistry::new())),
+                    sink.clone() as Arc<dyn ActionSink>,
+                    agent("atlas", true),
+                    MonitorEngineConfig::default(),
+                )
+                .with_invoker(invoker.clone());
+                let mon = engine.runtime.get("src", Some("alice")).await.unwrap();
+                invoker.answer(Err(InvokeError::Unavailable(missing.into())));
+                let state = source_state_of(&store, &mon.monitor_key()).await;
+                restarted.poll(&mon, state.as_ref()).await;
+                assert_eq!(invoker.calls().len(), 2);
+                assert_eq!(sink.notices().len(), 1, "not told again after a restart");
+
                 // Something else registers: it keeps its cadence.
                 invoker.register("other.tool");
                 engine.poll_due().await;
                 assert_eq!(
                     invoker.calls().len(),
-                    1,
+                    2,
                     "its own tool is still missing: it keeps its cadence"
                 );
 
                 // Past the auto-disable threshold (2), still missing: not
                 // disabled, not told again — what the notice promised.
-                let mon = engine.runtime.get("src", Some("alice")).await.unwrap();
                 for _ in 0..2 {
                     invoker.answer(Err(InvokeError::Unavailable(missing.into())));
                     let state = source_state_of(&store, &mon.monitor_key()).await;
                     engine.poll(&mon, state.as_ref()).await;
                 }
-                assert_eq!(invoker.calls().len(), 3);
+                assert_eq!(invoker.calls().len(), 4);
                 let mon = engine.runtime.get("src", Some("alice")).await.unwrap();
                 assert!(mon.enabled(), "a missing tool never auto-disables");
                 assert_eq!(sink.notices().len(), 1, "told once");
@@ -4060,11 +4094,27 @@ template = "x"
                 invoker.register("jira.search");
                 invoker.answer(Ok(issues(&[("A-1", "open")])));
                 engine.poll_due().await;
-                assert_eq!(invoker.calls().len(), 4, "polled again at once");
+                assert_eq!(invoker.calls().len(), 5, "polled again at once");
+                assert_eq!(
+                    source_state_of(&store, &mon.monitor_key())
+                        .await
+                        .unwrap()
+                        .failures,
+                    0,
+                    "the missing polls left no streak"
+                );
                 let summary = engine.summary_of("src", Some("alice")).await.unwrap();
                 assert_eq!(summary.status, crate::monitor::MonitorStatus::Active);
                 assert_eq!(summary.poll.as_ref().unwrap().error, None);
                 assert_eq!(sink.notices().len(), 1, "told once");
+
+                // One ordinary failure after it: nothing the missing polls
+                // counted makes it the last straw.
+                invoker.answer(Err(InvokeError::Failed("upstream broke".into())));
+                let state = source_state_of(&store, &mon.monitor_key()).await;
+                engine.poll(&mon, state.as_ref()).await;
+                let mon = engine.runtime.get("src", Some("alice")).await.unwrap();
+                assert!(mon.enabled());
             }
         })
         .await;

@@ -18,7 +18,10 @@
 //! decides here too — and the skill is then loaded within their scope, so
 //! their own credentials load. The load only adds: nothing already loaded is
 //! unloaded, so one owner's monitor never takes another's tools away. A
-//! system monitor (no owner) is gated as no person, as its calls are.
+//! system monitor (no owner) is gated as no person, as its calls are. The
+//! call is admitted without running, so whether the agent itself carries
+//! `system.enable_skill` does not matter: who may enable a skill is what the
+//! gauntlet scores, and the owner's call is scored either way.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -185,16 +188,43 @@ impl GovernedInvoker {
             let Some(vault) = service.vault.as_ref() else {
                 eyre::bail!("this agent has no vault to load {skill} from");
             };
-            crate::skill_loader::load_and_track(
+            let before = service.skill_state.get(skill);
+            let loaded = crate::skill_loader::load_skill_from_vault(
                 skill,
                 Arc::clone(vault),
                 service.global_vault.clone(),
                 &service.config,
                 &service.tools,
-                &service.skill_state,
-                "monitor",
-            )
-            .map(|loaded| loaded.context_hint)
+            )?;
+            // What every turn reads of the skill stays the agent's: this
+            // load adds its tools to those already listed, and its hint (one
+            // owner's view) replaces the standing one only when it added any.
+            let (tools, hint, source) = match before {
+                Some(was) => {
+                    let added = loaded
+                        .tool_names
+                        .iter()
+                        .any(|name| !was.tool_names.contains(name));
+                    let mut tools = was.tool_names;
+                    for name in &loaded.tool_names {
+                        if !tools.contains(name) {
+                            tools.push(name.clone());
+                        }
+                    }
+                    let hint = match added {
+                        true => loaded.context_hint.clone(),
+                        false => was.context_hint,
+                    };
+                    (tools, hint, was.source)
+                }
+                None => (
+                    loaded.tool_names.clone(),
+                    loaded.context_hint.clone(),
+                    "vault".to_string(),
+                ),
+            };
+            service.skill_state.mark_loaded(skill, tools, &source, hint);
+            Ok(loaded.context_hint)
         });
         Self::new(
             Arc::clone(&gates.tools),
@@ -884,6 +914,23 @@ mod tests {
             Ok(Resolved::Loaded)
         );
         assert_eq!(loads.len(), 1);
+    }
+
+    /// A system monitor (no owner) is gated as no person, as its calls
+    /// are: the capability gate scores users, and only an administrator may
+    /// save one.
+    #[tokio::test]
+    async fn a_system_monitor_loads_as_no_person() {
+        let (invoker, loads) = enabling_invoker("alice");
+        let why = invoker
+            .resolve("email.inbox", None, "monitor:system/inbox")
+            .await
+            .unwrap_err();
+        assert!(
+            why.contains("enabling the email skill as the hub didn't add it"),
+            "{why}"
+        );
+        assert_eq!(*loads.0.lock().unwrap(), vec![None]);
     }
 
     /// Only the skill that names the tool is loaded: a name its family does
