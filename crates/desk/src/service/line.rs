@@ -2023,6 +2023,42 @@ impl Desk {
         st.lines.seen.remove(&id);
     }
 
+    /// Why `m`, still to go into its session, waits now; none when nothing
+    /// holds it there.
+    pub fn line_waits(&self, m: &LineMessage) -> Option<Wait> {
+        let id = m.to_session()?;
+        let view = self.view(id).ok()?;
+        self.waits_why(&view, self.typed_since_idle(id), self.plugin_heard(id), m)
+    }
+
+    fn waits_why(
+        &self,
+        view: &SessionView,
+        typed: bool,
+        plugin: bool,
+        m: &LineMessage,
+    ) -> Option<Wait> {
+        match m.delivery {
+            Delivery::Held => Some(Wait::Stopped),
+            Delivery::Queued if self.steered(view.id, m.id) => Some(Wait::NextCall),
+            Delivery::Queued => match line::deliverable(view, typed, plugin) {
+                // A turn Esc ended: the plugin takes it now.
+                Err(Wait::Working)
+                    if plugin && view.caps.line == Deliver::Submit && !self.in_a_turn(view) =>
+                {
+                    self.line_gate(view, m)
+                }
+                Err(why) => Some(why),
+                Ok(_) => self.line_gate(view, m),
+            },
+            Delivery::Handed
+            | Delivery::Delivered
+            | Delivery::Refused
+            | Delivery::Withdrawn
+            | Delivery::Noted => None,
+        }
+    }
+
     /// A session's thread, oldest first, the page before `before`; each
     /// waiting message says why it waits.
     pub async fn line_thread(
@@ -2041,27 +2077,7 @@ impl Desk {
             .await?;
         rows.reverse();
         for m in rows.iter_mut().filter(|m| m.to_session() == Some(id)) {
-            m.waiting = match m.delivery {
-                Delivery::Held => Some(Wait::Stopped),
-                Delivery::Queued if self.steered(id, m.id) => Some(Wait::NextCall),
-                Delivery::Queued => match line::deliverable(&view, typed, plugin) {
-                    // A turn Esc ended: the plugin takes it now.
-                    Err(Wait::Working)
-                        if plugin
-                            && view.caps.line == Deliver::Submit
-                            && !self.in_a_turn(&view) =>
-                    {
-                        self.line_gate(&view, m)
-                    }
-                    Err(why) => Some(why),
-                    Ok(_) => self.line_gate(&view, m),
-                },
-                Delivery::Handed
-                | Delivery::Delivered
-                | Delivery::Refused
-                | Delivery::Withdrawn
-                | Delivery::Noted => None,
-            };
+            m.waiting = self.waits_why(&view, typed, plugin, m);
             m.actions = self.line_actions(&view, m);
         }
         Ok(rows)

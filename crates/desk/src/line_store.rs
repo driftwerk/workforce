@@ -321,6 +321,26 @@ impl DeskStore {
             .collect()
     }
 
+    /// What boss `boss` sent that still waits to go into its sessions,
+    /// oldest first.
+    pub async fn line_waiting_from(&self, boss: &str) -> Result<Vec<LineMessage>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                &format!(
+                    "SELECT {COLUMNS} FROM line_messages \
+                     WHERE sender ->> 'kind' = 'manager' AND sender ->> 'id' = $1 \
+                     AND recipient ->> 'kind' = 'session' \
+                     AND delivery IN ('queued', 'handed', 'held') ORDER BY at, id"
+                ),
+                &[&boss],
+            )
+            .await?
+            .iter()
+            .map(message)
+            .collect()
+    }
+
     /// Hands a waiting row on: `Handed` to Desk's plugin, or `Delivered`.
     /// Whether this caller moved it (another may have first).
     pub async fn line_take(&self, id: Uuid, to: Delivery) -> Result<Option<LineMessage>> {

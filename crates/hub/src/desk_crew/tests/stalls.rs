@@ -6,6 +6,7 @@
 //! and is never said to be missing; what only the person can settle is an
 //! item with its answer, reminded until it is answered.
 
+use super::super::actions::{Action, Target};
 use super::super::updates::UpdateWriter;
 use super::*;
 use workforce_common::channels::desk::DeliveryKind;
@@ -538,10 +539,10 @@ async fn a_stall_set_aside_is_left_and_one_answered_anywhere_is_settled() {
     .await;
 }
 
-/// What the boss tells a session it runs that never reaches it, the
-/// session showing no progress meanwhile (20 Nov: Cufflink Migration held
-/// "Go ahead… run step 12 now" from 02:46 until 06:44), wakes the boss
-/// once, past `stall_minutes`, to read where it stands and move it.
+/// A session the boss's message never reached, showing no progress
+/// meanwhile (20 Nov: Cufflink Migration held "Go ahead… run step 12 now"
+/// from 02:46 until 06:44), wakes its boss once, past `stall_minutes`, with
+/// why it waits; one that keeps working on its own is left to it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_message_that_never_reaches_a_session_wakes_its_boss_once() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
@@ -551,26 +552,59 @@ async fn a_message_that_never_reaches_a_session_wakes_its_boss_once() {
             pool,
             "I'll read its history.",
             "[oversight]\nenabled = true\nlevel = \"act\"\nact = { nudge = true }\n\
-             updates = { enabled = false }\nwake = { quiet_minutes = 0 }\nwork = { stall_minutes = 5 }\n",
+             updates = { enabled = false }\nwork = { stall_minutes = 5 }\n",
             &[],
         )
         .await;
-        let s = new_session(&d, dir.path(), "Cufflink Migration").await;
-        let url = hook_url(dir.path(), s.id).await;
-        hook(&url, json!({"hook_event_name": "SessionStart", "session_id": s.id.to_string()})).await;
-        hook(&url, json!({"hook_event_name": "UserPromptSubmit", "prompt": "Wait for the step 12 timer."})).await;
-        let sent = crew
-            .perform(
-                &super::super::actions::Action::Nudge {
-                    to: super::super::actions::Target::Session(s.id),
-                    message: "Go ahead: run step 12 now.".into(),
+        let working = |name: &'static str, prompt: &'static str| {
+            let d = d.clone();
+            let dir = dir.path().to_path_buf();
+            async move {
+                let s = new_session(&d, &dir, name).await;
+                let url = hook_url(&dir, s.id).await;
+                hook(
+                    &url,
+                    json!({"hook_event_name": "SessionStart", "session_id": s.id.to_string()}),
+                )
+                .await;
+                hook(
+                    &url,
+                    json!({"hook_event_name": "UserPromptSubmit", "prompt": prompt}),
+                )
+                .await;
+                (s, url)
+            }
+        };
+        let (stuck, _) = working("Cufflink Migration", "Wait for the step 12 timer.").await;
+        let (busy, busy_url) = working("Legacy removal", "Remove the legacy services.").await;
+        let tell = async |s: uuid::Uuid, message: &str| {
+            crew.perform(
+                &Action::Nudge {
+                    to: Target::Session(s),
+                    message: message.into(),
                     reply_to: None,
                 },
                 crew.by_overseer("Its timer went off.").unwrap(),
             )
             .await
-            .unwrap();
-        assert!(sent.starts_with("told Cufflink Migration"), "{sent}");
+        };
+        let since = chrono::Utc::now();
+        assert!(tell(stuck.id, "Go ahead: run step 12 now.")
+            .await
+            .unwrap()
+            .starts_with("told Cufflink Migration"));
+        tell(busy.id, "Then stop the old workers.").await.unwrap();
+        let progress = tokio::spawn(async move {
+            loop {
+                hook(
+                    &busy_url,
+                    json!({"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                    "tool_input": {"command": "systemctl stop legacy-worker"}}),
+                )
+                .await;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        });
         let woke = eventually("the boss woken", async || {
             d.store()
                 .latest_check_in("desk")
@@ -579,15 +613,21 @@ async fn a_message_that_never_reaches_a_session_wakes_its_boss_once() {
                 .filter(|c| c.prompt.contains("hasn't taken your message"))
         })
         .await;
-        assert!(woke.prompt.contains("Go ahead: run step 12 now."), "{}", woke.prompt);
-        assert!(woke.prompt.contains("crew.restart"), "{}", woke.prompt);
-        // Once a stall: the same waiting message wakes it no more.
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        let latest = d.store().latest_check_in("desk").await.unwrap().unwrap();
         assert!(
-            latest.id == woke.id || !latest.prompt.contains("hasn't taken your message"),
-            "woken again: {}",
-            latest.prompt
+            woke.prompt.contains("Cufflink Migration")
+                && woke.prompt.contains("Go ahead: run step 12 now.")
+                && woke.prompt.contains("its turn hasn't ended")
+                && woke.prompt.contains("crew.restart"),
+            "{}",
+            woke.prompt
+        );
+        assert!(!woke.prompt.contains("Legacy removal"), "{}", woke.prompt);
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        progress.abort();
+        assert_eq!(
+            d.store().wake_ups_since("desk", since).await.unwrap(),
+            1,
+            "one wake a stall, and none for the session at work"
         );
     })
     .await;

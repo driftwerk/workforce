@@ -22,7 +22,7 @@ use workforce_desk::crew::Crew as _;
 use workforce_desk::crew::{
     self, Event, ItemKind, ItemState, Kind, MentionedApproval, Party, PartyKind,
 };
-use workforce_desk::line::LineMessage;
+use workforce_desk::line::{LineMessage, Wait};
 use workforce_desk::model::{DeskEvent, Origin, SessionState};
 use workforce_desk::CheckIn;
 
@@ -592,6 +592,23 @@ impl CrewHub {
             if item.kind == ItemKind::Session && item.id.parse().is_ok_and(|s| self.taken_back(s)) {
                 continue;
             }
+            // What the boss sent that never reached it is the boss's to move,
+            // whatever it asks meanwhile: said instead of its quiet or wait.
+            if let Some((key, trigger)) = self.undelivered(
+                overseer,
+                item,
+                &party,
+                waiting.get(&item.id).map(Vec::as_slice),
+                now,
+                minute,
+                stall,
+            ) {
+                holding.insert(key.clone());
+                if noted.insert(key) {
+                    out.push(trigger);
+                }
+                continue;
+            }
             // A session's question the person is in control of, or its Act
             // fully boss answers itself (`answer`), and a request its decision
             // call has (`decide`): not raised here.
@@ -627,14 +644,6 @@ impl CrewHub {
                     })
             {
                 continue;
-            }
-            if let Some((key, trigger)) =
-                self.undelivered(item, &party, waiting.get(&item.id), now, stall)
-            {
-                holding.insert(key.clone());
-                if noted.insert(key) {
-                    out.push(trigger);
-                }
             }
             let (key, trigger) = match item.state {
                 ItemState::NeedsYou if past(item.since, o.wake.waiting_minutes) => {
@@ -727,58 +736,75 @@ impl CrewHub {
     /// `overseer`'s own messages still waiting to go into each session, by
     /// session id, oldest first.
     async fn waiting_from(&self, overseer: &str) -> HashMap<String, Vec<LineMessage>> {
-        let rows = match self.desk.store().line_waiting().await {
-            Ok(rows) => rows,
+        match self.desk.store().line_waiting_from(overseer).await {
+            Ok(rows) => rows.into_iter().fold(HashMap::new(), |mut by, m| {
+                by.entry(m.to.id.clone()).or_default().push(m);
+                by
+            }),
             Err(e) => {
                 tracing::warn!(error = %e, "the boss's waiting messages couldn't be read");
-                return HashMap::new();
+                HashMap::new()
             }
-        };
-        rows.into_iter()
-            .filter(|m| m.from.kind == PartyKind::Manager && m.from.id == overseer)
-            .fold(HashMap::new(), |mut by, m| {
-                by.entry(m.to.id.clone()).or_insert_with(Vec::new).push(m);
-                by
-            })
+        }
     }
 
-    /// A session the boss's messages haven't reached for `stall`, with no
-    /// progress of its own for as long (20 Nov: Cufflink Migration held
-    /// the boss's go for step 12 from 02:46 until 06:44), unless someone
-    /// stopped or closed it: the boss is woken once a stall, keyed by its
-    /// oldest message, to read where it stands and move it.
+    /// The trigger, keyed by its oldest message, for a session `overseer`'s
+    /// messages haven't reached for `stall` while it showed no progress of
+    /// its own: none while Desk holds them on purpose (the person typing,
+    /// driving or in its dialog, the breaker, a mode ending), or once
+    /// someone stopped or closed it.
+    #[allow(clippy::too_many_arguments)]
     fn undelivered(
         &self,
+        overseer: &str,
         item: &crew::Item,
         party: &Party,
-        waiting: Option<&Vec<LineMessage>>,
+        waiting: Option<&[LineMessage]>,
         now: DateTime<Utc>,
+        minute: chrono::Duration,
         stall: chrono::Duration,
     ) -> Option<(String, Trigger)> {
-        let oldest = waiting?.first()?;
+        let waiting = waiting?;
+        let oldest = waiting.first()?;
         let quiet = item.last_activity.is_none_or(|at| now - at >= stall);
-        if stall <= chrono::Duration::zero() || now - oldest.at < stall || !quiet {
+        if now - oldest.at < stall || !quiet {
             return None;
         }
-        let state = self.desk.view(item.id.parse().ok()?).ok()?.state;
-        if matches!(state, SessionState::Stopped | SessionState::Closed) {
+        let view = self.desk.view(item.id.parse().ok()?).ok()?;
+        if matches!(view.state, SessionState::Stopped | SessionState::Closed)
+            || self.person_has_questions(&view, overseer)
+        {
             return None;
         }
+        let why = match self.desk.line_waits(oldest) {
+            Some(Wait::Stopped) => "it isn't running, so it is held until it runs again",
+            Some(Wait::Working) => "its turn hasn't ended",
+            Some(Wait::Asking) => "it is asking something, and your messages wait behind that",
+            None => "it was free to take it, and nothing took it in",
+            Some(
+                Wait::Typing
+                | Wait::Paused
+                | Wait::PersonDriving
+                | Wait::ModeEnding
+                | Wait::NextCall,
+            ) => return None,
+        };
         let at = oldest
             .at
             .with_timezone(&self.desk.timezone())
             .format("%H:%M");
-        let minutes = (now - oldest.at).num_minutes();
+        let minutes =
+            ((now - oldest.at).num_milliseconds() / minute.num_milliseconds().max(1)).max(1);
         let line = format!(
             "{} hasn't taken your message of {at} in {minutes} min ({} waiting, the oldest “{}”) \
-             and has shown no progress meanwhile; it reads as {}. Read where it stands yourself \
+             and has shown no progress meanwhile: {why}. Read where it stands yourself \
              (crew.history) and move it now: answer what it waits on, restart it (crew.restart), \
-             start a fresh session on the work (crew.start_session), or do the step yourself. \
-             Tell the person only if none of those can work.",
+             start a fresh session on the work (crew.start_session), or do the step yourself; \
+             if a restart of it already failed, don't try another. Tell the person only if none \
+             of those can work.",
             who(party),
-            waiting.map_or(0, Vec::len),
+            waiting.len(),
             crew::words(&oldest.text, 20),
-            state.as_str(),
         );
         Some((
             format!("undelivered:{}:{}", item.id, oldest.id),
