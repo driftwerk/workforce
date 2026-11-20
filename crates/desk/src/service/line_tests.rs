@@ -303,23 +303,9 @@ async fn the_loop_guard_holds_a_session_to_its_budget_until_the_person_speaks_an
         let a = new_session(&d, dir.path()).await;
         idle(&d, a.id).await;
         for i in 0..crate::rooms::TURN_BUDGET {
-            d.line_call(
-                a.id,
-                "tell",
-                &json!({"to": "you", "text": format!("step {i}")}),
-                None,
-            )
-            .await
-            .unwrap();
+            tell_you(&d, a.id, &format!("step {i}")).await.unwrap();
         }
-        let refused = d
-            .line_call(
-                a.id,
-                "tell",
-                &json!({"to": "you", "text": "one more"}),
-                None,
-            )
-            .await;
+        let refused = tell_you(&d, a.id, "one more").await;
         assert_eq!(refused, Err(Refusal::Budget.to_string()));
         // A message Desk's plugin submitted is not the person speaking.
         let m = d
@@ -1837,6 +1823,264 @@ async fn stalled_items(d: &Desk, id: Uuid) -> Vec<crate::open_item::OpenItem> {
         .collect()
 }
 
+async fn tell_you(d: &Desk, id: Uuid, text: &str) -> Result<Value, String> {
+    d.line_call(id, "tell", &json!({"to": "you", "text": text}), None)
+        .await
+}
+
+/// A hub whose boss answers sessions on their lines.
+struct Answering;
+
+#[async_trait::async_trait]
+impl crate::crew::Crew for Answering {
+    fn overseer(&self) -> Option<crate::crew::Overseer> {
+        None
+    }
+    fn agents(&self) -> Vec<crate::crew::CrewAgent> {
+        Vec::new()
+    }
+    fn midnight(&self) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now()
+    }
+    async fn accept(&self, _: &crate::crew::Suggestion) -> Result<(), String> {
+        Ok(())
+    }
+    fn answers_lines(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn a_sessions_reports_to_the_boss_that_runs_it_are_never_refused_nor_counted() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        sarah_bosses(&d);
+        let crew: Arc<dyn crate::crew::Crew> = Arc::new(Answering);
+        d.answer_lines_with(&crew);
+        // Kept alive by the test: the desk holds it weakly.
+        std::mem::forget(crew);
+        // One its boss doesn't run: what it tells the boss is counted.
+        let free = new_session(&d, dir.path()).await;
+        idle(&d, free.id).await;
+        for i in 0..crate::rooms::TURN_BUDGET {
+            tell_desk(&d, free.id, &format!("report {i}"))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            tell_desk(&d, free.id, "one more").await,
+            Err(Refusal::Budget.to_string()),
+            "a boss that doesn't run it paces nothing of its"
+        );
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        d.take_on(
+            s.id,
+            &Party::manager("sarah", "Sarah"),
+            crate::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        for i in 0..crate::rooms::BOSS_RUN_CEILING * 4 {
+            tell_desk(&d, s.id, &format!("report {i}"))
+                .await
+                .unwrap_or_else(|e| panic!("report {i} refused: {e}"));
+        }
+        assert_eq!(
+            d.line_needs().len(),
+            1,
+            "only the one it doesn't run stopped"
+        );
+        assert!(stalled_items(&d, s.id).await.is_empty());
+        assert_eq!(d.line_run(s.id), LineRun::default());
+        // What it still sends the person is counted as before.
+        for i in 0..crate::rooms::TURN_BUDGET {
+            tell_you(&d, s.id, &format!("note {i}")).await.unwrap();
+        }
+        assert_eq!(
+            tell_you(&d, s.id, "one more").await,
+            Err(Refusal::Budget.to_string())
+        );
+        // Who it can't reach is said first, and stops nothing more.
+        let needs = d.line_needs().len();
+        let nobody = d
+            .line_call(s.id, "tell", &json!({"to": "nobody", "text": "hi"}), None)
+            .await;
+        assert_eq!(
+            nobody,
+            Err(Refusal::NoSuchSession("nobody".into()).to_string())
+        );
+        assert_eq!(d.line_needs().len(), needs);
+        let last = tell_desk(&d, s.id, "and its boss still hears it")
+            .await
+            .unwrap();
+        let last: Uuid = serde_json::from_value(last["id"].clone()).unwrap();
+        assert_eq!(row(&d, last).await.to, Party::manager("sarah", "Sarah"));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn reports_to_a_boss_that_only_watches_the_session_it_holds_are_counted() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        d.set_bosses(vec![crate::service::Boss {
+            agent: "sarah".into(),
+            name: "Sarah".into(),
+            scope: crate::scope::Scope::Ungrouped,
+            level: "watch".into(),
+        }]);
+        let crew: Arc<dyn crate::crew::Crew> = Arc::new(Answering);
+        d.answer_lines_with(&crew);
+        std::mem::forget(crew);
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        d.take_on(
+            s.id,
+            &Party::manager("sarah", "Sarah"),
+            crate::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        assert!(!d.its_acting_boss(s.id, &Party::manager("sarah", "Sarah")));
+        for i in 0..crate::rooms::TURN_BUDGET {
+            tell_desk(&d, s.id, &format!("report {i}")).await.unwrap();
+        }
+        assert_eq!(
+            tell_desk(&d, s.id, "one more").await,
+            Err(Refusal::Budget.to_string()),
+            "a boss that only watches it has no turns that pace it"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn questions_to_the_boss_that_runs_it_are_counted_as_reports_are_not() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        sarah_bosses(&d);
+        let crew: Arc<dyn crate::crew::Crew> = Arc::new(Answering);
+        d.answer_lines_with(&crew);
+        std::mem::forget(crew);
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        d.take_on(
+            s.id,
+            &Party::manager("sarah", "Sarah"),
+            crate::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        let ask = |text: String| {
+            let d = d.clone();
+            async move {
+                d.line_call(
+                    s.id,
+                    "ask",
+                    &json!({"to": "desk", "text": text}),
+                    Some(Duration::from_millis(10)),
+                )
+                .await
+            }
+        };
+        let mut asked = 0;
+        let refused = loop {
+            match ask(format!("Should I proceed with step {asked}?")).await {
+                Ok(_) => asked += 1,
+                Err(e) => break e,
+            }
+            assert!(
+                asked <= crate::rooms::BOSS_RUN_CEILING,
+                "questions to its boss run on unbounded"
+            );
+        };
+        assert!(
+            [Refusal::Budget.to_string(), Refusal::Ceiling.to_string()].contains(&refused),
+            "{refused}"
+        );
+        // Its reports still go.
+        tell_desk(&d, s.id, "Step 12 done.").await.unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn reports_and_the_answers_of_the_boss_that_runs_it_never_climb_the_hop() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let by = sarah_bosses(&d);
+        let crew: Arc<dyn crate::crew::Crew> = Arc::new(Answering);
+        d.answer_lines_with(&crew);
+        std::mem::forget(crew);
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        d.take_on(
+            s.id,
+            &Party::manager("sarah", "Sarah"),
+            crate::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        // Report, its boss's answer a hop on, taken in: round after round,
+        // well past the hops a chain may run.
+        for round in 0..crate::rooms::MAX_HOPS * 3 {
+            let sent = tell_desk(&d, s.id, &format!("step {round} done"))
+                .await
+                .unwrap_or_else(|e| panic!("report {round} refused: {e}"));
+            let report = row(&d, serde_json::from_value(sent["id"].clone()).unwrap()).await;
+            assert_eq!(report.hop, 1, "round {round}");
+            let mut answer = by.clone();
+            answer.hop = report.hop + 1;
+            let told = d
+                .line_send(Sender::Overseer(answer), tell(s.id, "Go on."))
+                .await
+                .unwrap();
+            let next = d.line_next(s.id, Duration::from_secs(2)).await.unwrap();
+            assert_eq!(next["id"], json!(told.id));
+            d.line_ack(s.id, told.id, true).await.unwrap();
+        }
+        // Its boss passing on words from further along the chain (another
+        // session's, in that one's turn) lengthens it.
+        let mut relayed = by.clone();
+        relayed.hop = crate::rooms::MAX_HOPS;
+        let passed = d
+            .line_send(
+                Sender::Overseer(relayed),
+                tell(s.id, "acme-api says it is rebased."),
+            )
+            .await
+            .unwrap();
+        d.line_next(s.id, Duration::from_secs(2)).await.unwrap();
+        d.line_ack(s.id, passed.id, true).await.unwrap();
+        assert_eq!(d.line_run(s.id).cause, crate::rooms::MAX_HOPS);
+        d.person_spoke(s.id);
+        // A peer's words still lengthen its chain.
+        let peer = new_session(&d, dir.path()).await;
+        idle(&d, peer.id).await;
+        let from_peer = d
+            .line_send(Sender::Session(peer.id), tell(s.id, "Rebased."))
+            .await
+            .unwrap();
+        d.line_next(s.id, Duration::from_secs(2)).await.unwrap();
+        d.line_ack(s.id, from_peer.id, true).await.unwrap();
+        assert_eq!(d.line_run(s.id).cause, from_peer.hop);
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn a_session_its_boss_answers_goes_on_past_the_budget_up_to_the_ceiling() {
     with_test_pool(build_pool, |pool| async move {
@@ -1846,12 +2090,12 @@ async fn a_session_its_boss_answers_goes_on_past_the_budget_up_to_the_ceiling() 
         let s = new_session(&d, dir.path()).await;
         idle(&d, s.id).await;
         let ceiling = crate::rooms::BOSS_RUN_CEILING as usize;
-        // Its boss answers every few of its reports, as a boss running it
-        // does: well past the budget, never refused below the ceiling.
+        // Its boss answers every few of its notes to the person: well past
+        // the budget, never refused below the ceiling.
         for i in 0..ceiling {
-            tell_desk(&d, s.id, &format!("report {i}"))
+            tell_you(&d, s.id, &format!("note {i}"))
                 .await
-                .unwrap_or_else(|e| panic!("report {i} refused: {e}"));
+                .unwrap_or_else(|e| panic!("note {i} refused: {e}"));
             if i % 5 == 4 {
                 d.line_send(Sender::Overseer(by.clone()), tell(s.id, "go on"))
                     .await
@@ -1863,7 +2107,7 @@ async fn a_session_its_boss_answers_goes_on_past_the_budget_up_to_the_ceiling() 
             .await
             .unwrap();
         assert_eq!(
-            tell_desk(&d, s.id, "one more").await,
+            tell_you(&d, s.id, "one more").await,
             Err(Refusal::Ceiling.to_string()),
             "its boss answering doesn't lift the ceiling"
         );
@@ -1872,7 +2116,7 @@ async fn a_session_its_boss_answers_goes_on_past_the_budget_up_to_the_ceiling() 
             .await
             .unwrap();
         assert_eq!(
-            tell_desk(&d, s.id, "and another").await,
+            tell_you(&d, s.id, "and another").await,
             Err(Refusal::Ceiling.to_string())
         );
         assert_eq!(d.line_needs().len(), 1);
@@ -1880,7 +2124,7 @@ async fn a_session_its_boss_answers_goes_on_past_the_budget_up_to_the_ceiling() 
         d.line_post(s.id, "carry on".into(), When::Queue)
             .await
             .unwrap();
-        tell_desk(&d, s.id, "carrying on").await.unwrap();
+        tell_you(&d, s.id, "carrying on").await.unwrap();
     })
     .await;
 }
@@ -1937,12 +2181,12 @@ async fn a_stopped_session_is_one_need_of_the_persons_until_they_speak_to_it() {
         idle(&d, s.id).await;
         let mut events = d.0.events.subscribe();
         for i in 0..crate::rooms::TURN_BUDGET {
-            tell_desk(&d, s.id, &format!("report {i}")).await.unwrap();
+            tell_you(&d, s.id, &format!("report {i}")).await.unwrap();
         }
         // Refused again and again: one need, said once.
         for _ in 0..3 {
             assert_eq!(
-                tell_desk(&d, s.id, "one more").await,
+                tell_you(&d, s.id, "one more").await,
                 Err(Refusal::Budget.to_string())
             );
         }
@@ -1952,7 +2196,7 @@ async fn a_stopped_session_is_one_need_of_the_persons_until_they_speak_to_it() {
         assert_eq!(
             needs[0].ask,
             format!(
-                "{name} stopped: it has sent {} messages to Desk without hearing from you. Reply to let it carry on.",
+                "{name} is waiting for you: it has sent {} messages without hearing from you. Reply to let it carry on.",
                 crate::rooms::TURN_BUDGET
             )
         );
@@ -1983,9 +2227,9 @@ async fn a_stopped_session_is_one_need_of_the_persons_until_they_speak_to_it() {
         .await;
         // Stopped again, its own boss answering lifts this one.
         for i in 0..crate::rooms::TURN_BUDGET {
-            tell_desk(&d, s.id, &format!("report {i}")).await.unwrap();
+            tell_you(&d, s.id, &format!("report {i}")).await.unwrap();
         }
-        assert!(tell_desk(&d, s.id, "one more").await.is_err());
+        assert!(tell_you(&d, s.id, "one more").await.is_err());
         assert_eq!(d.line_needs().len(), 1);
         d.line_send(Sender::Overseer(by), tell(s.id, "go on"))
             .await
@@ -2005,7 +2249,7 @@ async fn a_stopped_session_is_one_need_of_the_persons_until_they_speak_to_it() {
             }
         }
         assert_eq!(resumed, 2, "each lift is said, so the Floor reads it gone");
-        tell_desk(&d, s.id, "going on").await.unwrap();
+        tell_you(&d, s.id, "going on").await.unwrap();
     })
     .await;
 }

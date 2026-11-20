@@ -512,10 +512,7 @@ impl Desk {
                 };
                 let from_boss = (from != "desk").then(|| from.clone());
                 // The old boss is asked to write it unless it only watches.
-                let asks = from_boss
-                    .as_deref()
-                    .and_then(|b| self.bosses().into_iter().find(|x| x.agent == b))
-                    .is_some_and(|b| b.level != "watch");
+                let asks = from_boss.as_deref().is_some_and(|b| self.boss_acts(b));
                 for (key, facts) in about {
                     let note = moves::facts_note(&facts);
                     drafts.push((

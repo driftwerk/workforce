@@ -879,13 +879,25 @@ async fn overseeing(
     oversight: &str,
     crew_agents: &[Arc<AgentService>],
 ) -> (Arc<AgentService>, Arc<CrewHub>, Desk, wiremock::MockServer) {
+    overseeing_at(dir, pool, reply, oversight, crew_agents, FAST).await
+}
+
+/// [`overseeing`], its crew keeping `timing`.
+async fn overseeing_at(
+    dir: &Path,
+    pool: workforce_postgres::PostgresPool,
+    reply: &str,
+    oversight: &str,
+    crew_agents: &[Arc<AgentService>],
+    timing: Timing,
+) -> (Arc<AgentService>, Arc<CrewHub>, Desk, wiremock::MockServer) {
     let (overseer, llm) = agent(dir, "desk", reply).await;
     write_config(&overseer, oversight);
     let mut all = vec![Arc::clone(&overseer)];
     all.extend(crew_agents.iter().cloned());
     let state = hub(&all);
     let d = desk(pool, dir).await;
-    let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+    let crew = CrewHub::start(state, d.clone(), timing, CancellationToken::new());
     let dm = overseer
         .sessions
         .get_or_create(DESK_CHANNEL, PERSON, "desk")
