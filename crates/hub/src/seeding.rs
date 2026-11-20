@@ -320,6 +320,16 @@ async fn trusted(
 /// the rate, pages are as long as the endpoint is sent at once, and enough
 /// of them are stored at a time that one repo keeps it busy. With the
 /// node's own model, or a limit, a page at a time, as the hub fills.
+pub(crate) fn knowledge_dirs(config: &WorkforceConfig) -> (String, String) {
+    let knowledge = &config.knowledge;
+    let root = knowledge
+        .root
+        .clone()
+        .unwrap_or_else(|| config.hub.data_dir.clone());
+    let data_dir = knowledge.data_dir.clone().unwrap_or_else(|| root.clone());
+    (root, data_dir)
+}
+
 fn pace_of(options: &SeedOptions) -> FillPace {
     let mut pace = FillPace::at(options.per_sec);
     if let (Some(seeding), 0) = (&options.outside, options.per_sec) {
@@ -361,16 +371,7 @@ pub async fn reindex_code_vectors(
     let store: Arc<dyn CodeVectorStore> = Arc::new(store);
     store.ensure_collections().await?;
 
-    let root = config
-        .knowledge
-        .root
-        .clone()
-        .unwrap_or_else(|| config.hub.data_dir.clone());
-    let data_dir = config
-        .knowledge
-        .data_dir
-        .clone()
-        .unwrap_or_else(|| root.clone());
+    let (root, data_dir) = knowledge_dirs(config);
     let service = KnowledgeService::new_with_backend(
         root.into(),
         data_dir.into(),

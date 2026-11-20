@@ -292,7 +292,7 @@ pub(crate) fn count_embedded(backend: &'static str, records: usize) {
 }
 
 /// Result from a vector search query.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VectorSearchResult {
     pub entity_id: String,
     pub repo_id: String,
@@ -302,6 +302,67 @@ pub struct VectorSearchResult {
     pub start_line: u32,
     pub end_line: u32,
     pub score: f32,
+}
+
+/// A hit with the object it is and its distance under the collection's metric.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Near {
+    pub object: String,
+    pub distance: f32,
+    pub found: VectorSearchResult,
+}
+
+/// What a nearest search starts from.
+#[derive(Debug, Clone, Copy)]
+pub enum NearestTo<'a> {
+    Text(&'a str),
+    Vector(&'a [f32]),
+}
+
+/// A scan of every entity of a repo: the rows listed, each vector's nearest,
+/// and each vector's distance to the object it was asked about, if listed.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Scanned {
+    pub held: usize,
+    pub nearest: Vec<Vec<Near>>,
+    pub firsts: Vec<Option<f32>>,
+}
+
+/// Searches of the code entities by a vector, and the vectors to search with.
+#[async_trait]
+pub trait SearchedByVector: Send + Sync {
+    /// The prefix the node puts before a question's text.
+    fn query_prefix(&self) -> Option<String>;
+    /// The node's vector of each text, each embedded alone, nothing put before it.
+    async fn embedded(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
+    /// The `limit` entities of `repo_id` nearest, as the node's index finds them.
+    async fn nearest(&self, to: NearestTo<'_>, repo_id: &str, limit: usize) -> Result<Vec<Near>>;
+    /// For each vector, its `limit` nearest entities of `repo_id` by a scan of every
+    /// one, in the node's order (distance, then object), and its distance to the
+    /// object named beside it.
+    async fn nearest_exactly(
+        &self,
+        asked: &[(&[f32], Option<&str>)],
+        repo_id: &str,
+        limit: usize,
+    ) -> Result<Scanned>;
+    /// How many entities of `repo_id` the store holds.
+    async fn counted(&self, repo_id: &str) -> Result<usize>;
+}
+
+pub(crate) fn kept_nearest(top: Vec<Near>, more: Vec<Near>, limit: usize) -> Vec<Near> {
+    let mut nearest: Vec<Near> = top.into_iter().chain(more).collect();
+    nearest.sort_by(|a, b| {
+        a.distance
+            .total_cmp(&b.distance)
+            .then_with(|| a.object.cmp(&b.object))
+    });
+    nearest.truncate(limit);
+    nearest
+}
+
+fn graphql_string(text: &str) -> String {
+    serde_json::Value::from(text).to_string()
 }
 
 /// Why a code question was answered without searching the code vectors.
@@ -990,59 +1051,31 @@ impl CodeVectorStore for WeaviateCodeVectorStore {
         let Some(query) = search_text(query, "code_search_entities") else {
             return Ok(Vec::new());
         };
-        let mut where_conditions = Vec::new();
-
-        if let Some(rid) = repo_id {
-            where_conditions.push(format!(
-                r#"{{ path: ["repoId"], operator: Equal, valueText: "{}" }}"#,
-                rid
-            ));
-        }
-
-        if let Some(k) = kind {
-            where_conditions.push(format!(
-                r#"{{ path: ["kind"], operator: Equal, valueText: "{:?}" }}"#,
-                k
-            ));
-        }
-
-        let where_clause = if where_conditions.is_empty() {
-            String::new()
-        } else if where_conditions.len() == 1 {
-            format!("where: {}", where_conditions[0])
-        } else {
+        let conditions: Vec<String> = [
+            repo_id.map(|repo_id| ("repoId", repo_id.to_string())),
+            kind.map(|kind| ("kind", format!("{kind:?}"))),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|(path, value)| {
             format!(
-                "where: {{ operator: And, operands: [{}] }}",
-                where_conditions.join(", ")
+                r#"{{ path: ["{path}"], operator: Equal, valueText: {} }}"#,
+                graphql_string(&value)
             )
+        })
+        .collect();
+        let where_clause = match conditions.as_slice() {
+            [] => String::new(),
+            [condition] => format!("where: {condition}"),
+            conditions => format!(
+                "where: {{ operator: And, operands: [{}] }}",
+                conditions.join(", ")
+            ),
         };
-
         let graphql = format!(
-            r#"{{
-                Get {{
-                    {collection}(
-                        nearText: {{ concepts: ["{query}"] }}
-                        limit: {limit}
-                        {where_clause}
-                    ) {{
-                        entityId
-                        repoId
-                        qualifiedName
-                        kind
-                        filePath
-                        startLine
-                        endLine
-                        _additional {{
-                            certainty
-                        }}
-                    }}
-                }}
-            }}"#,
-            collection = CODE_ENTITY_COLLECTION,
-            query = query.as_str().replace('"', "\\\""),
+            "{{ Get {{ {CODE_ENTITY_COLLECTION}( nearText: {{ concepts: [{}] }} limit: {limit} {where_clause} ) {{ entityId repoId qualifiedName kind filePath startLine endLine _additional {{ certainty }} }} }} }}",
+            graphql_string(query.as_str()),
         );
-
-        let graphql = graphql.split_whitespace().collect::<Vec<_>>().join(" ");
 
         let url = format!("{}/v1/graphql", self.base_url);
         let resp = self
@@ -1211,10 +1244,9 @@ impl CodeVectorStore for WeaviateCodeVectorStore {
     /// Get entity count for a repo.
     async fn entity_count(&self, repo_id: &str) -> Result<usize> {
         let graphql = format!(
-            r#"{{ Aggregate {{ {collection}(where: {{ path: ["repoId"], operator: Equal, valueText: "{repo_id}" }}) {{ meta {{ count }} }} }} }}"#,
-            collection = CODE_ENTITY_COLLECTION,
+            r#"{{ Aggregate {{ {CODE_ENTITY_COLLECTION}(where: {{ path: ["repoId"], operator: Equal, valueText: {} }}) {{ meta {{ count }} }} }} }}"#,
+            graphql_string(repo_id),
         );
-        let graphql = graphql.split_whitespace().collect::<Vec<_>>().join(" ");
 
         let url = format!("{}/v1/graphql", self.base_url);
         let resp = self
@@ -1545,6 +1577,70 @@ mod tests {
         ];
         let count = store.index_summaries(&inputs).await.unwrap();
         assert_eq!(count, 0);
+    }
+
+    /// The text of the GraphQL string literal that follows `after` in
+    /// `query`, read as JSON reads it.
+    fn literal_after(query: &str, after: &str) -> String {
+        let rest = &query[query.find(after).unwrap() + after.len()..];
+        let mut read = serde_json::Deserializer::from_str(rest).into_iter::<String>();
+        read.next().unwrap().unwrap()
+    }
+
+    /// Weaviate is asked the question as it was put, and the repo as it is
+    /// named, each as a string GraphQL reads back exactly.
+    #[tokio::test]
+    async fn weaviate_is_asked_the_text_exactly() {
+        let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+        let recording = Arc::clone(&asked);
+        let app = axum::Router::new().route(
+            "/v1/graphql",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let recording = Arc::clone(&recording);
+                async move {
+                    let query = body["query"].as_str().unwrap().to_string();
+                    recording.lock().unwrap().push(query.clone());
+                    axum::Json(match query.starts_with("{ Aggregate") {
+                        true => serde_json::json!({ "data": { "Aggregate": { "CodeEntity": [
+                            { "meta": { "count": 3 } }
+                        ]}}}),
+                        false => serde_json::json!({ "data": { "Get": { "CodeEntity": [{
+                            "entityId": "e1", "repoId": "r", "qualifiedName": "crate::e1",
+                            "kind": "Function", "filePath": "src/e1.rs", "startLine": 1,
+                            "endLine": 2, "_additional": { "certainty": 0.9 }
+                        }]}}}),
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let store = WeaviateCodeVectorStore::new(url, None);
+
+        let question = "a \"b\" \\c\n  d";
+        let repo = r#"r"x\"#;
+        let found = store
+            .search_entities(question, Some(repo), Some(EntityKind::Struct), 20)
+            .await
+            .unwrap();
+        assert_eq!(found[0].entity_id, "e1");
+        assert_eq!(store.entity_count(repo).await.unwrap(), 3);
+        let asked = asked.lock().unwrap().clone();
+        assert_eq!(literal_after(&asked[0], "concepts: ["), question);
+        assert!(asked[0].contains(&format!("concepts: [{}]", graphql_string(question))));
+        assert_eq!(
+            literal_after(
+                &asked[0],
+                r#"path: ["repoId"], operator: Equal, valueText: "#
+            ),
+            repo
+        );
+        assert_eq!(
+            literal_after(&asked[0], r#"path: ["kind"], operator: Equal, valueText: "#),
+            "Struct"
+        );
+        assert_eq!(literal_after(&asked[1], "valueText: "), repo);
     }
 
     #[tokio::test]

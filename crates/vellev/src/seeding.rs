@@ -209,7 +209,7 @@ const STANDING_SAMPLE: [&str; 16] = [
     "struct Point { x: f64, y: f64 } // a point in the plane, in metres from the origin of the site survey, east then north",
 ];
 
-/// Drops the collection made to compare embeddings, however the comparison
+/// Drops the collection made to embed with the node, however the embedding
 /// ends: explicitly when it runs to its end, and from a task of its own if
 /// it is dropped part of the way.
 struct Probe {
@@ -218,11 +218,19 @@ struct Probe {
 }
 
 impl Probe {
-    async fn dropped(mut self) {
-        if let Some(records) = self.records.take() {
-            if let Err(e) = records.drop().await {
-                tracing::warn!(collection = %self.name, error = %e, "the collection made to compare embeddings was not dropped");
+    async fn dropped(mut self) -> Result<()> {
+        let Some(records) = self.records.take() else {
+            return Ok(());
+        };
+        match records.drop().await {
+            Err(e) if !e.is_not_found() => {
+                tracing::warn!(collection = %self.name, error = %e, "the collection made to embed with the node was not dropped");
+                Err(eyre::Report::new(e).wrap_err(format!(
+                    "the collection made to embed with the node, '{}', was not dropped",
+                    self.name
+                )))
             }
+            _ => Ok(()),
         }
     }
 }
@@ -237,6 +245,121 @@ impl Drop for Probe {
         runtime.spawn(async move {
             let _ = records.drop().await;
         });
+    }
+}
+
+const PROBE_LIST: u32 = 1000;
+
+/// The node itself as an embedder: texts are written `per_write` at a time
+/// to a collection made for them and read back with their vectors, and the
+/// collection is dropped. A question is embedded alone, so one text a write
+/// gives the vector the node searches with.
+pub struct NodeEmbedder {
+    tenants: Tenants,
+    embedding: Embedding,
+    per_write: usize,
+}
+
+impl NodeEmbedder {
+    pub fn new(tenants: Tenants, embedding: Embedding, per_write: usize) -> Self {
+        Self {
+            tenants,
+            embedding,
+            per_write: per_write.max(1),
+        }
+    }
+
+    fn probe(&self) -> Result<Collection> {
+        Ok(collection(
+            CollectionName::new(format!("WorkforceEmbedProbe{}", Uuid::new_v4().simple()))?,
+            vec![Property {
+                filterable: false,
+                ..Property::new("text", DataType::Text)
+            }],
+            Embedding {
+                properties: vec!["text".to_string()],
+                ..self.embedding.clone()
+            },
+        ))
+    }
+
+    async fn made(
+        &self,
+        probe: &Collection,
+        records: &vellev_client::Records,
+        texts: &[String],
+    ) -> Result<Vec<Vec<f32>>> {
+        let failed = |e| classified(e, &self.tenants);
+        records.create(probe).await.map_err(failed)?;
+        let ids: Vec<ObjectId> = texts.iter().map(|_| ObjectId(Uuid::new_v4())).collect();
+        let written: Vec<(&ObjectId, &String)> = ids.iter().zip(texts).collect();
+        for batch in written.chunks(self.per_write) {
+            let changes = batch
+                .iter()
+                .map(|(id, text)| {
+                    Change::upsert(
+                        probe.name.clone(),
+                        **id,
+                        Content::new(Map::from_iter([("text".to_string(), json!(text))])),
+                    )
+                })
+                .collect();
+            self.tenants.writes.apply(changes).await.map_err(failed)?;
+        }
+        let mut by_node = std::collections::HashMap::new();
+        let mut after = None;
+        loop {
+            let page = after
+                .into_iter()
+                .fold(Page::new(PROBE_LIST).vectors(true), Page::after);
+            let listed = records.list(&page).await.map_err(failed)?;
+            by_node.extend(
+                listed
+                    .objects
+                    .into_iter()
+                    .map(|object| (object.id, object.vector.unwrap_or_default())),
+            );
+            after = listed.next;
+            if after.is_none() {
+                break;
+            }
+        }
+        let vectors: Vec<Vec<f32>> = ids.iter().filter_map(|id| by_node.remove(id)).collect();
+        match vectors.len() == texts.len() {
+            true => Ok(vectors),
+            false => Err(eyre!(
+                "{} gave back {} vectors for {} texts",
+                self.name(),
+                vectors.len(),
+                texts.len()
+            )),
+        }
+    }
+}
+
+#[async_trait]
+impl DocumentEmbedder for NodeEmbedder {
+    fn name(&self) -> String {
+        format!(
+            "the vellev node at {} ({})",
+            self.tenants.node, self.embedding.model
+        )
+    }
+
+    async fn documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let probe = self.probe()?;
+        let records = self.tenants.reads.collection(&probe.name);
+        let made = Probe {
+            records: Some(records.clone()),
+            name: probe.name.clone(),
+        };
+        let vectors = self.made(&probe, &records, texts).await;
+        let dropped = made.dropped().await;
+        let vectors = vectors?;
+        dropped.map(|()| vectors)
     }
 }
 
@@ -323,133 +446,72 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Measure how near `embedder`'s vectors of `texts` are to those the node
-/// makes of them, embedding as `embedding` does: the texts are written to
-/// a collection made for the purpose, which the node embeds, read back
-/// with their vectors, and the collection dropped. Each is also written
-/// after the embedding's query prefix, if it has one, to tell an embedder
-/// that puts it before documents.
+/// makes of them, embedding as `embedding` does ([`NodeEmbedder`]). Each
+/// is also embedded by the node after the embedding's query prefix, if it
+/// has one, to tell an embedder that puts it before documents.
 pub async fn equivalence(
     tenants: &Tenants,
     embedding: &Embedding,
     embedder: &dyn DocumentEmbedder,
     texts: &[String],
 ) -> Result<Equivalence> {
-    let standing: Vec<String> = STANDING_SAMPLE
+    let documents: Vec<String> = texts
         .iter()
-        .map(|text| text.to_string())
-        .collect();
-    let texts: Vec<&String> = texts
-        .iter()
-        .chain(&standing)
+        .map(String::as_str)
+        .chain(STANDING_SAMPLE)
         .filter(|text| !text.trim().is_empty())
+        .map(str::to_string)
         .collect();
-    let probe = collection(
-        CollectionName::new(format!("WorkforceEmbedProbe{}", Uuid::new_v4().simple()))?,
-        vec![Property {
-            filterable: false,
-            ..Property::new("text", DataType::Text)
-        }],
-        Embedding {
-            properties: vec!["text".to_string()],
-            ..embedding.clone()
-        },
-    );
-    // Before it is made: a comparison given up while the node is making
-    // the collection still has it dropped.
-    let made = Probe {
-        records: Some(tenants.reads.collection(&probe.name)),
-        name: probe.name.clone(),
-    };
-    let failed = |e| classified(e, tenants);
-    let records = tenants.reads.collection(&probe.name);
-    records.create(&probe).await.map_err(failed)?;
-    let measured = async {
-        let prefix = embedding.query_prefix.as_deref();
-        let (ids, written) = texts.iter().fold(
-            (Vec::new(), Vec::<(ObjectId, String)>::new()),
-            |(mut ids, mut written), text| {
-                let plain = ObjectId(Uuid::new_v4());
-                let prefixed =
-                    prefix.map(|prefix| (ObjectId(Uuid::new_v4()), format!("{prefix}{text}")));
-                ids.push((plain, prefixed.as_ref().map(|(id, _)| *id)));
-                written.push((plain, (*text).clone()));
-                written.extend(prefixed);
-                (ids, written)
-            },
-        );
-        for batch in written.chunks(32) {
-            let changes = batch
-                .iter()
-                .map(|(id, text)| {
-                    Change::upsert(
-                        probe.name.clone(),
-                        *id,
-                        Content::new(
-                            json!({ "text": text })
-                                .as_object()
-                                .cloned()
-                                .unwrap_or_default(),
-                        ),
-                    )
-                })
-                .collect();
-            tenants.writes.apply(changes).await.map_err(failed)?;
-        }
-        let mut by_node = std::collections::HashMap::new();
-        let mut after = None;
-        loop {
-            let page = after
+    let prefix = embedding.query_prefix.as_deref();
+    let written: Vec<String> = documents
+        .iter()
+        .cloned()
+        .chain(
+            prefix
                 .into_iter()
-                .fold(Page::new(200).vectors(true), Page::after);
-            let listed = records.list(&page).await.map_err(failed)?;
-            for object in listed.objects {
-                by_node.insert(object.id, object.vector.unwrap_or_default());
-            }
-            after = listed.next;
-            if after.is_none() {
-                break;
-            }
-        }
-        let documents: Vec<String> = texts.iter().map(|text| (*text).clone()).collect();
-        let mut by_embedder = Vec::with_capacity(documents.len());
-        for batch in documents.chunks(PROBE_BATCH) {
-            by_embedder.extend(embedder.documents(batch).await?);
-        }
-        if by_embedder.len() != documents.len() {
-            return Err(eyre!(
-                "{} gave {} vectors for {} texts",
-                embedder.name(),
-                by_embedder.len(),
-                documents.len()
-            ));
-        }
-        let (mut lowest, mut sum, mut sum_prefixed, mut sum_length) = (1.0f32, 0.0, 0.0, 0.0);
-        let node = |id: &ObjectId| by_node.get(id).map(Vec::as_slice).unwrap_or(&[]);
-        for ((plain, prefixed), outside) in ids.iter().zip(&by_embedder) {
-            let near = cosine(node(plain), outside);
-            lowest = lowest.min(near);
-            sum += near;
-            sum_prefixed += prefixed.map_or(0.0, |id| cosine(node(&id), outside));
-            sum_length += outside.iter().map(|x| x * x).sum::<f32>().sqrt();
-        }
-        let compared = by_embedder.len();
-        let mean = |sum: f32| {
-            if compared == 0 {
-                0.0
-            } else {
-                sum / compared as f32
-            }
-        };
-        Ok(Equivalence {
-            compared,
-            lowest: if compared == 0 { 0.0 } else { lowest },
-            mean: mean(sum),
-            query_prefix: prefix.map(str::to_string),
-            mean_against_prefixed: prefix.map(|_| mean(sum_prefixed)),
-            mean_length: mean(sum_length),
-        })
+                .flat_map(|prefix| documents.iter().map(move |text| format!("{prefix}{text}"))),
+        )
+        .collect();
+    let node = NodeEmbedder::new(tenants.clone(), embedding.clone(), PROBE_BATCH);
+    let by_node = node.documents(&written).await?;
+    let (plain, prefixed) = by_node.split_at(documents.len());
+    let mut by_embedder = Vec::with_capacity(documents.len());
+    for batch in documents.chunks(PROBE_BATCH) {
+        by_embedder.extend(embedder.documents(batch).await?);
     }
-    .await;
-    made.dropped().await;
-    measured
+    if by_embedder.len() != documents.len() {
+        return Err(eyre!(
+            "{} gave {} vectors for {} texts",
+            embedder.name(),
+            by_embedder.len(),
+            documents.len()
+        ));
+    }
+    let compared = by_embedder.len();
+    let near: Vec<f32> = plain
+        .iter()
+        .zip(&by_embedder)
+        .map(|(node, outside)| cosine(node, outside))
+        .collect();
+    let mean = |sum: f32| match compared {
+        0 => 0.0,
+        compared => sum / compared as f32,
+    };
+    let against_prefixed: f32 = prefixed
+        .iter()
+        .zip(&by_embedder)
+        .map(|(node, outside)| cosine(node, outside))
+        .sum();
+    let lengths: f32 = by_embedder
+        .iter()
+        .map(|outside| outside.iter().map(|x| x * x).sum::<f32>().sqrt())
+        .sum();
+    Ok(Equivalence {
+        compared,
+        lowest: near.iter().copied().reduce(f32::min).unwrap_or(0.0),
+        mean: mean(near.iter().sum()),
+        query_prefix: prefix.map(str::to_string),
+        mean_against_prefixed: prefix.map(|_| mean(against_prefixed)),
+        mean_length: mean(lengths),
+    })
 }

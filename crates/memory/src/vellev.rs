@@ -960,6 +960,7 @@ impl MemoryAdmin for VellevStore {
             REIMPORT,
         )
         .await
+        .map(drop)
     }
 
     /// Objects whose id is not a UUID are passed over, and so is a batch

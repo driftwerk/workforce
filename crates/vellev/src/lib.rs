@@ -32,8 +32,8 @@ pub use ensure::{
     Unusable, RECHECK_AFTER, RETRY_AFTER,
 };
 pub use markers::{
-    index_claim, index_mark, index_marked, index_unmark, mark, mark_promoted, marked, marker_id,
-    promoted, unmark, unmark_promoted, INDEX_MARKERS, MARKERS,
+    index_claim, index_claimed, index_mark, index_marked, index_unmark, mark, mark_promoted,
+    marked, marker_id, promoted, unmark, unmark_promoted, INDEX_MARKERS, MARKERS,
 };
 pub use matching::{unmatched, Unmatched};
 pub use shape::{checked, mismatches, Refused};
@@ -205,54 +205,22 @@ pub mod testing {
         }
 
         async fn documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-            use vellev_client::api::{Change, Content, Page};
             self.asked
                 .fetch_add(texts.len(), std::sync::atomic::Ordering::SeqCst);
-            let scratch = collection(
-                CollectionName::new(format!("ByNode{}", uuid::Uuid::new_v4().simple()))?,
-                vec![Property::new("text", vellev_core::DataType::Text)],
-                Embedding {
-                    properties: vec!["text".into()],
-                    ..self.embedding.clone()
-                },
+            let prefixed: Vec<String> = texts
+                .iter()
+                .map(|text| format!("{}{text}", self.prefix))
+                .collect();
+            let node = seeding::NodeEmbedder::new(
+                self.tenants.clone(),
+                self.embedding.clone(),
+                texts.len(),
             );
-            let records = self.tenants.reads.collection(&scratch.name);
-            records.create(&scratch).await?;
-            let ids: Vec<vellev_core::ObjectId> = texts
-                .iter()
-                .map(|_| vellev_core::ObjectId(uuid::Uuid::new_v4()))
-                .collect();
-            let changes = ids
-                .iter()
-                .zip(texts)
-                .map(|(id, text)| {
-                    Change::upsert(
-                        scratch.name.clone(),
-                        *id,
-                        Content::new(
-                            serde_json::json!({ "text": format!("{}{text}", self.prefix) })
-                                .as_object()
-                                .cloned()
-                                .unwrap_or_default(),
-                        ),
-                    )
-                })
-                .collect();
-            self.tenants.writes.apply(changes).await?;
-            let page = Page::new(1000).vectors(true);
-            let listed = records.list(&page).await?;
-            records.drop().await?;
-            let made: std::collections::HashMap<_, _> = listed
-                .objects
+            Ok(node
+                .documents(&prefixed)
+                .await?
                 .into_iter()
-                .map(|object| (object.id, object.vector.unwrap_or_default()))
-                .collect();
-            Ok(ids
-                .iter()
-                .map(|id| {
-                    let vector = made.get(id).cloned().unwrap_or_default();
-                    vector.into_iter().map(|x| x * self.scaled).collect()
-                })
+                .map(|vector| vector.into_iter().map(|x| x * self.scaled).collect())
                 .collect())
         }
     }
@@ -491,6 +459,23 @@ pub mod testing {
             self.tenants().reads
         }
 
+        /// Where the node's metrics are read (`GET`), as
+        /// `VELLEV_TEST_METRICS_URL` names it, for a node run with
+        /// `VELLEV_METRICS_LISTEN`; or `None`, said why, to skip.
+        pub fn metrics(&self) -> Option<String> {
+            let metrics = std::env::var("VELLEV_TEST_METRICS_URL").ok();
+            if metrics.is_none() {
+                assert!(
+                    !required(),
+                    "VELLEV_TEST_REQUIRED is set, and VELLEV_TEST_METRICS_URL names no metrics listener of the node"
+                );
+                eprintln!(
+                    "skipping: VELLEV_TEST_METRICS_URL names no metrics listener of the node"
+                );
+            }
+            metrics
+        }
+
         /// A local URL that answers nothing yet, as a node not up; see
         /// [`Self::come_up_at`].
         pub async fn not_up_yet() -> (String, u16) {
@@ -564,6 +549,7 @@ pub(crate) async fn serve(app: axum::Router) -> String {
 mod tests {
     use vellev_core::DataType;
 
+    use super::seeding::DocumentEmbedder;
     use super::*;
 
     const REMEDY: &str = "put it right";
@@ -1345,12 +1331,21 @@ mod tests {
     /// A node that embeds what is written to it as [`made_up`] does, and
     /// keeps every text it was sent.
     async fn embedding_node() -> (Tenants, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        probe_node(200, 0).await
+    }
+
+    /// As [`embedding_node`], answering `dropping` to a collection's drop
+    /// and leaving the first `losing` objects out of what it lists.
+    async fn probe_node(
+        dropping: u16,
+        losing: usize,
+    ) -> (Tenants, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         use axum::response::IntoResponse;
         let held: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
         let sent: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
         let (holding, sending) = (std::sync::Arc::clone(&held), std::sync::Arc::clone(&sent));
-        let app =
-            axum::Router::new().fallback(move |uri: axum::http::Uri, body: axum::body::Bytes| {
+        let app = axum::Router::new().fallback(
+            move |method: axum::http::Method, uri: axum::http::Uri, body: axum::body::Bytes| {
                 let (held, sent) = (
                     std::sync::Arc::clone(&holding),
                     std::sync::Arc::clone(&sending),
@@ -1358,11 +1353,20 @@ mod tests {
                 async move {
                     let written =
                         serde_json::json!({ "incarnation": 1, "position": 1, "outcomes": [] });
+                    if method == axum::http::Method::DELETE && dropping != 200 {
+                        let status = axum::http::StatusCode::from_u16(dropping).unwrap();
+                        let failed = serde_json::json!({ "error": {
+                            "code": "internal",
+                            "message": "the drop failed",
+                        }});
+                        return (status, axum::Json(failed)).into_response();
+                    }
                     if uri.path().ends_with("/list") {
                         let objects: Vec<serde_json::Value> = held
                             .lock()
                             .unwrap()
                             .iter()
+                            .skip(losing)
                             .map(|(id, text)| {
                                 serde_json::json!({
                                     "id": id,
@@ -1386,9 +1390,47 @@ mod tests {
                     }
                     axum::Json(written).into_response()
                 }
-            });
+            },
+        );
         let tenants = connect(&crate::serve(app).await, "key", "harbor").unwrap();
         (tenants, sent)
+    }
+
+    /// A probe the node cannot drop fails the embedding that made it, and
+    /// the comparison made with it, naming it; so does a vector the node
+    /// did not give back.
+    #[tokio::test]
+    async fn a_probe_that_cannot_be_dropped_is_an_error() {
+        let texts = ["parse the config".to_string()];
+        let small = embedding_of(SMALL, 16, None, &["text"]);
+        let (tenants, _) = probe_node(500, 0).await;
+        let node = seeding::NodeEmbedder::new(tenants.clone(), small.clone(), 1);
+        let refused = node.documents(&texts).await.unwrap_err().to_string();
+        assert!(
+            refused.starts_with("the collection made to embed with the node, 'WorkforceEmbedProbe")
+                && refused.ends_with("', was not dropped"),
+            "{refused}"
+        );
+        let refused = seeding::equivalence(&tenants, &small, &Prefixing(String::new()), &texts)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("'WorkforceEmbedProbe") && refused.contains("was not dropped"),
+            "{refused}"
+        );
+
+        let (tenants, _) = probe_node(200, 1).await;
+        let node = seeding::NodeEmbedder::new(tenants, small, 1);
+        let short = node
+            .documents(&["a".to_string(), "b".to_string()])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            short.ends_with("gave back 1 vectors for 2 texts"),
+            "{short}"
+        );
     }
 
     /// An embedder that puts the collection's own query prefix before
@@ -1453,6 +1495,7 @@ mod node_tests {
     use vellev_client::api::Nearest;
     use vellev_core::DataType;
 
+    use super::seeding::DocumentEmbedder;
     use super::testing::Node;
     use super::tests::Fixed;
     use super::*;
@@ -1673,6 +1716,62 @@ mod node_tests {
         assert_eq!(
             index_claim(&tenants, "Other", "late").await.unwrap(),
             "late"
+        );
+    }
+
+    /// Whose a tenant's code vectors are is read without making the
+    /// markers' collection, and after a claim is the claimant's.
+    #[tokio::test]
+    async fn index_claimed_reads_without_making() {
+        let Some(node) = Node::fresh().await else {
+            return;
+        };
+        let tenants = node.tenants();
+        assert_eq!(index_claimed(&tenants, "CodeGraph").await.unwrap(), None);
+        let indexes = tenants
+            .reads
+            .collection(&CollectionName::new(INDEX_MARKERS).unwrap());
+        assert_eq!(indexes.schema().await.unwrap(), None, "nothing made");
+        index_claim(&tenants, "CodeGraph", "g").await.unwrap();
+        assert_eq!(
+            index_claimed(&tenants, "CodeGraph")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("g")
+        );
+        assert_eq!(index_claimed(&tenants, "Other").await.unwrap(), None);
+    }
+
+    /// The node embeds more texts than one page of its listing holds, and
+    /// gives each back in the order of the texts.
+    #[tokio::test]
+    async fn node_embedder_pages_its_listing() {
+        let Some(node) = Node::embedding().await else {
+            return;
+        };
+        let tenants = node.tenants();
+        let small = embedding_of(testing::SMALL, 384, None, &["text"]);
+        let texts: Vec<String> = (0..1500)
+            .map(|n| format!("item {n} of a long list"))
+            .collect();
+        let made = seeding::NodeEmbedder::new(tenants.clone(), small.clone(), 500)
+            .documents(&texts)
+            .await
+            .unwrap();
+        assert_eq!(made.len(), texts.len());
+        let alone = seeding::NodeEmbedder::new(tenants.clone(), small, 1)
+            .documents(&[texts[1200].clone()])
+            .await
+            .unwrap();
+        let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(a, b)| a * b).sum::<f32>();
+        assert!(dot(&alone[0], &made[1200]) > 0.9999);
+        assert!(dot(&alone[0], &made[1199]) < 0.9999);
+        let held = tenants.reads.collections().await.unwrap();
+        assert!(
+            held.iter()
+                .all(|c| !c.name.as_str().starts_with("WorkforceEmbedProbe")),
+            "every probe dropped"
         );
     }
 

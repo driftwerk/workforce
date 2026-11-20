@@ -151,14 +151,18 @@ impl Kept {
     /// Record `owner` under `what`, unless something is recorded there
     /// already; returns what is then recorded.
     async fn claim(self, at: &Tenants, what: &str, owner: &str) -> Result<String> {
-        let records = self.made(at).await?;
+        self.made(at).await?;
         self.insert(at, what, owner).await?;
-        let held = records
-            .get(ObjectId(marker_id(what)))
-            .await
-            .map_err(|e| classified(e, at))?;
-        held.and_then(|held| Some(held.properties.get("collection")?.as_str()?.to_string()))
+        self.claimed(at, what)
+            .await?
             .ok_or_else(|| eyre::eyre!("the claim on '{what}' cannot be read back"))
+    }
+
+    async fn claimed(self, at: &Tenants, what: &str) -> Result<Option<String>> {
+        let held = self.records(at)?.get(ObjectId(marker_id(what))).await;
+        Ok(held
+            .map_err(|e| classified(e, at))?
+            .and_then(|held| Some(held.properties.get("collection")?.as_str()?.to_string())))
     }
 
     async fn unmark(self, at: &Tenants, name: &str) -> Result<()> {
@@ -230,4 +234,10 @@ pub async fn index_unmark(at: &Tenants, name: &str) -> Result<()> {
 /// vectors.
 pub async fn index_claim(at: &Tenants, what: &str, owner: &str) -> Result<String> {
     INDEXES.claim(at, what, owner).await
+}
+
+/// Whose `what` in the tenant `at` is recorded as (see [`index_claim`]), read
+/// without making or recording anything.
+pub async fn index_claimed(at: &Tenants, what: &str) -> Result<Option<String>> {
+    INDEXES.claimed(at, what).await
 }
