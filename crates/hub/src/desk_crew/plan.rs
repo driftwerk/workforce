@@ -93,13 +93,27 @@ impl Failed {
     }
 }
 
+/// A running plan of a boss of no group, as each machine its tickets are
+/// still to start on knows it, for tickets on an engine Desk checks every
+/// call of: its plan grant is there before they start.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct MachinePlan {
+    pub boss: String,
+    pub goal: String,
+}
+
 /// A plan's session on one of the person's machines, as last read there.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct MachineSeen {
     pub plan: Uuid,
     pub ticket: Uuid,
     pub boss: String,
+    /// Its plan's goal, as the plan grant there names it.
+    pub goal: String,
     pub key: String,
+    /// The engine its ticket runs on: only one Desk checks every call of
+    /// is its plan grant's ([`workforce_desk::engine::boss_safe`]).
+    pub engine: Option<Engine>,
     /// Its state as the machine said it; `starting` until first read.
     pub state: String,
     /// Its last reply as read there: a new one is a turn more, however
@@ -365,7 +379,9 @@ pub fn update_schema() -> Value {
 /// A refused plan change, in the words the boss reads.
 fn plain(e: workforce_desk::DeskError) -> String {
     match e {
-        workforce_desk::DeskError::Conflict(why) | workforce_desk::DeskError::Invalid(why) => why,
+        workforce_desk::DeskError::Conflict(why)
+        | workforce_desk::DeskError::Invalid(why)
+        | workforce_desk::DeskError::NotHeld(why) => why,
         e
         @ (workforce_desk::DeskError::CrossesBoss | workforce_desk::DeskError::TooLong { .. }) => {
             e.to_string()
@@ -1610,16 +1626,41 @@ impl CrewHub {
         // Each machine's plan sessions: (item, as first seen, group, in Review).
         type Watched = (String, MachineSeen, Option<String>, bool);
         let mut on: HashMap<String, Vec<Watched>> = HashMap::new();
-        let open = self.desk.plans(None, None).await.unwrap_or_default();
+        // What is known of the plans' sessions stays until they are read:
+        // it is what their plan grants are made of.
+        let open = match self.desk.plans(None, None).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "the plans' machine sessions weren't read");
+                return;
+            }
+        };
+        let mut unread = HashSet::new();
+        let mut to_start = Vec::new();
         for s in open
             .iter()
             .filter(|s| !matches!(s.plan.state, PlanState::Done | PlanState::Dropped))
         {
             let Ok(detail) = self.desk.plan(s.plan.id).await else {
+                unread.insert(s.plan.id);
                 continue;
             };
             for t in &detail.tickets {
                 let row = &t.ticket.ticket;
+                if let Some(m) = t.machine.as_ref().filter(|_| {
+                    s.plan.state == PlanState::Running
+                        && s.plan.group.is_none()
+                        && t.engine.is_some_and(workforce_desk::engine::boss_safe)
+                        && matches!(row.state, TicketState::Todo | TicketState::Doing)
+                }) {
+                    to_start.push((
+                        (m.clone(), s.plan.id),
+                        MachinePlan {
+                            boss: s.plan.boss.clone(),
+                            goal: s.plan.goal.clone(),
+                        },
+                    ));
+                }
                 if !matches!(row.state, TicketState::Doing | TicketState::Review) {
                     continue;
                 }
@@ -1646,7 +1687,9 @@ impl CrewHub {
                     plan: s.plan.id,
                     ticket: row.id,
                     boss: s.plan.boss.clone(),
+                    goal: s.plan.goal.clone(),
                     key: key(),
+                    engine: t.engine,
                     state: "starting".into(),
                     reply: None,
                     misses: 0,
@@ -1662,10 +1705,17 @@ impl CrewHub {
         // What is no longer a plan's machine session isn't kept.
         {
             let ours: HashSet<&String> = on.values().flatten().map(|(k, ..)| k).collect();
-            self.machine_seen.lock().retain(|k, _| ours.contains(k));
+            self.machine_seen
+                .lock()
+                .retain(|k, s| ours.contains(k) || unread.contains(&s.plan));
+            let mut plans = self.machine_plans.lock();
+            plans.retain(|(_, p), _| unread.contains(p));
+            plans.extend(to_start);
             let machines: HashSet<&String> = on.keys().collect();
             self.machine_down.lock().retain(|m, _| machines.contains(m));
         }
+        self.plans_watched
+            .store(true, std::sync::atomic::Ordering::Release);
         for (machine, sessions) in on {
             {
                 let mut read = self.machine_read.lock();
@@ -1884,14 +1934,14 @@ impl CrewHub {
                 // One that left To do, or this plan, waits no more.
                 let waiting: Vec<Uuid> = {
                     let mut w = self.plan_waiting.lock();
-                    w.retain(|id, (plan, _)| {
+                    w.retain(|id, (plan, ..)| {
                         *plan != p.id
                             || tickets
                                 .iter()
                                 .any(|t| t.id == *id && t.state == TicketState::Todo && !t.assigned)
                     });
                     w.iter()
-                        .filter(|(_, (plan, _))| *plan == p.id)
+                        .filter(|(_, (plan, _, ready))| *plan == p.id && !ready)
                         .map(|(id, _)| *id)
                         .collect()
                 };
@@ -1909,30 +1959,35 @@ impl CrewHub {
                             self.plan_failed.lock().remove(&s.ticket);
                             self.plan_waiting.lock().remove(&s.ticket);
                             if let Some(m) = &started.machine {
-                                let key = tickets
-                                    .iter()
-                                    .find(|t| t.id == s.ticket)
-                                    .map_or_else(|| started.name.clone(), PlanTicket::name);
+                                let ticket = tickets.iter().find(|t| t.id == s.ticket);
+                                let key =
+                                    ticket.map_or_else(|| started.name.clone(), PlanTicket::name);
                                 self.machine_seen.lock().insert(
                                     format!("{m}/{}", started.id),
                                     MachineSeen {
                                         plan: p.id,
                                         ticket: s.ticket,
                                         boss: boss.id.clone(),
+                                        goal: p.goal.clone(),
                                         key,
+                                        engine: ticket.and_then(|t| t.engine),
                                         state: "starting".into(),
                                         reply: None,
                                         misses: 0,
                                     },
                                 );
                             }
+                            if let Some(note) = started.note {
+                                self.plan_notes.lock().push((p.id, note));
+                            }
                         }
                         // Read again next pass: a race, the breaker, a pause.
                         Err(e @ workforce_desk::StartRefused::Skipped(_)) => {
                             tracing::info!(plan = %p.id, ticket = %s.ticket, error = %e, "a plan's ticket didn't start now");
                         }
-                        // Under way (a clone): not a failure; its boss is
-                        // told once what it waits on.
+                        // Under way (a clone, its plan's grant on its
+                        // machine): not a failure; its boss is told once
+                        // what it waits on.
                         Err(workforce_desk::StartRefused::Waits(why)) => {
                             self.plan_waits(p.id, s.ticket, why);
                         }
@@ -1948,9 +2003,13 @@ impl CrewHub {
                 }
                 for id in waiting {
                     match self.desk.plan_prepare(&p, id, &boss).await {
-                        // Ready: it starts with the rest, next pass.
+                        // Ready: it starts with the rest, next pass, and what
+                        // it waited on is kept, so the same wait again isn't
+                        // told twice.
                         Ok(()) | Err(workforce_desk::StartRefused::Skipped(_)) => {
-                            self.plan_waiting.lock().remove(&id);
+                            if let Some(w) = self.plan_waiting.lock().get_mut(&id) {
+                                w.2 = true;
+                            }
                         }
                         Err(workforce_desk::StartRefused::Waits(why)) => {
                             self.plan_waits(p.id, id, why);
@@ -1978,8 +2037,8 @@ impl CrewHub {
         let tell = self
             .plan_waiting
             .lock()
-            .insert(ticket, (plan, why.clone()))
-            .is_none_or(|(_, was)| was != why);
+            .insert(ticket, (plan, why.clone(), false))
+            .is_none_or(|(_, was, _)| was != why);
         if tell {
             self.plan_failures.lock().push((plan, why));
         }
@@ -2641,7 +2700,9 @@ pub(super) async fn plan_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
             },
             _ = tick.tick() => {}
         }
-        for (plan, line) in std::mem::take(&mut *crew.plan_failures.lock()) {
+        let failures = std::mem::take(&mut *crew.plan_failures.lock());
+        let notes = std::mem::take(&mut *crew.plan_notes.lock());
+        for (plan, line) in failures.into_iter().chain(notes) {
             gathering
                 .entry(plan)
                 .or_insert_with(|| Gathered {
@@ -2789,7 +2850,9 @@ mod tests {
             plan: Uuid::nil(),
             ticket: Uuid::nil(),
             boss: "local:sarah".into(),
+            goal: "Speed up recall".into(),
             key: "VEL-3".into(),
+            engine: Some(Engine::Claude),
             state: state.into(),
             reply: reply.map(str::to_string),
             misses: 0,
@@ -2802,6 +2865,7 @@ mod tests {
             state: state.into(),
             last_reply: reply.map(str::to_string),
             created_at: None,
+            boss_has: None,
             exited: None,
         };
         // Nothing new: nothing said.

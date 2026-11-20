@@ -730,6 +730,10 @@ pub enum MachineRefused {
     Unreached(String),
     /// It refused, in its own words, before doing anything.
     Refused(String),
+    /// It refused a plan's ticket started for its boss, in its own words,
+    /// as it doesn't hold that plan's grant for that boss yet
+    /// ([`crate::grant::NOT_HELD`]): nothing was done, and the start waits.
+    NotHeld(String),
     /// It may have had it, but no answer came: what it did isn't known.
     Unknown(String),
 }
@@ -737,7 +741,9 @@ pub enum MachineRefused {
 impl std::fmt::Display for MachineRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unreached(w) | Self::Refused(w) | Self::Unknown(w) => f.write_str(w),
+            Self::Unreached(w) | Self::Refused(w) | Self::NotHeld(w) | Self::Unknown(w) => {
+                f.write_str(w)
+            }
         }
     }
 }
@@ -762,6 +768,10 @@ pub struct MachineSession {
     /// When it was made there; none from a Desk that doesn't say.
     #[serde(default)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The boss that has it there now, by name; none while the person has
+    /// it, or from a Desk that doesn't say.
+    #[serde(default)]
+    pub boss_has: Option<String>,
     /// How its process last ended on its own; none from a Desk that
     /// doesn't say, or says it in a way this one can't read.
     #[serde(default, deserialize_with = "exited_or_none")]

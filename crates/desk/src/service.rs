@@ -241,6 +241,11 @@ pub enum DeskError {
     CrossesBoss,
     #[error("{0}")]
     Invalid(String),
+    /// A plan's ticket started for its boss while this machine doesn't hold
+    /// that plan's grant for that boss ([`crate::Desk::create_held`]):
+    /// answered as a 409 with its own `code`, so the start waits for it.
+    #[error("{0}")]
+    NotHeld(String),
     /// A grant asked to last longer than this engine gives, `most` hours.
     /// Answered as a 400 with its own `code` and `mostHours`.
     #[error("{why}")]
