@@ -454,6 +454,18 @@ async fn served(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>, body: By
     let Some(level) = level else {
         return bad("a relayed call says its boss's level");
     };
+    // A machine call is never a group's: an older Desk on the home sent it
+    // here rather than to its own route.
+    if DESK_CALLS
+        .iter()
+        .chain(super::machines::MACHINE_CALLS.iter())
+        .any(|t| *t == r.tool)
+    {
+        return bad(&format!(
+            "{} goes to its own route on this machine, not to a group's: the Desk that carried it is older, so the person updates Desk where the boss runs.",
+            r.tool
+        ));
+    }
     if !workforce_desk::grant::group_id_ok(&r.group) {
         return bad("that can't be a group");
     }
