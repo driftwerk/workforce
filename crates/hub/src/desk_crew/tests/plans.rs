@@ -2367,11 +2367,20 @@ async fn editing_a_plans_ticket_goes_through_its_plan() {
 /// A Claude Code that says its version, and whose sessions say why they
 /// can't start and end at once.
 fn broken_cli(dir: &Path) -> PathBuf {
+    cli_broken_while(dir, "true")
+}
+
+/// A Claude Code whose sessions run on, except while `broken` holds: then
+/// they say why they can't start and end at once.
+fn cli_broken_while(dir: &Path, broken: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let path = dir.join("broken-claude");
     std::fs::write(
         &path,
-        "#!/bin/sh\ncase \"$1\" in --version) echo '2.1.300 (Claude Code)'; exit 0;; auth) exit 1;; esac\necho 'error: settings.json is not valid JSON'\nexit 1\n",
+        format!(
+            "#!/bin/sh\ncase \"$1\" in --version) echo '2.1.300 (Claude Code)'; exit 0;; auth) exit 1;; esac\n\
+             if {broken}; then echo 'error: settings.json is not valid JSON'; exit 1; fi\nexec sleep 600\n"
+        ),
     )
     .unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2427,6 +2436,86 @@ async fn a_ticket_whose_session_here_ends_as_it_starts_waits_in_to_do_its_boss_t
             (d.list().iter().filter(|v| v.name == "DES-1").count() == 2).then_some(())
         })
         .await;
+    })
+    .await;
+}
+
+/// A session that ends as it starts before its plan gives it its ticket:
+/// the ticket, given to no one yet, is held back all the same, its boss
+/// told once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ticket_whose_session_ends_before_it_is_given_it_waits_in_to_do_its_boss_told_once() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let broken = dir.path().join("broken");
+        let cli = cli_broken_while(dir.path(), &format!("[ -f '{}' ]", broken.display()));
+        let (_overseer, state, d, llm) = hub_running(dir.path(), pool, ACTS, cli).await;
+        let ticket = |title: &str, needs: Vec<usize>| DraftTicket {
+            title: title.into(),
+            folder: dir.path().to_string_lossy().into_owned(),
+            needs,
+            ..Default::default()
+        };
+        let p = d
+            .propose_plan(
+                NewPlan {
+                    draft: Draft {
+                        goal: "Make the suite green".into(),
+                        tickets: vec![ticket("Fix it", vec![]), ticket("Then this", vec![0])],
+                    },
+                    board: None,
+                    parallel: None,
+                    engine: Engine::Claude,
+                    group: None,
+                    budget: None,
+                },
+                &Party::manager("desk", "Desk"),
+                &By::manager("desk", "Desk", "Sam asked for a green suite."),
+            )
+            .await
+            .unwrap();
+        let id = p.summary.plan.id;
+        let then = p.tickets[1].ticket.ticket.id;
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        d.approve_plan(id, 1, &By::you()).await.unwrap();
+        eventually("its first ticket started", async || {
+            d.list().iter().any(|v| v.name == "DES-1").then_some(())
+        })
+        .await;
+
+        // DES-2's session, between its start and its ticket given it.
+        let s = new_session(&d, dir.path(), "DES-2").await;
+        d.stop(s.id, Some(By::you())).unwrap();
+        eventually("it stopped", async || {
+            (!d.view(s.id).ok()?.state.is_running()).then_some(())
+        })
+        .await;
+        let mut t = d.ticket(then).await.unwrap().ticket;
+        let rank = t.rank;
+        d.store()
+            .begin_start(&mut t, id, rank, s.id, chrono::Utc::now())
+            .await
+            .unwrap();
+        std::fs::write(&broken, "").unwrap();
+        d.resume(s.id, None, Some(By::you())).await.unwrap();
+
+        let held = eventually("the ticket held back", async || {
+            let t = d.plan(id).await.ok()?.tickets.remove(1);
+            (t.ticket.ticket.state == TicketState::Todo).then_some(t.held_back?)
+        })
+        .await;
+        assert_eq!(held, "its session ended as it started (exit 1)");
+        assert_eq!(d.ticket(then).await.unwrap().ticket.assignee, None, "never given it");
+        let told = "DES-2's session on this computer ended as it started (exit 1). \
+                    Its last output: “error: settings.json is not valid JSON” DES-2 is back in To do";
+        eventually("the boss told", async || {
+            (newly_said(&llm, told).await >= 1).then_some(())
+        })
+        .await;
+        for _ in 0..3 {
+            crew.run_plans().await;
+        }
+        assert_eq!(newly_said(&llm, "ended as it started").await, 1, "once");
     })
     .await;
 }

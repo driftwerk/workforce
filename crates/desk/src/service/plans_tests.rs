@@ -656,6 +656,12 @@ async fn a_ticket_is_held_back_only_while_its_own_session_has_it_and_until_someo
             !d.hold_back_ticket(id, a, "devbox/s2", why).await.unwrap(),
             "another session's"
         );
+        assert!(
+            !d.hold_back_ticket(Uuid::new_v4(), a, "devbox/s1", why)
+                .await
+                .unwrap(),
+            "another plan's"
+        );
         assert_eq!(d.ticket(a).await.unwrap().ticket.state, TicketState::Doing);
 
         assert!(d.hold_back_ticket(id, a, "devbox/s1", why).await.unwrap());

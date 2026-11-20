@@ -2449,11 +2449,12 @@ impl Desk {
     }
 
     /// Puts ticket `ticket` of plan `plan`, in Doing on `session` (its
-    /// assignee's id: `machine/id` for one on a machine), back in To do,
-    /// held back with `why`: its plan doesn't start it again by itself
+    /// assignee's id: `machine/id` for one on a machine; or the session
+    /// it is still being started on, given it by no one yet), back in To
+    /// do, held back with `why`: its plan doesn't start it again by itself
     /// until someone starts it, hands it out or moves it on, in the one
     /// write that moves it. Whether it did: not once it is elsewhere,
-    /// someone else's, or changed since it was read.
+    /// someone else's, out of the plan, or changed since it was read.
     pub async fn hold_back_ticket(
         &self,
         plan: Uuid,
@@ -2463,9 +2464,23 @@ impl Desk {
     ) -> Result<bool, DeskError> {
         let t = self.ticket_of(ticket).await?;
         let on_it = t.state == TicketState::Doing
-            && t.assignee
-                .as_ref()
-                .is_some_and(|a| a.kind == PartyKind::Session && a.id == session);
+            && match &t.assignee {
+                Some(a) => a.kind == PartyKind::Session && a.id == session,
+                None => self
+                    .0
+                    .store
+                    .starting_of(ticket)
+                    .await
+                    .map_err(internal)?
+                    .is_some_and(|s| s.session.to_string() == session),
+            }
+            && self
+                .0
+                .store
+                .plan_of_ticket(ticket)
+                .await
+                .map_err(internal)?
+                == Some(plan);
         if !on_it {
             return Ok(false);
         }
