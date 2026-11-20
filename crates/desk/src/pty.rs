@@ -815,6 +815,18 @@ pub fn plain_text(bytes: &[u8]) -> String {
     kept.join("\n").trim().to_string()
 }
 
+/// The end of what a terminal shows (`text`, as [`Pty::text`] gives it) as
+/// plain text: its last `lines` lines.
+pub fn shown_end(text: &str, lines: usize) -> String {
+    let plain = plain_text(text.as_bytes());
+    let from = plain
+        .match_indices('\n')
+        .rev()
+        .nth(lines.saturating_sub(1))
+        .map_or(0, |(i, _)| i + 1);
+    plain[from..].to_string()
+}
+
 /// portable-pty reports `anyhow` errors; carry their text into eyre.
 fn failed<E: std::fmt::Display>(what: &str) -> impl FnOnce(E) -> eyre::Report + '_ {
     move |e| eyre::eyre!("{what}: {e}")

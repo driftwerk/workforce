@@ -109,6 +109,27 @@ pub fn in_turn(state: SessionState) -> bool {
     matches!(state, SessionState::Working | SessionState::Blocked)
 }
 
+/// `text` without a leading "<who>, HH:MM[ UTC]." stamp, for a one-line
+/// row that shows its own sender and time; unchanged when there is no such
+/// stamp or nothing follows it.
+pub fn unstamped<'a>(text: &'a str, who: &str) -> &'a str {
+    if who.trim().is_empty() {
+        return text;
+    }
+    let past = text
+        .trim_start()
+        .strip_prefix(who)
+        .and_then(|rest| rest.strip_prefix(", "))
+        .and_then(|rest| {
+            let (time, after) = rest.split_once('.')?;
+            let time = time.strip_suffix(" UTC").unwrap_or(time);
+            let clock = chrono::NaiveTime::parse_from_str(time, "%H:%M").is_ok();
+            let said = after.trim_start();
+            (clock && after.starts_with(char::is_whitespace) && !said.is_empty()).then_some(said)
+        });
+    past.unwrap_or(text)
+}
+
 /// Which turn of a session's run something was sent in: an escalation
 /// interrupts that turn alone, never one begun since. `run` is the run's
 /// own: its counters start again with each Desk, so a mark from before a
@@ -253,6 +274,17 @@ pub enum Wait {
     /// Sent now into its running turn: it reads it with its next tool
     /// call's result (or, if the turn ends first, at the idle).
     NextCall,
+}
+
+impl Wait {
+    /// Whether Desk holds a message for this on purpose, until the person
+    /// or Desk itself lets it go: no one need move it.
+    pub fn on_purpose(self) -> bool {
+        match self {
+            Self::Typing | Self::Paused | Self::PersonDriving | Self::ModeEnding => true,
+            Self::Stopped | Self::Working | Self::Asking | Self::NextCall => false,
+        }
+    }
 }
 
 /// What the person can do with a message waiting to go into a session,
@@ -689,9 +721,9 @@ pub struct AskParts {
 pub enum Refusal {
     #[error("Loop guard: this has been handed on {MAX_HOPS} times already. Desk has told the person; if you need an answer, ask them (to: \"you\"), else stop here and wait for them.")]
     Hops,
-    #[error("Loop guard: you have sent {TURN_BUDGET} messages since the person or your boss last spoke to you. Desk has told the person. Stop here and wait: their reply comes to you as a message. Don't send again until then; it is refused the same way.")]
+    #[error("Loop guard: you have sent {TURN_BUDGET} messages since the person or your boss last spoke to you. Desk has told the person. Stop messaging the person and other sessions and wait: their reply comes to you as a message. What you tell the boss that runs you, if one does, still goes; a boss that only watches you counts like anyone else.")]
     Budget,
-    #[error("Loop guard: you have sent {BOSS_RUN_CEILING} messages since the person last spoke to you. Desk has told the person. Stop here and wait: their reply comes to you as a message. Don't send again until then; it is refused the same way.")]
+    #[error("Loop guard: you have sent {BOSS_RUN_CEILING} messages since the person last spoke to you. Desk has told the person. Stop messaging the person and other sessions and wait: their reply comes to you as a message. What you tell the boss that runs you, if one does, still goes; a boss that only watches you counts like anyone else.")]
     Ceiling,
     #[error("Loop guard: you have sent {TURN_BUDGET} messages to other sessions since the person last spoke to you. Desk has told the person. Stop messaging sessions and wait for them; you can still tell Desk how it stands.")]
     Peers,
@@ -729,8 +761,9 @@ pub enum Refusal {
 /// hop delivered into it, how many messages it sent since the person or
 /// its own boss last spoke to it (`sent`), how many since the person last
 /// did (`since_person`), and how many of those went to other sessions
-/// (`to_sessions`). Kept in memory: after a restart it starts again from
-/// the person-spoke state, the safe side for a loop guard.
+/// (`to_sessions`). What it tells the boss that runs it is never counted:
+/// that boss's own turns pace the exchange. Kept in memory: after a restart it starts
+/// again from the person-spoke state, the safe side for a loop guard.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LineRun {
     pub cause: i16,
@@ -745,8 +778,12 @@ impl LineRun {
         self.cause = self.cause.max(hop);
     }
 
-    /// The session sent a message, to another session or not.
-    pub fn sent_one(&mut self, to_session: bool) {
+    /// The session sent a message, to another session or not; `report`:
+    /// a report to the boss that runs it, whose turns pace them.
+    pub fn sent_one(&mut self, to_session: bool, report: bool) {
+        if report {
+            return;
+        }
         self.sent += 1;
         self.since_person += 1;
         if to_session {
@@ -866,43 +903,62 @@ pub fn hop_of(send: &Send, cause: i16, asked: Option<&LineMessage>) -> i16 {
     }
 }
 
-/// Refuses a hand-off chain run too long, and a sender over its budget:
-/// [`TURN_BUDGET`] since the person or its boss last spoke to it, and as
-/// many to other sessions (`to_session`) since the person did; and
-/// [`BOSS_RUN_CEILING`] in all since the person did.
-pub fn guard(hop: i16, run: &LineRun, to_session: bool) -> Result<(), Refusal> {
+/// Refuses a hand-off chain run too long.
+pub fn hops(hop: i16) -> Result<(), Refusal> {
     if hop > MAX_HOPS {
         return Err(Refusal::Hops);
     }
-    if run.since_person >= BOSS_RUN_CEILING as usize {
-        return Err(Refusal::Ceiling);
-    }
-    if to_session && run.to_sessions >= TURN_BUDGET as usize {
-        return Err(Refusal::Peers);
-    }
-    if run.sent >= TURN_BUDGET as usize {
-        return Err(Refusal::Budget);
-    }
     Ok(())
+}
+
+/// Refuses a hand-off chain run too long ([`hops`]), and a sender over its
+/// budget: [`TURN_BUDGET`] since the person or its boss last spoke to it,
+/// and as many to other sessions (`to_session`) since the person did; and
+/// [`BOSS_RUN_CEILING`] in all since the person did. A `report` (a tell to
+/// the boss that runs it) is never refused by a count: it is the work, and
+/// that boss's own turns gather what comes while one runs. Its questions,
+/// and anything to a boss that doesn't run it, count.
+pub fn guard(hop: i16, run: &LineRun, to_session: bool, report: bool) -> Result<(), Refusal> {
+    hops(hop)?;
+    if report {
+        Ok(())
+    } else if run.since_person >= BOSS_RUN_CEILING as usize {
+        Err(Refusal::Ceiling)
+    } else if to_session && run.to_sessions >= TURN_BUDGET as usize {
+        Err(Refusal::Peers)
+    } else if run.sent >= TURN_BUDGET as usize {
+        Err(Refusal::Budget)
+    } else {
+        Ok(())
+    }
 }
 
 /// What the person is told when the loop guard stops a session, after its
 /// name, in plain words; none for a refusal that isn't the loop guard's.
 pub fn stalled_why(r: &Refusal) -> Option<String> {
-    let why = match r {
-        Refusal::Budget => {
-            format!("it has sent {TURN_BUDGET} messages to Desk without hearing from you")
-        }
-        Refusal::Ceiling => {
-            format!("it has sent {BOSS_RUN_CEILING} messages to Desk without hearing from you")
-        }
-        Refusal::Peers => {
-            format!("it has sent {TURN_BUDGET} messages to other sessions without hearing from you")
-        }
-        Refusal::Hops => format!("its messages were handed on {MAX_HOPS} times without you"),
+    const WAITING: &str = "is waiting for you";
+    let (how, why) = match r {
+        Refusal::Budget => (
+            WAITING,
+            format!("it has sent {TURN_BUDGET} messages without hearing from you"),
+        ),
+        Refusal::Ceiling => (
+            WAITING,
+            format!("it has sent {BOSS_RUN_CEILING} messages without hearing from you"),
+        ),
+        Refusal::Peers => (
+            WAITING,
+            format!(
+                "it has sent {TURN_BUDGET} messages to other sessions without hearing from you"
+            ),
+        ),
+        Refusal::Hops => (
+            "stopped",
+            format!("its messages were handed on {MAX_HOPS} times without you"),
+        ),
         _ => return None,
     };
-    Some(format!("stopped: {why}. Reply to let it carry on."))
+    Some(format!("{how}: {why}. Reply to let it carry on."))
 }
 
 /// How a message reaches `recipient` now, or why it must wait. `typed` is
@@ -1844,43 +1900,95 @@ mod tests {
             since_person: sent,
             ..LineRun::default()
         };
-        assert_eq!(guard(MAX_HOPS, &run(0), false), Ok(()));
-        assert_eq!(guard(MAX_HOPS + 1, &run(0), false), Err(Refusal::Hops));
-        assert_eq!(guard(1, &run(TURN_BUDGET as usize - 1), false), Ok(()));
+        assert_eq!(guard(MAX_HOPS, &run(0), false, false), Ok(()));
         assert_eq!(
-            guard(1, &run(TURN_BUDGET as usize), false),
+            guard(MAX_HOPS + 1, &run(0), false, false),
+            Err(Refusal::Hops)
+        );
+        assert_eq!(
+            guard(1, &run(TURN_BUDGET as usize - 1), false, false),
+            Ok(())
+        );
+        assert_eq!(
+            guard(1, &run(TURN_BUDGET as usize), false, false),
             Err(Refusal::Budget)
         );
+    }
+
+    #[test]
+    fn a_report_to_the_boss_that_runs_it_is_never_counted_nor_refused_but_a_long_chain_is() {
+        let mut run = LineRun::default();
+        for _ in 0..BOSS_RUN_CEILING * 4 {
+            assert_eq!(guard(1, &run, false, true), Ok(()));
+            run.sent_one(false, true);
+        }
+        assert_eq!(run, LineRun::default(), "none of it counted");
+        let spent = LineRun {
+            sent: TURN_BUDGET as usize,
+            since_person: BOSS_RUN_CEILING as usize,
+            to_sessions: TURN_BUDGET as usize,
+            ..LineRun::default()
+        };
+        assert_eq!(guard(1, &spent, false, true), Ok(()), "over every count");
+        assert_eq!(guard(1, &spent, false, false), Err(Refusal::Ceiling));
+        assert_eq!(guard(MAX_HOPS + 1, &spent, false, true), Err(Refusal::Hops));
     }
 
     #[test]
     fn a_bosss_answers_start_the_budget_again_up_to_the_ceiling_and_never_for_sessions() {
         let mut run = LineRun::default();
         let mut sent = 0;
-        while guard(1, &run, false).is_ok() {
-            run.sent_one(false);
+        while guard(1, &run, false, false).is_ok() {
+            run.sent_one(false, false);
             sent += 1;
             if sent % 5 == 0 {
                 run.boss_spoke();
             }
         }
         assert_eq!(sent, BOSS_RUN_CEILING as usize, "answered by its boss");
-        assert_eq!(guard(1, &run, false), Err(Refusal::Ceiling));
+        assert_eq!(guard(1, &run, false, false), Err(Refusal::Ceiling));
         // To other sessions, its boss answering it doesn't start it again.
         let mut run = LineRun::default();
         for _ in 0..TURN_BUDGET {
-            run.sent_one(true);
+            run.sent_one(true, false);
             run.boss_spoke();
         }
-        assert_eq!(guard(1, &run, true), Err(Refusal::Peers));
-        assert_eq!(guard(1, &run, false), Ok(()), "Desk still hears it");
+        assert_eq!(guard(1, &run, true, false), Err(Refusal::Peers));
+        assert_eq!(
+            guard(1, &run, false, false),
+            Ok(()),
+            "the person still hears it"
+        );
+    }
+
+    #[test]
+    fn a_stamp_of_who_and_when_is_read_past() {
+        assert_eq!(
+            unstamped("Desk, 00:21. Update: run 4464 is already fixed.", "Desk"),
+            "Update: run 4464 is already fixed."
+        );
+        assert_eq!(
+            unstamped("Desk Bot, 3:12 UTC.  Go: run step 12.", "Desk Bot"),
+            "Go: run step 12."
+        );
+        for kept in [
+            "Desk, 00:21.",
+            "Desk, 00:21.5 is the version.",
+            "Tomorrow, 09:00. Deploy the release.",
+            "Friday, 17:00. Freeze starts.",
+            "Desk, 25:99. Go.",
+            "Desktop, 00:21. Go.",
+        ] {
+            assert_eq!(unstamped(kept, "Desk"), kept);
+        }
+        assert_eq!(unstamped("Desk, 00:21. Go.", ""), "Desk, 00:21. Go.");
     }
 
     #[test]
     fn a_stall_is_said_in_plain_words() {
         assert_eq!(
             stalled_why(&Refusal::Budget).unwrap(),
-            format!("stopped: it has sent {TURN_BUDGET} messages to Desk without hearing from you. Reply to let it carry on.")
+            format!("is waiting for you: it has sent {TURN_BUDGET} messages without hearing from you. Reply to let it carry on.")
         );
         assert!(stalled_why(&Refusal::Answered).is_none());
     }

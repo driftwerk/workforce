@@ -297,12 +297,66 @@ impl Desk {
     /// The boss that has `id` now: its charge's while one runs it, else
     /// its scope's.
     fn boss_of_session(&self, id: Uuid) -> Option<String> {
-        if let Some(c) = self.charge_of(id).filter(crate::charge::Charge::live) {
-            return Some(c.boss);
+        if let Some(boss) = self.running_boss(id) {
+            return Some(boss);
         }
         let group = self.group_of_member(&super::session_item(id));
         self.boss_of(&self.scope_of_group(group.as_deref()))
             .map(|b| b.agent)
+    }
+
+    /// The boss whose charge `id` is in now, if one's is.
+    fn running_boss(&self, id: Uuid) -> Option<String> {
+        self.charge_of(id)
+            .filter(crate::charge::Charge::live)
+            .map(|c| c.boss)
+    }
+
+    /// Whether `boss` is the boss that runs `id`, at a level that gives it
+    /// turns of its own for `id`'s line. What `id` tells it then is paced
+    /// by those turns (the hub's `reports_paced` asks the same), never
+    /// refused by the loop guard's counts; and their exchange is the work,
+    /// not a chain handed on: what it says to `id` doesn't climb the hop.
+    pub fn its_acting_boss(&self, id: Uuid, boss: &Party) -> bool {
+        boss.kind == PartyKind::Manager
+            && self.running_boss(id).is_some_and(|b| b == boss.id)
+            && self.boss_acts(&boss.id)
+    }
+
+    /// Holds the reports `ids` the boss that runs their session heard for
+    /// its next turn ([`crate::store::DeskStore::line_wait_for_boss`]), said to whoever
+    /// shows them. The ids of those that moved.
+    pub async fn line_hold_for_boss(&self, ids: &[Uuid]) -> Result<Vec<Uuid>, DeskError> {
+        let moved = self.0.store.line_wait_for_boss(ids).await?;
+        Ok(self.announce_moved(&moved))
+    }
+
+    /// The reports `ids` that waited for their boss's turn, taken by it
+    /// ([`crate::store::DeskStore::line_reports_taken`]), said to whoever shows them.
+    pub async fn line_reports_taken(&self, ids: &[Uuid]) -> Result<Vec<Uuid>, DeskError> {
+        let moved = self.0.store.line_reports_taken(ids).await?;
+        Ok(self.announce_moved(&moved))
+    }
+
+    fn announce_moved(&self, moved: &[LineMessage]) -> Vec<Uuid> {
+        moved
+            .iter()
+            .inspect(|m| self.line_announce(m))
+            .map(|m| m.id)
+            .collect()
+    }
+
+    /// `m` went into `id`: its run's chain is as long as `m`'s hop, unless
+    /// `m` is the boss that runs it answering its own exchange with it (no
+    /// further along than what `id` sent it). A boss passing on another
+    /// session's words carries their hop, and that counts.
+    fn run_heard(&self, id: Uuid, m: &LineMessage) {
+        let answering = self.its_acting_boss(id, &m.from);
+        let mut st = self.0.state.lock();
+        let run = st.lines.runs.entry(id).or_default();
+        if !(answering && m.hop <= run.cause + 2) {
+            run.delivered(m.hop);
+        }
     }
 
     /// Whether `boss` is `id`'s own boss.
@@ -606,7 +660,7 @@ impl Desk {
     }
 
     fn line_noted(&self, m: &LineMessage) {
-        let what = crew::one_line(m.headline(), 120);
+        let what = crew::one_line(line::unstamped(m.headline(), &m.from.name), 120);
         let (kind, text) = match m.kind {
             LineKind::Ask => (Kind::Asked, format!("asked {} “{what}”", m.to.name)),
             LineKind::Tell => (Kind::Told, format!("told {} “{what}”", m.to.name)),
@@ -671,13 +725,6 @@ impl Desk {
                     Target::Person => hop.min(crate::rooms::MAX_HOPS),
                     Target::Overseer | Target::Session(_) => hop,
                 };
-                let to_session = matches!(to, Target::Session(_));
-                if let Err(r) = line::guard(checked, &run, to_session) {
-                    // Only the budget its boss's answers renew is lifted
-                    // by them.
-                    self.line_stalled(me, &r, r == Refusal::Budget).await;
-                    return Err(r.into());
-                }
                 let overseer = self.line_overseer(me.group.as_ref().map(|g| g.id.as_str()));
                 let recipient = line::reach(
                     me,
@@ -687,6 +734,17 @@ impl Desk {
                     self.line_reach(),
                     &bossed,
                 )?;
+                // Who it can't reach is said before any count: one over its
+                // budget writing to a wrong name is told that, sends
+                // nothing, and stalls on its next send that could go.
+                let report = kind == LineKind::Tell && self.its_acting_boss(me.id, &recipient);
+                let to_session = recipient.kind == PartyKind::Session;
+                if let Err(r) = line::guard(checked, &run, to_session, report) {
+                    // Only the budget its boss's answers renew is lifted
+                    // by them.
+                    self.line_stalled(me, &r, r == Refusal::Budget).await;
+                    return Err(r.into());
+                }
                 (
                     Party::session(me),
                     hop,
@@ -699,7 +757,7 @@ impl Desk {
                     Sender::Overseer(by) => (by.party.clone(), by.hop.max(1)),
                     _ => (Party::you(), 0),
                 };
-                line::guard(hop, &LineRun::default(), false)?;
+                line::hops(hop)?;
                 let recipient = match to {
                     Target::Session(id) => {
                         let them = find(id).ok_or(DeskError::NotFound)?;
@@ -822,6 +880,7 @@ impl Desk {
         }
         match &from {
             Sender::Session(id) => {
+                let report = kind == LineKind::Tell && self.its_acting_boss(*id, &m.to);
                 self.0
                     .state
                     .lock()
@@ -829,7 +888,7 @@ impl Desk {
                     .runs
                     .entry(*id)
                     .or_default()
-                    .sent_one(m.to_session().is_some());
+                    .sent_one(m.to.kind == PartyKind::Session, report);
                 let what = match kind {
                     LineKind::Ask => crate::picture::What::SessionAsked,
                     _ => crate::picture::What::SessionReported,
@@ -1068,7 +1127,10 @@ impl Desk {
                 self.picture_person_answered(v.id, &a.text);
                 self.person_spoke(v.id)
             }
+            // Its answer to a question the boss that runs it asked is
+            // paced by the turns that asked it, as a report is.
             (Sender::Session(id), _) => {
+                let report = self.its_acting_boss(*id, &question.from);
                 self.0
                     .state
                     .lock()
@@ -1076,7 +1138,7 @@ impl Desk {
                     .runs
                     .entry(*id)
                     .or_default()
-                    .sent_one(question.from_session().is_some());
+                    .sent_one(question.from.kind == PartyKind::Session, report);
             }
             // Its own boss's answer starts the asker's budget again; any
             // other overseer's counts against it: its budget holds the
@@ -1143,14 +1205,7 @@ impl Desk {
                 .await?
             {
                 if let Some(asker) = taken.to_session() {
-                    self.0
-                        .state
-                        .lock()
-                        .lines
-                        .runs
-                        .entry(asker)
-                        .or_default()
-                        .delivered(taken.hop);
+                    self.run_heard(asker, &taken);
                 }
                 self.line_announce(&taken);
                 return Ok(Some(taken));
@@ -1551,14 +1606,7 @@ impl Desk {
     }
 
     pub(super) fn line_delivered_into(&self, id: Uuid, m: &LineMessage) {
-        self.0
-            .state
-            .lock()
-            .lines
-            .runs
-            .entry(id)
-            .or_default()
-            .delivered(m.hop);
+        self.run_heard(id, m);
         self.line_announce(m);
     }
 
@@ -1750,16 +1798,7 @@ impl Desk {
     /// in, at its hop.
     pub(super) async fn line_heard(&self, id: Uuid, mark: &str) {
         match self.0.store.line_marked(&id.to_string(), mark).await {
-            Ok(Some(m)) => {
-                self.0
-                    .state
-                    .lock()
-                    .lines
-                    .runs
-                    .entry(id)
-                    .or_default()
-                    .delivered(m.hop);
-            }
+            Ok(Some(m)) => self.run_heard(id, &m),
             Ok(None) => {}
             Err(e) => {
                 tracing::warn!(session = %id, error = %e, "couldn't read a line message back")
@@ -1995,7 +2034,7 @@ impl Desk {
                 format!(
                     "{} has ended, so your question “{}” to it is withdrawn.",
                     gone.label(),
-                    crew::one_line(ask.headline(), 120)
+                    crew::one_line(line::unstamped(ask.headline(), &ask.from.name), 120)
                 ),
                 ask.hop,
             );
@@ -2023,6 +2062,59 @@ impl Desk {
         st.lines.seen.remove(&id);
     }
 
+    /// Each of `rows`' reason to wait to go into `view` (a hand-off behind
+    /// its running turn waits on that), or none while Desk holds any of them
+    /// on purpose, whatever its turn ([`Wait::on_purpose`]).
+    pub fn line_waits(
+        &self,
+        view: &SessionView,
+        rows: &[LineMessage],
+    ) -> Option<Vec<Option<Wait>>> {
+        let (typed, plugin) = (self.typed_since_idle(view.id), self.plugin_heard(view.id));
+        let in_turn = self.in_a_turn(view);
+        let waits: Vec<Option<Wait>> = rows
+            .iter()
+            .map(|m| match m.delivery {
+                Delivery::Handed if in_turn => Some(Wait::Working),
+                _ => self.waits_why(view, typed, plugin, m),
+            })
+            .collect();
+        let on_purpose = rows
+            .iter()
+            .filter_map(|m| self.line_gate(view, m))
+            .chain(waits.iter().flatten().copied())
+            .any(Wait::on_purpose);
+        (!on_purpose).then_some(waits)
+    }
+
+    fn waits_why(
+        &self,
+        view: &SessionView,
+        typed: bool,
+        plugin: bool,
+        m: &LineMessage,
+    ) -> Option<Wait> {
+        match m.delivery {
+            Delivery::Held => Some(Wait::Stopped),
+            Delivery::Queued if self.steered(view.id, m.id) => Some(Wait::NextCall),
+            Delivery::Queued => match line::deliverable(view, typed, plugin) {
+                // A turn Esc ended: the plugin takes it now.
+                Err(Wait::Working)
+                    if plugin && view.caps.line == Deliver::Submit && !self.in_a_turn(view) =>
+                {
+                    self.line_gate(view, m)
+                }
+                Err(why) => Some(why),
+                Ok(_) => self.line_gate(view, m),
+            },
+            Delivery::Handed
+            | Delivery::Delivered
+            | Delivery::Refused
+            | Delivery::Withdrawn
+            | Delivery::Noted => None,
+        }
+    }
+
     /// A session's thread, oldest first, the page before `before`; each
     /// waiting message says why it waits.
     pub async fn line_thread(
@@ -2041,27 +2133,7 @@ impl Desk {
             .await?;
         rows.reverse();
         for m in rows.iter_mut().filter(|m| m.to_session() == Some(id)) {
-            m.waiting = match m.delivery {
-                Delivery::Held => Some(Wait::Stopped),
-                Delivery::Queued if self.steered(id, m.id) => Some(Wait::NextCall),
-                Delivery::Queued => match line::deliverable(&view, typed, plugin) {
-                    // A turn Esc ended: the plugin takes it now.
-                    Err(Wait::Working)
-                        if plugin
-                            && view.caps.line == Deliver::Submit
-                            && !self.in_a_turn(&view) =>
-                    {
-                        self.line_gate(&view, m)
-                    }
-                    Err(why) => Some(why),
-                    Ok(_) => self.line_gate(&view, m),
-                },
-                Delivery::Handed
-                | Delivery::Delivered
-                | Delivery::Refused
-                | Delivery::Withdrawn
-                | Delivery::Noted => None,
-            };
+            m.waiting = self.waits_why(&view, typed, plugin, m);
             m.actions = self.line_actions(&view, m);
         }
         Ok(rows)
@@ -2258,7 +2330,7 @@ impl Desk {
                 format!(
                     "gave you {}'s question “{}”",
                     q.from.name,
-                    crew::one_line(q.headline(), 120)
+                    crew::one_line(line::unstamped(q.headline(), &q.from.name), 120)
                 ),
             )
             .reason(why)

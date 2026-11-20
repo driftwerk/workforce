@@ -1281,6 +1281,67 @@ mod tests {
         );
     }
 
+    /// A probe whose drop the key may not make is told as the key's fault,
+    /// for an operator to put right.
+    #[tokio::test]
+    async fn a_probe_the_key_may_not_drop_is_forbidden() {
+        let (tenants, _) = probe_node(403, 0, true).await;
+        let small = embedding_of(SMALL, 16, None, &["text"]);
+        let node = seeding::NodeEmbedder::new(tenants, small, 1);
+        let refused = node.documents(&["a".to_string()]).await.unwrap_err();
+        assert!(
+            matches!(unusable(&refused), Some(Unusable::Forbidden { .. })),
+            "{refused:#}"
+        );
+        assert!(
+            refused.to_string().ends_with("was not dropped"),
+            "{refused}"
+        );
+    }
+
+    /// A probe whose create is refused outright was never made: only the
+    /// create's refusal is told, never a probe left behind.
+    #[tokio::test]
+    async fn a_probe_refused_at_its_create_is_not_told_as_left_behind() {
+        use axum::response::IntoResponse;
+        let app = axum::Router::new().fallback(|| async {
+            let refused = serde_json::json!({ "error": {
+                "code": "forbidden",
+                "message": "the key may not create collections",
+            }});
+            (axum::http::StatusCode::FORBIDDEN, axum::Json(refused)).into_response()
+        });
+        let tenants = connect(&crate::serve(app).await, "key", "harbor").unwrap();
+        let small = embedding_of(SMALL, 16, None, &["text"]);
+        let node = seeding::NodeEmbedder::new(tenants, small, 1);
+        let refused = format!(
+            "{:#}",
+            node.documents(&["a".to_string()]).await.unwrap_err()
+        );
+        assert!(
+            refused.contains("the key may not create collections") && !refused.contains("dropped"),
+            "{refused}"
+        );
+    }
+
+    /// A marker that is there but records no owner is an error naming it,
+    /// never read as unclaimed.
+    #[tokio::test]
+    async fn a_marker_with_no_owner_is_an_error() {
+        let app = axum::Router::new().fallback(|| async {
+            axum::Json(serde_json::json!({
+                "id": uuid::Uuid::from_u128(1),
+                "properties": { "collection": 7 },
+            }))
+        });
+        let tenants = connect(&crate::serve(app).await, "key", "harbor").unwrap();
+        let refused = index_claimed(&tenants, "CodeGraph").await.unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            "the marker of 'CodeGraph' in tenant 'harbor' records no owner"
+        );
+    }
+
     /// A claim or a collection read in a tenant that is not there is an
     /// error saying so: never unclaimed, nor a collection missing.
     #[tokio::test]
@@ -1387,8 +1448,13 @@ mod tests {
                         serde_json::json!({ "incarnation": 1, "position": 1, "outcomes": [] });
                     if method == axum::http::Method::DELETE && dropping != 200 {
                         let status = axum::http::StatusCode::from_u16(dropping).unwrap();
+                        let code = if dropping == 403 {
+                            "forbidden"
+                        } else {
+                            "internal"
+                        };
                         let failed = serde_json::json!({ "error": {
-                            "code": "internal",
+                            "code": code,
                             "message": "the drop failed",
                         }});
                         return (status, axum::Json(failed)).into_response();
@@ -1500,7 +1566,8 @@ mod tests {
     }
 
     /// An outside embedder that, each time it is asked, notes how many
-    /// objects of a probe the node still lists.
+    /// objects the node still lists: the probe fake lists all it holds,
+    /// whichever collection is asked.
     struct Watching {
         tenants: Tenants,
         listed: std::sync::Mutex<Vec<usize>>,
@@ -1513,7 +1580,7 @@ mod tests {
         }
 
         async fn documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-            let probe = CollectionName::new("WorkforceEmbedProbeWatched").unwrap();
+            let probe = CollectionName::new("AnyCollection").unwrap();
             let page = vellev_client::api::Page::new(2);
             let held = self.tenants.reads.collection(&probe).list(&page).await?;
             self.listed.lock().unwrap().push(held.objects.len());

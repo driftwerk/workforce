@@ -875,9 +875,21 @@ impl Desk {
     /// takes it off whoever had it, and that session is told.
     pub(super) async fn move_read(
         &self,
+        t: Ticket,
+        mv: Move,
+        by: &By,
+    ) -> Result<TicketView, DeskError> {
+        self.move_holding(t, mv, by, None).await
+    }
+
+    /// [`Self::move_read`], held back in To do with `held_back` when it
+    /// says, in the same write.
+    pub(super) async fn move_holding(
+        &self,
         mut t: Ticket,
         mv: Move,
         by: &By,
+        held_back: Option<&str>,
     ) -> Result<TicketView, DeskError> {
         let rank = self.drop_rank(&t, &mv).await?;
         let from = t.state;
@@ -892,7 +904,11 @@ impl Desk {
             true => t.assignee.take(),
             false => None,
         };
-        self.save_ticket(&mut t).await?;
+        self.0
+            .store
+            .put_ticket_holding(&mut t, held_back)
+            .await
+            .map_err(stale)?;
         if let Some(session) = off.as_ref().and_then(crate::line::session_of) {
             let key = self.key_of(&t).await?;
             let text = format!(
@@ -1259,6 +1275,7 @@ impl Desk {
                     id: m.id,
                     machine: Some(m.machine),
                     name: m.name,
+                    note: None,
                 };
                 self.assign_machine_session(t, &key, &started, by).await
             }

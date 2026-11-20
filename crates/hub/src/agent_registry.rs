@@ -153,12 +153,7 @@ impl AgentRegistry {
                 continue;
             }
 
-            // Resolve the effective root path for grouping
-            let root = effective
-                .root
-                .as_ref()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(&config.hub.data_dir));
+            let (root, _) = crate::knowledge::knowledge_dirs(&effective, &config.hub.data_dir);
 
             // Canonicalize for consistent grouping (handles symlinks, trailing slashes)
             let canonical_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());

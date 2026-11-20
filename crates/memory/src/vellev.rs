@@ -2929,9 +2929,7 @@ mod failure_tests {
         let app = axum::Router::new()
             .fallback(answer)
             .with_state(Arc::clone(&fake));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = workforce_vellev::testing::serve(app).await;
         (
             VellevStore::new_with_timeouts(&url, "key", "workforce", "Memories", timeouts).unwrap(),
             fake,
@@ -2997,9 +2995,7 @@ mod failure_tests {
                     .into_response()
             },
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = workforce_vellev::testing::serve(app).await;
         let timeouts = Timeouts {
             read: Duration::from_millis(500),
             write: Duration::from_millis(500),
@@ -3087,10 +3083,7 @@ mod index_time_tests {
             }
             panic!("a recall asked the node for {path}");
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        url
+        workforce_vellev::testing::serve(app).await
     }
 
     struct Embeds(bool);

@@ -232,6 +232,16 @@ impl DeskStore {
     /// from now while it is Doing or in Review, and no longer once it is
     /// taken off it, Done or Dropped.
     pub async fn put_ticket(&self, t: &mut Ticket) -> Result<(), TicketWrite> {
+        self.put_ticket_holding(t, None).await
+    }
+
+    /// [`Self::put_ticket`], held back in To do with `held_back` when it
+    /// says ([`crate::plan_store::Runs::held_back`]).
+    pub async fn put_ticket_holding(
+        &self,
+        t: &mut Ticket,
+        held_back: Option<&str>,
+    ) -> Result<(), TicketWrite> {
         let mut client = self.pool().get().await?;
         let tx = client.transaction().await?;
         let row = tx
@@ -239,6 +249,8 @@ impl DeskStore {
                 "UPDATE tickets SET title = $3, body = $4, state = $5, rank = $6, \
                  assignee = $7, pinned = $8, snoozed_until = $9, snoozed_at = $10, \
                  state_at = $11, updated_at = $12, external = $13, upstream_rank = $14, \
+                 held_back = CASE WHEN $15::text IS NOT NULL THEN $15 \
+                 WHEN $5 = 'todo' AND $7::jsonb IS NULL THEN held_back END, \
                  version = version + 1 \
                  WHERE id = $1 AND version = $2 RETURNING version",
                 &[
@@ -256,6 +268,7 @@ impl DeskStore {
                     &t.updated_at,
                     &t.external.as_ref().map(serde_json::to_value).transpose()?,
                     &t.upstream_rank,
+                    &held_back,
                 ],
             )
             .await?;
@@ -302,7 +315,7 @@ impl DeskStore {
             .try_get(0)?;
         let moved = tx
             .execute(
-                "UPDATE tickets SET board = $2, number = $3, plan = NULL, \
+                "UPDATE tickets SET board = $2, number = $3, plan = NULL, held_back = NULL, \
                    updated_at = now(), version = version + 1 WHERE id = $1",
                 &[&id, &to, &number],
             )
@@ -322,8 +335,8 @@ impl DeskStore {
         let client = self.pool().get().await?;
         Ok(client
             .execute(
-                "UPDATE tickets SET plan = NULL, updated_at = now(), version = version + 1 \
-                 WHERE id = $1 AND plan IS NOT NULL",
+                "UPDATE tickets SET plan = NULL, held_back = NULL, updated_at = now(), \
+                 version = version + 1 WHERE id = $1 AND plan IS NOT NULL",
                 &[&id],
             )
             .await?

@@ -3,8 +3,9 @@
 //! as a `[Desk work]` turn gathered with what the session said on its line
 //! ([`super::line`]); there it tells the session its next step, gives the
 //! person a question, or lets it go. Such turns are spent from a rolling
-//! hour (`[oversight.work] max_turns_per_hour`); while they are spent turn
-//! ends wait for the next, and questions still go through.
+//! hour (`[oversight.work] max_turns_per_hour`), and so are the turns its
+//! sessions' reports alone would start: while they are spent those wait,
+//! gathered, for the next, and questions still go through.
 //!
 //! With `take_on = "all"`, at level `act`, it takes on every session it
 //! can as it appears, but never one the person released; and the sessions
@@ -242,10 +243,12 @@ impl CrewHub {
 
     /// Spends one of the hour's work turns of the overseer that runs
     /// `session` if it has one left: each overseer's are its own. When none
-    /// is, the person is told once that the overseer is pacing itself.
+    /// is, the person is told once that the overseer is pacing itself. With
+    /// no overseer over it there is no hour to spend from: its turn goes on,
+    /// and finds no boss to answer it (the person is given what it asks).
     pub(crate) fn spend_work_turn(&self, session: Uuid) -> bool {
         let Some((service, o)) = self.overseer_of_session(session) else {
-            return false;
+            return true;
         };
         // At Act fully in force no count of turns holds it back: its
         // budget, the audit and Stop do.
@@ -258,8 +261,7 @@ impl CrewHub {
         let run = runs
             .entry(service.agent_id.as_str().to_string())
             .or_default();
-        if spend(&mut run.turns, Instant::now(), hour, max) {
-            run.told = false;
+        if spend_run(run, Instant::now(), hour, max) {
             return true;
         }
         if !run.told {

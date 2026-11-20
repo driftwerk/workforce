@@ -163,6 +163,12 @@ pub struct OpenItem {
     /// lets an ask carry answers.
     #[serde(default)]
     pub cant_decide: Option<String>,
+    /// A promise's: when it is chased next, if it is still owed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_at: Option<DateTime<Utc>>,
+    /// When its boss was told to go and get it itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chased_at: Option<DateTime<Utc>>,
 }
 
 /// An item to open (or, when one with its key is open, to update).
@@ -186,6 +192,8 @@ pub struct NewItem {
     pub sessions: Vec<Uuid>,
     pub layout: AskLayout,
     pub cant_decide: Option<String>,
+    /// A promise's: when it is chased if still owed.
+    pub due_at: Option<DateTime<Utc>>,
 }
 
 impl NewItem {
@@ -207,6 +215,7 @@ impl NewItem {
             sessions: Vec::new(),
             layout: AskLayout::default(),
             cant_decide: None,
+            due_at: None,
         }
     }
 
@@ -229,6 +238,7 @@ impl NewItem {
             sessions: Vec::new(),
             layout: AskLayout::default(),
             cant_decide: None,
+            due_at: None,
         }
     }
 
@@ -255,6 +265,12 @@ impl NewItem {
             sessions,
             ..Self::ask(boss, OpenKind::Order, None, text)
         }
+    }
+
+    /// The promise, chased at `at` if still owed then.
+    pub fn due(mut self, at: Option<DateTime<Utc>>) -> Self {
+        self.due_at = at;
+        self
     }
 
     /// Keyed by the kind of case it would settle, when it says one.
@@ -473,7 +489,8 @@ pub fn lapsed(
     after: Duration,
     ended: impl Fn(Uuid) -> bool,
 ) -> Option<String> {
-    if !matches!(i.kind, OpenKind::Promise | OpenKind::Order) {
+    // A promise is chased to its end while it has a due time.
+    if !matches!(i.kind, OpenKind::Promise | OpenKind::Order) || i.due_at.is_some() {
         return None;
     }
     let linked = i.linked();
@@ -498,6 +515,21 @@ pub fn ask_key(session: Option<Uuid>, generalizes: Option<&str>, text: &str) -> 
 }
 
 impl OpenItem {
+    /// When it is due, at `now` in `tz`: "due by 14:30", with its day when
+    /// that isn't today; none once it is chased.
+    pub fn due_by(&self, now: DateTime<Utc>, tz: &chrono_tz::Tz) -> Option<String> {
+        let at = self
+            .due_at
+            .filter(|_| self.chased_at.is_none())?
+            .with_timezone(tz);
+        Some(
+            match at.date_naive() == now.with_timezone(tz).date_naive() {
+                true => format!("due by {}", at.format("%H:%M")),
+                false => format!("due by {}", at.format("%a %-d %b, %H:%M")),
+            },
+        )
+    }
+
     /// How many times it was put to the person again after it was first
     /// said.
     pub fn restated(&self) -> i32 {
@@ -718,6 +750,9 @@ pub fn listed(items: &[OpenItem], now: DateTime<Utc>, tz: chrono_tz::Tz) -> Stri
         if let Some(d) = &i.done_when {
             l.push_str(&format!(" · done when: {d}"));
         }
+        if let Some(by) = i.due_by(now, &tz) {
+            l.push_str(&format!(" · {by}"));
+        }
         if !i.options.is_empty() {
             l.push_str(&format!(" · answers: {}", i.options.join(" / ")));
         }
@@ -810,6 +845,8 @@ mod tests {
             closed_why: None,
             layout: AskLayout::default(),
             cant_decide: None,
+            due_at: None,
+            chased_at: None,
         }
     }
 
@@ -938,6 +975,20 @@ mod tests {
             lapsed(&p, now, LAPSE_AFTER, |_| false).as_deref(),
             Some("nothing changed for 3 days")
         );
+        p.due_at = Some(now - Duration::days(1));
+        assert_eq!(
+            lapsed(&p, now, LAPSE_AFTER, |_| true),
+            None,
+            "due and not chased yet: chased first"
+        );
+        p.chased_at = Some(now);
+        assert_eq!(
+            lapsed(&p, now, LAPSE_AFTER, |_| true),
+            None,
+            "nor while chased"
+        );
+        p.due_at = None;
+        assert!(lapsed(&p, now, LAPSE_AFTER, |_| true).is_some());
         let ask = item(10, 1, None);
         assert_eq!(
             lapsed(&ask, now, Duration::zero(), |_| true),
