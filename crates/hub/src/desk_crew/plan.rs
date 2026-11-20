@@ -98,6 +98,8 @@ impl Failed {
 pub(crate) struct MachineSeen {
     pub plan: Uuid,
     pub boss: String,
+    /// Its plan's goal, as the plan grant there names it.
+    pub goal: String,
     pub key: String,
     /// Its state as the machine said it; `starting` until first read.
     pub state: String,
@@ -1485,12 +1487,22 @@ impl CrewHub {
         // Each machine's plan sessions: (item, as first seen, group, in Review).
         type Watched = (String, MachineSeen, Option<String>, bool);
         let mut on: HashMap<String, Vec<Watched>> = HashMap::new();
-        let open = self.desk.plans(None, None).await.unwrap_or_default();
+        // What is known of the plans' sessions stays until they are read:
+        // it is what their plan grants are made of.
+        let open = match self.desk.plans(None, None).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "the plans' machine sessions weren't read");
+                return;
+            }
+        };
+        let mut unread = HashSet::new();
         for s in open
             .iter()
             .filter(|s| !matches!(s.plan.state, PlanState::Done | PlanState::Dropped))
         {
             let Ok(detail) = self.desk.plan(s.plan.id).await else {
+                unread.insert(s.plan.id);
                 continue;
             };
             for t in &detail.tickets {
@@ -1511,6 +1523,7 @@ impl CrewHub {
                 let seen = MachineSeen {
                     plan: s.plan.id,
                     boss: s.plan.boss.clone(),
+                    goal: s.plan.goal.clone(),
                     key: t.ticket.key.clone().unwrap_or_else(|| row.id.to_string()),
                     state: "starting".into(),
                     reply: None,
@@ -1527,10 +1540,14 @@ impl CrewHub {
         // What is no longer a plan's machine session isn't kept.
         {
             let ours: HashSet<&String> = on.values().flatten().map(|(k, ..)| k).collect();
-            self.machine_seen.lock().retain(|k, _| ours.contains(k));
+            self.machine_seen
+                .lock()
+                .retain(|k, s| ours.contains(k) || unread.contains(&s.plan));
             let machines: HashSet<&String> = on.keys().collect();
             self.machine_down.lock().retain(|m, _| machines.contains(m));
         }
+        self.plans_watched
+            .store(true, std::sync::atomic::Ordering::Release);
         for (machine, sessions) in on {
             {
                 let mut read = self.machine_read.lock();
@@ -1764,6 +1781,7 @@ impl CrewHub {
                                     MachineSeen {
                                         plan: p.id,
                                         boss: boss.id.clone(),
+                                        goal: p.goal.clone(),
                                         key,
                                         state: "starting".into(),
                                         reply: None,
@@ -2508,6 +2526,7 @@ mod tests {
         let seen = |state: &str, reply: Option<&str>| MachineSeen {
             plan: Uuid::nil(),
             boss: "local:sarah".into(),
+            goal: "Speed up recall".into(),
             key: "VEL-3".into(),
             state: state.into(),
             reply: reply.map(str::to_string),

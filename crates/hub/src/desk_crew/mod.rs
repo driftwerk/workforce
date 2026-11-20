@@ -299,6 +299,9 @@ pub struct CrewHub {
     /// Plans' sessions on the person's machines, as last read there, by
     /// `<machine>/<id>`; and when each machine was last read.
     machine_seen: Mutex<HashMap<String, plan::MachineSeen>>,
+    /// Whether the plans' machine sessions were read since the hub started:
+    /// until then no plan grant is said ([`machine_grants`]).
+    plans_watched: std::sync::atomic::AtomicBool,
     machine_read: Mutex<HashMap<String, std::time::Instant>>,
     /// Each machine's plan reads that failed in a row.
     machine_down: Mutex<HashMap<String, u32>>,
@@ -766,6 +769,7 @@ impl CrewHub {
             plan_failures: Mutex::default(),
             plan_waiting: Mutex::default(),
             machine_seen: Mutex::default(),
+            plans_watched: std::sync::atomic::AtomicBool::new(false),
             machine_read: Mutex::default(),
             machine_down: Mutex::default(),
             reuse_claims: Mutex::default(),

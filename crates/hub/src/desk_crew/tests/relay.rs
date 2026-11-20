@@ -743,3 +743,349 @@ async fn a_job_held_here_or_on_a_machine_is_one_job_and_an_approval_there_carrie
     })
     .await;
 }
+
+/// The main overseer: it runs no group, and messages its sessions.
+const MAIN: &str = "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nnudge = true\nhand_out_work = false\n";
+
+/// Proposes a plan of one ticket on devbox, in `folder` there, as `boss`
+/// does, and approves it: its ticket's session there, once started.
+async fn planned_on_devbox(
+    boss: &AgentService,
+    d: &Desk,
+    goal: &str,
+    folder: &str,
+) -> (uuid::Uuid, String) {
+    let r = boss
+        .tools
+        .get("crew.plan")
+        .unwrap()
+        .execute(json!({"goal": goal, "machine": "devbox",
+                        "tickets": [{"title": goal, "folder": folder}]}))
+        .await
+        .unwrap();
+    assert!(r.success, "{r:?}");
+    let id: uuid::Uuid = r.output["proposed"]["plan_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    d.approve_plan(id, 1, &By::you()).await.unwrap();
+    let session = eventually("its session on devbox", async || {
+        let t = d.plan(id).await.ok()?.tickets[0].ticket.ticket.clone();
+        t.assignee
+            .filter(|_| t.state == workforce_desk::board::TicketState::Doing)
+            .map(|a| a.id)
+    })
+    .await;
+    (id, session)
+}
+
+/// The grants the Mac says devbox should hold, once it holds `group`'s.
+async fn wanted_with(crew: &CrewHub, group: &str) -> Vec<super::super::machine_grants::Wanted> {
+    eventually("devbox's grants", async || {
+        let w = crew.machine_grants()?;
+        let g = w.machines.get("devbox")?.grants.clone();
+        g.iter().any(|g| g.group == group).then_some(g)
+    })
+    .await
+}
+
+/// The main overseer reaches its own plan's ticket session on devbox end
+/// to end: Desk carries the plan's grant there, and each call through the
+/// relay to devbox's served route, where devbox decides it under that
+/// grant. It reads it at once, messages it once the person hands it over
+/// there, and reaches nothing else; at Watch it only reads; the grant
+/// goes with the plan.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_main_overseer_reads_and_messages_its_plans_session_on_a_machine_and_nothing_else() {
+    with_test_pool(workforce_desk::store::build_pool, |mac_pool| async move {
+        with_test_pool(workforce_desk::store::build_pool, |devbox_pool| async move {
+            let (mac_dir, devbox_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let (main, state, d, _llm) =
+                super::plans::hub_with(mac_dir.path(), mac_pool, MAIN).await;
+            let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+            // devbox, a machine whose groups are its grants, with a main
+            // overseer of its own.
+            let (theirs, _llm) = agent(devbox_dir.path(), "desk", "ok").await;
+            write_config(&theirs, MAIN);
+            let there_state = hub(std::slice::from_ref(&theirs));
+            let there = machine_desk(devbox_pool, devbox_dir.path()).await;
+            let there_crew =
+                CrewHub::start(Arc::clone(&there_state), there.clone(), FAST, CancellationToken::new());
+            let served = super::super::relay::routes(Arc::clone(&there_state), Arc::clone(&there_crew));
+            let there_token = there_state.auth_token.clone();
+            eventually("the plan tools", async || main.tools.has("crew.plan").then_some(())).await;
+
+            // Desk's native side: devbox's sessions and starts, and each
+            // crew call posted to devbox as it carries one.
+            let carried: Arc<parking_lot::Mutex<Vec<RelayCall>>> = Arc::default();
+            let poller = {
+                let (crew, there, carried, served, token, dir) = (
+                    Arc::clone(&crew),
+                    there.clone(),
+                    Arc::clone(&carried),
+                    served.clone(),
+                    there_token.clone(),
+                    devbox_dir.path().to_path_buf(),
+                );
+                tokio::spawn(async move {
+                    loop {
+                        for c in crew.relay_take(Duration::from_millis(200)).await {
+                            let answer = match c.tool.as_str() {
+                                "desk.sessions" => RelayAnswer {
+                                    status: ServedStatus::Ok,
+                                    body: serde_json::to_value(there.list()).unwrap(),
+                                },
+                                "desk.session_start" => {
+                                    let name = c.input["name"].as_str().unwrap();
+                                    RelayAnswer {
+                                        status: ServedStatus::Ok,
+                                        body: serde_json::to_value(new_session(&there, &dir, name).await)
+                                            .unwrap(),
+                                    }
+                                }
+                                _ => {
+                                    carried.lock().push(c.clone());
+                                    let w = serde_json::to_value(&c).unwrap();
+                                    let body = json!({"group": w["group"], "tool": w["tool"],
+                                        "input": w["input"], "boss": w["boss"], "linkId": w["linkId"],
+                                        "id": w["id"], "level": w["level"], "act": w["act"]});
+                                    let (code, out) = post(&served, "/api/desk/crew/served", &token, body).await;
+                                    assert_eq!(code, StatusCode::OK, "{out}");
+                                    serde_json::from_value(out).unwrap()
+                                }
+                            };
+                            crew.relay_answer(c.id, answer);
+                        }
+                    }
+                })
+            };
+
+            let folder = devbox_dir.path().to_string_lossy().into_owned();
+            let (plan, session) = planned_on_devbox(&main, &d, "Speed up recall", &folder).await;
+            let (_, id) = super::super::relay::machine_session(&session).unwrap();
+            let key = super::super::machine_grants::plan_key(plan);
+
+            // Desk carries the plan's grant to devbox as the Mac says it.
+            let grants = wanted_with(&crew, &key).await;
+            let g = grants.iter().find(|g| g.group == key).unwrap();
+            assert_eq!(g.plan, Some(plan));
+            assert_eq!(g.grant["boss"], "local:desk");
+            assert_eq!(g.grant["level"], "act");
+            assert_eq!(g.grant["name"], "Speed up recall");
+            assert_eq!(g.grant["members"], json!([id]));
+            let mut put = g.grant.clone();
+            put["revision"] = json!(1);
+            let (code, out) =
+                super::served::native(&there, "PUT", &format!("/api/desk/grants/{key}"), put).await;
+            assert_eq!(code, StatusCode::OK, "{out}");
+            assert_eq!(
+                there.view(id).unwrap().group.map(|g| g.id),
+                Some(key.clone()),
+                "a group of its own there"
+            );
+
+            let call = |tool: &'static str, input: Value| {
+                let main = Arc::clone(&main);
+                async move { main.tools.get(tool).unwrap().execute(input).await.unwrap() }
+            };
+            let nudge = |to: &str| json!({"session_id": to, "message": "Profile recall first.", "reason": "The plan says so."});
+
+            // It reads its plan's session there.
+            let r = call("crew.history", json!({"session_id": session})).await;
+            assert!(r.success, "{r:?}");
+            let name = there.view(id).unwrap().name;
+            assert!(r.output["done"].as_str().unwrap().contains(&name), "{r:?}");
+            let sent = carried.lock().last().cloned().unwrap();
+            assert_eq!((sent.group.as_str(), sent.boss.as_str()), (key.as_str(), "local:desk"));
+            // It messages it: the person's to do until they hand it over
+            // there, as for any boss of a machine's sessions; then done.
+            let r = call("crew.nudge", nudge(&session)).await;
+            assert!(r.success && r.output.get("suggested").is_some(), "{r:?}");
+            there.stop(id, None).unwrap();
+            eventually("it to stop", async || (!there.view(id).unwrap().live).then_some(())).await;
+            let (code, out) =
+                super::served::native(&there, "POST", &format!("/api/desk/sessions/{id}/charge"), json!({})).await;
+            assert_eq!(code, StatusCode::OK, "{out}");
+            assert_eq!(there.charge_of(id).unwrap().boss, "home/desk");
+            let r = call("crew.nudge", nudge(&session)).await;
+            assert!(r.success && r.output.get("done").is_some(), "{r:?}");
+
+            // A session there of no plan is never sent.
+            let loose = new_session(&there, devbox_dir.path(), "loose").await;
+            let before = carried.lock().len();
+            let r = call("crew.history", json!({"session_id": format!("devbox/{}", loose.id)})).await;
+            assert!(!r.success);
+            assert!(r.error.unwrap().contains("only your own plans' ticket sessions"));
+            assert_eq!(carried.lock().len(), before);
+            // devbox serves the plan's grant to its boss, for its members
+            // alone: never another boss, nor another session.
+            let direct = |boss: &str, s: uuid::Uuid, n: &str| {
+                json!({"group": key, "tool": "crew.history", "input": {"session_id": s},
+                       "boss": boss, "linkId": "home-relay", "id": n, "level": "act", "act": {}})
+            };
+            let (_, out) = post(&served, "/api/desk/crew/served", &there_token, direct("local:sarah", id, "d-1")).await;
+            assert_eq!(out["status"], "refused", "{out}");
+            let (_, out) =
+                post(&served, "/api/desk/crew/served", &there_token, direct("local:desk", loose.id, "d-2")).await;
+            assert_eq!(out["status"], "refused", "{out}");
+
+            // At Watch it only reads.
+            write_config(&main, "[oversight]\nenabled = true\nlevel = \"watch\"\n");
+            eventually("watching", async || {
+                (crew.overseer_named("desk")?.1.level == workforce_common::oversight::Level::Watch).then_some(())
+            })
+            .await;
+            let r = call("crew.history", json!({"session_id": session})).await;
+            assert!(r.success, "{r:?}");
+            let before = carried.lock().len();
+            let r = call("crew.nudge", nudge(&session)).await;
+            assert!(!r.success);
+            assert!(r.error.unwrap().contains("only watch"));
+            assert_eq!(carried.lock().len(), before);
+            assert_eq!(wanted_with(&crew, &key).await.iter().find(|g| g.group == key).unwrap().grant["level"], "watch");
+
+            // The plan ends: its grant is no longer wanted, and once Desk
+            // takes it off devbox, the session is let go of there.
+            d.drop_plan(plan, workforce_desk::OnDrop::Leave, &By::you()).await.unwrap();
+            eventually("the plan's grant gone", async || {
+                crew.machine_grants()?
+                    .machines
+                    .get("devbox")
+                    .is_none_or(|m| m.grants.iter().all(|g| g.group != key))
+                    .then_some(())
+            })
+            .await;
+            let r = call("crew.history", json!({"session_id": session})).await;
+            assert!(!r.success);
+            let (code, out) =
+                super::served::native(&there, "DELETE", &format!("/api/desk/grants/{key}"), json!({})).await;
+            assert!(code.is_success(), "{out}");
+            assert!(there.charge_of(id).is_none_or(|c| !c.live()));
+            poller.abort();
+        })
+        .await;
+    })
+    .await;
+}
+
+/// On the Mac: the main overseer's plan on devbox has a grant of its own
+/// there, holding its ticket's session alone; a group boss's plan session
+/// there is its group's, as before. Each reaches only its own: the main
+/// overseer never another boss's plan's session, nor one of no plan.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plans_grant_holds_its_bosss_own_ticket_sessions_and_a_group_bosss_are_its_groups() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (main, _llm) = agent(dir.path(), "desk", "ok").await;
+        write_config(&main, MAIN);
+        let (sarah, _sarah_llm) = agent(dir.path(), "sarah", "ok").await;
+        write_config(
+            &sarah,
+            "[oversight]\nenabled = true\ngroup = \"acme\"\nlevel = \"act\"\n[oversight.act]\nnudge = true\nhand_out_work = false\n",
+        );
+        let state = hub(&[Arc::clone(&main), Arc::clone(&sarah)]);
+        let d = desk_running(
+            pool,
+            dir.path(),
+            Default::default(),
+            installed_cli(dir.path()),
+            not_installed(dir.path()),
+        )
+        .await;
+        d.change_layout(|l| l.create("acme", "Acme", &[], None))
+            .await
+            .unwrap();
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        for boss in [&main, &sarah] {
+            eventually("the plan tools", async || boss.tools.has("crew.plan").then_some(())).await;
+        }
+        // devbox: its sessions, each start made, each crew call done.
+        let carried: Arc<parking_lot::Mutex<Vec<RelayCall>>> = Arc::default();
+        let listed: Arc<parking_lot::Mutex<Vec<Value>>> = Arc::default();
+        let poller = {
+            let (crew, carried, listed) = (Arc::clone(&crew), Arc::clone(&carried), Arc::clone(&listed));
+            tokio::spawn(async move {
+                loop {
+                    for c in crew.relay_take(Duration::from_millis(200)).await {
+                        let body = match c.tool.as_str() {
+                            "desk.sessions" => Value::Array(listed.lock().clone()),
+                            "desk.session_start" => {
+                                let s = json!({"id": uuid::Uuid::new_v4(), "name": c.input["name"],
+                                               "cwd": c.input["cwd"], "state": "working"});
+                                listed.lock().push(s.clone());
+                                s
+                            }
+                            _ => {
+                                carried.lock().push(c.clone());
+                                json!({"done": "read"})
+                            }
+                        };
+                        crew.relay_answer(c.id, RelayAnswer { status: ServedStatus::Ok, body });
+                    }
+                }
+            })
+        };
+        let (mine_plan, mine) = planned_on_devbox(&main, &d, "Speed up recall", "/home/dev/vellev").await;
+        let (_, hers) = planned_on_devbox(&sarah, &d, "Ship Acme's API", "/home/dev/acme").await;
+        let (_, mine_id) = super::super::relay::machine_session(&mine).unwrap();
+        let (_, hers_id) = super::super::relay::machine_session(&hers).unwrap();
+        let key = super::super::machine_grants::plan_key(mine_plan);
+        eventually("Sarah's session in Acme", async || {
+            (d.group_of_member(&format!("session:{hers}")).as_deref() == Some("acme")).then_some(())
+        })
+        .await;
+
+        let grants = eventually("both grants", async || {
+            let g = wanted_with(&crew, &key).await;
+            g.iter().any(|g| g.group == "acme").then_some(g)
+        })
+        .await;
+        assert_eq!(grants.len(), 2, "{grants:?}");
+        let acme = grants.iter().find(|g| g.group == "acme").unwrap();
+        assert_eq!((acme.agent.as_str(), acme.plan), ("sarah", None));
+        assert_eq!(acme.grant["members"], json!([hers_id]), "the group's, as before");
+        assert!(serde_json::to_value(acme).unwrap().get("plan").is_none());
+        let ours = grants.iter().find(|g| g.group == key).unwrap();
+        assert_eq!((ours.agent.as_str(), ours.plan), ("desk", Some(mine_plan)));
+        assert_eq!(ours.grant["members"], json!([mine_id]), "its own plan's alone");
+        assert!(workforce_desk::grant::group_id_ok(&key));
+        assert_eq!(super::super::machine_grants::plan_of(&key), Some(mine_plan));
+        assert_eq!(super::super::machine_grants::plan_of(&key.to_uppercase()), None);
+
+        eventually("Desk polling", async || crew.relay_polled.lock().is_some().then_some(())).await;
+        let history = |boss: &Arc<AgentService>, s: &str| {
+            let (boss, s) = (Arc::clone(boss), s.to_string());
+            async move {
+                boss.tools
+                    .get("crew.history")
+                    .unwrap()
+                    .execute(json!({"session_id": s}))
+                    .await
+                    .unwrap()
+            }
+        };
+        // Each reaches its own: the main overseer under its plan's grant,
+        // Sarah under Acme's.
+        let r = history(&main, &mine).await;
+        assert!(r.success, "{r:?}");
+        assert_eq!(carried.lock().last().unwrap().group, key);
+        let r = history(&sarah, &hers).await;
+        assert!(r.success, "{r:?}");
+        assert_eq!(carried.lock().last().unwrap().group, "acme");
+        // Nothing else is sent: another boss's plan's session, one of no
+        // plan, nor the main overseer's to Sarah.
+        let before = carried.lock().len();
+        for (boss, s) in [
+            (&main, hers.clone()),
+            (&main, format!("devbox/{}", uuid::Uuid::new_v4())),
+            (&sarah, mine.clone()),
+        ] {
+            let r = history(boss, &s).await;
+            assert!(!r.success, "{s}: {r:?}");
+        }
+        assert_eq!(carried.lock().len(), before);
+        poller.abort();
+    })
+    .await;
+}

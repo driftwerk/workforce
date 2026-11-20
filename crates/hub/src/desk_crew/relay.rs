@@ -1,6 +1,7 @@
 //! The relay (remote bosses, RB3): a local overseer on the person's Mac
-//! reaches its group's sessions on one of their machines through Desk's
-//! native side, which holds the machine's SSH forward. Both ends are here:
+//! reaches its group's sessions on one of their machines, or the main
+//! overseer its plans' ticket sessions there, through Desk's native side,
+//! which holds the machine's SSH forward. Both ends are here:
 //!
 //! - **On the Mac**, [`CrewHub::relay`] queues the call and waits for its
 //!   answer. Desk's native side takes queued calls from
@@ -9,7 +10,7 @@
 //!   once.
 //! - **On the machine**, `POST /api/desk/crew/served` hands the call to
 //!   [`CrewHub::serve_crew`], which decides it under the machine's grant
-//!   for the group, as any served boss's call is.
+//!   for the group (or the plan), as any served boss's call is.
 //! - **That grant** is what the Mac says at `GET /api/desk/machine-grants`
 //!   ([`super::machine_grants`]), which Desk's native side carries to each
 //!   machine.

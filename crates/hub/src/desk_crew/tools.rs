@@ -811,8 +811,9 @@ impl CrewTool {
     }
 }
 
-/// What a local overseer may ask of its group's sessions on a machine,
-/// through the relay: by a session id of the machine's (`devbox/<id>`).
+/// What a local overseer may ask of its group's or its plans' sessions on
+/// a machine, through the relay: by a session id of the machine's
+/// (`devbox/<id>`).
 const RELAYED: [&str; 9] = [
     "crew.history",
     "crew.nudge",
@@ -826,34 +827,38 @@ const RELAYED: [&str; 9] = [
 ];
 
 impl CrewTool {
-    /// The group its scope is, when it is one: a machine's sessions are
-    /// relayed only for a group's boss for now.
+    /// The group its scope is, when it is one.
     fn group(&self) -> Option<&str> {
         self.scope.group()
     }
 
-    /// The machines whose sessions are in its group, by the sidebar.
-    fn machines(&self, crew: &CrewHub) -> Vec<String> {
+    /// Each machine whose sessions it runs, with the grant they are under
+    /// there: its group's, by the sidebar, or each of its plans'.
+    fn machines(&self, crew: &CrewHub, b: &Bound) -> Vec<(String, String)> {
         let Some(g) = self.group() else {
-            return Vec::new();
+            return crew
+                .plan_sessions(b.service.agent_id.as_str(), &b.oversight)
+                .into_keys()
+                .map(|(m, plan)| (m, super::machine_grants::plan_key(plan)))
+                .collect();
         };
         let layout = crew.desk.layout();
-        let mut out: Vec<String> = layout
+        let mut out: Vec<(String, String)> = layout
             .groups
             .iter()
             .filter(|x| x.id == g)
             .flat_map(|x| x.items.iter())
             .filter_map(|i| i.strip_prefix("session:"))
             .filter_map(super::relay::machine_session)
-            .map(|(m, _)| m.to_string())
+            .map(|(m, _)| (m.to_string(), g.to_string()))
             .collect();
         out.sort();
         out.dedup();
         out
     }
 
-    /// `local`, the overview of this Mac, with each machine's part of its
-    /// group, asked through the relay at once.
+    /// `local`, the overview of this Mac, with each machine's part of what
+    /// it runs there, asked through the relay at once.
     async fn with_machines(
         &self,
         crew: &Arc<CrewHub>,
@@ -861,26 +866,59 @@ impl CrewTool {
         boss: &str,
         local: Value,
     ) -> Value {
-        let (Some(g), machines) = (self.group(), self.machines(crew)) else {
+        let machines = self.machines(crew, b);
+        if machines.is_empty() {
             return local;
-        };
+        }
         let ceiling = crew.ceiling_now(b.service.agent_id.as_str(), &b.oversight);
         let ceiling = &ceiling;
-        let asks = machines.iter().map(|m| {
+        let asks = machines.into_iter().map(|(m, g)| {
             let crew = Arc::clone(crew);
             async move {
                 let part = crew
-                    .relay(m, g, "crew.overview", json!({}), boss, ceiling)
+                    .relay(&m, &g, "crew.overview", json!({}), boss, ceiling)
                     .await;
-                (m.clone(), part)
+                (m, part)
             }
         });
         let parts = futures::future::join_all(asks).await;
         super::relay::merge_overview(local, parts)
     }
 
+    /// The grant session `id` of `machine` is under there for this boss,
+    /// or why it may not be reached: its group's, holding it by the
+    /// sidebar, or one of its own plans' that holds it.
+    fn grant_for(
+        &self,
+        crew: &CrewHub,
+        b: &Bound,
+        machine: &str,
+        id: uuid::Uuid,
+    ) -> Result<String, String> {
+        match self.group() {
+            // In its own group by the sidebar, as the machine's grant will
+            // also say: nothing outside it is sent anywhere.
+            Some(g)
+                if super::machine_grants::plan_of(g).is_none()
+                    && crew.desk.group_of_member(&format!("session:{machine}/{id}")).as_deref()
+                        == Some(g) =>
+            {
+                Ok(g.to_string())
+            }
+            Some(_) => Err(crew.not_ours(&self.scope)),
+            None => crew
+                .plan_grant_of(b.service.agent_id.as_str(), &b.oversight, machine, id)
+                .ok_or_else(|| {
+                    format!(
+                        "On {machine} you run only your own plans' ticket sessions, and this isn't one of them."
+                    )
+                }),
+        }
+    }
+
     /// The call, when it names one of a machine's sessions: relayed there,
-    /// decided there under its grant for the group, the boss this tool's.
+    /// decided there under its grant ([`Self::grant_for`]), the boss this
+    /// tool's.
     /// Nothing of it is done or judged here. None when it names none.
     async fn relayed(
         &self,
@@ -902,17 +940,10 @@ impl CrewTool {
                 self.name
             )));
         }
-        let Some(g) = self.group() else {
-            return Some(Err(
-                "Sessions on a machine are run only by their group's boss for now.".into(),
-            ));
+        let g = match self.grant_for(crew, b, machine, id) {
+            Ok(g) => g,
+            Err(why) => return Some(Err(why)),
         };
-        // In its own group by the sidebar, as the machine's grant will also
-        // say: nothing outside it is sent anywhere.
-        let item = format!("session:{machine}/{id}");
-        if crew.desk.group_of_member(&item).as_deref() != Some(g) {
-            return Some(Err(crew.not_ours(&self.scope)));
-        }
         // What its own level here doesn't let it do, it doesn't ask of a
         // machine either; the machine decides at no more than it.
         if name != "crew.history" && b.oversight.level == workforce_common::oversight::Level::Watch
@@ -959,7 +990,7 @@ impl CrewTool {
                 }
             }
         }
-        let relayed = crew.relay(machine, g, name, sent, agent, &ceiling).await;
+        let relayed = crew.relay(machine, &g, name, sent, agent, &ceiling).await;
         if let Some(a) = assigned.map(|a| a.id) {
             let ok = relayed
                 .as_ref()

@@ -263,6 +263,27 @@ async fn desk_running(
     claude: PathBuf,
     codex: PathBuf,
 ) -> Desk {
+    desk_as(pool, dir, floor, claude, codex, Default::default()).await
+}
+
+/// A desk on one of the person's machines: its groups are its grants.
+pub(crate) async fn machine_desk(pool: workforce_postgres::PostgresPool, dir: &Path) -> Desk {
+    let cli = fake_cli(dir);
+    let bosses = workforce_desk::grant::BossOptions {
+        machine: true,
+        ..Default::default()
+    };
+    desk_as(pool, dir, Default::default(), cli.clone(), cli, bosses).await
+}
+
+async fn desk_as(
+    pool: workforce_postgres::PostgresPool,
+    dir: &Path,
+    floor: workforce_desk::Floor,
+    claude: PathBuf,
+    codex: PathBuf,
+    bosses: workforce_desk::grant::BossOptions,
+) -> Desk {
     Desk::start(
         DeskStore::with_pool(pool).await.unwrap(),
         Options {
@@ -281,7 +302,7 @@ async fn desk_running(
             account_keys: None,
             line_reach: workforce_desk::line::Reach::Group,
             memory: Default::default(),
-            bosses: Default::default(),
+            bosses,
         },
         floor,
         CancellationToken::new(),
