@@ -343,7 +343,7 @@ pub trait SearchedByVector: Send + Sync {
     async fn nearest(&self, to: NearestTo<'_>, repo_id: &str, limit: usize) -> Result<Vec<Near>>;
     /// For each vector, its `limit` nearest entities of `repo_id` by a scan of every
     /// one, in the node's order (distance, then object), and its distance to the
-    /// object named beside it.
+    /// object named beside it. With no vector asked, nothing is listed.
     async fn nearest_exactly(
         &self,
         asked: &[(&[f32], Option<&str>)],
@@ -1312,15 +1312,6 @@ fn check_graphql_response(body: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-/// The URL of a local server answering with `app`.
-#[cfg(test)]
-pub(crate) async fn serve(app: axum::Router) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    url
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1618,20 +1609,21 @@ mod tests {
                 async move {
                     let query = body["query"].as_str().unwrap().to_string();
                     recording.lock().unwrap().push(query.clone());
-                    axum::Json(match query.starts_with("{ Aggregate") {
-                        true => serde_json::json!({ "data": { "Aggregate": { "CodeEntity": [
+                    axum::Json(if query.starts_with("{ Aggregate") {
+                        serde_json::json!({ "data": { "Aggregate": { "CodeEntity": [
                             { "meta": { "count": 3 } }
-                        ]}}}),
-                        false => serde_json::json!({ "data": { "Get": { "CodeEntity": [{
+                        ]}}})
+                    } else {
+                        serde_json::json!({ "data": { "Get": { "CodeEntity": [{
                             "entityId": "e1", "repoId": "r", "qualifiedName": "crate::e1",
                             "kind": "Function", "filePath": "src/e1.rs", "startLine": 1,
                             "endLine": 2, "_additional": { "certainty": 0.9 }
-                        }]}}}),
+                        }]}}})
                     })
                 }
             }),
         );
-        let url = serve(app).await;
+        let url = workforce_vellev::testing::serve(app).await;
         let store = WeaviateCodeVectorStore::new(url, None);
 
         let question = "a \"b\" \\c\n  d";

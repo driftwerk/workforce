@@ -33,18 +33,24 @@ impl Schema {
         }
     }
 
-    /// Refuse a schema older than the current one, changing nothing. A
-    /// newer one is accepted, as the hub's own open accepts it.
+    /// Refuse a schema older than the current one, changing nothing, and a
+    /// database with none. A newer one is accepted, as the hub's own open
+    /// accepts it.
     pub fn ensure_current(conn: &Connection) -> Result<()> {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .context("read user_version")?;
-        match version < CURRENT_VERSION {
-            true => Err(eyre::eyre!(
-                "its schema is at version {version}, older than {CURRENT_VERSION}: open it once with the hub to migrate it, then copy it again"
-            )),
-            false => Ok(()),
+        if version == 0 {
+            return Err(eyre::eyre!(
+                "it is not a code graph: it has no schema version"
+            ));
         }
+        if version < CURRENT_VERSION {
+            return Err(eyre::eyre!(
+                "its schema is at version {version}, older than {CURRENT_VERSION}: open it once with the hub to migrate it, then copy it again"
+            ));
+        }
+        Ok(())
     }
 
     fn migrate_locked(conn: &Connection) -> Result<()> {

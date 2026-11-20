@@ -1582,7 +1582,7 @@ pub fn knowledge_dirs(config: &KnowledgeConfig, hub_data_dir: &str) -> (PathBuf,
 /// The code graph on the backend `[codegraph]` names, at `db_path` if it is
 /// SQLite ([`code_graph_path`]), its vector state kept as `active`'s, with
 /// `[knowledge] vector_standby` told of changes.
-pub fn open_code_graph(
+fn open_code_graph(
     db_path: &Path,
     config: &KnowledgeConfig,
     active: &str,

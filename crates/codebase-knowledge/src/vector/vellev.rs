@@ -130,7 +130,7 @@ pub struct VellevCodeVectorStore {
     entities: Ensured,
     summaries: Ensured,
     /// The most results the node gives for one request.
-    cap: Cap,
+    cap: Arc<Cap>,
     /// Asks the node whether it is ready, without the tenant's key.
     health: Client,
     insert_errors: InsertErrorSlot,
@@ -159,7 +159,7 @@ impl VellevCodeVectorStore {
             summaries,
             tenants,
             local,
-            cap: Cap::default(),
+            cap: Arc::default(),
             health: Client::new(url, HEALTH_TIMEOUT)?,
             insert_errors: InsertErrorSlot::default(),
             seeding: None,
@@ -545,6 +545,48 @@ impl VellevCodeVectorStore {
                 async move { self.entities.collection().nearest(&nearest).await }
             })
             .await
+    }
+
+    /// Refuse a search for more than the node gives for one: cut, its
+    /// nearest would silently be fewer.
+    fn within_cap(&self, limit: usize) -> Result<()> {
+        let most = self.cap.most();
+        if limit > most {
+            return Err(eyre::eyre!(
+                "the {limit} nearest were asked, more than the {most} vellev gives for one search"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Refuse a vector asked of the entities that is not of their size.
+    fn sized(&self, vector: &[f32]) -> Result<()> {
+        let dimensions = self.entities.wanted().embedding.dimensions as usize;
+        if vector.len() != dimensions {
+            return Err(eyre::eyre!(
+                "a vector of {} dimensions was asked of a collection of {dimensions}",
+                vector.len()
+            ));
+        }
+        Ok(())
+    }
+
+    /// The entity `object` at `distance`, scored by the collection's
+    /// certainty for it.
+    fn near(
+        &self,
+        object: ObjectId,
+        distance: f32,
+        properties: Map<String, Value>,
+    ) -> Result<Near> {
+        let score = certainty(self.entities.wanted().distance, distance).unwrap_or(0.0);
+        let found = search_result(&Value::Object(properties), score)
+            .ok_or_else(|| eyre::eyre!("vellev object {} is no code entity", object.0))?;
+        Ok(Near {
+            object: object.0.to_string(),
+            distance,
+            found,
+        })
     }
 
     fn refused(&self, e: vellev_client::Error) -> eyre::Report {
@@ -1201,21 +1243,6 @@ async fn of_repo_counted(records: &Records, repo_id: &str) -> vellev_client::Res
     records.count(Some(&of_repo(repo_id))).await
 }
 
-fn near(
-    object: ObjectId,
-    distance: f32,
-    properties: Map<String, Value>,
-    score: f32,
-) -> Result<Near> {
-    let found = search_result(&Value::Object(properties), score)
-        .ok_or_else(|| eyre::eyre!("vellev object {} is no code entity", object.0))?;
-    Ok(Near {
-        object: object.0.to_string(),
-        distance,
-        found,
-    })
-}
-
 /// The node's search for the `limit` nearest to `to`.
 fn nearest_to(to: NearestTo<'_>, limit: u32) -> Nearest {
     match to {
@@ -1224,7 +1251,7 @@ fn nearest_to(to: NearestTo<'_>, limit: u32) -> Nearest {
     }
 }
 
-type Kept = (f32, ObjectId, Map<String, Value>);
+type Ranked = (f32, ObjectId, Map<String, Value>);
 
 /// The first `limit` of `rows` in the node's order, by distance and then
 /// object, sorted: those after them are left beyond the slice.
@@ -1256,6 +1283,7 @@ impl SearchedByVector for VellevCodeVectorStore {
             ..self.entities.wanted().embedding.clone()
         };
         NodeEmbedder::new(self.tenants.clone(), embedding, 1)
+            .sharing(Arc::clone(&self.cap))
             .documents(texts)
             .await
     }
@@ -1264,24 +1292,25 @@ impl SearchedByVector for VellevCodeVectorStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        if limit > MAX_RESULTS {
-            return Err(eyre::eyre!(
-                "the {limit} nearest were asked, more than the {MAX_RESULTS} vellev gives for one search"
-            ));
-        }
-        let cleaned = match to {
-            NearestTo::Text(text) => match search_text(text, "code_nearest") {
-                None => return Ok(Vec::new()),
-                cleaned => cleaned,
-            },
-            NearestTo::Vector(_) => None,
+        self.within_cap(limit)?;
+        let cleaned;
+        let to = match to {
+            NearestTo::Text(text) => {
+                let Some(text) = search_text(text, "code_nearest") else {
+                    return Ok(Vec::new());
+                };
+                cleaned = text;
+                NearestTo::Text(cleaned.as_str())
+            }
+            NearestTo::Vector(vector) => {
+                self.sized(vector)?;
+                to
+            }
         };
-        let to = cleaned
-            .as_ref()
-            .map_or(to, |text| NearestTo::Text(text.as_str()));
         let filter = of_repo(repo_id);
         let found = self.found(Some(&filter), limit, |limit| nearest_to(to, limit));
         let found = found.await.map_err(|e| self.refused(e))?;
+        self.within_cap(limit)?;
         found
             .results
             .into_iter()
@@ -1289,8 +1318,7 @@ impl SearchedByVector for VellevCodeVectorStore {
                 let distance = hit.distance.ok_or_else(|| {
                     eyre::eyre!("vellev gave no distance for object {}", hit.object.id.0)
                 })?;
-                let score = hit.certainty.unwrap_or(0.0);
-                near(hit.object.id, distance, hit.object.properties, score)
+                self.near(hit.object.id, distance, hit.object.properties)
             })
             .collect()
     }
@@ -1301,18 +1329,16 @@ impl SearchedByVector for VellevCodeVectorStore {
         repo_id: &str,
         limit: usize,
     ) -> Result<Scanned> {
+        if asked.is_empty() {
+            return Ok(Scanned::default());
+        }
         let records = self.entities.collection();
         let metric = self.entities.wanted().distance;
         let dimensions = self.entities.wanted().embedding.dimensions as usize;
         let scorers: Vec<(Scorer<'_>, Option<Uuid>)> = asked
             .iter()
             .map(|(vector, first)| {
-                if vector.len() != dimensions {
-                    return Err(eyre::eyre!(
-                        "a vector of {} dimensions was asked of a collection of {dimensions}",
-                        vector.len()
-                    ));
-                }
+                self.sized(vector)?;
                 let first = first.map(|first| {
                     first.parse().map_err(|e| {
                         eyre::eyre!(
@@ -1368,7 +1394,7 @@ impl SearchedByVector for VellevCodeVectorStore {
                 let page = page
                     .iter()
                     .map(|(distance, row)| (*distance, row.id, row.properties.clone()));
-                let mut merged: Vec<Kept> = std::mem::take(top).into_iter().chain(page).collect();
+                let mut merged: Vec<Ranked> = std::mem::take(top).into_iter().chain(page).collect();
                 nearest_of(
                     &mut merged,
                     |(distance, object, _)| (*distance, object.0),
@@ -1386,10 +1412,7 @@ impl SearchedByVector for VellevCodeVectorStore {
             .into_iter()
             .map(|top| {
                 top.into_iter()
-                    .map(|(distance, object, properties)| {
-                        let score = certainty(metric, distance).unwrap_or(0.0);
-                        near(object, distance, properties, score)
-                    })
+                    .map(|(distance, object, properties)| self.near(object, distance, properties))
                     .collect()
             })
             .collect::<Result<_>>()?;
@@ -1547,7 +1570,7 @@ mod tests {
                 }
             },
         );
-        let url = crate::vector::serve(app).await;
+        let url = workforce_vellev::testing::serve(app).await;
         (
             VellevCodeVectorStore::new(&url, "key", "code").unwrap(),
             asked,
@@ -1605,7 +1628,49 @@ mod tests {
         );
     }
 
-    /// The scan refuses a vector of another size than the collection's,
+    /// A search for more than the node gives for one is refused, never cut:
+    /// once the node has said so, before anything is asked.
+    #[tokio::test]
+    async fn a_search_for_more_than_the_node_gives_is_refused() {
+        use axum::response::IntoResponse;
+        let searches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = Arc::clone(&searches);
+        let app = axum::Router::new().fallback(move |body: String| {
+            let counting = Arc::clone(&counting);
+            async move {
+                counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let asked: Value = serde_json::from_str(&body).unwrap_or_default();
+                match asked["limit"].as_u64() {
+                    Some(limit) if limit > 10 => {
+                        let message = format!("limit must be from 1 to 10, not {limit}");
+                        let refused = json!({ "error": { "code": "invalid", "message": message } });
+                        (axum::http::StatusCode::BAD_REQUEST, axum::Json(refused)).into_response()
+                    }
+                    _ => axum::Json(json!({ "results": [] })).into_response(),
+                }
+            }
+        });
+        let url = workforce_vellev::testing::serve(app).await;
+        let store = VellevCodeVectorStore::new(&url, "key", "code").unwrap();
+        let asked = || searches.load(std::sync::atomic::Ordering::SeqCst);
+
+        let refused = store.nearest(NearestTo::Text("parse"), "r", 20).await;
+        let refused = refused.unwrap_err().to_string();
+        let told = "the 20 nearest were asked, more than the 10 vellev gives for one search";
+        assert_eq!(refused, told);
+        let before = asked();
+        assert!(store
+            .nearest(NearestTo::Text("parse"), "r", 20)
+            .await
+            .is_err());
+        assert_eq!(asked(), before, "refused before it is asked");
+        assert!(store
+            .nearest(NearestTo::Text("parse"), "r", 10)
+            .await
+            .is_ok());
+    }
+
+    /// The searches refuse a vector of another size than the collection's,
     /// asked or listed.
     #[tokio::test]
     async fn a_vector_of_another_size_is_refused() {
@@ -1618,6 +1683,8 @@ mod tests {
         let refused = refused.unwrap_err().to_string();
         let asked = format!("a vector of 2 dimensions was asked of a collection of {dimensions}");
         assert_eq!(refused, asked);
+        let refused = store.nearest(NearestTo::Vector(&short), "r", 3).await;
+        assert_eq!(refused.unwrap_err().to_string(), asked);
 
         let vector = vec![0.5; dimensions];
         let refused = store.nearest_exactly(&[(&vector, None)], "r", 3).await;
@@ -2589,7 +2656,7 @@ mod tests {
                 }
             },
         );
-        let url = crate::vector::serve(app).await;
+        let url = workforce_vellev::testing::serve(app).await;
         let store = VellevCodeVectorStore::new(&url, "key", "workforce").unwrap();
         let heard = Arc::new(Heard::default());
         store.set_insert_error_sink(Arc::clone(&heard) as Arc<dyn InsertErrorSink>);
@@ -3272,7 +3339,7 @@ mod tests {
                 }
             },
         );
-        let url = crate::vector::serve(app).await;
+        let url = workforce_vellev::testing::serve(app).await;
         let store = VellevCodeVectorStore::new(&url, "key", "workforce").unwrap();
         let entities: Vec<VectorCodeEntity> = (0..70)
             .map(|n| entity("r", &format!("e{n}"), "f", "Function", "does a thing"))
@@ -3309,7 +3376,7 @@ mod tests {
                 answer(400, "invalid", REFUSED)
             },
         );
-        let url = crate::vector::serve(app).await;
+        let url = workforce_vellev::testing::serve(app).await;
         let store = VellevCodeVectorStore::new(&url, "key", "workforce").unwrap();
         let refused = store.ensure_collections().await.unwrap_err();
         match refused.downcast_ref::<Unusable>() {
@@ -3405,7 +3472,7 @@ mod tests {
                 }
             },
         );
-        let url = crate::vector::serve(app).await;
+        let url = workforce_vellev::testing::serve(app).await;
         let store = VellevCodeVectorStore::new(&url, "key", "workforce").unwrap();
         let entity = entity("r", "e", "src/lib.rs", "Function", "parses a config file");
         let summary = VectorCodeSummary {

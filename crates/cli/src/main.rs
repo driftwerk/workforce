@@ -461,8 +461,8 @@ enum Commands {
     MigrateCodegraph {
         #[arg(short, long, default_value = "workforce.toml")]
         config: PathBuf,
-        /// SQLite source `codegraph.db`. Defaults to the code graph of the
-        /// `[knowledge]` data dir, as the hub opens it.
+        /// SQLite source `codegraph.db`. Defaults to the code graph under
+        /// `[knowledge] data_dir`, else `root`, else `hub.data_dir`.
         #[arg(long)]
         from: Option<PathBuf>,
     },
@@ -11856,7 +11856,7 @@ Describe what you should do in this step and what to discuss with the user.
                 }
             };
 
-            let sqlite_path = from.unwrap_or_else(|| hubs_code_graph(&wf_config));
+            let sqlite_path = from.unwrap_or_else(|| default_code_graph(&wf_config));
             if !sqlite_path.exists() {
                 eyre::bail!(
                     "source SQLite code graph database not found at {}",
@@ -12600,7 +12600,7 @@ struct RoleImportRow {
     _priority: Option<i32>,
 }
 
-fn hubs_code_graph(config: &workforce_common::settings::WorkforceConfig) -> PathBuf {
+fn default_code_graph(config: &workforce_common::settings::WorkforceConfig) -> PathBuf {
     let (_, data_dir) =
         workforce_hub::knowledge::knowledge_dirs(&config.knowledge, &config.hub.data_dir);
     workforce_hub::knowledge::code_graph_path(&data_dir)
@@ -13309,7 +13309,7 @@ mod tests {
             config.knowledge.root = root.map(Into::into);
             config.knowledge.data_dir = data_dir.map(Into::into);
             assert_eq!(
-                hubs_code_graph(&config),
+                default_code_graph(&config),
                 workforce_hub::knowledge::code_graph_path(Path::new(kept_in)),
                 "{root:?} {data_dir:?}"
             );

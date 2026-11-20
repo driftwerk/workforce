@@ -89,7 +89,8 @@ impl SqliteCodeGraphBackend {
     /// Open the code graph at `path` to read only: nothing is migrated or
     /// written, and its journal mode is left as it is. SQLite may make the
     /// `-wal` and `-shm` files a reader of a WAL-mode graph needs; nothing
-    /// else is made. A graph whose schema is older than this build's is
+    /// else is made, and in a directory that cannot be written such a graph
+    /// fails to open. A graph whose schema is older than this build's is
     /// refused.
     pub fn open_read_only(path: &Path) -> Result<Self> {
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
@@ -1594,6 +1595,18 @@ mod lease_tests {
             .unwrap();
         let refused = SqliteCodeGraphBackend::open_read_only(&old).err().unwrap();
         assert!(format!("{refused:#}").contains("older than"), "{refused:#}");
+        let empty = dir.path().join("empty.db");
+        Connection::open(&empty)
+            .unwrap()
+            .execute_batch("CREATE TABLE t (x);")
+            .unwrap();
+        let refused = SqliteCodeGraphBackend::open_read_only(&empty)
+            .err()
+            .unwrap();
+        assert!(
+            format!("{refused:#}").contains("is not a code graph"),
+            "{refused:#}"
+        );
     }
 
     /// The copy is what `VACUUM INTO` writes, as `sqlite3 .backup` would.

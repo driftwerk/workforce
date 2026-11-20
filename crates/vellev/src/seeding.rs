@@ -20,7 +20,7 @@ use uuid::Uuid;
 use vellev_client::api::{Change, Content, Page};
 use vellev_core::{Collection, CollectionName, DataType, Embedding, ObjectId, Property};
 
-use crate::{classified, collection, Cap, Tenants, MAX_RESULTS};
+use crate::{classified, collection, Cap, Tenants};
 
 /// Makes the vectors of documents, outside the node.
 #[async_trait]
@@ -253,6 +253,7 @@ pub struct NodeEmbedder {
     tenants: Tenants,
     embedding: Embedding,
     per_write: usize,
+    cap: Arc<Cap>,
 }
 
 impl NodeEmbedder {
@@ -263,7 +264,14 @@ impl NodeEmbedder {
             tenants,
             embedding,
             per_write: per_write.max(1),
+            cap: Arc::default(),
         }
+    }
+
+    /// Listing the probe within `cap`, the store's, so that a lower limit
+    /// the node gave it is not learned again.
+    pub fn sharing(self, cap: Arc<Cap>) -> Self {
+        Self { cap, ..self }
     }
 
     fn probe(&self) -> Result<Collection> {
@@ -304,10 +312,11 @@ impl NodeEmbedder {
             self.tenants.writes.apply(changes).await.map_err(failed)?;
         }
         let mut by_node = std::collections::HashMap::new();
-        let (cap, mut after) = (Cap::default(), None);
+        let mut after = None;
         loop {
-            let listed = cap
-                .ask(MAX_RESULTS, |limit| {
+            let listed = self
+                .cap
+                .ask(PROBE_PAGE, |limit| {
                     let page = after
                         .into_iter()
                         .fold(Page::new(limit).vectors(true), Page::after);
@@ -332,15 +341,15 @@ impl NodeEmbedder {
             }
         }
         let vectors: Vec<Vec<f32>> = ids.iter().filter_map(|id| by_node.remove(id)).collect();
-        match vectors.len() == texts.len() {
-            true => Ok(vectors),
-            false => Err(eyre!(
+        if vectors.len() != texts.len() {
+            return Err(eyre!(
                 "{} gave back vectors for {} of {} texts",
                 self.name(),
                 vectors.len(),
                 texts.len()
-            )),
+            ));
         }
+        Ok(vectors)
     }
 }
 
@@ -379,6 +388,9 @@ impl DocumentEmbedder for NodeEmbedder {
 /// Texts per request when an embedder is compared with the node: no more
 /// than text-embeddings-inference takes in one by default.
 const PROBE_BATCH: usize = 32;
+
+/// Probe objects listed a page at a time, with their vectors.
+const PROBE_PAGE: usize = 200;
 
 /// The least cosine between a vector the node makes of a text and one made
 /// outside it for the two to be taken as the same model's. Measured

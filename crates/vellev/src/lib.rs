@@ -166,6 +166,14 @@ pub fn is_conflict(error: &vellev_client::Error) -> bool {
 pub mod testing {
     use super::*;
 
+    /// The URL of a local server answering with `app`.
+    pub async fn serve(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url
+    }
+
     /// Whether the tests that need a node must run: with
     /// `VELLEV_TEST_REQUIRED=1`, as in CI, one that would skip itself for
     /// want of a node fails instead.
@@ -521,12 +529,7 @@ pub mod testing {
 }
 
 #[cfg(test)]
-pub(crate) async fn serve(app: axum::Router) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    url
-}
+pub(crate) use testing::serve;
 
 #[cfg(test)]
 mod tests {
@@ -1273,18 +1276,15 @@ mod tests {
         let tenants = missing.serve().await;
         let claimed = index_claimed(&tenants, "CodeGraph").await.unwrap_err();
         assert!(
-            claimed
-                .downcast_ref::<vellev_client::Error>()
-                .is_some_and(vellev_client::Error::is_not_found),
-            "{claimed:?}"
+            matches!(unusable(&claimed), Some(Unusable::NoTenant { .. })),
+            "{claimed:#}"
         );
         let lines = notes(local_embedding(&["body"]));
         let records = tenants.reads.collection(&lines.name);
         let doctored = crate::doctor(&tenants, &records, &lines, REMEDY).await;
         let doctored = doctored.unwrap_err();
-        assert!(unusable(&doctored).is_some(), "{doctored:#}");
         assert!(
-            !doctored.to_string().starts_with("vellev collection"),
+            matches!(unusable(&doctored), Some(Unusable::NoTenant { .. })),
             "{doctored:#}"
         );
     }
@@ -1347,7 +1347,8 @@ mod tests {
 
     /// As [`embedding_node`], answering `dropping` to a collection's drop,
     /// leaving the first `losing` objects out of what it lists, and listing
-    /// the rest with their vectors only if `vectors`.
+    /// the rest with their vectors only if `vectors`. A collection it drops
+    /// takes its objects with it.
     async fn probe_node(
         dropping: u16,
         losing: usize,
@@ -1373,6 +1374,9 @@ mod tests {
                             "message": "the drop failed",
                         }});
                         return (status, axum::Json(failed)).into_response();
+                    }
+                    if method == axum::http::Method::DELETE {
+                        held.lock().unwrap().clear();
                     }
                     if uri.path().ends_with("/list") {
                         let objects: Vec<serde_json::Value> = held
@@ -1465,6 +1469,48 @@ mod tests {
             bare.contains("of the probe 'WorkforceEmbedProbe")
                 && bare.ends_with("' with no vector"),
             "{bare}"
+        );
+    }
+
+    /// An outside embedder that, each time it is asked, notes how many
+    /// objects of a probe the node still lists.
+    struct Watching {
+        tenants: Tenants,
+        listed: std::sync::Mutex<Vec<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl seeding::DocumentEmbedder for Watching {
+        fn name(&self) -> String {
+            "a watching embedder".to_string()
+        }
+
+        async fn documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            let probe = CollectionName::new("WorkforceEmbedProbeWatched").unwrap();
+            let page = vellev_client::api::Page::new(10);
+            let held = self.tenants.reads.collection(&probe).list(&page).await?;
+            self.listed.lock().unwrap().push(held.objects.len());
+            Ok(texts.iter().map(|text| made_up(text)).collect())
+        }
+    }
+
+    /// The node's probe is dropped before the outside embedder is asked.
+    #[tokio::test]
+    async fn the_probe_is_dropped_before_the_embedder_is_asked() {
+        let (tenants, _) = embedding_node().await;
+        let watching = Watching {
+            tenants: tenants.clone(),
+            listed: Default::default(),
+        };
+        let small = embedding_of(SMALL, 16, None, &["text"]);
+        let texts = ["parse the config".to_string()];
+        seeding::equivalence(&tenants, &small, &watching, &texts)
+            .await
+            .unwrap();
+        let listed = watching.listed.lock().unwrap().clone();
+        assert!(
+            !listed.is_empty() && listed.iter().all(|held| *held == 0),
+            "{listed:?}"
         );
     }
 

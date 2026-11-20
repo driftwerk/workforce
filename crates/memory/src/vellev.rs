@@ -2830,6 +2830,29 @@ mod failure_tests {
 
     use super::*;
 
+    /// The doctor tells a tenant that is not there from a collection that
+    /// is not.
+    #[tokio::test]
+    async fn the_doctor_tells_a_missing_tenant_from_a_missing_collection() {
+        let told = [
+            (false, "vellev has no tenant 'workforce'"),
+            (true, "vellev collection 'Memories' does not exist"),
+        ];
+        for (tenant_there, told) in told {
+            let app = axum::Router::new().fallback(move |uri: axum::http::Uri| async move {
+                if tenant_there && uri.path().ends_with("/collections") {
+                    return axum::Json(json!({ "collections": [] })).into_response();
+                }
+                let missing = json!({ "error": { "code": "not_found", "message": "not found" } });
+                (StatusCode::NOT_FOUND, axum::Json(missing)).into_response()
+            });
+            let url = workforce_vellev::testing::serve(app).await;
+            let store = VellevStore::new(&url, "key", "workforce", "Memories").unwrap();
+            let refused = format!("{:#}", store.doctor().await.unwrap_err());
+            assert!(refused.contains(told), "{refused}");
+        }
+    }
+
     const ID: &str = "00000000-0000-0000-0000-000000000001";
 
     struct Fake {

@@ -11,7 +11,7 @@ use uuid::Uuid;
 use vellev_client::api::Change;
 use vellev_core::{CollectionName, DataType, Embedding, EmbeddingProvider, ObjectId, Property};
 
-use crate::{classified, collection, is_conflict, Tenants};
+use crate::{classified, collection, failure, is_conflict, Asked, Tenants};
 
 /// The collection markers are kept in, named as in Weaviate, so a marker
 /// imported from there is found.
@@ -173,7 +173,7 @@ impl Kept {
                 .collections()
                 .await
                 .map(|_| None)
-                .map_err(|e| classified(e, at)),
+                .map_err(|e| failure(e, at, Asked::Tenant)),
         }
     }
 
