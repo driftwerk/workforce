@@ -748,7 +748,7 @@ async fn a_job_held_here_or_on_a_machine_is_one_job_and_an_approval_there_carrie
 /// own run route; carried to its served route instead, as an older Desk
 /// did, it is refused there for what it is, never as a group's call.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_bosss_check_runs_at_the_machines_own_route_and_is_never_a_groups_call() {
+async fn a_boss_check_runs_at_the_machines_own_route_and_is_never_a_groups_call() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let (boss, crew, d, _llm) = overseeing(
@@ -768,13 +768,14 @@ async fn a_bosss_check_runs_at_the_machines_own_route_and_is_never_a_groups_call
             super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew)),
         );
         let token = crew.state.auth_token.clone();
-        let older = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let older = Arc::new(AtomicBool::new(false));
         let poller = {
             let (crew, older) = (Arc::clone(&crew), Arc::clone(&older));
             tokio::spawn(async move {
                 loop {
                     for c in crew.relay_take(Duration::from_millis(100)).await {
-                        let (uri, body) = match older.load(std::sync::atomic::Ordering::SeqCst) {
+                        let (uri, body) = match older.load(Ordering::SeqCst) {
                             false => ("/api/desk/run", c.input.clone()),
                             true => (
                                 "/api/desk/crew/served",
@@ -815,13 +816,56 @@ async fn a_bosss_check_runs_at_the_machines_own_route_and_is_never_a_groups_call
             "{r:?}"
         );
 
-        older.store(true, std::sync::atomic::Ordering::SeqCst);
+        older.store(true, Ordering::SeqCst);
         let r = run.execute(check).await.unwrap();
         assert!(!r.success, "{r:?}");
         let said = r.error.unwrap_or_default();
         assert!(said.contains("goes to its own route"), "{said}");
         assert!(!said.contains("can't be a group"), "{said}");
         poller.abort();
+    })
+    .await;
+}
+
+/// On devbox: every machine call, carried to its served route, is refused
+/// there by name, whatever group it says.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_machine_call_is_refused_at_the_served_route() {
+    use super::super::machines::MACHINE_CALLS;
+    use super::super::relay::DESK_CALLS;
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_any, crew, _d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = false\n",
+            &[],
+        )
+        .await;
+        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let token = crew.state.auth_token.clone();
+        for (i, (tool, group)) in DESK_CALLS
+            .iter()
+            .chain(MACHINE_CALLS.iter())
+            .flat_map(|t| [(*t, ""), (*t, "acme")])
+            .enumerate()
+        {
+            let (code, out) = post(
+                &app,
+                "/api/desk/crew/served",
+                &token,
+                json!({"group": group, "tool": tool, "input": {}, "boss": "local:sarah",
+                       "linkId": "home-relay", "id": format!("m-{i}"), "level": "act", "act": {}}),
+            )
+            .await;
+            assert_eq!(code, StatusCode::BAD_REQUEST, "{tool}: {out}");
+            let said = out["error"].as_str().unwrap_or_default();
+            assert!(
+                said.starts_with(&format!("{tool} goes to its own route")),
+                "{said}"
+            );
+        }
     })
     .await;
 }

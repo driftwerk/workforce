@@ -122,6 +122,15 @@ pub fn machine_ok(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
+/// Whether `tool` is one Desk carries to a machine's own route, never a
+/// group's: [`DESK_CALLS`] and [`super::machines::MACHINE_CALLS`].
+pub fn is_machine_call(tool: &str) -> bool {
+    DESK_CALLS
+        .iter()
+        .chain(super::machines::MACHINE_CALLS.iter())
+        .any(|t| *t == tool)
+}
+
 /// `id`, a session id as a tool was given it, split when it names a
 /// machine's session: `devbox/9f3c…`.
 pub fn machine_session(id: &str) -> Option<(&str, Uuid)> {
@@ -454,15 +463,11 @@ async fn served(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>, body: By
     let Some(level) = level else {
         return bad("a relayed call says its boss's level");
     };
-    // A machine call is never a group's: an older Desk on the home sent it
-    // here rather than to its own route.
-    if DESK_CALLS
-        .iter()
-        .chain(super::machines::MACHINE_CALLS.iter())
-        .any(|t| *t == r.tool)
-    {
+    // A machine call is never a group's: an older Desk sent it here rather
+    // than to its own route.
+    if is_machine_call(&r.tool) {
         return bad(&format!(
-            "{} goes to its own route on this machine, not to a group's: the Desk that carried it is older, so the person updates Desk where the boss runs.",
+            "{} goes to its own route on this machine, not to a group's: update Desk where the boss runs.",
             r.tool
         ));
     }
