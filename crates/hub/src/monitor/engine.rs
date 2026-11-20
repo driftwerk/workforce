@@ -1746,8 +1746,8 @@ impl MonitorEngine {
     /// repeats. `missing`: its tool could not be found or loaded, and whether
     /// this process saw it so before (`Some(false)`) — its owner is told as it
     /// starts, as nothing they or their agent see would say so otherwise.
-    /// Such a poll is no failure of the source: it clears the streak rather
-    /// than counting towards the auto-disable, and the monitor is polled
+    /// Such a poll is no failure of the source: it is not counted towards
+    /// the auto-disable, and the monitor is polled
     /// again as soon as its tool loads, as the notice says.
     async fn poll_failed(
         &self,
@@ -4101,7 +4101,7 @@ template = "x"
                         .unwrap()
                         .failures,
                     0,
-                    "the missing polls left no streak"
+                    "the missing polls counted nothing"
                 );
                 let summary = engine.summary_of("src", Some("alice")).await.unwrap();
                 assert_eq!(summary.status, crate::monitor::MonitorStatus::Active);

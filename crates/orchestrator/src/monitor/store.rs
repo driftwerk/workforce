@@ -715,8 +715,8 @@ impl MonitorStore {
     }
 
     /// Record a poll that could not find its tool: its error and when the
-    /// next is due, with the failure streak cleared — such a poll is no
-    /// failure of the source, and is never counted towards giving up on it.
+    /// next is due. Such a poll is no failure of the source: the failure
+    /// streak is left as it was, neither counted up nor cleared.
     pub async fn record_poll_unavailable(
         &self,
         key: &MonitorKey,
@@ -730,7 +730,7 @@ impl MonitorStore {
              VALUES ($1, $2, now(), $3, $4, 0) \
              ON CONFLICT (monitor_id, owner) DO UPDATE \
                SET polled_at = now(), next_due_at = EXCLUDED.next_due_at, \
-                   error = EXCLUDED.error, failures = 0, updated_at = now()",
+                   error = EXCLUDED.error, updated_at = now()",
             &[
                 &key.monitor_id,
                 &owner_col(key.owner.as_deref()),

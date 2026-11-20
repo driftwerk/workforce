@@ -188,7 +188,6 @@ impl GovernedInvoker {
             let Some(vault) = service.vault.as_ref() else {
                 eyre::bail!("this agent has no vault to load {skill} from");
             };
-            let before = service.skill_state.get(skill);
             let loaded = crate::skill_loader::load_skill_from_vault(
                 skill,
                 Arc::clone(vault),
@@ -199,31 +198,12 @@ impl GovernedInvoker {
             // What every turn reads of the skill stays the agent's: this
             // load adds its tools to those already listed, and its hint (one
             // owner's view) replaces the standing one only when it added any.
-            let (tools, hint, source) = match before {
-                Some(was) => {
-                    let added = loaded
-                        .tool_names
-                        .iter()
-                        .any(|name| !was.tool_names.contains(name));
-                    let mut tools = was.tool_names;
-                    for name in &loaded.tool_names {
-                        if !tools.contains(name) {
-                            tools.push(name.clone());
-                        }
-                    }
-                    let hint = match added {
-                        true => loaded.context_hint.clone(),
-                        false => was.context_hint,
-                    };
-                    (tools, hint, was.source)
-                }
-                None => (
-                    loaded.tool_names.clone(),
-                    loaded.context_hint.clone(),
-                    "vault".to_string(),
-                ),
-            };
-            service.skill_state.mark_loaded(skill, tools, &source, hint);
+            service.skill_state.merge_loaded(
+                skill,
+                &loaded.tool_names,
+                "vault",
+                loaded.context_hint.clone(),
+            );
             Ok(loaded.context_hint)
         });
         Self::new(

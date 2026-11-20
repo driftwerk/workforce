@@ -55,6 +55,38 @@ impl SkillStateTracker {
         );
     }
 
+    /// Record a load that only added to the skill, under one lock: its
+    /// tools join those already listed, and its hint replaces the standing
+    /// one only when it added any. A skill not yet listed is listed as
+    /// `source` with this load's tools and hint.
+    pub fn merge_loaded(
+        &self,
+        name: &str,
+        tool_names: &[String],
+        source: &str,
+        context_hint: Option<String>,
+    ) {
+        let mut loaded = self.loaded.write();
+        let entry = loaded
+            .entry(name.to_string())
+            .or_insert_with(|| LoadedSkillState {
+                name: name.to_string(),
+                tool_names: Vec::new(),
+                source: source.to_string(),
+                context_hint: context_hint.clone(),
+            });
+        let mut added = false;
+        for tool in tool_names {
+            if !entry.tool_names.contains(tool) {
+                entry.tool_names.push(tool.clone());
+                added = true;
+            }
+        }
+        if added {
+            entry.context_hint = context_hint;
+        }
+    }
+
     pub fn mark_unloaded(&self, name: &str) {
         self.loaded.write().remove(name);
     }
@@ -69,5 +101,39 @@ impl SkillStateTracker {
 
     pub fn all_loaded(&self) -> Vec<LoadedSkillState> {
         self.loaded.read().values().cloned().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_merged_load_adds_its_tools_and_keeps_the_hint_unless_it_added_any() {
+        let state = SkillStateTracker::new();
+        state.mark_loaded(
+            "email",
+            vec!["email.inbox".into()],
+            "vault",
+            Some("shared".into()),
+        );
+        state.merge_loaded(
+            "email",
+            &["email.setup".into()],
+            "monitor",
+            Some("none".into()),
+        );
+        let email = state.get("email").unwrap();
+        assert_eq!(email.tool_names, vec!["email.inbox", "email.setup"]);
+        assert_eq!(email.context_hint.as_deref(), Some("none"), "it added one");
+        state.merge_loaded(
+            "email",
+            &["email.inbox".into()],
+            "monitor",
+            Some("mine".into()),
+        );
+        let email = state.get("email").unwrap();
+        assert_eq!(email.context_hint.as_deref(), Some("none"), "it added none");
+        assert_eq!(email.source, "vault");
     }
 }
