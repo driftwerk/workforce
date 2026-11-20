@@ -4,6 +4,8 @@
 use super::*;
 
 const ACT: &str = "[oversight]\nenabled = true\nlevel = \"act\"\nact = { nudge = true }\nupdates = { enabled = false }\n";
+const ACT_QUIETLY: &str =
+    "[oversight]\nenabled = true\nlevel = \"act\"\nupdates = { enabled = false }\n";
 
 async fn bosss_turn_rows(d: &Desk) -> Vec<workforce_desk::crew::Event> {
     bosss_turn_rows_of(d, &[Kind::Started, Kind::Finished]).await
@@ -139,7 +141,7 @@ async fn work_turn_calling(
         dir,
         pool,
         "CI is still running, so it should wait.",
-        "[oversight]\nenabled = true\nlevel = \"act\"\nupdates = { enabled = false }\n",
+        ACT_QUIETLY,
         &[],
     )
     .await;
@@ -274,33 +276,34 @@ async fn an_end_held_from_an_earlier_turn_is_never_said_for_a_later_one() {
                 text,
             )
         };
-        let key = ("desk".to_string(), "desk:line:s".to_string());
+        let hold = |channel: &str, began: u64, ago: u64, text: &str| {
+            crew.quiet_ends.lock().insert(
+                ("desk".to_string(), channel.to_string(), began),
+                super::super::observe::HeldEnd {
+                    at: std::time::Instant::now() - Duration::from_secs(ago),
+                    event: end(text),
+                },
+            );
+        };
+        let held = |channel: &str| crew.quiet_ends.lock().keys().any(|(_, c, _)| c == channel);
         // A turn that finished after its caller had settled it.
-        crew.quiet_ends.lock().insert(
-            key.clone(),
-            (
-                0,
-                std::time::Instant::now(),
-                end("finished · the stale one"),
-            ),
-        );
-        crew.turn_end_said("desk", &key.1, 1, true);
-        assert!(crew.quiet_ends.lock().is_empty(), "dropped");
-        // Another session's line turn, still running, keeps its own.
-        let other = ("desk".to_string(), "desk:line:t".to_string());
-        crew.quiet_ends.lock().insert(
-            other.clone(),
-            (0, std::time::Instant::now(), end("finished · another")),
-        );
-        crew.turn_end_said("desk", &key.1, 1, true);
-        assert!(crew.quiet_ends.lock().contains_key(&other), "kept");
-        crew.quiet_ends.lock().remove(&other);
-        // This turn's own end is said.
-        crew.quiet_ends.lock().insert(
-            key.clone(),
-            (1, std::time::Instant::now(), end("finished · this one")),
-        );
-        crew.turn_end_said("desk", &key.1, 1, true);
+        hold("desk:line:s", 0, 0, "finished · the stale one");
+        crew.turn_end_said("desk", "desk:line:s", 1, true);
+        assert!(!held("desk:line:s"), "dropped");
+        // Another session's line turn, still running, keeps its own; one
+        // no caller came back for in ten minutes is let go.
+        hold("desk:line:t", 0, 0, "finished · another");
+        hold("desk:line:u", 0, 601, "finished · long gone");
+        crew.turn_end_said("desk", "desk:line:s", 1, true);
+        assert!(held("desk:line:t"), "kept");
+        assert!(!held("desk:line:u"), "let go");
+        crew.quiet_ends.lock().clear();
+        // A cancelled turn's late end beside this turn's own: this one's is
+        // said.
+        hold("desk:line:s", 1, 0, "finished · this one");
+        hold("desk:line:s", 0, 0, "finished · the late one");
+        crew.turn_end_said("desk", "desk:line:s", 1, true);
+        assert!(!held("desk:line:s"));
         let rows = finished(&d, 1).await;
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert!(rows[0].text.contains("this one"), "{rows:?}");

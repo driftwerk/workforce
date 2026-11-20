@@ -109,10 +109,9 @@ pub fn in_turn(state: SessionState) -> bool {
     matches!(state, SessionState::Working | SessionState::Blocked)
 }
 
-/// `text` past a leading stamp of `who` wrote it and when ("Desk, 00:21."),
-/// which says nothing on its own; all of it when the stamp is all it says,
-/// or its lead isn't the sender's name. For a one-line row that has its own
-/// sender and time: the message itself keeps it, as sent.
+/// `text` without a leading "<who>, HH:MM[ UTC]." stamp, for a one-line
+/// row that shows its own sender and time; unchanged when there is no such
+/// stamp or nothing follows it.
 pub fn unstamped<'a>(text: &'a str, who: &str) -> &'a str {
     if who.trim().is_empty() {
         return text;

@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use workforce_common::channels::DESK_CHANNEL;
 use workforce_common::oversight::{Level, Oversight, Scope};
 use workforce_common::settings::AgentWorkspaceConfig;
-use workforce_desk::crew::{By, Crew, CrewAgent, Event, LiveTurn, Overseer, Party, Suggestion};
+use workforce_desk::crew::{By, Crew, CrewAgent, LiveTurn, Overseer, Party, Suggestion};
 use workforce_desk::floor::Need;
 use workforce_desk::Desk;
 
@@ -218,10 +218,10 @@ pub struct CrewHub {
     /// How many decisions (and suggestions) each boss made, by the session
     /// they were about: a line or work turn that moved none let it wait.
     acted: Mutex<HashMap<(String, Option<uuid::Uuid>), u64>>,
-    /// The ends of line and work turns, by boss and channel, with each
-    /// turn's number among those begun and when it ended, until their
-    /// caller knows whether the turn did anything ([`Self::turn_end_said`]).
-    quiet_ends: Mutex<HashMap<(String, String), (u64, std::time::Instant, Event)>>,
+    /// The ends of line and work turns, by boss, channel and the turn's
+    /// number among those begun, until their caller knows whether the turn
+    /// did anything ([`Self::turn_end_said`]).
+    quiet_ends: Mutex<HashMap<(String, String, u64), observe::HeldEnd>>,
     /// How many line and work turns have begun.
     turns_begun: std::sync::atomic::AtomicU64,
     /// When each boss last asked the person with `crew.ask_person`: its

@@ -550,10 +550,8 @@ impl CrewHub {
                 None,
             )
             .await;
-        let (ran, did) = match ran {
-            Ok((sid, reply, did)) => (Ok((sid, reply)), did),
-            Err(e) => (Err(e), false),
-        };
+        let did = ran.as_ref().is_ok_and(|r| r.acted);
+        let ran = ran.map(|r| (r.session_id, r.answer));
         if let Err(e) = &ran {
             tracing::warn!(%session, error = %format!("{e:#}"), "the overseer's line turn failed");
         }

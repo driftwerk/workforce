@@ -49,9 +49,9 @@ pub(super) struct Track {
     /// answers, stamped on each of its events.
     place: Option<Place>,
     message: Option<uuid::Uuid>,
-    /// A boss's line or work turn: its end is held, by boss and channel
-    /// with the turn's place among the turns begun, for its caller to say
-    /// once it knows whether the turn did anything.
+    /// A boss's line or work turn: its end is held, by boss, channel and
+    /// the turn's number among those begun, for its caller to say once it
+    /// knows whether the turn did anything.
     held: Option<(String, String, u64)>,
     done: bool,
 }
@@ -276,19 +276,31 @@ impl Track {
         .at_place(self.place.clone(), self.message)
         .hop(self.hop);
         match self.held.take().filter(|_| ended == Outcome::Finished) {
-            Some((boss, channel, began)) => {
+            Some(key) => {
                 let mut held = crew.quiet_ends.lock();
-                // One no caller came back for (a session gone since) is let go.
-                held.retain(|_, (_, at, _)| at.elapsed() < HELD_FOR);
-                held.insert((boss, channel), (began, std::time::Instant::now(), event));
+                held.retain(|_, end| end.at.elapsed() < HELD_FOR);
+                held.insert(
+                    key,
+                    HeldEnd {
+                        at: std::time::Instant::now(),
+                        event,
+                    },
+                );
             }
             None => crew.desk.note(event),
         }
     }
 }
 
-/// How long a held turn end waits for its caller.
+/// How long a held turn end waits for its caller: one no caller came back
+/// for (a cancelled one) is let go as later ends are held or said.
 const HELD_FOR: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// A line or work turn's end, held for its caller.
+pub(super) struct HeldEnd {
+    pub(super) at: std::time::Instant,
+    pub(super) event: Event,
+}
 
 impl CrewHub {
     /// How many line and work turns have begun: one its caller starts
@@ -303,13 +315,21 @@ impl CrewHub {
     /// earlier turn there, whose caller was cancelled before it came back
     /// for it, is dropped, never said for this one.
     pub(super) fn turn_end_said(&self, boss: &str, channel: &str, since: u64, acted: bool) {
-        let end = self
-            .quiet_ends
-            .lock()
-            .remove(&(boss.to_string(), channel.to_string()));
-        if let Some((_, _, event)) = end.filter(|(began, _, _)| acted && *began >= since) {
-            self.desk.note(event);
-        }
+        let ends: Vec<(u64, HeldEnd)> = {
+            let mut held = self.quiet_ends.lock();
+            held.retain(|_, end| end.at.elapsed() < HELD_FOR);
+            let keys: Vec<_> = held
+                .keys()
+                .filter(|(b, c, _)| b == boss && c == channel)
+                .cloned()
+                .collect();
+            keys.into_iter()
+                .filter_map(|k| held.remove(&k).map(|end| (k.2, end)))
+                .collect()
+        };
+        ends.into_iter()
+            .filter(|(began, _)| acted && *began >= since)
+            .for_each(|(_, end)| self.desk.note(end.event));
     }
 }
 
