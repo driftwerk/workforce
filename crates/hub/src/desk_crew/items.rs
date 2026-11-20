@@ -251,42 +251,22 @@ fn restatements<'a>(due: &[&'a OpenItem], now: DateTime<Utc>) -> Vec<(&'a OpenIt
         .collect()
 }
 
-/// The longest a promise may be due in, in minutes: three days.
-const DUE_MAX: i64 = 72 * 60;
+/// The longest a promise may be due in, in minutes: as long as a watch
+/// lasts.
+const DUE_MAX: i64 = workforce_desk::boss_watch::MAX_HOURS * 60;
 
-/// `due_minutes` as given: a whole number of minutes from 1 to [`DUE_MAX`]
-/// (a rounded number, or one written as text, is taken too), or none.
+/// `due_minutes` as given: a whole number of minutes from 1 to [`DUE_MAX`],
+/// or none.
 fn due_minutes(v: &Value) -> Result<Option<i64>, String> {
-    let minutes = whole_minutes(v)?;
-    match minutes {
-        Some(m) if !(1..=DUE_MAX).contains(&m) => Err(format!(
-            "due_minutes must be from 1 to {DUE_MAX} (three days); {m} isn't."
-        )),
-        _ => Ok(minutes),
-    }
-}
-
-fn whole_minutes(v: &Value) -> Result<Option<i64>, String> {
-    let refused = || "due_minutes must be a whole number of minutes.".to_string();
     match v {
         Value::Null => Ok(None),
-        Value::Number(n) => n
-            .as_i64()
-            .or_else(|| {
-                n.as_f64()
-                    .filter(|f| f.is_finite())
-                    .map(|f| f.round() as i64)
-            })
-            .map(Some)
-            .ok_or_else(refused),
-        Value::String(t) => t
-            .trim()
-            .parse::<f64>()
-            .ok()
-            .filter(|f| f.is_finite())
-            .map(|f| Some(f.round() as i64))
-            .ok_or_else(refused),
-        _ => Err(refused()),
+        v => match v.as_i64() {
+            Some(m) if (1..=DUE_MAX).contains(&m) => Ok(Some(m)),
+            Some(m) => Err(format!(
+                "due_minutes must be from 1 to {DUE_MAX} (three days); {m} isn't."
+            )),
+            None => Err("due_minutes must be a whole number of minutes.".into()),
+        },
     }
 }
 
@@ -948,7 +928,7 @@ impl CrewHub {
                 return;
             }
         };
-        for i in due.iter().filter(|i| i.kind == OpenKind::Promise) {
+        for i in &due {
             let Some(was) = i.due_at else {
                 continue;
             };
@@ -957,12 +937,12 @@ impl CrewHub {
             let Some((_, o)) = self.overseer_named(&i.boss) else {
                 continue;
             };
-            // A question its boss asked the session that hasn't gone in yet:
-            // its due time moves on by as long again, so what is owed is
-            // still chased once it goes in (or told to the person, if it
-            // never does), and the boss isn't woken for it twice meanwhile
-            // ([`super::watcher`] chases an undelivered message).
-            if i.done_when.as_deref() == Some(REPLIED) && self.ask_still_waits(i).await {
+            // A question its boss asked a running session that is still
+            // waiting to go in: its due time moves on by as long again, and
+            // the boss isn't woken for it twice meanwhile ([`super::watcher`]
+            // chases an undelivered message). One held while the session is
+            // stopped is chased as owed now: nothing else chases it.
+            if i.done_when.as_deref() == Some(REPLIED) && self.ask_still_queued(i).await {
                 let next = now + self.crew_minutes(OWED_MINUTES);
                 if let Err(e) = self
                     .desk
@@ -1042,14 +1022,14 @@ impl CrewHub {
     }
 
     /// Whether the question promise `i` reports the answer to still waits
-    /// to go into its session.
-    async fn ask_still_waits(&self, i: &OpenItem) -> bool {
+    /// to go into its running session.
+    async fn ask_still_queued(&self, i: &OpenItem) -> bool {
         let Some(m) = i.line_message else {
             return false;
         };
         matches!(
             self.desk.store().line_message(m).await,
-            Ok(Some(m)) if matches!(m.delivery, Delivery::Queued | Delivery::Held)
+            Ok(Some(m)) if m.delivery == Delivery::Queued
         )
     }
 
@@ -2047,13 +2027,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn due_minutes_is_a_whole_number_however_it_is_written() {
+    fn due_minutes_is_a_whole_number_of_minutes_up_to_three_days() {
         assert_eq!(due_minutes(&Value::Null), Ok(None));
         assert_eq!(due_minutes(&json!(30)), Ok(Some(30)));
-        assert_eq!(due_minutes(&json!(30.0)), Ok(Some(30)));
-        assert_eq!(due_minutes(&json!(29.6)), Ok(Some(30)));
-        assert_eq!(due_minutes(&json!("30")), Ok(Some(30)));
-        assert_eq!(due_minutes(&json!(" 45 ")), Ok(Some(45)));
         for (bad, why) in [
             (
                 json!(0),
@@ -2071,7 +2047,13 @@ mod tests {
             assert_eq!(due_minutes(&bad), Err(why.into()), "{bad}");
         }
         assert_eq!(due_minutes(&json!(4320)), Ok(Some(4320)));
-        for bad in [json!("soon"), json!(true), json!([30])] {
+        for bad in [
+            json!("30"),
+            json!(29.6),
+            json!("soon"),
+            json!(true),
+            json!([30]),
+        ] {
             assert_eq!(
                 due_minutes(&bad),
                 Err("due_minutes must be a whole number of minutes.".into()),

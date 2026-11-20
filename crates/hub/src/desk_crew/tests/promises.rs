@@ -612,9 +612,14 @@ async fn an_unanswered_promise_is_chased_by_the_boss_then_told_to_the_person() {
             .find(|i| i.kind == OpenKind::Promise)
             .expect("the promise");
         assert!(promise.due_at.is_some(), "a promise to report back is due");
-        // While the question hasn't gone in, it is chased as a message that
-        // didn't reach its session, never as owed as well.
+        // While the question waits to go into its running session, it is
+        // chased as a message that didn't reach it, never as owed as well.
         let asked = promise.line_message.expect("the question it reports on");
+        let _ = d
+            .store()
+            .line_set_waiting(asked, workforce_desk::line::Delivery::Queued)
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(1500)).await;
         let chased = d.store().latest_check_in("desk").await.unwrap();
         assert!(
@@ -629,8 +634,10 @@ async fn an_unanswered_promise_is_chased_by_the_boss_then_told_to_the_person() {
             moved.due_at,
             promise.due_at
         );
+        // Held while its session is stopped, nothing else chases it: it is
+        // chased as owed.
         d.store()
-            .line_set_waiting(asked, workforce_desk::line::Delivery::Delivered)
+            .line_set_waiting(asked, workforce_desk::line::Delivery::Held)
             .await
             .unwrap()
             .expect("it waited to go in");

@@ -454,7 +454,8 @@ impl DeskStore {
             .query(
                 &format!(
                     "SELECT {COLUMNS} FROM boss_open_items \
-                     WHERE due_at <= $1 AND state <> 'closed' ORDER BY due_at, id"
+                     WHERE due_at <= $1 AND kind = 'promise' AND state = 'open' \
+                     ORDER BY due_at, id"
                 ),
                 &[&now],
             )
