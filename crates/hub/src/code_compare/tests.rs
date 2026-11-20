@@ -9,7 +9,7 @@ use workforce_codebase_knowledge::graph::entities::{
     CodeEntity, CodeVisibility, EntityId, EntityKind, Language,
 };
 use workforce_codebase_knowledge::graph::CodeGraph;
-use workforce_codebase_knowledge::testing::{Answering, Hook};
+use workforce_codebase_knowledge::testing::{entity_key, Held, Hook};
 use workforce_codebase_knowledge::vector::{
     CodeVectorStore, Near, NearestTo, Scanned, SearchedByVector, VectorCodeEntity,
     VectorSearchResult, VellevCodeVectorStore,
@@ -126,18 +126,33 @@ fn answering_each<'a, T: Clone>(
         .collect()
 }
 
+/// A Weaviate holding `entities` and answering `answers`.
+fn holding(
+    answers: BTreeMap<(String, String), Vec<VectorSearchResult>>,
+    entities: &[CodeEntity],
+) -> Held {
+    let held = Held {
+        answers: Mutex::new(answers),
+        ..Held::default()
+    };
+    held.entities
+        .lock()
+        .unwrap()
+        .extend(entities.iter().map(|entity| {
+            let held = VectorCodeEntity::from_code_entity(entity, &entity.repo_id, None);
+            (entity_key(&held), held)
+        }));
+    held
+}
+
 fn weaviate_of<'a>(
     entities: &'a [CodeEntity],
     found: impl Fn(&'a CodeEntity) -> Vec<&'a CodeEntity>,
-) -> Answering {
+) -> Held {
     let answers = answering_each(entities, found, |found| {
         found.iter().map(|entity| result(entity)).collect()
     });
-    entities
-        .iter()
-        .fold(Answering::new(answers), |answering, entity| {
-            answering.holding(&entity.repo_id, 1)
-        })
+    holding(answers, entities)
 }
 
 /// A fake of vellev's search: answers by text from a map, a vector by the
@@ -212,8 +227,8 @@ impl Searched {
 
 #[async_trait]
 impl SearchedByVector for Searched {
-    fn query_prefix(&self) -> Option<String> {
-        self.prefix.clone()
+    fn query_prefix(&self) -> Option<&str> {
+        self.prefix.as_deref()
     }
 
     async fn embedded(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -259,7 +274,7 @@ impl SearchedByVector for Searched {
             let at = found
                 .iter()
                 .find(|near| Some(near.object.as_str()) == *first);
-            scanned.firsts.push(at.map(|near| near.distance));
+            scanned.named.push(at.map(|near| near.distance));
             scanned
                 .nearest
                 .push(found.into_iter().take(limit).collect());
@@ -331,7 +346,7 @@ fn manifest(graph: &CodeGraph, options: &CompareOptions, measured: &Measured) ->
         graph: GraphAbout {
             identity: graph.identity().to_string(),
             backend: "sqlite".to_string(),
-            sha256: None,
+            sha256: String::new(),
         },
         repos: measured.repos.clone(),
         vellev: VellevAbout {
@@ -516,11 +531,13 @@ async fn resampling_draws_entities_not_queries() {
         .await
         .unwrap();
     let text = |text: &str| ("r".to_string(), text.to_string());
-    let weaviate = Answering::new(BTreeMap::from([
-        (text("Reads a file."), vec![result(&target)]),
-        (text(summary), vec![result(&target)]),
-    ]))
-    .holding("r", 1);
+    let weaviate = holding(
+        BTreeMap::from([
+            (text("Reads a file."), vec![result(&target)]),
+            (text(summary), vec![result(&target)]),
+        ]),
+        std::slice::from_ref(&target),
+    );
     let vellev = Searched {
         prefix: Some(PREFIX.to_string()),
         by_text: BTreeMap::from([
@@ -717,11 +734,11 @@ async fn every_search_is_the_products() {
     )
     .await
     .unwrap();
-    let questions = weaviate.questions();
-    assert_eq!(questions.len(), 24);
-    assert!(questions
+    let searches = weaviate.searches.lock().unwrap().clone();
+    assert_eq!(searches.len(), 24);
+    assert!(searches
         .iter()
-        .all(|(_, repo, limit)| repo.as_deref() == Some("r") && *limit == 20));
+        .all(|search| search.repo_id.as_deref() == Some("r") && search.limit == 20));
     let asked = vellev.asked();
     assert_eq!(asked.len(), 24 * 3);
     assert!(asked
@@ -771,11 +788,12 @@ async fn a_store_error_fails_the_run_with_no_result() {
         failed.contains(&format!("vellev vector failed on query {}", ids[1])),
         "{failed}"
     );
-    assert_eq!(weaviate.questions().len(), 2);
+    assert_eq!(weaviate.searches.lock().unwrap().len(), 2);
     holds_no_result(&out);
 
     let out = dir.path().join("weaviate");
-    let weaviate = weaviate_of(&entities, first).failing_at(2);
+    let weaviate = weaviate_of(&entities, first);
+    *weaviate.failing_search.lock().unwrap() = Some(2);
     let failed = ran(
         &graph,
         &weaviate,
@@ -834,7 +852,7 @@ async fn a_misrouted_node_fails_before_the_sample() {
         about: GraphAbout {
             identity: "graph".to_string(),
             backend: "sqlite".to_string(),
-            sha256: None,
+            sha256: String::new(),
         },
     };
     let dir = tempfile::tempdir().unwrap();
@@ -855,7 +873,7 @@ async fn a_misrouted_node_fails_before_the_sample() {
         "{failed:#}"
     );
     assert_eq!(node.asked(), 1);
-    assert!(weaviate.questions().is_empty());
+    assert!(weaviate.searches.lock().unwrap().is_empty());
     assert!(!out.exists() && !partial(&out).exists());
 }
 
@@ -1013,22 +1031,15 @@ async fn a_run_is_reproduced_by_its_seed() {
 }
 
 /// A graph whose write-ahead log holds pages is refused, naming it, and
-/// left as it was; with the log empty, the manifest's hash is the file's
-/// before the run.
+/// left as it was; with the log empty, the manifest's hash is the file's,
+/// which opening it to read leaves as it was.
 #[tokio::test]
 async fn a_graph_with_pending_wal_pages_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = WorkforceConfig::default();
     config.knowledge.data_dir = Some(dir.path().to_string_lossy().to_string());
     let path = workforce_knowledge_service::code_graph_path(dir.path());
-    let graph = workforce_knowledge_service::open_code_graph(
-        dir.path(),
-        &config.knowledge,
-        &config.knowledge.vector_backend,
-        &config.codegraph,
-        None,
-    )
-    .unwrap();
+    let graph = CodeGraph::open(&path).unwrap();
     graph.register_repo("r", "r", "/r").await.unwrap();
     let settled = rusqlite::Connection::open(&path).unwrap();
     let indexed = || -> bool {
@@ -1064,8 +1075,27 @@ async fn a_graph_with_pending_wal_pages_is_refused() {
     std::fs::write(&wal, b"").unwrap();
     let hash = hex::encode(Sha256::digest(&graph_bytes));
     let opened = opened_graph(&config, None).unwrap();
-    assert_eq!(opened.about.sha256, Some(hash));
+    assert_eq!(opened.about.sha256, hash);
     assert_eq!(opened.about.identity, opened.graph.identity());
+    drop(opened);
+    assert_eq!(std::fs::read(&path).unwrap(), graph_bytes, "read only");
+}
+
+/// A code graph on Postgres is refused before it is opened, with nothing
+/// made for it on disk.
+#[test]
+fn a_graph_not_on_sqlite_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = WorkforceConfig::default();
+    config.knowledge.data_dir = Some(dir.path().to_string_lossy().to_string());
+    config.codegraph.backend = "postgres".into();
+    let refused = opened_graph(&config, None).err().unwrap().to_string();
+    assert!(
+        refused
+            .starts_with("[codegraph] backend = \"postgres\": a run measures a SQLite code graph"),
+        "{refused}"
+    );
+    assert!(!dir.path().join(".workforce").exists(), "nothing made");
 }
 
 /// The config of a store on `node`'s tenant embedding with bge-small, and
@@ -1126,7 +1156,7 @@ async fn built(config: &WorkforceConfig, entities: &[CodeEntity]) -> Opened {
         about: GraphAbout {
             identity: graph.identity().to_string(),
             backend: "sqlite".to_string(),
-            sha256: None,
+            sha256: String::new(),
         },
         graph,
     }
@@ -1169,7 +1199,8 @@ async fn a_collection_dropped_during_a_run_is_never_made_again() {
             }
         })
     });
-    let weaviate = weaviate_of(&entities, first).after(2, dropping);
+    let weaviate = weaviate_of(&entities, first);
+    *weaviate.after_search.lock().unwrap() = Some((2, dropping));
     let vellev = VellevCodeVectorStore::configured(&config.vellev).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let failed = compared(
@@ -1223,7 +1254,7 @@ async fn a_tenant_claimed_for_another_graph_is_refused() {
         refused.contains(opened.graph.identity()) && refused.contains(other.graph.identity()),
         "{refused}"
     );
-    assert!(weaviate.questions().is_empty());
+    assert!(weaviate.searches.lock().unwrap().is_empty());
     assert_eq!(held(&node).await, before);
 
     let Some(unclaimed) = Node::embedding().await else {

@@ -645,7 +645,7 @@ async fn measured(
     let findings = found(
         &asked,
         &recall,
-        vellev.query_prefix(),
+        vellev.query_prefix().map(str::to_string),
         options,
         qualified,
         population,
@@ -708,7 +708,7 @@ async fn recalled(
             .await
             .map_err(failed_on("exact scan", repo))?;
         let held = scanned.held;
-        let scans = scanned.nearest.into_iter().zip(scanned.firsts);
+        let scans = scanned.nearest.into_iter().zip(scanned.named);
         for ((query, _, index, scored), (exact, first)) in asked.into_iter().zip(scans) {
             let counted = scored.1.searches.saturating_sub(scored.0.searches);
             let shortlisted = stats::shortlisted(scored.0, scored.1, held).ok_or_else(|| {
@@ -940,8 +940,7 @@ fn found(
 struct GraphAbout {
     identity: String,
     backend: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    sha256: Option<String>,
+    sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1155,41 +1154,33 @@ struct Opened {
     about: GraphAbout,
 }
 
-/// The code graph `config` names (in `data_dir`, if given), opened as the hub
-/// opens it: a SQLite graph is hashed first, and refused while its write-ahead
-/// log holds pages the hash would not cover.
+/// The SQLite code graph `config` names (in `data_dir`, if given), opened as
+/// the hub opens it, once it is hashed: refused while its write-ahead log holds
+/// pages the hash would not cover, and on any other backend.
 fn opened_graph(config: &WorkforceConfig, data_dir: Option<&Path>) -> Result<Opened> {
+    let backend = config.codegraph.backend.clone();
+    if backend == "postgres" {
+        return Err(eyre!(
+            "[codegraph] backend = \"postgres\": a run measures a SQLite code graph, whose file it hashes, and never opens one on Postgres"
+        ));
+    }
     let data_dir = data_dir.map_or_else(
-        || PathBuf::from(crate::seeding::knowledge_dirs(config).1),
+        || crate::knowledge::knowledge_dirs(&config.knowledge, &config.hub.data_dir).1,
         Path::to_path_buf,
     );
-    let backend = config.codegraph.backend.clone();
-    let sha256 = match backend.as_str() {
-        "postgres" => None,
-        _ => {
-            let path = workforce_knowledge_service::code_graph_path(&data_dir);
-            let wal = PathBuf::from(format!("{}-wal", path.display()));
-            if std::fs::metadata(&wal).is_ok_and(|wal| wal.len() > 0) {
-                return Err(eyre!(
-                    "{} holds pages not yet in the code graph, which its hash would not cover: open the graph once with sqlite3 and close it (or copy it with `.backup`), then run again",
-                    wal.display()
-                ));
-            }
-            if !path.is_file() {
-                return Err(eyre!("there is no code graph at {}", path.display()));
-            }
-            Some(sha256_of(&path)?)
-        }
-    };
-    let knowledge = &config.knowledge;
-    let (codegraph, postgres) = (&config.codegraph, config.postgres.as_ref());
-    let graph = workforce_knowledge_service::open_code_graph(
-        &data_dir,
-        knowledge,
-        &knowledge.vector_backend,
-        codegraph,
-        postgres,
-    )?;
+    let path = crate::knowledge::code_graph_path(&data_dir);
+    let wal = PathBuf::from(format!("{}-wal", path.display()));
+    if std::fs::metadata(&wal).is_ok_and(|wal| wal.len() > 0) {
+        return Err(eyre!(
+            "{} holds pages not yet in the code graph, which its hash would not cover: open the graph once with sqlite3 and close it (or copy it with `.backup`), then run again",
+            wal.display()
+        ));
+    }
+    if !path.is_file() {
+        return Err(eyre!("there is no code graph at {}", path.display()));
+    }
+    let sha256 = sha256_of(&path)?;
+    let graph = CodeGraph::open_read_only(&path)?;
     let identity = graph.identity().to_string();
     Ok(Opened {
         graph,

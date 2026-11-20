@@ -1944,7 +1944,7 @@ enum CompareCommand {
     /// their SHA256SUMS to --out, and exits non-zero naming it.
     Run {
         /// Workforce config file (reads `[knowledge]`, `[codegraph]`,
-        /// `[postgres]`, `[vellev]` and `[weaviate] api_key`).
+        /// `[vellev]` and `[weaviate] api_key`).
         #[arg(short, long, default_value = "workforce.toml")]
         config: PathBuf,
         /// The directory the code graph is kept under, instead of
