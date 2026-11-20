@@ -547,12 +547,15 @@ async fn a_stall_set_aside_is_left_and_one_answered_anywhere_is_settled() {
 async fn a_message_that_never_reaches_a_session_wakes_its_boss_once() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
+        // Gone quiet after the person's prompt stops holding it theirs (10
+        // min) and its stall is said: then never said.
         let (_overseer, crew, d, llm) = overseeing(
             dir.path(),
             pool,
             "I'll read its history.",
             "[oversight]\nenabled = true\nlevel = \"act\"\nact = { nudge = true }\n\
-             updates = { enabled = false }\nwork = { stall_minutes = 5 }\n",
+             updates = { enabled = false }\nwork = { stall_minutes = 5 }\n\
+             wake = { quiet_minutes = 15 }\n",
             &[],
         )
         .await;

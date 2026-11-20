@@ -611,11 +611,7 @@ impl CrewHub {
             if item.kind == ItemKind::Session && item.id.parse().is_ok_and(|s| self.taken_back(s)) {
                 continue;
             }
-            // What the boss sent that never reached it is the boss's to move:
-            // once said, said instead of its quiet (which may have come
-            // first), and beside what it asks the person. Kept while they
-            // wait and it hasn't moved, so a pause in a hold (the person
-            // typing a moment) never wakes the boss again.
+            // Said once a stall, instead of its quiet from then on.
             let waits = waiting.get(&item.id).map(Vec::as_slice).unwrap_or_default();
             if let Some(oldest) = waits.first() {
                 let key = format!("undelivered:{}:{}:{}", item.id, oldest.id, moved_at(item));
@@ -628,8 +624,6 @@ impl CrewHub {
                         noted.insert(quiet_key(item));
                         out.push(found.trigger);
                     }
-                    // Behind what it asks the person: that is still raised
-                    // as it waits, with its approval and its reminders.
                     if !found.behind_person {
                         continue;
                     }
@@ -785,7 +779,6 @@ impl CrewHub {
         now: DateTime<Utc>,
         stall_minutes: u32,
     ) -> Option<Undelivered> {
-        let minute = self.crew_minutes(1);
         let stall = self.crew_minutes(i64::from(stall_minutes));
         let oldest = waiting.first()?;
         let quiet = item.last_activity.is_none_or(|at| now - at >= stall);
@@ -796,7 +789,7 @@ impl CrewHub {
         if !view.state.is_running() || self.person_has_questions(&view, overseer) {
             return None;
         }
-        let waits = self.desk.line_waits(view.id, waiting)?;
+        let waits = self.desk.line_waits(&view, waiting)?;
         const LONG_STEP: &str =
             "it may be stuck, or in one long step (a build, a test run), which a restart would cut off";
         let (why, behind_person) = match waits.first().copied().flatten() {
@@ -838,8 +831,7 @@ impl CrewHub {
             .at
             .with_timezone(&self.desk.timezone())
             .format("%H:%M");
-        let minutes =
-            ((now - oldest.at).num_milliseconds() / minute.num_milliseconds().max(1)).max(1);
+        let minutes = (now - oldest.at).num_minutes().max(1);
         let line = format!(
             "{} hasn't taken your message of {at} in {minutes} min ({} waiting, the oldest “{}”) \
              and has shown no progress meanwhile: {why}. {move_it}",

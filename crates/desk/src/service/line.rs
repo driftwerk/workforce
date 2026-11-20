@@ -2023,24 +2023,26 @@ impl Desk {
         st.lines.seen.remove(&id);
     }
 
-    /// Why each of `rows`, still to go into session `id`, waits now (none:
-    /// nothing holds it there; one handed on, behind a running turn, waits
-    /// on that); nothing at all while Desk holds any of them on purpose,
-    /// whatever its turn ([`Wait::on_purpose`]).
-    pub fn line_waits(&self, id: Uuid, rows: &[LineMessage]) -> Option<Vec<Option<Wait>>> {
-        let view = self.view(id).ok()?;
-        let (typed, plugin) = (self.typed_since_idle(id), self.plugin_heard(id));
-        let in_turn = self.in_a_turn(&view);
+    /// Each of `rows`' reason to wait to go into `view` (a hand-off behind
+    /// its running turn waits on that), or none while Desk holds any of them
+    /// on purpose, whatever its turn ([`Wait::on_purpose`]).
+    pub fn line_waits(
+        &self,
+        view: &SessionView,
+        rows: &[LineMessage],
+    ) -> Option<Vec<Option<Wait>>> {
+        let (typed, plugin) = (self.typed_since_idle(view.id), self.plugin_heard(view.id));
+        let in_turn = self.in_a_turn(view);
         let waits: Vec<Option<Wait>> = rows
             .iter()
             .map(|m| match m.delivery {
                 Delivery::Handed if in_turn => Some(Wait::Working),
-                _ => self.waits_why(&view, typed, plugin, m),
+                _ => self.waits_why(view, typed, plugin, m),
             })
             .collect();
         let on_purpose = rows
             .iter()
-            .filter_map(|m| self.line_gate(&view, m))
+            .filter_map(|m| self.line_gate(view, m))
             .chain(waits.iter().flatten().copied())
             .any(Wait::on_purpose);
         (!on_purpose).then_some(waits)
