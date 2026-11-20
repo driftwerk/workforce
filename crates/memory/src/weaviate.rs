@@ -2618,9 +2618,7 @@ mod tests {
                     }
                 }),
             );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = workforce_vellev::testing::serve(app).await;
         let store = WeaviateStore::new(&url, None).in_collection("Memories");
         let tagged = store
             .add_tag(&AgentId::new("sarah"), "desk-group:acme", "desk-group:")
@@ -2660,9 +2658,7 @@ mod tests {
                 },
             ),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = workforce_vellev::testing::serve(app).await;
         let store = |class: &str| WeaviateStore::new(&url, None).in_collection(class);
         assert!(store("Here").collection_exists().await.unwrap());
         assert!(!store("Gone").collection_exists().await.unwrap());
@@ -2708,9 +2704,7 @@ mod tests {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = workforce_vellev::testing::serve(app).await;
         let object = |n: u128, content: &str| {
             serde_json::json!({
                 "id": uuid::Uuid::from_u128(n).to_string(),
@@ -2783,9 +2777,7 @@ mod tests {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = workforce_vellev::testing::serve(app).await;
         let objects: Vec<serde_json::Value> = (1..=3u128)
             .map(|n| {
                 serde_json::json!({
@@ -3537,10 +3529,7 @@ mod embedded_tests {
             )
             .route("/v1/batch/objects", post(record))
             .with_state(fake);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        format!("http://{addr}")
+        workforce_vellev::testing::serve(app).await
     }
 
     /// Vectors from text: [length, count of 'a'], enough to tell texts apart.

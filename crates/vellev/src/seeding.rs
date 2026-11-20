@@ -218,6 +218,12 @@ struct Probe {
 }
 
 impl Probe {
+    /// The probe was never made: its create was refused outright, so
+    /// there is nothing to drop.
+    fn never_made(&mut self) {
+        self.records = None;
+    }
+
     /// Drop the probe from the tenant `at`, where it embeds with `model`.
     async fn dropped(mut self, at: &Tenants, model: &str) -> Result<()> {
         let Some(records) = self.records.take() else {
@@ -298,11 +304,17 @@ impl NodeEmbedder {
     async fn made(
         &self,
         probe: &Collection,
+        armed: &mut Probe,
         records: &vellev_client::Records,
         texts: &[String],
     ) -> Result<Vec<Vec<f32>>> {
         let failed = |e| classified(e, &self.tenants);
-        records.create(probe).await.map_err(failed)?;
+        if let Err(e) = records.create(probe).await {
+            if refused_outright(&e) {
+                armed.never_made();
+            }
+            return Err(failed(e));
+        }
         let ids: Vec<ObjectId> = texts.iter().map(|_| ObjectId(Uuid::new_v4())).collect();
         let written: Vec<(&ObjectId, &String)> = ids.iter().zip(texts).collect();
         for batch in written.chunks(self.per_write) {
@@ -375,12 +387,12 @@ impl DocumentEmbedder for NodeEmbedder {
         }
         let probe = self.probe()?;
         let records = self.tenants.reads.collection(&probe.name);
-        let made = Probe {
+        let mut made = Probe {
             records: Some(records.clone()),
             name: probe.name.clone(),
         };
         match (
-            self.made(&probe, &records, texts).await,
+            self.made(&probe, &mut made, &records, texts).await,
             made.dropped(&self.tenants, &self.embedding.model).await,
         ) {
             (Ok(vectors), Ok(())) => Ok(vectors),
@@ -389,6 +401,17 @@ impl DocumentEmbedder for NodeEmbedder {
                 Err(e.wrap_err(format!("the embedding failed, and then {dropped:#}")))
             }
         }
+    }
+}
+
+/// Whether the node turned a request away for certain, leaving nothing
+/// done: its own refusal of the request, never a timeout or an answer that
+/// leaves the outcome open.
+fn refused_outright(error: &vellev_client::Error) -> bool {
+    match error {
+        vellev_client::Error::Api { status, .. } => status.is_client_error(),
+        vellev_client::Error::Limited { .. } => true,
+        _ => false,
     }
 }
 

@@ -1282,6 +1282,31 @@ mod tests {
         );
     }
 
+    /// A probe whose create is refused outright was never made: only the
+    /// create's refusal is told, never a probe left behind.
+    #[tokio::test]
+    async fn a_probe_refused_at_its_create_is_not_told_as_left_behind() {
+        use axum::response::IntoResponse;
+        let app = axum::Router::new().fallback(|| async {
+            let refused = serde_json::json!({ "error": {
+                "code": "forbidden",
+                "message": "the key may not create collections",
+            }});
+            (axum::http::StatusCode::FORBIDDEN, axum::Json(refused)).into_response()
+        });
+        let tenants = connect(&crate::serve(app).await, "key", "harbor").unwrap();
+        let small = embedding_of(SMALL, 16, None, &["text"]);
+        let node = seeding::NodeEmbedder::new(tenants, small, 1);
+        let refused = format!(
+            "{:#}",
+            node.documents(&["a".to_string()]).await.unwrap_err()
+        );
+        assert!(
+            refused.contains("the key may not create collections") && !refused.contains("dropped"),
+            "{refused}"
+        );
+    }
+
     /// A marker that is there but records no owner is an error naming it,
     /// never read as unclaimed.
     #[tokio::test]
