@@ -1,5 +1,7 @@
 //! Executables written whole, in one step, and only put in place once
-//! nothing has them open for writing.
+//! nothing has them open for writing. The directory they go in must be
+//! writable, and is where they are written first, so the rename stays on
+//! one file system.
 
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -34,6 +36,7 @@ fn no_writers(path: &Path) -> io::Result<()> {
     let file = std::fs::File::open(path)?;
     let fd = file.as_raw_fd();
     let started = std::time::Instant::now();
+    let mut wait = std::time::Duration::from_millis(1);
     loop {
         // SAFETY: `fd` is open for as long as `file` is.
         if unsafe { libc::fcntl(fd, libc::F_SETLEASE, libc::F_RDLCK) } == 0 {
@@ -43,6 +46,10 @@ fn no_writers(path: &Path) -> io::Result<()> {
         }
         let e = io::Error::last_os_error();
         if e.raw_os_error() != Some(libc::EAGAIN) {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                tracing::debug!(path = %path.display(), error = %e, "no lease here: an executable is put in place without waiting for its writers");
+            });
             return Ok(());
         }
         if started.elapsed() > std::time::Duration::from_secs(10) {
@@ -51,7 +58,8 @@ fn no_writers(path: &Path) -> io::Result<()> {
                 "an executable stayed open for writing",
             ));
         }
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        std::thread::sleep(wait);
+        wait = (wait * 2).min(std::time::Duration::from_millis(10));
     }
 }
 
