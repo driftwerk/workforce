@@ -56,7 +56,7 @@ pub fn schema() -> Value {
 
 /// The cadence keys `input` sets, as TOML values: a preset's first, then
 /// each key given. None given: nothing to change.
-fn changes(input: &Value) -> Result<Vec<(&'static str, toml_edit::Value)>, String> {
+pub(super) fn changes(input: &Value) -> Result<Vec<(&'static str, toml_edit::Value)>, String> {
     let mut out: Vec<(&'static str, toml_edit::Value)> = Vec::new();
     if let Some(p) = input["preset"].as_str() {
         let c = Cadence::preset(p.trim())

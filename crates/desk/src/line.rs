@@ -109,6 +109,27 @@ pub fn in_turn(state: SessionState) -> bool {
     matches!(state, SessionState::Working | SessionState::Blocked)
 }
 
+/// `text` without a leading "<who>, HH:MM[ UTC]." stamp, for a one-line
+/// row that shows its own sender and time; unchanged when there is no such
+/// stamp or nothing follows it.
+pub fn unstamped<'a>(text: &'a str, who: &str) -> &'a str {
+    if who.trim().is_empty() {
+        return text;
+    }
+    let past = text
+        .trim_start()
+        .strip_prefix(who)
+        .and_then(|rest| rest.strip_prefix(", "))
+        .and_then(|rest| {
+            let (time, after) = rest.split_once('.')?;
+            let time = time.strip_suffix(" UTC").unwrap_or(time);
+            let clock = chrono::NaiveTime::parse_from_str(time, "%H:%M").is_ok();
+            let said = after.trim_start();
+            (clock && after.starts_with(char::is_whitespace) && !said.is_empty()).then_some(said)
+        });
+    past.unwrap_or(text)
+}
+
 /// Which turn of a session's run something was sent in: an escalation
 /// interrupts that turn alone, never one begun since. `run` is the run's
 /// own: its counters start again with each Desk, so a mark from before a
@@ -1932,6 +1953,29 @@ mod tests {
         }
         assert_eq!(guard(1, &run, true), Err(Refusal::Peers));
         assert_eq!(guard(1, &run, false), Ok(()), "Desk still hears it");
+    }
+
+    #[test]
+    fn a_stamp_of_who_and_when_is_read_past() {
+        assert_eq!(
+            unstamped("Desk, 00:21. Update: run 4464 is already fixed.", "Desk"),
+            "Update: run 4464 is already fixed."
+        );
+        assert_eq!(
+            unstamped("Desk Bot, 3:12 UTC.  Go: run step 12.", "Desk Bot"),
+            "Go: run step 12."
+        );
+        for kept in [
+            "Desk, 00:21.",
+            "Desk, 00:21.5 is the version.",
+            "Tomorrow, 09:00. Deploy the release.",
+            "Friday, 17:00. Freeze starts.",
+            "Desk, 25:99. Go.",
+            "Desktop, 00:21. Go.",
+        ] {
+            assert_eq!(unstamped(kept, "Desk"), kept);
+        }
+        assert_eq!(unstamped("Desk, 00:21. Go.", ""), "Desk, 00:21. Go.");
     }
 
     #[test]

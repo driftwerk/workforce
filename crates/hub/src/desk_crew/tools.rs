@@ -56,6 +56,68 @@ pub const READ: [&str; 27] = [
     super::watches::WATCH,
     super::watches::WATCHES,
 ];
+/// The tools of [`READ`] that can change something (what the boss owes,
+/// what it was told, how it is run): every other one only looks.
+const KEEPS: [&str; 10] = [
+    super::items::ASK,
+    super::items::CLOSE,
+    super::items::PROMISE,
+    super::items::ORDER,
+    super::preferences::PREFER,
+    super::preferences::PREFERENCES,
+    super::directives::NAME,
+    super::cadence_tool::NAME,
+    super::watches::WATCH,
+    super::watches::WATCHES,
+];
+/// What `memory` does that only looks.
+const RECALLS: [&str; 5] = ["recall", "count", "overview", "timeline", "fetch_source"];
+
+/// Whether the call of `keeps`, one of [`KEEPS`], with `input` only read.
+fn only_reads(keeps: &str, input: &Value) -> bool {
+    match keeps {
+        super::preferences::PREFERENCES | super::directives::NAME => matches!(
+            input["action"].as_str().map(str::trim).unwrap_or_default(),
+            "" | "list"
+        ),
+        super::cadence_tool::NAME => {
+            super::cadence_tool::changes(input).is_ok_and(|c| c.is_empty())
+        }
+        super::watches::WATCHES => input["end"].is_null(),
+        _ => false,
+    }
+}
+
+/// Whether a call of `tool` with `input` only looked: a turn whose calls
+/// all did is one that did nothing. A tool not known to only look (a
+/// command run, a file written, a request that changes something) did
+/// something. Names match dotted or underscored, as the model calls them.
+pub(super) fn only_looks(tool: &str, input: &Value) -> bool {
+    let called = tool.replace('.', "_");
+    let named = |known: &str| known.replace('.', "_") == called;
+    if READ.iter().any(|t| named(t)) {
+        return KEEPS
+            .iter()
+            .find(|k| named(k))
+            .is_none_or(|k| only_reads(k, input));
+    }
+    // A node's tool, called by its underscored name: `node_<id>_<tool>`.
+    let node = || {
+        tool.strip_prefix("node_")
+            .and_then(|rest| rest.split_once('_'))
+            .map(|(id, rest)| format!("node.{id}.{rest}"))
+    };
+    crate::serve::CURATION_TOOL_PATTERNS
+        .iter()
+        .chain(crate::serve::CURATION_DATABASE_READ_TOOLS)
+        .chain(&workforce_skills::adapters::read_only_adapter_tools())
+        .any(|t| named(t))
+        || (named("memory")
+            && RECALLS.contains(&input["action"].as_str().map(str::trim).unwrap_or_default()))
+        || (named("http.request") && !workforce_agent::tools::http::is_mutating_request(input))
+        || crate::local_agent_registry::is_read_only_tool(tool)
+        || node().is_some_and(|n| crate::local_agent_registry::is_read_only_tool(&n))
+}
 pub const ACT: [&str; 32] = [
     "crew.nudge",
     "crew.ask_session",
@@ -811,8 +873,9 @@ impl CrewTool {
     }
 }
 
-/// What a local overseer may ask of its group's sessions on a machine,
-/// through the relay: by a session id of the machine's (`devbox/<id>`).
+/// What a local overseer may ask of its group's or its plans' sessions on
+/// a machine, through the relay: by a session id of the machine's
+/// (`devbox/<id>`).
 const RELAYED: [&str; 9] = [
     "crew.history",
     "crew.nudge",
@@ -826,34 +889,13 @@ const RELAYED: [&str; 9] = [
 ];
 
 impl CrewTool {
-    /// The group its scope is, when it is one: a machine's sessions are
-    /// relayed only for a group's boss for now.
+    /// The group its scope is, when it is one.
     fn group(&self) -> Option<&str> {
         self.scope.group()
     }
 
-    /// The machines whose sessions are in its group, by the sidebar.
-    fn machines(&self, crew: &CrewHub) -> Vec<String> {
-        let Some(g) = self.group() else {
-            return Vec::new();
-        };
-        let layout = crew.desk.layout();
-        let mut out: Vec<String> = layout
-            .groups
-            .iter()
-            .filter(|x| x.id == g)
-            .flat_map(|x| x.items.iter())
-            .filter_map(|i| i.strip_prefix("session:"))
-            .filter_map(super::relay::machine_session)
-            .map(|(m, _)| m.to_string())
-            .collect();
-        out.sort();
-        out.dedup();
-        out
-    }
-
-    /// `local`, the overview of this Mac, with each machine's part of its
-    /// group, asked through the relay at once.
+    /// `local`, the overview of this Mac, with each machine's part of what
+    /// it runs there, asked through the relay at once.
     async fn with_machines(
         &self,
         crew: &Arc<CrewHub>,
@@ -861,26 +903,59 @@ impl CrewTool {
         boss: &str,
         local: Value,
     ) -> Value {
-        let (Some(g), machines) = (self.group(), self.machines(crew)) else {
+        let machines = crew.machine_grants_of(b.service.agent_id.as_str(), &b.oversight);
+        if machines.is_empty() {
             return local;
-        };
+        }
         let ceiling = crew.ceiling_now(b.service.agent_id.as_str(), &b.oversight);
         let ceiling = &ceiling;
-        let asks = machines.iter().map(|m| {
+        let asks = machines.into_iter().map(|(m, g)| {
             let crew = Arc::clone(crew);
             async move {
                 let part = crew
-                    .relay(m, g, "crew.overview", json!({}), boss, ceiling)
+                    .relay(&m, &g, "crew.overview", json!({}), boss, ceiling)
                     .await;
-                (m.clone(), part)
+                (m, part)
             }
         });
         let parts = futures::future::join_all(asks).await;
         super::relay::merge_overview(local, parts)
     }
 
+    /// The grant session `id` of `machine` is under there for this boss,
+    /// or why it may not be reached: its group's, holding it by the
+    /// sidebar, or one of its own plans' that holds it.
+    fn grant_for(
+        &self,
+        crew: &CrewHub,
+        b: &Bound,
+        machine: &str,
+        id: uuid::Uuid,
+    ) -> Result<String, String> {
+        match self.group() {
+            // In its own group by the sidebar, as the machine's grant will
+            // also say: nothing outside it is sent anywhere.
+            Some(g)
+                if workforce_desk::grant::plan_of(g).is_none()
+                    && crew.desk.group_of_member(&format!("session:{machine}/{id}")).as_deref()
+                        == Some(g) =>
+            {
+                Ok(g.to_string())
+            }
+            Some(_) => Err(crew.not_ours(&self.scope)),
+            None => crew
+                .plan_grant_of(b.service.agent_id.as_str(), &b.oversight, machine, id)
+                .ok_or_else(|| {
+                    format!(
+                        "On {machine} you run only your own plans' ticket sessions, and this isn't one of them."
+                    )
+                }),
+        }
+    }
+
     /// The call, when it names one of a machine's sessions: relayed there,
-    /// decided there under its grant for the group, the boss this tool's.
+    /// decided there under its grant ([`Self::grant_for`]), the boss this
+    /// tool's.
     /// Nothing of it is done or judged here. None when it names none.
     async fn relayed(
         &self,
@@ -902,17 +977,10 @@ impl CrewTool {
                 self.name
             )));
         }
-        let Some(g) = self.group() else {
-            return Some(Err(
-                "Sessions on a machine are run only by their group's boss for now.".into(),
-            ));
+        let g = match self.grant_for(crew, b, machine, id) {
+            Ok(g) => g,
+            Err(why) => return Some(Err(why)),
         };
-        // In its own group by the sidebar, as the machine's grant will also
-        // say: nothing outside it is sent anywhere.
-        let item = format!("session:{machine}/{id}");
-        if crew.desk.group_of_member(&item).as_deref() != Some(g) {
-            return Some(Err(crew.not_ours(&self.scope)));
-        }
         // What its own level here doesn't let it do, it doesn't ask of a
         // machine either; the machine decides at no more than it.
         if name != "crew.history" && b.oversight.level == workforce_common::oversight::Level::Watch
@@ -959,7 +1027,7 @@ impl CrewTool {
                 }
             }
         }
-        let relayed = crew.relay(machine, g, name, sent, agent, &ceiling).await;
+        let relayed = crew.relay(machine, &g, name, sent, agent, &ceiling).await;
         if let Some(a) = assigned.map(|a| a.id) {
             let ok = relayed
                 .as_ref()
@@ -1363,6 +1431,63 @@ impl Tool for CrewTool {
 mod tests {
     use super::*;
     use workforce_desk::model::{Engine, Origin};
+
+    #[test]
+    fn the_crew_reads_that_only_look_and_those_that_keep_something_are_every_read() {
+        let looks: Vec<&str> = READ
+            .iter()
+            .copied()
+            .filter(|t| {
+                only_looks(
+                    t,
+                    &json!({"action": "set", "end": "w1", "preset": "balanced"}),
+                )
+            })
+            .collect();
+        assert_eq!(
+            looks,
+            [
+                "crew.overview",
+                LOGINS,
+                "crew.activity",
+                "crew.account",
+                super::super::decisions::NAME,
+                "crew.history",
+                super::super::spend::NAME,
+                super::super::board::NAME,
+                super::super::find::NAME,
+                super::super::tickets::READ,
+                super::super::items::OPEN,
+                super::super::github::PR,
+                super::super::github::BRANCH,
+                super::super::github::CI,
+                super::super::assignments::LIST,
+                super::super::machines::MACHINES,
+                super::super::machines::FOLDERS,
+            ],
+            "a crew read that can change something is in KEEPS"
+        );
+        assert!(KEEPS.iter().all(|t| READ.contains(t)));
+        assert!(only_looks("crew.watches", &json!({})));
+        assert!(only_looks("crew.updates_cadence", &json!({})));
+        // Named as the model calls them, dotted or not.
+        assert!(only_looks("crew_overview", &json!({})));
+        assert!(!only_looks("crew_promise", &json!({})));
+        // A list of what the person said only looks; a change keeps it.
+        assert!(only_looks("crew_directives", &json!({})));
+        assert!(only_looks("crew.preferences", &json!({"action": "list"})));
+        assert!(!only_looks("crew.directives", &json!({"action": "add"})));
+        // Any other tool did something, unless it is known only to look.
+        assert!(only_looks("filesystem_read", &json!({"path": "a"})));
+        assert!(only_looks("jira.search", &json!({})));
+        assert!(only_looks("memory", &json!({"action": "recall"})));
+        assert!(!only_looks("memory", &json!({"action": "remember"})));
+        assert!(!only_looks("filesystem.write", &json!({"path": "a"})));
+        assert!(!only_looks("exec.run", &json!({"command": "ls"})));
+        assert!(only_looks("http.request", &json!({"method": "GET"})));
+        assert!(!only_looks("http.request", &json!({"method": "POST"})));
+        assert!(!only_looks("ssh.run", &json!({})));
+    }
 
     fn item(name: &str, hub_name: Option<&str>, group: Option<&str>) -> Item {
         Item {

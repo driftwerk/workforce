@@ -160,6 +160,15 @@ impl BossRef {
             Self::Remote { hub, agent } => format!("remote:{hub}/{agent}"),
         }
     }
+    /// The name it goes by on this engine: a session it runs says it has
+    /// it by this name (`bossHas`).
+    pub fn name(&self) -> String {
+        match self {
+            Self::Local { agent } => agent.clone(),
+            Self::Remote { hub, agent } => format!("{agent} ({hub})"),
+        }
+    }
+
     /// The id it acts under on this engine, as a party, a charge's boss
     /// and every key a boss is known by: `<hub>/<agent>`, with `home` for
     /// a boss on the home's own hub. A local agent's id never has a `/` in
@@ -365,6 +374,30 @@ fn invalid(why: impl Into<String>) -> Refusal {
 pub fn group_id_ok(id: &str) -> bool {
     !id.trim().is_empty() && id.len() <= MAX_ID && !id.contains('/') && !id.contains(':')
 }
+
+/// What a plan's own grant's id starts with: the home's main overseer runs
+/// no group, so each of its plans has a grant of its own on each machine
+/// its tickets work on.
+const PLAN_GRANT: &str = "plan-";
+
+/// The id of plan `plan`'s grant on a machine.
+pub fn plan_key(plan: Uuid) -> String {
+    format!("{PLAN_GRANT}{plan}")
+}
+
+/// The plan `group` is the grant of, when it is a plan's.
+pub fn plan_of(group: &str) -> Option<Uuid> {
+    group
+        .strip_prefix(PLAN_GRANT)?
+        .parse()
+        .ok()
+        .filter(|p| plan_key(*p) == group)
+}
+
+/// The `code` a machine refuses a plan's ticket started for its boss with
+/// while it doesn't hold that plan's grant for that boss: the start waits
+/// for it.
+pub const NOT_HELD: &str = "plan_grant_not_held";
 
 fn check_list(what: &str, list: &[String]) -> Result<(), Refusal> {
     if list.len() > MAX_LIST {

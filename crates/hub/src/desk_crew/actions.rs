@@ -641,7 +641,9 @@ impl Action {
 /// A charge refused in the words the person reads, as they are.
 fn charge_plain(e: workforce_desk::DeskError) -> String {
     match e {
-        workforce_desk::DeskError::Conflict(why) | workforce_desk::DeskError::Invalid(why) => why,
+        workforce_desk::DeskError::Conflict(why)
+        | workforce_desk::DeskError::Invalid(why)
+        | workforce_desk::DeskError::NotHeld(why) => why,
         e
         @ (workforce_desk::DeskError::CrossesBoss | workforce_desk::DeskError::TooLong { .. }) => {
             e.to_string()
@@ -698,7 +700,9 @@ fn answer_refused(e: workforce_desk::DeskError) -> Result<String, workforce_desk
 /// A board change refused, in the words the person reads, as they are.
 pub(super) fn board_plain(e: workforce_desk::DeskError) -> String {
     match e {
-        workforce_desk::DeskError::Conflict(why) | workforce_desk::DeskError::Invalid(why) => why,
+        workforce_desk::DeskError::Conflict(why)
+        | workforce_desk::DeskError::Invalid(why)
+        | workforce_desk::DeskError::NotHeld(why) => why,
         e
         @ (workforce_desk::DeskError::CrossesBoss | workforce_desk::DeskError::TooLong { .. }) => {
             e.to_string()

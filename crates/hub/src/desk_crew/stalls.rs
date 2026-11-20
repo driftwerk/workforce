@@ -577,14 +577,21 @@ impl CrewHub {
             }
             handed.insert(key, now);
         }
-        self.wake_on(boss, s, line, format!("stall:{s}"));
+        self.wake_on(boss, s, line, format!("stall:{s}"), "a stall");
         Handed::Now
     }
 
     /// Wakes `boss`'s full turn with `line` about session `s`.
-    fn wake_on(&self, boss: &str, s: Uuid, line: String, about: String) {
+    pub(super) fn wake_on(
+        &self,
+        boss: &str,
+        s: Uuid,
+        line: String,
+        about: String,
+        what: &'static str,
+    ) {
         let Some((service, o)) = self.overseer_named(boss) else {
-            tracing::info!(%boss, "a stall has no boss here to hand it to");
+            tracing::info!(%boss, what, "no boss here to hand it to");
             return;
         };
         let group = self.desk.view(s).ok().and_then(|v| v.group.map(|g| g.id));
@@ -604,7 +611,7 @@ impl CrewHub {
         // As any turn of the boss's: holding its mind, so nothing that
         // waits for it to be free raises meanwhile.
         tokio::spawn(async move {
-            crew.with_mind(&boss, "a stall", crew.wake(service, o, vec![t]))
+            crew.with_mind(&boss, what, crew.wake(service, o, vec![t]))
                 .await;
         });
     }
@@ -756,7 +763,7 @@ impl CrewHub {
                     self.session_name(s)
                 ),
             };
-            self.wake_on(&i.boss, s, line, format!("recheck:{s}"));
+            self.wake_on(&i.boss, s, line, format!("recheck:{s}"), "a stall");
         }
     }
 }

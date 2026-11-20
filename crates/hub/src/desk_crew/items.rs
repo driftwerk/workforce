@@ -35,7 +35,7 @@ use workforce_common::channels::DESK_CHANNEL;
 use workforce_common::oversight::Oversight;
 use workforce_desk::crew::By;
 use workforce_desk::crew::{self, Extras, ItemRefused, MentionedApproval};
-use workforce_desk::line::{Asked, LineKind};
+use workforce_desk::line::{Asked, Delivery, LineKind};
 use workforce_desk::model::{DeskEvent, SessionState};
 use workforce_desk::open_item::{
     self, ClosedBy, NewItem, OpenItem, OpenKind, OpenState, DONE_WHY, FIRST_RESTATE, LAPSE_AFTER,
@@ -69,12 +69,25 @@ const CHECK_ORDERS: &str = "Not asked yet: check this against the person's own i
 const CHECKED_FOR: chrono::TimeDelta = chrono::TimeDelta::hours(1);
 
 pub const CLOSE_DESCRIPTION: &str = "Close one of your open items (item_id from crew.open_items or the open items Desk gives you): with answer when the person answered it in their own words (for a session's question, their answer goes on to the session), or with why when it no longer applies or you decided it yourself. A why is never said to the person. For a promise or one of their orders that ended in a real result they would want, say what was done in done (at most 12 words, e.g. \"Cufflink migration: 18 of 20 tables moved\"): it reaches them once as \"✓ <done>\". One that simply ended (its time or condition passed, the person came back or checked in, the morning came) or duplicated another item takes why only: nothing is said of it.";
-pub const PROMISE_DESCRIPTION: &str = "Keep a promise you made the person about a session (session_id): what you promised (text, in full) and when it is kept (done_when: \"merged\", \"in production\", \"PR open\", or your own words). Desk tracks it until the session's account shows it done, then reports it once; it lapses if the session ends or nothing changes for 3 days. crew.ask_session keeps its own promise to report back.";
+pub const PROMISE_DESCRIPTION: &str = "Keep a promise you made the person about a session (session_id): what you promised (text, in full) and when it is kept (done_when: \"merged\", \"in production\", \"PR open\", or your own words). Desk tracks it until the session's account shows it done, then reports it once; it lapses if the session ends or nothing changes for 3 days. For something you'll bring the person, set due_minutes; if not kept by then you're woken to fetch it, then they're told it's owed, and it doesn't lapse before that. crew.ask_session keeps its own promise to report back.";
 pub const ORDER_DESCRIPTION: &str = "Keep one of the person's orders you are carrying out (text, in their words) with the sessions working on it (session_ids), and done_when if it has a clear end (\"merged\", \"in production\"). An order you act on from their message (starting, telling or handing work to a session) is kept for you; use this for one that started nothing yet (\"leave the export alone\"). It is in every turn of yours until it is done or closed with crew.close_item.";
 pub const OPEN_DESCRIPTION: &str = "What you owe the person now (\"what's open?\"): the questions you asked them, the decisions you want confirmed, your promises, their orders, and the parked ones (no longer restated; they can answer or drop them), each with its item_id, when it was opened and last said, and what it holds up.";
 
 /// A promise to report back what a session says to a status question.
 const REPLIED: &str = "replied";
+
+/// What such a promise says before what it reports.
+const REPORT_BACK: &str = "Report back ";
+
+/// In the crew's minutes: how long a promise to report what a session
+/// says waits on its reply, how long a due promise's boss has to get it
+/// itself before the person is told it is still owed, and how far a due
+/// time moves on while its question is still on its way in.
+const OWED_MINUTES: i64 = 10;
+
+/// The longest a promise may be due in, in minutes: as long as a watch
+/// lasts.
+const DUE_MAX: i64 = workforce_desk::boss_watch::MAX_HOURS * 60;
 
 /// The most of a session's reply said to the person, in characters.
 const REPLY_CHARS: usize = 400;
@@ -132,7 +145,8 @@ pub fn schema(name: &str) -> Value {
         PROMISE => json!({ "type": "object", "properties": {
             "session_id": { "type": "string" },
             "text": { "type": "string", "description": "What you promised, in full" },
-            "done_when": { "type": "string", "description": "merged, in production, PR open, or your own words" }
+            "done_when": { "type": "string", "description": "merged, in production, PR open, or your own words" },
+            "due_minutes": { "type": "integer", "description": format!("For something you will bring the person: by when, in minutes from now (1 to {DUE_MAX})") }
         }, "required": ["session_id", "text", "done_when"] }),
         ORDER => json!({ "type": "object", "properties": {
             "text": { "type": "string", "description": "The person's order, in their words" },
@@ -240,6 +254,24 @@ fn restatements<'a>(due: &[&'a OpenItem], now: DateTime<Utc>) -> Vec<(&'a OpenIt
             (*i, text, park)
         })
         .collect()
+}
+
+/// `due_minutes` as given: a whole number of minutes from 1 to [`DUE_MAX`],
+/// or none.
+fn due_minutes(v: &Value) -> Result<Option<i64>, String> {
+    match v {
+        Value::Null => Ok(None),
+        v => match v
+            .as_i64()
+            .or_else(|| v.as_f64().filter(|f| f.fract() == 0.0).map(|f| f as i64))
+        {
+            Some(m) if (1..=DUE_MAX).contains(&m) => Ok(Some(m)),
+            Some(m) => Err(format!(
+                "due_minutes must be from 1 to {DUE_MAX}; {m} isn't."
+            )),
+            None => Err("due_minutes must be a whole number of minutes.".into()),
+        },
+    }
 }
 
 impl CrewHub {
@@ -521,7 +553,9 @@ impl CrewHub {
                         .ok_or("Say which session it is about (session_id).")?,
                 )?;
                 let done_when = some("done_when").ok_or("Say when it is kept (done_when).")?;
-                NewItem::promise(boss, s, &text, &done_when)
+                let due =
+                    due_minutes(&input["due_minutes"])?.map(|m| crew::now() + self.crew_minutes(m));
+                NewItem::promise(boss, s, &text, &done_when).due(due)
             }
             _ => {
                 let mut sessions = Vec::new();
@@ -540,13 +574,15 @@ impl CrewHub {
         .map_err(Self::item_err)?;
         Ok(json!(match opened {
             Opened::New(i) => format!(
-                "Kept as item {}: it is tracked until it is done, and in every turn of yours till then.",
-                i.id
+                "Kept as item {}: it is tracked until it is done, and in every turn of yours till then{}.",
+                i.id,
+                self.due_said(&i)
             ),
             Opened::Again(i) => format!(
-                "That is already kept as item {} (“{}”): it is one item, its sessions joined.",
+                "That is already kept as item {} (“{}”): it is one item, its sessions joined{}.",
                 i.id,
-                crew::one_line(&i.text, 120)
+                crew::one_line(&i.text, 120),
+                self.due_said(&i)
             ),
         }))
     }
@@ -630,12 +666,13 @@ impl CrewHub {
                     &boss,
                     *s,
                     &format!(
-                        "Report back what {name} says to “{}”",
+                        "{REPORT_BACK}what {name} says to “{}”",
                         crew::one_line(question, 200)
                     ),
                     REPLIED,
                 );
                 p.line_message = done.line.as_ref().map(|(id, _)| *id);
+                let p = p.due(Some(now + self.crew_minutes(OWED_MINUTES)));
                 if let Err(e) = self.desk.store().item_open(&p).await {
                     tracing::warn!(error = %format!("{e:#}"), "keeping the promise to report back failed");
                 }
@@ -881,6 +918,142 @@ impl CrewHub {
         if let Err(e) = crate::desk_surface::notice(&service, &owner, text).await {
             tracing::info!(error = %e, "a notice in the boss's DM failed");
         }
+    }
+
+    /// Each promise due by now: where its boss acts and hasn't been told
+    /// yet, it is told to get it itself, and due again [`OWED_MINUTES`]
+    /// later; else the person is told it is still owed, once.
+    async fn chase_owed(&self) {
+        let now = crew::now();
+        let due = match self.desk.store().items_due(now).await {
+            Ok(due) => due,
+            Err(e) => {
+                tracing::warn!(error = %e, "the boss's due promises couldn't be read");
+                return;
+            }
+        };
+        for i in &due {
+            let Some(was) = i.due_at else {
+                continue;
+            };
+            // Its boss isn't served now: looked at again once it is.
+            let Some((_, o)) = self.overseer_named(&i.boss) else {
+                continue;
+            };
+            // Its question still on its way in is chased as undelivered.
+            if i.done_when.as_deref() == Some(REPLIED)
+                && i.session.is_some_and(|s| !self.session_ended(s))
+                && self.ask_still_queued(i).await
+            {
+                let next = now + self.crew_minutes(OWED_MINUTES);
+                if let Err(e) = self
+                    .desk
+                    .store()
+                    .item_chased(i.id, was, None, Some(next))
+                    .await
+                {
+                    tracing::warn!(error = %e, "a due promise's time couldn't be moved on");
+                }
+                continue;
+            }
+            let chase_on = i.session.filter(|s| {
+                i.chased_at.is_none()
+                    && !self.session_ended(*s)
+                    && self.level_now(&i.boss, &o).0.acts()
+            });
+            let next = chase_on.map(|_| now + self.crew_minutes(OWED_MINUTES));
+            match self
+                .desk
+                .store()
+                .item_chased(i.id, was, chase_on.map(|_| now), next)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    tracing::warn!(error = %e, "a due promise couldn't be marked chased");
+                    continue;
+                }
+            }
+            let reported = i
+                .text
+                .strip_prefix(REPORT_BACK)
+                .filter(|_| i.done_when.as_deref() == Some(REPLIED));
+            let what = reported.map_or_else(|| crew::one_line(&i.text, 200), str::to_string);
+            match chase_on {
+                Some(s) => self.wake_on(
+                    &i.boss,
+                    s,
+                    format!(
+                        "You promised the person {}, and it is due and not kept. Don't wait on \
+                         the session: read its transcript and files yourself now (crew.history, \
+                         crew.account, your file and machine tools), bring the person what you \
+                         find in your DM, then close this promise (crew.close_item, item_id {}, \
+                         why: brought in the DM): they have it already, so nothing more is said.",
+                        match reported {
+                            Some(what) => format!("to report {what}"),
+                            None => format!("“{what}”"),
+                        },
+                        i.id
+                    ),
+                    format!("owed:{}", i.id),
+                    "a promise due",
+                ),
+                // Its sessions ended: said once, and no longer tracked.
+                None if !i.linked().is_empty()
+                    && i.linked().iter().all(|s| self.session_ended(*s)) =>
+                {
+                    if let Err(e) = self
+                        .desk
+                        .store()
+                        .item_close(i.id, ClosedBy::Lapsed, "its session ended")
+                        .await
+                    {
+                        tracing::warn!(error = %e, "an owed promise couldn't be closed");
+                    }
+                    self.say(
+                        &i.boss,
+                        format!("Still owed to you: {what}. It isn't in yet, and its session ended, so I'm no longer tracking it."),
+                    )
+                    .await
+                }
+                None => {
+                    self.say(
+                        &i.boss,
+                        format!("Still owed to you: {what}. It isn't in yet."),
+                    )
+                    .await
+                }
+            }
+        }
+    }
+
+    /// Whether session `s` ended: gone or closed. A view that failed says
+    /// nothing.
+    fn session_ended(&self, s: Uuid) -> bool {
+        match self.desk.view(s) {
+            Ok(v) => v.state == SessionState::Closed,
+            Err(workforce_desk::DeskError::NotFound) => true,
+            Err(_) => false,
+        }
+    }
+
+    /// When `i` is due, as its reply says it: "; due by 14:30".
+    fn due_said(&self, i: &OpenItem) -> String {
+        i.due_by(crew::now(), &self.desk.timezone())
+            .map_or_else(String::new, |by| format!("; {by}"))
+    }
+
+    /// Whether the question promise `i` reports the answer to still waits
+    /// to go into its running session.
+    async fn ask_still_queued(&self, i: &OpenItem) -> bool {
+        let Some(m) = i.line_message else {
+            return false;
+        };
+        matches!(
+            self.desk.store().line_message(m).await,
+            Ok(Some(m)) if matches!(m.delivery, Delivery::Queued | Delivery::Handed)
+        )
     }
 
     /// A promise or order kept by what its sessions' accounts say they did
@@ -1517,13 +1690,8 @@ impl CrewHub {
             }
             let minute = chrono::Duration::from_std(self.timing.minute).unwrap_or_default();
             let after = minute * LAPSE_AFTER.num_minutes() as i32;
-            // Gone or closed ended it; a view that failed says nothing.
-            let ended = |s: Uuid| match self.desk.view(s) {
-                Ok(v) => v.state == SessionState::Closed,
-                Err(workforce_desk::DeskError::NotFound) => true,
-                Err(_) => false,
-            };
-            return open_item::lapsed(i, now, after, ended).map(|why| (ClosedBy::Lapsed, why));
+            return open_item::lapsed(i, now, after, |s| self.session_ended(s))
+                .map(|why| (ClosedBy::Lapsed, why));
         }
         let view = match i.session {
             Some(s) => match self.desk.view(s) {
@@ -1793,6 +1961,7 @@ impl CrewHub {
         self.resurface(&items).await;
         self.remind_waiting(&items).await;
         self.look_at_rechecks(&items).await;
+        self.chase_owed().await;
         self.post_held_questions().await;
         self.look_for_silent_waits().await;
         self.look_at_plans().await;
@@ -1873,6 +2042,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn due_minutes_is_a_whole_number_of_minutes_up_to_three_days() {
+        assert_eq!(due_minutes(&Value::Null), Ok(None));
+        assert_eq!(due_minutes(&json!(30)), Ok(Some(30)));
+        for (bad, why) in [
+            (json!(0), "due_minutes must be from 1 to 4320; 0 isn't."),
+            (json!(-5), "due_minutes must be from 1 to 4320; -5 isn't."),
+            (
+                json!(4321),
+                "due_minutes must be from 1 to 4320; 4321 isn't.",
+            ),
+        ] {
+            assert_eq!(due_minutes(&bad), Err(why.into()), "{bad}");
+        }
+        assert_eq!(due_minutes(&json!(4320)), Ok(Some(4320)));
+        assert_eq!(due_minutes(&json!(30.0)), Ok(Some(30)));
+        for bad in [
+            json!("30"),
+            json!(29.6),
+            json!("soon"),
+            json!(true),
+            json!([30]),
+        ] {
+            assert_eq!(
+                due_minutes(&bad),
+                Err("due_minutes must be a whole number of minutes.".into()),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
     fn keys_name_their_session_and_request() {
         let (s, a) = (Uuid::new_v4(), Uuid::new_v4());
         assert_eq!(
@@ -1919,6 +2119,8 @@ mod tests {
                     closed_why: None,
                     layout: Default::default(),
                     cant_decide: None,
+                    due_at: None,
+                    chased_at: None,
                 }
             })
             .collect();
@@ -1968,6 +2170,8 @@ mod tests {
             closed_why: Some(why.into()),
             layout: Default::default(),
             cant_decide: None,
+            due_at: None,
+            chased_at: None,
         }
     }
 
