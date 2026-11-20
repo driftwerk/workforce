@@ -23,7 +23,7 @@ use workforce_desk::crew::{
     self, Event, ItemKind, ItemState, Kind, MentionedApproval, Party, PartyKind,
 };
 use workforce_desk::line::{LineMessage, Wait};
-use workforce_desk::model::{DeskEvent, Origin, SessionState};
+use workforce_desk::model::{DeskEvent, Origin};
 use workforce_desk::CheckIn;
 
 use super::github::CHECK_GITHUB;
@@ -93,6 +93,17 @@ struct Undelivered {
     trigger: Trigger,
     /// They wait behind what it asks the person, which is raised too.
     behind_person: bool,
+}
+
+/// What `item` going quiet is noted by: once each time it stops moving.
+fn quiet_key(item: &crew::Item) -> String {
+    format!(
+        "quiet:{}:{}",
+        item.id,
+        item.last_activity
+            .map(|t| t.timestamp_millis())
+            .unwrap_or(0)
+    )
 }
 
 /// One thing worth waking the overseer for.
@@ -614,6 +625,8 @@ impl CrewHub {
                         .unwrap_or_default()
                 );
                 holding.insert(key.clone());
+                // Nor its quiet, once said.
+                holding.insert(quiet_key(item));
                 if let Some(found) =
                     self.undelivered(overseer, item, &party, waits, now, o.work.stall_minutes)
                 {
@@ -714,13 +727,7 @@ impl CrewHub {
                         .map(|s| (now - s).num_minutes().max(1))
                         .unwrap_or(1);
                     (
-                        format!(
-                            "quiet:{}:{}",
-                            item.id,
-                            item.last_activity
-                                .map(|t| t.timestamp_millis())
-                                .unwrap_or(0)
-                        ),
+                        quiet_key(item),
                         Trigger {
                             line: format!(
                                 "{} has been quiet for {quiet} min while working on {}{}",
@@ -769,8 +776,8 @@ impl CrewHub {
     /// The trigger for a session `waiting`, `overseer`'s messages to it
     /// (oldest first), haven't reached for `stall_minutes` while it showed
     /// no progress of its own: none while Desk holds any of them on purpose,
-    /// or once it was stopped (a lost process too: Desk offers the person to
-    /// run it again) or closed.
+    /// or once it isn't running (stopped, closed, or its process lost: Desk
+    /// offers the person to run it again).
     fn undelivered(
         &self,
         overseer: &str,
@@ -780,17 +787,15 @@ impl CrewHub {
         now: DateTime<Utc>,
         stall_minutes: u32,
     ) -> Option<Undelivered> {
-        let minute = chrono::Duration::from_std(self.timing.minute).unwrap_or_default();
-        let stall = minute * stall_minutes as i32;
+        let minute = self.crew_minutes(1);
+        let stall = self.crew_minutes(i64::from(stall_minutes));
         let oldest = waiting.first()?;
         let quiet = item.last_activity.is_none_or(|at| now - at >= stall);
         if now - oldest.at < stall || !quiet {
             return None;
         }
         let view = self.desk.view(item.id.parse().ok()?).ok()?;
-        if matches!(view.state, SessionState::Stopped | SessionState::Closed)
-            || self.person_has_questions(&view, overseer)
-        {
+        if !view.state.is_running() || self.person_has_questions(&view, overseer) {
             return None;
         }
         let waits = self.desk.line_waits(view.id, waiting)?;
@@ -807,10 +812,7 @@ impl CrewHub {
                     .to_string(),
                 true,
             ),
-            Some(Wait::Stopped) => (
-                "it isn't running, so it is held until it runs again".to_string(),
-                false,
-            ),
+            Some(Wait::Stopped) => ("Desk can't reach it to put them in".to_string(), false),
             Some(Wait::Working) => (format!("its turn hasn't ended: {LONG_STEP}"), false),
             Some(Wait::NextCall) => (
                 format!("it was told to read it with its next tool call, and hasn't made one: {LONG_STEP}"),

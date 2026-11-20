@@ -873,6 +873,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_bosss_waiting_messages_are_its_own_still_to_go_into_sessions() {
+        with_test_pool(crate::store::build_pool, |pool| async move {
+            let s = DeskStore::with_pool(pool).await.unwrap();
+            let sarah = || Party::manager("sarah", "Sarah");
+            let to = session_party(Uuid::new_v4());
+            let waiting = ask(sarah(), to.clone());
+            let delivered = ask(sarah(), to.clone());
+            let to_person = ask(sarah(), Party::you());
+            let others = ask(Party::manager("scout", "Scout"), to.clone());
+            for m in [&waiting, &delivered, &to_person, &others] {
+                s.put_line(m).await.unwrap();
+            }
+            s.line_take(delivered.id, Delivery::Delivered)
+                .await
+                .unwrap()
+                .unwrap();
+            let ids: Vec<Uuid> = s
+                .line_waiting_from("sarah")
+                .await
+                .unwrap()
+                .iter()
+                .map(|m| m.id)
+                .collect();
+            assert_eq!(ids, vec![waiting.id]);
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn the_first_answer_stands() {
         with_test_pool(crate::store::build_pool, |pool| async move {
             let s = DeskStore::with_pool(pool).await.unwrap();

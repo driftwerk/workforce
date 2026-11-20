@@ -644,6 +644,15 @@ async fn a_message_that_never_reaches_a_session_wakes_its_boss_once() {
             steered_said.contains("with its next tool call, and hasn't made one"),
             "{steered_said}"
         );
+        // The person writes to it a moment, which holds it theirs for a
+        // while: its stall, once said, isn't said again after.
+        d.line_post(
+            stuck.id,
+            "Hold on.".into(),
+            workforce_desk::line::When::Queue,
+        )
+        .await
+        .unwrap();
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         progress.abort();
         assert!(

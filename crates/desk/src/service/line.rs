@@ -2024,14 +2024,19 @@ impl Desk {
     }
 
     /// Why each of `rows`, still to go into session `id`, waits now (none:
-    /// nothing holds it there); nothing at all while Desk holds any of them
-    /// on purpose, whatever its turn ([`Wait::on_purpose`]).
+    /// nothing holds it there; one handed on, behind a running turn, waits
+    /// on that); nothing at all while Desk holds any of them on purpose,
+    /// whatever its turn ([`Wait::on_purpose`]).
     pub fn line_waits(&self, id: Uuid, rows: &[LineMessage]) -> Option<Vec<Option<Wait>>> {
         let view = self.view(id).ok()?;
         let (typed, plugin) = (self.typed_since_idle(id), self.plugin_heard(id));
+        let in_turn = self.in_a_turn(&view);
         let waits: Vec<Option<Wait>> = rows
             .iter()
-            .map(|m| self.waits_why(&view, typed, plugin, m))
+            .map(|m| match m.delivery {
+                Delivery::Handed if in_turn => Some(Wait::Working),
+                _ => self.waits_why(&view, typed, plugin, m),
+            })
             .collect();
         let on_purpose = rows
             .iter()
