@@ -976,6 +976,27 @@ const STOP_GRACE: Duration = Duration::from_secs(3);
 #[cfg(test)]
 const STOP_GRACE: Duration = Duration::from_millis(150);
 
+/// After a hang-up, SIGTERM and then SIGKILL to `pid`'s process group, each
+/// [`STOP_GRACE`] after the last, while `still` says it is the same process
+/// and it is there. It is held from the first ([`crate::leader`]: a pidfd
+/// on Linux), so a number used again is never signalled.
+async fn end_firmly<F, Fut>(id: Uuid, pid: u32, still: F)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let Some(leader) = crate::leader::Leader::of(pid) else {
+        return;
+    };
+    for (signal, name) in [(libc::SIGTERM, "SIGTERM"), (libc::SIGKILL, "SIGKILL")] {
+        tokio::time::sleep(STOP_GRACE).await;
+        if !still().await || !leader.signal_group(signal) {
+            return;
+        }
+        tracing::warn!(%id, signal = name, "a stopped session was still running");
+    }
+}
+
 enum Persist {
     Terminal(Box<TerminalRecord>),
     DeleteTerminal(Uuid),
@@ -2101,24 +2122,85 @@ impl Desk {
             .collect()
     }
 
-    /// Whether the holder still runs a process for session `id` that this
-    /// hub doesn't hold: one it couldn't take back as it started (the holder
-    /// out of reach, or its list unread). Resuming it would start a second
-    /// engine on the same conversation.
-    async fn held_untaken(&self, id: Uuid) -> bool {
-        let Some(holder) = self.holder().await else {
-            return false;
-        };
+    /// The terminals the holder still runs session `id`'s processes in.
+    async fn held_running(&self, holder: &Holder, id: Uuid) -> Vec<Held> {
         let id = id.to_string();
         match holder.list().await {
-            Ok(all) => all.iter().any(|h| {
-                !h.exited
-                    && h.meta["kind"].as_str() == Some("session")
-                    && h.meta["session"].as_str() == Some(id.as_str())
-            }),
+            Ok(all) => all
+                .into_iter()
+                .filter(|h| {
+                    !h.exited
+                        && h.meta["kind"].as_str() == Some("session")
+                        && h.meta["session"].as_str() == Some(id.as_str())
+                })
+                .collect(),
             Err(e) => {
-                tracing::warn!(session = %id, error = %e, "the PTY holder didn't list its terminals; resuming as if it holds none");
-                false
+                tracing::warn!(session = %id, error = %e, "the PTY holder didn't list its terminals; going on as if it holds none");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Whether the holder still runs a process for session `id` that this
+    /// hub doesn't hold: one it couldn't take back as it started, or whose
+    /// link ended before the process did. Resuming beside it would start a
+    /// second engine on the same conversation.
+    async fn held_untaken(&self, id: Uuid) -> bool {
+        if self.0.state.lock().live.contains_key(&id) {
+            return false;
+        }
+        match self.holder().await {
+            Some(holder) => !self.held_running(&holder, id).await.is_empty(),
+            None => false,
+        }
+    }
+
+    /// Ends the processes the holder still runs for session `id` that this
+    /// hub doesn't hold, as Stop ends one it does ([`end_firmly`]), and
+    /// forgets them once they have ended.
+    async fn end_held(&self, id: Uuid) -> Result<(), DeskError> {
+        let Some(holder) = self.holder().await else {
+            return Ok(());
+        };
+        let held = self.held_running(&holder, id).await;
+        held.iter().for_each(|h| holder.kill(h.id));
+        let still = |pid: u32| {
+            let (desk, holder) = (self.clone(), holder.clone());
+            async move {
+                desk.held_running(&holder, id)
+                    .await
+                    .iter()
+                    .any(|h| h.pid == Some(pid))
+            }
+        };
+        futures::future::join_all(
+            held.iter()
+                .filter_map(|h| h.pid)
+                .map(|pid| end_firmly(id, pid, move || still(pid))),
+        )
+        .await;
+        let mut left = Vec::new();
+        for _ in 0..20 {
+            left = self.held_running(&holder, id).await;
+            if left.is_empty() {
+                break;
+            }
+            tokio::time::sleep(STOP_GRACE / 10).await;
+        }
+        held.iter()
+            .filter(|h| !left.iter().any(|l| l.id == h.id))
+            .for_each(|h| holder.reap(h.id));
+        match left.first() {
+            None => {
+                tracing::info!(session = %id, ended = held.len(), "ended the process the PTY holder ran for a session this hub had lost hold of");
+                Ok(())
+            }
+            Some(h) => {
+                tracing::warn!(session = %id, pid = ?h.pid, "a session's process in the PTY holder wouldn't end");
+                Err(DeskError::Conflict(format!(
+                    "this session's earlier process{} is still running in Desk's terminal keeper and wouldn't end, so it wasn't started again beside it",
+                    h.pid.map(|p| format!(" (pid {p})")).unwrap_or_default()
+                )))
             }
         }
     }
@@ -3671,35 +3753,43 @@ impl Desk {
 
     /// After Stop's SIGHUP (the PTY's, which a program may handle and
     /// outlive), SIGTERM and then SIGKILL to its process group, each
-    /// [`STOP_GRACE`] after the last, while the hub still holds that same PTY
-    /// for the session and its process is still there. The process is held
-    /// from now ([`crate::leader`]: a pidfd on Linux), so a number used again
-    /// is never signalled. Sent by the hub itself, so a holder started by an
-    /// older Desk, which only hangs up, ends it too.
+    /// [`STOP_GRACE`] after the last ([`end_firmly`]), while the hub still
+    /// holds that same PTY for the session, or the holder still runs its
+    /// process after the hub's link to it ended. Sent by the hub itself, so
+    /// a holder started by an older Desk, which only hangs up, ends it too.
     fn stop_firmly(&self, id: Uuid, pty: &Arc<Pty>) {
-        let Some(leader) = pty.pid().and_then(crate::leader::Leader::of) else {
+        let Some(pid) = pty.pid() else {
             return;
         };
         let Ok(rt) = tokio::runtime::Handle::try_current() else {
             return;
         };
         let (desk, held) = (self.clone(), Arc::downgrade(pty));
-        rt.spawn(async move {
-            for (signal, name) in [(libc::SIGTERM, "SIGTERM"), (libc::SIGKILL, "SIGKILL")] {
-                tokio::time::sleep(STOP_GRACE).await;
-                let still = {
+        // Still that process: the hub holds that same PTY for it, or (its
+        // link to the holder ended before it did) the holder still runs it.
+        let still = move || {
+            let (desk, held) = (desk.clone(), held.clone());
+            async move {
+                let holds = {
                     let st = desk.0.state.lock();
-                    match (st.live.get(&id), held.upgrade()) {
-                        (Some(l), Some(p)) => Arc::ptr_eq(&l.pty, &p),
-                        _ => false,
-                    }
+                    st.live
+                        .get(&id)
+                        .map(|l| held.upgrade().is_some_and(|p| Arc::ptr_eq(&l.pty, &p)))
                 };
-                if !still || !leader.signal_group(signal) {
-                    return;
+                match holds {
+                    Some(same) => same,
+                    None => match desk.holder().await {
+                        Some(holder) => desk
+                            .held_running(&holder, id)
+                            .await
+                            .iter()
+                            .any(|h| h.pid == Some(pid)),
+                        None => false,
+                    },
                 }
-                tracing::warn!(%id, signal = name, "a stopped session was still running");
             }
-        });
+        };
+        rt.spawn(end_firmly(id, pid, still));
     }
 
     pub async fn resume(
@@ -3749,11 +3839,16 @@ impl Desk {
                 "still running in another terminal — close it there first".into(),
             ));
         }
+        // Its own hooks said its turn ended: the process it left is ended.
+        // Otherwise what it still does isn't known here.
         if self.held_untaken(id).await {
-            return Err(DeskError::Conflict(
-                "this session is still running in Desk's terminal keeper, which Desk's helper couldn't reach when it started; restart Desk's helper on this computer to take it back"
-                    .into(),
-            ));
+            if !matches!(r.state, SessionState::Done | SessionState::Idle) {
+                return Err(DeskError::Conflict(
+                    "this session's earlier process is still running in Desk's terminal keeper, though Desk lost hold of it, and its turn may not be over: restart the session to end that process and go on from its conversation"
+                        .into(),
+                ));
+            }
+            self.end_held(id).await?;
         }
         // Devin's conversation, as Devin still lists it in its folder; a new
         // one, the person told why, when it doesn't.
@@ -3995,6 +4090,11 @@ impl Desk {
                 }
                 tokio::time::sleep(Duration::from_millis(40)).await;
             }
+        }
+        // What outlived the hub's hold on it is ended too: a restart is
+        // asked to start it again.
+        if self.held_untaken(id).await {
+            self.end_held(id).await?;
         }
         self.0.state.lock().acted.insert(id);
         let view = self
@@ -8924,6 +9024,86 @@ mod tests {
             let v = d.view(s.id).unwrap();
             assert_eq!(v.origin, Origin::Desk, "the holder's child is Desk's");
             assert_ne!(v.state, SessionState::Closed);
+            holder_cancel.cancel();
+        })
+        .await;
+    }
+
+    /// A session whose process outlived the hub's hold on it (its link to
+    /// the holder ended first): a resume never starts a second engine beside
+    /// a turn that may still run, and says what is true; a restart, or a
+    /// resume once its hooks said its turn ended, ends that process (deaf to
+    /// a hang-up) and starts again.
+    #[tokio::test]
+    async fn a_process_that_outlived_the_hubs_hold_is_ended_before_its_session_goes_on() {
+        with_test_pool(build_pool, |pool| async move {
+            let (_hdir, socket, holder_cancel) = crate::holder::tests::holder().await;
+            let dir = tempfile::tempdir().unwrap();
+            let cli = dir.path().join("deaf-cli");
+            std::fs::write(&cli, "#!/bin/sh\ntrap '' HUP\nexec sleep 60\n").unwrap();
+            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut opts = options(dir.path());
+            opts.programs = crate::testing::programs(cli.clone(), cli);
+            opts.holder = Some(HolderOptions {
+                socket,
+                token: crate::holder::tests::TOKEN.into(),
+            });
+            DeskStore::migrate(&pool).await.unwrap();
+            let d = Desk::start(
+                DeskStore::from_pool(pool),
+                opts,
+                Default::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let s = new_session(&d, dir.path()).await;
+            let lose = |state: SessionState| {
+                let pid = d.attach(s.id).unwrap().pid().unwrap();
+                d.change(s.id, |r, _| {
+                    r.cli_session_id = Some("cli-held".into());
+                    r.state = state;
+                });
+                drop(d.0.state.lock().live.remove(&s.id));
+                pid
+            };
+            let gone = async |pid: u32| {
+                for _ in 0..100 {
+                    // SAFETY: kill with no signal only asks.
+                    if unsafe { libc::kill(pid as i32, 0) } != 0 {
+                        return true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                false
+            };
+
+            let first = lose(SessionState::Working);
+            let DeskError::Conflict(why) = d.resume(s.id, None, None).await.unwrap_err() else {
+                panic!("resumed beside its running turn");
+            };
+            assert!(why.contains("its turn may not be over"), "{why}");
+            assert!(why.contains("restart the session"), "{why}");
+            assert!(!why.contains("helper"), "{why}");
+            assert!(d.held_untaken(s.id).await, "nothing was ended");
+
+            let v = d.restart(s.id, None, By::you()).await.unwrap();
+            assert!(v.live);
+            assert!(gone(first).await, "the kept process ended");
+
+            let second = lose(SessionState::Done);
+            assert!(d.resume(s.id, None, None).await.unwrap().live);
+            assert!(gone(second).await);
+            assert!(!d.held_untaken(s.id).await);
+
+            // Stopped as its link ends before its process: still ended.
+            let third = d.attach(s.id).unwrap().pid().unwrap();
+            d.stop(s.id, None).unwrap();
+            drop(d.0.state.lock().live.remove(&s.id));
+            assert!(
+                gone(third).await,
+                "a stop outlived by its process ends it firmly"
+            );
             holder_cancel.cancel();
         })
         .await;

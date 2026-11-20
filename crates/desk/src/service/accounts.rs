@@ -1775,27 +1775,31 @@ impl Desk {
                 return self.view(id);
             };
             let r = self.record(id)?;
-            let (live, hit_limit, running, kept_cut_off) = {
+            let (live, limited, running, kept_cut_off) = {
                 let st = self.0.state.lock();
                 let live = st.live.contains_key(&id);
                 // Work it started that still runs (CI watchers, sub-agents).
                 let running = st.live.get(&id).map_or(0, |l| l.background.count());
                 // What Claude Code said of how its turn ended comes first;
                 // the reply's words only when it said nothing.
-                let hit_limit = matches!(r.state, SessionState::Done | SessionState::Idle)
-                    && match st.turn_failures.get(&id) {
-                        // Its login turned away, it can't go on there either.
-                        Some(f) => f.limit().is_some() || f.refused(),
-                        None => r
-                            .last_reply
-                            .as_deref()
-                            .is_some_and(|reply| crew::outcome_of(Ok(reply)).0 == Outcome::Limit),
-                    };
+                let limited = match st.turn_failures.get(&id) {
+                    // Its login turned away, it can't go on there either.
+                    Some(f) => f.limit().is_some() || f.refused(),
+                    None => r
+                        .last_reply
+                        .as_deref()
+                        .is_some_and(|reply| crew::outcome_of(Ok(reply)).0 == Outcome::Limit),
+                };
                 // What it stopped, kept to be said as it carries on.
                 let kept_cut_off = st.cut_off.contains_key(&id);
-                (live, hit_limit, running, kept_cut_off)
+                (live, limited, running, kept_cut_off)
             };
-            if r.account == to && !hit_limit {
+            let hit_limit = limited && matches!(r.state, SessionState::Done | SessionState::Idle);
+            // Its process still runs in the holder though this hub lost
+            // hold of it: it moves as one running here does, in place, even
+            // to the login its record already names.
+            let held = !live && self.held_untaken(id).await;
+            if r.account == to && !hit_limit && !held {
                 let mut st = self.0.state.lock();
                 st.switches.remove(&id);
                 st.switch_by.remove(&id);
@@ -1803,11 +1807,13 @@ impl Desk {
                 drop(st);
                 return self.view(id);
             }
-            let when = match accounts::switch_when(r.state, live, hit_limit) {
+            let when = match accounts::switch_when(r.state, live || held, hit_limit) {
                 // A restart now would stop what it left running: it moves
                 // once that ends. On the old account's limit it can't go
                 // on, so it moves now, told what was stopped.
                 SwitchWhen::Now if running > 0 => SwitchWhen::AfterTurn,
+                SwitchWhen::NextStart if held && limited => SwitchWhen::NowWithContinue,
+                SwitchWhen::NextStart if held => SwitchWhen::Now,
                 when => when,
             };
             if when == SwitchWhen::AfterTurn {
@@ -1851,22 +1857,9 @@ impl Desk {
                     .map(|(_, note)| note)
             };
             self.change(id, |r, _| r.account = to);
-            {
-                // A removed account's name is kept only while something is on it.
-                let mut st = self.0.state.lock();
-                if let Some(from) = from {
-                    let still = st.records.values().any(|r| r.account == Some(from))
-                        || st.sign_in_problems.contains_key(&from);
-                    if !still {
-                        st.removed_names.remove(&from);
-                    }
-                }
-            }
-            match when {
-                SwitchWhen::NextStart | SwitchWhen::AfterTurn => return self.view(id),
-                SwitchWhen::Now => {
-                    self.restart(id, None, by.clone()).await?;
-                }
+            let restarted = match when {
+                SwitchWhen::NextStart | SwitchWhen::AfterTurn => None,
+                SwitchWhen::Now => Some(self.restart(id, None, by.clone()).await),
                 SwitchWhen::NowWithContinue => {
                     let prompt = match note {
                         // What it ran is named first, when Desk knew of it
@@ -1881,8 +1874,31 @@ impl Desk {
                         ),
                         None => accounts::CONTINUE.into(),
                     };
-                    self.restart(id, Some(prompt), by.clone()).await?;
+                    Some(self.restart(id, Some(prompt), by.clone()).await)
                 }
+            };
+            let started = match restarted {
+                // Not started on it: it is still on the login it ran on.
+                Some(Err(e)) => {
+                    self.change(id, |r, _| r.account = from);
+                    return Err(e);
+                }
+                Some(Ok(_)) => true,
+                None => false,
+            };
+            {
+                // A removed account's name is kept only while something is on it.
+                let mut st = self.0.state.lock();
+                if let Some(from) = from {
+                    let still = st.records.values().any(|r| r.account == Some(from))
+                        || st.sign_in_problems.contains_key(&from);
+                    if !still {
+                        st.removed_names.remove(&from);
+                    }
+                }
+            }
+            if !started {
+                return self.view(id);
             }
             // A switch asked for while it restarted: carried out next.
         }
