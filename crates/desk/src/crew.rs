@@ -159,6 +159,13 @@ kinds! {
     PlanDropped => "plan_dropped",
     PlanDone => "plan_done",
     Moved => "moved",
+    // Desk moved sessions off a login that can't serve (at its limit, or
+    // turned away) to another of the same provider's (`detail`: from, to,
+    // sessions, why).
+    LoginMoved => "login_moved",
+    // No login of a provider has room for the sessions on one that can't
+    // serve: said once until that changes.
+    LoginsFull => "logins_full",
     HandedOver => "handed_over",
     HandedOff => "handed_off",
     // A boss's ask the person settled in its session themselves: Desk
@@ -437,6 +444,11 @@ pub struct Item {
     pub group_id: Option<String>,
     pub engine: Option<Engine>,
     pub origin: Option<Origin>,
+    /// The person's login a session runs on, by its name (none: the CLI's
+    /// own sign-in, or an agent), and the one it moves to once its turn
+    /// ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<String>,
     pub state: ItemState,
     pub task: Option<String>,
     pub detail: Option<String>,

@@ -44,6 +44,7 @@ use crate::{devin, devin_config};
 mod accounts;
 mod asks;
 mod engine_sign_ins;
+mod failover;
 mod identities;
 pub use accounts::Added;
 mod board;
@@ -833,6 +834,18 @@ struct State {
     /// Accounts the provider turned away, as the hub's own calls found:
     /// until a call on one serves again or it is signed in again.
     refused: HashMap<Uuid, crate::engine_accounts::Refused>,
+    /// When a probe last found each login serving (`None`: the CLI's own
+    /// sign-in): a move onto it within minutes needs no new one.
+    verified: HashMap<Option<Uuid>, std::time::Instant>,
+    /// What each session moving off a login that can't serve is told when
+    /// it runs on the new one, why it moved: with the login it moves to, so
+    /// a later move elsewhere is never told it.
+    switch_notes: HashMap<Uuid, (Option<Uuid>, String)>,
+    /// Logins (`None`: the CLI's own sign-in) whose probe didn't answer, when
+    /// and their names: left out of moves for a while.
+    unchecked: HashMap<Option<Uuid>, (std::time::Instant, String)>,
+    /// What the person was last told of no login having room (kept).
+    no_room_told: Option<String>,
     /// Each turned-away account's refusal the person was told of: its
     /// reason and when it was found, kept so a restart (which forgets what
     /// the hub's calls were told) doesn't tell it again as news.
@@ -1052,6 +1065,11 @@ struct Inner {
     read_wait: Mutex<Duration>,
     /// Held while the accounts' needs are acted on.
     accounts_moving: tokio::sync::Mutex<()>,
+    /// Desk's own moves off logins that can't serve, one run at a time,
+    /// off whoever's task asked ([`Desk::fail_over_soon`]).
+    failing_over: tokio::sync::Mutex<()>,
+    /// Asked for again while one ran: it runs once more.
+    fail_over_again: std::sync::atomic::AtomicBool,
     /// The accounts' standing as last written ([`accounts::STANDING`]).
     standing_kept: Mutex<Option<accounts::KeptStanding>>,
     /// The budgets and every subject's breaker.
@@ -1709,6 +1727,8 @@ impl Desk {
             serde_json::from_value(kept(accounts::PUT_OFF).await).unwrap_or_default();
         let refused_told: HashMap<Uuid, accounts::Told> =
             serde_json::from_value(kept(accounts::REFUSED_TOLD).await).unwrap_or_default();
+        let no_room_told: Option<String> =
+            serde_json::from_value(kept(failover::NO_ROOM_TOLD).await).unwrap_or_default();
         let profiles: HashMap<String, crate::engine::ClaudeProfile> =
             serde_json::from_value(kept(identities::PROFILES).await).unwrap_or_default();
         let prints: HashMap<identities::Raw, crate::identity::Prints> =
@@ -1731,7 +1751,9 @@ impl Desk {
         let (standing, own_standing, moved_off, limit_marks, written_by) =
             kept_standing.clone().into_state();
         let auto_switch = match store.state(accounts::AUTO_SWITCH).await {
-            Ok(kept) => kept.is_some_and(|e| e.value == serde_json::json!(true)),
+            // On unless the person turned it off: a move to another of
+            // their logins of the same provider is an ordinary one.
+            Ok(kept) => kept.is_none_or(|e| e.value != serde_json::json!(false)),
             Err(e) => {
                 tracing::warn!(error = %e, "couldn't read whether accounts switch by themselves");
                 false
@@ -1844,6 +1866,7 @@ impl Desk {
                 auto_switch,
                 put_off,
                 refused_told,
+                no_room_told,
                 profiles,
                 ..State::default()
             }),
@@ -1871,6 +1894,8 @@ impl Desk {
             reader: Mutex::new(None),
             read_wait: Mutex::new(READ_LATER),
             accounts_moving: tokio::sync::Mutex::new(()),
+            failing_over: tokio::sync::Mutex::new(()),
+            fail_over_again: std::sync::atomic::AtomicBool::new(false),
             standing_kept: Mutex::new(Some(kept_standing.clone())),
             breakers: Mutex::new(breaker::BreakerRun::default()),
             agent_spend: Mutex::new(None),
@@ -2992,7 +3017,36 @@ impl Desk {
                 // Whoever did it recorded it.
                 Transition::Halted | Transition::Dismissed => None,
                 Transition::Finished { reply } => Some(match transition::finished(reply, now) {
-                    (Outcome::Limit, _, _) => own(Kind::Limit, "hit its usage limit".into()),
+                    // Said against the login it happened on, so the boss
+                    // names it.
+                    (Outcome::Limit, _, _) => {
+                        let hit = now.failure.as_ref().and_then(|f| f.limit());
+                        let window = match hit.and_then(|h| h.minutes()) {
+                            Some(300) => "5-hour limit",
+                            Some(10_080) => "weekly limit",
+                            _ => "usage limit",
+                        };
+                        let text = match &now.account {
+                            Some(a) => format!("hit {}'s {window}", a.name),
+                            None => format!("hit its {window}"),
+                        };
+                        own(Kind::Limit, text).detail(serde_json::json!({
+                            "login": now.account,
+                            "window": hit.and_then(|h| h.window.clone()),
+                            "resetsAt": hit.and_then(|h| h.resets_at),
+                        }))
+                    }
+                    (Outcome::Failed, _, _)
+                        if now.failure.as_ref().is_some_and(|f| f.refused()) =>
+                    {
+                        let reason = crate::limit::refusal_reason(Some(reply));
+                        let text = match &now.account {
+                            Some(a) => format!("was turned away on {}: {reason}", a.name),
+                            None => format!("was turned away: {reason}"),
+                        };
+                        own(Kind::Failed, text)
+                            .detail(serde_json::json!({ "login": now.account, "refused": reason }))
+                    }
                     (Outcome::Asked, _, Some(q)) => {
                         own(Kind::Question, format!("asked “{}”", q.text))
                             .detail(serde_json::json!({ "question": q }))
@@ -4030,6 +4084,7 @@ impl Desk {
             st.cut_off.remove(&id);
             st.restarted.remove(&id);
             st.switch_by.remove(&id);
+            st.switch_notes.remove(&id);
             st.live.remove(&id)
         };
         if let Some(live) = &live {
@@ -6436,7 +6491,25 @@ impl Desk {
             }
             // A sub-agent's own failure isn't its session's turn ending: the
             // main thread's StopFailure follows if it ends the turn.
-            Hook::StopFailure { .. } if inside.is_some() => {}
+            // One turned away for the account itself is its login's
+            // refusal all the same.
+            Hook::StopFailure { failure, reply, .. } if inside.is_some() => {
+                if failure.refused() {
+                    let raw = {
+                        let st = self.0.state.lock();
+                        st.records
+                            .contains_key(&id)
+                            .then(|| Self::raw_running(&st, id))
+                    };
+                    if let Some(raw) = raw {
+                        self.session_refused(
+                            id,
+                            &raw,
+                            crate::limit::refusal_reason(reply.as_deref()),
+                        );
+                    }
+                }
+            }
             Hook::StopFailure {
                 transcript,
                 reply,
@@ -6620,6 +6693,11 @@ impl Desk {
         // readings show a window full: the plan's limit after all.
         let failure = failure.map(|f| self.cross_checked(id, f));
         let limit = failure.as_ref().and_then(|f| f.limit()).cloned();
+        // Turned away for the account itself: why, in plain words.
+        let refusal = failure
+            .as_ref()
+            .filter(|f| f.refused())
+            .map(|_| crate::limit::refusal_reason(said.as_deref()));
         // A rate limit's transcript line decides what it was.
         let rate_limit = match &failure {
             Some(crate::limit::TurnFailure::Limit(_)) => true,
@@ -6753,9 +6831,13 @@ impl Desk {
             // A switch that waited for its turn: over on the limit, whatever
             // still runs; over on another failure once nothing does. A rate
             // limit waits for its transcript's word ([`Self::failure_known`]).
+            if let Some(reason) = refusal {
+                // Its login can't serve: what runs on it moves.
+                self.session_refused(id, &on, reason);
+            }
             let waiting = background_known || self.view(id).is_ok_and(|v| v.waiting_on() > 0);
             let other_failure = failed && !rate_limit && !waiting;
-            if limit.is_some() || other_failure {
+            if limit.is_some() || refusal.is_some() || other_failure {
                 self.drive_waiting_switch(id);
             }
             if let (true, Some(p)) = (rate_limit, path) {
@@ -6922,6 +7004,22 @@ impl Desk {
     /// [`Self::mark_ok`], then kept, and the accounts told when it ended a
     /// stop.
     fn ok_seen(&self, raw: &identities::Raw, at: DateTime<Utc>) {
+        // A login turned away before a call on it served serves again.
+        if let identities::Raw::Account(account) = raw {
+            let over = {
+                let mut st = self.0.state.lock();
+                let over = st.refused.get(account).is_some_and(|r| r.at < at);
+                if over {
+                    st.refused.remove(account);
+                }
+                over
+            };
+            if over {
+                tracing::info!(%account, "a login the provider turned away served a session again");
+                self.forget_told(*account);
+                self.announce_accounts();
+            }
+        }
         let Some(ended) = Self::mark_ok(&mut self.0.state.lock(), raw, at) else {
             return;
         };
