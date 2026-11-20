@@ -762,6 +762,10 @@ pub struct MachineSession {
     /// When it was made there; none from a Desk that doesn't say.
     #[serde(default)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The boss that has it there now, by name; none while the person has
+    /// it, or from a Desk that doesn't say.
+    #[serde(default)]
+    pub boss_has: Option<String>,
 }
 
 impl MachineSession {

@@ -14,25 +14,27 @@
 //!   named for a boss that oversees nothing now, and a group this hub
 //!   holds a grant for whose boss is on another hub get none: one boss per
 //!   group.
-//! - **The main overseer's plans:** it runs no group, so each of its plans
-//!   gets a grant of its own on each machine its tickets' sessions work on
-//!   ([`plan_key`], never a sidebar group's id), holding exactly those
-//!   sessions as the plan runner last read them, while it sees them in the
-//!   sidebar. It goes once the plan has none there, or ends. It acts
-//!   within Desk at most: Act fully's one budget is counted by group.
+//! - **The main overseer's plans:** it runs no group, so each of its running
+//!   plans gets a grant of its own on each machine its tickets work on
+//!   ([`plan_key`], never a sidebar group's id), from before the first of
+//!   them starts there: each starts in it, run by the boss from launch. It
+//!   holds exactly the plan's ticket sessions there as the plan runner last
+//!   read them, while the boss sees them in the sidebar, and goes once the
+//!   plan has none there and nothing left to start there, or ends.
 //! - **What it may do:** its level as chosen here (Act fully as chosen,
 //!   the rest as it runs now, [`CrewHub::level_now`]), and its own `[oversight.act]` switches and
 //!   `parallel`. At Act fully the grant carries its daily budget (with none
 //!   set here, the most Act fully allows), and that budget is one across
-//!   this computer and every machine ([`super::shared_budget`]): each
-//!   machine acts fully only while this hub's take, at most
-//!   [`super::relayed_decide::FRESH`] old, says so with what was spent
-//!   everywhere else.
+//!   this computer and every grant of the boss on every machine
+//!   ([`super::shared_budget`]): each machine acts fully only while this
+//!   hub's take, at most [`super::relayed_decide::FRESH`] old, says so with
+//!   what was spent everywhere else.
 //! - **What it sees:** everything, terminals included, as its
 //!   `crew.history` here shows them; the machine still redacts and caps
 //!   every string.
-//! - **Never more:** no folders (it starts no session there), no
-//!   repositories (Act fully ships nowhere from a grant), no memory
+//! - **Never more:** no folders (its boss starts no session there; a plan's
+//!   ticket starts in its plan's grant only as the plan runner starts it),
+//!   no repositories (Act fully ships nowhere from a grant), no memory
 //!   search, never a resume of a stop.
 //! - **Which sessions:** that machine's sessions the sidebar has in the
 //!   group, or the plan's tickets work in, and no other.
@@ -47,7 +49,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 use workforce_common::oversight::{Level, Oversight, Scope};
-use workforce_desk::grant::{BossRef, MAX_MEMBERS};
+use workforce_desk::grant::{plan_key, plan_of, BossRef, MAX_MEMBERS};
 
 use super::relay::machine_session;
 use super::{plan, CrewHub};
@@ -120,23 +122,6 @@ fn with_budget(mut act: Value, o: &Oversight) -> Value {
     act
 }
 
-/// What a plan grant's id starts with.
-const PLAN_KEY: &str = "plan-";
-
-/// The id of plan `plan`'s grant on a machine.
-pub(crate) fn plan_key(plan: Uuid) -> String {
-    format!("{PLAN_KEY}{plan}")
-}
-
-/// The plan `group` is the grant of, when it is a plan's.
-pub(crate) fn plan_of(group: &str) -> Option<Uuid> {
-    group
-        .strip_prefix(PLAN_KEY)?
-        .parse()
-        .ok()
-        .filter(|p| plan_key(*p) == group)
-}
-
 /// `name` as a grant names its group, or `or` when it is blank.
 fn named(name: &str, or: &str) -> String {
     match name.trim() {
@@ -192,13 +177,13 @@ impl Granted {
 }
 
 /// Each plan's ticket sessions on each machine, by machine and plan, with
-/// the plan's goal.
+/// the plan's goal: none yet where its tickets are still to start.
 pub(crate) type PlanSessions = BTreeMap<(String, Uuid), (String, BTreeSet<Uuid>)>;
 
 impl CrewHub {
-    /// What `service`'s grants say of it, as the module says, at Act fully
-    /// only where `fully`; none for an id a grant can't name.
-    fn granted(&self, service: &AgentService, o: &Oversight, fully: bool) -> Option<Granted> {
+    /// What `service`'s grants say of it, as the module says; none for an
+    /// id a grant can't name.
+    fn granted(&self, service: &AgentService, o: &Oversight) -> Option<Granted> {
         let agent = service.agent_id.as_str();
         let boss = BossRef::Local {
             agent: agent.to_string(),
@@ -213,10 +198,6 @@ impl CrewHub {
         let level = match o.level {
             Level::Full if o.fully().is_ok() => Level::Full,
             _ => self.level_now(agent, o).0,
-        };
-        let level = match level {
-            Level::Full if !fully => Level::Act,
-            l => l,
         };
         let act = match level {
             Level::Full => with_budget(act_of(o), o),
@@ -236,36 +217,62 @@ impl CrewHub {
     }
 
     /// The ticket sessions `agent`'s plans run on the person's machines, as
-    /// the plan runner last read them: only for a boss of no group (a group
-    /// boss's are its group's), only while it sees each in the sidebar
-    /// (never one in a group with a boss of its own), and none of a plan
-    /// whose key a sidebar group has.
+    /// the plan runner last read them, and the machines its running plans'
+    /// tickets are still to start on: only for a boss of no group (a group
+    /// boss's are its group's), only while it sees each session in the
+    /// sidebar (never one in a group with a boss of its own), and none of
+    /// a plan whose key a sidebar group has.
     pub(crate) fn plan_sessions(&self, agent: &str, o: &Oversight) -> PlanSessions {
         if o.scope != Scope::Ungrouped {
             return PlanSessions::new();
         }
-        let ours: Vec<(String, plan::MachineSeen)> = self
+        let ours = |plan: Uuid| !self.desk.is_group(&plan_key(plan));
+        let to_start: PlanSessions = self
+            .machine_plans
+            .lock()
+            .iter()
+            .filter(|((_, plan), p)| p.boss == agent && ours(*plan))
+            .map(|(k, p)| (k.clone(), (p.goal.clone(), BTreeSet::new())))
+            .collect();
+        let seen: Vec<(String, plan::MachineSeen)> = self
             .machine_seen
             .lock()
             .iter()
             .filter(|(_, s)| s.boss == agent && s.state != "gone")
             .map(|(k, s)| (k.clone(), s.clone()))
             .collect();
-        let seen = self.desk.seen_by(&o.scope);
-        ours.into_iter()
+        let sees = self.desk.seen_by(&o.scope);
+        seen.into_iter()
             .filter_map(|(item, s)| {
                 let (m, id) = machine_session(&item)?;
                 let group = self.desk.group_of_member(&format!("session:{item}"));
-                (seen.sees(group.as_deref()) && !self.desk.is_group(&plan_key(s.plan)))
+                (sees.sees(group.as_deref()) && ours(s.plan))
                     .then(|| ((m.to_string(), s.plan), s.goal, id))
             })
-            .fold(PlanSessions::new(), |mut out, (k, goal, id)| {
+            .fold(to_start, |mut out, (k, goal, id)| {
                 out.entry(k)
                     .or_insert_with(|| (goal, BTreeSet::new()))
                     .1
                     .insert(id);
                 out
             })
+    }
+
+    /// Each machine whose sessions `agent` runs, with the grant they are
+    /// under there: its group's, by the sidebar, or each of its plans'.
+    pub(crate) fn machine_grants_of(&self, agent: &str, o: &Oversight) -> Vec<(String, String)> {
+        match o.scope.group() {
+            Some(g) => self
+                .machines_in(g)
+                .into_iter()
+                .map(|m| (m, g.to_string()))
+                .collect(),
+            None => self
+                .plan_sessions(agent, o)
+                .into_keys()
+                .map(|(m, plan)| (m, plan_key(plan)))
+                .collect(),
+        }
     }
 
     /// The grant `agent`'s call on session `id` of `machine` goes under
@@ -349,7 +356,7 @@ impl CrewHub {
             let Some(granted) = (!by_machine.is_empty())
                 .then(|| overseers.iter().find(|(_, o)| o.scope == scope))
                 .flatten()
-                .and_then(|(service, o)| self.granted(service, o, true))
+                .and_then(|(service, o)| self.granted(service, o))
             else {
                 continue;
             };
@@ -361,7 +368,7 @@ impl CrewHub {
         for (service, o) in &overseers {
             let plans = self.plan_sessions(service.agent_id.as_str(), o);
             let Some(granted) = (!plans.is_empty())
-                .then(|| self.granted(service, o, false))
+                .then(|| self.granted(service, o))
                 .flatten()
             else {
                 continue;

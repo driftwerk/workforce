@@ -1,22 +1,27 @@
 //! One Act fully budget for a boss on this hub, counted across this
-//! computer and every machine whose sessions of its group it runs
-//! (designs/act-fully-machines-design.md). Each take the Mac relays to a machine
-//! ([`super::relayed_decide`]) carries where today's count starts here
-//! (`countFrom`) and what was spent everywhere else (`spentElsewhereUsd`);
-//! the machine answers with its own spend since then (`spentUsd`). The Mac
-//! keeps each machine's latest answer, here and in `machine_spent`, and
-//! [`CrewHub::fully`] counts them with this computer's own spend: when the
+//! computer and every grant it has on every machine: its group's, and each
+//! of its plans' (designs/act-fully-machines-design.md). Each take the Mac
+//! relays under a grant ([`super::relayed_decide`]) carries where today's
+//! count starts here (`countFrom`) and what was spent everywhere but that
+//! grant there (`spentElsewhereUsd`); the machine answers with that grant's
+//! sessions' spend since then (`spentUsd`). The Mac keeps each grant's
+//! latest answer, here and in `machine_grant_spent`, and
+//! [`CrewHub::fully`] adds them all to this computer's own spend: when the
 //! total reaches the budget, Act fully ends here, and the next take ends it
 //! on every machine.
 //!
-//! - A count is a machine's whole spend since `countFrom`, never a delta,
+//! - A count is a grant's whole spend since `countFrom`, never a delta,
 //!   so a lost or repeated answer changes nothing; for the same
 //!   `countFrom` the larger is kept, so a late answer never lowers it.
+//!   Two grants on one machine are two counts, added up.
+//! - A machine's one count from before grants were told apart
+//!   ([`ALL`]) is what it spent in all then: that machine counts at least
+//!   that much.
 //! - Each count is kept for its own `countFrom`, so a count for one start
 //!   never stands in for another's (a clear, midnight, or a change of time
 //!   zone moving the start either way). Counts over [`KEPT_FOR`] old go;
-//!   none goes because its machine went offline or left the group: that
-//!   money was spent.
+//!   none goes because its machine went offline, or its grant went (a
+//!   session left the group, a plan ended): that money was spent.
 //! - Until what was kept has been read back after a start, no boss here
 //!   acts fully ([`CrewHub::machines_spent`] says nothing), so a restart
 //!   never forgets an offline machine's spend.
@@ -25,7 +30,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use workforce_common::oversight::Oversight;
-use workforce_desk::machine_spent_store::MachineSpent;
+use workforce_desk::machine_spent_store::{MachineSpent, ALL};
 
 use super::CrewHub;
 
@@ -37,10 +42,10 @@ pub(crate) const MOST_USD: f64 = 1_000_000.0;
 /// once its day is well over.
 pub(crate) const KEPT_FOR: chrono::Duration = chrono::Duration::days(3);
 
-/// A machine's count, by machine and where it starts.
-type Slot = (String, DateTime<Utc>);
+/// A grant's count, by machine, grant and where it starts.
+type Slot = (String, String, DateTime<Utc>);
 
-/// Each machine's counts, by boss, machine and start.
+/// Each grant's counts, by boss, machine, grant and start.
 #[derive(Debug, Default)]
 pub(crate) struct Machines {
     loaded: bool,
@@ -57,7 +62,7 @@ impl Machines {
             .counts
             .entry(s.agent.clone())
             .or_default()
-            .entry((s.machine.clone(), s.count_from))
+            .entry((s.machine.clone(), s.grant.clone(), s.count_from))
             .or_insert(f64::NEG_INFINITY);
         let changed = s.usd > *slot;
         if changed {
@@ -69,20 +74,36 @@ impl Machines {
     /// Forgets counts that started over [`KEPT_FOR`] before `now`.
     fn tidy(&mut self, now: DateTime<Utc>) {
         for c in self.counts.values_mut() {
-            c.retain(|(_, f), _| now - *f <= KEPT_FOR);
+            c.retain(|(.., f), _| now - *f <= KEPT_FOR);
         }
         self.counts.retain(|_, c| !c.is_empty());
-        self.unsaved.retain(|(_, (_, f))| now - *f <= KEPT_FOR);
+        self.unsaved.retain(|(_, (.., f))| now - *f <= KEPT_FOR);
     }
 
-    /// What `agent`'s machines but `except` spent since `from`.
-    fn sum(&self, agent: &str, from: DateTime<Utc>, except: Option<&str>) -> f64 {
-        self.counts.get(agent).map_or(0.0, |m| {
-            m.iter()
-                .filter(|((machine, f), _)| Some(machine.as_str()) != except && *f == from)
-                .map(|(_, usd)| *usd)
-                .sum()
-        })
+    /// What `agent`'s grants on every machine but `except` (a machine and
+    /// grant) spent since `from`: each machine its grants' counts added up,
+    /// and never less than its count from before grants were told apart.
+    fn sum(&self, agent: &str, from: DateTime<Utc>, except: Option<(&str, &str)>) -> f64 {
+        let Some(counts) = self.counts.get(agent) else {
+            return 0.0;
+        };
+        let mut machines: HashMap<&str, (f64, f64)> = HashMap::new();
+        for ((machine, grant, _), usd) in counts.iter().filter(|((.., f), _)| *f == from) {
+            let (all, grants) = machines.entry(machine.as_str()).or_default();
+            match grant.as_str() {
+                ALL => *all = all.max(*usd),
+                _ => *grants += usd,
+            }
+        }
+        let left_out = except
+            .and_then(|(m, g)| counts.get(&(m.to_string(), g.to_string(), from)))
+            .copied()
+            .unwrap_or(0.0);
+        let total: f64 = machines
+            .values()
+            .map(|(all, grants)| all.max(*grants))
+            .sum();
+        (total - left_out).max(0.0)
     }
 }
 
@@ -140,36 +161,43 @@ impl CrewHub {
         m.loaded.then(|| m.sum(agent, from, None))
     }
 
-    /// What `agent` spent since `from` everywhere but `machine`: this
-    /// computer's own spend, as last read, and every other machine's
-    /// count. None while either isn't known.
+    /// What `agent` spent since `from` everywhere but its grant `grant` on
+    /// `machine`: this computer's own spend, as last read, and every other
+    /// grant's count, on that machine too. None while either isn't known.
     pub(crate) fn spent_elsewhere(
         &self,
         agent: &str,
         machine: &str,
+        grant: &str,
         from: DateTime<Utc>,
     ) -> Option<f64> {
         let here = self.spent_today.lock().get(agent).copied()?;
         let m = self.machine_spent.lock();
-        m.loaded.then(|| here + m.sum(agent, from, Some(machine)))
+        m.loaded
+            .then(|| here + m.sum(agent, from, Some((machine, grant))))
     }
 
-    /// `machine` said `agent`'s sessions there spent `usd` since `from`:
-    /// counted at once, and kept.
+    /// `machine` said `agent`'s sessions there under its grant `grant`
+    /// spent `usd` since `from`: counted at once, and kept.
     pub(crate) async fn machine_reported(
         &self,
         agent: &str,
         machine: &str,
+        grant: &str,
         from: DateTime<Utc>,
         usd: f64,
     ) {
         let s = MachineSpent {
             agent: agent.to_string(),
             machine: machine.to_string(),
+            grant: grant.to_string(),
             count_from: from,
             usd,
         };
-        let key = (agent.to_string(), (machine.to_string(), from));
+        let key = (
+            agent.to_string(),
+            (machine.to_string(), grant.to_string(), from),
+        );
         let write = {
             let mut m = self.machine_spent.lock();
             m.tidy(Utc::now());
@@ -206,9 +234,14 @@ mod tests {
     }
 
     fn s(machine: &str, from: DateTime<Utc>, usd: f64) -> MachineSpent {
+        on(machine, "acme", from, usd)
+    }
+
+    fn on(machine: &str, grant: &str, from: DateTime<Utc>, usd: f64) -> MachineSpent {
         MachineSpent {
             agent: "sarah".into(),
             machine: machine.into(),
+            grant: grant.into(),
             count_from: from,
             usd,
         }
@@ -226,7 +259,7 @@ mod tests {
         );
         m.take(&s("buildbox", at(0), 5.0));
         assert_eq!(m.sum("sarah", at(0), None), 15.0);
-        assert_eq!(m.sum("sarah", at(0), Some("devbox")), 5.0);
+        assert_eq!(m.sum("sarah", at(0), Some(("devbox", "acme"))), 5.0);
         // Cleared at 09:00: the old counts say nothing of the new day.
         m.take(&s("devbox", at(9), 1.0));
         assert_eq!(m.sum("sarah", at(9), None), 1.0);
@@ -243,6 +276,41 @@ mod tests {
         assert_eq!(m.sum("sarah", at(0), None), 0.0, "old counts go");
         assert_eq!(m.sum("sarah", at(9), None), 1.0);
         assert_eq!(m.sum("other", at(9), None), 0.0);
+    }
+
+    #[test]
+    fn a_bosss_grants_on_one_machine_add_up_and_one_gone_still_counts() {
+        let mut m = Machines::default();
+        m.take(&on("devbox", "plan-a", at(0), 10.0));
+        m.take(&on("devbox", "plan-b", at(0), 4.0));
+        m.take(&on("buildbox", "plan-a", at(0), 1.0));
+        assert_eq!(m.sum("sarah", at(0), None), 15.0, "one total, not the most");
+        assert_eq!(m.sum("sarah", at(0), Some(("devbox", "plan-a"))), 5.0);
+        assert_eq!(m.sum("sarah", at(0), Some(("devbox", "plan-b"))), 11.0);
+        // plan-a's grant went: nothing more comes for it, and what it spent
+        // still counts as plan-b spends on.
+        m.take(&on("devbox", "plan-b", at(0), 12.0));
+        assert_eq!(m.sum("sarah", at(0), None), 23.0);
+    }
+
+    #[test]
+    fn a_count_from_before_grants_were_told_apart_is_its_machines_least() {
+        let mut m = Machines::default();
+        m.take(&on("devbox", ALL, at(0), 20.0));
+        m.take(&on("devbox", "acme", at(0), 12.0));
+        assert_eq!(
+            m.sum("sarah", at(0), None),
+            20.0,
+            "never less than it said in all"
+        );
+        assert_eq!(m.sum("sarah", at(0), Some(("devbox", "acme"))), 8.0);
+        m.take(&on("devbox", "plan-b", at(0), 15.0));
+        assert_eq!(
+            m.sum("sarah", at(0), None),
+            27.0,
+            "once its grants say more"
+        );
+        assert_eq!(m.sum("sarah", at(0), Some(("devbox", "plan-b"))), 12.0);
     }
 
     #[test]

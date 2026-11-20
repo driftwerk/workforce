@@ -10,7 +10,9 @@
 //!   and waits for its answer, as a remote boss's does on its uplink
 //!   ([`super::remote_decide`]).
 //! - **On the Mac**, while Act fully is in force for the overseer there, its
-//!   pump relays [`TAKE`] to each machine of its group every second. Each
+//!   pump relays [`TAKE`] under each of its grants on each machine (its
+//!   group's, or each of its plans', [`CrewHub::machine_grants_of`]) every
+//!   second. Each
 //!   take hands back what waits, once, and says the home holds it at Act
 //!   fully. The Mac makes one decision call on the overseer's own model for
 //!   each, as for a local boss, and relays [`DECIDED`] with its text.
@@ -210,19 +212,18 @@ impl CrewHub {
     }
 
     /// What Act fully's one budget counts as spent today for `party`
-    /// (`home/<agent>`), by its home's word that is still fresh: its
-    /// sessions' spend here and everywhere else. None without one, so it
-    /// doesn't act fully.
+    /// (`home/<agent>`), by its home's words that are still fresh: each is
+    /// one grant's sessions' spend here and what the home counts everywhere
+    /// else, its other grants here included, so the most of them. None
+    /// without one, so it doesn't act fully.
     pub(crate) fn relayed_spent(&self, party: &str) -> Option<f64> {
-        let out = self.relayed.lock();
-        let fresh: Vec<&Home> = out
+        self.relayed
+            .lock()
             .homes
             .iter()
             .filter(|((p, _), h)| p == party && h.at.elapsed() < FRESH)
-            .map(|(_, h)| h)
-            .collect();
-        let elsewhere = fresh.iter().map(|h| h.elsewhere).reduce(f64::max)?;
-        Some(fresh.iter().map(|h| h.here).sum::<f64>() + elsewhere)
+            .map(|(_, h)| h.here + h.elsewhere)
+            .reduce(f64::max)
     }
 
     /// What `group`'s sessions here spent since `from` in real money (calls
@@ -325,9 +326,9 @@ impl CrewHub {
     /// The home's take for `boss`'s decisions in `group` ([`TAKE`]): it
     /// says whether Act fully is in force for it there (`inForce`, at the
     /// level `ceiling` says), where today's count starts there
-    /// (`countFrom`) and what was spent everywhere else
+    /// (`countFrom`) and what was spent everywhere but this grant here
     /// (`spentElsewhereUsd`), and is handed what waits, each once. Its
-    /// answer says what the group's sessions here spent since `countFrom`
+    /// answer says what the grant's sessions here spent since `countFrom`
     /// (`spentUsd`), for the home to count ([`super::shared_budget`]).
     pub(crate) async fn take_relayed(
         &self,
@@ -602,9 +603,9 @@ impl CrewHub {
     }
 }
 
-/// The Mac's pump: while Desk relays, each overseer of a group with
-/// machine sessions takes its decisions from each machine, as the module
-/// says, and says so when Act fully ends.
+/// The Mac's pump: while Desk relays, each overseer with grants on the
+/// person's machines takes its decisions under each, as the module says,
+/// and says so when Act fully ends.
 pub(crate) async fn pump_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     let pumps: Pumps = Arc::default();
     let mut tick = tokio::time::interval(TAKE_EVERY / 4);
@@ -620,13 +621,13 @@ pub(crate) async fn pump_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
         }
         let mut seen = HashSet::new();
         for (service, o) in crew.overseers() {
-            let Some(group) = o.scope.group().map(str::to_string) else {
-                continue;
-            };
             let agent = service.agent_id.as_str().to_string();
+            let grants = crew.machine_grants_of(&agent, &o);
+            if grants.is_empty() {
+                continue;
+            }
             let in_force = crew.relay_in_force(&agent, &o);
-            for machine in crew.machines_in(&group) {
-                let k = (machine.clone(), group.clone());
+            for k in grants {
                 seen.insert(k.clone());
                 {
                     let mut p = pumps.lock();
@@ -646,14 +647,14 @@ pub(crate) async fn pump_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 ));
             }
         }
-        // A machine's group no overseer here takes from now: dropped. Its
+        // A machine's grant no overseer here takes from now: dropped. Its
         // machine stops holding it within [`FRESH`].
         pumps.lock().retain(|k, p| seen.contains(k) || p.busy);
     }
 }
 
-/// One take from `k`'s machine for its group, and the decisions it hands
-/// back, each decided and answered.
+/// One take from `k`'s machine under its grant, and the decisions it
+/// hands back, each decided and answered.
 async fn take(
     crew: Arc<CrewHub>,
     service: Arc<AgentService>,
@@ -667,9 +668,9 @@ async fn take(
     let ceiling = crew.ceiling_now(&agent, &o);
     let started = Instant::now();
     // One budget across this Mac and every machine: where today's count
-    // starts here, and what was spent everywhere but this machine.
+    // starts here, and what was spent everywhere but this grant there.
     let from = crew.count_from(&o);
-    let elsewhere = from.and_then(|f| crew.spent_elsewhere(&agent, machine, f));
+    let elsewhere = from.and_then(|f| crew.spent_elsewhere(&agent, machine, group, f));
     // As many as there is room to decide now: none is refused for pace.
     // In force there only once the machine said it counts this budget, so
     // an engine that counts only its own spend never acts fully.
@@ -714,7 +715,7 @@ async fn take(
         _ => None,
     };
     if let Some((f, usd)) = reported {
-        crew.machine_reported(&agent, machine, f, usd).await;
+        crew.machine_reported(&agent, machine, group, f, usd).await;
     }
     {
         let mut p = pumps.lock();

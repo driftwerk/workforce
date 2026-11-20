@@ -758,9 +758,25 @@ async fn switch_account(
         .into_response()
 }
 
-async fn create(State(s): S, h: HeaderMap, Query(q): Q, Json(new): Json<NewSession>) -> Response {
+/// A start as New session asks it, or as a plan's ticket on this machine
+/// for its plan's boss (`boss`, `local:<agent>`), run by it from launch
+/// ([`Desk::create_held`]).
+#[derive(Deserialize)]
+struct Start {
+    #[serde(flatten)]
+    new: NewSession,
+    #[serde(default)]
+    boss: Option<String>,
+}
+
+async fn create(State(s): S, h: HeaderMap, Query(q): Q, Json(start): Json<Start>) -> Response {
     guarded!(s, h, q);
-    s.desk.create_chosen(new).await.map(Json).into_response()
+    match start.boss {
+        Some(boss) => s.desk.create_held(start.new, &boss).await,
+        None => s.desk.create_chosen(start.new).await,
+    }
+    .map(Json)
+    .into_response()
 }
 
 async fn update(

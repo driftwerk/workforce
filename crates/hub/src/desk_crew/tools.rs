@@ -832,31 +832,6 @@ impl CrewTool {
         self.scope.group()
     }
 
-    /// Each machine whose sessions it runs, with the grant they are under
-    /// there: its group's, by the sidebar, or each of its plans'.
-    fn machines(&self, crew: &CrewHub, b: &Bound) -> Vec<(String, String)> {
-        let Some(g) = self.group() else {
-            return crew
-                .plan_sessions(b.service.agent_id.as_str(), &b.oversight)
-                .into_keys()
-                .map(|(m, plan)| (m, super::machine_grants::plan_key(plan)))
-                .collect();
-        };
-        let layout = crew.desk.layout();
-        let mut out: Vec<(String, String)> = layout
-            .groups
-            .iter()
-            .filter(|x| x.id == g)
-            .flat_map(|x| x.items.iter())
-            .filter_map(|i| i.strip_prefix("session:"))
-            .filter_map(super::relay::machine_session)
-            .map(|(m, _)| (m.to_string(), g.to_string()))
-            .collect();
-        out.sort();
-        out.dedup();
-        out
-    }
-
     /// `local`, the overview of this Mac, with each machine's part of what
     /// it runs there, asked through the relay at once.
     async fn with_machines(
@@ -866,7 +841,7 @@ impl CrewTool {
         boss: &str,
         local: Value,
     ) -> Value {
-        let machines = self.machines(crew, b);
+        let machines = crew.machine_grants_of(b.service.agent_id.as_str(), &b.oversight);
         if machines.is_empty() {
             return local;
         }
@@ -899,7 +874,7 @@ impl CrewTool {
             // In its own group by the sidebar, as the machine's grant will
             // also say: nothing outside it is sent anywhere.
             Some(g)
-                if super::machine_grants::plan_of(g).is_none()
+                if workforce_desk::grant::plan_of(g).is_none()
                     && crew.desk.group_of_member(&format!("session:{machine}/{id}")).as_deref()
                         == Some(g) =>
             {

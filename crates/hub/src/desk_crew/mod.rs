@@ -293,12 +293,16 @@ pub struct CrewHub {
     plan_watch: Mutex<plan_watch::Watch>,
     /// What failed to start, for its plan's next turn.
     plan_failures: Mutex<Vec<(uuid::Uuid, String)>>,
-    /// The plan tickets waiting on something under way (a clone) to start,
-    /// with what they wait on: their boss is told once.
-    plan_waiting: Mutex<HashMap<uuid::Uuid, (uuid::Uuid, String)>>,
+    /// The plan tickets waiting on something under way (a clone, their
+    /// plan's grant on a machine) to start, with what they wait on, and
+    /// whether they are ready to be tried again: their boss is told once.
+    plan_waiting: Mutex<HashMap<uuid::Uuid, (uuid::Uuid, String, bool)>>,
     /// Plans' sessions on the person's machines, as last read there, by
     /// `<machine>/<id>`; and when each machine was last read.
     machine_seen: Mutex<HashMap<String, plan::MachineSeen>>,
+    /// The machines each running plan of a boss of no group has tickets
+    /// still to start on, by machine and plan, as last read.
+    machine_plans: Mutex<std::collections::BTreeMap<(String, uuid::Uuid), plan::MachinePlan>>,
     /// Whether the plans' machine sessions were read since the hub started:
     /// until then no plan grant is said ([`machine_grants`]).
     plans_watched: std::sync::atomic::AtomicBool,
@@ -769,6 +773,7 @@ impl CrewHub {
             plan_failures: Mutex::default(),
             plan_waiting: Mutex::default(),
             machine_seen: Mutex::default(),
+            machine_plans: Mutex::default(),
             plans_watched: std::sync::atomic::AtomicBool::new(false),
             machine_read: Mutex::default(),
             machine_down: Mutex::default(),

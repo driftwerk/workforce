@@ -366,6 +366,29 @@ pub fn group_id_ok(id: &str) -> bool {
     !id.trim().is_empty() && id.len() <= MAX_ID && !id.contains('/') && !id.contains(':')
 }
 
+/// What a plan's own grant's id starts with: the home's main overseer runs
+/// no group, so each of its plans has a grant of its own on each machine
+/// its tickets work on.
+const PLAN_GRANT: &str = "plan-";
+
+/// The id of plan `plan`'s grant on a machine.
+pub fn plan_key(plan: Uuid) -> String {
+    format!("{PLAN_GRANT}{plan}")
+}
+
+/// The plan `group` is the grant of, when it is a plan's.
+pub fn plan_of(group: &str) -> Option<Uuid> {
+    group
+        .strip_prefix(PLAN_GRANT)?
+        .parse()
+        .ok()
+        .filter(|p| plan_key(*p) == group)
+}
+
+/// How a machine refuses a plan's ticket started for its boss while it
+/// doesn't hold that plan's grant for that boss: the start waits for it.
+pub const NOT_HELD: &str = "This machine doesn't hold its plan's grant for that boss yet";
+
 fn check_list(what: &str, list: &[String]) -> Result<(), Refusal> {
     if list.len() > MAX_LIST {
         return Err(invalid(format!("at most {MAX_LIST} {what}")));

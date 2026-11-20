@@ -93,6 +93,14 @@ impl Failed {
     }
 }
 
+/// A running plan of a boss of no group, as each machine its tickets are
+/// still to start on knows it: its plan grant is there before they start.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct MachinePlan {
+    pub boss: String,
+    pub goal: String,
+}
+
 /// A plan's session on one of the person's machines, as last read there.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct MachineSeen {
@@ -1497,6 +1505,7 @@ impl CrewHub {
             }
         };
         let mut unread = HashSet::new();
+        let mut to_start = Vec::new();
         for s in open
             .iter()
             .filter(|s| !matches!(s.plan.state, PlanState::Done | PlanState::Dropped))
@@ -1507,6 +1516,19 @@ impl CrewHub {
             };
             for t in &detail.tickets {
                 let row = &t.ticket.ticket;
+                if let Some(m) = t.machine.as_ref().filter(|_| {
+                    s.plan.state == PlanState::Running
+                        && s.plan.group.is_none()
+                        && matches!(row.state, TicketState::Todo | TicketState::Doing)
+                }) {
+                    to_start.push((
+                        (m.clone(), s.plan.id),
+                        MachinePlan {
+                            boss: s.plan.boss.clone(),
+                            goal: s.plan.goal.clone(),
+                        },
+                    ));
+                }
                 if !matches!(row.state, TicketState::Doing | TicketState::Review) {
                     continue;
                 }
@@ -1543,6 +1565,9 @@ impl CrewHub {
             self.machine_seen
                 .lock()
                 .retain(|k, s| ours.contains(k) || unread.contains(&s.plan));
+            let mut plans = self.machine_plans.lock();
+            plans.retain(|(_, p), _| unread.contains(p));
+            plans.extend(to_start);
             let machines: HashSet<&String> = on.keys().collect();
             self.machine_down.lock().retain(|m, _| machines.contains(m));
         }
@@ -1747,14 +1772,14 @@ impl CrewHub {
                 // One that left To do, or this plan, waits no more.
                 let waiting: Vec<Uuid> = {
                     let mut w = self.plan_waiting.lock();
-                    w.retain(|id, (plan, _)| {
+                    w.retain(|id, (plan, ..)| {
                         *plan != p.id
                             || tickets
                                 .iter()
                                 .any(|t| t.id == *id && t.state == TicketState::Todo && !t.assigned)
                     });
                     w.iter()
-                        .filter(|(_, (plan, _))| *plan == p.id)
+                        .filter(|(_, (plan, _, ready))| *plan == p.id && !ready)
                         .map(|(id, _)| *id)
                         .collect()
                 };
@@ -1789,13 +1814,17 @@ impl CrewHub {
                                     },
                                 );
                             }
+                            if let Some(note) = started.note {
+                                self.plan_failures.lock().push((p.id, note));
+                            }
                         }
                         // Read again next pass: a race, the breaker, a pause.
                         Err(e @ workforce_desk::StartRefused::Skipped(_)) => {
                             tracing::info!(plan = %p.id, ticket = %s.ticket, error = %e, "a plan's ticket didn't start now");
                         }
-                        // Under way (a clone): not a failure; its boss is
-                        // told once what it waits on.
+                        // Under way (a clone, its plan's grant on its
+                        // machine): not a failure; its boss is told once
+                        // what it waits on.
                         Err(workforce_desk::StartRefused::Waits(why)) => {
                             self.plan_waits(p.id, s.ticket, why);
                         }
@@ -1811,9 +1840,13 @@ impl CrewHub {
                 }
                 for id in waiting {
                     match self.desk.plan_prepare(&p, id, &boss).await {
-                        // Ready: it starts with the rest, next pass.
+                        // Ready: it starts with the rest, next pass, and what
+                        // it waited on is kept, so the same wait again isn't
+                        // told twice.
                         Ok(()) | Err(workforce_desk::StartRefused::Skipped(_)) => {
-                            self.plan_waiting.lock().remove(&id);
+                            if let Some(w) = self.plan_waiting.lock().get_mut(&id) {
+                                w.2 = true;
+                            }
                         }
                         Err(workforce_desk::StartRefused::Waits(why)) => {
                             self.plan_waits(p.id, id, why);
@@ -1841,8 +1874,8 @@ impl CrewHub {
         let tell = self
             .plan_waiting
             .lock()
-            .insert(ticket, (plan, why.clone()))
-            .is_none_or(|(_, was)| was != why);
+            .insert(ticket, (plan, why.clone(), false))
+            .is_none_or(|(_, was, _)| was != why);
         if tell {
             self.plan_failures.lock().push((plan, why));
         }
@@ -2540,6 +2573,7 @@ mod tests {
             state: state.into(),
             last_reply: reply.map(str::to_string),
             created_at: None,
+            boss_has: None,
         };
         // Nothing new: nothing said.
         assert_eq!(
