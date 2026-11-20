@@ -2451,10 +2451,9 @@ impl Desk {
     /// Puts ticket `ticket` of plan `plan`, in Doing on `session` (its
     /// assignee's id: `machine/id` for one on a machine), back in To do,
     /// held back with `why`: its plan doesn't start it again by itself
-    /// until someone starts it, hands it out or moves it on. Whether it
-    /// did: not once it is elsewhere or someone else's. Called under the
-    /// runner's start lock, so no start comes between the move and the
-    /// hold.
+    /// until someone starts it, hands it out or moves it on, in the one
+    /// write that moves it. Whether it did: not once it is elsewhere,
+    /// someone else's, or changed since it was read.
     pub async fn hold_back_ticket(
         &self,
         plan: Uuid,
@@ -2475,14 +2474,14 @@ impl Desk {
             before: None,
             after: None,
         };
-        let moved = self.move_read(t, mv, &By::desk(why)).await?;
-        self.0
-            .store
-            .hold_back(ticket, moved.ticket.version, why)
-            .await
-            .map_err(internal)?;
-        self.plan_touched(plan).await;
-        Ok(true)
+        match self.move_holding(t, mv, &By::desk(why), Some(why)).await {
+            Ok(_) => {
+                self.plan_touched(plan).await;
+                Ok(true)
+            }
+            Err(DeskError::Conflict(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// Finishes the start `s` that a stop cut off: its session is known (it

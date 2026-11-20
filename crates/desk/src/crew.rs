@@ -763,9 +763,18 @@ pub struct MachineSession {
     #[serde(default)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     /// How its process last ended on its own; none from a Desk that
-    /// doesn't say.
-    #[serde(default)]
+    /// doesn't say, or says it in a way this one can't read.
+    #[serde(default, deserialize_with = "exited_or_none")]
     pub exited: Option<crate::model::Exited>,
+}
+
+/// A machine session's `exited` as its Desk said it; none where it can't
+/// be read, so the rest of it still is.
+fn exited_or_none<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<crate::model::Exited>, D::Error> {
+    <serde_json::Value as serde::Deserialize>::deserialize(d)
+        .map(|v| serde_json::from_value(v).ok())
 }
 
 impl MachineSession {
@@ -1061,6 +1070,14 @@ pub fn clip(text: &str, max: usize) -> String {
     }
     let cut: String = text.chars().take(max.saturating_sub(1)).collect();
     format!("{}…", cut.trim_end())
+}
+
+/// The last `max` characters of `text`.
+pub fn tail_chars(text: &str, max: usize) -> &str {
+    let skip = text.chars().count().saturating_sub(max);
+    text.char_indices()
+        .nth(skip)
+        .map_or("", |(at, _)| &text[at..])
 }
 
 /// The question a reply ends on, to the person: its last sentence when that

@@ -133,9 +133,9 @@ pub struct Runs {
     /// set it.
     pub adopted: bool,
     /// Why it waits in To do for someone to start it, its plan not
-    /// starting it by itself. Read only: [`DeskStore::hold_back`] sets it,
-    /// and starting it, handing it out, moving it to another column or
-    /// letting it go from its plan clears it.
+    /// starting it by itself. Read only: [`DeskStore::put_ticket_holding`]
+    /// sets it, and starting it, handing it out, moving it to another
+    /// column or letting it go from its plan clears it.
     pub held_back: Option<String>,
 }
 
@@ -435,22 +435,6 @@ impl DeskStore {
                 ))
             })
             .collect()
-    }
-
-    /// Holds `ticket` back in To do with `why` ([`Runs::held_back`]), while
-    /// it is as it was read (`version`), in To do, in a plan, and no one has
-    /// it: whether it was.
-    pub async fn hold_back(&self, ticket: Uuid, version: i32, why: &str) -> Result<bool> {
-        let client = self.pool().get().await?;
-        Ok(client
-            .execute(
-                "UPDATE tickets SET held_back = $3, version = version + 1 \
-                 WHERE id = $1 AND version = $2 AND state = 'todo' AND assignee IS NULL \
-                 AND plan IS NOT NULL",
-                &[&ticket, &version, &why],
-            )
-            .await?
-            == 1)
     }
 
     /// The plan `ticket` is in, if any.

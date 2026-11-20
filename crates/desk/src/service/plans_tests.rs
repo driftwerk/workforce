@@ -618,6 +618,55 @@ async fn a_ticket_the_person_moved_before_a_cut_off_start_is_left_where_they_put
 }
 
 #[tokio::test]
+async fn a_ticket_is_held_back_only_while_its_own_session_has_it_and_until_someone_moves_it_on() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let p = d
+            .propose_plan(new_plan(dir.path(), &[("a", &[]), ("b", &[])]), &sarah(), &by_sarah())
+            .await
+            .unwrap();
+        let id = p.summary.plan.id;
+        let p = d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let a = p.tickets[0].ticket.ticket.id;
+        let mut t = d.ticket_of(a).await.unwrap();
+        t.state = TicketState::Doing;
+        t.assignee = Some(Party {
+            kind: PartyKind::Session,
+            id: "devbox/s1".into(),
+            ..sarah()
+        });
+        d.0.store.put_ticket(&mut t).await.unwrap();
+        let why = "its session ended as it started (exit 1)";
+        let held_back = async || d.plan(id).await.unwrap().tickets[0].held_back.clone();
+        let starts = async || next(&d, id).await.into_iter().map(|s| s.ticket).collect::<Vec<_>>();
+        let b = p.tickets[1].ticket.ticket.id;
+
+        assert!(!d.hold_back_ticket(id, a, "devbox/s2", why).await.unwrap(), "another session's");
+        assert_eq!(d.ticket(a).await.unwrap().ticket.state, TicketState::Doing);
+
+        assert!(d.hold_back_ticket(id, a, "devbox/s1", why).await.unwrap());
+        let now = d.ticket(a).await.unwrap().ticket;
+        assert_eq!((now.state, now.assignee), (TicketState::Todo, None));
+        assert_eq!(held_back().await.as_deref(), Some(why));
+        assert_eq!(starts().await, vec![b], "never started by itself");
+        assert!(!d.hold_back_ticket(id, a, "devbox/s1", why).await.unwrap(), "held once");
+
+        for state in [TicketState::Backlog, TicketState::Todo] {
+            let mv = Move {
+                state,
+                before: None,
+                after: None,
+            };
+            d.move_ticket(a, mv, &By::you()).await.unwrap();
+        }
+        assert_eq!(held_back().await, None);
+        assert!(starts().await.contains(&a), "its plan starts it again");
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn a_started_ticket_keeps_where_it_runs_and_dropping_the_plan_stops_or_leaves_its_sessions() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();

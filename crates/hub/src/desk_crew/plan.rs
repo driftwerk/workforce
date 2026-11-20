@@ -1595,6 +1595,8 @@ impl CrewHub {
     /// sessions goes to the plan's boss as a line of its next plan turn.
     /// Its board is here, so the boss moves the ticket. A machine that
     /// can't be reached is read again next time; nothing is said of it.
+    /// A session here in Doing that ended as it started is held back too:
+    /// one that ended before its ticket was its was missed as it ended.
     async fn watch_machines(&self) {
         let gap = self.timing.tick.min(Duration::from_secs(15));
         // The plans themselves are read once a gap apart, too.
@@ -1628,14 +1630,24 @@ impl CrewHub {
                 else {
                     continue;
                 };
+                let key = || t.ticket.key.clone().unwrap_or_else(|| row.id.to_string());
                 let Some((machine, _)) = super::relay::machine_session(&a.id) else {
+                    let died = a
+                        .id
+                        .parse()
+                        .ok()
+                        .filter(|_| row.state == TicketState::Doing)
+                        .and_then(|session| self.ended_as_started_here(session));
+                    if let Some(e) = died {
+                        self.hold_back_died(s.plan.id, row.id, key(), a.id.clone(), None, e);
+                    }
                     continue;
                 };
                 let seen = MachineSeen {
                     plan: s.plan.id,
                     ticket: row.id,
                     boss: s.plan.boss.clone(),
-                    key: t.ticket.key.clone().unwrap_or_else(|| row.id.to_string()),
+                    key: key(),
                     state: "starting".into(),
                     reply: None,
                     misses: 0,
@@ -1739,17 +1751,14 @@ impl CrewHub {
                     _ => None,
                 };
                 match (died, line) {
-                    (Some(e), _) => {
-                        self.ended_as_started(
-                            fresh.plan,
-                            fresh.ticket,
-                            &fresh.key,
-                            &item,
-                            Some(&machine),
-                            e,
-                        )
-                        .await;
-                    }
+                    (Some(e), _) => self.hold_back_died(
+                        fresh.plan,
+                        fresh.ticket,
+                        fresh.key.clone(),
+                        item.clone(),
+                        Some(machine.clone()),
+                        e.clone(),
+                    ),
                     (None, Some(line)) => self.plan_failures.lock().push((fresh.plan, line)),
                     (None, None) => {}
                 }
@@ -2032,8 +2041,33 @@ impl CrewHub {
     /// Ticket `ticket` (`key`) of plan `plan`, whose session `session` (its
     /// assignee's id) on `machine` (none: this computer) ended as it
     /// started, saying `exited`: back in To do from Doing, held back so its
-    /// plan doesn't start it again by itself, and its boss told.
-    async fn ended_as_started(
+    /// plan doesn't start it again by itself, and its boss told; on its own
+    /// task, never holding up what found it.
+    fn hold_back_died(
+        &self,
+        plan: Uuid,
+        ticket: Uuid,
+        key: String,
+        session: String,
+        machine: Option<String>,
+        exited: Exited,
+    ) {
+        let Some(crew) = self.me.upgrade() else {
+            return;
+        };
+        tokio::spawn(async move {
+            if let Some(line) = crew
+                .held_back_line(plan, ticket, &key, &session, machine.as_deref(), &exited)
+                .await
+            {
+                crew.plan_failures.lock().push((plan, line));
+            }
+        });
+    }
+
+    /// [`Self::hold_back_died`]'s hold, and what its boss is told of it:
+    /// nothing unless it was held back, the ticket having moved on since.
+    async fn held_back_line(
         &self,
         plan: Uuid,
         ticket: Uuid,
@@ -2041,36 +2075,30 @@ impl CrewHub {
         session: &str,
         machine: Option<&str>,
         exited: &Exited,
-    ) {
-        let ended = exited.ended_as_started();
-        let held = {
-            let _one = self.starting.lock().await;
-            self.desk
-                .hold_back_ticket(plan, ticket, session, &format!("its session {ended}"))
-                .await
-        };
-        let held = held.unwrap_or_else(|e| {
-            tracing::info!(%plan, %ticket, error = %e, "a ticket whose session ended as it started wasn't held back");
-            false
-        });
-        let said = exited.said(600);
-        let output = match said.is_empty() {
-            true => String::new(),
-            false => format!(" Its last output: “{said}”"),
-        };
-        let then = match held {
-            true => format!(
-                " {key} is back in To do, and its plan won't start it again by itself: once what \
-                 stopped it is put right, move it to Backlog and back to To do with \
-                 crew.move_ticket and its plan starts it, or tell the person."
-            ),
-            false => String::new(),
-        };
-        let on = machine.unwrap_or("this computer");
-        self.plan_failures.lock().push((
-            plan,
-            format!("{key}'s session on {on} {ended}.{output}{then}"),
-        ));
+    ) -> Option<String> {
+        let ended = exited.words();
+        let held = self
+            .desk
+            .hold_back_ticket(plan, ticket, session, &format!("its session {ended}"))
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(%plan, %ticket, error = %e, "a ticket whose session ended as it started wasn't held back");
+                false
+            });
+        held.then(|| {
+            let said = exited.said(600);
+            let output = match said.is_empty() {
+                true => String::new(),
+                false => format!(" Its last output: “{said}”"),
+            };
+            let on = machine.unwrap_or("this computer");
+            format!(
+                "{key}'s session on {on} {ended}.{output} {key} is back in To do, and its plan \
+                 won't start it again by itself: once what stopped it is put right, move it to \
+                 Backlog and back to To do with crew.move_ticket and its plan starts it, or tell \
+                 the person."
+            )
+        })
     }
 
     /// At `suggest`, what the runner would start becomes a suggestion for
@@ -2326,14 +2354,7 @@ impl CrewHub {
                 let Some(e) = self.ended_as_started_here(session) else {
                     return Some((plan, format!("{key}'s session failed: {}", event.text)));
                 };
-                // Its hold waits on the runner's starts: on its own task,
-                // never holding up the plan loop.
-                let crew = self.me.upgrade()?;
-                tokio::spawn(async move {
-                    let session = session.to_string();
-                    crew.ended_as_started(plan, ticket, &key, &session, None, &e)
-                        .await;
-                });
+                self.hold_back_died(plan, ticket, key, session.to_string(), None, e);
                 None
             }
             _ => None,
@@ -2341,19 +2362,25 @@ impl CrewHub {
     }
 
     /// The plan, ticket and key of the plan's ticket `session` (one on this
-    /// computer) is linked to, if any.
+    /// computer) is linked to, or is being started on, if any.
     async fn plan_ticket_of(&self, session: Uuid) -> Option<(Uuid, Uuid, String)> {
-        let tickets = self.desk.store().linked_tickets(&[session]).await.ok()?;
-        for t in tickets {
-            if let Ok(Some(plan)) = self.desk.store().plan_of_ticket(t.id).await {
+        let store = self.desk.store();
+        let linked = store.linked_tickets(&[session]).await.ok()?;
+        let starting = store.starting().await.unwrap_or_default();
+        let tickets = linked
+            .iter()
+            .map(|t| t.id)
+            .chain(starting.iter().filter(|s| s.session == session).map(|s| s.ticket));
+        for ticket in tickets {
+            if let Ok(Some(plan)) = store.plan_of_ticket(ticket).await {
                 let key = self
                     .desk
-                    .ticket(t.id)
+                    .ticket(ticket)
                     .await
                     .ok()
                     .and_then(|v| v.key)
                     .unwrap_or_else(|| "a ticket".into());
-                return Some((plan, t.id, key));
+                return Some((plan, ticket, key));
             }
         }
         None
@@ -2367,7 +2394,7 @@ impl CrewHub {
 
     /// Whether `event` is a plan's ticket's session on this computer ending
     /// as it started: its plan's turn tells its boss, once
-    /// ([`Self::ended_as_started`]).
+    /// ([`Self::hold_back_died`]).
     pub(super) async fn its_plan_tells(&self, event: &crew::Event) -> bool {
         let Some(session) = event
             .subject
@@ -2854,6 +2881,14 @@ mod tests {
         later["onStart"] = json!(false);
         let worked = read(json!({"id": Uuid::nil(), "state": "interrupted", "exited": later}));
         assert_eq!(worked.ended_as_started(), None);
+        // One that can't be read is none, and leaves the rest of the list.
+        let listed: Vec<MachineSession> = serde_json::from_value(json!([
+            {"id": Uuid::nil(), "state": "interrupted", "exited": {"code": "one"}},
+            {"id": Uuid::nil(), "state": "idle"},
+        ]))
+        .unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].exited, None);
     }
 
     #[test]

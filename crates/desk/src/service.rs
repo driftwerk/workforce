@@ -3129,9 +3129,7 @@ impl Desk {
         let me = Party::session(now);
         let own = |kind: Kind, text: String| Event::new(kind, me.clone(), Some(me.clone()), text);
         // Ended as it started: a failure, whichever state it was lost from.
-        let died = now
-            .ended_as_started()
-            .map(|e| own(Kind::Failed, e.ended_as_started()));
+        let died = now.ended_as_started().map(|e| own(Kind::Failed, e.words()));
         transitions
             .iter()
             .filter_map(|t| match *t {
@@ -5083,11 +5081,8 @@ impl Desk {
 
     /// The end of what the terminal shows, as plain text.
     pub fn terminal_text(&self, id: Uuid, max_chars: usize) -> Result<String, DeskError> {
-        Ok(crate::pty::shown_end(
-            &self.attach(id)?.text(),
-            usize::MAX,
-            max_chars,
-        ))
+        let text = crate::pty::plain_text(self.attach(id)?.text().as_bytes());
+        Ok(crew::tail_chars(&text, max_chars).to_string())
     }
 
     pub fn rooms(&self) -> Vec<Room> {
@@ -6069,14 +6064,18 @@ impl Desk {
         let state = self.0.state.lock().records.get(&id).map(|r| r.state)?;
         let at = Utc::now();
         let on_start = live.ends == 0
-            && match state {
-                SessionState::Starting => true,
-                SessionState::Idle => at - live.started_at < chrono::Duration::minutes(1),
-                _ => false,
-            };
+            && at - live.started_at < chrono::Duration::minutes(1)
+            && matches!(
+                state,
+                SessionState::Starting | SessionState::Idle | SessionState::Working
+            );
         (state != SessionState::Closed).then(|| Exited {
             code,
-            last_output: crate::pty::shown_end(&live.pty.text(), EXITED_LINES, EXITED_CHARS),
+            last_output: crew::tail_chars(
+                &crate::pty::shown_end(&live.pty.text(), EXITED_LINES),
+                EXITED_CHARS,
+            )
+            .to_string(),
             at,
             on_start,
         })

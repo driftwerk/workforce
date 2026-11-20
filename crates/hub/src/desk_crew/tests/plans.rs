@@ -2390,7 +2390,7 @@ async fn a_ticket_whose_session_here_ends_as_it_starts_waits_in_to_do_its_boss_t
         let p = proposed(&d, dir.path(), 1).await;
         let id = p.summary.plan.id;
         d.approve_plan(id, 1, &By::you()).await.unwrap();
-        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
         let held = eventually("the ticket held back", async || {
             let t = d.plan(id).await.ok()?.tickets.remove(0);
             (t.ticket.ticket.state == TicketState::Todo).then_some(t.held_back?)
@@ -2403,9 +2403,12 @@ async fn a_ticket_whose_session_here_ends_as_it_starts_waits_in_to_do_its_boss_t
             (newly_said(&llm, told).await >= 1).then_some(())
         })
         .await;
-        tokio::time::sleep(Duration::from_millis(2_000)).await;
-        assert_eq!(newly_said(&llm, "ended as it started").await, 1, "once");
+        // Runner passes since the hold start nothing, so nothing more ends.
+        for _ in 0..3 {
+            crew.run_plans().await;
+        }
         assert_eq!(d.list().iter().filter(|v| v.name == "DES-1").count(), 1, "never started again");
+        assert_eq!(newly_said(&llm, "ended as it started").await, 1, "once");
         let p = d.plan(id).await.unwrap();
         assert_eq!(p.summary.progress.blocked, 1);
         assert!(p.summary.progress.next.is_empty());
@@ -2444,14 +2447,22 @@ async fn a_ticket_whose_session_on_a_machine_ends_as_it_starts_waits_in_to_do_it
         .await;
         let there: Arc<parking_lot::Mutex<Vec<Value>>> = Arc::default();
         let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let poller = {
-            let (crew, there, starts) =
-                (Arc::clone(&crew), Arc::clone(&there), Arc::clone(&starts));
+            let (crew, there, starts, reads) = (
+                Arc::clone(&crew),
+                Arc::clone(&there),
+                Arc::clone(&starts),
+                Arc::clone(&reads),
+            );
             tokio::spawn(async move {
                 loop {
                     for c in crew.relay_take(Duration::from_millis(200)).await {
                         let body = match c.tool.as_str() {
-                            "desk.sessions" => Value::Array(there.lock().clone()),
+                            "desk.sessions" => {
+                                reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                Value::Array(there.lock().clone())
+                            }
                             "desk.session_start" => {
                                 starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                                 let s = json!({
@@ -2542,13 +2553,19 @@ async fn a_ticket_whose_session_on_a_machine_ends_as_it_starts_waits_in_to_do_it
         })
         .await;
         assert_eq!(held, "its session ended as it started (exit 127)");
-        tokio::time::sleep(Duration::from_millis(2_000)).await;
-        assert_eq!(newly_said(&llm, "ended as it started").await, 1, "once");
+        // Devbox read again since, its session still ended as it started:
+        // nothing more said, and nothing started.
+        let after = reads.load(std::sync::atomic::Ordering::SeqCst);
+        eventually("devbox read twice more", async || {
+            (reads.load(std::sync::atomic::Ordering::SeqCst) >= after + 2).then_some(())
+        })
+        .await;
         assert_eq!(
             starts.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "never started again"
         );
+        assert_eq!(newly_said(&llm, "ended as it started").await, 1, "once");
         poller.abort();
     })
     .await;

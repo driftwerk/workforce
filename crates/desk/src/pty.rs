@@ -816,17 +816,15 @@ pub fn plain_text(bytes: &[u8]) -> String {
 }
 
 /// The end of what a terminal shows (`text`, as [`Pty::text`] gives it) as
-/// plain text: its last `lines` lines, at most `max_chars` of them.
-pub fn shown_end(text: &str, lines: usize, max_chars: usize) -> String {
+/// plain text: its last `lines` lines.
+pub fn shown_end(text: &str, lines: usize) -> String {
     let plain = plain_text(text.as_bytes());
     let from = plain
         .match_indices('\n')
         .rev()
         .nth(lines.saturating_sub(1))
         .map_or(0, |(i, _)| i + 1);
-    let kept = &plain[from..];
-    let skip = kept.chars().count().saturating_sub(max_chars);
-    kept.chars().skip(skip).collect()
+    plain[from..].to_string()
 }
 
 /// portable-pty reports `anyhow` errors; carry their text into eyre.

@@ -304,8 +304,8 @@ pub struct Exited {
     /// The end of what its terminal showed, as plain text.
     pub last_output: String,
     pub at: DateTime<Utc>,
-    /// It ended before it got to work: no turn of it ended, and it was
-    /// still starting or waiting for its first prompt.
+    /// It ended as it started: within a minute of its start, before any
+    /// turn of it ended.
     #[serde(default)]
     pub on_start: bool,
 }
@@ -318,7 +318,7 @@ impl Exited {
     }
 
     /// "ended as it started (exit 1)", said after its name.
-    pub fn ended_as_started(&self) -> String {
+    pub fn words(&self) -> String {
         match self.code {
             Some(c) => format!("ended as it started (exit {c})"),
             None => "ended as it started".into(),
@@ -335,8 +335,7 @@ impl Exited {
             .filter(|l| !l.is_empty())
             .collect::<Vec<_>>()
             .join(" / ");
-        let skip = line.chars().count().saturating_sub(max);
-        line.chars().skip(skip).collect()
+        crate::crew::tail_chars(&line, max).to_string()
     }
 }
 
