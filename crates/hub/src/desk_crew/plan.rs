@@ -94,7 +94,8 @@ impl Failed {
 }
 
 /// A running plan of a boss of no group, as each machine its tickets are
-/// still to start on knows it: its plan grant is there before they start.
+/// still to start on knows it, for tickets on an engine Desk checks every
+/// call of: its plan grant is there before they start.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct MachinePlan {
     pub boss: String,
@@ -109,6 +110,10 @@ pub(crate) struct MachineSeen {
     /// Its plan's goal, as the plan grant there names it.
     pub goal: String,
     pub key: String,
+    /// The engine its ticket runs on (its boss's default when it names
+    /// none): only one Desk checks every call of is its plan grant's
+    /// ([`workforce_desk::engine::boss_safe`]).
+    pub engine: Engine,
     /// Its state as the machine said it; `starting` until first read.
     pub state: String,
     /// Its last reply as read there: a new one is a turn more, however
@@ -374,7 +379,9 @@ pub fn update_schema() -> Value {
 /// A refused plan change, in the words the boss reads.
 fn plain(e: workforce_desk::DeskError) -> String {
     match e {
-        workforce_desk::DeskError::Conflict(why) | workforce_desk::DeskError::Invalid(why) => why,
+        workforce_desk::DeskError::Conflict(why)
+        | workforce_desk::DeskError::Invalid(why)
+        | workforce_desk::DeskError::NotHeld(why) => why,
         e
         @ (workforce_desk::DeskError::CrossesBoss | workforce_desk::DeskError::TooLong { .. }) => {
             e.to_string()
@@ -1641,6 +1648,10 @@ impl CrewHub {
                 if let Some(m) = t.machine.as_ref().filter(|_| {
                     s.plan.state == PlanState::Running
                         && s.plan.group.is_none()
+                        && workforce_desk::engine::boss_safe(
+                            t.engine
+                                .unwrap_or_else(|| self.desk.boss_engine(&s.plan.boss)),
+                        )
                         && matches!(row.state, TicketState::Todo | TicketState::Doing)
                 }) {
                     to_start.push((
@@ -1669,6 +1680,9 @@ impl CrewHub {
                     boss: s.plan.boss.clone(),
                     goal: s.plan.goal.clone(),
                     key: t.ticket.key.clone().unwrap_or_else(|| row.id.to_string()),
+                    engine: t
+                        .engine
+                        .unwrap_or_else(|| self.desk.boss_engine(&s.plan.boss)),
                     state: "starting".into(),
                     reply: None,
                     misses: 0,
@@ -1919,10 +1933,9 @@ impl CrewHub {
                             self.plan_failed.lock().remove(&s.ticket);
                             self.plan_waiting.lock().remove(&s.ticket);
                             if let Some(m) = &started.machine {
-                                let key = tickets
-                                    .iter()
-                                    .find(|t| t.id == s.ticket)
-                                    .map_or_else(|| started.name.clone(), PlanTicket::name);
+                                let ticket = tickets.iter().find(|t| t.id == s.ticket);
+                                let key =
+                                    ticket.map_or_else(|| started.name.clone(), PlanTicket::name);
                                 self.machine_seen.lock().insert(
                                     format!("{m}/{}", started.id),
                                     MachineSeen {
@@ -1930,6 +1943,9 @@ impl CrewHub {
                                         boss: boss.id.clone(),
                                         goal: p.goal.clone(),
                                         key,
+                                        engine: ticket
+                                            .and_then(|t| t.engine)
+                                            .unwrap_or_else(|| self.desk.boss_engine(&boss.id)),
                                         state: "starting".into(),
                                         reply: None,
                                         misses: 0,
@@ -1937,7 +1953,7 @@ impl CrewHub {
                                 );
                             }
                             if let Some(note) = started.note {
-                                self.plan_failures.lock().push((p.id, note));
+                                self.plan_notes.lock().push((p.id, note));
                             }
                         }
                         // Read again next pass: a race, the breaker, a pause.
@@ -2556,7 +2572,9 @@ pub(super) async fn plan_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
             },
             _ = tick.tick() => {}
         }
-        for (plan, line) in std::mem::take(&mut *crew.plan_failures.lock()) {
+        let failures = std::mem::take(&mut *crew.plan_failures.lock());
+        let notes = std::mem::take(&mut *crew.plan_notes.lock());
+        for (plan, line) in failures.into_iter().chain(notes) {
             gathering
                 .entry(plan)
                 .or_insert_with(|| Gathered {
@@ -2704,6 +2722,7 @@ mod tests {
             boss: "local:sarah".into(),
             goal: "Speed up recall".into(),
             key: "VEL-3".into(),
+            engine: Engine::Claude,
             state: state.into(),
             reply: reply.map(str::to_string),
             misses: 0,

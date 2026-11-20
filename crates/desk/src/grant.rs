@@ -160,6 +160,15 @@ impl BossRef {
             Self::Remote { hub, agent } => format!("remote:{hub}/{agent}"),
         }
     }
+    /// The name it goes by on this engine: a session it runs says it has
+    /// it by this name (`bossHas`).
+    pub fn name(&self) -> String {
+        match self {
+            Self::Local { agent } => agent.clone(),
+            Self::Remote { hub, agent } => format!("{agent} ({hub})"),
+        }
+    }
+
     /// The id it acts under on this engine, as a party, a charge's boss
     /// and every key a boss is known by: `<hub>/<agent>`, with `home` for
     /// a boss on the home's own hub. A local agent's id never has a `/` in
@@ -385,9 +394,10 @@ pub fn plan_of(group: &str) -> Option<Uuid> {
         .filter(|p| plan_key(*p) == group)
 }
 
-/// How a machine refuses a plan's ticket started for its boss while it
-/// doesn't hold that plan's grant for that boss: the start waits for it.
-pub const NOT_HELD: &str = "This machine doesn't hold its plan's grant for that boss yet";
+/// The `code` a machine refuses a plan's ticket started for its boss with
+/// while it doesn't hold that plan's grant for that boss: the start waits
+/// for it.
+pub const NOT_HELD: &str = "plan_grant_not_held";
 
 fn check_list(what: &str, list: &[String]) -> Result<(), Refusal> {
     if list.len() > MAX_LIST {

@@ -71,6 +71,24 @@ impl Machines {
         changed
     }
 
+    /// What `agent`'s grants on `machine` but `except` spent since `from`,
+    /// by grant: its count from before grants were told apart left out.
+    fn on(
+        &self,
+        agent: &str,
+        machine: &str,
+        from: DateTime<Utc>,
+        except: &str,
+    ) -> HashMap<String, f64> {
+        self.counts
+            .get(agent)
+            .into_iter()
+            .flatten()
+            .filter(|((m, g, f), _)| m == machine && g != except && g != ALL && *f == from)
+            .map(|((_, g, _), usd)| (g.clone(), *usd))
+            .collect()
+    }
+
     /// Forgets counts that started over [`KEPT_FOR`] before `now`.
     fn tidy(&mut self, now: DateTime<Utc>) {
         for c in self.counts.values_mut() {
@@ -175,6 +193,19 @@ impl CrewHub {
         let m = self.machine_spent.lock();
         m.loaded
             .then(|| here + m.sum(agent, from, Some((machine, grant))))
+    }
+
+    /// What `agent`'s grants on `machine` but `grant` spent since `from`, as
+    /// they last said, by grant: what [`Self::spent_elsewhere`] counts of
+    /// them, for the machine to add what they spent since.
+    pub(crate) fn grants_spent_on(
+        &self,
+        agent: &str,
+        machine: &str,
+        grant: &str,
+        from: DateTime<Utc>,
+    ) -> HashMap<String, f64> {
+        self.machine_spent.lock().on(agent, machine, from, grant)
     }
 
     /// `machine` said `agent`'s sessions there under its grant `grant`

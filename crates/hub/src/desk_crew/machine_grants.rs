@@ -4,7 +4,9 @@
 //! under its grant for the group. This hub works out what each grant says,
 //! from its own state alone; Desk's native side only carries it to each
 //! machine (`GET /api/desk/machine-grants`, the hub's own token from the
-//! `Authorization` header alone, as the relay's routes are).
+//! `Authorization` header alone, as the relay's routes are; `?plans=1`
+//! from a Desk that carries plans' grants, which an older one would ask
+//! the person about as a group's).
 //!
 //! Same rules, no wider powers: a grant says exactly what the boss may do
 //! here, in the same group, and nothing more.
@@ -93,6 +95,9 @@ pub struct MachineWanted {
 #[serde(rename_all = "camelCase")]
 pub struct MachineGrants {
     pub grant_version: u32,
+    /// Whether its plans' grants are said: false until its plans' machine
+    /// sessions have been read, or for a Desk that doesn't carry them.
+    pub plans_known: bool,
     pub machines: BTreeMap<String, MachineWanted>,
 }
 
@@ -238,7 +243,9 @@ impl CrewHub {
             .machine_seen
             .lock()
             .iter()
-            .filter(|(_, s)| s.boss == agent && s.state != "gone")
+            .filter(|(_, s)| {
+                s.boss == agent && s.state != "gone" && workforce_desk::engine::boss_safe(s.engine)
+            })
             .map(|(k, s)| (k.clone(), s.clone()))
             .collect();
         let sees = self.desk.seen_by(&o.scope);
@@ -262,6 +269,7 @@ impl CrewHub {
     /// under there: its group's, by the sidebar, or each of its plans'.
     pub(crate) fn machine_grants_of(&self, agent: &str, o: &Oversight) -> Vec<(String, String)> {
         match o.scope.group() {
+            Some(g) if plan_of(g).is_some() => Vec::new(),
             Some(g) => self
                 .machines_in(g)
                 .into_iter()
@@ -290,23 +298,25 @@ impl CrewHub {
             .map(|((_, plan), _)| plan_key(plan))
     }
 
-    /// The grants each machine should hold for this hub's group bosses and
-    /// the main overseer's plans, as the module says; none while this hub
-    /// hasn't read its agents, who runs which session, or its plans'
-    /// machine sessions yet, so nothing is taken off a machine for what
-    /// isn't known.
-    pub(crate) fn machine_grants(&self) -> Option<MachineGrants> {
-        if self.services().is_empty()
-            || !self.desk.charges_loaded()
-            || !self
-                .plans_watched
-                .load(std::sync::atomic::Ordering::Acquire)
-        {
+    /// The grants each machine should hold for this hub's group bosses and,
+    /// for a Desk that carries them (`plans`), the main overseer's plans, as
+    /// the module says; none while this hub hasn't read its agents or who
+    /// runs which session, so nothing is taken off a machine for what isn't
+    /// known. Its plans' grants are said once its plans' machine sessions
+    /// have been read (`plansKnown`): until then Desk leaves them as they
+    /// are, and the groups' go on.
+    pub(crate) fn machine_grants(&self, plans: bool) -> Option<MachineGrants> {
+        if self.services().is_empty() || !self.desk.charges_loaded() {
             return None;
         }
+        let plans = plans
+            && self
+                .plans_watched
+                .load(std::sync::atomic::Ordering::Acquire);
         let layout = self.desk.layout();
         let mut out = MachineGrants {
             grant_version: GRANT_VERSION,
+            plans_known: plans,
             machines: BTreeMap::new(),
         };
         let all = layout
@@ -365,7 +375,7 @@ impl CrewHub {
                 add(m, granted.wanted(g.id.clone(), name.clone(), members, None));
             }
         }
-        for (service, o) in &overseers {
+        for (service, o) in overseers.iter().filter(|_| plans) {
             let plans = self.plan_sessions(service.agent_id.as_str(), o);
             let Some(granted) = (!plans.is_empty())
                 .then(|| self.granted(service, o))

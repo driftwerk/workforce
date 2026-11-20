@@ -2733,13 +2733,10 @@ impl Desk {
             failed(e, retry)
         };
         // Only a start that may have reached the machine is unsure; one the
-        // machine can't hold for its boss yet waits.
-        let refused = |e: crew::MachineRefused| {
-            match e {
-            crew::MachineRefused::Refused(why) if why.starts_with(crate::grant::NOT_HELD) => (
-                StartRefused::Waits(format!(
-                    "{key} waits until {machine} holds its plan's grant, which Desk writes there shortly."
-                )),
+        // machine can't hold for its boss yet waits, as the machine says.
+        let refused = |e: crew::MachineRefused| match e {
+            crew::MachineRefused::NotHeld(why) => (
+                StartRefused::Waits(format!("{key} waits on {machine}: {why}")),
                 false,
             ),
             crew::MachineRefused::Refused(why) => sure(DeskError::Invalid(format!(
@@ -2747,8 +2744,12 @@ impl Desk {
             ))),
             e @ crew::MachineRefused::Unknown(_) => failed(DeskError::Invalid(e.to_string()), true),
             e => sure(DeskError::Invalid(e.to_string())),
-        }
         };
+        // Started in its plan's grant there, run by its boss from launch, for
+        // a plan of the main boss on an engine Desk checks every call of;
+        // Desk carries the start's grant and boss from the call itself.
+        let held = (p.group.is_none() && crate::engine::boss_safe(engine))
+            .then(|| crate::grant::plan_key(p.id));
         let group = p.group.as_deref();
         let listed = crew
             .machine_call(
@@ -2772,15 +2773,26 @@ impl Desk {
         };
         // Only one made for this start: an older session of the same key
         // (the ticket was sent back and started again) is never taken up.
-        // Wide enough for the two computers' clocks to differ.
+        // Wide enough for the two computers' clocks to differ. A held start
+        // takes up only one its boss has there, said to be made since: never
+        // the person's own of that name.
         let after = since - chrono::Duration::minutes(10);
+        // There, a boss of this hub goes by its agent's id
+        // ([`crate::grant::BossRef::name`]).
+        let made_for = |s: &crew::MachineSession| match held {
+            Some(_) => {
+                s.created_at.is_some_and(|c| c >= after)
+                    && s.boss_has.as_deref() == Some(boss.id.as_str())
+            }
+            None => s.created_at.is_none_or(|c| c >= after),
+        };
         if let Some(there) = listed
             .iter()
             .filter(|s| {
                 s.name == key
                     && made_in(&s.cwd)
                     && !matches!(s.state.as_str(), "closed" | "stopped")
-                    && s.created_at.is_none_or(|c| c >= after)
+                    && made_for(s)
             })
             .max_by_key(|s| s.created_at)
         {
@@ -2815,9 +2827,6 @@ impl Desk {
         if let Some(model) = &runs.model {
             body["model"] = model.clone().into();
         }
-        // Desk carries a start's grant and boss from the call itself.
-        let held = (p.group.is_none() && crate::engine::boss_safe(engine))
-            .then(|| crate::grant::plan_key(p.id));
         let made = crew
             .machine_call(
                 machine,

@@ -94,6 +94,13 @@ impl IntoResponse for DeskError {
                 )
                     .into_response()
             }
+            DeskError::NotHeld(_) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({ "error": self.to_string(), "code": crate::grant::NOT_HELD })),
+                )
+                    .into_response()
+            }
             DeskError::Invalid(_) => StatusCode::BAD_REQUEST,
             DeskError::TooLong { most, .. } => {
                 let most = *most;

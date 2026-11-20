@@ -266,10 +266,7 @@ impl Desk {
         let Some(boss) = g.boss.as_ref().filter(|b| b.servable()) else {
             return Err(None);
         };
-        let name = match boss {
-            grant::BossRef::Local { agent } => agent.clone(),
-            grant::BossRef::Remote { hub, agent } => format!("{agent} ({hub})"),
-        };
+        let name = boss.name();
         if g.level == grant::Level::Watch {
             return Err(Some(format!(
                 "{name} only watches {}; set them to Act to run work.",
@@ -300,15 +297,16 @@ impl Desk {
         };
         if !crate::engine::boss_safe(new.engine) {
             return Err(DeskError::Invalid(format!(
-                "A boss on another hub runs only sessions Desk checks every call of, so not {}.",
+                "A plan's boss runs only sessions Desk checks every call of from launch, so not {}.",
                 new.engine.title()
             )));
         }
         self.grants_loaded().await?;
         let not_held = |why: Option<String>| {
-            DeskError::Conflict(match why {
-                Some(why) => format!("{}: {why}", grant::NOT_HELD),
-                None => format!("{}.", grant::NOT_HELD),
+            let held = "This machine doesn't hold its plan's grant for that boss yet";
+            DeskError::NotHeld(match why {
+                Some(why) => format!("{held}: {why}"),
+                None => format!("{held}."),
             })
         };
         let (g, party) = self.grant_boss(&group).map_err(not_held)?;

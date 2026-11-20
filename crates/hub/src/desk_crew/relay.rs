@@ -341,6 +341,14 @@ struct TokenQuery {
     token: Option<String>,
 }
 
+/// What Desk asks the machines' grants with: `plans=1` from one that
+/// carries plans' grants.
+#[derive(Deserialize)]
+struct GrantsQuery {
+    token: Option<String>,
+    plans: Option<String>,
+}
+
 /// Why a request isn't Desk's native side's, when it isn't.
 fn not_native(s: &RelayApi, h: &HeaderMap, q: &TokenQuery) -> Option<Response> {
     if q.token.is_some() {
@@ -514,9 +522,9 @@ async fn served(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>, body: By
 /// On the Mac: the grants each of the person's machines should hold for
 /// this hub's own group bosses ([`super::machine_grants`]), for Desk's
 /// native side to carry to them.
-async fn machine_grants(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>) -> Response {
-    native!(s, h, q);
-    match s.crew.machine_grants() {
+async fn machine_grants(State(s): S, h: HeaderMap, Query(q): Query<GrantsQuery>) -> Response {
+    native!(s, h, TokenQuery { token: q.token });
+    match s.crew.machine_grants(q.plans.as_deref() == Some("1")) {
         Some(w) => Json(w).into_response(),
         // Not known yet: Desk writes nothing, and deletes nothing, until it is.
         None => (

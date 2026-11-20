@@ -293,6 +293,9 @@ pub struct CrewHub {
     plan_watch: Mutex<plan_watch::Watch>,
     /// What failed to start, for its plan's next turn.
     plan_failures: Mutex<Vec<(uuid::Uuid, String)>>,
+    /// What its boss is told of how a ticket started, when it isn't as
+    /// asked ([`workforce_desk::Started::note`]), for its plan's next turn.
+    plan_notes: Mutex<Vec<(uuid::Uuid, String)>>,
     /// The plan tickets waiting on something under way (a clone, their
     /// plan's grant on a machine) to start, with what they wait on, and
     /// whether they are ready to be tried again: their boss is told once.
@@ -771,6 +774,7 @@ impl CrewHub {
             plan_failed: Mutex::default(),
             plan_watch: Mutex::default(),
             plan_failures: Mutex::default(),
+            plan_notes: Mutex::default(),
             plan_waiting: Mutex::default(),
             machine_seen: Mutex::default(),
             machine_plans: Mutex::default(),
@@ -1397,14 +1401,18 @@ impl Crew for CrewHub {
         let a = self
             .relay_as(machine, group.unwrap_or(""), call, input, boss, &ceiling)
             .await?;
+        let why = || {
+            a.body
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .map_or_else(|| format!("{machine} refused it."), str::to_string)
+        };
         match a.status {
             served::ServedStatus::Ok => Ok(a.body),
-            _ => Err(MachineRefused::Refused(
-                a.body
-                    .get("error")
-                    .and_then(serde_json::Value::as_str)
-                    .map_or_else(|| format!("{machine} refused it."), str::to_string),
-            )),
+            _ if a.body["code"] == workforce_desk::grant::NOT_HELD => {
+                Err(MachineRefused::NotHeld(why()))
+            }
+            _ => Err(MachineRefused::Refused(why())),
         }
     }
 
