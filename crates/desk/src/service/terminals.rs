@@ -697,7 +697,11 @@ impl Desk {
             // Already running here: nothing to take back.
             return id;
         }
-        self.0.state.lock().live.insert(id, live);
+        {
+            let mut st = self.0.state.lock();
+            st.exited.remove(&id);
+            st.live.insert(id, live);
+        }
         match existing {
             Some(id) => self.change(id, |r, _| {
                 r.origin = Origin::Desk;

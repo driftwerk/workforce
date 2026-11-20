@@ -960,6 +960,7 @@ impl MemoryAdmin for VellevStore {
             REIMPORT,
         )
         .await
+        .map(|_| ())
     }
 
     /// Objects whose id is not a UUID are passed over, and so is a batch
@@ -2829,6 +2830,29 @@ mod failure_tests {
 
     use super::*;
 
+    /// The doctor tells a tenant that is not there from a collection that
+    /// is not.
+    #[tokio::test]
+    async fn the_doctor_tells_a_missing_tenant_from_a_missing_collection() {
+        let told = [
+            (false, "vellev has no tenant 'workforce'"),
+            (true, "vellev collection 'Memories' does not exist"),
+        ];
+        for (tenant_there, told) in told {
+            let app = axum::Router::new().fallback(move |uri: axum::http::Uri| async move {
+                if tenant_there && uri.path().ends_with("/collections") {
+                    return axum::Json(json!({ "collections": [] })).into_response();
+                }
+                let missing = json!({ "error": { "code": "not_found", "message": "not found" } });
+                (StatusCode::NOT_FOUND, axum::Json(missing)).into_response()
+            });
+            let url = workforce_vellev::testing::serve(app).await;
+            let store = VellevStore::new(&url, "key", "workforce", "Memories").unwrap();
+            let refused = format!("{:#}", store.doctor().await.unwrap_err());
+            assert!(refused.contains(told), "{refused}");
+        }
+    }
+
     const ID: &str = "00000000-0000-0000-0000-000000000001";
 
     struct Fake {
@@ -2905,9 +2929,7 @@ mod failure_tests {
         let app = axum::Router::new()
             .fallback(answer)
             .with_state(Arc::clone(&fake));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = workforce_vellev::testing::serve(app).await;
         (
             VellevStore::new_with_timeouts(&url, "key", "workforce", "Memories", timeouts).unwrap(),
             fake,
@@ -2973,9 +2995,7 @@ mod failure_tests {
                     .into_response()
             },
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = workforce_vellev::testing::serve(app).await;
         let timeouts = Timeouts {
             read: Duration::from_millis(500),
             write: Duration::from_millis(500),
@@ -3063,10 +3083,7 @@ mod index_time_tests {
             }
             panic!("a recall asked the node for {path}");
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        url
+        workforce_vellev::testing::serve(app).await
     }
 
     struct Embeds(bool);

@@ -11,7 +11,7 @@ use uuid::Uuid;
 use vellev_client::api::Change;
 use vellev_core::{CollectionName, DataType, Embedding, EmbeddingProvider, ObjectId, Property};
 
-use crate::{classified, collection, is_conflict, Tenants};
+use crate::{classified, collection, failure, is_conflict, Asked, Tenants};
 
 /// The collection markers are kept in, named as in Weaviate, so a marker
 /// imported from there is found.
@@ -106,7 +106,7 @@ impl Kept {
     }
 
     /// Make the collection, unless the node holds it already.
-    async fn made(self, at: &Tenants) -> Result<vellev_client::Records> {
+    async fn made(self, at: &Tenants) -> Result<()> {
         let records = self.records(at)?;
         if records
             .schema()
@@ -119,7 +119,7 @@ impl Kept {
                 _ => {}
             }
         }
-        Ok(records)
+        Ok(())
     }
 
     /// Insert `value` under `what`, unless something is recorded there
@@ -151,14 +151,36 @@ impl Kept {
     /// Record `owner` under `what`, unless something is recorded there
     /// already; returns what is then recorded.
     async fn claim(self, at: &Tenants, what: &str, owner: &str) -> Result<String> {
-        let records = self.made(at).await?;
+        self.made(at).await?;
         self.insert(at, what, owner).await?;
-        let held = records
-            .get(ObjectId(marker_id(what)))
-            .await
-            .map_err(|e| classified(e, at))?;
-        held.and_then(|held| Some(held.properties.get("collection")?.as_str()?.to_string()))
+        self.claimed(at, what)
+            .await?
             .ok_or_else(|| eyre::eyre!("the claim on '{what}' cannot be read back"))
+    }
+
+    /// What is recorded under `what`; none in a tenant that is there, and
+    /// an error in one that is not, or for a marker that records no owner.
+    async fn claimed(self, at: &Tenants, what: &str) -> Result<Option<String>> {
+        let held = self.records(at)?.get(ObjectId(marker_id(what))).await;
+        match held.map_err(|e| classified(e, at))? {
+            Some(held) => match held
+                .properties
+                .get("collection")
+                .and_then(|owner| owner.as_str())
+            {
+                Some(owner) => Ok(Some(owner.to_string())),
+                None => Err(eyre::eyre!(
+                    "the marker of '{what}' in tenant '{}' records no owner",
+                    at.reads.id()
+                )),
+            },
+            None => at
+                .reads
+                .collections()
+                .await
+                .map(|_| None)
+                .map_err(|e| failure(e, at, Asked::Tenant)),
+        }
     }
 
     async fn unmark(self, at: &Tenants, name: &str) -> Result<()> {
@@ -230,4 +252,10 @@ pub async fn index_unmark(at: &Tenants, name: &str) -> Result<()> {
 /// vectors.
 pub async fn index_claim(at: &Tenants, what: &str, owner: &str) -> Result<String> {
     INDEXES.claim(at, what, owner).await
+}
+
+/// Whose `what` in the tenant `at` is recorded as (see [`index_claim`]), read
+/// without making or recording anything.
+pub async fn index_claimed(at: &Tenants, what: &str) -> Result<Option<String>> {
+    INDEXES.claimed(at, what).await
 }

@@ -216,6 +216,15 @@ impl CodeGraph {
         Ok(Self::from_backend(backend))
     }
 
+    /// The SQLite code graph at `path`, to read only (see
+    /// [`SqliteCodeGraphBackend::open_read_only`]). It comes back with the
+    /// default `VectorKeys`: a caller that reads vector state calls
+    /// `.keyed(…)`.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let backend = Arc::new(SqliteCodeGraphBackend::open_read_only(path)?);
+        Ok(Self::from_backend(backend))
+    }
+
     /// Create an in-memory SQLite database (for tests).
     pub fn open_in_memory() -> Result<Self> {
         let backend = Arc::new(SqliteCodeGraphBackend::open_in_memory()?);

@@ -1383,10 +1383,12 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 Ok(DeskEvent::Activity { event }) => {
                     if let Some((s, o)) = crew.overseer_of_group(event.group.as_deref()) {
                         if let Some(mut t) = crew.trigger_for(&event, s.agent_id.as_str(), &o) {
-                            if let Some(session) = finished_session(&event) {
-                                t.line = crew.with_doing(session, t.line).await;
+                            if !crew.its_plan_tells(&event).await {
+                                if let Some(session) = finished_session(&event) {
+                                    t.line = crew.with_doing(session, t.line).await;
+                                }
+                                found.push((s.agent_id.as_str().to_string(), t));
                             }
-                            found.push((s.agent_id.as_str().to_string(), t));
                         }
                     }
                 }
