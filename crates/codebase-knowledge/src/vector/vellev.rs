@@ -1739,6 +1739,71 @@ mod tests {
             .is_ok());
     }
 
+    /// The exact scan keeps to a node that lists fewer rows for one request
+    /// than asked: it learns the cap, pages to the end, and keeps the rows
+    /// a sort of every one would.
+    #[tokio::test]
+    async fn the_exact_scan_pages_within_a_lower_node_cap() {
+        use axum::response::IntoResponse;
+        let dimensions = local_embedding(&[]).dimensions as usize;
+        let rows: Vec<(Uuid, Vec<f32>)> = (1..=5u128)
+            .map(|n| {
+                (
+                    Uuid::from_u128(n),
+                    (0..dimensions)
+                        .map(|at| ((at as u128 * n) % 7) as f32 + 1.0)
+                        .collect(),
+                )
+            })
+            .collect();
+        let held = rows.clone();
+        let app = axum::Router::new().fallback(move |body: String| {
+            let held = held.clone();
+            async move {
+                let asked: Value = serde_json::from_str(&body).unwrap_or_default();
+                let limit = asked["limit"].as_u64().unwrap_or(0) as usize;
+                if limit > 2 {
+                    let message = format!("limit must be from 1 to 2, not {limit}");
+                    let refused = json!({ "error": { "code": "invalid", "message": message } });
+                    return (axum::http::StatusCode::BAD_REQUEST, axum::Json(refused)).into_response();
+                }
+                let after: Option<Uuid> = asked["after"].as_str().map(|after| after.parse().unwrap());
+                let page: Vec<&(Uuid, Vec<f32>)> = held.iter().filter(|(id, _)| Some(*id) > after).take(limit).collect();
+                let objects: Vec<Value> = page
+                    .iter()
+                    .map(|(id, vector)| json!({ "id": id, "properties": { "entityId": id, "repoId": "r" }, "vector": vector }))
+                    .collect();
+                let next = (page.last().map(|(id, _)| id) != held.last().map(|(id, _)| id)).then(|| page.last().map(|(id, _)| id));
+                axum::Json(json!({ "objects": objects, "next": next.flatten() })).into_response()
+            }
+        });
+        let url = workforce_vellev::testing::serve(app).await;
+        let store = VellevCodeVectorStore::new(&url, "key", "code").unwrap();
+        let asked = rows[0].1.iter().rev().copied().collect::<Vec<f32>>();
+
+        let scanned = store
+            .nearest_exactly(&[(&asked, None)], "r", 3)
+            .await
+            .unwrap();
+        assert_eq!((store.cap.most(), scanned.held), (2, 5));
+        let scorer = Scorer::new(store.entities.wanted().distance, &asked);
+        let mut sorted: Vec<(f32, Uuid)> = rows
+            .iter()
+            .map(|(id, vector)| (scorer.distance(vector), *id))
+            .collect();
+        sorted.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        let kept: Vec<String> = scanned.nearest[0]
+            .iter()
+            .map(|near| near.object.clone())
+            .collect();
+        let expected: Vec<String> = sorted
+            .iter()
+            .take(3)
+            .map(|(_, id)| id.to_string())
+            .collect();
+        assert_eq!(kept, expected);
+    }
+
     /// The searches refuse a vector of another size than the collection's,
     /// asked or listed.
     #[tokio::test]
