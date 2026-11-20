@@ -158,11 +158,23 @@ impl Kept {
             .ok_or_else(|| eyre::eyre!("the claim on '{what}' cannot be read back"))
     }
 
+    /// What is recorded under `what`; none in a tenant that is there, and
+    /// an error in one that is not.
     async fn claimed(self, at: &Tenants, what: &str) -> Result<Option<String>> {
         let held = self.records(at)?.get(ObjectId(marker_id(what))).await;
-        Ok(held
-            .map_err(|e| classified(e, at))?
-            .and_then(|held| Some(held.properties.get("collection")?.as_str()?.to_string())))
+        match held.map_err(|e| classified(e, at))? {
+            Some(held) => Ok(held
+                .properties
+                .get("collection")
+                .and_then(|owner| owner.as_str())
+                .map(str::to_string)),
+            None => at
+                .reads
+                .collections()
+                .await
+                .map(|_| None)
+                .map_err(|e| classified(e, at)),
+        }
     }
 
     async fn unmark(self, at: &Tenants, name: &str) -> Result<()> {

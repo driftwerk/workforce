@@ -1207,6 +1207,46 @@ mod tests {
         assert_eq!(fake.artifacts(), ["spec-1"]);
     }
 
+    /// Weaviate is asked the question as it was put, in a string GraphQL
+    /// reads back exactly, by the search and by the counted search.
+    #[tokio::test]
+    async fn weaviate_is_asked_the_question_exactly() {
+        let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+        let recording = Arc::clone(&asked);
+        let app = axum::Router::new().route(
+            "/v1/graphql",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let recording = Arc::clone(&recording);
+                async move {
+                    recording
+                        .lock()
+                        .unwrap()
+                        .push(body["query"].as_str().unwrap().to_string());
+                    axum::Json(serde_json::json!({ "data": {
+                        "Get": { COLLECTION: [] },
+                        "Aggregate": { COLLECTION: [{ "meta": { "count": 0 } }] }
+                    }}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let weaviate = WeaviateArtifacts::new(&url, None);
+
+        let question = "a \"b\" \\c\n  d";
+        weaviate.search(question, 3).await.unwrap();
+        weaviate.search_counted(question, 3).await.unwrap();
+        let asked = asked.lock().unwrap().clone();
+        assert_eq!(asked.len(), 2);
+        for query in asked {
+            let after = "concepts: [";
+            let rest = &query[query.find(after).unwrap() + after.len()..];
+            let mut read = serde_json::Deserializer::from_str(rest).into_iter::<String>();
+            assert_eq!(read.next().unwrap().unwrap(), question, "{query}");
+        }
+    }
+
     /// A search on Weaviate asks for what it finds and how many it holds
     /// in one request.
     #[tokio::test]

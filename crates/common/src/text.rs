@@ -147,6 +147,7 @@ fn collapse_whitespace(text: &str) -> String {
 
 /// Escape a dynamic string for embedding inside a double-quoted GraphQL
 /// string literal: backslash first, then quote, then `\uXXXX` for controls.
+/// Weaviate rejects the whole query when a value holds a control character.
 pub fn graphql_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {

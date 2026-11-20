@@ -1216,7 +1216,14 @@ fn near(
     })
 }
 
-/// A scanned entity: its distance, its object, and its properties.
+/// The node's search for the `limit` nearest to `to`.
+fn nearest_to(to: NearestTo<'_>, limit: u32) -> Nearest {
+    match to {
+        NearestTo::Text(text) => Nearest::to_text(text, limit),
+        NearestTo::Vector(vector) => Nearest::to_vector(vector.to_vec(), limit),
+    }
+}
+
 type Kept = (f32, ObjectId, Map<String, Value>);
 
 /// The first `limit` of `rows` in the node's order, by distance and then
@@ -1254,21 +1261,26 @@ impl SearchedByVector for VellevCodeVectorStore {
     }
 
     async fn nearest(&self, to: NearestTo<'_>, repo_id: &str, limit: usize) -> Result<Vec<Near>> {
-        let nearest = match to {
-            _ if limit == 0 => return Ok(Vec::new()),
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        if limit > MAX_RESULTS {
+            return Err(eyre::eyre!(
+                "the {limit} nearest were asked, more than the {MAX_RESULTS} vellev gives for one search"
+            ));
+        }
+        let cleaned = match to {
             NearestTo::Text(text) => match search_text(text, "code_nearest") {
-                Some(text) => Nearest::to_text(text.as_str(), 0),
                 None => return Ok(Vec::new()),
+                cleaned => cleaned,
             },
-            NearestTo::Vector(vector) => Nearest::to_vector(vector.to_vec(), 0),
+            NearestTo::Vector(_) => None,
         };
-        let asked = |limit| {
-            let mut asked = nearest.clone();
-            asked.limit = limit;
-            asked
-        };
+        let to = cleaned
+            .as_ref()
+            .map_or(to, |text| NearestTo::Text(text.as_str()));
         let filter = of_repo(repo_id);
-        let found = self.found(Some(&filter), limit, asked);
+        let found = self.found(Some(&filter), limit, |limit| nearest_to(to, limit));
         let found = found.await.map_err(|e| self.refused(e))?;
         found
             .results
@@ -1535,9 +1547,7 @@ mod tests {
                 }
             },
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = crate::vector::serve(app).await;
         (
             VellevCodeVectorStore::new(&url, "key", "code").unwrap(),
             asked,
@@ -1560,15 +1570,22 @@ mod tests {
     }
 
     /// The searches send only their own search or listing: the collection
-    /// is never read or made, and nothing is asked for no results.
+    /// is never read or made, and nothing is asked for no results or for
+    /// more than the node gives for one search.
     #[tokio::test]
     async fn the_searches_send_only_their_own_requests() {
         let (store, asked) = answering(json!({ "results": [], "objects": [] })).await;
         let vector = vec![0.5; store.entities.wanted().embedding.dimensions as usize];
         for to in [NearestTo::Text("parse"), NearestTo::Vector(&vector)] {
             assert!(store.nearest(to, "r", 0).await.unwrap().is_empty());
+            let refused = store.nearest(to, "r", MAX_RESULTS + 1).await.unwrap_err();
+            let refused = refused.to_string();
+            assert!(
+                refused.starts_with("the 1001 nearest were asked"),
+                "{refused}"
+            );
         }
-        assert!(asked.lock().unwrap().is_empty(), "nothing asked for none");
+        assert!(asked.lock().unwrap().is_empty(), "nothing asked");
 
         for to in [NearestTo::Text("parse"), NearestTo::Vector(&vector)] {
             assert!(store.nearest(to, "r", 3).await.unwrap().is_empty());
@@ -2572,9 +2589,7 @@ mod tests {
                 }
             },
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = crate::vector::serve(app).await;
         let store = VellevCodeVectorStore::new(&url, "key", "workforce").unwrap();
         let heard = Arc::new(Heard::default());
         store.set_insert_error_sink(Arc::clone(&heard) as Arc<dyn InsertErrorSink>);
@@ -3257,9 +3272,7 @@ mod tests {
                 }
             },
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = crate::vector::serve(app).await;
         let store = VellevCodeVectorStore::new(&url, "key", "workforce").unwrap();
         let entities: Vec<VectorCodeEntity> = (0..70)
             .map(|n| entity("r", &format!("e{n}"), "f", "Function", "does a thing"))
@@ -3296,9 +3309,7 @@ mod tests {
                 answer(400, "invalid", REFUSED)
             },
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = crate::vector::serve(app).await;
         let store = VellevCodeVectorStore::new(&url, "key", "workforce").unwrap();
         let refused = store.ensure_collections().await.unwrap_err();
         match refused.downcast_ref::<Unusable>() {
@@ -3394,9 +3405,7 @@ mod tests {
                 }
             },
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = crate::vector::serve(app).await;
         let store = VellevCodeVectorStore::new(&url, "key", "workforce").unwrap();
         let entity = entity("r", "e", "src/lib.rs", "Function", "parses a config file");
         let summary = VectorCodeSummary {

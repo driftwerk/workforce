@@ -12600,7 +12600,6 @@ struct RoleImportRow {
     _priority: Option<i32>,
 }
 
-/// Where the hub keeps its SQLite code graph, as `[knowledge]` says.
 fn hubs_code_graph(config: &workforce_common::settings::WorkforceConfig) -> PathBuf {
     let (_, data_dir) =
         workforce_hub::knowledge::knowledge_dirs(&config.knowledge, &config.hub.data_dir);

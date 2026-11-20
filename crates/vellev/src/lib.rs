@@ -1261,6 +1261,34 @@ mod tests {
         );
     }
 
+    /// A claim or a collection read in a tenant that is not there is an
+    /// error saying so: never unclaimed, nor a collection missing.
+    #[tokio::test]
+    async fn a_missing_tenant_is_told_apart_from_nothing_held() {
+        let missing = std::sync::Arc::new(Fake::answering(
+            404,
+            "not_found",
+            "tenant harbor does not exist",
+        ));
+        let tenants = missing.serve().await;
+        let claimed = index_claimed(&tenants, "CodeGraph").await.unwrap_err();
+        assert!(
+            claimed
+                .downcast_ref::<vellev_client::Error>()
+                .is_some_and(vellev_client::Error::is_not_found),
+            "{claimed:?}"
+        );
+        let lines = notes(local_embedding(&["body"]));
+        let records = tenants.reads.collection(&lines.name);
+        let doctored = crate::doctor(&tenants, &records, &lines, REMEDY).await;
+        let doctored = doctored.unwrap_err();
+        assert!(unusable(&doctored).is_some(), "{doctored:#}");
+        assert!(
+            !doctored.to_string().starts_with("vellev collection"),
+            "{doctored:#}"
+        );
+    }
+
     /// Vectors made outside the node of another size than the collection's
     /// are refused, naming both, before anything is written.
     #[tokio::test]
@@ -1423,7 +1451,9 @@ mod tests {
         let both = node.documents(&["a".to_string(), "b".to_string()]).await;
         let both = format!("{:#}", both.unwrap_err());
         assert!(
-            both.contains("was not dropped")
+            both.starts_with("the embedding failed, and then the collection made to embed")
+                && both.contains("was not dropped: ")
+                && both.contains("the drop failed")
                 && both.ends_with("gave back vectors for 1 of 2 texts"),
             "{both}"
         );

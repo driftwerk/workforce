@@ -86,9 +86,11 @@ impl SqliteCodeGraphBackend {
         })
     }
 
-    /// Open the code graph at `path` to read only: nothing is made, migrated
-    /// or written, and its journal mode is left as it is. A graph whose
-    /// schema is older than this build's is refused.
+    /// Open the code graph at `path` to read only: nothing is migrated or
+    /// written, and its journal mode is left as it is. SQLite may make the
+    /// `-wal` and `-shm` files a reader of a WAL-mode graph needs; nothing
+    /// else is made. A graph whose schema is older than this build's is
+    /// refused.
     pub fn open_read_only(path: &Path) -> Result<Self> {
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let conn = Connection::open_with_flags(path, flags).wrap_err_with(|| {
@@ -98,7 +100,8 @@ impl SqliteCodeGraphBackend {
             )
         })?;
         conn.execute_batch("PRAGMA busy_timeout=30000;")?;
-        Schema::current(&conn).wrap_err_with(|| format!("the code graph at {}", path.display()))?;
+        Schema::ensure_current(&conn)
+            .wrap_err_with(|| format!("the code graph at {}", path.display()))?;
         Ok(Self {
             identity: identity_of(&conn)?,
             conn: Arc::new(Mutex::new(conn)),
@@ -1540,8 +1543,9 @@ mod lease_tests {
         .await;
     }
 
-    /// A graph opened to read only reads as it was written, and is left
-    /// byte for byte as it was; one of an older schema is refused.
+    /// A WAL-mode graph opened to read only reads as it was written, keeps
+    /// its bytes and its journal mode, and gains nothing beside it but the
+    /// `-wal` and `-shm` a reader needs; one of an older schema is refused.
     #[tokio::test]
     async fn a_graph_opened_to_read_is_left_as_it_was() {
         let backend = SqliteCodeGraphBackend::open_in_memory().unwrap();
@@ -1551,14 +1555,36 @@ mod lease_tests {
         let copied = |path: &Path| path.to_string_lossy().to_string();
         let conn = backend.conn.lock().await;
         conn.execute("VACUUM INTO ?1", [copied(&path)]).unwrap();
+        let journal = |conn: &Connection| -> String {
+            conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(
+            Connection::open(&path)
+                .unwrap()
+                .query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "wal"
+        );
         let bytes = std::fs::read(&path).unwrap();
+        let held = || -> BTreeSet<String> {
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+                .collect()
+        };
+        assert_eq!(held(), BTreeSet::from(["copy.db".to_string()]));
 
         let read = SqliteCodeGraphBackend::open_read_only(&path).unwrap();
         assert_eq!(read.identity, backend.identity);
         assert_eq!(read.list_repositories().await.unwrap().len(), 1);
         assert!(read.register_repo("s", "s", "/s").await.is_err());
+        assert_eq!(journal(&*read.conn.lock().await), "wal");
         drop(read);
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let besides = ["copy.db", "copy.db-shm", "copy.db-wal"].map(String::from);
+        assert!(held().is_subset(&BTreeSet::from(besides)), "{:?}", held());
+        assert_eq!(journal(&Connection::open(&path).unwrap()), "wal");
 
         let old = dir.path().join("old.db");
         conn.execute("VACUUM INTO ?1", [copied(&old)]).unwrap();

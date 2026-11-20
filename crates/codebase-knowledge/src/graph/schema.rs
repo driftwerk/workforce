@@ -33,8 +33,9 @@ impl Schema {
         }
     }
 
-    /// Refuse a schema older than the current one, changing nothing.
-    pub fn current(conn: &Connection) -> Result<()> {
+    /// Refuse a schema older than the current one, changing nothing. A
+    /// newer one is accepted, as the hub's own open accepts it.
+    pub fn ensure_current(conn: &Connection) -> Result<()> {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .context("read user_version")?;

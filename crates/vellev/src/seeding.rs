@@ -369,7 +369,9 @@ impl DocumentEmbedder for NodeEmbedder {
         ) {
             (Ok(vectors), Ok(())) => Ok(vectors),
             (Err(e), Ok(())) | (Ok(_), Err(e)) => Err(e),
-            (Err(e), Err(dropped)) => Err(e.wrap_err(dropped)),
+            (Err(e), Err(dropped)) => {
+                Err(e.wrap_err(format!("the embedding failed, and then {dropped:#}")))
+            }
         }
     }
 }

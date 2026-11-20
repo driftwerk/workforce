@@ -306,8 +306,14 @@ pub async fn doctor(
     let found = records
         .schema()
         .await
-        .map_err(|e| failure(e, at, Asked::collection(wanted)))?
-        .ok_or_else(|| eyre!("vellev collection '{}' does not exist", wanted.name))?;
+        .map_err(|e| failure(e, at, Asked::collection(wanted)))?;
+    let Some(found) = found else {
+        at.reads
+            .collections()
+            .await
+            .map_err(|e| failure(e, at, Asked::Tenant))?;
+        return Err(eyre!("vellev collection '{}' does not exist", wanted.name));
+    };
     checked(&found, wanted, remedy).map_err(as_unusable)?;
     Ok(found)
 }

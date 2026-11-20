@@ -1312,6 +1312,15 @@ fn check_graphql_response(body: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+/// The URL of a local server answering with `app`.
+#[cfg(test)]
+pub(crate) async fn serve(app: axum::Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    url
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1622,9 +1631,7 @@ mod tests {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = serve(app).await;
         let store = WeaviateCodeVectorStore::new(url, None);
 
         let question = "a \"b\" \\c\n  d";
