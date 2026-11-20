@@ -881,6 +881,7 @@ async fn a_boss_moved_into_a_bossed_group_asks_first_and_what_it_ran_passes_to_t
                     draft: crate::plan::Draft {
                         goal: "Ship the Acme checkout".into(),
                         tickets: vec![crate::plan::DraftTicket {
+                            repo: None,
                             id: None,
                             adopt: None,
                             title: "Wire the Acme form".into(),

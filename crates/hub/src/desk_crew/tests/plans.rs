@@ -635,6 +635,90 @@ async fn a_boss_moves_tickets_by_key_keeping_their_briefs_and_reads_them_back() 
     .await;
 }
 
+/// A ticket moves by its repository, its old folder left behind; the
+/// machine tools say plainly what they can't do, and never reach a machine
+/// Desk isn't carrying calls to.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_boss_moves_a_ticket_by_its_repository_and_its_machine_tools_say_what_they_cant() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
+        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("the plan tools", async || overseer.tools.has("crew.plan").then_some(())).await;
+        let folder = dir.path().to_string_lossy().into_owned();
+        let made = overseer
+            .tools
+            .get("crew.plan")
+            .unwrap()
+            .execute(json!({ "goal": "Faster reads", "tickets": [
+                { "title": "Add the cache", "body": "Cache it.", "folder": folder },
+            ] }))
+            .await
+            .unwrap();
+        let plan = &made.output["proposed"];
+        let id = plan["plan_id"].as_str().unwrap().to_string();
+        let key = plan["tickets"][0]["key"].as_str().unwrap().to_string();
+        let r = overseer
+            .tools
+            .get("crew.plan_update")
+            .unwrap()
+            .execute(json!({ "plan_id": id, "why": "Run it on devbox.",
+                "tickets_edit": [{ "key": key, "machine": "devbox", "repo": "driftwerk/vellev" }] }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        let p = d.plan(id.parse().unwrap()).await.unwrap();
+        let t = &p.tickets[0];
+        assert_eq!(t.machine.as_deref(), Some("devbox"));
+        assert_eq!(t.repo.as_deref(), Some("github.com/driftwerk/vellev"));
+        assert_eq!(t.folder.as_deref(), Some(""), "the Mac's folder isn't devbox's");
+        // Its repository alone, changed: saved where it starts from.
+        let r = overseer
+            .tools
+            .get("crew.plan_update")
+            .unwrap()
+            .execute(json!({ "plan_id": id, "why": "The other repository.",
+                "tickets_edit": [{ "key": key, "repo": "driftwerk/workforce" }] }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        let p = d.plan(id.parse().unwrap()).await.unwrap();
+        assert_eq!(
+            p.tickets[0].repo.as_deref(),
+            Some("github.com/driftwerk/workforce")
+        );
+        let runs = d.store().plan_runs(id.parse().unwrap()).await.unwrap();
+        assert_eq!(
+            runs[0].1.repo.as_deref(),
+            Some("github.com/driftwerk/workforce"),
+            "the row a start reads"
+        );
+
+        let said = |r: workforce_agent::tools::ToolResult| format!("{r:?}");
+        let folders = overseer.tools.get("crew.machine_folders").unwrap();
+        let bad = folders
+            .execute(json!({ "machine": "devbox", "repo": "not a repo" }))
+            .await
+            .unwrap();
+        assert!(said(bad).contains("host/owner/name"));
+        let odd = folders.execute(json!({ "machine": "../x" })).await.unwrap();
+        assert!(said(odd).contains("isn't one of the person's machines"));
+        // Nothing carries calls in a test: said, never waited on.
+        let away = folders.execute(json!({ "machine": "devbox" })).await.unwrap();
+        let away = said(away);
+        assert!(away.contains("can't be reached"), "{away}");
+        let machines = overseer.tools.get("crew.machines").unwrap();
+        assert!(!machines.execute(json!({})).await.unwrap().success);
+        let make = overseer.tools.get("crew.machine_make_folder").unwrap();
+        let why = make
+            .execute(json!({ "machine": "devbox", "path": "~/projects/acme" }))
+            .await
+            .unwrap();
+        assert!(said(why).contains("Give the reason"));
+    })
+    .await;
+}
+
 /// How many of the boss's model requests say `marker`.
 async fn said(llm: &wiremock::MockServer, marker: &str) -> usize {
     llm.received_requests()

@@ -49,6 +49,7 @@ mod items;
 mod line;
 mod logins;
 pub(crate) mod machine_grants;
+mod machines;
 mod mind;
 mod observe;
 mod orchestrator;
@@ -287,6 +288,9 @@ pub struct CrewHub {
     plan_watch: Mutex<plan_watch::Watch>,
     /// What failed to start, for its plan's next turn.
     plan_failures: Mutex<Vec<(uuid::Uuid, String)>>,
+    /// The plan tickets waiting on something under way (a clone) to start,
+    /// with what they wait on: their boss is told once.
+    plan_waiting: Mutex<HashMap<uuid::Uuid, (uuid::Uuid, String)>>,
     /// Plans' sessions on the person's machines, as last read there, by
     /// `<machine>/<id>`; and when each machine was last read.
     machine_seen: Mutex<HashMap<String, plan::MachineSeen>>,
@@ -744,6 +748,7 @@ impl CrewHub {
             plan_failed: Mutex::default(),
             plan_watch: Mutex::default(),
             plan_failures: Mutex::default(),
+            plan_waiting: Mutex::default(),
             machine_seen: Mutex::default(),
             machine_read: Mutex::default(),
             machine_down: Mutex::default(),

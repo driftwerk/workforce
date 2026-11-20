@@ -97,6 +97,8 @@ pub mod providers;
 mod pty;
 pub mod reads;
 pub mod realtime;
+pub mod repos;
+mod repos_api;
 pub mod rooms;
 pub mod scope;
 pub mod sees;

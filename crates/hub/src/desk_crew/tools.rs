@@ -27,7 +27,7 @@ use super::CrewHub;
 
 /// Every `crew.*` tool: the ones it has at every level first (its reads,
 /// and what it asks of the person, which is never gated).
-pub const READ: [&str; 25] = [
+pub const READ: [&str; 27] = [
     "crew.overview",
     LOGINS,
     "crew.activity",
@@ -51,10 +51,12 @@ pub const READ: [&str; 25] = [
     super::github::BRANCH,
     super::github::CI,
     super::assignments::LIST,
+    super::machines::MACHINES,
+    super::machines::FOLDERS,
     super::watches::WATCH,
     super::watches::WATCHES,
 ];
-pub const ACT: [&str; 30] = [
+pub const ACT: [&str; 31] = [
     "crew.nudge",
     "crew.ask_session",
     "crew.escalate",
@@ -85,6 +87,7 @@ pub const ACT: [&str; 30] = [
     SWITCH_LOGIN,
     super::own_settings::NAME,
     super::assignments::CLOSE,
+    super::machines::MAKE_FOLDER,
 ];
 
 /// The person's logins (engine accounts), each with what runs on it.
@@ -456,6 +459,9 @@ impl CrewTool {
             }
             super::board::NAME => crew.board_tool(b, input).await,
             super::find::NAME => crew.find_tickets_tool(b, input).await,
+            super::machines::MACHINES | super::machines::FOLDERS => {
+                crew.machine_tool(self.name, b, input).await
+            }
             super::tickets::READ => crew.ticket_tool_boxed(b, input).await,
             super::items::ASK
             | super::items::CLOSE
@@ -1023,6 +1029,9 @@ pub(crate) fn describe(name: &str) -> &'static str {
             super::own_settings::NAME => super::own_settings::DESCRIPTION,
             super::assignments::CLOSE => super::assignments::CLOSE_DESCRIPTION,
             super::assignments::LIST => super::assignments::LIST_DESCRIPTION,
+            super::machines::MACHINES => super::machines::MACHINES_DESCRIPTION,
+            super::machines::FOLDERS => super::machines::FOLDERS_DESCRIPTION,
+            super::machines::MAKE_FOLDER => super::machines::MAKE_FOLDER_DESCRIPTION,
             super::watches::WATCH => super::watches::WATCH_DESCRIPTION,
             super::watches::WATCHES => super::watches::WATCHES_DESCRIPTION,
             "crew.activity" => "What happened on the crew, newest first: turns started and finished, questions, requests, failures, and what you and the person did. Filter to one agent or session with subject_id.",
@@ -1099,6 +1108,9 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
         super::plan::BOARD_CREATE => super::plan::board_create_schema(),
         super::handover::NAME => super::handover::schema(),
         super::own_settings::NAME => super::own_settings::schema(),
+        super::machines::MACHINES | super::machines::FOLDERS | super::machines::MAKE_FOLDER => {
+            super::machines::schema(name)
+        }
         super::assignments::LIST => json!({ "type": "object", "properties": {
             "all": { "type": "boolean", "description": "true for the last day's closed ones too" }
         }}),
@@ -1315,6 +1327,8 @@ impl Tool for CrewTool {
             crew.plan_tool(self.name, &bound, &input).await
         } else if self.name == super::handover::NAME {
             crew.handover_tool(&bound, &input).await
+        } else if self.name == super::machines::MAKE_FOLDER {
+            crew.machine_tool(self.name, &bound, &input).await
         } else if self.name == super::assignments::CLOSE {
             crew.assignment_tool(&bound, &input).await
         } else {
