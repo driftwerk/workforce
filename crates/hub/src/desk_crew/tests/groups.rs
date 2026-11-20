@@ -718,13 +718,18 @@ async fn every_boss_kept_out(c: &Clients, dir: &Path) {
             .all(|s| s.subject.as_ref().is_none_or(|p| !outside.contains(&p.id))),
         "{after:?}"
     );
-    let thread =
-        c.d.line_thread(c.atlas.session.id, None, None)
-            .await
-            .unwrap();
-    assert!(thread
-        .iter()
-        .all(|m| m.from.id != "sarah" && m.from.id != "desk"));
+    for (client, outsiders) in [(&c.atlas, ["sarah", "desk"]), (&c.acme, ["mia", "desk"])] {
+        let thread =
+            c.d.line_thread(client.session.id, None, None)
+                .await
+                .unwrap();
+        assert!(
+            thread
+                .iter()
+                .all(|m| !outsiders.contains(&m.from.id.as_str())),
+            "{thread:?}"
+        );
+    }
     assert_eq!(
         c.d.ticket_by_key(&c.atlas.ticket)
             .await

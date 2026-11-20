@@ -879,13 +879,25 @@ async fn overseeing(
     oversight: &str,
     crew_agents: &[Arc<AgentService>],
 ) -> (Arc<AgentService>, Arc<CrewHub>, Desk, wiremock::MockServer) {
+    overseeing_at(dir, pool, reply, oversight, crew_agents, FAST).await
+}
+
+/// [`overseeing`], its crew's loops run at `timing`.
+async fn overseeing_at(
+    dir: &Path,
+    pool: workforce_postgres::PostgresPool,
+    reply: &str,
+    oversight: &str,
+    crew_agents: &[Arc<AgentService>],
+    timing: Timing,
+) -> (Arc<AgentService>, Arc<CrewHub>, Desk, wiremock::MockServer) {
     let (overseer, llm) = agent(dir, "desk", reply).await;
     write_config(&overseer, oversight);
     let mut all = vec![Arc::clone(&overseer)];
     all.extend(crew_agents.iter().cloned());
     let state = hub(&all);
     let d = desk(pool, dir).await;
-    let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+    let crew = CrewHub::start(state, d.clone(), timing, CancellationToken::new());
     let dm = overseer
         .sessions
         .get_or_create(DESK_CHANNEL, PERSON, "desk")
@@ -6654,7 +6666,9 @@ async fn a_wedged_mind_is_waited_for_only_so_long() {
         assert_eq!(crew.with_mind("desk", "an update", async { 5 }).await, 5);
         assert_eq!(said("m2").await, 2, "said again for a new stretch");
         // What it starts runs as part of it: a nested step never waits the
-        // whole bound again.
+        // whole bound again. A bound of a second keeps once and twice a
+        // second apart.
+        crew.set_mind_wait_max(Duration::from_secs(1));
         let nested = std::time::Instant::now();
         let out = crew
             .with_mind("desk", "a turn", async {
@@ -6663,7 +6677,7 @@ async fn a_wedged_mind_is_waited_for_only_so_long() {
             .await;
         assert_eq!(out, 6);
         assert!(
-            nested.elapsed() < Duration::from_millis(600),
+            nested.elapsed() < Duration::from_millis(2000),
             "waited once, not twice: {:?}",
             nested.elapsed()
         );

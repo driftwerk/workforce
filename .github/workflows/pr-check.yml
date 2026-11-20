@@ -326,7 +326,7 @@ jobs:
         partition: [1, 2, 3, 4, 5, 6, 7, 8]
     env:
       GITHUB_TOKEN: ${{ github.token }}
-      WORKFORCE_TEST_POSTGRES_URL: postgres://hub:hub@127.0.0.1:5432/postgres
+      WORKFORCE_TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
       # A debug build's deep futures overflow the default 2 MiB stack of a
       # spawned thread (SIGABRT, "has overflowed its stack").
       RUST_MIN_STACK: "16777216"
@@ -339,7 +339,7 @@ jobs:
       - uses: ./.github/actions/start-postgres
         with:
           name: postgres
-          user: hub
+          user: postgres
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
         with:
           tool: cargo-nextest

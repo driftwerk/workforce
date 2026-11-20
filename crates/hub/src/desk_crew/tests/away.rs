@@ -62,6 +62,13 @@ async fn begun(crew: &Arc<CrewHub>) {
 const ACT: &str = "[oversight]\nenabled = true\nlevel = \"act\"\nact = { nudge = true }\n\
                    updates = { every_minutes = 1, max_wait_minutes = 1, away_after_minutes = 5 }\n";
 
+/// A crew minute of a second: the typing's pause (20 s: 333 ms) and its cap
+/// (three minutes: 3 s) seconds apart, however slow the run.
+const SECOND_MINUTES: Timing = Timing {
+    minute: Duration::from_secs(1),
+    ..FAST
+};
+
 /// Pings typing in the boss's DM every 20 ms for `for_ms`.
 fn type_for(crew: &Arc<CrewHub>, for_ms: u64) -> tokio::task::JoinHandle<()> {
     let crew = Arc::clone(crew);
@@ -75,19 +82,21 @@ fn type_for(crew: &Arc<CrewHub>, for_ms: u64) -> tokio::task::JoinHandle<()> {
 }
 
 /// While the person types the update waits; typing on, it goes at the cap
-/// (three minutes: 300 ms here) all the same; a pause lets it go sooner.
+/// (three minutes: 3 s here) all the same; a pause (20 s: 333 ms) lets it
+/// go sooner.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_update_waits_for_a_pause_and_never_past_the_cap() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        let (overseer, crew, d, _llm) =
+            overseeing_at(dir.path(), pool, "ok", ACT, &[], SECOND_MINUTES).await;
         assert!(!crew.typing_in("nobody"), "no agent by that name");
         begun(&crew).await;
         let s = new_session(&d, dir.path(), "acme-web").await;
 
-        // Typing on for a second: held, then out at the cap.
-        let started = std::time::Instant::now();
-        let typing = type_for(&crew, 1000);
+        // Typing on for five seconds: held, then out at the cap.
+        let started = chrono::Utc::now();
+        let typing = type_for(&crew, 5000);
         did(&d, s.id, "Opened PR #622").await;
         let posted = eventually("the update", async || {
             delivered(&overseer, DeliveryKind::Update)
@@ -95,9 +104,9 @@ async fn an_update_waits_for_a_pause_and_never_past_the_cap() {
                 .next()
         })
         .await;
-        let at = started.elapsed();
+        let at = posted.timestamp - started;
         assert!(
-            at >= Duration::from_millis(280),
+            at >= chrono::Duration::milliseconds(2900),
             "held while typing: {at:?}"
         );
         assert!(
@@ -107,8 +116,8 @@ async fn an_update_waits_for_a_pause_and_never_past_the_cap() {
         assert!(posted.content.contains("Opened PR #622"));
         typing.await.unwrap();
 
-        // A short burst: out once they pause, before the cap.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // A short burst: out once they pause, long before the cap.
+        tokio::time::sleep(Duration::from_millis(500)).await;
         let started = chrono::Utc::now();
         let typing = type_for(&crew, 60);
         did(&d, s.id, "Merged PR #622").await;
@@ -119,16 +128,16 @@ async fn an_update_waits_for_a_pause_and_never_past_the_cap() {
         })
         .await;
         assert!(typing.is_finished(), "held while typing");
-        // Posted at the pause, before the cap (300 ms from when the typing
-        // began) would have let it go: when it was posted, not when the
-        // test saw it.
+        // When it was posted, not when the test saw it: after the pause,
+        // before the cap (3 s from when the typing began) would have let
+        // it go.
         let at = second.timestamp - started;
         assert!(
             at >= chrono::Duration::milliseconds(60),
             "held while typing: {at:?}"
         );
         assert!(
-            at < chrono::Duration::milliseconds(280),
+            at < chrono::Duration::milliseconds(2900),
             "a pause lets it go before the cap: {at:?}"
         );
     })
@@ -179,15 +188,17 @@ async fn an_update_waits_for_a_running_reply() {
 async fn a_needs_you_waits_only_for_typing_and_the_cap() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let (overseer, crew, _d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        let (overseer, crew, _d, _llm) =
+            overseeing_at(dir.path(), pool, "ok", ACT, &[], SECOND_MINUTES).await;
         let started = std::time::Instant::now();
-        let typing = type_for(&crew, 1000);
+        let typing = type_for(&crew, 5000);
         tokio::time::sleep(Duration::from_millis(30)).await;
         let r = ask(&crew, "Which key should staging use?").await;
         assert!(r.success, "{:?}", r.error);
         assert!(
-            started.elapsed() < Duration::from_millis(200),
-            "the asking turn isn't held up"
+            started.elapsed() < Duration::from_millis(1500),
+            "the asking turn isn't held up to the cap (3 s): {:?}",
+            started.elapsed()
         );
         assert!(needs_you(&overseer).is_empty(), "held while typing");
         eventually("the needs-you", async || {
@@ -195,7 +206,7 @@ async fn a_needs_you_waits_only_for_typing_and_the_cap() {
         })
         .await;
         let at = started.elapsed();
-        assert!(at >= Duration::from_millis(280), "{at:?}");
+        assert!(at >= Duration::from_millis(2900), "{at:?}");
         assert!(
             !typing.is_finished(),
             "out at the cap while still typing: {at:?}"
