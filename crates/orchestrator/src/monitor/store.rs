@@ -640,6 +640,22 @@ impl MonitorStore {
         Ok(taken.is_some())
     }
 
+    /// Make a failing source due now: what it failed for may have changed
+    /// (its tool registered). A healthy one keeps its cadence; `true` when
+    /// one was brought forward.
+    pub async fn bring_forward_failing(&self, key: &MonitorKey) -> Result<bool> {
+        let conn = self.pool.get().await?;
+        let changed = conn
+            .execute(
+                "UPDATE monitor_source_state SET next_due_at = now(), updated_at = now() \
+                 WHERE monitor_id = $1 AND owner = $2 AND error IS NOT NULL \
+                   AND next_due_at > now()",
+                &[&key.monitor_id, &owner_col(key.owner.as_deref())],
+            )
+            .await?;
+        Ok(changed > 0)
+    }
+
     /// Record a successful poll: what it saw, when the next is due, and a
     /// clean failure count.
     pub async fn record_poll(
@@ -696,6 +712,34 @@ impl MonitorStore {
             )
             .await?;
         Ok(row.get::<_, i32>("failures").max(0) as u32)
+    }
+
+    /// Record a poll that could not find its tool: its error and when the
+    /// next is due. Such a poll is no failure of the source: the failure
+    /// streak is left as it was, neither counted up nor cleared.
+    pub async fn record_poll_unavailable(
+        &self,
+        key: &MonitorKey,
+        error: &str,
+        next_due_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let conn = self.pool.get().await?;
+        conn.execute(
+            "INSERT INTO monitor_source_state \
+             (monitor_id, owner, polled_at, next_due_at, error, failures) \
+             VALUES ($1, $2, now(), $3, $4, 0) \
+             ON CONFLICT (monitor_id, owner) DO UPDATE \
+               SET polled_at = now(), next_due_at = EXCLUDED.next_due_at, \
+                   error = EXCLUDED.error, updated_at = now()",
+            &[
+                &key.monitor_id,
+                &owner_col(key.owner.as_deref()),
+                &next_due_at,
+                &error,
+            ],
+        )
+        .await?;
+        Ok(())
     }
 
     /// Drop a monitor's observation state: it goes away, or starts afresh.

@@ -608,10 +608,10 @@ template = "Invoice email from {{json:/sender}}: {{json:/subject}}"
                     crate::monitor::MonitorEngineConfig::default().on_desk(true),
                 )
                 .with_invoker(Arc::new(
-                    crate::monitor::GovernedInvoker::for_service(Arc::clone(&scout), None),
+                    crate::monitor::GovernedInvoker::for_service(Arc::clone(&scout)),
                 ));
                 let mon = runtime.get("invoice-emails", Some(PERSON)).await.unwrap();
-                engine.preflight(&mon.def).await.unwrap();
+                engine.preflight(&mon.def, Some(PERSON)).await.unwrap();
                 let state = || async {
                     store
                         .source_states(std::slice::from_ref(&mon.monitor_key()))
@@ -658,9 +658,9 @@ template = "Invoice email from {{json:/sender}}: {{json:/subject}}"
                     crate::monitor::MonitorEngineConfig::default(),
                 )
                 .with_invoker(Arc::new(
-                    crate::monitor::GovernedInvoker::for_service(Arc::clone(&scout), None),
+                    crate::monitor::GovernedInvoker::for_service(Arc::clone(&scout)),
                 ));
-                let refused = server.preflight(&mon.def).await.unwrap_err();
+                let refused = server.preflight(&mon.def, Some(PERSON)).await.unwrap_err();
                 assert!(refused.contains("doesn't run Desk"), "{refused}");
             },
         )
