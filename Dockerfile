@@ -112,7 +112,7 @@ RUN apt-get update \
 # Pinned: an unpinned install silently crossing CC's 2.1.69 schema-deferral
 # boundary inside a frozen cache epoch is what hid the ToolSearch breakage.
 # Bump deliberately, with a deploy you can verify.
-ARG CLAUDE_CODE_VERSION=2.1.284
+ARG CLAUDE_CODE_VERSION=2.1.329
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
 # ─── Codex CLI (the `codex` coding engine, `/cx`) ──────────────────────────
