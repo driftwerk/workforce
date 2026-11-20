@@ -244,7 +244,9 @@ impl CrewHub {
             .lock()
             .iter()
             .filter(|(_, s)| {
-                s.boss == agent && s.state != "gone" && workforce_desk::engine::boss_safe(s.engine)
+                s.boss == agent
+                    && s.state != "gone"
+                    && s.engine.is_some_and(workforce_desk::engine::boss_safe)
             })
             .map(|(k, s)| (k.clone(), s.clone()))
             .collect();

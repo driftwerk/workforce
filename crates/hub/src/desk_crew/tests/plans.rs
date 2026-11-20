@@ -1812,9 +1812,10 @@ async fn a_plans_ticket_on_a_machine_starts_there_once_and_its_turns_wake_the_bo
 }
 
 /// A start on a machine whose answer never came isn't undone or made
-/// again: Desk looks for it there, takes up the session it made, run by
-/// its boss, and the ticket is that session's. An older session of the
-/// same key is never taken up, nor the person's own of that key there.
+/// again: Desk looks for it there and takes up the session it made, by the
+/// id it gave it, though it waits on the person there by then; the ticket
+/// is that session's. An older session of the same key is never taken up,
+/// nor the person's own of that key there.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_machine_start_never_answered_is_found_there_and_never_made_twice() {
     use super::super::relay::RelayAnswer;
@@ -1883,10 +1884,11 @@ async fn a_machine_start_never_answered_is_found_there_and_never_made_twice() {
                             }
                             "desk.session_start" => {
                                 *starts.lock() += 1;
+                                // Under the id it was given, run by its
+                                // boss but waiting on the person by now.
                                 there.lock().push(json!({
-                                    "id": uuid::Uuid::new_v4(), "name": c.input["name"],
-                                    "cwd": c.input["cwd"], "state": "working", "lastReply": null,
-                                    "bossHas": "desk",
+                                    "id": c.input["id"], "name": c.input["name"],
+                                    "cwd": c.input["cwd"], "state": "waiting", "lastReply": null,
                                     "createdAt": chrono::Utc::now().to_rfc3339(),
                                 }));
                                 // No answer.

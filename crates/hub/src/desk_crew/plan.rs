@@ -110,10 +110,9 @@ pub(crate) struct MachineSeen {
     /// Its plan's goal, as the plan grant there names it.
     pub goal: String,
     pub key: String,
-    /// The engine its ticket runs on (its boss's default when it names
-    /// none): only one Desk checks every call of is its plan grant's
-    /// ([`workforce_desk::engine::boss_safe`]).
-    pub engine: Engine,
+    /// The engine its ticket runs on: only one Desk checks every call of
+    /// is its plan grant's ([`workforce_desk::engine::boss_safe`]).
+    pub engine: Option<Engine>,
     /// Its state as the machine said it; `starting` until first read.
     pub state: String,
     /// Its last reply as read there: a new one is a turn more, however
@@ -1648,10 +1647,7 @@ impl CrewHub {
                 if let Some(m) = t.machine.as_ref().filter(|_| {
                     s.plan.state == PlanState::Running
                         && s.plan.group.is_none()
-                        && workforce_desk::engine::boss_safe(
-                            t.engine
-                                .unwrap_or_else(|| self.desk.boss_engine(&s.plan.boss)),
-                        )
+                        && t.engine.is_some_and(workforce_desk::engine::boss_safe)
                         && matches!(row.state, TicketState::Todo | TicketState::Doing)
                 }) {
                     to_start.push((
@@ -1680,9 +1676,7 @@ impl CrewHub {
                     boss: s.plan.boss.clone(),
                     goal: s.plan.goal.clone(),
                     key: t.ticket.key.clone().unwrap_or_else(|| row.id.to_string()),
-                    engine: t
-                        .engine
-                        .unwrap_or_else(|| self.desk.boss_engine(&s.plan.boss)),
+                    engine: t.engine,
                     state: "starting".into(),
                     reply: None,
                     misses: 0,
@@ -1943,9 +1937,7 @@ impl CrewHub {
                                         boss: boss.id.clone(),
                                         goal: p.goal.clone(),
                                         key,
-                                        engine: ticket
-                                            .and_then(|t| t.engine)
-                                            .unwrap_or_else(|| self.desk.boss_engine(&boss.id)),
+                                        engine: ticket.and_then(|t| t.engine),
                                         state: "starting".into(),
                                         reply: None,
                                         misses: 0,
@@ -2722,7 +2714,7 @@ mod tests {
             boss: "local:sarah".into(),
             goal: "Speed up recall".into(),
             key: "VEL-3".into(),
-            engine: Engine::Claude,
+            engine: Some(Engine::Claude),
             state: state.into(),
             reply: reply.map(str::to_string),
             misses: 0,

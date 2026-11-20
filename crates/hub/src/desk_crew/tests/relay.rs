@@ -1140,6 +1140,30 @@ async fn directs_from_launch(
     assert!(r.error.unwrap().contains("took"), "the person's now");
     carry(&crew, &there, &key, 3).await;
     assert!(there.charge_of(id).is_none_or(|c| !c.live()));
+    // Its start sent again, under the id its plan gave it, is that session
+    // as it is now, the person's: never a second, nor given back. Another
+    // session's id there is never taken.
+    let again = |with: uuid::Uuid| {
+        let mut b = start(Some(&key), "local:desk");
+        b["id"] = json!(with);
+        b
+    };
+    let (code, out) = native(&there, "POST", sessions, again(id)).await;
+    assert_eq!(code, StatusCode::OK, "{out}");
+    assert_eq!(out["id"], json!(id));
+    assert!(out.get("bossHas").is_none(), "{out}");
+    assert!(there.charge_of(id).is_none_or(|c| !c.live()));
+    let (code, out) = native(&there, "POST", sessions, again(loose.id)).await;
+    assert_eq!(code, StatusCode::CONFLICT, "{out}");
+    let mut named = start(None, "local:desk");
+    (named["boss"], named["id"]) = (Value::Null, json!(uuid::Uuid::new_v4()));
+    let (code, out) = native(&there, "POST", sessions, named).await;
+    assert_eq!(
+        code,
+        StatusCode::BAD_REQUEST,
+        "only a held start names its session: {out}"
+    );
+    assert_eq!(there.list().len(), 3, "nothing more started there");
 
     // At Watch it only reads: it has no tool to act with.
     write_config(&main, "[oversight]\nenabled = true\nlevel = \"watch\"\n");
@@ -1355,7 +1379,7 @@ async fn holds_its_own(pool: workforce_postgres::PostgresPool) {
     crew.machine_seen.lock().insert(
         format!("devbox/{codex}"),
         super::super::plan::MachineSeen {
-            engine: workforce_desk::model::Engine::Codex,
+            engine: Some(workforce_desk::model::Engine::Codex),
             ..seen
         },
     );

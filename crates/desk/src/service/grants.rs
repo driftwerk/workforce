@@ -284,11 +284,14 @@ impl Desk {
     /// that boss from this computer's home, at more than Watch, and on an
     /// engine Desk checks every call of; the boss is the grant's, never the
     /// caller's word. A grant not here yet, or not for that boss, is
-    /// [`grant::NOT_HELD`]: the start waits for it.
+    /// [`grant::NOT_HELD`]: the start waits for it. Under `id`, the session
+    /// id its plan gave it, a start sent again is the one already started
+    /// in that grant, as it is now (the person may have it): never a second.
     pub async fn create_held(
         &self,
         new: crate::model::NewSession,
         boss: &str,
+        id: Option<Uuid>,
     ) -> Result<crate::model::SessionView, DeskError> {
         let Some(group) = new.group.clone().filter(|g| grant::plan_of(g).is_some()) else {
             return Err(DeskError::Invalid(
@@ -317,12 +320,23 @@ impl Desk {
         if named.map(grant::BossRef::key).as_deref() != Some(boss) {
             return Err(not_held(None));
         }
+        // Started already, under the id its plan gave it: that one, as it
+        // is now, never a second.
+        if let Some(there) = id.and_then(|id| self.view(id).ok()) {
+            return match there.group.as_ref().is_some_and(|g| g.id == group) {
+                true => Ok(there),
+                false => Err(DeskError::Conflict(format!(
+                    "the session {} has started already",
+                    there.id
+                ))),
+            };
+        }
         let by = crate::crew::By::manager(
             &party.id,
             &party.name,
             "The person approved its plan; Desk started its ticket for it.",
         );
-        self.start_session(new, None, Some(&party), Some(by), true)
+        self.start_session(new, id, Some(&party), Some(by), true)
             .await
     }
 

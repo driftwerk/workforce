@@ -2656,7 +2656,7 @@ impl Desk {
                 })
                 .map_err(StartRefused::from),
             Some(m) => match self
-                .plan_spawn_on(&m, p, &t, since, retry, runs, worktree, boss)
+                .plan_spawn_on(&m, p, &t, session, since, retry, runs, worktree, boss)
                 .await
             {
                 Ok(started) => Ok((started, None)),
@@ -2693,14 +2693,15 @@ impl Desk {
     /// else one started there now in the machine's own folder, its prompt
     /// saying its board is here. A plan of the main boss (no group) on an
     /// engine Desk checks every call of starts in its plan's grant there,
-    /// run by its boss from launch ([`Desk::create_held`]): until the
-    /// machine holds that grant, the start waits.
+    /// run by its boss from launch ([`Desk::create_held`]), as `session`:
+    /// until the machine holds that grant, the start waits.
     #[allow(clippy::too_many_arguments)]
     async fn plan_spawn_on(
         &self,
         machine: &str,
         p: &Plan,
         t: &Ticket,
+        session: Uuid,
         since: chrono::DateTime<chrono::Utc>,
         retry: bool,
         runs: &Runs,
@@ -2771,11 +2772,13 @@ impl Desk {
             cwd == folder
                 || cwd.starts_with(&format!("{}/.worktrees/", folder.trim_end_matches('/')))
         };
-        // Only one made for this start: an older session of the same key
-        // (the ticket was sent back and started again) is never taken up.
-        // Wide enough for the two computers' clocks to differ. A held start
-        // takes up only one its boss has there, said to be made since: never
-        // the person's own of that name.
+        // The one made for this start: a held start's is the session id it
+        // gave, whatever has come of it since (the person may have it). Else
+        // (a start not held, or a machine that doesn't take its id), one of
+        // its key made since: an older session of the same key (the ticket
+        // was sent back and started again) is never taken up. Wide enough
+        // for the two computers' clocks to differ. A held start takes up
+        // only one its boss has there: never the person's own of that name.
         let after = since - chrono::Duration::minutes(10);
         // There, a boss of this hub goes by its agent's id
         // ([`crate::grant::BossRef::name`]).
@@ -2786,16 +2789,19 @@ impl Desk {
             }
             None => s.created_at.is_none_or(|c| c >= after),
         };
-        if let Some(there) = listed
-            .iter()
-            .filter(|s| {
-                s.name == key
-                    && made_in(&s.cwd)
-                    && !matches!(s.state.as_str(), "closed" | "stopped")
-                    && made_for(s)
-            })
-            .max_by_key(|s| s.created_at)
-        {
+        let by_name = || {
+            listed
+                .iter()
+                .filter(|s| {
+                    s.name == key
+                        && made_in(&s.cwd)
+                        && !matches!(s.state.as_str(), "closed" | "stopped")
+                        && made_for(s)
+                })
+                .max_by_key(|s| s.created_at)
+        };
+        let by_id = listed.iter().find(|s| held.is_some() && s.id == session);
+        if let Some(there) = by_id.or_else(by_name) {
             return Ok(Started {
                 id: there.id,
                 machine: Some(machine.to_string()),
@@ -2827,6 +2833,9 @@ impl Desk {
         if let Some(model) = &runs.model {
             body["model"] = model.clone().into();
         }
+        if held.is_some() {
+            body["id"] = session.to_string().into();
+        }
         let made = crew
             .machine_call(
                 machine,
@@ -2847,8 +2856,9 @@ impl Desk {
             )
         })?;
         // A Desk there, or here, older than held starts makes it the
-        // person's: said, so its boss knows why it only suggests.
-        let note = (held.is_some() && made.boss_has.is_none()).then(|| {
+        // person's, under an id of its own: said, so its boss knows why it
+        // only suggests.
+        let note = (held.is_some() && made.id != session).then(|| {
             format!(
                 "{key} started on {machine} as the person's, not yours: Desk on {machine}, or on this computer, \
                  is older and doesn't start a plan's sessions for its boss. Until it is updated, what you send \
