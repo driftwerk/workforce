@@ -187,6 +187,11 @@ async fn act_fully_aims_at_the_end_state_in_parallel_without_polish_first() {
             CrewHub::dm_hint(Level::Full, &o, false),
             CrewHub::level_hint(Level::Full, &o),
             CrewHub::bound_level_line(Level::Full),
+            // What it decides at Act fully by itself: a finished turn's next
+            // step, a session's question, a plan.
+            super::super::idle::SYSTEM.to_string(),
+            super::super::answer::SYSTEM.to_string(),
+            super::super::answer::PLAN_SYSTEM.to_string(),
         ];
         for hint in &said {
             for rule in [
