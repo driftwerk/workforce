@@ -353,14 +353,15 @@ impl DeskStore {
     /// Writes where `ticket` runs, and which plan it is in. The ticket's
     /// version moves on: a start read before is refused. One taken on that
     /// is no longer the plan's (let go, or another plan's now) is left as
-    /// it is: only a claim takes it again. A folder left empty keeps the
-    /// checkout a start found only when `found_kept`.
-    pub async fn put_runs(&self, ticket: Uuid, runs: &Runs, found_kept: bool) -> Result<()> {
+    /// it is: only a claim takes it again. A folder left empty for its
+    /// repository to say keeps the checkout a start found, while the
+    /// repository and machine are the same, unless the plan said one
+    /// before (`was`): that one goes.
+    pub async fn put_runs(&self, ticket: Uuid, runs: &Runs, was: Option<&str>) -> Result<()> {
+        let found_kept = was.is_none_or(|f| f.trim().is_empty());
         let client = self.pool().get().await?;
         client
             .execute(
-                // A folder left empty for its repository to say keeps the
-                // checkout a start found, while the repository is the same.
                 "UPDATE tickets SET plan = $2, engine = $3, \
                  folder = CASE WHEN $4 = '' AND $9 AND repo IS NOT DISTINCT FROM $8 AND machine IS NOT DISTINCT FROM $6 \
                  THEN folder ELSE $4 END, view = $5, \
@@ -858,9 +859,23 @@ mod tests {
                 adopted: false,
                 held_back: None,
             };
-            s.put_runs(t.id, &runs, true).await.unwrap();
-            assert_eq!(s.plan_runs(p.id).await.unwrap(), vec![(t.id, runs)]);
+            s.put_runs(t.id, &runs, None).await.unwrap();
+            assert_eq!(s.plan_runs(p.id).await.unwrap(), vec![(t.id, runs.clone())]);
             assert_eq!(s.plan_of_ticket(t.id).await.unwrap(), Some(p.id));
+
+            // Left for its repository to say: the checkout a start found
+            // stays, unless the plan had said a folder before.
+            let left = Runs {
+                folder: Some(String::new()),
+                ..runs
+            };
+            let folder = async || s.plan_runs(p.id).await.unwrap()[0].1.folder.clone();
+            s.put_runs(t.id, &left, Some("")).await.unwrap();
+            assert_eq!(folder().await.as_deref(), Some("/work/acme-api"));
+            s.put_runs(t.id, &left, Some("/work/acme-api"))
+                .await
+                .unwrap();
+            assert_eq!(folder().await.as_deref(), Some(""));
         })
         .await;
     }
@@ -885,7 +900,7 @@ mod tests {
                 adopted: false,
                 held_back: None,
             },
-            true,
+            None,
         )
         .await
         .unwrap();
@@ -960,7 +975,7 @@ mod tests {
                     adopted: false,
                     held_back: None,
                 },
-                true,
+                None,
             )
             .await
             .unwrap();
@@ -1068,7 +1083,7 @@ mod tests {
                     plan: Some(p.id),
                     ..Default::default()
                 },
-                true,
+                None,
             )
             .await
             .unwrap();

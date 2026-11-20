@@ -1010,6 +1010,12 @@ fn a_folder_left_for_desk_to_find_is_said_so_never_as_a_move_to_nothing() {
         describe(&left, &a),
         "Moved “Add the cart API” to /work/acme-web"
     );
+    let mut viewed = left.clone();
+    viewed.tickets[0].view = Some(View::Terminal);
+    assert_eq!(
+        describe(&left, &viewed),
+        "Set “Add the cart API” to run in the terminal view"
+    );
 }
 
 #[test]

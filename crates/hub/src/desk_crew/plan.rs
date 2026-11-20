@@ -2063,7 +2063,7 @@ impl CrewHub {
     /// plan pauses, and the person reads why on the Floor.
     async fn start_failed(&self, p: &Plan, t: &PlanTicket, scope: i32, why: &str) {
         let (ticket, key) = (t.id, t.name());
-        tracing::warn!(plan = %p.id, ticket = %key, error = %why, "a plan's ticket didn't start");
+        tracing::warn!(plan = %p.id, ticket = %ticket, key = %key, error = %why, "a plan's ticket didn't start");
         let (count, tell) = {
             let mut failed = self.plan_failed.lock();
             let f = failed.entry(ticket).or_insert_with(|| Failed {
@@ -2088,11 +2088,7 @@ impl CrewHub {
         }
         if count >= FAILS_BEFORE_PAUSE {
             let said = format!("{key} couldn't start {count} times: {why}");
-            if let Err(e) = self
-                .desk
-                .pause_plan_failing(p.id, &said, &By::desk(&said))
-                .await
-            {
+            if let Err(e) = self.desk.pause_plan_failing(p.id, &said).await {
                 tracing::warn!(plan = %p.id, error = %e, "a plan that keeps failing wasn't paused");
             }
             self.plan_failed.lock().remove(&ticket);

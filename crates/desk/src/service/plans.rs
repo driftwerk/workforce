@@ -1495,7 +1495,6 @@ impl Desk {
         t: &Planned,
         was: Option<&Planned>,
     ) -> Result<(), DeskError> {
-        let found_kept = was.is_none_or(|w| w.folder.trim().is_empty());
         self.0
             .store
             .put_runs(
@@ -1511,7 +1510,7 @@ impl Desk {
                     adopted: t.adopted,
                     held_back: None,
                 },
-                found_kept,
+                was.map(|w| w.folder.as_str()),
             )
             .await
             .map_err(internal)
@@ -2040,20 +2039,13 @@ impl Desk {
     }
 
     /// Pauses plan `id` because one of its tickets keeps failing to start,
-    /// `why` saying so in the person's words; they continue it from the
-    /// Floor.
-    pub async fn pause_plan_failing(
-        &self,
-        id: Uuid,
-        why: &str,
-        by: &By,
-    ) -> Result<PlanDetail, DeskError> {
-        self.0
-            .boss_plans
-            .lock()
-            .failing
-            .insert(id, crew::one_line(why, 300));
-        self.pause_plan(id, Paused::StartFailing, by).await
+    /// `why` saying so in the person's words, as Desk with that reason;
+    /// they continue it from the Floor.
+    pub async fn pause_plan_failing(&self, id: Uuid, why: &str) -> Result<PlanDetail, DeskError> {
+        let why = crew::one_line(why, 300);
+        let by = By::desk(&why);
+        self.0.boss_plans.lock().failing.insert(id, why);
+        self.pause_plan(id, Paused::StartFailing, &by).await
     }
 
     /// The person keeps plan `id` as approved and turns down the boss's
