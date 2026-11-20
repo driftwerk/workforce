@@ -1070,22 +1070,29 @@ impl CrewHub {
             .map(|(s, _)| s.agent_id.as_str().to_string())
     }
 
-    /// Whether `order` answers the question session `s`'s turn ended on,
-    /// and that is still what it asks.
-    fn answers_turn(&self, s: Uuid, order: &super::assignments::Order) -> bool {
-        order.answers.as_ref().is_some_and(|ask| {
-            self.desk
-                .view(s)
-                .is_ok_and(|v| super::answer::question_of(&v).is_some_and(|q| &q.ask == ask))
-        })
-    }
-
     /// What the boss is told of its message `m` to session `name`, as
-    /// `did` ("told", "answered"): what, if anything, it waits on.
-    fn nudge_said(&self, name: &str, did: &str, m: &workforce_desk::line::LineMessage) -> String {
-        use workforce_desk::line::Wait;
-        let why = match self.desk.line_waits(m) {
-            None => return format!("{did} {name}"),
+    /// `did` ("told", "answered"), with where it stands, read again now:
+    /// what, if anything, it waits on; refused as stale once it was
+    /// withdrawn before it went in.
+    async fn nudge_said(
+        &self,
+        name: &str,
+        did: &str,
+        m: &workforce_desk::line::LineMessage,
+    ) -> Result<(String, workforce_desk::line::Delivery), String> {
+        use workforce_desk::line::{Delivery, Wait};
+        let now = match self.desk.store().line_message(m.id).await {
+            Ok(Some(now)) => now,
+            _ => m.clone(),
+        };
+        if now.delivery == Delivery::Withdrawn {
+            return Err(format!(
+                "{} {name} moved on before it went in: decide again on where it stands now.",
+                super::picture::STALE
+            ));
+        }
+        let why = match self.desk.line_waits(&now) {
+            None => return Ok((format!("{did} {name}"), now.delivery)),
             Some(Wait::Stopped) => "it is stopped and gets it when it runs again",
             Some(Wait::Working) => "it gets it once its turn ends",
             Some(Wait::Dialog) => "a dialog in its terminal waits on an answer: it gets it once that is answered and its turn ends",
@@ -1096,7 +1103,7 @@ impl CrewHub {
             Some(Wait::PersonDriving) => "the person is driving it, so your message waits until they stop giving it input for a little while or hand it back",
             Some(Wait::NextCall) => "it reads it with its next tool call's result",
         };
-        format!("{did} {name}; {why}")
+        Ok((format!("{did} {name}; {why}"), now.delivery))
     }
 
     /// The session `action` is done to, when it is one.
@@ -2079,8 +2086,8 @@ impl CrewHub {
                     workforce_desk::LineError::Refused(r) => r.to_string(),
                     workforce_desk::LineError::Desk(e) => plain(e),
                 };
-                match reply_to {
-                    Some(ask) => {
+                match (reply_to, order.answers) {
+                    (Some(ask), _) => {
                         let answer = d
                             .line_answer(*ask, sender, message.clone())
                             .await
@@ -2088,32 +2095,40 @@ impl CrewHub {
                         done.line = Some((answer.id, answer.delivery));
                         Ok(format!("answered {name}"))
                     }
-                    None if self.answers_turn(*s, order) => {
-                        let (answer, _) = d
+                    // The answer to the question a turn ended on: refused as
+                    // stale once it asks something else, never sent as a
+                    // plain message in its place.
+                    (None, Some(turn)) => {
+                        let sent = d
                             .line_send_with(
                                 sender,
                                 workforce_desk::line::Send::Answer {
                                     to: *s,
                                     text: message.clone(),
-                                    asks: order.answers.clone().unwrap_or_default(),
+                                    turn,
                                 },
                                 None,
                             )
-                            .await
-                            .map_err(line)?;
-                        done.line = Some((answer.id, answer.delivery));
-                        Ok(self.nudge_said(&name, "answered", &answer))
+                            .await;
+                        let (answer, _) = match sent {
+                            Err(workforce_desk::LineError::Refused(
+                                workforce_desk::line::Refusal::Passed,
+                            )) => {
+                                return Err(format!(
+                                "{} {name} asks something else now: decide again on what it asks.",
+                                super::picture::STALE
+                            ))
+                            }
+                            sent => sent.map_err(line)?,
+                        };
+                        let (said, delivery) = self.nudge_said(&name, "answered", &answer).await?;
+                        done.line = Some((answer.id, delivery));
+                        Ok(said)
                     }
-                    // It asks something else now: never a plain message
-                    // in its place.
-                    None if order.answers.is_some() => Err(format!(
-                        "{} {name} asks something else now: decide again on what it asks.",
-                        super::picture::STALE
-                    )),
                     // On its line: it gets it once its turn ends, never typed
                     // in over what it is doing (Interrupt is for that); a
                     // boss's urgent one, with its next tool call's result.
-                    None => {
+                    (None, None) => {
                         let urgency = super::urgent::of(order, &sender);
                         let (told, rushed) = d
                             .line_send_with(
@@ -2131,7 +2146,9 @@ impl CrewHub {
                         if let Some(said) = super::urgent::told(&name, rushed) {
                             return Ok(said);
                         }
-                        Ok(self.nudge_said(&name, "told", &told))
+                        let (said, delivery) = self.nudge_said(&name, "told", &told).await?;
+                        done.line = Some((told.id, delivery));
+                        Ok(said)
                     }
                 }
             }

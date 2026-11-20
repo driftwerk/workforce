@@ -111,6 +111,22 @@ impl Desk {
         Self::mark_in(&st, id)
     }
 
+    /// The turn end session `id` asks its question at, while it still asks
+    /// it ([`line::open_question`]): what a boss's answer answers
+    /// ([`line::Send::Answer`]). A restart starts its counters again, so a
+    /// mark from before one never matches.
+    pub fn asked_mark(&self, id: Uuid) -> Option<TurnMark> {
+        let st = self.0.state.lock();
+        let view = Self::view_of(&st, st.records.get(&id)?);
+        line::open_question(&view)?;
+        let l = st.live.get(&id)?;
+        Some(TurnMark {
+            run: l.breaker.run.0,
+            ends: l.ends,
+            turns: l.breaker.turns,
+        })
+    }
+
     pub(super) fn mark_in(st: &super::State, id: Uuid) -> Option<TurnMark> {
         let state = st.records.get(&id)?.state;
         let l = st.live.get(&id)?;

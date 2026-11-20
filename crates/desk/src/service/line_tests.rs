@@ -1197,47 +1197,97 @@ async fn ends_asking(d: &Desk, id: Uuid, reply: &str, prompted: bool) {
 }
 
 #[tokio::test]
-async fn a_bosss_answer_to_a_question_its_session_no_longer_asks_is_withdrawn() {
+async fn a_bosss_answer_goes_in_only_while_its_session_asks_at_that_turn_end() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let d = desk(pool, dir.path()).await;
         let by = sarah_bosses(&d);
         let s = new_session(&d, dir.path()).await;
         idle(&d, s.id).await;
-        ends_asking(&d, s.id, "The replica is ready. Should I switch reads to it?", false).await;
-        let asks = d.view(s.id).unwrap().asked.expect("its question").ask;
-        let answer = d
-            .line_send(
-                Sender::Overseer(by),
+        let q = "The replica is ready. Should I switch reads to it?";
+        ends_asking(&d, s.id, q, false).await;
+        let turn = d.asked_mark(s.id).expect("it asks");
+        let answer = |turn| {
+            d.line_send(
+                Sender::Overseer(by.clone()),
                 Send::Answer {
                     to: s.id,
                     text: "Yes, switch them.".into(),
-                    asks,
+                    turn,
                 },
             )
-            .await
-            .unwrap();
-        assert_eq!(answer.about.as_deref(), Some(d.view(s.id).unwrap().asked.unwrap().ask.as_str()));
-        // Before it went in, its turn ended on another question.
+        };
+        let sent = answer(turn).await.unwrap();
+        assert_eq!(
+            sent.about.as_deref(),
+            Some(d.view(s.id).unwrap().asked.unwrap().ask.as_str()),
+            "the question it answers, to show"
+        );
+        // Before it went in, its turn ended again: on the same words, a
+        // later question all the same.
         hook(
             &d,
             s.id,
-            json!({"hook_event_name": "Stop", "last_assistant_message": "Reads moved. Should I drop the old table?"}),
+            json!({"hook_event_name": "Stop", "last_assistant_message": q}),
         )
         .await;
-        until(|| {
-            d.view(s.id)
-                .is_ok_and(|v| v.asked.is_some_and(|a| a.ask.contains("drop the old table")))
-        })
-        .await;
+        until(|| d.asked_mark(s.id).is_some_and(|t| t != turn)).await;
         let _ = d.line_next(s.id, Duration::from_millis(300)).await;
-        assert_eq!(row(&d, answer.id).await.delivery, Delivery::Withdrawn);
+        assert_eq!(row(&d, sent.id).await.delivery, Delivery::Withdrawn);
         assert!(
             d.picture_recent("sarah", s.id, 10)
                 .iter()
                 .any(|h| h.what == crate::picture::What::Withdrawn && h.text == "Yes, switch them."),
             "its boss hears it never went in"
         );
+        // An answer to a turn end gone by is refused at once.
+        assert!(matches!(
+            answer(turn).await,
+            Err(LineError::Refused(Refusal::Passed))
+        ));
+        // After a restart Desk no longer knows which turn end one answers:
+        // it is withdrawn, never put to whatever it asks then.
+        let now = d.asked_mark(s.id).unwrap();
+        let kept = answer(now).await.unwrap();
+        d.0.state.lock().lines.answers.clear();
+        let _ = d.line_next(s.id, Duration::from_millis(300)).await;
+        assert_eq!(row(&d, kept.id).await.delivery, Delivery::Withdrawn);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_dialog_on_its_screen_holds_what_waits_at_its_prompt_too() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        ends_asking(&d, s.id, "Should I switch reads to the replica?", false).await;
+        d.0.state.lock().live.get_mut(&s.id).unwrap().pending =
+            Some(crate::model::PendingApproval {
+                id: Uuid::new_v4(),
+                tool: "Bash".into(),
+                detail: "cargo test".into(),
+                since: chrono::Utc::now(),
+                answerable: true,
+                choices: Vec::new(),
+                why: None,
+                options: None,
+                request: None,
+                call: None,
+                agent: None,
+                cli_session: None,
+            });
+        d.plugin_heard_from(s.id);
+        // Even the person's own words wait behind it.
+        let sent = d
+            .line_post(s.id, "Yes, switch them.".into(), When::Queue)
+            .await
+            .unwrap();
+        assert_eq!(d.line_waits(&row(&d, sent.id).await), Some(Wait::Dialog));
+        assert_eq!(d.line_next(s.id, Duration::from_millis(300)).await, None);
+        assert_eq!(row(&d, sent.id).await.delivery, Delivery::Queued);
     })
     .await;
 }
@@ -1259,7 +1309,7 @@ async fn its_bosss_answer_goes_in_when_its_turn_ended_on_a_question_and_nothing_
         )
         .await;
         let v = d.view(s.id).unwrap();
-        let asks = v.asked.clone().expect("its question").ask;
+        let turn = d.asked_mark(s.id).expect("it asks");
         let peer = new_session(&d, dir.path()).await;
         idle(&d, peer.id).await;
         let theirs = d
@@ -1278,7 +1328,7 @@ async fn its_bosss_answer_goes_in_when_its_turn_ended_on_a_question_and_nothing_
                 Send::Answer {
                     to: s.id,
                     text: "ship it".into(),
-                    asks: asks.clone(),
+                    turn,
                 },
             )
             .await,
@@ -1291,7 +1341,7 @@ async fn its_bosss_answer_goes_in_when_its_turn_ended_on_a_question_and_nothing_
                 Send::Answer {
                     to: s.id,
                     text: "Yes, ship it.".into(),
-                    asks: asks.clone(),
+                    turn,
                 },
             )
             .await
@@ -1359,7 +1409,7 @@ async fn its_bosss_answer_goes_in_when_its_turn_ended_on_a_question_and_nothing_
                 Send::Answer {
                     to: theirs.id,
                     text: "Yes, drop it.".into(),
-                    asks: d.view(theirs.id).unwrap().asked.expect("its question").ask,
+                    turn: d.asked_mark(theirs.id).expect("it asks"),
                 },
             )
             .await

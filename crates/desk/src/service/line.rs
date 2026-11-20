@@ -52,6 +52,9 @@ pub(crate) struct Lines {
     /// When each session's line last had a message for the person, and
     /// last an exchange of its own: what its thread is unread by.
     pub(crate) seen: HashMap<Uuid, Seen>,
+    /// Each waiting turn-answer's turn end it answers the question of
+    /// ([`Send::Answer`]), by row, with its session.
+    pub(super) answers: HashMap<Uuid, (Uuid, line::TurnMark)>,
     /// The sessions the loop guard stopped, until the person speaks to
     /// them (or, for a stop its boss lifts, their boss does): each a need
     /// of the person's on the Floor, said once.
@@ -655,6 +658,9 @@ impl Desk {
             Send::Answer { .. } if matches!(from, Sender::Session(_)) => {
                 return Err(Refusal::NotYours.into())
             }
+            Send::Answer { to, turn, .. } if self.asked_mark(to) != Some(turn) => {
+                return Err(Refusal::Passed.into())
+            }
             Send::Answer { to, text, .. } => {
                 (Target::Session(to), text, LineKind::Answer, When::Queue)
             }
@@ -768,8 +774,11 @@ impl Desk {
         m.in_reply_to = in_reply_to;
         // The person's and the overseer's to a session are its group's.
         m.group = group.or_else(|| self.line_group(&m));
-        if let Send::Answer { asks, .. } = &hop_send {
-            m.about = Some(asks.clone());
+        if let Send::Answer { to, turn, .. } = &hop_send {
+            m.about = find(*to)
+                .and_then(|v| line::open_question(v))
+                .map(|a| a.ask.clone());
+            self.0.state.lock().lines.answers.insert(m.id, (*to, *turn));
         }
         if let Send::Ask { chose, parts, .. } = &hop_send {
             let clean = |v: &Option<String>| {
@@ -1681,8 +1690,9 @@ impl Desk {
 
     async fn line_next_now(&self, caller: Uuid) -> Result<Option<Value>, LineError> {
         let view = self.view(caller)?;
-        // Inside a turn Desk keeps what waits (see [`line::deliverable`]).
-        if !view.live || self.in_a_turn(&view) {
+        // Inside a turn, or behind a dialog, Desk keeps what waits (see
+        // [`line::deliverable`]).
+        if !view.live || self.in_a_turn(&view) || view.pending.is_some() {
             return Ok(None);
         }
         let inbox = self.0.store.line_inbox(&caller.to_string()).await?;
@@ -2039,16 +2049,13 @@ impl Desk {
             .went_ahead
             .retain(|_, m| m.from_session() != Some(id) && m.to_session() != Some(id));
         st.lines.seen.remove(&id);
+        st.lines.answers.retain(|_, (s, _)| *s != id);
     }
 
     /// Each of `rows`' reason to wait to go into `view` (a hand-off behind
     /// its running turn waits on that), or none while Desk holds any of them
     /// on purpose, whatever its turn ([`Wait::on_purpose`]).
-    pub fn rows_wait(
-        &self,
-        view: &SessionView,
-        rows: &[LineMessage],
-    ) -> Option<Vec<Option<Wait>>> {
+    pub fn rows_wait(&self, view: &SessionView, rows: &[LineMessage]) -> Option<Vec<Option<Wait>>> {
         let (typed, plugin) = (self.typed_since_idle(view.id), self.plugin_heard(view.id));
         let in_turn = self.in_a_turn(view);
         let waits: Vec<Option<Wait>> = rows
@@ -2107,12 +2114,18 @@ impl Desk {
         match m.delivery {
             Delivery::Held => Some(Wait::Stopped),
             Delivery::Queued if self.steered(view.id, m.id) => Some(Wait::NextCall),
+            Delivery::Queued if view.pending.is_some() => Some(Wait::Dialog),
             Delivery::Queued => match line::deliverable(view, typed, plugin) {
                 // A turn Esc ended: the plugin takes it now.
-                Err(Wait::Working | Wait::Dialog)
+                Err(Wait::Working)
                     if plugin && view.caps.line == Deliver::Submit && !self.in_a_turn(view) =>
                 {
                     self.line_gate(view, m)
+                }
+                // The person at its wheel holds its boss's words past the
+                // turn they wait on.
+                Err(Wait::Working) if self.line_gate(view, m) == Some(Wait::PersonDriving) => {
+                    Some(Wait::PersonDriving)
                 }
                 Err(why) => Some(why),
                 Ok(_) => self.line_gate(view, m),

@@ -551,6 +551,19 @@ async fn at_act_the_boss_that_runs_it_answers_a_session_whose_turn_ended_on_a_qu
         })
         .await;
         assert!(v.pending.is_none(), "no dialog on its screen");
+        // An answer decided at an earlier end of its turn, though it asks
+        // in the same words now.
+        let earlier = d.asked_mark(s.id).expect("it asks");
+        hook(
+            &url,
+            json!({"hook_event_name": "Stop",
+                "last_assistant_message": "Status: the replica is ready. Should I go ahead and switch reads to it?"}),
+        )
+        .await;
+        eventually("its turn to end again", async || {
+            d.asked_mark(s.id).filter(|t| *t != earlier)
+        })
+        .await;
         let stale = crew
             .perform_with(
                 &Action::Nudge {
@@ -560,12 +573,12 @@ async fn at_act_the_boss_that_runs_it_answers_a_session_whose_turn_ended_on_a_qu
                 },
                 crew.by_overseer("It asked whether to drop it.").unwrap(),
                 &super::super::assignments::Order {
-                    answers: Some("Should I drop the old table?".into()),
+                    answers: Some(earlier),
                     ..Default::default()
                 },
             )
             .await
-            .expect_err("it asks something else now");
+            .expect_err("that turn end has passed");
         assert!(super::super::picture::stale(&stale), "{stale}");
         let said = crew
             .perform(

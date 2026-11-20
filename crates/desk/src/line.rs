@@ -113,7 +113,7 @@ pub fn in_turn(state: SessionState) -> bool {
 /// interrupts that turn alone, never one begun since. `run` is the run's
 /// own: its counters start again with each Desk, so a mark from before a
 /// restart never matches a turn after it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct TurnMark {
     pub(crate) run: uuid::Uuid,
     pub(crate) ends: u64,
@@ -305,7 +305,7 @@ pub struct LineMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chose: Option<String>,
     /// An ask's short work-item label ("W7 · PR 2"); a turn-answer's
-    /// question it answers ([`Send::Answer`]).
+    /// question it answers, as it read when sent ([`Send::Answer`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub about: Option<String>,
     /// An ask's one line on why it asks.
@@ -698,13 +698,13 @@ pub enum Send {
         to: Uuid,
         text: String,
     },
-    /// The answer to the question session `to`'s turn ended on (`asks`,
-    /// as it asked it): no session gives one. It goes in only while that is
-    /// still what it asks.
+    /// The answer to the question session `to`'s turn ended on, at the
+    /// turn end `turn` ([`crate::Desk::asked_mark`]): no session gives one.
+    /// It goes in only while that is still what it asks.
     Answer {
         to: Uuid,
         text: String,
-        asks: String,
+        turn: TurnMark,
     },
 }
 
@@ -735,6 +735,8 @@ pub enum Refusal {
     NoSuchAsk(Uuid),
     #[error("Already answered: the first answer to that question stands.")]
     Answered,
+    #[error("It asks something else now: that question has passed.")]
+    Passed,
     #[error("It went ahead without an answer, so this no longer waits on the person; they can still answer it from its thread.")]
     WentAhead,
     #[error("The person set that question aside.")]
@@ -935,6 +937,14 @@ pub fn stalled_why(r: &Refusal) -> Option<String> {
         _ => return None,
     };
     Some(format!("stopped: {why}. Reply to let it carry on."))
+}
+
+/// The question `view`'s turn ended on, while it still asks it: at its
+/// prompt, with no dialog on its screen, and not a tool auto mode refused.
+pub fn open_question(view: &SessionView) -> Option<&crate::asking::Asked> {
+    view.asked.as_ref().filter(|a| {
+        view.state == SessionState::Asking && view.pending.is_none() && a.denied.is_none()
+    })
 }
 
 /// Why a message waits for `recipient`'s turn: a dialog only its terminal
@@ -1979,7 +1989,6 @@ mod tests {
                 "{state:?}"
             );
         }
-        claude.state = SessionState::Working;
         claude.pending = None;
         claude.state = SessionState::Idle;
         assert_eq!(deliverable(&claude, true, true), Ok(Deliver::Submit));

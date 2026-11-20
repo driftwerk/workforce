@@ -149,10 +149,9 @@ pub(crate) struct Order {
     /// Relayed from the boss's home: the irreversible jobs it keeps for its
     /// other sessions, which a request here is compared with (R5).
     pub held_elsewhere: Option<Vec<Assignment>>,
-    /// The question its session's turn ended on that this message answers
-    /// (`answer`): while that is still what it asks, it goes in as the
-    /// answer.
-    pub answers: Option<String>,
+    /// The turn end whose question this message answers (`answer`): while
+    /// that is still what its session asks, it goes in as the answer.
+    pub answers: Option<workforce_desk::line::TurnMark>,
 }
 
 impl Order {

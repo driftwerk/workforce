@@ -128,6 +128,7 @@ impl Desk {
         }
         match self.line_withdraw(m.id).await {
             Ok(Some(_)) => {
+                self.0.state.lock().lines.answers.remove(&m.id);
                 tracing::info!(session = %s, message = %m.id, "a boss's message overtaken before it went in was withdrawn");
                 // Its boss knows it never went in.
                 self.picture_note(
@@ -145,14 +146,18 @@ impl Desk {
         }
     }
 
-    /// Whether session `s` still asks what turn-answer `m` answers: its
-    /// turn ended on that question, with no dialog on its screen.
+    /// Whether session `s` still asks what turn-answer `m` answers, at the
+    /// same turn end: none kept for it (from before a restart) never does.
     fn still_asks(&self, s: Uuid, m: &crate::line::LineMessage) -> bool {
-        self.view(s).is_ok_and(|v| {
-            v.state == crate::model::SessionState::Asking
-                && v.pending.is_none()
-                && v.asked.as_ref().map(|a| &a.ask) == m.about.as_ref()
-        })
+        let kept = self
+            .0
+            .state
+            .lock()
+            .lines
+            .answers
+            .get(&m.id)
+            .map(|(_, t)| *t);
+        kept.is_some_and(|t| self.asked_mark(s) == Some(t))
     }
 
     /// The person's own words into session `id` (a prompt, a message from
