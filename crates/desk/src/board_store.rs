@@ -239,6 +239,7 @@ impl DeskStore {
                 "UPDATE tickets SET title = $3, body = $4, state = $5, rank = $6, \
                  assignee = $7, pinned = $8, snoozed_until = $9, snoozed_at = $10, \
                  state_at = $11, updated_at = $12, external = $13, upstream_rank = $14, \
+                 held_back = CASE WHEN $5 = 'todo' AND $7::jsonb IS NULL THEN held_back END, \
                  version = version + 1 \
                  WHERE id = $1 AND version = $2 RETURNING version",
                 &[
@@ -302,7 +303,7 @@ impl DeskStore {
             .try_get(0)?;
         let moved = tx
             .execute(
-                "UPDATE tickets SET board = $2, number = $3, plan = NULL, \
+                "UPDATE tickets SET board = $2, number = $3, plan = NULL, held_back = NULL, \
                    updated_at = now(), version = version + 1 WHERE id = $1",
                 &[&id, &to, &number],
             )
@@ -322,8 +323,8 @@ impl DeskStore {
         let client = self.pool().get().await?;
         Ok(client
             .execute(
-                "UPDATE tickets SET plan = NULL, updated_at = now(), version = version + 1 \
-                 WHERE id = $1 AND plan IS NOT NULL",
+                "UPDATE tickets SET plan = NULL, held_back = NULL, updated_at = now(), \
+                 version = version + 1 WHERE id = $1 AND plan IS NOT NULL",
                 &[&id],
             )
             .await?

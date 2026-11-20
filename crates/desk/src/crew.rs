@@ -762,6 +762,10 @@ pub struct MachineSession {
     /// When it was made there; none from a Desk that doesn't say.
     #[serde(default)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// How its process last ended on its own; none from a Desk that
+    /// doesn't say.
+    #[serde(default)]
+    pub exited: Option<crate::model::Exited>,
 }
 
 impl MachineSession {
@@ -771,6 +775,12 @@ impl MachineSession {
             .as_deref()
             .filter(|n| !n.trim().is_empty())
             .unwrap_or(&self.name)
+    }
+
+    /// What it said as it ended, when it ended as it started.
+    pub fn ended_as_started(&self) -> Option<&crate::model::Exited> {
+        let state = crate::model::SessionState::parse(&self.state).ok()?;
+        crate::model::Exited::as_started(self.exited.as_ref(), state)
     }
 }
 

@@ -717,33 +717,6 @@ fn devin_signed_in(d: &Desk) -> crate::engine::SignIn {
         .unwrap()
 }
 
-/// Everything logged, as one string.
-#[derive(Clone, Default)]
-struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl Captured {
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-    }
-}
-
-impl std::io::Write for Captured {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
-    type Writer = Captured;
-    fn make_writer(&'a self) -> Captured {
-        self.clone()
-    }
-}
-
 /// Every run of 6 of `secret`'s characters that `text` repeats.
 fn leaked(text: &str, secret: &str) -> Vec<String> {
     (0..=secret.len() - 6)
@@ -816,20 +789,7 @@ async fn only_the_hub_holder_signs_an_engine_in() {
 #[tokio::test(flavor = "current_thread")]
 async fn devin_signs_in_by_a_pasted_code_kept_and_said_nowhere() {
     use super::engine_sign_ins::EngineSignInState;
-    let log = Captured::default();
-    let _logging = tracing::subscriber::set_default(
-        tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_ansi(false)
-            .with_writer(log.clone())
-            .finish(),
-    );
-    // Under `cargo test` other tests' threads share these callsites. A
-    // second live subscriber keeps tracing from caching "off" for them on
-    // a thread that listens to nothing; what is caught is still only what
-    // this thread logs (its own desk's tasks run here).
-    let _second = tracing::Dispatch::new(tracing_subscriber::registry());
-    tracing::callsite::rebuild_interest_cache();
+    let (log, _logging) = crate::testing::Captured::on_this_thread();
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let mut o = account_options(dir.path(), Arc::new(MemoryKeys::default()));

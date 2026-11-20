@@ -270,6 +270,9 @@ pub struct SessionView {
     /// with it, and what it gives the person comes as its own card.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub boss_has: Option<String>,
+    /// How its process last ended on its own, until it starts again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exited: Option<Exited>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -283,6 +286,57 @@ impl SessionView {
             (SessionState::Done, Some(b)) => b.count,
             _ => 0,
         }
+    }
+
+    /// What it said as it ended, when it ended as it started.
+    pub fn ended_as_started(&self) -> Option<&Exited> {
+        Exited::as_started(self.exited.as_ref(), self.state)
+    }
+}
+
+/// How a session's process ended on its own (not stopped, closed or ended
+/// by Desk): what it showed last, kept until it starts again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Exited {
+    /// Its exit code; none where it wasn't known.
+    pub code: Option<u32>,
+    /// The end of what its terminal showed, as plain text.
+    pub last_output: String,
+    pub at: DateTime<Utc>,
+    /// It ended before it got to work: no turn of it ended, and it was
+    /// still starting or waiting for its first prompt.
+    #[serde(default)]
+    pub on_start: bool,
+}
+
+impl Exited {
+    /// What a session in `state` said as it ended, when it ended as it
+    /// started.
+    pub fn as_started(exited: Option<&Self>, state: SessionState) -> Option<&Self> {
+        exited.filter(|e| e.on_start && !state.is_running())
+    }
+
+    /// "ended as it started (exit 1)", said after its name.
+    pub fn ended_as_started(&self) -> String {
+        match self.code {
+            Some(c) => format!("ended as it started (exit {c})"),
+            None => "ended as it started".into(),
+        }
+    }
+
+    /// The end of its last output on one line, its lines joined by " / ",
+    /// at most `max` characters.
+    pub fn said(&self, max: usize) -> String {
+        let line = self
+            .last_output
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(" / ");
+        let skip = line.chars().count().saturating_sub(max);
+        line.chars().skip(skip).collect()
     }
 }
 
@@ -380,6 +434,7 @@ impl SessionView {
             waits_on_you: None,
             boss_has: None,
             failure: None,
+            exited: None,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }

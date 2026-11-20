@@ -90,6 +90,9 @@ pub struct PlanTicketView {
     /// What holds its session, while Desk's breaker does: the ticket is
     /// blocked on the person, and nothing is started in its place.
     pub held: Option<String>,
+    /// Why it waits in To do for someone to start it ([`Runs::held_back`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub held_back: Option<String>,
 }
 
 /// A plan in full: its tickets, its waves, and every revision.
@@ -441,6 +444,7 @@ impl Desk {
                     model: r.model,
                     repo: r.repo,
                     adopted: r.adopted,
+                    held_back: r.held_back,
                     ticket: v,
                 }
             })
@@ -776,6 +780,7 @@ impl Desk {
                 model: t.model.clone(),
                 repo: t.repo.clone(),
                 adopted: t.adopted,
+                held_back: None,
             };
             if t.adopted {
                 // Only the needs it doesn't have already.
@@ -1448,6 +1453,7 @@ impl Desk {
                 model: t.model.clone(),
                 repo: t.repo.clone(),
                 adopted: true,
+                held_back: None,
             };
             if let Err(e) = self.0.store.adopt_ticket(t.id, &runs).await {
                 self.unclaim(p, &claimed).await;
@@ -1482,6 +1488,7 @@ impl Desk {
                     model: t.model.clone(),
                     repo: t.repo.clone(),
                     adopted: t.adopted,
+                    held_back: None,
                 },
             )
             .await
@@ -2441,6 +2448,43 @@ impl Desk {
         }
     }
 
+    /// Puts ticket `ticket` of plan `plan`, in Doing on `session` (its
+    /// assignee's id: `machine/id` for one on a machine), back in To do,
+    /// held back with `why`: its plan doesn't start it again by itself
+    /// until someone starts it, hands it out or moves it on. Whether it
+    /// did: not once it is elsewhere or someone else's. Called under the
+    /// runner's start lock, so no start comes between the move and the
+    /// hold.
+    pub async fn hold_back_ticket(
+        &self,
+        plan: Uuid,
+        ticket: Uuid,
+        session: &str,
+        why: &str,
+    ) -> Result<bool, DeskError> {
+        let t = self.ticket_of(ticket).await?;
+        let on_it = t.state == TicketState::Doing
+            && t.assignee
+                .as_ref()
+                .is_some_and(|a| a.kind == PartyKind::Session && a.id == session);
+        if !on_it {
+            return Ok(false);
+        }
+        let mv = Move {
+            state: TicketState::Todo,
+            before: None,
+            after: None,
+        };
+        let moved = self.move_read(t, mv, &By::desk(why)).await?;
+        self.0
+            .store
+            .hold_back(ticket, moved.ticket.version, why)
+            .await
+            .map_err(internal)?;
+        self.plan_touched(plan).await;
+        Ok(true)
+    }
+
     /// Finishes the start `s` that a stop cut off: its session is known (it
     /// is linked to the ticket; one the holder kept was adopted when Desk
     /// started), or it never started (it is started now, as the same
@@ -2978,6 +3022,7 @@ fn plan_ticket(
         repo: r.repo,
         assigned: v.ticket.assignee.is_some(),
         starting,
+        held_back: r.held_back,
     }
 }
 
@@ -3027,6 +3072,7 @@ fn plan_why(s: &Snapshot, parallel: Option<i16>) -> String {
             repo: t.repo.clone(),
             assigned: false,
             starting: false,
+            held_back: None,
         })
         .collect();
     let waves = plan::waves(&rows).len();

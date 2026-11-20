@@ -27,17 +27,25 @@ pub(super) async fn hub_with(
     Desk,
     wiremock::MockServer,
 ) {
+    hub_running(dir, pool, oversight, installed_cli(dir)).await
+}
+
+/// [`hub_with`], its Claude Code `claude`.
+async fn hub_running(
+    dir: &Path,
+    pool: workforce_postgres::PostgresPool,
+    oversight: &str,
+    claude: PathBuf,
+) -> (
+    Arc<AgentService>,
+    Arc<GatewayState>,
+    Desk,
+    wiremock::MockServer,
+) {
     let (overseer, llm) = agent(dir, "desk", "ok").await;
     write_config(&overseer, oversight);
     let state = hub(std::slice::from_ref(&overseer));
-    let d = desk_running(
-        pool,
-        dir,
-        Default::default(),
-        installed_cli(dir),
-        not_installed(dir),
-    )
-    .await;
+    let d = desk_running(pool, dir, Default::default(), claude, not_installed(dir)).await;
     let dm = overseer
         .sessions
         .get_or_create(DESK_CHANNEL, PERSON, "desk")
@@ -2213,6 +2221,196 @@ async fn editing_a_plans_ticket_goes_through_its_plan() {
             assert!(!r.success, "{tool}: {r:?}");
             assert!(r.error.as_deref().unwrap_or_default().contains(says), "{tool}: {r:?}");
         }
+    })
+    .await;
+}
+
+/// A Claude Code that says its version, and whose sessions say why they
+/// can't start and end at once.
+fn broken_cli(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("broken-claude");
+    std::fs::write(
+        &path,
+        "#!/bin/sh\ncase \"$1\" in --version) echo '2.1.300 (Claude Code)'; exit 0;; auth) exit 1;; esac\necho 'error: settings.json is not valid JSON'\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// A plan's ticket whose session here ends as it starts is back in To do,
+/// held back: its boss is told once, with its exit and what it said, and
+/// its plan starts it no more by itself. Moved on and back, it starts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ticket_whose_session_here_ends_as_it_starts_waits_in_to_do_its_boss_told_once() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, state, d, llm) =
+            hub_running(dir.path(), pool, ACTS, broken_cli(dir.path())).await;
+        let p = proposed(&d, dir.path(), 1).await;
+        let id = p.summary.plan.id;
+        d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        let held = eventually("the ticket held back", async || {
+            let t = d.plan(id).await.ok()?.tickets.remove(0);
+            (t.ticket.ticket.state == TicketState::Todo).then_some(t.held_back?)
+        })
+        .await;
+        assert_eq!(held, "its session ended as it started (exit 1)");
+        let told = "DES-1's session on this computer ended as it started (exit 1). \
+                    Its last output: “error: settings.json is not valid JSON” DES-1 is back in To do";
+        eventually("the boss told", async || {
+            (newly_said(&llm, told).await >= 1).then_some(())
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(2_000)).await;
+        assert_eq!(newly_said(&llm, "ended as it started").await, 1, "once");
+        assert_eq!(d.list().iter().filter(|v| v.name == "DES-1").count(), 1, "never started again");
+        let p = d.plan(id).await.unwrap();
+        assert_eq!(p.summary.progress.blocked, 1);
+        assert!(p.summary.progress.next.is_empty());
+
+        // Moved on and back by the person, its plan starts it again.
+        let ticket = p.tickets[0].ticket.ticket.id;
+        for state in [TicketState::Backlog, TicketState::Todo] {
+            let mv = workforce_desk::Move {
+                state,
+                before: None,
+                after: None,
+            };
+            d.move_ticket(ticket, mv, &By::you()).await.unwrap();
+        }
+        eventually("started again", async || {
+            (d.list().iter().filter(|v| v.name == "DES-1").count() == 2).then_some(())
+        })
+        .await;
+    })
+    .await;
+}
+
+/// The same of one on a machine, as its Desk says it ended; a plain turn's
+/// end there still reads as one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ticket_whose_session_on_a_machine_ends_as_it_starts_waits_in_to_do_its_boss_told_once() {
+    use super::super::relay::RelayAnswer;
+    use super::super::served::ServedStatus;
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, llm) = hub_with(dir.path(), pool, ACTS).await;
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("the plan tools", async || {
+            overseer.tools.has("crew.plan").then_some(())
+        })
+        .await;
+        let there: Arc<parking_lot::Mutex<Vec<Value>>> = Arc::default();
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let poller = {
+            let (crew, there, starts) =
+                (Arc::clone(&crew), Arc::clone(&there), Arc::clone(&starts));
+            tokio::spawn(async move {
+                loop {
+                    for c in crew.relay_take(Duration::from_millis(200)).await {
+                        let body = match c.tool.as_str() {
+                            "desk.sessions" => Value::Array(there.lock().clone()),
+                            "desk.session_start" => {
+                                starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                let s = json!({
+                                    "id": uuid::Uuid::new_v4(), "name": c.input["name"],
+                                    "cwd": c.input["cwd"], "state": "starting", "lastReply": null,
+                                });
+                                there.lock().push(s.clone());
+                                s
+                            }
+                            other => panic!("{other} relayed"),
+                        };
+                        crew.relay_answer(
+                            c.id,
+                            RelayAnswer {
+                                status: ServedStatus::Ok,
+                                body,
+                            },
+                        );
+                    }
+                }
+            })
+        };
+        let r = overseer
+            .tools
+            .get("crew.plan")
+            .unwrap()
+            .execute(json!({
+                "goal": "Speed up vellev's recall",
+                "machine": "devbox",
+                "tickets": [
+                    {"title": "Profile recall", "folder": "/home/dev/vellev"},
+                    {"title": "Cache recall", "folder": "/home/dev/vellev-cache"},
+                ],
+            }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        let id: uuid::Uuid = r.output["proposed"]["plan_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        d.approve_plan(id, 1, &By::you()).await.unwrap();
+        eventually("both started on devbox", async || {
+            (there.lock().len() == 2).then_some(())
+        })
+        .await;
+        let key_of = |i: usize| there.lock()[i]["name"].as_str().unwrap().to_string();
+        let (worked, died) = (key_of(0), key_of(1));
+
+        // One ends its turn as ever; the other ends as it starts.
+        {
+            let mut on = there.lock();
+            on[0]["state"] = json!("idle");
+            on[0]["lastReply"] = json!("Profiled.");
+            on[1]["state"] = json!("interrupted");
+            on[1]["exited"] = json!({
+                "code": 127, "lastOutput": "Starting\nclaude: command not found",
+                "at": chrono::Utc::now(), "onStart": true,
+            });
+        }
+        let told = format!(
+            "{died}'s session on devbox ended as it started (exit 127). \
+             Its last output: “Starting / claude: command not found” {died} is back in To do"
+        );
+        eventually("the boss told", async || {
+            (newly_said(&llm, &told).await >= 1).then_some(())
+        })
+        .await;
+        eventually("a plain turn told as ever", async || {
+            (newly_said(
+                &llm,
+                &format!("{worked}'s session on devbox finished a turn"),
+            )
+            .await
+                >= 1)
+                .then_some(())
+        })
+        .await;
+        let held = eventually("the ticket held back", async || {
+            let p = d.plan(id).await.ok()?;
+            let t = p
+                .tickets
+                .into_iter()
+                .find(|t| t.ticket.key.as_deref() == Some(&died))?;
+            (t.ticket.ticket.state == TicketState::Todo && t.ticket.ticket.assignee.is_none())
+                .then_some(t.held_back?)
+        })
+        .await;
+        assert_eq!(held, "its session ended as it started (exit 127)");
+        tokio::time::sleep(Duration::from_millis(2_000)).await;
+        assert_eq!(newly_said(&llm, "ended as it started").await, 1, "once");
+        assert_eq!(
+            starts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "never started again"
+        );
+        poller.abort();
     })
     .await;
 }

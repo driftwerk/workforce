@@ -1133,6 +1133,9 @@ pub struct PlanTicket {
     /// The runner is starting a session for it.
     #[serde(default)]
     pub starting: bool,
+    /// Why it waits in To do for someone to start it: the runner doesn't.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_back: Option<String>,
 }
 
 impl PlanTicket {
@@ -1155,10 +1158,12 @@ pub fn waves(tickets: &[PlanTicket]) -> Vec<Vec<Uuid>> {
     out
 }
 
-/// Whether `t` may start now: in To do, every need Done (a need not among
-/// `states` holds it back), and no one has it or is starting it.
+/// Whether `t` may start now: in To do, not held back, every need Done (a
+/// need not among `states` holds it back), and no one has it or is
+/// starting it.
 fn startable(t: &PlanTicket, states: &HashMap<Uuid, TicketState>) -> bool {
     t.state == TicketState::Todo
+        && t.held_back.is_none()
         && !t.assigned
         && !t.starting
         && t.needs
@@ -1262,7 +1267,8 @@ pub struct Progress {
     pub review: usize,
     /// In To do with every need done, and no one on it yet.
     pub ready: usize,
-    /// Held back by a need that was dropped: someone must decide.
+    /// Held back by a need that was dropped, or by its session ending as
+    /// it started: someone must decide.
     pub blocked: usize,
     /// Waiting on needs not done yet, or not handed out yet.
     pub waiting: usize,
@@ -1289,7 +1295,7 @@ pub fn progress(tickets: &[PlanTicket]) -> Progress {
                     .needs
                     .iter()
                     .any(|n| states.get(n) == Some(&TicketState::Dropped));
-                if dropped_need {
+                if dropped_need || t.held_back.is_some() {
                     p.blocked += 1;
                 } else if startable(t, &states) {
                     p.ready += 1;

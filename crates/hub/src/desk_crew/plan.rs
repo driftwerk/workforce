@@ -31,7 +31,7 @@ use workforce_desk::board::TicketState;
 use workforce_desk::crew::{
     self, By, Crew as _, Extras, Kind, MachineSession, MentionedPlan, Party, PartyKind,
 };
-use workforce_desk::model::{DeskEvent, Engine, SessionState};
+use workforce_desk::model::{DeskEvent, Engine, Exited, SessionState};
 use workforce_desk::plan::{self, Draft, DraftTicket, Plan, PlanState, PlanTicket};
 use workforce_desk::{Changed, NewPlan, PlanDetail, PlanEdit};
 
@@ -97,6 +97,7 @@ impl Failed {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct MachineSeen {
     pub plan: Uuid,
+    pub ticket: Uuid,
     pub boss: String,
     pub key: String,
     /// Its state as the machine said it; `starting` until first read.
@@ -1510,6 +1511,7 @@ impl CrewHub {
                 };
                 let seen = MachineSeen {
                     plan: s.plan.id,
+                    ticket: row.id,
                     boss: s.plan.boss.clone(),
                     key: t.ticket.key.clone().unwrap_or_else(|| row.id.to_string()),
                     state: "starting".into(),
@@ -1592,6 +1594,16 @@ impl CrewHub {
                         was.key, was.key
                     )
                 };
+                // Ended as it started, in Doing: said once as it is first
+                // seen so, however long since its last read.
+                let died = now
+                    .filter(|now| {
+                        !review
+                            && was
+                                .as_ref()
+                                .is_none_or(|w| w.state != now.state || w.reply != now.last_reply)
+                    })
+                    .and_then(MachineSession::ended_as_started);
                 let line = match (now, &was) {
                     // In Review, its turns are the person's to read.
                     (Some(now), Some(was)) => machine_line(&machine, was, now)
@@ -1604,8 +1616,20 @@ impl CrewHub {
                     }
                     _ => None,
                 };
-                if let Some(line) = line {
-                    self.plan_failures.lock().push((fresh.plan, line));
+                match (died, line) {
+                    (Some(e), _) => {
+                        self.ended_as_started(
+                            fresh.plan,
+                            fresh.ticket,
+                            &fresh.key,
+                            &item,
+                            Some(&machine),
+                            e,
+                        )
+                        .await;
+                    }
+                    (None, Some(line)) => self.plan_failures.lock().push((fresh.plan, line)),
+                    (None, None) => {}
                 }
                 let mut next = was.unwrap_or(fresh);
                 match now {
@@ -1763,6 +1787,7 @@ impl CrewHub {
                                     format!("{m}/{}", started.id),
                                     MachineSeen {
                                         plan: p.id,
+                                        ticket: s.ticket,
                                         boss: boss.id.clone(),
                                         key,
                                         state: "starting".into(),
@@ -1880,6 +1905,50 @@ impl CrewHub {
             }
             self.plan_failed.lock().remove(&ticket);
         }
+    }
+
+    /// Ticket `ticket` (`key`) of plan `plan`, whose session `session` (its
+    /// assignee's id) on `machine` (none: this computer) ended as it
+    /// started, saying `exited`: back in To do from Doing, held back so its
+    /// plan doesn't start it again by itself, and its boss told.
+    async fn ended_as_started(
+        &self,
+        plan: Uuid,
+        ticket: Uuid,
+        key: &str,
+        session: &str,
+        machine: Option<&str>,
+        exited: &Exited,
+    ) {
+        let ended = exited.ended_as_started();
+        let held = {
+            let _one = self.starting.lock().await;
+            self.desk
+                .hold_back_ticket(plan, ticket, session, &format!("its session {ended}"))
+                .await
+        };
+        let held = held.unwrap_or_else(|e| {
+            tracing::info!(%plan, %ticket, error = %e, "a ticket whose session ended as it started wasn't held back");
+            false
+        });
+        let said = exited.said(600);
+        let output = match said.is_empty() {
+            true => String::new(),
+            false => format!(" Its last output: “{said}”"),
+        };
+        let then = match held {
+            true => format!(
+                " {key} is back in To do, and its plan won't start it again by itself: once what \
+                 stopped it is put right, move it to Backlog and back to To do with \
+                 crew.move_ticket and its plan starts it, or tell the person."
+            ),
+            false => String::new(),
+        };
+        let on = machine.unwrap_or("this computer");
+        self.plan_failures.lock().push((
+            plan,
+            format!("{key}'s session on {on} {ended}.{output}{then}"),
+        ));
     }
 
     /// At `suggest`, what the runner would start becomes a suggestion for
@@ -2130,25 +2199,64 @@ impl CrewHub {
                 Some((plan?, line))
             }
             Kind::Failed => {
-                let subject = event.subject.as_ref()?;
-                let session: Uuid = subject.id.parse().ok()?;
-                let tickets = self.desk.store().linked_tickets(&[session]).await.ok()?;
-                for t in tickets {
-                    if let Ok(Some(plan)) = self.desk.store().plan_of_ticket(t.id).await {
-                        let key = self
-                            .desk
-                            .ticket(t.id)
-                            .await
-                            .ok()
-                            .and_then(|v| v.key)
-                            .unwrap_or_else(|| "a ticket".into());
-                        return Some((plan, format!("{key}'s session failed: {}", event.text)));
-                    }
-                }
+                let session: Uuid = event.subject.as_ref()?.id.parse().ok()?;
+                let (plan, ticket, key) = self.plan_ticket_of(session).await?;
+                let Some(e) = self.ended_as_started_here(session) else {
+                    return Some((plan, format!("{key}'s session failed: {}", event.text)));
+                };
+                // Its hold waits on the runner's starts: on its own task,
+                // never holding up the plan loop.
+                let crew = self.me.upgrade()?;
+                tokio::spawn(async move {
+                    let session = session.to_string();
+                    crew.ended_as_started(plan, ticket, &key, &session, None, &e)
+                        .await;
+                });
                 None
             }
             _ => None,
         }
+    }
+
+    /// The plan, ticket and key of the plan's ticket `session` (one on this
+    /// computer) is linked to, if any.
+    async fn plan_ticket_of(&self, session: Uuid) -> Option<(Uuid, Uuid, String)> {
+        let tickets = self.desk.store().linked_tickets(&[session]).await.ok()?;
+        for t in tickets {
+            if let Ok(Some(plan)) = self.desk.store().plan_of_ticket(t.id).await {
+                let key = self
+                    .desk
+                    .ticket(t.id)
+                    .await
+                    .ok()
+                    .and_then(|v| v.key)
+                    .unwrap_or_else(|| "a ticket".into());
+                return Some((plan, t.id, key));
+            }
+        }
+        None
+    }
+
+    /// What `session`, on this computer, said as it ended, when it ended
+    /// as it started.
+    fn ended_as_started_here(&self, session: Uuid) -> Option<Exited> {
+        self.desk.view(session).ok()?.ended_as_started().cloned()
+    }
+
+    /// Whether `event` is a plan's ticket's session on this computer ending
+    /// as it started: its plan's turn tells its boss, once
+    /// ([`Self::ended_as_started`]).
+    pub(super) async fn its_plan_tells(&self, event: &crew::Event) -> bool {
+        let Some(session) = event
+            .subject
+            .as_ref()
+            .and_then(|s| s.id.parse::<Uuid>().ok())
+            .filter(|_| event.kind == Kind::Failed)
+        else {
+            return false;
+        };
+        self.ended_as_started_here(session).is_some()
+            && self.plan_ticket_of(session).await.is_some()
     }
 
     /// One `[Desk plan]` turn of plan `id`'s boss, for `lines`.
@@ -2483,6 +2591,7 @@ mod tests {
             model: None,
             assigned: false,
             starting: false,
+            held_back: None,
         };
         let f = Failed {
             plan: Uuid::new_v4(),
@@ -2507,6 +2616,7 @@ mod tests {
     fn a_machine_session_tells_its_boss_of_each_turn_its_ask_and_its_end() {
         let seen = |state: &str, reply: Option<&str>| MachineSeen {
             plan: Uuid::nil(),
+            ticket: Uuid::nil(),
             boss: "local:sarah".into(),
             key: "VEL-3".into(),
             state: state.into(),
@@ -2521,6 +2631,7 @@ mod tests {
             state: state.into(),
             last_reply: reply.map(str::to_string),
             created_at: None,
+            exited: None,
         };
         // Nothing new: nothing said.
         assert_eq!(
@@ -2581,6 +2692,25 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn a_machine_session_says_how_it_ended_as_it_started_and_an_older_desks_says_nothing() {
+        let read = |v: Value| serde_json::from_value::<MachineSession>(v).unwrap();
+        let older = read(json!({"id": Uuid::nil(), "state": "interrupted"}));
+        assert_eq!(older.exited, None);
+        assert_eq!(older.ended_as_started(), None);
+        let exited = json!({"code": 1, "lastOutput": "bad flag", "at": "2026-11-20T09:00:00Z", "onStart": true});
+        let died = read(json!({"id": Uuid::nil(), "state": "interrupted", "exited": exited}));
+        let e = died.ended_as_started().unwrap();
+        assert_eq!((e.code, e.last_output.as_str()), (Some(1), "bad flag"));
+        // Running again, or after its first turn, it didn't.
+        let again = read(json!({"id": Uuid::nil(), "state": "working", "exited": exited}));
+        assert_eq!(again.ended_as_started(), None);
+        let mut later = exited.clone();
+        later["onStart"] = json!(false);
+        let worked = read(json!({"id": Uuid::nil(), "state": "interrupted", "exited": later}));
+        assert_eq!(worked.ended_as_started(), None);
     }
 
     #[test]

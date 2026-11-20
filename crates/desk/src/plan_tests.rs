@@ -46,6 +46,7 @@ fn ticket(n: u128, state: TicketState, needs: &[u128]) -> PlanTicket {
         model: None,
         assigned: false,
         starting: false,
+        held_back: None,
     }
 }
 
@@ -622,6 +623,22 @@ fn an_approved_plan_starts_its_ready_tickets_up_to_the_limit_in_rank_order() {
 }
 
 #[test]
+fn a_ticket_held_back_never_starts_by_itself_and_waits_on_someone() {
+    let p = plan(PlanState::Running);
+    let mut held = ticket(1, TicketState::Todo, &[]);
+    held.held_back = Some("its session ended as it started (exit 1)".into());
+    let tickets = vec![held, ticket(2, TicketState::Todo, &[])];
+    let order: Vec<Uuid> = next_starts(&p, &tickets, 0, 4, None)
+        .iter()
+        .map(|s| s.ticket)
+        .collect();
+    assert_eq!(order, vec![u(2)]);
+    let progress = super::progress(&tickets);
+    assert_eq!((progress.ready, progress.blocked), (1, 1));
+    assert_eq!(progress.next, vec!["ACM-2".to_string()]);
+}
+
+#[test]
 fn a_ticket_sharing_a_folder_with_work_under_way_gets_a_worktree() {
     let p = plan(PlanState::Running);
     let mut doing = ticket(1, TicketState::Doing, &[]);
@@ -1046,6 +1063,7 @@ fn over_the_limit_nothing_starts_until_it_drains() {
             model: None,
             assigned: false,
             starting: false,
+            held_back: None,
         });
     }
     assert!(next_starts(&p, &tickets, 5, 4, None).is_empty());

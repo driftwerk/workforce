@@ -25,8 +25,8 @@ use crate::first_run;
 use crate::floor::{Outcome, Scope, Subject, SubjectKey, Turn, TurnLog, TurnOp};
 use crate::holder::{Held, Holder};
 use crate::model::{
-    Approvals, Decision, DeskEvent, Engine, NewSession, Origin, PendingApproval, SessionPatch,
-    SessionRecord, SessionState, SessionView,
+    Approvals, Decision, DeskEvent, Engine, Exited, NewSession, Origin, PendingApproval,
+    SessionPatch, SessionRecord, SessionState, SessionView,
 };
 use crate::procs;
 use crate::pty::{Exit, Pty};
@@ -784,6 +784,9 @@ struct State {
     /// How each session's last turn ended when an API error ended it, until
     /// it is asked again ([`crate::limit`]).
     turn_failures: HashMap<Uuid, crate::limit::TurnFailure>,
+    /// How each session's process last ended on its own, until it starts
+    /// again ([`SessionView::exited`]).
+    exited: HashMap<Uuid, Exited>,
     /// Which Anthropic account each of the person's accounts is, when known
     /// ([`crate::identity`]).
     links: HashMap<Uuid, crate::identity::Link>,
@@ -975,6 +978,11 @@ const SIGN_IN_WAIT: Duration = Duration::from_secs(20);
 const STOP_GRACE: Duration = Duration::from_secs(3);
 #[cfg(test)]
 const STOP_GRACE: Duration = Duration::from_millis(150);
+
+/// How much of what a session's terminal showed is kept when its process
+/// ends on its own ([`Exited::last_output`]).
+const EXITED_LINES: usize = 20;
+const EXITED_CHARS: usize = 2000;
 
 enum Persist {
     Terminal(Box<TerminalRecord>),
@@ -2300,6 +2308,7 @@ impl Desk {
         view.reading = live.is_some_and(|l| l.reading.is_some());
         view.prompts = live.map_or(0, |l| l.prompts);
         view.failure = state.turn_failures.get(&r.id).cloned();
+        view.exited = state.exited.get(&r.id).cloned();
         view.mode = live.and(state.modes_started.get(&r.id).copied());
         view.waits_on_you = Self::waits_on_you(state, &view);
         view.boss_has = Self::boss_has(state, &view);
@@ -2973,6 +2982,10 @@ impl Desk {
     ) -> Vec<Event> {
         let me = Party::session(now);
         let own = |kind: Kind, text: String| Event::new(kind, me.clone(), Some(me.clone()), text);
+        // Ended as it started: a failure, whichever state it was lost from.
+        let died = now
+            .ended_as_started()
+            .map(|e| own(Kind::Failed, e.ended_as_started()));
         transitions
             .iter()
             .filter_map(|t| match *t {
@@ -3054,6 +3067,10 @@ impl Desk {
                     (_, Some(answer), _) => own(Kind::Finished, format!("finished · {answer}")),
                     _ => own(Kind::Finished, "finished".into()),
                 }),
+                Transition::Stopped { .. } | Transition::Interrupted if died.is_some() => {
+                    st.acted.remove(&now.id);
+                    died.clone()
+                }
                 Transition::Stopped { closed } => (!st.acted.remove(&now.id)).then(|| {
                     own(
                         Kind::Stopped,
@@ -3781,8 +3798,13 @@ impl Desk {
                 "this session never started a conversation, so there is nothing to resume".into(),
             ));
         }
-        if by.is_some() {
-            self.0.state.lock().acted.insert(id);
+        {
+            let mut st = self.0.state.lock();
+            if by.is_some() {
+                st.acted.insert(id);
+            }
+            // Starting again: how it last ended is over.
+            st.exited.remove(&id);
         }
         let carried = r.cli_session_id.clone();
         self.change(id, |r, _| {
@@ -4092,6 +4114,7 @@ impl Desk {
             st.acted.remove(&id);
             st.cut_off.remove(&id);
             st.restarted.remove(&id);
+            st.exited.remove(&id);
             st.switch_by.remove(&id);
             st.switch_notes.remove(&id);
             st.live.remove(&id)
@@ -4892,9 +4915,11 @@ impl Desk {
 
     /// The end of what the terminal shows, as plain text.
     pub fn terminal_text(&self, id: Uuid, max_chars: usize) -> Result<String, DeskError> {
-        let text = crate::pty::plain_text(self.attach(id)?.text().as_bytes());
-        let skip = text.chars().count().saturating_sub(max_chars);
-        Ok(text.chars().skip(skip).collect())
+        Ok(crate::pty::shown_end(
+            &self.attach(id)?.text(),
+            usize::MAX,
+            max_chars,
+        ))
     }
 
     pub fn rooms(&self) -> Vec<Room> {
@@ -5830,8 +5855,17 @@ impl Desk {
         }
         let clean = live.ended || live.stopping;
         let closing = live.closing;
+        let exited = (!clean && !closing)
+            .then(|| self.exited_of(id, code, &live))
+            .flatten();
         live.end();
         drop(live);
+        if let Some(e) = exited {
+            if e.on_start || e.code != Some(0) {
+                tracing::warn!(%id, code = ?e.code, on_start = e.on_start, said = %e.said(400), "a desk session ended on its own");
+            }
+            self.0.state.lock().exited.insert(id, e);
+        }
         self.spend_read_ending(id);
         self.change(id, |r, _| {
             // Ended from Desk, whether before its exit was seen or since.
@@ -5843,6 +5877,25 @@ impl Desk {
                 r.state.after_loss()
             };
         });
+    }
+
+    /// How session `id`'s process ended on its own with `code`, from its run
+    /// `live`: none once it was closed.
+    fn exited_of(&self, id: Uuid, code: Exit, live: &Live) -> Option<Exited> {
+        let state = self.0.state.lock().records.get(&id).map(|r| r.state)?;
+        let at = Utc::now();
+        let on_start = live.ends == 0
+            && match state {
+                SessionState::Starting => true,
+                SessionState::Idle => at - live.started_at < chrono::Duration::minutes(1),
+                _ => false,
+            };
+        (state != SessionState::Closed).then(|| Exited {
+            code,
+            last_output: crate::pty::shown_end(&live.pty.text(), EXITED_LINES, EXITED_CHARS),
+            at,
+            on_start,
+        })
     }
 
     /// Handles one Claude Code hook call. Returns `None` when the URL's token
@@ -10054,6 +10107,96 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("fewer than {n} events were recorded");
+    }
+
+    /// A stand-in CLI that says why it can't start and exits 3, until
+    /// `ok` is in `dir`; then it stays up until killed.
+    fn failing_cli(dir: &Path) -> PathBuf {
+        let path = dir.join("failing-cli");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n[ -e '{}/ok' ] && exec sleep 60\nprintf 'Starting\\n\\033[31merror: unknown model opus-9\\033[0m\\n'\nexit 3\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    async fn until_ended(d: &Desk, id: Uuid) -> SessionView {
+        for _ in 0..200 {
+            let v = d.view(id).unwrap();
+            if !v.live && !v.state.is_running() {
+                return v;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("it never ended");
+    }
+
+    // One thread, so what the desk's tasks log is caught here.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_session_that_ends_as_it_starts_keeps_what_it_said_until_it_starts_again() {
+        let (log, _logging) = crate::testing::Captured::on_this_thread();
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            DeskStore::migrate(&pool).await.unwrap();
+            let d = Desk::start(
+                DeskStore::from_pool(pool),
+                options(dir.path()).with_program(Engine::Claude, failing_cli(dir.path())),
+                Default::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let s = new_session(&d, dir.path()).await;
+            let ended = until_ended(&d, s.id).await;
+            assert_eq!(ended.state, SessionState::Interrupted);
+            let e = ended.exited.clone().expect("what it said is kept");
+            assert_eq!(e.code, Some(3));
+            assert!(e.on_start);
+            assert!(
+                e.last_output.ends_with("error: unknown model opus-9"),
+                "{e:?}"
+            );
+            assert!(!e.last_output.contains('\x1b'), "plain text: {e:?}");
+            assert_eq!(ended.ended_as_started(), Some(&e));
+            let wire = serde_json::to_value(&ended).unwrap();
+            assert_eq!(wire["exited"]["code"], 3);
+            assert_eq!(wire["exited"]["onStart"], true);
+            assert!(wire["exited"]["lastOutput"]
+                .as_str()
+                .unwrap()
+                .contains("unknown model"));
+            let events = recorded(&d, 2).await;
+            assert_eq!(
+                events.last().map(|(k, t, _)| (*k, t.as_str())),
+                Some((crew::Kind::Failed, "ended as it started (exit 3)"))
+            );
+            let logged = log.text();
+            assert!(
+                logged.contains("WARN")
+                    && logged.contains("a desk session ended on its own")
+                    && logged.contains(&s.id.to_string())
+                    && logged.contains("unknown model opus-9"),
+                "{logged}"
+            );
+
+            // Started again, how it last ended is over; stopped by Desk, its
+            // end is none of its own.
+            std::fs::write(dir.path().join("ok"), "").unwrap();
+            d.change(s.id, |r, _| r.cli_session_id = Some("c1".into()));
+            let again = d.resume(s.id, None, Some(By::you())).await.unwrap();
+            assert_eq!(again.exited, None);
+            assert_eq!(serde_json::to_value(&again).unwrap().get("exited"), None);
+            d.stop(s.id, Some(By::you())).unwrap();
+            let stopped = until_ended(&d, s.id).await;
+            assert_eq!(stopped.state, SessionState::Stopped);
+            assert_eq!(stopped.exited, None);
+        })
+        .await;
     }
 
     #[tokio::test]
