@@ -1635,15 +1635,32 @@ fn build_code_graph(
         }
     }
     info!(path = %db_path.display(), "Using SQLite code graph backend");
-    if let Some(dir) = db_path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
     CodeGraph::open(db_path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The knowledge root falls back to the hub's data dir, and the
+    /// knowledge data dir to the root.
+    #[test]
+    fn the_knowledge_dirs_fall_back_to_the_hubs() {
+        let dirs = |root: Option<&str>, data_dir: Option<&str>| {
+            let config = KnowledgeConfig {
+                root: root.map(Into::into),
+                data_dir: data_dir.map(Into::into),
+                ..KnowledgeConfig::default()
+            };
+            let (root, data_dir) = knowledge_dirs(&config, "hub");
+            (root.display().to_string(), data_dir.display().to_string())
+        };
+        let pair = |root: &str, data_dir: &str| (root.to_string(), data_dir.to_string());
+        assert_eq!(dirs(None, None), pair("hub", "hub"));
+        assert_eq!(dirs(Some("k"), None), pair("k", "k"));
+        assert_eq!(dirs(None, Some("d")), pair("hub", "d"));
+        assert_eq!(dirs(Some("k"), Some("d")), pair("k", "d"));
+    }
 
     /// A Postgres code graph is opened with nothing made on disk for it,
     /// where a SQLite one has its directory made.

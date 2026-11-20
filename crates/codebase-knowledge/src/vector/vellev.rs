@@ -29,7 +29,7 @@ use workforce_common::settings::{CodeModel, QueryPrefix, VellevConfig};
 use workforce_vellev::seeding::{apply_embedded, DocumentEmbedder, NodeEmbedder, Seeding};
 use workforce_vellev::{
     collection, embedding_of, failure, is_conflict, local_embedding, Asked, Cap, Ensured, Unusable,
-    LOCAL_MODEL, LOCAL_QUERY_PREFIX, RECHECK_AFTER,
+    LOCAL_MODEL, LOCAL_QUERY_PREFIX, MAX_RESULTS, RECHECK_AFTER,
 };
 
 use super::health::{InsertErrorSink, InsertErrorSlot};
@@ -532,7 +532,6 @@ impl VellevCodeVectorStore {
 
     async fn found(
         &self,
-        records: &Records,
         filter: Option<&Filter>,
         limit: usize,
         asked: impl Fn(u32) -> Nearest,
@@ -543,7 +542,7 @@ impl VellevCodeVectorStore {
                     .cloned()
                     .into_iter()
                     .fold(asked(limit), Nearest::filter);
-                async move { records.nearest(&nearest).await }
+                async move { self.entities.collection().nearest(&nearest).await }
             })
             .await
     }
@@ -918,12 +917,9 @@ impl CodeVectorStore for VellevCodeVectorStore {
         let found = self
             .entities
             .run(|| {
-                self.found(
-                    self.entities.collection(),
-                    filter.as_ref(),
-                    limit,
-                    |limit| Nearest::to_text(query.as_str(), limit),
-                )
+                self.found(filter.as_ref(), limit, |limit| {
+                    Nearest::to_text(query.as_str(), limit)
+                })
             })
             .await?;
         Ok(found
@@ -1220,8 +1216,6 @@ fn near(
     })
 }
 
-const LIST_PAGE: usize = 1000;
-
 /// A scanned entity: its distance, its object, and its properties.
 type Kept = (f32, ObjectId, Map<String, Value>);
 
@@ -1245,8 +1239,8 @@ fn nearest_of<T>(rows: &mut [T], key: impl Fn(&T) -> (f32, Uuid), limit: usize) 
 /// never made again.
 #[async_trait]
 impl SearchedByVector for VellevCodeVectorStore {
-    fn query_prefix(&self) -> Option<String> {
-        self.entities.wanted().embedding.query_prefix.clone()
+    fn query_prefix(&self) -> Option<&str> {
+        self.entities.wanted().embedding.query_prefix.as_deref()
     }
 
     async fn embedded(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -1260,22 +1254,21 @@ impl SearchedByVector for VellevCodeVectorStore {
     }
 
     async fn nearest(&self, to: NearestTo<'_>, repo_id: &str, limit: usize) -> Result<Vec<Near>> {
-        let text = match to {
+        let nearest = match to {
+            _ if limit == 0 => return Ok(Vec::new()),
             NearestTo::Text(text) => match search_text(text, "code_nearest") {
-                Some(text) => Some(text),
+                Some(text) => Nearest::to_text(text.as_str(), 0),
                 None => return Ok(Vec::new()),
             },
-            NearestTo::Vector(_) => None,
+            NearestTo::Vector(vector) => Nearest::to_vector(vector.to_vec(), 0),
         };
-        let to = text
-            .as_ref()
-            .map_or(to, |text| NearestTo::Text(text.as_str()));
-        let asked = |limit| match to {
-            NearestTo::Text(text) => Nearest::to_text(text, limit),
-            NearestTo::Vector(vector) => Nearest::to_vector(vector.to_vec(), limit),
+        let asked = |limit| {
+            let mut asked = nearest.clone();
+            asked.limit = limit;
+            asked
         };
         let filter = of_repo(repo_id);
-        let found = self.found(self.entities.collection(), Some(&filter), limit, asked);
+        let found = self.found(Some(&filter), limit, asked);
         let found = found.await.map_err(|e| self.refused(e))?;
         found
             .results
@@ -1298,9 +1291,16 @@ impl SearchedByVector for VellevCodeVectorStore {
     ) -> Result<Scanned> {
         let records = self.entities.collection();
         let metric = self.entities.wanted().distance;
+        let dimensions = self.entities.wanted().embedding.dimensions as usize;
         let scorers: Vec<(Scorer<'_>, Option<Uuid>)> = asked
             .iter()
             .map(|(vector, first)| {
+                if vector.len() != dimensions {
+                    return Err(eyre::eyre!(
+                        "a vector of {} dimensions was asked of a collection of {dimensions}",
+                        vector.len()
+                    ));
+                }
                 let first = first.map(|first| {
                     first.parse().map_err(|e| {
                         eyre::eyre!(
@@ -1313,12 +1313,12 @@ impl SearchedByVector for VellevCodeVectorStore {
             .collect::<Result<_>>()?;
         let filter = of_repo(repo_id);
         let (mut held, mut kept) = (0, vec![Vec::new(); asked.len()]);
-        let mut firsts = vec![None; asked.len()];
+        let mut named = vec![None; asked.len()];
         let mut after = None;
         loop {
             let listed = self
                 .cap
-                .ask(LIST_PAGE, |limit| {
+                .ask(MAX_RESULTS, |limit| {
                     let page = Page::new(limit).filter(filter.clone()).vectors(true);
                     let page = after.into_iter().fold(page, Page::after);
                     async move { records.list(&page).await }
@@ -1329,7 +1329,12 @@ impl SearchedByVector for VellevCodeVectorStore {
                 .objects
                 .iter()
                 .map(|row| match row.vector.as_deref() {
-                    Some(vector) => Ok((row, vector)),
+                    Some(vector) if vector.len() == dimensions => Ok((row, vector)),
+                    Some(vector) => Err(eyre::eyre!(
+                        "vellev listed object {} with a vector of {} dimensions, in a collection of {dimensions}",
+                        row.id.0,
+                        vector.len()
+                    )),
                     None => Err(eyre::eyre!(
                         "vellev listed object {} with no vector",
                         row.id.0
@@ -1338,7 +1343,7 @@ impl SearchedByVector for VellevCodeVectorStore {
                 .collect::<Result<_>>()?;
             held += rows.len();
             for ((scorer, first), (top, found)) in
-                scorers.iter().zip(kept.iter_mut().zip(&mut firsts))
+                scorers.iter().zip(kept.iter_mut().zip(&mut named))
             {
                 let mut page: Vec<(f32, &Stored)> = rows
                     .iter()
@@ -1379,7 +1384,7 @@ impl SearchedByVector for VellevCodeVectorStore {
         Ok(Scanned {
             held,
             nearest,
-            firsts,
+            named,
         })
     }
 
@@ -1499,7 +1504,7 @@ mod tests {
     #[tokio::test]
     async fn a_scan_about_no_object_id_is_refused() {
         let store = VellevCodeVectorStore::new("http://127.0.0.1:1", "key", "code").unwrap();
-        let vector = [1.0, 0.0];
+        let vector = vec![1.0; store.entities.wanted().embedding.dimensions as usize];
         let refused = store
             .nearest_exactly(&[(&vector, Some("not-an-id"))], "r", 10)
             .await
@@ -1511,28 +1516,38 @@ mod tests {
         );
     }
 
-    /// Counting asks the entities' collection, as it is, for one repo's.
-    #[tokio::test]
-    async fn counted_asks_one_repos_entities_and_nothing_else() {
-        let asked: Arc<std::sync::Mutex<Vec<(String, String, String)>>> = Arc::default();
+    type Asked = Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
+
+    /// A store on a node that answers everything but its health with
+    /// `answer`, and the requests it was sent.
+    async fn answering(answer: Value) -> (VellevCodeVectorStore, Asked) {
+        let asked: Asked = Arc::default();
         let recording = Arc::clone(&asked);
         let app = axum::Router::new().fallback(
             move |method: axum::http::Method, uri: axum::http::Uri, body: String| {
-                let recording = Arc::clone(&recording);
+                let (recording, answer) = (Arc::clone(&recording), answer.clone());
                 async move {
                     if !uri.path().starts_with("/health") {
                         let request = (method.to_string(), uri.path().to_string(), body);
                         recording.lock().unwrap().push(request);
                     }
-                    axum::Json(json!({ "count": 7 }))
+                    axum::Json(answer)
                 }
             },
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let store = VellevCodeVectorStore::new(&url, "key", "code").unwrap();
+        (
+            VellevCodeVectorStore::new(&url, "key", "code").unwrap(),
+            asked,
+        )
+    }
 
+    /// Counting asks the entities' collection, as it is, for one repo's.
+    #[tokio::test]
+    async fn counted_asks_one_repos_entities_and_nothing_else() {
+        let (store, asked) = answering(json!({ "count": 7 })).await;
         assert_eq!(store.counted(r#"r"x"#).await.unwrap(), 7);
         let asked = asked.lock().unwrap().clone();
         let [(method, path, body)] = asked.as_slice() else {
@@ -1542,6 +1557,57 @@ mod tests {
         assert!(path.ends_with("/collections/CodeEntity/count"), "{path}");
         let body: Value = serde_json::from_str(body).unwrap();
         assert_eq!(body["filter"], json!(of_repo(r#"r"x"#)));
+    }
+
+    /// The searches send only their own search or listing: the collection
+    /// is never read or made, and nothing is asked for no results.
+    #[tokio::test]
+    async fn the_searches_send_only_their_own_requests() {
+        let (store, asked) = answering(json!({ "results": [], "objects": [] })).await;
+        let vector = vec![0.5; store.entities.wanted().embedding.dimensions as usize];
+        for to in [NearestTo::Text("parse"), NearestTo::Vector(&vector)] {
+            assert!(store.nearest(to, "r", 0).await.unwrap().is_empty());
+        }
+        assert!(asked.lock().unwrap().is_empty(), "nothing asked for none");
+
+        for to in [NearestTo::Text("parse"), NearestTo::Vector(&vector)] {
+            assert!(store.nearest(to, "r", 3).await.unwrap().is_empty());
+        }
+        let scanned = store.nearest_exactly(&[(&vector, None)], "r", 3).await;
+        assert_eq!(scanned.unwrap().held, 0);
+        let sent: Vec<(String, String)> = asked
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(method, path, _)| (method.clone(), path.rsplit('/').next().unwrap().into()))
+            .collect();
+        let sent: Vec<(&str, &str)> = sent.iter().map(|(m, p)| (m.as_str(), p.as_str())).collect();
+        assert_eq!(
+            sent,
+            [("POST", "nearest"), ("POST", "nearest"), ("POST", "list")]
+        );
+    }
+
+    /// The scan refuses a vector of another size than the collection's,
+    /// asked or listed.
+    #[tokio::test]
+    async fn a_vector_of_another_size_is_refused() {
+        let id = Uuid::new_v4();
+        let listed = json!({ "objects": [{ "id": id.to_string(), "properties": {}, "vector": [0.5, 0.5] }] });
+        let (store, _) = answering(listed).await;
+        let dimensions = store.entities.wanted().embedding.dimensions as usize;
+        let short = [0.5, 0.5];
+        let refused = store.nearest_exactly(&[(&short, None)], "r", 3).await;
+        let refused = refused.unwrap_err().to_string();
+        let asked = format!("a vector of 2 dimensions was asked of a collection of {dimensions}");
+        assert_eq!(refused, asked);
+
+        let vector = vec![0.5; dimensions];
+        let refused = store.nearest_exactly(&[(&vector, None)], "r", 3).await;
+        let refused = refused.unwrap_err().to_string();
+        let listed =
+            format!("vellev listed object {id} with a vector of 2 dimensions, in a collection of {dimensions}");
+        assert_eq!(refused, listed);
     }
 
     #[test]
@@ -2996,7 +3062,7 @@ mod tests {
             .iter()
             .find(|(_, object, _)| *object == first.object)
             .unwrap();
-        assert_eq!(scanned.firsts, [Some(*scanned_first)]);
+        assert_eq!(scanned.named, [Some(*scanned_first)]);
         assert!(
             (scanned_first - first.distance).abs() <= 1e-6,
             "{scanned_first} {}",

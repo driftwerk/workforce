@@ -7,7 +7,7 @@
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
@@ -80,6 +80,25 @@ impl SqliteCodeGraphBackend {
         if let Err(e) = spawned {
             tracing::warn!(error = %e, "could not start building the fill index");
         }
+        Ok(Self {
+            identity: identity_of(&conn)?,
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    /// Open the code graph at `path` to read only: nothing is made, migrated
+    /// or written, and its journal mode is left as it is. A graph whose
+    /// schema is older than this build's is refused.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(path, flags).wrap_err_with(|| {
+            format!(
+                "Failed to open codegraph database at {} to read",
+                path.display()
+            )
+        })?;
+        conn.execute_batch("PRAGMA busy_timeout=30000;")?;
+        Schema::current(&conn).wrap_err_with(|| format!("the code graph at {}", path.display()))?;
         Ok(Self {
             identity: identity_of(&conn)?,
             conn: Arc::new(Mutex::new(conn)),
@@ -1519,6 +1538,36 @@ mod lease_tests {
                 .unwrap();
         })
         .await;
+    }
+
+    /// A graph opened to read only reads as it was written, and is left
+    /// byte for byte as it was; one of an older schema is refused.
+    #[tokio::test]
+    async fn a_graph_opened_to_read_is_left_as_it_was() {
+        let backend = SqliteCodeGraphBackend::open_in_memory().unwrap();
+        backend.register_repo("r", "r", "/r").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("copy.db");
+        let copied = |path: &Path| path.to_string_lossy().to_string();
+        let conn = backend.conn.lock().await;
+        conn.execute("VACUUM INTO ?1", [copied(&path)]).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+
+        let read = SqliteCodeGraphBackend::open_read_only(&path).unwrap();
+        assert_eq!(read.identity, backend.identity);
+        assert_eq!(read.list_repositories().await.unwrap().len(), 1);
+        assert!(read.register_repo("s", "s", "/s").await.is_err());
+        drop(read);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+        let old = dir.path().join("old.db");
+        conn.execute("VACUUM INTO ?1", [copied(&old)]).unwrap();
+        Connection::open(&old)
+            .unwrap()
+            .execute_batch("PRAGMA user_version = 6;")
+            .unwrap();
+        let refused = SqliteCodeGraphBackend::open_read_only(&old).err().unwrap();
+        assert!(format!("{refused:#}").contains("older than"), "{refused:#}");
     }
 
     /// The copy is what `VACUUM INTO` writes, as `sqlite3 .backup` would.

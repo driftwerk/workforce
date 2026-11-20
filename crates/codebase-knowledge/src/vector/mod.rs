@@ -321,19 +321,20 @@ pub enum NearestTo<'a> {
 }
 
 /// A scan of every entity of a repo: the rows listed, each vector's nearest,
-/// and each vector's distance to the object it was asked about, if listed.
+/// and each vector's distance to the object named beside it, if listed.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Scanned {
     pub held: usize,
     pub nearest: Vec<Vec<Near>>,
-    pub firsts: Vec<Option<f32>>,
+    pub named: Vec<Option<f32>>,
 }
 
-/// Searches of the code entities by a vector, and the vectors to search with.
+/// Nearest searches of the code entities, by text or by vector, and the
+/// vectors to search with.
 #[async_trait]
 pub trait SearchedByVector: Send + Sync {
     /// The prefix the node puts before a question's text.
-    fn query_prefix(&self) -> Option<String>;
+    fn query_prefix(&self) -> Option<&str>;
     /// The node's vector of each text, each embedded alone, nothing put before
     /// it: the texts are written to a probe collection made in the tenant for
     /// them, and it is dropped.
@@ -1061,8 +1062,28 @@ impl CodeVectorStore for WeaviateCodeVectorStore {
             ),
         };
         let graphql = format!(
-            "{{ Get {{ {CODE_ENTITY_COLLECTION}( nearText: {{ concepts: [\"{}\"] }} limit: {limit} {where_clause} ) {{ entityId repoId qualifiedName kind filePath startLine endLine _additional {{ certainty }} }} }} }}",
-            graphql_escape(query.as_str()),
+            r#"{{
+                Get {{
+                    {collection}(
+                        nearText: {{ concepts: ["{query}"] }}
+                        limit: {limit}
+                        {where_clause}
+                    ) {{
+                        entityId
+                        repoId
+                        qualifiedName
+                        kind
+                        filePath
+                        startLine
+                        endLine
+                        _additional {{
+                            certainty
+                        }}
+                    }}
+                }}
+            }}"#,
+            collection = CODE_ENTITY_COLLECTION,
+            query = graphql_escape(query.as_str()),
         );
 
         let url = format!("{}/v1/graphql", self.base_url);

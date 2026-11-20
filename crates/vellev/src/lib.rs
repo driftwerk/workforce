@@ -1383,7 +1383,8 @@ mod tests {
 
     /// A probe the node cannot drop fails the embedding that made it, and
     /// the comparison made with it, naming it; so does a vector the node
-    /// did not give back, or an object it listed with none.
+    /// did not give back, or an object it listed with none; a probe left
+    /// behind by a failed embedding is named with its failure.
     #[tokio::test]
     async fn a_probe_that_cannot_be_dropped_is_an_error() {
         let texts = ["parse the config".to_string()];
@@ -1413,8 +1414,18 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            short.ends_with("gave back 1 vectors for 2 texts"),
+            short.ends_with("gave back vectors for 1 of 2 texts"),
             "{short}"
+        );
+
+        let (tenants, _) = probe_node(500, 1, true).await;
+        let node = seeding::NodeEmbedder::new(tenants, small.clone(), 1);
+        let both = node.documents(&["a".to_string(), "b".to_string()]).await;
+        let both = format!("{:#}", both.unwrap_err());
+        assert!(
+            both.contains("was not dropped")
+                && both.ends_with("gave back vectors for 1 of 2 texts"),
+            "{both}"
         );
 
         let (tenants, _) = probe_node(200, 0, false).await;

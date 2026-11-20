@@ -20,7 +20,7 @@ use uuid::Uuid;
 use vellev_client::api::{Change, Content, Page};
 use vellev_core::{Collection, CollectionName, DataType, Embedding, ObjectId, Property};
 
-use crate::{classified, collection, Tenants};
+use crate::{classified, collection, Cap, Tenants, MAX_RESULTS};
 
 /// Makes the vectors of documents, outside the node.
 #[async_trait]
@@ -245,8 +245,6 @@ impl Drop for Probe {
     }
 }
 
-const PROBE_LIST: u32 = 1000;
-
 /// The node itself as an embedder: texts are written `per_write` at a time
 /// to a collection made for them and read back with their vectors, and the
 /// collection is dropped. A question is embedded alone, so one text a write
@@ -306,12 +304,17 @@ impl NodeEmbedder {
             self.tenants.writes.apply(changes).await.map_err(failed)?;
         }
         let mut by_node = std::collections::HashMap::new();
-        let mut after = None;
+        let (cap, mut after) = (Cap::default(), None);
         loop {
-            let page = after
-                .into_iter()
-                .fold(Page::new(PROBE_LIST).vectors(true), Page::after);
-            let listed = records.list(&page).await.map_err(failed)?;
+            let listed = cap
+                .ask(MAX_RESULTS, |limit| {
+                    let page = after
+                        .into_iter()
+                        .fold(Page::new(limit).vectors(true), Page::after);
+                    async move { records.list(&page).await }
+                })
+                .await
+                .map_err(failed)?;
             for object in listed.objects {
                 let vector = object.vector.ok_or_else(|| {
                     eyre!(
@@ -332,7 +335,7 @@ impl NodeEmbedder {
         match vectors.len() == texts.len() {
             true => Ok(vectors),
             false => Err(eyre!(
-                "{} gave back {} vectors for {} texts",
+                "{} gave back vectors for {} of {} texts",
                 self.name(),
                 vectors.len(),
                 texts.len()
@@ -360,10 +363,14 @@ impl DocumentEmbedder for NodeEmbedder {
             records: Some(records.clone()),
             name: probe.name.clone(),
         };
-        let vectors = self.made(&probe, &records, texts).await;
-        let dropped = made.dropped().await;
-        let vectors = vectors?;
-        dropped.map(|()| vectors)
+        match (
+            self.made(&probe, &records, texts).await,
+            made.dropped().await,
+        ) {
+            (Ok(vectors), Ok(())) => Ok(vectors),
+            (Err(e), Ok(())) | (Ok(_), Err(e)) => Err(e),
+            (Err(e), Err(dropped)) => Err(e.wrap_err(dropped)),
+        }
     }
 }
 

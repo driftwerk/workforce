@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use tracing::{debug, warn};
+use workforce_common::text::graphql_escape;
 
 use super::{object_id, ArtifactVectors, COLLECTION};
 
@@ -353,7 +354,7 @@ impl ArtifactVectors for WeaviateArtifacts {
     }
 
     async fn search(&self, query: &str, limit: usize) -> eyre::Result<Vec<(String, f32)>> {
-        let escaped = query.replace('\\', "\\\\").replace('"', "\\\"");
+        let escaped = graphql_escape(query);
         let gql = format!(
             r#"{{ Get {{ {COLLECTION}(limit: {limit}, nearText: {{ concepts: ["{escaped}"] }}) {{ artifactId _additional {{ certainty }} }} }} }}"#
         );
@@ -413,7 +414,7 @@ impl ArtifactVectors for WeaviateArtifacts {
         query: &str,
         limit: usize,
     ) -> eyre::Result<(Vec<(String, f32)>, usize)> {
-        let escaped = query.replace('\\', "\\\\").replace('"', "\\\"");
+        let escaped = graphql_escape(query);
         let gql = format!(
             r#"{{ Get {{ {COLLECTION}(limit: {limit}, nearText: {{ concepts: ["{escaped}"] }}) {{ artifactId _additional {{ certainty }} }} }} Aggregate {{ {COLLECTION} {{ meta {{ count }} }} }} }}"#
         );

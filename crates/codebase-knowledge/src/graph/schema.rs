@@ -33,6 +33,19 @@ impl Schema {
         }
     }
 
+    /// Refuse a schema older than the current one, changing nothing.
+    pub fn current(conn: &Connection) -> Result<()> {
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .context("read user_version")?;
+        match version < CURRENT_VERSION {
+            true => Err(eyre::eyre!(
+                "its schema is at version {version}, older than {CURRENT_VERSION}: open it once with the hub to migrate it, then copy it again"
+            )),
+            false => Ok(()),
+        }
+    }
+
     fn migrate_locked(conn: &Connection) -> Result<()> {
         conn.execute_batch(SCHEMA_V1)?;
         let version: i64 = conn

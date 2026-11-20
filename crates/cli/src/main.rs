@@ -11856,13 +11856,7 @@ Describe what you should do in this step and what to discuss with the user.
                 }
             };
 
-            let sqlite_path = from.unwrap_or_else(|| {
-                let (_, data_dir) = workforce_hub::knowledge::knowledge_dirs(
-                    &wf_config.knowledge,
-                    &wf_config.hub.data_dir,
-                );
-                workforce_hub::knowledge::code_graph_path(&data_dir)
-            });
+            let sqlite_path = from.unwrap_or_else(|| hubs_code_graph(&wf_config));
             if !sqlite_path.exists() {
                 eyre::bail!(
                     "source SQLite code graph database not found at {}",
@@ -12606,6 +12600,13 @@ struct RoleImportRow {
     _priority: Option<i32>,
 }
 
+/// Where the hub keeps its SQLite code graph, as `[knowledge]` says.
+fn hubs_code_graph(config: &workforce_common::settings::WorkforceConfig) -> PathBuf {
+    let (_, data_dir) =
+        workforce_hub::knowledge::knowledge_dirs(&config.knowledge, &config.hub.data_dir);
+    workforce_hub::knowledge::code_graph_path(&data_dir)
+}
+
 /// The URL of the store memories are kept in, to tell the operator.
 fn memory_store_url(config: &workforce_common::settings::WorkforceConfig) -> &str {
     if config.memory.is_vellev() {
@@ -13291,6 +13292,29 @@ mod tests {
         assert_eq!(cli.secrets_fd, Some(3));
         let cli = Cli::try_parse_from(["workforce", "serve", "-c", "hub.toml"]).unwrap();
         assert_eq!(cli.secrets_fd, None);
+    }
+
+    /// The codegraph migration reads, unless told otherwise, the graph the
+    /// hub keeps under `[knowledge] data_dir`, else its root, else the
+    /// hub's data dir.
+    #[test]
+    fn the_code_graph_migrated_is_the_hubs() {
+        let mut config = workforce_common::settings::WorkforceConfig::default();
+        config.hub.data_dir = "hub".into();
+        let dirs = [
+            (None, None, "hub"),
+            (Some("root"), None, "root"),
+            (Some("root"), Some("data"), "data"),
+        ];
+        for (root, data_dir, kept_in) in dirs {
+            config.knowledge.root = root.map(Into::into);
+            config.knowledge.data_dir = data_dir.map(Into::into);
+            assert_eq!(
+                hubs_code_graph(&config),
+                workforce_hub::knowledge::code_graph_path(Path::new(kept_in)),
+                "{root:?} {data_dir:?}"
+            );
+        }
     }
 
     #[test]
