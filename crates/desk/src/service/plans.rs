@@ -2934,6 +2934,7 @@ impl Desk {
         if worktree {
             body["worktree"] = branch_for(&key).into();
         }
+        body["deps"] = true.into();
         if let Some(model) = &runs.model {
             body["model"] = model.clone().into();
         }
@@ -3091,7 +3092,8 @@ impl Desk {
             env: BTreeMap::new(),
             group,
         };
-        self.create_for_as(session, new, boss, by.clone()).await
+        self.create_for_as(session, new, boss, by.clone(), true)
+            .await
     }
 
     /// Gives `t` to the session started for it, as it is now: the person's

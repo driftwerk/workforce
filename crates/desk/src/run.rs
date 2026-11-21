@@ -232,10 +232,32 @@ impl Drop for Group {
 
 /// Runs `command` in `cwd` as the module says, its environment `env`.
 pub async fn run(command: &str, cwd: &Path, secs: u64, env: &[(String, String)]) -> Ran {
+    exec(
+        "bash",
+        &["-lc", command],
+        cwd,
+        Duration::from_secs(secs),
+        env,
+    )
+    .await
+}
+
+/// Runs `program` with `args` in `cwd` as [`run`] runs a check, for at
+/// most `wait`, its environment `env` alone.
+pub async fn exec<P, A>(
+    program: P,
+    args: &[A],
+    cwd: &Path,
+    wait: Duration,
+    env: &[(String, String)],
+) -> Ran
+where
+    P: AsRef<std::ffi::OsStr>,
+    A: AsRef<std::ffi::OsStr>,
+{
     use std::os::unix::process::ExitStatusExt;
-    let mut cmd = tokio::process::Command::new("bash");
-    cmd.arg("-lc")
-        .arg(command)
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args)
         .env_clear()
         .envs(env.iter().map(|(k, v)| (k, v)))
         .current_dir(cwd)
@@ -275,11 +297,10 @@ pub async fn run(command: &str, cwd: &Path, secs: u64, env: &[(String, String)])
             Arc::clone(&err),
         )),
     ];
-    let (status, timed_out) =
-        match tokio::time::timeout(Duration::from_secs(secs), child.wait()).await {
-            Ok(s) => (s.ok(), false),
-            Err(_) => (None, true),
-        };
+    let (status, timed_out) = match tokio::time::timeout(wait, child.wait()).await {
+        Ok(s) => (s.ok(), false),
+        Err(_) => (None, true),
+    };
     // Its whole session ends with it: nothing it started runs on, or holds
     // its output open. Killed before its leader is reaped when out of time.
     group.kill();

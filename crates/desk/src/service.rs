@@ -63,6 +63,7 @@ mod charge;
 pub use charge::{ChargeView, DialogAnswerer};
 mod codex_terminals;
 mod copies;
+mod deps;
 mod devin_sessions;
 #[cfg(test)]
 mod devin_tests;
@@ -794,6 +795,12 @@ struct State {
     /// How each session's process last ended on its own, until it starts
     /// again ([`SessionView::exited`]).
     exited: HashMap<Uuid, Exited>,
+    /// Each session's folder's dependencies, as Desk installs them
+    /// ([`SessionView::deps`]).
+    deps: HashMap<Uuid, crate::deps::Deps>,
+    /// The install running into each folder, and the sessions told when it
+    /// ends.
+    installing: HashMap<PathBuf, Vec<Uuid>>,
     /// Which Anthropic account each of the person's accounts is, when known
     /// ([`crate::identity`]).
     links: HashMap<Uuid, crate::identity::Link>,
@@ -2465,6 +2472,7 @@ impl Desk {
         view.prompts = live.map_or(0, |l| l.prompts);
         view.failure = state.turn_failures.get(&r.id).cloned();
         view.exited = state.exited.get(&r.id).cloned();
+        view.deps = state.deps.get(&r.id).cloned();
         view.mode = live.and(state.modes_started.get(&r.id).copied());
         view.waits_on_you = Self::waits_on_you(state, &view);
         view.boss_has = Self::boss_has(state, &view);
@@ -3455,14 +3463,19 @@ impl Desk {
     /// Starts a session; `by` is who asked (none: the session's own
     /// `started` is recorded).
     pub async fn create(&self, new: NewSession, by: Option<By>) -> Result<SessionView, DeskError> {
-        self.start_session(new, None, None, by, false).await
+        self.start_session(new, None, None, by, false, false).await
     }
 
     /// Starts a session the person asked for in Desk, in a folder they
     /// chose: the one start whose CLI may trust its folder (see
-    /// [`SessionRecord::folder_chosen`]).
-    pub async fn create_chosen(&self, new: NewSession) -> Result<SessionView, DeskError> {
-        self.start_session(new, None, None, Some(By::you()), true)
+    /// [`SessionRecord::folder_chosen`]). `deps`: its folder's dependencies
+    /// are installed as it starts (a plan's ticket on this machine).
+    pub async fn create_chosen(
+        &self,
+        new: NewSession,
+        deps: bool,
+    ) -> Result<SessionView, DeskError> {
+        self.start_session(new, None, None, Some(By::you()), true, deps)
             .await
     }
 
@@ -3476,7 +3489,7 @@ impl Desk {
         boss: &Party,
         by: By,
     ) -> Result<SessionView, DeskError> {
-        self.start_session(new, None, Some(boss), Some(by), false)
+        self.start_session(new, None, Some(boss), Some(by), false, false)
             .await
     }
 
@@ -3514,11 +3527,14 @@ impl Desk {
         new: NewSession,
         boss: &Party,
         by: By,
+        deps: bool,
     ) -> Result<SessionView, DeskError> {
-        self.start_session(new, Some(id), Some(boss), Some(by), false)
+        self.start_session(new, Some(id), Some(boss), Some(by), false, deps)
             .await
     }
 
+    /// Starts `new`; `deps`: its folder's dependencies are installed as it
+    /// starts ([`crate::deps`]).
     async fn start_session(
         &self,
         new: NewSession,
@@ -3526,6 +3542,7 @@ impl Desk {
         boss: Option<&Party>,
         by: Option<By>,
         folder_chosen: bool,
+        deps: bool,
     ) -> Result<SessionView, DeskError> {
         let name = new.name.trim();
         if name.is_empty() {
@@ -3637,6 +3654,12 @@ impl Desk {
             None => (cwd, None),
         };
         let now = Utc::now();
+        let found = deps.then(|| crate::deps::found(&cwd)).flatten();
+        let begun = found.as_ref().map(|f| crate::deps::Deps::begun(f, now));
+        let prompt = match (new.prompt, &begun) {
+            (Some(p), Some(d)) => Some(format!("{p}\n\n{}", d.brief())),
+            (p, _) => p,
+        };
         let caps = engine::caps(new.engine, view);
         let record = SessionRecord {
             id,
@@ -3660,7 +3683,7 @@ impl Desk {
             // Claude Code takes the id Desk gives it; Codex says its thread's.
             cli_session_id: (new.engine == Engine::Claude).then(|| id.to_string()),
             transcript: None,
-            last_prompt: new.prompt.clone(),
+            last_prompt: prompt.clone(),
             last_reply: None,
             external_pid: None,
             restore_offer: false,
@@ -3688,7 +3711,7 @@ impl Desk {
             placed = self.0.store.put(&record).await.map_err(DeskError::Internal);
         }
         let launched = match placed {
-            Ok(()) => self.launch(&record, false, new.prompt.as_deref()).await,
+            Ok(()) => self.launch(&record, false, prompt.as_deref()).await,
             Err(e) => Err(e),
         };
         if let Err(e) = launched {
@@ -3696,6 +3719,9 @@ impl Desk {
             self.start_unplaced(id, group.is_some(), boss.is_some())
                 .await;
             return Err(e);
+        }
+        if let (Some(found), Some(begun)) = (found, begun) {
+            self.deps_begin(id, &cwd, found, begun);
         }
         // Persist what hooks may already have changed since launch.
         self.change(id, |_, _| {});
@@ -4291,6 +4317,7 @@ impl Desk {
             st.cut_off.remove(&id);
             st.restarted.remove(&id);
             st.exited.remove(&id);
+            st.deps.remove(&id);
             st.switch_by.remove(&id);
             st.switch_notes.remove(&id);
             st.live.remove(&id)
@@ -9901,9 +9928,9 @@ mod tests {
                 "an agent's start trusts nothing"
             );
 
-            let plain = d.create_chosen(new(&repo, None)).await.unwrap();
+            let plain = d.create_chosen(new(&repo, None), false).await.unwrap();
             let in_worktree = d
-                .create_chosen(new(&repo, Some("desk/login-race")))
+                .create_chosen(new(&repo, Some("desk/login-race")), false)
                 .await
                 .unwrap();
             assert!(in_worktree.cwd.contains("/.worktrees/"));
