@@ -64,8 +64,9 @@ pub fn is_model_image_type(mime: &str) -> bool {
         .any(|t| mime.eq_ignore_ascii_case(t))
 }
 
-/// Whether `head` (a file's first bytes) opens with a HEIF `ftyp` box whose
-/// major brand, or any compatible brand but an AVIF's, is a HEIC one.
+/// Whether `head` (a file's first bytes) opens with a HEIF `ftyp` box: an
+/// AVIF, by its major or any compatible brand, never is; otherwise a HEIF
+/// major brand, or any compatible HEVC one, makes it so.
 pub fn is_heif(head: &[u8]) -> bool {
     let Some((major, rest)) = head
         .get(4..16)
@@ -74,15 +75,13 @@ pub fn is_heif(head: &[u8]) -> bool {
     else {
         return false;
     };
-    if HEIF_BRANDS.contains(&major) {
-        return true;
-    }
     let boxed = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
-    !matches!(major, b"avif" | b"avis")
-        && rest
-            .chunks_exact(4)
-            .take(boxed.saturating_sub(16) / 4)
-            .any(|brand| HEVC_BRANDS.contains(&brand))
+    let compatible = || rest.chunks_exact(4).take(boxed.saturating_sub(16) / 4);
+    let is_avif = |brand: &[u8]| matches!(brand, b"avif" | b"avis");
+    if is_avif(major) || compatible().any(is_avif) {
+        return false;
+    }
+    HEIF_BRANDS.contains(&major) || compatible().any(|brand| HEVC_BRANDS.contains(&brand))
 }
 
 fn is_heif_mime(mime: &str) -> bool {
@@ -201,7 +200,7 @@ fn named(label: &str) -> String {
 
 /// The first bytes of a base64 payload, enough to tell what the file is.
 pub(crate) fn head_of(data: &str) -> Vec<u8> {
-    let prefix = data.get(..data.len().min(96) / 4 * 4).unwrap_or_default();
+    let prefix = data.get(..data.len().min(172) / 4 * 4).unwrap_or_default();
     STANDARD.decode(prefix).unwrap_or_default()
 }
 
@@ -317,6 +316,8 @@ mod tests {
         assert!(is_heif(&ftyp(b"mif1", &[b"miaf", b"heic"])));
         assert!(is_heif(&ftyp(b"heic", &[])));
         assert!(!is_heif(&ftyp(b"avif", &[b"mif1", b"miaf"])));
+        assert!(!is_heif(&ftyp(b"mif1", &[b"avif", b"miaf"])));
+        assert!(!is_heif(&ftyp(b"heic", &[b"avis"])));
         assert!(!is_heif(&ftyp(b"mp42", &[b"isom"])));
         assert!(!is_heif(&ftyp(b"isom", &[b"mif1", b"miaf"])));
         assert!(!is_heif(PNG));

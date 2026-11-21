@@ -129,10 +129,11 @@ impl Tool for VideoGenerationTool {
             ));
         };
 
-        let images = match match input_images(&input) {
+        let images = match input_images(&input) {
             Ok(images) => resolve_reference_images(&images, &self.agent_id).await,
             Err(msg) => Err(msg),
-        } {
+        };
+        let images = match images {
             Ok(images) => images,
             Err(msg) => return Ok(ToolResult::failure(msg, elapsed(started))),
         };

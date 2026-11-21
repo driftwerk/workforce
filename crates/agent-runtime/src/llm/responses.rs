@@ -1065,6 +1065,7 @@ fn usage(usage: &Value) -> TokenUsage {
 
 /// Longest a provider's message is kept in an error: it can quote the input.
 const MAX_ERROR_MESSAGE_CHARS: usize = 500;
+const MAX_ERROR_PARAM_CHARS: usize = 100;
 
 /// The error a `response.failed` / `error` event names. The backend puts the
 /// error object under `response.error`, under `response.status_details`, under
@@ -1094,16 +1095,17 @@ fn error_code(error: &Value) -> Option<&str> {
         .or_else(|| text_of(error, "type").filter(|t| *t != "error" && !t.starts_with("response.")))
 }
 
-/// `reason` as a log-safe line: inlined `data:` URLs (an image the provider
-/// quotes back) cut out, and bounded in length.
-fn shown(reason: &str) -> String {
+/// `text` as a log-safe line: inlined `data:` URLs (an image the provider
+/// quotes back) cut out, the query strings of web URLs (signed links) dropped,
+/// and bounded to `max` characters.
+fn shown(text: &str, max: usize) -> String {
     static DATA_URL: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r#"data:[^\s"'<>)]*"#).expect("a valid pattern"));
-    DATA_URL
-        .replace_all(reason, "data:…")
-        .chars()
-        .take(MAX_ERROR_MESSAGE_CHARS)
-        .collect()
+    static QUERY: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(https?://[^\s"'<>)?]*)\?[^\s"'<>)]*"#).expect("a valid pattern")
+    });
+    let text = DATA_URL.replace_all(text, "data:…");
+    QUERY.replace_all(&text, "$1").chars().take(max).collect()
 }
 
 /// Whether `code` names an image the provider refused, which no retry fixes.
@@ -1117,9 +1119,12 @@ fn is_invalid_input(code: &str) -> bool {
 
 /// The error an error object names.
 fn failed_error(error: &Value) -> ResponsesError {
-    let reason = shown(text_of(error, "message").unwrap_or("the provider gave no reason"));
+    let reason = shown(
+        text_of(error, "message").unwrap_or("the provider gave no reason"),
+        MAX_ERROR_MESSAGE_CHARS,
+    );
     let message = match text_of(error, "param") {
-        Some(param) => format!("{reason} (param: {param})"),
+        Some(param) => format!("{reason} (param: {})", shown(param, MAX_ERROR_PARAM_CHARS)),
         None => reason,
     };
     match error_code(error) {
@@ -2287,8 +2292,19 @@ mod tests {
         );
         assert_eq!(classify_error(&text), ErrorKind::ClientError);
         let long = failure(json!({"type": "error", "code": "invalid_image",
-            "message": "x".repeat(2000), "param": "p"}));
-        assert!(long.ends_with("(param: p)") && long.len() < 700, "{long}");
+            "message": "x".repeat(2000), "param": "p".repeat(300)}));
+        assert!(
+            long.len() < 700 && long.ends_with(&format!("(param: {})", "p".repeat(100))),
+            "{long}"
+        );
+        let signed = failure(json!({"type": "error", "code": "invalid_image_url",
+            "message": "Could not fetch https://cdn.example.com/a.heic?X-Amz-Signature=abc&Expires=9 or http://h/p?q=1.",
+            "param": "https://h/x?token=t"}));
+        assert_eq!(
+            signed,
+            "ChatGPT API error: request input refused (invalid_image_url): Could not fetch \
+             https://cdn.example.com/a.heic or http://h/p (param: https://h/x)"
+        );
     }
 
     #[test]
