@@ -516,29 +516,30 @@ pub async fn end_left(running: &Path) {
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|t| t.to_utc());
     let mark = words.next().map(|t| format!("{RUN_VAR}={t}"));
+    // SAFETY: getpgid only reads a process's group.
+    let in_group = |pid: u32| i32::try_from(pid).is_ok_and(|p| unsafe { libc::getpgid(p) } == pgid);
+    // The process that shows the group is the install's.
     let ours = match (mark, crate::procs::started_at(group).await) {
-        (None, _) => false,
+        (None, _) => None,
         (Some(mark), Some(leader)) => {
-            then.is_some_and(|t| (leader - t).num_seconds().abs() <= 2)
-                && crate::procs::carries(group, &mark).await
+            let began = then.is_some_and(|t| (leader - t).num_seconds().abs() <= 2);
+            (began && crate::procs::carries(group, &mark).await).then_some(group)
         }
         (Some(mark), None) => {
-            let mut found = false;
+            let mut found = None;
             for pid in crate::procs::in_group(group).await {
-                // SAFETY: getpgid only reads a process's group.
-                let still = i32::try_from(pid).is_ok_and(|p| unsafe { libc::getpgid(p) } == pgid);
-                if still && crate::procs::carries(pid, &mark).await {
-                    found = true;
+                if in_group(pid) && crate::procs::carries(pid, &mark).await {
+                    found = Some(pid);
                     break;
                 }
             }
             found
         }
     };
-    if ours {
+    if ours.is_some_and(in_group) {
         tracing::info!(group, "an install a stopped Desk left running is ended");
-        // SAFETY: killpg only signals the group the install made, still its
-        // own as checked just now.
+        // SAFETY: killpg only signals the group the install made, one of
+        // its own still in it as checked just now.
         unsafe {
             libc::killpg(pgid, libc::SIGKILL);
         }
