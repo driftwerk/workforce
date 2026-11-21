@@ -406,6 +406,126 @@ async fn a_ticket_in_doing_whose_session_is_gone_starts_again_told_to_check_what
     .await;
 }
 
+/// A session removed is gone from Desk before its ticket's let go of it is
+/// written: one look sees the ticket in Doing still on a session that is
+/// gone, the next sees it with no one on it. Putting it back is suggested
+/// once across both.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ticket_whose_session_is_gone_is_put_back_once_however_each_look_sees_it() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (_overseer, state, d, _llm) = hub_with(&base, pool, &watching()).await;
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        let (id, _) = running(&d, &base, 1).await;
+        let first = eventually("its ticket given its session", async || {
+            ticket(&d, id, "DES-1").await.ticket.ticket.session()
+        })
+        .await;
+        let held = ticket(&d, id, "DES-1").await.ticket.ticket.assignee;
+        d.end(first, Some(boss_by())).await.unwrap();
+        d.remove_closed(first).await.unwrap();
+        let open = || async {
+            d.store()
+                .suggestions(50)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|s| s.state == workforce_desk::crew::SuggestionState::Open)
+                .filter(|s| s.text.contains("DES-1"))
+                .collect::<Vec<_>>()
+        };
+        // The moment before the let go is written: the session gone, the
+        // ticket still on it.
+        let mut t = ticket(&d, id, "DES-1").await.ticket.ticket;
+        let doing_since = t.state_at;
+        t.assignee = held;
+        d.store().put_ticket(&mut t).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        eventually("putting it back suggested", async || {
+            crew.look_at_plans().await;
+            (!open().await.is_empty()).then_some(())
+        })
+        .await;
+        // Then the let go written: the ticket in Doing with no one on it,
+        // since the same moment.
+        let mut t = ticket(&d, id, "DES-1").await.ticket.ticket;
+        t.assignee = None;
+        d.store().put_ticket(&mut t).await.unwrap();
+        assert_eq!(t.state, TicketState::Doing);
+        assert_eq!(t.state_at, doing_since);
+        for _ in 0..3 {
+            crew.look_at_plans().await;
+        }
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(open().await.len(), 1, "once");
+    })
+    .await;
+}
+
+/// A ticket put back, then given another session while still in Doing (its
+/// time in Doing the same): when that session goes too, it is put back
+/// again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ticket_given_another_session_in_doing_is_put_back_again_when_that_one_goes() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (_overseer, state, d, _llm) = hub_with(&base, pool, &watching()).await;
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        let (id, _) = running(&d, &base, 1).await;
+        let first = eventually("its ticket given its session", async || {
+            ticket(&d, id, "DES-1").await.ticket.ticket.session()
+        })
+        .await;
+        let held = ticket(&d, id, "DES-1")
+            .await
+            .ticket
+            .ticket
+            .assignee
+            .unwrap();
+        let doing_since = ticket(&d, id, "DES-1").await.ticket.ticket.state_at;
+        let open = || async {
+            d.store()
+                .suggestions(50)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|s| s.state == workforce_desk::crew::SuggestionState::Open)
+                .filter(|s| s.action["tool"] == "crew.move_ticket" && s.text.contains("DES-1"))
+                .collect::<Vec<_>>()
+        };
+        let gone_and_put_back = async |s: uuid::Uuid, by: Option<By>| {
+            d.end(s, by).await.unwrap();
+            d.remove_closed(s).await.unwrap();
+            eventually("putting it back suggested", async || {
+                crew.look_at_plans().await;
+                open().await.into_iter().next()
+            })
+            .await
+        };
+        // Its session goes: putting it back is suggested, and the person
+        // says no.
+        let once = gone_and_put_back(first, Some(boss_by())).await;
+        assert!(d.store().suggestion_dismiss_open(&once.id).await.unwrap());
+        // Given another session within Doing, seen by a look.
+        let again = new_session(&d, &base, "again").await;
+        let mut t = ticket(&d, id, "DES-1").await.ticket.ticket;
+        t.assignee = Some(workforce_desk::crew::Party {
+            id: again.id.to_string(),
+            ..held
+        });
+        d.store().put_ticket(&mut t).await.unwrap();
+        assert_eq!(t.state, TicketState::Doing);
+        assert_eq!(t.state_at, doing_since);
+        crew.look_at_plans().await;
+        // That one (the person's own) goes too: it is put back again.
+        let twice = gone_and_put_back(again.id, Some(By::you())).await;
+        assert_ne!(twice.id, once.id);
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stopped_session_is_the_persons_a_hand_run_ticket_is_left_alone_and_a_stall_is_said_once()
 {

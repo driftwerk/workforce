@@ -5,10 +5,10 @@
 //! posting to the owner-derived ones, so the guarantee this file exists to
 //! hold is that **every address that resolved before still resolves**.
 //!
-//! The Postgres suite does not run in CI (`WORKFORCE_SKIP_POSTGRES_TESTS`), so
-//! that guarantee is pinned twice. The store-less cases below need no database
-//! and are the CI-enforced half; the store-backed ones cover the member form
-//! and the minted paths, and are never the only coverage of a behaviour.
+//! That guarantee is pinned twice. The store-less cases below need no
+//! database; the store-backed ones cover the member form and the minted
+//! paths against a Postgres (CI's `hub-postgres` job), and are never the only
+//! coverage of a behaviour.
 
 use std::sync::Arc;
 use workforce_hub::serve::Compose as _;
@@ -154,9 +154,9 @@ impl Harness {
     }
 }
 
-/// **The test the whole change exists to make pass**, and the only end-to-end
-/// one CI runs. Deleting it removes CI's proof that live webhook URLs still
-/// resolve.
+/// **The test the whole change exists to make pass**, and the one end to end
+/// that needs no database. Deleting it removes the proof that live webhook
+/// URLs still resolve.
 #[tokio::test]
 async fn a_legacy_system_url_still_resolves_after_the_change() {
     let hub =
@@ -278,8 +278,8 @@ async fn save_member_workflow(store: &WorkflowStore, toml: &str) {
         .expect("save the member definition");
 }
 
-/// The member half of the compatibility guarantee; its CI-enforced
-/// counterpart is the unit test over `TriggerIndex::build` with no overlay.
+/// The member half of the compatibility guarantee; its counterpart with no
+/// database is the unit test over `TriggerIndex::build` with no overlay.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_legacy_member_url_still_resolves_after_the_change() {
     with_member_workflow(|hub, _store, _pool, key| async move {

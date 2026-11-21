@@ -88,6 +88,12 @@ async fn act_fully_answers_a_sessions_question_itself_once_the_person_is_quiet_a
         // The person prompted it just now: its question is theirs for now.
         let s = new_session(&d, &base, "Cufflink Migration").await;
         let url = hook_url(&base, s.id).await;
+        // Taken on before the person prompts it: their input before a
+        // take-on doesn't count against the boss's wheel.
+        eventually("the boss to take it on", async || {
+            d.charge_of(s.id).filter(|c| c.live()).map(drop)
+        })
+        .await;
         asks(&url, "Ship it?").await;
         eventually("the question to be asked", async || {
             d.view(s.id).unwrap().asked.is_some().then_some(())
@@ -154,6 +160,16 @@ async fn act_fully_answers_a_sessions_question_itself_once_the_person_is_quiet_a
         // answered once they stop.
         let s2 = new_session(&d, &base, "acme-web").await;
         let url2 = hook_url(&base, s2.id).await;
+        // Taken on first: a take-on gives the boss the wheel, and only the
+        // person's input after it counts, so input before it would leave
+        // the boss free to answer until the next keystroke.
+        eventually("the boss to take it on", async || {
+            d.charge_of(s2.id).filter(|c| c.live()).map(drop)
+        })
+        .await;
+        // Typing before it asks, so no look between the ask and the first
+        // keystroke finds it quiet.
+        d.person_typing(s2.id).unwrap();
         asks(&url2, "Run the migration?").await;
         for _ in 0..12 {
             d.person_typing(s2.id).unwrap();

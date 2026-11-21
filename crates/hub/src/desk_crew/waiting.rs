@@ -300,12 +300,36 @@ pub(super) fn waiting_in(thread: &[LineMessage], boss: &str, s: Uuid) -> Option<
             // "Understood, holding" waits on as the hold does.
             let waits = t.kind == LineKind::Tell
                 && (waits_on_answer(&t.text) || (held && !goes_on(&t.text)));
-            // Under the boss's hold, the wait began with the hold.
+            // Under the boss's hold, the wait began with the hold; a
+            // reply that only says it holds keeps what it waits on in its
+            // words that asked, so the wait reads the same whichever Desk
+            // saw first.
             let began = ours.filter(|_| held);
+            // Only words the hold answered: said before it reached the
+            // session, and after the boss's word before it (what that
+            // answered is settled).
+            let said = match began {
+                Some(o) if !waits_on_answer(&t.text) => {
+                    let before = thread.iter().rfind(|m| {
+                        m.id != o.id && bosss_word(m, boss, s) && reached(m) < reached(o)
+                    });
+                    thread
+                        .iter()
+                        .rfind(|m| {
+                            to_boss(m, boss, s)
+                                && m.kind == LineKind::Tell
+                                && m.at < reached(o)
+                                && before.is_none_or(|b| m.at > reached(b))
+                                && waits_on_answer(&m.text)
+                        })
+                        .unwrap_or(t)
+                }
+                _ => t,
+            };
             waits.then(|| Waiting {
                 since: began.map_or(t.at, reached),
                 message: began.map_or(t.id, |o| o.id),
-                said: Some(t.clone()),
+                said: Some(said.clone()),
                 persons,
             })
         }
@@ -773,11 +797,15 @@ impl CrewHub {
                 ),
             ));
         }
-        if matches!(view.state, SessionState::Working | SessionState::Blocked)
-            || thread
-                .iter()
-                .any(|m| to_boss(m, &i.boss, s) && m.at > i.opened_at && !waits_on_answer(&m.text))
-        {
+        // A word since that waits on no answer is its going on, unless by
+        // the rule that found it waiting it still waits on this item's
+        // message: a held session's "Understood, holding." is no going on.
+        let spoke = thread
+            .iter()
+            .any(|m| to_boss(m, &i.boss, s) && m.at > i.opened_at && !waits_on_answer(&m.text));
+        let still =
+            waiting_in(&thread, &i.boss, s).is_some_and(|w| key(s, w.message) == i.dedupe_key);
+        if matches!(view.state, SessionState::Working | SessionState::Blocked) || spoke && !still {
             return Some((
                 ClosedBy::Session,
                 format!("{name} went on without waiting; I've closed the question."),
@@ -888,6 +916,76 @@ mod tests {
         // Text that changes length in lower case never panics.
         let _ = options_in("Option Éé: İ foo bar\nİİİİ Option: x y");
         let _ = waits_on_answer("İİİİ until Desk answers; K your call");
+    }
+
+    /// Under a hold, a reply that only says it holds keeps the words the
+    /// hold answered: never an older question the boss answered before.
+    #[test]
+    fn a_holding_reply_keeps_only_the_words_its_hold_answered() {
+        use workforce_desk::crew::Party;
+        let s = Uuid::new_v4();
+        let session = Party {
+            kind: PartyKind::Session,
+            id: s.to_string(),
+            name: "web".into(),
+            engine: None,
+            origin: None,
+        };
+        let boss = Party::manager("desk", "Desk");
+        let t0 = Utc::now() - chrono::Duration::minutes(10);
+        let at = |m: i64| t0 + chrono::Duration::minutes(m);
+        let said = |text: &str, m: i64| {
+            let mut l = LineMessage::new(
+                session.clone(),
+                boss.clone(),
+                LineKind::Tell,
+                text.into(),
+                1,
+            );
+            l.at = at(m);
+            l
+        };
+        let told = |text: &str, m: i64| {
+            let mut l = LineMessage::new(
+                boss.clone(),
+                session.clone(),
+                LineKind::Tell,
+                text.into(),
+                1,
+            );
+            l.at = at(m);
+            l.delivery = Delivery::Delivered;
+            l.delivered_at = Some(at(m));
+            l
+        };
+        let asked = said("Which database should the drill use? Your call.", 0);
+        let answered = told("Use the staging one.", 1);
+        let hold = told(
+            "Don't change staging any further until I answer: this is the person's call.",
+            3,
+        );
+        let holding = said("Understood, holding.", 4);
+        assert!(waits_on_answer(&asked.text));
+        assert!(!waits_on_answer(&holding.text));
+        assert!(workforce_desk::line::holds(&hold.text));
+        // The question before the boss's answer is settled: the reply's
+        // own words are kept.
+        let thread = [
+            asked.clone(),
+            answered.clone(),
+            hold.clone(),
+            holding.clone(),
+        ];
+        let w = waiting_in(&thread, "desk", s).expect("it waits on the hold");
+        assert_eq!(w.message, hold.id);
+        assert_eq!(w.said.map(|m| m.id), Some(holding.id));
+        // Asked after that answer and before the hold: what the hold
+        // answered, kept.
+        let report = said("Both need your decision: (a) or (b)?", 2);
+        let thread = [asked, answered, report.clone(), hold.clone(), holding];
+        let w = waiting_in(&thread, "desk", s).expect("it waits on the hold");
+        assert_eq!(w.message, hold.id);
+        assert_eq!(w.said.map(|m| m.id), Some(report.id));
     }
 
     #[test]
