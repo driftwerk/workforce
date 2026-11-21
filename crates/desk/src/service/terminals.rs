@@ -677,6 +677,7 @@ impl Desk {
             fail_closed: false,
             interrupted: false,
             ends: 0,
+            ended_at: None,
             reading: None,
             closing: false,
             codex_asks: Vec::new(),
@@ -818,6 +819,9 @@ impl Desk {
                             fail_closed: false,
                             interrupted: false,
                             ends: 0,
+                            // What it asks now it asked before this hub
+                            // linked it again: nothing sent before answers it.
+                            ended_at: Some(Utc::now()),
                             reading: None,
                             closing: false,
                             codex_asks: Vec::new(),
@@ -887,6 +891,7 @@ impl Desk {
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::eventually;
     use super::*;
     use crate::floor::{Outcome, TurnOp};
     use crate::store::build_pool;
@@ -1103,6 +1108,181 @@ mod tests {
             assert_eq!(d.terminal(id).unwrap().exit_code, Some(4));
             d.close_terminal(id).unwrap();
             assert!(d.terminals().is_empty());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_session_relinked_asking_in_its_terminal_takes_only_what_its_boss_says_after() {
+        with_test_pool(build_pool, |pool| async move {
+            let (_hdir, socket, _holder_cancel) = crate::holder::tests::holder().await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut opts = options(dir.path());
+            opts.restore = RestorePolicy::Auto;
+            opts.holder = Some(super::super::HolderOptions {
+                socket,
+                token: crate::holder::tests::TOKEN.into(),
+            });
+            opts.env = BTreeMap::from([
+                ("PATH".into(), "/usr/bin:/bin".into()),
+                ("SHELL".into(), "/bin/sh".into()),
+                ("HOME".into(), dir.path().to_string_lossy().into_owned()),
+            ]);
+            // A Claude Code recent enough for its line, whatever is installed.
+            let cli = super::super::tests::versioned_cli(dir.path());
+            opts.programs = crate::testing::programs(cli.clone(), cli);
+            crate::store::DeskStore::migrate(&pool).await.unwrap();
+            let bosses = |d: &Desk| {
+                d.set_bosses(vec![super::super::Boss {
+                    agent: "sarah".into(),
+                    name: "Sarah".into(),
+                    scope: crate::scope::Scope::Ungrouped,
+                    level: "act".into(),
+                }]);
+                crate::crew::By::manager("sarah", "Sarah", "Next step.")
+            };
+            let tell = |to: Uuid, text: &str| crate::line::Send::Tell {
+                to: crate::line::Target::Session(to),
+                text: text.into(),
+                when: crate::line::When::Queue,
+            };
+            let cwd = dir.path().to_string_lossy().into_owned();
+            let hook = |event: serde_json::Value| {
+                let mut body = event;
+                body["session_id"] = "cli-1".into();
+                body["cwd"] = cwd.clone().into();
+                serde_json::to_vec(&body).unwrap()
+            };
+            let cancel = CancellationToken::new();
+            let d = Desk::start(
+                crate::store::DeskStore::from_pool(pool.clone()),
+                opts.clone(),
+                Default::default(),
+                cancel.clone(),
+            )
+            .await
+            .unwrap();
+            d.engines_read_now(None).await;
+            let by = bosses(&d);
+            let terminal = Uuid::new_v4();
+            d.create_terminal(NewTerminal {
+                id: Some(terminal),
+                name: None,
+                cwd: cwd.clone(),
+                env: BTreeMap::from([("DESK_HOOK_TOKEN".into(), "tok".into())]),
+            })
+            .await
+            .unwrap();
+            let start = serde_json::json!({"hook_event_name": "SessionStart", "source": "startup"});
+            d.terminal_hook(terminal, "tok", &hook(start))
+                .await
+                .unwrap();
+            let s = d
+                .terminal_session(terminal, Some("cli-1"))
+                .expect("its session");
+            d.take_on(
+                s,
+                &by.party,
+                crate::charge::How::Handed,
+                &Default::default(),
+                &crate::crew::By::you(),
+            )
+            .await
+            .unwrap();
+            d.change(s, |r, _| r.state = SessionState::Working);
+            let earlier = d
+                .line_send(
+                    super::super::Sender::Overseer(by.clone()),
+                    tell(s, "When that is done, run the linter."),
+                )
+                .await
+                .unwrap();
+            let stop = serde_json::json!({"hook_event_name": "Stop",
+                "last_assistant_message": "The replica is ready. Should I switch reads to it?"});
+            d.terminal_hook(terminal, "tok", &hook(stop)).await.unwrap();
+            assert_eq!(d.view(s).unwrap().state, SessionState::Asking);
+
+            // The hub restarts; the holder kept its terminal, and the
+            // session in it is linked again, still asking.
+            let store = crate::store::DeskStore::from_pool(pool.clone());
+            eventually("kept as asking", async || {
+                let r = store.get(s).await.ok()??;
+                (r.state == SessionState::Asking).then_some(())
+            })
+            .await;
+            let holder = d.holder().await.expect("a holder");
+            eventually("its terminal in the holder", async || {
+                let held = holder.list().await.ok()?;
+                held.iter()
+                    .any(|h| {
+                        !h.exited
+                            && h.meta["kind"].as_str() == Some("terminal")
+                            && h.meta["terminal"].as_str() == Some(terminal.to_string().as_str())
+                    })
+                    .then_some(())
+            })
+            .await;
+            let port = d.0.hook_port;
+            cancel.cancel();
+            eventually("the last hub gone", async || {
+                std::net::TcpListener::bind(("127.0.0.1", port))
+                    .ok()
+                    .map(drop)
+            })
+            .await;
+            let d = Desk::start(
+                crate::store::DeskStore::from_pool(pool.clone()),
+                opts,
+                Default::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let by = bosses(&d);
+            eventually("linked again, still asking", async || {
+                let v = d.view(s).ok()?;
+                (v.live && v.state == SessionState::Asking).then_some(())
+            })
+            .await;
+            assert_eq!(
+                d.0.state.lock().live.get(&s).and_then(|l| l.terminal),
+                Some(terminal),
+                "linked again in its terminal"
+            );
+            eventually("its boss runs it", async || {
+                d.charge_of(s).filter(|c| c.live()).map(drop)
+            })
+            .await;
+            let row = |id| {
+                let d = d.clone();
+                async move { d.0.store.line_message(id).await.unwrap().unwrap() }
+            };
+            // What it said before is never the answer: back in its queue
+            // once it runs, it waits on the question.
+            eventually("queued again, waiting on the question", async || {
+                let m = row(earlier.id).await;
+                (m.delivery == crate::line::Delivery::Queued
+                    && d.line_waits(&m) == Some(crate::line::Wait::Asking))
+                .then_some(())
+            })
+            .await;
+            assert_eq!(d.line_next(s, Duration::from_millis(300)).await, None);
+            let after = d
+                .line_send(
+                    super::super::Sender::Overseer(by),
+                    tell(s, "Yes, switch them."),
+                )
+                .await
+                .unwrap();
+            assert_ne!(
+                d.line_waits(&row(after.id).await),
+                Some(crate::line::Wait::Asking),
+                "its running boss answers it"
+            );
+            assert_eq!(
+                d.line_waits(&row(earlier.id).await),
+                Some(crate::line::Wait::Asking)
+            );
         })
         .await;
     }

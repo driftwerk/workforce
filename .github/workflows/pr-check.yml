@@ -202,28 +202,8 @@ jobs:
       # hub (and what depends on it) on every later cargo command. Create it
       # first so each crate is built once.
       - run: mkdir -p ui/dist
-      # The hub's library and its tests are each a rustc of about 9 GB, and
-      # they build at once: with the rest of the workspace that can pass the
-      # runner's 16 GB, and the runner is then killed (exit 143, "lost
-      # communication"). Swap lets such a moment pass, a little slower,
-      # instead of losing the job.
       - name: Give the build room to swap
-        run: |
-          free -h
-          # Only a mitigation: without room on the scratch disk, build as
-          # before.
-          if [ ! -d /mnt ] || [ "$(df --output=avail -BG /mnt | tail -1 | tr -dc 0-9)" -lt 24 ]; then
-            echo "No room on /mnt for swap: building with the runner's own."
-            exit 0
-          fi
-          sudo swapoff -a
-          sudo fallocate -l 16G /mnt/test-build.swap
-          sudo chmod 600 /mnt/test-build.swap
-          sudo mkswap /mnt/test-build.swap >/dev/null
-          sudo swapon /mnt/test-build.swap
-          # Swap only under real pressure, so the runner itself isn't starved.
-          sudo sysctl -q vm.swappiness=10
-          free -h
+        uses: ./.github/actions/swap
       - name: Build every test binary
         run: cargo nextest archive --all-features --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst"
       # Every test the archive holds that a plain run would run (not
@@ -526,6 +506,17 @@ jobs:
           path: ~/vellev-models
           key: vellev-models-bge-base-bge-small-en-v1.5
           restore-keys: vellev-models-
+      # See test-build: the hub's build script makes ui/dist, and the
+      # directory is newer than its last run, so without this every cargo
+      # command rebuilds the hub.
+      - run: mkdir -p ui/dist
+      - name: Give the build room to swap
+        uses: ./.github/actions/swap
+      # Built before the node and Weaviate start, so its memory peak is not
+      # theirs too; the tests then run this binary as it is.
+      - name: Build the hub's tests
+        if: matrix.leg == 'hub'
+        run: crates/hub/vellev-node-tests.sh --no-run --all-features
       - name: Start a vellev node
         timeout-minutes: 30
         run: |
@@ -687,10 +678,6 @@ jobs:
           PY
           echo "Weaviate $WEAVIATE_VERSION at $url"
           echo "WORKFORCE_TEST_WEAVIATE_URL=$url" >> "$GITHUB_ENV"
-      # See test-build: the hub's build script makes ui/dist, and the
-      # directory is newer than its last run, so without this every cargo
-      # command rebuilds the hub.
-      - run: mkdir -p ui/dist
       - name: Run the tests against the node
         timeout-minutes: 60
         env:

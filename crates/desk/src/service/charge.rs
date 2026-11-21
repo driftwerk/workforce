@@ -41,7 +41,7 @@ pub struct DialogAnswerer {
 pub(crate) struct Charges {
     rows: HashMap<Uuid, Charge>,
     /// The person's own prompts and composer messages, by session.
-    driven: HashMap<Uuid, DateTime<Utc>>,
+    pub(super) driven: HashMap<Uuid, DateTime<Utc>>,
     /// What each boss that took a session on is called, by agent id.
     names: HashMap<String, String>,
     /// How long the person's input holds each boss's sessions, by agent

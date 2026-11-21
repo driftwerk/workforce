@@ -83,23 +83,25 @@ pub(super) async fn install(config: &WorkforceConfig) {
     let Some(pg) = config.postgres.as_ref().filter(|p| p.enabled) else {
         return;
     };
-    OPENED
-        .get_or_init(|| async {
-            match PgFloorStore::new(pg).await {
-                Ok(store) => {
-                    let installed = Installed::open(store);
-                    tokio::spawn(prune_forever(Arc::clone(&installed.store)));
-                    observe_with(installed.plans.clone());
-                    let _ = INSTALLED.set(installed);
-                }
-                Err(e) => warn!(
-                    target: "floor",
-                    error = %format!("{e:#}"),
-                    "floor store unavailable; turns are not recorded"
-                ),
-            }
+    // Opened once; a store that couldn't be opened (Postgres down at boot)
+    // is tried again on the next install.
+    let opened = OPENED
+        .get_or_try_init(|| async {
+            let store = PgFloorStore::new(pg).await?;
+            let installed = Installed::open(store);
+            tokio::spawn(prune_forever(Arc::clone(&installed.store)));
+            observe_with(installed.plans.clone());
+            let _ = INSTALLED.set(installed);
+            Ok::<(), eyre::Report>(())
         })
         .await;
+    if let Err(e) = opened {
+        warn!(
+            target: "floor",
+            error = %format!("{e:#}"),
+            "floor store unavailable; turns are not recorded"
+        );
+    }
 }
 
 /// The log as the hub writes it: every op through one writer, in order, the

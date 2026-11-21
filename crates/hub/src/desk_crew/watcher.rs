@@ -800,11 +800,15 @@ impl CrewHub {
         if !view.state.is_running() || self.person_has_questions(&view, overseer) {
             return None;
         }
-        let waits = self.desk.line_waits(&view, waiting)?;
+        let waits = self.desk.rows_wait(&view, waiting)?;
         const LONG_STEP: &str =
             "it may be stuck, or in one long step (a build, a test run), which a restart would cut off";
-        let (why, behind_person) = match waits.first().copied().flatten() {
-            _ if view.pending.is_some() => (
+        let first = match view.pending {
+            Some(_) => Some(Wait::Dialog),
+            None => waits.first().copied().flatten(),
+        };
+        let (why, behind_person) = match first {
+            Some(Wait::Dialog) => (
                 "it waits on an approval or a dialog in its terminal, and your messages wait behind that"
                     .to_string(),
                 true,
@@ -1355,8 +1359,6 @@ pub(super) fn wake_loop(
     crew: Arc<CrewHub>,
     cancel: CancellationToken,
 ) -> impl std::future::Future<Output = ()> {
-    // Subscribed now, before the loop is spawned: nothing that happens
-    // once the crew has started is missed while it starts.
     let mut events = crew.desk.events();
     let mut rework = crew.rework.subscribe();
     async move {

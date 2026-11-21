@@ -1976,8 +1976,6 @@ pub(super) fn items_loop(
     crew: Arc<CrewHub>,
     cancel: CancellationToken,
 ) -> impl std::future::Future<Output = ()> {
-    // Subscribed now, before the loop is spawned: nothing that happens
-    // once the crew has started is missed while it starts.
     let mut events = crew.desk.events();
     async move {
         let mut every = tokio::time::interval(crew.timing.minute);

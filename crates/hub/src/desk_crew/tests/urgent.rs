@@ -142,7 +142,7 @@ async fn an_urgent_nudge_a_session_cant_take_mid_turn_or_past_the_limit_waits_an
         let out = nudge(&overseer, s, "Stop: don't start release 4.", true).await;
         assert_eq!(
             out["done"],
-            "told user-flip; it gets it once its turn ends: it can't take words mid-turn",
+            "told user-flip; a dialog in its terminal waits on an answer: it gets it once that is answered and its turn ends",
             "{out}"
         );
 
@@ -201,18 +201,21 @@ async fn a_stand_down_not_read_in_time_is_an_interrupt_through_the_bosss_gate() 
         // goes in at the idle after.
         let (s, _) = working(&d, &base, "release-prep").await;
         let row = stand_down(&d, &crew, s, Urgency::Escalate).await;
-        eventually("its turn interrupted", async || {
-            (d.view(s).unwrap().state == SessionState::Done).then_some(())
+        let ended = eventually("its turn interrupted", async || {
+            d.view(s).ok().filter(|v| v.state == SessionState::Done)
         })
         .await;
-        let interrupted = d
-            .activity(Filter::Manager, None, 20)
-            .await
-            .unwrap()
-            .events
-            .into_iter()
-            .find(|e| e.kind == Kind::Interrupted)
-            .expect("the boss's interrupt");
+        assert!(ended.interrupted, "ended by the interrupt, not otherwise");
+        // Its note is kept after the turn is seen to end: waited for.
+        let interrupted = eventually("the boss's interrupt", async || {
+            d.activity(Filter::Manager, None, 20)
+                .await
+                .ok()?
+                .events
+                .into_iter()
+                .find(|e| e.kind == Kind::Interrupted)
+        })
+        .await;
         assert_eq!(interrupted.actor.id, "desk");
         assert!(
             interrupted

@@ -554,11 +554,17 @@ async fn a_question_behind_reports_waiting_for_the_next_hour_is_answered_at_once
             "at once, not at the next hour nor the next look: {:?}",
             asked_at.elapsed()
         );
-        assert_eq!(
-            d.store().line_waiting_for_bosses().await.unwrap().len(),
-            0,
-            "the waiting report went with it"
-        );
+        // The waiting report went with it: taken as the turn that answers
+        // runs, which can end after the answer is kept.
+        eventually("the waiting report taken with it", async || {
+            d.store()
+                .line_waiting_for_bosses()
+                .await
+                .ok()
+                .filter(Vec::is_empty)
+                .map(drop)
+        })
+        .await;
     })
     .await;
 }

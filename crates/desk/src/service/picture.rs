@@ -110,22 +110,25 @@ impl Desk {
     }
 
     /// Whether `m`, a boss's message waiting to go into its session, was
-    /// overtaken by the person's own words there since it was written: it
-    /// is withdrawn, never delivered, and the boss decides again on what
-    /// they said (its picture has it).
+    /// overtaken there since it was written: by the person's own words, or,
+    /// for its answer to the question a turn ended on, by that question
+    /// passing. It is withdrawn, never delivered, and the boss decides
+    /// again (its picture has it).
     pub(super) async fn line_overtaken(&self, m: &crate::line::LineMessage) -> bool {
         let Some(s) = m.to_session() else {
             return false;
         };
+        let said = m.kind == crate::line::LineKind::Tell || m.answers_turn();
         if m.from.kind != crate::crew::PartyKind::Manager
-            || m.kind != crate::line::LineKind::Tell
-            || !self.0.picture.lock().person_since(s, m.at)
+            || !said
+            || !(self.0.picture.lock().person_since(s, m.at)
+                || (m.answers_turn() && !self.still_asks(s, m)))
         {
             return false;
         }
         match self.line_withdraw(m.id).await {
             Ok(Some(_)) => {
-                tracing::info!(session = %s, message = %m.id, "a boss's message the person's own words overtook was withdrawn");
+                tracing::info!(session = %s, message = %m.id, "a boss's message overtaken before it went in was withdrawn");
                 // Its boss knows it never went in.
                 self.picture_note(
                     Note::new(What::Withdrawn, m.text.clone())
@@ -140,6 +143,20 @@ impl Desk {
                 false
             }
         }
+    }
+
+    /// Whether session `s` still asks what turn-answer `m` answers, at the
+    /// same turn end: none kept for it (from before a restart) never does.
+    pub(super) fn still_asks(&self, s: Uuid, m: &crate::line::LineMessage) -> bool {
+        let kept = self
+            .0
+            .state
+            .lock()
+            .lines
+            .answers
+            .get(&m.id)
+            .map(|(_, t)| *t);
+        kept.is_some_and(|t| self.asked_mark(s) == Some(t))
     }
 
     /// The person's own words into session `id` (a prompt, a message from

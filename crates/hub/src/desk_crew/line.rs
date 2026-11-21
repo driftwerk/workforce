@@ -968,9 +968,14 @@ impl Gathered {
     /// Adds `messages`, each once.
     fn take(&mut self, messages: Vec<LineMessage>) {
         for m in messages {
-            if !self.messages.iter().any(|k| k.id == m.id) {
-                self.messages.push(m);
-            }
+            self.add(m);
+        }
+    }
+
+    /// Adds `m`, once.
+    fn add(&mut self, m: LineMessage) {
+        if !self.messages.iter().any(|k| k.id == m.id) {
+            self.messages.push(m);
         }
     }
 
@@ -996,8 +1001,6 @@ pub(super) fn line_loop(
     crew: Arc<CrewHub>,
     cancel: CancellationToken,
 ) -> impl std::future::Future<Output = ()> {
-    // Subscribed now, before the loop is spawned: nothing that happens
-    // once the crew has started is missed while it starts.
     let mut events = crew.desk.events();
     let mut rework = crew.rework.subscribe();
     async move {
@@ -1036,7 +1039,7 @@ pub(super) fn line_loop(
                             gathering
                                 .entry(session)
                                 .or_insert_with(Gathered::new)
-                                .take(vec![*message]);
+                                .add(*message);
                         }
                     }
                     Ok(DeskEvent::Activity { event }) => {
