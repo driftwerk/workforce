@@ -162,9 +162,13 @@ async fn account(d: &Desk, s: uuid::Uuid, done: &[&str], now: &str, next: &str) 
 }
 
 /// The boss's state is begun before anything is done, so all of it is news.
-async fn begun(crew: &Arc<CrewHub>) {
+pub(super) async fn begun(crew: &Arc<CrewHub>) {
     crew.look_at_updates().await;
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    crew.desk
+        .store()
+        .update_state("desk", chrono::Utc::now())
+        .await
+        .unwrap();
 }
 
 const ACT: &str = "[oversight]\nenabled = true\nlevel = \"act\"\nact = { nudge = true }\n";
@@ -249,6 +253,17 @@ async fn decisions_read_as_their_rows_and_the_plain_update_stands_in() {
             let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", &toml, &[]).await;
             crew.set_update_writer(Arc::new(Writer(writer)));
             begun(&crew).await;
+            // Held as by a running reply while both rows are written.
+            let dm = overseer
+                .sessions
+                .find(DESK_CHANNEL, PERSON)
+                .unwrap()
+                .unwrap()
+                .id
+                .to_string();
+            crew.manager_turns
+                .lock()
+                .insert(dm.clone(), chrono::Utc::now());
             let s = new_session(&d, dir.path(), "acme-web").await;
             let t0 = chrono::Utc::now() - chrono::Duration::minutes(1);
             crew.perform(
@@ -262,6 +277,8 @@ async fn decisions_read_as_their_rows_and_the_plain_update_stands_in() {
             .await
             .unwrap();
             account(&d, s.id, &["Merged PR #622"], "", "Deploy it").await;
+            crew.manager_turns.lock().remove(&dm);
+            crew.update_poke.notify_one();
             let row = d
                 .store()
                 .decisions_since("desk", t0, 10)
@@ -512,17 +529,23 @@ async fn a_restart_neither_loses_nor_repeats_an_update() {
             .update_pend("desk", &pending("Kept, not sent."))
             .await
             .unwrap();
+        let state = async || {
+            d.store()
+                .update_state("desk", chrono::Utc::now())
+                .await
+                .unwrap()
+        };
+        let marked = async || {
+            let s = state().await;
+            s.pending.is_none() && s.last_update_at.is_some()
+        };
         crew.look_at_updates().await;
         crew.look_at_updates().await;
         eventually("sent", async || updates(&overseer).into_iter().next()).await;
+        eventually("marked sent", async || marked().await.then_some(())).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(updates(&overseer).len(), 1);
-        let state = d
-            .store()
-            .update_state("desk", chrono::Utc::now())
-            .await
-            .unwrap();
-        assert!(state.pending.is_none() && state.last_update_at.is_some());
+        assert!(marked().await);
 
         // Sent, but the hub stopped before it was marked: not sent again.
         let p = pending("Sent, not marked.");
@@ -536,15 +559,13 @@ async fn a_restart_neither_loses_nor_repeats_an_update() {
             .unwrap();
         d.store().update_pend("desk", &p).await.unwrap();
         crew.look_at_updates().await;
+        eventually("its pending let go", async || {
+            state().await.pending.is_none().then_some(())
+        })
+        .await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(updates(&overseer).len(), 2);
-        assert!(d
-            .store()
-            .update_state("desk", chrono::Utc::now())
-            .await
-            .unwrap()
-            .pending
-            .is_none());
+        assert!(state().await.pending.is_none());
     })
     .await;
 }

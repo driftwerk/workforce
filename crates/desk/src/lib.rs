@@ -57,6 +57,7 @@ pub mod grant_store;
 pub mod handoff;
 pub mod holder;
 pub mod identity;
+pub mod issues;
 pub mod knows;
 mod knows_api;
 pub mod knows_collect;

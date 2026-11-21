@@ -162,7 +162,9 @@ jobs:
         with:
           shared-key: clippy
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo clippy --all-targets --all-features --no-deps -- -D warnings
+      - name: Give the build room to swap
+        uses: ./.github/actions/swap
+      - run: .github/scripts/held-to-memory.sh cargo clippy --all-targets --all-features --no-deps -- -D warnings
 
   # The test suite is built once here and run in parallel partitions below:
   # the tests of every crate that can reach Postgres (each that depends on
@@ -206,10 +208,9 @@ jobs:
       - name: Give the build room to swap
         uses: ./.github/actions/swap
       # Two jobs, not the runner's four: the hub's lib tests alone fill its
-      # memory, and the test binaries linked beside them would push it far
-      # into swap, where the runner stops answering and is lost.
+      # memory, and fewer test binaries linked beside them swap less.
       - name: Build every test binary
-        run: cargo nextest archive --all-features --build-jobs 2 --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst"
+        run: .github/scripts/held-to-memory.sh cargo nextest archive --all-features --build-jobs 2 --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst"
       # Every test the archive holds that a plain run would run (not
       # #[ignore]d), for `test-count` to hold the partitions to.
       - name: Count the tests
@@ -416,7 +417,9 @@ jobs:
           shared-key: test
           save-if: false
       - run: mkdir -p ui/dist
-      - run: cargo test --all-features --doc
+      - name: Give the build room to swap
+        uses: ./.github/actions/swap
+      - run: .github/scripts/held-to-memory.sh cargo test --all-features --doc
 
   # The tests that need a real vellev node and Postgres. Elsewhere these skip
   # themselves; VELLEV_TEST_REQUIRED makes a skip a failure here, so a green
@@ -522,7 +525,7 @@ jobs:
       # theirs too; the tests then run this binary as it is.
       - name: Build the hub's tests
         if: matrix.leg == 'hub'
-        run: crates/hub/vellev-node-tests.sh --no-run --all-features
+        run: .github/scripts/held-to-memory.sh crates/hub/vellev-node-tests.sh --no-run --all-features
       - name: Start a vellev node
         timeout-minutes: 30
         run: |
@@ -733,7 +736,7 @@ jobs:
           save-if: false
       - name: Give the build room to swap
         uses: ./.github/actions/swap
-      - run: cargo test -p workforce-hub --lib -- remote_mcp::help
+      - run: .github/scripts/held-to-memory.sh cargo test -p workforce-hub --lib -- remote_mcp::help
 
   # The one check branch protection requires: path- and lane-skipped jobs
   # never report, so this always does, and fails if anything that ran failed.

@@ -77,6 +77,7 @@ mod knows;
 mod knows_sync;
 pub use handoff::{HandedOff, HandoffPreview, Hop, LineageView};
 pub use knows_sync::Gather as KnowsGather;
+mod issues;
 mod lifecycle;
 mod line;
 mod picture;
@@ -1164,6 +1165,8 @@ struct Inner {
     rush: urgent::Rush,
     /// What answers sessions' MCP requests on their lines.
     line_mcp: std::sync::OnceLock<Arc<dyn line::SessionMcp>>,
+    /// Where sessions' Linear and Jira calls go ([`crate::issues`]).
+    issues: std::sync::OnceLock<Arc<dyn crate::issues::Issues>>,
     /// The crew whose overseer answers sessions on their lines.
     line_crew: Mutex<Option<Weak<dyn crew::Crew>>>,
     /// Where a boss's answers for its sessions are judged; none until the
@@ -1980,6 +1983,7 @@ impl Desk {
             line_pump: tokio::sync::Mutex::new(()),
             rush: Default::default(),
             line_mcp: std::sync::OnceLock::new(),
+            issues: std::sync::OnceLock::new(),
             line_crew: Mutex::new(None),
             boss_bounds: Mutex::new(None),
             agent_fast: Mutex::new(None),
