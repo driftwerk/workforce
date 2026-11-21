@@ -492,16 +492,20 @@ async fn an_install_runs_the_repositorys_tool_and_stamps_what_it_made() {
 async fn an_install_a_stopped_desk_left_running_is_ended_before_another_begins() {
     let home = tempfile::tempdir().unwrap();
     let home = home.path().canonicalize().unwrap();
-    let mut left = tokio::process::Command::new("sleep")
-        .arg("60")
-        .process_group(0)
-        .spawn()
-        .unwrap();
+    let sleeping = |token: Option<&str>| {
+        let mut c = tokio::process::Command::new("sleep");
+        c.arg("60").process_group(0);
+        if let Some(t) = token {
+            c.env(RUN_VAR, t);
+        }
+        c.spawn().unwrap()
+    };
+    let mut left = sleeping(Some("tok1"));
     let pid = left.id().unwrap();
-    let since = crate::procs::started_at(pid).await.unwrap();
+    let since = crate::procs::started_at(pid).await.unwrap().to_rfc3339();
     let running = home.join("run/deps.pid");
     std::fs::create_dir_all(running.parent().unwrap()).unwrap();
-    std::fs::write(&running, format!("{pid} {}", since.to_rfc3339())).unwrap();
+    std::fs::write(&running, format!("{pid} {since} tok1")).unwrap();
     let bin = home.join("tools");
     fake_npx(&bin, 0, 0);
     let dir = home.join("work");
@@ -524,20 +528,24 @@ async fn an_install_a_stopped_desk_left_running_is_ended_before_another_begins()
         .expect("the one left running was ended")
         .unwrap();
     assert!(!ended.success());
-    // One that names a process started at another time is left alone.
-    let mut other = tokio::process::Command::new("sleep")
-        .arg("60")
-        .process_group(0)
-        .spawn()
-        .unwrap();
-    let pid = other.id().unwrap();
-    std::fs::write(&running, format!("{pid} 2001-01-01T00:00:00+00:00")).unwrap();
-    assert_eq!(
-        install(&i, &dir, &home, &env, INSTALL_FOR, &running).await,
-        Ok(())
-    );
-    assert!(other.try_wait().unwrap().is_none(), "still running");
-    other.kill().await.unwrap();
+    // A process started at another time, or one without the install's
+    // token, is left alone.
+    for (token, kept) in [
+        (Some("tok2"), "2001-01-01T00:00:00+00:00 tok2"),
+        (None, "{since} tok3"),
+    ] {
+        let mut other = sleeping(token);
+        let pid = other.id().unwrap();
+        let since = crate::procs::started_at(pid).await.unwrap().to_rfc3339();
+        let kept = kept.replace("{since}", &since);
+        std::fs::write(&running, format!("{pid} {kept}")).unwrap();
+        assert_eq!(
+            install(&i, &dir, &home, &env, INSTALL_FOR, &running).await,
+            Ok(())
+        );
+        assert!(other.try_wait().unwrap().is_none(), "{kept}: still running");
+        other.kill().await.unwrap();
+    }
 }
 
 /// Whether `pid` runs: there, and not a zombie.
@@ -551,16 +559,18 @@ async fn runs(pid: u32) -> bool {
     !stat.trim().is_empty() && !stat.trim().starts_with('Z')
 }
 
-/// A group whose leader is gone, the process it left in it, and when it
-/// was begun.
-async fn leaderless() -> (u32, u32, chrono::DateTime<chrono::Utc>) {
-    let then = chrono::Utc::now() - chrono::Duration::seconds(1);
-    let sh = tokio::process::Command::new("sh")
-        .args(["-c", "sleep 60 >/dev/null 2>&1 & echo $!"])
+/// A group whose leader is gone, the process it left in it (carrying
+/// `token` as an install's, when given), and a time before it was begun.
+async fn leaderless(token: Option<&str>) -> (u32, u32, String) {
+    let then = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+    let mut sh = tokio::process::Command::new("sh");
+    sh.args(["-c", "sleep 60 >/dev/null 2>&1 & echo $!"])
         .stdout(std::process::Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .unwrap();
+        .process_group(0);
+    if let Some(t) = token {
+        sh.env(RUN_VAR, t);
+    }
+    let sh = sh.spawn().unwrap();
     let group = sh.id().unwrap();
     let out = sh.wait_with_output().await.unwrap();
     let left: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
@@ -568,12 +578,12 @@ async fn leaderless() -> (u32, u32, chrono::DateTime<chrono::Utc>) {
 }
 
 #[tokio::test]
-async fn an_install_left_running_without_its_leader_is_ended_by_its_group() {
+async fn an_install_left_running_without_its_leader_is_ended_by_its_token() {
     let home = tempfile::tempdir().unwrap();
     let running = home.path().join("deps.pid");
-    let (group, left, then) = leaderless().await;
+    let (group, left, then) = leaderless(Some("tok1")).await;
     assert!(runs(left).await);
-    std::fs::write(&running, format!("{group} {}", then.to_rfc3339())).unwrap();
+    std::fs::write(&running, format!("{group} {then} tok1")).unwrap();
     end_left(&running).await;
     let mut ended = false;
     for _ in 0..500 {
@@ -585,26 +595,17 @@ async fn an_install_left_running_without_its_leader_is_ended_by_its_group() {
     }
     assert!(ended, "its group was ended");
     assert!(!running.exists());
-    // With no start kept, Desk can't tell it is the install's: left.
-    let (group, left, _) = leaderless().await;
-    std::fs::write(&running, format!("{group} ")).unwrap();
-    end_left(&running).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(runs(left).await, "left alone");
-    // So is one begun before the install was.
-    std::fs::write(
-        &running,
-        format!(
-            "{group} {}",
-            (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339()
-        ),
-    )
-    .unwrap();
-    end_left(&running).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(runs(left).await, "left alone");
-    // SAFETY: ends the test's own group.
-    unsafe {
-        libc::killpg(i32::try_from(group).unwrap(), libc::SIGKILL);
+    // A group begun since whose processes don't carry the install's token
+    // (one that took the number since), or one with no token kept: left.
+    for (token, kept) in [(None, " tok2"), (Some("tok3"), " tok4"), (Some("tok5"), "")] {
+        let (group, left, then) = leaderless(token).await;
+        std::fs::write(&running, format!("{group} {then}{kept}")).unwrap();
+        end_left(&running).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(runs(left).await, "{token:?}{kept}: left alone");
+        // SAFETY: ends the test's own group.
+        unsafe {
+            libc::killpg(i32::try_from(group).unwrap(), libc::SIGKILL);
+        }
     }
 }

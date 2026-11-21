@@ -131,6 +131,38 @@ pub async fn in_group(group: u32) -> Vec<u32> {
         .unwrap_or_default()
 }
 
+/// Whether process `pid`'s environment holds `entry` (`NAME=value`): from
+/// `/proc` on Linux, elsewhere as `ps -E` shows it (the person's own
+/// processes alone).
+pub async fn carries(pid: u32, entry: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let entry = entry.as_bytes().to_vec();
+        tokio::task::spawn_blocking(move || {
+            std::fs::read(format!("/proc/{pid}/environ"))
+                .is_ok_and(|env| env.split(|b| *b == 0).any(|e| e == entry.as_slice()))
+        })
+        .await
+        .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let run = tokio::process::Command::new("ps")
+            .args(["-E", "-ww", "-o", "command=", "-p", &pid.to_string()])
+            .kill_on_drop(true)
+            .output();
+        tokio::time::timeout(PS_WAIT, run)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .is_some_and(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .split_whitespace()
+                    .any(|w| w == entry)
+            })
+    }
+}
+
 /// How long `ps` is waited on for one process's start.
 #[cfg(not(target_os = "linux"))]
 const PS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);

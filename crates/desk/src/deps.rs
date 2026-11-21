@@ -37,6 +37,9 @@ use crate::run::Ran;
 
 /// How long one install may take.
 pub const INSTALL_FOR: Duration = Duration::from_secs(15 * 60);
+/// The variable each install's processes carry its run's token in, so one
+/// left running is told apart from any other.
+const RUN_VAR: &str = "DESK_DEPS_RUN";
 /// The folder Desk keeps its stamp in, whichever the tool.
 const STATE: &str = "node_modules";
 /// Desk's stamp of the install it made.
@@ -413,12 +416,14 @@ pub async fn install(
         }
         .into());
     };
+    let token = uuid::Uuid::new_v4().simple().to_string();
     let env: Vec<(String, String)> = env
         .iter()
         .cloned()
         .chain(
             [
                 ("HOME", home.to_string_lossy().as_ref()),
+                (RUN_VAR, &token),
                 // No terminal: pnpm replaces a node_modules without asking.
                 ("CI", "1"),
                 // A corepack shim refuses another manager's project.
@@ -433,10 +438,8 @@ pub async fn install(
     let keep = async {
         if let Ok(pid) = pid.await {
             let since = crate::procs::started_at(pid).await;
-            let kept = format!(
-                "{pid} {}",
-                since.map(|s| s.to_rfc3339()).unwrap_or_default()
-            );
+            let since = since.map_or_else(|| "-".to_string(), |s| s.to_rfc3339());
+            let kept = format!("{pid} {since} {token}");
             if let Some(parent) = running.parent() {
                 let _ = tokio::fs::create_dir_all(parent).await;
             }
@@ -492,9 +495,9 @@ pub async fn install(
 }
 
 /// Ends the install `running` says a stopped Desk left running: its
-/// process group, when its leader is still the process that began then, or,
-/// with its leader gone, when one of the group still in it began since. One
-/// Desk can't tell is that install is left, and said so.
+/// process group, when a process of it carries that install's token in its
+/// environment, and its leader, when there, is still the process that began
+/// then. One Desk can't tell is that install is left, and said so.
 pub async fn end_left(running: &Path) {
     let Ok(kept) = tokio::fs::read_to_string(running).await else {
         return;
@@ -512,29 +515,25 @@ pub async fn end_left(running: &Path) {
         .next()
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|t| t.to_utc());
-    // Started then, or since, to the second either reading has.
-    let since = |at: chrono::DateTime<chrono::Utc>, t: chrono::DateTime<chrono::Utc>| {
-        (at - t).num_seconds() >= -2
-    };
-    let ours = match (then, crate::procs::started_at(group).await) {
-        (Some(t), Some(leader)) => (leader - t).num_seconds().abs() <= 2,
-        (Some(t), None) => {
-            let mut members = Vec::new();
+    let mark = words.next().map(|t| format!("{RUN_VAR}={t}"));
+    let ours = match (mark, crate::procs::started_at(group).await) {
+        (None, _) => false,
+        (Some(mark), Some(leader)) => {
+            then.is_some_and(|t| (leader - t).num_seconds().abs() <= 2)
+                && crate::procs::carries(group, &mark).await
+        }
+        (Some(mark), None) => {
+            let mut found = false;
             for pid in crate::procs::in_group(group).await {
-                if let Some(at) = crate::procs::started_at(pid).await {
-                    members.push((pid, at));
+                // SAFETY: getpgid only reads a process's group.
+                let still = i32::try_from(pid).is_ok_and(|p| unsafe { libc::getpgid(p) } == pgid);
+                if still && crate::procs::carries(pid, &mark).await {
+                    found = true;
+                    break;
                 }
             }
-            members.into_iter().any(|(pid, at)| {
-                since(at, t)
-                    && i32::try_from(pid).is_ok_and(|p| {
-                        // SAFETY: getpgid only reads a process's group.
-                        let now = unsafe { libc::getpgid(p) };
-                        now == pgid
-                    })
-            })
+            found
         }
-        (None, _) => false,
     };
     if ours {
         tracing::info!(group, "an install a stopped Desk left running is ended");
