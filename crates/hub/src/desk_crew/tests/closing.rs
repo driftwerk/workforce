@@ -409,7 +409,7 @@ async fn asked_to_close_what_is_finished_a_boss_closes_and_removes_its_own_and_n
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_boss_still_closes_what_it_started_after_it_let_it_go_and_never_what_the_person_took_back(
+async fn asked_to_close_a_boss_ends_what_it_let_go_as_done_and_never_what_it_no_longer_runs_or_the_person_is_in(
 ) {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
@@ -422,32 +422,83 @@ async fn a_boss_still_closes_what_it_started_after_it_let_it_go_and_never_what_t
         let boss = Party::manager("desk", &super::super::name_of(&overseer));
         let clean = base.join("acme-web");
         repo(&clean, "git@github.com:acme/acme-web.git");
-        let let_go = finished(&d, &crew, &base, &clean, "let-go", &boss, How::Started).await;
-        let taken_back = finished(&d, &crew, &base, &clean, "theirs", &boss, How::Started).await;
-        *crew.close_settle.lock() = chrono::Duration::zero();
         let by_boss = By::manager("desk", &boss.name, "Its work is done.");
-        d.release(let_go.id, &by_boss).await.unwrap();
-        d.release(taken_back.id, &By::you()).await.unwrap();
+        let mut done = Vec::new();
+        for (name, how) in [("started", How::Started), ("handed", How::Handed)] {
+            let s = finished(&d, &crew, &base, &clean, name, &boss, how).await;
+            d.release_done(s.id, &by_boss).await.unwrap();
+            done.push(s);
+        }
+        let by_desk = finished(&d, &crew, &base, &clean, "desk", &boss, How::Started).await;
+        d.release(by_desk.id, &by_boss).await.unwrap();
+        let theirs = finished(&d, &crew, &base, &clean, "theirs", &boss, How::Started).await;
+        d.release(theirs.id, &By::you()).await.unwrap();
+        let typing = finished(&d, &crew, &base, &clean, "typing", &boss, How::Started).await;
+        let url = hook_url(&base, typing.id).await;
+        hook(
+            &url,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "one more thing"}),
+        )
+        .await;
+        hook(
+            &url,
+            json!({"hook_event_name": "Stop", "last_assistant_message": "Done that too."}),
+        )
+        .await;
+        let typing = eventually("its turn to end again", async || {
+            d.view(typing.id)
+                .ok()
+                .filter(|v| v.state == SessionState::Done && v.prompts > typing.prompts)
+        })
+        .await;
+        d.release_done(typing.id, &by_boss).await.unwrap();
+        *crew.close_settle.lock() = chrono::Duration::zero();
         assert!(d.charges().iter().all(|c| c.boss != "desk"), "none live");
 
         let close = overseer.tools.get(super::super::closing::TOOL).unwrap();
         let ask = |s: &SessionView| {
             json!({ "session_id": s.id.to_string(), "reason": "The person asked to close the finished sessions." })
         };
-        let r = close.execute(ask(&taken_back)).await.unwrap();
+        for s in [&by_desk, &theirs] {
+            let r = close.execute(ask(s)).await.unwrap();
+            assert!(!r.success || r.output["suggested"].is_string(), "{r:?}");
+            assert_ne!(state(&d, s.id), SessionState::Closed);
+        }
+        let r = close.execute(ask(&typing)).await.unwrap();
         assert!(!r.success, "{r:?}");
         assert!(
-            r.error.as_deref().is_some_and(|e| e.contains("took theirs back")),
+            r.error.as_deref().is_some_and(|e| e.contains("in it now")),
             "{r:?}"
         );
-        assert_ne!(state(&d, taken_back.id), SessionState::Closed);
+        assert_ne!(state(&d, typing.id), SessionState::Closed);
+        for s in &done {
+            let r = close.execute(ask(s)).await.unwrap();
+            assert!(r.success, "{r:?}");
+            eventually("it is closed and removed", async || {
+                d.view(s.id).is_err().then_some(())
+            })
+            .await;
+        }
+    })
+    .await;
+}
 
-        let r = close.execute(ask(&let_go)).await.unwrap();
-        assert!(r.success, "{r:?}");
-        eventually("it is closed and removed", async || {
-            d.view(let_go.id).is_err().then_some(())
-        })
-        .await;
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sweep_never_closes_a_session_its_boss_let_go() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (overseer, crew, d, _llm) = overseeing(&base, pool, "ok", ACT, &[]).await;
+        let boss = Party::manager("desk", &super::super::name_of(&overseer));
+        let plain = base.join("notes");
+        std::fs::create_dir_all(&plain).unwrap();
+        let let_go = finished(&d, &crew, &base, &plain, "let-go", &boss, How::Started).await;
+        d.release_done(let_go.id, &By::manager("desk", &boss.name, "Done."))
+            .await
+            .unwrap();
+        *crew.close_settle.lock() = chrono::Duration::zero();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(state(&d, let_go.id), SessionState::Done);
     })
     .await;
 }

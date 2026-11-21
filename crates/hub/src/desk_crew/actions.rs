@@ -658,6 +658,7 @@ fn charge_plain(e: workforce_desk::DeskError) -> String {
 
 /// How long a boss's resume or restart is waited for: its turn goes on
 /// past it, never held for the whole of a tool call's time.
+const NOT_ITS: &str = "a session you didn't start and weren't handed, or that the person took back";
 const STARTS_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
 /// How long a close waits, past Desk's own wait, for a session still
 /// stopping to have closed, so it is removed as it closes.
@@ -797,8 +798,7 @@ impl CrewHub {
         Some(match o.level {
             Level::Watch => Gate::Refuse,
             _ => Gate::Suggest(
-                "only the person closes a session you didn't start, weren't handed or they took back from you: they close it with one click"
-                    .into(),
+format!("only the person closes {NOT_ITS}: they close it with one click").into(),
             ),
         })
     }
@@ -2222,10 +2222,7 @@ impl CrewHub {
                 // now and has nothing to lose.
                 if by.party.kind == crew::PartyKind::Manager {
                     if !d.may_end(*session, Some(&by)) {
-                        return Err(
-                            "Only the person closes a session you didn't start, weren't handed or they took back from you."
-                                .into(),
-                        );
+                        return Err(format!("Only the person closes {NOT_ITS}."));
                     }
                     if let Some(why) = self.close_held(&was, &by.party.id).await {
                         return Err(why);
@@ -2356,7 +2353,7 @@ impl CrewHub {
                 Ok(format!("took on {}", self.session_name(c.session)))
             }
             Action::Release { session } => {
-                let c = d.release(*session, &by).await.map_err(charge_plain)?;
+                let c = d.release_done(*session, &by).await.map_err(charge_plain)?;
                 Ok(format!("let {} go", self.session_name(c.session)))
             }
             Action::Handoff {

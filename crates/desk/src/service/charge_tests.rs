@@ -1323,11 +1323,12 @@ fn a_command_is_read_for_settings_where_it_runs() {
 }
 
 #[tokio::test]
-async fn a_boss_that_let_a_session_go_still_ends_what_it_started_until_the_person_takes_it_back() {
+async fn a_boss_ends_what_it_started_or_was_handed_only_while_it_runs_it_or_let_it_go_as_done() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let d = desk(pool, dir.path()).await;
         let boss = By::manager("sarah", "Sarah", "its work is done");
+        let mia = Party::manager("mia", "Mia");
         let charged = |how| {
             let d = d.clone();
             let dir = dir.path().to_path_buf();
@@ -1339,28 +1340,48 @@ async fn a_boss_that_let_a_session_go_still_ends_what_it_started_until_the_perso
                 s.id
             }
         };
-        let started = charged(How::Started).await;
-        let handed = charged(How::Handed).await;
-        let taken = charged(How::Taken).await;
-        let theirs = charged(How::Started).await;
-        for (id, by) in [
-            (started, &boss),
-            (handed, &boss),
-            (taken, &boss),
-            (theirs, &By::you()),
-        ] {
-            d.release(id, by).await.unwrap();
+        let mut ends = Vec::new();
+        for how in [How::Started, How::Handed] {
+            let done = charged(how).await;
+            d.release_done(done, &boss).await.unwrap();
+            let by_desk = charged(how).await;
+            d.release(by_desk, &By::manager("sarah", "Sarah", "its group has a boss"))
+                .await
+                .unwrap();
+            let by_person = charged(how).await;
+            d.release(by_person, &By::you()).await.unwrap();
+            let passed_on = charged(how).await;
+            d.take_on(passed_on, &mia, how, &Default::default(), &By::you())
+                .await
+                .unwrap();
+            let running = charged(how).await;
+            ends.extend([
+                (done, true),
+                (by_desk, false),
+                (by_person, false),
+                (passed_on, false),
+                (running, true),
+            ]);
         }
-        assert!(d.charges().iter().all(|c| c.boss != "sarah"), "none live");
+        let taken = charged(How::Taken).await;
+        d.release_done(taken, &boss).await.unwrap();
+        ends.push((taken, false));
+        let legacy = charged(How::Started).await;
+        d.release(legacy, &boss).await.unwrap();
+        let mut row = d.store().charge(legacy).await.unwrap().unwrap();
+        row.released_by = None;
+        d.store().put_charge(&row).await.unwrap();
+        ends.push((legacy, false));
         assert!(d.charge_load().await, "read again, as after a restart");
-        assert!(d.may_end(started, Some(&boss)));
-        assert!(d.may_end(handed, Some(&boss)));
-        assert!(!d.may_end(taken, Some(&boss)), "took it on itself");
-        assert!(!d.may_end(theirs, Some(&boss)), "the person took it back");
-        d.end(started, Some(boss.clone())).await.unwrap();
-        assert_eq!(d.view(started).unwrap().state, SessionState::Closed);
+        for (id, ok) in &ends {
+            assert_eq!(d.may_end(*id, Some(&boss)), *ok, "{id}");
+        }
+        let (done, _) = ends[0];
+        d.end(done, Some(boss.clone())).await.unwrap();
+        assert_eq!(d.view(done).unwrap().state, SessionState::Closed);
+        let (by_desk, _) = ends[1];
         assert!(matches!(
-            d.end(theirs, Some(boss)).await,
+            d.end(by_desk, Some(boss)).await,
             Err(DeskError::Conflict(_))
         ));
     })
