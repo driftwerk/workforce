@@ -439,10 +439,7 @@ async fn an_install_left_running_is_ended_though_its_folder_is_current_by_the_ne
         std::fs::write(work.join("node_modules/.modules.yaml"), "").unwrap();
         let again = h.desk(pool).await;
         until(|| matches!(deps_of(&again, a.id), Some(Deps::Installed { .. }))).await;
-        told(&again, a.id, |t| {
-            t.starts_with("This folder's dependencies are installed")
-        })
-        .await;
+        told(&again, a.id, installed).await;
         let mut ended = false;
         for _ in 0..500 {
             if crate::procs::started_at(pid).await.is_none() {
