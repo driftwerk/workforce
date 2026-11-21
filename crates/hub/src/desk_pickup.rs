@@ -180,8 +180,11 @@ struct Forgotten<'a, C: Ticketed, A> {
 }
 
 impl<C: Ticketed, A> Forgotten<'_, C, A> {
+    /// Forgotten now, once: whether it was taken.
     fn forget(self) -> bool {
-        self.pickup.forget(self.id)
+        let taken = self.pickup.forget(self.id);
+        std::mem::forget(self);
+        taken
     }
 }
 

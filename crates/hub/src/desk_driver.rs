@@ -1198,7 +1198,8 @@ pub async fn mount(
         });
     knows_sync.start(cancel_sync);
     let app = app.merge(crate::gateway::hardened(knows_routes));
-    Ok(app.merge(workforce_desk::router(
+    let native = Arc::clone(&crew.native);
+    let app = app.merge(workforce_desk::router(
         desk,
         Arc::new(SystemAdmins(Arc::clone(state))),
         Arc::new(voice),
@@ -1225,7 +1226,14 @@ pub async fn mount(
                 }),
         }),
         crew,
-    )))
+    ));
+    // On a machine, Desk's native side reaching it by any route is seen,
+    // so a Desk that never asks for its sessions' issue calls is known to
+    // be older.
+    Ok(match is_machine(&config.desk) {
+        true => crate::desk_crew::relay::noting_native(app, state.auth_token.clone(), native),
+        false => app,
+    })
 }
 
 #[cfg(test)]

@@ -113,12 +113,11 @@ mod tests {
             Err("not here".into())
         }
 
-        async fn offers(
+        async fn offered(
             &self,
             _: &workforce_desk::issues::Asker,
-            system: workforce_desk::board::System,
-        ) -> bool {
-            system == workforce_desk::board::System::Linear
+        ) -> Vec<workforce_desk::board::System> {
+            vec![workforce_desk::board::System::Linear]
         }
     }
 

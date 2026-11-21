@@ -37,7 +37,7 @@ use workforce_desk::board_sync::RemoteError;
 use workforce_desk::issues::{self, Asked, Asker, By, Issues};
 
 use crate::desk_board_sync::{paused_words, refusal, BoardSync};
-use crate::desk_crew::relay::{machine_ok, native, Native, NativeSeen, TokenQuery};
+use crate::desk_crew::relay::{machine_ok, native, NativeSeen, TokenQuery};
 use crate::desk_pickup::{Limits, Pickup, Ticketed, Unsent};
 use crate::gateway::GatewayState;
 
@@ -118,17 +118,16 @@ impl HomeIssues {
             .unwrap_or_else(|_| Err(issues::no_answer(asked)))
     }
 
-    /// The links of `system` the session with id `id` (on `machine`) reaches.
-    async fn links(
-        &self,
-        system: System,
-        id: Uuid,
-        machine: Option<&str>,
-    ) -> Result<Vec<Sync>, String> {
+    /// The links the session with id `id` (on `machine`) reaches, or why
+    /// it reaches none.
+    async fn links(&self, id: Uuid, machine: Option<&str>) -> Result<Vec<Sync>, String> {
         let key = machine.map_or_else(|| id.to_string(), |m| format!("{m}/{id}"));
-        self.sync.desk.issue_links(system, &key).await.map_err(|e| {
-            tracing::warn!(error = %e, "the boards' links couldn't be read for a session");
-            "Desk couldn't read its boards just now; try again.".to_string()
+        self.sync.desk.issue_links(&key).await.map_err(|e| match e {
+            workforce_desk::DeskError::Invalid(why) => why,
+            e => {
+                tracing::warn!(error = %e, "the boards' links couldn't be read for a session");
+                "Desk couldn't read its boards just now; try again.".to_string()
+            }
         })
     }
 
@@ -141,7 +140,12 @@ impl HomeIssues {
     ) -> Result<Value, String> {
         let call = issues::call_of(asked.system, &asked.input)?;
         let title = asked.system.title();
-        let links = self.links(asked.system, id, machine).await?;
+        let links: Vec<Sync> = self
+            .links(id, machine)
+            .await?
+            .into_iter()
+            .filter(|s| s.system == asked.system)
+            .collect();
         let picked = issues::pick(&links, &call)?;
         let link = picked.link;
         let hub = self.sync.hub_name(&link.via).await;
@@ -206,10 +210,12 @@ impl Issues for HomeIssues {
         self.serve(&asker.name, asker.session, None, asked).await
     }
 
-    async fn offers(&self, asker: &Asker, system: System) -> bool {
-        self.links(system, asker.session, None)
-            .await
-            .is_ok_and(|l| !l.is_empty())
+    async fn offered(&self, asker: &Asker) -> Vec<System> {
+        let links = self.links(asker.session, None).await.unwrap_or_default();
+        [System::Linear, System::Jira]
+            .into_iter()
+            .filter(|s| links.iter().any(|l| l.system == *s))
+            .collect()
     }
 }
 
@@ -310,8 +316,6 @@ struct Api<T> {
     state: Arc<GatewayState>,
     issues: Arc<T>,
 }
-
-impl<T> Native for Api<T> {}
 
 /// On a machine: its sessions' queued calls.
 async fn take(

@@ -136,9 +136,25 @@ impl NativeSeen {
     }
 }
 
-/// What a native route's state notes of Desk's native side reaching it.
-pub(crate) trait Native {
-    fn reached(&self) {}
+/// `router`, noting in `seen` each request made with the hub's own token
+/// `token`, as only Desk's native side makes them, whatever its route.
+pub(crate) fn noting_native(router: Router, token: String, seen: Arc<NativeSeen>) -> Router {
+    router.layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            if hubs_own(&token, request.headers()) {
+                seen.mark();
+            }
+            next.run(request)
+        },
+    ))
+}
+
+/// Whether `h` carries the hub's own token `token` in `Authorization`.
+fn hubs_own(token: &str, h: &HeaderMap) -> bool {
+    h.get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|given| !token.is_empty() && crate::auth::constant_time_token_eq(given, token))
 }
 
 /// What only Desk's own plan runner asks a machine through the relay, never
@@ -347,14 +363,7 @@ pub(crate) fn not_native(
                 .into_response(),
         );
     }
-    let ours = h
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|given| {
-            !state.auth_token.is_empty()
-                && crate::auth::constant_time_token_eq(given, &state.auth_token)
-        });
+    let ours = hubs_own(&state.auth_token, h);
     // 401: refused before anything is done, so Desk's native side may read
     // the hub's token again and send it once more.
     (!ours).then(|| {
@@ -366,23 +375,15 @@ pub(crate) fn not_native(
     })
 }
 
-/// Returns the refusal when the request isn't Desk's native side's, and
-/// notes that it reached `$s` when it is.
+/// Returns the refusal when the request isn't Desk's native side's.
 macro_rules! native {
     ($s:expr, $h:expr, $token:expr) => {
         if let Some(r) = $crate::desk_crew::relay::not_native(&$s.state, &$h, $token) {
             return r;
         }
-        $crate::desk_crew::relay::Native::reached(&*$s);
     };
 }
 pub(crate) use native;
-
-impl Native for RelayApi {
-    fn reached(&self) {
-        self.crew.native.mark();
-    }
-}
 
 /// On the Mac: the calls queued for machines.
 async fn take(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>) -> Response {

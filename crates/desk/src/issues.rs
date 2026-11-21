@@ -41,6 +41,9 @@ pub const RUN_FOR: Duration = Duration::from_secs(15);
 /// How many issues a list answers when it doesn't say, and at most.
 pub const LISTED: usize = 20;
 pub const MOST_LISTED: usize = 50;
+/// How many issues a Linear search reads before it keeps the linked
+/// teams' alone.
+const SEARCHED: usize = 100;
 /// The longest comment a session posts.
 pub const MOST_COMMENT: usize = 20_000;
 /// The most of an answer a session reads, in bytes as JSON: escaped as
@@ -79,10 +82,10 @@ pub trait Issues: Send + std::marker::Sync {
     /// `asked` run for `asker`: what it answers, or its words for why not.
     async fn issue(&self, asker: &Asker, asked: &Asked) -> Result<Value, String>;
 
-    /// Whether `asker` is offered `system`'s tool: where the links can't
-    /// be seen from, always.
-    async fn offers(&self, _asker: &Asker, _system: System) -> bool {
-        true
+    /// The systems whose tools `asker` is offered: where the links can't
+    /// be seen from, both.
+    async fn offered(&self, _asker: &Asker) -> Vec<System> {
+        vec![System::Linear, System::Jira]
     }
 }
 
@@ -304,43 +307,46 @@ pub fn no_answer(asked: &Asked) -> String {
     }
 }
 
+/// The bytes `c` takes in a JSON string.
+fn escaped_width(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
 /// The bytes `s` takes as a JSON string, its quotes included.
 pub fn json_len(s: &str) -> usize {
-    2 + s
-        .chars()
-        .map(|c| match c {
-            '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
-            c if (c as u32) < 0x20 => 6,
-            c => c.len_utf8(),
-        })
-        .sum::<usize>()
+    2 + s.chars().map(escaped_width).sum::<usize>()
 }
 
 /// `answer` as a session reads it: fenced as the issue's writers' words,
 /// clipped to take at most `budget` bytes as JSON; `None` when even its
-/// fence wouldn't fit.
+/// fence wouldn't fit. Defanged first, as the fence would, so what is
+/// counted is what is sent.
 fn read(system: System, of: &str, answer: &Value, budget: usize) -> Option<Value> {
-    let text = serde_json::to_string_pretty(answer).unwrap_or_default();
+    let text =
+        crate::memory::render::defanged(&serde_json::to_string_pretty(answer).unwrap_or_default());
     let nonce = sync::nonce();
-    let mut end = text.len();
-    let mut clip = "";
-    loop {
-        let out = sync::fence(system, of, &format!("{}{clip}", &text[..end]), &nonce);
-        let over = json_len(&out).saturating_sub(budget);
-        if over == 0 {
-            return Some(Value::String(out));
-        }
-        if end == 0 {
-            return None;
-        }
-        clip = CLIPPED;
-        // A character takes at most six bytes escaped: never cut more than
-        // the excess needs.
-        end = end.saturating_sub(over.div_ceil(6));
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
+    let fenced = |t: &str| sync::fence(system, of, t, &nonce);
+    let whole = fenced(&text);
+    if json_len(&whole) <= budget {
+        return Some(Value::String(whole));
     }
+    // What a cut adds to what it keeps: the fence and the clip's note (a
+    // one-byte stand-in keeps the note's newline from being trimmed).
+    let room = budget.checked_sub(json_len(&fenced(&format!(".{CLIPPED}"))) - 1)?;
+    let mut width = json_len(&text) - 2;
+    let mut end = text.len();
+    for (at, c) in text.char_indices().rev() {
+        if width <= room {
+            break;
+        }
+        width -= escaped_width(c);
+        end = at;
+    }
+    Some(Value::String(fenced(&format!("{}{CLIPPED}", &text[..end]))))
 }
 
 /// `answer` read whole within [`MOST_ANSWER`].
@@ -398,18 +404,22 @@ fn jql(link: &Sync, call: &IssueCall, targets: &[String]) -> String {
     format!("{} ORDER BY updated DESC", clauses.join(" AND "))
 }
 
-/// Of a Linear search's issues, those of `targets`' teams.
-fn only_of(mut answer: Value, targets: &[String]) -> Value {
-    if let Some(issues) = answer["issues"].as_array_mut() {
-        issues.retain(|i| {
+/// Of a Linear search's issues, the first `limit` of `targets`' teams;
+/// none when it isn't a list of issues.
+fn only_of(answer: &Value, targets: &[String], limit: usize) -> Value {
+    let issues: Vec<&Value> = answer["issues"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|i| {
             i["identifier"]
                 .as_str()
                 .and_then(|k| k.rsplit_once('-'))
                 .is_some_and(|(t, _)| targets.iter().any(|x| x == t))
-        });
-        answer["count"] = json!(issues.len());
-    }
-    answer
+        })
+        .take(limit)
+        .collect();
+    json!({ "count": issues.len(), "issues": issues })
 }
 
 /// `body` posted on `key` in `system`.
@@ -473,11 +483,12 @@ pub async fn run(
             let query = call.query.as_deref().unwrap_or_default();
             let answer = get(
                 "linear.issue_search",
-                json!({ "query": query, "limit": call.limit }),
+                json!({ "query": query, "limit": SEARCHED }),
             )
             .await?;
+            let found = only_of(&answer, targets, call.limit);
             Ok(
-                json!({ "issues": read_all(system, &format!("search ({})", targets.join(", ")), &only_of(answer, targets)) }),
+                json!({ "issues": read_all(system, &format!("search ({})", targets.join(", ")), &found) }),
             )
         }
         Action::Get => {

@@ -9,7 +9,7 @@ use workforce_postgres::test_support::with_test_pool;
 
 use super::super::tests::{desk, new_session, options};
 use super::*;
-use crate::board::{Filter, TicketState, Via};
+use crate::board::{Filter, System, TicketState, Via};
 use crate::line::Reach;
 use crate::service::{LinkBoard, NewBoard, Options};
 use crate::store::{build_pool, DeskStore};
@@ -54,7 +54,7 @@ async fn linked(d: &Desk, target: &str, group: Option<&str>) {
 /// The targets of the links `session` reaches, sorted.
 async fn targets(d: &Desk, session: &str) -> Vec<String> {
     let mut t: Vec<String> = d
-        .issue_links(System::Jira, session)
+        .issue_links(session)
         .await
         .unwrap()
         .into_iter()
@@ -148,6 +148,61 @@ async fn a_bossed_group_is_a_boundary_even_when_sessions_reach_all() {
             ["LOOSE", "OPEN"]
         );
         assert_eq!(targets(&d, &inside.id.to_string()).await, ["ACME"]);
+    })
+    .await;
+}
+
+fn boss_of(group: &str) -> crate::service::Boss {
+    crate::service::Boss {
+        agent: format!("boss-{group}"),
+        name: group.into(),
+        scope: crate::scope::Scope::Group(group.into()),
+        level: "act".into(),
+    }
+}
+
+async fn refusal(d: &Desk, session: &str) -> String {
+    match d.issue_links(session).await {
+        Err(DeskError::Invalid(why)) => why,
+        other => panic!("{session} wasn't refused: {other:?}"),
+    }
+}
+
+/// A machine is one OS account: on one running a client's sessions, only
+/// that client's are given its links, none of its others, ungrouped ones
+/// too; on one running more than one client's, none is given any.
+#[tokio::test]
+async fn a_machine_running_a_clients_sessions_gives_the_others_nothing() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let (client, loose) = (Uuid::new_v4(), Uuid::new_v4());
+        boards(&d, vec![format!("session:devbox/{client}")]).await;
+        d.set_bosses(vec![boss_of("g-acme")]);
+        assert_eq!(targets(&d, &format!("devbox/{client}")).await, ["ACME"]);
+        let why = refusal(&d, &format!("devbox/{loose}")).await;
+        assert!(why.contains("runs another client's sessions"), "{why}");
+        // Another machine, and this computer's own sessions, as they were.
+        assert_eq!(targets(&d, &format!("laptop/{loose}")).await, ["LOOSE"]);
+        let here = new_session(&d, dir.path()).await;
+        assert_eq!(targets(&d, &here.id.to_string()).await, ["LOOSE"]);
+
+        let other = Uuid::new_v4();
+        d.change_layout(|l| {
+            l.create(
+                "g-globex",
+                "Globex",
+                &[format!("session:devbox/{other}")],
+                None,
+            )
+        })
+        .await
+        .unwrap();
+        d.set_bosses(vec![boss_of("g-acme"), boss_of("g-globex")]);
+        for s in [client, other, loose] {
+            let why = refusal(&d, &format!("devbox/{s}")).await;
+            assert!(why.contains("sessions of more than one client"), "{why}");
+        }
     })
     .await;
 }
