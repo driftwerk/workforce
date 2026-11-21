@@ -71,10 +71,8 @@ async fn a_hub_without_desk_serves_no_plan_routes() {
 
 /// A Desk on `pool` whose engines are stand-ins that never start.
 async fn desk(pool: workforce_postgres::PostgresPool, dir: &std::path::Path) -> Desk {
-    use std::os::unix::fs::PermissionsExt;
     let cli = dir.join("fake-claude");
-    std::fs::write(&cli, "#!/bin/sh\nexec sleep 60\n").unwrap();
-    std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    workforce_common::executable::write(&cli, "#!/bin/sh\nexec sleep 60\n").unwrap();
     Desk::start(
         DeskStore::with_pool(pool).await.unwrap(),
         Options {

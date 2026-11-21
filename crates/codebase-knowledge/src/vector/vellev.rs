@@ -20,22 +20,24 @@ use eyre::Result;
 use serde_json::{json, Map, Value};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
-use vellev_client::api::{Change, Changes, Content, Nearest, OnlyIf, Page};
-use vellev_client::Client;
-use vellev_core::{Collection, CollectionName, DataType, Embedding, ObjectId, Property};
+use vellev_client::api::{Change, Changes, Content, Nearest, OnlyIf, Page, Results, Stored};
+use vellev_client::{Client, Records};
+use vellev_core::{Collection, CollectionName, DataType, Distance, Embedding, ObjectId, Property};
 use vellev_index::filter::Filter;
+use vellev_index::vector::{certainty, Scorer};
 use workforce_common::settings::{CodeModel, QueryPrefix, VellevConfig};
-use workforce_vellev::seeding::{apply_embedded, Seeding};
+use workforce_vellev::seeding::{apply_embedded, DocumentEmbedder, NodeEmbedder, Seeding};
 use workforce_vellev::{
     collection, embedding_of, failure, is_conflict, local_embedding, Asked, Cap, Ensured, Unusable,
-    LOCAL_MODEL, LOCAL_QUERY_PREFIX, RECHECK_AFTER,
+    LOCAL_MODEL, LOCAL_QUERY_PREFIX, MAX_RESULTS, RECHECK_AFTER,
 };
 
 use super::health::{InsertErrorSink, InsertErrorSlot};
 use super::{
     count_embedded, entity_text, search_result, search_text, summary_text, vectorizable,
-    CodeVectorStore, DeleteOutcome, Differing, HeldRecord, VectorCodeEntity, VectorCodeSummary,
-    VectorSearchResult, CODE_ENTITY_COLLECTION, CODE_SUMMARY_COLLECTION, VERIFY_PAGE,
+    CodeVectorStore, DeleteOutcome, Differing, HeldRecord, Near, NearestTo, Scanned,
+    SearchedByVector, VectorCodeEntity, VectorCodeSummary, VectorSearchResult,
+    CODE_ENTITY_COLLECTION, CODE_SUMMARY_COLLECTION, VERIFY_PAGE,
 };
 use crate::graph::entities::EntityKind;
 use crate::graph::VectorKeys;
@@ -128,7 +130,7 @@ pub struct VellevCodeVectorStore {
     entities: Ensured,
     summaries: Ensured,
     /// The most results the node gives for one request.
-    cap: Cap,
+    cap: Arc<Cap>,
     /// Asks the node whether it is ready, without the tenant's key.
     health: Client,
     insert_errors: InsertErrorSlot,
@@ -157,7 +159,7 @@ impl VellevCodeVectorStore {
             summaries,
             tenants,
             local,
-            cap: Cap::default(),
+            cap: Arc::default(),
             health: Client::new(url, HEALTH_TIMEOUT)?,
             insert_errors: InsertErrorSlot::default(),
             seeding: None,
@@ -278,6 +280,11 @@ impl VellevCodeVectorStore {
     /// collections embed: what an equivalence check needs.
     pub fn embedded_as(&self) -> (&workforce_vellev::Tenants, Embedding) {
         (&self.tenants, self.entities.wanted().embedding.clone())
+    }
+
+    /// The metric the code entities' distances are under.
+    pub fn distance(&self) -> Distance {
+        self.entities.wanted().distance
     }
 
     /// `e`, an indexing of `what` that failed, as the sink hears of it,
@@ -521,6 +528,101 @@ impl VellevCodeVectorStore {
             })
             .await?;
         Ok(listed.objects.iter().map(|object| object.id).collect())
+    }
+
+    async fn found(
+        &self,
+        filter: Option<&Filter>,
+        limit: usize,
+        asked: impl Fn(u32) -> Nearest,
+    ) -> vellev_client::Result<Results> {
+        self.cap
+            .ask(limit, |limit| {
+                let nearest = filter
+                    .cloned()
+                    .into_iter()
+                    .fold(asked(limit), Nearest::filter);
+                async move { self.entities.collection().nearest(&nearest).await }
+            })
+            .await
+    }
+
+    /// Refuse a search for more than the node gives for one: cut, its
+    /// nearest would silently be fewer.
+    fn within_cap(&self, limit: usize) -> Result<()> {
+        let most = self.cap.most();
+        if limit > most {
+            return Err(eyre::eyre!(
+                "the {limit} nearest were asked, more than the {most} vellev gives for one search"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Refuse a vector asked of the entities that is not of their size.
+    fn sized(&self, vector: &[f32]) -> Result<()> {
+        let dimensions = self.entities.wanted().embedding.dimensions as usize;
+        if vector.len() != dimensions {
+            return Err(eyre::eyre!(
+                "a vector of {} dimensions was asked of a collection of {dimensions}",
+                vector.len()
+            ));
+        }
+        Ok(())
+    }
+
+    /// The entity `object` at `distance`, scored by the collection's
+    /// certainty for it.
+    fn near(
+        &self,
+        object: ObjectId,
+        distance: f32,
+        properties: Map<String, Value>,
+    ) -> Result<Near> {
+        let score = certainty(self.entities.wanted().distance, distance).unwrap_or(0.0);
+        let found = search_result(&Value::Object(properties), score)
+            .ok_or_else(|| eyre::eyre!("vellev object {} is no code entity", object.0))?;
+        Ok(Near {
+            object: object.0.to_string(),
+            distance,
+            found,
+        })
+    }
+
+    fn refused(&self, e: vellev_client::Error) -> eyre::Report {
+        failure(e, &self.tenants, Asked::request(self.entities.wanted()))
+    }
+
+    /// Both code collections' identities, as [`CodeVectorStore::identity`]
+    /// gives them, read without making, widening or adopting anything.
+    pub async fn found_as_wanted(&self) -> Result<String> {
+        Ok(format!(
+            "{}/{}",
+            self.identified(&self.entities).await?,
+            self.identified(&self.summaries).await?
+        ))
+    }
+
+    async fn identified(&self, ensured: &Ensured) -> Result<String> {
+        let found = workforce_vellev::doctor(
+            &self.tenants,
+            ensured.collection(),
+            ensured.wanted(),
+            REINDEX,
+        )
+        .await?;
+        workforce_vellev::identity(&found).ok_or_else(|| {
+            eyre::eyre!(
+                "vellev collection '{}' of tenant '{}' has no identity",
+                ensured.name(),
+                self.tenants.reads.id()
+            )
+        })
+    }
+
+    /// The code graph the tenant's code vectors are claimed for, read only.
+    pub async fn claimed_by(&self) -> Result<Option<String>> {
+        workforce_vellev::index_claimed(&self.tenants, OWNER).await
     }
 
     /// The collection of entities, or `summaries`, and the property each
@@ -857,10 +959,8 @@ impl CodeVectorStore for VellevCodeVectorStore {
         let found = self
             .entities
             .run(|| {
-                self.cap.ask(limit, |limit| {
-                    let nearest = Nearest::to_text(query.as_str(), limit);
-                    let nearest = filter.clone().into_iter().fold(nearest, Nearest::filter);
-                    async move { self.entities.collection().nearest(&nearest).await }
+                self.found(filter.as_ref(), limit, |limit| {
+                    Nearest::to_text(query.as_str(), limit)
                 })
             })
             .await?;
@@ -1123,21 +1223,209 @@ impl CodeVectorStore for VellevCodeVectorStore {
     }
 
     async fn summary_count(&self, repo_id: &str) -> Result<usize> {
-        let filter = of_repo(repo_id);
         let counted = self
             .summaries
-            .run(|| self.summaries.collection().count(Some(&filter)))
+            .run(|| of_repo_counted(self.summaries.collection(), repo_id))
             .await?;
         Ok(usize::try_from(counted)?)
     }
 
     async fn entity_count(&self, repo_id: &str) -> Result<usize> {
-        let filter = of_repo(repo_id);
         let counted = self
             .entities
-            .run(|| self.entities.collection().count(Some(&filter)))
+            .run(|| of_repo_counted(self.entities.collection(), repo_id))
             .await?;
         Ok(usize::try_from(counted)?)
+    }
+}
+
+async fn of_repo_counted(records: &Records, repo_id: &str) -> vellev_client::Result<u64> {
+    records.count(Some(&of_repo(repo_id))).await
+}
+
+/// The node's search for the `limit` nearest to `to`.
+fn nearest_to(to: NearestTo<'_>, limit: u32) -> Nearest {
+    match to {
+        NearestTo::Text(text) => Nearest::to_text(text, limit),
+        NearestTo::Vector(vector) => Nearest::to_vector(vector.to_vec(), limit),
+    }
+}
+
+type Ranked = (f32, ObjectId, Map<String, Value>);
+
+/// The first `limit` of `rows` in the node's order, by distance and then
+/// object, sorted: those after them are left beyond the slice.
+fn nearest_of<T>(rows: &mut [T], key: impl Fn(&T) -> (f32, Uuid), limit: usize) -> &[T] {
+    let order = |a: &T, b: &T| {
+        let (a, b) = (key(a), key(b));
+        a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1))
+    };
+    let limit = limit.min(rows.len());
+    if limit < rows.len() {
+        rows.select_nth_unstable_by(limit, order);
+    }
+    rows[..limit].sort_by(order);
+    &rows[..limit]
+}
+
+/// Every search, listing and count goes to the entities' collection as it is,
+/// never through [`Ensured::run`]: a collection that is gone is an error,
+/// never made again.
+#[async_trait]
+impl SearchedByVector for VellevCodeVectorStore {
+    fn query_prefix(&self) -> Option<&str> {
+        self.entities.wanted().embedding.query_prefix.as_deref()
+    }
+
+    async fn embedded(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let embedding = Embedding {
+            document_prefix: None,
+            ..self.entities.wanted().embedding.clone()
+        };
+        NodeEmbedder::new(self.tenants.clone(), embedding, 1)
+            .sharing(Arc::clone(&self.cap))
+            .documents(texts)
+            .await
+    }
+
+    async fn nearest(&self, to: NearestTo<'_>, repo_id: &str, limit: usize) -> Result<Vec<Near>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.within_cap(limit)?;
+        let cleaned;
+        let to = match to {
+            NearestTo::Text(text) => {
+                let Some(text) = search_text(text, "code_nearest") else {
+                    return Ok(Vec::new());
+                };
+                cleaned = text;
+                NearestTo::Text(cleaned.as_str())
+            }
+            NearestTo::Vector(vector) => {
+                self.sized(vector)?;
+                to
+            }
+        };
+        let filter = of_repo(repo_id);
+        let found = self.found(Some(&filter), limit, |limit| nearest_to(to, limit));
+        let found = found.await.map_err(|e| self.refused(e))?;
+        self.within_cap(limit)?;
+        found
+            .results
+            .into_iter()
+            .map(|hit| {
+                let distance = hit.distance.ok_or_else(|| {
+                    eyre::eyre!("vellev gave no distance for object {}", hit.object.id.0)
+                })?;
+                self.near(hit.object.id, distance, hit.object.properties)
+            })
+            .collect()
+    }
+
+    async fn nearest_exactly(
+        &self,
+        asked: &[(&[f32], Option<&str>)],
+        repo_id: &str,
+        limit: usize,
+    ) -> Result<Scanned> {
+        if asked.is_empty() {
+            return Ok(Scanned::default());
+        }
+        let records = self.entities.collection();
+        let metric = self.entities.wanted().distance;
+        let dimensions = self.entities.wanted().embedding.dimensions as usize;
+        let scorers: Vec<(Scorer<'_>, Option<Uuid>)> = asked
+            .iter()
+            .map(|(vector, first)| {
+                self.sized(vector)?;
+                let first = first.map(|first| {
+                    first.parse().map_err(|e| {
+                        eyre::eyre!(
+                            "the object asked about, {first:?}, is no vellev object id: {e}"
+                        )
+                    })
+                });
+                Ok((Scorer::new(metric, vector), first.transpose()?))
+            })
+            .collect::<Result<_>>()?;
+        let filter = of_repo(repo_id);
+        let (mut held, mut kept) = (0, vec![Vec::new(); asked.len()]);
+        let mut named = vec![None; asked.len()];
+        let mut after = None;
+        loop {
+            let listed = self
+                .cap
+                .ask(MAX_RESULTS, |limit| {
+                    let page = Page::new(limit).filter(filter.clone()).vectors(true);
+                    let page = after.into_iter().fold(page, Page::after);
+                    async move { records.list(&page).await }
+                })
+                .await
+                .map_err(|e| self.refused(e))?;
+            let rows: Vec<(&Stored, &[f32])> = listed
+                .objects
+                .iter()
+                .map(|row| match row.vector.as_deref() {
+                    Some(vector) if vector.len() == dimensions => Ok((row, vector)),
+                    Some(vector) => Err(eyre::eyre!(
+                        "vellev listed object {} with a vector of {} dimensions, in a collection of {dimensions}",
+                        row.id.0,
+                        vector.len()
+                    )),
+                    None => Err(eyre::eyre!(
+                        "vellev listed object {} with no vector",
+                        row.id.0
+                    )),
+                })
+                .collect::<Result<_>>()?;
+            held += rows.len();
+            for ((scorer, first), (top, found)) in
+                scorers.iter().zip(kept.iter_mut().zip(&mut named))
+            {
+                let mut page: Vec<(f32, &Stored)> = rows
+                    .iter()
+                    .map(|(row, vector)| (scorer.distance(vector), *row))
+                    .collect();
+                if let Some((distance, _)) = page.iter().find(|(_, row)| Some(row.id.0) == *first) {
+                    *found = Some(*distance);
+                }
+                let page = nearest_of(&mut page, |(distance, row)| (*distance, row.id.0), limit);
+                let page = page
+                    .iter()
+                    .map(|(distance, row)| (*distance, row.id, row.properties.clone()));
+                let mut merged: Vec<Ranked> = std::mem::take(top).into_iter().chain(page).collect();
+                nearest_of(
+                    &mut merged,
+                    |(distance, object, _)| (*distance, object.0),
+                    limit,
+                );
+                merged.truncate(limit);
+                *top = merged;
+            }
+            after = listed.next;
+            if after.is_none() {
+                break;
+            }
+        }
+        let nearest = kept
+            .into_iter()
+            .map(|top| {
+                top.into_iter()
+                    .map(|(distance, object, properties)| self.near(object, distance, properties))
+                    .collect()
+            })
+            .collect::<Result<_>>()?;
+        Ok(Scanned {
+            held,
+            nearest,
+            named,
+        })
+    }
+
+    async fn counted(&self, repo_id: &str) -> Result<usize> {
+        let counted = of_repo_counted(self.entities.collection(), repo_id).await;
+        Ok(usize::try_from(counted.map_err(|e| self.refused(e))?)?)
     }
 }
 
@@ -1235,6 +1523,309 @@ mod tests {
             .unwrap()
             .embedding(local)
             .unwrap()
+    }
+
+    #[test]
+    fn the_nearest_are_kept_by_distance_then_object() {
+        let ids: Vec<Uuid> = (1..=4).map(Uuid::from_u128).collect();
+        let mut rows = vec![(0.2, ids[3]), (0.1, ids[2]), (0.2, ids[0]), (0.1, ids[1])];
+        let kept = nearest_of(&mut rows, |row| *row, 3).to_vec();
+        assert_eq!(kept, [(0.1, ids[1]), (0.1, ids[2]), (0.2, ids[0])]);
+        assert_eq!(nearest_of(&mut rows, |row| *row, 10).len(), 4);
+    }
+
+    /// A scan asked about an object that is no vellev id is refused before
+    /// anything is asked of the node.
+    #[tokio::test]
+    async fn a_scan_about_no_object_id_is_refused() {
+        let store = VellevCodeVectorStore::new("http://127.0.0.1:1", "key", "code").unwrap();
+        let vector = vec![1.0; store.entities.wanted().embedding.dimensions as usize];
+        let refused = store
+            .nearest_exactly(&[(&vector, Some("not-an-id"))], "r", 10)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.starts_with("the object asked about, \"not-an-id\", is no vellev object id"),
+            "{refused}"
+        );
+    }
+
+    type Asked = Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
+
+    /// A store on a node that answers everything but its health with
+    /// `answer`, and the requests it was sent.
+    async fn answering(answer: Value) -> (VellevCodeVectorStore, Asked) {
+        let asked: Asked = Arc::default();
+        let recording = Arc::clone(&asked);
+        let app = axum::Router::new().fallback(
+            move |method: axum::http::Method, uri: axum::http::Uri, body: String| {
+                let (recording, answer) = (Arc::clone(&recording), answer.clone());
+                async move {
+                    if !uri.path().starts_with("/health") {
+                        let request = (method.to_string(), uri.path().to_string(), body);
+                        recording.lock().unwrap().push(request);
+                    }
+                    axum::Json(answer)
+                }
+            },
+        );
+        let url = workforce_vellev::testing::serve(app).await;
+        (
+            VellevCodeVectorStore::new(&url, "key", "code").unwrap(),
+            asked,
+        )
+    }
+
+    /// Counting asks the entities' collection, as it is, for one repo's.
+    #[tokio::test]
+    async fn counted_asks_one_repos_entities_and_nothing_else() {
+        let (store, asked) = answering(json!({ "count": 7 })).await;
+        assert_eq!(store.counted(r#"r"x"#).await.unwrap(), 7);
+        let asked = asked.lock().unwrap().clone();
+        let [(method, path, body)] = asked.as_slice() else {
+            panic!("one request, {asked:?}");
+        };
+        assert_eq!(method, "POST");
+        assert!(path.ends_with("/collections/CodeEntity/count"), "{path}");
+        let body: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["filter"], json!(of_repo(r#"r"x"#)));
+    }
+
+    /// The searches send only their own search or listing: the collection
+    /// is never read or made, and nothing is asked for no results or for
+    /// more than the node gives for one search.
+    #[tokio::test]
+    async fn the_searches_send_only_their_own_requests() {
+        let (store, asked) = answering(json!({ "results": [], "objects": [] })).await;
+        let vector = vec![0.5; store.entities.wanted().embedding.dimensions as usize];
+        for to in [NearestTo::Text("parse"), NearestTo::Vector(&vector)] {
+            assert!(store.nearest(to, "r", 0).await.unwrap().is_empty());
+            let refused = store.nearest(to, "r", MAX_RESULTS + 1).await.unwrap_err();
+            let refused = refused.to_string();
+            assert!(
+                refused.starts_with("the 1001 nearest were asked"),
+                "{refused}"
+            );
+        }
+        assert!(asked.lock().unwrap().is_empty(), "nothing asked");
+
+        for to in [NearestTo::Text("parse"), NearestTo::Vector(&vector)] {
+            assert!(store.nearest(to, "r", 3).await.unwrap().is_empty());
+        }
+        let scanned = store.nearest_exactly(&[(&vector, None)], "r", 3).await;
+        assert_eq!(scanned.unwrap().held, 0);
+        let sent: Vec<(String, String)> = asked
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(method, path, _)| (method.clone(), path.rsplit('/').next().unwrap().into()))
+            .collect();
+        let sent: Vec<(&str, &str)> = sent.iter().map(|(m, p)| (m.as_str(), p.as_str())).collect();
+        assert_eq!(
+            sent,
+            [("POST", "nearest"), ("POST", "nearest"), ("POST", "list")]
+        );
+    }
+
+    /// A question is embedded as it is, in a probe with no document prefix
+    /// whatever the code collection puts before documents, listed within
+    /// the store's own cap.
+    #[tokio::test]
+    async fn embedded_writes_the_bare_text_within_the_stores_cap() {
+        use axum::response::IntoResponse;
+        let (asked, ids): (Asked, Arc<std::sync::Mutex<Vec<String>>>) = Default::default();
+        let (recording, holding) = (Arc::clone(&asked), Arc::clone(&ids));
+        let app = axum::Router::new().fallback(
+            move |method: axum::http::Method, uri: axum::http::Uri, body: String| {
+                let (recording, holding) = (Arc::clone(&recording), Arc::clone(&holding));
+                async move {
+                    let path = uri.path().to_string();
+                    recording.lock().unwrap().push((method.to_string(), path.clone(), body.clone()));
+                    let sent: Value = serde_json::from_str(&body).unwrap_or_default();
+                    if path.ends_with("/changes") {
+                        let changes = sent["changes"].as_array().cloned().unwrap_or_default();
+                        let mut held = holding.lock().unwrap();
+                        held.extend(changes.iter().map(|change| change["id"].as_str().unwrap().into()));
+                    }
+                    if path.ends_with("/list") {
+                        if sent["limit"].as_u64().is_some_and(|limit| limit > 2) {
+                            let message = "limit must be from 1 to 2, not more";
+                            let refused = json!({ "error": { "code": "invalid", "message": message } });
+                            return (axum::http::StatusCode::BAD_REQUEST, axum::Json(refused)).into_response();
+                        }
+                        let objects: Vec<Value> = holding
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .map(|id| json!({ "id": id, "properties": {}, "vector": vec![0.5; 384] }))
+                            .collect();
+                        return axum::Json(json!({ "objects": objects })).into_response();
+                    }
+                    axum::Json(json!({ "incarnation": 1, "position": 1, "outcomes": [] })).into_response()
+                }
+            },
+        );
+        let url = workforce_vellev::testing::serve(app).await;
+        let prefixed = Embedding {
+            document_prefix: Some("passage: ".into()),
+            ..small()
+        };
+        let store = VellevCodeVectorStore::new(&url, "key", "code")
+            .unwrap()
+            .embedding(prefixed)
+            .unwrap();
+
+        let embedded = store.embedded(&["parse the config".to_string()]).await;
+        assert_eq!(embedded.unwrap().len(), 1);
+        assert_eq!(store.cap.most(), 2);
+        let asked = asked.lock().unwrap().clone();
+        let made = asked
+            .iter()
+            .find(|(method, path, _)| method == "PUT" && path.contains("WorkforceEmbedProbe"));
+        let made: Value = serde_json::from_str(&made.unwrap().2).unwrap();
+        assert_eq!(made["embedding"]["model"], SMALL, "{made}");
+        assert!(made["embedding"].get("document_prefix").is_none(), "{made}");
+        let written = asked
+            .iter()
+            .find(|(_, path, _)| path.ends_with("/changes"))
+            .unwrap();
+        let written: Value = serde_json::from_str(&written.2).unwrap();
+        assert_eq!(
+            written["changes"][0]["properties"]["text"],
+            "parse the config"
+        );
+    }
+
+    /// A search for more than the node gives for one is refused, never cut:
+    /// once the node has said so, before anything is asked.
+    #[tokio::test]
+    async fn a_search_for_more_than_the_node_gives_is_refused() {
+        use axum::response::IntoResponse;
+        let searches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = Arc::clone(&searches);
+        let app = axum::Router::new().fallback(move |body: String| {
+            let counting = Arc::clone(&counting);
+            async move {
+                counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let asked: Value = serde_json::from_str(&body).unwrap_or_default();
+                match asked["limit"].as_u64() {
+                    Some(limit) if limit > 10 => {
+                        let message = format!("limit must be from 1 to 10, not {limit}");
+                        let refused = json!({ "error": { "code": "invalid", "message": message } });
+                        (axum::http::StatusCode::BAD_REQUEST, axum::Json(refused)).into_response()
+                    }
+                    _ => axum::Json(json!({ "results": [] })).into_response(),
+                }
+            }
+        });
+        let url = workforce_vellev::testing::serve(app).await;
+        let store = VellevCodeVectorStore::new(&url, "key", "code").unwrap();
+        let asked = || searches.load(std::sync::atomic::Ordering::SeqCst);
+
+        let refused = store.nearest(NearestTo::Text("parse"), "r", 20).await;
+        let refused = refused.unwrap_err().to_string();
+        let told = "the 20 nearest were asked, more than the 10 vellev gives for one search";
+        assert_eq!(refused, told);
+        let before = asked();
+        assert!(store
+            .nearest(NearestTo::Text("parse"), "r", 20)
+            .await
+            .is_err());
+        assert_eq!(asked(), before, "refused before it is asked");
+        assert!(store
+            .nearest(NearestTo::Text("parse"), "r", 10)
+            .await
+            .is_ok());
+    }
+
+    /// The exact scan keeps to a node that lists fewer rows for one request
+    /// than asked: it learns the cap, pages to the end, and keeps the rows
+    /// a sort of every one would.
+    #[tokio::test]
+    async fn the_exact_scan_pages_within_a_lower_node_cap() {
+        use axum::response::IntoResponse;
+        let dimensions = local_embedding(&[]).dimensions as usize;
+        let rows: Vec<(Uuid, Vec<f32>)> = (1..=5u128)
+            .map(|n| {
+                (
+                    Uuid::from_u128(n),
+                    (0..dimensions)
+                        .map(|at| ((at as u128 * n) % 7) as f32 + 1.0)
+                        .collect(),
+                )
+            })
+            .collect();
+        let held = rows.clone();
+        let app = axum::Router::new().fallback(move |body: String| {
+            let held = held.clone();
+            async move {
+                let asked: Value = serde_json::from_str(&body).unwrap_or_default();
+                let limit = asked["limit"].as_u64().unwrap_or(0) as usize;
+                if limit > 2 {
+                    let message = format!("limit must be from 1 to 2, not {limit}");
+                    let refused = json!({ "error": { "code": "invalid", "message": message } });
+                    return (axum::http::StatusCode::BAD_REQUEST, axum::Json(refused)).into_response();
+                }
+                let after: Option<Uuid> = asked["after"].as_str().map(|after| after.parse().unwrap());
+                let page: Vec<&(Uuid, Vec<f32>)> = held.iter().filter(|(id, _)| Some(*id) > after).take(limit).collect();
+                let objects: Vec<Value> = page
+                    .iter()
+                    .map(|(id, vector)| json!({ "id": id, "properties": { "entityId": id, "repoId": "r" }, "vector": vector }))
+                    .collect();
+                let next = (page.last().map(|(id, _)| id) != held.last().map(|(id, _)| id)).then(|| page.last().map(|(id, _)| id));
+                axum::Json(json!({ "objects": objects, "next": next.flatten() })).into_response()
+            }
+        });
+        let url = workforce_vellev::testing::serve(app).await;
+        let store = VellevCodeVectorStore::new(&url, "key", "code").unwrap();
+        let asked = rows[0].1.iter().rev().copied().collect::<Vec<f32>>();
+
+        let scanned = store
+            .nearest_exactly(&[(&asked, None)], "r", 3)
+            .await
+            .unwrap();
+        assert_eq!((store.cap.most(), scanned.held), (2, 5));
+        let scorer = Scorer::new(store.entities.wanted().distance, &asked);
+        let mut sorted: Vec<(f32, Uuid)> = rows
+            .iter()
+            .map(|(id, vector)| (scorer.distance(vector), *id))
+            .collect();
+        sorted.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        let kept: Vec<String> = scanned.nearest[0]
+            .iter()
+            .map(|near| near.object.clone())
+            .collect();
+        let expected: Vec<String> = sorted
+            .iter()
+            .take(3)
+            .map(|(_, id)| id.to_string())
+            .collect();
+        assert_eq!(kept, expected);
+    }
+
+    /// The searches refuse a vector of another size than the collection's,
+    /// asked or listed.
+    #[tokio::test]
+    async fn a_vector_of_another_size_is_refused() {
+        let id = Uuid::new_v4();
+        let listed = json!({ "objects": [{ "id": id.to_string(), "properties": {}, "vector": [0.5, 0.5] }] });
+        let (store, _) = answering(listed).await;
+        let dimensions = store.entities.wanted().embedding.dimensions as usize;
+        let short = [0.5, 0.5];
+        let refused = store.nearest_exactly(&[(&short, None)], "r", 3).await;
+        let refused = refused.unwrap_err().to_string();
+        let asked = format!("a vector of 2 dimensions was asked of a collection of {dimensions}");
+        assert_eq!(refused, asked);
+        let refused = store.nearest(NearestTo::Vector(&short), "r", 3).await;
+        assert_eq!(refused.unwrap_err().to_string(), asked);
+
+        let vector = vec![0.5; dimensions];
+        let refused = store.nearest_exactly(&[(&vector, None)], "r", 3).await;
+        let refused = refused.unwrap_err().to_string();
+        let listed =
+            format!("vellev listed object {id} with a vector of 2 dimensions, in a collection of {dimensions}");
+        assert_eq!(refused, listed);
     }
 
     #[test]
@@ -2199,9 +2790,7 @@ mod tests {
                 }
             },
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = workforce_vellev::testing::serve(app).await;
         let store = VellevCodeVectorStore::new(&url, "key", "workforce").unwrap();
         let heard = Arc::new(Heard::default());
         store.set_insert_error_sink(Arc::clone(&heard) as Arc<dyn InsertErrorSink>);
@@ -2522,6 +3111,235 @@ mod tests {
         assert_eq!(held, 0, "nothing was written to it");
     }
 
+    /// The product's search is the nearest by text, within its filter,
+    /// without the objects and distances the nearest keeps.
+    #[tokio::test]
+    async fn search_entities_is_nearest_by_text_without_its_ids() {
+        let Some(node) = Node::embedding().await else {
+            return;
+        };
+        let store = embedding_as(&node, small());
+        store.ensure_collections().await.unwrap();
+        let entities = [
+            entity(
+                "repo",
+                "parse_config",
+                "src/config.rs",
+                "Function",
+                "parse_config reads the TOML configuration file",
+            ),
+            entity(
+                "repo",
+                "Config",
+                "src/config.rs",
+                "Struct",
+                "Config holds the settings loaded from TOML",
+            ),
+            entity(
+                "repo",
+                "send_email",
+                "src/mail.rs",
+                "Function",
+                "send_email delivers a message over SMTP",
+            ),
+            entity(
+                "other",
+                "parse_config",
+                "src/config.rs",
+                "Function",
+                "parse_config reads the TOML configuration file",
+            ),
+        ];
+        store.index_entities(&entities).await.unwrap();
+        let text = "reading the configuration";
+        let found = |nearest: Vec<Near>| -> Vec<VectorSearchResult> {
+            nearest.into_iter().map(|near| near.found).collect()
+        };
+        let nearest = found(
+            store
+                .nearest(NearestTo::Text(text), "repo", 10)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(nearest.len(), 3, "{nearest:?}");
+        let searched = store
+            .search_entities(text, Some("repo"), None, 10)
+            .await
+            .unwrap();
+        assert_eq!(searched, nearest);
+        let structs = store
+            .search_entities(text, Some("repo"), Some(EntityKind::Struct), 10)
+            .await
+            .unwrap();
+        let nearest_structs: Vec<VectorSearchResult> = nearest
+            .into_iter()
+            .filter(|found| found.kind == "Struct")
+            .collect();
+        assert_eq!(structs, nearest_structs);
+        assert!(store
+            .nearest(NearestTo::Text("  "), "repo", 10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A scan of one repo's entities finds what a scan in the test does,
+    /// in the node's order, and nothing of another repo; where the node
+    /// scores every row, as for a small repo, its search is the scan.
+    #[tokio::test]
+    async fn the_exact_scan_is_the_nodes_order_over_one_repo() {
+        let Some(node) = Node::embedding().await else {
+            return;
+        };
+        let (store, _) =
+            crate::testing::counted(&node.url, &node.key, &node.tenant, Some(&small()));
+        store.ensure_collections().await.unwrap();
+        let of = |repo: &str, entities: usize| -> Vec<VectorCodeEntity> {
+            (0..entities)
+                .map(|n| {
+                    let id = format!("e{n:05}");
+                    entity(
+                        repo,
+                        &id,
+                        &format!("src/{id}.rs"),
+                        "Function",
+                        &format!("entity {n} of {repo}"),
+                    )
+                })
+                .collect()
+        };
+        for batch in of("big", 4_500)
+            .chunks(500)
+            .chain(of("small", 300).chunks(300))
+        {
+            store.index_entities(batch).await.unwrap();
+        }
+        let vector = workforce_vellev::testing::Counted::new(384)
+            .documents(&["what is asked".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let brute = |repo: &'static str| {
+            let store = &store;
+            let vector = &vector;
+            async move {
+                let mut rows = Vec::new();
+                let mut after = None;
+                loop {
+                    let page = Page::new(1000).filter(of_repo(repo)).vectors(true);
+                    let page = after.into_iter().fold(page, Page::after);
+                    let listed = store.entities.collection().list(&page).await.unwrap();
+                    rows.extend(listed.objects.into_iter().map(|object| {
+                        let distance = vellev_index::vector::distance(
+                            Distance::Cosine,
+                            vector,
+                            object.vector.as_deref().unwrap(),
+                        );
+                        (distance, object.id.0.to_string(), object.properties)
+                    }));
+                    after = listed.next;
+                    if after.is_none() {
+                        break;
+                    }
+                }
+                rows.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+                rows
+            }
+        };
+        let rows = brute("big").await;
+        assert_eq!(rows.len(), 4_500);
+        let indexed = store
+            .nearest(NearestTo::Vector(&vector), "big", 20)
+            .await
+            .unwrap();
+        let first = &indexed[0];
+        let scanned = store
+            .nearest_exactly(&[(&vector, Some(&first.object))], "big", 20)
+            .await
+            .unwrap();
+        assert_eq!(scanned.held, 4_500);
+        let objects = |nearest: &[Near]| -> Vec<(String, f32)> {
+            nearest
+                .iter()
+                .map(|near| (near.object.clone(), near.distance))
+                .collect()
+        };
+        let brute_top: Vec<(String, f32)> = rows
+            .iter()
+            .take(20)
+            .map(|(distance, object, _)| (object.clone(), *distance))
+            .collect();
+        assert_eq!(objects(&scanned.nearest[0]), brute_top);
+        assert!(scanned.nearest[0]
+            .iter()
+            .all(|near| near.found.repo_id == "big"));
+
+        let (scanned_first, _, _) = rows
+            .iter()
+            .find(|(_, object, _)| *object == first.object)
+            .unwrap();
+        assert_eq!(scanned.named, [Some(*scanned_first)]);
+        assert!(
+            (scanned_first - first.distance).abs() <= 1e-6,
+            "{scanned_first} {}",
+            first.distance
+        );
+
+        let small_scan = store
+            .nearest_exactly(&[(&vector, None)], "small", 20)
+            .await
+            .unwrap();
+        assert_eq!(small_scan.held, 300);
+        let small_index = store
+            .nearest(NearestTo::Vector(&vector), "small", 20)
+            .await
+            .unwrap();
+        let (index, scan) = (objects(&small_index), objects(&small_scan.nearest[0]));
+        assert_eq!(
+            index.iter().map(|(object, _)| object).collect::<Vec<_>>(),
+            scan.iter().map(|(object, _)| object).collect::<Vec<_>>()
+        );
+        assert!(index
+            .iter()
+            .zip(&scan)
+            .all(|((_, a), (_, b))| (a - b).abs() <= 1e-6));
+    }
+
+    /// Whether the code collections are as wanted is read, and nothing is
+    /// made, widened or adopted to make them so.
+    #[tokio::test]
+    async fn found_as_wanted_reads_and_never_makes() {
+        let Some(node) = Node::embedding().await else {
+            return;
+        };
+        let store = embedding_as(&node, small());
+        let missing = store.found_as_wanted().await.unwrap_err().to_string();
+        assert!(
+            missing.contains("vellev collection 'CodeEntity' does not exist"),
+            "{missing}"
+        );
+        assert!(node.tenant().collections().await.unwrap().is_empty());
+
+        let unidentified = entity_collection(&small()).unwrap();
+        let records = node.tenant().collection(&unidentified.name);
+        records.create(&unidentified).await.unwrap();
+        let before = records.schema().await.unwrap();
+        let refused = store.found_as_wanted().await.unwrap_err().to_string();
+        assert!(
+            refused.contains("vellev collection 'CodeEntity'")
+                && refused.contains("has no identity"),
+            "{refused}"
+        );
+        assert_eq!(records.schema().await.unwrap(), before, "nothing adopted");
+        records.drop().await.unwrap();
+
+        store.ensure_collections().await.unwrap();
+        assert_eq!(
+            store.found_as_wanted().await.unwrap(),
+            store.identity(false).await.unwrap()
+        );
+    }
+
     /// Indexing `impl A { fn new }` and `impl B { fn new }` keeps both.
     #[tokio::test]
     async fn methods_of_one_name_in_one_file_are_both_indexed() {
@@ -2655,9 +3473,7 @@ mod tests {
                 }
             },
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = workforce_vellev::testing::serve(app).await;
         let store = VellevCodeVectorStore::new(&url, "key", "workforce").unwrap();
         let entities: Vec<VectorCodeEntity> = (0..70)
             .map(|n| entity("r", &format!("e{n}"), "f", "Function", "does a thing"))
@@ -2694,9 +3510,7 @@ mod tests {
                 answer(400, "invalid", REFUSED)
             },
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = workforce_vellev::testing::serve(app).await;
         let store = VellevCodeVectorStore::new(&url, "key", "workforce").unwrap();
         let refused = store.ensure_collections().await.unwrap_err();
         match refused.downcast_ref::<Unusable>() {
@@ -2792,9 +3606,7 @@ mod tests {
                 }
             },
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = workforce_vellev::testing::serve(app).await;
         let store = VellevCodeVectorStore::new(&url, "key", "workforce").unwrap();
         let entity = entity("r", "e", "src/lib.rs", "Function", "parses a config file");
         let summary = VectorCodeSummary {

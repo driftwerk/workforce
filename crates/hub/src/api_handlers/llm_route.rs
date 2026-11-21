@@ -1557,7 +1557,6 @@ mod tests {
     #[tokio::test]
     async fn a_slow_list_answers_with_the_hubs_and_fills_in_for_the_next_ask() {
         use crate::claude_code::tests::CLAUDE;
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let shared = shared(dir.path());
         let reply = serde_json::json!({
@@ -1570,12 +1569,11 @@ mod tests {
         })
         .to_string();
         let program = dir.path().join("claude");
-        std::fs::write(
+        workforce_common::executable::write(
             &program,
             format!("#!/bin/sh\nread line\nsleep 1\nprintf '%s\\n' '{reply}'\nsleep 30\n"),
         )
         .unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         let login =
             crate::subscription::test_support::claude_login(&format!("slow-{}", Uuid::new_v4()));
 

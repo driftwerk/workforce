@@ -295,19 +295,27 @@ async fn ensure_as(
     Ok(false)
 }
 
-/// Check an existing collection against `wanted` without changing it.
+/// Check an existing collection against `wanted` without changing it,
+/// returning it as found.
 pub async fn doctor(
     at: &Tenants,
     records: &Records,
     wanted: &Collection,
     remedy: &str,
-) -> Result<()> {
+) -> Result<Collection> {
     let found = records
         .schema()
         .await
-        .map_err(|e| failure(e, at, Asked::collection(wanted)))?
-        .ok_or_else(|| eyre!("vellev collection '{}' does not exist", wanted.name))?;
-    checked(&found, wanted, remedy).map_err(as_unusable)
+        .map_err(|e| failure(e, at, Asked::collection(wanted)))?;
+    let Some(found) = found else {
+        at.reads
+            .collections()
+            .await
+            .map_err(|e| failure(e, at, Asked::Tenant))?;
+        return Err(eyre!("vellev collection '{}' does not exist", wanted.name));
+    };
+    checked(&found, wanted, remedy).map_err(as_unusable)?;
+    Ok(found)
 }
 
 /// A [`Refused`] as the [`Unusable`] it is.

@@ -37,6 +37,11 @@ impl Cap {
         u32::try_from(wanted.clamp(1, most)).unwrap_or(u32::MAX)
     }
 
+    /// The most results one request may ask now.
+    pub fn most(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+
     /// `op` asked for `wanted` results, within the cap; if the node allows
     /// fewer than that, the cap becomes what it allows and `op` is asked
     /// again.

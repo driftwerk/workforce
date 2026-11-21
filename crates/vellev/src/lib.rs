@@ -32,8 +32,8 @@ pub use ensure::{
     Unusable, RECHECK_AFTER, RETRY_AFTER,
 };
 pub use markers::{
-    index_claim, index_mark, index_marked, index_unmark, mark, mark_promoted, marked, marker_id,
-    promoted, unmark, unmark_promoted, INDEX_MARKERS, MARKERS,
+    index_claim, index_claimed, index_mark, index_marked, index_unmark, mark, mark_promoted,
+    marked, marker_id, promoted, unmark, unmark_promoted, INDEX_MARKERS, MARKERS,
 };
 pub use matching::{unmatched, Unmatched};
 pub use shape::{checked, mismatches, Refused};
@@ -166,6 +166,14 @@ pub fn is_conflict(error: &vellev_client::Error) -> bool {
 pub mod testing {
     use super::*;
 
+    /// The URL of a local server answering with `app`.
+    pub async fn serve(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url
+    }
+
     /// Whether the tests that need a node must run: with
     /// `VELLEV_TEST_REQUIRED=1`, as in CI, one that would skip itself for
     /// want of a node fails instead.
@@ -205,54 +213,22 @@ pub mod testing {
         }
 
         async fn documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-            use vellev_client::api::{Change, Content, Page};
             self.asked
                 .fetch_add(texts.len(), std::sync::atomic::Ordering::SeqCst);
-            let scratch = collection(
-                CollectionName::new(format!("ByNode{}", uuid::Uuid::new_v4().simple()))?,
-                vec![Property::new("text", vellev_core::DataType::Text)],
-                Embedding {
-                    properties: vec!["text".into()],
-                    ..self.embedding.clone()
-                },
+            let prefixed: Vec<String> = texts
+                .iter()
+                .map(|text| format!("{}{text}", self.prefix))
+                .collect();
+            let node = seeding::NodeEmbedder::new(
+                self.tenants.clone(),
+                self.embedding.clone(),
+                texts.len(),
             );
-            let records = self.tenants.reads.collection(&scratch.name);
-            records.create(&scratch).await?;
-            let ids: Vec<vellev_core::ObjectId> = texts
-                .iter()
-                .map(|_| vellev_core::ObjectId(uuid::Uuid::new_v4()))
-                .collect();
-            let changes = ids
-                .iter()
-                .zip(texts)
-                .map(|(id, text)| {
-                    Change::upsert(
-                        scratch.name.clone(),
-                        *id,
-                        Content::new(
-                            serde_json::json!({ "text": format!("{}{text}", self.prefix) })
-                                .as_object()
-                                .cloned()
-                                .unwrap_or_default(),
-                        ),
-                    )
-                })
-                .collect();
-            self.tenants.writes.apply(changes).await?;
-            let page = Page::new(1000).vectors(true);
-            let listed = records.list(&page).await?;
-            records.drop().await?;
-            let made: std::collections::HashMap<_, _> = listed
-                .objects
+            Ok(node
+                .documents(&prefixed)
+                .await?
                 .into_iter()
-                .map(|object| (object.id, object.vector.unwrap_or_default()))
-                .collect();
-            Ok(ids
-                .iter()
-                .map(|id| {
-                    let vector = made.get(id).cloned().unwrap_or_default();
-                    vector.into_iter().map(|x| x * self.scaled).collect()
-                })
+                .map(|vector| vector.into_iter().map(|x| x * self.scaled).collect())
                 .collect())
         }
     }
@@ -553,17 +529,13 @@ pub mod testing {
 }
 
 #[cfg(test)]
-pub(crate) async fn serve(app: axum::Router) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    url
-}
+pub(crate) use testing::serve;
 
 #[cfg(test)]
 mod tests {
     use vellev_core::DataType;
 
+    use super::seeding::DocumentEmbedder;
     use super::*;
 
     const REMEDY: &str = "put it right";
@@ -1292,6 +1264,92 @@ mod tests {
         );
     }
 
+    /// A probe whose drop the key may not make is told as the key's fault,
+    /// for an operator to put right.
+    #[tokio::test]
+    async fn a_probe_the_key_may_not_drop_is_forbidden() {
+        let (tenants, _) = probe_node(403, 0, true).await;
+        let small = embedding_of(SMALL, 16, None, &["text"]);
+        let node = seeding::NodeEmbedder::new(tenants, small, 1);
+        let refused = node.documents(&["a".to_string()]).await.unwrap_err();
+        assert!(
+            matches!(unusable(&refused), Some(Unusable::Forbidden { .. })),
+            "{refused:#}"
+        );
+        assert!(
+            refused.to_string().ends_with("was not dropped"),
+            "{refused}"
+        );
+    }
+
+    /// A probe whose create is refused outright was never made: only the
+    /// create's refusal is told, never a probe left behind.
+    #[tokio::test]
+    async fn a_probe_refused_at_its_create_is_not_told_as_left_behind() {
+        use axum::response::IntoResponse;
+        let app = axum::Router::new().fallback(|| async {
+            let refused = serde_json::json!({ "error": {
+                "code": "forbidden",
+                "message": "the key may not create collections",
+            }});
+            (axum::http::StatusCode::FORBIDDEN, axum::Json(refused)).into_response()
+        });
+        let tenants = connect(&crate::serve(app).await, "key", "harbor").unwrap();
+        let small = embedding_of(SMALL, 16, None, &["text"]);
+        let node = seeding::NodeEmbedder::new(tenants, small, 1);
+        let refused = format!(
+            "{:#}",
+            node.documents(&["a".to_string()]).await.unwrap_err()
+        );
+        assert!(
+            refused.contains("the key may not create collections") && !refused.contains("dropped"),
+            "{refused}"
+        );
+    }
+
+    /// A marker that is there but records no owner is an error naming it,
+    /// never read as unclaimed.
+    #[tokio::test]
+    async fn a_marker_with_no_owner_is_an_error() {
+        let app = axum::Router::new().fallback(|| async {
+            axum::Json(serde_json::json!({
+                "id": uuid::Uuid::from_u128(1),
+                "properties": { "collection": 7 },
+            }))
+        });
+        let tenants = connect(&crate::serve(app).await, "key", "harbor").unwrap();
+        let refused = index_claimed(&tenants, "CodeGraph").await.unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            "the marker of 'CodeGraph' in tenant 'harbor' records no owner"
+        );
+    }
+
+    /// A claim or a collection read in a tenant that is not there is an
+    /// error saying so: never unclaimed, nor a collection missing.
+    #[tokio::test]
+    async fn a_missing_tenant_is_told_apart_from_nothing_held() {
+        let missing = std::sync::Arc::new(Fake::answering(
+            404,
+            "not_found",
+            "tenant harbor does not exist",
+        ));
+        let tenants = missing.serve().await;
+        let claimed = index_claimed(&tenants, "CodeGraph").await.unwrap_err();
+        assert!(
+            matches!(unusable(&claimed), Some(Unusable::NoTenant { .. })),
+            "{claimed:#}"
+        );
+        let lines = notes(local_embedding(&["body"]));
+        let records = tenants.reads.collection(&lines.name);
+        let doctored = crate::doctor(&tenants, &records, &lines, REMEDY).await;
+        let doctored = doctored.unwrap_err();
+        assert!(
+            matches!(unusable(&doctored), Some(Unusable::NoTenant { .. })),
+            "{doctored:#}"
+        );
+    }
+
     /// Vectors made outside the node of another size than the collection's
     /// are refused, naming both, before anything is written.
     #[tokio::test]
@@ -1345,12 +1403,25 @@ mod tests {
     /// A node that embeds what is written to it as [`made_up`] does, and
     /// keeps every text it was sent.
     async fn embedding_node() -> (Tenants, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        probe_node(200, 0, true).await
+    }
+
+    /// As [`embedding_node`], answering `dropping` to a collection's drop,
+    /// leaving the first `losing` objects out of what it lists, and listing
+    /// the rest with their vectors only if `vectors`. A collection it drops
+    /// takes its objects with it, and it lists no more than two objects for
+    /// one request.
+    async fn probe_node(
+        dropping: u16,
+        losing: usize,
+        vectors: bool,
+    ) -> (Tenants, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         use axum::response::IntoResponse;
         let held: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
         let sent: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
         let (holding, sending) = (std::sync::Arc::clone(&held), std::sync::Arc::clone(&sent));
-        let app =
-            axum::Router::new().fallback(move |uri: axum::http::Uri, body: axum::body::Bytes| {
+        let app = axum::Router::new().fallback(
+            move |method: axum::http::Method, uri: axum::http::Uri, body: axum::body::Bytes| {
                 let (held, sent) = (
                     std::sync::Arc::clone(&holding),
                     std::sync::Arc::clone(&sending),
@@ -1358,16 +1429,42 @@ mod tests {
                 async move {
                     let written =
                         serde_json::json!({ "incarnation": 1, "position": 1, "outcomes": [] });
+                    if method == axum::http::Method::DELETE && dropping != 200 {
+                        let status = axum::http::StatusCode::from_u16(dropping).unwrap();
+                        let code = if dropping == 403 {
+                            "forbidden"
+                        } else {
+                            "internal"
+                        };
+                        let failed = serde_json::json!({ "error": {
+                            "code": code,
+                            "message": "the drop failed",
+                        }});
+                        return (status, axum::Json(failed)).into_response();
+                    }
+                    if method == axum::http::Method::DELETE {
+                        held.lock().unwrap().clear();
+                    }
                     if uri.path().ends_with("/list") {
+                        let asked: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        if let Some(limit) = asked["limit"].as_u64().filter(|limit| *limit > 2) {
+                            let refused = serde_json::json!({ "error": {
+                                "code": "invalid",
+                                "message": format!("limit must be from 1 to 2, not {limit}"),
+                            }});
+                            return (axum::http::StatusCode::BAD_REQUEST, axum::Json(refused))
+                                .into_response();
+                        }
                         let objects: Vec<serde_json::Value> = held
                             .lock()
                             .unwrap()
                             .iter()
+                            .skip(losing)
                             .map(|(id, text)| {
                                 serde_json::json!({
                                     "id": id,
                                     "properties": { "text": text },
-                                    "vector": made_up(text),
+                                    "vector": vectors.then(|| made_up(text)),
                                 })
                             })
                             .collect();
@@ -1386,9 +1483,125 @@ mod tests {
                     }
                     axum::Json(written).into_response()
                 }
-            });
+            },
+        );
         let tenants = connect(&crate::serve(app).await, "key", "harbor").unwrap();
         (tenants, sent)
+    }
+
+    /// A probe the node cannot drop fails the embedding that made it, and
+    /// the comparison made with it, naming it; so does a vector the node
+    /// did not give back, or an object it listed with none; a probe left
+    /// behind by a failed embedding is named with its failure.
+    #[tokio::test]
+    async fn a_probe_that_cannot_be_dropped_is_an_error() {
+        let texts = ["parse the config".to_string()];
+        let small = embedding_of(SMALL, 16, None, &["text"]);
+        let (tenants, _) = probe_node(500, 0, true).await;
+        let node = seeding::NodeEmbedder::new(tenants.clone(), small.clone(), 1);
+        let refused = node.documents(&texts).await.unwrap_err().to_string();
+        assert!(
+            refused.starts_with("the collection made to embed with the node, 'WorkforceEmbedProbe")
+                && refused.ends_with("', was not dropped"),
+            "{refused}"
+        );
+        let refused = seeding::equivalence(&tenants, &small, &Prefixing(String::new()), &texts)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("'WorkforceEmbedProbe") && refused.contains("was not dropped"),
+            "{refused}"
+        );
+
+        let (tenants, _) = probe_node(200, 1, true).await;
+        let node = seeding::NodeEmbedder::new(tenants, small.clone(), 1);
+        let short = node
+            .documents(&["a".to_string(), "b".to_string()])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            short.ends_with("gave back vectors for 1 of 2 texts"),
+            "{short}"
+        );
+
+        let (tenants, _) = probe_node(500, 1, true).await;
+        let node = seeding::NodeEmbedder::new(tenants, small.clone(), 1);
+        let both = node.documents(&["a".to_string(), "b".to_string()]).await;
+        let both = format!("{:#}", both.unwrap_err());
+        assert!(
+            both.starts_with("the embedding failed, and then the collection made to embed")
+                && both.contains("was not dropped: ")
+                && both.contains("the drop failed")
+                && both.ends_with("gave back vectors for 1 of 2 texts"),
+            "{both}"
+        );
+
+        let (tenants, _) = probe_node(200, 0, false).await;
+        let node = seeding::NodeEmbedder::new(tenants, small, 1);
+        let bare = node.documents(&texts).await.unwrap_err().to_string();
+        assert!(
+            bare.contains("of the probe 'WorkforceEmbedProbe")
+                && bare.ends_with("' with no vector"),
+            "{bare}"
+        );
+    }
+
+    /// An outside embedder that, each time it is asked, notes how many
+    /// objects the node still lists: the probe fake lists all it holds,
+    /// whichever collection is asked.
+    struct Watching {
+        tenants: Tenants,
+        listed: std::sync::Mutex<Vec<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl seeding::DocumentEmbedder for Watching {
+        fn name(&self) -> String {
+            "a watching embedder".to_string()
+        }
+
+        async fn documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            let probe = CollectionName::new("AnyCollection").unwrap();
+            let page = vellev_client::api::Page::new(2);
+            let held = self.tenants.reads.collection(&probe).list(&page).await?;
+            self.listed.lock().unwrap().push(held.objects.len());
+            Ok(texts.iter().map(|text| made_up(text)).collect())
+        }
+    }
+
+    /// The probe is listed within the cap the embedder is given, which
+    /// learns what the node allows.
+    #[tokio::test]
+    async fn the_probe_is_listed_within_the_cap_it_shares() {
+        let (tenants, _) = embedding_node().await;
+        let cap = std::sync::Arc::new(Cap::default());
+        let small = embedding_of(SMALL, 16, None, &["text"]);
+        let node =
+            seeding::NodeEmbedder::new(tenants, small, 1).sharing(std::sync::Arc::clone(&cap));
+        let vectors = node.documents(&["a".to_string(), "b".to_string()]).await;
+        assert_eq!((vectors.unwrap().len(), cap.most()), (2, 2));
+    }
+
+    /// The node's probe is dropped before the outside embedder is asked.
+    #[tokio::test]
+    async fn the_probe_is_dropped_before_the_embedder_is_asked() {
+        let (tenants, _) = embedding_node().await;
+        let watching = Watching {
+            tenants: tenants.clone(),
+            listed: Default::default(),
+        };
+        let small = embedding_of(SMALL, 16, None, &["text"]);
+        let texts = ["parse the config".to_string()];
+        seeding::equivalence(&tenants, &small, &watching, &texts)
+            .await
+            .unwrap();
+        let listed = watching.listed.lock().unwrap().clone();
+        assert!(
+            !listed.is_empty() && listed.iter().all(|held| *held == 0),
+            "{listed:?}"
+        );
     }
 
     /// An embedder that puts the collection's own query prefix before
@@ -1453,6 +1666,7 @@ mod node_tests {
     use vellev_client::api::Nearest;
     use vellev_core::DataType;
 
+    use super::seeding::DocumentEmbedder;
     use super::testing::Node;
     use super::tests::Fixed;
     use super::*;
@@ -1673,6 +1887,62 @@ mod node_tests {
         assert_eq!(
             index_claim(&tenants, "Other", "late").await.unwrap(),
             "late"
+        );
+    }
+
+    /// Whose a tenant's code vectors are is read without making the
+    /// markers' collection, and after a claim is the claimant's.
+    #[tokio::test]
+    async fn index_claimed_reads_without_making() {
+        let Some(node) = Node::fresh().await else {
+            return;
+        };
+        let tenants = node.tenants();
+        assert_eq!(index_claimed(&tenants, "CodeGraph").await.unwrap(), None);
+        let indexes = tenants
+            .reads
+            .collection(&CollectionName::new(INDEX_MARKERS).unwrap());
+        assert_eq!(indexes.schema().await.unwrap(), None, "nothing made");
+        index_claim(&tenants, "CodeGraph", "g").await.unwrap();
+        assert_eq!(
+            index_claimed(&tenants, "CodeGraph")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("g")
+        );
+        assert_eq!(index_claimed(&tenants, "Other").await.unwrap(), None);
+    }
+
+    /// The node embeds more texts than one page of its listing holds, and
+    /// gives each back in the order of the texts.
+    #[tokio::test]
+    async fn node_embedder_pages_its_listing() {
+        let Some(node) = Node::embedding().await else {
+            return;
+        };
+        let tenants = node.tenants();
+        let small = embedding_of(testing::SMALL, 384, None, &["text"]);
+        let texts: Vec<String> = (0..1500)
+            .map(|n| format!("item {n} of a long list"))
+            .collect();
+        let made = seeding::NodeEmbedder::new(tenants.clone(), small.clone(), 500)
+            .documents(&texts)
+            .await
+            .unwrap();
+        assert_eq!(made.len(), texts.len());
+        let alone = seeding::NodeEmbedder::new(tenants.clone(), small, 1)
+            .documents(&[texts[1200].clone()])
+            .await
+            .unwrap();
+        let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(a, b)| a * b).sum::<f32>();
+        assert!(dot(&alone[0], &made[1200]) > 0.9999);
+        assert!(dot(&alone[0], &made[1199]) < 0.9999);
+        let held = tenants.reads.collections().await.unwrap();
+        assert!(
+            held.iter()
+                .all(|c| !c.name.as_str().starts_with("WorkforceEmbedProbe")),
+            "every probe dropped"
         );
     }
 

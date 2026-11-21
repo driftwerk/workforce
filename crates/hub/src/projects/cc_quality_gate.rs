@@ -641,14 +641,16 @@ mod tests {
 
     #[tokio::test]
     async fn a_local_tsc_gate_runs_the_checkouts_own_binary_from_its_directory() {
-        use std::os::unix::fs::PermissionsExt;
         let tmp = TempDir::new().unwrap();
         let repo = tmp.path().join("frontend");
         std::fs::create_dir_all(repo.join("node_modules/.bin")).unwrap();
         std::fs::write(repo.join("package.json"), r#"{"name":"f"}"#).unwrap();
         let tsc = repo.join("node_modules/.bin/tsc");
-        std::fs::write(&tsc, "#!/bin/sh\n[ \"$1\" = --noEmit ] && exit 0\nexit 7\n").unwrap();
-        std::fs::set_permissions(&tsc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        workforce_common::executable::write(
+            &tsc,
+            "#!/bin/sh\n[ \"$1\" = --noEmit ] && exit 0\nexit 7\n",
+        )
+        .unwrap();
         let sandbox = adopt_workdir(tmp.path().to_path_buf(), Vec::new(), None);
         let gates = gates_for(&RepoFiles::probe(sandbox.as_ref(), Path::new("frontend")).await);
         assert_eq!(gates.len(), 1);

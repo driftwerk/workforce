@@ -290,9 +290,17 @@ async fn a_bosss_hold_is_the_persons_at_once_and_its_decision_closes_it() {
             "{}",
             wait.dedupe_key
         );
+        // In its own words: those of its reply when it came before Desk
+        // looked, else its report before the hold (given at once, the hold
+        // can be looked at before the reply is).
         assert!(
-            wait.text.contains("holding"),
+            wait.text.contains("holding") || wait.text.contains("Both need your decision"),
             "its own words: {}",
+            wait.text
+        );
+        assert!(
+            !wait.text.contains("until I answer"),
+            "not the boss's: {}",
             wait.text
         );
 

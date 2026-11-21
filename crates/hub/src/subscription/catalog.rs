@@ -533,9 +533,8 @@ pub(crate) mod tests {
     /// A `claude` that answers `initialize` with the CLI's list, then waits
     /// for a prompt that never comes.
     pub(crate) fn lister(dir: &Path, reply: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let program = dir.join("claude");
-        std::fs::write(
+        workforce_common::executable::write(
             &program,
             format!(
                 "#!/bin/sh\nprintf '%s' \"$*\" > \"{args}\"\nprintf '%s' \"$CLAUDE_CODE_OAUTH_TOKEN\" > \"{token}\"\nread line\ncase \"$line\" in *initialize*) ;; *) exit 3;; esac\nprintf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\"}}'\nprintf '%s\\n' '{reply}'\nsleep 30\n",
@@ -544,7 +543,6 @@ pub(crate) mod tests {
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         program
     }
 

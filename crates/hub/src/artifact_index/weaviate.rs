@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use tracing::{debug, warn};
+use workforce_common::text::graphql_escape;
 
 use super::{object_id, ArtifactVectors, COLLECTION};
 
@@ -353,7 +354,7 @@ impl ArtifactVectors for WeaviateArtifacts {
     }
 
     async fn search(&self, query: &str, limit: usize) -> eyre::Result<Vec<(String, f32)>> {
-        let escaped = query.replace('\\', "\\\\").replace('"', "\\\"");
+        let escaped = graphql_escape(query);
         let gql = format!(
             r#"{{ Get {{ {COLLECTION}(limit: {limit}, nearText: {{ concepts: ["{escaped}"] }}) {{ artifactId _additional {{ certainty }} }} }} }}"#
         );
@@ -413,7 +414,7 @@ impl ArtifactVectors for WeaviateArtifacts {
         query: &str,
         limit: usize,
     ) -> eyre::Result<(Vec<(String, f32)>, usize)> {
-        let escaped = query.replace('\\', "\\\\").replace('"', "\\\"");
+        let escaped = graphql_escape(query);
         let gql = format!(
             r#"{{ Get {{ {COLLECTION}(limit: {limit}, nearText: {{ concepts: ["{escaped}"] }}) {{ artifactId _additional {{ certainty }} }} }} Aggregate {{ {COLLECTION} {{ meta {{ count }} }} }} }}"#
         );
@@ -502,9 +503,7 @@ mod tests {
     async fn a_refused_upsert_is_logged_in_weaviates_words() {
         let app = with_class(axum::Router::new())
             .fallback(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = workforce_vellev::testing::serve(app).await;
 
         #[derive(Clone, Default)]
         struct Captured(Arc<Mutex<Vec<u8>>>);
@@ -545,10 +544,7 @@ mod tests {
     async fn a_refused_removal_is_told_and_a_missing_object_is_removed_already() {
         async fn serving(status: axum::http::StatusCode) -> String {
             let app = axum::Router::new().fallback(move || async move { status });
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!("http://{}", listener.local_addr().unwrap());
-            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-            url
+            workforce_vellev::testing::serve(app).await
         }
         let down = serving(axum::http::StatusCode::INTERNAL_SERVER_ERROR).await;
         assert!(WeaviateArtifacts::new(&down, None)
@@ -589,9 +585,7 @@ mod tests {
                 },
             ),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = workforce_vellev::testing::serve(app).await;
         let weaviate = WeaviateArtifacts::new(&url, None);
         let (mut ids, mut after, mut pages) = (Vec::new(), None, 0);
         loop {
@@ -636,9 +630,7 @@ mod tests {
             std::future::pending::<()>().await;
             axum::http::StatusCode::OK
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = workforce_vellev::testing::serve(app).await;
         let request = Duration::from_millis(300);
         let weaviate = WeaviateArtifacts::waiting(&url, None, Duration::from_secs(5), request);
         let page = [("a".to_string(), "h".to_string())];
@@ -706,9 +698,7 @@ mod tests {
                     "put object: import into index artifacts: put local object",
                 )),
             );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = workforce_vellev::testing::serve(app).await;
         let weaviate = WeaviateArtifacts::new(&url, None);
         let told = weaviate.upsert("a", "some text", "hash").await.unwrap_err();
         assert!(
@@ -971,10 +961,7 @@ mod tests {
                 )
                 .route("/v1/graphql", post(asked))
                 .with_state(Arc::clone(self));
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!("http://{}", listener.local_addr().unwrap());
-            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-            url
+            workforce_vellev::testing::serve(app).await
         }
     }
 
@@ -1206,6 +1193,44 @@ mod tests {
         assert_eq!(fake.artifacts(), ["spec-1"]);
     }
 
+    /// Weaviate is asked the question as it was put, in a string GraphQL
+    /// reads back exactly, by the search and by the counted search.
+    #[tokio::test]
+    async fn weaviate_is_asked_the_question_exactly() {
+        let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+        let recording = Arc::clone(&asked);
+        let app = axum::Router::new().route(
+            "/v1/graphql",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let recording = Arc::clone(&recording);
+                async move {
+                    recording
+                        .lock()
+                        .unwrap()
+                        .push(body["query"].as_str().unwrap().to_string());
+                    axum::Json(serde_json::json!({ "data": {
+                        "Get": { COLLECTION: [] },
+                        "Aggregate": { COLLECTION: [{ "meta": { "count": 0 } }] }
+                    }}))
+                }
+            }),
+        );
+        let url = workforce_vellev::testing::serve(app).await;
+        let weaviate = WeaviateArtifacts::new(&url, None);
+
+        let question = "a \"b\" \\c\n  d";
+        weaviate.search(question, 3).await.unwrap();
+        weaviate.search_counted(question, 3).await.unwrap();
+        let asked = asked.lock().unwrap().clone();
+        assert_eq!(asked.len(), 2);
+        for query in asked {
+            let after = "concepts: [";
+            let rest = &query[query.find(after).unwrap() + after.len()..];
+            let mut read = serde_json::Deserializer::from_str(rest).into_iter::<String>();
+            assert_eq!(read.next().unwrap().unwrap(), question, "{query}");
+        }
+    }
+
     /// A search on Weaviate asks for what it finds and how many it holds
     /// in one request.
     #[tokio::test]
@@ -1407,9 +1432,7 @@ mod tests {
                 "/v1/objects",
                 get(|| async { panic!("the class is not listed") as axum::http::StatusCode }),
             );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = workforce_vellev::testing::serve(app).await;
         let weaviate = WeaviateArtifacts::new(&url, None);
         assert_eq!(weaviate.count().await.unwrap(), 7);
         let page = [

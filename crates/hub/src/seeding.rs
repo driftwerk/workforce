@@ -361,19 +361,11 @@ pub async fn reindex_code_vectors(
     let store: Arc<dyn CodeVectorStore> = Arc::new(store);
     store.ensure_collections().await?;
 
-    let root = config
-        .knowledge
-        .root
-        .clone()
-        .unwrap_or_else(|| config.hub.data_dir.clone());
-    let data_dir = config
-        .knowledge
-        .data_dir
-        .clone()
-        .unwrap_or_else(|| root.clone());
+    let (root, data_dir) =
+        crate::knowledge::knowledge_dirs(&config.knowledge, &config.hub.data_dir);
     let service = KnowledgeService::new_with_backend(
-        root.into(),
-        data_dir.into(),
+        root,
+        data_dir,
         &config.knowledge,
         VectorBackend::Given(Arc::clone(&store)),
         &config.codegraph,

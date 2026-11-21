@@ -1141,11 +1141,9 @@ mod tests {
     /// A desk whose terminals run `/bin/sh`, with a plugin folder of the
     /// person's own in its login environment.
     async fn shell_desk(pool: workforce_postgres::PostgresPool, dir: &Path) -> Desk {
-        use std::os::unix::fs::PermissionsExt;
         let mut opts = options(dir);
         let cli = dir.join("fake-claude");
-        std::fs::write(&cli, "#!/bin/sh\nexec sleep 60\n").unwrap();
-        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        workforce_common::executable::write(&cli, "#!/bin/sh\nexec sleep 60\n").unwrap();
         opts = opts.with_program(Engine::Claude, cli);
         opts.env = BTreeMap::from([
             ("PATH".into(), "/usr/bin:/bin".into()),
