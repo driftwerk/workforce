@@ -840,23 +840,27 @@ async fn a_running_session_goes_back_to_its_own_mode_when_unbound_ends() {
             };
             // Taken back by the person, it is left alone altogether. Handed
             // to another boss, it may be passed on to this one before the
-            // hold is ever seen, and then nothing holds it.
+            // hold is ever seen, and then nothing holds it: who runs it then
+            // is kept as it was seen.
             let held = eventually("the boss held", async || {
                 let (_, o) = crew.overseer_service()?;
                 match (crew.gate(&deploy, &o), ends) {
-                    (Gate::No(why), Ends::Released) => Some(Some(why.into_owned())),
+                    (Gate::No(why), Ends::Released) => Some(Ok(why.into_owned())),
                     (Gate::Suggest(why), _) if why.contains("still runs in auto mode") => {
-                        Some(Some(why.into_owned()))
+                        Some(Ok(why.into_owned()))
                     }
-                    (Gate::Run, _) if desks() => Some(None),
+                    (Gate::Run, Ends::AnotherBoss) => d
+                        .charge_of(s.id)
+                        .filter(|c| c.live())
+                        .map(|c| Err(c.boss.clone())),
                     _ => None,
                 }
             })
             .await;
             match (ends, held) {
-                (_, None) => assert!(desks(), "{ends:?}: never held, yet not passed on"),
-                (Ends::Released, Some(why)) => assert!(why.contains("leave it alone"), "{why}"),
-                (_, Some(why)) => assert!(
+                (_, Err(runs)) => assert_eq!(runs, "desk", "never held, yet not passed on"),
+                (Ends::Released, Ok(why)) => assert!(why.contains("leave it alone"), "{why}"),
+                (_, Ok(why)) => assert!(
                     why.contains("put back in its own mode") || why.contains("puts it back"),
                     "{why}"
                 ),
