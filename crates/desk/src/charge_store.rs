@@ -75,22 +75,12 @@ impl DeskStore {
     /// Every charge, released ones too.
     pub async fn charges(&self) -> Result<Vec<Charge>> {
         let client = self.pool().get().await?;
-        let rows = client
+        client
             .query(&format!("SELECT {COLUMNS} FROM charges"), &[])
-            .await?;
-        Ok(rows
+            .await?
             .iter()
-            .filter_map(|row| {
-                charge(row)
-                    .inspect_err(|e| {
-                        tracing::warn!(
-                            error = format!("{e:#}"),
-                            "a charge couldn't be read and is skipped"
-                        )
-                    })
-                    .ok()
-            })
-            .collect())
+            .map(charge)
+            .collect()
     }
 
     pub async fn charge(&self, session: Uuid) -> Result<Option<Charge>> {

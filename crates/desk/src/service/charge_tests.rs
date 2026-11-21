@@ -1392,7 +1392,7 @@ async fn a_boss_ends_what_it_started_or_was_handed_only_while_it_runs_it_or_let_
 }
 
 #[tokio::test]
-async fn a_charge_row_this_desk_cant_read_never_stops_the_rest_and_an_unknown_reason_is_the_bosss()
+async fn an_unknown_release_reason_is_the_bosss_and_an_unreadable_charge_fails_the_load()
 {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
@@ -1421,6 +1421,12 @@ async fn a_charge_row_this_desk_cant_read_never_stops_the_rest_and_an_unknown_re
             )
             .await
             .unwrap();
+        let read = d.store().charges().await.unwrap();
+        let unknown = read.iter().find(|c| c.session == ids[0]).unwrap();
+        assert_eq!(unknown.released_by, Some(crate::charge::ReleasedBy::Boss));
+        assert!(d.charge_load().await, "the load goes on");
+        assert!(!d.may_end(ids[0], Some(&boss)), "unknown reason: refused");
+        assert!(d.may_end(ids[2], Some(&boss)), "the row it can read stands");
         client
             .execute(
                 "UPDATE charges SET how = 'garbled' WHERE session = $1",
@@ -1429,13 +1435,8 @@ async fn a_charge_row_this_desk_cant_read_never_stops_the_rest_and_an_unknown_re
             .await
             .unwrap();
         drop(client);
-        let read = d.store().charges().await.unwrap();
-        assert!(read.iter().all(|c| c.session != ids[1]), "bad row skipped");
-        let unknown = read.iter().find(|c| c.session == ids[0]).unwrap();
-        assert_eq!(unknown.released_by, Some(crate::charge::ReleasedBy::Boss));
-        assert!(d.charge_load().await, "the load goes on");
-        assert!(!d.may_end(ids[0], Some(&boss)), "unknown reason: refused");
-        assert!(d.may_end(ids[2], Some(&boss)), "the row it can read stands");
+        assert!(d.store().charges().await.is_err(), "no row is skipped");
+        assert!(!d.charge_load().await, "the load fails, as it would unread");
     })
     .await;
 }
