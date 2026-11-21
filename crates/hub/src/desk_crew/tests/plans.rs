@@ -2265,7 +2265,7 @@ async fn a_boss_runs_a_check_on_a_machine_and_what_no_boss_does_is_the_persons()
                 }
             })
         };
-        eventually("Desk polling", async || crew.relay_polled.lock().is_some().then_some(())).await;
+        eventually("Desk polling", async || crew.relay.polled_ever().then_some(())).await;
         // Read: run, judged there at Act.
         let r = run
             .execute(json!({ "machine": "devbox", "command": "git status", "reason": "Is it clean?" }))

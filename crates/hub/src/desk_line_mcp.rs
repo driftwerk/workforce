@@ -4,13 +4,15 @@
 //! `workforce_desk::line::TOOLS`, and every call goes to the one dispatch
 //! Desk's Claude Code plugin uses too, [`Desk::line_call`].
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use uuid::Uuid;
 use workforce_agent::tools::registry::ToolRegistry;
 use workforce_agent::tools::{Tool, ToolResult};
-use workforce_desk::line::{LineTool, TOOLS};
+use workforce_desk::line::LineTool;
 use workforce_desk::{Desk, SessionMcp};
 
 use crate::mcp::{DirectExecutor, McpEndpoint, Surface};
@@ -55,19 +57,48 @@ impl Tool for LineToolHandle {
     }
 }
 
+/// How long a session's tool list serves its calls, a `tools/list` always
+/// reading it afresh.
+const LISTED_FOR: Duration = Duration::from_secs(5);
+
+type Listed = HashMap<Uuid, (Instant, Vec<&'static LineTool>)>;
+
 /// Answers sessions' MCP requests on their lines.
 pub(crate) struct LineMcp {
     desk: Desk,
+    /// Each session's tools as last worked out, so a `tools/call` doesn't
+    /// read the board again.
+    listed: parking_lot::Mutex<Listed>,
 }
 
 impl LineMcp {
     pub(crate) fn new(desk: Desk) -> Arc<Self> {
-        Arc::new(Self { desk })
+        Arc::new(Self {
+            desk,
+            listed: parking_lot::Mutex::new(HashMap::new()),
+        })
     }
 
-    fn endpoint(&self, caller: Uuid) -> McpEndpoint {
+    /// The tools offered to `caller`: as worked out in the last few
+    /// seconds unless `fresh`, which a `tools/list` is.
+    async fn tools(&self, caller: Uuid, fresh: bool) -> Vec<&'static LineTool> {
+        if !fresh {
+            if let Some((at, tools)) = self.listed.lock().get(&caller) {
+                if at.elapsed() < LISTED_FOR {
+                    return tools.clone();
+                }
+            }
+        }
+        let tools = self.desk.line_tools(caller).await;
+        let mut listed = self.listed.lock();
+        listed.retain(|_, (at, _)| at.elapsed() < LISTED_FOR);
+        listed.insert(caller, (Instant::now(), tools.clone()));
+        tools
+    }
+
+    async fn endpoint(&self, caller: Uuid, fresh: bool) -> McpEndpoint {
         let registry = ToolRegistry::new();
-        for def in &TOOLS {
+        for def in self.tools(caller, fresh).await {
             registry.register(Arc::new(LineToolHandle {
                 caller,
                 def,
@@ -86,7 +117,9 @@ impl LineMcp {
 #[async_trait]
 impl SessionMcp for LineMcp {
     async fn answer(&self, caller: Uuid, body: &str) -> Option<String> {
-        self.endpoint(caller).handle(body).await
+        let fresh = serde_json::from_str::<serde_json::Value>(body)
+            .map_or(true, |v| v["method"] == "tools/list");
+        self.endpoint(caller, fresh).await.handle(body).await
     }
 }
 
@@ -95,8 +128,53 @@ mod tests {
     use serde_json::{json, Value};
     use workforce_postgres::test_support::with_test_pool;
 
+    use workforce_desk::line::TOOLS;
+
     use super::*;
     use crate::desk_crew::tests::{desk, hook_url, new_session};
+
+    /// Linear reached, Jira not.
+    struct OnlyLinear;
+
+    #[async_trait::async_trait]
+    impl workforce_desk::issues::Issues for OnlyLinear {
+        async fn issue(
+            &self,
+            _: &workforce_desk::issues::Asker,
+            _: &workforce_desk::issues::Asked,
+        ) -> Result<Value, String> {
+            Err("not here".into())
+        }
+
+        async fn offered(
+            &self,
+            _: &workforce_desk::issues::Asker,
+        ) -> Vec<workforce_desk::board::System> {
+            vec![workforce_desk::board::System::Linear]
+        }
+    }
+
+    /// Linear reached, counting the times it is asked.
+    struct Counting(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl workforce_desk::issues::Issues for Counting {
+        async fn issue(
+            &self,
+            _: &workforce_desk::issues::Asker,
+            _: &workforce_desk::issues::Asked,
+        ) -> Result<Value, String> {
+            Err("not here".into())
+        }
+
+        async fn offered(
+            &self,
+            _: &workforce_desk::issues::Asker,
+        ) -> Vec<workforce_desk::board::System> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            vec![workforce_desk::board::System::Linear]
+        }
+    }
 
     async fn rpc(url: &str, body: Value) -> (reqwest::StatusCode, Value) {
         let response = reqwest::Client::new()
@@ -122,18 +200,34 @@ mod tests {
             assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
             d.serve_lines(LineMcp::new(d.clone()));
 
-            let (_, listed) = rpc(&url, json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).await;
-            let names: Vec<&str> = listed["result"]["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|t| t["name"].as_str().unwrap())
-                .collect();
-            let mut want: Vec<&str> = TOOLS.iter().map(|t| t.name).collect();
-            let mut got = names.clone();
-            want.sort();
-            got.sort();
-            assert_eq!(got, want);
+            let listed = async || {
+                let (_, listed) =
+                    rpc(&url, json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).await;
+                let mut names: Vec<String> = listed["result"]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|t| t["name"].as_str().unwrap().to_string())
+                    .collect();
+                names.sort();
+                names
+            };
+            let want = |offered: &[&str]| {
+                let mut want: Vec<String> = TOOLS
+                    .iter()
+                    .map(|t| t.name)
+                    .filter(|n| {
+                        workforce_desk::issues::system_of_tool(n).is_none() || offered.contains(n)
+                    })
+                    .map(str::to_string)
+                    .collect();
+                want.sort();
+                want
+            };
+            // An issue tool is offered only where its system is reached.
+            assert_eq!(listed().await, want(&[]));
+            d.issues_with(Arc::new(OnlyLinear));
+            assert_eq!(listed().await, want(&["linear"]));
 
             let (_, told) = rpc(
                 &url,
@@ -167,13 +261,52 @@ mod tests {
             let ok = bearer(token).await.unwrap();
             assert_eq!(ok.status(), reqwest::StatusCode::OK);
             let listed: Value = ok.json().await.unwrap();
-            assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), TOOLS.len());
+            assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), TOOLS.len() - 1);
             assert_eq!(bearer("nope").await.unwrap().status(), reqwest::StatusCode::NOT_FOUND);
 
             // A wrong token is answered nothing.
             let wrong = format!("{}nope", &url[..url.rfind('/').unwrap() + 1]);
             let (status, body) = rpc(&wrong, json!({"jsonrpc": "2.0", "id": 4, "method": "tools/list"})).await;
             assert_eq!((status, body), (reqwest::StatusCode::NOT_FOUND, Value::Null));
+        })
+        .await;
+    }
+
+    /// A call doesn't read the board again for the tools; a list does.
+    #[tokio::test]
+    async fn calls_reuse_the_tools_a_list_worked_out() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let d = desk(pool, dir.path()).await;
+            let s = new_session(&d, dir.path(), "acme-web").await;
+            let url = hook_url(dir.path(), s.id).await.replace("/hook/", "/mcp/");
+            let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            d.issues_with(Arc::new(Counting(Arc::clone(&reads))));
+            d.serve_lines(LineMcp::new(d.clone()));
+            let count = || reads.load(std::sync::atomic::Ordering::SeqCst);
+
+            rpc(
+                &url,
+                json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+            )
+            .await;
+            assert_eq!(count(), 1);
+            for id in 2..5 {
+                let (_, told) = rpc(
+                    &url,
+                    json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+                        "params": {"name": "tell", "arguments": {"to": "you", "text": "hi"}}}),
+                )
+                .await;
+                assert_ne!(told["result"]["isError"], true, "{told}");
+            }
+            assert_eq!(count(), 1, "calls read the board again");
+            rpc(
+                &url,
+                json!({"jsonrpc": "2.0", "id": 9, "method": "tools/list"}),
+            )
+            .await;
+            assert_eq!(count(), 2, "a list reads it afresh");
         })
         .await;
     }
