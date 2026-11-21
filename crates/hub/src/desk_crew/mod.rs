@@ -547,30 +547,37 @@ pub(crate) fn boss_may_change(caller: &str, target: &str) -> Result<(), String> 
         .iter()
         .filter_map(Weak::upgrade)
         .find(|c| c.state.registry.get(caller).is_some());
-    let Some(crew) = crew else {
-        return Ok(());
-    };
-    let Some((_, o)) = crew.overseer_named(caller) else {
-        return Ok(());
-    };
-    if caller == target {
-        return Ok(());
+    match crew {
+        Some(crew) => crew.boss_may_change(caller, target),
+        None => Ok(()),
     }
-    let seen = crew.desk.seen_by(&o.scope);
-    let other_boss = crew.overseer_named(target).is_some()
-        || named_group(
-            &crew
-                .state
-                .registry
-                .get(target)
-                .map(|s| s.workspace.clone())
-                .unwrap_or_default(),
-        )
-        .is_some();
-    if other_boss || !crew.agent_in(target, &seen) {
-        return Err(crew.not_ours(&o.scope));
+}
+
+impl CrewHub {
+    /// [`boss_may_change`], on this crew's hub.
+    pub(crate) fn boss_may_change(&self, caller: &str, target: &str) -> Result<(), String> {
+        let Some((_, o)) = self.overseer_named(caller) else {
+            return Ok(());
+        };
+        if caller == target {
+            return Ok(());
+        }
+        let seen = self.desk.seen_by(&o.scope);
+        let other_boss = self.overseer_named(target).is_some()
+            || named_group(
+                &self
+                    .state
+                    .registry
+                    .get(target)
+                    .map(|s| s.workspace.clone())
+                    .unwrap_or_default(),
+            )
+            .is_some();
+        if other_boss || !self.agent_in(target, &seen) {
+            return Err(self.not_ours(&o.scope));
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// `service`'s settings as they are run: while any group has a boss of its

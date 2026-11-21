@@ -1063,17 +1063,18 @@ async fn only_the_person_sets_oversight_and_a_boss_changes_no_agent_outside_its_
             c.crew.overseer_named("sarah").unwrap().1.scope,
             Scope::Group("acme".into())
         );
+        // On this test's own crew: another test's "sarah" may be running.
         let refusal = "That isn't one of Acme's.";
         for target in ["desk", "mia", "ada"] {
             assert_eq!(
-                super::super::boss_may_change("sarah", target).unwrap_err(),
+                c.crew.boss_may_change("sarah", target).unwrap_err(),
                 refusal,
                 "{target}"
             );
         }
-        assert!(super::super::boss_may_change("sarah", "scout").is_ok());
+        assert!(c.crew.boss_may_change("sarah", "scout").is_ok());
         assert!(
-            super::super::boss_may_change("scout", "desk").is_ok(),
+            c.crew.boss_may_change("scout", "desk").is_ok(),
             "only bosses are held"
         );
         // An overseer never writes to another on a line.

@@ -1037,12 +1037,18 @@ async fn what_happens_together_is_one_check_in_and_the_day_has_a_cap() {
     use workforce_desk::crew::Event;
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let (_, _crew, d, _llm) = overseeing(
+        let (_, _crew, d, _llm) = overseeing_at(
             dir.path(),
             pool,
             "Both sessions finished.",
             "[oversight]\nenabled = true\nmax_checkins_per_day = 1\nwake = { waiting_minutes = 0, quiet_minutes = 0 }\n",
             &[],
+            // A wide gathering window: under load the two finishes are
+            // noted further apart than FAST's 150 ms.
+            Timing {
+                coalesce: Duration::from_secs(2),
+                ..FAST
+            },
         )
         .await;
         for name in ["acme-web", "workforce-e7"] {
