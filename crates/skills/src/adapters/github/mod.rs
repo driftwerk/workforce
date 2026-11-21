@@ -17,7 +17,7 @@ use std::sync::Arc;
 use workforce_agent::tools::Tool;
 
 use crate::adapters::utils::{
-    build_instances, live_from_config, InstancePaths, Instances, LiveInstances,
+    build_instances, live_from_config, InstancePaths, Instances, LiveInstances, WorkspacesTool,
 };
 use crate::definition::{
     CredentialRequirement, SkillDefinition, SkillEventSource, SkillPolicy, SkillRequirements,
@@ -335,9 +335,11 @@ impl GithubSkill {
                 self.default_owner.clone(),
             )),
             // Desk's GitHub board sync
-            Arc::new(board::GithubWorkspacesTool::new(
+            Arc::new(WorkspacesTool::new(
+                "github.workspaces",
+                "The GitHub connections you can use, by name, as {workspaces, default}: default is the one a call without `workspace` goes to, or null when you must pass one. Takes no arguments.",
                 Arc::clone(&self.clients),
-                self.default_workspace.clone(),
+                Some(self.default_workspace.clone()),
             )),
             Arc::new(board::GithubViewerTool::new(
                 Arc::clone(&self.clients),

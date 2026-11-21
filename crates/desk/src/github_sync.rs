@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 
 use crate::board::{Assignee, Facts, Filter, IssueRef, Sprint, TicketState};
-use crate::board_sync::{remote_time, unfence, Issue, RemoteState};
+use crate::board_sync::{remote_time, unfence, Issue, RemoteError, RemoteState};
 
 /// The tools a GitHub board's sync needs ([`crate::board_sync::tools_of`]).
 pub const TOOLS: &[&str] = workforce_core::desk::BOARD_SYNC_GITHUB_TOOLS;
@@ -117,38 +117,48 @@ pub fn reached(tool: &str, answer: &Value) -> bool {
     tool != "github.projects_list" || answer["projects"].as_array().is_some_and(|p| !p.is_empty())
 }
 
-/// Which of a person's several GitHub connections a link goes through.
+/// Whether a connection reaches what a link names, as [`reach_probe`]'s
+/// read answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    Yes,
+    /// GitHub said it can't: not found, or no access.
+    No,
+    /// It couldn't be asked (the hub away, a rate limit, an approval).
+    Unknown,
+}
+
+/// What `tool`'s `answer` says of a connection's reach.
+pub fn reach_of(tool: &str, answer: &Result<Value, RemoteError>) -> Reach {
+    match answer {
+        Ok(answer) if reached(tool, answer) => Reach::Yes,
+        Ok(_) | Err(RemoteError::Failed(_) | RemoteError::Workspace { .. }) => Reach::No,
+        Err(_) => Reach::Unknown,
+    }
+}
+
+/// Which of a person's several GitHub connections a link goes through,
+/// where neither the one picked nor the default does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Connection {
     Use(String),
-    /// More than one reaches it and neither the one asked for nor the
-    /// default does: the person picks among these.
+    /// More than one of the others reaches it: the person picks among
+    /// these.
     Ask(Vec<String>),
 }
 
-/// The connection asked for when it reaches what the link names (in
-/// `reaching`), else the default when it does, else the only one that
-/// does; with several and neither, the person picks. None reaching: the
-/// one asked for or the default, so GitHub's own answer says why.
-pub fn connection(
-    asked: Option<&str>,
-    default: Option<&str>,
-    reaching: &[String],
-) -> Option<Connection> {
-    let reaches = |n: &&str| reaching.iter().any(|r| r == n);
-    let named = |n: &str| Connection::Use(n.to_string());
-    asked
-        .filter(reaches)
-        .or_else(|| default.filter(reaches))
-        .map(named)
-        .or_else(|| match reaching {
-            [] => asked.or(default).map(named),
-            [one] => Some(named(one)),
-            several => Some(Connection::Ask(several.to_vec())),
-        })
+/// Of the other connections that reach what a link names, the only one;
+/// several, the person picks; none, nothing is chosen, so the default's
+/// own answer says why.
+pub fn among(reaching: Vec<String>) -> Option<Connection> {
+    match reaching.len() {
+        0 => None,
+        1 => reaching.into_iter().next().map(Connection::Use),
+        _ => Some(Connection::Ask(reaching)),
+    }
 }
 
-/// Checks a project's or repository's `owner/repo` for new tickets./// Checks a project's or repository's `owner/repo` for new tickets.
+/// Checks a project's or repository's `owner/repo` for new tickets.
 pub fn check_repo(repo: &str) -> Result<(), String> {
     match target_of(repo) {
         Some(Target::Repo { .. }) => Ok(()),

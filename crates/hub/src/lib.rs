@@ -238,6 +238,7 @@ pub use hub_core::profile;
 pub mod projects;
 pub mod rate_limit;
 pub mod reaction_tool;
+pub(crate) mod recent;
 pub use hub_core::recipients;
 pub mod boss_links;
 pub mod redact;

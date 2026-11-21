@@ -1923,42 +1923,6 @@ impl Tool for JiraAttachmentReadTool {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// jira.workspaces: the caller's Jira sites, by name
-// ──────────────────────────────────────────────────────────────────────
-
-pub struct JiraWorkspacesTool {
-    instances: Arc<LiveInstances<JiraClient>>,
-}
-
-impl JiraWorkspacesTool {
-    /// Workspaces read as the caller on each call.
-    pub fn new(instances: Arc<LiveInstances<JiraClient>>) -> Self {
-        Self { instances }
-    }
-}
-
-#[async_trait]
-impl Tool for JiraWorkspacesTool {
-    fn name(&self) -> &str {
-        "jira.workspaces"
-    }
-    fn description(&self) -> &str {
-        "The Jira sites (workspaces) you can use, by name, as {workspaces, default}: default is the one a call without `workspace` goes to, or null when you must pass one. Takes no arguments."
-    }
-    fn input_schema(&self) -> Value {
-        json!({ "type": "object", "properties": {}, "required": [] })
-    }
-    async fn execute(&self, _input: Value) -> Result<ToolResult> {
-        let start = std::time::Instant::now();
-        let (clients, default) = self.instances.for_caller();
-        Ok(ToolResult::success(
-            crate::adapters::utils::workspaces_answer(&clients, &default),
-            start.elapsed().as_millis() as u64,
-        ))
-    }
-}
-
-// ──────────────────────────────────────────────────────────────────────
 // 12. jira.list_projects
 // ──────────────────────────────────────────────────────────────────────
 

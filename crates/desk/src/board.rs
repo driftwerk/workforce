@@ -98,10 +98,10 @@ pub enum Via {
 pub const THIS_COMPUTER: &str = "This computer";
 
 /// A hub's name as it reads mid-sentence: "on this computer", "on Atlas".
-pub fn in_sentence(hub: &str) -> std::borrow::Cow<'_, str> {
+pub fn in_sentence(hub: &str) -> &str {
     match hub {
-        THIS_COMPUTER => THIS_COMPUTER.to_lowercase().into(),
-        named => named.into(),
+        THIS_COMPUTER => "this computer",
+        named => named,
     }
 }
 

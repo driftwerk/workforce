@@ -479,40 +479,50 @@ fn states_come_from_status_options_or_open_closed_and_labels() {
     );
 }
 
-/// A case of [`connection`]: asked, default, reaching, and the answer.
-type ConnectionCase<'a> = (
-    Option<&'a str>,
-    Option<&'a str>,
-    &'a [&'a str],
-    Option<Connection>,
-);
+#[test]
+fn of_the_other_connections_the_only_one_reaching_is_used_and_several_are_asked() {
+    let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(among(vec![]), None);
+    assert_eq!(among(names(&["b"])), Some(Connection::Use("b".into())));
+    assert_eq!(
+        among(names(&["b", "c"])),
+        Some(Connection::Ask(names(&["b", "c"])))
+    );
+}
 
 #[test]
-fn a_link_s_connection_is_the_one_that_reaches_what_it_names() {
-    let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-    let used = |n: &str| Some(Connection::Use(n.to_string()));
-    let cases: &[ConnectionCase] = &[
-        (Some("b"), Some("a"), &["a", "b"], used("b")),
-        (Some("c"), Some("a"), &["a", "b"], used("a")),
-        (None, Some("a"), &["a", "b"], used("a")),
-        (None, Some("a"), &["b"], used("b")),
-        (Some("a"), Some("a"), &["b"], used("b")),
-        (
-            None,
-            Some("a"),
-            &["b", "c"],
-            Some(Connection::Ask(names(&["b", "c"]))),
+fn a_connection_s_reach_is_what_github_said_or_unknown() {
+    let project = "github.project_get";
+    assert_eq!(reach_of(project, &Ok(json!({ "id": "PVT_1" }))), Reach::Yes);
+    assert_eq!(
+        reach_of(project, &Err(RemoteError::Failed("Not found".into()))),
+        Reach::No
+    );
+    assert_eq!(
+        reach_of(
+            project,
+            &Err(RemoteError::Workspace {
+                what: "GitHub connection".into(),
+                asked: Some("x".into()),
+                names: vec![],
+            })
         ),
-        (Some("c"), Some("a"), &[], used("c")),
-        (None, Some("a"), &[], used("a")),
-        (None, None, &[], None),
-    ];
-    for (asked, default, reaching, want) in cases {
-        assert_eq!(
-            &connection(*asked, *default, &names(reaching)),
-            want,
-            "asked {asked:?}, default {default:?}, reaching {reaching:?}"
-        );
+        Reach::No
+    );
+    assert_eq!(
+        reach_of("github.projects_list", &Ok(json!({ "projects": [] }))),
+        Reach::No
+    );
+    for unknown in [
+        RemoteError::Offline("away".into()),
+        RemoteError::RateLimited {
+            retry_after_secs: None,
+        },
+        RemoteError::Waiting {
+            request_id: "r".into(),
+        },
+    ] {
+        assert_eq!(reach_of(project, &Err(unknown)), Reach::Unknown);
     }
 }
 

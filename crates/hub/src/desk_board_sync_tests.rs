@@ -14,7 +14,7 @@ use uuid::Uuid;
 use workforce_agent::security::external_content::wrap_external_content;
 use workforce_agent::tools::{Tool, ToolResult};
 use workforce_common::settings::RemoteMcpConfig;
-use workforce_desk::board::{Filter, Paused, System, TicketState, Via};
+use workforce_desk::board::{Filter, Paused, System, TicketState, Via, THIS_COMPUTER};
 use workforce_desk::{Desk, LinkBoard, NewBoard};
 use workforce_identity::store::IdentityStore;
 use workforce_identity::types::{Identity, IdentityRole};
@@ -1773,7 +1773,7 @@ async fn a_person_s_own_github_key_offers_github_through_this_computer() {
             .sync
             .offered(System::Github, &Via::ThisHub, &person, None, None)
             .await
-            .map_err(|p| paused_words("This computer", System::Github, &p))
+            .map_err(|p| paused_words(THIS_COMPUTER, System::Github, &p))
             .expect("GitHub is offered through this computer");
         assert_eq!(reached.agent.as_deref(), Some("default"));
         let tools = reached.remote.tools().await.unwrap();
@@ -1822,6 +1822,21 @@ async fn this_computer_finds_the_agent_that_has_jira() {
             desk.tickets(b.id, &Default::default()).await.unwrap().len(),
             1
         );
+
+        // Its agent shut to the person: the board pauses, as missing the
+        // tools, and goes on through it once it lets them in again.
+        close_agent(&local.fx.state, "lattice", true);
+        local.sync.pass_board(b.id, true).await.unwrap();
+        local.sync.pass_board(b.id, true).await.unwrap();
+        let paused = desk.board_sync(b.id).await.unwrap().unwrap().1.paused;
+        assert_eq!(
+            paused.as_ref().map(|p| p.say(THIS_COMPUTER)).as_deref(),
+            Some("Paused: no agent on this computer you can reach has Jira switched on any more.")
+        );
+        close_agent(&local.fx.state, "lattice", false);
+        local.sync.pass_board(b.id, true).await.unwrap();
+        let s = desk.board_sync(b.id).await.unwrap().unwrap().1;
+        assert_eq!((s.agent.as_deref(), s.paused), (Some("lattice"), None));
 
         close_agent(&local.fx.state, "lattice", true);
         let (status, body) = local
