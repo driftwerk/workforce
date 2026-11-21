@@ -276,6 +276,7 @@ pub(super) async fn start_one(
         "MCP server initialised"
     );
 
+    super::tool::mark_external(id, cfg.external);
     let tool_count = register_tools(id, agent_id, &client, &tools, &upstream_tools, &cost);
     // Record (or clear) this server's MCP-workspace membership so the tool
     // filter + call guard know whether it's gated. A server with `workspace`

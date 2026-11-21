@@ -169,6 +169,7 @@ fn gate_with(
         .computer_gate
         .as_deref()
         .is_some_and(|g| g.asks_nothing());
+    let unbound = gates.computer_gate.as_deref().is_some_and(|g| g.unbound());
     let response = apply_surface_gate(
         response,
         effect.as_ref(),
@@ -235,6 +236,9 @@ fn gate_with(
                 consumed: Vec::new(),
             };
         }
+        // At Full access or Act fully nothing is asked: only a refusing
+        // scope (a monitor's turn) still stops a call.
+        Some(_) if asks_nothing || unbound => (response, holds),
         Some((_, held)) => (held_for_approval(response, held.reason), None),
     };
     match response.decision {
@@ -2600,6 +2604,48 @@ mod tests {
                 1,
                 "a call missing its text was never refused"
             );
+        }
+
+        /// A gate at Full access that asks before nothing.
+        struct FullAccess;
+
+        impl ComputerGate for FullAccess {
+            fn decides(&self, _tool: &str) -> bool {
+                false
+            }
+            fn asks_nothing(&self) -> bool {
+                true
+            }
+            fn verdict(
+                &self,
+                _tool: &str,
+                _effect: &workforce_core::computer::Effect,
+            ) -> workforce_core::computer::Verdict {
+                workforce_core::computer::Verdict::Run {
+                    by: workforce_core::computer::By::Rule,
+                }
+            }
+            fn record(&self, _record: crate::tools::computer::Record) {}
+        }
+
+        #[test]
+        fn at_full_access_or_act_fully_only_a_refusing_scope_stops_a_call() {
+            let ungated: [Arc<dyn ComputerGate>; 2] =
+                [Arc::new(FullAccess), Arc::new(Standing(true))];
+            for gate in ungated {
+                let with = |refuses: bool| ToolGates {
+                    computer_gate: Some(Arc::clone(&gate)),
+                    ..guarded("C2", refuses)
+                };
+                assert!(matches!(
+                    post(&with(false), &permissive_policy()),
+                    GateOutcome::Execute { .. }
+                ));
+                assert!(matches!(
+                    post(&with(true), &permissive_policy()),
+                    GateOutcome::Blocked { .. }
+                ));
+            }
         }
 
         #[test]

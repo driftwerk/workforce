@@ -240,6 +240,7 @@ async fn deliver(svc: &Arc<AgentService>, row: &PendingApproval, response: &str)
                 username: None,
                 icon_url: None,
                 blocks: None,
+                outside: false,
             })
             .await
         {

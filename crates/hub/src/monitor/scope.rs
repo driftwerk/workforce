@@ -23,9 +23,11 @@ const MESSAGING_READS: &[&str] = &[
 ];
 
 /// Reads a monitor's turn is not given unless it names them: a fetch can
-/// carry what the turn read out in its URL, and the agent's own files and
-/// data are not what the event is about.
-const UNOFFERED_READS: &[&str] = &["web.", "filesystem.", "data."];
+/// carry what the turn read out in its URL, and the agent's own files are
+/// not what the event is about. `data.*` stays: every whitelisted turn keeps
+/// it to read back what a call spilled
+/// ([`survives_exclusive_filter`](crate::turn_loop::tools::survives_exclusive_filter)).
+const UNOFFERED_READS: &[&str] = &["web.", "filesystem."];
 
 /// How a monitor's turn delivers its result.
 pub(crate) enum Delivery<'a> {
@@ -40,21 +42,30 @@ pub(crate) enum Delivery<'a> {
     Told,
 }
 
-/// The tools a monitor's turn is given: the read set, its own delivery when
-/// it posts, and `named`.
-pub(crate) fn turn_tools(delivery: &Delivery<'_>, named: &[String]) -> Vec<String> {
-    let posts = matches!(delivery, Delivery::Posts { .. }).then_some(DELIVERY_TOOL);
+/// The tools the hub knows only read: the curation set, every adapter's
+/// reads, mail's, Google's outside reads and the messaging reads.
+pub(crate) fn reads() -> Vec<String> {
     crate::turn_loop::worker::curation_tool_patterns()
         .into_iter()
-        .filter(|tool| !UNOFFERED_READS.iter().any(|read| tool.starts_with(read)))
         .chain(
             workforce_skills::adapters::email::READ_TOOLS
                 .iter()
                 .chain(workforce_skills::adapters::google::tool_helpers::OUTSIDE_READS)
                 .chain(MESSAGING_READS)
-                .chain(posts.as_ref())
                 .map(|tool| tool.to_string()),
         )
+        .collect()
+}
+
+/// The tools a monitor's turn is given: the reads it is offered, its own
+/// delivery when it posts, and `named`. A `program_run` the agent offers
+/// runs only these, under the same guard.
+pub(crate) fn turn_tools(delivery: &Delivery<'_>, named: &[String]) -> Vec<String> {
+    let posts = matches!(delivery, Delivery::Posts { .. }).then_some(DELIVERY_TOOL);
+    reads()
+        .into_iter()
+        .filter(|tool| !UNOFFERED_READS.iter().any(|read| tool.starts_with(read)))
+        .chain(posts.map(str::to_string))
         .chain(named.iter().cloned())
         .collect()
 }
@@ -85,6 +96,7 @@ impl MonitorTurn {
                 named: named.to_vec(),
                 armed: Some(format!("what monitor '{}' was given", monitor.name)),
                 refuses: true,
+                stops: Vec::new(),
             })),
             tools: turn_tools(delivery, named),
         }
@@ -102,7 +114,7 @@ impl MonitorTurn {
         with_tool_whitelist(
             Some(ToolWhitelist::for_own_session(&self.tools)),
             with_content_guard(
-                Arc::clone(&self.guard),
+                Some(Arc::clone(&self.guard)),
                 service.process_turn(
                     session,
                     "monitor",
@@ -140,14 +152,22 @@ pub(crate) fn keep(session: &mut workforce_common::session::Session) {
     }
 }
 
-/// The guard kept on `session` for a turn its caller set none for.
+/// The guard kept on `session` for a turn its caller set none for. A kept
+/// scope that can't be read is kept as strictly as any: armed, refusing.
 pub(crate) fn kept_guard(
     session: &workforce_common::session::Session,
 ) -> Option<Arc<ContentGuard>> {
     if workforce_agent::runner::caller_content_guard().is_some() {
         return None;
     }
-    let scope: ContentScope = serde_json::from_value(session.content_scope()?.clone()).ok()?;
+    let scope = serde_json::from_value(session.content_scope()?.clone()).unwrap_or_else(|e| {
+        tracing::warn!(session = %session.id, error = %e, "A kept content scope could not be read; the turn refuses");
+        ContentScope {
+            armed: Some("a turn kept before it was resumed".to_string()),
+            refuses: true,
+            ..ContentScope::default()
+        }
+    });
     Some(Arc::new(ContentGuard::new(scope)))
 }
 
@@ -228,12 +248,74 @@ mod tests {
         ] {
             assert!(tools.iter().any(|t| t == tool), "{tool} is missing");
         }
-        for tool in ["filesystem.read", "data.query", "web.fetch"] {
+        for tool in ["filesystem.read", "web.fetch"] {
             assert!(
                 !tools.iter().any(|t| t == tool),
                 "{tool} is offered unnamed"
             );
         }
+    }
+
+    #[test]
+    fn every_tool_a_turn_is_offered_passes_the_guard() {
+        workforce_agent::security::monitor::know_reads(reads());
+        let scope = ContentScope::default();
+        for tool in turn_tools(&Delivery::Told, &[]) {
+            assert_eq!(
+                workforce_agent::security::monitor::assess(
+                    &tool,
+                    &serde_json::json!({}),
+                    None,
+                    &scope
+                ),
+                None,
+                "{tool}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_kept_scope_guards_the_resumed_turn_as_the_first_was() {
+        use workforce_common::session::Session;
+        let turn = MonitorTurn::new(&meta(), &posts(), &["linear".into()]);
+        let held = turn
+            .guard
+            .check("vault.get", &serde_json::json!({}), None)
+            .unwrap();
+        turn.guard.refused(&held.signal);
+        let mut session = Session::new("monitor:inbox:1", "u", "a");
+        assert!(
+            kept_guard(&session).is_none(),
+            "nothing kept, nothing guarded"
+        );
+        with_content_guard(Some(Arc::clone(&turn.guard)), async { keep(&mut session) }).await;
+        assert!(session.content_scope().is_some());
+        let resumed = kept_guard(&session).unwrap();
+        assert_eq!(resumed.armed(), turn.guard.armed());
+        assert_eq!(resumed.stops(), vec![held.signal]);
+        let refused = resumed
+            .check("email.send", &serde_json::json!({}), None)
+            .unwrap();
+        assert!(refused.refused);
+        assert!(resumed
+            .check("linear.issue_create", &serde_json::json!({}), None)
+            .is_none());
+        let under_caller = with_content_guard(Some(Arc::clone(&turn.guard)), async {
+            kept_guard(&session)
+        })
+        .await;
+        assert!(under_caller.is_none(), "a caller's own guard wins");
+    }
+
+    #[test]
+    fn a_kept_scope_that_cannot_be_read_refuses() {
+        let mut session = workforce_common::session::Session::new("monitor:inbox:1", "u", "a");
+        session.set_content_scope(serde_json::json!({ "expected": "not a list" }));
+        let guard = kept_guard(&session).unwrap();
+        assert!(guard.armed().is_some());
+        assert!(guard
+            .check("messaging.send", &serde_json::json!({}), None)
+            .is_some_and(|held| held.refused));
     }
 
     #[test]

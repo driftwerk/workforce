@@ -319,6 +319,91 @@ pub trait Tool: Send + Sync {
     }
 }
 
+/// A tool saying what it returns is outside content
+/// ([`Tool::reads_outside_content`]); in every other way, the tool it wraps.
+pub struct ReadsOutside(std::sync::Arc<dyn Tool>);
+
+impl ReadsOutside {
+    /// `tools`, each one `reads` names saying what it returns is outside
+    /// content.
+    pub fn marking(
+        tools: Vec<std::sync::Arc<dyn Tool>>,
+        reads: impl Fn(&str) -> bool,
+    ) -> Vec<std::sync::Arc<dyn Tool>> {
+        tools
+            .into_iter()
+            .map(|tool| match reads(tool.name()) {
+                true => std::sync::Arc::new(Self(tool)) as std::sync::Arc<dyn Tool>,
+                false => tool,
+            })
+            .collect()
+    }
+}
+
+#[async_trait]
+impl Tool for ReadsOutside {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    fn description(&self) -> &str {
+        self.0.description()
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        self.0.input_schema()
+    }
+
+    async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
+        self.0.execute(input).await
+    }
+
+    fn soft_deadline(&self) -> Option<std::time::Duration> {
+        self.0.soft_deadline()
+    }
+
+    fn approval_summary(&self, input: &serde_json::Value) -> Option<String> {
+        self.0.approval_summary(input)
+    }
+
+    fn approval_requirement(&self) -> Option<String> {
+        self.0.approval_requirement()
+    }
+
+    fn approval_notice(&self) -> Option<String> {
+        self.0.approval_notice()
+    }
+
+    fn surface_effect(&self, input: &serde_json::Value) -> Option<SurfaceEffect> {
+        self.0.surface_effect(input)
+    }
+
+    fn reads_outside_content(&self) -> bool {
+        true
+    }
+
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        self.0.effect(input)
+    }
+
+    async fn collect(
+        &self,
+        input: serde_json::Value,
+        plan: serde_json::Value,
+        checkpoint: Option<String>,
+    ) -> Result<ToolResult> {
+        self.0.collect(input, plan, checkpoint).await
+    }
+
+    async fn abandon(&self, plan: serde_json::Value, checkpoint: Option<String>) {
+        self.0.abandon(plan, checkpoint).await
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        self.0.definition()
+    }
+}
+
 impl ToolResult {
     pub fn success(output: serde_json::Value, duration_ms: u64) -> Self {
         Self {

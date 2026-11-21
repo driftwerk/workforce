@@ -192,6 +192,8 @@ struct CustomConfig {
     #[serde(default)]
     fallback_to_builtin: bool,
     #[serde(default)]
+    external: bool,
+    #[serde(default)]
     tools_allow: Vec<String>,
     #[serde(default)]
     tools_deny: Vec<String>,
@@ -245,6 +247,7 @@ async fn install_server(
                 refresh_interval_secs: c.refresh_interval_secs,
                 shadows: c.shadows,
                 fallback_to_builtin: c.fallback_to_builtin,
+                external: c.external,
                 tools_allow: c.tools_allow,
                 tools_deny: c.tools_deny,
                 // New installs are ungrouped (always active). Group later via

@@ -75,6 +75,7 @@ fn dynamic_config() -> McpServerConfig {
         workspace: None,
         env: None,
         default: false,
+        external: false,
     }
 }
 
@@ -183,6 +184,7 @@ fn discover_config(endpoint: String, provider: &str) -> McpServerConfig {
         workspace: None,
         env: None,
         default: false,
+        external: false,
     }
 }
 

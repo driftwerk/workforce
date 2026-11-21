@@ -76,6 +76,7 @@ impl Tool for SlackSendTool {
             username: None,
             icon_url: None,
             blocks: None,
+            outside: false,
         };
 
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -1916,6 +1917,7 @@ mod tests {
                 thread_id: None,
                 files: vec![],
                 bot_id: None,
+                outside: false,
             }])
         }
 
@@ -1938,6 +1940,7 @@ mod tests {
                 thread_id: None,
                 files: vec![],
                 bot_id: None,
+                outside: false,
             };
             Ok(HistoryPage {
                 messages: vec![msg("100.002"), msg("100.001")],

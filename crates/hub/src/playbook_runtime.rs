@@ -1085,6 +1085,7 @@ async fn post_returning(
                 username: None,
                 icon_url: None,
                 blocks: None,
+                outside: false,
             })
             .await
         {
@@ -1119,6 +1120,7 @@ fn card_outbound(
             status,
             button_rows,
         )),
+        outside: false,
     }
 }
 

@@ -2948,7 +2948,12 @@ pub(crate) fn spawn_turn_extraction(
     response: &str,
     principal: &str,
 ) {
-    if crate::turn_extraction::is_eval_channel(&session.channel) {
+    // What a turn handling outside content said is that content's, never a
+    // memory of the person's.
+    let reads_outside = session.channel.starts_with("monitor:")
+        || workforce_agent::runner::caller_content_guard()
+            .is_some_and(|guard| guard.armed().is_some());
+    if crate::turn_extraction::is_eval_channel(&session.channel) || reads_outside {
         return;
     }
     let mem = service.effective_memory();
@@ -5588,7 +5593,7 @@ pub(crate) async fn stream_admitted(
     let chat_for_task = workforce_agent::runner::chat_origin();
     // The caller's guard (a workflow step's, a monitor's) crosses the spawn.
     let guard_for_task = workforce_agent::runner::caller_content_guard();
-    let handle = tokio::spawn(workforce_agent::runner::with_caller_guard(guard_for_task, workforce_agent::runner::CURRENT_CHAT_ORIGIN.scope(chat_for_task, workforce_agent::runner::CURRENT_MEMORY_FENCE.scope(memory_fence_for_task, workforce_agent::runner::with_desk(desk_scope_for_task, CURRENT_BILLING_IDENTITY.scope(
+    let handle = tokio::spawn(workforce_agent::runner::with_content_guard(guard_for_task, workforce_agent::runner::CURRENT_CHAT_ORIGIN.scope(chat_for_task, workforce_agent::runner::CURRENT_MEMORY_FENCE.scope(memory_fence_for_task, workforce_agent::runner::with_desk(desk_scope_for_task, CURRENT_BILLING_IDENTITY.scope(
         billing_identity_for_task.unwrap_or_default(),
         CURRENT_VOICE_CHANNEL.scope(
         voice_channel_for_task,

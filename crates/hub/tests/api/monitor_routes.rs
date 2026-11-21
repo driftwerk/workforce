@@ -63,6 +63,7 @@ impl MemberSurface {
             thread_id: None,
             files: vec![],
             bot_id: None,
+            outside: false,
         });
     }
 }

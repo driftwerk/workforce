@@ -412,6 +412,12 @@ impl ToolWhitelist {
     }
 }
 
+/// Whether `name` is the tool `entry` names, or one under its namespace.
+pub fn names_tool(entry: &str, name: &str) -> bool {
+    name.strip_prefix(entry)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+}
+
 /// The tool whitelist the current turn declared, if any (see
 /// [`TOOL_WHITELIST`]). Absent scope reads as `None`: the full surface.
 pub fn tool_whitelist() -> Option<ToolWhitelist> {
@@ -451,7 +457,7 @@ pub fn caller_content_guard() -> Option<Arc<crate::security::monitor::ContentGua
 }
 
 /// Run `fut` under `guard`, or unchanged when there is none.
-pub async fn with_caller_guard<F: std::future::Future>(
+pub async fn with_content_guard<F: std::future::Future>(
     guard: Option<Arc<crate::security::monitor::ContentGuard>>,
     fut: F,
 ) -> F::Output {
@@ -459,14 +465,6 @@ pub async fn with_caller_guard<F: std::future::Future>(
         Some(guard) => CONTENT_GUARD.scope(guard, fut).await,
         None => fut.await,
     }
-}
-
-/// Run `fut` under `guard`.
-pub async fn with_content_guard<F: std::future::Future>(
-    guard: Arc<crate::security::monitor::ContentGuard>,
-    fut: F,
-) -> F::Output {
-    CONTENT_GUARD.scope(guard, fut).await
 }
 
 /// Whether the current turn is a sandboxed game turn — it runs with no tools and
@@ -1015,7 +1013,7 @@ impl SessionContext {
                 None => inner.await,
             }
         };
-        let inner = with_caller_guard(content_guard, inner);
+        let inner = with_content_guard(content_guard, inner);
         CURRENT_CHAT_ORIGIN.scope(self.chat, inner).await
     }
 }

@@ -245,6 +245,9 @@ impl Tool for MessagingSendTool {
             username: None,
             icon_url: None,
             blocks: None,
+            // A turn that read outside content may be posting it on.
+            outside: workforce_agent::runner::caller_content_guard()
+                .is_some_and(|guard| guard.armed().is_some()),
         };
 
         let surface = resolve_for_channel(&self.surfaces, &input, channel).await?;
@@ -1775,6 +1778,7 @@ mod tests {
                 thread_id: None,
                 files: vec![],
                 bot_id: None,
+                outside: false,
             }])
         }
 
@@ -1804,6 +1808,7 @@ mod tests {
                     thread_id: Some(thread_ts.to_string()),
                     files: vec![],
                     bot_id: None,
+                    outside: false,
                 },
                 ChannelMessage {
                     channel: channel.to_string(),
@@ -1816,6 +1821,7 @@ mod tests {
                     thread_id: Some(thread_ts.to_string()),
                     files: vec![],
                     bot_id: None,
+                    outside: false,
                 },
             ])
         }

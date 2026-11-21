@@ -154,6 +154,7 @@ pub async fn deliver_routed_approval(
                 username: None,
                 icon_url: None,
                 blocks: Some(blocks),
+                outside: false,
             })
             .await
         {
@@ -191,6 +192,7 @@ pub async fn deliver_routed_approval(
             username: None,
             icon_url: None,
             blocks: None,
+            outside: false,
         })
         .await
     {
@@ -436,6 +438,7 @@ pub async fn rewrite_all_targets(
             username: None,
             icon_url: None,
             blocks: Some(blocks),
+            outside: false,
         };
         if let Err(e) = surface.update_message(dm, ts, &outbound).await {
             tracing::warn!(error = %e, request = %row.request_id, "failed to rewrite approver DM");
@@ -450,6 +453,7 @@ pub async fn rewrite_all_targets(
             username: None,
             icon_url: None,
             blocks: None,
+            outside: false,
         };
         if let Err(e) = surface.update_message(channel, ts, &outbound).await {
             tracing::warn!(error = %e, "failed to rewrite origin-channel approval notice");
@@ -486,6 +490,7 @@ pub async fn rewrite_single_target(
         username: None,
         icon_url: None,
         blocks: Some(blocks),
+        outside: false,
     };
     if let Err(e) = surface.update_message(dm, ts, &outbound).await {
         tracing::warn!(error = %e, "failed to rewrite loser DM");

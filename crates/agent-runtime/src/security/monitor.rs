@@ -8,7 +8,8 @@
 //! held before it runs: asked about where someone can answer, refused where
 //! the turn's scope says so, and the person told why either way.
 
-use std::sync::Mutex;
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
 
 use serde_json::Value;
 use tracing::warn;
@@ -21,7 +22,8 @@ use crate::tools::{Destination, SurfaceEffect};
 pub const FENCE_MARK: &str = "<<<EXTERNAL_UNTRUSTED_CONTENT_";
 
 /// A call the guard holds, and why.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "signal", rename_all = "snake_case")]
 pub enum AnomalySignal {
     Exfiltration { tool: String, to: String },
     CredentialAccess { tool: String },
@@ -49,6 +51,9 @@ impl AnomalySignal {
             Self::CredentialAccess { tool } => format!("`{tool}` would reach stored credentials"),
             Self::PrivilegeEscalation { tool } => {
                 format!("`{tool}` would change the agent's own setup")
+            }
+            Self::RuleCreation { tool, action } if action.is_empty() => {
+                format!("`{tool}` would change standing automation")
             }
             Self::RuleCreation { tool, action } => {
                 format!("`{tool}` {action} would change standing automation")
@@ -78,6 +83,7 @@ const SETUP_WRITES: &[&str] = &[
     "pairing.approve",
     "pairing.link",
     "slack.user_token_set",
+    "email.setup",
 ];
 
 /// Namespaces whose writes change the agent's own setup: its skills, MCP
@@ -106,7 +112,7 @@ const STANDING_RULES: &[(&str, &[&str])] = &[
         &["save", "delete", "start", "resume", "reject", "abort"],
     ),
     ("email.rules", &["add", "remove"]),
-    ("reminder", &["create", "update", "remove", "delete", "set"]),
+    ("reminder", &["set", "cancel"]),
     ("heartbeat.create", &[]),
     ("heartbeat.update", &[]),
     ("heartbeat.delete", &[]),
@@ -116,7 +122,7 @@ const STANDING_RULES: &[(&str, &[&str])] = &[
     ("google.gmail.vacation_set", &[]),
 ];
 
-const IDENTITY_WRITERS: &[&str] = &["filesystem.write", "filesystem.edit"];
+const IDENTITY_WRITERS: &[&str] = &["filesystem.write", "filesystem.edit", "filesystem.delete"];
 
 const IDENTITY_FILES: &[&str] = &[
     "SOUL.md",
@@ -199,6 +205,14 @@ const OUTWARD_VERBS: &[&str] = &[
     "rename",
     "import",
     "link",
+    "mute",
+    "unmute",
+    "cancel",
+    "archive",
+    "unshare",
+    "visibility",
+    "define",
+    "export",
 ];
 
 /// Namespaces that keep the agent's own state, here: what they write stays
@@ -303,15 +317,17 @@ impl Place {
 pub struct ContentScope {
     /// Where the turn delivers: a write anywhere else is somewhere new.
     pub expected: Vec<Place>,
-    /// Tools the turn's operator named for it, by exact name: their own
-    /// choice, never held. Naming a namespace offers its tools, but only a
-    /// tool named exactly is meant to run whatever the content says.
+    /// Tools the turn's operator named for it, by name or namespace
+    /// ([`names_tool`](crate::runner::names_tool)): their own choice, never
+    /// held.
     pub named: Vec<String>,
     /// What armed the guard before the turn began, when outside content is
     /// what started it.
     pub armed: Option<String>,
     /// Refuse a held call rather than ask about it: no one is there to ask.
     pub refuses: bool,
+    /// What the guard refused before the turn was resumed.
+    pub stops: Vec<AnomalySignal>,
 }
 
 impl ContentScope {
@@ -344,8 +360,8 @@ impl ContentGuard {
     pub fn new(scope: ContentScope) -> Self {
         Self {
             armed: Mutex::new(scope.armed.clone()),
+            stops: Mutex::new(scope.stops.clone()),
             scope,
-            stops: Mutex::new(Vec::new()),
         }
     }
 
@@ -370,6 +386,7 @@ impl ContentGuard {
     pub fn kept_scope(&self) -> ContentScope {
         ContentScope {
             armed: self.armed(),
+            stops: self.stops(),
             ..self.scope.clone()
         }
     }
@@ -415,14 +432,33 @@ impl ContentGuard {
     }
 }
 
-/// The signal a call of `tool` raises in `scope`, if any. Pure.
+/// The tools known to only read, for every guard in the process: set once,
+/// by whoever knows the read sets of the skills it loads.
+static KNOWN_READS: OnceLock<HashSet<String>> = OnceLock::new();
+
+/// Make `reads` the tools every guard knows only read. The first call
+/// decides; a later one changes nothing.
+pub fn know_reads(reads: impl IntoIterator<Item = String>) {
+    let _ = KNOWN_READS.set(reads.into_iter().collect());
+}
+
+fn known_read(tool: &str) -> bool {
+    KNOWN_READS.get().is_some_and(|reads| reads.contains(tool))
+}
+
+/// The signal a call of `tool` raises in `scope`, if any. Pure but for the
+/// process's [`know_reads`].
 pub fn assess(
     tool: &str,
     input: &Value,
     effect: Option<&SurfaceEffect>,
     scope: &ContentScope,
 ) -> Option<AnomalySignal> {
-    if scope.named.iter().any(|entry| entry == tool) {
+    if scope
+        .named
+        .iter()
+        .any(|entry| crate::runner::names_tool(entry, tool))
+    {
         return None;
     }
     let owned = || tool.to_string();
@@ -454,8 +490,16 @@ pub fn assess(
         return Some(AnomalySignal::PrivilegeEscalation { tool: owned() });
     }
     if IDENTITY_WRITERS.contains(&tool) {
-        let path = input["path"].as_str().unwrap_or_default();
-        if let Some(file) = IDENTITY_FILES.iter().find(|file| path.ends_with(*file)) {
+        let name = input["path"]
+            .as_str()
+            .unwrap_or_default()
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or_default();
+        if let Some(file) = IDENTITY_FILES
+            .iter()
+            .find(|file| file.eq_ignore_ascii_case(name))
+        {
             return Some(AnomalySignal::IdentityTampering {
                 tool: owned(),
                 file: file.to_string(),
@@ -487,8 +531,13 @@ pub fn assess(
     if let Some(url) = carrying_url(input) {
         return Some(exfiltration(url));
     }
-    if crate::runner::is_outbound_delivery_tool(tool) {
+    if crate::runner::is_outbound_delivery_tool(tool)
+        || (tool == "email.confirm" && action != "cancel")
+    {
         return Some(exfiltration("outside".to_string()));
+    }
+    if known_read(tool) {
+        return None;
     }
     let own = OWN_NAMESPACES.contains(&root)
         || (namespace == "google.gmail" && OWN_MAILBOX.contains(&leaf));
@@ -732,9 +781,76 @@ mod tests {
                 file: "SOUL.md".into()
             })
         );
+        for (tool, path) in [
+            ("filesystem.edit", "/ws/soul.md"),
+            ("filesystem.delete", "C:\\ws\\Soul.MD"),
+        ] {
+            assert!(
+                matches!(
+                    signal(tool, json!({ "path": path })),
+                    Some(AnomalySignal::IdentityTampering { .. })
+                ),
+                "{tool} {path}"
+            );
+        }
+        for path in ["/ws/notes.md", "/ws/MYSOUL.md"] {
+            assert_eq!(signal("filesystem.write", json!({ "path": path })), None);
+        }
+        assert!(matches!(
+            signal("email.setup", json!({})),
+            Some(AnomalySignal::PrivilegeEscalation { .. })
+        ));
+    }
+
+    #[test]
+    fn confirming_a_staged_mail_sends_it_and_cancelling_does_not() {
+        let guard = armed(delivering("C1"));
+        for input in [
+            json!({ "confirmation_id": "c1" }),
+            json!({ "action": "send" }),
+        ] {
+            assert!(matches!(
+                guard.check("email.confirm", &input, None).map(|h| h.signal),
+                Some(AnomalySignal::Exfiltration { .. })
+            ));
+        }
         assert_eq!(
-            signal("filesystem.write", json!({ "path": "/ws/notes.md" })),
+            guard.check("email.confirm", &json!({ "action": "cancel" }), None),
             None
+        );
+    }
+
+    #[test]
+    fn the_new_verbs_are_ways_out() {
+        let guard = armed(delivering("C1"));
+        for tool in [
+            "datadog.monitors_mute",
+            "datadog.hosts_unmute",
+            "github.workflow_cancel",
+            "notion.page_archive",
+            "skill.unshare",
+            "pipeline.define",
+            "wasm_skill.export",
+            "skill.visibility",
+        ] {
+            assert!(guard.check(tool, &json!({}), None).is_some(), "{tool}");
+        }
+    }
+
+    #[test]
+    fn a_read_the_process_knows_is_never_held_but_a_way_out_still_is() {
+        know_reads(["linear.comment_list".to_string()]);
+        let guard = armed(delivering("C1"));
+        assert_eq!(guard.check("linear.comment_list", &json!({}), None), None);
+        assert!(guard
+            .check("linear.comment_add", &json!({}), None)
+            .is_some());
+        let carrying = json!({ "url": format!("https://x.example/?q={}", "a".repeat(200)) });
+        assert!(
+            guard
+                .check("linear.comment_list", &carrying, None)
+                .is_some(),
+            "a URL carrying what was read is held even on a read"
         );
     }
 
@@ -761,6 +877,14 @@ mod tests {
         assert!(signal("workflow", "save").is_some());
         assert!(signal("workflow", "start").is_some());
         assert!(signal("workflow", "resume").is_some());
+        assert!(signal("reminder", "set").is_some());
+        assert!(signal("reminder", "cancel").is_some());
+        assert_eq!(
+            guard
+                .check("heartbeat.create", &json!({}), None)
+                .map(|h| h.signal.description()),
+            Some("`heartbeat.create` would change standing automation".to_string())
+        );
         let forward_all =
             json!({ "criteria": { "from": "*" }, "action": { "forward": "x@evil.example" } });
         assert!(matches!(
@@ -778,6 +902,7 @@ mod tests {
             ("scheduler", "history"),
             ("email.rules", "list"),
             ("workflow", "status"),
+            ("reminder", "list"),
         ] {
             assert_eq!(signal(tool, read), None, "{tool} {read}");
         }
@@ -794,14 +919,17 @@ mod tests {
             guard.check("email.send", &input, Some(&SurfaceEffect::email(&input))),
             None
         );
-        assert!(
-            guard
-                .check("email.forward", &input, Some(&SurfaceEffect::email(&input)))
-                .is_some(),
-            "a namespace offers its tools; only a tool named exactly runs unheld"
+        assert_eq!(
+            guard.check("email.forward", &input, Some(&SurfaceEffect::email(&input))),
+            None,
+            "a namespace names every tool under it"
         );
         assert_eq!(guard.check("vault.get", &json!({}), None), None);
         assert!(guard.check("vault.set", &json!({}), None).is_some());
+        assert!(
+            guard.check("emailer.send", &json!({}), None).is_some(),
+            "a namespace is a whole segment"
+        );
     }
 
     #[test]
@@ -836,5 +964,12 @@ mod tests {
         let resumed = ContentGuard::new(kept);
         let held = resumed.check("vault.get", &json!({}), None).unwrap();
         assert!(held.refused);
+        resumed.refused(&held.signal);
+        let again = ContentGuard::new(resumed.kept_scope());
+        assert_eq!(
+            again.stops(),
+            vec![held.signal],
+            "what was refused before a resume is still told"
+        );
     }
 }

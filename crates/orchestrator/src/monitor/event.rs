@@ -123,11 +123,12 @@ impl MonitorEvent {
             || (name == "id" && matches!(self, Self::Observed(_)))
     }
 
-    /// Whether `template` puts any outside content in.
-    pub fn inlines_outside(&self, template: &str) -> bool {
+    /// Whether `template` puts in what the event said: its `text` or
+    /// `value`.
+    pub fn inlines_body(template: &str) -> bool {
         placeholder()
             .captures_iter(template)
-            .any(|captures| self.is_outside(&captures[1]))
+            .any(|captures| matches!(&captures[1], "text" | "value"))
     }
 
     fn placeholder_value(&self, name: &str, payload: &Value) -> String {
@@ -307,13 +308,12 @@ mod tests {
     }
 
     #[test]
-    fn inlines_outside_sees_any_outside_placeholder() {
-        let (msg, obs) = (message(), observation());
-        assert!(msg.inlines_outside("Summarise {{text}}"));
-        assert!(msg.inlines_outside("Subject {{json:/text}}"));
-        assert!(obs.inlines_outside("Item {{id}}"));
-        assert!(!msg.inlines_outside("In {{channel}} by {{user}} at {{ts}}, id {{id}}"));
-        assert!(!obs.inlines_outside("No placeholders"));
+    fn inlines_body_sees_only_what_the_event_said() {
+        assert!(MonitorEvent::inlines_body("Summarise {{text}}"));
+        assert!(MonitorEvent::inlines_body("Now {{value}}"));
+        assert!(!MonitorEvent::inlines_body("Subject {{json:/text}}"));
+        assert!(!MonitorEvent::inlines_body("Item {{id}}, was {{previous}}"));
+        assert!(!MonitorEvent::inlines_body("No placeholders"));
     }
 
     #[test]

@@ -121,16 +121,19 @@ workflow = "release-note"
   (on a source monitor) `surface` are optional. What the message or item said is
   outside content: wherever a placeholder puts it (`{{text}}`, `{{value}}`,
   `{{previous}}`, `{{json:…}}`, an item's `{{id}}`) it goes in fenced and labelled as
-  data, and when your prompt puts none of it in, the whole event is appended that way,
-  with who it came from inside the fence.
+  data, and unless your prompt puts in what the event said (`{{text}}` or `{{value}}`),
+  the whole event is appended that way, with who it came from inside the fence. Secrets
+  in it are redacted before the agent sees it, as in any outside content.
   The turn reads and delivers, and nothing more: it gets read-only tools (mail,
-  messages, files, knowledge, and every connected service's reads) and, unless it
-  tells you in Desk, `messaging.send` to its own `deliver_to`. Anything else it needs
-  you name in `tools`, as a scheduled job's — a tool (`email.move`) or a namespace
-  (`linear`). While it runs, a call that would send somewhere other than `deliver_to`,
-  reach the vault, change the agent's setup, or save a monitor, job, workflow or email
-  rule is refused unless `tools` names it, and you are told what was refused where the
-  monitor delivers.
+  messages, knowledge, and every connected service's reads; not your files or the web)
+  and, unless it tells you in Desk, `messaging.send` to its own `deliver_to`. Anything
+  else it needs you name in `tools`, as a scheduled job's — a tool (`email.move`) or a
+  namespace (`linear`). While it runs, a call that would send somewhere other than
+  `deliver_to`, reach the vault, change the agent's setup, or save a monitor, job,
+  workflow or email rule is refused unless `tools` names it, and you are told what was
+  refused where the monitor delivers. What it posts goes out without link previews.
+  `deliver_to` is who sees what the monitor saw: a shared channel there shows it to
+  everyone in it.
 - **`persona`** is not a per-message action at all: it binds `agent` to converse in
   the watched channel with `prompt` as a channel-scoped system prompt, for as long as
   the monitor is enabled. `mode` is `all` (the default), `mention_only` or `quiet`. A

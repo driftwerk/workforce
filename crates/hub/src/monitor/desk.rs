@@ -90,8 +90,21 @@ pub(crate) async fn deliver(
         };
         let text = match &monitor.action {
             Action::Notify { template, .. } => ev.render(template),
-            Action::AgentTask { prompt, tools, .. } => {
-                match turn(service, &crew, &owner, monitor, ev, prompt, tools, from).await {
+            Action::AgentTask {
+                agent,
+                prompt,
+                deliver_to,
+                surface,
+                tools,
+            } => {
+                let spec = super::engine::AgentTaskSpec {
+                    agent: agent.as_deref(),
+                    prompt,
+                    deliver_to,
+                    surface: surface.as_deref(),
+                    tools,
+                };
+                match turn(service, &crew, &owner, monitor, ev, &spec, from).await {
                     Ok(text) => text,
                     Err(outcome) => return outcome,
                 }
@@ -133,18 +146,16 @@ fn key_of(monitor: &MonitorMeta, owner: &str, ev: &MonitorEvent) -> String {
     format!("{}\n{owner}\n{}", monitor.id, ev.dispatch_id())
 }
 
-/// The `agent_task` turn for `ev`, as `owner`, with the `tools` its monitor
-/// names: its answer, or how the dispatch ends without one.
+/// The `agent_task` turn for `ev`, as `owner`, as `spec` asks: its answer,
+/// or how the dispatch ends without one.
 #[cfg(feature = "postgres")]
-#[allow(clippy::too_many_arguments)]
 async fn turn(
     service: &Arc<AgentService>,
     crew: &crate::desk_crew::CrewHub,
     owner: &str,
     monitor: &MonitorMeta,
     ev: &MonitorEvent,
-    prompt: &str,
-    tools: &[String],
+    spec: &super::engine::AgentTaskSpec<'_>,
     from: &str,
 ) -> Result<String, ActionOutcome> {
     // As any monitor's turn: a suspended owner's acts on nothing, and
@@ -152,9 +163,9 @@ async fn turn(
     if let Some(person) = service.suspended(owner) {
         return Err(ActionOutcome::Terminal(crate::standing::refusal(&person)));
     }
-    let task = super::engine::build_agent_task_prompt(prompt, ev, from, TELLS_DESK);
+    let task = super::engine::build_agent_task_prompt(spec.prompt, ev, from, TELLS_DESK);
     let session = format!("monitor:{}:{}", monitor.id, ev.dispatch_id());
-    let scoped = super::scope::MonitorTurn::new(monitor, &super::scope::Delivery::Told, tools);
+    let scoped = super::scope::MonitorTurn::new(monitor, &super::scope::Delivery::Told, spec.tools);
     let run = scoped.run(service, &session, &task, None, Some(owner));
     let payer = service.background_payer(Some(owner));
     let outcome = crate::user_config::billed_to(payer, run).await;

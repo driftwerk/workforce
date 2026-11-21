@@ -145,7 +145,14 @@ impl JiraSkill {
     }
 
     /// Return all agent-callable tools.
+    /// Its reads say what they return is outside content.
     pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        workforce_agent::tools::ReadsOutside::marking(self.every_tool(), |name| {
+            READ_TOOLS.contains(&name)
+        })
+    }
+
+    fn every_tool(&self) -> Vec<Arc<dyn Tool>> {
         let i = || Arc::clone(&self.instances);
         let p = || Arc::clone(&self.prefix_map);
         vec![

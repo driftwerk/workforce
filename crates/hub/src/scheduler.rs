@@ -1813,6 +1813,7 @@ impl Scheduler {
                             username: None,
                             icon_url: None,
                             blocks: None,
+                            outside: false,
                         })
                         .await
                     {
@@ -1847,6 +1848,7 @@ impl Scheduler {
                         icon_url: None,
 
                         blocks: None,
+                        outside: false,
                     })
                     .await
                 {
@@ -1898,6 +1900,7 @@ impl Scheduler {
                         username: None,
                         icon_url: None,
                         blocks: None,
+                        outside: false,
                     })
                     .await
                 {
@@ -2379,6 +2382,7 @@ impl Scheduler {
                                             icon_url: None,
 
                                             blocks: None,
+                                            outside: false,
                                         })
                                         .await
                                     {

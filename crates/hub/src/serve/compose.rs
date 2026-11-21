@@ -1518,6 +1518,7 @@ impl crate::job_runner::NotificationSink for SurfaceNotificationSink {
             username: None,
             icon_url: None,
             blocks: None,
+            outside: false,
         };
         let registry = self.surface_registry.read().await;
         for surface in registry.all() {
@@ -2051,6 +2052,7 @@ impl Setup {
         crate::floor::install(config).await;
         #[cfg(feature = "postgres")]
         crate::surface_allows::install(config).await;
+        workforce_agent::security::monitor::know_reads(crate::monitor::scope::reads());
         let effective_memory = resolved_at_build.memory.clone();
 
         // Capture pre-resolution spec before the block below overwrites

@@ -172,7 +172,14 @@ impl MetabaseSkill {
     /// clients the hub publishes schema to here; a store-backed set's do as
     /// they're built (`on_built`), and only those on shared keys, so no
     /// one's own learned tables are published.
+    /// Its reads say what they return is outside content.
     pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        workforce_agent::tools::ReadsOutside::marking(self.every_tool(), |name| {
+            READ_TOOLS.contains(&name)
+        })
+    }
+
+    fn every_tool(&self) -> Vec<Arc<dyn Tool>> {
         if !self.clients.is_live() {
             self.clients
                 .for_caller()

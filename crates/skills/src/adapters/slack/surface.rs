@@ -86,7 +86,16 @@ fn validate_blocks(blocks: &[serde_json::Value]) -> Result<()> {
 /// onto an already-built `chat.postMessage` body. Pulled out so the
 /// three send paths (Block Kit, rich_text, mrkdwn-chunked) share one
 /// definition of the optional-field contract.
+/// The message-metadata event a post carrying outside content is marked
+/// with, so reading it back knows it for what it is.
+const OUTSIDE_EVENT: &str = "workforce_outside_content";
+
 fn apply_outbound_extras(body: &mut serde_json::Value, message: &OutboundMessage) {
+    if message.outside {
+        body["unfurl_links"] = serde_json::json!(false);
+        body["unfurl_media"] = serde_json::json!(false);
+        body["metadata"] = serde_json::json!({ "event_type": OUTSIDE_EVENT, "event_payload": {} });
+    }
     if let Some(ref thread_id) = message.thread_id {
         body["thread_ts"] = serde_json::json!(thread_id);
     }
@@ -2143,6 +2152,7 @@ fn channel_message_from_json(channel: &str, message: &serde_json::Value) -> Chan
         thread_id: message["thread_ts"].as_str().map(|s| s.to_string()),
         files: parse_message_files(message),
         bot_id: message["bot_id"].as_str().map(|s| s.to_string()),
+        outside: message["metadata"]["event_type"].as_str() == Some(OUTSIDE_EVENT),
     }
 }
 
@@ -2482,6 +2492,7 @@ impl ChannelSurface for SlackSurface {
                     ("channel", channel),
                     ("ts", thread_ts),
                     ("limit", &limit_str),
+                    ("include_all_metadata", "true"),
                 ],
             )
             .await?;
@@ -3340,6 +3351,7 @@ pub(crate) mod tests {
             username: None,
             icon_url: None,
             blocks: None,
+            outside: false,
         }
     }
 
@@ -3460,6 +3472,41 @@ pub(crate) mod tests {
             .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("rich_text")));
         let fallback = bodies[0].get("text").and_then(|t| t.as_str()).unwrap_or("");
         assert!(!fallback.contains("```"), "fallback strips fences");
+    }
+
+    #[tokio::test]
+    async fn a_post_carrying_outside_content_has_no_previews_and_is_marked() {
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        ok_post_message(&server).await;
+        let surface = SlackSurface::with_store(
+            "xoxb-bot",
+            crate::adapters::test_support::InMem::from(&[]),
+            "allan",
+            server.uri(),
+        );
+        let text = "Invoice from https://evil.example/?d=secret";
+        surface
+            .send_message(&message("C123", text).carrying_outside())
+            .await
+            .unwrap();
+        surface.send_message(&message("C123", text)).await.unwrap();
+        let bodies = captured_post_bodies(&server).await;
+        assert_eq!(bodies[0]["unfurl_links"], false);
+        assert_eq!(bodies[0]["unfurl_media"], false);
+        assert_eq!(bodies[0]["metadata"]["event_type"], OUTSIDE_EVENT);
+        assert!(bodies[1].get("unfurl_links").is_none());
+        assert!(bodies[1].get("metadata").is_none());
+        let back = |metadata: serde_json::Value| {
+            channel_message_from_json(
+                "C123",
+                &serde_json::json!({ "ts": "1.5", "text": text, "metadata": metadata }),
+            )
+            .outside
+        };
+        assert!(back(bodies[0]["metadata"].clone()));
+        assert!(!back(serde_json::Value::Null));
     }
 
     #[tokio::test]
@@ -4102,6 +4149,7 @@ pub(crate) mod tests {
                 username: None,
                 icon_url: None,
                 blocks: None,
+                outside: false,
             })
             .await
             .unwrap();
@@ -4139,6 +4187,7 @@ pub(crate) mod tests {
                 username: None,
                 icon_url: None,
                 blocks: None,
+                outside: false,
             })
             .await
             .unwrap();
@@ -4224,6 +4273,7 @@ pub(crate) mod tests {
                     username: None,
                     icon_url: None,
                     blocks: None,
+                    outside: false,
                 })
                 .await
                 .unwrap();
@@ -4260,6 +4310,7 @@ pub(crate) mod tests {
                 username: None,
                 icon_url: None,
                 blocks: None,
+                outside: false,
             })
             .await
             .unwrap();
@@ -4293,6 +4344,7 @@ pub(crate) mod tests {
                 username: None,
                 icon_url: None,
                 blocks: None,
+                outside: false,
             })
             .await
             .unwrap();
@@ -4326,6 +4378,7 @@ pub(crate) mod tests {
                     username: None,
                     icon_url: None,
                     blocks: None,
+                    outside: false,
                 },
             )
             .await
@@ -4357,6 +4410,7 @@ pub(crate) mod tests {
                 username: None,
                 icon_url: None,
                 blocks: None,
+                outside: false,
             })
             .await
             .unwrap();

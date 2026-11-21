@@ -2764,6 +2764,7 @@ fn outbound(
         username: None,
         icon_url: None,
         blocks: Some(blocks),
+        outside: false,
     }
 }
 
@@ -2864,6 +2865,7 @@ fn text_outbound(channel: String, text: String, thread_id: Option<String>) -> Ou
         username: None,
         icon_url: None,
         blocks: None,
+        outside: false,
     }
 }
 

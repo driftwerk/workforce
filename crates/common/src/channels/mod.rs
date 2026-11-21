@@ -101,6 +101,11 @@ pub struct OutboundMessage {
     /// fallback) and rendered as the primary message body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocks: Option<Vec<serde_json::Value>>,
+    /// It may carry outside content (what a monitor saw): posted without
+    /// link previews, which would fetch what a link carries, and marked so
+    /// whoever reads it back reads it as data.
+    #[serde(default)]
+    pub outside: bool,
 }
 
 impl OutboundMessage {
@@ -113,6 +118,15 @@ impl OutboundMessage {
             username: None,
             icon_url: None,
             blocks: None,
+            outside: false,
+        }
+    }
+
+    /// This message, marked as carrying outside content.
+    pub fn carrying_outside(self) -> Self {
+        Self {
+            outside: true,
+            ..self
         }
     }
 }
@@ -167,6 +181,9 @@ pub struct ChannelMessage {
     /// the bot's own output apart on the catch-up read path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bot_id: Option<String>,
+    /// It was posted carrying outside content ([`OutboundMessage::outside`]).
+    #[serde(default)]
+    pub outside: bool,
 }
 
 /// One bounded walk of a channel's history, as returned by
@@ -1263,6 +1280,7 @@ mod tests {
             username: None,
             icon_url: None,
             blocks: None,
+            outside: false,
         };
         let json = serde_json::to_string(&m).unwrap();
         assert!(json.contains("hello"));

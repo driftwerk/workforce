@@ -376,8 +376,14 @@ pub fn build_prior_messages_reading<'m>(
     result
 }
 
-/// What a monitor told in Desk carries what it saw, from outside: read back
-/// as data, never as the agent's own words.
+/// What a monitor told carries what it saw, from outside: `text` fenced to
+/// be read back as data, never as the agent's own words.
+pub fn what_a_monitor_saw(text: &str) -> String {
+    workforce_agent::security::external_content::wrap_external_content(text, "what a monitor saw")
+        .wrapped_content
+}
+
+/// What a monitor told in Desk, read back as data ([`what_a_monitor_saw`]).
 fn told_as_data<'m>(
     msg: &SessionMessage,
     text: std::borrow::Cow<'m, str>,
@@ -385,13 +391,7 @@ fn told_as_data<'m>(
     let by_monitor = msg.desk.as_ref().and_then(|mark| mark.delivery)
         == Some(workforce_common::channels::desk::DeliveryKind::Monitor);
     if by_monitor {
-        std::borrow::Cow::Owned(
-            workforce_agent::security::external_content::wrap_external_content(
-                &text,
-                "what a monitor saw",
-            )
-            .wrapped_content,
-        )
+        std::borrow::Cow::Owned(what_a_monitor_saw(&text))
     } else {
         text
     }

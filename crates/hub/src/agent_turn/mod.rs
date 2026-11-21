@@ -655,7 +655,10 @@ impl TurnChain {
         let routes: std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<ChainOutcome>> + Send + '_>,
         > = match kept {
-            Some(guard) => Box::pin(workforce_agent::runner::with_content_guard(guard, routes)),
+            Some(guard) => Box::pin(workforce_agent::runner::with_content_guard(
+                Some(guard),
+                routes,
+            )),
             None => routes,
         };
         workforce_agent::llm::provider::with_effort_override(

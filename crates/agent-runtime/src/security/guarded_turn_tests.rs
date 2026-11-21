@@ -120,6 +120,7 @@ struct Mailbox {
     read: Arc<Fake>,
     forward: Arc<Fake>,
     vault: Arc<Fake>,
+    file_issue: Arc<Fake>,
 }
 
 impl Mailbox {
@@ -129,6 +130,7 @@ impl Mailbox {
             read: Fake::new("email.read", json!({ "uid": 7, "body_text": body }), false),
             forward: Fake::new("email.forward", json!({ "staged": true }), true),
             vault: Fake::new("vault.get", json!({ "value": "s3cret" }), false),
+            file_issue: Fake::new("linear.issue_create", json!({ "id": "DW-1" }), false),
         }
     }
 
@@ -137,6 +139,7 @@ impl Mailbox {
         tools.register(Arc::clone(&self.read) as Arc<dyn Tool>);
         tools.register(Arc::clone(&self.forward) as Arc<dyn Tool>);
         tools.register(Arc::clone(&self.vault) as Arc<dyn Tool>);
+        tools.register(Arc::clone(&self.file_issue) as Arc<dyn Tool>);
         tools.register(Arc::new(Unfenced));
         let policy = workforce_policy::engine::PolicyEngine::from_yaml(
             "rules:\n  - name: allow-all\n    scope: global\n    tool: \"*\"\n    action: allow\n",
@@ -259,6 +262,35 @@ async fn what_an_earlier_turn_read_does_not_hold_the_persons_next_request() {
 }
 
 #[tokio::test]
+async fn a_job_that_reads_mail_files_the_issue_its_tools_name() {
+    let script = || {
+        Script::new([
+            vec![("email.read", json!({ "uid": 7 }))],
+            vec![(
+                "linear.issue_create",
+                json!({ "title": "Mailbox migration" }),
+            )],
+        ])
+    };
+    let unnamed = Mailbox::new();
+    run(&unnamed.runner(script()), "file what came in").await;
+    assert_eq!(unnamed.file_issue.ran(), 0, "unnamed, it is asked about");
+    let job = Mailbox::new();
+    let tools = ["email".to_string(), "linear".to_string()];
+    let result = crate::runner::with_tool_whitelist(
+        Some(crate::runner::ToolWhitelist::for_turn(&tools)),
+        run(&job.runner(script()), "file what came in"),
+    )
+    .await;
+    assert_eq!(
+        job.file_issue.ran(),
+        1,
+        "a job's `tools` names it, by namespace"
+    );
+    assert_eq!(decided(&result, "linear.issue_create"), ["allow"]);
+}
+
+#[tokio::test]
 async fn a_forward_the_person_asked_for_with_no_outside_content_runs() {
     let mailbox = Mailbox::new();
     let result = run(
@@ -292,7 +324,7 @@ async fn a_refusing_guard_refuses_and_keeps_what_it_refused() {
     }));
     let script = Script::new([vec![("vault.get", json!({ "key": "gmail" })), forward()]]);
     let runner = mailbox.runner(script);
-    let result = with_content_guard(Arc::clone(&guard), run(&runner, "triage it")).await;
+    let result = with_content_guard(Some(Arc::clone(&guard)), run(&runner, "triage it")).await;
     assert_eq!(mailbox.vault.ran() + mailbox.forward.ran(), 0);
     assert_eq!(decided(&result, "vault.get"), ["deny"]);
     assert_eq!(decided(&result, "email.forward"), ["deny"]);

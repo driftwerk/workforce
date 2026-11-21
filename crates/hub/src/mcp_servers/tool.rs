@@ -14,6 +14,26 @@ use workforce_agent::tools::{Tool, ToolResult};
 use workforce_common::cost::CostTracker;
 use workforce_mcp_client::{McpClient, McpError, McpToolDef};
 
+/// The servers whose tools return outside content
+/// ([`McpServerConfig::external`](workforce_common::settings::McpServerConfig::external)),
+/// read at call time so a tool a refresh registers again says the same.
+static EXTERNAL: std::sync::LazyLock<parking_lot::RwLock<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Record whether `server_id`'s tools return outside content.
+pub(crate) fn mark_external(server_id: &str, external: bool) {
+    let mut servers = EXTERNAL.write();
+    if external {
+        servers.insert(server_id.to_string());
+    } else {
+        servers.remove(server_id);
+    }
+}
+
+fn is_external(server_id: &str) -> bool {
+    EXTERNAL.read().contains(server_id)
+}
+
 /// One agent-callable tool backed by an upstream MCP server.
 ///
 /// `name` is the agent-facing form (`mcp.<server_id>.<tool>`),
@@ -69,10 +89,8 @@ impl Tool for McpTool {
         self.input_schema.clone()
     }
 
-    /// What a server returns is its own, or someone else's: never the
-    /// agent's.
     fn reads_outside_content(&self) -> bool {
-        true
+        is_external(&self.server_id)
     }
 
     async fn execute(&self, input: Value) -> Result<ToolResult> {
@@ -184,6 +202,19 @@ mod tests {
             Some(30)
         );
         assert!(result.error.unwrap().contains("rate limited: HTTP 429"));
+    }
+
+    #[test]
+    fn only_a_server_marked_external_returns_outside_content() {
+        assert!(!is_external("mcp-test-forum"));
+        mark_external("mcp-test-forum", true);
+        assert!(is_external("mcp-test-forum"));
+        mark_external("mcp-test-forum", true);
+        mark_external("mcp-test-forum", false);
+        assert!(
+            !is_external("mcp-test-forum"),
+            "unmarked when it is set up again without it"
+        );
     }
 
     #[test]

@@ -26,11 +26,7 @@ pub(crate) fn survives_exclusive_filter(name: &str) -> bool {
         || name == workforce_agent::spill::RETRIEVE_TOOL_NAME
 }
 
-/// Whether `name` is the tool `entry` names, or one under its namespace.
-pub(crate) fn names_tool(entry: &str, name: &str) -> bool {
-    name.strip_prefix(entry)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
-}
+pub(crate) use workforce_agent::runner::names_tool;
 
 /// Whether an exclusive surface for `whitelist` keeps `name`.
 fn whitelisted(whitelist: &[String], name: &str) -> bool {

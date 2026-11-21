@@ -560,6 +560,7 @@ pub async fn asked(
             username: None,
             icon_url: None,
             blocks: Some(blocks(&asked, live, hub, &request)),
+            outside: false,
         })
         .await;
     match sent {
@@ -799,6 +800,7 @@ async fn rewrite(
             blocks: Some(vec![
                 json!({"type": "section", "text": {"type": "mrkdwn", "text": text}}),
             ]),
+            outside: false,
         };
         if let Err(e) = surface.update_message(dm, ts, &out).await {
             tracing::warn!(error = %e, "an ask's card couldn't be rewritten");

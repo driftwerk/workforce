@@ -146,6 +146,7 @@ impl Preset {
             workspace: None,
             env: None,
             default: false,
+            external: false,
         }
     }
 

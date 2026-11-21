@@ -648,7 +648,6 @@ fn validate_input(id: &str, what: &str, input: &Value) -> Result<()> {
     Ok(())
 }
 
-/// A JSON pointer is empty (the whole document) or starts at its root.
 /// Whether `entry` reads as a tool's or a namespace's name: dotted
 /// segments of letters, digits, `_` and `-`.
 fn names_a_tool(entry: &str) -> bool {
@@ -661,6 +660,7 @@ fn names_a_tool(entry: &str) -> bool {
         })
 }
 
+/// A JSON pointer is empty (the whole document) or starts at its root.
 pub fn validate_pointer(id: &str, field: &str, pointer: Option<&str>) -> Result<()> {
     match pointer {
         Some(p) if !p.is_empty() && !p.starts_with('/') => Err(eyre::eyre!(

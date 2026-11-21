@@ -128,7 +128,14 @@ impl NotionSkill {
         Arc::clone(&self.clients) as Arc<dyn workforce_agent::llm::environment::InstanceSource>
     }
 
+    /// Every tool, its reads saying what they return is outside content.
     pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        workforce_agent::tools::ReadsOutside::marking(self.every_tool(), |name| {
+            READ_TOOLS.contains(&name)
+        })
+    }
+
+    fn every_tool(&self) -> Vec<Arc<dyn Tool>> {
         let c = &self.clients;
         let d = &self.default_workspace;
         vec![

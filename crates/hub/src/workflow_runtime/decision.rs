@@ -587,6 +587,7 @@ impl WorkflowRuntime {
                             username: None,
                             icon_url: None,
                             blocks: Some(blocks),
+                            outside: false,
                         }
                     };
                 let ts =
@@ -749,6 +750,7 @@ impl WorkflowRuntime {
                     username: None,
                     icon_url: None,
                     blocks: Some(blocks.clone()),
+                    outside: false,
                 };
                 if let Err(e) = surface
                     .update_message(&card.channel, &card.ts, &message)
@@ -1291,6 +1293,7 @@ impl WorkflowRuntime {
             username: None,
             icon_url: None,
             blocks: Some(blocks.clone()),
+            outside: false,
         };
         let updated = match &surface {
             Some(surface) => surface.update_message(channel, ts, &message).await.is_ok(),

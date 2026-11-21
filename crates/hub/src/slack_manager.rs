@@ -1160,6 +1160,7 @@ async fn deliver_credential_reply(
             username: None,
             icon_url: None,
             blocks: None,
+            outside: false,
         }
     };
     let in_thread = match reply {
@@ -2395,6 +2396,7 @@ pub fn spawn_slack_dispatch_loop(
                                                 icon_url: None,
 
                                                 blocks: None,
+                                                outside: false,
                                             },
                                         )
                                         .await;
@@ -2548,6 +2550,7 @@ pub fn spawn_slack_dispatch_loop(
                                                 username: None,
                                                 icon_url: None,
                                                 blocks: None,
+                                                outside: false,
                                             },
                                         )
                                         .await;
@@ -3104,6 +3107,7 @@ pub fn spawn_slack_dispatch_loop(
                                                     username: None,
                                                     icon_url: None,
                                                     blocks: None,
+                                                    outside: false,
                                                 },
                                             )
                                             .await;
@@ -4309,6 +4313,7 @@ pub fn spawn_slack_dispatch_loop(
                                                             username: None,
                                                             icon_url: None,
                                                             blocks: Some(blocks),
+                                                            outside: false,
                                                         })
                                                         .await;
                                                 }
@@ -5457,6 +5462,7 @@ pub fn spawn_slack_dispatch_loop(
                                         username: None,
                                         icon_url: None,
                                         blocks: Some(blocks.clone()),
+                                        outside: false,
                                     };
                                     surface
                                         .update_message(&channel, ts, &outbound)
@@ -5583,6 +5589,7 @@ pub fn spawn_slack_dispatch_loop(
                                         username: None,
                                         icon_url: None,
                                         blocks: Some(blocks.clone()),
+                                        outside: false,
                                     };
                                     surface
                                         .update_message(&channel, ts, &outbound)
@@ -6219,6 +6226,7 @@ pub async fn handle_permission_button(
             username: None,
             icon_url: None,
             blocks: Some(blocks.clone()),
+            outside: false,
         };
         surface.update_message(channel, ts, &outbound).await.is_ok()
     } else {
@@ -7793,6 +7801,7 @@ pub async fn emit_status(
             username: None,
             icon_url: None,
             blocks: None,
+            outside: false,
         })
         .await
     {
@@ -7878,6 +7887,7 @@ pub(crate) async fn emit_answer(
                     username: identity.map(|id| id.display_name.clone()),
                     icon_url: identity.and_then(|id| id.icon_url.clone()),
                     blocks: None,
+                    outside: false,
                 })
                 .await
             {
@@ -7946,6 +7956,7 @@ async fn post_checkin_card(
             username: None,
             icon_url: None,
             blocks: Some(blocks),
+            outside: false,
         })
         .await
         .ok()
@@ -7987,6 +7998,7 @@ async fn settle_checkin_card(
                 username: None,
                 icon_url: None,
                 blocks: Some(blocks),
+                outside: false,
             },
         )
         .await;
@@ -8324,6 +8336,7 @@ mod seed_tests {
             thread_id: None,
             files: Vec::new(),
             bot_id: None,
+            outside: false,
         }
     }
 
@@ -11326,6 +11339,7 @@ async fn send_to_surfaces_with_blocks(
                 username: username.clone(),
                 icon_url: icon_url.clone(),
                 blocks: outbound_blocks.clone(),
+                outside: false,
             })
             .await
         {
@@ -11884,6 +11898,7 @@ pub async fn send_to_thread(
                 username: None,
                 icon_url: None,
                 blocks: None,
+                outside: false,
             })
             .await;
     }

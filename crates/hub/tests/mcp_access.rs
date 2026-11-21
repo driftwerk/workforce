@@ -144,6 +144,7 @@ fn pat_cfg(uri: &str, fallback: bool) -> McpServerConfig {
         workspace: None,
         env: None,
         default: false,
+        external: false,
     }
 }
 
@@ -167,6 +168,7 @@ fn oauth_cfg(uri: &str, fallback: bool) -> McpServerConfig {
         workspace: None,
         env: None,
         default: false,
+        external: false,
     }
 }
 

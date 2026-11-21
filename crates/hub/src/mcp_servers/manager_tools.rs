@@ -235,6 +235,8 @@ struct CustomInstall {
     shadows: Vec<String>,
     #[serde(default)]
     fallback_to_builtin: bool,
+    #[serde(default)]
+    external: bool,
     /// Glob patterns (`*`, `?`, `[...]`) matched against each upstream
     /// tool's raw name. Non-empty = allowlist: only matching tools are
     /// registered, curating a large server's surface so fewer schemas
@@ -305,6 +307,7 @@ impl Tool for McpInstallTool {
                         "refresh_interval_secs": {"type": "integer", "minimum": 60},
                         "shadows": {"type": "array", "items": {"type": "string"}},
                         "fallback_to_builtin": {"type": "boolean"},
+                        "external": {"type": "boolean", "description": "What this server returns is written by people outside the user's own work (a public forum, a shared inbox). A turn that reads it then asks before sending anything elsewhere. Default false."},
                         "tools_allow": {"type": "array", "items": {"type": "string"}, "description": "Glob patterns (*, ?, [...]) matched against each upstream tool's raw name. Non-empty = allowlist: only matching tools are registered, so fewer schemas load into every request on a large server. Empty = register all."},
                         "tools_deny": {"type": "array", "items": {"type": "string"}, "description": "Glob patterns whose matches are dropped even if matched by tools_allow (deny wins). E.g. allow [\"issue_*\"], deny [\"issue_delete\"]."},
                         "discover": {"type": "boolean", "description": "Run OAuth 2.1/OIDC discovery (RFC 8414/9728) against `endpoint` (or `issuer` if set) to auto-resolve the authorization/token endpoints AND auto-register an OAuth client. Use for any OAuth-protected server that isn't a preset (Keycloak/Okta/Auth0). Requires auth.kind=\"oauth2\" and [hub].public_url. Default false."},
@@ -362,6 +365,7 @@ impl Tool for McpInstallTool {
                         refresh_interval_secs: custom.refresh_interval_secs,
                         shadows: custom.shadows,
                         fallback_to_builtin: custom.fallback_to_builtin,
+                        external: custom.external,
                         tools_allow: custom.tools_allow,
                         tools_deny: custom.tools_deny,
                         // Ungrouped on install; group later via mcp.workspace_add.
