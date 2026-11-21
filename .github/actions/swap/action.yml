@@ -1,0 +1,29 @@
+name: Give the build room to swap
+description: Adds 16 GB of swap on /mnt when it has room.
+
+# The hub's library and its tests are each a rustc of about 9 GB: with the
+# rest of a build, or the services a job runs beside it, that can pass the
+# runner's 16 GB, and the runner is then killed (exit 143, "lost
+# communication"). Swap lets such a moment pass, a little slower, instead of
+# losing the job.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        free -h
+        # Only a mitigation: without room on the scratch disk, build as
+        # before.
+        avail=$(df --output=avail -BG /mnt 2>/dev/null | tail -1 | tr -dc 0-9) || true
+        if [ "${avail:-0}" -lt 24 ]; then
+          echo "No room on /mnt for swap: building with the runner's own."
+          exit 0
+        fi
+        sudo swapoff -a
+        sudo fallocate -l 16G /mnt/build.swap
+        sudo chmod 600 /mnt/build.swap
+        sudo mkswap /mnt/build.swap >/dev/null
+        sudo swapon /mnt/build.swap
+        # Swap only under real pressure, so the runner itself isn't starved.
+        sudo sysctl -q vm.swappiness=10
+        free -h
