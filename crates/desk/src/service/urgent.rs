@@ -111,6 +111,31 @@ impl Desk {
         Self::mark_in(&st, id)
     }
 
+    /// The turn end session `id` asks its question at, while it still asks
+    /// it ([`line::open_question`]): what a boss's answer answers
+    /// ([`line::Send::Answer`]). A restart starts its counters again, so a
+    /// mark from before one never matches.
+    pub fn asked_mark(&self, id: Uuid) -> Option<TurnMark> {
+        self.asked_now(id).map(|(_, mark)| mark)
+    }
+
+    /// What session `id` asks now and the turn end it asks it at
+    /// ([`Self::asked_mark`]), read together: the mark is that question's.
+    pub fn asked_now(&self, id: Uuid) -> Option<(crate::asking::Asked, TurnMark)> {
+        let st = self.0.state.lock();
+        let view = Self::view_of(&st, st.records.get(&id)?);
+        let asked = line::open_question(&view)?.clone();
+        let l = st.live.get(&id)?;
+        Some((
+            asked,
+            TurnMark {
+                run: l.breaker.run.0,
+                ends: l.ends,
+                turns: l.breaker.turns,
+            },
+        ))
+    }
+
     pub(super) fn mark_in(st: &super::State, id: Uuid) -> Option<TurnMark> {
         let state = st.records.get(&id)?.state;
         let l = st.live.get(&id)?;
@@ -245,9 +270,12 @@ impl Desk {
                 line::Wait::PersonDriving => {
                     "You're driving it: hand it back for its boss's messages to go in."
                 }
-                line::Wait::Asking => "It's asking you something: answer that first.",
+                line::Wait::Asking => {
+                    "Its turn ended asking you something: answer that, and this goes in after."
+                }
                 line::Wait::ModeEnding => "Desk is putting it back in its own mode first.",
-                line::Wait::Stopped
+                line::Wait::Dialog
+                | line::Wait::Stopped
                 | line::Wait::Working
                 | line::Wait::Typing
                 | line::Wait::NextCall => "It can't take this now.",
@@ -545,6 +573,11 @@ impl Desk {
         else {
             return Ok(Took::Gone);
         };
+        super::line::after_take(id);
+        if !self.still_goes_in(id, &taken) {
+            let withdrawn = self.put_back(id, &taken, line::Delivery::Delivered).await?;
+            return Ok(if withdrawn { Took::Gone } else { Took::Back });
+        }
         self.line_delivered_into(id, &taken);
         tracing::info!(session = %id, %row, "an urgent line message was read mid-turn");
         Ok(Took::Read(self.rendered(&taken).await))

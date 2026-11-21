@@ -155,16 +155,13 @@ pub(super) fn reply(text: &str) -> Option<Reply> {
     }
 }
 
-/// A question a session asks: which session, and its words.
-type Key = (Uuid, String);
+/// A question a session asks: which session, and the turn end it asks at.
+type Key = (Uuid, workforce_desk::line::TurnMark);
 
-/// The question `view`'s turn ended on, when it asks one: not a request
-/// (`pending`, which `decide` has), nor a refused tool it stopped on.
-pub(super) fn question_of(view: &SessionView) -> Option<&Asked> {
-    view.asked
-        .as_ref()
-        .filter(|a| a.denied.is_none() && view.pending.is_none())
-}
+/// The question `view`'s turn ended on, when it still asks one: not a
+/// request (`pending`, which `decide` has), nor a refused tool it stopped
+/// on.
+pub(super) use workforce_desk::line::open_question as question_of;
 
 pub(super) async fn answer_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     let (_, mut events) = crew.desk.subscribe();
@@ -204,7 +201,7 @@ pub(super) async fn answer_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 .desk
                 .list()
                 .iter()
-                .filter_map(|v| question_of(v).map(|a| (v.id, a.ask.clone())))
+                .filter_map(|v| crew.desk.asked_mark(v.id).map(|t| (v.id, t)))
                 .collect();
             taken.retain(|k| open.contains(k));
         }
@@ -283,7 +280,7 @@ impl CrewHub {
         let Ok(view) = self.desk.view(id) else {
             return;
         };
-        let Some(question) = question_of(&view).cloned() else {
+        let Some((question, turn)) = self.desk.asked_now(id) else {
             return;
         };
         let Some(boss) = self.boss_over(&view) else {
@@ -297,8 +294,8 @@ impl CrewHub {
         {
             return;
         }
-        let key = (view.id, question.ask.clone());
-        if !asked.lock().insert(key.clone()) {
+        let key = (view.id, turn);
+        if !asked.lock().insert(key) {
             return;
         }
         let crew = Arc::clone(self);
@@ -320,7 +317,7 @@ impl CrewHub {
                         &boss,
                         "answering a session's question",
                         super::mind::FOCUSED_WAIT,
-                        crew.on_picture(crew.answer_question(&view, &question, &boss)),
+                        crew.on_picture(crew.answer_question(&view, &question, turn, &boss)),
                     )
                     .await
                     .ok()
@@ -344,8 +341,15 @@ impl CrewHub {
         });
     }
 
-    /// The boss's answer to `view`'s question `q`, given.
-    async fn answer_question(&self, view: &SessionView, q: &Asked, boss: &str) -> Answered {
+    /// The boss's answer to `view`'s question `q`, asked at turn end
+    /// `turn`, given.
+    async fn answer_question(
+        &self,
+        view: &SessionView,
+        q: &Asked,
+        turn: workforce_desk::line::TurnMark,
+        boss: &str,
+    ) -> Answered {
         let Some((service, o)) = self.overseer_named(boss) else {
             return Answered::Done;
         };
@@ -393,7 +397,7 @@ impl CrewHub {
         let Ok(now) = self.desk.view(view.id) else {
             return Answered::Done;
         };
-        if question_of(&now).map(|a| &a.ask) != Some(&q.ask) {
+        if self.desk.asked_mark(now.id) != Some(turn) {
             return Answered::Done;
         }
         if self.person_has_questions(&now, boss) {
@@ -431,7 +435,14 @@ impl CrewHub {
                     message: text,
                     reply_to: None,
                 };
-                match self.perform(&action, By::manager(boss, &name, &why)).await {
+                let order = super::assignments::Order {
+                    answers: Some(turn),
+                    ..Default::default()
+                };
+                match self
+                    .perform_with(&action, By::manager(boss, &name, &why), &order)
+                    .await
+                {
                     Ok(done) => {
                         tracing::info!(session = %view.id, %boss, %done, "the boss answered a question itself");
                     }

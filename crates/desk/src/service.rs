@@ -290,6 +290,8 @@ pub(crate) struct Live {
     interrupted: bool,
     /// How many of its turns have ended while it ran here.
     ends: u64,
+    /// When the last of them ended.
+    ended_at: Option<DateTime<Utc>>,
     /// The turn end whose reply the hub's model is reading, while it is:
     /// its turn stays open on the floor until the model says.
     reading: Option<u64>,
@@ -2355,6 +2357,9 @@ impl Desk {
                     allowed: HashSet::new(),
                     interrupted: false,
                     ends: 0,
+                    // Whatever it asks now, it asked before Desk took it
+                    // back: nothing sent before then answers it.
+                    ended_at: Some(Utc::now()),
                     reading: None,
                     closing: false,
                     codex_asks: Vec::new(),
@@ -5775,6 +5780,7 @@ impl Desk {
                 allowed: HashSet::new(),
                 interrupted: false,
                 ends: 0,
+                ended_at: None,
                 reading: None,
                 closing: false,
                 codex_asks: Vec::new(),
@@ -6991,6 +6997,7 @@ impl Desk {
             };
             if let Some(l) = l.as_deref_mut() {
                 l.ends += 1;
+                l.ended_at = Some(Utc::now());
                 l.reading = reader.as_ref().map(|_| l.ends);
                 read = l.reading;
             }
@@ -7990,6 +7997,7 @@ impl Desk {
                             };
                             if let Some(l) = l.as_deref_mut() {
                                 l.ends += 1;
+                                l.ended_at = Some(Utc::now());
                                 l.reading = reader.as_ref().map(|_| l.ends);
                                 read = l.reading;
                             }
@@ -8614,6 +8622,29 @@ mod tests {
     use serde_json::json;
     use workforce_postgres::test_support::with_test_pool;
 
+    /// What `check` finds, once it finds something: up to ten seconds.
+    pub(super) async fn eventually<T>(what: &str, mut check: impl AsyncFnMut() -> Option<T>) -> T {
+        for _ in 0..400 {
+            if let Some(found) = check().await {
+                return found;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("{what} never happened");
+    }
+
+    /// A stand-in Claude Code 2.1.300, recent enough for its line, that
+    /// otherwise stays up until killed.
+    pub(super) fn versioned_cli(dir: &Path) -> PathBuf {
+        let path = dir.join("versioned-cli");
+        workforce_common::executable::write(
+            &path,
+            "#!/bin/sh\ncase \"$1\" in\n--version) echo '2.1.300 (Claude Code)' ;;\n*) exec sleep 60 ;;\nesac\n",
+        )
+        .unwrap();
+        path
+    }
+
     /// A stand-in CLI that stays up until killed, ignoring its arguments.
     pub(super) fn fake_cli(dir: &Path) -> PathBuf {
         let path = dir.join("fake-cli");
@@ -8895,6 +8926,140 @@ mod tests {
                 .filter(|h| !h.exited && h.meta["session"].as_str() == Some(&s.id.to_string()))
                 .count();
             assert_eq!(running, 1, "one process for the conversation");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_session_taken_back_asking_takes_only_what_its_boss_says_after_as_the_answer() {
+        with_test_pool(build_pool, |pool| async move {
+            let (_hdir, socket, _holder_cancel) = crate::holder::tests::holder().await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut opts = options(dir.path());
+            opts.restore = RestorePolicy::Auto;
+            opts.holder = Some(HolderOptions {
+                socket: socket.clone(),
+                token: crate::holder::tests::TOKEN.into(),
+            });
+            DeskStore::migrate(&pool).await.unwrap();
+            let bosses = |d: &Desk| {
+                d.set_bosses(vec![Boss {
+                    agent: "sarah".into(),
+                    name: "Sarah".into(),
+                    scope: crate::scope::Scope::Ungrouped,
+                    level: "act".into(),
+                }]);
+                By::manager("sarah", "Sarah", "Next step.")
+            };
+            let tell = |to: Uuid, text: &str| crate::line::Send::Tell {
+                to: crate::line::Target::Session(to),
+                text: text.into(),
+                when: crate::line::When::Queue,
+            };
+            let first_cancel = CancellationToken::new();
+            let first = Desk::start(
+                DeskStore::from_pool(pool.clone()),
+                opts.clone(),
+                Floor::default(),
+                first_cancel.clone(),
+            )
+            .await
+            .unwrap();
+            let by = bosses(&first);
+            let s = new_session(&first, dir.path()).await;
+            first
+                .take_on(
+                    s.id,
+                    &by.party,
+                    crate::charge::How::Handed,
+                    &Default::default(),
+                    &By::you(),
+                )
+                .await
+                .unwrap();
+            first.change(s.id, |r, _| r.state = SessionState::Working);
+            let earlier = first
+                .line_send(
+                    Sender::Overseer(by.clone()),
+                    tell(s.id, "When that is done, run the linter."),
+                )
+                .await
+                .unwrap();
+            post(
+                &first,
+                s.id,
+                json!({"hook_event_name": "Stop",
+                    "last_assistant_message": "The replica is ready. Should I switch reads to it?"}),
+            )
+            .await;
+            assert_eq!(first.view(s.id).unwrap().state, SessionState::Asking);
+            // Kept as asking, its process in the holder: then the hub goes,
+            // and its hook port with it.
+            let store = DeskStore::from_pool(pool.clone());
+            eventually("kept as asking", async || {
+                let r = store.get(s.id).await.ok()??;
+                (r.state == SessionState::Asking).then_some(())
+            })
+            .await;
+            let holder = first.holder().await.expect("a holder");
+            eventually("in the holder", async || {
+                let held = Desk::held_running(&holder, s.id).await.ok()?;
+                (!held.is_empty()).then_some(())
+            })
+            .await;
+            let port = first.0.hook_port;
+            first_cancel.cancel();
+            eventually("the last hub gone", async || {
+                std::net::TcpListener::bind(("127.0.0.1", port)).ok().map(drop)
+            })
+            .await;
+
+            let second = Desk::start(
+                DeskStore::from_pool(pool.clone()),
+                opts.clone(),
+                Floor::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let by = bosses(&second);
+            eventually("taken back, still asking", async || {
+                let v = second.view(s.id).ok()?;
+                (v.live && v.state == SessionState::Asking).then_some(())
+            })
+            .await;
+            eventually("its boss runs it", async || {
+                second.charge_of(s.id).filter(|c| c.live()).map(drop)
+            })
+            .await;
+            let row = |id| {
+                let d = second.clone();
+                async move { d.0.store.line_message(id).await.unwrap().unwrap() }
+            };
+            // What its boss said before is never the answer to it: back in
+            // its queue once it runs, it waits on the question.
+            eventually("queued again, waiting on the question", async || {
+                let m = row(earlier.id).await;
+                (m.delivery == crate::line::Delivery::Queued
+                    && second.line_waits(&m) == Some(crate::line::Wait::Asking))
+                .then_some(())
+            })
+            .await;
+            assert_eq!(second.line_next(s.id, Duration::from_millis(300)).await, None);
+            // What it says now, having read it, is.
+            let after = second
+                .line_send(Sender::Overseer(by), tell(s.id, "Yes, switch them."))
+                .await
+                .unwrap();
+            assert_ne!(
+                second.line_waits(&row(after.id).await),
+                Some(crate::line::Wait::Asking),
+                "its running boss answers it"
+            );
+            assert_eq!(
+                second.line_waits(&row(earlier.id).await),
+                Some(crate::line::Wait::Asking)
+            );
         })
         .await;
     }

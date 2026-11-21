@@ -1074,6 +1074,42 @@ impl CrewHub {
             .map(|(s, _)| s.agent_id.as_str().to_string())
     }
 
+    /// What the boss is told of its message `m` to session `name`, as
+    /// `did` ("told", "answered"), with where it stands, read again now:
+    /// what, if anything, it waits on; refused as stale once it was
+    /// withdrawn before it went in.
+    async fn nudge_said(
+        &self,
+        name: &str,
+        did: &str,
+        m: &workforce_desk::line::LineMessage,
+    ) -> Result<(String, workforce_desk::line::Delivery), String> {
+        use workforce_desk::line::{Delivery, Wait};
+        let now = match self.desk.store().line_message(m.id).await {
+            Ok(Some(now)) => now,
+            _ => m.clone(),
+        };
+        if now.delivery == Delivery::Withdrawn {
+            return Err(format!(
+                "{} {name} moved on before it went in: decide again on where it stands now.",
+                super::picture::STALE
+            ));
+        }
+        let why = match self.desk.line_waits(&now) {
+            None => return Ok((format!("{did} {name}"), now.delivery)),
+            Some(Wait::Stopped) => "it is stopped and gets it when it runs again",
+            Some(Wait::Working) => "it gets it once its turn ends",
+            Some(Wait::Dialog) => "a dialog in its terminal waits on an answer: it gets it once that is answered and its turn ends",
+            Some(Wait::Asking) => "its turn ended asking the person something, so it gets it once they answer",
+            Some(Wait::Typing) => "the person is typing in its terminal: it gets it once they stop",
+            Some(Wait::Paused) => "Desk's breaker paused it: it gets it once the person lets it go on",
+            Some(Wait::ModeEnding) => "Desk starts it again in its own mode first, then it gets it",
+            Some(Wait::PersonDriving) => "the person is driving it, so your message waits until they stop giving it input for a little while or hand it back",
+            Some(Wait::NextCall) => "it reads it with its next tool call's result",
+        };
+        Ok((format!("{did} {name}; {why}"), now.delivery))
+    }
+
     /// The session `action` is done to, when it is one.
     pub(crate) fn session_of(action: &Action) -> Option<Uuid> {
         match action {
@@ -2054,8 +2090,8 @@ impl CrewHub {
                     workforce_desk::LineError::Refused(r) => r.to_string(),
                     workforce_desk::LineError::Desk(e) => plain(e),
                 };
-                match reply_to {
-                    Some(ask) => {
+                match (reply_to, order.answers) {
+                    (Some(ask), _) => {
                         let answer = d
                             .line_answer(*ask, sender, message.clone())
                             .await
@@ -2063,10 +2099,40 @@ impl CrewHub {
                         done.line = Some((answer.id, answer.delivery));
                         Ok(format!("answered {name}"))
                     }
+                    // The answer to the question a turn ended on: refused as
+                    // stale once it asks something else, never sent as a
+                    // plain message in its place.
+                    (None, Some(turn)) => {
+                        let sent = d
+                            .line_send_with(
+                                sender,
+                                workforce_desk::line::Send::Answer {
+                                    to: *s,
+                                    text: message.clone(),
+                                    turn,
+                                },
+                                None,
+                            )
+                            .await;
+                        let (answer, _) = match sent {
+                            Err(workforce_desk::LineError::Refused(
+                                workforce_desk::line::Refusal::Passed,
+                            )) => {
+                                return Err(format!(
+                                "{} {name} asks something else now: decide again on what it asks.",
+                                super::picture::STALE
+                            ))
+                            }
+                            sent => sent.map_err(line)?,
+                        };
+                        let (said, delivery) = self.nudge_said(&name, "answered", &answer).await?;
+                        done.line = Some((answer.id, delivery));
+                        Ok(said)
+                    }
                     // On its line: it gets it once its turn ends, never typed
                     // in over what it is doing (Interrupt is for that); a
                     // boss's urgent one, with its next tool call's result.
-                    None => {
+                    (None, None) => {
                         let urgency = super::urgent::of(order, &sender);
                         let (told, rushed) = d
                             .line_send_with(
@@ -2084,18 +2150,9 @@ impl CrewHub {
                         if let Some(said) = super::urgent::told(&name, rushed) {
                             return Ok(said);
                         }
-                        if d.wheel_of(*s).is_some_and(|w| w.person()) {
-                            return Ok(format!(
-                                "told {name}; the person is driving it, so your message waits until they stop giving it input for a little while or hand it back"
-                            ));
-                        }
-                        Ok(match told.delivery {
-                            workforce_desk::line::Delivery::Held => {
-                                format!("told {name}; it is stopped and gets it when it runs again")
-                            }
-                            workforce_desk::line::Delivery::Delivered => format!("told {name}"),
-                            _ => format!("told {name}; it gets it once its turn ends"),
-                        })
+                        let (said, delivery) = self.nudge_said(&name, "told", &told).await?;
+                        done.line = Some((told.id, delivery));
+                        Ok(said)
                     }
                 }
             }

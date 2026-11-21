@@ -126,6 +126,72 @@ async fn the_next_tool_call_reads_an_urgent_order_and_its_row_is_delivered_once(
 }
 
 #[tokio::test]
+async fn an_urgent_order_the_person_took_the_wheel_from_as_its_call_took_it_waits_for_them() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        d.set_bosses(vec![super::Boss {
+            agent: "sarah".into(),
+            name: "Sarah".into(),
+            scope: crate::scope::Scope::Ungrouped,
+            level: "act".into(),
+        }]);
+        let s = working(&d, dir.path()).await;
+        d.take_on(
+            s,
+            &boss().party,
+            crate::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        assert!(!d.person_driving(s), "its boss drives");
+        let (m, rushed) = urgent(
+            &d,
+            s,
+            "Stand down: don't dispatch release 4.",
+            Urgency::Order,
+        )
+        .await;
+        assert_eq!(rushed, Rushed::Steered);
+        // The person takes the wheel as its next call takes it.
+        let wheel = d.clone();
+        super::line::AFTER_TAKE.lock().push((
+            s,
+            Box::new(move || {
+                wheel
+                    .0
+                    .state
+                    .lock()
+                    .charges
+                    .driven
+                    .insert(s, chrono::Utc::now());
+            }),
+        ));
+        let said = post(&d, s, done()).await;
+        assert!(
+            context(&said).is_none_or(|t| !t.contains("don't dispatch release 4")),
+            "{said}"
+        );
+        let kept = row(&d, m.id).await;
+        assert_eq!(
+            kept.delivery,
+            Delivery::Queued,
+            "back in the queue, not withdrawn"
+        );
+        // Held, as the gate holds it before a take: past the turn's end it
+        // waits on the person's wheel.
+        post(&d, s, stop()).await;
+        assert!(d.line_next(s, Duration::from_millis(300)).await.is_none());
+        let kept = row(&d, m.id).await;
+        assert_eq!(kept.delivery, Delivery::Queued);
+        assert_eq!(d.line_waits(&kept), Some(line::Wait::PersonDriving));
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn an_urgent_order_no_call_took_goes_in_at_the_idle_exactly_once() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
@@ -254,6 +320,7 @@ async fn a_session_that_cant_take_words_mid_turn_gets_them_at_its_end_and_the_bo
         assert_eq!(d.view(t).unwrap().state, SessionState::Blocked);
         let (_, rushed) = urgent(&d, t, "Stop.", Urgency::Order).await;
         assert_eq!(rushed, Rushed::CantSteer(Unsteerable::Dialog));
+        assert_eq!(rushed.said(), None, "said as the dialog it waits on");
 
         // Not working: it goes in now, as any message.
         let idle = new_session(&d, dir.path()).await;
@@ -306,13 +373,17 @@ fn only_claude_code_devin_and_codex_take_a_bosss_words_mid_turn() {
         mid_turn(Engine::Claude, working, true, true),
         Err(Unsteerable::Dialog)
     );
-    for s in [SessionState::Blocked, SessionState::Asking] {
-        assert_eq!(
-            mid_turn(Engine::Claude, s, true, false),
-            Err(Unsteerable::Dialog)
-        );
-    }
+    assert_eq!(
+        mid_turn(Engine::Claude, SessionState::Blocked, true, false),
+        Err(Unsteerable::Dialog)
+    );
+    // A dialog holds them in any state, as in `line::deliverable`.
+    assert_eq!(
+        mid_turn(Engine::Claude, SessionState::Asking, true, true),
+        Err(Unsteerable::Dialog)
+    );
     for s in [
+        SessionState::Asking,
         SessionState::Idle,
         SessionState::Done,
         SessionState::Starting,

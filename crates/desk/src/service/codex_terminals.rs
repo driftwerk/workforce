@@ -319,9 +319,15 @@ impl Desk {
                         .is_none_or(|p| r.last_reply.as_ref() == Some(p))
             });
         if !unchanged {
-            self.change(id, |r, _| {
+            self.change(id, |r, l| {
                 if ended_anew || state != SessionState::Asking {
                     r.asked = asked;
+                }
+                // A turn end of its own: what answered the last question
+                // never answers this one.
+                if let (true, Some(l)) = (ended_anew, l) {
+                    l.ends += 1;
+                    l.ended_at = Some(Utc::now());
                 }
                 r.state = state;
                 // A tail that misses them keeps what was known.

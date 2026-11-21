@@ -134,7 +134,7 @@ pub fn unstamped<'a>(text: &'a str, who: &str) -> &'a str {
 /// interrupts that turn alone, never one begun since. `run` is the run's
 /// own: its counters start again with each Desk, so a mark from before a
 /// restart never matches a turn after it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct TurnMark {
     pub(crate) run: uuid::Uuid,
     pub(crate) ends: u64,
@@ -191,6 +191,7 @@ impl Rushed {
         Some(match self {
             Self::Steered => "it reads it with its next tool call's result".into(),
             Self::SaidIn => "it was said into its running turn".into(),
+            Self::CantSteer(Unsteerable::Dialog) => return None,
             Self::CantSteer(_) => {
                 "it gets it once its turn ends: it can't take words mid-turn".into()
             }
@@ -217,10 +218,10 @@ pub fn mid_turn(
     use crate::engine::Engine;
     match state {
         SessionState::Working if !dialog => {}
-        SessionState::Working | SessionState::Blocked | SessionState::Asking => {
-            return Err(Unsteerable::Dialog)
-        }
+        SessionState::Working | SessionState::Blocked => return Err(Unsteerable::Dialog),
+        _ if dialog => return Err(Unsteerable::Dialog),
         SessionState::Starting
+        | SessionState::Asking
         | SessionState::Idle
         | SessionState::Done
         | SessionState::Interrupted
@@ -263,8 +264,13 @@ pub enum Wait {
     Typing,
     /// Desk's breaker paused it: only the person's own messages go in.
     Paused,
-    /// It is asking the person something: only the person answers it.
+    /// Its turn ended asking the person something: only they, the boss
+    /// that runs it, or a boss giving its answer ([`Send::Answer`]) get in.
     Asking,
+    /// A dialog in its terminal (a permission request, or questions it
+    /// asks there) waits on an answer: it gets this once that is answered
+    /// and its turn ends.
+    Dialog,
     /// The person has the wheel of a session a boss runs: the boss's
     /// messages wait until their hold is up or they hand it back.
     PersonDriving,
@@ -282,7 +288,7 @@ impl Wait {
     pub fn on_purpose(self) -> bool {
         match self {
             Self::Typing | Self::Paused | Self::PersonDriving | Self::ModeEnding => true,
-            Self::Stopped | Self::Working | Self::Asking | Self::NextCall => false,
+            Self::Stopped | Self::Working | Self::Asking | Self::Dialog | Self::NextCall => false,
         }
     }
 }
@@ -319,7 +325,8 @@ pub struct LineMessage {
     /// comes in time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chose: Option<String>,
-    /// An ask's short work-item label ("W7 · PR 2").
+    /// An ask's short work-item label ("W7 · PR 2"); a turn-answer's
+    /// question it answers, as it read when sent ([`Send::Answer`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub about: Option<String>,
     /// An ask's one line on why it asks.
@@ -421,6 +428,12 @@ impl LineMessage {
     /// The session it is from, when it is from one.
     pub fn from_session(&self) -> Option<Uuid> {
         session_of(&self.from)
+    }
+
+    /// Whether it answers the question its recipient's turn ended on
+    /// ([`Send::Answer`]), not an ask of its own.
+    pub fn answers_turn(&self) -> bool {
+        self.kind == LineKind::Answer && self.in_reply_to.is_none()
     }
 
     /// Whether it still waits to go out.
@@ -706,6 +719,14 @@ pub enum Send {
         to: Uuid,
         text: String,
     },
+    /// The answer to the question session `to`'s turn ended on, at the
+    /// turn end `turn` ([`crate::Desk::asked_mark`]): no session gives one.
+    /// It goes in only while that is still what it asks.
+    Answer {
+        to: Uuid,
+        text: String,
+        turn: TurnMark,
+    },
 }
 
 /// What an ask says besides its question and default.
@@ -735,6 +756,8 @@ pub enum Refusal {
     NoSuchAsk(Uuid),
     #[error("Already answered: the first answer to that question stands.")]
     Answered,
+    #[error("It asks something else now: that question has passed.")]
+    Passed,
     #[error("It went ahead without an answer, so this no longer waits on the person; they can still answer it from its thread.")]
     WentAhead,
     #[error("The person set that question aside.")]
@@ -899,7 +922,7 @@ pub fn peers<'a>(
 pub fn hop_of(send: &Send, cause: i16, asked: Option<&LineMessage>) -> i16 {
     match send {
         Send::Reply { .. } => asked.map_or(cause, |a| a.hop),
-        Send::Ask { .. } | Send::Tell { .. } => cause + 1,
+        Send::Ask { .. } | Send::Tell { .. } | Send::Answer { .. } => cause + 1,
     }
 }
 
@@ -961,6 +984,23 @@ pub fn stalled_why(r: &Refusal) -> Option<String> {
     Some(format!("{how}: {why}. Reply to let it carry on."))
 }
 
+/// The question `view`'s turn ended on, while it still asks it: at its
+/// prompt, with no dialog on its screen, and not a tool auto mode refused.
+pub fn open_question(view: &SessionView) -> Option<&crate::asking::Asked> {
+    view.asked.as_ref().filter(|a| {
+        view.state == SessionState::Asking && view.pending.is_none() && a.denied.is_none()
+    })
+}
+
+/// Why a message waits for `recipient`'s turn: a dialog only its terminal
+/// answers, or its work.
+fn turn_wait(recipient: &SessionView) -> Wait {
+    match recipient.state {
+        SessionState::Blocked => Wait::Dialog,
+        _ => Wait::Working,
+    }
+}
+
 /// How a message reaches `recipient` now, or why it must wait. `typed` is
 /// whether the person typed in its terminal since their last prompt;
 /// `plugin` whether Desk's plugin was heard from in it. A Claude Code
@@ -970,12 +1010,15 @@ pub fn deliverable(recipient: &SessionView, typed: bool, plugin: bool) -> Result
     if !recipient.live {
         return Err(Wait::Stopped);
     }
+    if recipient.pending.is_some() {
+        return Err(Wait::Dialog);
+    }
     match recipient.caps.line {
         // Inside a turn Desk keeps it: handed to the plugin then, Claude
         // Code would queue it behind the turn, where Desk can neither send
         // it now, change it nor take it back, and a hand-off it holds that
         // long looks lost and would go again ([`in_turn`]).
-        Deliver::Submit if plugin && in_turn(recipient.state) => Err(Wait::Working),
+        Deliver::Submit if plugin && in_turn(recipient.state) => Err(turn_wait(recipient)),
         Deliver::Submit if plugin => Ok(Deliver::Submit),
         Deliver::Submit | Deliver::Paste => match recipient.state {
             SessionState::Idle | SessionState::Done | SessionState::Asking if typed => {
@@ -983,7 +1026,7 @@ pub fn deliverable(recipient: &SessionView, typed: bool, plugin: bool) -> Result
             }
             SessionState::Idle | SessionState::Done | SessionState::Asking => Ok(Deliver::Paste),
             SessionState::Starting | SessionState::Working | SessionState::Blocked => {
-                Err(Wait::Working)
+                Err(turn_wait(recipient))
             }
             SessionState::Interrupted | SessionState::Stopped | SessionState::Closed => {
                 Err(Wait::Stopped)
@@ -1294,6 +1337,10 @@ fn render_raw(msg: &LineMessage, question: Option<&str>) -> String {
             Some(q) => format!(
                 "{mark} {who} answers your earlier question “{}” (you went ahead without an answer): {}",
                 crate::crew::one_line(q, 160),
+                msg.text
+            ),
+            None if msg.answers_turn() => format!(
+                "{mark} {who} answers the question your turn ended on: {}\n(A message on Desk's line, not the person's words.)",
                 msg.text
             ),
             None => format!("{mark} {who} answers you: {}", msg.text),
@@ -2008,7 +2055,38 @@ mod tests {
         claude.state = SessionState::Working;
         assert_eq!(deliverable(&claude, true, true), Err(Wait::Working));
         claude.state = SessionState::Blocked;
-        assert_eq!(deliverable(&claude, false, true), Err(Wait::Working));
+        assert_eq!(deliverable(&claude, false, true), Err(Wait::Dialog));
+        claude.state = SessionState::Working;
+        claude.pending = Some(crate::model::PendingApproval {
+            id: Uuid::new_v4(),
+            tool: "Bash".into(),
+            detail: "cargo test".into(),
+            since: Utc::now(),
+            answerable: true,
+            choices: Vec::new(),
+            why: None,
+            options: None,
+            request: None,
+            call: None,
+            agent: None,
+            cli_session: None,
+        });
+        assert_eq!(deliverable(&claude, false, true), Err(Wait::Dialog));
+        assert_eq!(deliverable(&claude, false, false), Err(Wait::Dialog));
+        for state in [SessionState::Asking, SessionState::Idle] {
+            claude.state = state;
+            assert_eq!(
+                deliverable(&claude, false, true),
+                Err(Wait::Dialog),
+                "{state:?}"
+            );
+            assert_eq!(
+                deliverable(&claude, false, false),
+                Err(Wait::Dialog),
+                "{state:?}"
+            );
+        }
+        claude.pending = None;
         claude.state = SessionState::Idle;
         assert_eq!(deliverable(&claude, true, true), Ok(Deliver::Submit));
         claude.state = SessionState::Working;
@@ -2103,6 +2181,19 @@ mod tests {
         let mark = is_delivery(&format!("The desk plugin sent a message: {text}")).unwrap();
         assert!(marks(&mark, answer.id));
         assert!(!marks(&mark, Uuid::new_v4()));
+        let turn = LineMessage::new(
+            Party::manager("sarah", "Sarah"),
+            to.clone(),
+            LineKind::Answer,
+            "Yes, ship it.".into(),
+            1,
+        );
+        assert!(render(&turn, None).contains(
+            "Sarah, the person's overseer on Desk answers the question your turn ended on: Yes, ship it.\n(A message on Desk's line, not the person's words.)"
+        ));
+        answer.in_reply_to = Some(Uuid::new_v4());
+        assert!(render(&answer, None).contains("answers you: 5433."));
+        answer.in_reply_to = None;
 
         let from = session("atlas-web", Engine::Codex);
         let mut tell = LineMessage::new(

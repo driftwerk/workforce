@@ -229,6 +229,22 @@ async fn a_boss_message_the_persons_own_words_overtook_is_withdrawn_never_delive
         d.picture_person_answered(a.id, "Use port 5433.");
         d.line_pump(a.id).await;
         assert_ne!(delivery(waiting.id).await, crate::line::Delivery::Withdrawn);
+
+        // The boss's answer to the question its turn ended on, still
+        // waiting when the person answered it there themselves: withdrawn.
+        let mut answer = crate::line::LineMessage::new(
+            crate::crew::Party::manager("boss", "Boss"),
+            crate::crew::Party::session(&view),
+            crate::line::LineKind::Answer,
+            "Yes, ship it.".into(),
+            1,
+        );
+        answer.delivery = crate::line::Delivery::Queued;
+        d.store().put_line(&answer).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        d.picture_person_said(a.id, "No, hold the release.");
+        d.line_pump(a.id).await;
+        assert_eq!(delivery(answer.id).await, crate::line::Delivery::Withdrawn);
     })
     .await;
 }
