@@ -253,8 +253,7 @@ impl BankSync {
         }
         let banks = self.get(&key, "/banks", &[]).await?;
         let id = bank_named(&banks, &named)?;
-        *self.bank_id.lock().unwrap_or_else(PoisonError::into_inner) =
-            Some((named, id.clone()));
+        *self.bank_id.lock().unwrap_or_else(PoisonError::into_inner) = Some((named, id.clone()));
         Ok((key, id))
     }
 }
@@ -428,7 +427,11 @@ impl BankProvider for BankSync {
         let account = plain_id(account)?;
         let (key, id) = self.bank().await?;
         let body = self
-            .get(&key, &format!("/banks/{id}/accounts/{account}/balances"), &[])
+            .get(
+                &key,
+                &format!("/banks/{id}/accounts/{account}/balances"),
+                &[],
+            )
             .await?;
         balance_of(&body["data"])
     }

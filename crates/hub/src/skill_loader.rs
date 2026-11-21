@@ -3337,9 +3337,7 @@ fn load_bank_from_vault(
     let store = layered_user_store(vault, global_vault);
     let paths = BankSkill::instance_paths();
     if paths.names(store.as_ref()).is_empty() {
-        eyre::bail!(
-            "No bank connections. Set one up with connections.setup {{service: 'bank'}}."
-        );
+        eyre::bail!("No bank connections. Set one up with connections.setup {{service: 'bank'}}.");
     }
     let selector = selector(store.as_ref(), "bank", "skills/bank/default_workspace");
     let skill = BankSkill::with_store(store, selector, banksync::API);
@@ -3353,7 +3351,11 @@ fn load_bank_from_vault(
             name
         })
         .collect();
-    info!(skill = "bank", count = names.len(), "Loaded skill from vault");
+    info!(
+        skill = "bank",
+        count = names.len(),
+        "Loaded skill from vault"
+    );
     Ok(SkillLoadResult {
         tool_names: names,
         context_hint: Some(

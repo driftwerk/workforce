@@ -2291,7 +2291,12 @@ fn a_turn_that_read_the_person_s_bank_is_never_remembered() {
             None,
         )
     };
-    assert!(super::extraction::read_personal(&[read("linear.issue_get"), read("bank.transactions")]));
-    assert!(!super::extraction::read_personal(&[read("linear.issue_get")]));
+    assert!(super::extraction::read_personal(&[
+        read("linear.issue_get"),
+        read("bank.transactions")
+    ]));
+    assert!(!super::extraction::read_personal(&[read(
+        "linear.issue_get"
+    )]));
     assert!(!super::extraction::read_personal(&[]));
 }

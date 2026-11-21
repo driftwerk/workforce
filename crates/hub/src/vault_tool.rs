@@ -1790,11 +1790,14 @@ mod tests {
             RedactionMode::Redact,
             RedactionMode::Deny,
         ] {
-            let policy = RedactionPolicy::new(mode, Arc::new(PathMatcher::new([path.into()])));
+            let bank = "skills/bank/workspaces/natwest/bank";
+            let policy =
+                RedactionPolicy::new(mode, Arc::new(PathMatcher::new([path.into(), bank.into()])));
             assert_eq!(policy.apply(path, "bsk_x".repeat(8)), None, "{mode:?}");
-            assert!(policy
-                .apply("skills/bank/workspaces/natwest/bank", "NatWest".into())
-                .is_some());
+            assert_eq!(
+                policy.apply(bank, "NatWest".into()),
+                Some(("NatWest".to_string(), false))
+            );
         }
     }
 

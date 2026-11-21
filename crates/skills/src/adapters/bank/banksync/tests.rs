@@ -71,7 +71,12 @@ fn natwest(server: &MockServer) -> BankSync {
 }
 
 fn window() -> Window {
-    Window::of(None, Some("2026-11-21".parse().unwrap()), Utc::now().date_naive()).unwrap()
+    Window::of(
+        None,
+        Some("2026-11-21".parse().unwrap()),
+        Utc::now().date_naive(),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -103,12 +108,14 @@ async fn every_read_is_a_get_and_the_key_is_checked_once() {
         .await;
     Mock::given(method("GET"))
         .and(path("/banks/bnk_nw/accounts/acc_1/balances"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"success": true, "data": {
-            "date": "2026-11-21", "retrievedAt": "2026-11-21T08:00:00Z", "balanceAsOf": null,
-            "bank": "NatWest", "account": "Current", "accountName": "Current",
-            "accountNumber": "12345678", "accountType": "checking", "accountId": "acc_1",
-            "bankId": "bnk_nw", "amount": 1234.56, "availableBalance": 1200.5, "currency": "GBP"
-        }})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"success": true, "data": {
+                "date": "2026-11-21", "retrievedAt": "2026-11-21T08:00:00Z", "balanceAsOf": null,
+                "bank": "NatWest", "account": "Current", "accountName": "Current",
+                "accountNumber": "12345678", "accountType": "checking", "accountId": "acc_1",
+                "bankId": "bnk_nw", "amount": 1234.56, "availableBalance": 1200.5, "currency": "GBP"
+            }})),
+        )
         .mount(&server)
         .await;
     Mock::given(method("GET"))
@@ -125,7 +132,10 @@ async fn every_read_is_a_get_and_the_key_is_checked_once() {
     assert!(connection.connected);
     let accounts = bs.accounts().await.unwrap();
     assert_eq!(accounts[0].number, "•••• 5678");
-    assert_eq!(accounts[0].balance, Some(Number::from_f64(1234.56).unwrap()));
+    assert_eq!(
+        accounts[0].balance,
+        Some(Number::from_f64(1234.56).unwrap())
+    );
     let balance = bs.balance("acc_1").await.unwrap();
     assert_eq!(balance.amount.to_string(), "1234.56");
     let page = bs.transactions("acc_1", window(), None).await.unwrap();
@@ -150,7 +160,10 @@ async fn a_key_that_can_write_is_never_used() {
 #[tokio::test]
 async fn a_key_without_banks_read_is_told_so() {
     let server = serve(&["institutions:read"]).await;
-    assert_eq!(natwest(&server).accounts().await, Err(BankError::ScopeMissing));
+    assert_eq!(
+        natwest(&server).accounts().await,
+        Err(BankError::ScopeMissing)
+    );
 }
 
 #[tokio::test]
@@ -158,9 +171,15 @@ async fn a_bank_is_named_by_its_id_or_its_name_alone() {
     let all = banks();
     assert_eq!(bank_named(&all, "bnk_rev").unwrap(), "bnk_rev");
     assert_eq!(bank_named(&all, "REVOLUT").unwrap(), "bnk_rev");
-    assert!(matches!(bank_named(&all, "Monzo"), Err(BankError::Invalid(_))));
+    assert!(matches!(
+        bank_named(&all, "Monzo"),
+        Err(BankError::Invalid(_))
+    ));
     let twins = json!({"data": [bank("a", "NatWest", true), bank("b", "NatWest Business", true)]});
-    assert!(matches!(bank_named(&twins, "natwest"), Err(BankError::Invalid(_))));
+    assert!(matches!(
+        bank_named(&twins, "natwest"),
+        Err(BankError::Invalid(_))
+    ));
     assert_eq!(bank_named(&twins, "natwest business").unwrap(), "b");
 }
 
@@ -241,7 +260,10 @@ async fn a_stored_connection_reads_its_key_bank_and_approval_as_the_caller() {
     let store = InMem::from(&[
         ("skills/bank/workspaces/revolut/api_key", KEY),
         ("skills/bank/workspaces/revolut/bank", "Revolut"),
-        ("skills/bank/workspaces/revolut/consented_at", "2026-09-01T10:00:00Z"),
+        (
+            "skills/bank/workspaces/revolut/consented_at",
+            "2026-09-01T10:00:00Z",
+        ),
     ]);
     let bs = BankSync::with_store(store, "revolut", &server.uri(), Arc::default());
     assert_eq!(bs.accounts().await.unwrap().len(), 1);

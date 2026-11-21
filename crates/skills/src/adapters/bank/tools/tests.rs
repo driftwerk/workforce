@@ -118,7 +118,10 @@ fn ctx(fakes: Vec<(&str, Fake)>, default: &str) -> Ctx<Fake> {
         .into_iter()
         .map(|(n, f)| (n.to_string(), Arc::new(f)))
         .collect();
-    Ctx::new(Arc::new(LiveInstances::fixed_map(clients, default)), default.into())
+    Ctx::new(
+        Arc::new(LiveInstances::fixed_map(clients, default)),
+        default.into(),
+    )
 }
 
 fn resume() -> Resume {
@@ -150,16 +153,24 @@ async fn a_listing_goes_on_inside_a_page_it_stopped_in() {
     assert_eq!((next.page.as_deref(), next.offset), (None, 2));
     let second = list(&fake, next, None, 2).await.unwrap();
     assert_eq!(ids(&second), ["c"]);
-    let third = list(&fake, Resume::decode(&second.next_cursor.unwrap()).unwrap(), None, 2)
-        .await
-        .unwrap();
+    let third = list(
+        &fake,
+        Resume::decode(&second.next_cursor.unwrap()).unwrap(),
+        None,
+        2,
+    )
+    .await
+    .unwrap();
     assert_eq!(ids(&third), ["d"]);
     assert_eq!(third.next_cursor, None);
 }
 
 #[tokio::test]
 async fn a_search_reads_at_most_four_pages() {
-    let fake = Fake::new(&["acc"], &[&["x1"], &["x2"], &["x3"], &["hit"], &["x5"], &["hit2"]]);
+    let fake = Fake::new(
+        &["acc"],
+        &[&["x1"], &["x2"], &["x3"], &["hit"], &["x5"], &["hit2"]],
+    );
     let got = list(&fake, resume(), Some("hit"), 50).await.unwrap();
     assert_eq!(ids(&got), ["hit"]);
     assert_eq!(fake.asked.lock().unwrap().len(), SEARCH_PAGES);
@@ -190,7 +201,10 @@ async fn a_first_read_the_rate_limit_stops_is_an_error() {
 
 #[tokio::test]
 async fn the_account_is_implied_only_when_there_is_one() {
-    let tool = BankTransactionsTool(ctx(vec![("natwest", Fake::new(&["acc"], &[&["a"]]))], "natwest"));
+    let tool = BankTransactionsTool(ctx(
+        vec![("natwest", Fake::new(&["acc"], &[&["a"]]))],
+        "natwest",
+    ));
     let out = tool.execute(json!({})).await.unwrap();
     assert!(out.success, "{:?}", out.error);
     assert_eq!(out.output["connection"], "natwest");
@@ -208,7 +222,10 @@ async fn the_account_is_implied_only_when_there_is_one() {
 
 #[tokio::test]
 async fn a_cursor_or_date_that_is_not_one_is_refused() {
-    let tool = BankTransactionsTool(ctx(vec![("natwest", Fake::new(&["acc"], &[&["a"]]))], "natwest"));
+    let tool = BankTransactionsTool(ctx(
+        vec![("natwest", Fake::new(&["acc"], &[&["a"]]))],
+        "natwest",
+    ));
     for input in [
         json!({"cursor": "not-a-cursor"}),
         json!({"from": "1st November"}),
@@ -236,12 +253,18 @@ async fn several_connections_are_picked_by_name_and_an_unknown_one_lists_them() 
     assert!(out.error.unwrap().contains("revolut"));
 
     let names = BankWorkspacesTool(ctx).execute(json!({})).await.unwrap();
-    assert_eq!(names.output, json!({"workspaces": ["natwest", "revolut"], "default": "natwest"}));
+    assert_eq!(
+        names.output,
+        json!({"workspaces": ["natwest", "revolut"], "default": "natwest"})
+    );
 }
 
 #[tokio::test]
 async fn accounts_say_when_the_approval_lapses_and_to_remind_a_week_before() {
-    let tool = BankAccountsTool(ctx(vec![("natwest", Fake::new(&["acc"], &[&["a"]]))], "natwest"));
+    let tool = BankAccountsTool(ctx(
+        vec![("natwest", Fake::new(&["acc"], &[&["a"]]))],
+        "natwest",
+    ));
     let out = tool.execute(json!({})).await.unwrap();
     let approval = &data(&out.output)["approval"];
     assert_eq!(approval["days_left"], 7);
@@ -261,7 +284,10 @@ async fn balances_of_every_account_stop_at_the_rate_limit_with_what_they_have() 
 
 #[tokio::test]
 async fn what_a_bank_says_reaches_the_model_fenced() {
-    let tool = BankTransactionsTool(ctx(vec![("natwest", Fake::new(&["acc"], &[&["a"]]))], "natwest"));
+    let tool = BankTransactionsTool(ctx(
+        vec![("natwest", Fake::new(&["acc"], &[&["a"]]))],
+        "natwest",
+    ));
     let out = tool.execute(json!({})).await.unwrap();
     assert!(out.output["data"]
         .as_str()

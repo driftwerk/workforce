@@ -158,7 +158,9 @@ pub enum BankError {
     /// The key can do more than read, so it is never used.
     NotReadOnly,
     NotFound(&'static str),
-    RateLimited { retry_after: u64 },
+    RateLimited {
+        retry_after: u64,
+    },
     Invalid(String),
     NotConfigured(&'static str),
     Unavailable(Option<u16>),
@@ -218,7 +220,9 @@ mod tests {
             }
         );
         assert_eq!(
-            Window::of(None, Some(day("2026-01-31")), today).unwrap().from,
+            Window::of(None, Some(day("2026-01-31")), today)
+                .unwrap()
+                .from,
             day("2026-01-01")
         );
         assert!(matches!(

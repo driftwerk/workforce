@@ -259,7 +259,12 @@ const DATADOG_HELD: &[&str] = &[
     "skills/datadog/site",
 ];
 const BANK_FIELDS: &[Field] = &[
-    secret("api_key", "BankSync API key", "skills/bank/api_key", "api_key"),
+    secret(
+        "api_key",
+        "BankSync API key",
+        "skills/bank/api_key",
+        "api_key",
+    ),
     plain("bank", "Bank", "NatWest", "skills/bank/bank", "bank"),
 ];
 const BANK_HELD: &[&str] = &[

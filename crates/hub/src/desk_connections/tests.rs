@@ -2100,6 +2100,8 @@ mod setups {
             "https://github.com/settings/personal-access-tokens/new",
             "https://app.datadoghq.eu/organization-settings/api-keys",
             "https://app.ddog-gov.com/personal-settings/application-keys",
+            "https://app.banksync.io/wsAbc123/settings/developers",
+            "https://app.banksync.io/wsAbc123/settings/developers/api-keys",
             // A Metabase's address is each person's own: its key page is
             // hidden wherever it is, before any setup has kept one.
             "https://bi.globex.example/admin/settings/authentication/api-keys",
@@ -2108,6 +2110,7 @@ mod setups {
             assert!(keys::is_key_page(at), "{at}");
         }
         assert!(!keys::is_key_page("https://linear.app/acme/issue/ACM-1"));
+        assert!(!keys::is_key_page("https://app.banksync.io/wsAbc123/banks"));
         assert!(!keys::is_key_page(
             "https://bi.globex.example/admin/settings/authentication"
         ));
@@ -3210,21 +3213,39 @@ fn bank(key: &str, bank: &str) -> BTreeMap<String, String> {
 #[tokio::test]
 async fn a_bank_connects_only_on_a_key_that_reads_and_says_when_its_approval_lapses() {
     let h = hub().await;
-    let refused = h
-        .c
-        .connect(SARAH, "bank", Some("NatWest"), "agent", Some("allan"), bank(BS_WRITES, "NatWest"))
+    let refused =
+        h.c.connect(
+            SARAH,
+            "bank",
+            Some("NatWest"),
+            "agent",
+            Some("allan"),
+            bank(BS_WRITES, "NatWest"),
+        )
         .await;
-    assert!(matches!(refused, Err(_)), "a key that can write is refused");
-    let lapsed = h
-        .c
-        .connect(SARAH, "bank", Some("Revolut"), "agent", Some("allan"), bank(BS_GOOD, "Revolut"))
+    assert!(refused.is_err(), "a key that can write is refused");
+    let lapsed =
+        h.c.connect(
+            SARAH,
+            "bank",
+            Some("Revolut"),
+            "agent",
+            Some("allan"),
+            bank(BS_GOOD, "Revolut"),
+        )
         .await;
-    assert!(matches!(lapsed, Err(_)), "a bank whose approval lapsed is refused");
+    assert!(lapsed.is_err(), "a bank whose approval lapsed is refused");
 
     let before = Utc::now();
-    let natwest = h
-        .c
-        .connect(SARAH, "bank", Some("NatWest"), "agent", Some("allan"), bank(BS_GOOD, "natwest"))
+    let natwest =
+        h.c.connect(
+            SARAH,
+            "bank",
+            Some("NatWest"),
+            "agent",
+            Some("allan"),
+            bank(BS_GOOD, "natwest"),
+        )
         .await
         .unwrap();
     assert_eq!(natwest.account.as_deref(), Some("NatWest"));
@@ -3233,7 +3254,11 @@ async fn a_bank_connects_only_on_a_key_that_reads_and_says_when_its_approval_lap
     assert!(until <= Utc::now() + chrono::Duration::days(90));
 
     let tested = h.c.test(SARAH, "bank", &natwest.id).await.unwrap();
-    assert_eq!(tested.approved_until, Some(until), "a Test alone moves nothing");
+    assert_eq!(
+        tested.approved_until,
+        Some(until),
+        "a Test alone moves nothing"
+    );
     let renewed = h.c.renew(SARAH, "bank", &natwest.id).await.unwrap();
     assert!(renewed.approved_until.unwrap() > until, "a renewal does");
 }

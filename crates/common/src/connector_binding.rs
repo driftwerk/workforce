@@ -81,7 +81,9 @@ pub fn is_personal_secret(path: &str) -> bool {
         _ => &segments[..],
     };
     match logical {
-        [skills, connector, rest @ ..] if skills == "skills" && PERSONAL.contains(&connector.as_str()) => {
+        [skills, connector, rest @ ..]
+            if skills == "skills" && PERSONAL.contains(&connector.as_str()) =>
+        {
             matches!(rest, [key] if key == "api_key")
                 || matches!(rest, [_, _, key] if key == "api_key")
                 || rest.iter().any(|s| s == "..")

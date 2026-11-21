@@ -419,6 +419,21 @@ fn recipe(service: &str) -> Option<Recipe> {
             sign_in_label: "Sign in to GitHub",
             key_label: "Make a token and save it to the vault",
         },
+        "bank" => Recipe {
+            page: |_| Some(BANKSYNC_APP.into()),
+            origins: |_| vec![BANKSYNC_APP.into()],
+            // BankSync's settings sit under the workspace's own segment:
+            // `/<workspace>/settings/developers/api-keys`.
+            paths: &["/settings/developers"],
+            workspace_segment: true,
+            shaped: |_, v| v.starts_with("bsk_") && plain_token(v, 20),
+            shape: r"bsk_[!#-&(-~]{16,4092}",
+            where_label: Some("Say which bank"),
+            page_label: "Open BankSync › Settings › Developers › API keys",
+            sign_in_label: "Sign in to BankSync",
+            key_label:
+                "Make a key with banks:read and institutions:read only, and save it to the vault",
+        },
         _ => return None,
     })
 }

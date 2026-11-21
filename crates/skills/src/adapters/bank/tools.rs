@@ -122,18 +122,28 @@ fn elapsed(start: Instant) -> u64 {
 }
 
 /// The one account of `client`'s, when `account` names none.
-async fn account_of<P: BankProvider>(client: &P, account: Option<&str>) -> Result<String, BankError> {
+async fn account_of<P: BankProvider>(
+    client: &P,
+    account: Option<&str>,
+) -> Result<String, BankError> {
     if let Some(account) = account.map(str::trim).filter(|a| !a.is_empty()) {
         return Ok(account.to_string());
     }
     match client.accounts().await?.as_slice() {
         [one] => Ok(one.id.clone()),
-        [] => Err(BankError::Invalid("This bank connection has no accounts.".into())),
+        [] => Err(BankError::Invalid(
+            "This bank connection has no accounts.".into(),
+        )),
         many => Err(BankError::Invalid(format!(
             "This bank has {} accounts: pass `account`, one of {}.",
             many.len(),
             many.iter()
-                .map(|a| format!("{} ({} {})", a.id, a.name.as_deref().unwrap_or(&a.kind), a.number))
+                .map(|a| format!(
+                    "{} ({} {})",
+                    a.id,
+                    a.name.as_deref().unwrap_or(&a.kind),
+                    a.number
+                ))
                 .collect::<Vec<_>>()
                 .join(", ")
         ))),
@@ -144,9 +154,9 @@ fn date(input: &Value, key: &str) -> Result<Option<NaiveDate>, BankError> {
     input[key]
         .as_str()
         .map(|d| {
-            d.trim().parse().map_err(|_| {
-                BankError::Invalid(format!("`{key}` is a date like 2026-11-21."))
-            })
+            d.trim()
+                .parse()
+                .map_err(|_| BankError::Invalid(format!("`{key}` is a date like 2026-11-21.")))
         })
         .transpose()
 }
@@ -245,7 +255,11 @@ impl<P: BankProvider + 'static> Tool for BankBalancesTool<P> {
             Err(e) => return Ok(ToolResult::failure(e, elapsed(start))),
         };
         let read = async {
-            let ids = match input["account"].as_str().map(str::trim).filter(|a| !a.is_empty()) {
+            let ids = match input["account"]
+                .as_str()
+                .map(str::trim)
+                .filter(|a| !a.is_empty())
+            {
                 Some(id) => vec![id.to_string()],
                 None => client.accounts().await?.into_iter().map(|a| a.id).collect(),
             };
@@ -294,7 +308,9 @@ impl Resume {
             .decode(raw.trim())
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .ok_or_else(|| BankError::Invalid("That cursor isn't one bank.transactions gave.".into()))
+            .ok_or_else(|| {
+                BankError::Invalid("That cursor isn't one bank.transactions gave.".into())
+            })
     }
 }
 

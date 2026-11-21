@@ -8,7 +8,8 @@
 use workforce_agent::tools::access::{ToolAccess, ToolAccessSnapshot};
 use workforce_common::connector_binding::PERSONAL;
 
-const OFF_DESK: &str = "The person's bank is read only in a Desk conversation with them. Ask them there.";
+const OFF_DESK: &str =
+    "The person's bank is read only in a Desk conversation with them. Ask them there.";
 const UNNAMED: &str = "Work nobody is watching reads the person's bank only when it names the bank tools in its `tools` and answers in Desk.";
 
 /// Why `tool`, a personal connector's, can't be called now; `None` when it
