@@ -874,10 +874,11 @@ impl BoardSync {
 
     /// Which of the person's several GitHub connections there a link goes
     /// through: the one they picked, unless GitHub says it can't reach what
-    /// the link names; else the default when it does; else the only other
-    /// that does, the others asked a few at once. `None`: nothing to
-    /// choose (Jira or Linear, one connection, nothing named, a pick that
-    /// isn't theirs, or none reaching it), so the link goes on as asked.
+    /// the link names; else the default, unless GitHub says the same of it;
+    /// else the only other that does, the others asked a few at once.
+    /// `None`: nothing to choose (Jira or Linear, one connection, nothing
+    /// named, a pick that isn't theirs, or none reaching it), so the link
+    /// goes on as asked.
     async fn github_connection(
         &self,
         via: &Via,
@@ -918,8 +919,9 @@ impl BoardSync {
         }
         let default = default.filter(|d| names.iter().any(|n| n == d));
         if let Some(d) = default {
-            if self.reaches(remote, key, d, tool, args).await == gh::Reach::Yes {
-                return Ok(Some(d.to_string()));
+            match self.reaches(remote, key, d, tool, args).await {
+                gh::Reach::Yes | gh::Reach::Unknown => return Ok(Some(d.to_string())),
+                gh::Reach::No => {}
             }
         }
         let others: Vec<_> = names

@@ -495,7 +495,10 @@ fn a_connection_s_reach_is_what_github_said_or_unknown() {
     let project = "github.project_get";
     assert_eq!(reach_of(project, &Ok(json!({ "id": "PVT_1" }))), Reach::Yes);
     assert_eq!(
-        reach_of(project, &Err(RemoteError::Failed("Not found".into()))),
+        reach_of(
+            project,
+            &Err(RemoteError::Failed("Not found: Not Found".into()))
+        ),
         Reach::No
     );
     assert_eq!(
@@ -532,6 +535,8 @@ fn a_connection_s_reach_is_what_github_said_or_unknown() {
         ),
         RemoteError::Failed("GitHub GraphQL rate limited: limit".into()),
         RemoteError::Failed("error sending request for url".into()),
+        RemoteError::Failed("tool not found: github.project_get".into()),
+        RemoteError::Failed("Tool github.project_get not found or not enabled".into()),
         RemoteError::Offline("away".into()),
         RemoteError::RateLimited {
             retry_after_secs: None,

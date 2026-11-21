@@ -140,24 +140,26 @@ pub fn reach_of(tool: &str, answer: &Result<Value, RemoteError>) -> Reach {
     }
 }
 
-/// Whether the GitHub adapter's error `why` says no: not found, no access,
-/// a key it refused. A rate limit's 403 says "rate limit exceeded".
+/// Whether the GitHub adapter's error `why` says no, in its own words: a
+/// 404, GraphQL's `NOT_FOUND` or `FORBIDDEN`, a 403 that isn't a rate limit,
+/// a key GitHub refused, or `project_get`'s missing project. Anything else
+/// (a tool the hub lacks, a rate limit) can't say.
 fn turned_away(why: &str) -> bool {
-    let why = why.to_ascii_lowercase();
     let limited = [
         "rate limited",
         "rate limit exceeded",
         "secondary rate limit",
     ];
     let no = [
-        "not found",
-        "not_found",
-        "forbidden",
-        "could not resolve",
-        "authentication failed",
-        "no project ",
+        "Not found: ",
+        "GitHub GraphQL NOT_FOUND",
+        "GitHub GraphQL FORBIDDEN",
+        "Forbidden (rate limit or permissions): ",
+        "Authentication failed: ",
+        "No project ",
     ];
-    !limited.iter().any(|l| why.contains(l)) && no.iter().any(|n| why.contains(n))
+    let lower = why.to_ascii_lowercase();
+    !limited.iter().any(|l| lower.contains(l)) && no.iter().any(|n| why.contains(n))
 }
 
 /// Which of a person's several GitHub connections a link goes through,

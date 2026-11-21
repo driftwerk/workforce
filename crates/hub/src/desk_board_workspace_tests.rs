@@ -431,7 +431,7 @@ impl Tool for FakeGithub {
         }
         let through = input["workspace"].as_str().unwrap_or("mantis");
         if !self.reach.contains(&through) {
-            return Ok(ToolResult::failure("Not found".to_string(), 0));
+            return Ok(ToolResult::failure("Not found: Not Found".to_string(), 0));
         }
         Ok(ToolResult::success(
             match self.name {
@@ -741,6 +741,31 @@ async fn a_connection_github_turns_away_doesn_t_reach_the_target() {
                 let got = local.sync.reaches(&remote, tool, name, tool, args).await;
                 assert_eq!(got, reach, "{name} {tool}");
             }
+        }
+
+        // A default GitHub can't answer for is kept, not swapped for
+        // another that reaches.
+        let names = ["busy", "open", "shut"].map(String::from);
+        let reached = super::Reached {
+            remote,
+            agent: Some("default".into()),
+        };
+        let chosen = |default: &'static str| super::Wanted {
+            system: System::Github,
+            names: &names,
+            default: Some(default),
+            asked: None,
+            target: Some("acme/web"),
+            owner: None,
+        };
+        for (default, kept) in [("busy", "busy"), ("shut", "open")] {
+            let got = local
+                .sync
+                .github_connection(&Via::ThisHub, &person, &reached, chosen(default))
+                .await
+                .ok()
+                .flatten();
+            assert_eq!(got.as_deref(), Some(kept), "default {default}");
         }
     })
     .await;
