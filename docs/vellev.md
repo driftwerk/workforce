@@ -750,7 +750,10 @@ workforce code compare same --config workforce.toml \
   passes, from 0.90 it passes with a warning, and below 0.90, which would
   mean another model or prefix, it fails.
 - **What it writes.** Nothing to any store: it only searches. The result,
-  each query's outcome with the mean and the verdict, goes to `--out` by
+  naming the run by the sha256 of its `SHA256SUMS` and the code
+  collections by their identity, with each query's outcome, the mean and
+  the verdict, goes to `--out` by
   way of `<out>.partial`; an existing one of either is refused and never
   written over. The sha256 of `--out` is printed, and a failure, still
-  written, exits non-zero naming the queries that differ.
+  written, exits non-zero naming the queries that differ, the text
+  overlap below its floor, or both.

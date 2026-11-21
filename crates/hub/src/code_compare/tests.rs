@@ -1113,7 +1113,9 @@ async fn the_run_is_moved_into_out_alone() {
     assert!(ran.dir.join(SUMS).is_file());
     assert!(!dir.path().join("slashed.partial").exists());
 
-    let refused = refused_if_there(Path::new("..")).unwrap_err().to_string();
+    let refused = refused_if_there(Path::new(".."), "a run")
+        .unwrap_err()
+        .to_string();
     assert!(refused.contains("names no directory"), "{refused}");
 
     let out = dir.path().join("meanwhile");
@@ -1775,6 +1777,15 @@ fn edited(run: &Path, name: &str, change: impl FnOnce(&mut Vec<serde_json::Value
     std::fs::write(run.join(SUMS), listing(&sums)).unwrap();
 }
 
+/// What a check writes of `found`, on a run and collections it names.
+fn checked_on(found: Found) -> Same {
+    Same {
+        run_sums_sha256: "sums".to_string(),
+        identity: "entities/summaries".to_string(),
+        found,
+    }
+}
+
 /// A store on a node that serves no tenant, embedding as the default.
 fn not_serving(node: &NotServing) -> VellevCodeVectorStore {
     VellevCodeVectorStore::new(&node.url, "key", "code").unwrap()
@@ -1789,11 +1800,11 @@ async fn same_asks_the_runs_vectors_again_and_writes_nothing() {
     let vellev = Searched::of(&entities, first);
     let dir = tempfile::tempdir().unwrap();
     let run = a_run(&entities, &vellev, &options(&dir.path().join("run"))).await;
-    let (_, asked) = verified(&run).unwrap();
+    let asked = verified(&run).unwrap().asked;
     let (before, besides) = (vellev.asked().len(), vellev.besides.load(Ordering::SeqCst));
-    let found = same(&asked, &vellev).await.unwrap();
+    let found = asked_again(&asked, &vellev).await.unwrap();
     assert_eq!(found.vector.len(), 10);
-    assert!(found.vector.iter().all(|(_, same)| *same));
+    assert!(found.differing().is_empty(), "{found:?}");
     assert_eq!((found.text_overlap, found.verdict), (1.0, Verdict::Pass));
     assert_eq!(vellev.besides.load(Ordering::SeqCst), besides);
     let wanted: Vec<_> = asked
@@ -1803,20 +1814,21 @@ async fn same_asks_the_runs_vectors_again_and_writes_nothing() {
     assert_eq!(vellev.asked()[before..], wanted[..]);
 }
 
-/// An answer reordered between near-equal scores is the run's, and one
-/// reordered between scores apart fails by its query. The vectors are held
-/// to the run's vector answers and the texts to its text answers.
+/// An answer reordered between scores 5e-4 apart is the run's, and one
+/// reordered between scores 2e-3 apart fails by its query. The vectors are
+/// held to the run's vector answers and the texts to its text answers.
 #[tokio::test]
 async fn a_changed_answer_fails_by_its_query_and_near_ties_do_not() {
     let entities = functions("r", 12);
     let every = |_: &CodeEntity| entities.iter().collect::<Vec<_>>();
-    let mut mac = Searched::of(&entities, every);
-    for answer in mac.by_text.values_mut() {
+    let mut original = Searched::of(&entities, every);
+    for answer in original.by_text.values_mut() {
         answer[3].distance = answer[2].distance + 5e-4;
+        answer[6].distance = answer[5].distance + 2e-3;
     }
     let dir = tempfile::tempdir().unwrap();
-    let run = a_run(&entities, &mac, &options(&dir.path().join("run"))).await;
-    let (_, asked) = verified(&run).unwrap();
+    let run = a_run(&entities, &original, &options(&dir.path().join("run"))).await;
+    let asked = verified(&run).unwrap().asked;
     let (changed, short) = (asked[0].query.clone(), asked[1].query.id.clone());
     edited(&run, "answers.jsonl", |rows| {
         let row = rows.iter_mut().find(|row| row["id"] == short.as_str());
@@ -1825,40 +1837,89 @@ async fn a_changed_answer_fails_by_its_query_and_near_ties_do_not() {
             .unwrap()
             .truncate(9);
     });
-    let (_, asked) = verified(&run).unwrap();
+    let asked = verified(&run).unwrap().asked;
     let node = |swapped: (usize, usize)| {
-        let mut by_text = mac.by_text.clone();
+        let mut by_text = original.by_text.clone();
         let key = (changed.repo_id.clone(), changed.text.clone());
         by_text.get_mut(&key).unwrap().swap(swapped.0, swapped.1);
         Searched {
             by_text,
-            made: Mutex::new(mac.made.lock().unwrap().clone()),
+            made: Mutex::new(original.made.lock().unwrap().clone()),
             ..Searched::of(&entities, first)
         }
     };
 
-    let near = same(&asked, &node((2, 3))).await.unwrap();
-    assert!(near.vector.iter().all(|(_, same)| *same), "{near:?}");
+    let near = asked_again(&asked, &node((2, 3))).await.unwrap();
+    assert!(near.differing().is_empty(), "{near:?}");
     let shortened = near.text.iter().find(|(id, _)| *id == short).unwrap();
     assert_eq!(shortened.1, 0.9);
     assert_eq!(near.verdict, Verdict::Pass);
 
-    let apart = same(&asked, &node((5, 6))).await.unwrap();
-    let differing: Vec<&str> = apart
-        .vector
-        .iter()
-        .filter(|(_, same)| !same)
-        .map(|(id, _)| id.as_str())
-        .collect();
-    assert_eq!(differing, [changed.id.as_str()]);
+    let apart = asked_again(&asked, &node((5, 6))).await.unwrap();
+    assert_eq!(apart.differing(), [changed.id.as_str()]);
     assert_eq!(apart.verdict, Verdict::Fail);
-    let checked = Checked {
-        out: dir.path().join("same.json"),
-        sha256: String::new(),
-        same: apart,
+}
+
+/// A failure names only what failed: the queries whose vector answers
+/// differ, the mean text overlap below its floor, or both.
+#[test]
+fn a_failure_names_only_what_failed() {
+    fn failed(vector: &[(&str, bool)], text_overlap: f64) -> Option<String> {
+        let all_same = vector.iter().all(|(_, same)| *same);
+        let found = Found {
+            vector: vector
+                .iter()
+                .map(|(id, same)| (id.to_string(), *same))
+                .collect(),
+            text: Vec::new(),
+            text_overlap,
+            verdict: stats::same_verdict(all_same, text_overlap),
+        };
+        let checked = Checked {
+            out: PathBuf::from("same.json"),
+            sha256: String::new(),
+            same: checked_on(found),
+        };
+        checked.passed().err().map(|failed| failed.to_string())
+    }
+    let vectors = "1 of 2 same queries' vector answers differ from the run's (b)";
+    let text = "the mean text overlap is 0.8500, below the 0.9 needed";
+    assert_eq!(failed(&[("a", true), ("b", true)], 0.92), None);
+    assert_eq!(
+        failed(&[("a", true), ("b", false)], 0.99),
+        Some(format!("check 4 failed: {vectors}; same.json is complete"))
+    );
+    assert_eq!(
+        failed(&[("a", true), ("b", true)], 0.85),
+        Some(format!("check 4 failed: {text}; same.json is complete"))
+    );
+    assert_eq!(
+        failed(&[("a", true), ("b", false)], 0.85),
+        Some(format!(
+            "check 4 failed: {vectors}, and {text}; same.json is complete"
+        ))
+    );
+}
+
+/// A request the node fails fails the check, naming the side and the
+/// query, and nothing else is asked of the store.
+#[tokio::test]
+async fn a_failing_request_fails_naming_its_side_and_query() {
+    let entities = functions("r", 12);
+    let original = Searched::of(&entities, first);
+    let dir = tempfile::tempdir().unwrap();
+    let run = a_run(&entities, &original, &options(&dir.path().join("run"))).await;
+    let asked = verified(&run).unwrap().asked;
+    let node = Searched {
+        failing_vector: Some(2),
+        made: Mutex::new(original.made.lock().unwrap().clone()),
+        ..Searched::of(&entities, first)
     };
-    let failed = checked.passed().unwrap_err().to_string();
-    assert!(failed.contains(&changed.id), "{failed}");
+    let failed = format!("{:#}", asked_again(&asked, &node).await.unwrap_err());
+    let said = format!("vellev vector failed on query {}", asked[1].query.id);
+    assert!(failed.contains(&said), "{failed}");
+    assert_eq!(node.asked().len(), 3);
+    assert_eq!(node.besides.load(Ordering::SeqCst), 0);
 }
 
 /// A run changed after it was made, or missing a file, is refused before
@@ -1921,7 +1982,7 @@ async fn a_same_query_missing_from_the_run_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let options = options(&dir.path().join("run"));
     let run = a_run(&entities, &Searched::of(&entities, first), &options).await;
-    let id = verified(&run).unwrap().1[0].query.id.clone();
+    let id = verified(&run).unwrap().asked[0].query.id.clone();
     for name in ["answers.jsonl", "vectors.jsonl", "queries.jsonl"] {
         edited(&run, name, |rows| {
             rows.retain(|row| row["id"] != id.as_str())
@@ -2033,16 +2094,20 @@ async fn an_existing_out_is_never_written_over() {
     }
     assert_eq!(node.asked(), 0);
 
-    let (_, asked) = verified(&run).unwrap();
-    let found = same(&asked, &searched).await.unwrap();
-    assert_eq!(kept(&out, &found).unwrap(), sha256_of(&out).unwrap());
+    let asked = verified(&run).unwrap().asked;
+    let same = checked_on(asked_again(&asked, &searched).await.unwrap());
+    assert_eq!(
+        kept(&out, &same).unwrap(),
+        (out.clone(), sha256_of(&out).unwrap())
+    );
     let written: serde_json::Value = serde_json::from_str(&read(dir.path(), "same.json")).unwrap();
+    assert_eq!(written["identity"], "entities/summaries");
     assert_eq!(written["verdict"], "pass");
     assert!(!partial(&out).exists());
 
     let meanwhile = dir.path().join("meanwhile.json");
     std::fs::write(&meanwhile, b"kept").unwrap();
-    let failed = format!("{:#}", kept(&meanwhile, &found).unwrap_err());
+    let failed = format!("{:#}", kept(&meanwhile, &same).unwrap_err());
     let holding = format!("{} holds the result", partial(&meanwhile).display());
     assert!(failed.contains(&holding), "{failed}");
     assert_eq!(std::fs::read(&meanwhile).unwrap(), b"kept");
@@ -2074,10 +2139,14 @@ async fn same_passes_the_runs_own_node_and_leaves_it_as_it_was() {
     let checked = same_as_run(&config, &run.dir, &dir.path().join("same.json"))
         .await
         .unwrap();
-    let found = &checked.same;
-    assert!(found.vector.iter().all(|(_, same)| *same), "{found:?}");
+    let found = &checked.same.found;
+    assert!(found.differing().is_empty(), "{found:?}");
     assert_eq!((found.text_overlap, found.verdict), (1.0, Verdict::Pass));
     assert!(checked.passed().is_ok());
+    assert_eq!(
+        (&checked.same.run_sums_sha256, &checked.same.identity),
+        (&sha256_of(&run.dir.join(SUMS)).unwrap(), &before.1)
+    );
     let after = (held(&node).await, vellev.found_as_wanted().await.unwrap());
     assert_eq!(after, before);
 }
