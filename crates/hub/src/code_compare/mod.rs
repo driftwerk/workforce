@@ -6,7 +6,8 @@
 //! a paired bootstrap, measures the recall of vellev's index against an exact
 //! scan, and checks that the node applies its query prefix. Nothing measured
 //! is written to: the one collection made, for the node to embed the
-//! questions, is dropped.
+//! questions, is dropped. `same` asks the serving node a run's same queries
+//! again, and writes to no store at all.
 
 mod stats;
 
@@ -15,12 +16,13 @@ mod tests;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use eyre::{eyre, Result, WrapErr};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use vellev_core::Distance;
@@ -34,7 +36,7 @@ use workforce_common::settings::WorkforceConfig;
 use workforce_common::vectorizable::VectorizableText;
 
 use crate::known_items::Smallest;
-use stats::{Applying, Estimate, Form, Sum, Unit};
+use stats::{Applying, Estimate, Form, Sum, Unit, Verdict};
 
 const LIMIT: usize = 20;
 const DEPTH: usize = 10;
@@ -948,7 +950,7 @@ struct GraphAbout {
     sha256: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct VellevAbout {
     url: String,
     tenant: String,
@@ -1095,7 +1097,8 @@ fn refused_if_there(out: &Path) -> Result<()> {
 }
 
 fn wrote(path: &Path, write: impl FnOnce(&mut BufWriter<File>) -> Result<()>) -> Result<String> {
-    let mut writer = BufWriter::new(File::create(path)?);
+    let file = File::create_new(path).wrap_err_with(|| format!("making {}", path.display()))?;
+    let mut writer = BufWriter::new(file);
     write(&mut writer)?;
     writer
         .into_inner()
@@ -1138,6 +1141,21 @@ fn lines<T: Serialize>(
     }
 }
 
+fn pretty<T: Serialize>(value: &T) -> impl FnOnce(&mut BufWriter<File>) -> Result<()> + '_ {
+    move |writer| {
+        serde_json::to_writer_pretty(&mut *writer, value)?;
+        Ok(writer.write_all(b"\n")?)
+    }
+}
+
+fn listing(sums: &[String]) -> String {
+    FILES
+        .iter()
+        .zip(sums)
+        .map(|(name, sum)| format!("{sum}  {name}\n"))
+        .collect()
+}
+
 /// Make `out`'s `.partial`, measure into it, write the files and then their
 /// sums, and move them to `out`, made empty for them so that nothing else
 /// there is written over. A failure before the sums are in place leaves
@@ -1162,16 +1180,9 @@ async fn recorded(
         wrote(&at(FILES[1]), lines(asked.iter().map(|one| &one.vectors)))?,
         wrote(&at(FILES[2]), lines(asked.iter().map(|one| &one.answers)))?,
         wrote(&at(FILES[3]), lines(measured.recall.iter()))?,
-        wrote(&at(FILES[4]), |writer| {
-            serde_json::to_writer_pretty(&mut *writer, &report)?;
-            Ok(writer.write_all(b"\n")?)
-        })?,
+        wrote(&at(FILES[4]), pretty(&report))?,
     ];
-    let listed: String = FILES
-        .iter()
-        .zip(&sums)
-        .map(|(name, sum)| format!("{sum}  {name}\n"))
-        .collect();
+    let listed = listing(&sums);
     let writing = at(SUMS_WRITING);
     wrote(&writing, |writer| Ok(writer.write_all(listed.as_bytes())?))
         .and_then(|_| Ok(std::fs::rename(&writing, at(SUMS))?))
@@ -1339,4 +1350,251 @@ async fn compared(
         Ok((measured, manifest))
     };
     recorded(&options.out, measure).await
+}
+
+#[derive(Deserialize)]
+struct Made {
+    vellev: VellevAbout,
+}
+
+#[derive(Deserialize)]
+struct Ran {
+    manifest: Made,
+    same_queries: BTreeSet<String>,
+}
+
+fn keyed<T: DeserializeOwned>(path: &Path, id: fn(&T) -> &str) -> Result<HashMap<String, T>> {
+    File::open(path)
+        .map_err(eyre::Report::from)
+        .and_then(|file| {
+            BufReader::new(file)
+                .lines()
+                .map(|line| -> Result<(String, T)> {
+                    let row: T = serde_json::from_str(&line?)?;
+                    Ok((id(&row).to_string(), row))
+                })
+                .collect()
+        })
+        .wrap_err_with(|| format!("reading {}", path.display()))
+}
+
+/// The run at `run` as it was made, refused unless every file is as summed,
+/// with each same query's question, vectors and answers.
+fn verified(run: &Path) -> Result<(VellevAbout, Vec<Asked>)> {
+    let at = |name: &str| run.join(name);
+    let kept = std::fs::read_to_string(at(SUMS))
+        .wrap_err_with(|| format!("reading {}", at(SUMS).display()))?;
+    let sums = FILES
+        .iter()
+        .map(|name| sha256_of(&at(name)))
+        .collect::<Result<Vec<_>>>()?;
+    let found = listing(&sums);
+    if kept != found {
+        let differing: Vec<&str> = FILES
+            .iter()
+            .zip(found.lines())
+            .filter(|(_, line)| !kept.lines().any(|kept| kept == *line))
+            .map(|(name, _)| *name)
+            .collect();
+        return Err(match differing.is_empty() {
+            true => eyre!(
+                "{} lists other files than a run's {}",
+                at(SUMS).display(),
+                FILES.join(", ")
+            ),
+            false => eyre!(
+                "{} in {} differ from its {SUMS}: the run was changed after it was made",
+                differing.join(", "),
+                run.display()
+            ),
+        });
+    }
+    let ran: Ran = serde_json::from_slice(&std::fs::read(at(FILES[4]))?)
+        .wrap_err_with(|| format!("reading {}", at(FILES[4]).display()))?;
+    if ran.same_queries.is_empty() {
+        return Err(eyre!(
+            "{} lists no same queries, having been made with --same-queries 0: make another",
+            run.display()
+        ));
+    }
+    let mut queries = keyed(&at(FILES[0]), |query: &Query| query.id.as_str())?;
+    let mut vectors = keyed(&at(FILES[1]), |vectors: &Vectors| vectors.id.as_str())?;
+    let mut answers = keyed(&at(FILES[2]), |answers: &Answers| answers.id.as_str())?;
+    let asked = ran
+        .same_queries
+        .iter()
+        .map(|id| {
+            let missing = |name: &str| eyre!("same query {id} is not in the run's {name}");
+            Ok(Asked {
+                query: queries.remove(id).ok_or_else(|| missing(FILES[0]))?,
+                vectors: vectors.remove(id).ok_or_else(|| missing(FILES[1]))?,
+                answers: answers.remove(id).ok_or_else(|| missing(FILES[2]))?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((ran.manifest.vellev, asked))
+}
+
+fn made_as(made: &VellevAbout, vellev: &VellevCodeVectorStore) -> Result<()> {
+    let (_, embedding) = vellev.embedded_as();
+    let run = (
+        made.model.as_str(),
+        made.dimensions,
+        made.query_prefix.as_deref(),
+        made.distance,
+    );
+    let node = (
+        embedding.model.as_str(),
+        embedding.dimensions,
+        embedding.query_prefix.as_deref(),
+        vellev.distance(),
+    );
+    match run == node {
+        true => Ok(()),
+        false => Err(eyre!(
+            "the run's vectors were made as {run:?} (model, dimensions, query prefix, distance), and [vellev.code] embeds as {node:?}: they would be asked of another model"
+        )),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct Same {
+    vector: Vec<(String, bool)>,
+    text: Vec<(String, f64)>,
+    text_overlap: f64,
+    verdict: Verdict,
+}
+
+async fn same(asked: &[Asked], vellev: &dyn SearchedByVector) -> Result<Same> {
+    let mut found = Vec::with_capacity(asked.len());
+    for Asked {
+        query,
+        vectors,
+        answers,
+    } in asked
+    {
+        let to = NearestTo::Vector(&vectors.prefixed);
+        let by_vector = nearest(vellev, to, query, "vellev vector").await?;
+        let by_text = nearest(vellev, NearestTo::Text(&query.text), query, "vellev").await?;
+        let mac = (&answers.vellev_vector.results, &answers.vellev.results);
+        found.push((
+            query.id.clone(),
+            stats::same_top(mac.0, &by_vector, DEPTH, WITHIN),
+            stats::overlap(mac.1, &by_text, DEPTH),
+        ));
+    }
+    let text_overlap = found.iter().map(|(.., overlap)| overlap).sum::<f64>() / found.len() as f64;
+    let verdict = stats::same_verdict(found.iter().all(|(_, same, _)| *same), text_overlap);
+    let (vector, text): (Vec<_>, Vec<_>) = found
+        .into_iter()
+        .map(|(id, same, overlap)| ((id.clone(), same), (id, overlap)))
+        .unzip();
+    Ok(Same {
+        vector,
+        text,
+        text_overlap,
+        verdict,
+    })
+}
+
+fn kept(out: &Path, same: &Same) -> Result<String> {
+    let (out, partial) = placed(out)?;
+    let parent = out.parent().unwrap_or(Path::new(""));
+    std::fs::create_dir_all(parent)?;
+    let sha256 = wrote(&partial, pretty(same))?;
+    std::fs::hard_link(&partial, &out).wrap_err_with(|| {
+        format!(
+            "placing {}, which is never written over: {} holds the result",
+            out.display(),
+            partial.display()
+        )
+    })?;
+    std::fs::remove_file(&partial)
+        .map_err(eyre::Report::from)
+        .and_then(|()| synced(parent))
+        .wrap_err_with(|| format!("{} holds the result", out.display()))?;
+    Ok(sha256)
+}
+
+/// A finished `code compare same`: where its result was written, and its
+/// sha256.
+#[derive(Debug)]
+pub struct Checked {
+    pub out: PathBuf,
+    pub sha256: String,
+    same: Same,
+}
+
+impl Checked {
+    /// `Err` naming what differs, unless the verdict is a pass, with or
+    /// without a warning.
+    pub fn passed(&self) -> Result<()> {
+        let differing: Vec<&str> = self
+            .same
+            .vector
+            .iter()
+            .filter(|(_, same)| !same)
+            .map(|(id, _)| id.as_str())
+            .collect();
+        match self.same.verdict {
+            Verdict::Fail => Err(eyre!(
+                "check 4 failed: {} of {} same queries' vector answers differ from the run's ({}), and the mean text overlap is {:.4}, of at least {} needed; {} is complete",
+                differing.len(),
+                self.same.vector.len(),
+                differing.join(", "),
+                self.same.text_overlap,
+                stats::TEXT_FLOOR,
+                self.out.display()
+            )),
+            Verdict::Pass | Verdict::Warn => Ok(()),
+        }
+    }
+}
+
+impl std::fmt::Display for Checked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let same = &self.same;
+        let agreed = same.vector.iter().filter(|(_, same)| *same).count();
+        writeln!(
+            f,
+            "  vector answers are the run's on {agreed} of {} same queries",
+            same.vector.len()
+        )?;
+        writeln!(
+            f,
+            "  text answers share {:.4} of the run's top {DEPTH}",
+            same.text_overlap
+        )?;
+        if same.verdict == Verdict::Warn {
+            writeln!(
+                f,
+                "  warning: below {}; the text check is advisory down to {}",
+                stats::TEXT_PASS,
+                stats::TEXT_FLOOR
+            )?;
+        }
+        write!(f, "  {} (sha256 {})", self.out.display(), self.sha256)
+    }
+}
+
+/// Ask the vellev `[vellev.code]` names the same queries of the run at
+/// `run` again, by their vectors (the gate) and by their texts, and write
+/// the result to `out`, which it never writes over. It writes to no store.
+pub async fn same_as_run(config: &WorkforceConfig, run: &Path, out: &Path) -> Result<Checked> {
+    let vellev = VellevCodeVectorStore::configured(&config.vellev)?;
+    checked_again(&vellev, run, out).await
+}
+
+async fn checked_again(vellev: &VellevCodeVectorStore, run: &Path, out: &Path) -> Result<Checked> {
+    refused_if_there(out)?;
+    let (made, asked) = verified(run)?;
+    made_as(&made, vellev)?;
+    vellev.found_as_wanted().await?;
+    let same = same(&asked, vellev).await?;
+    let sha256 = kept(out, &same)?;
+    Ok(Checked {
+        out: placed(out)?.0,
+        sha256,
+        same,
+    })
 }

@@ -18,7 +18,7 @@ use workforce_common::settings::{VellevCodeConfig, WorkforceConfig};
 use workforce_vellev::seeding::DocumentEmbedder;
 use workforce_vellev::testing::{Counted, Node, NotServing};
 
-use super::stats::{self, Applying, Form};
+use super::stats::{self, Applying, Form, Verdict};
 use super::*;
 use sha2::{Digest, Sha256};
 
@@ -157,7 +157,8 @@ fn weaviate_of<'a>(
 
 /// A fake of vellev's search: answers by text from a map, a vector by the
 /// text it was made of (with the prefix, as that text; without, the same
-/// entities as other objects), and an exact scan as its index answers.
+/// entities as other objects), and an exact scan as its index answers. It
+/// counts the calls that are not searches in `besides`.
 #[derive(Default)]
 struct Searched {
     prefix: Option<String>,
@@ -167,6 +168,7 @@ struct Searched {
     asked: Mutex<Vec<(&'static str, String, usize)>>,
     failing_vector: Option<usize>,
     failing_count: bool,
+    besides: AtomicUsize,
 }
 
 fn bits(vector: &[f32]) -> Vec<u32> {
@@ -233,6 +235,7 @@ impl SearchedByVector for Searched {
     }
 
     async fn embedded(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.besides.fetch_add(1, Ordering::SeqCst);
         let vectors = Counted::new(8).documents(texts).await?;
         let mut made = self.made.lock().unwrap();
         for (text, vector) in texts.iter().zip(&vectors) {
@@ -266,6 +269,7 @@ impl SearchedByVector for Searched {
         repo_id: &str,
         limit: usize,
     ) -> Result<Scanned> {
+        self.besides.fetch_add(1, Ordering::SeqCst);
         let mut scanned = Scanned {
             held: self.held.get(repo_id).copied().unwrap_or_default(),
             ..Scanned::default()
@@ -284,6 +288,7 @@ impl SearchedByVector for Searched {
     }
 
     async fn counted(&self, repo_id: &str) -> Result<usize> {
+        self.besides.fetch_add(1, Ordering::SeqCst);
         match self.failing_count {
             true => Err(eyre!("the node went away")),
             false => Ok(self.held.get(repo_id).copied().unwrap_or_default()),
@@ -1735,4 +1740,344 @@ async fn shortlisted_queries_are_told_by_the_node() {
         .unwrap();
     assert_eq!(rows[0].held, 3_500);
     assert_eq!(told(rows), BTreeMap::from([("big".to_string(), false)]));
+}
+
+/// A run on fakes whose vectors `vellev` made, and its directory.
+async fn a_run(entities: &[CodeEntity], vellev: &Searched, options: &CompareOptions) -> PathBuf {
+    let graph = graph_of(entities).await;
+    let weaviate = weaviate_of(entities, first);
+    ran(
+        &graph,
+        &weaviate,
+        vellev,
+        &Counters::shortlisting(),
+        options,
+    )
+    .await
+    .unwrap()
+    .dir
+}
+
+/// The run at `run` with the rows of `name` changed by `change`, summed
+/// again as a run sums it.
+fn edited(run: &Path, name: &str, change: impl FnOnce(&mut Vec<serde_json::Value>)) {
+    let mut rows: Vec<serde_json::Value> = serde_json::Deserializer::from_str(&read(run, name))
+        .into_iter()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    change(&mut rows);
+    let written: String = rows.iter().map(|row| format!("{row}\n")).collect();
+    std::fs::write(run.join(name), written).unwrap();
+    let sums: Vec<String> = FILES
+        .iter()
+        .map(|name| sha256_of(&run.join(name)).unwrap())
+        .collect();
+    std::fs::write(run.join(SUMS), listing(&sums)).unwrap();
+}
+
+/// A store on a node that serves no tenant, embedding as the default.
+fn not_serving(node: &NotServing) -> VellevCodeVectorStore {
+    VellevCodeVectorStore::new(&node.url, "key", "code").unwrap()
+}
+
+/// The same queries are asked again by their saved vectors and by their
+/// texts, one of each on the query's repo at the product's limit, and
+/// nothing else is asked of the store.
+#[tokio::test]
+async fn same_asks_the_runs_vectors_again_and_writes_nothing() {
+    let entities = functions("r", 12);
+    let vellev = Searched::of(&entities, first);
+    let dir = tempfile::tempdir().unwrap();
+    let run = a_run(&entities, &vellev, &options(&dir.path().join("run"))).await;
+    let (_, asked) = verified(&run).unwrap();
+    let (before, besides) = (vellev.asked().len(), vellev.besides.load(Ordering::SeqCst));
+    let found = same(&asked, &vellev).await.unwrap();
+    assert_eq!(found.vector.len(), 10);
+    assert!(found.vector.iter().all(|(_, same)| *same));
+    assert_eq!((found.text_overlap, found.verdict), (1.0, Verdict::Pass));
+    assert_eq!(vellev.besides.load(Ordering::SeqCst), besides);
+    let wanted: Vec<_> = asked
+        .iter()
+        .flat_map(|one| ["vector", "text"].map(|how| (how, one.query.repo_id.clone(), LIMIT)))
+        .collect();
+    assert_eq!(vellev.asked()[before..], wanted[..]);
+}
+
+/// An answer reordered between near-equal scores is the run's, and one
+/// reordered between scores apart fails by its query. The vectors are held
+/// to the run's vector answers and the texts to its text answers.
+#[tokio::test]
+async fn a_changed_answer_fails_by_its_query_and_near_ties_do_not() {
+    let entities = functions("r", 12);
+    let every = |_: &CodeEntity| entities.iter().collect::<Vec<_>>();
+    let mut mac = Searched::of(&entities, every);
+    for answer in mac.by_text.values_mut() {
+        answer[3].distance = answer[2].distance + 5e-4;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let run = a_run(&entities, &mac, &options(&dir.path().join("run"))).await;
+    let (_, asked) = verified(&run).unwrap();
+    let (changed, short) = (asked[0].query.clone(), asked[1].query.id.clone());
+    edited(&run, "answers.jsonl", |rows| {
+        let row = rows.iter_mut().find(|row| row["id"] == short.as_str());
+        row.unwrap()["vellev"]["results"]
+            .as_array_mut()
+            .unwrap()
+            .truncate(9);
+    });
+    let (_, asked) = verified(&run).unwrap();
+    let node = |swapped: (usize, usize)| {
+        let mut by_text = mac.by_text.clone();
+        let key = (changed.repo_id.clone(), changed.text.clone());
+        by_text.get_mut(&key).unwrap().swap(swapped.0, swapped.1);
+        Searched {
+            by_text,
+            made: Mutex::new(mac.made.lock().unwrap().clone()),
+            ..Searched::of(&entities, first)
+        }
+    };
+
+    let near = same(&asked, &node((2, 3))).await.unwrap();
+    assert!(near.vector.iter().all(|(_, same)| *same), "{near:?}");
+    let shortened = near.text.iter().find(|(id, _)| *id == short).unwrap();
+    assert_eq!(shortened.1, 0.9);
+    assert_eq!(near.verdict, Verdict::Pass);
+
+    let apart = same(&asked, &node((5, 6))).await.unwrap();
+    let differing: Vec<&str> = apart
+        .vector
+        .iter()
+        .filter(|(_, same)| !same)
+        .map(|(id, _)| id.as_str())
+        .collect();
+    assert_eq!(differing, [changed.id.as_str()]);
+    assert_eq!(apart.verdict, Verdict::Fail);
+    let checked = Checked {
+        out: dir.path().join("same.json"),
+        sha256: String::new(),
+        same: apart,
+    };
+    let failed = checked.passed().unwrap_err().to_string();
+    assert!(failed.contains(&changed.id), "{failed}");
+}
+
+/// A run changed after it was made, or missing a file, is refused before
+/// the node is asked anything, with no result written.
+#[tokio::test]
+async fn a_run_whose_sums_differ_is_refused() {
+    let node = NotServing::up().await;
+    let vellev = not_serving(&node);
+    let entities = functions("r", 12);
+    let dir = tempfile::tempdir().unwrap();
+    let cases: [(&str, fn(&Path), &str); 4] = [
+        (
+            "changed",
+            |run| {
+                let mut answers = std::fs::read(run.join("answers.jsonl")).unwrap();
+                answers[0] ^= 1;
+                std::fs::write(run.join("answers.jsonl"), answers).unwrap();
+            },
+            "answers.jsonl in",
+        ),
+        (
+            "unsummed",
+            |run| std::fs::remove_file(run.join(SUMS)).unwrap(),
+            SUMS,
+        ),
+        (
+            "missing",
+            |run| std::fs::remove_file(run.join("recall.jsonl")).unwrap(),
+            "recall.jsonl",
+        ),
+        (
+            "listed",
+            |run| {
+                let mut sums = read(run, SUMS);
+                sums.push_str(&format!("{}  extra\n", "0".repeat(64)));
+                std::fs::write(run.join(SUMS), sums).unwrap();
+            },
+            "lists other files",
+        ),
+    ];
+    for (name, change, said) in cases {
+        let options = options(&dir.path().join(name));
+        let run = a_run(&entities, &Searched::of(&entities, first), &options).await;
+        change(&run);
+        let out = dir.path().join(format!("{name}.json"));
+        let refused = format!(
+            "{:#}",
+            checked_again(&vellev, &run, &out).await.unwrap_err()
+        );
+        assert!(refused.contains(said), "{name}: {refused}");
+        assert!(!out.exists() && !partial(&out).exists());
+    }
+    assert_eq!(node.asked(), 0);
+}
+
+/// A same query any of the run's files lacks is refused, naming the file.
+#[tokio::test]
+async fn a_same_query_missing_from_the_run_is_refused() {
+    let entities = functions("r", 12);
+    let dir = tempfile::tempdir().unwrap();
+    let options = options(&dir.path().join("run"));
+    let run = a_run(&entities, &Searched::of(&entities, first), &options).await;
+    let id = verified(&run).unwrap().1[0].query.id.clone();
+    for name in ["answers.jsonl", "vectors.jsonl", "queries.jsonl"] {
+        edited(&run, name, |rows| {
+            rows.retain(|row| row["id"] != id.as_str())
+        });
+        let refused = verified(&run).err().unwrap().to_string();
+        assert_eq!(
+            refused,
+            format!("same query {id} is not in the run's {name}")
+        );
+    }
+}
+
+/// A run made with no same queries has nothing to check, and is refused.
+#[tokio::test]
+async fn a_run_with_no_same_queries_is_refused() {
+    let entities = functions("r", 12);
+    let dir = tempfile::tempdir().unwrap();
+    let options = CompareOptions {
+        same_queries: 0,
+        ..options(&dir.path().join("run"))
+    };
+    let run = a_run(&entities, &Searched::of(&entities, first), &options).await;
+    let refused = verified(&run).err().unwrap().to_string();
+    assert!(refused.contains("lists no same queries"), "{refused}");
+}
+
+/// A run made with another model, size, prefix or distance than the node's
+/// is refused before any request; one made as the node embeds goes on to
+/// the node, whose misroute fails it with nothing written.
+#[tokio::test]
+async fn a_node_embedding_otherwise_is_refused_and_a_misroute_fails() {
+    let node = NotServing::up().await;
+    let vellev = not_serving(&node);
+    let entities = functions("r", 12);
+    let dir = tempfile::tempdir().unwrap();
+    let options = options(&dir.path().join("run"));
+    let run = a_run(&entities, &Searched::of(&entities, first), &options).await;
+    let (_, embedding) = vellev.embedded_as();
+    let as_node = serde_json::json!({
+        "model": embedding.model,
+        "dimensions": embedding.dimensions,
+        "query_prefix": embedding.query_prefix,
+        "distance": vellev.distance(),
+    });
+    let remade = |about: &serde_json::Value| {
+        edited(&run, "report.json", |report| {
+            for (field, value) in about.as_object().unwrap() {
+                report[0]["manifest"]["vellev"][field] = value.clone();
+            }
+        })
+    };
+    for (field, other) in [
+        ("model", serde_json::json!("another model")),
+        ("dimensions", serde_json::json!(7)),
+        ("query_prefix", serde_json::json!("other: ")),
+        ("distance", serde_json::json!("dot")),
+    ] {
+        let mut about = as_node.clone();
+        about[field] = other;
+        remade(&about);
+        let out = dir.path().join(format!("{field}.json"));
+        let refused = checked_again(&vellev, &run, &out)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("[vellev.code] embeds as"),
+            "{field}: {refused}"
+        );
+        assert!(!out.exists());
+    }
+    assert_eq!(node.asked(), 0);
+
+    remade(&as_node);
+    let out = dir.path().join("misrouted.json");
+    let failed = format!(
+        "{:#}",
+        checked_again(&vellev, &run, &out).await.unwrap_err()
+    );
+    assert!(
+        failed.contains(&node.misrouted("code").to_string()),
+        "{failed}"
+    );
+    assert_eq!(node.asked(), 1);
+    assert!(!out.exists() && !partial(&out).exists());
+}
+
+/// An existing out, or one left half-made, is refused before anything is
+/// asked and kept as it was; one made meanwhile is never written over; a
+/// result is the JSON whose sha256 is reported.
+#[tokio::test]
+async fn an_existing_out_is_never_written_over() {
+    let node = NotServing::up().await;
+    let vellev = not_serving(&node);
+    let entities = functions("r", 12);
+    let searched = Searched::of(&entities, first);
+    let dir = tempfile::tempdir().unwrap();
+    let run = a_run(&entities, &searched, &options(&dir.path().join("run"))).await;
+    let out = dir.path().join("same.json");
+    for there in [out.clone(), partial(&out)] {
+        std::fs::write(&there, b"kept").unwrap();
+        let refused = checked_again(&vellev, &run, &out)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("exists"), "{refused}");
+        assert_eq!(std::fs::read(&there).unwrap(), b"kept");
+        std::fs::remove_file(&there).unwrap();
+    }
+    assert_eq!(node.asked(), 0);
+
+    let (_, asked) = verified(&run).unwrap();
+    let found = same(&asked, &searched).await.unwrap();
+    assert_eq!(kept(&out, &found).unwrap(), sha256_of(&out).unwrap());
+    let written: serde_json::Value = serde_json::from_str(&read(dir.path(), "same.json")).unwrap();
+    assert_eq!(written["verdict"], "pass");
+    assert!(!partial(&out).exists());
+
+    let meanwhile = dir.path().join("meanwhile.json");
+    std::fs::write(&meanwhile, b"kept").unwrap();
+    let failed = format!("{:#}", kept(&meanwhile, &found).unwrap_err());
+    let holding = format!("{} holds the result", partial(&meanwhile).display());
+    assert!(failed.contains(&holding), "{failed}");
+    assert_eq!(std::fs::read(&meanwhile).unwrap(), b"kept");
+}
+
+/// The node a run was made on answers its same queries as the run did, and
+/// is left as it was.
+#[tokio::test]
+async fn same_passes_the_runs_own_node_and_leaves_it_as_it_was() {
+    let Some(node) = Node::embedding().await else {
+        return;
+    };
+    let config = configured(&node, workforce_vellev::LOCAL_QUERY_PREFIX);
+    let entities = documented();
+    let opened = built(&config, &entities).await;
+    let vellev = VellevCodeVectorStore::configured(&config.vellev).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let run = compared(
+        &opened,
+        &weaviate_of(&entities, first),
+        &vellev,
+        &Counters::shortlisting(),
+        &options(&dir.path().join("run")),
+        &|_| {},
+    )
+    .await
+    .unwrap();
+    let before = (held(&node).await, vellev.found_as_wanted().await.unwrap());
+    let checked = same_as_run(&config, &run.dir, &dir.path().join("same.json"))
+        .await
+        .unwrap();
+    let found = &checked.same;
+    assert!(found.vector.iter().all(|(_, same)| *same), "{found:?}");
+    assert_eq!((found.text_overlap, found.verdict), (1.0, Verdict::Pass));
+    assert!(checked.passed().is_ok());
+    let after = (held(&node).await, vellev.found_as_wanted().await.unwrap());
+    assert_eq!(after, before);
 }
