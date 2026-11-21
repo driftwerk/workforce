@@ -174,9 +174,10 @@ jobs:
     needs: [changes]
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    # A warm cache builds in about 30 minutes; a cold one (the cache is saved
-    # only from main, so after a red main or a lockfile change) takes over 60.
-    timeout-minutes: 100
+    # At two build jobs a warm cache builds in 20 to 35 minutes; a cold one
+    # (the cache is saved only from main, so after a red main or a lockfile
+    # change) takes much longer, and the limit allows for it.
+    timeout-minutes: 120
     permissions:
       contents: read
     env:
@@ -200,8 +201,11 @@ jobs:
       - run: mkdir -p ui/dist
       - name: Give the build room to swap
         uses: ./.github/actions/swap
+      # Two jobs, not the runner's four: the hub's lib tests alone fill its
+      # memory, and the test binaries linked beside them would push it far
+      # into swap, where the runner stops answering and is lost.
       - name: Build every test binary
-        run: cargo nextest archive --all-features --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst"
+        run: cargo nextest archive --all-features --build-jobs 2 --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst"
       # Every test the archive holds that a plain run would run (not
       # #[ignore]d), for `test-count` to hold the partitions to.
       - name: Count the tests
@@ -637,6 +641,7 @@ jobs:
     needs: [changes]
     if: needs.changes.outputs.docs == 'true' && needs.changes.outputs.code != 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     permissions:
       contents: read
     env:
@@ -649,6 +654,8 @@ jobs:
         with:
           shared-key: test
           save-if: false
+      - name: Give the build room to swap
+        uses: ./.github/actions/swap
       - run: cargo test -p workforce-hub --lib -- remote_mcp::help
 
   # The one check branch protection requires: path- and lane-skipped jobs
