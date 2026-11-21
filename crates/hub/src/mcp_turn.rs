@@ -1858,12 +1858,8 @@ mod tests {
             call(tools.endpoint(), "catalogue_remove_entry", figma.clone()).await;
         }
 
-        let text = lines.text();
-        let audited: Vec<&str> = text
-            .lines()
-            .filter(|l| l.contains("round MCP tool call"))
-            .collect();
-        assert_eq!(audited.len(), 3, "{text}");
+        let audited = lines.at("INFO", "round MCP tool call");
+        assert_eq!(audited.len(), 3, "{}", lines.text());
         assert!(
             audited.iter().all(|l| l.contains("require_approval")),
             "{audited:?}"

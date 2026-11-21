@@ -1181,9 +1181,13 @@ fn a_file_whose_lookup_failed_is_logged_when_its_mark_leaves_it_out() {
     )];
     let files = carried_files(&store, sessions.as_ref(), "scout", "alice", &named);
     assert!(files.is_empty());
-    let logged = logged.text();
-    assert!(logged.contains(id.as_str()), "{logged}");
-    assert!(logged.contains("the bucket is having a moment"), "{logged}");
+    let warned = logged.at("WARN", "looking up a message's file failed");
+    assert_eq!(warned.len(), 1, "{}", logged.text());
+    assert!(warned[0].contains(id.as_str()), "{warned:?}");
+    assert!(
+        warned[0].contains("the bucket is having a moment"),
+        "{warned:?}"
+    );
 }
 
 /// A device with no identity behind it uploads under a session, not a

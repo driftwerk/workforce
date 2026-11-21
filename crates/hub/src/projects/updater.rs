@@ -38,15 +38,23 @@ pub enum RepoUpdateResult {
 const LOGGED_ERROR_MAX_BYTES: usize = 2048;
 
 impl RepoUpdateReport {
-    /// Why this repo failed, fit for a log: credentials redacted before the
-    /// cut, so no fragment of one survives it.
+    /// Why this repo failed, fit for a log: credentials redacted while the
+    /// lines are whole, the lines joined so a server's `remote:` text can't
+    /// start a log line of its own, and the cut last, so no fragment of a
+    /// credential survives it.
     fn logged_error(&self) -> Option<String> {
         match &self.result {
             RepoUpdateResult::Ok(_) => None,
-            RepoUpdateResult::Err { error } => Some(truncate_with_ellipsis(
-                &redact_secrets(error),
-                LOGGED_ERROR_MAX_BYTES,
-            )),
+            RepoUpdateResult::Err { error } => {
+                let redacted = redact_secrets(error);
+                let joined = redacted
+                    .split(['\r', '\n'])
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                Some(truncate_with_ellipsis(&joined, LOGGED_ERROR_MAX_BYTES))
+            }
         }
     }
 }
@@ -185,6 +193,14 @@ mod tests {
         )
     }
 
+    fn refresh_refused(token: &str) -> String {
+        format!(
+            "git fetch failed (exit status: 128): remote: Repository not found.\n\
+             fatal: repository 'https://x-access-token:{token}@github.com/acme/gizmos.git/' \
+             not found\n"
+        )
+    }
+
     fn logged_by(run: impl FnOnce()) -> String {
         let (lines, _logging, _others) = Lines::capture();
         run();
@@ -200,13 +216,19 @@ mod tests {
                 branch: "main".into(),
                 result: RepoUpdateResult::Ok(PullOutcome::UpToDate),
             },
-            failed("gizmos", refresh_unreachable(BARE_TOKEN)),
+            failed("gizmos", refresh_refused(BARE_TOKEN)),
         ];
         let logged = logged_by(|| warn_failures("harbor", &reports));
-        assert_eq!(logged.lines().count(), 2, "{logged}");
-        for alias in ["widgets", "gizmos"] {
-            assert!(logged.contains(&format!("alias={alias}")), "{logged}");
+        let warned: Vec<&str> = logged.lines().collect();
+        assert_eq!(warned.len(), 2, "{logged}");
+        for (line, alias) in warned.iter().zip(["widgets", "gizmos"]) {
+            assert!(line.contains(" WARN "), "{line}");
+            assert!(line.contains(&format!("alias={alias}")), "{line}");
         }
+        assert!(
+            warned[1].contains("remote: Repository not found. | fatal: repository"),
+            "{logged}"
+        );
         assert!(!logged.contains("gadgets"), "{logged}");
         assert!(logged.contains("project=harbor"), "{logged}");
         assert!(logged.contains("exit status: 128"), "{logged}");

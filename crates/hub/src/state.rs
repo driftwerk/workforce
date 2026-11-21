@@ -919,8 +919,8 @@ mod tests {
                 .contains("Weaviate unavailable after 1s"),
             "{refused}"
         );
-        let logged = captured.text();
-        assert!(logged.contains("Weaviate not ready ("), "{logged}");
+        let warned = captured.at("WARN", "Weaviate not ready (");
+        assert!(!warned.is_empty(), "{}", captured.text());
     }
 
     /// A missing tenant is for an operator to create: boot fails at once

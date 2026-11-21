@@ -512,12 +512,11 @@ mod tests {
             .expect_err("the store is told, to index the artifact later");
         assert!(refused.to_string().contains("500"), "{refused}");
         drop(logging);
-        let logged = captured.text();
+        let warned = captured.at("WARN", "artifact vector upsert non-2xx");
+        assert_eq!(warned.len(), 1, "{}", captured.text());
         assert!(
-            logged.contains("artifact vector upsert non-2xx")
-                && logged.contains("status=500")
-                && logged.contains("id=spec-1"),
-            "{logged}"
+            warned[0].contains("status=500") && warned[0].contains("id=spec-1"),
+            "{warned:?}"
         );
     }
 
