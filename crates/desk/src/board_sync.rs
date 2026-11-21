@@ -236,6 +236,7 @@ pub fn workspace_error(text: &str) -> Option<RemoteError> {
     let u = workforce_core::instances::parse_unknown_instance(text)?;
     let kind = match u.what.as_str() {
         "Jira workspace" => "Jira site",
+        "GitHub workspace" => "GitHub connection",
         _ => "Linear workspace",
     };
     Some(RemoteError::Workspace {
@@ -1264,7 +1265,8 @@ impl Who {
                 "{hub} uses a shared {title} key, and {title} doesn't show your email to the shared key, so it can't say who you are."
             )),
             Self::Shared(NoMatch::Stale) => Some(format!(
-                "{hub} uses a shared {title} key, and it hasn't confirmed your email lately: sign in to {hub} again so it can say who you are."
+                "{hub} uses a shared {title} key, and it hasn't confirmed your email lately: sign in to {} again so it can say who you are.",
+                crate::board::in_sentence(hub)
             )),
             Self::Shared(_) => Some(format!(
                 "{hub} uses a shared {title} key, so it can't say who you are."

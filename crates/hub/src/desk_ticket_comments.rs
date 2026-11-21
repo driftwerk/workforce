@@ -116,7 +116,10 @@ async fn list(
                     tracing::info!(ticket = %id, error = %e, "a ticket's comments weren't read");
                     problem = Some(match e {
                         RemoteError::Waiting { .. } => {
-                            format!("Waiting for your approval on {hub} to read its comments.")
+                            format!(
+                                "Waiting for your approval on {} to read its comments.",
+                                workforce_desk::board::in_sentence(&hub)
+                            )
                         }
                         RemoteError::Missing(_) | RemoteError::NotAllowed(_) => {
                             format!("{hub} can't send {}'s comments yet.", s.system.title())
@@ -212,7 +215,10 @@ async fn post(
                         StatusCode::ACCEPTED,
                         Json(json!({
                             "pending": true,
-                            "message": format!("Waiting for your approval on {hub} to post it."),
+                            "message": format!(
+                                "Waiting for your approval on {} to post it.",
+                                workforce_desk::board::in_sentence(&hub)
+                            ),
                         })),
                     )
                         .into_response()

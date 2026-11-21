@@ -50,6 +50,7 @@ pub const READ_TOOLS: &[&str] = &[
     "github.workflow_run_logs",
     "github.workflow_run_failed_logs",
     "github.viewer",
+    "github.workspaces",
     "github.projects_list",
     "github.project_get",
     "github.project_items",
@@ -334,6 +335,10 @@ impl GithubSkill {
                 self.default_owner.clone(),
             )),
             // Desk's GitHub board sync
+            Arc::new(board::GithubWorkspacesTool::new(
+                Arc::clone(&self.clients),
+                self.default_workspace.clone(),
+            )),
             Arc::new(board::GithubViewerTool::new(
                 Arc::clone(&self.clients),
                 self.default_workspace.clone(),
@@ -420,6 +425,7 @@ impl GithubSkill {
             "github.pr_update",
             "github.workflow_run_failed_logs",
             "github.api",
+            "github.workspaces",
             "github.viewer",
             "github.projects_list",
             "github.project_get",
@@ -882,6 +888,11 @@ impl GithubSkill {
                     }),
                 },
                 SkillTool {
+                    name: "github.workspaces".to_string(),
+                    description: "The GitHub connections you can use, by name, and the one a call naming none goes to".to_string(),
+                    input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+                },
+                SkillTool {
                     name: "github.projects_list".to_string(),
                     description: "List GitHub Projects (v2) of a user or organisation".to_string(),
                     input_schema: serde_json::json!({
@@ -1095,6 +1106,10 @@ impl GithubSkill {
                 },
                 SkillPolicy {
                     tool: "github.viewer".to_string(),
+                    action: "allow".to_string(),
+                },
+                SkillPolicy {
+                    tool: "github.workspaces".to_string(),
                     action: "allow".to_string(),
                 },
                 SkillPolicy {

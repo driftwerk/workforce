@@ -395,3 +395,170 @@ async fn several_jira_sites_are_picked_from_too() {
     })
     .await;
 }
+
+const CONNECTIONS: [&str; 3] = ["driftwerk", "mantis", "patchwork"];
+
+/// A fake GitHub of three connections, `mantis` the default, as a person's
+/// own keys make one: only the connections in `reach` reach acme's
+/// project 7.
+struct FakeGithub {
+    name: &'static str,
+    reach: &'static [&'static str],
+    calls: Calls,
+}
+
+#[async_trait::async_trait]
+impl Tool for FakeGithub {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn description(&self) -> &str {
+        "a fake GitHub tool of three connections"
+    }
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+    async fn execute(&self, input: Value) -> eyre::Result<ToolResult> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((self.name.to_string(), input.clone()));
+        if self.name == "github.workspaces" {
+            return Ok(ToolResult::success(
+                json!({ "workspaces": CONNECTIONS, "default": "mantis" }),
+                0,
+            ));
+        }
+        let through = input["workspace"].as_str().unwrap_or("mantis");
+        if !self.reach.contains(&through) {
+            return Ok(ToolResult::failure("Not found".to_string(), 0));
+        }
+        Ok(ToolResult::success(
+            match self.name {
+                "github.project_get" => json!({
+                    "id": "PVT_acme7", "title": "Acme", "number": 7,
+                    "status": { "options": [{ "name": "Todo" }, { "name": "In Progress" }, { "name": "Done" }] },
+                }),
+                _ => json!({ "items": [], "issues": [] }),
+            },
+            0,
+        ))
+    }
+}
+
+/// A hub whose GitHub is the fake's.
+async fn hub_of_connections(
+    dir: &std::path::Path,
+    reach: &'static [&'static str],
+) -> (RemoteHub, Calls) {
+    let fx = fixture(true);
+    with_agents(&fx, dir, &["default"]).await;
+    let calls: Calls = Arc::default();
+    let service = fx.state.registry.default_agent().unwrap();
+    for name in workforce_desk::github_sync::TOOLS
+        .iter()
+        .chain(&["github.workspaces", "github.viewer"])
+    {
+        service.tools.register(Arc::new(FakeGithub {
+            name,
+            reach,
+            calls: Arc::clone(&calls),
+        }));
+    }
+    let remote = super::tests::serve_remote(fx, &["github.*"], Arc::default(), None).await;
+    (remote, calls)
+}
+
+fn project(workspace: Option<&str>, link: bool) -> Value {
+    let mut b = json!({
+        "system": "github", "target": "acme/projects/7",
+        "via": { "kind": "hub", "hub": "atlas" },
+    });
+    if link {
+        b["filter"] = json!({ "kind": "all", "value": { "includeDone": false } });
+        b["states"] = json!({});
+    }
+    if let Some(w) = workspace {
+        b["workspace"] = json!(w);
+    }
+    b
+}
+
+/// Of several GitHub connections, a link goes through the one that reaches
+/// its project, though the default doesn't: the check says which, the link
+/// keeps it, and every call of the sync names it.
+#[tokio::test]
+async fn a_github_link_goes_through_the_connection_that_reaches_its_project() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let (remote, calls) = hub_of_connections(&dir.path().join("remote"), &["driftwerk"]).await;
+        let local = local_hub(desk.clone(), dir.path());
+        local.link_atlas(&remote).await;
+
+        for asked in [None, Some("mantis")] {
+            let (status, found) = local
+                .send("POST", "/api/desk/boards/link/check", project(asked, false))
+                .await;
+            assert_eq!(status, StatusCode::OK, "{found}");
+            assert_eq!(found["workspaces"], json!(CONNECTIONS));
+            assert_eq!(found["workspace"], "driftwerk", "{found}");
+            assert_eq!(found["targetId"], "PVT_acme7");
+        }
+
+        let b = board(&desk, "Acme").await;
+        let (status, linked) = local
+            .send(
+                "PUT",
+                &format!("/api/desk/boards/{}/link", b.id),
+                project(None, true),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{linked}");
+        assert_eq!(linked["sync"]["workspace"], "driftwerk");
+        let before = calls.lock().unwrap().len();
+        local.sync.pass_board(b.id, true).await.unwrap();
+        let after: Vec<(String, Value)> = calls.lock().unwrap()[before..].to_vec();
+        assert!(!after.is_empty(), "the pass called GitHub");
+        for (tool, args) in after.iter().filter(|(t, _)| t != "github.workspaces") {
+            assert_eq!(args["workspace"], "driftwerk", "{tool} {args}");
+        }
+    })
+    .await;
+}
+
+/// Two connections reach the project and the default doesn't: the person
+/// picks, and the one picked is kept.
+#[tokio::test]
+async fn two_github_connections_reaching_a_project_are_picked_from() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let (remote, _) =
+            hub_of_connections(&dir.path().join("remote"), &["driftwerk", "patchwork"]).await;
+        let local = local_hub(desk.clone(), dir.path());
+        local.link_atlas(&remote).await;
+        let why = "Pick which GitHub connection: driftwerk or patchwork";
+
+        let (status, found) = local
+            .send("POST", "/api/desk/boards/link/check", project(None, false))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{found}");
+        assert_eq!(found["workspaceWhy"], why);
+        assert_eq!(found["workspaces"], json!(CONNECTIONS));
+        assert!(found.get("states").is_none(), "{found}");
+
+        let b = board(&desk, "Acme").await;
+        let uri = format!("/api/desk/boards/{}/link", b.id);
+        let (status, said) = local.send("PUT", &uri, project(None, true)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{said}");
+        assert_eq!(said["error"], why);
+
+        let (status, linked) = local
+            .send("PUT", &uri, project(Some("patchwork"), true))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{linked}");
+        assert_eq!(linked["sync"]["workspace"], "patchwork");
+    })
+    .await;
+}
