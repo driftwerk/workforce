@@ -223,22 +223,7 @@ fn parse_events(raw: &str) -> Option<Vec<ExtractedEvent>> {
     None
 }
 
-/// Run passive memory extraction for a single conversation turn.
-///
-/// Returns the number of memories written (0 if the turn was routine, gated, or
-/// produced no extractable events).
-///
-/// `channel` is the session channel — used to skip background-agent turns
-/// (memory consolidation, scheduler tasks). Pass an empty string when called
-/// from a context that has no channel (e.g. the session-scanner backfill);
-/// the gate then falls through to the recap-detection check.
-///
-/// `event_time` anchors the depicted event to wallclock — for live turns it's
-/// the latest source-message timestamp; for session-scanner backfill it's the
-/// archived turn's timestamp. Pass `None` to fall back to "now", which is
-/// only correct for turns that just happened.
-/// Whom a memory is extracted for: the agent that owns it, by its id, and
-/// the name the exchange calls it by.
+/// The agent a memory is extracted for: its id, and the name it goes by.
 #[derive(Debug, Clone)]
 pub struct Assistant {
     pub id: AgentId,
@@ -254,6 +239,14 @@ impl Assistant {
         }
     }
 
+    /// Agent `id` by the name its IDENTITY.md gives, else its id.
+    pub fn named_in(id: AgentId, identity: Option<&str>) -> Self {
+        match identity.and_then(crate::agent_rename::identity_name) {
+            Some(name) => Self { id, name },
+            None => Self::by_id(id),
+        }
+    }
+
     /// `service`, by its name now.
     pub fn of(service: &crate::serve::AgentService) -> Self {
         Self {
@@ -265,6 +258,20 @@ impl Assistant {
     }
 }
 
+/// Run passive memory extraction for a single conversation turn.
+///
+/// Returns the number of memories written (0 if the turn was routine, gated, or
+/// produced no extractable events).
+///
+/// `channel` is the session channel — used to skip background-agent turns
+/// (memory consolidation, scheduler tasks). Pass an empty string when called
+/// from a context that has no channel (e.g. the session-scanner backfill);
+/// the gate then falls through to the recap-detection check.
+///
+/// `event_time` anchors the depicted event to wallclock — for live turns it's
+/// the latest source-message timestamp; for session-scanner backfill it's the
+/// archived turn's timestamp. Pass `None` to fall back to "now", which is
+/// only correct for turns that just happened.
 #[allow(clippy::too_many_arguments)]
 pub async fn extract_and_store(
     llm: Arc<dyn LlmProvider>,

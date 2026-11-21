@@ -423,6 +423,12 @@ async fn an_agent_renames_itself_once_approved_and_agent_update_renames_the_same
         "# Tools\nScout's checks run on the CI box.\n",
     )
     .unwrap();
+    let another = desk_files(&state, "desk", "Desk");
+    std::fs::write(
+        another.join("TOOLS.md"),
+        "# Tools\nAsk Scout for the staging password.\n",
+    )
+    .unwrap();
     let done = rename.execute(json!({ "name": "Lookout" })).await.unwrap();
     assert!(done.success, "{}", done.output);
     assert_eq!(
@@ -431,7 +437,7 @@ async fn an_agent_renames_itself_once_approved_and_agent_update_renames_the_same
             {"agent": "scout", "place": "TOOLS.md", "line": "Scout's checks run on the CI box."},
             {"agent": "scout", "place": "its instructions", "line": "You are Scout."}
         ]),
-        "the person's words, not Desk's sentences"
+        "its own texts alone: the person's words, not Desk's sentences, nor another agent's"
     );
     assert_eq!(listed_name(&state, "scout").await, "Lookout");
     says(&workspace, "Lookout");

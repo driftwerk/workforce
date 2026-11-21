@@ -194,7 +194,11 @@ pub enum Effect {
     MemoryStays,
     /// A handover note to boss `to`: from the boss `from`, or from Desk,
     /// out of the facts, when no boss oversaw it.
-    Handover { from: Option<String>, to: String },
+    Handover {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+        to: String,
+    },
     /// It is told on its line what changed.
     Tell,
     /// The move can't be made.

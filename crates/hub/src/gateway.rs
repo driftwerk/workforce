@@ -6126,7 +6126,14 @@ async fn get_agent_mentions(
         )
     })?;
     let config_path = resolve_config_path(&state)?;
-    let mentions = crate::agent_rename::mentions(&*state.registry, &config_path, &id, &name).await;
+    let mentions = crate::agent_rename::mentions(
+        &*state.registry,
+        &config_path,
+        &id,
+        &name,
+        crate::agent_rename::Reach::Hub,
+    )
+    .await;
     Ok(Json(serde_json::json!({ "mentions": mentions })))
 }
 

@@ -423,6 +423,13 @@ fn each_effect_reads_in_plain_words() {
         "Mia receives only the note below from Kat.",
         "the main boss, renamed, is a boss like any"
     );
+    let facts = Effect::Handover {
+        from: None,
+        to: "mia".into(),
+    };
+    let stored = serde_json::to_value(&facts).unwrap();
+    assert_eq!(stored, serde_json::json!({"kind": "handover", "to": "mia"}));
+    assert_eq!(serde_json::from_value::<Effect>(stored).unwrap(), facts);
     // Every effect says something.
     for e in [
         Effect::ChargeTo { boss: "mia".into() },

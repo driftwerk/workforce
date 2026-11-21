@@ -1,8 +1,5 @@
-//! Renaming a boss changes only what it is called: the main boss, `desk`,
-//! renamed Kat, answers sessions, directs them and checks in as Kat, knows
-//! its new name, remembers what it did, runs plans and keeps Act fully; a
-//! group boss renamed and rebuilt keeps its group, charges and grant; a
-//! name another agent has is refused, and a boss is renamed back.
+//! Renaming a boss changes only what it is called: its plans, charges,
+//! group, grant and memories stay its id's.
 
 use super::*;
 use workforce_common::locking::LockManager;
@@ -13,8 +10,7 @@ use workforce_memory::types::{Memory, MemoryFilter, MemoryLayer};
 
 use crate::agent_rename::{RenameError, Renamer};
 
-/// The hub's base config naming `agents` (id, name), as Desk's hub writes
-/// it on every start.
+/// The hub's base config, as Desk's hub writes it on every start.
 fn base_config(dir: &Path, agents: &[(&str, &str)]) {
     let data = dir.join("data");
     std::fs::create_dir_all(&data).unwrap();

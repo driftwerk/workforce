@@ -153,12 +153,13 @@ fn says(lower: &str, phrase: &str) -> bool {
 /// only lists what it did ("1. Updated the migration", "CI: green") never
 /// does.
 pub(crate) fn waits_on_answer(text: &str, boss: &str) -> bool {
-    let lower = text.to_lowercase();
+    let lower = workforce_desk::line::plain(text);
     workforce_desk::line::holds(text, boss)
         || WAITS.iter().any(|w| says(&lower, w))
-        || workforce_desk::line::boss_words(boss)
+        || workforce_desk::line::boss_phrases(boss)
             .iter()
-            .any(|n| says(&lower, &format!("until {n}")))
+            .filter(|p| p.starts_with("until "))
+            .any(|p| says(&lower, p))
         || crew::question_in(text).is_some()
         || (options_in(text).len() >= 2 && recommends(&lower))
 }
@@ -937,9 +938,7 @@ mod tests {
         let _ = waits_on_answer("İİİİ until Desk answers; K your call", "Desk");
     }
 
-    /// A boss renamed Kat: the session waiting "until Kat answers" waits on
-    /// it, and so does one Kat held "wait for Kat's go-ahead"; Kat's word
-    /// that holds nothing ends neither.
+    /// A boss renamed Kat is waited on by its name.
     #[test]
     fn a_session_waiting_on_its_boss_by_its_name_waits_on_it() {
         use workforce_desk::crew::Party;
@@ -997,6 +996,37 @@ mod tests {
         );
         assert!(!waits_on_answer("Holding until Kat answers.", "Mia"));
         assert!(!waits_on_answer("Ran it until Katalog finished.", "Kat"));
+        assert!(waits_on_answer("Holding until Kat\u{2019}s answer.", "Kat"));
+        assert!(!waits_on_answer("Ran it until it finished.", "It"));
+    }
+
+    /// "until Desk answers", written before the rename, still waits.
+    #[test]
+    fn a_wait_stored_under_the_old_name_still_waits_after_a_rename() {
+        use workforce_desk::crew::Party;
+        let session = Party {
+            kind: PartyKind::Session,
+            id: Uuid::new_v4().to_string(),
+            name: "web".into(),
+            engine: None,
+            origin: None,
+        };
+        let to = |name: &str, text: &str| {
+            LineMessage::new(
+                session.clone(),
+                Party::manager("desk", name),
+                LineKind::Tell,
+                text.into(),
+                1,
+            )
+        };
+        assert!(waits_for_answer(&to("Desk", "Holding until Desk answers.")));
+        assert!(waits_for_answer(&to("Kat", "Holding until Desk answers.")));
+        assert!(waits_for_answer(&to("Kat", "Holding until Kat answers.")));
+        assert!(!waits_for_answer(&to(
+            "Desk",
+            "Ran it until Kat's tests passed."
+        )));
     }
 
     /// Under a hold, a reply that only says it holds keeps the words the
