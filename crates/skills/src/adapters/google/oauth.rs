@@ -81,6 +81,18 @@ pub const DEVICE_SCOPES: &[&str] = &[
     "https://www.googleapis.com/auth/userinfo.profile",
 ];
 
+/// Scopes a Desk sign-in asks for on the person's own Desktop app:
+/// Calendar, Drive (which Sheets and Docs also take) and Gmail, and who
+/// signed in. Fewer than [`WEB_SCOPES`], so the consent screen lists what
+/// the agent uses; a scope left unticked is said on the connection.
+pub const APP_SCOPES: &[&str] = &[
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/drive",
+    "https://mail.google.com/",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "openid",
+];
+
 /// Scopes for the hub-hosted web-redirect flow.
 ///
 /// Web application OAuth clients permit the broad `https://mail.google.com/`
@@ -988,6 +1000,21 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
+
+    #[test]
+    fn app_scopes_name_calendar_drive_and_gmail() {
+        for scope in [
+            "https://www.googleapis.com/auth/calendar",
+            "https://www.googleapis.com/auth/drive",
+            "https://mail.google.com/",
+            "https://www.googleapis.com/auth/userinfo.email",
+        ] {
+            assert!(APP_SCOPES.contains(&scope), "{scope}");
+        }
+        assert!(APP_SCOPES
+            .iter()
+            .all(|s| WEB_SCOPES.contains(s) || *s == "openid"));
+    }
 
     #[test]
     fn pkce_verifier_is_url_safe_and_long_enough() {

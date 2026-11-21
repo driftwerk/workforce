@@ -14,11 +14,15 @@
 //!   keys; `PATCH` `{name}` renames it; `DELETE` removes its keys alone;
 //!   `POST …/{connector}/{connection}/test` checks it again.
 //! - `POST …/{connector}/oauth/start` `{name?, level, agent?}`: GitHub's
-//!   device sign-in, or Google's on the person's own OAuth client, for a new
-//!   connection; `POST /api/desk/connections/google/client` keeps that
-//!   client.
+//!   device sign-in, or Google's or FreeAgent's sign-in page on the person's
+//!   own app ([`app`]), for a new connection; `POST …/{connector}/app`
+//!   `{client_id, client_secret}` keeps that app, and `POST
+//!   …/{connector}/{connection}/approve` signs a connection in again,
+//!   keeping its name and its agents' choice of it.
 //! - `GET|DELETE /api/desk/connection-flows/{flow}`: a sign-in's progress,
 //!   or cancelling it.
+//! - `GET /api/desk/agents/{agent}/documents`: `{path}`, the agent's
+//!   documents folder.
 //! - `POST …/{connector}/test` `{level, agent?}` and `DELETE
 //!   …/{connector}?level=&agent=` act on the level's one connection, for a
 //!   Desk from before a service held several.
@@ -30,6 +34,7 @@
 //! Requests are the person's own, through their paired device, and only the
 //! person whose hub this is may make them.
 
+pub mod app;
 pub mod catalog;
 pub mod check;
 pub mod gh;
@@ -86,6 +91,9 @@ pub struct Binding {
     pub own: Vec<String>,
     /// Connectors, and single connections (`jira:globex`), that only read.
     pub read_only: Vec<String>,
+    /// Connectors, and single connections (`freeagent:harbor`), that start
+    /// read only and take writes.
+    pub writable: Vec<String>,
     /// `[skills.connections]`: per connector, the instances it uses, the
     /// first its default.
     pub connections: BTreeMap<String, Vec<String>>,
@@ -111,6 +119,7 @@ impl Binding {
                 enabled: b.enabled,
                 own: b.own_credential,
                 read_only: b.read_only,
+                writable: b.writable,
                 connections: b.connections,
             },
             Err(_) => Self::default(),
@@ -132,11 +141,15 @@ impl Binding {
         self.connections.get(connector).map(Vec::as_slice)
     }
 
-    /// Whether instance `key` of `connector` only reads for it.
+    /// Whether instance `key` of `connector` only reads for it, as the hub
+    /// enforces it.
     pub fn reads_only(&self, connector: &str, key: &str) -> bool {
-        self.read_only
-            .iter()
-            .any(|r| r == connector || r.split_once(':') == Some((connector, key)))
+        workforce_common::connector_binding::ConnectorBinding {
+            read_only: self.read_only.clone(),
+            writable: self.writable.clone(),
+            ..Default::default()
+        }
+        .reads_only_instance(connector, key)
     }
 
     /// Whether the agent `agent` with this binding reaches instance `key`
@@ -336,6 +349,9 @@ pub struct ConnectionView {
     pub source: VaultSource,
     /// The agents it reaches.
     pub used_by: Vec<UsedBy>,
+    /// Whether Desk offers to approve it again: it signs in on the
+    /// person's app, and its sign-in lapsed or was on an earlier app.
+    pub approve_again: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -347,8 +363,12 @@ pub struct ConnectorView {
     pub sign_in: SignIn,
     pub fields: &'static [Field],
     /// Whether its sign-in can start: GitHub's app is set up, or the
-    /// person's Google client is kept.
+    /// person's own app is kept and names this hub.
     pub sign_in_ready: bool,
+    /// For a service signed in to on the person's own app: `ready`,
+    /// `missing` (none kept yet) or `moved` (FreeAgent's names an older
+    /// address of this hub).
+    pub app: Option<app::AppState>,
     /// Whether it holds more than one connection (Slack holds one).
     pub several: bool,
     /// What a new connection's name should be, as the form says.
@@ -402,8 +422,19 @@ struct Flow {
     key: Option<String>,
     /// The name the person gave it, if any.
     name: Option<String>,
+    /// It signs connection `key` in again: its name stays.
+    again: bool,
     state: FlowState,
     until: Instant,
+}
+
+/// A sign-in still waited on, as its flow keeps it.
+struct WaitingFlow {
+    person: String,
+    level: Level,
+    key: Option<String>,
+    name: Option<String>,
+    again: bool,
 }
 
 /// Connections, over the hub's vaults and Desk's store.
@@ -414,9 +445,12 @@ pub struct Connections {
     pub services: Services,
     /// Driftwerk's GitHub OAuth app, for the device sign-in.
     pub github_client_id: Option<String>,
-    /// The hub's own Google callback, for a client that names none.
-    pub google_redirect: String,
+    /// The gateway's listen address: the port a sign-in's loopback
+    /// redirect names.
+    pub gateway: String,
     flows: Mutex<HashMap<String, Flow>>,
+    /// Sign-ins on the person's own app, by their `state`.
+    pending: Mutex<HashMap<String, app::Pending>>,
     /// Held while flat connections are moved, so two requests never move
     /// one twice.
     migrating: tokio::sync::Mutex<()>,
@@ -503,7 +537,7 @@ impl Connections {
         statuses: Arc<dyn Statuses>,
         services: Services,
         github_client_id: Option<String>,
-        google_redirect: String,
+        gateway: String,
     ) -> Self {
         Self {
             global,
@@ -511,8 +545,9 @@ impl Connections {
             statuses,
             services,
             github_client_id: github_client_id.filter(|id| !id.trim().is_empty()),
-            google_redirect,
+            gateway,
             flows: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
             migrating: tokio::sync::Mutex::new(()),
         }
     }
@@ -779,6 +814,8 @@ impl Connections {
             checked_at: checked.and_then(|k| k.checked_at),
             source: tier,
             used_by,
+            approve_again: c.sign_in == SignIn::App
+                && checked.is_some_and(|k| k.status == Status::NeedsReconnect),
         }
     }
 
@@ -786,18 +823,8 @@ impl Connections {
         match c.sign_in {
             SignIn::Fields => true,
             SignIn::Github => self.github_client_id.is_some(),
-            SignIn::Google => self.google_client().is_some(),
+            SignIn::App => self.app_state(c) == Some(app::AppState::Ready),
         }
-    }
-
-    /// The person's Google OAuth client, as the callback reads it.
-    fn google_client(&self) -> Option<(String, String, Option<String>)> {
-        let global = self.global.as_ref()?;
-        Some((
-            global.get(catalog::GOOGLE_CLIENT_ID)?,
-            global.get(catalog::GOOGLE_CLIENT_SECRET)?,
-            global.get(catalog::GOOGLE_REDIRECT_URI),
-        ))
     }
 
     /// Moves every flat connection of `person`'s (`skills/jira/api_token`)
@@ -1099,6 +1126,7 @@ impl Connections {
                     sign_in: c.sign_in,
                     fields: c.fields,
                     sign_in_ready: self.sign_in_ready(c),
+                    app: self.app_state(c),
                     several: c.named(),
                     name_hint: c.name_hint,
                     connections,
@@ -1201,8 +1229,23 @@ impl Connections {
         found: &Found,
         connected: bool,
     ) {
+        self.record_noted(c, conn, person, found, connected, None)
+            .await
+    }
+
+    /// [`Self::record`], with what a working connection lacks said beside
+    /// it.
+    async fn record_noted(
+        &self,
+        c: &Connector,
+        conn: &Conn,
+        person: &str,
+        found: &Found,
+        connected: bool,
+        note: Option<String>,
+    ) {
         let (status, account, detail) = match found {
-            Found::Works { account } => (Status::Connected, Some(account.clone()), None),
+            Found::Works { account } => (Status::Connected, Some(account.clone()), note),
             Found::Refused(e) => (Status::NeedsReconnect, None, Some(e.clone())),
             Found::Failed(e) => (Status::Failing, None, Some(e.clone())),
         };
@@ -1406,37 +1449,16 @@ impl Connections {
             .ok_or_else(|| {
                 Refusal::NotFound(format!("That {} connection isn't there any more", c.name))
             })?;
-        let found = match c.sign_in {
-            SignIn::Google => self.test_google(conn, tier, person).await,
+        let (found, note) = match c.sign_in {
+            SignIn::App => self.test_app(c, conn, tier, person).await,
             _ => {
                 let fields = self.kept(c, &conn.level, &conn.key, tier, person);
-                self.check(c, &fields).await
+                (self.check(c, &fields).await, None)
             }
         };
-        self.record(c, conn, person, &found, false).await;
+        self.record_noted(c, conn, person, &found, false, note)
+            .await;
         self.shown(c, conn, person).await
-    }
-
-    async fn test_google(&self, conn: &Conn, tier: VaultSource, person: &str) -> Found {
-        let Some((id, secret, _)) = self.google_client() else {
-            return Found::Refused("Your Google OAuth client isn't saved in Desk any more".into());
-        };
-        let Ok(vault) = self.vault_at(tier, &conn.level) else {
-            return Found::Failed("Desk couldn't read this connection".into());
-        };
-        let google = catalog::find("google").expect("google is in the catalog");
-        let Some(refresh) = vault.get(&key_at(tier, person, &google.primary_at(&conn.key))) else {
-            return Found::Refused("Google isn't signed in".into());
-        };
-        let email = vault.get(&key_at(tier, person, &google.at(&conn.key, "email")));
-        let mut fields = BTreeMap::new();
-        fields.insert("refresh".into(), refresh.clone());
-        fields.insert("secret".into(), secret.clone());
-        match self.services.google(&id, &secret, &refresh, email).await {
-            Found::Refused(e) => Found::Refused(scrub(&e, &fields)),
-            Found::Failed(e) => Found::Failed(scrub(&e, &fields)),
-            works => works,
-        }
     }
 
     /// Removes connection `conn`'s keys at the tier it is kept at, and
@@ -1567,42 +1589,6 @@ impl Connections {
         }
     }
 
-    /// Keeps the person's own Google OAuth client, hub-wide, where the
-    /// callback reads it.
-    pub fn keep_google_client(
-        &self,
-        person: &str,
-        client_id: &str,
-        client_secret: &str,
-    ) -> Result<(), Refusal> {
-        let (client_id, client_secret) = (client_id.trim(), client_secret.trim());
-        if client_id.is_empty() || client_secret.is_empty() {
-            return Err(Refusal::Invalid(
-                "The client ID and secret are both needed".into(),
-            ));
-        }
-        if client_id.len() > MAX_VALUE || client_secret.len() > MAX_VALUE {
-            return Err(Refusal::Invalid("That client is too long".into()));
-        }
-        let vault = self.vault_at(VaultSource::Global, &Level::All)?;
-        vault
-            .apply(
-                &[
-                    VaultOp::Set {
-                        path: catalog::GOOGLE_CLIENT_ID,
-                        value: client_id,
-                    },
-                    VaultOp::Set {
-                        path: catalog::GOOGLE_CLIENT_SECRET,
-                        value: client_secret,
-                    },
-                ],
-                VaultActor::User(person),
-            )
-            .map_err(Refusal::Internal)?;
-        Ok(())
-    }
-
     fn insert_flow(
         &self,
         person: &str,
@@ -1610,6 +1596,7 @@ impl Connections {
         level: Level,
         key: Option<String>,
         name: Option<String>,
+        again: bool,
     ) -> String {
         let id = Uuid::new_v4().simple().to_string();
         let now = Instant::now();
@@ -1623,6 +1610,7 @@ impl Connections {
                 level,
                 key,
                 name,
+                again,
                 state: FlowState::Waiting,
                 until: now + FLOW_TTL,
             },
@@ -1641,6 +1629,21 @@ impl Connections {
                 f.state = state;
             }
         }
+    }
+
+    /// Sign-in `flow`, while it is still waited on.
+    fn waiting_flow(&self, flow: &str) -> Option<WaitingFlow> {
+        let flows = self.flows.lock().expect("connection flows poisoned");
+        let f = flows
+            .get(flow)
+            .filter(|f| f.state == FlowState::Waiting && f.until > Instant::now())?;
+        Some(WaitingFlow {
+            person: f.person.clone(),
+            level: f.level.clone(),
+            key: f.key.clone(),
+            name: f.name.clone(),
+            again: f.again,
+        })
     }
 
     fn waiting(&self, flow: &str) -> bool {
@@ -1694,21 +1697,17 @@ impl Connections {
         // (for GitHub, the token git reaches any owner with). A later GitHub
         // one is the person's name for it, else its account's login once it
         // is signed in.
-        let key = match (c.id, &name, self.keys_in_use(c, person).is_empty()) {
+        // One signed in to on an app is named after its account too.
+        let named_later = c.id == "github" || c.sign_in == SignIn::App;
+        let key = match (named_later, &name, self.keys_in_use(c, person).is_empty()) {
             (_, _, true) => Some(DEFAULT_INSTANCE.to_string()),
-            ("github", None, _) => None,
-            ("github", Some(name), _) => Some(self.new_key(c, person, name)),
-            (_, Some(name), false) => Some(self.new_key(c, person, name)),
-            (_, None, false) => Some(self.new_key(c, person, c.name)),
+            (true, None, _) => None,
+            (_, Some(name), _) => Some(self.new_key(c, person, name)),
+            (false, None, false) => Some(self.new_key(c, person, c.name)),
         };
         match c.sign_in {
             SignIn::Github => self.start_github(person, c, level, key, name).await,
-            SignIn::Google => self.start_google(
-                person,
-                level,
-                key.unwrap_or_else(|| DEFAULT_INSTANCE.to_string()),
-                name,
-            ),
+            SignIn::App => self.begin_app(person, c, level, key, name, false),
             SignIn::Fields => Err(Refusal::Invalid(format!(
                 "{} is connected with a key",
                 c.name
@@ -1754,7 +1753,7 @@ impl Connections {
         }
         // The flow holds its key from now, before GitHub is asked: a second
         // sign-in started meanwhile takes another.
-        let flow = self.insert_flow(person, c.id, level.clone(), key, name);
+        let flow = self.insert_flow(person, c.id, level.clone(), key, name, false);
         let asked = async {
             let response = self
                 .services
@@ -1908,148 +1907,6 @@ impl Connections {
             .get(flow)
             .map(|f| (f.key.clone(), f.name.clone()))
             .unwrap_or_default()
-    }
-
-    fn start_google(
-        &self,
-        person: &str,
-        level: Level,
-        key: String,
-        name: Option<String>,
-    ) -> Result<Started, Refusal> {
-        use workforce_skills::adapters::google::oauth::{start_web_flow, OAuthClientCreds};
-        use workforce_skills::adapters::google::web_flow::DeskFlow;
-        let Some((client_id, client_secret, redirect)) = self.google_client() else {
-            return Err(Refusal::Invalid(
-                "Add your Google OAuth client first: its client ID and secret".into(),
-            ));
-        };
-        let redirect_uri = redirect.unwrap_or_else(|| self.google_redirect.clone());
-        if !check::is_loopback_url(&redirect_uri) {
-            return Err(Refusal::Invalid(format!(
-                "Desk signs in to Google on this computer only. Set your OAuth client's redirect to {} (a Desktop app client allows it).",
-                self.google_redirect
-            )));
-        }
-        let creds = OAuthClientCreds {
-            client_id,
-            client_secret,
-            redirect_uri: Some(redirect_uri.clone()),
-        };
-        let web = start_web_flow(&creds, &redirect_uri);
-        let agent = match &level {
-            Level::All => None,
-            Level::Agent(agent) => Some(agent.clone()),
-        };
-        let flow = self.insert_flow(person, "google", level, Some(key.clone()), name);
-        crate::google_oauth_callback::google_web_flow_store().insert_flow(
-            web.state,
-            person.to_string(),
-            key,
-            web.verifier,
-            Some(DeskFlow {
-                flow: flow.clone(),
-                agent,
-                redirect_uri,
-            }),
-        );
-        Ok(Started {
-            flow,
-            url: Some(web.authorization_url),
-            user_code: None,
-            verification_uri: None,
-            expires_in: FLOW_TTL.as_secs(),
-        })
-    }
-
-    /// Google came back without signing in: the flow is cancelled.
-    pub fn google_cancelled(&self, flow: &str) {
-        self.settle(flow, FlowState::Cancelled);
-    }
-
-    /// Google's sign-in failed before anything was kept.
-    pub fn google_failed(&self, flow: &str, error: &str) {
-        self.settle(
-            flow,
-            FlowState::Failed {
-                error: error.to_string(),
-            },
-        );
-    }
-
-    /// Google signed `person` in for `flow`: keeps the tokens as the flow's
-    /// instance at its tier, unless it was cancelled meanwhile.
-    pub async fn google_signed_in(
-        &self,
-        flow: &str,
-        person: &str,
-        tokens: &workforce_skills::adapters::google::oauth::StoredTokens,
-    ) -> Result<String, String> {
-        let (level, key, name) = {
-            let flows = self.flows.lock().expect("connection flows poisoned");
-            match flows.get(flow) {
-                Some(f) if f.person == person && f.state == FlowState::Waiting => (
-                    f.level.clone(),
-                    f.key
-                        .clone()
-                        .unwrap_or_else(|| DEFAULT_INSTANCE.to_string()),
-                    f.name.clone(),
-                ),
-                _ => {
-                    return Err(
-                        "This sign-in was cancelled or has expired. Nothing was saved.".into(),
-                    )
-                }
-            }
-        };
-        let c = catalog::find("google").expect("google is in the catalog");
-        let tier = Self::tiers(c, &level)[0];
-        let failed = |this: &Self| {
-            this.settle(
-                flow,
-                FlowState::Failed {
-                    error: "Desk couldn't keep the sign-in".into(),
-                },
-            );
-            Err("Desk couldn't keep the sign-in.".to_string())
-        };
-        let vault = match self.vault_at(tier, &level) {
-            Ok(vault) => vault,
-            Err(_) => return failed(self),
-        };
-        let store =
-            crate::user_config::UserAwareVault::for_user(Arc::clone(&vault), person.to_string());
-        if let Err(e) = workforce_skills::adapters::google::oauth::persist_tokens_at_user_scope(
-            &store, person, &key, tokens,
-        ) {
-            tracing::error!(error = %format!("{e:#}"), "keeping a Google sign-in failed");
-            return failed(self);
-        }
-        let account = tokens.email.clone().unwrap_or_else(|| "Google".into());
-        let label = key_at(tier, person, &c.label_at(&key).expect("google is named"));
-        let name = name.unwrap_or_else(|| account.clone());
-        if let Err(e) = vault.apply(
-            &[VaultOp::Set {
-                path: &label,
-                value: &name,
-            }],
-            VaultActor::User(person),
-        ) {
-            warn!(error = %format!("{e:#}"), "a Google connection's name wasn't kept");
-        }
-        let found = Found::Works {
-            account: account.clone(),
-        };
-        let conn = Conn { level, key };
-        self.record(c, &conn, person, &found, true).await;
-        self.reload(c, &conn.level, person).await;
-        self.settle(
-            flow,
-            FlowState::Connected {
-                account: account.clone(),
-            },
-        );
-        Ok(account)
     }
 }
 
@@ -2219,12 +2076,6 @@ pub fn reload_skill(
     }
 }
 
-/// The hub's Google callback, on this computer.
-fn google_redirect(listen: &str) -> String {
-    let port = listen.rsplit_once(':').map_or("8080", |(_, port)| port);
-    format!("http://127.0.0.1:{port}/api/auth/google/callback")
-}
-
 /// Connections for this `[desk]` hub, kept for the Google callback, and
 /// its routes.
 pub fn install(
@@ -2240,7 +2091,7 @@ pub fn install(
                 Arc::new(desk),
                 Services::live(),
                 config.desk.github_client_id.clone(),
-                google_redirect(&config.gateway.listen),
+                config.gateway.listen.clone(),
             );
             Arc::new(connections)
         })
@@ -2391,7 +2242,7 @@ struct NameBody {
 }
 
 #[derive(Deserialize)]
-struct ClientBody {
+struct AppBody {
     client_id: String,
     client_secret: String,
 }
@@ -2457,7 +2308,7 @@ pub fn router(state: Arc<GatewayState>, connections: Arc<Connections>) -> Router
             post(connect).delete(disconnect_level),
         )
         .route("/api/desk/connections/{connector}/test", post(test_level))
-        .route("/api/desk/connections/{connector}/client", post(client))
+        .route("/api/desk/connections/{connector}/app", post(keep_app))
         .route("/api/desk/connections/{connector}/oauth/start", post(start))
         .route(
             "/api/desk/connections/{connector}/{connection}",
@@ -2468,6 +2319,10 @@ pub fn router(state: Arc<GatewayState>, connections: Arc<Connections>) -> Router
             post(test),
         )
         .route(
+            "/api/desk/connections/{connector}/{connection}/approve",
+            post(approve_again),
+        )
+        .route(
             "/api/desk/connection-flows/{flow}",
             get(flow).delete(cancel),
         )
@@ -2475,6 +2330,7 @@ pub fn router(state: Arc<GatewayState>, connections: Arc<Connections>) -> Router
             "/api/desk/agents/{agent}/connections",
             get(picks::get_picks).put(picks::put_picks),
         )
+        .route("/api/desk/agents/{agent}/documents", get(documents))
         .with_state(Arc::new(Routes { state, connections }))
 }
 
@@ -2619,20 +2475,32 @@ async fn disconnect_level(
         .into_response()
 }
 
-async fn client(
+async fn keep_app(
     State(r): S,
     h: HeaderMap,
     Query(q): Query<TokenQuery>,
     Path(connector): Path<String>,
-    Json(body): Json<ClientBody>,
+    Json(body): Json<AppBody>,
 ) -> Response {
     let person = person!(r, h, q);
-    if connector != "google" {
-        return Refusal::NotFound(format!("{connector} takes no OAuth client")).into_response();
-    }
     r.connections
-        .keep_google_client(&person, &body.client_id, &body.client_secret)
+        .keep_app(&person, &connector, &body.client_id, &body.client_secret)
+        .await
         .map(|()| StatusCode::NO_CONTENT)
+        .into_response()
+}
+
+async fn approve_again(
+    State(r): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path((connector, connection)): Path<(String, String)>,
+) -> Response {
+    let person = person!(r, h, q);
+    r.connections
+        .approve_again(&person, &connector, &connection)
+        .await
+        .map(Json)
         .into_response()
 }
 
@@ -2655,6 +2523,26 @@ async fn start(
         .await
         .map(Json)
         .into_response()
+}
+
+/// Agent `agent`'s documents folder, made where it isn't yet: `{path}`.
+async fn documents(
+    State(r): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path(agent): Path<String>,
+) -> Response {
+    let _person = person!(r, h, q);
+    let Some(service) = r.state.registry.get(&agent) else {
+        return refusal(StatusCode::NOT_FOUND, "There's no such agent");
+    };
+    match crate::desk_driver::documents(&service.workspace) {
+        Some(path) => Json(json!({ "path": path })).into_response(),
+        None => refusal(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Desk couldn't make the agent's documents folder",
+        ),
+    }
 }
 
 async fn flow(

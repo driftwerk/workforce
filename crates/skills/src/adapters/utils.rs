@@ -422,6 +422,52 @@ pub fn workspaces_answer<V>(clients: &HashMap<String, V>, default: &str) -> Valu
     })
 }
 
+/// A `*.workspaces` tool over a live set: [`workspaces_answer`] for the
+/// caller, taking no arguments.
+pub struct WorkspacesTool<C> {
+    name: &'static str,
+    description: &'static str,
+    clients: Arc<LiveInstances<C>>,
+}
+
+impl<C> WorkspacesTool<C> {
+    pub fn new(
+        name: &'static str,
+        description: &'static str,
+        clients: Arc<LiveInstances<C>>,
+    ) -> Self {
+        Self {
+            name,
+            description,
+            clients,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<C: Send + Sync + 'static> workforce_agent::tools::Tool for WorkspacesTool<C> {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn description(&self) -> &str {
+        self.description
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object", "properties": {}, "required": [] })
+    }
+
+    async fn execute(&self, _input: Value) -> eyre::Result<workforce_agent::tools::ToolResult> {
+        let start = std::time::Instant::now();
+        let (clients, default) = self.clients.for_caller();
+        Ok(workforce_agent::tools::ToolResult::success(
+            workspaces_answer(&clients, &default),
+            start.elapsed().as_millis() as u64,
+        ))
+    }
+}
+
 /// The `Available: …. Default: ….` tail of an instance parameter's
 /// description; the default reads `none — pass <param>` when no instance
 /// carries that name.

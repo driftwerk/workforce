@@ -247,8 +247,9 @@ fn works_in_of(subject: &ComputerSubject, config: &WorkforceConfig, home: &Path)
 }
 
 /// This agent's `[skills]` binding, as the verdict reads it: `None` (every
-/// connector) where it names no `enabled` nor `read_only`. One that can't be
-/// read turns every connector off: admission refuses it before it is written.
+/// connector) where it names no `enabled` nor connections and no connector
+/// only reads. One that can't be read turns every connector off: admission
+/// refuses it before it is written.
 fn connectors_of(subject: &ComputerSubject) -> Option<workforce_desk::computer::Connectors> {
     let binding = match AgentWorkspaceConfig::load(&subject.workspace) {
         Ok(Some(config)) => config.connectors().unwrap_or_else(|e| {
@@ -260,18 +261,22 @@ fn connectors_of(subject: &ComputerSubject) -> Option<workforce_desk::computer::
         }),
         _ => return None,
     };
-    if binding.enabled.is_none() && binding.read_only.is_empty() && binding.connections.is_empty() {
+    let connectors = workforce_common::connector_binding::CONNECTORS;
+    if binding.enabled.is_none()
+        && binding.connections.is_empty()
+        && !connectors.iter().any(|c| binding.reads_only(c))
+    {
         return None;
     }
     // A connector it uses no connection of is off; one connection that only
     // reads is refused where the adapter resolves it, not here.
     Some(workforce_desk::computer::Connectors {
-        enabled: workforce_common::connector_binding::CONNECTORS
+        enabled: connectors
             .iter()
             .filter(|c| binding.is_on(c))
             .map(|c| c.to_string())
             .collect(),
-        read_only: workforce_common::connector_binding::CONNECTORS
+        read_only: connectors
             .iter()
             .filter(|c| binding.reads_only(c))
             .map(|c| c.to_string())
@@ -1392,6 +1397,8 @@ mod tests {
                 "github.pr_get",
                 "jira.search",
                 "browser.navigate",
+                "freeagent.invoices_list",
+                "freeagent.invoice_create",
             ] {
                 tools.register(Arc::new(Elsewhere(name)));
             }
@@ -1422,6 +1429,14 @@ mod tests {
             // No binding: every connector, as before; a send still asks.
             assert_eq!(decide_with("", "jira.search").0, "run");
             assert_eq!(decide_with("", "slack.send").0, "asks once");
+            // FreeAgent reads only until a connection of it is writable,
+            // and a change to the books then asks, unless it asks never.
+            assert_eq!(decide_with("", "freeagent.invoices_list").0, "run");
+            assert_eq!(decide_with("", "freeagent.invoice_create").0, "refused");
+            let harbor = "[skills]\nwritable = [\"freeagent:harbor\"]\n";
+            assert_eq!(decide_with(harbor, "freeagent.invoice_create").0, "asks once");
+            let never = format!("[computer]\nasks = \"never\"\n\n{harbor}");
+            assert_eq!(decide_with(&never, "freeagent.invoice_create").0, "run");
         })
         .await;
     }

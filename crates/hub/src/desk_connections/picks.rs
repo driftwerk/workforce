@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, Item, Table, Value as TomlValue};
-use workforce_common::connector_binding::{CONNECTORS, READ_ONLY_EACH};
+use workforce_common::connector_binding::{CONNECTORS, READ_ONLY_EACH, READ_ONLY_FIRST};
 
 use super::*;
 
@@ -342,14 +342,24 @@ pub fn choose(
         }
     }
 
+    let of_service = |r: &String| r.as_str() == service || r.starts_with(&format!("{service}:"));
     let mut read_only = strings(skills.get("read_only"));
-    read_only.retain(|r| r.as_str() != service && !r.starts_with(&format!("{service}:")));
-    let reading: Vec<&str> = picked
-        .iter()
-        .filter(|(_, write)| !write)
-        .map(|(k, _)| k.as_str())
-        .collect();
-    if !picked.is_empty() && reading.len() == picked.len() {
+    read_only.retain(|r| !of_service(r));
+    let mut writable = strings(skills.get("writable"));
+    writable.retain(|r| !of_service(r));
+    let keys = |write: bool| -> Vec<&str> {
+        picked
+            .iter()
+            .filter(|(_, w)| *w == write)
+            .map(|(k, _)| k.as_str())
+            .collect()
+    };
+    let (writing, reading) = (keys(true), keys(false));
+    if READ_ONLY_FIRST.contains(&service) {
+        // It reads only until it is named: each connection that takes
+        // writes is.
+        writable.extend(writing.iter().map(|k| format!("{service}:{k}")));
+    } else if !picked.is_empty() && reading.len() == picked.len() {
         read_only.push(service.to_string());
     } else if read_only_each {
         read_only.extend(reading.iter().map(|k| format!("{service}:{k}")));
@@ -358,12 +368,14 @@ pub fn choose(
             "{service}'s connections take writes all together or not at all"
         ));
     }
-    match read_only.is_empty() {
-        true => {
-            skills.remove("read_only");
-        }
-        false => {
-            skills.insert("read_only", array(&read_only));
+    for (key, list) in [("read_only", &read_only), ("writable", &writable)] {
+        match list.is_empty() {
+            true => {
+                skills.remove(key);
+            }
+            false => {
+                skills.insert(key, array(list));
+            }
         }
     }
 
@@ -505,6 +517,39 @@ mod tests {
         );
         let all = chosen("", "email", &[("work", false), ("home", false)], None).unwrap();
         assert!(binding(&all).reads_only("email"));
+    }
+
+    #[test]
+    fn freeagent_takes_writes_only_where_writable_names_it() {
+        let body = chosen(
+            "[skills]\nread_only = [\"freeagent:old\"]\nwritable = [\"freeagent:old\", \"freeagent\"]\n",
+            "freeagent",
+            &[("harbor", true), ("lumen", false)],
+            Some("harbor"),
+        )
+        .unwrap();
+        let b = binding(&body);
+        assert_eq!(b.writable, ["freeagent:harbor"]);
+        assert!(b.read_only.is_empty(), "{body}");
+        assert!(!b.reads_only_instance("freeagent", "harbor"));
+        assert!(b.reads_only_instance("freeagent", "lumen"));
+        // All of them read only: nothing is writable, and nothing more is
+        // written.
+        let reading = chosen(&body, "freeagent", &[("harbor", false)], None).unwrap();
+        let b = binding(&reading);
+        assert!(b.writable.is_empty() && b.read_only.is_empty(), "{reading}");
+        assert!(b.reads_only_instance("freeagent", "harbor"));
+        assert!(!reading.contains("writable"), "{reading}");
+    }
+
+    #[test]
+    fn an_unpicked_freeagent_connection_shows_no_writes() {
+        let b = Binding::parse("");
+        assert!(b.reads_only("freeagent", "harbor"));
+        assert!(!b.reads_only("jira", "acme"));
+        let named = Binding::parse("[skills]\nwritable = [\"freeagent:harbor\"]\n");
+        assert!(!named.reads_only("freeagent", "harbor"));
+        assert!(named.reads_only("freeagent", "lumen"));
     }
 
     #[test]

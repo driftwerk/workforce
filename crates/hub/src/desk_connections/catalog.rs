@@ -21,8 +21,9 @@ pub enum SignIn {
     Fields,
     /// GitHub's device flow, or a token in the fields.
     Github,
-    /// Google's sign-in on the person's own OAuth client.
-    Google,
+    /// The service's own sign-in page, on the person's own app
+    /// ([`super::app`]).
+    App,
 }
 
 /// One thing the person types to connect.
@@ -118,6 +119,12 @@ pub struct Connector {
     /// the form): where a single connection kept each, and where an
     /// instance does, under `<prefix><key>/`.
     pub extras: &'static [(&'static str, &'static str)],
+    /// The sub that names an instance's account (Google's email, a
+    /// FreeAgent business): shown beside its name.
+    pub account_sub: Option<&'static str>,
+    /// A new connection of it takes no agent's writes until the person
+    /// allows them.
+    pub starts_read_only: bool,
 }
 
 /// Where an instance keeps the name the person gave it.
@@ -133,18 +140,18 @@ const GOOGLE_HELD: &[&str] = &[
     "skills/google/workspaces/default/expires_at",
     "skills/google/workspaces/default/scopes",
     "skills/google/workspaces/default/email",
+    "skills/google/workspaces/default/client_id",
 ];
 
-/// The Google OAuth client the person brings: hub-wide, as the callback
-/// reads it.
-pub const GOOGLE_CLIENT_ID: &str = "skills/google/oauth_client/client_id";
-pub const GOOGLE_CLIENT_SECRET: &str = "skills/google/oauth_client/client_secret";
-pub const GOOGLE_REDIRECT_URI: &str = "skills/google/oauth_client/redirect_uri";
-/// Where Google's account email is kept beside its tokens.
-pub const GOOGLE_EMAIL: &str = "skills/google/workspaces/default/email";
-pub const GOOGLE_WORKSPACE: &str = "default";
-/// The email account a connection is kept as.
-pub const EMAIL_ACCOUNT: &str = "default";
+const FREEAGENT_HELD: &[&str] = &[
+    "skills/freeagent/workspaces/default/refresh_token",
+    "skills/freeagent/workspaces/default/access_token",
+    "skills/freeagent/workspaces/default/expires_at",
+    "skills/freeagent/workspaces/default/scopes",
+    "skills/freeagent/workspaces/default/company",
+    "skills/freeagent/workspaces/default/company_url",
+    "skills/freeagent/workspaces/default/client_id",
+];
 
 const GITHUB_FIELDS: &[Field] = &[secret(
     "token",
@@ -274,12 +281,14 @@ pub const CATALOG: &[Connector] = &[
             ("skills/github/app_id", "app_id"),
             ("skills/github/app_private_key", "app_private_key"),
         ],
+        account_sub: None,
+        starts_read_only: false,
     },
     Connector {
         id: "google",
         name: "Google",
         about: "Gmail, Calendar, Drive, Docs and Sheets.",
-        sign_in: SignIn::Google,
+        sign_in: SignIn::App,
         fields: &[],
         shared: false,
         held: GOOGLE_HELD,
@@ -291,11 +300,41 @@ pub const CATALOG: &[Connector] = &[
             "expires_at",
             "scopes",
             "email",
+            "client_id",
         ],
         primary_sub: "refresh_token",
         site: None,
         name_hint: "Work, Personal",
         extras: &[],
+        account_sub: Some("email"),
+        starts_read_only: false,
+    },
+    Connector {
+        id: "freeagent",
+        name: "FreeAgent",
+        about:
+            "Your business accounts: bank balances and transactions, invoices, bills and expenses.",
+        sign_in: SignIn::App,
+        fields: &[],
+        shared: false,
+        held: FREEAGENT_HELD,
+        primary: "skills/freeagent/workspaces/default/refresh_token",
+        prefix: Some("skills/freeagent/workspaces/"),
+        subs: &[
+            "refresh_token",
+            "access_token",
+            "expires_at",
+            "scopes",
+            "company",
+            "company_url",
+            "client_id",
+        ],
+        primary_sub: "refresh_token",
+        site: None,
+        name_hint: "The business, like Harbor",
+        extras: &[],
+        account_sub: Some("company"),
+        starts_read_only: true,
     },
     Connector {
         id: "email",
@@ -325,6 +364,8 @@ pub const CATALOG: &[Connector] = &[
                 "command_timeout_secs",
             ),
         ],
+        account_sub: None,
+        starts_read_only: false,
     },
     Connector {
         id: "jira",
@@ -341,6 +382,8 @@ pub const CATALOG: &[Connector] = &[
         site: Some("site"),
         name_hint: "Acme",
         extras: &[("skills/jira/default_project", "default_project")],
+        account_sub: None,
+        starts_read_only: false,
     },
     Connector {
         id: "linear",
@@ -357,6 +400,8 @@ pub const CATALOG: &[Connector] = &[
         site: None,
         name_hint: "Acme",
         extras: &[("skills/linear/default_team_id", "default_team_id")],
+        account_sub: None,
+        starts_read_only: false,
     },
     Connector {
         id: "slack",
@@ -373,6 +418,8 @@ pub const CATALOG: &[Connector] = &[
         site: None,
         name_hint: "",
         extras: &[],
+        account_sub: None,
+        starts_read_only: false,
     },
     Connector {
         id: "datadog",
@@ -389,6 +436,8 @@ pub const CATALOG: &[Connector] = &[
         site: Some("site"),
         name_hint: "Production",
         extras: &[("skills/datadog/base_url", "base_url")],
+        account_sub: None,
+        starts_read_only: false,
     },
     Connector {
         id: "metabase",
@@ -412,6 +461,8 @@ pub const CATALOG: &[Connector] = &[
                 "access_client_secret",
             ),
         ],
+        account_sub: None,
+        starts_read_only: false,
     },
 ];
 
@@ -564,8 +615,8 @@ mod tests {
 
     #[test]
     fn a_flat_connection_becomes_the_default_instance_the_adapters_already_name() {
-        // Email and Google always kept theirs at `default`.
-        for id in ["email", "google"] {
+        // Email, Google and FreeAgent always kept theirs at `default`.
+        for id in ["email", "google", "freeagent"] {
             let c = find(id).unwrap();
             assert_eq!(c.primary, c.primary_at(DEFAULT_INSTANCE), "{id}");
         }

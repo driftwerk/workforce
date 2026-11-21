@@ -3,7 +3,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::extract::Form;
 use axum::routing::post as post_route;
-use workforce_skills::adapters::google::oauth::StoredTokens;
 
 use super::*;
 
@@ -147,6 +146,81 @@ struct Github {
     outcome: Mutex<&'static str>,
 }
 
+/// Whose a fake provider's token is: `at-<who>`, `rt-<who>`, a rotated
+/// one `rt-<who>-r`.
+fn who(token: &str) -> Option<&str> {
+    let who = token
+        .strip_prefix("at-")
+        .or_else(|| token.strip_prefix("rt-"))?;
+    Some(who.trim_end_matches("-r"))
+}
+
+/// Google's and FreeAgent's token endpoints, as a test has them: a code is
+/// whose it is, `narrow` grants Calendar alone, a refresh rotates its token,
+/// and `revoked` is refused as Google and FreeAgent refuse one.
+async fn provider_token(h: HeaderMap, Form(form): Form<BTreeMap<String, String>>) -> Response {
+    // FreeAgent sends its app in Basic auth, Google in the body.
+    if h.get("authorization").is_none() && !form.contains_key("client_id") {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "invalid_client" })),
+        )
+            .into_response();
+    }
+    let refresh = form.get("grant_type").map(String::as_str) == Some("refresh_token");
+    let named = match refresh {
+        true => form.get("refresh_token").map(String::as_str).and_then(who),
+        false => form.get("code").map(String::as_str),
+    };
+    let Some(who) = named.filter(|w| *w != "revoked") else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid_grant" })),
+        )
+            .into_response();
+    };
+    let scope = match who {
+        "narrow" => "https://www.googleapis.com/auth/calendar".to_string(),
+        _ => workforce_skills::adapters::google::oauth::APP_SCOPES.join(" "),
+    };
+    Json(json!({
+        "access_token": format!("at-{who}"),
+        "refresh_token": format!("rt-{who}{}", if refresh { "-r" } else { "" }),
+        "expires_in": 3600,
+        "scope": scope,
+    }))
+    .into_response()
+}
+
+fn bearer(h: &HeaderMap) -> Option<String> {
+    let v = h.get("authorization")?.to_str().ok()?;
+    who(v.strip_prefix("Bearer ")?).map(str::to_string)
+}
+
+async fn google_userinfo(h: HeaderMap) -> Response {
+    match bearer(&h) {
+        Some(who) => Json(json!({ "email": format!("{who}@acme.example") })).into_response(),
+        None => StatusCode::UNAUTHORIZED.into_response(),
+    }
+}
+
+/// FreeAgent's company: `harbor2` is Harbor again, signed in once more.
+async fn freeagent_company(h: HeaderMap) -> Response {
+    match bearer(&h) {
+        Some(who) => {
+            let at = who.trim_end_matches('2');
+            let mut name = at.to_string();
+            name[..1].make_ascii_uppercase();
+            Json(json!({ "company": {
+                "name": name,
+                "url": format!("https://api.freeagent.com/v2/company/{at}"),
+            }}))
+            .into_response()
+        }
+        None => StatusCode::UNAUTHORIZED.into_response(),
+    }
+}
+
 async fn services(github: Arc<Github>) -> Services {
     let app = Router::new()
         .route(
@@ -216,6 +290,10 @@ async fn services(github: Arc<Github>) -> Services {
                 },
             ),
         )
+        .route("/token", post_route(provider_token))
+        .route("/token_endpoint", post_route(provider_token))
+        .route("/userinfo", get(google_userinfo))
+        .route("/company", get(freeagent_company))
         .with_state(github);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -227,8 +305,10 @@ async fn services(github: Arc<Github>) -> Services {
         linear_api: base.clone(),
         slack_api: base.clone(),
         datadog_api: Some(base.clone()),
+        google_auth: format!("{base}/auth"),
         google_token: format!("{base}/token"),
         google_userinfo: format!("{base}/userinfo"),
+        freeagent_api: base.clone(),
         poll_floor: Duration::from_millis(10),
         gh: super::gh::GhCli::none(),
     }
@@ -273,7 +353,7 @@ async fn hub() -> Hub {
         kept.clone(),
         services(Arc::clone(&github)).await,
         Some("Iv1.driftwerk".into()),
-        "http://127.0.0.1:1/api/auth/google/callback".into(),
+        "127.0.0.1:1".into(),
     ));
     Hub {
         _dir: dir,
@@ -1406,22 +1486,6 @@ fn a_moved_connection_still_loads() {
 }
 
 #[tokio::test]
-async fn google_signs_in_on_this_computer_only() {
-    let h = hub().await;
-    h.c.keep_google_client(SARAH, "client", "secret").unwrap();
-    h.global
-        .set(
-            catalog::GOOGLE_REDIRECT_URI,
-            "https://hub.acme.example/api/auth/google/callback",
-        )
-        .unwrap();
-    match h.c.start(SARAH, "google", None, "all", None).await {
-        Err(Refusal::Invalid(said)) => assert!(said.contains("this computer only"), "{said}"),
-        other => panic!("{other:?}"),
-    }
-}
-
-#[tokio::test]
 async fn a_disconnect_removes_only_its_tier() {
     let h = hub().await;
     h.connect(None, "all", None, GOOD).await.unwrap();
@@ -1617,106 +1681,6 @@ async fn without_driftwerks_github_app_github_takes_a_token() {
             .account
             .as_deref(),
         Some("sarah")
-    );
-}
-
-fn tokens() -> StoredTokens {
-    StoredTokens {
-        email: Some("sarah@acme.example".into()),
-        refresh_token: "1//refresh".into(),
-        access_token: "ya29.access".into(),
-        expires_at: 1,
-        scopes: "email".into(),
-    }
-}
-
-#[tokio::test]
-async fn a_google_sign_in_is_kept_where_desk_started_it() {
-    let h = hub().await;
-    assert!(matches!(
-        h.c.start(SARAH, "google", Some("Work"), "agent", Some("allan"))
-            .await,
-        Err(Refusal::Invalid(_))
-    ));
-    h.c.keep_google_client(SARAH, "client.apps.googleusercontent.com", "client-secret")
-        .unwrap();
-    let started =
-        h.c.start(SARAH, "google", Some("Work"), "agent", Some("allan"))
-            .await
-            .unwrap();
-    let url = started.url.unwrap();
-    assert!(
-        url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A1"),
-        "{url}"
-    );
-    let account =
-        h.c.google_signed_in(&started.flow, SARAH, &tokens())
-            .await
-            .unwrap();
-    assert_eq!(account, "sarah@acme.example");
-    assert!(keys(&h.allan)
-        .iter()
-        .all(|k| k.starts_with(&mine("skills/google/workspaces/default/"))));
-    assert!(h.allan.get(&mine(catalog::GOOGLE_EMAIL)).is_some());
-    assert_eq!(
-        h.allan
-            .get(&mine("skills/google/workspaces/default/label"))
-            .as_deref(),
-        Some("Work")
-    );
-    // A second Google is another instance, never over the first.
-    let started =
-        h.c.start(SARAH, "google", Some("Personal"), "agent", Some("allan"))
-            .await
-            .unwrap();
-    h.c.google_signed_in(&started.flow, SARAH, &tokens())
-        .await
-        .unwrap();
-    assert!(h
-        .allan
-        .get(&mine("skills/google/workspaces/personal/refresh_token"))
-        .is_some());
-    let list = h.c.list(SARAH).await;
-    assert_eq!(connector(&list, "google").connections.len(), 2);
-    assert_eq!(
-        keys(&h.global),
-        [catalog::GOOGLE_CLIENT_ID, catalog::GOOGLE_CLIENT_SECRET],
-        "only the person's own client is hub-wide"
-    );
-    assert_eq!(
-        h.c.flow(SARAH, &started.flow),
-        Some(FlowState::Connected {
-            account: "sarah@acme.example".into()
-        })
-    );
-}
-
-#[tokio::test]
-async fn a_google_sign_in_cancelled_meanwhile_keeps_nothing() {
-    let h = hub().await;
-    h.c.keep_google_client(SARAH, "client", "secret").unwrap();
-    let started = h.c.start(SARAH, "google", None, "all", None).await.unwrap();
-    h.c.google_cancelled(&started.flow);
-    assert!(h
-        .c
-        .google_signed_in(&started.flow, SARAH, &tokens())
-        .await
-        .is_err());
-    assert_eq!(keys(&h.global).len(), 2, "only the client");
-    // Nor does a sign-in someone else started.
-    let started = h.c.start(SARAH, "google", None, "all", None).await.unwrap();
-    assert!(h
-        .c
-        .google_signed_in(&started.flow, "someone-else", &tokens())
-        .await
-        .is_err());
-}
-
-#[test]
-fn the_google_callback_is_the_hubs_own_on_this_computer() {
-    assert_eq!(
-        google_redirect("0.0.0.0:50111"),
-        "http://127.0.0.1:50111/api/auth/google/callback"
     );
 }
 
@@ -2363,7 +2327,7 @@ mod setups {
             assert!(s.start(&who, "linear", None, None, false).await.is_err());
             assert!(s.key_page(&who, "linear").is_none());
         }
-        for by_hand in ["google", "email", "slack"] {
+        for by_hand in ["email", "slack"] {
             let e = s
                 .start(&allan, by_hand, None, None, false)
                 .await
@@ -3041,6 +3005,247 @@ mod setups {
         assert!(!format!("{failed:?}").contains("ghp_badtoken"));
         assert!(keys(&h.allan).is_empty());
     }
+
+    const GOOGLE_PAGE: (&str, &str) = ("https://console.cloud.google.com", "/auth/clients");
+
+    /// Google with no app of the person's: every step the agent drives,
+    /// the keys read off the console kept as the person's app (never as the
+    /// connection), then approving on Google's page, and the hub finishing.
+    #[tokio::test]
+    async fn google_setup_without_an_app_walks_every_step_then_approves() {
+        let (h, s) = setups().await;
+        let allan = caller("allan");
+        let started = s
+            .start(&allan, "google", Some("Work"), None, false)
+            .await
+            .unwrap();
+        assert_eq!(started.way, Way::App);
+        let ids: Vec<&str> = started.steps.iter().map(|x| x.id).collect();
+        assert_eq!(
+            ids,
+            [
+                "page", "sign_in", "project", "apis", "branding", "audience", "access", "client",
+                "key", "approve", "check"
+            ]
+        );
+        let next = s.next(&started);
+        for says in [
+            "projectcreate",
+            "Desktop app",
+            "Publish app",
+            "https://mail.google.com/",
+            "stuck",
+        ] {
+            assert!(next.contains(says), "{says}: {next}");
+        }
+        let kept = s
+            .keep(&allan, &started.id, "email", "sarah@acme.example")
+            .unwrap();
+        let branding = kept.steps[4].instruction.clone().unwrap();
+        assert!(
+            branding.contains("support email sarah@acme.example"),
+            "{branding}"
+        );
+        for step in [
+            "page", "sign_in", "project", "apis", "branding", "audience", "access", "client",
+        ] {
+            s.step(&allan, &started.id, step, StepState::Done, None)
+                .unwrap();
+        }
+        assert!(s
+            .step(&allan, &started.id, "approve", StepState::Done, None)
+            .is_err());
+        let page = s.key_page(&allan, "google").unwrap();
+        assert_eq!(page.fields, ["client_id", "client_secret"]);
+        let kept = s
+            .keep_key(
+                &allan,
+                "google",
+                None,
+                GOOGLE_PAGE.0,
+                GOOGLE_PAGE.1,
+                Secret::new(GOOGLE_ID.to_string()),
+            )
+            .unwrap();
+        assert!(
+            !kept.ready && kept.test.contains("client_secret"),
+            "{}",
+            kept.test
+        );
+        let kept = s
+            .keep_key(
+                &allan,
+                "google",
+                None,
+                GOOGLE_PAGE.0,
+                GOOGLE_PAGE.1,
+                Secret::new(GOOGLE_SECRET.to_string()),
+            )
+            .unwrap();
+        assert!(kept.ready);
+        assert!(!format!("{kept:?}").contains(GOOGLE_SECRET.as_str()));
+        s.finish(&allan, &started.id).await;
+        let approving = card_shows(&s, &started.id, NowKind::Approve).await;
+        assert_eq!(approving.now.action, Some("open_approve"));
+        assert!(approving
+            .now
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("Advanced"));
+        // The app is the person's, hub-wide; nothing of the connection yet.
+        assert_eq!(
+            h.global
+                .get("skills/google/oauth_client/client_id")
+                .as_deref(),
+            Some(GOOGLE_ID.as_str())
+        );
+        assert!(keys(&h.allan).is_empty());
+        let url = approving.now.url.unwrap();
+        let pending = h.c.take_pending(&state_of(&url)).unwrap();
+        h.c.complete(pending, "work").await.unwrap();
+        let done = card_shows(&s, &started.id, NowKind::Connected).await;
+        assert_eq!(done.connected.unwrap().account, "work@acme.example");
+        assert_eq!(
+            h.allan
+                .get(&mine("skills/google/workspaces/default/label"))
+                .as_deref(),
+            Some("Work")
+        );
+    }
+
+    #[tokio::test]
+    async fn freeagent_second_business_starts_at_approve() {
+        let (h, s) = setups().await;
+        h.c.keep_app(SARAH, "freeagent", FA_ID, FA_SECRET)
+            .await
+            .unwrap();
+        let allan = caller("allan");
+        let lumen = s
+            .start(&allan, "freeagent", Some("Lumen"), None, false)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = lumen.steps.iter().map(|x| x.id).collect();
+        assert_eq!(ids, ["approve", "check"]);
+        assert_eq!(lumen.now.kind, NowKind::Approve);
+        assert!(lumen
+            .now
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("sign in as Lumen"));
+        assert!(
+            lumen.steps[0].label.contains("as Lumen"),
+            "{:?}",
+            lumen.steps[0]
+        );
+        assert!(s.next(&lumen).contains("approve"));
+    }
+
+    /// A step the agent can't do is the person's, exactly as the agent was
+    /// told it; once they've done it, the agent is told to go on.
+    #[tokio::test]
+    async fn a_stuck_step_waits_on_the_person_with_its_instruction() {
+        let (_h, s) = setups().await;
+        let allan = caller("allan");
+        let started = s.start(&allan, "google", None, None, false).await.unwrap();
+        let stuck = s
+            .keep(&allan, &started.id, "stuck", "Chrome isn't connected")
+            .unwrap();
+        assert_eq!(stuck.now.kind, NowKind::Step);
+        assert_eq!(stuck.now.title, "Step 1 of 11: Open Google Cloud");
+        assert!(stuck
+            .now
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("projectcreate"));
+        assert_eq!(stuck.now.action, Some("open_step"));
+        assert_eq!(stuck.now.other, Some("done_step"));
+        assert!(!stuck.now.app_paste);
+        let done = s.done_step(SARAH, &started.id).await.unwrap();
+        assert_eq!(done.steps[0].state, StepState::Done);
+        let said = s.wait(&allan, &started.id, Duration::ZERO).await.unwrap();
+        assert_eq!(said["did"], json!("page"));
+        assert!(s.keep(&allan, &started.id, "colour", "blue").is_err());
+    }
+
+    #[tokio::test]
+    async fn the_persons_app_paste_keeps_it_and_moves_on() {
+        let (h, s) = setups().await;
+        let allan = caller("allan");
+        let started = s
+            .start(&allan, "freeagent", Some("Harbor"), None, false)
+            .await
+            .unwrap();
+        assert!(started.steps.iter().any(|x| x
+            .instruction
+            .as_deref()
+            .is_some_and(|i| i.contains("http://localhost:1/api/auth/freeagent/callback"))));
+        assert!(s
+            .paste_app(
+                SARAH,
+                &started.id,
+                Secret::new("short".into()),
+                Secret::new(FA_SECRET.into())
+            )
+            .await
+            .is_err());
+        assert!(s
+            .paste_app(
+                "someone-else",
+                &started.id,
+                Secret::new(FA_ID.into()),
+                Secret::new(FA_SECRET.into())
+            )
+            .await
+            .is_err());
+        let pasted = s
+            .paste_app(
+                SARAH,
+                &started.id,
+                Secret::new(FA_ID.into()),
+                Secret::new(FA_SECRET.into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pasted.now.kind, NowKind::Approve);
+        assert!(!format!("{pasted:?}").contains(FA_SECRET));
+        assert_eq!(
+            h.global
+                .get("skills/freeagent/oauth_client/client_id")
+                .as_deref(),
+            Some(FA_ID)
+        );
+        assert_eq!(
+            h.global
+                .get("skills/freeagent/oauth_client/redirect_uri")
+                .as_deref(),
+            Some("http://localhost:1/api/auth/freeagent/callback")
+        );
+    }
+
+    #[test]
+    fn connections_setup_describes_google_and_freeagent() {
+        use workforce_agent::tools::Tool;
+        let tools = setup::SetupTool::all("allan");
+        let setup = tools
+            .iter()
+            .find(|t| t.name() == "connections.setup")
+            .unwrap();
+        assert!(setup.description().contains("Google"));
+        assert!(setup.description().contains("FreeAgent"));
+        let schema = setup.input_schema().to_string();
+        assert!(
+            schema.contains("\"google\"") && schema.contains("\"freeagent\""),
+            "{schema}"
+        );
+        let keep = tools
+            .iter()
+            .find(|t| t.name() == "connections.keep")
+            .unwrap();
+        assert!(keep.description().contains("stuck"));
+    }
 }
 
 #[test]
@@ -3161,5 +3366,354 @@ async fn a_copied_connection_is_audited_here_with_where_it_came_from() {
             );
         }
         assert_eq!(row.actor, format!("user:{SARAH}"));
+    }
+}
+
+/// A Google app's id and secret in their shapes, made up: built here so no
+/// source line looks like a real one.
+static GOOGLE_ID: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "{}-{}.{}",
+        "1".repeat(12),
+        "ab".repeat(16),
+        "apps.googleusercontent.com"
+    )
+});
+static GOOGLE_SECRET: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| ["GOCSPX", &"x".repeat(28)].join("-"));
+const FA_ID: &str = "p0sIUgWBrTC8BOy5B-6bmA";
+const FA_SECRET: &str = "Zx9_kq2LmN4pR7sT1vW3yA";
+
+/// The `state` a sign-in page's address carries.
+fn state_of(url: &str) -> String {
+    url::Url::parse(url)
+        .unwrap()
+        .query_pairs()
+        .find(|(k, _)| k == "state")
+        .unwrap()
+        .1
+        .into_owned()
+}
+
+mod apps {
+    use super::*;
+
+    /// Signs `started` in as `code`'s account, as the service's redirect
+    /// would.
+    async fn signs_in(h: &Hub, started: &Started, code: &str) -> Result<String, String> {
+        let pending =
+            h.c.take_pending(&state_of(started.url.as_deref().unwrap()))
+                .unwrap();
+        h.c.complete(pending, code).await
+    }
+
+    async fn freeagent(h: &Hub, name: Option<&str>, code: &str) -> Result<String, String> {
+        let started =
+            h.c.start(SARAH, "freeagent", name, "all", None)
+                .await
+                .unwrap();
+        signs_in(h, &started, code).await
+    }
+
+    #[tokio::test]
+    async fn google_sign_in_keeps_tokens_email_and_client_at_the_level() {
+        let h = hub().await;
+        assert!(matches!(
+            h.c.start(SARAH, "google", Some("Work"), "agent", Some("allan"))
+                .await,
+            Err(Refusal::Invalid(_))
+        ));
+        assert_eq!(
+            connector(&h.c.list(SARAH).await, "google").app,
+            Some(app::AppState::Missing)
+        );
+        assert!(h
+            .c
+            .keep_app(SARAH, "google", "123", &GOOGLE_SECRET)
+            .await
+            .is_err());
+        h.c.keep_app(SARAH, "google", &GOOGLE_ID, &GOOGLE_SECRET)
+            .await
+            .unwrap();
+        let started =
+            h.c.start(SARAH, "google", Some("Work"), "agent", Some("allan"))
+                .await
+                .unwrap();
+        let url = started.url.clone().unwrap();
+        assert!(
+            url.contains(
+                "redirect_uri=http%3A%2F%2F127.0.0.1%3A1%2Fapi%2Fauth%2Fgoogle%2Fcallback"
+            ),
+            "{url}"
+        );
+        assert!(
+            url.contains("code_challenge=") && url.contains("access_type=offline"),
+            "{url}"
+        );
+        assert_eq!(
+            signs_in(&h, &started, "work").await.unwrap(),
+            "Google is connected as work@acme.example."
+        );
+        let at = |sub: &str| {
+            h.allan
+                .get(&mine(&format!("skills/google/workspaces/default/{sub}")))
+        };
+        assert_eq!(at("email").as_deref(), Some("work@acme.example"));
+        assert_eq!(at("client_id").as_deref(), Some(GOOGLE_ID.as_str()));
+        assert_eq!(at("label").as_deref(), Some("Work"));
+        assert_eq!(at("refresh_token").as_deref(), Some("rt-work"));
+        assert_eq!(
+            keys(&h.global),
+            [
+                "skills/google/oauth_client/client_id",
+                "skills/google/oauth_client/client_secret"
+            ],
+            "only the person's own app is hub-wide"
+        );
+        assert_eq!(
+            h.c.flow(SARAH, &started.flow),
+            Some(FlowState::Connected {
+                account: "work@acme.example".into()
+            })
+        );
+        // A second account is another instance, never over the first.
+        let started =
+            h.c.start(SARAH, "google", None, "agent", Some("allan"))
+                .await
+                .unwrap();
+        signs_in(&h, &started, "personal").await.unwrap();
+        let list = h.c.list(SARAH).await;
+        let google = connector(&list, "google");
+        assert_eq!(google.app, Some(app::AppState::Ready));
+        let names: Vec<&str> = google.connections.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names.len(), 2);
+        assert!(
+            names.contains(&"Work") && names.contains(&"personal@acme.example"),
+            "{names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn freeagent_sign_in_keeps_company_and_url() {
+        let h = hub().await;
+        h.c.keep_app(SARAH, "freeagent", FA_ID, FA_SECRET)
+            .await
+            .unwrap();
+        let started =
+            h.c.start(SARAH, "freeagent", None, "all", None)
+                .await
+                .unwrap();
+        let url = started.url.clone().unwrap();
+        assert!(
+            !url.contains("code_challenge"),
+            "FreeAgent takes no PKCE: {url}"
+        );
+        assert!(url.contains("localhost%3A1"), "{url}");
+        signs_in(&h, &started, "harbor").await.unwrap();
+        let at = |sub: &str| {
+            h.global
+                .get(&mine(&format!("skills/freeagent/workspaces/default/{sub}")))
+        };
+        assert_eq!(at("company").as_deref(), Some("Harbor"));
+        assert_eq!(
+            at("company_url").as_deref(),
+            Some("https://api.freeagent.com/v2/company/harbor")
+        );
+        assert_eq!(at("label").as_deref(), Some("Harbor"));
+        freeagent(&h, None, "lumen").await.unwrap();
+        let list = h.c.list(SARAH).await;
+        let accounts: Vec<Option<&str>> = connector(&list, "freeagent")
+            .connections
+            .iter()
+            .map(|c| c.account.as_deref())
+            .collect();
+        assert_eq!(accounts.len(), 2);
+        assert!(accounts.contains(&Some("Harbor")) && accounts.contains(&Some("Lumen")));
+    }
+
+    #[tokio::test]
+    async fn the_same_business_twice_is_refused_and_nothing_kept() {
+        let h = hub().await;
+        h.c.keep_app(SARAH, "freeagent", FA_ID, FA_SECRET)
+            .await
+            .unwrap();
+        freeagent(&h, None, "harbor").await.unwrap();
+        let before = keys(&h.global);
+        let started =
+            h.c.start(SARAH, "freeagent", Some("Other"), "all", None)
+                .await
+                .unwrap();
+        let said = signs_in(&h, &started, "harbor2").await.unwrap_err();
+        assert!(
+            said.contains("same business") && said.contains("Nothing was saved"),
+            "{said}"
+        );
+        assert_eq!(keys(&h.global), before);
+        assert!(matches!(
+            h.c.flow(SARAH, &started.flow),
+            Some(FlowState::Failed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_scopes_keep_and_say_what_is_missing() {
+        let h = hub().await;
+        h.c.keep_app(SARAH, "google", &GOOGLE_ID, &GOOGLE_SECRET)
+            .await
+            .unwrap();
+        let started = h.c.start(SARAH, "google", None, "all", None).await.unwrap();
+        let said = signs_in(&h, &started, "narrow").await.unwrap();
+        assert!(said.contains("without Drive or Gmail"), "{said}");
+        let list = h.c.list(SARAH).await;
+        let conn = &connector(&list, "google").connections[0];
+        assert_eq!(conn.status, Status::Connected);
+        assert!(conn
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("tick Drive or Gmail"));
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_flow_keeps_nothing() {
+        let h = hub().await;
+        h.c.keep_app(SARAH, "google", &GOOGLE_ID, &GOOGLE_SECRET)
+            .await
+            .unwrap();
+        let started = h.c.start(SARAH, "google", None, "all", None).await.unwrap();
+        assert!(h.c.cancel(SARAH, &started.flow));
+        assert!(signs_in(&h, &started, "work").await.is_err());
+        assert_eq!(keys(&h.global).len(), 2, "only the app");
+    }
+
+    #[tokio::test]
+    async fn the_callback_takes_desk_state_and_leaves_agent_flows() {
+        let h = hub().await;
+        h.c.keep_app(SARAH, "google", &GOOGLE_ID, &GOOGLE_SECRET)
+            .await
+            .unwrap();
+        let started = h.c.start(SARAH, "google", None, "all", None).await.unwrap();
+        assert!(h.c.take_pending("an-agents-own-state").is_none());
+        let state = state_of(started.url.as_deref().unwrap());
+        assert!(h.c.take_pending(&state).is_some());
+        assert!(h.c.take_pending(&state).is_none(), "once");
+    }
+
+    #[tokio::test]
+    async fn a_moved_freeagent_address_is_refused_with_words() {
+        let h = hub().await;
+        h.c.keep_app(SARAH, "freeagent", FA_ID, FA_SECRET)
+            .await
+            .unwrap();
+        h.global
+            .set(
+                "skills/freeagent/oauth_client/redirect_uri",
+                "http://localhost:2/api/auth/freeagent/callback",
+            )
+            .unwrap();
+        let list = h.c.list(SARAH).await;
+        let fa = connector(&list, "freeagent");
+        assert_eq!(fa.app, Some(app::AppState::Moved));
+        assert!(!fa.sign_in_ready);
+        match h.c.start(SARAH, "freeagent", None, "all", None).await {
+            Err(Refusal::Invalid(said)) => assert!(said.contains("address changed"), "{said}"),
+            other => panic!("{other:?}"),
+        }
+        let c = catalog::find("freeagent").unwrap();
+        h.c.keep_app_address(SARAH, c).unwrap();
+        assert_eq!(h.c.app_state(c), Some(app::AppState::Ready));
+    }
+
+    #[tokio::test]
+    async fn approve_again_keeps_the_name_and_instance() {
+        let h = hub().await;
+        h.c.keep_app(SARAH, "freeagent", FA_ID, FA_SECRET)
+            .await
+            .unwrap();
+        freeagent(&h, Some("Books"), "harbor").await.unwrap();
+        let id = connector(&h.c.list(SARAH).await, "freeagent").connections[0]
+            .id
+            .clone();
+        let again = h.c.approve_again(SARAH, "freeagent", &id).await.unwrap();
+        signs_in(&h, &again, "harbor").await.unwrap();
+        let list = h.c.list(SARAH).await;
+        let fa = connector(&list, "freeagent");
+        assert_eq!(fa.connections.len(), 1);
+        assert_eq!(fa.connections[0].id, id);
+        assert_eq!(fa.connections[0].name, "Books");
+        assert!(h
+            .c
+            .approve_again(SARAH, "freeagent", "all~~nothing")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_check_that_refreshes_freeagent_keeps_the_rotated_token() {
+        let h = hub().await;
+        h.c.keep_app(SARAH, "freeagent", FA_ID, FA_SECRET)
+            .await
+            .unwrap();
+        freeagent(&h, None, "harbor").await.unwrap();
+        let path = |sub: &str| mine(&format!("skills/freeagent/workspaces/default/{sub}"));
+        h.global.set(&path("expires_at"), "1").unwrap();
+        let id = connector(&h.c.list(SARAH).await, "freeagent").connections[0]
+            .id
+            .clone();
+        let checked = h.c.test(SARAH, "freeagent", &id).await.unwrap();
+        assert_eq!(checked.status, Status::Connected);
+        assert_eq!(checked.account.as_deref(), Some("Harbor"));
+        assert_eq!(
+            h.global.get(&path("refresh_token")).as_deref(),
+            Some("rt-harbor-r")
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_grant_reads_lapsed() {
+        let h = hub().await;
+        h.c.keep_app(SARAH, "google", &GOOGLE_ID, &GOOGLE_SECRET)
+            .await
+            .unwrap();
+        let started = h.c.start(SARAH, "google", None, "all", None).await.unwrap();
+        signs_in(&h, &started, "work").await.unwrap();
+        let path = |sub: &str| mine(&format!("skills/google/workspaces/default/{sub}"));
+        h.global.set(&path("refresh_token"), "rt-revoked").unwrap();
+        h.global.set(&path("expires_at"), "1").unwrap();
+        let id = connector(&h.c.list(SARAH).await, "google").connections[0]
+            .id
+            .clone();
+        let checked = h.c.test(SARAH, "google", &id).await.unwrap();
+        assert_eq!(checked.status, Status::NeedsReconnect);
+        assert!(checked
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("Approve it again"));
+        assert!(checked.approve_again);
+    }
+
+    #[tokio::test]
+    async fn another_app_reads_other_app() {
+        let h = hub().await;
+        h.c.keep_app(SARAH, "google", &GOOGLE_ID, &GOOGLE_SECRET)
+            .await
+            .unwrap();
+        let started = h.c.start(SARAH, "google", None, "all", None).await.unwrap();
+        signs_in(&h, &started, "work").await.unwrap();
+        let other = GOOGLE_ID.replace(&"1".repeat(12), &"9".repeat(12));
+        h.c.keep_app(SARAH, "google", &other, &GOOGLE_SECRET)
+            .await
+            .unwrap();
+        let id = connector(&h.c.list(SARAH).await, "google").connections[0]
+            .id
+            .clone();
+        let checked = h.c.test(SARAH, "google", &id).await.unwrap();
+        assert_eq!(checked.status, Status::NeedsReconnect);
+        assert!(checked
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("earlier Google app"));
     }
 }

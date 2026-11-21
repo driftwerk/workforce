@@ -66,6 +66,21 @@ pub(crate) fn install_desk_for_test(desk: Desk) -> bool {
     DESK.set(desk).is_ok()
 }
 
+/// A local agent's documents folder, `<workspace>/documents`, made where it
+/// isn't yet: where it keeps invoices, statements and the files it makes or
+/// downloads for the person. Inside its workspace, so its file tools reach
+/// it; keyed by its id, so a rename keeps it.
+pub(crate) fn documents(workspace: &std::path::Path) -> Option<std::path::PathBuf> {
+    let dir = workspace.join("documents");
+    match std::fs::create_dir_all(&dir) {
+        Ok(()) => Some(dir),
+        Err(e) => {
+            tracing::warn!(dir = %dir.display(), error = %e, "an agent's documents folder couldn't be made");
+            None
+        }
+    }
+}
+
 /// Gives `service` the `desk.*` tools when desk sessions are on. Called for
 /// every agent at boot and for agents spawned later.
 pub fn register_tools(service: &AgentService) {

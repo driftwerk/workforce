@@ -15,7 +15,6 @@
 //! themselves.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use eyre::{eyre, Result, WrapErr};
 use reqwest::{header, Method, StatusCode};
@@ -24,7 +23,7 @@ use serde::Serialize;
 use tracing::{debug, warn};
 use workforce_agent::tools::RateLimitedError;
 
-use crate::adapters::utils::retry_after_secs;
+use crate::adapters::utils::{retry_after_secs, LiveInstances};
 
 use super::token_store::TokenStore;
 
@@ -212,10 +211,16 @@ impl GoogleApi {
                 .send_once(&method, url, query, body)
                 .await
                 .wrap_err_with(|| format!("{method} {url} (retry after refresh)"))?;
-            return Self::parse_response(retry_status, retry_after, retry_text, allow_empty_body);
+            return Self::parse_response(
+                url,
+                retry_status,
+                retry_after,
+                retry_text,
+                allow_empty_body,
+            );
         }
 
-        Self::parse_response(status, retry_after, text, allow_empty_body)
+        Self::parse_response(url, status, retry_after, text, allow_empty_body)
     }
 
     async fn send_once<B, Q>(
@@ -243,7 +248,18 @@ impl GoogleApi {
         Ok((status, retry_after, text))
     }
 
-    fn status_error(status: StatusCode, retry_after: Option<u64>, text: &str) -> eyre::Report {
+    fn status_error(
+        url: &str,
+        status: StatusCode,
+        retry_after: Option<u64>,
+        text: &str,
+    ) -> eyre::Report {
+        if let Some(words) = (status == StatusCode::FORBIDDEN)
+            .then(|| forbidden_in_words(url, text))
+            .flatten()
+        {
+            return eyre!("{words}");
+        }
         let err = Self::decode_error(status, text);
         if status == StatusCode::TOO_MANY_REQUESTS {
             return RateLimitedError::new(err.to_string(), retry_after).into();
@@ -252,13 +268,14 @@ impl GoogleApi {
     }
 
     fn parse_response<T: DeserializeOwned>(
+        url: &str,
         status: StatusCode,
         retry_after: Option<u64>,
         text: String,
         allow_empty_body: bool,
     ) -> Result<T> {
         if !status.is_success() {
-            return Err(Self::status_error(status, retry_after, &text));
+            return Err(Self::status_error(url, status, retry_after, &text));
         }
         if text.is_empty() && allow_empty_body {
             // DELETE and a few other endpoints return 204 with no body. We
@@ -365,7 +382,7 @@ impl GoogleApi {
         let retry_after = retry_after_secs(resp.headers());
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(Self::status_error(status, retry_after, &text));
+            return Err(Self::status_error(url, status, retry_after, &text));
         }
         serde_json::from_str(&text).wrap_err_with(|| format!("parsing upload response: {text}"))
     }
@@ -400,7 +417,7 @@ impl GoogleApi {
                 let retry_after = retry_after_secs(resp2.headers());
                 if !retry_status.is_success() {
                     let t = resp2.text().await.unwrap_or_default();
-                    return Err(Self::status_error(retry_status, retry_after, &t));
+                    return Err(Self::status_error(url, retry_status, retry_after, &t));
                 }
                 return resp2
                     .bytes()
@@ -408,7 +425,7 @@ impl GoogleApi {
                     .map(|b| b.to_vec())
                     .wrap_err("reading bytes");
             }
-            return Err(Self::status_error(status, retry_after, &text));
+            return Err(Self::status_error(url, status, retry_after, &text));
         }
         resp.bytes()
             .await
@@ -417,42 +434,69 @@ impl GoogleApi {
     }
 }
 
-/// Holds one or more `GoogleApi` instances for multi-account support.
-///
-/// Tools use `resolve(account)` to get the right client. When no `account`
-/// is specified, the default client is used. Mirrors the shape of the old
-/// `GoogleToolContext` so Phase 3 tools can drop in without churn.
-pub struct GoogleApiContext {
-    default: Arc<GoogleApi>,
-    accounts: HashMap<String, Arc<GoogleApi>>,
+/// Every Google connection the caller can use, by name, each read as them.
+pub type GoogleApis = LiveInstances<GoogleApi>;
+
+/// The Google service a request to `url` is served by, as the person ticks
+/// it on Google's consent page.
+fn service_of(url: &str) -> &'static str {
+    let rest = url
+        .split_once("://")
+        .map_or(url, |(_, rest)| rest)
+        .trim_start_matches("www.googleapis.com/")
+        .trim_start_matches("upload/");
+    match rest.split(['.', '/']).next().unwrap_or_default() {
+        "gmail" => "Gmail",
+        "calendar" => "Calendar",
+        "tasks" => "Tasks",
+        "people" => "Contacts",
+        "chat" => "Chat",
+        _ => "Drive",
+    }
 }
 
-impl GoogleApiContext {
-    pub fn single(api: Arc<GoogleApi>) -> Self {
-        Self {
-            default: api,
-            accounts: HashMap::new(),
-        }
+/// A 403 Google gives for a scope the connection wasn't granted, or an API
+/// the person's project hasn't turned on, in words the person acts on.
+fn forbidden_in_words(url: &str, text: &str) -> Option<String> {
+    let body: serde_json::Value = serde_json::from_str(text).ok()?;
+    let error = body.get("error")?;
+    let list = |key: &str| {
+        error
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let (errors, details) = (list("errors"), list("details"));
+    let reason_is = |names: &[&str]| {
+        errors
+            .iter()
+            .chain(&details)
+            .filter_map(|e| e.get("reason").and_then(serde_json::Value::as_str))
+            .any(|r| names.contains(&r))
+    };
+    let metadata = |key: &str| {
+        details
+            .iter()
+            .find_map(|d| d.get("metadata")?.get(key)?.as_str().map(str::to_string))
+    };
+    let service = service_of(url);
+    if reason_is(&["insufficientPermissions", "ACCESS_TOKEN_SCOPE_INSUFFICIENT"]) {
+        return Some(format!(
+            "This Google connection wasn't given {service}. The person approves it again with {service} ticked (Connections → Google → Approve again)."
+        ));
     }
-
-    pub fn multi(default: Arc<GoogleApi>, accounts: HashMap<String, Arc<GoogleApi>>) -> Self {
-        Self { default, accounts }
+    if reason_is(&["SERVICE_DISABLED", "accessNotConfigured"]) {
+        let api = metadata("serviceTitle").unwrap_or_else(|| format!("{service} API"));
+        let at = metadata("activationUrl").map_or_else(
+            || "in the Google Cloud console".to_string(),
+            |u| format!("at {u}"),
+        );
+        return Some(format!(
+            "The {api} isn't turned on in your Google project. The person's agent turns it on (connections.setup service=google), or the person enables it {at}."
+        ));
     }
-
-    pub fn resolve(&self, account: Option<&str>) -> &GoogleApi {
-        match account {
-            Some(name) => self
-                .accounts
-                .get(name)
-                .map(|a| a.as_ref())
-                .unwrap_or(&self.default),
-            None => &self.default,
-        }
-    }
-
-    pub fn account_names(&self) -> Vec<&str> {
-        self.accounts.keys().map(|s| s.as_str()).collect()
-    }
+    None
 }
 
 /// Helper: build the shared `reqwest::Client` we use for all Google calls.
@@ -492,6 +536,7 @@ mod tests {
         let body =
             r#"{"error":{"code":429,"message":"Quota exceeded","status":"RESOURCE_EXHAUSTED"}}"#;
         let err = GoogleApi::parse_response::<serde_json::Value>(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages",
             StatusCode::TOO_MANY_REQUESTS,
             Some(12),
             body.to_string(),
@@ -512,6 +557,7 @@ mod tests {
     fn parse_response_429_without_header_carries_no_hint() {
         use workforce_agent::tools::RateLimitedError;
         let err = GoogleApi::parse_response::<serde_json::Value>(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages",
             StatusCode::TOO_MANY_REQUESTS,
             None,
             "busy".to_string(),
@@ -526,6 +572,7 @@ mod tests {
     fn parse_response_non_429_error_stays_untyped() {
         use workforce_agent::tools::RateLimitedError;
         let err = GoogleApi::parse_response::<serde_json::Value>(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages",
             StatusCode::NOT_FOUND,
             Some(12),
             "nope".to_string(),
@@ -533,6 +580,42 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.downcast_ref::<RateLimitedError>().is_none());
+    }
+
+    #[test]
+    fn insufficient_scope_is_said_in_words() {
+        let scope = r#"{"error":{"code":403,"message":"Request had insufficient authentication scopes.","errors":[{"reason":"insufficientPermissions"}],"status":"PERMISSION_DENIED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"ACCESS_TOKEN_SCOPE_INSUFFICIENT"}]}}"#;
+        let said = |url: &str, body: &str| {
+            GoogleApi::status_error(url, StatusCode::FORBIDDEN, None, body).to_string()
+        };
+        assert_eq!(
+            said("https://gmail.googleapis.com/gmail/v1/users/me/messages", scope),
+            "This Google connection wasn't given Gmail. The person approves it again with Gmail ticked (Connections → Google → Approve again)."
+        );
+        assert!(
+            said("https://www.googleapis.com/calendar/v3/calendars", scope)
+                .contains("wasn't given Calendar")
+        );
+        assert!(
+            said("https://sheets.googleapis.com/v4/spreadsheets/x", scope)
+                .contains("wasn't given Drive")
+        );
+        assert!(
+            said("https://www.googleapis.com/upload/drive/v3/files", scope)
+                .contains("wasn't given Drive")
+        );
+        let disabled = r#"{"error":{"code":403,"message":"Tasks API has not been used","errors":[{"reason":"accessNotConfigured"}],"details":[{"reason":"SERVICE_DISABLED","metadata":{"serviceTitle":"Google Tasks API","activationUrl":"https://console.developers.google.com/apis/api/tasks.googleapis.com/overview?project=1"}}]}}"#;
+        assert_eq!(
+            said("https://tasks.googleapis.com/tasks/v1/users/@me/lists", disabled),
+            "The Google Tasks API isn't turned on in your Google project. The person's agent turns it on (connections.setup service=google), or the person enables it at https://console.developers.google.com/apis/api/tasks.googleapis.com/overview?project=1."
+        );
+        let bare = r#"{"error":{"code":403,"errors":[{"reason":"accessNotConfigured"}]}}"#;
+        assert!(said("https://chat.googleapis.com/v1/spaces", bare)
+            .contains("The Chat API isn't turned on in your Google project"));
+        // Any other 403 keeps Google's own words.
+        let other = r#"{"error":{"code":403,"message":"The caller does not have permission","status":"PERMISSION_DENIED"}}"#;
+        assert!(said("https://www.googleapis.com/drive/v3/files/x", other)
+            .contains("The caller does not have permission"));
     }
 
     #[test]

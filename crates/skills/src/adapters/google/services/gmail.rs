@@ -26,7 +26,7 @@ use workforce_agent::tools::image_view::{
 };
 use workforce_agent::tools::{SurfaceEffect, Tool};
 
-use crate::adapters::google::api::{GoogleApi, GoogleApiContext};
+use crate::adapters::google::api::{GoogleApi, GoogleApis};
 use crate::adapters::outbound_mail::{assemble, MailPart};
 use crate::adapters::utils::{
     artifact_attachments_schema, coerce_to_id_string, coerce_to_u64, resolve_artifact_attachments,
@@ -45,7 +45,7 @@ const GMAIL_BASE64: GeneralPurpose = GeneralPurpose::new(
     GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
 );
 
-pub fn tools(ctx: Arc<GoogleApiContext>) -> Vec<Arc<dyn Tool>> {
+pub fn tools(ctx: Arc<GoogleApis>) -> Vec<Arc<dyn Tool>> {
     let mut out: Vec<Arc<dyn Tool>> = Vec::new();
 
     // ── messages search ──────────────────────────────────────────────────────

@@ -862,7 +862,8 @@ fn prune_shots(shots: &Path) {
     }
 }
 
-/// Gives `service` the browser, if it hasn't it: an overseer reaches for it.
+/// Gives `service` the browser, if it hasn't it: every local agent reaches
+/// for it.
 pub fn equip(service: &crate::serve::AgentService) {
     if crate::skill_loader::skill_tools_registered("browser", &service.tools) {
         return;
@@ -879,7 +880,7 @@ pub fn equip(service: &crate::serve::AgentService) {
         &service.skill_state,
         "desk",
     ) {
-        warn!(agent = %service.agent_id, error = %format!("{e:#}"), "giving the overseer the browser failed");
+        warn!(agent = %service.agent_id, error = %format!("{e:#}"), "giving the agent the browser failed");
     }
 }
 
