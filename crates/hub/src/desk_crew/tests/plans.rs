@@ -983,6 +983,20 @@ async fn a_ticket_that_keeps_failing_to_start_tells_the_boss_once_and_pauses_its
             .plan_needs()
             .iter()
             .any(|n| n.ask.contains("couldn't start 5 times")));
+        let noted = eventually("the pause noted", async || {
+            d.activity(workforce_desk::crew::Filter::All, None, 50)
+                .await
+                .unwrap()
+                .events
+                .into_iter()
+                .find(|e| e.kind == workforce_desk::crew::Kind::PlanPaused)
+        })
+        .await;
+        assert_eq!(
+            noted.reason.as_deref(),
+            Some(why.as_str()),
+            "kept with its pause"
+        );
         eventually("the boss told", async || {
             (said(&llm, "DES-1 didn't start").await >= 1).then_some(())
         })
