@@ -809,19 +809,12 @@ impl Desk {
                         return Err(Refusal::Unreachable("You".into(), "that is you").into())
                     }
                     Target::Person => Party::you(),
-                    // An overseer never messages another.
-                    Target::Overseer if matches!(from, Sender::Overseer(_)) => {
-                        return Err(Refusal::Unreachable(
-                            "Desk".into(),
-                            "message a session or the person",
-                        )
-                        .into())
-                    }
                     Target::Overseer => match self.line_overseer(None) {
-                        Some(o) if o.id != party.id => o,
-                        _ => {
+                        // An overseer never messages another.
+                        Some(o) if o.id != party.id && !matches!(from, Sender::Overseer(_)) => o,
+                        o => {
                             return Err(Refusal::Unreachable(
-                                "Desk".into(),
+                                o.map_or_else(|| "Desk".to_string(), |o| o.name),
                                 "message a session or the person",
                             )
                             .into())

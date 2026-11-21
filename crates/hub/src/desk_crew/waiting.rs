@@ -48,7 +48,7 @@ const LOOK_BACK: i64 = 30;
 const KEPT_CHARS: usize = 1_500;
 
 /// Words a session says when what it says waits on its boss's answer.
-const WAITS: [&str; 15] = [
+const WAITS: [&str; 14] = [
     "need your decision",
     "needs your decision",
     "your call",
@@ -60,7 +60,6 @@ const WAITS: [&str; 15] = [
     "waiting on your",
     "waiting for your",
     "until you decide",
-    "until desk",
     "wait for your",
     "until you answer",
     "until you confirm",
@@ -153,10 +152,14 @@ fn says(lower: &str, phrase: &str) -> bool {
 /// answers", or options laid out with a recommendation. A report that
 /// only lists what it did ("1. Updated the migration", "CI: green") never
 /// does.
-pub(crate) fn waits_on_answer(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    workforce_desk::line::holds(text)
+pub(crate) fn waits_on_answer(text: &str, boss: &str) -> bool {
+    let lower = workforce_desk::line::plain(text);
+    workforce_desk::line::holds(text, boss)
         || WAITS.iter().any(|w| says(&lower, w))
+        || workforce_desk::line::boss_phrases(boss)
+            .iter()
+            .filter(|p| p.starts_with("until "))
+            .any(|p| says(&lower, p))
         || crew::question_in(text).is_some()
         || (options_in(text).len() >= 2 && recommends(&lower))
 }
@@ -264,6 +267,26 @@ pub(super) struct Waiting {
     persons: bool,
 }
 
+/// The boss's name in `m`, as its writer knew it: the sender's when the
+/// boss wrote it, else the recipient's.
+fn boss_named(m: &LineMessage) -> &str {
+    if m.from.kind == PartyKind::Manager {
+        &m.from.name
+    } else {
+        &m.to.name
+    }
+}
+
+/// Whether `m` holds its session for the boss's answer.
+fn holds_for_answer(m: &LineMessage) -> bool {
+    workforce_desk::line::holds(&m.text, boss_named(m))
+}
+
+/// Whether `m`, a session's word to its boss, waits on the boss's answer.
+fn waits_for_answer(m: &LineMessage) -> bool {
+    waits_on_answer(&m.text, boss_named(m))
+}
+
 /// Whether `m` is the boss's word to `s`, as the session got it.
 fn bosss_word(m: &LineMessage, boss: &str, s: Uuid) -> bool {
     m.from.kind == PartyKind::Manager
@@ -286,7 +309,7 @@ fn reached(m: &LineMessage) -> DateTime<Utc> {
 pub(super) fn waiting_in(thread: &[LineMessage], boss: &str, s: Uuid) -> Option<Waiting> {
     let ours = thread.iter().rfind(|m| bosss_word(m, boss, s));
     let theirs = thread.iter().rfind(|m| to_boss(m, boss, s));
-    let held = ours.is_some_and(|o| workforce_desk::line::holds(&o.text));
+    let held = ours.is_some_and(holds_for_answer);
     let persons = held && ours.is_some_and(|o| persons_hold(&o.text));
     match (theirs, ours) {
         // Its word is the newest: the ball is in the boss's court when it
@@ -298,8 +321,8 @@ pub(super) fn waiting_in(thread: &[LineMessage], boss: &str, s: Uuid) -> Option<
             // Spoken since the boss's hold, its own words say whether it
             // still waits ("Done, merged" doesn't).
             // "Understood, holding" waits on as the hold does.
-            let waits = t.kind == LineKind::Tell
-                && (waits_on_answer(&t.text) || (held && !goes_on(&t.text)));
+            let waits =
+                t.kind == LineKind::Tell && (waits_for_answer(t) || (held && !goes_on(&t.text)));
             // Under the boss's hold, the wait began with the hold; a
             // reply that only says it holds keeps what it waits on in its
             // words that asked, so the wait reads the same whichever Desk
@@ -309,7 +332,7 @@ pub(super) fn waiting_in(thread: &[LineMessage], boss: &str, s: Uuid) -> Option<
             // session, and after the boss's word before it (what that
             // answered is settled).
             let said = match began {
-                Some(o) if !waits_on_answer(&t.text) => {
+                Some(o) if !waits_for_answer(t) => {
                     let before = thread.iter().rfind(|m| {
                         m.id != o.id && bosss_word(m, boss, s) && reached(m) < reached(o)
                     });
@@ -320,7 +343,7 @@ pub(super) fn waiting_in(thread: &[LineMessage], boss: &str, s: Uuid) -> Option<
                                 && m.kind == LineKind::Tell
                                 && m.at < reached(o)
                                 && before.is_none_or(|b| m.at > reached(b))
-                                && waits_on_answer(&m.text)
+                                && waits_for_answer(m)
                         })
                         .unwrap_or(t)
                 }
@@ -373,13 +396,6 @@ impl CrewHub {
             (None, Some(r)) => Some((r.at, Some(r.text))),
             (None, None) => None,
         }
-    }
-
-    /// What the person calls boss `boss`.
-    fn boss_name(&self, boss: &str) -> String {
-        self.overseer_named(boss)
-            .map(|(s, _)| super::name_of(&s))
-            .unwrap_or_else(|| "Desk".into())
     }
 
     /// The bound before what waits on boss `boss` is the person's: its
@@ -521,7 +537,7 @@ impl CrewHub {
             Some(q) => format!("{name} waits on a decision: {q}"),
             None => format!(
                 "{name} is holding, waiting on {}'s answer",
-                self.boss_name(boss)
+                self.boss_name_of(boss)
             ),
         };
         let mut text = headline.clone();
@@ -783,15 +799,13 @@ impl CrewHub {
         }
         let thread = self.desk.line_thread(s, None, Some(LOOK_BACK)).await.ok()?;
         if let Some(m) = thread.iter().rfind(|m| {
-            bosss_word(m, &i.boss, s)
-                && reached(m) > i.opened_at
-                && !workforce_desk::line::holds(&m.text)
+            bosss_word(m, &i.boss, s) && reached(m) > i.opened_at && !holds_for_answer(m)
         }) {
             return Some((
                 ClosedBy::Boss,
                 format!(
                     "{} answered {name} at {} (“{}”); I've closed the question.",
-                    self.boss_name(&i.boss),
+                    self.boss_name_of(&i.boss),
                     at(reached(m)),
                     crew::words(&crew::one_line(&m.text, 200), 12)
                 ),
@@ -802,7 +816,7 @@ impl CrewHub {
         // message: a held session's "Understood, holding." is no going on.
         let spoke = thread
             .iter()
-            .any(|m| to_boss(m, &i.boss, s) && m.at > i.opened_at && !waits_on_answer(&m.text));
+            .any(|m| to_boss(m, &i.boss, s) && m.at > i.opened_at && !waits_for_answer(m));
         let still =
             waiting_in(&thread, &i.boss, s).is_some_and(|w| key(s, w.message) == i.dedupe_key);
         if matches!(view.state, SessionState::Working | SessionState::Blocked) || spoke && !still {
@@ -870,7 +884,7 @@ mod tests {
         let report = "The REINDEX can't fix the drill. Both need your decision.\n\n\
                       (a) Upgrade staging to 16.16.\n(b) Pin the drill's minor.\n(c) Accept it.\n\
                       I recommend (a) on staging in the day.";
-        assert!(waits_on_answer(report));
+        assert!(waits_on_answer(report, "Desk"));
         assert_eq!(options_in(report).len(), 3, "{:?}", options_in(report));
         assert_eq!(options_in(report)[1], "Pin the drill's minor.");
         assert_eq!(
@@ -878,36 +892,42 @@ mod tests {
             Some("I recommend (a) on staging in the day")
         );
         assert!(waits_on_answer(
-            "Holding: I'm changing nothing until Desk answers."
+            "Holding: I'm changing nothing until Desk answers.",
+            "Desk"
         ));
         assert!(!waits_on_answer(
-            "Done: the date picker is on 4.2 and the tests pass."
+            "Done: the date picker is on 4.2 and the tests pass.",
+            "Desk"
         ));
         assert!(options_in("Fixed 3 tests.\n2 left.").is_empty());
         // A recommendation, however it is worded.
         assert!(waits_on_answer(
-            "(a) Upgrade staging\n(b) Pin the minor\nMy recommendation: (a)."
+            "(a) Upgrade staging\n(b) Pin the minor\nMy recommendation: (a).",
+            "Desk"
         ));
-        assert!(waits_on_answer("I'll wait for your decision."));
+        assert!(waits_on_answer("I'll wait for your decision.", "Desk"));
         assert!(goes_on("Merged; carrying on with the docs."));
         assert!(!goes_on("Understood, holding."));
         assert!(!goes_on(
             "Holding. The REINDEX is done; nothing else changes."
         ));
         assert!(!waits_on_answer(
-            "Left the flag off until you need it. Done."
+            "Left the flag off until you need it. Done.",
+            "Desk"
         ));
         assert!(options_in("e.g. the staging host\ni.e. not production").is_empty());
         // What was done, listed, is no choice.
         let done = "Done.\n1. Updated the migration.\n2. Ran the tests.\nCI: green on all jobs.\nPR: opened #12.";
         assert!(options_in(done).is_empty(), "{:?}", options_in(done));
-        assert!(!waits_on_answer(done));
+        assert!(!waits_on_answer(done, "Desk"));
         assert!(!waits_on_answer(
-            "Wired up your callback and the until-desktop flag."
+            "Wired up your callback and the until-desktop flag.",
+            "Desk"
         ));
         // Options alone, without a recommendation or a question, are a list.
         assert!(!waits_on_answer(
-            "Tried:\n(a) the 16.15 image\n(b) the 16.16 image"
+            "Tried:\n(a) the 16.15 image\n(b) the 16.16 image",
+            "Desk"
         ));
         assert_eq!(
             options_in("Option A: upgrade staging first\nOption B: pin the minor").len(),
@@ -915,7 +935,98 @@ mod tests {
         );
         // Text that changes length in lower case never panics.
         let _ = options_in("Option Éé: İ foo bar\nİİİİ Option: x y");
-        let _ = waits_on_answer("İİİİ until Desk answers; K your call");
+        let _ = waits_on_answer("İİİİ until Desk answers; K your call", "Desk");
+    }
+
+    /// A boss renamed Kat is waited on by its name.
+    #[test]
+    fn a_session_waiting_on_its_boss_by_its_name_waits_on_it() {
+        use workforce_desk::crew::Party;
+        let s = Uuid::new_v4();
+        let session = Party {
+            kind: PartyKind::Session,
+            id: s.to_string(),
+            name: "web".into(),
+            engine: None,
+            origin: None,
+        };
+        let kat = Party::manager("desk", "Kat");
+        let t0 = Utc::now() - chrono::Duration::minutes(10);
+        let at = |m: i64| t0 + chrono::Duration::minutes(m);
+        let said = |text: &str, m: i64| {
+            let mut l =
+                LineMessage::new(session.clone(), kat.clone(), LineKind::Tell, text.into(), 1);
+            l.at = at(m);
+            l
+        };
+        let told = |text: &str, m: i64| {
+            let mut l =
+                LineMessage::new(kat.clone(), session.clone(), LineKind::Tell, text.into(), 1);
+            l.at = at(m);
+            l.delivery = Delivery::Delivered;
+            l.delivered_at = Some(at(m));
+            l
+        };
+        let waiting = said(
+            "Migration staged. I'm changing nothing until Kat answers.",
+            0,
+        );
+        assert!(waiting_in(std::slice::from_ref(&waiting), "desk", s).is_some());
+        let held = [
+            said("Migration staged.", 0),
+            told("Wait for Kat's go-ahead before you run it.", 1),
+            said("Understood.", 2),
+        ];
+        assert!(waiting_in(&held, "desk", s).is_some());
+        let went_on = [
+            said("Migration staged.", 0),
+            told("Run it.", 1),
+            said("Running it now.", 2),
+        ];
+        assert!(waiting_in(&went_on, "desk", s).is_none());
+    }
+
+    #[test]
+    fn a_wait_on_the_boss_by_its_name_waits_on_it() {
+        assert!(waits_on_answer("Holding until Kat answers.", "Kat"));
+        assert!(waits_on_answer("Nothing more from me until Kat.", "Kat"));
+        assert!(
+            waits_on_answer("Holding until Desk answers.", "Kat"),
+            "the line's address"
+        );
+        assert!(!waits_on_answer("Holding until Kat answers.", "Mia"));
+        assert!(!waits_on_answer("Ran it until Katalog finished.", "Kat"));
+        assert!(waits_on_answer("Holding until Kat\u{2019}s answer.", "Kat"));
+        assert!(!waits_on_answer("Ran it until it finished.", "It"));
+    }
+
+    /// "until Desk answers", written before the rename, still waits.
+    #[test]
+    fn a_wait_stored_under_the_old_name_still_waits_after_a_rename() {
+        use workforce_desk::crew::Party;
+        let session = Party {
+            kind: PartyKind::Session,
+            id: Uuid::new_v4().to_string(),
+            name: "web".into(),
+            engine: None,
+            origin: None,
+        };
+        let to = |name: &str, text: &str| {
+            LineMessage::new(
+                session.clone(),
+                Party::manager("desk", name),
+                LineKind::Tell,
+                text.into(),
+                1,
+            )
+        };
+        assert!(waits_for_answer(&to("Desk", "Holding until Desk answers.")));
+        assert!(waits_for_answer(&to("Kat", "Holding until Desk answers.")));
+        assert!(waits_for_answer(&to("Kat", "Holding until Kat answers.")));
+        assert!(!waits_for_answer(&to(
+            "Desk",
+            "Ran it until Kat's tests passed."
+        )));
     }
 
     /// Under a hold, a reply that only says it holds keeps the words the
@@ -965,9 +1076,9 @@ mod tests {
             3,
         );
         let holding = said("Understood, holding.", 4);
-        assert!(waits_on_answer(&asked.text));
-        assert!(!waits_on_answer(&holding.text));
-        assert!(workforce_desk::line::holds(&hold.text));
+        assert!(waits_on_answer(&asked.text, "Desk"));
+        assert!(!waits_on_answer(&holding.text, "Desk"));
+        assert!(workforce_desk::line::holds(&hold.text, "Desk"));
         // The question before the boss's answer is settled: the reply's
         // own words are kept.
         let thread = [
