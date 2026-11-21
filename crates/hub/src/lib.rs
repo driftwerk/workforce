@@ -43,6 +43,7 @@ pub mod claude_code_tool;
 pub mod claude_pilot;
 pub mod cli_session;
 pub mod code;
+pub mod code_compare;
 pub mod code_context;
 pub mod codex_setup_auth_tool;
 pub mod coding_engine;

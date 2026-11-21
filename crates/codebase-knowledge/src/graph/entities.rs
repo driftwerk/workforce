@@ -78,14 +78,11 @@ impl CodeEntity {
     /// on every trigger forever. The `count_matches_is_summarisable_predicate`
     /// test guards the coupling.
     pub fn is_summarisable(&self) -> bool {
-        if !self.language.has_parser() {
-            return false;
-        }
-        match self.kind {
-            EntityKind::Function | EntityKind::Method => !self.is_trivial_private_helper(),
-            EntityKind::File | EntityKind::Module => true,
-            _ => false,
-        }
+        self.language.has_parser()
+            && match SummaryGranularity::of(&self.kind) {
+                Some(SummaryGranularity::Function) => !self.is_trivial_private_helper(),
+                granularity => granularity.is_some(),
+            }
     }
 
     /// A private, undocumented, very short function/method. The doc check is
@@ -245,6 +242,38 @@ impl EntityKind {
             "test" => Self::Test,
             "macro" => Self::Macro,
             _ => Self::Function, // fallback
+        }
+    }
+}
+
+/// Granularity levels for summaries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryGranularity {
+    Function,
+    File,
+    Module,
+    Architecture,
+}
+
+impl SummaryGranularity {
+    /// The granularity an entity of `kind` is summarised at; `None` for a
+    /// kind that is never summarised.
+    pub fn of(kind: &EntityKind) -> Option<Self> {
+        match kind {
+            EntityKind::Function | EntityKind::Method => Some(Self::Function),
+            EntityKind::File => Some(Self::File),
+            EntityKind::Module => Some(Self::Module),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Function => "function",
+            Self::File => "file",
+            Self::Module => "module",
+            Self::Architecture => "architecture",
         }
     }
 }
@@ -548,5 +577,15 @@ mod tests {
         for kind in kinds {
             assert_eq!(EntityKind::from_str(kind.as_str()), kind);
         }
+    }
+
+    #[test]
+    fn a_kind_is_summarised_at_one_granularity_or_none() {
+        let of = |kind: EntityKind| SummaryGranularity::of(&kind);
+        assert_eq!(of(EntityKind::Function), Some(SummaryGranularity::Function));
+        assert_eq!(of(EntityKind::Method), Some(SummaryGranularity::Function));
+        assert_eq!(of(EntityKind::File), Some(SummaryGranularity::File));
+        assert_eq!(of(EntityKind::Module), Some(SummaryGranularity::Module));
+        assert_eq!(of(EntityKind::Struct), None);
     }
 }

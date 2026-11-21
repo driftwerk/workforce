@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use eyre::{eyre, Result};
+use futures::future::BoxFuture;
 use vellev_core::Embedding;
 use workforce_vellev::seeding::Seeding;
 use workforce_vellev::testing::Counted;
@@ -115,6 +116,8 @@ pub struct Held {
     /// Writes of entities or summaries asked for, however many each held.
     pub writes: AtomicUsize,
     pub fail_index: AtomicBool,
+    /// Its health check says it is unhealthy.
+    pub unhealthy: AtomicBool,
     pub fail_file_purge: AtomicBool,
     /// The next look for a repo held besides the graph's fails.
     pub fail_held_outside: AtomicBool,
@@ -127,6 +130,14 @@ pub struct Held {
     pub untracked: AtomicBool,
     /// What a search finds.
     pub found: Mutex<Vec<VectorSearchResult>>,
+    /// What a search finds by the repo and text asked, in place of `found`.
+    pub answers: Mutex<BTreeMap<(String, String), Vec<VectorSearchResult>>>,
+    /// Every search asked.
+    pub searches: Mutex<Vec<Search>>,
+    /// The search, counted from one, that fails.
+    pub failing_search: Mutex<Option<usize>>,
+    /// What is done after the search counted from one, before it is answered.
+    pub after_search: Mutex<Option<(usize, Hook)>>,
     /// Pages of what is held that were listed.
     pub listed: AtomicUsize,
     /// The first entity of each page of entities compared.
@@ -166,6 +177,17 @@ pub struct Held {
     /// Writes of entities come in and not yet gone, however they go:
     /// stored, failed, or dropped where they wait.
     pub writing: Arc<AtomicUsize>,
+}
+
+/// What a [`Held`] store does after a search, before answering it.
+pub type Hook = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
+
+/// A search asked of a [`Held`] store.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Search {
+    pub text: String,
+    pub repo_id: Option<String>,
+    pub limit: usize,
 }
 
 /// One write counted as under way until this is dropped.
@@ -343,7 +365,7 @@ impl CodeVectorStore for Held {
     }
 
     async fn health_check(&self) -> Result<bool> {
-        Ok(true)
+        Ok(!self.unhealthy.load(Ordering::SeqCst))
     }
 
     fn base_url(&self) -> &str {
@@ -427,15 +449,33 @@ impl CodeVectorStore for Held {
 
     async fn search_entities(
         &self,
-        _query: &str,
-        _repo_id: Option<&str>,
+        query: &str,
+        repo_id: Option<&str>,
         _kind: Option<EntityKind>,
-        _limit: usize,
+        limit: usize,
     ) -> Result<Vec<VectorSearchResult>> {
         if self.hang_search.load(Ordering::SeqCst) {
             std::future::pending::<()>().await;
         }
-        Ok(self.found.lock().unwrap().clone())
+        let n = {
+            let mut searches = self.searches.lock().unwrap();
+            searches.push(Search {
+                text: query.to_string(),
+                repo_id: repo_id.map(str::to_string),
+                limit,
+            });
+            searches.len()
+        };
+        if *self.failing_search.lock().unwrap() == Some(n) {
+            return Err(eyre!("the store went away at search {n}"));
+        }
+        let after = self.after_search.lock().unwrap().clone();
+        if let Some((_, hook)) = after.filter(|(after, _)| *after == n) {
+            hook().await;
+        }
+        let key = (repo_id.unwrap_or_default().to_string(), query.to_string());
+        let answered = self.answers.lock().unwrap().get(&key).cloned();
+        Ok(answered.unwrap_or_else(|| self.found.lock().unwrap().clone()))
     }
 
     async fn differing_entities(

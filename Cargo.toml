@@ -161,6 +161,7 @@ blake3 = "1.6.0"
 aes-gcm = "0.10"
 argon2 = "0.5"
 rand = "0.8"
+rand_chacha = "0.3"
 
 # vellev
 vellev-client = { git = "https://github.com/driftwerk/vellev", rev = "ada7a63ef132d18049d3c7342f6076a249a69979" }

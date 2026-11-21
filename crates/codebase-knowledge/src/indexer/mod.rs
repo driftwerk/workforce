@@ -14,7 +14,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::graph::entities::{CodeEntity, EntityId, EntityKind};
+use crate::graph::entities::{CodeEntity, EntityId, SummaryGranularity};
 use crate::graph::relationships::Relationship;
 use crate::graph::CodeGraph;
 use crate::lease::{IndexPhase, LeaseContext, LeaseProgress};
@@ -23,7 +23,7 @@ use crawler::{CrawledFile, CrawlerConfig, FileCrawler};
 use incremental::IncrementalDetector;
 use parser::AstParser;
 use relationship_builder::RelationshipBuilder;
-use summary_generator::{SummaryGenerator, SummaryGranularity};
+use summary_generator::SummaryGenerator;
 use symbol_extractor::{CallReference, ImplTraitInfo, SymbolExtractor};
 
 /// Options bundle for [`IndexingPipeline`] runs. Defaults to "no
@@ -171,23 +171,19 @@ fn build_summary_jobs(entities: &[CodeEntity]) -> Vec<SummaryJob> {
         .iter()
         .filter(|e| e.is_summarisable())
         .filter_map(|e| {
-            let (granularity, source) = match e.kind {
-                EntityKind::Function | EntityKind::Method => (
-                    SummaryGranularity::Function,
-                    e.signature
-                        .clone()
-                        .unwrap_or_else(|| e.qualified_name.clone()),
-                ),
-                EntityKind::File => (
-                    SummaryGranularity::File,
-                    assemble_child_signatures(e, by_file.get(e.file_path.as_str())),
-                ),
-                EntityKind::Module => (
-                    SummaryGranularity::Module,
-                    assemble_child_signatures(e, by_parent.get(e.id.as_str())),
-                ),
-                // `is_summarisable` already excludes every other kind.
-                _ => return None,
+            let granularity = SummaryGranularity::of(&e.kind)?;
+            let source = match granularity {
+                SummaryGranularity::Function => e
+                    .signature
+                    .clone()
+                    .unwrap_or_else(|| e.qualified_name.clone()),
+                SummaryGranularity::File => {
+                    assemble_child_signatures(e, by_file.get(e.file_path.as_str()))
+                }
+                SummaryGranularity::Module => {
+                    assemble_child_signatures(e, by_parent.get(e.id.as_str()))
+                }
+                SummaryGranularity::Architecture => return None,
             };
             let context = e.doc_comment.clone().unwrap_or_default();
             let source_hash = summary_source_hash(&source, &context);
@@ -1354,12 +1350,10 @@ impl IndexingPipeline {
             if !fresh.contains(entity.id.as_str()) {
                 continue;
             }
-            let granularity = match entity.kind {
-                EntityKind::Function | EntityKind::Method => "function",
-                EntityKind::File => "file",
-                EntityKind::Module => "module",
-                _ => continue,
+            let Some(granularity) = SummaryGranularity::of(&entity.kind) else {
+                continue;
             };
+            let granularity = granularity.as_str();
             if let Ok(Some((text, is_stale))) =
                 self.graph.get_summary(&entity.id, granularity).await
             {
@@ -1440,7 +1434,9 @@ pub struct IndexResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::entities::{mk_entity, CodeVisibility, Language, TRIVIAL_FN_MAX_SPAN};
+    use crate::graph::entities::{
+        mk_entity, CodeVisibility, EntityKind, Language, TRIVIAL_FN_MAX_SPAN,
+    };
 
     /// Convenience for the common "public Rust code symbol" case.
     fn code(

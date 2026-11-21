@@ -467,6 +467,23 @@ pub mod testing {
             self.tenants().reads
         }
 
+        /// Where the node's metrics are read (`GET`), as
+        /// `VELLEV_TEST_METRICS_URL` names it, for a node run with
+        /// `VELLEV_METRICS_LISTEN`; or `None`, said why, to skip.
+        pub fn metrics(&self) -> Option<String> {
+            let metrics = std::env::var("VELLEV_TEST_METRICS_URL").ok();
+            if metrics.is_none() {
+                assert!(
+                    !required(),
+                    "VELLEV_TEST_REQUIRED is set, and VELLEV_TEST_METRICS_URL names no metrics listener of the node"
+                );
+                eprintln!(
+                    "skipping: VELLEV_TEST_METRICS_URL names no metrics listener of the node"
+                );
+            }
+            metrics
+        }
+
         /// A local URL that answers nothing yet, as a node not up; see
         /// [`Self::come_up_at`].
         pub async fn not_up_yet() -> (String, u16) {

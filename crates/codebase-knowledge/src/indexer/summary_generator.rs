@@ -3,6 +3,7 @@ use eyre::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::graph::entities::EntityId;
+pub use crate::graph::entities::SummaryGranularity;
 
 /// LLM backend for the summary generator.
 #[async_trait]
@@ -21,27 +22,6 @@ pub struct CodeSummary {
     pub model_used: String,
     pub generated_at: String,
     pub is_stale: bool,
-}
-
-/// Granularity levels for summaries.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SummaryGranularity {
-    Function,
-    File,
-    Module,
-    Architecture,
-}
-
-impl SummaryGranularity {
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Function => "function",
-            Self::File => "file",
-            Self::Module => "module",
-            Self::Architecture => "architecture",
-        }
-    }
 }
 
 /// Generates code summaries at various granularities using a pluggable LLM backend.
