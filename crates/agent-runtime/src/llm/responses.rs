@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
+use regex::Regex;
 use reqwest::header::{HeaderMap, ACCEPT, RETRY_AFTER, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -23,6 +24,7 @@ use tokio::sync::mpsc;
 use url::Url;
 
 use super::anthropic::CACHE_BREAK_MARKER;
+use super::failover::INPUT_REFUSED_MARKER;
 use super::image_cap::{cap_images, RESPONSES_MAX_IMAGES};
 use super::oai_common::budget_to_effort;
 use super::provider::{effective_thinking_budget, reasoning_suppressed};
@@ -370,7 +372,7 @@ pub enum ResponsesError {
     InvalidReasoning(String),
     #[error("ChatGPT API error (400): response stopped by the content filter ({0})")]
     ContentFiltered(String),
-    #[error("ChatGPT API error (400): {code}: {message}")]
+    #[error("ChatGPT API error: {marker} ({code}): {message}", marker = INPUT_REFUSED_MARKER)]
     InvalidInput { code: String, message: String },
     #[error("ChatGPT API error (529): {0}")]
     Overloaded(String),
@@ -1092,30 +1094,34 @@ fn error_code(error: &Value) -> Option<&str> {
         .or_else(|| text_of(error, "type").filter(|t| *t != "error" && !t.starts_with("response.")))
 }
 
-/// `message` as a log-safe line: cut before any inlined base64 payload and
-/// bounded in length.
-fn shown(message: &str) -> String {
-    let text = message
-        .split_once("base64,")
-        .map_or(message.to_string(), |(head, _)| format!("{head}base64,…"));
-    text.chars().take(MAX_ERROR_MESSAGE_CHARS).collect()
+/// `reason` as a log-safe line: inlined `data:` URLs (an image the provider
+/// quotes back) cut out, and bounded in length.
+fn shown(reason: &str) -> String {
+    static DATA_URL: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"data:[^\s"'<>)]*"#).expect("a valid pattern"));
+    DATA_URL
+        .replace_all(reason, "data:…")
+        .chars()
+        .take(MAX_ERROR_MESSAGE_CHARS)
+        .collect()
 }
 
-/// Whether `code` says the request's input was refused, which no retry fixes.
+/// Whether `code` names an image the provider refused, which no retry fixes.
+/// Server and generation errors that mention images are not that.
 fn is_invalid_input(code: &str) -> bool {
-    code.starts_with("invalid_")
-        || code.starts_with("unsupported_")
-        || code.contains("image")
-        || code == "bad_request"
+    ["invalid_image", "unsupported_image", "image_"]
+        .iter()
+        .any(|prefix| code.starts_with(prefix))
+        && !code.contains("generation")
 }
 
 /// The error an error object names.
 fn failed_error(error: &Value) -> ResponsesError {
-    let reason = text_of(error, "message").unwrap_or("the provider gave no reason");
-    let message = shown(&match text_of(error, "param") {
+    let reason = shown(text_of(error, "message").unwrap_or("the provider gave no reason"));
+    let message = match text_of(error, "param") {
         Some(param) => format!("{reason} (param: {param})"),
-        None => reason.to_string(),
-    });
+        None => reason,
+    };
     match error_code(error) {
         Some("context_length_exceeded") => ResponsesError::ContextOverflow(message),
         Some("server_is_overloaded" | "slow_down") => ResponsesError::Overloaded(message),
@@ -2205,42 +2211,43 @@ mod tests {
         assert_eq!(classify_error(&err.to_string()), ErrorKind::Overloaded);
     }
 
+    fn failure(event: Value) -> String {
+        emits(&format!("data: {event}\n\n"))
+            .expect_err("failed response")
+            .to_string()
+    }
+
     #[test]
     fn a_failed_response_says_why_wherever_the_backend_put_it() {
-        let reason = |event: Value| {
-            emits(&format!("data: {event}\n\n"))
-                .expect_err("failed response")
-                .to_string()
-        };
-        let nested = reason(json!({"type": "response.failed", "response": {"error": {
-            "code": "invalid_image_format",
-            "message": "The image data you provided could not be decoded.",
-            "param": "input[3].content[1]"}}}));
         assert_eq!(
-            nested,
-            "ChatGPT API error (400): invalid_image_format: The image data you provided could not \
-             be decoded. (param: input[3].content[1])"
+            failure(json!({"type": "response.failed", "response": {"error": {
+                "code": "invalid_image_format",
+                "message": "The image data you provided could not be decoded.",
+                "param": "input[3].content[1]"}}})),
+            "ChatGPT API error: request input refused (invalid_image_format): The image data you \
+             provided could not be decoded. (param: input[3].content[1])"
         );
-        let status_details = reason(json!({"type": "response.failed", "response": {
+        let status_details = failure(json!({"type": "response.failed", "response": {
             "error": {"type": "error"},
             "status_details": {"error": {"code": "invalid_prompt", "message": "Rejected."}}}}));
-        assert!(
-            status_details.contains("invalid_prompt: Rejected."),
-            "{status_details}"
+        assert_eq!(
+            status_details,
+            "ChatGPT API error: response failed (invalid_prompt): Rejected."
         );
-        let wrapped = reason(json!({"type": "error",
+        let wrapped = failure(json!({"type": "error",
             "error": {"type": "invalid_request_error", "message": "Bad input."}}));
-        assert!(
-            wrapped.contains("invalid_request_error: Bad input."),
-            "{wrapped}"
+        assert_eq!(
+            wrapped,
+            "ChatGPT API error: response failed (invalid_request_error): Bad input."
         );
-        let flat = reason(json!({"type": "error", "code": "unsupported_image_type",
+        let flat = failure(json!({"type": "error", "code": "unsupported_image_type",
             "message": "HEIC is not supported."}));
-        assert!(
-            flat.contains("unsupported_image_type: HEIC is not supported."),
-            "{flat}"
+        assert_eq!(
+            flat,
+            "ChatGPT API error: request input refused (unsupported_image_type): HEIC is not \
+             supported."
         );
-        let unexplained = reason(json!({"type": "response.failed", "response": {
+        let unexplained = failure(json!({"type": "response.failed", "response": {
             "instructions": "secret system prompt", "error": {"type": "error"}}}));
         assert_eq!(
             unexplained,
@@ -2249,19 +2256,49 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_input_is_not_retried_and_never_quotes_an_image() {
+    fn only_a_refused_image_is_a_refused_input() {
+        for code in ["invalid_image", "invalid_image_url", "image_parse_error"] {
+            assert!(is_invalid_input(code), "{code}");
+        }
+        for code in [
+            "server_error",
+            "image_generation_user_error",
+            "invalid_prompt",
+            "rate_limit_exceeded",
+        ] {
+            assert!(!is_invalid_input(code), "{code}");
+        }
+        let generation = failure(json!({"type": "response.failed", "response": {"error": {
+            "code": "server_error", "message": "An image could not be generated."}}}));
+        assert_eq!(classify_error(&generation), ErrorKind::Unknown);
+    }
+
+    #[test]
+    fn a_refused_input_is_a_client_error_and_never_quotes_an_image() {
         let blob = "A".repeat(4000);
-        let err = emits(&format!(
-            "data: {}\n\n",
-            json!({"type": "response.failed", "response": {"error": {
-                "code": "invalid_image_url",
-                "message": format!("Invalid image data:image/heic;base64,{blob}")}}})
-        ))
-        .expect_err("failed response");
-        let text = err.to_string();
-        assert!(text.ends_with("data:image/heic;base64,…"), "{text}");
+        let text = failure(json!({"type": "response.failed", "response": {"error": {
+            "code": "invalid_image_url",
+            "message": format!("Invalid image data:image/heic;base64,{blob} (exceeded)"),
+            "param": "input[0].content[2]"}}}));
+        assert_eq!(
+            text,
+            "ChatGPT API error: request input refused (invalid_image_url): Invalid image data:… (exceeded) \
+             (param: input[0].content[2])"
+        );
         assert_eq!(classify_error(&text), ErrorKind::ClientError);
-        assert!(!ErrorKind::ClientError.is_retryable());
+        let long = failure(json!({"type": "error", "code": "invalid_image",
+            "message": "x".repeat(2000), "param": "p"}));
+        assert!(long.ends_with("(param: p)") && long.len() < 700, "{long}");
+    }
+
+    #[test]
+    fn a_refused_input_says_what_the_failover_classifier_keys_on() {
+        let refused = ResponsesError::InvalidInput {
+            code: "invalid_image".into(),
+            message: "the context exceeded".into(),
+        };
+        assert!(refused.to_string().contains(INPUT_REFUSED_MARKER));
+        assert_eq!(classify_error(&refused.to_string()), ErrorKind::ClientError);
     }
 
     // ── Client ──────────────────────────────────────────────────────────

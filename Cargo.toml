@@ -144,7 +144,7 @@ base64 = "0.22.0"
 # Photos a model can read: JPEG re-encoding (no metadata written) and a pure-Rust
 # HEIC decoder, so no C codec or LGPL library ships.
 image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
-heic-rs = "0.1.4"
+heic-rs = "=0.1.4"
 unicode-normalization = "0.1"
 
 # CLI

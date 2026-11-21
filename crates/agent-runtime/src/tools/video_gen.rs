@@ -129,9 +129,10 @@ impl Tool for VideoGenerationTool {
             ));
         };
 
-        let images = match input_images(&input)
-            .and_then(|images| resolve_reference_images(&images, &self.agent_id))
-        {
+        let images = match match input_images(&input) {
+            Ok(images) => resolve_reference_images(&images, &self.agent_id).await,
+            Err(msg) => Err(msg),
+        } {
             Ok(images) => images,
             Err(msg) => return Ok(ToolResult::failure(msg, elapsed(started))),
         };
@@ -418,7 +419,10 @@ mod tests {
         let photo = base64::engine::general_purpose::STANDARD.encode(b"photo");
         let provider = Arc::new(Recording::default());
         tool(Arc::clone(&provider))
-            .execute(json!({ "prompt": "wave", "image": { "data_base64": photo } }))
+            .execute(json!({
+                "prompt": "wave",
+                "image": { "data_base64": photo, "media_type": "image/png" }
+            }))
             .await
             .unwrap();
         let sent = provider

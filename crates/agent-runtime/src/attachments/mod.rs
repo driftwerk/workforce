@@ -19,6 +19,7 @@
 //! row. Resolving one re-checks its owner and producer — that check is what
 //! keeps one user's upload out of another user's turn.
 
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -282,7 +283,7 @@ pub async fn process_attachment(
         return process_by_ref_attachment(att, &artifact_id, strategies, workspace, staging).await;
     }
     if att.mime_type.starts_with("image/") {
-        return vec![process_image_attachment(att, &strategies.vision).await];
+        return process_image(att, &strategies.vision, workspace).await;
     }
     if att.mime_type == "application/pdf" {
         return process_pdf_attachment(att, &strategies.vision).await;
@@ -364,21 +365,13 @@ fn infer_mime_from_extension(filename: &str, mime_type: &str) -> Option<&'static
 /// extension's. A by-reference payload has no bytes to check yet, so those are
 /// left generic here and checked once [`materialize_by_ref`] inlines them.
 fn retype_attachment(att: &SessionAttachment, mime: &str) -> Option<SessionAttachment> {
-    use base64::Engine;
     let relabel = |mime: &str| SessionAttachment {
         mime_type: mime.to_string(),
         ..att.clone()
     };
     let inline = att.artifact_id.is_none();
     if mime.starts_with("image/") || mime == "application/pdf" {
-        let head = inline
-            .then(|| {
-                let prefix = att.data.get(..16).unwrap_or(&att.data);
-                base64::engine::general_purpose::STANDARD
-                    .decode(prefix)
-                    .ok()
-            })
-            .flatten()?;
+        let head = inline.then(|| photo::head_of(&att.data))?;
         let actual = photo::sniff(&head)
             .or_else(|| head.starts_with(b"%PDF-").then_some("application/pdf"))?;
         return (actual.starts_with("image/") == mime.starts_with("image/"))
@@ -610,60 +603,63 @@ async fn save_attachment_from_path(
     }
 }
 
+/// An image attachment as `vision` presents it. A format models cannot read
+/// is saved to the workspace like any other binary, unless a describer is to
+/// look at it, which may know formats the models do not.
+async fn process_image(
+    att: &SessionAttachment,
+    vision: &VisionStrategy<'_>,
+    workspace: &Path,
+) -> Vec<ContentBlock> {
+    match try_image_attachment(att, vision).await {
+        Ok(block) => vec![block],
+        Err(photo::PhotoError::Unsupported(mime)) => {
+            tracing::warn!(file = %att.filename, mime, "Image format no model reads; saving it");
+            vec![process_binary_attachment(workspace, att)]
+        }
+        Err(e) => vec![unreadable_image(att, &e)],
+    }
+}
+
+fn unreadable_image(att: &SessionAttachment, error: &photo::PhotoError) -> ContentBlock {
+    tracing::warn!(file = %att.filename, error = %error, "Image not readable by a model");
+    ContentBlock::Text {
+        text: format!(
+            "Image `{}` was attached but cannot be shown to the model: {error}",
+            att.filename
+        ),
+    }
+}
+
+/// An image attachment as `strategy` presents it, a block saying so when it
+/// cannot be shown.
 pub async fn process_image_attachment(
     att: &SessionAttachment,
     strategy: &VisionStrategy<'_>,
 ) -> ContentBlock {
-    let ready = match photo::model_ready(att).await {
-        Ok(ready) => ready,
-        Err(e) => {
-            tracing::warn!(file = %att.filename, error = %e, "Image not readable by a model");
-            return ContentBlock::Text {
-                text: format!(
-                    "Image `{}` was attached but cannot be shown to the model: {e}",
-                    att.filename
-                ),
-            };
-        }
-    };
-    let att = ready.as_ref();
-    match strategy {
+    try_image_attachment(att, strategy)
+        .await
+        .unwrap_or_else(|e| unreadable_image(att, &e))
+}
+
+async fn try_image_attachment(
+    att: &SessionAttachment,
+    strategy: &VisionStrategy<'_>,
+) -> Result<ContentBlock, photo::PhotoError> {
+    Ok(match strategy {
         VisionStrategy::Native | VisionStrategy::NativeImages => ContentBlock::Image {
-            source: base64_source(&att.mime_type, &att.data),
+            source: {
+                let ready = photo::model_ready(att).await?;
+                base64_source(&ready.mime_type, &ready.data)
+            },
         },
         VisionStrategy::DescribeWith(llm, _) => {
-            match llm
-                .describe_image(&att.mime_type, &att.data, Some(&att.filename))
-                .await
-            {
-                Ok(desc) => ContentBlock::Text {
-                    text: format!(
-                        "Image `{}` (described by {}):\n{}",
-                        att.filename,
-                        llm.model_name(),
-                        desc
-                    ),
-                },
-                Err(e) if e.is::<NoKey>() => ContentBlock::Text {
-                    text: format!(
-                        "Image `{}` was attached but not described: {e}",
-                        att.filename
-                    ),
-                },
-                Err(e) => {
-                    tracing::warn!(
-                        file = %att.filename,
-                        error = %e,
-                        "Vision describe failed; substituting placeholder"
-                    );
-                    ContentBlock::Text {
-                        text: format!(
-                            "Image `{}` was attached but the vision provider failed: {e}",
-                            att.filename
-                        ),
-                    }
-                }
-            }
+            let ready = match photo::model_ready(att).await {
+                Ok(ready) => ready,
+                Err(photo::PhotoError::Unsupported(_)) => Cow::Borrowed(att),
+                Err(e) => return Err(e),
+            };
+            describe_image(&ready, *llm).await
         }
         VisionStrategy::StripWithPlaceholder(why) => ContentBlock::Text {
             text: format!(
@@ -671,6 +667,44 @@ pub async fn process_image_attachment(
                 att.filename
             ),
         },
+    })
+}
+
+async fn describe_image(
+    att: &SessionAttachment,
+    llm: &dyn crate::vision::VisionLlm,
+) -> ContentBlock {
+    match llm
+        .describe_image(&att.mime_type, &att.data, Some(&att.filename))
+        .await
+    {
+        Ok(desc) => ContentBlock::Text {
+            text: format!(
+                "Image `{}` (described by {}):\n{}",
+                att.filename,
+                llm.model_name(),
+                desc
+            ),
+        },
+        Err(e) if e.is::<NoKey>() => ContentBlock::Text {
+            text: format!(
+                "Image `{}` was attached but not described: {e}",
+                att.filename
+            ),
+        },
+        Err(e) => {
+            tracing::warn!(
+                file = %att.filename,
+                error = %e,
+                "Vision describe failed; substituting placeholder"
+            );
+            ContentBlock::Text {
+                text: format!(
+                    "Image `{}` was attached but the vision provider failed: {e}",
+                    att.filename
+                ),
+            }
+        }
     }
 }
 
@@ -3206,6 +3240,111 @@ mod tests {
     ) -> VisionStrategy<'a> {
         let tiers = crate::llm::vision_tiers::VisionTierRegistry::from_defaults().unwrap();
         resolve_vision_strategy_for(&tiers, describer, model, primary)
+    }
+
+    const GPS_HEIC: &[u8] = include_bytes!("testdata/gps.heic");
+
+    /// Reports the media type and size of each image it is asked to describe.
+    #[derive(Default)]
+    struct Seen(std::sync::Mutex<Vec<(String, usize)>>);
+
+    #[async_trait::async_trait]
+    impl crate::vision::VisionLlm for Seen {
+        async fn describe_image(
+            &self,
+            media_type: &str,
+            data: &str,
+            _: Option<&str>,
+        ) -> Result<String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((media_type.to_string(), data.len()));
+            Ok("a picture".into())
+        }
+        fn model_name(&self) -> &str {
+            "seen"
+        }
+    }
+
+    async fn presented(
+        filename: &str,
+        mime: &str,
+        bytes: &[u8],
+        vision: VisionStrategy<'_>,
+    ) -> (Vec<ContentBlock>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let att = SessionAttachment::from_bytes(filename, mime, bytes);
+        let blocks = process_attachment(
+            &att,
+            &vision_only(vision),
+            dir.path(),
+            &SessionContext::default(),
+        )
+        .await;
+        (blocks, dir)
+    }
+
+    #[tokio::test]
+    async fn an_iphone_photo_reaches_every_way_of_seeing_as_a_jpeg() {
+        let (blocks, _dir) =
+            presented("IMG_1.HEIC", "image/heic", GPS_HEIC, VisionStrategy::Native).await;
+        assert!(matches!(&blocks[..], [ContentBlock::Image { source }]
+            if source.media_type == "image/jpeg"));
+
+        let seen = Seen::default();
+        let cfg: LlmVisionConfig =
+            toml::from_str(r#"model = "openrouter:anthropic:cheap""#).unwrap();
+        let (blocks, _dir) = presented(
+            "IMG_1.HEIC",
+            "application/octet-stream",
+            GPS_HEIC,
+            VisionStrategy::DescribeWith(&seen, &cfg),
+        )
+        .await;
+        assert!(matches!(&blocks[..], [ContentBlock::Text { text }] if text.contains("a picture")));
+        assert_eq!(seen.0.lock().unwrap()[0].0, "image/jpeg");
+    }
+
+    #[tokio::test]
+    async fn a_model_that_cannot_see_is_not_given_a_photo_to_decode() {
+        let why = NoDescriber::Unconfigured;
+        let (blocks, _dir) = presented(
+            "IMG_1.HEIC",
+            "image/heic",
+            b"\0\0\0\x18ftypheic not decodable",
+            VisionStrategy::StripWithPlaceholder(why),
+        )
+        .await;
+        assert!(
+            matches!(&blocks[..], [ContentBlock::Text { text }]
+            if text.contains("cannot process images")),
+            "{blocks:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_format_no_model_reads_is_saved_unless_a_describer_is_to_look() {
+        let tiff = b"II*\0\x08\0\0\0 pixels";
+        let (blocks, _dir) =
+            presented("scan.tiff", "image/tiff", tiff, VisionStrategy::Native).await;
+        assert!(
+            matches!(&blocks[..], [ContentBlock::Text { text }]
+            if text.starts_with("Binary file `scan.tiff` (image/tiff) saved to")),
+            "{blocks:?}"
+        );
+
+        let seen = Seen::default();
+        let cfg: LlmVisionConfig =
+            toml::from_str(r#"model = "openrouter:anthropic:cheap""#).unwrap();
+        presented(
+            "scan.tiff",
+            "image/tiff",
+            tiff,
+            VisionStrategy::DescribeWith(&seen, &cfg),
+        )
+        .await;
+        assert_eq!(seen.0.lock().unwrap()[0].0, "image/tiff");
     }
 
     #[tokio::test]
