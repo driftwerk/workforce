@@ -20,6 +20,7 @@ fn plan(state: PlanState) -> Plan {
         goal: "Ship the new checkout".into(),
         state,
         paused: None,
+        paused_why: None,
         parallel: None,
         revision: 1,
         approved_revision: match state {
@@ -94,8 +95,10 @@ fn engines() -> Vec<EngineView> {
     ]
 }
 
-fn is_dir(p: &str) -> bool {
+fn fits(p: &str, _: Option<&str>) -> Result<(), String> {
     p.starts_with("/work/")
+        .then_some(())
+        .ok_or_else(|| format!("{p} isn't a folder"))
 }
 
 fn draft_ticket(title: &str, needs: &[usize]) -> DraftTicket {
@@ -441,7 +444,7 @@ fn a_machine_ticket_is_checked_there_not_on_this_computer() {
         goal: "Ship".into(),
         tickets: vec![there, relative, pane],
     };
-    let problems = validate(&s, &engines(), &|_| false).unwrap_err();
+    let problems = validate(&s, &engines(), &|_, _| Err(String::new())).unwrap_err();
     assert!(
         !problems
             .iter()
@@ -475,7 +478,7 @@ fn a_plan_that_can_run_here_is_valid() {
             planned(2, "Wire it", &[1]),
         ],
     };
-    assert_eq!(validate(&s, &engines(), &is_dir), Ok(()));
+    assert_eq!(validate(&s, &engines(), &fits), Ok(()));
 }
 
 #[test]
@@ -514,7 +517,7 @@ fn each_thing_that_keeps_a_plan_from_running_is_said() {
             outside,
         ],
     };
-    let problems = validate(&s, &engines(), &is_dir).unwrap_err();
+    let problems = validate(&s, &engines(), &fits).unwrap_err();
     let expect = [
         Problem::NoGoal,
         Problem::SignedOut {
@@ -572,7 +575,7 @@ fn a_cycle_is_refused_naming_the_tickets_in_it() {
             planned(5, "e", &[2]),
         ],
     };
-    let problems = validate(&s, &engines(), &is_dir).unwrap_err();
+    let problems = validate(&s, &engines(), &fits).unwrap_err();
     assert_eq!(problems, vec![Problem::Cycle("2, 3, 4, 5".into())]);
     assert!(problems[0].to_string().contains("in a loop"));
 }
@@ -586,7 +589,7 @@ fn a_plan_has_one_to_thirty_tickets_and_a_short_enough_goal() {
         tickets: vec![],
     };
     assert_eq!(
-        validate(&none, &engines(), &is_dir),
+        validate(&none, &engines(), &fits),
         Err(vec![Problem::NoTickets])
     );
     let many = Snapshot {
@@ -596,7 +599,7 @@ fn a_plan_has_one_to_thirty_tickets_and_a_short_enough_goal() {
         tickets: (1..=31).map(|n| planned(n, "t", &[])).collect(),
     };
     assert_eq!(
-        validate(&many, &engines(), &is_dir),
+        validate(&many, &engines(), &fits),
         Err(vec![Problem::LongGoal(GOAL_MAX + 1), Problem::TooMany(31)])
     );
 }
@@ -932,7 +935,7 @@ fn a_plans_budget_raised_or_taken_off_is_a_change_of_scope() {
     assert_eq!(describe(&a, &base()), "Took its budget off");
     let mut nothing = capped(0.0);
     nothing.tickets.truncate(1);
-    let problems = validate(&nothing, &[], &|_| true).unwrap_err();
+    let problems = validate(&nothing, &[], &|_, _| Ok(())).unwrap_err();
     assert!(problems.contains(&Problem::Budget(
         "A plan's budget is more than nothing.".into()
     )));
@@ -1359,7 +1362,7 @@ fn a_ticket_names_its_folder_or_its_repository() {
         tickets: vec![t],
     };
     let s = snapshot_of(&d, None, Engine::Claude, &mut counter()).unwrap();
-    let refused = validate(&s, &engines(), &is_dir).unwrap_err();
+    let refused = validate(&s, &engines(), &fits).unwrap_err();
     assert!(
         refused
             .iter()
@@ -1368,7 +1371,7 @@ fn a_ticket_names_its_folder_or_its_repository() {
     );
     d.tickets[0].repo = Some("driftwerk/vellev".into());
     let s = snapshot_of(&d, None, Engine::Claude, &mut counter()).unwrap();
-    assert_eq!(validate(&s, &engines(), &is_dir), Ok(()));
+    assert_eq!(validate(&s, &engines(), &fits), Ok(()));
     assert_eq!(
         s.tickets[0].repo.as_deref(),
         Some("github.com/driftwerk/vellev")

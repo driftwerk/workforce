@@ -1994,6 +1994,7 @@ impl CrewHub {
                         Err(workforce_desk::StartRefused::Failed(e)) => {
                             self.plan_waiting.lock().remove(&s.ticket);
                             let Some(t) = tickets.iter().find(|t| t.id == s.ticket) else {
+                                tracing::warn!(plan = %p.id, ticket = %s.ticket, error = %e, "a ticket no longer in its plan didn't start");
                                 continue;
                             };
                             self.start_failed(&p, t, scope, &plain(e)).await;

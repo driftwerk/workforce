@@ -40,9 +40,6 @@ pub(crate) const AGAIN_NOTE: &str = "\n\nThis ticket was started before and its 
 #[derive(Default)]
 pub(crate) struct Plans {
     awaiting: HashMap<Uuid, Need>,
-    /// Why each plan paused for a ticket failing to start is, in the
-    /// person's words.
-    failing: HashMap<Uuid, String>,
     /// What each boss that made a plan is called, by agent id: until the
     /// hub's roster says.
     names: HashMap<String, String>,
@@ -323,7 +320,7 @@ impl Desk {
     fn paused_why(&self, p: &Plan) -> Option<String> {
         let why = p.paused?;
         let said = match why {
-            Paused::StartFailing => self.0.boss_plans.lock().failing.get(&p.id).cloned(),
+            Paused::StartFailing => p.paused_why.clone(),
             Paused::Budget => self
                 .plan_starts_held(p.group.as_deref(), p.id)
                 .map(|(_, ask)| ask)
@@ -506,6 +503,20 @@ impl Desk {
         })
     }
 
+    /// Whether a ticket on this computer may run in a folder: one there, or
+    /// for a ticket of a repository, its checkout there or a folder Desk
+    /// would clone it into as it starts.
+    fn folder_fits(&self) -> impl Fn(&str, Option<&str>) -> Result<(), String> {
+        let home = self.home_folder();
+        move |f, repo| match repo.and_then(crate::repos::repo_of) {
+            Some(r) => crate::repos::fits(&r, f, home.as_deref()),
+            None => Path::new(f)
+                .is_dir()
+                .then_some(())
+                .ok_or_else(|| format!("{f} isn't a folder")),
+        }
+    }
+
     /// The snapshot the plan's rows follow: its approved revision's, or
     /// its newest while none is.
     async fn applied(&self, p: &Plan) -> Result<Snapshot, DeskError> {
@@ -575,36 +586,14 @@ impl Desk {
     pub(super) async fn plans_load(&self) {
         match self.0.store.plans(None).await {
             Ok(all) => {
-                for p in all {
-                    let failing = p.paused == Some(Paused::StartFailing);
-                    if failing {
-                        self.failing_read(p.id).await;
-                    }
-                    if failing || p.awaiting() {
-                        self.plan_awaits(&p).await;
-                    }
+                for p in all
+                    .into_iter()
+                    .filter(|p| p.awaiting() || p.paused == Some(Paused::StartFailing))
+                {
+                    self.plan_awaits(&p).await;
                 }
             }
             Err(e) => tracing::warn!(error = format!("{e:#}"), "couldn't read plans"),
-        }
-    }
-
-    /// Why plan `id` paused for a ticket failing to start, read back from
-    /// its pause.
-    async fn failing_read(&self, id: Uuid) {
-        match self
-            .0
-            .store
-            .paused_reason(id, Paused::StartFailing.as_str())
-            .await
-        {
-            Ok(Some(why)) => {
-                self.0.boss_plans.lock().failing.insert(id, why);
-            }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::warn!(plan = %id, error = format!("{e:#}"), "why a plan paused wasn't read");
-            }
         }
     }
 
@@ -617,12 +606,13 @@ impl Desk {
         }
         let summary = self.0.store.revision(p.id, p.revision).await.ok().flatten();
         let boss = self.plan_boss_name(p);
-        let failed = self.0.boss_plans.lock().failing.get(&p.id).cloned();
         let (ask, why) = match p.approved_revision {
             _ if failing && !p.awaiting() => (
                 format!(
                     "{boss}'s plan is paused: {}",
-                    failed.unwrap_or_else(|| "a ticket keeps failing to start".into())
+                    p.paused_why
+                        .as_deref()
+                        .unwrap_or("a ticket keeps failing to start")
                 ),
                 Some("Continue tries it again; or edit or drop the ticket first.".into()),
             ),
@@ -742,7 +732,7 @@ impl Desk {
         keep_needs(&mut s, &taking, &HashMap::new());
         s.parallel = new.parallel;
         s.budget = new.budget;
-        plan::validate(&s, &self.engines(), &|f| Path::new(f).is_dir()).map_err(problems)?;
+        plan::validate(&s, &self.engines(), &self.folder_fits()).map_err(problems)?;
         if new.parallel.is_some_and(|p| !(1..=12).contains(&p)) {
             return Err(DeskError::Invalid(
                 "A plan runs from 1 to 12 sessions at once.".into(),
@@ -783,6 +773,7 @@ impl Desk {
             goal: s.goal.clone(),
             state: PlanState::Proposed,
             paused: None,
+            paused_why: None,
             parallel: new.parallel,
             revision: 1,
             approved_revision: None,
@@ -1536,7 +1527,7 @@ impl Desk {
                     adopted: t.adopted,
                     held_back: None,
                 },
-                was.map(|w| w.folder.as_str()),
+                was.is_none_or(|w| w.folder.trim().is_empty()),
             )
             .await
             .map_err(internal)
@@ -1709,7 +1700,7 @@ impl Desk {
         if let Some(b) = edit.budget {
             next.budget = b;
         }
-        plan::validate(&next, &self.engines(), &|f| Path::new(f).is_dir()).map_err(problems)?;
+        plan::validate(&next, &self.engines(), &self.folder_fits()).map_err(problems)?;
         let change = plan::plan_change(&applied, &next, &started)
             .map_err(|e| DeskError::Conflict(e.to_string()))?;
         if change.is_none() && next == newest {
@@ -1952,6 +1943,18 @@ impl Desk {
         why: Paused,
         by: &By,
     ) -> Result<PlanDetail, DeskError> {
+        self.pause_plan_saying(id, why, None, by).await
+    }
+
+    /// [`Self::pause_plan`], `said` saying why in the person's words: a
+    /// pause for the same reason saying something new keeps the newer.
+    async fn pause_plan_saying(
+        &self,
+        id: Uuid,
+        why: Paused,
+        said: Option<String>,
+        by: &By,
+    ) -> Result<PlanDetail, DeskError> {
         let _write = self.0.plan_write.lock().await;
         let mut p = self.plan_of(id).await?;
         if !matches!(p.state, PlanState::Running | PlanState::Paused) {
@@ -1961,11 +1964,13 @@ impl Desk {
         }
         // A pause of the person's stays theirs: Desk's own reasons never
         // replace it.
-        if p.paused == Some(why) || (p.paused == Some(Paused::Person) && why != Paused::Person) {
+        let same = p.paused == Some(why) && p.paused_why == said;
+        if same || (p.paused == Some(Paused::Person) && why != Paused::Person) {
             return self.plan_detail(p).await;
         }
         p.state = PlanState::Paused;
         p.paused = Some(why);
+        p.paused_why = said;
         p.updated_at = crew::now();
         self.plan_note_why(
             &p,
@@ -2052,7 +2057,7 @@ impl Desk {
         };
         p.state = PlanState::Running;
         p.paused = None;
-        self.0.boss_plans.lock().failing.remove(&p.id);
+        p.paused_why = None;
         p.updated_at = crew::now();
         self.plan_note_why(
             &p,
@@ -2070,8 +2075,8 @@ impl Desk {
     pub async fn pause_plan_failing(&self, id: Uuid, why: &str) -> Result<PlanDetail, DeskError> {
         let why = crew::one_line(why, 300);
         let by = By::desk(&why);
-        self.0.boss_plans.lock().failing.insert(id, why);
-        self.pause_plan(id, Paused::StartFailing, &by).await
+        self.pause_plan_saying(id, Paused::StartFailing, Some(why), &by)
+            .await
     }
 
     /// The person keeps plan `id` as approved and turns down the boss's

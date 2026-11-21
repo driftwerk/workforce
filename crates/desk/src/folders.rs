@@ -6,6 +6,7 @@
 //! checked, so `..` and a link that leads out are refused alike. A folder is
 //! made only inside the home, from a path with no `.` or `..` in it.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -31,17 +32,21 @@ pub enum FolderError {
     OutsideHome,
     #[error("the folder could not be made")]
     NotMade,
+    #[error("a folder can be made at most {MAX_MADE} folders below one already there")]
+    TooDeep,
 }
 
 /// Most folders one make may add below the deepest one already there.
 pub const MAX_MADE: usize = 8;
 
-/// Makes the folder `requested` (`~` and `~/x` are the home; anything else
-/// must be absolute) and any folders above it that aren't there yet, all
-/// inside `home`; one already there is its answer too. What is already
-/// there is followed through symlinks and must be inside the home, so a link
-/// that leads out is never made into. Returns the folder, links resolved.
-pub fn make(requested: &str, home: Option<&Path>) -> Result<String, FolderError> {
+/// The folder `requested` (`~` and `~/x` are the home; anything else must
+/// be absolute) as it would be made inside `home`: what is already there
+/// followed through symlinks and inside the home, and the names to make
+/// below it. Nothing is made.
+pub fn resolve(
+    requested: &str,
+    home: Option<&Path>,
+) -> Result<(PathBuf, Vec<OsString>), FolderError> {
     use std::path::Component;
     let home = home
         .and_then(|h| h.canonicalize().ok())
@@ -66,15 +71,18 @@ pub fn make(requested: &str, home: Option<&Path>) -> Result<String, FolderError>
         return Err(FolderError::BadName);
     }
     // The deepest folder already there, and the names to make below it.
-    let mut there = wanted.clone();
+    let mut there = wanted;
     let mut names = Vec::new();
     while std::fs::symlink_metadata(&there).is_err() {
-        let Some(name) = there.file_name().map(|n| n.to_os_string()) else {
+        let Some(name) = there.file_name().map(std::ffi::OsStr::to_os_string) else {
             return Err(FolderError::OutsideHome);
         };
         names.push(name);
-        if !there.pop() || names.len() > MAX_MADE {
+        if !there.pop() {
             return Err(FolderError::BadName);
+        }
+        if names.len() > MAX_MADE {
+            return Err(FolderError::TooDeep);
         }
     }
     let base = there.canonicalize().map_err(|_| FolderError::Unreadable)?;
@@ -84,8 +92,21 @@ pub fn make(requested: &str, home: Option<&Path>) -> Result<String, FolderError>
     if !base.is_dir() {
         return Err(FolderError::NotAFolder);
     }
+    names.reverse();
+    Ok((base, names))
+}
+
+/// Makes the folder `requested` and any folders above it that aren't there
+/// yet, all inside `home`, as [`resolve`] says; one already there is its
+/// answer too. A link that leads out is never made into. Returns the
+/// folder, links resolved.
+pub fn make(requested: &str, home: Option<&Path>) -> Result<String, FolderError> {
+    let (base, names) = resolve(requested, home)?;
+    let home = home
+        .and_then(|h| h.canonicalize().ok())
+        .ok_or(FolderError::NoHome)?;
     let mut made = base;
-    for name in names.into_iter().rev() {
+    for name in names {
         made.push(name);
         match std::fs::create_dir(&made) {
             Ok(()) => {}
@@ -366,7 +387,7 @@ mod tests {
         std::fs::write(t.home.join("a-file"), "x").unwrap();
         assert_eq!(make("~/a-file/x", home), Err(FolderError::NotAFolder));
         // Too deep at once.
-        assert_eq!(make("~/1/2/3/4/5/6/7/8/9", home), Err(FolderError::BadName));
+        assert_eq!(make("~/1/2/3/4/5/6/7/8/9", home), Err(FolderError::TooDeep));
         assert_eq!(make("~/x", None), Err(FolderError::NoHome));
         // A home that resolves to `/`: nothing is made anywhere.
         assert_eq!(

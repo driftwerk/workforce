@@ -115,6 +115,9 @@ pub struct Plan {
     pub goal: String,
     pub state: PlanState,
     pub paused: Option<Paused>,
+    /// Why it paused, when Desk paused it for a ticket that keeps failing
+    /// to start.
+    pub paused_why: Option<String>,
     /// This plan's limit of sessions at once, when lower than its boss's.
     pub parallel: Option<i16>,
     /// Its newest revision.
@@ -575,7 +578,7 @@ pub fn edited(before: &Snapshot, edits: &[TicketEdit]) -> Result<Snapshot, Vec<P
             t.model = Some(model.clone());
         }
         if let Some(folder) = &e.folder {
-            t.folder.clone_from(folder);
+            t.folder = folder.trim().to_string();
         }
         if let Some(repo) = &e.repo {
             t.repo = Some(repo.clone());
@@ -670,6 +673,8 @@ pub enum Problem {
     NoLine { ticket: usize, engine: &'static str },
     #[error("Ticket {ticket}'s folder {folder:?} isn't a folder on this computer.")]
     NoFolder { ticket: usize, folder: String },
+    #[error("Ticket {ticket}'s folder can't hold its repository: {why}.")]
+    NoCheckout { ticket: usize, why: String },
     #[error("Ticket {ticket}'s folder {folder:?} isn't a full path on {machine}: give it as /home/… or /Users/… there.")]
     NoMachineFolder {
         ticket: usize,
@@ -914,11 +919,12 @@ pub fn snapshot_with(
 /// Whether `s` can run on this computer: a goal, between one and
 /// [`MAX_TICKETS`] tickets, each with a title, an engine that is installed,
 /// signed in and has a line for its boss (`engines`, as Desk reads them),
-/// a folder that `is_dir`, and needs that never loop.
+/// a folder that `fits` (its repository's, when it has one: why not when
+/// it doesn't), and needs that never loop.
 pub fn validate(
     s: &Snapshot,
     engines: &[EngineView],
-    is_dir: &dyn Fn(&str) -> bool,
+    fits: &dyn Fn(&str, Option<&str>) -> Result<(), String>,
 ) -> Result<(), Vec<Problem>> {
     let mut problems = Vec::new();
     let goal = s.goal.trim();
@@ -984,10 +990,18 @@ pub fn validate(
                     problems.push(Problem::NoFolderOrRepo { ticket });
                 } else if folder.is_empty() {
                     // Its repository's checkout, found or cloned as it starts.
-                } else if !std::path::Path::new(folder).is_absolute() || !is_dir(folder) {
+                } else if !std::path::Path::new(folder).is_absolute() {
                     problems.push(Problem::NoFolder {
                         ticket,
                         folder: t.folder.clone(),
+                    });
+                } else if let Err(why) = fits(folder, t.repo.as_deref()) {
+                    problems.push(match &t.repo {
+                        None => Problem::NoFolder {
+                            ticket,
+                            folder: t.folder.clone(),
+                        },
+                        Some(_) => Problem::NoCheckout { ticket, why },
                     });
                 }
             }

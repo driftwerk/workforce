@@ -257,6 +257,9 @@ fn target<'a>(
 ) -> Result<Target<'a>, String> {
     match folder.map(str::trim).filter(|f| !f.is_empty()) {
         Some(f) if !f.starts_with(['/', '~']) => Err(format!("{f} isn't a full path")),
+        Some(f) if f.trim_end_matches('/').is_empty() => {
+            Err(format!("{f} isn't a folder inside the home folder"))
+        }
         Some(f) => root_in(f, home)
             .map(|at| Target { at, said: Some(f) })
             .ok_or_else(|| format!("{f} isn't inside the home folder")),
@@ -269,36 +272,58 @@ fn target<'a>(
     }
 }
 
+/// Whether `name`, a folder in a path, is one Desk never clones into: a
+/// hidden one, or the system's own.
+fn kept_out(name: &std::ffi::OsStr) -> bool {
+    name.to_string_lossy().starts_with('.') || name == "Library"
+}
+
 /// The checkout of `repo` at `t`, else one under `home` when no folder was
-/// said; or where to clone it while nothing is there, never in a hidden
-/// folder. A folder said is used, cloned into or refused, never replaced
-/// by another.
+/// said; or where to clone it while nothing is there, links followed: never
+/// in a folder [`kept_out`]. A folder said is used, cloned into or refused,
+/// never replaced by another.
 fn place(repo: &Repo, t: &Target, home: &Path) -> Result<Place, String> {
+    let shown = || {
+        t.said
+            .map_or_else(|| t.at.to_string_lossy().into_owned(), str::to_string)
+    };
     if is_checkout(&t.at, repo, home) {
-        return Ok(Place::There(t.said.map_or_else(
-            || t.at.to_string_lossy().into_owned(),
-            str::to_string,
-        )));
+        return Ok(Place::There(shown()));
     }
     if t.said.is_none() {
         if let Some(c) = find(repo, home).into_iter().next() {
             return Ok(Place::There(c.path));
         }
     }
-    let hidden =
-        t.at.strip_prefix(home)
-            .is_ok_and(|p| p.iter().any(|c| c.to_string_lossy().starts_with('.')));
-    match (t.at.exists(), t.said) {
-        (false, Some(f)) if hidden => Err(format!("{f} is inside a hidden folder, where Desk clones nothing")),
-        (false, _) => Ok(Place::Clone(t.at.clone())),
-        (true, Some(f)) => Err(format!(
-            "{f} is there already and isn't a checkout of {repo}; give it that folder's checkout, or leave its folder for Desk to find"
-        )),
-        (true, None) => Err(format!(
-            "{} is there already and isn't a checkout of {repo}",
-            t.at.display()
-        )),
+    if std::fs::symlink_metadata(&t.at).is_ok() {
+        return Err(match t.said {
+            Some(f) => format!(
+                "{f} is there already and isn't a checkout of {repo}; give it that folder's checkout, or leave its folder for Desk to find"
+            ),
+            None => format!("{} is there already and isn't a checkout of {repo}", shown()),
+        });
     }
+    let (base, names) = folders::resolve(&t.at.to_string_lossy(), Some(home))
+        .map_err(|e| format!("{} can't be made: {e}", shown()))?;
+    let dest = names.iter().fold(base, |d, n| d.join(n));
+    match dest.strip_prefix(home) {
+        Ok(inside) if inside.iter().any(kept_out) => Err(format!(
+            "{} is inside a hidden or system folder, where Desk clones nothing",
+            shown()
+        )),
+        Ok(_) => Ok(Place::Clone(dest)),
+        Err(_) => Err(format!("{} isn't inside the home folder", shown())),
+    }
+}
+
+/// Whether a session of `repo` may work in `folder`: a checkout of it
+/// there, or a folder Desk would clone it into as the session starts.
+pub fn fits(repo: &Repo, folder: &str, home: Option<&Path>) -> Result<(), String> {
+    let home = home
+        .and_then(|h| h.canonicalize().ok())
+        .ok_or_else(|| "this computer has no home folder to look in".to_string())?;
+    let t = target(repo, Some(folder), PROJECTS_ROOT, &home)?;
+    place(repo, &t, &home).map(drop)
 }
 
 impl Cloner {
@@ -341,13 +366,15 @@ impl Cloner {
             Ok(Place::Clone(dest)) => dest,
             Err(why) => return failed(why),
         };
-        // The folder it goes in, inside the home only.
-        let parent = dest.parent().unwrap_or(&home).to_string_lossy();
-        if let Err(e) = folders::make(&parent, Some(&home)) {
-            return failed(match e {
-                FolderError::OutsideHome => "its folder isn't inside the home folder".into(),
-                e => format!("its folder couldn't be made: {e}"),
-            });
+        // The folder it goes in, made where it was found to be.
+        let parent = dest.parent().unwrap_or(&home);
+        match folders::make(&parent.to_string_lossy(), Some(&home)) {
+            Ok(made) if Path::new(&made) == parent => {}
+            Ok(_) => return failed(format!("{} moved as it was made", parent.display())),
+            Err(FolderError::OutsideHome) => {
+                return failed("its folder isn't inside the home folder".into())
+            }
+            Err(e) => return failed(format!("its folder couldn't be made: {e}")),
         }
         clones.insert(key.clone(), Run::Running);
         drop(clones);
@@ -792,14 +819,18 @@ mod tests {
             placed("~/projects/vellev"),
             Ok(Place::Clone(home.join("projects/vellev")))
         );
+        // A link in the home to a hidden folder leads nowhere a clone goes.
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::os::unix::fs::symlink(home.join(".ssh"), home.join("keys")).unwrap();
+        let hidden = "is inside a hidden or system folder, where Desk clones nothing";
         for (folder, why) in [
             ("/etc/vellev", "isn't inside the home folder"),
             ("~/../vellev", "isn't inside the home folder"),
+            ("/", "isn't a folder inside the home folder"),
             ("work/vellev", "isn't a full path"),
-            (
-                "~/.ssh/vellev",
-                "is inside a hidden folder, where Desk clones nothing",
-            ),
+            ("~/.ssh/vellev", hidden),
+            ("~/keys/vellev", hidden),
+            ("~/Library/vellev", hidden),
         ] {
             assert_eq!(placed(folder), Err(format!("{folder} {why}")), "{folder}");
         }
@@ -836,6 +867,12 @@ mod tests {
         let repo = repo_of("driftwerk/vellev").unwrap();
         let got = Cloner::default().checkout(&repo, None, "/etc", Some(&home), &BTreeMap::new());
         assert!(matches!(got, Got::Failed { .. }), "{got:?}");
+        let got =
+            Cloner::default().checkout(&repo, None, "~/.projects", Some(&home), &BTreeMap::new());
+        assert!(
+            matches!(&got, Got::Failed { why } if why.contains("hidden or system folder")),
+            "{got:?}"
+        );
         // Something there already that isn't it is never cloned over.
         std::fs::create_dir_all(home.join("projects/driftwerk/vellev")).unwrap();
         let got =

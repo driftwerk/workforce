@@ -20,7 +20,7 @@ use crate::plan::{Change, Paused, Plan, PlanState, Revision};
 use crate::store::DeskStore;
 
 const PLAN: &str = "id, board, group_id, boss, goal, state, paused, parallel, revision, \
-                    approved_revision, created_at, updated_at";
+                    approved_revision, created_at, updated_at, paused_why";
 const REVISION: &str = "plan, revision, at, made_by, change, summary, snapshot";
 
 /// The `ticket_links` kind of a session about to start for a ticket.
@@ -36,6 +36,7 @@ fn plan(row: &Row) -> Result<Plan> {
         goal: row.try_get("goal")?,
         state: PlanState::parse(row.try_get("state")?)?,
         paused: paused.as_deref().map(Paused::parse).transpose()?,
+        paused_why: row.try_get("paused_why")?,
         parallel: row.try_get("parallel")?,
         revision: row.try_get("revision")?,
         approved_revision: row.try_get("approved_revision")?,
@@ -87,10 +88,11 @@ async fn put_plan_in<C: tokio_postgres::GenericClient>(client: &C, p: &Plan) -> 
     client
         .execute(
             &format!(
-                "INSERT INTO plans ({PLAN}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+                "INSERT INTO plans ({PLAN}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
                  ON CONFLICT (id) DO UPDATE SET board = EXCLUDED.board, group_id = EXCLUDED.group_id, \
                  boss = EXCLUDED.boss, goal = EXCLUDED.goal, state = EXCLUDED.state, \
-                 paused = EXCLUDED.paused, parallel = EXCLUDED.parallel, \
+                 paused = EXCLUDED.paused, paused_why = EXCLUDED.paused_why, \
+                 parallel = EXCLUDED.parallel, \
                  revision = EXCLUDED.revision, approved_revision = EXCLUDED.approved_revision, \
                  updated_at = EXCLUDED.updated_at"
             ),
@@ -107,6 +109,7 @@ async fn put_plan_in<C: tokio_postgres::GenericClient>(client: &C, p: &Plan) -> 
                 &p.approved_revision,
                 &p.created_at,
                 &p.updated_at,
+                &p.paused_why,
             ],
         )
         .await?;
@@ -355,10 +358,8 @@ impl DeskStore {
     /// is no longer the plan's (let go, or another plan's now) is left as
     /// it is: only a claim takes it again. A folder left empty for its
     /// repository to say keeps the checkout a start found, while the
-    /// repository and machine are the same, unless the plan said one
-    /// before (`was`): that one goes.
-    pub async fn put_runs(&self, ticket: Uuid, runs: &Runs, was: Option<&str>) -> Result<()> {
-        let found_kept = was.is_none_or(|f| f.trim().is_empty());
+    /// repository and machine are the same, when `keep_found`.
+    pub async fn put_runs(&self, ticket: Uuid, runs: &Runs, keep_found: bool) -> Result<()> {
         let client = self.pool().get().await?;
         client
             .execute(
@@ -376,7 +377,7 @@ impl DeskStore {
                     &runs.machine,
                     &runs.model,
                     &runs.repo,
-                    &found_kept,
+                    &keep_found,
                 ],
             )
             .await?;
@@ -783,6 +784,7 @@ mod tests {
             goal: "Ship the new checkout".into(),
             state: PlanState::Proposed,
             paused: None,
+            paused_why: None,
             parallel: Some(2),
             revision: 1,
             approved_revision: None,
@@ -859,7 +861,7 @@ mod tests {
                 adopted: false,
                 held_back: None,
             };
-            s.put_runs(t.id, &runs, None).await.unwrap();
+            s.put_runs(t.id, &runs, true).await.unwrap();
             assert_eq!(s.plan_runs(p.id).await.unwrap(), vec![(t.id, runs.clone())]);
             assert_eq!(s.plan_of_ticket(t.id).await.unwrap(), Some(p.id));
 
@@ -870,11 +872,9 @@ mod tests {
                 ..runs
             };
             let folder = async || s.plan_runs(p.id).await.unwrap()[0].1.folder.clone();
-            s.put_runs(t.id, &left, Some("")).await.unwrap();
+            s.put_runs(t.id, &left, true).await.unwrap();
             assert_eq!(folder().await.as_deref(), Some("/work/acme-api"));
-            s.put_runs(t.id, &left, Some("/work/acme-api"))
-                .await
-                .unwrap();
+            s.put_runs(t.id, &left, false).await.unwrap();
             assert_eq!(folder().await.as_deref(), Some(""));
         })
         .await;
@@ -900,7 +900,7 @@ mod tests {
                 adopted: false,
                 held_back: None,
             },
-            None,
+            true,
         )
         .await
         .unwrap();
@@ -975,7 +975,7 @@ mod tests {
                     adopted: false,
                     held_back: None,
                 },
-                None,
+                true,
             )
             .await
             .unwrap();
@@ -1083,7 +1083,7 @@ mod tests {
                     plan: Some(p.id),
                     ..Default::default()
                 },
-                None,
+                true,
             )
             .await
             .unwrap();

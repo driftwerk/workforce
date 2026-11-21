@@ -1427,25 +1427,18 @@ async fn a_plan_paused_for_a_ticket_that_keeps_failing_says_why_again_after_a_re
         d.approve_plan(id, 1, &By::you()).await.unwrap();
         let why = "DES-1 couldn't start 5 times: /gone is not a folder";
         d.pause_plan_failing(id, why).await.unwrap();
-        for _ in 0..100 {
-            if d.0
-                .store
-                .paused_reason(id, "start_failing")
-                .await
-                .unwrap()
-                .is_some()
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        let again = desk(pool, dir.path()).await;
+        let again = desk(pool.clone(), dir.path()).await;
         let read = again.plan(id).await.unwrap();
         assert_eq!(read.summary.plan.paused, Some(Paused::StartFailing));
         assert_eq!(read.summary.paused_why.as_deref(), Some(why));
         let needs = again.plan_needs();
         assert_eq!(needs.len(), 1, "its Floor need is read back");
         assert!(needs[0].ask.contains(why), "{}", needs[0].ask);
+        // Paused again for a newer reason: that one is kept.
+        let newer = "DES-1 couldn't start 5 times: its checkout is gone";
+        again.pause_plan_failing(id, newer).await.unwrap();
+        let read = desk(pool, dir.path()).await.plan(id).await.unwrap();
+        assert_eq!(read.summary.paused_why.as_deref(), Some(newer));
     })
     .await;
 }
@@ -2399,11 +2392,12 @@ async fn a_folder_the_plan_takes_away_goes_from_its_row_and_its_checkout_is_foun
         let dir = tempfile::tempdir().unwrap();
         let (d, home) = desk_at_home(pool, dir.path()).await;
         let named = home.join("work/other");
-        std::fs::create_dir_all(&named).unwrap();
+        vellev_at(&named);
         let checkout = home.join("code/vellev");
         vellev_at(&checkout);
         let (ran, t) = vellev_plan(&d, &named).await;
         let id = ran.summary.plan.id;
+        std::fs::remove_dir_all(named.join(".git")).unwrap();
         let refused = d
             .plan_prepare(&ran.summary.plan, t, &sarah())
             .await
@@ -2475,6 +2469,31 @@ async fn a_folder_taken_away_by_a_change_waiting_on_the_person_is_still_the_one_
             row_folder(&d, id, t).await,
             Some(named.to_string_lossy().into_owned()),
             "as approved, until the person approves the change"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_ticket_of_a_repository_here_may_name_a_folder_desk_clones_into_but_never_a_hidden_one() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, home) = desk_at_home(pool, dir.path()).await;
+        let propose = |folder: std::path::PathBuf| {
+            let d = d.clone();
+            async move {
+                let mut plan = new_plan(&folder, &[("Add the cache", &[])]);
+                plan.draft.tickets[0].repo = Some("driftwerk/vellev".into());
+                d.propose_plan(plan, &sarah(), &by_sarah()).await
+            }
+        };
+        propose(home.join("projects/vellev")).await.unwrap();
+        let refused = propose(home.join(".cache/vellev")).await.unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("is inside a hidden or system folder, where Desk clones nothing"),
+            "{refused}"
         );
     })
     .await;

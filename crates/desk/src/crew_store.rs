@@ -126,19 +126,6 @@ impl DeskStore {
         Ok(())
     }
 
-    /// Why plan `plan` was last paused for `paused`, as its pause said.
-    pub async fn paused_reason(&self, plan: uuid::Uuid, paused: &str) -> Result<Option<String>> {
-        let client = self.pool().get().await?;
-        let row = client
-            .query_opt(
-                "SELECT reason FROM activity WHERE kind = $1 AND detail ->> 'plan' = $2 \
-                 AND detail ->> 'paused' = $3 ORDER BY at DESC, id DESC LIMIT 1",
-                &[&Kind::PlanPaused.as_str(), &plan.to_string(), &paused],
-            )
-            .await?;
-        Ok(row.and_then(|r| r.get::<_, Option<String>>("reason")))
-    }
-
     /// Up to `limit` events of `filter`, newest first, from before the
     /// event `before`; and whether more remain.
     pub async fn events(
