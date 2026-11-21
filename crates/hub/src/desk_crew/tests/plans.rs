@@ -1809,6 +1809,7 @@ async fn a_plans_ticket_on_a_machine_starts_there_once_and_its_turns_wake_the_bo
         assert_eq!(sent[0]["name"], json!(key));
         assert_eq!(sent[0]["cwd"], "/home/dev/vellev");
         assert_eq!(sent[0]["model"], "claude-opus-4-8");
+        assert_eq!(sent[0]["deps"], true, "its folder is made ready there");
         assert!(
             sent[0]["prompt"]
                 .as_str()
