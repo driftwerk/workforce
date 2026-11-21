@@ -1080,11 +1080,7 @@ impl Desk {
                     .await?
             }
             System::Jira => {
-                // A shared key's "assigned to me" is whom the person's
-                // verified email names, never the key's owner.
-                let shared_me =
-                    s.me.as_deref()
-                        .filter(|_| s.me_source.is_some_and(board::MeSource::on_a_shared_key));
+                let shared_me = crate::board_sync::shared_me(s);
                 let mut page: Option<String> = None;
                 for n in 0.. {
                     if n == crate::board_sync::PAGES_PER_PASS || budget.take().is_err() {
@@ -2710,73 +2706,21 @@ impl Desk {
         name: &str,
     ) -> Result<(), RemoteError> {
         budget.take()?;
-        match s.system {
-            // Its own moves ([`Self::github_move`]).
-            System::Github => Ok(()),
-            System::Jira => {
-                let list = crate::board_sync::call(
-                    remote,
-                    s.system,
-                    "jira.list_transitions",
-                    json!({ "issue_key": key }),
-                )
-                .await?;
-                let Some(id) = list["transitions"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .find(|t| {
-                        t["to_status"]
-                            .as_str()
-                            .is_some_and(|n| n.eq_ignore_ascii_case(name))
-                    })
-                    .and_then(|t| t["id"].as_str().map(str::to_string))
-                else {
-                    // No way there from where it is: the state stays Desk's.
-                    return Ok(());
-                };
-                budget.take()?;
-                crate::board_sync::call(
-                    remote,
-                    s.system,
-                    "jira.transition_issue",
-                    json!({ "issue_key": key, "transition": id }),
-                )
-                .await
-                .map(drop)
-            }
-            System::Linear => {
-                let list = crate::board_sync::call(
-                    remote,
-                    s.system,
-                    "linear.states_list",
-                    json!({ "team_id": s.target_id.clone().unwrap_or_default() }),
-                )
-                .await?;
-                let Some(id) = list["states"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .find(|st| {
-                        st["name"]
-                            .as_str()
-                            .is_some_and(|n| n.eq_ignore_ascii_case(name))
-                    })
-                    .and_then(|st| st["id"].as_str().map(str::to_string))
-                else {
-                    return Ok(());
-                };
-                budget.take()?;
-                crate::board_sync::call(
-                    remote,
-                    s.system,
-                    "linear.issue_update",
-                    json!({ "identifier": key, "state_id": id }),
-                )
-                .await
-                .map(drop)
-            }
+        // Its own moves ([`Self::github_move`]).
+        if s.system == System::Github {
+            return Ok(());
         }
+        // No way there from where it is: the state stays Desk's.
+        crate::board_sync::move_issue(
+            remote,
+            s.system,
+            s.target_id.as_deref().unwrap_or_default(),
+            key,
+            name,
+            || budget.take(),
+        )
+        .await
+        .map(drop)
     }
 
     /// Creates the issue for `t`, made here on a synced board, and gives `t`

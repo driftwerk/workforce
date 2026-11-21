@@ -322,15 +322,11 @@ pub struct CrewHub {
     /// [`actions::REUSE_CLAIM`] has passed.
     reuse_claims: Mutex<HashMap<uuid::Uuid, std::time::Instant>>,
     /// Calls for the person's machines, waiting for Desk's native side
-    /// ([`relay`]), and who waits for each answer.
-    relays: Mutex<relay::Relays>,
-    /// Told when a call is queued for a machine.
-    relay_queued: tokio::sync::Notify,
+    /// ([`relay`]), and who waits for each answer: while Desk hasn't asked
+    /// lately, nothing is queued and a machine is said not reached at once.
+    relay: relay::Relays,
     /// How long a relayed call waits for its machine's answer.
     relay_wait: Mutex<Duration>,
-    /// When Desk's native side last asked for calls: while it hasn't
-    /// lately, nothing is queued and a machine is said not reached at once.
-    relay_polled: Mutex<Option<std::time::Instant>>,
     /// Each boss's mind: its own deciding, one stretch at a time
     /// ([`mind`]).
     minds: mind::Minds,
@@ -790,10 +786,8 @@ impl CrewHub {
             machine_read: Mutex::default(),
             machine_down: Mutex::default(),
             reuse_claims: Mutex::default(),
-            relays: Mutex::default(),
-            relay_queued: tokio::sync::Notify::new(),
+            relay: relay::Relays::new(relay::LIMITS),
             relay_wait: Mutex::new(Duration::from_secs(30)),
-            relay_polled: Mutex::new(None),
             minds: mind::Minds::default(),
             notices: orchestrator::Notices::default(),
             watches_in_flight: Mutex::default(),

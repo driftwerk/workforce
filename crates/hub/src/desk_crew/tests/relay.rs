@@ -273,7 +273,7 @@ async fn a_local_boss_reaches_its_groups_machine_sessions_through_desk() {
             })
         };
         eventually("Desk polling", async || {
-            crew.relay_polled.lock().is_some().then_some(())
+            crew.relay.polled_ever().then_some(())
         })
         .await;
 
@@ -695,7 +695,7 @@ async fn a_job_held_here_or_on_a_machine_is_one_job_and_an_approval_there_carrie
             })
         };
         eventually("Desk polling", async || {
-            crew.relay_polled.lock().is_some().then_some(())
+            crew.relay.polled_ever().then_some(())
         })
         .await;
         let release = |key: &str| json!({ "kind": "release", "target": "acme/api", "key": key });
@@ -1390,7 +1390,7 @@ async fn holds_its_own(pool: workforce_postgres::PostgresPool) {
     );
 
     eventually("Desk polling", async || {
-        crew.relay_polled.lock().is_some().then_some(())
+        crew.relay.polled_ever().then_some(())
     })
     .await;
     // Each reaches its own: the main overseer under its plan's grant, Sarah
@@ -1474,7 +1474,7 @@ async fn a_boss_check_runs_at_the_machines_own_route_and_is_never_a_groups_call(
             })
         };
         eventually("Desk polling", async || {
-            crew.relay_polled.lock().is_some().then_some(())
+            crew.relay.polled_ever().then_some(())
         })
         .await;
         eventually("the run tool", async || boss.tools.get("crew.machine_run")).await;
