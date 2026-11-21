@@ -1112,6 +1112,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_session_relinked_asking_in_its_terminal_takes_only_what_its_boss_says_after() {
+        with_test_pool(build_pool, |pool| async move {
+            let (_hdir, socket, _holder_cancel) = crate::holder::tests::holder().await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut opts = options(dir.path());
+            opts.restore = RestorePolicy::Auto;
+            opts.holder = Some(super::super::HolderOptions {
+                socket,
+                token: crate::holder::tests::TOKEN.into(),
+            });
+            opts.env = BTreeMap::from([
+                ("PATH".into(), "/usr/bin:/bin".into()),
+                ("SHELL".into(), "/bin/sh".into()),
+                ("HOME".into(), dir.path().to_string_lossy().into_owned()),
+            ]);
+            crate::store::DeskStore::migrate(&pool).await.unwrap();
+            let bosses = |d: &Desk| {
+                d.set_bosses(vec![super::super::Boss {
+                    agent: "sarah".into(),
+                    name: "Sarah".into(),
+                    scope: crate::scope::Scope::Ungrouped,
+                    level: "act".into(),
+                }]);
+                crate::crew::By::manager("sarah", "Sarah", "Next step.")
+            };
+            let tell = |to: Uuid, text: &str| crate::line::Send::Tell {
+                to: crate::line::Target::Session(to),
+                text: text.into(),
+                when: crate::line::When::Queue,
+            };
+            let cwd = dir.path().to_string_lossy().into_owned();
+            let hook = |event: serde_json::Value| {
+                let mut body = event;
+                body["session_id"] = "cli-1".into();
+                body["cwd"] = cwd.clone().into();
+                serde_json::to_vec(&body).unwrap()
+            };
+            let cancel = CancellationToken::new();
+            let d = Desk::start(
+                crate::store::DeskStore::from_pool(pool.clone()),
+                opts.clone(),
+                Default::default(),
+                cancel.clone(),
+            )
+            .await
+            .unwrap();
+            let by = bosses(&d);
+            let terminal = Uuid::new_v4();
+            d.create_terminal(NewTerminal {
+                id: Some(terminal),
+                name: None,
+                cwd: cwd.clone(),
+                env: BTreeMap::from([("DESK_HOOK_TOKEN".into(), "tok".into())]),
+            })
+            .await
+            .unwrap();
+            let start = serde_json::json!({"hook_event_name": "SessionStart", "source": "startup"});
+            d.terminal_hook(terminal, "tok", &hook(start))
+                .await
+                .unwrap();
+            let s = d
+                .terminal_session(terminal, Some("cli-1"))
+                .expect("its session");
+            d.take_on(
+                s,
+                &by.party,
+                crate::charge::How::Handed,
+                &Default::default(),
+                &crate::crew::By::you(),
+            )
+            .await
+            .unwrap();
+            d.change(s, |r, _| r.state = SessionState::Working);
+            let earlier = d
+                .line_send(
+                    super::super::Sender::Overseer(by.clone()),
+                    tell(s, "When that is done, run the linter."),
+                )
+                .await
+                .unwrap();
+            let stop = serde_json::json!({"hook_event_name": "Stop",
+                "last_assistant_message": "The replica is ready. Should I switch reads to it?"});
+            d.terminal_hook(terminal, "tok", &hook(stop)).await.unwrap();
+            assert_eq!(d.view(s).unwrap().state, SessionState::Asking);
+
+            // The hub restarts; the holder kept its terminal, and the
+            // session in it is linked again, still asking.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            cancel.cancel();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let d = Desk::start(
+                crate::store::DeskStore::from_pool(pool.clone()),
+                opts,
+                Default::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let by = bosses(&d);
+            wait_until(|| d.view(s).is_ok_and(|v| v.live)).await;
+            assert_eq!(
+                d.0.state.lock().live.get(&s).and_then(|l| l.terminal),
+                Some(terminal),
+                "linked again in its terminal"
+            );
+            assert_eq!(d.view(s).unwrap().state, SessionState::Asking);
+            wait_until(|| d.charge_of(s).is_some_and(|c| c.live())).await;
+            let row = |id| {
+                let d = d.clone();
+                async move { d.0.store.line_message(id).await.unwrap().unwrap() }
+            };
+            assert_eq!(
+                d.line_waits(&row(earlier.id).await),
+                Some(crate::line::Wait::Asking),
+                "what it said before is never the answer"
+            );
+            let after = d
+                .line_send(
+                    super::super::Sender::Overseer(by),
+                    tell(s, "Yes, switch them."),
+                )
+                .await
+                .unwrap();
+            assert_ne!(
+                d.line_waits(&row(after.id).await),
+                Some(crate::line::Wait::Asking),
+                "its running boss answers it"
+            );
+            assert_eq!(
+                d.line_waits(&row(earlier.id).await),
+                Some(crate::line::Wait::Asking)
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn bad_terminals_are_refused() {
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
