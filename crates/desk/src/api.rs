@@ -1181,7 +1181,7 @@ impl IntoResponse for crate::folders::FolderError {
             E::NotAFolder => StatusCode::BAD_REQUEST,
             E::NoHome => StatusCode::CONFLICT,
             E::Unreadable | E::NotMade => StatusCode::INTERNAL_SERVER_ERROR,
-            E::BadName => StatusCode::BAD_REQUEST,
+            E::BadName | E::TooDeep => StatusCode::BAD_REQUEST,
             E::OutsideHome => StatusCode::FORBIDDEN,
         };
         (status, Json(json!({ "error": self.to_string() }))).into_response()
