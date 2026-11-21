@@ -184,6 +184,21 @@ async fn asked_handover(d: &Desk, session: &SessionView, group: &str, boss: &str
 }
 
 async fn clients(dir: &Path, pool: workforce_postgres::PostgresPool) -> Clients {
+    clients_at(dir, pool, ACTS).await
+}
+
+/// The bosses at Act fully: what a crew tool reads first there (the
+/// person's standing words, an ask's first check) is read only of its own.
+fn act_fully() -> String {
+    format!(
+        "{}[oversight.full]\nbudget_usd_per_day = 25\n",
+        ACTS.replace("level = \"act\"", "level = \"full\"")
+    )
+}
+
+/// The three bosses and their groups, each boss at `level` (its
+/// `[oversight]` settings past `enabled` and `group`).
+async fn clients_at(dir: &Path, pool: workforce_postgres::PostgresPool, level: &str) -> Clients {
     let (desk_boss, l1) = agent(dir, "desk", "ok").await;
     let (sarah, l2) = agent(dir, "sarah", "ok").await;
     let (mia, l3) = agent(dir, "mia", "ok").await;
@@ -220,14 +235,14 @@ async fn clients(dir: &Path, pool: workforce_postgres::PostgresPool) -> Clients 
     })
     .await
     .unwrap();
-    write_config(&desk_boss, &format!("[oversight]\nenabled = true\n{ACTS}"));
+    write_config(&desk_boss, &format!("[oversight]\nenabled = true\n{level}"));
     write_config(
         &sarah,
-        &format!("[oversight]\nenabled = true\ngroup = \"acme\"\n{ACTS}"),
+        &format!("[oversight]\nenabled = true\ngroup = \"acme\"\n{level}"),
     );
     write_config(
         &mia,
-        &format!("[oversight]\nenabled = true\ngroup = \"atlas\"\n{ACTS}"),
+        &format!("[oversight]\nenabled = true\ngroup = \"atlas\"\n{level}"),
     );
     let all = [&desk_boss, &sarah, &mia, &scout, &ada];
     let state = hub(&all.iter().map(|s| Arc::clone(s)).collect::<Vec<_>>());
@@ -260,8 +275,9 @@ async fn clients(dir: &Path, pool: workforce_postgres::PostgresPool) -> Clients 
 /// Every way a crew tool can be pointed at `other`'s scope, and whether it
 /// must be refused (an id outside) or only read nothing of it (no id). A
 /// tool this doesn't know fails the test: a new one needs its case here.
-/// A ticket of another scope's is refused as one that isn't there.
-fn pointed_at(name: &str, other: &Client, dir: &Path) -> Vec<(Value, bool)> {
+/// A ticket of another scope's is refused as one that isn't there. `mine`
+/// is a ticket of the boss's own scope, when it has one.
+fn pointed_at(name: &str, mine: Option<&str>, other: &Client, dir: &Path) -> Vec<(Value, bool)> {
     let s = other.session.id.to_string();
     let r = "For the test.";
     match name {
@@ -291,38 +307,6 @@ fn pointed_at(name: &str, other: &Client, dir: &Path) -> Vec<(Value, bool)> {
                 false,
             ),
         ],
-        // A ticket of another scope's, named, is as none.
-        super::super::tickets::READ => vec![(json!({ "ticket": other.ticket }), true)],
-        super::super::tickets::EDIT => vec![(
-            json!({ "ticket": other.ticket, "title": "Retitled", "reason": r }),
-            true,
-        )],
-        super::super::tickets::COMMENT => vec![(
-            json!({ "ticket": other.ticket, "comment": "Seen", "reason": r }),
-            true,
-        )],
-        super::super::tickets::LINK => vec![(
-            json!({ "ticket": other.ticket, "needs": other.ticket, "reason": r }),
-            true,
-        )],
-        super::super::tickets::DELETE => {
-            vec![(json!({ "ticket": other.ticket, "reason": r }), true)]
-        }
-        super::super::tickets::CREATE => vec![(
-            json!({
-                "board": other.ticket.split('-').next().unwrap_or_default(),
-                "title": "Elsewhere",
-                "reason": r
-            }),
-            true,
-        )],
-        // A boss's own waits: below Act fully none starts, and another
-        // scope's session is never said back.
-        super::super::watches::WATCH => vec![(
-            json!({ "minutes": 5, "note": "Look again.", "session_id": s }),
-            false,
-        )],
-        super::super::watches::WATCHES => vec![(json!({}), false)],
         // The person's GitHub, read as them: no scope of Desk's in it.
         "crew.github_pr" => vec![(json!({ "repo": "acme/web", "number": 1 }), false)],
         "crew.github_branch" => vec![(json!({ "repo": "acme/web", "branch": "main" }), false)],
@@ -359,10 +343,18 @@ fn pointed_at(name: &str, other: &Client, dir: &Path) -> Vec<(Value, bool)> {
             true,
         )],
         "crew.order" => vec![(json!({ "text": "Ship it", "session_ids": [s] }), true)],
-        "crew.ask_person" => vec![(
-            json!({ "text": "Shall I merge it?", "session_id": s }),
-            true,
-        )],
+        // At Act fully also with why it can't decide: nothing of the
+        // session is read for the person's standing words first.
+        "crew.ask_person" => vec![
+            (
+                json!({ "text": "Shall I merge it?", "session_id": s }),
+                true,
+            ),
+            (
+                json!({ "text": "Shall I merge it?", "session_id": s, "cant_decide": "Their orders say nothing of it." }),
+                true,
+            ),
+        ],
         // Only its own items: another's is refused as one that isn't there.
         "crew.close_item" => vec![(
             json!({ "item_id": uuid::Uuid::new_v4().to_string(), "why": "Settled." }),
@@ -525,6 +517,84 @@ fn pointed_at(name: &str, other: &Client, dir: &Path) -> Vec<(Value, bool)> {
             json!({ "machine": "devbox", "command": "ls", "reason": r }),
             false,
         )],
+        // A ticket is looked up only on the boards its scope sees: another
+        // scope's, by its key in any case, is as one that isn't there.
+        super::super::tickets::READ => vec![
+            (json!({ "ticket": other.ticket }), true),
+            (json!({ "ticket": other.ticket.to_lowercase() }), true),
+        ],
+        // Read the same way before anything changes, through a plan or the
+        // board.
+        super::super::tickets::EDIT => vec![
+            (
+                json!({ "ticket": other.ticket, "title": "Mine now", "reason": r }),
+                true,
+            ),
+            (
+                json!({ "ticket": other.ticket, "append": "Mine now.", "reason": r }),
+                true,
+            ),
+            (
+                json!({ "ticket": other.ticket, "machine": "devbox", "reason": r }),
+                true,
+            ),
+        ],
+        super::super::tickets::COMMENT => vec![(
+            json!({ "ticket": other.ticket, "comment": "Mine now.", "reason": r }),
+            true,
+        )],
+        // Both ends: another's ticket made to need anything, and its own
+        // made to need another's.
+        super::super::tickets::LINK => {
+            let mut cases = vec![(
+                json!({ "ticket": other.ticket, "needs": other.ticket, "reason": r }),
+                true,
+            )];
+            if let Some(mine) = mine {
+                cases.push((
+                    json!({ "ticket": mine, "needs": other.ticket, "reason": r }),
+                    true,
+                ));
+                cases.push((
+                    json!({ "ticket": mine, "needs": other.ticket, "unlink": true, "reason": r }),
+                    true,
+                ));
+            }
+            cases
+        }
+        // Made only on a board its scope sees, needing only tickets there.
+        super::super::tickets::CREATE => {
+            let mut cases = vec![(
+                json!({
+                    "board": other.ticket.split('-').next().unwrap_or_default(),
+                    "title": "Mine now",
+                    "reason": r,
+                }),
+                true,
+            )];
+            if mine.is_some() {
+                cases.push((
+                    json!({ "title": "Mine now", "needs": [other.ticket], "reason": r }),
+                    true,
+                ));
+            }
+            cases
+        }
+        // A wait is for a session in its scope or a plan of its own there,
+        // refused before anything else is looked at.
+        super::super::watches::WATCH => vec![
+            (json!({ "minutes": 5, "session_id": s, "note": r }), true),
+            (
+                json!({ "minutes": 5, "plan_id": other.plan.to_string(), "note": r }),
+                true,
+            ),
+        ],
+        // Its own waits alone, kept by boss and person.
+        super::super::watches::WATCHES => vec![(json!({}), false)],
+        // Always the person's yes, and even then never another scope's.
+        super::super::tickets::DELETE => {
+            vec![(json!({ "ticket": other.ticket, "reason": r }), true)]
+        }
         other => {
             panic!("{other} is a crew tool with no case here: say how it is kept to its scope")
         }
@@ -534,13 +604,20 @@ fn pointed_at(name: &str, other: &Client, dir: &Path) -> Vec<(Value, bool)> {
 /// Points every crew tool `boss` has at `other`'s scope: each one aimed at
 /// an id there is refused in `refusal`'s words, before it does anything,
 /// and no answer says `secret`.
-async fn kept_out(boss: &AgentService, other: &Client, secret: &str, refusal: &str, dir: &Path) {
+async fn kept_out(
+    boss: &AgentService,
+    mine: Option<&str>,
+    other: &Client,
+    secret: &str,
+    refusal: &str,
+    dir: &Path,
+) {
     for name in READ.iter().chain(ACT.iter()) {
         let tool = boss
             .tools
             .get(name)
             .unwrap_or_else(|| panic!("{} has no {name}", boss.agent_id));
-        for (input, refused) in pointed_at(name, other, dir) {
+        for (input, refused) in pointed_at(name, mine, other, dir) {
             let r = tool.execute(input.clone()).await.unwrap();
             let said = format!("{:?} {}", r.error, r.output);
             assert!(
@@ -562,18 +639,14 @@ async fn kept_out(boss: &AgentService, other: &Client, secret: &str, refusal: &s
                 // one, and a group that isn't which to name, after the same
                 // words.
                 let said = r.error.as_deref().unwrap_or_default();
-                // A ticket made on another scope's board: it has none so
-                // called.
+                // A new ticket's board it doesn't see is one it hasn't got;
+                // a ticket it needs there is as none.
                 if *name == super::super::tickets::CREATE {
-                    assert_eq!(
-                        said,
-                        format!(
-                            "You have no board called {:?}.",
-                            input["board"].as_str().unwrap_or_default()
-                        ),
-                        "{} {name} {input}",
-                        boss.agent_id
-                    );
+                    let words = match input["board"].as_str() {
+                        Some(b) => format!("You have no board called {b:?}."),
+                        None => format!("There's no {}.", other.ticket),
+                    };
+                    assert_eq!(said, words, "{} {name} {input}", boss.agent_id);
                 } else if input.get("board").is_some() {
                     assert!(
                         said.starts_with(&words) && said.contains("new_board"),
@@ -596,72 +669,104 @@ async fn kept_out(boss: &AgentService, other: &Client, secret: &str, refusal: &s
     }
 }
 
+/// Each boss, through every crew tool, kept out of the other group's
+/// session and ticket (and Desk's own out of both): and nothing it was
+/// refused became a suggestion, a message or a move; asking for settings
+/// asked for its own.
+async fn every_boss_kept_out(c: &Clients, dir: &Path) {
+    let suggestions = c.d.store().suggestions(100).await.unwrap().len();
+    kept_out(
+        &c.sarah,
+        Some(&c.acme.ticket),
+        &c.atlas,
+        ATLAS_SECRET,
+        "That isn't one of Acme's.",
+        dir,
+    )
+    .await;
+    kept_out(
+        &c.mia,
+        Some(&c.atlas.ticket),
+        &c.acme,
+        ACME_SECRET,
+        "That isn't one of Atlas's.",
+        dir,
+    )
+    .await;
+    let main = "That isn't one of yours.";
+    kept_out(&c.desk, None, &c.acme, ACME_SECRET, main, dir).await;
+    kept_out(&c.desk, None, &c.atlas, ATLAS_SECRET, main, dir).await;
+
+    let after = c.d.store().suggestions(100).await.unwrap();
+    for s in after.iter().skip(suggestions) {
+        if s.action["tool"] == super::super::own_settings::NAME {
+            assert_eq!(
+                s.action["input"]["agent_id"].as_str(),
+                Some(s.agent_id.as_str()),
+                "{s:?}"
+            );
+        }
+    }
+    let outside = [
+        c.acme.session.id.to_string(),
+        c.atlas.session.id.to_string(),
+    ];
+    assert!(
+        after
+            .iter()
+            .skip(suggestions)
+            .all(|s| s.subject.as_ref().is_none_or(|p| !outside.contains(&p.id))),
+        "{after:?}"
+    );
+    for (client, outsiders) in [(&c.atlas, ["sarah", "desk"]), (&c.acme, ["mia", "desk"])] {
+        let thread =
+            c.d.line_thread(client.session.id, None, None)
+                .await
+                .unwrap();
+        assert!(
+            thread
+                .iter()
+                .all(|m| !outsiders.contains(&m.from.id.as_str())),
+            "{thread:?}"
+        );
+    }
+    assert_eq!(
+        c.d.ticket_by_key(&c.atlas.ticket)
+            .await
+            .unwrap()
+            .ticket
+            .state,
+        TicketState::Todo
+    );
+    assert!(c.d.charge_of(c.atlas.session.id).is_none());
+}
+
+/// The same at Act fully, where some tools read more before they act.
+#[tokio::test(flavor = "multi_thread")]
+async fn at_act_fully_each_boss_reads_and_acts_only_inside_its_own_group_too() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let c = clients_at(dir.path(), pool, &act_fully()).await;
+        for boss in [&c.desk, &c.sarah, &c.mia] {
+            let (_, o) = c.crew.overseer_named(boss.agent_id.as_str()).unwrap();
+            assert_eq!(
+                c.crew.level_now(boss.agent_id.as_str(), &o).0,
+                workforce_common::oversight::Level::Full,
+                "{}",
+                boss.agent_id
+            );
+        }
+        every_boss_kept_out(&c, dir.path()).await;
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn each_boss_reads_and_acts_only_inside_its_own_group_through_every_crew_tool() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let c = clients(dir.path(), pool).await;
-        let suggestions = c.d.store().suggestions(100).await.unwrap().len();
-
-        kept_out(
-            &c.sarah,
-            &c.atlas,
-            ATLAS_SECRET,
-            "That isn't one of Acme's.",
-            dir.path(),
-        )
-        .await;
-        kept_out(
-            &c.mia,
-            &c.acme,
-            ACME_SECRET,
-            "That isn't one of Atlas's.",
-            dir.path(),
-        )
-        .await;
-        let main = "That isn't one of yours.";
-        kept_out(&c.desk, &c.acme, ACME_SECRET, main, dir.path()).await;
-        kept_out(&c.desk, &c.atlas, ATLAS_SECRET, main, dir.path()).await;
-
-        // Nothing it was refused became a suggestion, a message or a move;
-        // asking for settings asked for its own.
-        let after = c.d.store().suggestions(100).await.unwrap();
-        for s in after.iter().skip(suggestions) {
-            if s.action["tool"] == super::super::own_settings::NAME {
-                assert_eq!(
-                    s.action["input"]["agent_id"].as_str(),
-                    Some(s.agent_id.as_str()),
-                    "{s:?}"
-                );
-            }
-        }
-        let outside = [
-            c.acme.session.id.to_string(),
-            c.atlas.session.id.to_string(),
-        ];
-        assert!(
-            after
-                .iter()
-                .skip(suggestions)
-                .all(|s| s.subject.as_ref().is_none_or(|p| !outside.contains(&p.id))),
-            "{after:?}"
-        );
-        let thread =
-            c.d.line_thread(c.atlas.session.id, None, None)
-                .await
-                .unwrap();
-        assert!(thread
-            .iter()
-            .all(|m| m.from.id != "sarah" && m.from.id != "desk"));
-        assert_eq!(
-            c.d.ticket_by_key(&c.atlas.ticket)
-                .await
-                .unwrap()
-                .ticket
-                .state,
-            TicketState::Todo
-        );
-        assert!(c.d.charge_of(c.atlas.session.id).is_none());
+        every_boss_kept_out(&c, dir.path()).await;
 
         // The registry: every overseer's tools are bound to its own scope.
         for (boss, scope) in [
@@ -958,17 +1063,18 @@ async fn only_the_person_sets_oversight_and_a_boss_changes_no_agent_outside_its_
             c.crew.overseer_named("sarah").unwrap().1.scope,
             Scope::Group("acme".into())
         );
+        // On this test's own crew: another test's "sarah" may be running.
         let refusal = "That isn't one of Acme's.";
         for target in ["desk", "mia", "ada"] {
             assert_eq!(
-                super::super::boss_may_change("sarah", target).unwrap_err(),
+                c.crew.boss_may_change("sarah", target).unwrap_err(),
                 refusal,
                 "{target}"
             );
         }
-        assert!(super::super::boss_may_change("sarah", "scout").is_ok());
+        assert!(c.crew.boss_may_change("sarah", "scout").is_ok());
         assert!(
-            super::super::boss_may_change("scout", "desk").is_ok(),
+            c.crew.boss_may_change("scout", "desk").is_ok(),
             "only bosses are held"
         );
         // An overseer never writes to another on a line.

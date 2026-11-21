@@ -385,7 +385,7 @@ async fn a_persons_plans_are_their_own_logins_and_any_replica_serves_the_newest(
         assert_eq!(status, 200);
         assert_eq!(
             usage["readings"],
-            json!([{"kind": "claude", "where": "hub", "account": null, "plan": null,
+            json!([{"kind": "claude", "where": "hub", "account": null, "login": "theirs", "plan": null,
                 "windows": [{"usedPercent": 62.0, "resetsAt": null, "minutes": 300}],
                 "observedAt": usage["readings"][0]["observedAt"]}]),
             "a login the hub shares is not the person's plan"

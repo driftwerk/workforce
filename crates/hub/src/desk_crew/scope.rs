@@ -44,6 +44,24 @@ impl CrewHub {
         }
     }
 
+    /// The plan `id`, when it is `b`'s own and in its scope; refused in
+    /// the same words whether it is another's or isn't there at all.
+    pub(super) async fn own_plan(
+        &self,
+        b: &super::tools::Bound,
+        id: Uuid,
+    ) -> Result<workforce_desk::PlanDetail, String> {
+        match self.desk.plan(id).await {
+            Ok(p)
+                if p.summary.plan.boss == b.service.agent_id.as_str()
+                    && b.seen.sees(p.summary.plan.group.as_deref()) =>
+            {
+                Ok(p)
+            }
+            _ => Err(self.not_ours(&b.oversight.scope)),
+        }
+    }
+
     /// Whether `seen` holds the session `id`: refused in the same words
     /// whether it is another scope's or isn't there at all.
     pub(crate) fn session_seen(&self, id: Uuid, seen: &Seen) -> Result<(), String> {

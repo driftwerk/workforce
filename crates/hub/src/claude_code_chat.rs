@@ -76,8 +76,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// (subprocess spawn) is invisible in steady state.
 const CLI_HEALTH_REPROBE_INTERVAL: Duration = Duration::from_secs(300);
 
-/// Concurrency for the synchronous auto-refresh fired before
-/// `materialise_repos` when bases are stale. Mirrors the existing
+/// Concurrency for the periodic project refresh. Mirrors the existing
 /// per-project `update` tool default; configurable knobs are not worth
 /// adding for a path that only runs once per hour.
 const AUTO_REFRESH_CONCURRENCY: usize = 4;
@@ -1005,12 +1004,10 @@ impl ClaudeChatService {
         }
     }
 
-    /// Force-refresh every repo in `project` from its GitHub upstream.
-    /// Shared by the dispatch-time stale check, the periodic background
-    /// pass, and `/cc-rebase` (which always wants fresh refs before it
-    /// rebases). Per-repo failures are warned and the call still returns
-    /// `Ok(())` — falling back to the stale base for one repo beats
-    /// blocking the whole project's refresh.
+    /// Force-refresh every repo in `project` from its GitHub upstream, for
+    /// the periodic background pass. Each failed repo is warned with why,
+    /// and the call still returns `Ok(())` — falling back to the stale base
+    /// for one repo beats blocking the whole project's refresh.
     async fn update_project_now(
         &self,
         agent_id: &str,
@@ -1038,21 +1035,7 @@ impl ClaudeChatService {
             AUTO_REFRESH_CONCURRENCY,
         );
         let reports = updater.update(project).await?;
-        let failed: Vec<&str> = reports
-            .iter()
-            .filter_map(|r| match &r.result {
-                crate::projects::updater::RepoUpdateResult::Err { .. } => Some(r.alias.as_str()),
-                _ => None,
-            })
-            .collect();
-        if !failed.is_empty() {
-            warn!(
-                target: "cc",
-                project = %project.name,
-                failed = ?failed,
-                "cc project refresh: some repos failed; continuing with their stale state"
-            );
-        }
+        crate::projects::updater::warn_failures(&project.name, &reports);
         Ok(())
     }
 

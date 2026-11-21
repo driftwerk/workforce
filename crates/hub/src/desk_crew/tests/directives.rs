@@ -88,13 +88,13 @@ async fn a_boss_newly_at_act_fully_asks_the_persons_directives_once() {
         // Still at Act fully: never again, even while it is held at Act
         // (its budget spent for the day, or not read after a restart).
         let id = overseer.agent_id.as_str().to_string();
-        crew.spent_today.lock().insert(id.clone(), 100.0);
+        crew.pin_spent_today(&id, 100.0);
         assert_ne!(
             crew.level_now(&id, &crew.overseers()[0].1).0,
             workforce_common::oversight::Level::Full
         );
         crew.look_at_directives().await;
-        crew.spent_today.lock().insert(id, 0.0);
+        crew.pin_spent_today(&id, 0.0);
         // Two looks at once (another instance's, the minute's) post one.
         tokio::join!(crew.look_at_directives(), crew.look_at_directives());
         assert_eq!(cards(&overseer).len(), 1);

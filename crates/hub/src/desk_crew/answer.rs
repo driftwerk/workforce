@@ -164,47 +164,52 @@ type Key = (Uuid, workforce_desk::line::TurnMark);
 /// on.
 pub(super) use workforce_desk::line::open_question as question_of;
 
-pub(super) async fn answer_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
-    let (_, mut events) = crew.desk.subscribe();
-    let mut sweep = tokio::time::interval(SWEEP);
-    sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // The questions handed to a boss: each is answered once, unless the
-    // person took it meanwhile (then it is looked at again later).
-    let asked: Arc<parking_lot::Mutex<HashSet<Key>>> = Arc::default();
-    let mut slots: HashMap<String, Arc<tokio::sync::Semaphore>> = HashMap::new();
-    loop {
-        let sessions: Vec<Uuid> = tokio::select! {
-            () = cancel.cancelled() => return,
-            received = events.recv() => match received {
-                Ok(DeskEvent::Session { session }) if question_of(&session).is_some() => vec![session.id],
-                Ok(DeskEvent::Activity { event }) if event.kind == Kind::Question => event
-                    .subject
-                    .as_ref()
-                    .and_then(|s| s.id.parse().ok())
-                    .into_iter()
-                    .collect(),
-                Ok(_) => continue,
-                Err(RecvError::Lagged(_)) => asking(&crew),
-                Err(RecvError::Closed) => return,
-            },
-            _ = sweep.tick() => match crew.desk.any_boss_unbound() {
-                true => asking(&crew),
-                false => Vec::new(),
-            },
-        };
-        for id in sessions {
-            crew.look_at_question(id, &asked, &cancel, &mut slots);
-        }
-        // Only what is still asked is remembered.
-        let mut taken = asked.lock();
-        if !taken.is_empty() {
-            let open: HashSet<Key> = crew
-                .desk
-                .list()
-                .iter()
-                .filter_map(|v| crew.desk.asked_mark(v.id).map(|t| (v.id, t)))
-                .collect();
-            taken.retain(|k| open.contains(k));
+pub(super) fn answer_loop(
+    crew: Arc<CrewHub>,
+    cancel: CancellationToken,
+) -> impl std::future::Future<Output = ()> {
+    let mut events = crew.desk.events();
+    async move {
+        let mut sweep = tokio::time::interval(SWEEP);
+        sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The questions handed to a boss: each is answered once, unless the
+        // person took it meanwhile (then it is looked at again later).
+        let asked: Arc<parking_lot::Mutex<HashSet<Key>>> = Arc::default();
+        let mut slots: HashMap<String, Arc<tokio::sync::Semaphore>> = HashMap::new();
+        loop {
+            let sessions: Vec<Uuid> = tokio::select! {
+                () = cancel.cancelled() => return,
+                received = events.recv() => match received {
+                    Ok(DeskEvent::Session { session }) if question_of(&session).is_some() => vec![session.id],
+                    Ok(DeskEvent::Activity { event }) if event.kind == Kind::Question => event
+                        .subject
+                        .as_ref()
+                        .and_then(|s| s.id.parse().ok())
+                        .into_iter()
+                        .collect(),
+                    Ok(_) => continue,
+                    Err(RecvError::Lagged(_)) => asking(&crew),
+                    Err(RecvError::Closed) => return,
+                },
+                _ = sweep.tick() => match crew.desk.any_boss_unbound() {
+                    true => asking(&crew),
+                    false => Vec::new(),
+                },
+            };
+            for id in sessions {
+                crew.look_at_question(id, &asked, &cancel, &mut slots);
+            }
+            // Only what is still asked is remembered.
+            let mut taken = asked.lock();
+            if !taken.is_empty() {
+                let open: HashSet<Key> = crew
+                    .desk
+                    .list()
+                    .iter()
+                    .filter_map(|v| crew.desk.asked_mark(v.id).map(|t| (v.id, t)))
+                    .collect();
+                taken.retain(|k| open.contains(k));
+            }
         }
     }
 }

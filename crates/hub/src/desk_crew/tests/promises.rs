@@ -439,8 +439,12 @@ async fn a_sessions_reply_is_said_in_words_never_its_mark() {
             "{:?}",
             all.iter().map(|m| &m.content).collect::<Vec<_>>()
         );
+        // An update of its own nudges, once their gather (300 ms here) is
+        // past on a slow run, is no word of these replies.
+        let update = Some(workforce_common::channels::desk::DeliveryKind::Update);
         assert_eq!(
             all.iter()
+                .filter(|m| m.desk.as_ref().and_then(|d| d.delivery) != update)
                 .filter(|m| m.content.contains("Cufflink Migration"))
                 .count(),
             2,

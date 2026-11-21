@@ -983,7 +983,20 @@ async fn a_question_the_person_is_answering_in_the_session_is_left_to_them() {
             .await
             .unwrap();
         let ask: uuid::Uuid = serde_json::from_value(asked["id"].clone()).unwrap();
-        let q = d.store().line_message(ask).await.unwrap().unwrap();
+        // Given to the person by the boss, as crew.escalate does: a held
+        // question not given to them is let go at the next look.
+        let q = d
+            .line_escalate(
+                ask,
+                &By::manager("desk", "Desk", "It can't be undone."),
+                workforce_desk::line::Escalation {
+                    why: "It can't be undone.".into(),
+                    options: Vec::new(),
+                    draft: None,
+                },
+            )
+            .await
+            .unwrap();
         crew.post_question(&q).await;
         // Within the wheel's hold it waits for them.
         tokio::time::sleep(Duration::from_millis(50)).await;

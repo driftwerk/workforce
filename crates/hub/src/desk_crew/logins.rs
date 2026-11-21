@@ -97,21 +97,26 @@ impl CrewHub {
 
 /// Desk's own moves between logins, and that none has room, each said in
 /// the main boss's DM as Desk said it in Activity: once.
-pub(super) async fn logins_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
-    let (_, mut events) = crew.desk.subscribe();
-    loop {
-        let event = tokio::select! {
-            () = cancel.cancelled() => return,
-            received = events.recv() => match received {
-                Ok(DeskEvent::Activity { event })
-                    if matches!(event.kind, Kind::LoginMoved | Kind::LoginsFull) => event,
-                Ok(_) | Err(RecvError::Lagged(_)) => continue,
-                Err(RecvError::Closed) => return,
-            },
-        };
-        let Some((service, _)) = crew.overseer_for(&Scope::Ungrouped) else {
-            continue;
-        };
-        crew.tell_dm(service.agent_id.as_str(), &event.text).await;
+pub(super) fn logins_loop(
+    crew: Arc<CrewHub>,
+    cancel: CancellationToken,
+) -> impl std::future::Future<Output = ()> {
+    let mut events = crew.desk.events();
+    async move {
+        loop {
+            let event = tokio::select! {
+                () = cancel.cancelled() => return,
+                received = events.recv() => match received {
+                    Ok(DeskEvent::Activity { event })
+                        if matches!(event.kind, Kind::LoginMoved | Kind::LoginsFull) => event,
+                    Ok(_) | Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => return,
+                },
+            };
+            let Some((service, _)) = crew.overseer_for(&Scope::Ungrouped) else {
+                continue;
+            };
+            crew.tell_dm(service.agent_id.as_str(), &event.text).await;
+        }
     }
 }
