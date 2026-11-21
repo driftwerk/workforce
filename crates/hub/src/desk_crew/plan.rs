@@ -1285,15 +1285,7 @@ impl CrewHub {
             .ok_or("Say why: the person reads it.")?;
         // Only its own, in its scope: any other is refused as one that
         // isn't there.
-        let detail = match self.desk.plan(id).await {
-            Ok(p)
-                if p.summary.plan.boss == b.service.agent_id.as_str()
-                    && b.seen.sees(p.summary.plan.group.as_deref()) =>
-            {
-                p
-            }
-            _ => return Err(self.not_ours(&o.scope)),
-        };
+        let detail = self.own_plan(b, id).await?;
         let known: HashMap<String, Uuid> = detail
             .tickets
             .iter()
@@ -2631,114 +2623,119 @@ impl CrewHub {
 /// anything they wait on changes and every tick, the starts cut off by a
 /// stop finished first; and what happens to a plan, gathered into its
 /// boss's `[Desk plan]` turns, one at a time per plan.
-pub(super) async fn plan_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
-    let (_, mut events) = crew.desk.subscribe();
-    // Desk knows which sessions bosses run before anything is started.
-    while !crew.desk.charges_loaded() {
-        tokio::select! {
-            () = cancel.cancelled() => return,
-            () = tokio::time::sleep(Duration::from_millis(200)) => {}
+pub(super) fn plan_loop(
+    crew: Arc<CrewHub>,
+    cancel: CancellationToken,
+) -> impl std::future::Future<Output = ()> {
+    let mut events = crew.desk.events();
+    async move {
+        // Desk knows which sessions bosses run before anything is started.
+        while !crew.desk.charges_loaded() {
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                () = tokio::time::sleep(Duration::from_millis(200)) => {}
+            }
         }
-    }
-    let mut gathering: HashMap<Uuid, Gathered> = HashMap::new();
-    let at = chrono::Local::now().format("%H:%M");
-    for (_, (plan, lines)) in crew.reconcile_plans().await {
-        let mut lines = lines;
-        lines.insert(0, format!("Desk restarted at {at}. Since your last turn:"));
-        if lines.len() == 1 {
-            lines.push("nothing of your plans changed".into());
-        }
-        gathering.insert(
-            plan,
-            Gathered {
-                since: Instant::now(),
-                lines,
-            },
-        );
-    }
-    let mut states = crew.plan_states().await;
-    let mut running: HashMap<Uuid, tokio::task::JoinHandle<()>> = HashMap::new();
-    let mut pass: Option<tokio::task::JoinHandle<()>> = None;
-    let mut dirty = true;
-    let mut last = Instant::now()
-        .checked_sub(Duration::from_secs(60))
-        .unwrap_or_else(Instant::now);
-    let mut tick = tokio::time::interval(Duration::from_millis(250));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        tokio::select! {
-            () = cancel.cancelled() => return,
-            received = events.recv() => match received {
-                Ok(DeskEvent::Ticket { ticket }) => {
-                    dirty = true;
-                    if let Some((plan, line)) = crew.ticket_lines(&ticket, &mut states).await {
-                        gathering.entry(plan).or_insert_with(|| Gathered { since: Instant::now(), lines: Vec::new() }).lines.push(line);
-                    }
-                }
-                Ok(DeskEvent::Plan { plan }) => {
-                    dirty = true;
-                    // A plan approved, changed, resumed: its tickets as they are.
-                    for t in crew.desk.plan_tickets(plan.plan.id).await.unwrap_or_default() {
-                        states.entry(t.id).or_insert(t.state);
-                    }
-                }
-                Ok(DeskEvent::Activity { event }) => {
-                    if let Some((plan, line)) = crew.plan_line(&event).await {
-                        gathering.entry(plan).or_insert_with(|| Gathered { since: Instant::now(), lines: Vec::new() }).lines.push(line);
-                    }
-                }
-                Ok(
-                    DeskEvent::Session { .. }
-                    | DeskEvent::Charge { .. }
-                    | DeskEvent::Removed { .. }
-                    | DeskEvent::Breaker { .. }
-                    | DeskEvent::Budgets { .. },
-                ) => dirty = true,
-                Ok(_) => {}
-                Err(RecvError::Lagged(_)) => dirty = true,
-                Err(RecvError::Closed) => return,
-            },
-            _ = tick.tick() => {}
-        }
-        let failures = std::mem::take(&mut *crew.plan_failures.lock());
-        let notes = std::mem::take(&mut *crew.plan_notes.lock());
-        for (plan, line) in failures.into_iter().chain(notes) {
-            gathering
-                .entry(plan)
-                .or_insert_with(|| Gathered {
-                    since: Instant::now(),
-                    lines: Vec::new(),
-                })
-                .lines
-                .push(line);
-        }
-        if last.elapsed() >= crew.timing.tick {
-            dirty = true;
-        }
-        // Not more often than a gap apart, however busy the sessions are.
-        let gap = crew.timing.tick.min(Duration::from_secs(1));
-        if dirty && last.elapsed() >= gap && pass.as_ref().is_none_or(|h| h.is_finished()) {
-            dirty = false;
-            last = Instant::now();
-            let c = Arc::clone(&crew);
-            pass = Some(tokio::spawn(async move { c.run_plans().await }));
-        }
-        // A plan whose every ticket settled is closed by a turn of its own.
-        running.retain(|_, h| !h.is_finished());
-        let due: Vec<Uuid> = gathering
-            .iter()
-            .filter(|(p, g)| g.since.elapsed() >= GATHER && !running.contains_key(p))
-            .map(|(p, _)| *p)
-            .collect();
-        for plan in due {
-            let Some(g) = gathering.remove(&plan) else {
-                continue;
-            };
-            let c = Arc::clone(&crew);
-            running.insert(
+        let mut gathering: HashMap<Uuid, Gathered> = HashMap::new();
+        let at = chrono::Local::now().format("%H:%M");
+        for (_, (plan, lines)) in crew.reconcile_plans().await {
+            let mut lines = lines;
+            lines.insert(0, format!("Desk restarted at {at}. Since your last turn:"));
+            if lines.len() == 1 {
+                lines.push("nothing of your plans changed".into());
+            }
+            gathering.insert(
                 plan,
-                tokio::spawn(async move { c.plan_turn(plan, g.lines).await }),
+                Gathered {
+                    since: Instant::now(),
+                    lines,
+                },
             );
+        }
+        let mut states = crew.plan_states().await;
+        let mut running: HashMap<Uuid, tokio::task::JoinHandle<()>> = HashMap::new();
+        let mut pass: Option<tokio::task::JoinHandle<()>> = None;
+        let mut dirty = true;
+        let mut last = Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .unwrap_or_else(Instant::now);
+        let mut tick = tokio::time::interval(Duration::from_millis(250));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                received = events.recv() => match received {
+                    Ok(DeskEvent::Ticket { ticket }) => {
+                        dirty = true;
+                        if let Some((plan, line)) = crew.ticket_lines(&ticket, &mut states).await {
+                            gathering.entry(plan).or_insert_with(|| Gathered { since: Instant::now(), lines: Vec::new() }).lines.push(line);
+                        }
+                    }
+                    Ok(DeskEvent::Plan { plan }) => {
+                        dirty = true;
+                        // A plan approved, changed, resumed: its tickets as they are.
+                        for t in crew.desk.plan_tickets(plan.plan.id).await.unwrap_or_default() {
+                            states.entry(t.id).or_insert(t.state);
+                        }
+                    }
+                    Ok(DeskEvent::Activity { event }) => {
+                        if let Some((plan, line)) = crew.plan_line(&event).await {
+                            gathering.entry(plan).or_insert_with(|| Gathered { since: Instant::now(), lines: Vec::new() }).lines.push(line);
+                        }
+                    }
+                    Ok(
+                        DeskEvent::Session { .. }
+                        | DeskEvent::Charge { .. }
+                        | DeskEvent::Removed { .. }
+                        | DeskEvent::Breaker { .. }
+                        | DeskEvent::Budgets { .. },
+                    ) => dirty = true,
+                    Ok(_) => {}
+                    Err(RecvError::Lagged(_)) => dirty = true,
+                    Err(RecvError::Closed) => return,
+                },
+                _ = tick.tick() => {}
+            }
+            let failures = std::mem::take(&mut *crew.plan_failures.lock());
+            let notes = std::mem::take(&mut *crew.plan_notes.lock());
+            for (plan, line) in failures.into_iter().chain(notes) {
+                gathering
+                    .entry(plan)
+                    .or_insert_with(|| Gathered {
+                        since: Instant::now(),
+                        lines: Vec::new(),
+                    })
+                    .lines
+                    .push(line);
+            }
+            if last.elapsed() >= crew.timing.tick {
+                dirty = true;
+            }
+            // Not more often than a gap apart, however busy the sessions are.
+            let gap = crew.timing.tick.min(Duration::from_secs(1));
+            if dirty && last.elapsed() >= gap && pass.as_ref().is_none_or(|h| h.is_finished()) {
+                dirty = false;
+                last = Instant::now();
+                let c = Arc::clone(&crew);
+                pass = Some(tokio::spawn(async move { c.run_plans().await }));
+            }
+            // A plan whose every ticket settled is closed by a turn of its own.
+            running.retain(|_, h| !h.is_finished());
+            let due: Vec<Uuid> = gathering
+                .iter()
+                .filter(|(p, g)| g.since.elapsed() >= GATHER && !running.contains_key(p))
+                .map(|(p, _)| *p)
+                .collect();
+            for plan in due {
+                let Some(g) = gathering.remove(&plan) else {
+                    continue;
+                };
+                let c = Arc::clone(&crew);
+                running.insert(
+                    plan,
+                    tokio::spawn(async move { c.plan_turn(plan, g.lines).await }),
+                );
+            }
         }
     }
 }

@@ -330,6 +330,18 @@ impl CrewHub {
                 .map(str::to_string)
         };
         let cant_decide = some_of("cant_decide");
+        // The session it is about is in its scope, checked before anything
+        // is read of it.
+        let session = match input["session_id"].as_str() {
+            Some(s) => {
+                let id: Uuid = s
+                    .parse()
+                    .map_err(|_| "That isn’t a session id from crew.overview.".to_string())?;
+                self.session_seen(id, &b.seen)?;
+                Some(id)
+            }
+            None => None,
+        };
         // At Act fully the boss decides and acts by the person's own
         // instructions; it asks only what they don't cover and it truly
         // can't decide, and says why. Before its first ask of a matter it
@@ -341,8 +353,7 @@ impl CrewHub {
             });
             at_full = full.is_some();
             if let Some((_, o)) = full {
-                let about: Option<Uuid> = input["session_id"].as_str().and_then(|s| s.parse().ok());
-                let standing = self.standing_words(boss, &o, about).await;
+                let standing = self.standing_words(boss, &o, session).await;
                 let words = |lead: &str| match standing.is_empty() {
                     true => lead.to_string(),
                     false => format!("{lead}\n\n{standing}"),
@@ -362,7 +373,7 @@ impl CrewHub {
                 }
                 // A matter is its session, or its words when about none:
                 // reworded, it is not checked twice.
-                let matter = match about {
+                let matter = match session {
                     Some(s) => format!("{boss}\u{1f}{s}"),
                     None => format!("{boss}\u{1f}{}", open_item::normalised(text)),
                 };
@@ -380,16 +391,6 @@ impl CrewHub {
                 ));
             }
         }
-        let session = match input["session_id"].as_str() {
-            Some(s) => {
-                let id: Uuid = s
-                    .parse()
-                    .map_err(|_| "That isn’t a session id from crew.overview.".to_string())?;
-                self.session_seen(id, &b.seen)?;
-                Some(id)
-            }
-            None => None,
-        };
         let some = |k: &str| {
             input[k]
                 .as_str()
@@ -1971,37 +1972,42 @@ impl CrewHub {
 /// Keeps the open items: each session question that stops waiting on the
 /// person closes its item as it happens; every minute what is past closes
 /// and what is due is said again; and the nightly sweep runs.
-pub(super) async fn items_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
-    let (_, mut events) = crew.desk.subscribe();
-    let mut every = tokio::time::interval(crew.timing.minute);
-    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let sweep_after = chrono::Duration::from_std(crew.timing.minute)
-        .map(|m| m * SWEEP_AFTER.num_minutes() as i32)
-        .unwrap_or(SWEEP_AFTER);
-    loop {
-        tokio::select! {
-            () = cancel.cancelled() => return,
-            received = events.recv() => match received {
-                Ok(DeskEvent::Line { message, removed: false })
-                    if message.kind != LineKind::Ask && message.from_session().is_some() =>
-                {
-                    crew.replied(&message).await;
-                }
-                Ok(DeskEvent::Line { message, .. }) if message.kind == LineKind::Ask => {
-                    let name = message.from.name.clone();
-                    if let Some((by, why)) = line_closed(message.asked, &name) {
-                        if let Err(e) = crew.desk.store().item_close_of_line(message.id, by, &why).await {
-                            tracing::warn!(error = %e, "closing a question's open item failed");
+pub(super) fn items_loop(
+    crew: Arc<CrewHub>,
+    cancel: CancellationToken,
+) -> impl std::future::Future<Output = ()> {
+    let mut events = crew.desk.events();
+    async move {
+        let mut every = tokio::time::interval(crew.timing.minute);
+        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let sweep_after = chrono::Duration::from_std(crew.timing.minute)
+            .map(|m| m * SWEEP_AFTER.num_minutes() as i32)
+            .unwrap_or(SWEEP_AFTER);
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                received = events.recv() => match received {
+                    Ok(DeskEvent::Line { message, removed: false })
+                        if message.kind != LineKind::Ask && message.from_session().is_some() =>
+                    {
+                        crew.replied(&message).await;
+                    }
+                    Ok(DeskEvent::Line { message, .. }) if message.kind == LineKind::Ask => {
+                        let name = message.from.name.clone();
+                        if let Some((by, why)) = line_closed(message.asked, &name) {
+                            if let Err(e) = crew.desk.store().item_close_of_line(message.id, by, &why).await {
+                                tracing::warn!(error = %e, "closing a question's open item failed");
+                            }
                         }
                     }
-                }
-                Ok(_) | Err(RecvError::Lagged(_)) => {}
-                Err(RecvError::Closed) => return,
-            },
-            _ = every.tick() => {
-                crew.look_at_items().await;
-                if crew.sweep_due().await {
-                    crew.sweep_items(sweep_after).await;
+                    Ok(_) | Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => return,
+                },
+                _ = every.tick() => {
+                    crew.look_at_items().await;
+                    if crew.sweep_due().await {
+                        crew.sweep_items(sweep_after).await;
+                    }
                 }
             }
         }

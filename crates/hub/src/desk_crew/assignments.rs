@@ -1928,34 +1928,39 @@ impl CrewHub {
 /// Keeps the assignments up to date with what happens on the lines, and
 /// looks at them every crew minute. First settles what a restart left
 /// being sent. Events missed (lagged) are read from the line at once.
-pub(super) async fn assignments_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
-    let (_, mut events) = crew.desk.subscribe();
-    crew.assignments_after_restart(Utc::now()).await;
-    let mut every = tokio::time::interval(crew.timing.minute);
-    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut raised: HashSet<Uuid> = HashSet::new();
-    let mut pruned = Utc::now();
-    loop {
-        tokio::select! {
-            () = cancel.cancelled() => return,
-            received = events.recv() => match received {
-                Ok(DeskEvent::Line { message, removed: false }) => {
-                    crew.assignment_heard(&message).await;
-                }
-                Err(RecvError::Lagged(_)) => crew.assignments_look(&mut raised).await,
-                Ok(_) => {}
-                Err(RecvError::Closed) => return,
-            },
-            _ = every.tick() => {
-                crew.assignments_look(&mut raised).await;
-                // Once a day, closed rows a month old are let go.
-                if Utc::now() - pruned >= chrono::TimeDelta::days(1) {
-                    pruned = Utc::now();
-                    let _ = crew
-                        .desk
-                        .store()
-                        .assignments_prune(pruned - chrono::TimeDelta::days(30))
-                        .await;
+pub(super) fn assignments_loop(
+    crew: Arc<CrewHub>,
+    cancel: CancellationToken,
+) -> impl std::future::Future<Output = ()> {
+    let mut events = crew.desk.events();
+    async move {
+        crew.assignments_after_restart(Utc::now()).await;
+        let mut every = tokio::time::interval(crew.timing.minute);
+        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut raised: HashSet<Uuid> = HashSet::new();
+        let mut pruned = Utc::now();
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                received = events.recv() => match received {
+                    Ok(DeskEvent::Line { message, removed: false }) => {
+                        crew.assignment_heard(&message).await;
+                    }
+                    Err(RecvError::Lagged(_)) => crew.assignments_look(&mut raised).await,
+                    Ok(_) => {}
+                    Err(RecvError::Closed) => return,
+                },
+                _ = every.tick() => {
+                    crew.assignments_look(&mut raised).await;
+                    // Once a day, closed rows a month old are let go.
+                    if Utc::now() - pruned >= chrono::TimeDelta::days(1) {
+                        pruned = Utc::now();
+                        let _ = crew
+                            .desk
+                            .store()
+                            .assignments_prune(pruned - chrono::TimeDelta::days(30))
+                            .await;
+                    }
                 }
             }
         }

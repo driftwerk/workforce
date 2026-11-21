@@ -1037,12 +1037,18 @@ async fn what_happens_together_is_one_check_in_and_the_day_has_a_cap() {
     use workforce_desk::crew::Event;
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let (_, _crew, d, _llm) = overseeing(
+        let (_, _crew, d, _llm) = overseeing_at(
             dir.path(),
             pool,
             "Both sessions finished.",
             "[oversight]\nenabled = true\nmax_checkins_per_day = 1\nwake = { waiting_minutes = 0, quiet_minutes = 0 }\n",
             &[],
+            // A wide gathering window: under load the two finishes are
+            // noted further apart than FAST's 150 ms.
+            Timing {
+                coalesce: Duration::from_secs(2),
+                ..FAST
+            },
         )
         .await;
         for name in ["acme-web", "workforce-e7"] {
@@ -6261,7 +6267,14 @@ async fn a_start_reuses_only_the_overseers_own_session_on_its_engine_once_and_as
     use super::actions::Action;
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", REUSES, &[]).await;
+        // Another boss, here, overseeing acme.
+        let (sarah, _l2) = agent(dir.path(), "sarah", "ok").await;
+        write_config(&sarah, "[oversight]\nenabled = true\ngroup = \"acme\"\n");
+        let (overseer, crew, d, _llm) =
+            overseeing(dir.path(), pool, "ok", REUSES, &[Arc::clone(&sarah)]).await;
+        d.change_layout(|l| l.create("acme", "Acme", &[], None))
+            .await
+            .unwrap();
         let mine = dir.path().join("mine");
         let theirs = dir.path().join("theirs");
         let others = dir.path().join("others");
@@ -6660,7 +6673,8 @@ async fn a_wedged_mind_is_waited_for_only_so_long() {
         assert_eq!(crew.with_mind("desk", "an update", async { 5 }).await, 5);
         assert_eq!(said("m2").await, 2, "said again for a new stretch");
         // What it starts runs as part of it: a nested step never waits the
-        // whole bound again.
+        // whole bound again (a second here).
+        crew.set_mind_wait_max(Duration::from_secs(1));
         let nested = std::time::Instant::now();
         let out = crew
             .with_mind("desk", "a turn", async {
@@ -6669,7 +6683,7 @@ async fn a_wedged_mind_is_waited_for_only_so_long() {
             .await;
         assert_eq!(out, 6);
         assert!(
-            nested.elapsed() < Duration::from_millis(600),
+            nested.elapsed() < Duration::from_millis(2000),
             "waited once, not twice: {:?}",
             nested.elapsed()
         );

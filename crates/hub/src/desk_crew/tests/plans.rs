@@ -659,10 +659,13 @@ async fn a_proposed_move_is_told_of_the_briefs_it_proposes() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
-        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
         eventually("the plan tools", async || overseer.tools.has("crew.plan").then_some(())).await;
         let update = overseer.tools.get("crew.plan_update").unwrap();
         let (id, keys) = plan_with_local_paths(&overseer, &d, dir.path()).await;
+        // Nothing of the plan starts until the move is asked: a ticket that
+        // started can't move. Every start waits its turn on this.
+        let no_starts = crew.starting.lock().await;
         d.approve_plan(id.parse().unwrap(), 1, &By::you()).await.unwrap();
         let r = update
             .execute(json!({ "plan_id": id, "why": "The person wants it on devbox.", "tickets_edit": [
@@ -676,7 +679,7 @@ async fn a_proposed_move_is_told_of_the_briefs_it_proposes() {
         let note = r.output["note"].as_str().unwrap();
         assert!(note.contains(&format!("{}'s brief names /Volumes/T9 on", keys[1])), "{note}");
         assert!(!note.contains(&format!("{}'s brief", keys[0])), "{note}");
-
+        drop(no_starts);
     })
     .await;
 }

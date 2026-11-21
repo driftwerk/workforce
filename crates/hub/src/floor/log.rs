@@ -5,10 +5,11 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{info, warn};
 use workforce_common::channels::desk::DeskSignal;
 use workforce_common::settings::WorkforceConfig;
 use workforce_desk::floor::{Scope, Turn, TurnLog, TurnOp};
+use workforce_postgres::PostgresConfig;
 
 use super::gists::Gists;
 use super::plans::Plans;
@@ -75,28 +76,65 @@ pub fn turns() -> Option<&'static Arc<dyn TurnLog>> {
     installed().map(|i| &i.log)
 }
 
+/// The first wait before a store that couldn't be opened is tried again.
+const REOPEN_FIRST: Duration = Duration::from_secs(1);
+/// The longest wait between tries.
+const REOPEN_MOST: Duration = Duration::from_secs(60);
+
 pub(super) async fn install(config: &WorkforceConfig) {
     static OPENED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    // A config without Postgres opens nothing and settles nothing: the
+    // floor stays the first one's with Postgres to open (in one process,
+    // a hub composed without it never keeps a later one from its store).
+    let Some(pg) = config.postgres.as_ref().filter(|p| p.enabled) else {
+        return;
+    };
+    // Opened once. The hub installs once, at boot: a store that couldn't
+    // be opened then (Postgres down) is tried again in the background
+    // until it opens.
     OPENED
         .get_or_init(|| async {
-            let Some(pg) = config.postgres.as_ref().filter(|p| p.enabled) else {
+            let Err(e) = open(pg).await else {
                 return;
             };
-            match PgFloorStore::new(pg).await {
-                Ok(store) => {
-                    let installed = Installed::open(store);
-                    tokio::spawn(prune_forever(Arc::clone(&installed.store)));
-                    observe_with(installed.plans.clone());
-                    let _ = INSTALLED.set(installed);
-                }
-                Err(e) => warn!(
-                    target: "floor",
-                    error = %format!("{e:#}"),
-                    "floor store unavailable; turns are not recorded"
-                ),
-            }
+            warn!(
+                target: "floor",
+                error = %format!("{e:#}"),
+                "floor store unavailable; turns are not recorded until it opens"
+            );
+            let pg = pg.clone();
+            tokio::spawn(async move {
+                until_opened(|| open(&pg), REOPEN_FIRST, REOPEN_MOST).await;
+                info!(target: "floor", "floor store opened; turns are recorded");
+            });
         })
         .await;
+}
+
+/// Opens the store over `pg` and installs it.
+async fn open(pg: &PostgresConfig) -> eyre::Result<()> {
+    let store = PgFloorStore::new(pg).await?;
+    let installed = Installed::open(store);
+    tokio::spawn(prune_forever(Arc::clone(&installed.store)));
+    observe_with(installed.plans.clone());
+    let _ = INSTALLED.set(installed);
+    Ok(())
+}
+
+/// Tries `open` after `wait`, doubling the wait up to `most`, until it
+/// succeeds.
+async fn until_opened<F, Fut>(mut open: F, mut wait: Duration, most: Duration)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = eyre::Result<()>>,
+{
+    loop {
+        tokio::time::sleep(wait).await;
+        if open().await.is_ok() {
+            return;
+        }
+        wait = (wait * 2).min(most);
+    }
 }
 
 /// The log as the hub writes it: every op through one writer, in order, the
@@ -167,5 +205,44 @@ async fn prune_forever(store: Arc<PgFloorStore>) {
                 warn!(target: "floor", error = %format!("{e:#}"), "pruning the turn log failed")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_store_that_wont_open_is_tried_again_waiting_longer_each_time_up_to_a_minute() {
+        let tries = Arc::new(AtomicUsize::new(0));
+        let began = tokio::time::Instant::now();
+        let counted = Arc::clone(&tries);
+        until_opened(
+            move || {
+                let n = counted.fetch_add(1, Ordering::SeqCst) + 1;
+                async move {
+                    if n < 9 {
+                        Err(eyre::eyre!("Postgres is down"))
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            REOPEN_FIRST,
+            REOPEN_MOST,
+        )
+        .await;
+        assert_eq!(
+            tries.load(Ordering::SeqCst),
+            9,
+            "tried until it opened, then no more"
+        );
+        // 1 + 2 + 4 + 8 + 16 + 32, then a minute each.
+        assert_eq!(
+            began.elapsed(),
+            Duration::from_secs(1 + 2 + 4 + 8 + 16 + 32 + 60 + 60 + 60)
+        );
     }
 }
