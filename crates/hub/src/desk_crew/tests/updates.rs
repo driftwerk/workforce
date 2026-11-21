@@ -162,9 +162,13 @@ async fn account(d: &Desk, s: uuid::Uuid, done: &[&str], now: &str, next: &str) 
 }
 
 /// The boss's state is begun before anything is done, so all of it is news.
-async fn begun(crew: &Arc<CrewHub>) {
+pub(super) async fn begun(crew: &Arc<CrewHub>) {
     crew.look_at_updates().await;
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    crew.desk
+        .store()
+        .update_state("desk", chrono::Utc::now())
+        .await
+        .unwrap();
 }
 
 const ACT: &str = "[oversight]\nenabled = true\nlevel = \"act\"\nact = { nudge = true }\n";
@@ -525,17 +529,23 @@ async fn a_restart_neither_loses_nor_repeats_an_update() {
             .update_pend("desk", &pending("Kept, not sent."))
             .await
             .unwrap();
+        let state = async || {
+            d.store()
+                .update_state("desk", chrono::Utc::now())
+                .await
+                .unwrap()
+        };
+        let marked = async || {
+            let s = state().await;
+            s.pending.is_none() && s.last_update_at.is_some()
+        };
         crew.look_at_updates().await;
         crew.look_at_updates().await;
         eventually("sent", async || updates(&overseer).into_iter().next()).await;
+        eventually("marked sent", async || marked().await.then_some(())).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(updates(&overseer).len(), 1);
-        let state = d
-            .store()
-            .update_state("desk", chrono::Utc::now())
-            .await
-            .unwrap();
-        assert!(state.pending.is_none() && state.last_update_at.is_some());
+        assert!(marked().await);
 
         // Sent, but the hub stopped before it was marked: not sent again.
         let p = pending("Sent, not marked.");
@@ -549,15 +559,13 @@ async fn a_restart_neither_loses_nor_repeats_an_update() {
             .unwrap();
         d.store().update_pend("desk", &p).await.unwrap();
         crew.look_at_updates().await;
+        eventually("its pending let go", async || {
+            state().await.pending.is_none().then_some(())
+        })
+        .await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(updates(&overseer).len(), 2);
-        assert!(d
-            .store()
-            .update_state("desk", chrono::Utc::now())
-            .await
-            .unwrap()
-            .pending
-            .is_none());
+        assert!(state().await.pending.is_none());
     })
     .await;
 }
