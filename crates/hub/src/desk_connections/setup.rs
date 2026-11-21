@@ -90,6 +90,9 @@ pub const NAMES: [&str; 7] = [
     "connections.use",
 ];
 
+/// BankSync's web app, where its keys are made.
+const BANKSYNC_APP: &str = "https://app.banksync.io";
+
 /// Datadog's regions, as a setup keeps its site.
 const DATADOG_SITES: &[&str] = &["us1", "us3", "us5", "eu1", "ap1", "us1-fed"];
 
@@ -309,11 +312,11 @@ fn browser_page(connector: &str, origin: &str) -> Option<browser_keys::KeyPage> 
 
 /// Registers every key page, so their text is hidden and they are never
 /// pictured, whoever opens them and whether or not a setup is running:
-/// Jira's, Linear's, GitHub's and each Datadog region's at their origins,
+/// Jira's, Linear's, GitHub's, BankSync's and each Datadog region's at their origins,
 /// and Metabase's, whose address is each person's own, on any `http` or `https`
 /// origin. Nothing is registered later, so the registry never grows.
 pub fn register_key_pages() {
-    for service in ["jira", "linear", "github"] {
+    for service in ["jira", "linear", "github", "bank"] {
         if let Some(r) = recipe(service) {
             for origin in (r.origins)(&BTreeMap::new()) {
                 if let Some(page) = browser_page(service, &origin) {
@@ -898,7 +901,7 @@ impl Setups {
     ) -> Result<SetupView, String> {
         self.check_caller(caller)?;
         let c = catalog::find(service)
-            .ok_or_else(|| format!("Desk has no connector {service}. It sets up: Jira, Linear, Datadog, Metabase and GitHub."))?;
+            .ok_or_else(|| format!("Desk has no connector {service}. It sets up: Jira, Linear, Datadog, Metabase, GitHub and Bank."))?;
         let Some(recipe) = recipe(c.id) else {
             return Err(by_hand(c.id).into());
         };
@@ -1639,7 +1642,11 @@ impl Setups {
             let value = value.as_str();
             s.fields.insert(field.to_string(), value.to_string());
             if Some(field) == c.site {
-                s.relabel("where", format!("Found your site: {value}"));
+                let found = match s.service {
+                    "bank" => "The bank",
+                    _ => "Found your site",
+                };
+                s.relabel("where", format!("{found}: {value}"));
                 s.mark("where", StepState::Done, None);
             }
             if field == "email" {
@@ -2684,11 +2691,11 @@ impl Tool for SetupTool {
 
     fn description(&self) -> &str {
         match self.name {
-            "connections.list" => "The person's connections to services (Jira, Linear, GitHub, Datadog, Metabase, Email, Google, Slack) you can use: each by the name the person gave it, its site and account, whether it is for all their agents or just you, whether you use it, take writes with it, and which is your default. Never a key.",
+            "connections.list" => "The person's connections to services (Jira, Linear, GitHub, Datadog, Metabase, Bank, Email, Google, Slack) you can use: each by the name the person gave it, its site and account, whether it is for all their agents or just you, whether you use it, take writes with it, and which is your default. Never a key.",
             "connections.step" => "Rarely needed: the setup's card follows the setup by itself. Marks a step `current`, `waiting` or `done`.",
             "connections.wait" => "Wait while a setup waits on the person (using a sign-in on this computer, approving GitHub's code, signing in to the service in your browser): Desk sees when they have, and checks and turns the connection on itself. Returns what to do next. Call it again while it says it's still waiting; never message the person meanwhile, the card says what to do.",
-            "connections.setup" => "Start setting up a connection to a service yourself: Jira, Linear, Datadog, Metabase or GitHub. `name` is what the person calls it (Acme, Work). `for` is `me` (default), or, for the person's overseer only, `all` or another agent's name. `write` (default false) lets whom it is for make changes with it. Desk shows the person one card for it in this conversation, and turns it on itself once it works. Calling it again for the same connection returns the same setup. Returns the setup's id and what to do next. Google, Email and Slack the person connects themselves.",
-            "connections.keep" => "Keep a field of a setup that isn't a secret: a Jira site (acme.atlassian.net), a Metabase address (its https origin), a Datadog site (us1, eu1, …), an email. A key is read off its page with browser.capture_key instead, and once one is held nothing more is kept.",
+            "connections.setup" => "Start setting up a connection to a service yourself: Jira, Linear, Datadog, Metabase, GitHub or Bank (one bank the person linked in BankSync: keep `bank`, its name, before the key). `name` is what the person calls it (Acme, Work). `for` is `me` (default), or, for the person's overseer only, `all` or another agent's name. `write` (default false) lets whom it is for make changes with it. Desk shows the person one card for it in this conversation, and turns it on itself once it works. Calling it again for the same connection returns the same setup. Returns the setup's id and what to do next. Google, Email and Slack the person connects themselves.",
+            "connections.keep" => "Keep a field of a setup that isn't a secret: a Jira site (acme.atlassian.net), a Metabase address (its https origin), a Datadog site (us1, eu1, …), a bank's name as BankSync shows it (NatWest), an email. A key is read off its page with browser.capture_key instead, and once one is held nothing more is kept.",
             "connections.test" => "Check the setup's keys with the service again, or finish GitHub's sign-in once the person approved its code. Only if it works are they kept, in the vault, for whom the setup is for. A failed check keeps nothing.",
             "connections.use" => "Turn a connection on for an agent: the setup's (`setup`), or one by `service` and `connection` (its name). `agent` is you by default; another agent only for the person's overseer. `write` (default false) lets it make changes; `default` makes it the one used when a request doesn't say.",
             _ => "",
@@ -2713,7 +2720,7 @@ impl Tool for SetupTool {
             "connections.setup" => json!({
                 "type": "object",
                 "properties": {
-                    "service": { "type": "string", "enum": ["jira", "linear", "datadog", "metabase", "github"] },
+                    "service": { "type": "string", "enum": ["jira", "linear", "datadog", "metabase", "github", "bank"] },
                     "name": { "type": "string" },
                     "for": { "type": "string", "description": "me (default), all, or an agent's name" },
                     "write": { "type": "boolean", "description": "Whether whom it is for makes changes with it (default false)" }

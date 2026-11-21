@@ -2277,3 +2277,21 @@ fn an_advisor_step_keeps_its_question_and_answer_with_secrets_hidden() {
     assert_eq!(last.question, format!("round {}", many.len() - 1));
     assert!(steps.iter().all(|s| s.advice_fits()));
 }
+
+#[test]
+fn a_turn_that_read_the_person_s_bank_is_never_remembered() {
+    use workforce_common::session::SessionMessage;
+    let read = |tool: &str| {
+        SessionMessage::tool(
+            tool,
+            &serde_json::json!({}),
+            &serde_json::json!({"data": "£12.30 at Tesco"}),
+            true,
+            1,
+            None,
+        )
+    };
+    assert!(super::extraction::read_personal(&[read("linear.issue_get"), read("bank.transactions")]));
+    assert!(!super::extraction::read_personal(&[read("linear.issue_get")]));
+    assert!(!super::extraction::read_personal(&[]));
+}

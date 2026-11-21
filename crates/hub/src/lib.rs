@@ -358,6 +358,7 @@ pub mod vault_view;
 pub mod version_tool;
 pub mod vision;
 pub mod voice_announce;
+pub mod personal_access;
 pub mod wasm_skill_access;
 pub mod wasm_skill_publish;
 pub mod wasm_skill_tools;

@@ -22,6 +22,20 @@ pub(crate) fn digest_turn_admits(
     personalizes_prompt(user)
         && !is_automated_source(user)
         && prompt_visibility(session, channel_id).is_private()
+        && !read_personal(&session.messages)
+}
+
+/// Whether `messages` hold what a personal connector (the person's bank)
+/// read: nothing of them is remembered or digested.
+pub(crate) fn read_personal(messages: &[workforce_common::session::SessionMessage]) -> bool {
+    messages.iter().any(|m| {
+        matches!(m.role, workforce_common::session::MessageRole::Tool)
+            && m.tool_data
+                .as_ref()
+                .and_then(|d| d.get("name"))
+                .and_then(|n| n.as_str())
+                .is_some_and(workforce_common::connector_binding::is_personal)
+    })
 }
 
 /// Decide whether a completed turn should run passive-memory extraction and/or

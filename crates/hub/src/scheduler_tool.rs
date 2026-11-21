@@ -518,6 +518,15 @@ impl SchedulerTool {
             ));
         }
 
+        if names_personal(input.tools.as_deref())
+            && workforce_agent::runner::current_desk().is_none()
+        {
+            return Ok(ToolResult::failure(
+                PERSONAL_OFF_DESK,
+                start.elapsed().as_millis() as u64,
+            ));
+        }
+
         let service = self.scheduler.service();
         let budget = &service.config.budget;
         let tz = service.config.user_timezone();
@@ -742,6 +751,14 @@ impl SchedulerTool {
                 elapsed(),
             ));
         }
+        let answers_in_desk = job
+            .deliver_to
+            .as_ref()
+            .and_then(crate::scheduler::DeliveryTarget::desk_target)
+            .is_some();
+        if names_personal(input.tools.as_deref()) && !answers_in_desk {
+            return Ok(ToolResult::failure(PERSONAL_OFF_DESK, elapsed()));
+        }
         let rescheduled = schedule.is_some();
         let edit = JobEdit {
             name: input.name,
@@ -952,6 +969,19 @@ impl SchedulerTool {
         ))
     }
 }
+
+/// Whether a job given `tools` reads the person's bank.
+fn names_personal(tools: Option<&[String]>) -> bool {
+    tools.unwrap_or_default().iter().any(|t| {
+        workforce_common::connector_binding::is_personal(t)
+            || workforce_common::connector_binding::PERSONAL.contains(&t.as_str())
+    })
+}
+
+/// What a job that reads the person's bank is told when it wouldn't answer
+/// in their Desk conversation.
+const PERSONAL_OFF_DESK: &str =
+    "A job that reads the person's bank answers only in their Desk conversation: make it from there.";
 
 #[cfg(test)]
 mod tests {

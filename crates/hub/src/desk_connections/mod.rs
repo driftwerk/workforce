@@ -332,6 +332,9 @@ pub struct ConnectionView {
     pub detail: Option<String>,
     pub connected_at: Option<DateTime<Utc>>,
     pub checked_at: Option<DateTime<Utc>>,
+    /// When the person's approval at the service lapses, for a service
+    /// whose approval does (a bank's).
+    pub approved_until: Option<DateTime<Utc>>,
     /// The vault tier it is kept at.
     pub source: VaultSource,
     /// The agents it reaches.
@@ -777,6 +780,7 @@ impl Connections {
             detail: checked.and_then(|k| k.detail.clone()),
             connected_at: checked.map(|k| k.connected_at),
             checked_at: checked.and_then(|k| k.checked_at),
+            approved_until: self.approved_until(c, conn, tier, person),
             source: tier,
             used_by,
         }
@@ -1167,6 +1171,9 @@ impl Connections {
     ) -> Result<VaultSource, Refusal> {
         let tier = Self::tiers(c, level)[0];
         let vault = self.vault_at(tier, level)?;
+        // A new connection (one given its name) was approved at the service
+        // just now, to make its key; a new key for one already kept was not.
+        let now = Utc::now().to_rfc3339();
         let mut keys: Vec<(String, Option<&str>)> = c
             .fields
             .iter()
@@ -1179,6 +1186,9 @@ impl Connections {
             .collect();
         if let (Some(label), Some(name)) = (c.label_at(key), name) {
             keys.push((key_at(tier, person, &label), Some(name)));
+        }
+        if let (Some(at), Some(_)) = (Self::consented_path(c, key), name) {
+            keys.push((key_at(tier, person, &at), Some(&now)));
         }
         let ops: Vec<VaultOp<'_>> = keys
             .iter()
@@ -1380,6 +1390,74 @@ impl Connections {
             .map_err(Refusal::Internal)?;
         // Its agents are told it by its new name.
         self.reload(c, &conn.level, person).await;
+        self.shown(c, &conn, person).await
+    }
+
+    /// Where `c`'s instance `key` keeps when it was approved, for a service
+    /// whose approval lapses.
+    fn consented_path(c: &Connector, key: &str) -> Option<String> {
+        c.consent_days?;
+        c.extras
+            .iter()
+            .find(|(_, sub)| *sub == catalog::CONSENTED_AT)
+            .map(|&extra| c.extra_at(extra, key))
+    }
+
+    /// When the approval of `conn` lapses: when it was given, and for how
+    /// long `c`'s last.
+    fn approved_until(
+        &self,
+        c: &Connector,
+        conn: &Conn,
+        tier: VaultSource,
+        person: &str,
+    ) -> Option<DateTime<Utc>> {
+        let at = Self::consented_path(c, &conn.key)?;
+        let given = self
+            .vault_at(tier, &conn.level)
+            .ok()?
+            .get(&key_at(tier, person, &at))?;
+        DateTime::parse_from_rfc3339(given.trim())
+            .ok()
+            .map(|t| t.with_timezone(&Utc) + chrono::Duration::days(c.consent_days?))
+    }
+
+    /// The person renewed `conn`'s approval at the service (Desk's
+    /// Reconnect): checks it, and only on a pass keeps that it was approved
+    /// now. A service whose approval doesn't lapse is only checked.
+    pub async fn renew(
+        &self,
+        person: &str,
+        id: &str,
+        conn: &str,
+    ) -> Result<ConnectionView, Refusal> {
+        let c = Self::connector(id)?;
+        let conn = self.conn(conn)?;
+        let Some(at) = Self::consented_path(c, &conn.key) else {
+            return self.test_conn(c, &conn, person).await;
+        };
+        let tier = self
+            .held_at(c, &conn.level, &conn.key, person)
+            .ok_or_else(|| {
+                Refusal::NotFound(format!("That {} connection isn't there any more", c.name))
+            })?;
+        let found = self
+            .check(c, &self.kept(c, &conn.level, &conn.key, tier, person))
+            .await;
+        if let Found::Works { .. } = &found {
+            let path = key_at(tier, person, &at);
+            let now = Utc::now().to_rfc3339();
+            self.vault_at(tier, &conn.level)?
+                .apply(
+                    &[VaultOp::Set {
+                        path: &path,
+                        value: &now,
+                    }],
+                    VaultActor::User(person),
+                )
+                .map_err(Refusal::Internal)?;
+        }
+        self.record(c, &conn, person, &found, false).await;
         self.shown(c, &conn, person).await
     }
 
@@ -2260,6 +2338,13 @@ struct TokenQuery {
     token: Option<String>,
 }
 
+/// A Test the person asked for after renewing the service's approval.
+#[derive(Deserialize)]
+struct Renewal {
+    #[serde(default)]
+    renewed: bool,
+}
+
 #[derive(Deserialize)]
 struct At {
     level: String,
@@ -2565,12 +2650,15 @@ async fn test(
     State(r): S,
     h: HeaderMap,
     Query(q): Query<TokenQuery>,
+    Query(renewal): Query<Renewal>,
     Path((connector, connection)): Path<(String, String)>,
 ) -> Response {
     let person = person!(r, h, q);
-    r.connections
-        .test(&person, &connector, &connection)
-        .await
+    let tested = match renewal.renewed {
+        true => r.connections.renew(&person, &connector, &connection).await,
+        false => r.connections.test(&person, &connector, &connection).await,
+    };
+    tested
         .map(|c| Json(json!({ "connection": c })))
         .into_response()
 }

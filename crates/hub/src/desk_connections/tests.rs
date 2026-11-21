@@ -147,8 +147,43 @@ struct Github {
     outcome: Mutex<&'static str>,
 }
 
+const BS_GOOD: &str = "bsk_readonly0000000000000000000";
+const BS_WRITES: &str = "bsk_canwrite0000000000000000000";
+
 async fn services(github: Arc<Github>) -> Services {
     let app = Router::new()
+        .route(
+            "/banksync/whoami",
+            get(|h: HeaderMap| async move {
+                let scopes = match h.get("x-api-key").and_then(|v| v.to_str().ok()) {
+                    Some(BS_GOOD) => json!(["banks:read", "institutions:read"]),
+                    Some(BS_WRITES) => json!(["banks:read", "banks:write"]),
+                    _ => return StatusCode::UNAUTHORIZED.into_response(),
+                };
+                Json(json!({ "success": true, "data": { "scopes": scopes } })).into_response()
+            }),
+        )
+        .route(
+            "/banksync/banks",
+            get(|| async {
+                Json(json!({ "success": true, "data": [
+                    { "id": "bnk_nw", "name": "NatWest", "connectionStatus": { "connected": true } },
+                    { "id": "bnk_rev", "name": "Revolut", "connectionStatus": { "connected": false } }
+                ] }))
+            }),
+        )
+        .route(
+            "/banksync/banks/{id}",
+            get(|axum::extract::Path(id): axum::extract::Path<String>| async move {
+                let (name, connected) = match id.as_str() {
+                    "bnk_nw" => ("NatWest", true),
+                    _ => ("Revolut", false),
+                };
+                Json(json!({ "success": true, "data": {
+                    "id": id, "name": name, "connectionStatus": { "connected": connected }
+                } }))
+            }),
+        )
         .route(
             "/user",
             get(|h: HeaderMap| async move {
@@ -227,6 +262,7 @@ async fn services(github: Arc<Github>) -> Services {
         linear_api: base.clone(),
         slack_api: base.clone(),
         datadog_api: Some(base.clone()),
+        bank_api: format!("{base}/banksync"),
         google_token: format!("{base}/token"),
         google_userinfo: format!("{base}/userinfo"),
         poll_floor: Duration::from_millis(10),
@@ -3162,4 +3198,42 @@ async fn a_copied_connection_is_audited_here_with_where_it_came_from() {
         }
         assert_eq!(row.actor, format!("user:{SARAH}"));
     }
+}
+
+fn bank(key: &str, bank: &str) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("api_key".to_string(), key.to_string()),
+        ("bank".to_string(), bank.to_string()),
+    ])
+}
+
+#[tokio::test]
+async fn a_bank_connects_only_on_a_key_that_reads_and_says_when_its_approval_lapses() {
+    let h = hub().await;
+    let refused = h
+        .c
+        .connect(SARAH, "bank", Some("NatWest"), "agent", Some("allan"), bank(BS_WRITES, "NatWest"))
+        .await;
+    assert!(matches!(refused, Err(_)), "a key that can write is refused");
+    let lapsed = h
+        .c
+        .connect(SARAH, "bank", Some("Revolut"), "agent", Some("allan"), bank(BS_GOOD, "Revolut"))
+        .await;
+    assert!(matches!(lapsed, Err(_)), "a bank whose approval lapsed is refused");
+
+    let before = Utc::now();
+    let natwest = h
+        .c
+        .connect(SARAH, "bank", Some("NatWest"), "agent", Some("allan"), bank(BS_GOOD, "natwest"))
+        .await
+        .unwrap();
+    assert_eq!(natwest.account.as_deref(), Some("NatWest"));
+    let until = natwest.approved_until.expect("an approval date");
+    assert!(until >= before + chrono::Duration::days(90));
+    assert!(until <= Utc::now() + chrono::Duration::days(90));
+
+    let tested = h.c.test(SARAH, "bank", &natwest.id).await.unwrap();
+    assert_eq!(tested.approved_until, Some(until), "a Test alone moves nothing");
+    let renewed = h.c.renew(SARAH, "bank", &natwest.id).await.unwrap();
+    assert!(renewed.approved_until.unwrap() > until, "a renewal does");
 }

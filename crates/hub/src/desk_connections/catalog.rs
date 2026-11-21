@@ -118,7 +118,14 @@ pub struct Connector {
     /// the form): where a single connection kept each, and where an
     /// instance does, under `<prefix><key>/`.
     pub extras: &'static [(&'static str, &'static str)],
+    /// How many days the person's approval at the service lasts, for one
+    /// whose approval lapses (a bank's): kept as [`CONSENTED_AT`] each time
+    /// it is connected or renewed.
+    pub consent_days: Option<i64>,
 }
+
+/// Where a connection whose approval lapses keeps when it was last given.
+pub const CONSENTED_AT: &str = "consented_at";
 
 /// Where an instance keeps the name the person gave it.
 pub const LABEL: &str = "label";
@@ -251,6 +258,15 @@ const DATADOG_HELD: &[&str] = &[
     "skills/datadog/app_key",
     "skills/datadog/site",
 ];
+const BANK_FIELDS: &[Field] = &[
+    secret("api_key", "BankSync API key", "skills/bank/api_key", "api_key"),
+    plain("bank", "Bank", "NatWest", "skills/bank/bank", "bank"),
+];
+const BANK_HELD: &[&str] = &[
+    "skills/bank/api_key",
+    "skills/bank/bank",
+    "skills/bank/consented_at",
+];
 const METABASE_HELD: &[&str] = &["skills/metabase/site_url", "skills/metabase/api_key"];
 
 /// The connectors of v1, in the order Settings lists them.
@@ -274,6 +290,7 @@ pub const CATALOG: &[Connector] = &[
             ("skills/github/app_id", "app_id"),
             ("skills/github/app_private_key", "app_private_key"),
         ],
+        consent_days: None,
     },
     Connector {
         id: "google",
@@ -296,6 +313,7 @@ pub const CATALOG: &[Connector] = &[
         site: None,
         name_hint: "Work, Personal",
         extras: &[],
+        consent_days: None,
     },
     Connector {
         id: "email",
@@ -325,6 +343,7 @@ pub const CATALOG: &[Connector] = &[
                 "command_timeout_secs",
             ),
         ],
+        consent_days: None,
     },
     Connector {
         id: "jira",
@@ -341,6 +360,7 @@ pub const CATALOG: &[Connector] = &[
         site: Some("site"),
         name_hint: "Acme",
         extras: &[("skills/jira/default_project", "default_project")],
+        consent_days: None,
     },
     Connector {
         id: "linear",
@@ -357,6 +377,7 @@ pub const CATALOG: &[Connector] = &[
         site: None,
         name_hint: "Acme",
         extras: &[("skills/linear/default_team_id", "default_team_id")],
+        consent_days: None,
     },
     Connector {
         id: "slack",
@@ -373,6 +394,7 @@ pub const CATALOG: &[Connector] = &[
         site: None,
         name_hint: "",
         extras: &[],
+        consent_days: None,
     },
     Connector {
         id: "datadog",
@@ -389,6 +411,7 @@ pub const CATALOG: &[Connector] = &[
         site: Some("site"),
         name_hint: "Production",
         extras: &[("skills/datadog/base_url", "base_url")],
+        consent_days: None,
     },
     Connector {
         id: "metabase",
@@ -412,6 +435,24 @@ pub const CATALOG: &[Connector] = &[
                 "access_client_secret",
             ),
         ],
+        consent_days: None,
+    },
+    Connector {
+        id: "bank",
+        name: "Bank",
+        about: "Your own bank accounts' balances and transactions, through BankSync. Read only: nothing can move money.",
+        sign_in: SignIn::Fields,
+        fields: BANK_FIELDS,
+        shared: false,
+        held: BANK_HELD,
+        primary: "skills/bank/api_key",
+        prefix: Some("skills/bank/workspaces/"),
+        subs: &["api_key", "bank", CONSENTED_AT],
+        primary_sub: "api_key",
+        site: Some("bank"),
+        name_hint: "NatWest",
+        extras: &[("skills/bank/consented_at", CONSENTED_AT)],
+        consent_days: Some(90),
     },
 ];
 

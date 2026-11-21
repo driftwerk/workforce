@@ -2850,7 +2850,11 @@ pub(crate) async fn spawn_know_how(
     let Some(person) = know_how_person(service, session, principal) else {
         return;
     };
-    if crate::turn_extraction::is_eval_channel(&session.channel) {
+    if crate::turn_extraction::is_eval_channel(&session.channel)
+        || invocations
+            .iter()
+            .any(|i| workforce_common::connector_binding::is_personal(&i.tool_name))
+    {
         return;
     }
     let kh = crate::know_how::KnowHow::shared(&service.config).await;
@@ -2948,7 +2952,9 @@ pub(crate) fn spawn_turn_extraction(
     response: &str,
     principal: &str,
 ) {
-    if crate::turn_extraction::is_eval_channel(&session.channel) {
+    if crate::turn_extraction::is_eval_channel(&session.channel)
+        || extraction::read_personal(session.messages.get(archive_base..).unwrap_or_default())
+    {
         return;
     }
     let mem = service.effective_memory();

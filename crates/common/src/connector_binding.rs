@@ -34,8 +34,13 @@ type Table = toml::map::Map<String, Value>;
 /// each agent's Connectors tab. Every other built-in adapter (`browser`,
 /// `xero`, …) is not chosen per agent and always reaches it.
 pub const CONNECTORS: &[&str] = &[
-    "github", "google", "email", "jira", "linear", "slack", "datadog", "metabase",
+    "github", "google", "email", "jira", "linear", "slack", "datadog", "metabase", "bank",
 ];
+
+/// The connectors that read a person's own private life (their bank): only
+/// ever in a Desk conversation, never remembered, and on automated work only
+/// where it names their tools.
+pub const PERSONAL: &[&str] = &["bank"];
 
 /// Where each connector keeps its instances, one connection each: every
 /// connector but Slack, which holds one.
@@ -47,13 +52,43 @@ pub const INSTANCE_PREFIXES: &[(&str, &str)] = &[
     ("linear", "skills/linear/workspaces/"),
     ("datadog", "skills/datadog/accounts/"),
     ("metabase", "skills/metabase/instances/"),
+    ("bank", "skills/bank/workspaces/"),
 ];
 
 /// The connectors whose tools resolve one instance per call
 /// (`environment::resolve_instance`), so one connection of theirs can be
 /// read only while another takes writes. Email's and Google's read only
 /// whole.
-pub const READ_ONLY_EACH: &[&str] = &["github", "jira", "linear", "datadog", "metabase"];
+pub const READ_ONLY_EACH: &[&str] = &["github", "jira", "linear", "datadog", "metabase", "bank"];
+
+/// Whether `tool` is one of a [`PERSONAL`] connector's.
+pub fn is_personal(tool: &str) -> bool {
+    connector_of(tool).is_some_and(|c| PERSONAL.contains(&c))
+}
+
+/// Whether vault `path` holds a [`PERSONAL`] connector's key (its flat one,
+/// or one of its instances'), at any tier, however it is spelled: never
+/// shown to an agent or put into a request, whatever the vault's redaction.
+pub fn is_personal_secret(path: &str) -> bool {
+    let segments: Vec<String> = path
+        .split('/')
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != ".")
+        .map(str::to_lowercase)
+        .collect();
+    let logical = match segments.first().map(String::as_str) {
+        Some("users") => segments.get(2..).unwrap_or_default(),
+        _ => &segments[..],
+    };
+    match logical {
+        [skills, connector, rest @ ..] if skills == "skills" && PERSONAL.contains(&connector.as_str()) => {
+            matches!(rest, [key] if key == "api_key")
+                || matches!(rest, [_, _, key] if key == "api_key")
+                || rest.iter().any(|s| s == "..")
+        }
+        _ => false,
+    }
+}
 
 /// Where `connector` keeps its instances.
 pub fn instance_prefix(connector: &str) -> Option<&'static str> {
@@ -384,6 +419,9 @@ const NAMED: &[(&str, bool)] = &[
     ("github.repo_labels", true),
     ("github.project_item_status", false),
     ("github.issue_labels", false),
+    ("bank.workspaces", true),
+    ("bank.balances", true),
+    ("bank.transactions", true),
 ];
 
 /// Whether connector `tool` only reads. Its name after the connector, split
@@ -407,6 +445,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_bank_s_keys_are_secret_at_every_tier_and_spelling() {
+        for key in [
+            "skills/bank/api_key",
+            "skills/bank/workspaces/natwest/api_key",
+            "users/ann/skills/bank/workspaces/revolut/api_key",
+            "Skills//Bank/./workspaces/natwest/API_KEY",
+            "skills/bank/workspaces/../api_key",
+        ] {
+            assert!(is_personal_secret(key), "{key}");
+        }
+        for not in [
+            "skills/bank/workspaces/natwest/bank",
+            "skills/bank/default_workspace",
+            "skills/linear/workspaces/acme/api_key",
+        ] {
+            assert!(!is_personal_secret(not), "{not}");
+        }
+    }
+
+    #[test]
+    fn a_bank_s_tools_are_personal_and_nothing_else_is() {
+        assert!(is_personal("bank.transactions"));
+        assert!(is_personal("bank.workspaces"));
+        for other in ["linear.issue_get", "bank", "banking.list", "memory.recall"] {
+            assert!(!is_personal(other), "{other}");
+        }
+    }
+
+    #[test]
     fn reads_and_writes_are_told_apart_and_what_is_unclear_is_a_write() {
         for read in [
             "linear.issue_get",
@@ -427,6 +494,10 @@ mod tests {
             "slack.lookup_user_by_email",
             "datadog.logs_search",
             "metabase.card_query",
+            "bank.workspaces",
+            "bank.accounts",
+            "bank.balances",
+            "bank.transactions",
         ] {
             assert!(is_read(read), "{read} reads");
         }

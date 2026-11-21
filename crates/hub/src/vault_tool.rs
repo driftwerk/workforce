@@ -89,7 +89,9 @@ impl RedactionPolicy {
     /// - `Some((redacted, true))` when redaction was applied.
     /// - `None` when `Deny` mode hides the value entirely.
     pub fn apply(&self, path: &str, value: String) -> Option<(String, bool)> {
-        let disclosure = if self.non_secret_paths.matches(path) {
+        let disclosure = if workforce_common::connector_binding::is_personal_secret(path) {
+            Disclosure::Denied
+        } else if self.non_secret_paths.matches(path) {
             Disclosure::Cleartext
         } else {
             match self.mode {
@@ -1778,6 +1780,22 @@ mod tests {
         let out = res.output;
         assert_eq!(out["value"], "supersecret-1234567890");
         assert_eq!(out["redacted"], false);
+    }
+
+    #[test]
+    fn a_bank_key_is_never_disclosed_in_any_redaction_mode() {
+        let path = "skills/bank/workspaces/natwest/api_key";
+        for mode in [
+            RedactionMode::Off,
+            RedactionMode::Redact,
+            RedactionMode::Deny,
+        ] {
+            let policy = RedactionPolicy::new(mode, Arc::new(PathMatcher::new([path.into()])));
+            assert_eq!(policy.apply(path, "bsk_x".repeat(8)), None, "{mode:?}");
+            assert!(policy
+                .apply("skills/bank/workspaces/natwest/bank", "NatWest".into())
+                .is_some());
+        }
     }
 
     #[tokio::test]

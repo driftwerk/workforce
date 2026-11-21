@@ -143,6 +143,9 @@ pub fn compose_tool_access(
             .chain(databases)
             .chain(std::iter::once(environments))
             .chain(connectors)
+            .chain(std::iter::once(
+                Arc::new(crate::personal_access::PersonalDataAccess) as Arc<dyn ToolAccess>
+            ))
             .collect(),
     ))
 }

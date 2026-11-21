@@ -29,6 +29,7 @@ pub struct Services {
     pub slack_api: String,
     /// `None`: `https://api.{site}`.
     pub datadog_api: Option<String>,
+    pub bank_api: String,
     pub google_token: String,
     pub google_userinfo: String,
     /// The shortest wait between two polls of a device sign-in.
@@ -53,6 +54,7 @@ impl Services {
             linear_api: "https://api.linear.app".into(),
             slack_api: "https://slack.com/api".into(),
             datadog_api: None,
+            bank_api: workforce_skills::adapters::bank::banksync::API.into(),
             google_token: workforce_skills::adapters::google::oauth::TOKEN_URL.into(),
             google_userinfo: workforce_skills::adapters::google::oauth::USERINFO_URL.into(),
             poll_floor: Duration::from_secs(5),
@@ -296,8 +298,37 @@ impl Services {
                 }
             }
             "email" => check_mailbox(f).await,
+            "bank" => self.bank(f).await,
             other => Found::Failed(format!("{other} can't be tested")),
         })
+    }
+
+    /// Whether a BankSync key only reads, and the bank it names is connected
+    /// with its approval standing: the bank's name.
+    async fn bank(&self, f: &Fields) -> Found {
+        use workforce_skills::adapters::bank::model::BankError;
+        match workforce_skills::adapters::bank::banksync::check(
+            field(f, "api_key"),
+            field(f, "bank"),
+            &self.bank_api,
+        )
+        .await
+        {
+            Ok(c) if c.connected => Found::Works { account: c.bank },
+            Ok(c) => Found::Refused(format!(
+                "{}'s approval has lapsed in BankSync: the person renews it there, then presses Reconnect",
+                c.bank
+            )),
+            Err(
+                e @ (BankError::Revoked
+                | BankError::ScopeMissing
+                | BankError::NotReadOnly
+                | BankError::NeedsReconnect
+                | BankError::Invalid(_)
+                | BankError::NotConfigured(_)),
+            ) => Found::Refused(e.to_string()),
+            Err(e) => Found::Failed(e.to_string()),
+        }
     }
 
     /// GitHub's `GET /user` with `token`.
