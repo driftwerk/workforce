@@ -91,7 +91,64 @@ pub fn check_target(target: &str) -> Result<(), String> {
     }
 }
 
-/// Checks a project's or repository's `owner/repo` for new tickets.
+/// The quiet read that says whether one of a person's GitHub connections
+/// reaches what a link names: its project, its repository, else the
+/// projects of the owner asked for. `None`: nothing named yet.
+pub fn reach_probe(target: Option<&str>, owner: Option<&str>) -> Option<(&'static str, Value)> {
+    match target.and_then(target_of) {
+        Some(Target::Project { owner, number }) => Some((
+            "github.project_get",
+            json!({ "owner": owner, "number": number }),
+        )),
+        Some(Target::Repo { owner, repo }) => Some((
+            "github.repo_labels",
+            json!({ "owner": owner, "repo": repo }),
+        )),
+        None => owner
+            .filter(|o| login_ok(o))
+            .map(|o| ("github.projects_list", json!({ "owner": o }))),
+    }
+}
+
+/// Whether `answer` to [`reach_probe`]'s `tool` says the connection reaches
+/// it: any answer for a project or repository, at least one project for
+/// an owner (an owner's empty list reads alike to every key).
+pub fn reached(tool: &str, answer: &Value) -> bool {
+    tool != "github.projects_list" || answer["projects"].as_array().is_some_and(|p| !p.is_empty())
+}
+
+/// Which of a person's several GitHub connections a link goes through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Connection {
+    Use(String),
+    /// More than one reaches it and neither the one asked for nor the
+    /// default does: the person picks among these.
+    Ask(Vec<String>),
+}
+
+/// The connection asked for when it reaches what the link names (in
+/// `reaching`), else the default when it does, else the only one that
+/// does; with several and neither, the person picks. None reaching: the
+/// one asked for or the default, so GitHub's own answer says why.
+pub fn connection(
+    asked: Option<&str>,
+    default: Option<&str>,
+    reaching: &[String],
+) -> Option<Connection> {
+    let reaches = |n: &&str| reaching.iter().any(|r| r == n);
+    let named = |n: &str| Connection::Use(n.to_string());
+    asked
+        .filter(reaches)
+        .or_else(|| default.filter(reaches))
+        .map(named)
+        .or_else(|| match reaching {
+            [] => asked.or(default).map(named),
+            [one] => Some(named(one)),
+            several => Some(Connection::Ask(several.to_vec())),
+        })
+}
+
+/// Checks a project's or repository's `owner/repo` for new tickets./// Checks a project's or repository's `owner/repo` for new tickets.
 pub fn check_repo(repo: &str) -> Result<(), String> {
     match target_of(repo) {
         Some(Target::Repo { .. }) => Ok(()),

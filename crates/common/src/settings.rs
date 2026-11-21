@@ -9721,6 +9721,7 @@ impl RemoteMcpConfig {
         "github.issue_labels",
         "github.issue_comment",
         "github.viewer",
+        "github.workspaces",
         "github.projects_list",
         "github.list_repos",
         "github.repo_labels",

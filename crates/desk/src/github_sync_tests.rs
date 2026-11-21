@@ -478,3 +478,70 @@ fn states_come_from_status_options_or_open_closed_and_labels() {
         Some("Closed")
     );
 }
+
+/// A case of [`connection`]: asked, default, reaching, and the answer.
+type ConnectionCase<'a> = (
+    Option<&'a str>,
+    Option<&'a str>,
+    &'a [&'a str],
+    Option<Connection>,
+);
+
+#[test]
+fn a_link_s_connection_is_the_one_that_reaches_what_it_names() {
+    let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let used = |n: &str| Some(Connection::Use(n.to_string()));
+    let cases: &[ConnectionCase] = &[
+        (Some("b"), Some("a"), &["a", "b"], used("b")),
+        (Some("c"), Some("a"), &["a", "b"], used("a")),
+        (None, Some("a"), &["a", "b"], used("a")),
+        (None, Some("a"), &["b"], used("b")),
+        (Some("a"), Some("a"), &["b"], used("b")),
+        (
+            None,
+            Some("a"),
+            &["b", "c"],
+            Some(Connection::Ask(names(&["b", "c"]))),
+        ),
+        (Some("c"), Some("a"), &[], used("c")),
+        (None, Some("a"), &[], used("a")),
+        (None, None, &[], None),
+    ];
+    for (asked, default, reaching, want) in cases {
+        assert_eq!(
+            &connection(*asked, *default, &names(reaching)),
+            want,
+            "asked {asked:?}, default {default:?}, reaching {reaching:?}"
+        );
+    }
+}
+
+#[test]
+fn what_a_link_names_is_reached_by_its_own_read() {
+    assert_eq!(
+        reach_probe(Some("acme/projects/7"), Some("other")),
+        Some((
+            "github.project_get",
+            json!({ "owner": "acme", "number": 7 })
+        ))
+    );
+    assert_eq!(
+        reach_probe(Some("acme/web"), None),
+        Some((
+            "github.repo_labels",
+            json!({ "owner": "acme", "repo": "web" })
+        ))
+    );
+    assert_eq!(
+        reach_probe(None, Some("acme")),
+        Some(("github.projects_list", json!({ "owner": "acme" })))
+    );
+    assert_eq!(reach_probe(None, Some("-bad")), None);
+    assert_eq!(reach_probe(None, None), None);
+    assert!(reached("github.project_get", &json!({})));
+    assert!(reached(
+        "github.projects_list",
+        &json!({ "projects": [{ "number": 1 }] })
+    ));
+    assert!(!reached("github.projects_list", &json!({ "projects": [] })));
+}

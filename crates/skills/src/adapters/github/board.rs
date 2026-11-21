@@ -333,6 +333,49 @@ fn str_list(input: &Value, key: &str) -> Result<Vec<String>> {
     }
 }
 
+// ── github.workspaces ────────────────────────────────────────────
+
+/// `github.workspaces`: the caller's GitHub connections by name (never a
+/// key), and the one a call naming none goes to, so a program (Desk's
+/// board link) with several picks one.
+pub struct GithubWorkspacesTool {
+    clients: Arc<LiveInstances<GithubClient>>,
+    default_workspace: String,
+}
+
+impl GithubWorkspacesTool {
+    pub fn new(clients: Arc<LiveInstances<GithubClient>>, default_workspace: String) -> Self {
+        Self {
+            clients,
+            default_workspace,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for GithubWorkspacesTool {
+    fn name(&self) -> &str {
+        "github.workspaces"
+    }
+
+    fn description(&self) -> &str {
+        "The GitHub connections you can use, by name, as {workspaces, default}: default is the one a call without `workspace` goes to, or null when you must pass one. Takes no arguments."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object", "properties": {}, "required": [] })
+    }
+
+    async fn execute(&self, _input: Value) -> Result<ToolResult> {
+        let start = std::time::Instant::now();
+        let (clients, default) = self.clients.for_caller_or(&self.default_workspace);
+        Ok(ToolResult::success(
+            crate::adapters::utils::workspaces_answer(&clients, &default),
+            start.elapsed().as_millis() as u64,
+        ))
+    }
+}
+
 // ── github.viewer ────────────────────────────────────────────────
 
 board_tool!(
@@ -1099,6 +1142,28 @@ mod tests {
             "default".to_string(),
             Some("acme".to_string()),
         )
+    }
+
+    #[tokio::test]
+    async fn workspaces_names_the_connections_and_the_default() {
+        let server = MockServer::start().await;
+        let client = Arc::new(GithubClient::new("ghp_test", &server.uri()).unwrap());
+        let clients = Arc::new(LiveInstances::from(HashMap::from([
+            ("mantis".to_string(), Arc::clone(&client)),
+            ("driftwerk".to_string(), client),
+        ])));
+        let out = GithubWorkspacesTool::new(clients, "mantis".into())
+            .execute(json!({}))
+            .await
+            .unwrap();
+        assert!(out.success);
+        assert_eq!(
+            out.output,
+            json!({ "workspaces": ["driftwerk", "mantis"], "default": "mantis" })
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert!(super::super::GithubSkill::tool_names().contains(&"github.workspaces"));
+        assert!(super::super::READ_TOOLS.contains(&"github.workspaces"));
     }
 
     async fn graphql_answers(server: &MockServer, partial: Value, body: Value) {
