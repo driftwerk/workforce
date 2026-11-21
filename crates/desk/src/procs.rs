@@ -107,6 +107,30 @@ pub async fn table() -> Option<Vec<Proc>> {
         .then(|| parse(&String::from_utf8_lossy(&out.stdout)))
 }
 
+/// The processes in process group `group`, as `ps` lists them now.
+pub async fn in_group(group: u32) -> Vec<u32> {
+    let out = tokio::process::Command::new("ps")
+        .args(["-A", "-o", "pid=,pgid="])
+        .kill_on_drop(true)
+        .output()
+        .await;
+    out.ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|l| {
+                    let mut f = l.split_whitespace().map(|w| w.parse::<u32>().ok());
+                    match (f.next().flatten(), f.next().flatten()) {
+                        (Some(pid), Some(g)) if g == group => Some(pid),
+                        _ => None,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// How long `ps` is waited on for one process's start.
 #[cfg(not(target_os = "linux"))]
 const PS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);

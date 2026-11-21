@@ -281,35 +281,6 @@ async fn a_session_forgotten_while_its_folder_installs_is_never_told() {
     .await;
 }
 
-#[tokio::test]
-async fn a_start_that_doesnt_vouch_for_its_folder_installs_nothing_there() {
-    with_test_pool(build_pool, |pool| async move {
-        let h = Home::new();
-        let d = h.desk(pool).await;
-        let work = h.project("mantis");
-        let a = d
-            .start_session(
-                start("MAN-1", &work),
-                None,
-                None,
-                Some(By::you()),
-                false,
-                true,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            a.deps,
-            Some(Deps::Left {
-                why: crate::deps::UNVOUCHED.into()
-            })
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(h.runs(), 0);
-    })
-    .await;
-}
-
 #[test]
 fn what_a_session_was_told_of_its_folder_leaves_its_card_once_a_later_turn_ends() {
     let command = "npm ci".to_string();
@@ -345,6 +316,46 @@ fn what_a_session_was_told_of_its_folder_leaves_its_card_once_a_later_turn_ends(
         true
     ));
     assert!(!st.deps.contains_key(&id));
+    // Failed mid-turn: that turn's end leaves it, and so does a prompt that
+    // reached it otherwise (typed while it was busy); a turn prompted and
+    // ended in one change clears it.
+    let failed = |st: &mut State| {
+        st.deps.insert(
+            id,
+            Kept::new(Deps::Failed {
+                command: "npm ci".into(),
+                why: "x".into(),
+            }),
+        )
+    };
+    failed(&mut st);
+    for t in [
+        Transition::Finished { reply: said },
+        Transition::Spoke { prompt },
+    ] {
+        assert!(!Desk::deps_read(&mut st, id, &[t], true));
+    }
+    assert!(st.deps.contains_key(&id));
+    assert!(Desk::deps_read(
+        &mut st,
+        id,
+        &[
+            Transition::Prompted { prompt },
+            Transition::Finished { reply: said }
+        ],
+        true
+    ));
+    assert!(!st.deps.contains_key(&id));
+    // One left at a start is read once its first turn ends.
+    st.deps
+        .insert(id, Kept::new(Deps::Left { why: "x".into() }));
+    assert!(!Desk::deps_read(&mut st, id, &[Transition::Started], false));
+    assert!(Desk::deps_read(
+        &mut st,
+        id,
+        &[Transition::Finished { reply: said }],
+        true
+    ));
     // One installing stays whatever its turns.
     st.deps.insert(
         id,
@@ -399,6 +410,50 @@ async fn a_desk_started_again_looks_again_at_the_folders_it_was_installing() {
         h.go();
         until(|| matches!(deps_of(&again, a.id), Some(Deps::Installed { .. }))).await;
         told(&again, a.id, installed).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_install_left_running_is_ended_though_its_folder_is_current_by_the_next_start() {
+    with_test_pool(build_pool, |pool| async move {
+        let h = Home::new();
+        let d = h.desk(pool.clone()).await;
+        let work = h.project("mantis");
+        let a = d.create_chosen(start("MAN-1", &work), true).await.unwrap();
+        until(|| h.runs() == 1).await;
+        let running = crate::deps::running_in(&h.home.join("run"), &work);
+        let mut pid = None;
+        for _ in 0..500 {
+            pid = std::fs::read_to_string(&running)
+                .ok()
+                .and_then(|k| k.split_whitespace().next()?.parse::<u32>().ok());
+            if pid.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let pid = pid.expect("the install's process is kept");
+        // Installed by hand meanwhile: pnpm's own state, newer than the lockfile.
+        std::fs::create_dir_all(work.join("node_modules")).unwrap();
+        std::fs::write(work.join("node_modules/.modules.yaml"), "").unwrap();
+        let again = h.desk(pool).await;
+        until(|| matches!(deps_of(&again, a.id), Some(Deps::Installed { .. }))).await;
+        told(&again, a.id, |t| {
+            t.starts_with("This folder's dependencies are installed")
+        })
+        .await;
+        let mut ended = false;
+        for _ in 0..500 {
+            if crate::procs::started_at(pid).await.is_none() {
+                ended = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(ended, "the install left running was ended");
+        assert_eq!(h.runs(), 1, "nothing installed again");
+        drop(d);
     })
     .await;
 }

@@ -3549,8 +3549,8 @@ impl Desk {
     }
 
     /// Starts `new`; `deps`: its folder's dependencies are installed as it
-    /// starts ([`crate::deps`]), where a boss's plan or the person's choice
-    /// of folder vouches for it.
+    /// starts ([`crate::deps`]): a plan's ticket, its folder vouched for by
+    /// the plan's approval, or a folder the person chose.
     async fn start_session(
         &self,
         new: NewSession,
@@ -3672,9 +3672,7 @@ impl Desk {
         let ready = match deps {
             true => {
                 let at = deps::canonical(&cwd).await;
-                deps::found(at.clone(), folder_chosen || boss.is_some())
-                    .await
-                    .map(|f| (at, f))
+                deps::found(at.clone()).await.map(|f| (at, f))
             }
             false => None,
         };

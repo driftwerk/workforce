@@ -11,8 +11,9 @@
 //!   are shared by every folder it installs into.
 //! - **The repository's own code:** an install runs what the repository
 //!   says it runs (its packages' install scripts, its `.npmrc`, a pnpmfile,
-//!   Berry's `yarnPath` and plugins), so Desk runs one only in a folder its
-//!   session's start vouches for.
+//!   Berry's `yarnPath` and plugins), so Desk runs one only for a start
+//!   that asks: a plan's ticket, its folder vouched for by the plan's
+//!   approval, or a folder the person chose.
 //! - **Read with care:** `package.json` and the lockfile are read only as
 //!   plain files in the folder, never through a link, and only so much.
 //! - **Once:** a folder whose install is current is left as it is: Desk's
@@ -36,10 +37,6 @@ use crate::run::Ran;
 
 /// How long one install may take.
 pub const INSTALL_FOR: Duration = Duration::from_secs(15 * 60);
-/// Why Desk installs nothing in a folder its session's start doesn't vouch
-/// for.
-pub const UNVOUCHED: &str =
-    "Desk installs them only in a folder it made for this ticket or one the person chose, and this is neither";
 /// The folder Desk keeps its stamp in, whichever the tool.
 const STATE: &str = "node_modules";
 /// Desk's stamp of the install it made.
@@ -197,14 +194,23 @@ impl Install {
             return false;
         }
         let modified = |p: &Path| std::fs::symlink_metadata(p).and_then(|m| m.modified()).ok();
-        match read_in(&dir.join(STATE), STAMP, 4096) {
-            Ok(Some(had)) => had == self.print.as_bytes(),
-            Ok(None) => self.tool.marker().is_some_and(|m| {
+        // The tool's own state, made no earlier than the lockfile, and after
+        // `since` when given.
+        let marked = |since: Option<std::time::SystemTime>| {
+            self.tool.marker().is_some_and(|m| {
                 modified(&dir.join(m))
                     .zip(modified(&dir.join(self.lock)))
-                    .is_some_and(|(made, locked)| made >= locked)
-            }),
-            Err(_) => false,
+                    .is_some_and(|(made, locked)| made >= locked && since.is_none_or(|s| made > s))
+            })
+        };
+        let stamp = dir.join(STATE).join(STAMP);
+        match read_in(&dir.join(STATE), STAMP, 4096) {
+            Ok(Some(had)) if had == self.print.as_bytes() => true,
+            Ok(Some(had)) if had == FAILED.as_bytes() => {
+                modified(&stamp).is_some_and(|failed| marked(Some(failed)))
+            }
+            Ok(Some(_)) | Err(_) => false,
+            Ok(None) => marked(None),
         }
     }
 }
@@ -248,17 +254,6 @@ pub enum Found {
     Stale(Install),
     /// Desk installs nothing there: why.
     Left(String),
-}
-
-impl Found {
-    /// As a start that doesn't vouch for its folder takes it: one current
-    /// stays so; nothing is installed.
-    pub fn unvouched(self) -> Self {
-        match self {
-            Self::Stale(_) => Self::Left(UNVOUCHED.into()),
-            f => f,
-        }
-    }
 }
 
 /// What Desk found of `dir`'s dependencies; none when it has no
@@ -489,58 +484,84 @@ pub async fn install(
         }
         Ran::Refused { why } | Ran::NeedsPerson { why } => Err(why),
     };
-    stamp(
-        dir,
-        match &ended {
-            Ok(()) => &i.print,
-            Err(_) => FAILED,
-        },
-    )
-    .await;
+    match &ended {
+        Ok(()) => stamp(dir, &i.print, true).await,
+        Err(_) => stamp(dir, FAILED, false).await,
+    }
     ended
 }
 
-/// Ends the install `running` says is still running from before, when the
-/// process it names is still the one that started then.
-async fn end_left(running: &Path) {
+/// Ends the install `running` says a stopped Desk left running: its
+/// process group, when its leader is still the process that began then, or,
+/// with its leader gone, when one of the group still in it began since. One
+/// Desk can't tell is that install is left, and said so.
+pub async fn end_left(running: &Path) {
     let Ok(kept) = tokio::fs::read_to_string(running).await else {
         return;
     };
     let _ = tokio::fs::remove_file(running).await;
     let mut words = kept.split_whitespace();
-    let Some(pid) = words.next().and_then(|p| p.parse::<u32>().ok()) else {
+    let Some((group, pgid)) = words
+        .next()
+        .and_then(|p| p.parse::<u32>().ok())
+        .and_then(|p| i32::try_from(p).ok().filter(|g| *g > 1).map(|g| (p, g)))
+    else {
         return;
     };
     let then = words
         .next()
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
-    let now = crate::procs::started_at(pid).await;
-    let same = then
-        .zip(now)
-        .is_some_and(|(t, n)| (n - t.to_utc()).num_seconds().abs() <= 2);
-    if let (true, Ok(group)) = (same, i32::try_from(pid)) {
-        tracing::info!(pid, "an install a stopped Desk left running is ended");
-        // SAFETY: killpg only signals the group the install made, still
-        // the process that started then.
-        unsafe {
-            libc::killpg(group, libc::SIGKILL);
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.to_utc());
+    // Started then, or since, to the second either reading has.
+    let since = |at: chrono::DateTime<chrono::Utc>, t: chrono::DateTime<chrono::Utc>| {
+        (at - t).num_seconds() >= -2
+    };
+    let ours = match (then, crate::procs::started_at(group).await) {
+        (Some(t), Some(leader)) => (leader - t).num_seconds().abs() <= 2,
+        (Some(t), None) => {
+            let mut members = Vec::new();
+            for pid in crate::procs::in_group(group).await {
+                if let Some(at) = crate::procs::started_at(pid).await {
+                    members.push((pid, at));
+                }
+            }
+            members.into_iter().any(|(pid, at)| {
+                since(at, t)
+                    && i32::try_from(pid).is_ok_and(|p| {
+                        // SAFETY: getpgid only reads a process's group.
+                        let now = unsafe { libc::getpgid(p) };
+                        now == pgid
+                    })
+            })
         }
+        (None, _) => false,
+    };
+    if ours {
+        tracing::info!(group, "an install a stopped Desk left running is ended");
+        // SAFETY: killpg only signals the group the install made, still its
+        // own as checked just now.
+        unsafe {
+            libc::killpg(pgid, libc::SIGKILL);
+        }
+    // SAFETY: signal 0 only asks whether the group is there.
+    } else if unsafe { libc::killpg(pgid, 0) } == 0 {
+        tracing::warn!(group, "a process group where an install a stopped Desk left was running isn't ended: Desk can't tell it is that install");
     }
 }
 
 /// Desk's stamp in `dir`, saying `what`: written beside the stamp and moved
 /// over it, so a link there is replaced, never written through; never in a
-/// `node_modules` that is a link.
-async fn stamp(dir: &Path, what: &str) {
+/// `node_modules` that is a link, nor in one there isn't unless `make`.
+async fn stamp(dir: &Path, what: &str, make: bool) {
     let state = dir.join(STATE);
     match tokio::fs::symlink_metadata(&state).await {
         Ok(m) if m.is_dir() => {}
-        Ok(_) => return,
-        Err(_) => {
+        Err(_) if make => {
             if tokio::fs::create_dir(&state).await.is_err() {
                 return;
             }
         }
+        Ok(_) | Err(_) => return,
     }
     let part = state.join(format!("{STAMP}.{}", uuid::Uuid::new_v4().simple()));
     let written = async {
@@ -619,7 +640,13 @@ const FAILURES: &[(&[&str], &[&str], &str)] = &[
         "this machine's node isn't a version the repository supports",
     ),
     (
-        &["ELIFECYCLE", "ERR_PNPM_LIFECYCLE", "YN0009"],
+        &[
+            "ELIFECYCLE",
+            "ERR_PNPM_LIFECYCLE",
+            "YN0009",
+            "npm error command failed",
+            "npm ERR! command failed",
+        ],
         &["lifecycle script"],
         "one of its packages' install scripts failed",
     ),

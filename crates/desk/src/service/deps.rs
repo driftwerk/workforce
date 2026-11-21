@@ -37,20 +37,15 @@ impl Kept {
 }
 
 /// What a folder's dependencies are, as Desk finds them in `dir`, read off
-/// the runtime's threads; `vouched`: the start vouches for the folder, so
-/// Desk may install there.
-pub(super) async fn found(dir: PathBuf, vouched: bool) -> Option<Found> {
-    let found = tokio::task::spawn_blocking(move || crate::deps::found(&dir))
+/// the runtime's threads.
+pub(super) async fn found(dir: PathBuf) -> Option<Found> {
+    tokio::task::spawn_blocking(move || crate::deps::found(&dir))
         .await
         .unwrap_or_else(|e| {
             Some(Found::Left(format!(
                 "Desk couldn't look at its package.json: {e}"
             )))
-        });
-    found.map(|f| match vouched {
-        true => f,
-        false => f.unvouched(),
-    })
+        })
 }
 
 /// `dir` as one name for it, whichever path reached it.
@@ -192,7 +187,8 @@ impl Desk {
                 continue;
             }
             let dir = PathBuf::from(dir);
-            let Some(found) = found(dir.clone(), true).await else {
+            crate::deps::end_left(&crate::deps::running_in(&self.0.opts.run_dir, &dir)).await;
+            let Some(found) = found(dir.clone()).await else {
                 continue;
             };
             let by = By::desk("Desk looked at the folder's dependencies again as it started.");
@@ -207,8 +203,9 @@ impl Desk {
     }
 
     /// Whether `id`'s failed or left dependencies, said, are read: a turn
-    /// that began after they were said has ended (`turn_over`), and they
-    /// leave its card.
+    /// begun after they were said (one prompted, or its first) has ended
+    /// (`turn_over`), and they leave its card. A turn begun and ended in
+    /// one change counts.
     pub(super) fn deps_read(
         st: &mut State,
         id: Uuid,
@@ -218,17 +215,14 @@ impl Desk {
         let Some(kept) = st.deps.get_mut(&id).filter(|k| k.deps.said_only()) else {
             return false;
         };
-        if kept.turned && turn_over {
+        kept.turned |= transitions
+            .iter()
+            .any(|t| matches!(t, Transition::Started | Transition::Prompted { .. }));
+        let read = kept.turned && turn_over;
+        if read {
             st.deps.remove(&id);
-            return true;
         }
-        kept.turned |= transitions.iter().any(|t| {
-            matches!(
-                t,
-                Transition::Started | Transition::Prompted { .. } | Transition::Spoke { .. }
-            )
-        });
-        false
+        read
     }
 }
 
