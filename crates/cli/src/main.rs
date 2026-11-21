@@ -1955,6 +1955,25 @@ enum CompareCommand {
         #[command(flatten)]
         args: CompareArgs,
     },
+    /// Check 4, on the serving node before a switch: a run's same queries
+    /// asked again. (a), the gate: each one's saved vector must find the
+    /// run's top 10, the order differing only between near-equal scores.
+    /// (b), advisory: each one's text, whose mean top-10 overlap with the
+    /// run's passes at 0.95, warns from 0.90 and fails below. The run's
+    /// SHA256SUMS and its embedding are checked before any request. It
+    /// writes to no store, never writes over --out, and exits non-zero on
+    /// a failure, whose result is still written.
+    Same {
+        /// Workforce config file (reads `[vellev]`).
+        #[arg(short, long, default_value = "workforce.toml")]
+        config: PathBuf,
+        /// The directory a `code compare run` wrote.
+        #[arg(long)]
+        run: PathBuf,
+        /// The JSON file the result goes to; it must not exist.
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 #[derive(clap::Args, Debug, Clone, PartialEq)]
@@ -12139,6 +12158,21 @@ Describe what you should do in this step and what to discuss with the user.
                 style("✓").green().bold()
             );
         }
+        Commands::Code {
+            command:
+                CodeCommand::Compare {
+                    command: CompareCommand::Same { config, run, out },
+                },
+        } => {
+            let wf_config = workforce_common::settings::WorkforceConfig::load(&config)?;
+            let checked = workforce_hub::code_compare::same_as_run(&wf_config, &run, &out).await?;
+            println!("{checked}");
+            checked.passed()?;
+            println!(
+                "{} the node answers the run's same queries as the run",
+                style("✓").green().bold()
+            );
+        }
         Commands::Permissions { command } => {
             handle_permissions_command(command).await?;
         }
@@ -13614,6 +13648,51 @@ mod tests {
                 "0",
             ];
             assert!(Cli::try_parse_from(asked).is_err(), "{none} 0");
+        }
+    }
+
+    #[test]
+    fn the_same_check_is_its_own_command() {
+        let cli = Cli::try_parse_from([
+            "workforce",
+            "code",
+            "compare",
+            "same",
+            "--run",
+            "runs/one",
+            "--out",
+            "same.json",
+        ])
+        .unwrap();
+        let Commands::Code {
+            command:
+                CodeCommand::Compare {
+                    command: CompareCommand::Same { config, run, out },
+                },
+        } = cli.command
+        else {
+            panic!("the compare same command");
+        };
+        assert_eq!(
+            (config, run, out),
+            (
+                PathBuf::from("workforce.toml"),
+                PathBuf::from("runs/one"),
+                PathBuf::from("same.json")
+            )
+        );
+        for missing in ["--run", "--out"] {
+            let asked: Vec<&str> = ["workforce", "code", "compare", "same"]
+                .into_iter()
+                .chain(
+                    ["--run", "runs/one", "--out", "same.json"]
+                        .chunks(2)
+                        .filter(|pair| pair[0] != missing)
+                        .flatten()
+                        .copied(),
+                )
+                .collect();
+            assert!(Cli::try_parse_from(asked).is_err(), "without {missing}");
         }
     }
 
