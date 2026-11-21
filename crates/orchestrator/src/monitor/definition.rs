@@ -483,7 +483,8 @@ pub enum Action {
     },
     /// Run a one-shot agent turn for the matching message and deliver its reply
     /// to `deliver_to` (a `#channel` id or `@user` DM; with `surface = "desk"`,
-    /// `"dm"`, the default, or `"notice"`).
+    /// `"dm"`, the default, or `"notice"`). The turn reads and delivers; `tools`
+    /// names anything more it may use, as a scheduled job's `tools` does.
     AgentTask {
         #[serde(default)]
         agent: Option<String>,
@@ -492,6 +493,8 @@ pub enum Action {
         deliver_to: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         surface: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tools: Vec<String>,
     },
     /// Bind `agent` to converse in the watched channel with `prompt` as a
     /// channel-scoped system prompt (response mode defaults to `all`). A standing
@@ -866,10 +869,16 @@ impl MonitorDefinition {
                 prompt,
                 deliver_to,
                 surface,
+                tools,
                 ..
             } => {
                 if prompt.trim().is_empty() {
                     return Err(needs("a prompt"));
+                }
+                if tools.iter().any(|tool| tool.trim().is_empty()) {
+                    return Err(eyre::eyre!(
+                        "Monitor '{id}' agent_task tools has an empty entry: name each tool or namespace"
+                    ));
                 }
                 if surface.as_deref() == Some(SURFACE_DESK) {
                     return Self::validate_desk_target(id, Some(deliver_to));

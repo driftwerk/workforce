@@ -118,10 +118,19 @@ workflow = "release-note"
 - **`agent_task`** runs a one-shot agent turn per matching message or observation and
   has the agent post its own result to `deliver_to` (a channel id or an `@user` DM).
   `prompt` is your instruction, with the placeholders filled in it, and `agent` and
-  (on a source monitor) `surface` are optional. Unless your prompt already inlines the
-  content with `{{text}}`, it is appended in a fenced block labelled as data to process
-  rather than as instructions — so an agent will still refuse content that reads as an
-  attempt to redirect it.
+  (on a source monitor) `surface` are optional. What the message or item said is
+  outside content: wherever a placeholder puts it (`{{text}}`, `{{value}}`,
+  `{{previous}}`, `{{json:…}}`, an item's `{{id}}`) it goes in fenced and labelled as
+  data, and when your prompt puts none of it in, the whole event is appended that way,
+  with who it came from inside the fence.
+  The turn reads and delivers, and nothing more: it gets read-only tools (mail,
+  messages, files, knowledge, and every connected service's reads) and, unless it
+  tells you in Desk, `messaging.send` to its own `deliver_to`. Anything else it needs
+  you name in `tools`, as a scheduled job's — a tool (`email.move`) or a namespace
+  (`linear`). While it runs, a call that would send somewhere other than `deliver_to`,
+  reach the vault, change the agent's setup, or save a monitor, job, workflow or email
+  rule is refused unless `tools` names it, and you are told what was refused where the
+  monitor delivers.
 - **`persona`** is not a per-message action at all: it binds `agent` to converse in
   the watched channel with `prompt` as a channel-scoped system prompt, for as long as
   the monitor is enabled. `mode` is `all` (the default), `mention_only` or `quiet`. A

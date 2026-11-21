@@ -390,6 +390,20 @@ pub enum TriggerSource {
     },
 }
 
+impl TriggerSource {
+    /// What started a run whose payload is outside content — a webhook, an
+    /// HTTP call or a monitor's event — named for the fence around it; `None`
+    /// for a run a person, a hand-off or another run started.
+    pub fn outside(&self) -> Option<String> {
+        match self {
+            Self::Webhook { source, .. } => Some(format!("a webhook from {source}")),
+            Self::Http { id } => Some(format!("an HTTP call to {id}")),
+            Self::Monitor { monitor_id } => Some(format!("monitor {monitor_id}")),
+            Self::Cli | Self::Handoff { .. } | Self::Api | Self::Workflow { .. } => None,
+        }
+    }
+}
+
 /// The first prior step output called `name`, if any step produced one.
 pub fn step_output<'a>(variables: &'a serde_json::Value, name: &str) -> Option<&'a str> {
     variables

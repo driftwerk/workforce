@@ -852,6 +852,7 @@ input = { gmail_id = "{{id}}", subject = "{{json:/snippet}}" }
 # prompt = "Summarise this and tell the user what changed."
 # deliver_to = "@U123"             # channel id or @user DM
 # surface = "slack"                # as for notify
+# tools = ["email.move"]           # optional: anything beyond reading and posting to deliver_to
 # --- tell the person in Desk (only on a hub that runs Desk; a server hub refuses it) ---
 # type = "notify"                  # or agent_task, whose answer is what they read
 # surface = "desk"

@@ -8,6 +8,7 @@ pub(crate) mod desk;
 pub mod engine;
 pub mod invoke;
 pub mod runtime;
+pub(crate) mod scope;
 pub mod tool;
 mod wire;
 

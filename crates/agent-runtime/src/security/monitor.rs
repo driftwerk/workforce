@@ -1,104 +1,85 @@
-//! Post-execution behavioural anomaly monitor.
+//! The guard a turn runs under once outside content has entered it.
 //!
-//! Tracks tool usage patterns after untrusted content is processed and flags
-//! suspicious sequences: data exfiltration, identity tampering, privilege
-//! escalation, and credential access.
+//! An email body, a fetched page, a webhook payload or a watched message is
+//! fenced as data, but a model can still be talked into acting on it. From the
+//! moment such content enters a turn until the turn ends, a call that would
+//! carry data somewhere the turn doesn't deliver, reach credentials, change
+//! the agent's own setup or standing automation, or rewrite its identity is
+//! held before it runs: asked about where someone can answer, refused where
+//! the turn's scope says so, and the person told why either way.
 
-use std::collections::VecDeque;
-use std::time::Instant;
+use std::sync::Mutex;
 
+use serde_json::Value;
 use tracing::warn;
 
-// ─── Anomaly Signals ─────────────────────────────────────────────────────────
+use crate::tools::{Destination, SurfaceEffect};
 
-/// A detected anomalous behaviour.
-#[derive(Debug, Clone)]
+/// How every fence of outside content opens ([`super::external_content`]).
+/// Content inside a fence has its `<<<` defanged, so only a real fence reads
+/// as one.
+pub const FENCE_MARK: &str = "<<<EXTERNAL_UNTRUSTED_CONTENT_";
+
+/// A call the guard holds, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnomalySignal {
-    /// File read followed by outbound message — potential data leak.
-    DataExfiltration {
-        read_tool: String,
-        send_tool: String,
-    },
-    /// Write or modification of identity files.
-    IdentityTampering { file: String },
-    /// Access to system or policy administration tools.
-    PrivilegeEscalation { tool: String },
-    /// Access to vault or credential storage.
+    Exfiltration { tool: String, to: String },
     CredentialAccess { tool: String },
-    /// Unusual tool sequence not seen in normal operation.
-    UnusualToolSequence { tools: Vec<String> },
+    PrivilegeEscalation { tool: String },
+    RuleCreation { tool: String, action: String },
+    IdentityTampering { tool: String, file: String },
 }
 
 impl AnomalySignal {
-    /// Risk weight for this signal type.
-    pub fn weight(&self) -> f64 {
+    pub fn tool(&self) -> &str {
         match self {
-            AnomalySignal::DataExfiltration { .. } => 0.5,
-            AnomalySignal::IdentityTampering { .. } => 0.8,
-            AnomalySignal::PrivilegeEscalation { .. } => 0.6,
-            AnomalySignal::CredentialAccess { .. } => 0.7,
-            AnomalySignal::UnusualToolSequence { .. } => 0.3,
+            Self::Exfiltration { tool, .. }
+            | Self::CredentialAccess { tool }
+            | Self::PrivilegeEscalation { tool }
+            | Self::RuleCreation { tool, .. }
+            | Self::IdentityTampering { tool, .. } => tool,
         }
     }
 
-    /// Human-readable description.
     pub fn description(&self) -> String {
         match self {
-            AnomalySignal::DataExfiltration {
-                read_tool,
-                send_tool,
-            } => {
-                format!("Data exfiltration pattern: {} → {}", read_tool, send_tool)
+            Self::Exfiltration { tool, to } => {
+                format!("`{tool}` would send to {to}, somewhere this turn doesn't deliver")
             }
-            AnomalySignal::IdentityTampering { file } => {
-                format!("Identity file modification: {}", file)
+            Self::CredentialAccess { tool } => format!("`{tool}` would reach stored credentials"),
+            Self::PrivilegeEscalation { tool } => {
+                format!("`{tool}` would change the agent's own setup")
             }
-            AnomalySignal::PrivilegeEscalation { tool } => {
-                format!("Privilege escalation via: {}", tool)
+            Self::RuleCreation { tool, action } => {
+                format!("`{tool}` {action} would change standing automation")
             }
-            AnomalySignal::CredentialAccess { tool } => {
-                format!("Credential access via: {}", tool)
-            }
-            AnomalySignal::UnusualToolSequence { tools } => {
-                format!("Unusual tool sequence: {}", tools.join(" → "))
+            Self::IdentityTampering { tool, file } => {
+                format!("`{tool}` would rewrite the agent's {file}")
             }
         }
     }
 }
 
-// ─── Tool Record ─────────────────────────────────────────────────────────────
+const CREDENTIAL_NAMESPACE: &str = "vault.";
 
-/// Record of a single tool invocation for pattern tracking.
-#[derive(Debug, Clone)]
-struct ToolRecord {
-    tool_name: String,
-    #[allow(dead_code)]
-    timestamp: Instant,
-}
+const SYSTEM_NAMESPACE: &str = "system.";
 
-// ─── Tool Classification ─────────────────────────────────────────────────────
+/// The `system.*` tools that only look.
+const SYSTEM_READS: &[&str] = &["version", "logs"];
 
-/// Tools that read data (potential exfiltration sources).
-const READ_TOOLS: &[&str] = &[
-    "code.read",
-    "code.search",
-    "code.tree",
-    "code.symbols",
-    "memory.search",
-    "memory.recall",
-    "vault.get",
-    "vault.list",
+const POLICY_WRITES: &[&str] = &["policy.propose"];
+
+/// Tools whose named actions change standing automation: what runs later, on
+/// its own, without anyone asking.
+const STANDING_RULES: &[(&str, &[&str])] = &[
+    ("monitor", &["save", "set_enabled", "delete"]),
+    ("scheduler", &["create", "update", "remove"]),
+    ("workflow", &["save", "delete"]),
+    ("email.rules", &["add", "remove"]),
 ];
 
-/// Tools that send data externally (potential exfiltration sinks).
-const SEND_TOOLS: &[&str] = &[
-    "messaging.send",
-    "messaging.edit",
-    "messaging.upload_file",
-    "reaction.add",
-];
+const IDENTITY_WRITERS: &[&str] = &["filesystem.write", "filesystem.edit"];
 
-/// Identity files that must not be tampered with.
 const IDENTITY_FILES: &[&str] = &[
     "SOUL.md",
     "AGENTS.md",
@@ -107,342 +88,377 @@ const IDENTITY_FILES: &[&str] = &[
     "GOALS.md",
 ];
 
-/// Tools that indicate privilege escalation attempts.
-const ADMIN_TOOLS: &[&str] = &[
-    "system.enable_skill",
-    "system.disable_skill",
-    "system.save_config",
-    "policy.propose",
-];
-
-/// Tools that access credentials.
-const CREDENTIAL_TOOLS: &[&str] = &["vault.get", "vault.list", "vault.set", "vault.delete"];
-
-// ─── Session Risk Tracker ────────────────────────────────────────────────────
-
-/// Tracks tool usage and detects anomalous patterns after untrusted content.
-#[derive(Debug)]
-pub struct SessionRiskTracker {
-    /// When untrusted content was last processed.
-    untrusted_content_at: Option<Instant>,
-    /// Recent tool invocations (ring buffer).
-    tool_window: VecDeque<ToolRecord>,
-    /// Cumulative risk score for the monitoring window.
-    risk_score: f64,
-    /// All signals detected in the current monitoring window.
-    signals: Vec<AnomalySignal>,
-    /// Number of tool calls to monitor after untrusted content (default 10).
-    cooldown_calls: u32,
-    /// Counter of tool calls since untrusted content.
-    calls_since_untrusted: u32,
-    /// Maximum time window for monitoring (5 minutes).
-    max_window_secs: u64,
+/// What a turn's guard knows about the turn.
+#[derive(Debug, Clone, Default)]
+pub struct ContentScope {
+    /// Where the turn delivers: a write anywhere else is somewhere new.
+    pub expected: Vec<String>,
+    /// Tools the turn's operator named for it: their own choice, never held.
+    pub named: Vec<String>,
+    /// What armed the guard before the turn began, when outside content is
+    /// what started it.
+    pub armed: Option<String>,
+    /// Refuse a held call rather than ask about it: no one is there to ask.
+    pub refuses: bool,
 }
 
-/// Risk threshold for flagging a session.
-const RISK_THRESHOLD: f64 = 0.7;
-
-impl Default for SessionRiskTracker {
-    fn default() -> Self {
-        Self::new(10)
-    }
-}
-
-impl SessionRiskTracker {
-    /// Create a new tracker with a given cooldown window size.
-    pub fn new(cooldown_calls: u32) -> Self {
+impl ContentScope {
+    /// The scope of an ordinary turn delivering to `channel`.
+    pub fn delivering_to(channel: Option<&str>) -> Self {
         Self {
-            untrusted_content_at: None,
-            tool_window: VecDeque::with_capacity(20),
-            risk_score: 0.0,
-            signals: Vec::new(),
-            cooldown_calls,
-            calls_since_untrusted: 0,
-            max_window_secs: 300, // 5 minutes
-        }
-    }
-
-    /// Mark that untrusted content was just processed — start monitoring window.
-    pub fn on_untrusted_content(&mut self) {
-        self.untrusted_content_at = Some(Instant::now());
-        self.calls_since_untrusted = 0;
-        self.risk_score = 0.0;
-        self.signals.clear();
-    }
-
-    /// Whether the tracker is currently in a monitoring window.
-    pub fn is_monitoring(&self) -> bool {
-        if let Some(at) = self.untrusted_content_at {
-            self.calls_since_untrusted < self.cooldown_calls
-                && at.elapsed().as_secs() < self.max_window_secs
-        } else {
-            false
-        }
-    }
-
-    /// Current cumulative risk score.
-    pub fn risk_score(&self) -> f64 {
-        self.risk_score
-    }
-
-    /// Whether the risk score exceeds the threshold.
-    pub fn is_high_risk(&self) -> bool {
-        self.risk_score >= RISK_THRESHOLD
-    }
-
-    /// All signals detected so far.
-    pub fn signals(&self) -> &[AnomalySignal] {
-        &self.signals
-    }
-
-    /// Called after each tool execution. Returns new signals detected, if any.
-    ///
-    /// The `input` parameter is the tool's JSON input — used for detecting
-    /// identity file paths in write operations.
-    pub fn on_tool_executed(
-        &mut self,
-        tool_name: &str,
-        input: &serde_json::Value,
-    ) -> Option<Vec<AnomalySignal>> {
-        // Record the tool call
-        self.tool_window.push_back(ToolRecord {
-            tool_name: tool_name.to_string(),
-            timestamp: Instant::now(),
-        });
-        if self.tool_window.len() > 20 {
-            self.tool_window.pop_front();
-        }
-
-        // Not in monitoring window → skip
-        if !self.is_monitoring() {
-            return None;
-        }
-
-        self.calls_since_untrusted += 1;
-        let mut new_signals = Vec::new();
-
-        // ── Check: data exfiltration ─────────────────────────────────────
-        if SEND_TOOLS.contains(&tool_name) {
-            // Look back for recent read tools
-            for record in self.tool_window.iter().rev().skip(1) {
-                if READ_TOOLS.contains(&record.tool_name.as_str()) {
-                    new_signals.push(AnomalySignal::DataExfiltration {
-                        read_tool: record.tool_name.clone(),
-                        send_tool: tool_name.to_string(),
-                    });
-                    break;
-                }
-            }
-        }
-
-        // ── Check: identity tampering ────────────────────────────────────
-        if tool_name == "code.edit" || tool_name == "code.write" {
-            if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
-                for identity_file in IDENTITY_FILES {
-                    if path.ends_with(identity_file) {
-                        new_signals.push(AnomalySignal::IdentityTampering {
-                            file: identity_file.to_string(),
-                        });
-                    }
-                }
-            }
-        }
-
-        // ── Check: privilege escalation ──────────────────────────────────
-        if ADMIN_TOOLS.contains(&tool_name) {
-            new_signals.push(AnomalySignal::PrivilegeEscalation {
-                tool: tool_name.to_string(),
-            });
-        }
-
-        // ── Check: credential access ─────────────────────────────────────
-        if CREDENTIAL_TOOLS.contains(&tool_name) {
-            new_signals.push(AnomalySignal::CredentialAccess {
-                tool: tool_name.to_string(),
-            });
-        }
-
-        // Update risk score
-        for signal in &new_signals {
-            self.risk_score += signal.weight();
-            self.signals.push(signal.clone());
-        }
-
-        // Log anomaly signals
-        for signal in &new_signals {
-            warn!(
-                target: "sentinel.monitor",
-                tool = %tool_name,
-                signal = %signal.description(),
-                risk_score = format!("{:.2}", self.risk_score),
-                "Anomaly signal detected"
-            );
-        }
-        if self.is_high_risk() {
-            warn!(
-                target: "sentinel.monitor",
-                risk_score = format!("{:.2}", self.risk_score),
-                signal_count = self.signals.len(),
-                "Session risk threshold exceeded"
-            );
-        }
-
-        if new_signals.is_empty() {
-            None
-        } else {
-            Some(new_signals)
+            expected: channel.into_iter().map(str::to_string).collect(),
+            ..Self::default()
         }
     }
 }
 
-// ─── Tests ───────────────────────────────────────────────────────────────────
+/// A call the guard holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Held {
+    pub signal: AnomalySignal,
+    pub refused: bool,
+    pub reason: String,
+}
+
+/// One turn's guard: armed once outside content enters, never disarmed.
+#[derive(Debug, Default)]
+pub struct ContentGuard {
+    scope: ContentScope,
+    armed: Mutex<Option<String>>,
+    stops: Mutex<Vec<AnomalySignal>>,
+}
+
+impl ContentGuard {
+    pub fn new(scope: ContentScope) -> Self {
+        Self {
+            armed: Mutex::new(scope.armed.clone()),
+            scope,
+            stops: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Outside content from `what` entered the turn. The first arming names
+    /// the turn's outside content; a later one changes nothing.
+    pub fn on_untrusted_content(&self, what: &str) {
+        let mut armed = self.armed.lock().unwrap_or_else(|e| e.into_inner());
+        if armed.is_none() {
+            *armed = Some(what.to_string());
+        }
+    }
+
+    /// Arm when `text` carries a fence of outside content from `what`.
+    pub fn arm_if_fenced(&self, text: &str, what: &str) {
+        if text.contains(FENCE_MARK) {
+            self.on_untrusted_content(what);
+        }
+    }
+
+    pub fn armed(&self) -> Option<String> {
+        self.armed.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// What the guard refused this turn.
+    pub fn stops(&self) -> Vec<AnomalySignal> {
+        self.stops.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Whether a call of `tool` with `input`, doing `effect`, is held.
+    pub fn check(&self, tool: &str, input: &Value, effect: Option<&SurfaceEffect>) -> Option<Held> {
+        let armed = self.armed()?;
+        let signal = assess(tool, input, effect, &self.scope)?;
+        let refused = self.scope.refuses;
+        warn!(
+            target: "sentinel.monitor",
+            tool = %tool,
+            signal = %signal.description(),
+            refused,
+            "Call held after outside content"
+        );
+        if refused {
+            self.stops
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(signal.clone());
+        }
+        let reason = format!(
+            "{}, and this turn is processing outside content ({armed}) that may be steering it",
+            signal.description()
+        );
+        Some(Held {
+            signal,
+            refused,
+            reason,
+        })
+    }
+}
+
+/// The signal a call of `tool` raises in `scope`, if any. Pure.
+pub fn assess(
+    tool: &str,
+    input: &Value,
+    effect: Option<&SurfaceEffect>,
+    scope: &ContentScope,
+) -> Option<AnomalySignal> {
+    if scope.named.iter().any(|entry| names(entry, tool)) {
+        return None;
+    }
+    let owned = || tool.to_string();
+    let action = || input["action"].as_str().unwrap_or_default().trim();
+    if tool.starts_with(CREDENTIAL_NAMESPACE) {
+        return Some(AnomalySignal::CredentialAccess { tool: owned() });
+    }
+    if tool.strip_prefix(SYSTEM_NAMESPACE).is_some_and(|rest| {
+        !(rest.starts_with("list_") || rest.ends_with("_status") || SYSTEM_READS.contains(&rest))
+    }) || POLICY_WRITES.contains(&tool)
+    {
+        return Some(AnomalySignal::PrivilegeEscalation { tool: owned() });
+    }
+    if let Some((_, writes)) = STANDING_RULES.iter().find(|(name, _)| *name == tool) {
+        return writes
+            .contains(&action())
+            .then(|| AnomalySignal::RuleCreation {
+                tool: owned(),
+                action: action().to_string(),
+            });
+    }
+    if IDENTITY_WRITERS.contains(&tool) {
+        let path = input["path"].as_str().unwrap_or_default();
+        if let Some(file) = IDENTITY_FILES.iter().find(|file| path.ends_with(*file)) {
+            return Some(AnomalySignal::IdentityTampering {
+                tool: owned(),
+                file: file.to_string(),
+            });
+        }
+    }
+    sends_somewhere_new(tool, effect, scope)
+        .map(|to| AnomalySignal::Exfiltration { tool: owned(), to })
+}
+
+/// Where a call sends that its turn doesn't deliver, if it does. A Desk
+/// write is the person's own conversation, and a write naming no
+/// destination goes to the turn's own.
+fn sends_somewhere_new(
+    tool: &str,
+    effect: Option<&SurfaceEffect>,
+    scope: &ContentScope,
+) -> Option<String> {
+    match effect {
+        Some(SurfaceEffect::Writes { platform, .. })
+            if platform == workforce_common::channels::desk::DESK_PLATFORM =>
+        {
+            None
+        }
+        Some(effect @ SurfaceEffect::Writes { .. }) => effect
+            .destination()
+            .filter(|to| !scope.expected.iter().any(|place| delivers_to(place, to)))
+            .map(|to| format!("{} {}", to.platform, to.target)),
+        Some(SurfaceEffect::Reads) => None,
+        None => crate::runner::is_outbound_delivery_tool(tool).then(|| "outside".to_string()),
+    }
+}
+
+/// Whether a write to `to` lands at `place`: the same channel, its thread,
+/// or it in a named workspace.
+fn delivers_to(place: &str, to: &Destination) -> bool {
+    Destination::of(&to.platform, place).is_some_and(|place| {
+        to.target == place.target
+            || to
+                .target
+                .strip_prefix(place.target.as_str())
+                .is_some_and(|rest| rest.starts_with(' '))
+    })
+}
+
+/// Whether `entry` names `tool`: exactly, or as a namespace it lies under.
+fn names(entry: &str, tool: &str) -> bool {
+    tool == entry
+        || tool
+            .strip_prefix(entry)
+            .is_some_and(|rest| rest.starts_with('.'))
+}
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
-    #[test]
-    fn no_monitoring_without_untrusted_content() {
-        let mut tracker = SessionRiskTracker::default();
-        let result = tracker.on_tool_executed("code.read", &serde_json::json!({"path": "main.rs"}));
-        assert!(result.is_none());
-        assert!(!tracker.is_monitoring());
+    fn writes(platform: &str, destination: &str) -> SurfaceEffect {
+        SurfaceEffect::Writes {
+            platform: platform.into(),
+            destination: destination.into(),
+        }
+    }
+
+    fn armed(scope: ContentScope) -> ContentGuard {
+        let guard = ContentGuard::new(scope);
+        guard.on_untrusted_content("email from x@evil.example");
+        guard
+    }
+
+    fn delivering(channel: &str) -> ContentScope {
+        ContentScope::delivering_to(Some(channel))
     }
 
     #[test]
-    fn monitoring_starts_after_untrusted_content() {
-        let mut tracker = SessionRiskTracker::default();
-        tracker.on_untrusted_content();
-        assert!(tracker.is_monitoring());
-    }
-
-    #[test]
-    fn exfiltration_pattern_detected() {
-        let mut tracker = SessionRiskTracker::default();
-        tracker.on_untrusted_content();
-
-        // Read a file
-        tracker.on_tool_executed("code.read", &serde_json::json!({"path": "secrets.txt"}));
-
-        // Then send a message
-        let signals = tracker
-            .on_tool_executed(
-                "messaging.send",
-                &serde_json::json!({"channel": "C123", "text": "data"}),
-            )
-            .unwrap();
-
-        assert!(signals
-            .iter()
-            .any(|s| matches!(s, AnomalySignal::DataExfiltration { .. })));
-    }
-
-    #[test]
-    fn identity_tampering_detected() {
-        let mut tracker = SessionRiskTracker::default();
-        tracker.on_untrusted_content();
-
-        let signals = tracker
-            .on_tool_executed(
-                "code.edit",
-                &serde_json::json!({"path": "/workspace/SOUL.md", "content": "hacked"}),
-            )
-            .unwrap();
-
-        assert!(signals
-            .iter()
-            .any(|s| matches!(s, AnomalySignal::IdentityTampering { .. })));
-    }
-
-    #[test]
-    fn privilege_escalation_detected() {
-        let mut tracker = SessionRiskTracker::default();
-        tracker.on_untrusted_content();
-
-        let signals = tracker
-            .on_tool_executed(
-                "system.enable_skill",
-                &serde_json::json!({"skill": "github"}),
-            )
-            .unwrap();
-
-        assert!(signals
-            .iter()
-            .any(|s| matches!(s, AnomalySignal::PrivilegeEscalation { .. })));
-    }
-
-    #[test]
-    fn credential_access_detected() {
-        let mut tracker = SessionRiskTracker::default();
-        tracker.on_untrusted_content();
-
-        let signals = tracker
-            .on_tool_executed("vault.get", &serde_json::json!({"key": "api_key"}))
-            .unwrap();
-
-        assert!(signals
-            .iter()
-            .any(|s| matches!(s, AnomalySignal::CredentialAccess { .. })));
-    }
-
-    #[test]
-    fn cooldown_expires() {
-        let mut tracker = SessionRiskTracker::new(2);
-        tracker.on_untrusted_content();
-
-        // Two calls exhaust the cooldown
-        tracker.on_tool_executed("code.read", &serde_json::json!({}));
-        tracker.on_tool_executed("code.read", &serde_json::json!({}));
-
-        assert!(!tracker.is_monitoring());
-
-        // After cooldown, no detection
-        let result = tracker.on_tool_executed("vault.get", &serde_json::json!({"key": "secret"}));
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn risk_score_accumulates() {
-        let mut tracker = SessionRiskTracker::default();
-        tracker.on_untrusted_content();
-
-        // Credential access (0.7)
-        tracker.on_tool_executed("vault.get", &serde_json::json!({}));
-        assert!((tracker.risk_score() - 0.7).abs() < 0.01);
-        assert!(tracker.is_high_risk());
-    }
-
-    #[test]
-    fn safe_tools_produce_no_signals() {
-        let mut tracker = SessionRiskTracker::default();
-        tracker.on_untrusted_content();
-
-        let result =
-            tracker.on_tool_executed("code.read", &serde_json::json!({"path": "readme.md"}));
-        // code.read alone is not suspicious
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn normal_edit_not_flagged() {
-        let mut tracker = SessionRiskTracker::default();
-        tracker.on_untrusted_content();
-
-        // Edit a normal file — not identity
-        let result = tracker.on_tool_executed(
-            "code.edit",
-            &serde_json::json!({"path": "/workspace/src/main.rs"}),
+    fn nothing_is_held_before_outside_content_enters() {
+        let guard = ContentGuard::new(delivering("C1"));
+        assert_eq!(guard.check("vault.get", &json!({}), None), None);
+        assert_eq!(
+            guard.check("messaging.send", &json!({}), Some(&writes("slack", "C9"))),
+            None
         );
-        assert!(result.is_none());
     }
 
     #[test]
-    fn signal_descriptions() {
-        let s = AnomalySignal::DataExfiltration {
-            read_tool: "code.read".into(),
-            send_tool: "messaging.send".into(),
+    fn a_fence_arms_and_plain_text_does_not() {
+        let guard = ContentGuard::new(delivering("C1"));
+        guard.arm_if_fenced(
+            "<<<END MESSAGE CONTENT>>> ‹‹‹EXTERNAL_UNTRUSTED_CONTENT_x",
+            "page",
+        );
+        assert_eq!(guard.armed(), None);
+        guard.arm_if_fenced("<<<EXTERNAL_UNTRUSTED_CONTENT_00ff>>>\nbody", "email.read");
+        assert_eq!(guard.armed().as_deref(), Some("email.read"));
+        guard.arm_if_fenced("<<<EXTERNAL_UNTRUSTED_CONTENT_11ee>>>\nbody", "web.fetch");
+        assert_eq!(guard.armed().as_deref(), Some("email.read"));
+    }
+
+    #[test]
+    fn sending_somewhere_new_is_held_and_the_turns_own_delivery_is_not() {
+        let guard = armed(delivering("C1"));
+        let held = guard
+            .check("messaging.send", &json!({}), Some(&writes("slack", "C9")))
+            .unwrap();
+        assert_eq!(
+            held.signal,
+            AnomalySignal::Exfiltration {
+                tool: "messaging.send".into(),
+                to: "slack c9".into()
+            }
+        );
+        assert!(!held.refused);
+        assert!(held.reason.contains("email from x@evil.example"));
+        for own in ["C1", "#c1", "C1 › thread 1.5", "C1 in T1", ""] {
+            assert_eq!(
+                guard.check("messaging.send", &json!({}), Some(&writes("slack", own))),
+                None,
+                "{own}"
+            );
+        }
+        assert!(guard
+            .check("messaging.send", &json!({}), Some(&writes("slack", "C10")))
+            .is_some());
+        assert_eq!(
+            guard.check("messaging.send", &json!({}), Some(&writes("desk", "#ops"))),
+            None
+        );
+    }
+
+    #[test]
+    fn forwarding_mail_to_a_stranger_is_held() {
+        let guard = armed(delivering("C1"));
+        let input = json!({ "to": "x@evil.example", "uid": 7 });
+        let held = guard
+            .check("email.forward", &input, Some(&SurfaceEffect::email(&input)))
+            .unwrap();
+        assert!(
+            matches!(held.signal, AnomalySignal::Exfiltration { ref to, .. } if to == "email x@evil.example")
+        );
+        assert!(guard
+            .check("browser.upload_file", &json!({}), None)
+            .is_some());
+    }
+
+    #[test]
+    fn credentials_setup_and_identity_are_held() {
+        let guard = armed(delivering("C1"));
+        let signal = |tool: &str, input: Value| guard.check(tool, &input, None).map(|h| h.signal);
+        assert_eq!(
+            signal("vault.get", json!({ "key": "k" })),
+            Some(AnomalySignal::CredentialAccess {
+                tool: "vault.get".into()
+            })
+        );
+        assert!(matches!(
+            signal("system.enable_skill", json!({})),
+            Some(AnomalySignal::PrivilegeEscalation { .. })
+        ));
+        assert!(matches!(
+            signal("policy.propose", json!({})),
+            Some(AnomalySignal::PrivilegeEscalation { .. })
+        ));
+        for read in ["system.list_skills", "system.version", "system.llm_status"] {
+            assert_eq!(signal(read, json!({})), None, "{read}");
+        }
+        assert_eq!(
+            signal("filesystem.write", json!({ "path": "/ws/SOUL.md" })),
+            Some(AnomalySignal::IdentityTampering {
+                tool: "filesystem.write".into(),
+                file: "SOUL.md".into()
+            })
+        );
+        assert_eq!(
+            signal("filesystem.write", json!({ "path": "/ws/notes.md" })),
+            None
+        );
+    }
+
+    #[test]
+    fn standing_automation_is_held_by_action() {
+        let guard = armed(delivering("C1"));
+        let signal = |tool: &str, action: &str| {
+            guard
+                .check(tool, &json!({ "action": action }), None)
+                .map(|h| h.signal)
         };
-        assert!(s.description().contains("code.read"));
-        assert!(s.description().contains("messaging.send"));
+        assert_eq!(
+            signal("email.rules", "add"),
+            Some(AnomalySignal::RuleCreation {
+                tool: "email.rules".into(),
+                action: "add".into()
+            })
+        );
+        assert!(signal("monitor", "save").is_some());
+        assert!(signal("scheduler", "create").is_some());
+        assert!(signal("workflow", "save").is_some());
+        for (tool, read) in [
+            ("monitor", "list"),
+            ("scheduler", "history"),
+            ("email.rules", "list"),
+            ("workflow", "status"),
+        ] {
+            assert_eq!(signal(tool, read), None, "{tool} {read}");
+        }
+    }
+
+    #[test]
+    fn named_tools_are_the_operators_choice() {
+        let guard = armed(ContentScope {
+            named: vec!["email".into(), "vault.get".into()],
+            ..delivering("C1")
+        });
+        let input = json!({ "to": "someone@else.example" });
+        assert_eq!(
+            guard.check("email.send", &input, Some(&SurfaceEffect::email(&input))),
+            None
+        );
+        assert_eq!(guard.check("vault.get", &json!({}), None), None);
+        assert!(guard.check("vault.set", &json!({}), None).is_some());
+    }
+
+    #[test]
+    fn a_refusing_scope_refuses_and_keeps_what_it_refused() {
+        let guard = ContentGuard::new(ContentScope {
+            armed: Some("monitored email".into()),
+            refuses: true,
+            ..delivering("C1")
+        });
+        let held = guard.check("vault.list", &json!({}), None).unwrap();
+        assert!(held.refused);
+        assert_eq!(guard.stops(), vec![held.signal]);
+        let quiet = armed(delivering("C1"));
+        quiet.check("vault.list", &json!({}), None);
+        assert!(quiet.stops().is_empty());
     }
 }

@@ -273,6 +273,15 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Whether what this tool returns is content from outside (mail, a
+    /// channel's messages) even where it isn't fenced, as in a listing whose
+    /// fields other code reads. A turn that calls it is armed against that
+    /// content steering it ([`crate::security::monitor`]), as one that reads
+    /// a fence is. `false`, the default.
+    fn reads_outside_content(&self) -> bool {
+        false
+    }
+
     /// What THIS call does to this computer: reads, writes or deletes which
     /// paths, runs which command where, starts a session where. A hub with
     /// `[desk]` decides a call in a namespace that touches this computer by

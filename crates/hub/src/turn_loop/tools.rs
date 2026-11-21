@@ -434,6 +434,58 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_monitors_turn_is_offered_its_reads_and_delivery_and_nothing_else() {
+        let source = registry(&[
+            "email.read",
+            "email.search",
+            "email.send",
+            "email.forward",
+            "email.move",
+            "email.rules",
+            "messaging.read",
+            "messaging.send",
+            "vault.get",
+            "exec.run",
+            "monitor",
+            "scheduler",
+            "system.enable_skill",
+            "tool.describe",
+            "program_run",
+            "web.fetch",
+        ]);
+        let delivery = crate::monitor::scope::Delivery::Posts {
+            dest: "C1",
+            deliver_to: "#ops",
+        };
+        let offered = |named: &[String]| {
+            let tools = crate::monitor::scope::turn_tools(&delivery, named);
+            sorted(exclusive_registry(&source, &tools).names())
+                .into_iter()
+                .filter(|name| !RETRIEVAL.contains(&name.as_str()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            offered(&[]),
+            [
+                "email.read",
+                "email.search",
+                "messaging.read",
+                "messaging.send"
+            ]
+        );
+        assert_eq!(
+            offered(&["email.move".into()]),
+            [
+                "email.move",
+                "email.read",
+                "email.search",
+                "messaging.read",
+                "messaging.send"
+            ]
+        );
+    }
+
+    #[test]
     fn empty_whitelist_keeps_only_retrieval_survivors() {
         let kept = exclusive_registry(&registry(&["memory", "messaging.send"]), &[]);
         assert_eq!(

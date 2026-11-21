@@ -147,6 +147,7 @@ surface = "slack"                 # where to deliver (optional when the hub has 
 # prompt = "Read this and tell me whether it needs action."
 # deliver_to = "@U0XXXXXXX"
 # surface = "slack"
+# tools = ["email.move"]          # optional: anything beyond reading and posting to deliver_to
 `;
 
 const NEW_STUBS: Record<MonitorKind, string> = {

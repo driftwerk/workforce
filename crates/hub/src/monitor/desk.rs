@@ -90,8 +90,8 @@ pub(crate) async fn deliver(
         };
         let text = match &monitor.action {
             Action::Notify { template, .. } => ev.render(template),
-            Action::AgentTask { prompt, .. } => {
-                match turn(service, &crew, &owner, monitor, ev, prompt, from).await {
+            Action::AgentTask { prompt, tools, .. } => {
+                match turn(service, &crew, &owner, monitor, ev, prompt, tools, from).await {
                     Ok(text) => text,
                     Err(outcome) => return outcome,
                 }
@@ -133,9 +133,10 @@ fn key_of(monitor: &MonitorMeta, owner: &str, ev: &MonitorEvent) -> String {
     format!("{}\n{owner}\n{}", monitor.id, ev.dispatch_id())
 }
 
-/// The `agent_task` turn for `ev`, as `owner`: its answer, or how the
-/// dispatch ends without one.
+/// The `agent_task` turn for `ev`, as `owner`, with the `tools` its monitor
+/// names: its answer, or how the dispatch ends without one.
 #[cfg(feature = "postgres")]
+#[allow(clippy::too_many_arguments)]
 async fn turn(
     service: &Arc<AgentService>,
     crew: &crate::desk_crew::CrewHub,
@@ -143,6 +144,7 @@ async fn turn(
     monitor: &MonitorMeta,
     ev: &MonitorEvent,
     prompt: &str,
+    tools: &[String],
     from: &str,
 ) -> Result<String, ActionOutcome> {
     // As any monitor's turn: a suspended owner's acts on nothing, and
@@ -152,39 +154,32 @@ async fn turn(
     }
     let task = super::engine::build_agent_task_prompt(prompt, ev, from, TELLS_DESK);
     let session = format!("monitor:{}:{}", monitor.id, ev.dispatch_id());
-    let run = service.process_turn(
-        &session,
-        "monitor",
-        &task,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(&session),
-        None,
-        Some(owner),
-        crate::serve::RunAuthor::Other,
-    );
+    let scoped = super::scope::MonitorTurn::new(monitor, &super::scope::Delivery::Told, tools);
+    let run = scoped.run(service, &session, &task, None, Some(owner));
     let payer = service.background_payer(Some(owner));
-    match crate::user_config::billed_to(payer, run).await {
+    let outcome = crate::user_config::billed_to(payer, run).await;
+    let tell = |what: &'static str, text: String| async move {
+        let told = Finding {
+            key: format!("{}\n{what}", key_of(monitor, owner, ev)),
+            monitor_id: monitor.id.clone(),
+            monitor_name: monitor.name.clone(),
+            place: DeskDelivery::Notice,
+            text,
+        };
+        if let Err(e) = crew.monitor_told(service, owner, told).await {
+            tracing::warn!(monitor = %monitor.id, error = %format!("{e:#}"), "telling Desk how a monitor's turn ended failed");
+        }
+    };
+    if let Some(notice) = scoped.notice(monitor) {
+        tell("refused", notice).await;
+    }
+    match outcome {
         Ok(crate::serve::TurnOutcome::Answered(answer)) => Ok(answer),
         // Told why it stopped where its answer would have gone; retrying
         // would be refused the same way.
         Ok(crate::serve::TurnOutcome::Stopped(stop)) => {
             if let Some(notice) = stop.notice() {
-                let told = Finding {
-                    key: format!("{}\nstopped", key_of(monitor, owner, ev)),
-                    monitor_id: monitor.id.clone(),
-                    monitor_name: monitor.name.clone(),
-                    place: DeskDelivery::Notice,
-                    text: notice,
-                };
-                if let Err(e) = crew.monitor_told(service, owner, told).await {
-                    tracing::warn!(monitor = %monitor.id, error = %format!("{e:#}"), "telling Desk why a monitor's turn stopped failed");
-                }
+                tell("stopped", notice).await;
             }
             Err(ActionOutcome::Terminal(stop.reason()))
         }

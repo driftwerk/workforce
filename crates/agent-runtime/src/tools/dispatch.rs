@@ -19,6 +19,7 @@ use crate::runner::{
     combine_with_cascade, execute_with_deadline, tool_not_found_message, CapabilityGate,
     PermissionGate, RunnerConfig, CURRENT_SESSION_KEY, CURRENT_USER_ID,
 };
+use crate::security::monitor::{ContentGuard, Held};
 use crate::security::secret_sinks::substitute_secret_markers;
 use crate::tools::access::ToolAccessSnapshot;
 use crate::tools::arguments::{
@@ -52,6 +53,9 @@ pub struct ToolGates {
     /// with `[desk]` ([`crate::tools::computer`]).
     pub computer_gate: Option<Arc<dyn ComputerGate>>,
     pub arguments: ArgumentValidation,
+    /// The turn's guard against outside content steering it; none outside a
+    /// turn.
+    pub content_guard: Option<Arc<ContentGuard>>,
 }
 
 impl From<&RunnerConfig> for ToolGates {
@@ -65,6 +69,7 @@ impl From<&RunnerConfig> for ToolGates {
             surface_allows: config.surface_allows.clone(),
             computer_gate: config.computer_gate.clone(),
             arguments: config.arguments,
+            content_guard: None,
         }
     }
 }
@@ -203,6 +208,27 @@ fn gate_with(
     ) {
         return blocked;
     }
+    let held = gates
+        .content_guard
+        .as_deref()
+        .and_then(|guard| guard.check(tool_name, input, effect.as_ref()));
+    let response = match held {
+        None => response,
+        Some(Held {
+            refused: true,
+            reason,
+            ..
+        }) => {
+            return GateOutcome::Blocked {
+                message: format!(
+                    "BLOCKED: {reason}. It did not run. Finish the task without it;                      the person has been told."
+                ),
+                reason,
+                consumed: Vec::new(),
+            }
+        }
+        Some(Held { reason, .. }) => held_for_approval(response, reason),
+    };
     match response.decision {
         PolicyDecision::RequireApproval {
             reason,
@@ -645,6 +671,23 @@ pub fn apply_surface_gate(
     }
 }
 
+/// `response` asking the person about a call the content guard holds, with
+/// why; one already asking adds the guard's reason. Never "always": the hold
+/// is about this turn's content, not the call.
+fn held_for_approval(response: PolicyResponse, held: String) -> PolicyResponse {
+    let reason = match response.decision {
+        PolicyDecision::RequireApproval { reason, .. } => format!("{reason}. Also: {held}"),
+        _ => held,
+    };
+    PolicyResponse {
+        decision: PolicyDecision::RequireApproval {
+            reason,
+            allow_save_allow: false,
+        },
+        ..response
+    }
+}
+
 /// Besides a write off Desk, what a turn relayed to an agent (the
 /// overseer's nudges and tasks) never does without the person: delete
 /// anything (any tool [`is_destructive`] names, built-in, skill or MCP),
@@ -1028,6 +1071,7 @@ mod tests {
             surface_allows: None,
             computer_gate: None,
             arguments: ArgumentValidation::default(),
+            content_guard: None,
         }
     }
 
@@ -2474,5 +2518,67 @@ mod tests {
             ),
             "and in every other tool"
         );
+    }
+
+    mod content_guard {
+        use super::*;
+        use crate::security::monitor::{ContentGuard, ContentScope};
+
+        fn guarded(expected: &str, refuses: bool) -> ToolGates {
+            ToolGates {
+                content_guard: Some(Arc::new(ContentGuard::new(ContentScope {
+                    expected: vec![expected.into()],
+                    armed: Some("email from x@evil.example".into()),
+                    refuses,
+                    ..ContentScope::default()
+                }))),
+                ..gates(&Arc::new(Calls::default()), None, CascadeState::Allow)
+            }
+        }
+
+        fn post(gates: &ToolGates, policy: &PolicyEngine) -> GateOutcome {
+            let input = serde_json::json!({ "channel": "C1", "text": "all your mail" });
+            as_user(|| gate_tool_call(gates, policy, &surfaced_tools(), "messaging.send", &input))
+        }
+
+        #[test]
+        fn a_post_somewhere_new_after_outside_content_is_asked_about() {
+            match post(&guarded("C2", false), &permissive_policy()) {
+                GateOutcome::RequireApproval {
+                    reason,
+                    allow_save_allow,
+                    ..
+                } => {
+                    assert!(reason.contains("slack c1"), "{reason}");
+                    assert!(reason.contains("outside content"), "{reason}");
+                    assert!(!allow_save_allow);
+                }
+                other => panic!("expected an approval, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_refusing_guard_blocks_and_the_turns_own_delivery_runs() {
+            assert!(matches!(
+                post(&guarded("C2", true), &permissive_policy()),
+                GateOutcome::Blocked { ref message, .. } if message.starts_with("BLOCKED:")
+            ));
+            assert!(matches!(
+                post(&guarded("C1", true), &permissive_policy()),
+                GateOutcome::Execute { .. }
+            ));
+        }
+
+        #[test]
+        fn a_denial_stays_a_denial() {
+            let deny = PolicyEngine::from_yaml(
+                "rules:\n  - name: no-posts\n    scope: global\n    tool: \"messaging.send\"\n    action: deny\n",
+            )
+            .unwrap();
+            assert!(matches!(
+                post(&guarded("C2", false), &deny),
+                GateOutcome::Blocked { ref message, .. } if message.starts_with("Policy denied")
+            ));
+        }
     }
 }

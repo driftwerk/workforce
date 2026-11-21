@@ -2816,6 +2816,7 @@ impl AgentService {
             surface_allows,
             computer_gate: self.computer_gate(),
             arguments: self.config.tools.validation.mode,
+            content_guard: None,
         }
     }
 

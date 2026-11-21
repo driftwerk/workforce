@@ -122,6 +122,27 @@ mod tests {
         assert_eq!(effect("google.chat.messages_list", json!({})), None);
     }
 
+    #[test]
+    fn a_tool_that_returns_what_someone_wrote_says_so() {
+        let tools = build_all(context());
+        let outside: HashSet<&str> = tools
+            .iter()
+            .filter(|t| t.reads_outside_content())
+            .map(|t| t.name())
+            .collect();
+        assert_eq!(
+            outside,
+            HashSet::from([
+                "google.gmail.search",
+                "google.gmail.get",
+                "google.gmail.attachment",
+                "google.gmail.thread_get",
+                "google.chat.messages_list",
+                "google.chat.threads_list",
+            ])
+        );
+    }
+
     /// Regression: the `tool_names()` enumeration on the parent
     /// `adapters::google` module must list every tool that `build_all()`
     /// actually registers, plus `google.setup`. Drift here breaks the

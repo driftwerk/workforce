@@ -29,6 +29,7 @@ pub struct GoogleTool {
     ctx: Arc<GoogleApiContext>,
     handler: HandlerFn,
     effect: Option<EffectFn>,
+    outside: bool,
 }
 
 impl GoogleTool {
@@ -46,6 +47,7 @@ impl GoogleTool {
             ctx,
             handler,
             effect: None,
+            outside: false,
         }
     }
 
@@ -70,6 +72,10 @@ impl Tool for GoogleTool {
 
     fn surface_effect(&self, input: &serde_json::Value) -> Option<SurfaceEffect> {
         self.effect.map(|effect| effect(input))
+    }
+
+    fn reads_outside_content(&self) -> bool {
+        self.outside
     }
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
@@ -142,6 +148,22 @@ pub fn sending_tool(
 ) -> Arc<dyn Tool> {
     GoogleTool {
         effect: Some(effect),
+        ..GoogleTool::new(name, desc, schema, ctx.clone(), h)
+    }
+    .arc()
+}
+
+/// Shorthand for a tool that returns what someone else wrote (a message, a
+/// thread, an attachment): a turn that reads it is guarded from then on.
+pub fn outside_tool(
+    name: &str,
+    desc: &str,
+    schema: serde_json::Value,
+    ctx: &Arc<GoogleApiContext>,
+    h: HandlerFn,
+) -> Arc<dyn Tool> {
+    GoogleTool {
+        outside: true,
         ..GoogleTool::new(name, desc, schema, ctx.clone(), h)
     }
     .arc()

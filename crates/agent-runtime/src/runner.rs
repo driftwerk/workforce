@@ -185,6 +185,11 @@ tokio::task_local! {
     /// a scheduled job's `tools`). The turn's registry keeps only those, by
     /// name or namespace, plus retrieval. See [`tool_whitelist`].
     pub static TOOL_WHITELIST: ToolWhitelist;
+    /// The guard a caller runs its turn under, when it knows more about the
+    /// turn than the runner does (a monitor's: armed from the start, refusing,
+    /// delivering to one place). Otherwise each run makes its own. See
+    /// [`content_guard`].
+    pub static CONTENT_GUARD: Arc<crate::security::monitor::ContentGuard>;
     /// Per-session active environment overrides for gated MCP workspaces,
     /// keyed `workspace -> env`. Populated each turn from the session's
     /// persisted `mcp_active_envs` (set by a human `cmd: use <ws> <env>`),
@@ -426,6 +431,29 @@ pub async fn with_tool_whitelist<F: std::future::Future>(
         Some(tools) => TOOL_WHITELIST.scope(tools, fut).await,
         None => fut.await,
     }
+}
+
+/// The guard the current turn runs under: its caller's, else a fresh one
+/// for a turn delivering to the current channel, whose declared tools (a
+/// job's or a heartbeat's `tools`) are its operator's choice.
+pub fn content_guard() -> Arc<crate::security::monitor::ContentGuard> {
+    CONTENT_GUARD.try_with(Arc::clone).unwrap_or_else(|_| {
+        let channel = task_local_value(&CURRENT_CHANNEL_ID, false);
+        Arc::new(crate::security::monitor::ContentGuard::new(
+            crate::security::monitor::ContentScope {
+                named: tool_whitelist().map_or_else(Vec::new, |w| w.tools.to_vec()),
+                ..crate::security::monitor::ContentScope::delivering_to(channel.as_deref())
+            },
+        ))
+    })
+}
+
+/// Run `fut` under `guard`.
+pub async fn with_content_guard<F: std::future::Future>(
+    guard: Arc<crate::security::monitor::ContentGuard>,
+    fut: F,
+) -> F::Output {
+    CONTENT_GUARD.scope(guard, fut).await
 }
 
 /// Whether the current turn is a sandboxed game turn — it runs with no tools and
@@ -1774,6 +1802,37 @@ async fn conclude(
     )
 }
 
+/// The guard a turn sending `messages` runs under, armed when any of them
+/// carries a fence of outside content.
+fn guard_for_turn(messages: &[LlmMessage]) -> Arc<crate::security::monitor::ContentGuard> {
+    let guard = content_guard();
+    messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } | ContentBlock::ToolResult { content: text, .. } => {
+                Some(text)
+            }
+            _ => None,
+        })
+        .for_each(|text| guard.arm_if_fenced(text, "the conversation"));
+    guard
+}
+
+/// Arm `guard` when `tool`'s result is outside content: a fence in it, or a
+/// tool that returns outside content as it is.
+fn arm_on_result(
+    guard: &crate::security::monitor::ContentGuard,
+    tools: &ToolRegistry,
+    tool: &str,
+    output: &str,
+) {
+    match tools.get(tool).is_some_and(|t| t.reads_outside_content()) {
+        true => guard.on_untrusted_content(tool),
+        false => guard.arm_if_fenced(output, tool),
+    }
+}
+
 /// The outcome of a call that ran, for the loop that reports no progress.
 fn executed_outcome(
     tool_use_id: String,
@@ -1822,11 +1881,18 @@ fn planned_outcome(
 
 /// What a `tool_call` naming no registered tool gets back.
 pub(crate) fn unknown_call_message(tool: &str) -> String {
-    format!(
-        "`{}` is not a tool. Load it with `{}` using its exact name from the tool catalogue.",
-        to_llm_name(tool),
-        to_llm_name(crate::tools::loading::LOAD_TOOL)
-    )
+    match tool_whitelist() {
+        Some(_) => format!(
+            "`{}` is not one of the tools this run was given. It runs with the tools its \
+             `tools` names; add `{tool}` there to use it.",
+            to_llm_name(tool)
+        ),
+        None => format!(
+            "`{}` is not a tool. Load it with `{}` using its exact name from the tool catalogue.",
+            to_llm_name(tool),
+            to_llm_name(crate::tools::loading::LOAD_TOOL)
+        ),
+    }
 }
 
 /// The outcome of a `tool_call` the runner could not unwrap.
@@ -3767,12 +3833,16 @@ impl AgentRunner {
         offered: &OfferedTools,
         access: &Arc<ToolAccessSnapshot>,
         messages: &[LlmMessage],
+        guard: &Arc<crate::security::monitor::ContentGuard>,
     ) -> Option<crate::tools::program::ProgramContext> {
         self.config
             .programs
             .as_ref()
             .map(|programs| crate::tools::program::ProgramContext {
-                gates: ToolGates::from(&self.config),
+                gates: ToolGates {
+                    content_guard: Some(Arc::clone(guard)),
+                    ..ToolGates::from(&self.config)
+                },
                 policy: Arc::clone(&self.policy),
                 tools: Arc::clone(&self.tools),
                 access: Arc::clone(access),
@@ -4007,6 +4077,7 @@ impl AgentRunner {
         self.seed_calls(&mut messages, &mut tool_invocations, None, None)
             .await;
         let mut compile_gate = self.gate_turn(&tool_invocations);
+        let content_guard = guard_for_turn(&messages);
         let mut rounds = 0;
         let mut model_switches: Vec<ModelSwitchRecord> = Vec::new();
         let start_time = std::time::Instant::now();
@@ -4564,7 +4635,7 @@ impl AgentRunner {
                 }
                 if crate::tools::program::is_program_call(&tool_name) {
                     if let Some(program) =
-                        self.program_context(&offered, &access_snapshot, &messages)
+                        self.program_context(&offered, &access_snapshot, &messages, &content_guard)
                     {
                         let ctx = SessionContext::capture();
                         let call = self.call_for(&mut round_calls, tool_use_id, input);
@@ -4612,6 +4683,7 @@ impl AgentRunner {
                         true => crate::tools::arguments::ArgumentValidation::Enforce,
                         false => self.config.arguments,
                     },
+                    content_guard: Some(Arc::clone(&content_guard)),
                     ..ToolGates::from(&self.config)
                 };
                 // No one watches a turn without progress: nobody can be asked.
@@ -4787,6 +4859,7 @@ impl AgentRunner {
                     denial_reason,
                     loads,
                 ) = result.map_err(|e| eyre::eyre!("Tool task panicked: {}", e))?;
+                arm_on_result(&content_guard, &self.tools, &tool_name, &output_str);
                 if let Some(gate) = compile_gate.as_mut() {
                     gate.observe(&tool_name, &input, &output, success);
                 }
@@ -5044,6 +5117,7 @@ impl AgentRunner {
         )
         .await;
         let mut compile_gate = self.gate_turn(&tool_invocations);
+        let content_guard = guard_for_turn(&messages);
         let mut rounds = 0;
         let model_switches: Vec<ModelSwitchRecord> = Vec::new();
         let start_time = std::time::Instant::now();
@@ -5827,7 +5901,7 @@ impl AgentRunner {
                 }
                 if crate::tools::program::is_program_call(&tool_name) {
                     if let Some(program) =
-                        self.program_context(&offered, &access_snapshot, &messages)
+                        self.program_context(&offered, &access_snapshot, &messages, &content_guard)
                     {
                         let _ = progress_tx
                             .send(ProgressEvent::ToolStart {
@@ -5898,6 +5972,7 @@ impl AgentRunner {
                         true => crate::tools::arguments::ArgumentValidation::Enforce,
                         false => self.config.arguments,
                     },
+                    content_guard: Some(Arc::clone(&content_guard)),
                     ..ToolGates::from(&self.config)
                 };
                 let (outcome, decided) = match approvals {
@@ -6251,6 +6326,7 @@ impl AgentRunner {
                     denial_reason,
                     loads,
                 ) = result.map_err(|e| eyre::eyre!("Tool task panicked: {}", e))?;
+                arm_on_result(&content_guard, &self.tools, &tool_name, &output_str);
                 if let Some(gate) = compile_gate.as_mut() {
                     gate.observe(&tool_name, &input, &output, success);
                 }

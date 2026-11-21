@@ -302,6 +302,10 @@ impl Tool for MessagingReadTool {
         "messaging.read"
     }
 
+    fn reads_outside_content(&self) -> bool {
+        true
+    }
+
     fn surface_effect(&self, _input: &serde_json::Value) -> Option<SurfaceEffect> {
         Some(SurfaceEffect::Reads)
     }
@@ -667,6 +671,10 @@ impl MessagingReadThreadTool {
 impl Tool for MessagingReadThreadTool {
     fn name(&self) -> &str {
         "messaging.read_thread"
+    }
+
+    fn reads_outside_content(&self) -> bool {
+        true
     }
 
     fn surface_effect(&self, _input: &serde_json::Value) -> Option<SurfaceEffect> {
