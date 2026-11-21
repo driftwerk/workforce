@@ -1116,8 +1116,14 @@ impl CrewHub {
 
     /// Says `text` in `boss`'s DM, as a notice; in the person's conversation
     /// with `boss` off Desk instead, when a turn of theirs there is what
-    /// says it ([`crate::desk_surface::notice`]).
+    /// says it ([`crate::desk_surface::notice`]); at home for the home's own
+    /// boss of a machine's sessions.
     pub(super) async fn tell_dm(&self, boss: &str, text: &str) {
+        // The home's own boss of a machine's sessions: its home's next take
+        // says it in its DM there ([`super::relayed_decide`]).
+        if super::relayed_decide::relayed_party(boss) {
+            return self.relayed_note(boss, text);
+        }
         // A boss on another hub: its conversation is there, where what it
         // leaves to the person goes up as an ask ([`Self::left_by_served`]).
         if workforce_desk::grant::is_served(boss) {

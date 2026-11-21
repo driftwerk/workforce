@@ -401,12 +401,8 @@ impl Desk {
         }
         let now = Utc::now();
         let midnight = self.period_start(crate::ledger::Period::Day, now);
-        let scope = match g.grant.group.as_str() {
-            UNGROUPED => crate::scope::Scope::Ungrouped,
-            group => crate::scope::Scope::Group(group.to_string()),
-        };
         let filter = crate::ledger_store::Filter {
-            seen: Some(self.seen_by(&scope)),
+            seen: Some(self.seen_by(&grant::scope_of_group(&g.grant.group))),
             ..Default::default()
         };
         match self.billed_usd(midnight, now, &filter).await {

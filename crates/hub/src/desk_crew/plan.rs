@@ -134,12 +134,14 @@ impl MachineSeen {
 }
 
 /// What a plan's boss is told of its session on `machine` going from `was`
-/// to `now`, if anything: a turn ended (with its last reply), it asks the
-/// person there, or it ended.
+/// to `now`, if anything: a turn ended (with its last reply), one ended on
+/// a question for it (none while its answerer there has it, `answered`), a
+/// request waits there, or it ended.
 pub(crate) fn machine_line(
     machine: &str,
     was: &MachineSeen,
     now: &MachineSession,
+    answered: bool,
 ) -> Option<String> {
     let key = &was.key;
     let ended = matches!(now.state.as_str(), "closed" | "stopped");
@@ -168,9 +170,14 @@ pub(crate) fn machine_line(
             reply()
         ));
     }
-    if matches!(now.state.as_str(), "asking" | "blocked")
-        && !matches!(was.state.as_str(), "asking" | "blocked")
-    {
+    if now.state == "asking" {
+        return (!answered).then(|| format!(
+            "{key}'s session on {machine} finished a turn on a question for you.{} Answer it with \
+             crew.nudge as the person would, so it goes on; tell the person only what only they can answer.",
+            reply()
+        ));
+    }
+    if now.state == "blocked" && was.state != "blocked" {
         return Some(format!(
             "{key}'s session on {machine} is waiting on a request there: the person answers it in Desk."
         ));
@@ -1588,14 +1595,13 @@ impl CrewHub {
         }
     }
 
-    /// How many of `boss`'s plans' sessions on the person's machines hold a
-    /// slot: working, or not read yet.
+    /// How many of `boss`'s sessions on the person's machines hold a slot:
+    /// its plans' working or not read yet, and the others it runs there
+    /// working ([`super::relayed_work`]).
     fn machine_busy(&self, boss: &str) -> usize {
-        self.machine_seen
-            .lock()
-            .values()
-            .filter(|s| s.boss == boss && s.busy())
-            .count()
+        let seen = self.machine_seen.lock();
+        seen.values().filter(|s| s.boss == boss && s.busy()).count()
+            + self.machine_runs_busy(boss, |k| seen.contains_key(k))
     }
 
     /// Reads each machine that open plans' tickets work on, at most once a
@@ -1781,8 +1787,10 @@ impl CrewHub {
                     .and_then(MachineSession::ended_as_started);
                 let line = match (now, &was) {
                     // In Review, its turns are the person's to read.
-                    (Some(now), Some(was)) => machine_line(&machine, was, now)
-                        .filter(|l| !(review && l.contains("finished a turn"))),
+                    (Some(now), Some(was)) => {
+                        machine_line(&machine, was, now, self.answered_on_machine(&item))
+                            .filter(|l| !(review && l.contains("finished a turn")))
+                    }
                     (None, Some(was)) if was.state == "starting" && was.misses >= 1 => {
                         Some(gone(was))
                     }
@@ -2744,6 +2752,12 @@ pub(super) fn plan_loop(
 mod tests {
     use super::*;
 
+    /// What a plan's boss is told of a session on `machine` its answerer
+    /// there doesn't have.
+    fn told(machine: &str, was: &MachineSeen, now: &MachineSession) -> Option<String> {
+        machine_line(machine, was, now, false)
+    }
+
     #[test]
     fn a_brief_names_the_paths_only_this_computer_has_by_their_roots() {
         let roots = |brief: &str| local_roots(brief, "/Users/kim/");
@@ -2867,15 +2881,15 @@ mod tests {
         };
         // Nothing new: nothing said.
         assert_eq!(
-            machine_line("devbox", &seen("idle", Some("a")), &now("idle", Some("a"))),
+            told("devbox", &seen("idle", Some("a")), &now("idle", Some("a"))),
             None
         );
         assert_eq!(
-            machine_line("devbox", &seen("working", None), &now("working", None)),
+            told("devbox", &seen("working", None), &now("working", None)),
             None
         );
         // A turn ends, with its reply.
-        let ended = machine_line(
+        let ended = told(
             "devbox",
             &seen("working", None),
             &now("idle", Some("Done the parser.")),
@@ -2890,23 +2904,61 @@ mod tests {
             "{ended}"
         );
         // First read after its start, already idle: its turn ended.
-        assert!(machine_line("devbox", &seen("starting", None), &now("idle", None)).is_some());
+        assert!(told("devbox", &seen("starting", None), &now("idle", None)).is_some());
         // A whole turn between two reads: a new reply.
-        let quick =
-            machine_line("devbox", &seen("idle", Some("a")), &now("idle", Some("b"))).unwrap();
+        let quick = told("devbox", &seen("idle", Some("a")), &now("idle", Some("b"))).unwrap();
         assert!(
             quick.contains("finished a turn") && quick.contains("“b”"),
             "{quick}"
         );
-        // It asks the person there, once.
-        let asks = machine_line("devbox", &seen("working", None), &now("asking", None)).unwrap();
-        assert!(asks.contains("waiting on a request there"), "{asks}");
+        // A turn that ends on a question is the boss's to answer, once a
+        // question.
+        let asks = told(
+            "devbox",
+            &seen("working", None),
+            &now("asking", Some("Which branch?")),
+        )
+        .unwrap();
+        assert!(
+            asks.starts_with("VEL-3's session on devbox finished a turn on a question for you.")
+                && asks.contains("“Which branch?”")
+                && asks.contains("crew.nudge"),
+            "{asks}"
+        );
         assert_eq!(
-            machine_line("devbox", &seen("asking", None), &now("blocked", None)),
+            told(
+                "devbox",
+                &seen("asking", Some("Which branch?")),
+                &now("asking", Some("Which branch?"))
+            ),
+            None
+        );
+        let again = told(
+            "devbox",
+            &seen("asking", Some("Which branch?")),
+            &now("asking", Some("Main or dev?")),
+        )
+        .unwrap();
+        assert!(again.contains("“Main or dev?”"), "{again}");
+        // Its answerer there has it: the boss isn't told.
+        assert_eq!(
+            machine_line(
+                "devbox",
+                &seen("working", None),
+                &now("asking", Some("Which branch?")),
+                true
+            ),
+            None
+        );
+        // A request waits there, once.
+        let request = told("devbox", &seen("working", None), &now("blocked", None)).unwrap();
+        assert!(request.contains("waiting on a request there"), "{request}");
+        assert_eq!(
+            told("devbox", &seen("blocked", None), &now("blocked", None)),
             None
         );
         // It ends, once.
-        let gone = machine_line(
+        let gone = told(
             "devbox",
             &seen("idle", Some("a")),
             &now("closed", Some("a")),
@@ -2917,7 +2969,7 @@ mod tests {
             "{gone}"
         );
         assert_eq!(
-            machine_line(
+            told(
                 "devbox",
                 &seen("closed", Some("a")),
                 &now("stopped", Some("a"))

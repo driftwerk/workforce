@@ -244,6 +244,24 @@ impl Desk {
             .map(|b| Party::manager(&b.agent, &b.name))
     }
 
+    /// The boss session `me` reaches as "desk": the one served from a grant
+    /// that runs it, while that boss takes its line ([`crew::Crew::answers_for`]);
+    /// else its scope's ([`Self::line_overseer`]).
+    fn session_overseer(&self, me: &SessionView) -> Option<Party> {
+        let crew = self
+            .0
+            .line_crew
+            .lock()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        self.running_boss(me.id)
+            .filter(|b| {
+                crate::grant::is_served(b) && crew.as_ref().is_some_and(|c| c.answers_for(b))
+            })
+            .map(|b| Party::manager(&b, &self.boss_name(&b)))
+            .or_else(|| self.line_overseer(me.group.as_ref().map(|g| g.id.as_str())))
+    }
+
     /// The group a line message is its session's: its sender's when that
     /// is a session, else its recipient's.
     pub(super) fn line_group(&self, m: &LineMessage) -> Option<String> {
@@ -740,7 +758,7 @@ impl Desk {
                     Target::Person => hop.min(crate::rooms::MAX_HOPS),
                     Target::Overseer | Target::Session(_) => hop,
                 };
-                let overseer = self.line_overseer(me.group.as_ref().map(|g| g.id.as_str()));
+                let overseer = self.session_overseer(me);
                 let recipient = line::reach(
                     me,
                     &to,
@@ -1428,7 +1446,7 @@ impl Desk {
                             })
                         })
                         .collect();
-                let desk = match self.line_overseer(me.group.as_ref().map(|g| g.id.as_str())) {
+                let desk = match self.session_overseer(me) {
                     Some(o) => format!("{}, the person's overseer: to \"desk\"", o.name),
                     None => "No overseer answers here: \"desk\" reaches the person".into(),
                 };

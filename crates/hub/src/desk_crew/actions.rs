@@ -639,7 +639,7 @@ impl Action {
 }
 
 /// A charge refused in the words the person reads, as they are.
-fn charge_plain(e: workforce_desk::DeskError) -> String {
+pub(super) fn charge_plain(e: workforce_desk::DeskError) -> String {
     match e {
         workforce_desk::DeskError::Conflict(why)
         | workforce_desk::DeskError::Invalid(why)

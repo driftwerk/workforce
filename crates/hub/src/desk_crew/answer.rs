@@ -30,6 +30,7 @@ use workforce_desk::model::{DeskEvent, PendingApproval, SessionView};
 
 use super::actions::{Action, Target};
 use super::decide::{MARK, WITHIN};
+use super::remote_decide::{Decider, Failed};
 use super::{name_of, CrewHub};
 
 /// How often every open question is looked at again: one the person had
@@ -223,6 +224,24 @@ fn asking(crew: &CrewHub) -> Vec<Uuid> {
         .collect()
 }
 
+/// Why a reply the boss's model gave can't be used.
+fn neither(text: &str) -> String {
+    format!(
+        "its answer was neither an answer nor a question for you (“{}”)",
+        workforce_desk::crew::one_line(text, 120)
+    )
+}
+
+/// Why an answer call made no answer: its model's own error, or what its
+/// home said of a call relayed there.
+fn failure(e: &Failed) -> String {
+    let why = workforce_desk::crew::one_line(&e.why, 160);
+    match e.code {
+        None => format!("its model failed: {why}"),
+        Some(_) => why,
+    }
+}
+
 /// What became of a question handed to its boss.
 enum Answered {
     /// Answered, left to the person, or no longer asked.
@@ -247,11 +266,22 @@ impl CrewHub {
     /// Whether the person is in control of `view` for its questions, as its
     /// boss `boss`'s settings say: then nothing is said of them.
     pub(crate) fn person_has_questions(&self, view: &SessionView, boss: &str) -> bool {
-        let gap = self
-            .overseer_named(boss)
-            .map(|(_, o)| self.answer_gap(&o))
-            .unwrap_or_else(|| self.answer_gap(&workforce_common::oversight::Oversight::default()));
-        self.desk.person_in_control(view.id, gap)
+        let o = self
+            .decider_of(boss, view)
+            .map(|d| d.oversight)
+            .unwrap_or_default();
+        self.desk.person_in_control(view.id, self.answer_gap(&o))
+    }
+
+    /// Who answers `view`'s questions for `boss` itself, now: `boss` at Act
+    /// fully in force, when it answers them here
+    /// ([`CrewHub::answers`]).
+    fn question_answerer(&self, boss: &str, view: &SessionView) -> Option<Decider> {
+        self.desk
+            .boss_unbound(boss)
+            .then(|| self.decider_of(boss, view))
+            .flatten()
+            .filter(|d| self.answers(d))
     }
 
     /// Whether `view` waits on a question its dialog asks (not a permission
@@ -268,9 +298,9 @@ impl CrewHub {
         // A boss on another hub answers questions in its own turns there,
         // woken as before: none is swallowed here.
         question_of(view).is_some()
-            && self.boss_over(view).is_some_and(|b| {
-                !workforce_desk::grant::is_served(&b) && self.desk.boss_unbound(&b)
-            })
+            && self
+                .boss_over(view)
+                .is_some_and(|b| self.question_answerer(&b, view).is_some())
     }
 
     /// Looks at session `id`'s question: hands it to its boss (once,
@@ -292,8 +322,7 @@ impl CrewHub {
             return;
         };
         // A boss on another hub answers questions in its own turns there.
-        if workforce_desk::grant::is_served(&boss)
-            || !self.desk.boss_unbound(&boss)
+        if self.question_answerer(&boss, &view).is_none()
             || !self.desk.charges_loaded()
             || self.person_has_questions(&view, &boss)
         {
@@ -355,11 +384,10 @@ impl CrewHub {
         turn: workforce_desk::line::TurnMark,
         boss: &str,
     ) -> Answered {
-        let Some((service, o)) = self.overseer_named(boss) else {
+        let Some(d) = self.question_answerer(boss, view) else {
             return Answered::Done;
         };
-        let name = name_of(&service);
-        let (session, prefs) = self.session_brief(boss, view, &o).await;
+        let (session, prefs) = self.session_brief(boss, view, &d.oversight).await;
         let question = serde_json::json!({"question": q.ask, "options": q.options});
         let prompt = format!(
             "{MARK} A session you oversee ended its turn asking this. Answer it now.\n\n{}\n\n{}{prefs}",
@@ -369,25 +397,19 @@ impl CrewHub {
         let mut failed = String::new();
         let mut replied = None;
         for _ in 0..2 {
-            match tokio::time::timeout(WITHIN, self.decision_call(&service, SYSTEM, &prompt)).await
-            {
+            match tokio::time::timeout(WITHIN, self.answer_by(&d, &prompt)).await {
                 Ok(Ok(text)) => match reply(&text) {
                     Some(r) => {
                         replied = Some(r);
                         break;
                     }
-                    None => {
-                        failed = format!(
-                            "its answer was neither an answer nor a question for you (“{}”)",
-                            workforce_desk::crew::one_line(&text, 120)
-                        )
-                    }
+                    None => failed = neither(&text),
                 },
                 Ok(Err(e)) => {
-                    failed = format!(
-                        "its model failed: {}",
-                        workforce_desk::crew::one_line(&e, 160)
-                    )
+                    failed = failure(&e);
+                    if !e.again() {
+                        break;
+                    }
                 }
                 Err(_) => {
                     failed = format!(
@@ -397,6 +419,7 @@ impl CrewHub {
                 }
             }
         }
+        self.after_decided(&d).await;
         // Answered meanwhile, by the person or the session going on; or the
         // person took it, or Act fully ended: nothing is said now.
         let Ok(now) = self.desk.view(view.id) else {
@@ -445,7 +468,7 @@ impl CrewHub {
                     ..Default::default()
                 };
                 match self
-                    .perform_with(&action, By::manager(boss, &name, &why), &order)
+                    .perform_with(&action, By::manager(boss, &d.name, &why), &order)
                     .await
                 {
                     Ok(done) => {
@@ -486,11 +509,10 @@ impl CrewHub {
         let release = || {
             self.desk.release_dialog(view.id, p.id);
         };
-        let Some((service, o)) = self.overseer_named(boss) else {
+        let Some(d) = self.question_answerer(boss, view) else {
             return release();
         };
-        let name = name_of(&service);
-        let (session, prefs) = self.session_brief(boss, view, &o).await;
+        let (session, prefs) = self.session_brief(boss, view, &d.oversight).await;
         let questions = p
             .request
             .as_ref()
@@ -530,33 +552,24 @@ impl CrewHub {
                 failed = "it ran out of time before the dialog had to open".into();
                 break;
             }
-            match tokio::time::timeout(
-                left.min(WITHIN),
-                self.decision_call(&service, SYSTEM, &prompt),
-            )
-            .await
-            {
+            match tokio::time::timeout(left.min(WITHIN), self.answer_by(&d, &prompt)).await {
                 Ok(Ok(text)) => match reply(&text) {
                     Some(r) => {
                         replied = Some(r);
                         break;
                     }
-                    None => {
-                        failed = format!(
-                            "its answer was neither an answer nor a question for you (“{}”)",
-                            workforce_desk::crew::one_line(&text, 120)
-                        )
-                    }
+                    None => failed = neither(&text),
                 },
                 Ok(Err(e)) => {
-                    failed = format!(
-                        "its model failed: {}",
-                        workforce_desk::crew::one_line(&e, 160)
-                    )
+                    failed = failure(&e);
+                    if !e.again() {
+                        break;
+                    }
                 }
                 Err(_) => failed = "its model didn't answer in time".into(),
             }
         }
+        self.after_decided(&d).await;
         // Gone meanwhile (answered, released to the person), or theirs now.
         let still = self.desk.view(view.id).ok().filter(|v| {
             v.pending
@@ -583,7 +596,10 @@ impl CrewHub {
                     session: view.id,
                     approval: p.id,
                 };
-                if let Err(refused) = self.perform(&action, By::manager(boss, &name, &text)).await {
+                if let Err(refused) = self
+                    .perform(&action, By::manager(boss, &d.name, &text))
+                    .await
+                {
                     // Let go meanwhile (the person took the session, or the
                     // hold ran out): it is theirs, and nothing is said.
                     let held = self.desk.view(view.id).ok().filter(|v| {

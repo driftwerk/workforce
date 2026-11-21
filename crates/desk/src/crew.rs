@@ -961,6 +961,12 @@ pub trait Crew: Send + Sync {
     fn answers_lines(&self) -> bool {
         false
     }
+    /// Whether `boss`, a boss served from a grant that runs a session
+    /// here, takes what that session says on Desk's line now: one relayed
+    /// from the home, while its home reads it.
+    fn answers_for(&self, _boss: &str) -> bool {
+        false
+    }
     /// Gives the agent `agent` a task in its Desk conversation, as you,
     /// as `crew.assign` does: what was done, or what went wrong, in plain
     /// words.

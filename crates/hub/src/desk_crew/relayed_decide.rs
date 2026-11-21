@@ -128,6 +128,47 @@ fn most_spent(fresh: &[(&str, &Home)]) -> Option<f64> {
         .reduce(f64::max)
 }
 
+/// What a relayed boss's decision call is for: a session's request, or a
+/// question it asks ([`super::answer`]). The home answers each with its
+/// own instructions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Call {
+    Request,
+    Question,
+}
+
+impl Call {
+    /// How a take names it: a request's is said as none, as an older
+    /// machine's is.
+    fn said(self) -> Option<&'static str> {
+        match self {
+            Self::Request => None,
+            Self::Question => Some("question"),
+        }
+    }
+
+    fn of(kind: Option<&str>) -> Option<Self> {
+        match kind {
+            None => Some(Self::Request),
+            Some("question") => Some(Self::Question),
+            Some(_) => None,
+        }
+    }
+
+    fn system(self) -> &'static str {
+        match self {
+            Self::Request => super::decide::SYSTEM,
+            Self::Question => super::answer::SYSTEM,
+        }
+    }
+}
+
+/// The most notices for the person a machine keeps for one boss until its
+/// home takes them.
+const MOST_NOTES: usize = 16;
+/// How long a notice for the person may be.
+const MAX_NOTE: usize = 1_000;
+
 /// What a machine holds of its relayed bosses' decisions.
 #[derive(Default)]
 pub(crate) struct Outbox {
@@ -135,7 +176,10 @@ pub(crate) struct Outbox {
     /// was spent.
     homes: HashMap<Key, Home>,
     /// What waits to be taken, oldest first.
-    queued: HashMap<Key, VecDeque<(Uuid, String)>>,
+    queued: HashMap<Key, VecDeque<(Uuid, String, Call)>>,
+    /// What each boss (`home/<agent>`) says to the person, oldest first:
+    /// its home's take carries it to the boss's DM there.
+    notes: HashMap<String, VecDeque<String>>,
     /// Who waits for each answer, and whose it is.
     waiting: HashMap<Uuid, (Key, oneshot::Sender<Result<String, Failed>>)>,
     /// What a take handed out: only these are answered.
@@ -155,7 +199,7 @@ impl Outbox {
         self.waiting.remove(&id);
         self.taken.remove(&id);
         for q in self.queued.values_mut() {
-            q.retain(|(i, _)| *i != id);
+            q.retain(|(i, ..)| *i != id);
         }
         self.queued.retain(|_, q| !q.is_empty());
     }
@@ -198,7 +242,7 @@ impl Drop for Forget<'_> {
     }
 }
 
-fn key_of(boss: &BossRef, group: &str) -> Option<Key> {
+pub(super) fn key_of(boss: &BossRef, group: &str) -> Option<Key> {
     matches!(boss, BossRef::Local { .. }).then(|| (boss.party_id(), group.to_string()))
 }
 
@@ -256,9 +300,7 @@ impl CrewHub {
         let filter = workforce_desk::ledger_store::Filter {
             seen: Some(
                 self.desk
-                    .seen_by(&workforce_common::oversight::Scope::Group(
-                        group.to_string(),
-                    )),
+                    .seen_by(&workforce_desk::grant::scope_of_group(group)),
             ),
             ..Default::default()
         };
@@ -298,15 +340,31 @@ impl CrewHub {
         }
     }
 
+    /// Keeps `text` for the person, from the boss `party` relayed from the
+    /// home, for its home's next take to say in the boss's DM there; the
+    /// oldest goes first once [`MOST_NOTES`] wait.
+    pub(crate) fn relayed_note(&self, party: &str, text: &str) {
+        let mut out = self.relayed.lock();
+        let notes = out.notes.entry(party.to_string()).or_default();
+        if notes.len() >= MOST_NOTES {
+            notes.pop_front();
+        }
+        notes.push_back(workforce_desk::sees::capped(
+            &crate::redact::hide_secrets(text),
+            MAX_NOTE,
+        ));
+    }
+
     /// One decision call by `boss` (`home/<agent>`), relayed from the home,
-    /// for a session of `group`, on `prompt`: the text its model answered
-    /// at home, or why there is none. Its secrets are hidden before it
-    /// leaves. The caller bounds how long it waits.
+    /// for a session of `group`, on `prompt`, for `call`: the text its model
+    /// answered at home, or why there is none. Its secrets are hidden
+    /// before it leaves. The caller bounds how long it waits.
     pub(crate) async fn relayed_decision_call(
         &self,
         boss: &str,
         group: &str,
         prompt: &str,
+        call: Call,
     ) -> Result<String, Failed> {
         let prompt = crate::redact::hide_secrets(prompt);
         if prompt.chars().count() > MAX_PROMPT {
@@ -333,7 +391,7 @@ impl CrewHub {
                     code: Some(Code::Paced),
                 });
             }
-            q.push_back((id, prompt));
+            q.push_back((id, prompt, call));
             out.waiting.insert(id, (key, tx));
         }
         let _forget = Forget { crew: self, id };
@@ -443,13 +501,18 @@ impl CrewHub {
                 }
                 let mut handed = Vec::new();
                 while handed.len() < most {
-                    let Some((id, prompt)) = out.queued.get_mut(&key).and_then(VecDeque::pop_front)
+                    let Some((id, prompt, call)) =
+                        out.queued.get_mut(&key).and_then(VecDeque::pop_front)
                     else {
                         break;
                     };
                     if out.waiting.contains_key(&id) {
                         out.taken.insert(id);
-                        handed.push(json!({"decideId": id, "prompt": prompt}));
+                        let mut d = json!({"decideId": id, "prompt": prompt});
+                        if let Some(kind) = call.said() {
+                            d["kind"] = json!(kind);
+                        }
+                        handed.push(d);
                     }
                 }
                 out.queued.retain(|_, q| !q.is_empty());
@@ -459,8 +522,15 @@ impl CrewHub {
         if !ours {
             return refused(&workforce_desk::scope::not_ours(None));
         }
+        let notes: Vec<String> = self
+            .relayed
+            .lock()
+            .notes
+            .remove(&key.0)
+            .map(Vec::from)
+            .unwrap_or_default();
         let full = in_force && self.served_full(&key.0).is_some();
-        let mut body = json!({ "full": full, "decisions": decisions });
+        let mut body = json!({ "full": full, "decisions": decisions, "notes": notes });
         if let (Some(f), Some(usd)) = (from, here) {
             body["countFrom"] = json!(f.timestamp_millis());
             body["spentUsd"] = json!(usd);
@@ -550,7 +620,7 @@ impl CrewHub {
     }
 }
 
-fn refused(why: &str) -> (ServedStatus, Value) {
+pub(super) fn refused(why: &str) -> (ServedStatus, Value) {
     (ServedStatus::Refused, json!({ "error": why }))
 }
 
@@ -772,6 +842,16 @@ async fn take(
                 _ => IDLE_EVERY,
             };
     }
+    let notes = match &got {
+        Ok(a) if a.status == ServedStatus::Ok => a.body["notes"].as_array().cloned(),
+        _ => None,
+    };
+    for note in notes.into_iter().flatten().take(MOST_NOTES) {
+        if let Some(text) = note.as_str() {
+            crew.tell_dm(&agent, &workforce_desk::sees::capped(text, MAX_NOTE))
+                .await;
+        }
+    }
     for d in decisions {
         let (Some(id), Some(prompt)) = (d["decideId"].as_str(), d["prompt"].as_str()) else {
             continue;
@@ -783,6 +863,7 @@ async fn take(
             k.clone(),
             id.to_string(),
             prompt.to_string(),
+            Call::of(d["kind"].as_str()),
             Arc::clone(&pumps),
         ));
     }
@@ -797,12 +878,13 @@ async fn decide_one(
     k: (String, String),
     id: String,
     prompt: String,
+    call: Option<Call>,
     pumps: Pumps,
 ) {
     let (machine, group) = &k;
     let agent = service.agent_id.as_str().to_string();
     let refuse = |code: Code, why: &str| Err::<String, _>((code, why.to_string()));
-    let checked = if !prompt.starts_with(super::decide::MARK) {
+    let checked = if !prompt.starts_with(super::decide::MARK) || call.is_none() {
         Some(refuse(Code::NotADecision, "not a decision its home takes"))
     } else if prompt.chars().count() > MAX_PROMPT {
         Some(refuse(
@@ -847,7 +929,7 @@ async fn decide_one(
     } else {
         match tokio::time::timeout(
             HERE_WITHIN,
-            crew.decision_call(&service, super::decide::SYSTEM, &prompt),
+            crew.decision_call(&service, call.unwrap_or(Call::Request).system(), &prompt),
         )
         .await
         {
