@@ -162,7 +162,9 @@ jobs:
         with:
           shared-key: clippy
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo clippy --all-targets --all-features --no-deps -- -D warnings
+      - name: Give the build room to swap
+        uses: ./.github/actions/swap
+      - run: .github/scripts/held-to-memory.sh cargo clippy --all-targets --all-features --no-deps -- -D warnings
 
   # The hub test suite is built once here and run in parallel partitions
   # below (`test-run`), with the doctests in their own job (`test-doc`).
@@ -329,7 +331,9 @@ jobs:
           shared-key: test
           save-if: false
       - run: mkdir -p ui/dist
-      - run: cargo test --all-features --doc
+      - name: Give the build room to swap
+        uses: ./.github/actions/swap
+      - run: .github/scripts/held-to-memory.sh cargo test --all-features --doc
 
   # The tests that need a real vellev node and Postgres. Elsewhere these skip
   # themselves; VELLEV_TEST_REQUIRED makes a skip a failure here, so a green
