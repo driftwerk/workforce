@@ -201,7 +201,7 @@ jobs:
       - name: Give the build room to swap
         uses: ./.github/actions/swap
       - name: Build every test binary
-        run: cargo nextest archive --all-features --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst"
+        run: .github/scripts/held-to-memory.sh cargo nextest archive --all-features --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst"
       # Every test the archive holds that a plain run would run (not
       # #[ignore]d), for `test-count` to hold the partitions to.
       - name: Count the tests
@@ -441,7 +441,7 @@ jobs:
       # theirs too; the tests then run this binary as it is.
       - name: Build the hub's tests
         if: matrix.leg == 'hub'
-        run: crates/hub/vellev-node-tests.sh --no-run --all-features
+        run: .github/scripts/held-to-memory.sh crates/hub/vellev-node-tests.sh --no-run --all-features
       - name: Start a vellev node
         timeout-minutes: 30
         run: |
