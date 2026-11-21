@@ -198,7 +198,7 @@ impl Drop for Forget<'_> {
     }
 }
 
-fn key_of(boss: &BossRef, group: &str) -> Option<Key> {
+pub(super) fn key_of(boss: &BossRef, group: &str) -> Option<Key> {
     matches!(boss, BossRef::Local { .. }).then(|| (boss.party_id(), group.to_string()))
 }
 
@@ -256,9 +256,7 @@ impl CrewHub {
         let filter = workforce_desk::ledger_store::Filter {
             seen: Some(
                 self.desk
-                    .seen_by(&workforce_common::oversight::Scope::Group(
-                        group.to_string(),
-                    )),
+                    .seen_by(&workforce_desk::grant::scope_of_group(group)),
             ),
             ..Default::default()
         };
@@ -550,7 +548,7 @@ impl CrewHub {
     }
 }
 
-fn refused(why: &str) -> (ServedStatus, Value) {
+pub(super) fn refused(why: &str) -> (ServedStatus, Value) {
     (ServedStatus::Refused, json!({ "error": why }))
 }
 

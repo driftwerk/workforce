@@ -2025,6 +2025,7 @@ mod uplink_client;
 
 mod relay;
 mod relayed_decide;
+mod relayed_work;
 mod shared_budget;
 
 /// A boss still among the hub's agents whose config fails to read for a

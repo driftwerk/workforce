@@ -80,7 +80,9 @@ pub struct RelayCall {
     /// The overseer's own level and switches here: the machine decides at
     /// no more than these and its grant's.
     pub level: workforce_common::oversight::Level,
-    pub act: workforce_common::oversight::Act,
+    /// Its switches, and whether it takes on every session
+    /// ([`super::served::Ceiling::relayed_act`]).
+    pub act: Value,
     /// When this hub stops waiting for its answer: Desk's native side sends
     /// nothing it can't carry by then, so a call the boss was told may
     /// not have been done is never done later. Desk leaves it out of what
@@ -196,7 +198,7 @@ impl CrewHub {
             .key(),
             link_id: RELAY_LINK,
             level: ceiling.level,
-            act: ceiling.act,
+            act: ceiling.relayed_act(),
             deadline: chrono::Utc::now()
                 + chrono::Duration::from_std(wait).unwrap_or(chrono::Duration::seconds(30)),
         };
@@ -287,6 +289,16 @@ impl CrewHub {
     }
 }
 
+/// What a machine's refusal of `tool` means when it is one an older Desk
+/// there doesn't serve: that Desk there needs updating.
+pub(crate) fn older(machine: &str, tool: &str, answer: &RelayAnswer) -> Option<String> {
+    (answer.status == ServedStatus::Refused
+        && answer.body["error"].as_str() == Some(&format!("{tool} isn't served to a boss here.")))
+    .then(|| {
+        format!("Desk on {machine} is older and can't do {tool} yet: tell the person to update Desk there.")
+    })
+}
+
 /// The machine's parts of an overview, beside this Mac's: each machine's
 /// sessions as it said them, or why it said nothing. Nothing of a part is
 /// changed or raised; each says which machine it is.
@@ -342,11 +354,13 @@ struct TokenQuery {
 }
 
 /// What Desk asks the machines' grants with: `plans=1` from one that
-/// carries plans' grants.
+/// carries plans' grants, `ungrouped=1` from one that carries machines'
+/// Ungrouped grants.
 #[derive(Deserialize)]
 struct GrantsQuery {
     token: Option<String>,
     plans: Option<String>,
+    ungrouped: Option<String>,
 }
 
 /// Why a request isn't Desk's native side's, when it isn't.
@@ -483,15 +497,14 @@ async fn served(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>, body: By
     if !workforce_desk::grant::group_id_ok(&r.group) {
         return bad("that can't be a group");
     }
-    let ceiling = super::served::Ceiling {
-        level,
-        act: super::served::act_of(&r.act),
-    };
+    let ceiling = super::served::Ceiling::of(level, &r.act);
     // The home taking its boss's decisions at Act fully, and answering
     // them ([`super::relayed_decide`]): the Mac hub's own calls, never a
     // crew tool's.
     use super::relayed_decide::{DECIDED, TAKE};
+    use super::relayed_work::WORK_TAKE;
     let (status, body) = match r.tool.as_str() {
+        WORK_TAKE => s.crew.work_take(&boss, &r.group, &r.input).await,
         TAKE => {
             s.crew
                 .take_relayed(&boss, &r.group, &r.input, &ceiling)
@@ -524,7 +537,8 @@ async fn served(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>, body: By
 /// native side to carry to them.
 async fn machine_grants(State(s): S, h: HeaderMap, Query(q): Query<GrantsQuery>) -> Response {
     native!(s, h, TokenQuery { token: q.token });
-    match s.crew.machine_grants(q.plans.as_deref() == Some("1")) {
+    let said = |f: &Option<String>| f.as_deref() == Some("1");
+    match s.crew.machine_grants(said(&q.plans), said(&q.ungrouped)) {
         Some(w) => Json(w).into_response(),
         // Not known yet: Desk writes nothing, and deletes nothing, until it is.
         None => (

@@ -42,7 +42,7 @@ fn counted(mut take: Value) -> Value {
     take
 }
 
-async fn post(app: &axum::Router, token: &str, body: Value) -> Value {
+pub(super) async fn post(app: &axum::Router, token: &str, body: Value) -> Value {
     let res = app
         .clone()
         .oneshot(

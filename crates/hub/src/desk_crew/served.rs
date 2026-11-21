@@ -62,6 +62,11 @@ pub const SERVED_ACT: [&str; 10] = [
     "crew.start_session",
     "crew.release",
 ];
+/// The acting tools served only to the home's own boss, on its relay: it
+/// is the person's own Desk that holds the session's grant.
+pub const SERVED_RELAYED: [&str; 1] = ["crew.take_on"];
+/// The switch a grant and a relayed ceiling turn on for `take_on = "all"`.
+pub const TAKE_ON_ALL: &str = "take_on_all";
 
 /// The most sessions a served boss runs at once when its grant doesn't
 /// say.
@@ -106,11 +111,40 @@ pub fn act_of(act: &Value) -> Act {
     }
 }
 
+/// The sessions `act` lets its boss take on itself: every one when it
+/// says [`TAKE_ON_ALL`], else only those the person hands it.
+pub fn take_on_of(act: &Value) -> TakeOn {
+    match switch_on(act, TAKE_ON_ALL) {
+        true => TakeOn::All,
+        false => TakeOn::Handed,
+    }
+}
+
 /// A boss's own level and switches, as its home holds them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ceiling {
     pub level: Level,
     pub act: Act,
+    pub take_on: TakeOn,
+}
+
+impl Ceiling {
+    /// The ceiling a relayed call says it is decided under: its level, and
+    /// its switches with [`TAKE_ON_ALL`] among them.
+    pub fn of(level: Level, act: &Value) -> Self {
+        Self {
+            level,
+            act: act_of(act),
+            take_on: take_on_of(act),
+        }
+    }
+
+    /// Its switches as a relayed call carries them.
+    pub fn relayed_act(&self) -> Value {
+        let mut act = serde_json::to_value(self.act).unwrap_or_else(|_| json!({}));
+        act[TAKE_ON_ALL] = json!(self.take_on == TakeOn::All);
+        act
+    }
 }
 
 fn rank(l: Level) -> u8 {
@@ -138,6 +172,9 @@ pub fn narrowed(mut o: Oversight, c: &Ceiling) -> Oversight {
     a.message_agents &= b.message_agents;
     a.message_terminal_sessions &= b.message_terminal_sessions;
     a.hand_off &= b.hand_off;
+    if c.take_on != TakeOn::All {
+        o.work.take_on = TakeOn::Handed;
+    }
     o
 }
 
@@ -201,10 +238,7 @@ pub fn served_oversight(g: &Grant) -> Oversight {
         });
     let mut o = Oversight {
         enabled: true,
-        scope: match g.group.as_str() {
-            workforce_desk::UNGROUPED => Scope::Ungrouped,
-            group => Scope::Group(group.to_string()),
-        },
+        scope: grant::scope_of_group(&g.group),
         level: match g.level {
             grant::Level::Watch => Level::Watch,
             grant::Level::Suggest => Level::Suggest,
@@ -238,7 +272,12 @@ pub fn served_oversight(g: &Grant) -> Oversight {
         },
         ..Oversight::default()
     };
-    o.work.take_on = TakeOn::Handed;
+    // Only the home's own boss is let take on every session, by the switch
+    // its home's grant carries.
+    o.work.take_on = match g.boss {
+        Some(BossRef::Local { .. }) => take_on_of(&g.act),
+        _ => TakeOn::Handed,
+    };
     o.work.parallel = parallel;
     o.work.engine = Engine::Claude.as_str().to_string();
     o
@@ -258,6 +297,33 @@ pub fn folder_inside(folder: &str, allowed: &[String]) -> Option<std::path::Path
         .then_some(real)
 }
 
+/// The `event` frame that tells a served boss of `g` that session `view`
+/// waits on request `p`: its words only where Sees shows its question.
+pub(super) fn request_frame(
+    g: &Grant,
+    view: &workforce_desk::model::SessionView,
+    p: &workforce_desk::model::PendingApproval,
+) -> Value {
+    let what = match (sees::shows(g.sees, Part::Question), p.detail.trim()) {
+        (false, _) => String::new(),
+        (true, "") => format!(": {}", p.tool),
+        (true, detail) => format!(": {}: {}", p.tool, workforce_desk::crew::clip(detail, 300)),
+    };
+    let line = format!(
+        "{} ({}) waits on a request{what} (approval_id {})",
+        view.label(),
+        view.id,
+        p.id
+    );
+    json!({
+        "kind": "needs_you",
+        "subject": view.id,
+        "line": sees::capped(&line, 2_000),
+        "at": chrono::Utc::now(),
+        "hop": 0,
+    })
+}
+
 /// The group rows of `g`'s sessions are stamped with: none for Ungrouped.
 fn stamped_as(g: &Grant) -> Option<&str> {
     (g.group != workforce_desk::UNGROUPED).then_some(g.group.as_str())
@@ -265,7 +331,7 @@ fn stamped_as(g: &Grant) -> Option<&str> {
 
 /// Every string of `v`, secrets hidden whole and each capped: how many
 /// were changed.
-fn cleaned(v: &mut Value) -> usize {
+pub(super) fn cleaned(v: &mut Value) -> usize {
     match v {
         Value::String(s) => {
             let hidden = crate::redact::hide_secrets(s);
@@ -284,9 +350,11 @@ impl CrewHub {
     /// Decides `call` for `group`'s grant on this engine, as the module
     /// says, and records what came of it.
     pub async fn serve_crew(self: &Arc<Self>, call: ServedCall, group: &str) -> Served {
+        let relayed = call.link_id.as_deref() == Some(super::relay::RELAY_LINK);
         let tool = SERVED_READ
             .iter()
             .chain(SERVED_ACT.iter())
+            .chain(SERVED_RELAYED.iter().filter(|_| relayed))
             .find(|t| **t == call.tool)
             .copied();
         let row = CallRow {
@@ -466,11 +534,20 @@ impl CrewHub {
         boss: &BossRef,
         event: &workforce_desk::crew::Event,
     ) -> Option<Value> {
-        use workforce_desk::crew::{Kind, PartyKind};
         let g = self.desk.grant_live(group).ok()?;
-        if !self.serves_remote(&g, boss) {
-            return None;
-        }
+        self.serves_remote(&g, boss)
+            .then(|| self.grant_event(&g, event))
+            .flatten()
+    }
+
+    /// What `event` tells the boss of `g` ([`Self::served_event`]), its
+    /// boss served: the frame, or nothing.
+    pub(super) fn grant_event(
+        &self,
+        g: &Grant,
+        event: &workforce_desk::crew::Event,
+    ) -> Option<Value> {
+        use workforce_desk::crew::{Kind, PartyKind};
         if matches!(event.actor.kind, PartyKind::Manager | PartyKind::You)
             || event.hop >= i16::from(workforce_core::desk::MAX_HOPS)
         {
@@ -489,7 +566,7 @@ impl CrewHub {
         }
         let subject = event.subject.as_ref()?;
         let id: Uuid = subject.id.parse().ok()?;
-        if !self.in_grant(&g, id) || event.group.as_deref() != stamped_as(&g) {
+        if !self.in_grant(g, id) || event.group.as_deref() != stamped_as(g) {
             return None;
         }
         let words = sees::shows(g.sees, Part::Words);
@@ -666,35 +743,7 @@ impl CrewHub {
                     left: false,
                 },
             );
-            let line = if sees::shows(g.sees, Part::Question) {
-                let what = match p.detail.trim() {
-                    "" => p.tool.clone(),
-                    detail => format!("{}: {}", p.tool, workforce_desk::crew::clip(detail, 300)),
-                };
-                format!(
-                    "{} ({}) waits on a request: {what} (approval_id {})",
-                    view.label(),
-                    c.session,
-                    p.id
-                )
-            } else {
-                format!(
-                    "{} ({}) waits on a request (approval_id {})",
-                    view.label(),
-                    c.session,
-                    p.id
-                )
-            };
-            owed.push((
-                p.id,
-                json!({
-                    "kind": "needs_you",
-                    "subject": c.session,
-                    "line": sees::capped(&line, 2_000),
-                    "at": chrono::Utc::now(),
-                    "hop": 0,
-                }),
-            ));
+            owed.push((p.id, request_frame(&g, &view, p)));
         }
         offered.retain(|(id, _), _| open.contains(id));
         owed
@@ -817,7 +866,7 @@ impl CrewHub {
     }
 
     /// Whether `id` is one of this engine's sessions in `g`.
-    fn in_grant(&self, g: &Grant, id: Uuid) -> bool {
+    pub(super) fn in_grant(&self, g: &Grant, id: Uuid) -> bool {
         (g.members.contains(&id) || g.born.contains(&id)) && self.desk.view(id).is_ok()
     }
 
@@ -1012,6 +1061,10 @@ impl CrewHub {
                 }
             }
             Action::StartSession { .. } | Action::Release { .. } => {}
+            Action::TakeOn { session } if !self.in_grant(g, *session) => {
+                return Err(self.not_in_grant(g));
+            }
+            Action::TakeOn { .. } => {}
             other => {
                 let s = Self::session_of(other).ok_or("That isn't served to a boss here.")?;
                 if !self.in_grant(g, s) {
@@ -1101,6 +1154,21 @@ impl CrewHub {
                             Box::pin(self.assign_after(r, &who, None, id, started.is_ok())).await;
                         }
                         started?.0
+                    }
+                    Action::TakeOn { session } => {
+                        let party = Party::manager(boss, &boss_name(g));
+                        let c = self
+                            .desk
+                            .take_on(
+                                *session,
+                                &party,
+                                workforce_desk::charge::How::Taken,
+                                &o.scope,
+                                &by,
+                            )
+                            .await
+                            .map_err(super::actions::charge_plain)?;
+                        format!("took on {}", self.session_name(c.session))
                     }
                     _ => Box::pin(self.perform_with(&action, by, &order)).await?,
                 };

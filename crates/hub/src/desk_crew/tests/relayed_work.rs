@@ -1,0 +1,325 @@
+//! A boss relayed from the home on a session the person started on a
+//! machine (designs/boss-takes-on-machine-sessions.md): on devbox, Desk (the
+//! Mac's main overseer, `home/desk`) takes on VEL-9, in no group there,
+//! under devbox's Ungrouped grant, and hears what it says and does by its
+//! home's takes.
+
+use super::relayed_decide::post;
+use super::served::native;
+use super::*;
+use workforce_desk::line::Asked;
+
+use super::super::relayed_work::{Taken, WORK_TAKE};
+use super::super::served::{ServedCall, ServedStatus};
+
+const HOME_DESK: &str = "home/desk";
+
+fn ungrouped(revision: i64, members: &[uuid::Uuid], take_on_all: bool) -> Value {
+    json!({"grantVersion": 1, "revision": revision, "name": "Ungrouped", "boss": "local:desk",
+           "level": "act", "sees": "replies", "members": members,
+           "act": {"nudge": true, "interrupt": true, "take_on_all": take_on_all}})
+}
+
+async fn put_ungrouped(d: &Desk, revision: i64, members: &[uuid::Uuid], take_on_all: bool) {
+    let body = ungrouped(revision, members, take_on_all);
+    let (code, out) = native(d, "PUT", "/api/desk/grants/ungrouped", body).await;
+    assert_eq!(code, StatusCode::OK, "{out}");
+}
+
+/// The home's call under devbox's Ungrouped grant, as Desk posts it, with
+/// the home letting its boss take on every session or not.
+fn relayed(tool: &str, input: Value, take_on_all: bool) -> Value {
+    json!({"group": "ungrouped", "tool": tool, "input": input, "boss": "local:desk",
+           "linkId": "home-relay", "id": uuid::Uuid::new_v4().to_string(), "level": "act",
+           "act": {"nudge": true, "interrupt": true, "take_on_all": take_on_all}})
+}
+
+fn take_on(id: uuid::Uuid, all: bool) -> Value {
+    relayed(
+        "crew.take_on",
+        json!({"session_id": id, "reason": "The person asked."}),
+        all,
+    )
+}
+
+async fn take(app: &axum::Router, token: &str, input: Value) -> Taken {
+    let out = post(app, token, relayed(WORK_TAKE, input, true)).await;
+    assert_eq!(out["status"], "ok", "{out}");
+    serde_json::from_value(out["body"].clone()).unwrap()
+}
+
+/// A session the person started on `d` and stopped: one running without
+/// Desk's closed check of each call is never a served boss's.
+pub(super) async fn person_started(
+    d: &Desk,
+    dir: &Path,
+    name: &str,
+) -> workforce_desk::model::SessionView {
+    let s = new_session(d, dir, name).await;
+    d.stop(s.id, Some(By::you())).unwrap();
+    eventually("stopped", async || d.servable_launch(s.id).then_some(())).await;
+    s
+}
+
+/// devbox, overseeing nothing of its own, with VEL-9, VEL-15 and VEL-20 in
+/// its Ungrouped grant for the Mac's Desk, and notes outside it.
+async fn devbox(
+    dir: &Path,
+    pool: workforce_postgres::PostgresPool,
+) -> (Arc<CrewHub>, Desk, [workforce_desk::model::SessionView; 4]) {
+    let (_any, crew, d, _llm) =
+        overseeing(dir, pool, "ok", "[oversight]\nenabled = false\n", &[]).await;
+    let sessions = [
+        person_started(&d, dir, "VEL-9").await,
+        person_started(&d, dir, "VEL-15").await,
+        person_started(&d, dir, "VEL-20").await,
+        person_started(&d, dir, "notes").await,
+    ];
+    let members: Vec<uuid::Uuid> = sessions[..3].iter().map(|s| s.id).collect();
+    put_ungrouped(&d, 1, &members, true).await;
+    (crew, d, sessions)
+}
+
+/// On devbox: the home's boss takes on a session of its grant only as both
+/// the grant and its home let it, once however often it is sent, on the
+/// relay alone; the person hands one to it from devbox's own Desk.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_homes_boss_takes_on_a_machines_ungrouped_session_only_as_both_ends_let_it() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (crew, d, [vel9, vel15, vel20, notes]) = devbox(dir.path(), pool).await;
+        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let token = crew.state.auth_token.clone();
+        let from = chrono::Utc::now() - chrono::Duration::hours(1);
+
+        let once = take_on(vel9.id, true);
+        let out = post(&app, &token, once.clone()).await;
+        assert_eq!(out["status"], "ok", "{out}");
+        let c = d.charge_of(vel9.id).expect("taken on");
+        assert_eq!(c.boss, HOME_DESK);
+        assert_eq!(c.how, workforce_desk::charge::How::Taken);
+        let again = post(&app, &token, once).await;
+        assert_eq!(again["body"]["again"], json!(true), "done once: {again}");
+        let noted = d
+            .store()
+            .events_since(from, &[vel9.id.to_string()], 20, None)
+            .await
+            .unwrap();
+        assert!(
+            noted
+                .iter()
+                .any(|e| e.kind == workforce_desk::crew::Kind::TakenOn),
+            "{noted:?}"
+        );
+
+        // Its home doesn't let it take on every session: the person is
+        // offered it instead.
+        let out = post(&app, &token, take_on(vel15.id, false)).await;
+        assert_eq!(out["status"], "suggested", "{out}");
+        assert!(d.charge_of(vel15.id).is_none());
+        // Nor does its grant there: the same, whatever its home says.
+        put_ungrouped(&d, 2, &[vel9.id, vel15.id, vel20.id], false).await;
+        let out = post(&app, &token, take_on(vel15.id, true)).await;
+        assert_eq!(out["status"], "suggested", "{out}");
+        assert!(d.charge_of(vel15.id).is_none());
+        // Not one of the grant's: refused.
+        let out = post(&app, &token, take_on(notes.id, true)).await;
+        assert_eq!(out["status"], "refused", "{out}");
+        assert!(d.charge_of(notes.id).is_none());
+        // Never on a link of its own: the relay's alone.
+        let r = crew
+            .serve_crew(
+                ServedCall {
+                    tool: "crew.take_on".into(),
+                    input: json!({"session_id": vel15.id}),
+                    boss: workforce_desk::grant::BossRef::Local {
+                        agent: "desk".into(),
+                    },
+                    link_id: Some("link-of-mine".into()),
+                    call_id: Some("c-1".into()),
+                    ceiling: None,
+                },
+                "ungrouped",
+            )
+            .await;
+        assert_eq!(r.status, ServedStatus::Refused, "{:?}", r.body);
+        assert!(d.charge_of(vel15.id).is_none());
+
+        // The person hands one in no group to it from devbox's own Desk.
+        let (code, out) = native(
+            &d,
+            "POST",
+            &format!("/api/desk/sessions/{}/charge", vel20.id),
+            json!({"boss": HOME_DESK}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{out}");
+        assert_eq!(d.charge_of(vel20.id).unwrap().boss, HOME_DESK);
+    })
+    .await;
+}
+
+/// On devbox: a take hands its home what the sessions its boss runs did
+/// since the home's cursor (or devbox's own), what they ask it and report
+/// to it on Desk's line, each report once acknowledged; while its home
+/// takes, the sessions reach that boss as "desk", and once it doesn't,
+/// what they asked is the person's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_take_hands_the_home_its_sessions_work_and_their_line_waits_for_it_while_it_takes() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (crew, d, [vel9, vel15, _, _]) = devbox(dir.path(), pool).await;
+        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let token = crew.state.auth_token.clone();
+        let out = post(&app, &token, take_on(vel9.id, true)).await;
+        assert_eq!(out["status"], "ok", "{out}");
+
+        let first = take(&app, &token, json!({})).await;
+        assert_eq!(
+            first.sessions.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![vel9.id],
+            "the sessions it runs alone"
+        );
+        assert_eq!(first.sessions[0].name, "VEL-9");
+        assert!(first.events.is_empty(), "nothing before its first take");
+
+        // VEL-9 asks Desk, and tells it: its home's boss is "desk".
+        let asked = d
+            .line_call(
+                vel9.id,
+                "ask",
+                &json!({"to": "desk", "text": "Ship VEL-9 now?", "wait_seconds": 60}),
+                Some(Duration::from_millis(10)),
+            )
+            .await
+            .unwrap();
+        let ask: uuid::Uuid = serde_json::from_value(asked["id"].clone()).unwrap();
+        assert_eq!(
+            d.store().line_message(ask).await.unwrap().unwrap().to.id,
+            HOME_DESK
+        );
+        let told = d
+            .line_call(
+                vel9.id,
+                "tell",
+                &json!({"to": "desk", "text": "Tests pass."}),
+                None,
+            )
+            .await
+            .unwrap();
+        let report: uuid::Uuid = serde_json::from_value(told["id"].clone()).unwrap();
+        // VEL-15, which it doesn't run, reaches the person as "desk".
+        let other = d
+            .line_call(
+                vel15.id,
+                "tell",
+                &json!({"to": "desk", "text": "Not yours."}),
+                None,
+            )
+            .await
+            .unwrap();
+        let other: uuid::Uuid = serde_json::from_value(other["id"].clone()).unwrap();
+        assert_ne!(
+            d.store().line_message(other).await.unwrap().unwrap().to.id,
+            HOME_DESK
+        );
+
+        // Its report waits for the home; its question stays open for it.
+        let next = eventually("its report kept for the home", async || {
+            let t = take(&app, &token, json!({"since": first.now})).await;
+            t.reports.iter().any(|r| r.said.id == report).then_some(t)
+        })
+        .await;
+        assert_eq!(next.asks.len(), 1, "{next:?}");
+        assert_eq!(next.asks[0].said.id, ask);
+        assert_eq!(next.asks[0].session, vel9.id);
+        assert!(next.asks[0].said.text.contains("Ship VEL-9 now?"));
+        assert!(next.reports.iter().all(|r| r.said.id != other));
+        // Acknowledged, it is taken once.
+        let after = take(
+            &app,
+            &token,
+            json!({"since": next.now, "taken": [report, other]}),
+        )
+        .await;
+        assert!(after.reports.is_empty(), "{after:?}");
+        assert_eq!(
+            d.store()
+                .line_message(other)
+                .await
+                .unwrap()
+                .unwrap()
+                .delivery,
+            workforce_desk::line::Delivery::Delivered,
+            "another's report isn't touched"
+        );
+        // A home that restarted (no cursor) reads on from devbox's.
+        let resumed = take(&app, &token, json!({})).await;
+        assert!(resumed.now >= after.now);
+        // A peek leaves the cursor where it was.
+        let peeked = take(&app, &token, json!({"peek": true})).await;
+        assert_eq!(peeked.asks.len(), 1);
+
+        // Its home stops taking: what VEL-9 asked is the person's.
+        crew.homes_gone();
+        let q = eventually("its question given to the person", async || {
+            d.store()
+                .line_message(ask)
+                .await
+                .unwrap()
+                .filter(|q| q.asked == Some(Asked::Escalated))
+        })
+        .await;
+        assert!(q.escalation.is_some(), "{q:?}");
+        // And what it asks from now goes straight there.
+        let later = d
+            .line_call(
+                vel9.id,
+                "tell",
+                &json!({"to": "desk", "text": "Done."}),
+                None,
+            )
+            .await
+            .unwrap();
+        let later: uuid::Uuid = serde_json::from_value(later["id"].clone()).unwrap();
+        assert_ne!(
+            d.store().line_message(later).await.unwrap().unwrap().to.id,
+            HOME_DESK
+        );
+    })
+    .await;
+}
+
+/// On devbox: a take is for the home's own boss of a live grant alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_take_is_refused_to_any_boss_but_the_grants_own_from_its_home() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (crew, _d, _) = devbox(dir.path(), pool).await;
+        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let token = crew.state.auth_token.clone();
+        let mut other = relayed(WORK_TAKE, json!({}), true);
+        other["boss"] = json!("local:mia");
+        assert_eq!(post(&app, &token, other).await["status"], "refused");
+        let mut elsewhere = relayed(WORK_TAKE, json!({}), true);
+        elsewhere["group"] = json!("acme");
+        assert_eq!(post(&app, &token, elsewhere).await["status"], "refused");
+        let r = crew
+            .serve_crew(
+                ServedCall {
+                    tool: WORK_TAKE.into(),
+                    input: json!({}),
+                    boss: workforce_desk::grant::BossRef::Local {
+                        agent: "desk".into(),
+                    },
+                    link_id: Some("home-relay".into()),
+                    call_id: Some("c-1".into()),
+                    ceiling: None,
+                },
+                "ungrouped",
+            )
+            .await;
+        assert_eq!(r.status, ServedStatus::Refused, "never a crew tool");
+    })
+    .await;
+}

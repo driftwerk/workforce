@@ -1596,14 +1596,13 @@ impl CrewHub {
         }
     }
 
-    /// How many of `boss`'s plans' sessions on the person's machines hold a
-    /// slot: working, or not read yet.
+    /// How many of `boss`'s sessions on the person's machines hold a slot:
+    /// its plans' working or not read yet, and the others it runs there
+    /// working ([`super::relayed_work`]).
     fn machine_busy(&self, boss: &str) -> usize {
-        self.machine_seen
-            .lock()
-            .values()
-            .filter(|s| s.boss == boss && s.busy())
-            .count()
+        let seen = self.machine_seen.lock();
+        seen.values().filter(|s| s.boss == boss && s.busy()).count()
+            + self.machine_runs_busy(boss, |k| seen.contains_key(k))
     }
 
     /// Reads each machine that open plans' tickets work on, at most once a

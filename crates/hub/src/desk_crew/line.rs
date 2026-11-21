@@ -110,17 +110,45 @@ pub(crate) enum LineTurn {
     NotRun,
 }
 
+/// A message on a session's line as its boss's turn reads it: here, or as a
+/// machine's take carries it ([`super::relayed_work`]).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Said {
+    pub id: Uuid,
+    pub kind: LineKind,
+    pub in_reply_to: Option<Uuid>,
+    pub text: String,
+}
+
+impl From<&LineMessage> for Said {
+    fn from(m: &LineMessage) -> Self {
+        Self {
+            id: m.id,
+            kind: m.kind,
+            in_reply_to: m.in_reply_to,
+            text: m.full_text(),
+        }
+    }
+}
+
+/// What a line turn says of the session it is about, from what is known of
+/// it.
+pub(crate) fn about_session(known: &serde_json::Value) -> String {
+    reported(&known.to_string(), "the session")
+}
+
 /// What of `messages` a line turn shows in full, in order: every question
 /// and its newest [`REPORTS_SHOWN`] reports; and the ids of the reports
 /// before them, said by id alone.
-fn shown_reports(messages: &[LineMessage]) -> (Vec<&LineMessage>, Vec<Uuid>) {
+fn shown_reports(messages: &[Said]) -> (Vec<&Said>, Vec<Uuid>) {
     let reports = messages.iter().filter(|m| m.kind != LineKind::Ask);
     let hidden: HashSet<Uuid> = reports
         .clone()
         .take(reports.count().saturating_sub(REPORTS_SHOWN))
         .map(|m| m.id)
         .collect();
-    let (earlier, shown): (Vec<&LineMessage>, Vec<&LineMessage>) =
+    let (earlier, shown): (Vec<&Said>, Vec<&Said>) =
         messages.iter().partition(|m| hidden.contains(&m.id));
     (shown, earlier.into_iter().map(|m| m.id).collect())
 }
@@ -499,6 +527,12 @@ impl CrewHub {
             .await;
             return LineTurn::None;
         }
+        // Run by a boss on the Mac that reads its line: its home takes it
+        // there ([`super::relayed_work`]).
+        if let Some(boss) = self.reading_home(session) {
+            self.hold_for_home(&boss, &messages).await;
+            return LineTurn::None;
+        }
         // The overseer of the session's scope answers it, and no other.
         let Some((service, o)) = self.overseer_of_session(session) else {
             let asks: Vec<LineMessage> = messages
@@ -725,19 +759,40 @@ impl CrewHub {
         o: &Oversight,
     ) -> String {
         let about = match self.desk.view(session) {
-            Ok(v) => {
-                let said = serde_json::json!({
-                    "name": v.label(),
-                    "engine": v.engine.title(),
-                    "folder": v.cwd,
-                    "goal": v.goal,
-                    "state": v.state,
-                    "last_reply": v.last_reply.as_deref().map(|r| crew::clip(r, 1500)),
-                });
-                reported(&said.to_string(), "the session")
-            }
+            Ok(v) => about_session(&serde_json::json!({
+                "name": v.label(),
+                "engine": v.engine.title(),
+                "folder": v.cwd,
+                "goal": v.goal,
+                "state": v.state,
+                "last_reply": v.last_reply.as_deref().map(|r| crew::clip(r, 1500)),
+            })),
             Err(_) => format!("session {session}"),
         };
+        let said: Vec<Said> = messages.iter().map(Said::from).collect();
+        self.line_prompt_of(
+            &session.to_string(),
+            &about,
+            &said,
+            ended,
+            o,
+            self.ships_in(session, o),
+        )
+    }
+
+    /// [`Self::line_prompt`] for the session the overseer knows as
+    /// `session`, told of as `about`: one here, or one of a machine's
+    /// ([`super::relayed_work`]). `ships`: it acts fully in the session's
+    /// repository.
+    pub(super) fn line_prompt_of(
+        &self,
+        session: &str,
+        about: &str,
+        messages: &[Said],
+        ended: &[String],
+        o: &Oversight,
+        ships: bool,
+    ) -> String {
         let (shown, earlier) = shown_reports(messages);
         let lines: Vec<String> = shown
             .into_iter()
@@ -747,12 +802,12 @@ impl CrewHub {
                     (LineKind::Tell, Some(to)) => format!("replies to your message {to}"),
                     (LineKind::Tell | LineKind::Answer, _) => "tells you".to_string(),
                 };
-                format!("- message {} ({kind}): {}", m.id, m.full_text())
+                format!("- message {} ({kind}): {}", m.id, m.text)
             })
             .chain(earlier_said(&earlier))
             .collect();
         // Acting fully in its repository, shipping is the overseer's too.
-        let (level, outward) = match self.ships_in(session, o) {
+        let (level, outward) = match ships {
             true => (
                 Level::Full,
                 "deletes, spends, sends to people, changes scope or touches secrets, where the person's own \
@@ -1101,6 +1156,7 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
         // second: each open request it can answer and hasn't been given.
         if asked_at.is_none_or(|at| at.elapsed() >= ASKS_EVERY) {
             asked_at = Some(Instant::now());
+            crew.sweep_unread_homes().await;
             for (session, approval, line) in crew.owed_asks(&mut offered) {
                 tracing::info!(%session, %approval, "a request goes to the boss that runs its session");
                 gathering
@@ -1283,7 +1339,8 @@ mod tests {
             .map(|i| said(LineKind::Tell, format!("step {i} done")))
             .collect();
         messages.insert(2, said(LineKind::Ask, "Drop the queue table?".into()));
-        let (shown, earlier) = shown_reports(&messages);
+        let said: Vec<Said> = messages.iter().map(Said::from).collect();
+        let (shown, earlier) = shown_reports(&said);
         assert_eq!(
             earlier,
             messages
@@ -1304,7 +1361,7 @@ mod tests {
             shown[REPORTS_SHOWN].text,
             format!("step {} done", REPORTS_SHOWN + 4)
         );
-        let few = &messages[..4];
+        let few = &said[..4];
         assert_eq!(shown_reports(few).0.len(), 4);
         assert!(shown_reports(few).1.is_empty());
     }

@@ -50,8 +50,9 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use serde::Serialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
-use workforce_common::oversight::{Level, Oversight, Scope};
+use workforce_common::oversight::{Level, Oversight, Scope, TakeOn};
 use workforce_desk::grant::{plan_key, plan_of, BossRef, MAX_MEMBERS};
+use workforce_desk::UNGROUPED;
 
 use super::relay::machine_session;
 use super::{plan, CrewHub};
@@ -105,7 +106,7 @@ pub struct MachineGrants {
 /// served boss's are read from (`served_oversight`), each as it is here.
 fn act_of(o: &Oversight) -> Value {
     let a = &o.act;
-    json!({
+    let mut act = json!({
         "nudge": a.nudge,
         "resume_restart": a.resume_restart,
         "read_only_approvals": a.read_only_approvals,
@@ -113,7 +114,9 @@ fn act_of(o: &Oversight) -> Value {
         "interrupt": a.interrupt,
         "answer_sessions": a.answer_sessions,
         "parallel": o.work.parallel,
-    })
+    });
+    act[super::served::TAKE_ON_ALL] = json!(o.work.take_on == TakeOn::All);
+    act
 }
 
 /// `act` with Act fully's daily budget for a machine: the boss's own, or
@@ -180,6 +183,13 @@ impl Granted {
         }
     }
 }
+
+/// Sessions by the machine they are on.
+pub(crate) type MachineSessions = BTreeMap<String, BTreeSet<Uuid>>;
+
+/// How long Desk's last ask for machines' Ungrouped grants says it carries
+/// them: well past its polls, which come every 30 seconds.
+const UNGROUPED_ASKED_FOR: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Each plan's ticket sessions on each machine, by machine and plan, with
 /// the plan's goal: none yet where its tickets are still to start.
@@ -267,8 +277,69 @@ impl CrewHub {
             })
     }
 
+    /// Each machine's sessions the sidebar has in Ungrouped that the main
+    /// overseer `agent` reaches by its machine's Ungrouped grant: none for
+    /// a group's boss, and none of its plans' (a machine holds a session in
+    /// one grant only).
+    pub(crate) fn ungrouped_sessions(&self, agent: &str, o: &Oversight) -> MachineSessions {
+        if o.scope != Scope::Ungrouped {
+            return MachineSessions::new();
+        }
+        let planned: BTreeSet<(String, Uuid)> = self
+            .plan_sessions(agent, o)
+            .into_iter()
+            .flat_map(|((m, _), (_, ids))| ids.into_iter().map(move |id| (m.clone(), id)))
+            .collect();
+        self.desk
+            .layout()
+            .ungrouped
+            .items
+            .iter()
+            .filter_map(|i| i.strip_prefix("session:").and_then(machine_session))
+            .map(|(m, id)| (m.to_string(), id))
+            .filter(|k| !planned.contains(k))
+            .fold(MachineSessions::new(), |mut out, (m, id)| {
+                out.entry(m).or_default().insert(id);
+                out
+            })
+    }
+
+    /// Whether Desk on this computer carries machines' Ungrouped grants:
+    /// it asked for them lately.
+    pub(crate) fn ungrouped_carried(&self) -> bool {
+        self.ungrouped_asked
+            .lock()
+            .is_some_and(|at| at.elapsed() < UNGROUPED_ASKED_FOR)
+    }
+
+    /// The grant `agent`'s call on session `id` of `machine` goes under
+    /// when it is one of that machine's sessions in Ungrouped, or why it
+    /// can't be reached.
+    pub(crate) fn ungrouped_grant_of(
+        &self,
+        agent: &str,
+        o: &Oversight,
+        machine: &str,
+        id: Uuid,
+    ) -> Result<String, String> {
+        let ours = self
+            .ungrouped_sessions(agent, o)
+            .get(machine)
+            .is_some_and(|ids| ids.contains(&id));
+        match (ours, self.ungrouped_carried()) {
+            (true, true) => Ok(UNGROUPED.to_string()),
+            (true, false) => Err(format!(
+                "Desk on this computer is older and can't let you reach {machine}'s ungrouped sessions: tell the person to update Desk."
+            )),
+            (false, _) => Err(format!(
+                "On {machine} you run only your own plans' ticket sessions and the sessions in no group, and this isn't one of them."
+            )),
+        }
+    }
+
     /// Each machine whose sessions `agent` runs, with the grant they are
-    /// under there: its group's, by the sidebar, or each of its plans'.
+    /// under there: its group's, by the sidebar; or each of its plans', and
+    /// the machine's Ungrouped grant while Desk carries it.
     pub(crate) fn machine_grants_of(&self, agent: &str, o: &Oversight) -> Vec<(String, String)> {
         match o.scope.group() {
             Some(g) if plan_of(g).is_some() => Vec::new(),
@@ -281,6 +352,12 @@ impl CrewHub {
                 .plan_sessions(agent, o)
                 .into_keys()
                 .map(|(m, plan)| (m, plan_key(plan)))
+                .chain(
+                    self.ungrouped_sessions(agent, o)
+                        .into_keys()
+                        .filter(|_| self.ungrouped_carried())
+                        .map(|m| (m, UNGROUPED.to_string())),
+                )
                 .collect(),
         }
     }
@@ -307,7 +384,10 @@ impl CrewHub {
     /// known. Its plans' grants are said once its plans' machine sessions
     /// have been read (`plansKnown`): until then Desk leaves them as they
     /// are, and the groups' go on.
-    pub(crate) fn machine_grants(&self, plans: bool) -> Option<MachineGrants> {
+    pub(crate) fn machine_grants(&self, plans: bool, ungrouped: bool) -> Option<MachineGrants> {
+        if ungrouped {
+            *self.ungrouped_asked.lock() = Some(std::time::Instant::now());
+        }
         if self.services().is_empty() || !self.desk.charges_loaded() {
             return None;
         }
@@ -389,6 +469,23 @@ impl CrewHub {
                 add(
                     &m,
                     granted.wanted(plan_key(plan), named(&goal, "Plan"), members, Some(plan)),
+                );
+            }
+        }
+        // Said only once the plans' sessions are known, so none of theirs is
+        // taken into it.
+        for (service, o) in overseers.iter().filter(|_| plans && ungrouped) {
+            let machines = self.ungrouped_sessions(service.agent_id.as_str(), o);
+            let Some(granted) = (!machines.is_empty())
+                .then(|| self.granted(service, o))
+                .flatten()
+            else {
+                continue;
+            };
+            for (m, members) in machines {
+                add(
+                    &m,
+                    granted.wanted(UNGROUPED.to_string(), "Ungrouped".into(), members, None),
                 );
             }
         }

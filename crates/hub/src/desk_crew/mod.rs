@@ -64,6 +64,7 @@ mod reading;
 mod refusal;
 pub(crate) mod relay;
 pub(crate) mod relayed_decide;
+pub(crate) mod relayed_work;
 pub(crate) mod remote_asks;
 pub(crate) mod remote_decide;
 mod scope;
@@ -177,6 +178,10 @@ pub struct CrewHub {
     /// On a machine, the decisions of bosses relayed from the home, and
     /// when the home last held each at Act fully ([`relayed_decide`]).
     relayed: Mutex<relayed_decide::Outbox>,
+    /// On a machine: its relayed bosses' homes' takes of their work.
+    work_homes: Mutex<relayed_work::Homes>,
+    /// On the Mac: its bosses' work on machines.
+    work_away: Mutex<relayed_work::Away>,
     /// When the overseer's turns in its DM started, by session.
     manager_turns: Mutex<HashMap<String, DateTime<Utc>>>,
     /// The DM sessions of other agents whose reply is being written, with
@@ -315,6 +320,8 @@ pub struct CrewHub {
     /// Whether the plans' machine sessions were read since the hub started:
     /// until then no plan grant is said ([`machine_grants`]).
     plans_watched: std::sync::atomic::AtomicBool,
+    /// When Desk last asked for machines' Ungrouped grants: it carries them.
+    ungrouped_asked: Mutex<Option<std::time::Instant>>,
     machine_read: Mutex<HashMap<String, std::time::Instant>>,
     /// Each machine's plan reads that failed in a row.
     machine_down: Mutex<HashMap<String, u32>>,
@@ -737,6 +744,8 @@ impl CrewHub {
             served_deciding: Mutex::default(),
             keeping: decisions::Kept::default(),
             relayed: Mutex::default(),
+            work_homes: Mutex::default(),
+            work_away: Mutex::default(),
             manager_turns: Mutex::default(),
             dm_turns: Mutex::default(),
             listed: Mutex::default(),
@@ -787,6 +796,7 @@ impl CrewHub {
             machine_seen: Mutex::default(),
             machine_plans: Mutex::default(),
             plans_watched: std::sync::atomic::AtomicBool::new(false),
+            ungrouped_asked: Mutex::default(),
             machine_read: Mutex::default(),
             machine_down: Mutex::default(),
             reuse_claims: Mutex::default(),
@@ -839,6 +849,7 @@ impl CrewHub {
         tokio::spawn(watcher::wake_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(decide::decide_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(relayed_decide::pump_loop(Arc::clone(&crew), cancel.clone()));
+        tokio::spawn(relayed_work::work_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(answer::answer_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(idle::idle_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(logins::logins_loop(Arc::clone(&crew), cancel.clone()));
@@ -1077,6 +1088,7 @@ impl CrewHub {
         served::Ceiling {
             level: self.level_now(agent, o).0,
             act: o.act,
+            take_on: o.work.take_on,
         }
     }
 
@@ -1704,6 +1716,10 @@ impl Crew for CrewHub {
 
     fn answers_lines(&self) -> bool {
         !self.overseers().is_empty()
+    }
+
+    fn answers_for(&self, boss: &str) -> bool {
+        self.home_reads(boss)
     }
 
     async fn assign(&self, agent: &str, task: &str) -> Result<String, String> {
