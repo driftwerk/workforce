@@ -206,9 +206,9 @@ fake = { version = "3.1.0", features = ["derive"] }
 
 # Document parsing
 csv = "1.3"
-calamine = { version = "0.26", features = ["dates"] }
+calamine = { version = "0.38", features = ["dates"] }
 # Spreadsheet writing (xlsx export). calamine is read-only; this is the writer.
-rust_xlsxwriter = "0.79"
+rust_xlsxwriter = "0.103"
 # `default-features = false` drops the `lzma` feature which pulls in
 # `liblzma-sys`. liblzma-sys conflicts (via the cargo `links` mechanism)
 # with `lzma-sys` that ends up in the tree through other deps such as
