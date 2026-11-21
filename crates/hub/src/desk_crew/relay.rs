@@ -26,9 +26,8 @@
 //! boss on the home's own hub (`local:<agent>`) comes this way: one on
 //! another hub comes only on its own uplink.
 
-use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
@@ -43,6 +42,7 @@ use workforce_desk::grant::BossRef;
 
 use super::served::{ServedCall, ServedStatus};
 use super::CrewHub;
+use crate::desk_pickup::{Limits, Pickup, Ticketed, Unsent};
 use crate::gateway::GatewayState;
 use workforce_desk::sees;
 
@@ -81,12 +81,12 @@ pub struct RelayCall {
     /// no more than these and its grant's.
     pub level: workforce_common::oversight::Level,
     pub act: workforce_common::oversight::Act,
-    /// When this hub stops waiting for its answer: Desk's native side sends
-    /// nothing it can't carry by then, so a call the boss was told may
-    /// not have been done is never done later. Desk leaves it out of what
-    /// it sends the machine, whose `served` route refuses a field it
-    /// doesn't know.
-    pub deadline: chrono::DateTime<chrono::Utc>,
+    /// How long, in milliseconds as it is taken, this hub still waits for
+    /// its answer: Desk's native side sends nothing it can't carry in that
+    /// time, so a call the boss was told may not have been done is never
+    /// done later. Desk leaves it out of what it sends the machine, whose
+    /// `served` route refuses a field it doesn't know.
+    pub left_ms: u64,
 }
 
 /// What a machine answered.
@@ -98,13 +98,63 @@ pub struct RelayAnswer {
     pub body: Value,
 }
 
+impl Ticketed for RelayCall {
+    fn ticket(&self) -> Uuid {
+        self.id
+    }
+
+    fn left(&mut self, left: Duration) {
+        self.left_ms = u64::try_from(left.as_millis()).unwrap_or(u64::MAX);
+    }
+}
+
 /// The Mac's relay: what waits to be taken, and who waits for each answer.
+pub(crate) type Relays = Pickup<RelayCall, RelayAnswer>;
+
+/// An empty relay.
+pub(crate) fn relays() -> Relays {
+    Pickup::new(Limits {
+        most_queued: MOST_QUEUED,
+        most_waiting: MOST_WAITING,
+        most_taken: MOST_TAKEN,
+        poll_for: POLL_FOR,
+    })
+}
+
+/// When Desk's native side last reached this hub by any of its routes.
 #[derive(Default)]
-pub(crate) struct Relays {
-    queued: VecDeque<(RelayCall, Instant)>,
-    waiting: HashMap<Uuid, tokio::sync::oneshot::Sender<RelayAnswer>>,
-    /// Calls Desk's native side took: they may have been done.
-    taken: std::collections::HashSet<Uuid>,
+pub(crate) struct NativeSeen(parking_lot::Mutex<Option<std::time::Instant>>);
+
+impl NativeSeen {
+    pub(crate) fn mark(&self) {
+        *self.0.lock() = Some(std::time::Instant::now());
+    }
+
+    /// Whether it did within `within`.
+    pub(crate) fn within(&self, within: Duration) -> bool {
+        self.0.lock().is_some_and(|at| at.elapsed() < within)
+    }
+}
+
+/// `router`, noting in `seen` each request made with the hub's own token
+/// `token`, as only Desk's native side makes them, whatever its route.
+pub(crate) fn noting_native(router: Router, token: String, seen: Arc<NativeSeen>) -> Router {
+    router.layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            if hubs_own(&token, request.headers()) {
+                seen.mark();
+            }
+            next.run(request)
+        },
+    ))
+}
+
+/// Whether `h` carries the hub's own token `token` in `Authorization`.
+fn hubs_own(token: &str, h: &HeaderMap) -> bool {
+    h.get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|given| !token.is_empty() && crate::auth::constant_time_token_eq(given, token))
 }
 
 /// What only Desk's own plan runner asks a machine through the relay, never
@@ -175,11 +225,7 @@ impl CrewHub {
             ))
         };
         // No one takes calls: nothing is queued to wait on.
-        let polled = self
-            .relay_polled
-            .lock()
-            .is_some_and(|at| at.elapsed() < POLL_FOR * 2);
-        if !polled {
+        if !self.relay.polling() {
             return Err(unreached());
         }
         let id = Uuid::new_v4();
@@ -197,8 +243,7 @@ impl CrewHub {
             link_id: RELAY_LINK,
             level: ceiling.level,
             act: ceiling.act,
-            deadline: chrono::Utc::now()
-                + chrono::Duration::from_std(wait).unwrap_or(chrono::Duration::seconds(30)),
+            left_ms: 0,
         };
         // Too large to carry: never queued, so nothing of it is done.
         if serde_json::to_vec(&call).map_or(usize::MAX, |b| b.len()) > MOST_CALL {
@@ -206,84 +251,36 @@ impl CrewHub {
                 "That call is too large to send to {machine}; send less in it."
             )));
         }
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        {
-            let mut r = self.relays.lock();
-            r.queued.retain(|(_, at)| at.elapsed() < wait);
-            if r.queued.len() >= MOST_QUEUED || r.waiting.len() >= MOST_WAITING {
-                return Err(unreached());
-            }
-            r.queued.push_back((call, Instant::now()));
-            r.waiting.insert(id, tx);
-        }
-        self.relay_queued.notify_waiters();
-        let got = tokio::time::timeout(wait, rx).await;
-        // Whatever came of it, nothing waits for it any more, and a call
-        // no one took goes.
-        let taken = {
-            let mut r = self.relays.lock();
-            r.waiting.remove(&id);
-            r.queued.retain(|(c, _)| c.id != id);
-            r.taken.remove(&id)
-        };
-        match got {
-            Ok(Ok(answer)) => Ok(answer),
+        match self.relay.send(call, wait).await {
+            Ok(answer) => Ok(answer),
             // Desk took it: it may have been done there. Not to be sent
             // again as new.
-            _ if taken && tool == "desk.run" => Err(MachineRefused::Unknown(format!(
+            Err(Unsent::Taken) if tool == "desk.run" => Err(MachineRefused::Unknown(format!(
                 "Sent to {machine}, but no answer came back: the check may have run there. Look at what it would have changed before you run it again."
             ))),
-            _ if taken => Err(MachineRefused::Unknown(format!(
+            Err(Unsent::Taken) => Err(MachineRefused::Unknown(format!(
                 "Sent to {machine}, but its outcome isn't known yet: check {machine}'s session (crew.history) before you try it again."
             ))),
-            _ => Err(unreached()),
+            Err(Unsent::NotPolling | Unsent::Full | Unsent::NotTaken) => Err(unreached()),
         }
     }
 
     /// Whether Desk's native side relays now: it asked for calls lately.
     pub(crate) fn relaying(&self) -> bool {
-        self.relay_polled
-            .lock()
-            .is_some_and(|at| at.elapsed() < POLL_FOR * 2)
+        self.relay.polling()
     }
 
     /// The calls queued for machines, up to [`MOST_TAKEN`]: each taken
     /// once. Waits up to `wait` for one when none is queued.
     pub(crate) async fn relay_take(&self, wait: Duration) -> Vec<RelayCall> {
-        *self.relay_polled.lock() = Some(Instant::now());
-        let take = |crew: &Self| {
-            let mut r = crew.relays.lock();
-            let mut out = Vec::new();
-            while out.len() < MOST_TAKEN {
-                match r.queued.pop_front() {
-                    Some((c, _)) if r.waiting.contains_key(&c.id) => {
-                        r.taken.insert(c.id);
-                        out.push(c);
-                    }
-                    Some(_) => {}
-                    None => break,
-                }
-            }
-            out
-        };
-        let notified = self.relay_queued.notified();
-        let now = take(self);
-        if !now.is_empty() {
-            return now;
-        }
-        let _ = tokio::time::timeout(wait, notified).await;
-        *self.relay_polled.lock() = Some(Instant::now());
-        take(self)
+        self.relay.take(wait).await
     }
 
     /// The machine's answer to call `id`: taken once, by the call that
     /// waits for it; one for a call no one waits for (late, or answered
     /// already) is dropped.
     pub(crate) fn relay_answer(&self, id: Uuid, answer: RelayAnswer) -> bool {
-        match self.relays.lock().waiting.remove(&id) {
-            Some(tx) => tx.send(answer).is_ok(),
-            None => false,
-        }
+        self.relay.answer(id, answer)
     }
 }
 
@@ -336,9 +333,10 @@ struct RelayApi {
 
 type S = State<Arc<RelayApi>>;
 
+/// A native route's query: a `token` in it is refused.
 #[derive(Deserialize)]
-struct TokenQuery {
-    token: Option<String>,
+pub(crate) struct TokenQuery {
+    pub(crate) token: Option<String>,
 }
 
 /// What Desk asks the machines' grants with: `plans=1` from one that
@@ -349,9 +347,14 @@ struct GrantsQuery {
     plans: Option<String>,
 }
 
-/// Why a request isn't Desk's native side's, when it isn't.
-fn not_native(s: &RelayApi, h: &HeaderMap, q: &TokenQuery) -> Option<Response> {
-    if q.token.is_some() {
+/// Why a request isn't Desk's native side's, when it isn't: only the hub's
+/// own token, in the `Authorization` header alone, is.
+pub(crate) fn not_native(
+    state: &GatewayState,
+    h: &HeaderMap,
+    token: Option<&str>,
+) -> Option<Response> {
+    if token.is_some() {
         return Some(
             (
                 StatusCode::BAD_REQUEST,
@@ -360,36 +363,31 @@ fn not_native(s: &RelayApi, h: &HeaderMap, q: &TokenQuery) -> Option<Response> {
                 .into_response(),
         );
     }
-    let ours = h
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|given| {
-            !s.state.auth_token.is_empty()
-                && crate::auth::constant_time_token_eq(given, &s.state.auth_token)
-        });
+    let ours = hubs_own(&state.auth_token, h);
     // 401: refused before anything is done, so Desk's native side may read
     // the hub's token again and send it once more.
     (!ours).then(|| {
         (
             StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "only Desk itself relays a boss's calls, with the hub's own token"})),
+            Json(json!({"error": "only Desk itself relays these calls, with the hub's own token"})),
         )
             .into_response()
     })
 }
 
+/// Returns the refusal when the request isn't Desk's native side's.
 macro_rules! native {
-    ($s:expr, $h:expr, $q:expr) => {
-        if let Some(r) = not_native(&$s, &$h, &$q) {
+    ($s:expr, $h:expr, $token:expr) => {
+        if let Some(r) = $crate::desk_crew::relay::not_native(&$s.state, &$h, $token) {
             return r;
         }
     };
 }
+pub(crate) use native;
 
 /// On the Mac: the calls queued for machines.
 async fn take(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>) -> Response {
-    native!(s, h, q);
+    native!(s, h, q.token.as_deref());
     Json(s.crew.relay_take(POLL_FOR).await).into_response()
 }
 
@@ -401,7 +399,7 @@ async fn answer(
     Path(id): Path<Uuid>,
     body: Bytes,
 ) -> Response {
-    native!(s, h, q);
+    native!(s, h, q.token.as_deref());
     if body.len() > MOST_ANSWER {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -446,7 +444,7 @@ struct Relayed {
 /// On the machine: a boss's call relayed from the home, decided under the
 /// machine's grant for its group.
 async fn served(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>, body: Bytes) -> Response {
-    native!(s, h, q);
+    native!(s, h, q.token.as_deref());
     let bad = |why: &str| (StatusCode::BAD_REQUEST, Json(json!({"error": why}))).into_response();
     let Ok(r) = serde_json::from_slice::<Relayed>(&body) else {
         return bad("that isn't a relayed call");
@@ -523,7 +521,7 @@ async fn served(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>, body: By
 /// this hub's own group bosses ([`super::machine_grants`]), for Desk's
 /// native side to carry to them.
 async fn machine_grants(State(s): S, h: HeaderMap, Query(q): Query<GrantsQuery>) -> Response {
-    native!(s, h, TokenQuery { token: q.token });
+    native!(s, h, q.token.as_deref());
     match s.crew.machine_grants(q.plans.as_deref() == Some("1")) {
         Some(w) => Json(w).into_response(),
         // Not known yet: Desk writes nothing, and deletes nothing, until it is.

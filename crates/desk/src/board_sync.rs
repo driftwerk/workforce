@@ -403,6 +403,63 @@ pub async fn call(
     Ok(answer)
 }
 
+/// Where a move left an issue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Moved {
+    To(String),
+    /// No way to that state from where it is: the states it can reach.
+    NoWay(Vec<String>),
+}
+
+/// Moves `system`'s issue `key` to the state `name`: Jira's transition to
+/// that status, or Linear's state of that name in the team `team_id`.
+/// `spend` is asked before the move itself, after the states are read.
+pub async fn move_issue(
+    remote: &dyn Remote,
+    system: System,
+    team_id: &str,
+    key: &str,
+    name: &str,
+    mut spend: impl FnMut() -> Result<(), RemoteError>,
+) -> Result<Moved, RemoteError> {
+    let (list, args, items, label, write) = match system {
+        System::Jira => (
+            "jira.list_transitions",
+            json!({ "issue_key": key }),
+            "transitions",
+            "to_status",
+            "jira.transition_issue",
+        ),
+        System::Linear => (
+            "linear.states_list",
+            json!({ "team_id": team_id }),
+            "states",
+            "name",
+            "linear.issue_update",
+        ),
+        System::Github => return Ok(Moved::NoWay(Vec::new())),
+    };
+    let listed = call(remote, system, list, args).await?;
+    let ways: Vec<(&str, &str)> = listed[items]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|w| Some((w[label].as_str()?, w["id"].as_str()?)))
+        .collect();
+    let Some((to, id)) = ways.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) else {
+        return Ok(Moved::NoWay(
+            ways.iter().map(|(n, _)| n.to_string()).collect(),
+        ));
+    };
+    spend()?;
+    let args = match system {
+        System::Jira => json!({ "issue_key": key, "transition": id }),
+        _ => json!({ "identifier": key, "state_id": id }),
+    };
+    call(remote, system, write, args).await?;
+    Ok(Moved::To(to.to_string()))
+}
+
 /// The answer an MCP `tools/call` gave, as JSON: its text items joined and
 /// read as JSON (or kept as a string), or the error it reported.
 pub fn mcp_answer(result: &Value) -> Result<Value, RemoteError> {
@@ -643,10 +700,7 @@ pub fn jql(project: &str, f: &Filter, since: Option<&str>, shared_me: Option<&st
             "statusCategory != Done OR statusCategoryChangedDate >= -{}d",
             crate::board::DONE_WITHIN_DAYS
         ),
-        Filter::AssignedToMe => match shared_me.filter(|m| check_me(System::Jira, m).is_ok()) {
-            Some(me) => format!("assignee = \"{me}\""),
-            None => "assignee = currentUser()".to_string(),
-        },
+        Filter::AssignedToMe => assigned_to_me(shared_me),
         Filter::CurrentCycle => "sprint in openSprints()".to_string(),
         Filter::Label(l) => format!("labels = \"{}\"", l.trim()),
         Filter::Query(q) => q.trim().to_string(),
@@ -666,6 +720,24 @@ pub fn jql(project: &str, f: &Filter, since: Option<&str>, shared_me: Option<&st
         false => format!(" AND ({filter})"),
     };
     format!("project = \"{project}\"{filter}{since} ORDER BY updated ASC")
+}
+
+/// The JQL for issues assigned to the person: `shared_me` on a shared key,
+/// else the key's own user.
+pub fn assigned_to_me(shared_me: Option<&str>) -> String {
+    match shared_me.filter(|m| check_me(System::Jira, m).is_ok()) {
+        Some(me) => format!("assignee = \"{me}\""),
+        None => "assignee = currentUser()".to_string(),
+    }
+}
+
+/// Who the person is on `s`'s Jira when its key is shared (matched by their
+/// verified email): "assigned to me" is then them, never the key's owner.
+pub fn shared_me(s: &crate::board::Sync) -> Option<&str> {
+    s.me.as_deref().filter(|_| {
+        s.me_source
+            .is_some_and(crate::board::MeSource::on_a_shared_key)
+    })
 }
 
 /// The fields a pull's `jira.search` asks for: with the description, so a
