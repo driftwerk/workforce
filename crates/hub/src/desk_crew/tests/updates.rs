@@ -249,6 +249,17 @@ async fn decisions_read_as_their_rows_and_the_plain_update_stands_in() {
             let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", &toml, &[]).await;
             crew.set_update_writer(Arc::new(Writer(writer)));
             begun(&crew).await;
+            // Held as by a running reply while both rows are written.
+            let dm = overseer
+                .sessions
+                .find(DESK_CHANNEL, PERSON)
+                .unwrap()
+                .unwrap()
+                .id
+                .to_string();
+            crew.manager_turns
+                .lock()
+                .insert(dm.clone(), chrono::Utc::now());
             let s = new_session(&d, dir.path(), "acme-web").await;
             let t0 = chrono::Utc::now() - chrono::Duration::minutes(1);
             crew.perform(
@@ -262,6 +273,8 @@ async fn decisions_read_as_their_rows_and_the_plain_update_stands_in() {
             .await
             .unwrap();
             account(&d, s.id, &["Merged PR #622"], "", "Deploy it").await;
+            crew.manager_turns.lock().remove(&dm);
+            crew.update_poke.notify_one();
             let row = d
                 .store()
                 .decisions_since("desk", t0, 10)
