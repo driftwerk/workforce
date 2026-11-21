@@ -8910,6 +8910,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_session_taken_back_asking_takes_only_what_its_boss_says_after_as_the_answer() {
+        with_test_pool(build_pool, |pool| async move {
+            let (_hdir, socket, _holder_cancel) = crate::holder::tests::holder().await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut opts = options(dir.path());
+            opts.restore = RestorePolicy::Auto;
+            opts.holder = Some(HolderOptions {
+                socket: socket.clone(),
+                token: crate::holder::tests::TOKEN.into(),
+            });
+            DeskStore::migrate(&pool).await.unwrap();
+            let bosses = |d: &Desk| {
+                d.set_bosses(vec![Boss {
+                    agent: "sarah".into(),
+                    name: "Sarah".into(),
+                    scope: crate::scope::Scope::Ungrouped,
+                    level: "act".into(),
+                }]);
+                By::manager("sarah", "Sarah", "Next step.")
+            };
+            let tell = |to: Uuid, text: &str| crate::line::Send::Tell {
+                to: crate::line::Target::Session(to),
+                text: text.into(),
+                when: crate::line::When::Queue,
+            };
+            let first_cancel = CancellationToken::new();
+            let first = Desk::start(
+                DeskStore::from_pool(pool.clone()),
+                opts.clone(),
+                Floor::default(),
+                first_cancel.clone(),
+            )
+            .await
+            .unwrap();
+            let by = bosses(&first);
+            let s = new_session(&first, dir.path()).await;
+            first
+                .take_on(
+                    s.id,
+                    &by.party,
+                    crate::charge::How::Handed,
+                    &Default::default(),
+                    &By::you(),
+                )
+                .await
+                .unwrap();
+            first.change(s.id, |r, _| r.state = SessionState::Working);
+            let earlier = first
+                .line_send(
+                    Sender::Overseer(by.clone()),
+                    tell(s.id, "When that is done, run the linter."),
+                )
+                .await
+                .unwrap();
+            post(
+                &first,
+                s.id,
+                json!({"hook_event_name": "Stop",
+                    "last_assistant_message": "The replica is ready. Should I switch reads to it?"}),
+            )
+            .await;
+            assert_eq!(first.view(s.id).unwrap().state, SessionState::Asking);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            first_cancel.cancel();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            let second = Desk::start(
+                DeskStore::from_pool(pool.clone()),
+                opts.clone(),
+                Floor::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let by = bosses(&second);
+            let v = second.view(s.id).unwrap();
+            assert!(v.live, "taken back");
+            assert_eq!(v.state, SessionState::Asking, "still asking");
+            for _ in 0..200 {
+                if second.charge_of(s.id).is_some_and(|c| c.live()) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert!(second.charge_of(s.id).is_some_and(|c| c.live()), "its boss runs it");
+            let row = |id| {
+                let d = second.clone();
+                async move { d.0.store.line_message(id).await.unwrap().unwrap() }
+            };
+            // What its boss said before is never the answer to it.
+            assert_eq!(
+                second.line_waits(&row(earlier.id).await),
+                Some(crate::line::Wait::Asking)
+            );
+            // What it says now, having read it, is.
+            let after = second
+                .line_send(Sender::Overseer(by), tell(s.id, "Yes, switch them."))
+                .await
+                .unwrap();
+            assert_ne!(
+                second.line_waits(&row(after.id).await),
+                Some(crate::line::Wait::Asking),
+                "its running boss answers it"
+            );
+            assert_eq!(
+                second.line_waits(&row(earlier.id).await),
+                Some(crate::line::Wait::Asking)
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn sessions_the_holder_kept_are_taken_back_as_they_were_after_a_hub_restart() {
         with_test_pool(build_pool, |pool| async move {
             let (_hdir, socket, holder_cancel) = crate::holder::tests::holder().await;

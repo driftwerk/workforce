@@ -1428,6 +1428,69 @@ async fn an_answer_whose_question_passed_as_desk_took_it_to_type_is_withdrawn() 
 }
 
 #[tokio::test]
+async fn an_answer_the_person_took_the_wheel_from_as_it_was_taken_waits_for_them() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let by = sarah_bosses(&d);
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        d.take_on(
+            s.id,
+            &by.party,
+            crate::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        ends_asking(&d, s.id, "Should I switch reads to the replica?", false).await;
+        d.plugin_heard_from(s.id);
+        assert!(!d.person_driving(s.id), "its boss drives");
+        let sent = d
+            .line_send(
+                Sender::Overseer(by),
+                Send::Answer {
+                    to: s.id,
+                    text: "Yes, switch them.".into(),
+                    turn: d.asked_mark(s.id).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        // The person takes the wheel as the plugin takes it.
+        let wheel = d.clone();
+        let id = s.id;
+        super::AFTER_TAKE.lock().push((
+            s.id,
+            Box::new(move || {
+                wheel
+                    .0
+                    .state
+                    .lock()
+                    .charges
+                    .driven
+                    .insert(id, chrono::Utc::now());
+            }),
+        ));
+        assert_eq!(d.line_next(s.id, Duration::from_millis(300)).await, None);
+        assert!(d.person_driving(s.id));
+        let kept = row(&d, sent.id).await;
+        assert_eq!(
+            kept.delivery,
+            Delivery::Queued,
+            "back in the queue, not withdrawn"
+        );
+        assert_eq!(d.line_waits(&kept), Some(Wait::PersonDriving));
+        assert!(
+            d.0.state.lock().lines.answers.contains_key(&sent.id),
+            "still the answer to that question"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn an_answer_that_went_in_leaves_no_mark_behind() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
