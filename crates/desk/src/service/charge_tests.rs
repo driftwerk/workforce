@@ -1392,8 +1392,7 @@ async fn a_boss_ends_what_it_started_or_was_handed_only_while_it_runs_it_or_let_
 }
 
 #[tokio::test]
-async fn an_unknown_release_reason_is_the_bosss_and_an_unreadable_charge_fails_the_load()
-{
+async fn an_unknown_release_reason_is_the_bosss_and_an_unreadable_charge_fails_the_load() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let d = desk(pool, dir.path()).await;
