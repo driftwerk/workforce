@@ -513,7 +513,25 @@ fn a_connection_s_reach_is_what_github_said_or_unknown() {
         reach_of("github.projects_list", &Ok(json!({ "projects": [] }))),
         Reach::No
     );
+    for no in [
+        "Forbidden (rate limit or permissions): Resource not accessible by integration",
+        "GitHub GraphQL FORBIDDEN: Resource not accessible",
+        "Authentication failed: Bad credentials",
+        "No project 7 for \"acme\"",
+    ] {
+        assert_eq!(
+            reach_of(project, &Err(RemoteError::Failed(no.into()))),
+            Reach::No,
+            "{no}"
+        );
+    }
     for unknown in [
+        RemoteError::Failed("GitHub API error (502 Bad Gateway): ".into()),
+        RemoteError::Failed(
+            "Forbidden (rate limit or permissions): API rate limit exceeded".into(),
+        ),
+        RemoteError::Failed("GitHub GraphQL rate limited: limit".into()),
+        RemoteError::Failed("error sending request for url".into()),
         RemoteError::Offline("away".into()),
         RemoteError::RateLimited {
             retry_after_secs: None,

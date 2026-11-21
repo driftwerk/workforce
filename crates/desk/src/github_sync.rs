@@ -128,13 +128,36 @@ pub enum Reach {
     Unknown,
 }
 
-/// What `tool`'s `answer` says of a connection's reach.
+/// What `tool`'s `answer` says of a connection's reach: a failure is a
+/// No only where GitHub said the target isn't there for its key, or the key
+/// isn't good; any other (a rate limit, GitHub down) can't say.
 pub fn reach_of(tool: &str, answer: &Result<Value, RemoteError>) -> Reach {
     match answer {
         Ok(answer) if reached(tool, answer) => Reach::Yes,
-        Ok(_) | Err(RemoteError::Failed(_) | RemoteError::Workspace { .. }) => Reach::No,
+        Ok(_) | Err(RemoteError::Workspace { .. }) => Reach::No,
+        Err(RemoteError::Failed(why)) if turned_away(why) => Reach::No,
         Err(_) => Reach::Unknown,
     }
+}
+
+/// Whether the GitHub adapter's error `why` says no: not found, no access,
+/// a key it refused. A rate limit's 403 says "rate limit exceeded".
+fn turned_away(why: &str) -> bool {
+    let why = why.to_ascii_lowercase();
+    let limited = [
+        "rate limited",
+        "rate limit exceeded",
+        "secondary rate limit",
+    ];
+    let no = [
+        "not found",
+        "not_found",
+        "forbidden",
+        "could not resolve",
+        "authentication failed",
+        "no project ",
+    ];
+    !limited.iter().any(|l| why.contains(l)) && no.iter().any(|n| why.contains(n))
 }
 
 /// Which of a person's several GitHub connections a link goes through,

@@ -612,7 +612,8 @@ async fn a_github_connection_picked_is_kept_unless_it_can_t_reach() {
 
 /// Whether a connection reaches a target is the real adapter's read: a
 /// project GitHub can't resolve for its key, or a repository it answers
-/// 404 for, isn't reached; the same reads with a key that can are.
+/// 404 for, isn't reached; the same reads with a key that can are; and
+/// GitHub down or rate limited says neither.
 #[tokio::test]
 async fn a_connection_github_turns_away_doesn_t_reach_the_target() {
     use wiremock::matchers::{header, method, path, path_regex};
@@ -666,6 +667,23 @@ async fn a_connection_github_turns_away_doesn_t_reach_the_target() {
             .mount(&github)
             .await;
 
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(by("busy"))
+            .respond_with(ResponseTemplate::new(502))
+            .mount(&github)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/repos/acme/web/"))
+            .and(by("busy"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .insert_header("x-ratelimit-remaining", "0")
+                    .set_body_json(json!({ "message": "API rate limit exceeded" })),
+            )
+            .mount(&github)
+            .await;
+
         let dir = tempfile::tempdir().unwrap();
         let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
         let local = local_hub(desk, dir.path());
@@ -683,7 +701,11 @@ async fn a_connection_github_turns_away_doesn_t_reach_the_target() {
             token: None,
             base_url: github.uri(),
             default_owner: None,
-            workspaces: std::collections::HashMap::from([connection("open"), connection("shut")]),
+            workspaces: std::collections::HashMap::from([
+                connection("open"),
+                connection("shut"),
+                connection("busy"),
+            ]),
             default_workspace: Some("open".into()),
         })
         .unwrap();
@@ -710,7 +732,12 @@ async fn a_connection_github_turns_away_doesn_t_reach_the_target() {
             ),
         ];
         for (tool, args) in &reads {
-            for (name, reach) in [("open", Reach::Yes), ("shut", Reach::No)] {
+            let said = [
+                ("open", Reach::Yes),
+                ("shut", Reach::No),
+                ("busy", Reach::Unknown),
+            ];
+            for (name, reach) in said {
                 let got = local.sync.reaches(&remote, tool, name, tool, args).await;
                 assert_eq!(got, reach, "{name} {tool}");
             }
