@@ -376,7 +376,6 @@ async fn ran(
     work: &dyn Worked,
     options: &CompareOptions,
 ) -> Result<Run> {
-    refused_if_there(&options.out)?;
     recorded(&options.out, async {
         let measured = measured(graph, weaviate, vellev, work, options, &|_| {}).await?;
         let manifest = manifest(graph, options, &measured);
@@ -971,32 +970,22 @@ async fn an_empty_answer_is_a_miss_not_an_error() {
     assert_eq!(run.report.findings.check1.weaviate, 0.5);
 }
 
-/// The sums are of the files as they lie on disk, in coreutils' format;
-/// and an existing out, or one left half-made, is refused.
+/// The sums are of the files as they lie on disk, in coreutils' format.
 #[tokio::test]
 async fn the_files_are_summed_as_they_lie_on_disk() {
     let entities = functions("r", 12);
     let graph = graph_of(&entities).await;
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("run");
-    let run = || {
-        let (weaviate, vellev) = (
-            weaviate_of(&entities, first),
-            Searched::of(&entities, first),
-        );
-        let (graph, out) = (&graph, out.clone());
-        async move {
-            ran(
-                graph,
-                &weaviate,
-                &vellev,
-                &Counters::shortlisting(),
-                &options(&out),
-            )
-            .await
-        }
-    };
-    run().await.unwrap();
+    ran(
+        &graph,
+        &weaviate_of(&entities, first),
+        &Searched::of(&entities, first),
+        &Counters::shortlisting(),
+        &options(&out),
+    )
+    .await
+    .unwrap();
     let listed = read(&out, SUMS);
     let recomputed: String = FILES
         .iter()
@@ -1006,17 +995,74 @@ async fn the_files_are_summed_as_they_lie_on_disk() {
         })
         .collect();
     assert_eq!(listed, recomputed);
+}
 
-    let before = std::fs::read(out.join(SUMS)).unwrap();
-    let refused = format!("{:#}", run().await.unwrap_err());
-    assert!(refused.contains("exists"), "{refused}");
-    assert_eq!(std::fs::read(out.join(SUMS)).unwrap(), before);
+/// An existing out, or one left half-made, is refused before anything is
+/// read, and left as it was.
+#[tokio::test]
+async fn an_existing_out_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let refused = |out: PathBuf| async move {
+        compare_code_search(&WorkforceConfig::default(), None, options(&out), &|_| {})
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+    };
+
+    let out = dir.path().join("run");
+    std::fs::create_dir(&out).unwrap();
+    std::fs::write(out.join(SUMS), b"kept").unwrap();
+    let said = refused(out.clone()).await;
+    assert!(
+        said.contains("run exists: a run never writes over one"),
+        "{said}"
+    );
+    assert_eq!(std::fs::read(out.join(SUMS)).unwrap(), b"kept");
+    assert!(!partial(&out).exists());
 
     let half = dir.path().join("half");
     std::fs::create_dir(partial(&half)).unwrap();
-    let refused = refused_if_there(&half).unwrap_err().to_string();
-    assert!(refused.contains("half.partial exists"), "{refused}");
+    let said = refused(half.clone()).await;
+    assert!(
+        said.contains("half.partial exists: a run never writes over one"),
+        "{said}"
+    );
     assert!(partial(&half).exists() && !half.exists());
+}
+
+/// A sums file that cannot be written leaves `.partial` with the files and
+/// no sums, and the run is not said to be finished.
+#[tokio::test]
+async fn a_failed_sums_write_leaves_no_sums() {
+    let entities = functions("r", 12);
+    let graph = graph_of(&entities).await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("run");
+    let options = options(&out);
+    let failed = recorded(&out, async {
+        let measured = measured(
+            &graph,
+            &weaviate_of(&entities, first),
+            &Searched::of(&entities, first),
+            &Counters::shortlisting(),
+            &options,
+            &|_| {},
+        )
+        .await?;
+        std::fs::create_dir(partial(&out).join(SUMS_WRITING))?;
+        let manifest = manifest(&graph, &options, &measured);
+        Ok((measured, manifest))
+    })
+    .await
+    .err()
+    .unwrap();
+    let failed = format!("{failed:#}");
+    let writing = format!("writing {SUMS} in {}", partial(&out).display());
+    assert!(failed.contains(&writing), "{failed}");
+    assert!(!failed.contains("holds the finished run"), "{failed}");
+    assert!(!partial(&out).join(SUMS).exists() && !out.exists());
+    assert!(FILES.iter().all(|name| partial(&out).join(name).is_file()));
 }
 
 /// An out ending in a separator is moved into as the directory it names,

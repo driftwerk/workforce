@@ -2,7 +2,8 @@ use async_trait::async_trait;
 use eyre::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::graph::entities::{EntityId, EntityKind};
+use crate::graph::entities::EntityId;
+pub use crate::graph::entities::SummaryGranularity;
 
 /// LLM backend for the summary generator.
 #[async_trait]
@@ -21,38 +22,6 @@ pub struct CodeSummary {
     pub model_used: String,
     pub generated_at: String,
     pub is_stale: bool,
-}
-
-/// Granularity levels for summaries.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SummaryGranularity {
-    Function,
-    File,
-    Module,
-    Architecture,
-}
-
-impl SummaryGranularity {
-    /// The granularity an entity of `kind` is summarised at; `None` for a
-    /// kind that is never summarised.
-    pub fn of(kind: &EntityKind) -> Option<Self> {
-        match kind {
-            EntityKind::Function | EntityKind::Method => Some(Self::Function),
-            EntityKind::File => Some(Self::File),
-            EntityKind::Module => Some(Self::Module),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Function => "function",
-            Self::File => "file",
-            Self::Module => "module",
-            Self::Architecture => "architecture",
-        }
-    }
 }
 
 /// Generates code summaries at various granularities using a pluggable LLM backend.
@@ -105,20 +74,5 @@ impl SummaryGenerator {
                 entity_source
             ),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_kind_is_summarised_at_one_granularity_or_none() {
-        let of = |kind: EntityKind| SummaryGranularity::of(&kind);
-        assert_eq!(of(EntityKind::Function), Some(SummaryGranularity::Function));
-        assert_eq!(of(EntityKind::Method), Some(SummaryGranularity::Function));
-        assert_eq!(of(EntityKind::File), Some(SummaryGranularity::File));
-        assert_eq!(of(EntityKind::Module), Some(SummaryGranularity::Module));
-        assert_eq!(of(EntityKind::Struct), None);
     }
 }

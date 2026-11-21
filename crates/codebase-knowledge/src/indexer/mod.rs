@@ -14,7 +14,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::graph::entities::{CodeEntity, EntityId};
+use crate::graph::entities::{CodeEntity, EntityId, SummaryGranularity};
 use crate::graph::relationships::Relationship;
 use crate::graph::CodeGraph;
 use crate::lease::{IndexPhase, LeaseContext, LeaseProgress};
@@ -23,7 +23,7 @@ use crawler::{CrawledFile, CrawlerConfig, FileCrawler};
 use incremental::IncrementalDetector;
 use parser::AstParser;
 use relationship_builder::RelationshipBuilder;
-use summary_generator::{SummaryGenerator, SummaryGranularity};
+use summary_generator::SummaryGenerator;
 use symbol_extractor::{CallReference, ImplTraitInfo, SymbolExtractor};
 
 /// Options bundle for [`IndexingPipeline`] runs. Defaults to "no

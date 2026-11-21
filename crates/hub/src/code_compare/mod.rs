@@ -24,9 +24,8 @@ use eyre::{eyre, Result, WrapErr};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use vellev_core::Distance;
-use workforce_codebase_knowledge::graph::entities::{CodeEntity, EntityId};
+use workforce_codebase_knowledge::graph::entities::{CodeEntity, EntityId, SummaryGranularity};
 use workforce_codebase_knowledge::graph::CodeGraph;
-use workforce_codebase_knowledge::indexer::summary_generator::SummaryGranularity;
 use workforce_codebase_knowledge::vector::{
     CodeVectorStore, Near, NearestTo, SearchedByVector, VectorCodeEntity, VectorSearchResult,
     VellevCodeVectorStore, WeaviateCodeVectorStore,
@@ -53,6 +52,7 @@ const FILES: [&str; 5] = [
     "report.json",
 ];
 const SUMS: &str = "SHA256SUMS";
+const SUMS_WRITING: &str = "SHA256SUMS.tmp";
 const NOTHING_TO_EMBED: &str = "record text has nothing to embed";
 const NO_QUERY: &str = "no question to ask";
 
@@ -380,25 +380,24 @@ struct Held {
 
 struct Judge<'a> {
     graph: &'a CodeGraph,
-    held: HashMap<(String, String), Option<Held>>,
+    held: HashMap<String, Option<Held>>,
 }
 
 impl Judge<'_> {
-    async fn held(&mut self, found: &VectorSearchResult) -> Result<Option<Held>> {
-        let key = (found.repo_id.clone(), found.entity_id.clone());
-        if let Some(held) = self.held.get(&key) {
+    async fn held(&mut self, entity_id: &str) -> Result<Option<Held>> {
+        if let Some(held) = self.held.get(entity_id) {
             return Ok(held.clone());
         }
         let entity = self
             .graph
-            .get_entity(&EntityId(found.entity_id.clone()))
+            .get_entity(&EntityId(entity_id.to_string()))
             .await?;
         let held = entity.map(|entity| Held {
             qualified_name: entity.qualified_name.clone(),
             start_line: entity.start_line as u32,
             text: record_text(&entity),
         });
-        self.held.insert(key, held.clone());
+        self.held.insert(entity_id.to_string(), held.clone());
         Ok(held)
     }
 
@@ -410,7 +409,7 @@ impl Judge<'_> {
     ) -> Result<Side> {
         let (mut seen, mut hit, mut hit_raw, mut moved) = (HashSet::new(), false, false, 0);
         for (at, result) in results.iter().enumerate() {
-            let Some(held) = self.held(&result.found).await? else {
+            let Some(held) = self.held(&result.found.entity_id).await? else {
                 continue;
             };
             let is_target = held.text == target.text;
@@ -456,11 +455,14 @@ fn picked<'a>(
     asked: impl Iterator<Item = &'a Asked>,
     count: usize,
 ) -> Vec<&'a Asked> {
-    let mut keyed: Vec<([u8; 32], &Asked)> = asked
-        .map(|one| (stats::key(seed, purpose, &[&one.query.id]), one))
-        .collect();
-    keyed.sort_by(|a, b| a.0.cmp(&b.0));
-    keyed.into_iter().take(count).map(|(_, one)| one).collect()
+    asked
+        .fold(Smallest::new(count), |mut lowest, one| {
+            lowest.offer(stats::key(seed, purpose, &[&one.query.id]), one, |_| false);
+            lowest
+        })
+        .into_values()
+        .map(|(_, one)| one)
+        .collect()
 }
 
 async fn nearest(
@@ -1138,8 +1140,9 @@ fn lines<T: Serialize>(
 
 /// Make `out`'s `.partial`, measure into it, write the files and then their
 /// sums, and move them to `out`, made empty for them so that nothing else
-/// there is written over. A failure before the sums leaves `.partial` with
-/// none; one in moving them says that `.partial` holds the finished run.
+/// there is written over. A failure before the sums are in place leaves
+/// `.partial` with none; one in moving them says that `.partial` holds the
+/// finished run.
 async fn recorded(
     out: &Path,
     measure: impl std::future::Future<Output = Result<(Measured, Manifest)>>,
@@ -1169,7 +1172,13 @@ async fn recorded(
         .zip(&sums)
         .map(|(name, sum)| format!("{sum}  {name}\n"))
         .collect();
-    wrote(&at(SUMS), |writer| Ok(writer.write_all(listed.as_bytes())?))?;
+    let writing = at(SUMS_WRITING);
+    wrote(&writing, |writer| Ok(writer.write_all(listed.as_bytes())?))
+        .and_then(|_| Ok(std::fs::rename(&writing, at(SUMS))?))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&writing);
+        })
+        .wrap_err_with(|| format!("writing {SUMS} in {}", partial.display()))?;
     synced(&partial)
         .and_then(|()| {
             std::fs::create_dir(&out).wrap_err_with(|| {
@@ -1192,7 +1201,12 @@ async fn recorded(
                 partial.display()
             )
         })?;
-    synced(parent)?;
+    synced(parent).wrap_err_with(|| {
+        format!(
+            "{} holds the finished run; its move may not be durable",
+            out.display()
+        )
+    })?;
     Ok(Run { dir: out, report })
 }
 

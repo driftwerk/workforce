@@ -701,19 +701,20 @@ workforce code compare run --config workforce.toml \
   `queries.jsonl`, `vectors.jsonl`, `answers.jsonl`, `recall.jsonl`,
   `report.json` and `SHA256SUMS`, which `shasum -a 256 -c SHA256SUMS`
   verifies anywhere. An existing `--out`, or a `.partial` left by a run
-  that failed, is refused and never removed.
+  that failed, is refused and never removed. A failure in the final move
+  leaves the finished, summed run in `<out>.partial`, which the error
+  names.
 - **The gates.** The lower bound of `D` must be at least −0.02 overall
   and −0.05 for each kind of 300 queries or more; a run that asks no
-  query fails the overall gate. Every same query's
-  answer by its saved vector (the `--same-queries` a later check 4 asks
-  again) must be its text answer, and the node must
-  be seen applying its query prefix (`--no-prefix` says the model has
-  none, on purpose). Recall at 10 against an exact scan, over the
-  questions the node shortlisted, must be at least 0.97; with none
-  shortlisted it is reported exhaustive. The `self_check` gate: on every recall
-  question, the exact scan must find the node's first hit at the node's
-  distance, and a question the node did not shortlist must have recall 1.
-  A run with a failed gate still
+  query fails the overall gate. Every same query's answer by its saved
+  vector (the `--same-queries` a later check 4 asks again) must be its
+  text answer, and the node must be seen applying its query prefix
+  (`--no-prefix` says the model has none, on purpose). Recall at 10
+  against an exact scan, over the questions the node shortlisted, must
+  be at least 0.97; with none shortlisted it is reported exhaustive. The
+  `self_check` gate: on every recall question, the exact scan must find
+  the node's first hit at the node's distance, and a question the node
+  did not shortlist must have recall 1. A run with a failed gate still
   writes its files, and exits non-zero naming the gate.
 - **Siblings.** Methods of one name in one file share an id in the
   graph, which keeps one of them; Weaviate holds both. The report gives
