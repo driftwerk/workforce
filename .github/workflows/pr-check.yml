@@ -200,8 +200,11 @@ jobs:
       - run: mkdir -p ui/dist
       - name: Give the build room to swap
         uses: ./.github/actions/swap
+      # Two jobs, not the runner's four: the hub's lib tests alone fill its
+      # memory, and the test binaries linked beside them would push it far
+      # into swap, where the runner stops answering and is lost.
       - name: Build every test binary
-        run: cargo nextest archive --all-features --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst"
+        run: cargo nextest archive --all-features --build-jobs 2 --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst"
       # Every test the archive holds that a plain run would run (not
       # #[ignore]d), for `test-count` to hold the partitions to.
       - name: Count the tests
