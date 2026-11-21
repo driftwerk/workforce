@@ -136,12 +136,16 @@ impl NativeSeen {
     }
 }
 
-/// `router`, noting in `seen` each request made with the hub's own token
-/// `token`, as only Desk's native side makes them, whatever its route.
+/// `router`, noting in `seen` each `/api/desk/` request made with the hub's
+/// own token `token`, as only Desk's native side makes them, whatever its
+/// route. Desk Helper's bootstrap (`/api/identities`, `/api/me`,
+/// `/api/pair/*`) carries the same token and is no sign of Desk's native
+/// side, so it isn't noted.
 pub(crate) fn noting_native(router: Router, token: String, seen: Arc<NativeSeen>) -> Router {
     router.layer(axum::middleware::from_fn(
         move |request: axum::extract::Request, next: axum::middleware::Next| {
-            if hubs_own(&token, request.headers()) {
+            if request.uri().path().starts_with("/api/desk/") && hubs_own(&token, request.headers())
+            {
                 seen.mark();
             }
             next.run(request)

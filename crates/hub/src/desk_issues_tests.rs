@@ -451,12 +451,18 @@ async fn only_desk_itself_carries_the_calls() {
 async fn desk_reaching_a_machine_by_any_route_is_seen() {
     let seen = Arc::new(crate::desk_crew::relay::NativeSeen::default());
     let app = crate::desk_crew::relay::noting_native(
-        Router::new().route("/api/desk/sessions", axum::routing::get(|| async { "[]" })),
+        Router::new()
+            .route("/api/desk/sessions", axum::routing::get(|| async { "[]" }))
+            .route("/api/me", axum::routing::get(|| async { "{}" })),
         "the-hubs-token".into(),
         Arc::clone(&seen),
     );
     let (status, _) = send(&app, "/api/desk/sessions", "someone-else", None).await;
     assert_eq!(status, StatusCode::OK);
+    assert!(!seen.within(Duration::from_secs(60)));
+    // Desk Helper's bootstrap carries the same token and isn't Desk's
+    // native side.
+    send(&app, "/api/me", "the-hubs-token", None).await;
     assert!(!seen.within(Duration::from_secs(60)));
     send(&app, "/api/desk/sessions", "the-hubs-token", None).await;
     assert!(seen.within(Duration::from_secs(60)));
