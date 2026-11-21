@@ -12,7 +12,7 @@ use std::process::Output;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use eyre::{eyre, Result};
+use eyre::{eyre, Result, WrapErr};
 
 use crate::git_hardening::hardened_git;
 
@@ -52,14 +52,20 @@ pub(super) async fn run_git(
     let timeout = git_timeout();
     let output = tokio::time::timeout(timeout, cmd.output())
         .await
-        .map_err(|_| eyre!("git {} timed out after {}s", args[0], timeout.as_secs()))??;
+        .map_err(|_| eyre!("git {} timed out after {}s", args[0], timeout.as_secs()))?
+        .wrap_err_with(|| format!("git {} could not run", args[0]))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         let sanitised = match token {
             Some(t) => stderr.replace(t, "***"),
             None => stderr,
         };
-        return Err(eyre!("git {} failed: {}", args[0], sanitised.trim()));
+        return Err(eyre!(
+            "git {} failed ({}): {}",
+            args[0],
+            output.status,
+            sanitised.trim()
+        ));
     }
     Ok(output)
 }
@@ -107,6 +113,19 @@ mod tests {
         let helper = github_credential_helper("ghp_xxx");
         assert!(helper.contains("ghp_xxx"));
         assert!(helper.contains("x-access-token"));
+    }
+
+    #[tokio::test]
+    async fn failed_git_names_its_command_and_exit_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = run_git(Some(dir.path()), &["rev-parse", "HEAD"], None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("git rev-parse failed (exit status: 128): "),
+            "{err}"
+        );
     }
 
     #[test]

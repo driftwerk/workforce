@@ -7,7 +7,10 @@ use std::sync::Arc;
 use eyre::Result;
 use serde::Serialize;
 use tokio::sync::Semaphore;
+use tracing::warn;
 
+use workforce_common::redact::redact_secrets;
+use workforce_common::text::truncate_with_ellipsis;
 use workforce_projects::{Project, RepoSource};
 
 use super::fetcher::{Fetcher, PullOutcome};
@@ -29,6 +32,40 @@ pub struct RepoUpdateReport {
 pub enum RepoUpdateResult {
     Ok(PullOutcome),
     Err { error: String },
+}
+
+/// Most of a failed repo's error a log line carries; git's stderr is unbounded.
+const LOGGED_ERROR_MAX_BYTES: usize = 2048;
+
+impl RepoUpdateReport {
+    /// Why this repo failed, fit for a log: credentials redacted before the
+    /// cut, so no fragment of one survives it.
+    fn logged_error(&self) -> Option<String> {
+        match &self.result {
+            RepoUpdateResult::Ok(_) => None,
+            RepoUpdateResult::Err { error } => Some(truncate_with_ellipsis(
+                &redact_secrets(error),
+                LOGGED_ERROR_MAX_BYTES,
+            )),
+        }
+    }
+}
+
+/// Warn once for each repo of `project` that failed to update, with why.
+pub fn warn_failures(project: &str, reports: &[RepoUpdateReport]) {
+    reports
+        .iter()
+        .filter_map(|r| r.logged_error().map(|error| (r, error)))
+        .for_each(|(r, error)| {
+            warn!(
+                target: "cc",
+                project = %project,
+                alias = %r.alias,
+                branch = %r.branch,
+                error = %error,
+                "cc project refresh: some repos failed; continuing with their stale state"
+            )
+        });
 }
 
 pub struct ProjectUpdater {
@@ -81,7 +118,7 @@ impl ProjectUpdater {
                     let result = match fetcher.pull_repo(&repo.source, &dest, &branch).await {
                         Ok(outcome) => RepoUpdateResult::Ok(outcome),
                         Err(e) => RepoUpdateResult::Err {
-                            error: e.to_string(),
+                            error: format!("{e:#}"),
                         },
                     };
                     RepoUpdateReport {
@@ -126,6 +163,110 @@ mod tests {
         assert_eq!(ok_json["result"], "up_to_date");
         assert_eq!(err_json["alias"], "rails");
         assert_eq!(err_json["error"], "network down");
+    }
+
+    const GITHUB_TOKEN: &str = "ghs_0123456789abcdefghijklmnopqrstuvwxyzAB";
+    const BARE_TOKEN: &str = "q7Rk2LmZp9Vx4Nt8Bw3Hc6Jd";
+
+    fn failed(alias: &str, error: String) -> RepoUpdateReport {
+        RepoUpdateReport {
+            alias: alias.into(),
+            branch: "main".into(),
+            result: RepoUpdateResult::Err { error },
+        }
+    }
+
+    fn refresh_unreachable(token: &str) -> String {
+        format!(
+            "git fetch failed (exit status: 128): fatal: unable to access \
+             'https://x-access-token:{token}@github.com/acme/widgets.git/': \
+             Could not resolve host: github.com"
+        )
+    }
+
+    fn logged_by(run: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Lines(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Lines {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let lines = Lines::default();
+        let writer = lines.clone();
+        let logs = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        let _others = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        tracing::dispatcher::with_default(&logs, run);
+        let logged = lines.0.lock().unwrap().clone();
+        String::from_utf8(logged).unwrap()
+    }
+
+    #[test]
+    fn refresh_warning_names_each_failed_repo_without_its_token() {
+        let reports = [
+            failed("widgets", refresh_unreachable(GITHUB_TOKEN)),
+            RepoUpdateReport {
+                alias: "gadgets".into(),
+                branch: "main".into(),
+                result: RepoUpdateResult::Ok(PullOutcome::UpToDate),
+            },
+            failed("gizmos", refresh_unreachable(BARE_TOKEN)),
+        ];
+        let logged = logged_by(|| warn_failures("harbor", &reports));
+        assert_eq!(logged.lines().count(), 2, "{logged}");
+        for alias in ["widgets", "gizmos"] {
+            assert!(logged.contains(&format!("alias={alias}")), "{logged}");
+        }
+        assert!(!logged.contains("gadgets"), "{logged}");
+        assert!(logged.contains("project=harbor"), "{logged}");
+        assert!(logged.contains("exit status: 128"), "{logged}");
+        assert!(logged.contains("Could not resolve host"), "{logged}");
+        assert!(!logged.contains(GITHUB_TOKEN), "{logged}");
+        assert!(!logged.contains(BARE_TOKEN), "{logged}");
+    }
+
+    #[test]
+    fn refresh_warning_bounds_a_long_error() {
+        let unreachable = refresh_unreachable(GITHUB_TOKEN);
+        let token_at = unreachable.find(GITHUB_TOKEN).unwrap();
+        let padding = "x".repeat(LOGGED_ERROR_MAX_BYTES - token_at - 10);
+        let error = format!("{padding}{unreachable}{}", "y".repeat(100_000));
+        let logged_error = failed("widgets", error.clone()).logged_error().unwrap();
+        assert!(
+            logged_error.len() <= LOGGED_ERROR_MAX_BYTES + '…'.len_utf8(),
+            "{}",
+            logged_error.len()
+        );
+        assert!(logged_error.ends_with('…'));
+        assert!(!logged_error.contains(&GITHUB_TOKEN[..10]));
+        let logged = logged_by(|| warn_failures("harbor", &[failed("widgets", error)]));
+        assert!(logged.contains("alias=widgets"), "{logged}");
+        assert!(
+            logged.len() < LOGGED_ERROR_MAX_BYTES * 2,
+            "{}",
+            logged.len()
+        );
+        assert!(!logged.contains(GITHUB_TOKEN), "{logged}");
+    }
+
+    #[test]
+    fn refresh_warning_is_silent_when_every_repo_updated() {
+        let reports = [RepoUpdateReport {
+            alias: "widgets".into(),
+            branch: "main".into(),
+            result: RepoUpdateResult::Ok(PullOutcome::Cloned),
+        }];
+        assert!(reports[0].logged_error().is_none());
+        assert!(logged_by(|| warn_failures("harbor", &reports)).is_empty());
     }
 
     #[test]
