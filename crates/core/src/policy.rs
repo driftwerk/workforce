@@ -63,6 +63,10 @@ pub struct PermissionPromptOptions {
     /// A surface that doesn't know it offers Allow once and Deny.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_in_folder: Option<String>,
+    /// Set when the lasting answer lets the agent do this kind of action
+    /// on its own in [`Self::allow_in_folder`]'s scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_scope: Option<crate::computer::Kind>,
     /// What a call on this computer would do, as the hub resolved it, for
     /// the card to show in place of the agent's own summary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -71,15 +75,16 @@ pub struct PermissionPromptOptions {
 
 impl PermissionPromptOptions {
     /// Whether the card is one only the person in Desk answers: "Sign in
-    /// for me", and anything in their Chrome. No client may answer it for
-    /// them.
+    /// for me", anything in their Chrome, and one whose lasting answer lets
+    /// the agent work on its own. No client may answer it for them.
     pub fn person_only(&self) -> bool {
-        self.facts.as_ref().is_some_and(|f| {
-            f.effect == "sign_in"
-                || f.connector.as_deref().is_some_and(|c| {
-                    c == "chrome" || c.starts_with("chrome:") || c.starts_with("chrome-visit:")
-                })
-        })
+        self.allow_scope.is_some()
+            || self.facts.as_ref().is_some_and(|f| {
+                f.effect == "sign_in"
+                    || f.connector.as_deref().is_some_and(|c| {
+                        c == "chrome" || c.starts_with("chrome:") || c.starts_with("chrome-visit:")
+                    })
+            })
     }
 
     /// Standard `ask` prompt. `allow_save_allow = false` collapses to
@@ -92,6 +97,7 @@ impl PermissionPromptOptions {
             deny_always: true,
             allow_session: false,
             allow_in_folder: None,
+            allow_scope: None,
             facts: None,
         }
     }

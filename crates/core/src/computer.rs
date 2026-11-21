@@ -183,6 +183,10 @@ pub enum Effect {
     Delete {
         paths: Vec<PathBuf>,
     },
+    /// A move of `paths` to the Trash: a delete that can be undone.
+    Trash {
+        paths: Vec<PathBuf>,
+    },
     /// A delete of `from` and a write of `to`.
     Move {
         from: Vec<PathBuf>,
@@ -240,6 +244,129 @@ impl Ability {
     }
 }
 
+/// A kind of action an agent may take on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    /// Running commands and starting sessions.
+    Commands,
+    /// Commands that reach other machines: ssh, scp, sftp, rsync, mosh.
+    Network,
+    /// The person's Chrome: using it, opening sites, acting on pages.
+    Browser,
+    /// Changing files outside its folders.
+    Files,
+    /// Moving things to the Trash.
+    Delete,
+}
+
+impl Kind {
+    pub const ALL: [Kind; 5] = [
+        Kind::Commands,
+        Kind::Network,
+        Kind::Browser,
+        Kind::Files,
+        Kind::Delete,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Commands => "commands",
+            Self::Network => "network",
+            Self::Browser => "browser",
+            Self::Files => "files",
+            Self::Delete => "delete",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.as_str() == s)
+    }
+
+    /// Whether "in its folders" means anything for it: not for hosts or
+    /// sites.
+    pub fn takes_folders(self) -> bool {
+        !matches!(self, Self::Network | Self::Browser)
+    }
+}
+
+/// How far an agent does a kind of action on its own. Asking each time is
+/// no level at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Level {
+    /// Where its targets are inside its own folder or one it works in.
+    InFolders,
+    Anywhere,
+}
+
+impl Level {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InFolders => "in_folders",
+            Self::Anywhere => "anywhere",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "in_folders" => Some(Self::InFolders),
+            "anywhere" => Some(Self::Anywhere),
+            _ => None,
+        }
+    }
+}
+
+/// Where a kind's level holds: the whole kind, or one folder, host or site.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum Scope {
+    Kind,
+    Folder(PathBuf),
+    /// A host as a command names it (`devbox`, `10.0.1.20`).
+    Host(String),
+    /// A site's origin (`https://github.com`).
+    Site(String),
+}
+
+impl Scope {
+    /// As it is stored: empty for the whole kind, else `folder:`, `host:` or
+    /// `site:` and its value.
+    pub fn text(&self) -> String {
+        match self {
+            Self::Kind => String::new(),
+            Self::Folder(f) => format!("folder:{}", f.display()),
+            Self::Host(h) => format!("host:{h}"),
+            Self::Site(s) => format!("site:{s}"),
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        if s.is_empty() {
+            return Some(Self::Kind);
+        }
+        let (kind, value) = s.split_once(':')?;
+        (!value.is_empty()).then_some(())?;
+        match kind {
+            "folder" => Some(Self::Folder(PathBuf::from(value))),
+            "host" => Some(Self::Host(value.to_string())),
+            "site" => Some(Self::Site(value.to_string())),
+            _ => None,
+        }
+    }
+
+    /// Whether it fits `kind`: a host for the network, a site for the
+    /// browser, a folder for the rest.
+    pub fn fits(&self, kind: Kind) -> bool {
+        match self {
+            Self::Kind => true,
+            Self::Folder(_) => kind.takes_folders(),
+            Self::Host(_) => kind == Kind::Network,
+            Self::Site(_) => kind == Kind::Browser,
+        }
+    }
+}
+
 /// Where an "always" answer holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
@@ -248,6 +375,8 @@ pub enum Always {
     Folder(PathBuf),
     /// Writes to this connector.
     Connector(String),
+    /// This kind of action, on its own, in this scope.
+    OnItsOwn { kind: Kind, scope: Scope },
 }
 
 /// An answer a card may offer.
@@ -274,6 +403,8 @@ pub enum By {
     /// ask (`[computer] unattended = "run"`, the default). Never a verdict's
     /// own answer: the gate's, on a path with nobody on it.
     Unattended,
+    /// The person lets it do this kind of action on its own.
+    OnItsOwn,
 }
 
 /// Which rule refused a call.
@@ -285,6 +416,8 @@ pub enum Refused {
     OutsideLevel,
     ConnectorOff,
     ConnectorReadOnly,
+    /// It deletes on its own only by moving to the Trash.
+    UseTrash,
 }
 
 /// A refusal, with the sentence the agent and the person read.
@@ -376,6 +509,10 @@ pub enum Why {
     NewSite,
     /// It waits while the person signs in to a site themselves.
     SignIn,
+    /// It changes the computer's own settings or security.
+    System,
+    /// It moves something to the Trash outside its folder.
+    ToTrash,
 }
 
 impl Why {
@@ -394,6 +531,8 @@ impl Why {
             Self::TheirChrome => "Uses your own Chrome, signed in as you",
             Self::NewSite => "Opens a new site in your Chrome",
             Self::SignIn => "Waits while you sign in. Desk never sees your password",
+            Self::System => "Changes this computer's own settings or security",
+            Self::ToTrash => "Moves to the Trash",
         }
     }
 }

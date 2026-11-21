@@ -18,6 +18,8 @@
 //!    Full access runs everything past rule 5; kept for AC11).
 //! 9. Otherwise: ask, offering Allow once, for this session, always in the
 //!    folder, and Deny.
+//! 10. What the person lets it do on its own may turn that ask into a run
+//!     ([`super::on_its_own::lift`]).
 //!
 //! A call with no effect here (`memory.*`, `web.*`, …) runs before any of
 //! them. The kill switch stops what touches this computer, not connectors.
@@ -143,6 +145,25 @@ pub struct Browser {
     pub hostile: bool,
 }
 
+/// Whether `connector` is what a browser call is kept under: a site in the
+/// person's Chrome (`chrome:<origin>`, `chrome-visit:<origin>`), or
+/// `chrome` itself.
+pub fn is_browser_key(connector: &str) -> bool {
+    connector == "chrome"
+        || connector
+            .strip_prefix("chrome")
+            .is_some_and(|rest| rest.starts_with(':') || rest.starts_with("-visit:"))
+}
+
+/// The site a browser key names (`chrome-visit:https://x` → `https://x`);
+/// `None` for `chrome` itself, or anything else.
+pub fn browser_origin(connector: &str) -> Option<&str> {
+    connector
+        .strip_prefix("chrome:")
+        .or_else(|| connector.strip_prefix("chrome-visit:"))
+        .filter(|o| !o.is_empty())
+}
+
 /// What a browser call is kept under: the site it acts on in the person's
 /// Chrome (`chrome:https://shop.example`), so "Allow for this session"
 /// holds for that site alone; a page with no origin of its own (blank) is
@@ -188,6 +209,9 @@ pub struct AgentPolicy {
     pub connectors: Option<Connectors>,
     /// Its browser: how far it acts on pages.
     pub browser: Browser,
+    /// What the person lets it do on its own: levels and overrides, read
+    /// with its grants.
+    pub on_its_own: super::on_its_own::OnItsOwn,
 }
 
 /// The job or workflow run a call is made in, for a grant held by one.
@@ -209,6 +233,9 @@ pub struct CallFacts {
     /// The folder an "always" answer would cover: the git work tree holding
     /// the target, or its parent; `None` when the caller found none.
     pub folder: Option<PathBuf>,
+    /// Whether the turn is one the person or the agent's own jobs started,
+    /// the only ones its levels apply to.
+    pub own_work: bool,
 }
 
 /// A standing grant, or a session allowance when `session_id` is set.
@@ -271,7 +298,7 @@ pub fn shown(path: &Path, home: &Path) -> String {
 
 /// Whether `path` lies under `root`, compared as a case-insensitive disk
 /// (APFS) compares names ([`fold`]).
-fn under(path: &Path, root: &Path) -> bool {
+pub(super) fn under(path: &Path, root: &Path) -> bool {
     fold(path).starts_with(fold(root))
 }
 
@@ -283,7 +310,7 @@ impl AgentPolicy {
 
     /// Inside its own folder or a folder it works in: where it reads,
     /// changes and runs at every level.
-    fn inside(&self, path: &Path) -> bool {
+    pub(super) fn inside(&self, path: &Path) -> bool {
         self.in_own(path) || self.works_in.iter().any(|root| under(path, root))
     }
 
@@ -314,7 +341,7 @@ impl AgentPolicy {
             || (self.withheld.iter().any(|w| under(path, w)) && !self.in_own(path))
     }
 
-    fn shown(&self, path: &Path) -> String {
+    pub(super) fn shown(&self, path: &Path) -> String {
         shown(path, &self.home)
     }
 
@@ -334,7 +361,7 @@ impl AgentPolicy {
 
     /// Whether `folder` may be offered as an "always" scope: never home, the
     /// root, a volume root, or anything above home.
-    fn offerable(&self, folder: &Path) -> bool {
+    pub(super) fn offerable(&self, folder: &Path) -> bool {
         let depth = folder
             .components()
             .filter(|c| matches!(c, std::path::Component::Normal(_)))
@@ -345,11 +372,12 @@ impl AgentPolicy {
 }
 
 /// Every path a call names, for the withheld check.
-fn paths(effect: &Effect) -> Vec<&Path> {
+pub(super) fn paths(effect: &Effect) -> Vec<&Path> {
     match effect {
-        Effect::Read { paths } | Effect::Write { paths } | Effect::Delete { paths } => {
-            paths.iter().map(PathBuf::as_path).collect()
-        }
+        Effect::Read { paths }
+        | Effect::Write { paths }
+        | Effect::Delete { paths }
+        | Effect::Trash { paths } => paths.iter().map(PathBuf::as_path).collect(),
         Effect::Move { from, to } => from
             .iter()
             .map(PathBuf::as_path)
@@ -372,7 +400,7 @@ fn changes(effect: &Effect) -> Vec<Change<'_>> {
     }
     match effect {
         Effect::Write { paths } => each(Ability::Write, paths),
-        Effect::Delete { paths } => each(Ability::Delete, paths),
+        Effect::Delete { paths } | Effect::Trash { paths } => each(Ability::Delete, paths),
         Effect::Move { from, to } => {
             let mut out = each(Ability::Delete, from);
             out.push(Change::Path(Ability::Write, to));
@@ -481,9 +509,24 @@ fn deleting(p: &AgentPolicy, grants: &[Grant], call: &CallFacts, targets: &[Path
     ask(choices, Why::CantBeUndone)
 }
 
-/// What happens to `call`, given the kill switch and the agent's live
-/// grants. See the module for the rules.
+/// A move of `targets` to the Trash, outside the own folder: a standing
+/// grant to delete in a folder holding every one lets it run, as it would a
+/// delete; otherwise it asks, Allow once or Deny.
+fn trashing(p: &AgentPolicy, grants: &[Grant], call: &CallFacts, targets: &[PathBuf]) -> Verdict {
+    match deleting(p, grants, call, targets) {
+        run @ Verdict::Run { .. } => run,
+        _ => ask(vec![Choice::AllowOnce, Choice::Deny], Why::ToTrash),
+    }
+}
+
+/// What happens to `call`, given the kill switch, the agent's live grants
+/// and what it does on its own. See the module for the rules.
 pub fn verdict(p: &AgentPolicy, stopped: bool, grants: &[Grant], call: &CallFacts) -> Verdict {
+    super::on_its_own::lift(p, call, asked(p, stopped, grants, call))
+}
+
+/// [`verdict`] before what the agent does on its own: rules 1 to 9.
+fn asked(p: &AgentPolicy, stopped: bool, grants: &[Grant], call: &CallFacts) -> Verdict {
     let name = &p.name;
     let settings = "Settings → This computer";
     let access = p.access.access;
@@ -523,7 +566,7 @@ pub fn verdict(p: &AgentPolicy, stopped: bool, grants: &[Grant], call: &CallFact
     // 2. The withheld set.
     let change = matches!(
         call.effect,
-        Effect::Write { .. } | Effect::Delete { .. } | Effect::Move { .. }
+        Effect::Write { .. } | Effect::Delete { .. } | Effect::Trash { .. } | Effect::Move { .. }
     );
     if let Some(path) = paths(&call.effect)
         .into_iter()
@@ -559,7 +602,12 @@ pub fn verdict(p: &AgentPolicy, stopped: bool, grants: &[Grant], call: &CallFact
                 return outside_level("read", Some(path));
             }
         }
-        Effect::Write { .. } | Effect::Delete { .. } | Effect::Move { .. } if lower => {
+        Effect::Write { .. }
+        | Effect::Delete { .. }
+        | Effect::Trash { .. }
+        | Effect::Move { .. }
+            if lower =>
+        {
             if let Some(path) = paths(&call.effect).into_iter().find(|path| !p.inside(path)) {
                 return outside_level("change", Some(path));
             }
@@ -631,6 +679,10 @@ pub fn verdict(p: &AgentPolicy, stopped: bool, grants: &[Grant], call: &CallFact
             let outside: Vec<PathBuf> = paths.iter().filter(|x| !p.deletable(x)).cloned().collect();
             return deleting(p, grants, call, &outside);
         }
+        Effect::Trash { paths } if paths.iter().any(|path| !p.deletable(path)) => {
+            let outside: Vec<PathBuf> = paths.iter().filter(|x| !p.deletable(x)).cloned().collect();
+            return trashing(p, grants, call, &outside);
+        }
         // Writing over a file outside the folder loses what was there; a
         // new file there loses nothing.
         Effect::Write { paths } | Effect::Move { to: _, from: paths }
@@ -645,6 +697,7 @@ pub fn verdict(p: &AgentPolicy, stopped: bool, grants: &[Grant], call: &CallFact
                 Some(Asks::Deletes(targets)) => return deleting(p, grants, call, &targets),
                 Some(Asks::Irreversible) => return ask(once(), Why::CantBeUndone),
                 Some(Asks::Unclear) => return ask(once(), Why::Unclear),
+                Some(Asks::System) => return ask(once(), Why::System),
                 None => {}
             }
         }
@@ -665,7 +718,10 @@ pub fn verdict(p: &AgentPolicy, stopped: bool, grants: &[Grant], call: &CallFact
         // Full access: whatever passed the always-asks list runs.
         _ if access == Access::Full => true,
         Effect::Read { .. } | Effect::Connector { write: false, .. } => true,
-        Effect::Write { .. } | Effect::Delete { .. } | Effect::Move { .. } => changes_inside(),
+        Effect::Write { .. }
+        | Effect::Delete { .. }
+        | Effect::Trash { .. }
+        | Effect::Move { .. } => changes_inside(),
         // Contained to the level (checked in 3).
         Effect::Exec { .. } | Effect::Session { .. } => lower,
         _ => false,

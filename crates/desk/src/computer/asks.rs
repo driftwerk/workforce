@@ -42,6 +42,9 @@ pub enum Asks {
     Irreversible,
     /// It can't be read as simple commands.
     Unclear,
+    /// It changes the computer's own settings or security, or asks for a
+    /// password: the person's at every level.
+    System,
 }
 
 impl Asks {
@@ -50,12 +53,14 @@ impl Asks {
         match self {
             Self::Deletes(_) | Self::Irreversible => "Can't be undone",
             Self::Unclear => "Can't tell what this command runs",
+            Self::System => "Changes this computer's own settings or security",
         }
     }
 
     /// The one that decides, of two a command's parts gave.
     fn worst(self, other: Self) -> Self {
         match (self, other) {
+            (Self::System, _) | (_, Self::System) => Self::System,
             (Self::Unclear, _) | (_, Self::Unclear) => Self::Unclear,
             (Self::Irreversible, _) | (_, Self::Irreversible) => Self::Irreversible,
             (Self::Deletes(mut a), Self::Deletes(b)) => {
@@ -395,6 +400,160 @@ pub fn always_asks(command: &str, place: &Place<'_>) -> Option<Asks> {
         here.later |= makes_links(simple);
     }
     found
+}
+
+/// Where the command a wrapper (`nohup`, `env X=1`, `timeout 10`, `nice
+/// -n 5`, …) runs starts in its `args`; `None` when `name` wraps nothing
+/// or names no command after its own options.
+fn wrapped(name: &str, args: &[&Word]) -> Option<usize> {
+    match name {
+        "exec" | "command" | "builtin" | "nohup" | "time" | "caffeinate" => {
+            Some(args.iter().take_while(|w| is_option(w)).count())
+        }
+        "nice" | "timeout" | "stdbuf" | "env" => {
+            let mut j = 0;
+            while let Some(w) = args.get(j) {
+                let t = w.text.as_str();
+                if is_assignment(w) && name == "env" {
+                    j += 1;
+                } else if is_option(w) {
+                    let takes = matches!(
+                        (name, t),
+                        ("nice", "-n") | ("env", "-u" | "-C" | "-S") | ("timeout", "-s" | "-k")
+                    ) || (name == "stdbuf" && t.len() == 2);
+                    j += if takes { 2 } else { 1 };
+                } else if name == "timeout" && j == args.iter().take_while(|w| is_option(w)).count()
+                {
+                    j += 1;
+                    break;
+                } else {
+                    break;
+                }
+            }
+            args.get(j).map(|_| j)
+        }
+        _ => None,
+    }
+}
+
+/// A machine a command reaches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Host {
+    /// As the command names it: an address, a name, an `~/.ssh/config`
+    /// alias, never resolved.
+    Named(String),
+    /// Expanded only when it runs.
+    Unread,
+}
+
+/// The other machines `command` reaches: what `ssh`, `sftp`, `mosh`, `scp`
+/// and `rsync` connect to, behind wrappers and in a shell's `-c` script.
+/// A command that can't be split reaches none Desk can name.
+pub fn hosts(command: &str) -> Vec<Host> {
+    split(command)
+        .map(|commands| {
+            commands
+                .iter()
+                .flat_map(|c| {
+                    let words: Vec<&Word> = c
+                        .words
+                        .iter()
+                        .skip_while(|w| is_assignment(w) || KEYWORDS.contains(&w.text.as_str()))
+                        .collect();
+                    hosts_of(&words)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The options of `ssh` (and `sftp`, `mosh`, `scp`) that take a value.
+const SSH_VALUED: &[&str] = &[
+    "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-p", "-P",
+    "-Q", "-R", "-S", "-W", "-w",
+];
+
+fn hosts_of(words: &[&Word]) -> Vec<Host> {
+    let Some((first, args)) = words.split_first() else {
+        return vec![];
+    };
+    if first.dynamic {
+        return vec![];
+    }
+    let name = first.text.rsplit('/').next().unwrap_or(&first.text);
+    if let Some(at) = wrapped(name, args) {
+        return hosts_of(&args[at..]);
+    }
+    let operands = || {
+        let mut out = vec![];
+        let mut skip = false;
+        for w in args {
+            if skip {
+                skip = false;
+            } else if SSH_VALUED.contains(&w.text.as_str()) {
+                skip = true;
+            } else if !is_option(w) {
+                out.push(*w);
+            }
+        }
+        out
+    };
+    match name {
+        _ if SHELLS.contains(&name) => {
+            let flag = args.iter().position(|w| {
+                !w.text.starts_with("--") && w.text.starts_with('-') && w.text.contains('c')
+            });
+            match flag.and_then(|at| args.get(at + 1)) {
+                Some(script) if script.dynamic => vec![Host::Unread],
+                Some(script) => hosts(&script.text),
+                None => vec![],
+            }
+        }
+        "ssh" | "sftp" | "mosh" => operands()
+            .first()
+            .map(|w| host_word(w, true))
+            .into_iter()
+            .flatten()
+            .collect(),
+        "scp" | "rsync" => operands()
+            .into_iter()
+            .filter_map(|w| host_word(w, false))
+            .collect(),
+        _ => vec![],
+    }
+}
+
+/// The host `word` names: for `ssh` the word itself (`user@host`,
+/// `ssh://user@host:22`); for a copy only a `[user@]host:path` or a
+/// `scp://`/`rsync://` address. `None` when it names no other machine.
+fn host_word(word: &Word, whole: bool) -> Option<Host> {
+    let text = word.text.as_str();
+    let address = ["ssh://", "scp://", "sftp://", "rsync://"]
+        .iter()
+        .find_map(|scheme| text.strip_prefix(scheme));
+    let at = match address {
+        Some(rest) => rest.split('/').next().unwrap_or(rest),
+        None if whole => text,
+        // A variable's spelling isn't kept: any colon may follow a host.
+        None if word.dynamic && text.contains(':') => return Some(Host::Unread),
+        None => {
+            let (before, _) = text.split_once(':')?;
+            if before.is_empty() || before.contains('/') || text.starts_with(['.', '~']) {
+                return None;
+            }
+            before
+        }
+    };
+    if word.dynamic {
+        return Some(Host::Unread);
+    }
+    let host = at.rsplit('@').next().unwrap_or(at);
+    let host = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(v6),
+        None if address.is_some() => host.split(':').next().unwrap_or(host),
+        None => host,
+    };
+    (!host.is_empty()).then(|| Host::Named(host.to_string()))
 }
 
 /// Whether `simple` could make a link for what follows it on the line:
@@ -1061,15 +1220,41 @@ impl Splitter {
 }
 
 const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh"];
-const ALWAYS: &[&str] = &[
+/// What changes the computer's own settings or security, or asks for a
+/// password: never done on its own.
+const SYSTEM: &[&str] = &[
     "sudo",
     "doas",
-    "dd",
-    "diskutil",
-    "launchctl",
+    "su",
     "security",
-    "crontab",
+    "launchctl",
+    "diskutil",
+    "dd",
+    "csrutil",
+    "spctl",
+    "tccutil",
+    "systemsetup",
+    "nvram",
+    "pmset",
+    "profiles",
+    "fdesetup",
+    "dscl",
+    "passwd",
+    "scutil",
+    "networksetup",
+    "softwareupdate",
+    "kextload",
+    "kextunload",
+    "bless",
 ];
+
+/// Whether a `defaults` domain is the system's own: the global domain,
+/// Apple's, or a file under `/Library`.
+fn system_domain(domain: &str) -> bool {
+    matches!(domain, "-g" | "-globalDomain" | "NSGlobalDomain")
+        || domain.starts_with("com.apple.")
+        || domain.starts_with("/Library/")
+}
 const KEYWORDS: &[&str] = &[
     "!", "{", "}", "then", "do", "else", "elif", "if", "while", "until", "fi", "done",
 ];
@@ -1160,34 +1345,9 @@ fn classify_words(
     match name {
         "for" | "select" => None,
         "case" | "function" | "eval" | "coproc" => Some(Asks::Unclear),
-        "exec" | "command" | "builtin" | "nohup" | "time" | "caffeinate" => {
-            let skip = args.iter().take_while(|w| is_option(w)).count();
-            classify_words(&args[skip..], simple, place, unknown)
-        }
-        "nice" | "timeout" | "stdbuf" | "env" => {
-            // Options, their values, and (env) assignments, then the command.
-            let mut j = 0;
-            while let Some(w) = args.get(j) {
-                let t = w.text.as_str();
-                if is_assignment(w) && name == "env" {
-                    j += 1;
-                } else if is_option(w) {
-                    let takes = matches!(
-                        (name, t),
-                        ("nice", "-n") | ("env", "-u" | "-C" | "-S") | ("timeout", "-s" | "-k")
-                    ) || (name == "stdbuf" && t.len() == 2);
-                    j += if takes { 2 } else { 1 };
-                } else if name == "timeout" && j == args.iter().take_while(|w| is_option(w)).count()
-                {
-                    // The duration.
-                    j += 1;
-                    break;
-                } else {
-                    break;
-                }
-            }
-            args.get(j)?;
-            classify_words(&args[j..], simple, place, unknown)
+        _ if wrapped(name, args).is_some() => {
+            let at = wrapped(name, args)?;
+            classify_words(&args[at..], simple, place, unknown)
         }
         "xargs" => {
             let mut j = 0;
@@ -1222,14 +1382,22 @@ fn classify_words(
                 None
             }
         }
-        _ if ALWAYS.contains(&name) || name.starts_with("mkfs") || name.starts_with("newfs") => {
-            Some(Asks::Irreversible)
+        _ if SYSTEM.contains(&name) || name.starts_with("mkfs") || name.starts_with("newfs") => {
+            Some(Asks::System)
         }
-        "defaults" => args
-            .iter()
-            .find(|w| !is_option(w))
-            .filter(|w| w.text == "write")
-            .map(|_| Asks::Irreversible),
+        "crontab" => Some(Asks::Irreversible),
+        "defaults" => {
+            let mut words = args.iter().filter(|w| !is_option(w) || w.text == "-g");
+            let verb = words.next().map(|w| w.text.as_str());
+            let system = words
+                .next()
+                .is_none_or(|d| d.dynamic || system_domain(&d.text));
+            match verb {
+                Some("write" | "delete" | "import") if system => Some(Asks::System),
+                Some("write") => Some(Asks::Irreversible),
+                _ => None,
+            }
+        }
         "rm" | "rmdir" | "unlink" => {
             let targets = operands(args);
             if targets.is_empty() && !unknown {
@@ -1658,7 +1826,7 @@ mod tests {
 
     /// It can't be undone, whether or not an "always" could cover it.
     fn undoes(command: &str) -> bool {
-        matches!(asks(command), Some(I | Asks::Deletes(_)))
+        matches!(asks(command), Some(I | Asks::Deletes(_) | Asks::System))
     }
 
     use Asks::{Irreversible as I, Unclear as U};
@@ -1973,6 +2141,98 @@ mod tests {
             "kubectl delete pod web-1",
         ] {
             assert!(undoes(command), "{command:?} → {:?}", asks(command));
+        }
+    }
+
+    #[test]
+    fn the_computers_own_settings_and_security_are_the_persons() {
+        for command in [
+            "sudo ls",
+            "echo ok && sudo rm x",
+            "doas reboot",
+            "su -",
+            "dd if=/dev/zero of=/dev/disk2",
+            "mkfs.ext4 /dev/sdb1",
+            "diskutil eraseDisk APFS x disk2",
+            "launchctl unload x.plist",
+            "security find-generic-password -s x",
+            "csrutil disable",
+            "spctl --master-disable",
+            "tccutil reset All",
+            "systemsetup -setremotelogin on",
+            "nvram boot-args=x",
+            "pmset -a sleep 0",
+            "profiles remove -all",
+            "fdesetup disable",
+            "dscl . -passwd /Users/sarah",
+            "passwd",
+            "scutil --set HostName x",
+            "networksetup -setdnsservers Wi-Fi 1.1.1.1",
+            "softwareupdate -ia",
+            "defaults write com.apple.dock autohide -bool true",
+            "defaults write -g AppleShowAllExtensions -bool true",
+            "defaults delete NSGlobalDomain x",
+            "defaults write /Library/Preferences/x k v",
+            "defaults write \"$D\" k v",
+            "nohup sudo x &",
+            "sh -c 'cargo build && sudo make install'",
+            // It outranks what can't be read.
+            "eval \"$X\"; sudo ls",
+        ] {
+            assert_eq!(asks(command), Some(Asks::System), "{command:?}");
+        }
+        assert_eq!(asks("defaults write com.acme.app k v"), Some(I));
+        assert_eq!(asks("crontab -r"), Some(I));
+        for command in [
+            "defaults read com.apple.dock",
+            "defaults delete com.acme.app k",
+            "defaults import com.acme.app x.plist",
+        ] {
+            assert_eq!(asks(command), None, "{command:?}");
+        }
+    }
+
+    #[test]
+    fn the_machines_a_command_reaches_are_named() {
+        let named = |h: &str| Host::Named(h.to_string());
+        for (command, reached) in [
+            ("ssh devbox uptime", vec![named("devbox")]),
+            (
+                "ssh -p 2222 -i ~/.ssh/k dev@devbox 'cargo build'",
+                vec![named("devbox")],
+            ),
+            ("ssh -J root@gw root@10.0.1.20", vec![named("10.0.1.20")]),
+            ("ssh ssh://dev@devbox:2222", vec![named("devbox")]),
+            (
+                "ssh -o StrictHostKeyChecking=no prod.example ls",
+                vec![named("prod.example")],
+            ),
+            ("sftp dev@devbox", vec![named("devbox")]),
+            ("mosh devbox", vec![named("devbox")]),
+            ("scp a.txt devbox:/tmp/", vec![named("devbox")]),
+            ("scp -P 22 dev@a:/x dev@b:/y", vec![named("a"), named("b")]),
+            ("scp scp://dev@devbox//tmp/x .", vec![named("devbox")]),
+            ("rsync -az ./ devbox:src/x/", vec![named("devbox")]),
+            ("rsync -a host::module/ ./", vec![named("host")]),
+            ("timeout 10 ssh devbox ls", vec![named("devbox")]),
+            ("env A=1 nice -n 5 ssh devbox ls", vec![named("devbox")]),
+            ("cd x && bash -c 'ssh devbox ls'", vec![named("devbox")]),
+            ("ssh \"$HOST\" ls", vec![Host::Unread]),
+            ("scp x \"$H\":/tmp", vec![Host::Unread]),
+            ("bash -c \"$X\"", vec![Host::Unread]),
+        ] {
+            assert_eq!(hosts(command), reached, "{command:?}");
+        }
+        for command in [
+            "cargo build",
+            "cp a.txt /tmp/b.txt",
+            "rsync -a ./ ../copy/",
+            "scp ./a:b ./c",
+            "echo ssh devbox",
+            "git push origin main",
+            "'unterminated",
+        ] {
+            assert_eq!(hosts(command), vec![], "{command:?}");
         }
     }
 

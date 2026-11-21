@@ -130,7 +130,8 @@ pub trait ComputerGate: Send + Sync {
     fn unbound(&self) -> bool {
         false
     }
-    /// Keeps a session or folder answer as Desk's grant.
+    /// Keeps a session or lasting answer as Desk's grant, or as what the
+    /// agent does on its own.
     fn keep(
         &self,
         _decision: &Decision,
@@ -205,6 +206,7 @@ pub fn describe(effect: &Effect) -> String {
         Effect::Read { paths } => format!("read {}", list(paths)),
         Effect::Write { paths } => format!("change {}", list(paths)),
         Effect::Delete { paths } => format!("delete {}", list(paths)),
+        Effect::Trash { paths } => format!("move {} to the Trash", list(paths)),
         Effect::Move { from, to } => format!("move {} to {}", list(from), to.display()),
         Effect::Exec { command, cwd } => match cwd {
             Some(cwd) => format!("run `{command}` in {}", cwd.display()),
@@ -238,7 +240,6 @@ pub fn apply(response: PolicyResponse, decision: Option<&Decision>) -> PolicyRes
             },
             ..response
         },
-        // Working on its own (AC11) is not built yet: a review asks.
         Verdict::Ask { why, .. } => held(response, why.sentence(), &decision.effect),
         Verdict::Review => held(response, "Asks first", &decision.effect),
     }
@@ -273,6 +274,7 @@ pub fn once_or_deny() -> workforce_core::policy::PermissionPromptOptions {
         deny_always: false,
         allow_session: false,
         allow_in_folder: None,
+        allow_scope: None,
         facts: None,
     }
 }
@@ -289,8 +291,9 @@ pub fn prompt_options(
     options
 }
 
-/// Keeps a session or folder answer to `decision` as a grant; any other
-/// answer keeps nothing. A grant that can't be kept is logged: the call
+/// Keeps a session or lasting answer to `decision` (a folder's or a
+/// connector's grant, or a kind of action on its own); any other answer
+/// keeps nothing. A grant that can't be kept is logged: the call
 /// itself was still allowed once.
 pub fn keep_answer(
     gate: Option<&dyn ComputerGate>,

@@ -789,10 +789,304 @@ fn glob_walk(
     (out, truncated)
 }
 
+/// Tool for moving files and folders to the OS's Trash, where the person
+/// can put them back: how an agent deletes on its own.
+pub struct TrashFiles {
+    allowed_paths: Vec<PathBuf>,
+    trash: fn(&[PathBuf]) -> std::result::Result<(), String>,
+}
+
+impl TrashFiles {
+    pub fn new(allowed_paths: Vec<PathBuf>) -> Self {
+        Self {
+            allowed_paths,
+            trash: os_trash,
+        }
+    }
+
+    /// The paths `input` names, each where it stands: its folder real, its
+    /// own name as written, so a link is moved, never what it points to.
+    fn targets(&self, input: &serde_json::Value) -> Vec<(String, PathBuf)> {
+        let named: Vec<&str> = match &input["paths"] {
+            serde_json::Value::String(s) => vec![s.as_str()],
+            serde_json::Value::Array(items) => {
+                items.iter().filter_map(serde_json::Value::as_str).collect()
+            }
+            _ => vec![],
+        };
+        named
+            .into_iter()
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+            .map(|raw| {
+                let joined = resolve_against_workspace(Path::new(raw), &self.allowed_paths);
+                let standing = match (joined.parent(), joined.file_name()) {
+                    (Some(parent), Some(name)) => super::paths::resolve_real(parent).join(name),
+                    _ => super::paths::resolve_real(&joined),
+                };
+                (raw.to_string(), standing)
+            })
+            .collect()
+    }
+}
+
+/// Moves `paths` to the OS's Trash. On macOS through the file manager, so
+/// Finder is never scripted and asks nothing.
+fn os_trash(paths: &[PathBuf]) -> std::result::Result<(), String> {
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut context = trash::TrashContext::default();
+    #[cfg(target_os = "macos")]
+    {
+        use trash::macos::{DeleteMethod, TrashContextExtMacos};
+        context.set_delete_method(DeleteMethod::NsFileManager);
+    }
+    context.delete_all(paths).map_err(|e| e.to_string())
+}
+
+/// Why `real` (named `shown`) isn't moved to the Trash: it is outside the
+/// roots, missing, a root or what holds one, home, or the agent's own
+/// settings.
+fn trash_refusal(
+    roots: &CanonicalRoots,
+    own: &[PathBuf],
+    shown: &str,
+    real: &Path,
+) -> Option<String> {
+    let home = std::env::var_os("HOME").map(|h| super::paths::resolve_real(Path::new(&h)));
+    if !roots.holds(real) {
+        return Some(refusal(shown, real));
+    }
+    if std::fs::symlink_metadata(real).is_err() {
+        return Some(format!("'{shown}' isn't there, so nothing was moved."));
+    }
+    if real.parent().is_none()
+        || home.as_deref() == Some(real)
+        || own.iter().any(|root| root.starts_with(real))
+    {
+        return Some(format!(
+            "'{shown}' holds a whole working folder, so it wasn't moved to the Trash."
+        ));
+    }
+    config_guard::is_config(roots, real).then(|| WriteError::Config.to_string())
+}
+
+#[async_trait]
+impl Tool for TrashFiles {
+    fn name(&self) -> &str {
+        "filesystem.trash"
+    }
+
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::Trash {
+            paths: self.targets(input).into_iter().map(|(_, p)| p).collect(),
+        }
+    }
+
+    fn description(&self) -> &str {
+        "Move files or folders to the Trash, where the person can put them back. Use this, not rm, to delete."
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Files or folders to move to the Trash"
+                }
+            },
+            "required": ["paths"]
+        })
+    }
+
+    async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
+        let start = Instant::now();
+        let elapsed = || start.elapsed().as_millis() as u64;
+        let targets = self.targets(&input);
+        if targets.is_empty() {
+            return Ok(ToolResult::failure(
+                "Name at least one file or folder to move to the Trash.".to_string(),
+                elapsed(),
+            ));
+        }
+        let roots = CanonicalRoots::new(&self.allowed_paths);
+        let own: Vec<PathBuf> = self
+            .allowed_paths
+            .iter()
+            .map(|root| super::paths::resolve_real(root))
+            .collect();
+        if let Some(why) = targets
+            .iter()
+            .find_map(|(shown, real)| trash_refusal(&roots, &own, shown, real))
+        {
+            return Ok(ToolResult::failure(why, elapsed()));
+        }
+        let (shown, real): (Vec<String>, Vec<PathBuf>) = targets.into_iter().unzip();
+        let trash = self.trash;
+        let moved = tokio::task::spawn_blocking(move || trash(&real))
+            .await
+            .map_err(|e| eyre::eyre!("trash task failed: {e}"))?;
+        match moved {
+            Ok(()) => Ok(ToolResult::success(
+                serde_json::json!({ "moved_to_trash": shown }),
+                elapsed(),
+            )),
+            Err(e) => Ok(ToolResult::failure(
+                format!("Couldn't move {} to the Trash: {e}", shown.join(", ")),
+                elapsed(),
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    fn removes(paths: &[PathBuf]) -> std::result::Result<(), String> {
+        paths.iter().try_for_each(|path| {
+            match fs::symlink_metadata(path)
+                .map_err(|e| e.to_string())?
+                .is_dir()
+            {
+                true => fs::remove_dir_all(path),
+                false => fs::remove_file(path),
+            }
+            .map_err(|e| e.to_string())
+        })
+    }
+
+    fn never(_: &[PathBuf]) -> std::result::Result<(), String> {
+        panic!("nothing should have been moved")
+    }
+
+    fn fails(_: &[PathBuf]) -> std::result::Result<(), String> {
+        Err("the Trash is full".into())
+    }
+
+    fn trasher(
+        root: &Path,
+        trash: fn(&[PathBuf]) -> std::result::Result<(), String>,
+    ) -> TrashFiles {
+        TrashFiles {
+            allowed_paths: vec![root.to_path_buf()],
+            trash,
+        }
+    }
+
+    #[tokio::test]
+    async fn trash_moves_what_it_names_inside_its_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "a").unwrap();
+        fs::create_dir_all(dir.path().join("build/x")).unwrap();
+        let result = trasher(dir.path(), removes)
+            .execute(serde_json::json!({ "paths": ["a.txt", "build"] }))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            result.output["moved_to_trash"],
+            serde_json::json!(["a.txt", "build"])
+        );
+        assert!(!dir.path().join("a.txt").exists());
+        assert!(!dir.path().join("build").exists());
+    }
+
+    #[tokio::test]
+    async fn trash_names_its_paths_as_they_stand_for_the_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = fs::canonicalize(dir.path()).unwrap();
+        let tool = trasher(dir.path(), never);
+        assert_eq!(
+            tool.effect(&serde_json::json!({ "paths": ["a.txt", " ", "sub/b"] })),
+            workforce_core::computer::Effect::Trash {
+                paths: vec![real.join("a.txt"), real.join("sub/b")],
+            }
+        );
+        assert_eq!(
+            tool.effect(&serde_json::json!({ "paths": "a.txt" })),
+            workforce_core::computer::Effect::Trash {
+                paths: vec![real.join("a.txt")],
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn trash_moves_a_link_not_what_it_points_to() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("target.txt"), "t").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("target.txt"), dir.path().join("link")).unwrap();
+        let result = trasher(dir.path(), removes)
+            .execute(serde_json::json!({ "paths": ["link"] }))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(dir.path().join("target.txt").exists());
+        assert!(fs::symlink_metadata(dir.path().join("link")).is_err());
+    }
+
+    #[tokio::test]
+    async fn trash_refuses_without_moving_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "a").unwrap();
+        fs::write(outside.path().join("b.txt"), "b").unwrap();
+        let tool = trasher(dir.path(), never);
+        let refused = |paths: serde_json::Value| {
+            let tool = &tool;
+            async move {
+                let result = tool
+                    .execute(serde_json::json!({ "paths": paths }))
+                    .await
+                    .unwrap();
+                assert!(!result.success);
+                result.error.unwrap()
+            }
+        };
+        let b = outside.path().join("b.txt").display().to_string();
+        assert!(refused(serde_json::json!(["a.txt", b]))
+            .await
+            .contains("Access denied"));
+        assert!(refused(serde_json::json!(["gone.txt"]))
+            .await
+            .contains("isn't there"));
+        let root = dir.path().display().to_string();
+        assert!(refused(serde_json::json!([root]))
+            .await
+            .contains("whole working folder"));
+        assert!(refused(serde_json::json!(["."]))
+            .await
+            .contains("whole working folder"));
+        fs::create_dir_all(dir.path().join("sub")).unwrap();
+        assert!(!refused(serde_json::json!(["sub/.."])).await.is_empty());
+        assert!(!refused(serde_json::json!([".."])).await.is_empty());
+        assert!(refused(serde_json::json!([]))
+            .await
+            .contains("at least one"));
+        assert!(refused(serde_json::json!("  "))
+            .await
+            .contains("at least one"));
+        assert!(dir.path().join("a.txt").exists());
+        assert!(outside.path().join("b.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn trash_says_when_the_trash_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "a").unwrap();
+        let result = trasher(dir.path(), fails)
+            .execute(serde_json::json!({ "paths": ["a.txt"] }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("Couldn't move a.txt to the Trash: the Trash is full")
+        );
+    }
 
     #[tokio::test]
     async fn read_file_works() {

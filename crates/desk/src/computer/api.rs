@@ -8,8 +8,14 @@
 //!   for which session; `DELETE /api/desk/computer/grants/{id}` revokes one.
 //! - `POST /api/desk/computer/sessions/{session_id}/forget`: drops a
 //!   session's allowances.
-//! - `GET /api/desk/computer/activity[?agent=&kind=&before=]`: a page of
-//!   what agents did here, newest first, and where the next starts.
+//! - `GET /api/desk/computer/activity[?agent=&kind=&decided_by=&before=]`:
+//!   a page of what agents did here, newest first, and where the next
+//!   starts.
+//! - `GET /api/desk/computer/on-its-own?agent=`: what a local agent does on
+//!   its own; `PUT` sets one level or override, `{agent, kind, scope,
+//!   level}` (`level` null asks each time again); `POST
+//!   /api/desk/computer/on-its-own/ask-again` `{agent}` forgets all of it
+//!   and every grant the agent holds.
 //!
 //! An agent's level is its `[computer]` table, set through the agent's
 //! config like any other setting.
@@ -26,7 +32,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
-use super::store::{ActivityFilter, KeptGrant};
+use super::store::{level_refusal, ActivityFilter, KeptGrant, OnItsOwnRow};
+use workforce_core::computer::{Kind, Level, Scope};
 
 use crate::api::Authorize;
 use crate::service::Desk;
@@ -248,6 +255,7 @@ struct ActivityQuery {
     token: Option<String>,
     agent: Option<String>,
     kind: Option<String>,
+    decided_by: Option<String>,
     /// A page's `next`: `<micros>~<id>`.
     before: Option<String>,
 }
@@ -283,6 +291,7 @@ async fn list_activity(State(s): S, h: HeaderMap, Query(q): Query<ActivityQuery>
     let filter = ActivityFilter {
         agent: q.agent,
         kind: q.kind,
+        decided_by: q.decided_by,
         before,
     };
     match s.desk.store().activity(&filter).await {
@@ -299,6 +308,196 @@ async fn list_activity(State(s): S, h: HeaderMap, Query(q): Query<ActivityQuery>
     }
 }
 
+/// The hub a local agent's levels are kept for.
+const LOCAL: &str = "local";
+
+fn bad(why: impl Into<String>) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": why.into() })),
+    )
+        .into_response()
+}
+
+/// A level or override as Settings lists it: a folder as the person reads it.
+#[derive(Serialize)]
+struct OnItsOwnView {
+    kind: Kind,
+    scope: Scope,
+    level: Level,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl OnItsOwnView {
+    fn of(row: OnItsOwnRow, home: &Path) -> Self {
+        let scope = match row.scope {
+            Scope::Folder(f) => Scope::Folder(PathBuf::from(super::policy::shown(&f, home))),
+            other => other,
+        };
+        Self {
+            kind: row.kind,
+            scope,
+            level: row.level,
+            created_at: row.created_at,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct AgentQuery {
+    token: Option<String>,
+    agent: String,
+}
+
+async fn get_on_its_own(State(s): S, h: HeaderMap, Query(q): Query<AgentQuery>) -> Response {
+    let t = TokenQuery {
+        token: q.token.clone(),
+    };
+    if let Err(r) = guard(&s, &h, &t).await {
+        return r;
+    }
+    let home = home();
+    match s.desk.store().on_its_own_rows(LOCAL, &q.agent).await {
+        Ok(rows) => Json(
+            rows.into_iter()
+                .map(|r| OnItsOwnView::of(r, &home))
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(e) => failed(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct OnItsOwnBody {
+    agent: String,
+    kind: Kind,
+    scope: Scope,
+    level: Option<Level>,
+}
+
+/// The longest host name.
+const MAX_HOST: usize = 253;
+
+/// `scope` as it is kept, or why it can't be: a host as a command names
+/// it, less any `user@`; a site's bare origin; a folder, `~` read as home,
+/// that an agent may work in.
+fn kept_scope(scope: Scope, home: &Path) -> Result<Scope, String> {
+    match scope {
+        Scope::Kind => Ok(Scope::Kind),
+        Scope::Host(host) => {
+            let host = host.trim();
+            let host = host.rsplit('@').next().unwrap_or(host).to_ascii_lowercase();
+            let plain = !host.is_empty()
+                && host.len() <= MAX_HOST
+                && host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'));
+            match plain {
+                true => Ok(Scope::Host(host)),
+                false => Err(format!("{host} isn't a host name or address.")),
+            }
+        }
+        Scope::Site(site) => {
+            let site = site.trim().trim_end_matches('/').to_ascii_lowercase();
+            let bare = site
+                .split_once("://")
+                .filter(|(scheme, _)| matches!(*scheme, "http" | "https"))
+                .is_some_and(|(_, host)| {
+                    !host.is_empty()
+                        && host
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':'))
+                });
+            match bare {
+                true => Ok(Scope::Site(site)),
+                false => Err(format!(
+                    "{site} isn't a site's address: write it as https://example.com."
+                )),
+            }
+        }
+        Scope::Folder(folder) => {
+            let folder = match folder.strip_prefix("~") {
+                Ok(rest) => home.join(rest),
+                Err(_) => folder,
+            };
+            let plain = folder.is_absolute()
+                && folder.components().all(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::RootDir | std::path::Component::Normal(_)
+                    )
+                });
+            if !plain {
+                return Err(format!("{} isn't a full folder path.", folder.display()));
+            }
+            match workforce_common::computer_access::works_in_refusal(&folder, home, &[]) {
+                Some(why) => Err(why),
+                None => Ok(Scope::Folder(folder)),
+            }
+        }
+    }
+}
+
+async fn put_on_its_own(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    body: Option<Json<OnItsOwnBody>>,
+) -> Response {
+    if let Err(r) = guard(&s, &h, &q).await {
+        return r;
+    }
+    let Some(Json(body)) = body else {
+        return bad("the body is {\"agent\", \"kind\", \"scope\", \"level\"}");
+    };
+    let scope = match kept_scope(body.scope, &home()) {
+        Ok(scope) => scope,
+        Err(why) => return bad(why),
+    };
+    if let Some(why) = level_refusal(body.kind, &scope, body.level) {
+        return bad(why);
+    }
+    match s
+        .desk
+        .store()
+        .set_on_its_own(LOCAL, &body.agent, body.kind, &scope, body.level)
+        .await
+    {
+        Ok(()) => {
+            tracing::info!(agent = %body.agent, kind = body.kind.as_str(), scope = %scope.text(), level = ?body.level, "what an agent does on its own set");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => failed(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct AskAgainBody {
+    agent: String,
+}
+
+async fn ask_again(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    body: Option<Json<AskAgainBody>>,
+) -> Response {
+    if let Err(r) = guard(&s, &h, &q).await {
+        return r;
+    }
+    let Some(Json(body)) = body else {
+        return bad("the body is {\"agent\"}");
+    };
+    match s.desk.store().ask_again(LOCAL, &body.agent).await {
+        Ok(cleared) => {
+            tracing::info!(agent = %body.agent, cleared, "an agent asks about everything again");
+            Json(json!({ "cleared": cleared })).into_response()
+        }
+        Err(e) => failed(e),
+    }
+}
+
 pub(crate) fn computer_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
     Router::new()
         .route("/api/desk/computer/disk-access", get(get_disk_access))
@@ -310,6 +509,11 @@ pub(crate) fn computer_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
             post(forget_session),
         )
         .route("/api/desk/computer/activity", get(list_activity))
+        .route(
+            "/api/desk/computer/on-its-own",
+            get(get_on_its_own).put(put_on_its_own),
+        )
+        .route("/api/desk/computer/on-its-own/ask-again", post(ask_again))
         .with_state(Arc::new(ComputerApi { desk, auth }))
 }
 

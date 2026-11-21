@@ -1,4 +1,5 @@
-//! The kill switch, grants and activity in Postgres (`desk` schema, V020).
+//! The kill switch, grants, what each agent does on its own (V090) and
+//! activity in Postgres (`desk` schema, V020).
 //!
 //! `arguments` reach here already tokenised by the caller
 //! (`redact::tokenize_secrets` on the hub): nothing in this crate sees a
@@ -13,8 +14,9 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio_postgres::Row;
 use uuid::Uuid;
-use workforce_core::computer::Ability;
+use workforce_core::computer::{Ability, Kind, Level, Scope};
 
+use super::on_its_own::OnItsOwn;
 use super::policy::{Grant, RunOf};
 use crate::store::DeskStore;
 
@@ -48,6 +50,32 @@ pub struct KeptGrant {
     pub created_at: DateTime<Utc>,
 }
 
+/// One level or override, as Settings lists it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct OnItsOwnRow {
+    pub kind: Kind,
+    pub scope: Scope,
+    pub level: Level,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Why a level can't be kept as asked, in the person's words.
+pub fn level_refusal(kind: Kind, scope: &Scope, level: Option<Level>) -> Option<String> {
+    match (scope, level) {
+        _ if !scope.fits(kind) => Some(
+            "A host goes with other machines, a site with the browser, and a folder with commands, files or the Trash."
+                .into(),
+        ),
+        (Scope::Kind, Some(Level::InFolders)) if !kind.takes_folders() => Some(
+            "Other machines and the browser are allowed one by one, or everywhere.".into(),
+        ),
+        (Scope::Folder(_) | Scope::Host(_) | Scope::Site(_), Some(Level::InFolders)) => {
+            Some("An override for one folder, host or site lets it do that there.".into())
+        }
+        _ => None,
+    }
+}
+
 /// One decided call, to record.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Activity {
@@ -65,7 +93,7 @@ pub struct Activity {
     pub connector: Option<String>,
     pub tool: String,
     pub vault_source: Option<String>,
-    /// rule | grant | session | person | classifier
+    /// rule | grant | session | person | classifier | on_its_own
     pub decided_by: String,
     pub outcome: Value,
     pub reason: Option<String>,
@@ -92,6 +120,8 @@ pub struct ActivityRow {
 pub struct ActivityFilter {
     pub agent: Option<String>,
     pub kind: Option<String>,
+    /// How it was decided: `on_its_own` for what the agent did on its own.
+    pub decided_by: Option<String>,
     pub before: Option<(DateTime<Utc>, Uuid)>,
 }
 
@@ -268,6 +298,124 @@ impl DeskStore {
         })
     }
 
+    /// What `agent` on `hub` does on its own.
+    pub async fn on_its_own(&self, hub: &str, agent: &str) -> Result<OnItsOwn> {
+        let client = self.pool().get().await?;
+        let rows = client
+            .query(
+                "SELECT kind, scope, level FROM access_on_its_own WHERE hub = $1 AND agent = $2",
+                &[&hub, &agent],
+            )
+            .await?;
+        let rows: Vec<(String, String, String)> = rows
+            .iter()
+            .map(|r| Ok((r.try_get(0)?, r.try_get(1)?, r.try_get(2)?)))
+            .collect::<Result<_>>()?;
+        Ok(OnItsOwn::from_rows(
+            rows.iter()
+                .map(|(k, s, l)| (k.as_str(), s.as_str(), l.as_str())),
+        ))
+    }
+
+    /// `agent`'s levels and overrides on `hub`, kinds first, as Settings
+    /// lists them; one this hub can't read is left out.
+    pub async fn on_its_own_rows(&self, hub: &str, agent: &str) -> Result<Vec<OnItsOwnRow>> {
+        let client = self.pool().get().await?;
+        let rows = client
+            .query(
+                "SELECT kind, scope, level, created_at FROM access_on_its_own
+                  WHERE hub = $1 AND agent = $2 ORDER BY kind, scope",
+                &[&hub, &agent],
+            )
+            .await?;
+        rows.iter()
+            .map(|r| {
+                let (kind, scope, level): (String, String, String) =
+                    (r.try_get(0)?, r.try_get(1)?, r.try_get(2)?);
+                Ok(
+                    match (
+                        Kind::parse(&kind),
+                        Scope::parse(&scope),
+                        Level::parse(&level),
+                    ) {
+                        (Some(kind), Some(scope), Some(level)) => Some(OnItsOwnRow {
+                            kind,
+                            scope,
+                            level,
+                            created_at: r.try_get(3)?,
+                        }),
+                        _ => None,
+                    },
+                )
+            })
+            .filter_map(Result::transpose)
+            .collect()
+    }
+
+    /// Sets what `agent` does on its own for `kind` in `scope`: `None` asks
+    /// each time again. Refused, in the person's words, where the level
+    /// doesn't fit ([`level_refusal`]).
+    pub async fn set_on_its_own(
+        &self,
+        hub: &str,
+        agent: &str,
+        kind: Kind,
+        scope: &Scope,
+        level: Option<Level>,
+    ) -> Result<()> {
+        if let Some(why) = level_refusal(kind, scope, level) {
+            eyre::bail!("{why}");
+        }
+        let client = self.pool().get().await?;
+        match level {
+            None => {
+                client
+                    .execute(
+                        "DELETE FROM access_on_its_own
+                          WHERE hub = $1 AND agent = $2 AND kind = $3 AND scope = $4",
+                        &[&hub, &agent, &kind.as_str(), &scope.text()],
+                    )
+                    .await?
+            }
+            Some(level) => {
+                client
+                    .execute(
+                        "INSERT INTO access_on_its_own (hub, agent, kind, scope, level)
+                         VALUES ($1, $2, $3, $4, $5)
+                         ON CONFLICT (hub, agent, kind, scope)
+                         DO UPDATE SET level = EXCLUDED.level, created_at = now()",
+                        &[&hub, &agent, &kind.as_str(), &scope.text(), &level.as_str()],
+                    )
+                    .await?
+            }
+        };
+        self.access_changed();
+        Ok(())
+    }
+
+    /// "Ask me again": forgets everything `agent` on `hub` does on its own
+    /// and every grant it holds, standing and for a session, at once. How
+    /// many were forgotten.
+    pub async fn ask_again(&self, hub: &str, agent: &str) -> Result<u64> {
+        let mut client = self.pool().get().await?;
+        let tx = client.transaction().await?;
+        let levels = tx
+            .execute(
+                "DELETE FROM access_on_its_own WHERE hub = $1 AND agent = $2",
+                &[&hub, &agent],
+            )
+            .await?;
+        let grants = tx
+            .execute(
+                "DELETE FROM access_grants WHERE hub = $1 AND agent = $2",
+                &[&hub, &agent],
+            )
+            .await?;
+        tx.commit().await?;
+        self.access_changed();
+        Ok(levels + grants)
+    }
+
     /// Whether there was such a grant.
     pub async fn revoke_grant(&self, id: Uuid) -> Result<bool> {
         let client = self.pool().get().await?;
@@ -357,9 +505,17 @@ impl DeskStore {
                  WHERE ($1::text IS NULL OR agent = $1)
                    AND ($2::text IS NULL OR kind = $2)
                    AND ($3::timestamptz IS NULL OR (at, id) < ($3, $4))
+                   AND ($6::text IS NULL OR decided_by = $6)
                  ORDER BY at DESC, id DESC
                  LIMIT $5",
-                &[&filter.agent, &filter.kind, &before_at, &before_id, &PAGE],
+                &[
+                    &filter.agent,
+                    &filter.kind,
+                    &before_at,
+                    &before_id,
+                    &PAGE,
+                    &filter.decided_by,
+                ],
             )
             .await?;
         rows.iter().map(activity_row).collect()
@@ -720,6 +876,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn levels_round_trip_and_ask_again_forgets_them_with_every_grant() {
+        with_test_pool(build_pool, |pool| async move {
+            DeskStore::migrate(&pool).await.unwrap();
+            let store = DeskStore::from_pool(pool);
+            let devbox = Scope::Host("devbox".into());
+            let before = store.access_version();
+            store
+                .set_on_its_own(
+                    "local",
+                    "kat",
+                    Kind::Commands,
+                    &Scope::Kind,
+                    Some(Level::InFolders),
+                )
+                .await
+                .unwrap();
+            assert!(store.access_version() > before);
+            store
+                .set_on_its_own(
+                    "local",
+                    "kat",
+                    Kind::Network,
+                    &devbox,
+                    Some(Level::Anywhere),
+                )
+                .await
+                .unwrap();
+            store
+                .set_on_its_own(
+                    "local",
+                    "kat",
+                    Kind::Commands,
+                    &Scope::Kind,
+                    Some(Level::Anywhere),
+                )
+                .await
+                .unwrap();
+            store
+                .set_on_its_own(
+                    "local",
+                    "ben",
+                    Kind::Browser,
+                    &Scope::Kind,
+                    Some(Level::Anywhere),
+                )
+                .await
+                .unwrap();
+            let kat = store.on_its_own("local", "kat").await.unwrap();
+            assert_eq!(
+                kat.levels.into_iter().collect::<Vec<_>>(),
+                vec![(Kind::Commands, Level::Anywhere)]
+            );
+            assert_eq!(kat.scoped, vec![(Kind::Network, devbox.clone())]);
+            assert_eq!(
+                store
+                    .on_its_own_rows("local", "kat")
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| (r.kind, r.scope, r.level))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (Kind::Commands, Scope::Kind, Level::Anywhere),
+                    (Kind::Network, devbox.clone(), Level::Anywhere),
+                ]
+            );
+            assert_eq!(
+                store.on_its_own("acme", "kat").await.unwrap(),
+                OnItsOwn::default()
+            );
+
+            // What doesn't fit is refused and nothing is written.
+            for (kind, scope, level) in [
+                (Kind::Network, Scope::Kind, Level::InFolders),
+                (
+                    Kind::Commands,
+                    Scope::Host("devbox".into()),
+                    Level::Anywhere,
+                ),
+                (
+                    Kind::Files,
+                    Scope::Folder(PathBuf::from("/x")),
+                    Level::InFolders,
+                ),
+            ] {
+                assert!(store
+                    .set_on_its_own("local", "kat", kind, &scope, Some(level))
+                    .await
+                    .is_err());
+            }
+
+            store
+                .set_on_its_own("local", "kat", Kind::Network, &devbox, None)
+                .await
+                .unwrap();
+            assert!(store
+                .on_its_own("local", "kat")
+                .await
+                .unwrap()
+                .scoped
+                .is_empty());
+
+            store
+                .add_grant(&new_grant("kat", None, None))
+                .await
+                .unwrap();
+            store
+                .add_grant(&new_grant("kat", Some("s1"), None))
+                .await
+                .unwrap();
+            store
+                .add_grant(&new_grant("ben", None, None))
+                .await
+                .unwrap();
+            let before = store.access_version();
+            assert_eq!(store.ask_again("local", "kat").await.unwrap(), 3);
+            assert!(store.access_version() > before);
+            assert_eq!(
+                store.on_its_own("local", "kat").await.unwrap(),
+                OnItsOwn::default()
+            );
+            assert!(store.live_grants("local", "kat").await.unwrap().is_empty());
+            assert_eq!(store.live_grants("local", "ben").await.unwrap().len(), 1);
+            assert_eq!(
+                store.on_its_own("local", "ben").await.unwrap().levels.len(),
+                1
+            );
+
+            store
+                .record_activity(&activity("kat", "exec", "sarah"))
+                .await
+                .unwrap();
+            let mut alone = activity("kat", "exec", "sarah");
+            alone.decided_by = "on_its_own".into();
+            let alone = store.record_activity(&alone).await.unwrap();
+            let own = store
+                .activity(&ActivityFilter {
+                    agent: Some("kat".into()),
+                    decided_by: Some("on_its_own".into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(own.iter().map(|r| r.id).collect::<Vec<_>>(), vec![alone]);
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn activity_pages_newest_first_prunes_and_erases_by_person() {
         with_test_pool(build_pool, |pool| async move {
             DeskStore::migrate(&pool).await.unwrap();
@@ -748,7 +1053,7 @@ mod tests {
                 .activity(&ActivityFilter {
                     agent: Some("allan".into()),
                     kind: Some("exec".into()),
-                    before: None,
+                    ..Default::default()
                 })
                 .await
                 .unwrap();

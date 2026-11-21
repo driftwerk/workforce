@@ -5,6 +5,7 @@
 pub(crate) mod api;
 pub mod asks;
 pub mod boss;
+pub mod on_its_own;
 pub mod policy;
 mod store;
 
@@ -18,16 +19,18 @@ use workforce_core::computer::Verdict;
 
 use crate::store::DeskStore;
 
+pub use on_its_own::OnItsOwn;
 pub use policy::{
     browser_site, verdict, AgentPolicy, Browser, Browsing, CallFacts, Connectors, Grant, Namespace,
     RunOf, NAMESPACES,
 };
 pub use store::{
-    Activity, ActivityFilter, ActivityRow, KeptGrant, NewGrant, ACTIVITY_KEPT_DAYS, PAGE,
+    Activity, ActivityFilter, ActivityRow, KeptGrant, NewGrant, OnItsOwnRow, ACTIVITY_KEPT_DAYS,
+    PAGE,
 };
 
-/// The verdict with this computer's kill switch and the agent's live
-/// grants read from Postgres. A read that fails is an error the caller
+/// The verdict with this computer's kill switch, the agent's live grants
+/// and what it does on its own read from Postgres. A read that fails is an error the caller
 /// refuses on: nothing runs on a verdict it could not reach.
 ///
 /// What was read is kept until the switch or the grants change through
@@ -45,7 +48,22 @@ struct Read {
     version: u64,
     at: std::time::Instant,
     stopped: bool,
-    grants: std::collections::HashMap<(String, String), Vec<Grant>>,
+    agents: std::collections::HashMap<(String, String), Agent>,
+}
+
+/// What was read of one agent.
+struct Agent {
+    grants: Vec<Grant>,
+    on_its_own: OnItsOwn,
+}
+
+/// `policy` with what the agent does on its own as it was read.
+fn decided(policy: &AgentPolicy, stopped: bool, agent: &Agent, call: &CallFacts) -> Verdict {
+    let policy = AgentPolicy {
+        on_its_own: agent.on_its_own.clone(),
+        ..policy.clone()
+    };
+    verdict(&policy, stopped, &agent.grants, call)
 }
 
 impl Computer {
@@ -69,14 +87,17 @@ impl Computer {
                 .as_ref()
                 .filter(|r| r.version == version && r.at.elapsed() < FRESH)
             {
-                if let Some(grants) = r.grants.get(&key) {
-                    return Ok(verdict(policy, r.stopped, grants, call));
+                if let Some(agent) = r.agents.get(&key) {
+                    return Ok(decided(policy, r.stopped, agent, call));
                 }
             }
         }
         let stopped = self.store.access_stopped().await?;
-        let grants = self.store.live_grants(&policy.hub, &policy.agent).await?;
-        let v = verdict(policy, stopped, &grants, call);
+        let agent = Agent {
+            grants: self.store.live_grants(&policy.hub, &policy.agent).await?,
+            on_its_own: self.store.on_its_own(&policy.hub, &policy.agent).await?,
+        };
+        let v = decided(policy, stopped, &agent, call);
         let mut read = self.read.lock();
         let fresh = read
             .as_ref()
@@ -86,11 +107,11 @@ impl Computer {
                 version,
                 at: std::time::Instant::now(),
                 stopped,
-                grants: Default::default(),
+                agents: Default::default(),
             });
         }
         if let Some(r) = read.as_mut() {
-            r.grants.insert(key, grants);
+            r.agents.insert(key, agent);
         }
         Ok(v)
     }

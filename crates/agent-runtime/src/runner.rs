@@ -7401,7 +7401,7 @@ impl ToolSecrets {
 /// Builder for creating a default set of tools.
 pub fn default_tools(allowed_paths: Vec<std::path::PathBuf>, secrets: ToolSecrets) -> ToolRegistry {
     use crate::tools::exec::ExecCommand;
-    use crate::tools::filesystem::{EditFile, ListDir, ReadFile, WriteFile};
+    use crate::tools::filesystem::{EditFile, ListDir, ReadFile, TrashFiles, WriteFile};
     use crate::tools::security::SecurityAuditTool;
     use crate::tools::web::{WebFetchTool, WebSearchTool};
 
@@ -7410,6 +7410,7 @@ pub fn default_tools(allowed_paths: Vec<std::path::PathBuf>, secrets: ToolSecret
     registry.register(Arc::new(WriteFile::new(allowed_paths.clone())));
     registry.register(Arc::new(EditFile::new(allowed_paths.clone())));
     registry.register(Arc::new(ListDir::new(allowed_paths.clone())));
+    registry.register(Arc::new(TrashFiles::new(allowed_paths.clone())));
 
     let mut exec = if let Some(workspace) = allowed_paths.first() {
         ExecCommand::default().with_workspace(workspace.clone())
