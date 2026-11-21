@@ -1453,17 +1453,24 @@ async fn a_plan_paused_for_a_ticket_that_keeps_failing_says_why_again_after_a_re
                     .unwrap()
                     .events
                     .into_iter()
-                    .filter(|e| e.kind == Kind::PlanPaused && e.detail.as_ref().is_some_and(|d| d["paused"] == of))
+                    .filter(|e| {
+                        e.kind == Kind::PlanPaused
+                            && e.detail.as_ref().is_some_and(|d| d["paused"] == of)
+                    })
                     .count()
             }
         };
         let mut waited = 0;
-        while pauses("person").await == 0 {
+        while pauses("person").await == 0 || pauses("start_failing").await == 0 {
             waited += 1;
-            assert!(waited < 100, "the person's pause was never kept");
+            assert!(waited < 100, "the pauses were never kept");
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert_eq!(pauses("start_failing").await, 1, "a newer reason is no second pause");
+        assert_eq!(
+            pauses("start_failing").await,
+            1,
+            "a newer reason is no second pause"
+        );
     })
     .await;
 }

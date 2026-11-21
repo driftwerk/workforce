@@ -272,8 +272,6 @@ fn target<'a>(
     }
 }
 
-/// Whether `name`, a folder in a path, is one Desk never clones into: a
-/// hidden one, or the system's own.
 /// Whether `inside`, a path below the home, goes through a folder Desk
 /// never clones into: a hidden one, or the system's own (a Mac's
 /// `~/Library`).
