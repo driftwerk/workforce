@@ -212,6 +212,20 @@ pub struct AgentPolicy {
     /// What the person lets it do on its own: levels and overrides, read
     /// with its grants.
     pub on_its_own: super::on_its_own::OnItsOwn,
+    /// Whether this computer has a Trash a command's delete may go to
+    /// instead ([`has_trash`]).
+    pub trash: bool,
+}
+
+/// Whether the computer whose home is `home` has a Trash: macOS and
+/// Windows always; elsewhere where the desktop keeps one.
+pub fn has_trash(home: &Path) -> bool {
+    cfg!(any(target_os = "macos", target_os = "windows"))
+        || std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local/share"))
+            .join("Trash")
+            .is_dir()
 }
 
 /// The job or workflow run a call is made in, for a grant held by one.
@@ -332,6 +346,12 @@ impl AgentPolicy {
     /// scratch.
     fn overwritable(&self, path: &Path) -> bool {
         self.inside(path) || self.in_scratch(path)
+    }
+
+    /// Whether `path`, outside its own folder, is what the person keeps in
+    /// their home: keys, sign-ins, what starts with a shell or a login.
+    pub(super) fn kept(&self, path: &Path) -> bool {
+        !self.in_own(path) && workforce_core::home_secrets::kept_in_home(path, &self.home)
     }
 
     /// Whether `path` is kept from the agent; `change` when the call would
@@ -673,6 +693,17 @@ fn asked(p: &AgentPolicy, stopped: bool, grants: &[Grant], call: &CallFacts) -> 
     let never = access == Access::Full && p.access.asks == Asking::Never;
     match &call.effect {
         _ if never => {}
+        effect
+            if matches!(
+                effect,
+                Effect::Write { .. }
+                    | Effect::Delete { .. }
+                    | Effect::Trash { .. }
+                    | Effect::Move { .. }
+            ) && paths(effect).into_iter().any(|path| p.kept(path)) =>
+        {
+            return ask(once(), Why::System);
+        }
         Effect::Delete { paths } | Effect::Move { from: paths, .. }
             if paths.iter().any(|path| !p.deletable(path)) =>
         {
@@ -693,12 +724,16 @@ fn asked(p: &AgentPolicy, stopped: bool, grants: &[Grant], call: &CallFacts) -> 
         }
         Effect::Exec { command, cwd } => {
             let place = Place::new(cwd.clone(), &p.own, &p.scratch, &p.home);
-            match always_asks(command, &place) {
-                Some(Asks::Deletes(targets)) => return deleting(p, grants, call, &targets),
-                Some(Asks::Irreversible) => return ask(once(), Why::CantBeUndone),
-                Some(Asks::Unclear) => return ask(once(), Why::Unclear),
-                Some(Asks::System) => return ask(once(), Why::System),
-                None => {}
+            if let Some(asks) = always_asks(command, &place) {
+                return match asks {
+                    Asks::System => ask(once(), Why::System),
+                    Asks::Unclear => ask(once(), Why::Unclear),
+                    Asks::ForGood => ask(once(), Why::ForGood),
+                    asks => match asks.replaced() {
+                        Some(targets) => deleting(p, grants, call, &targets),
+                        None => ask(once(), Why::CantBeUndone),
+                    },
+                };
             }
         }
         Effect::Connector { write: true, .. } if sends_to_people(&call.tool) => {

@@ -1613,6 +1613,9 @@ pub struct PendingApprovalCore {
     /// ([`CURRENT_CHAT_ORIGIN`]): the turn resumed on its decision is then a
     /// chat turn too, on the conversation model.
     pub chat: bool,
+    /// The automated origin the asking turn carried
+    /// ([`CURRENT_AUTOMATED_ORIGIN`]), for the turn resumed on its decision.
+    pub origin: Option<String>,
 }
 
 /// One tool the resume turn executes deterministically before the first LLM
@@ -1978,6 +1981,7 @@ pub fn route_approval(
                 approver_user_ids: route.approver_user_ids.clone(),
                 ttl: route.ttl,
                 chat: chat_origin(),
+                origin: task_local_value(&CURRENT_AUTOMATED_ORIGIN, false),
             };
             match router.defer(&core) {
                 Ok(()) => RouteResolution::Routed {

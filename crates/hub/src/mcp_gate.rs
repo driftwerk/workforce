@@ -80,14 +80,18 @@ pub fn choice_name(choice: PermissionChoice) -> &'static str {
 }
 
 /// What a client trying to answer a card only the person answers is told.
-pub const PERSON_ONLY: &str = "Only the person answers this, in Desk on their computer: it waits while they sign in to a site there.";
+pub const PERSON_ONLY: &str = "Only the person answers this, in Desk on their computer: it uses their own Chrome, or waits while they sign in to a site there.";
 
 /// Whether a prompt offers `choice` to a client; an `always_ask` rule
 /// withholds `allow_always`, and a caller must not be able to type it back
 /// in. A card only the person in Desk answers ("Sign in for me") offers a
-/// client nothing.
+/// client nothing; one whose lasting answer lets the agent work on its own
+/// offers everything but that answer.
 pub fn offered(options: &PermissionPromptOptions, choice: PermissionChoice) -> bool {
     if options.person_only() {
+        return false;
+    }
+    if choice == PermissionChoice::AllowInFolder && options.allow_scope.is_some() {
         return false;
     }
     match choice {
@@ -1073,6 +1077,21 @@ mod tests {
         for choice in [PermissionChoice::AllowOnce, PermissionChoice::DenyOnce] {
             assert!(!offered(&options, choice), "{choice:?}");
         }
+    }
+
+    /// A card that would let the agent work on its own keeps that answer
+    /// for the person; a client may still allow it once or deny it.
+    #[test]
+    fn a_client_answers_an_on_its_own_card_but_never_raises_the_level() {
+        let mut options = PermissionPromptOptions::ask(false);
+        options.allow_in_folder = Some("devbox".into());
+        options.allow_scope = Some(workforce_core::computer::ActionKind::Network);
+        assert!(!options.person_only());
+        assert!(offered(&options, PermissionChoice::AllowOnce));
+        assert!(offered(&options, PermissionChoice::DenyOnce));
+        assert!(!offered(&options, PermissionChoice::AllowInFolder));
+        options.allow_scope = None;
+        assert!(offered(&options, PermissionChoice::AllowInFolder));
     }
 
     #[test]

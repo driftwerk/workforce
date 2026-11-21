@@ -256,6 +256,7 @@ mod tests {
             approver_user_ids: vec!["bob".to_string()],
             ttl: std::time::Duration::from_secs(3600),
             chat: false,
+            origin: None,
         }
     }
 

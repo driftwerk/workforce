@@ -247,7 +247,7 @@ impl Ability {
 /// A kind of action an agent may take on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Kind {
+pub enum ActionKind {
     /// Running commands and starting sessions.
     Commands,
     /// Commands that reach other machines: ssh, scp, sftp, rsync, mosh.
@@ -260,13 +260,13 @@ pub enum Kind {
     Delete,
 }
 
-impl Kind {
-    pub const ALL: [Kind; 5] = [
-        Kind::Commands,
-        Kind::Network,
-        Kind::Browser,
-        Kind::Files,
-        Kind::Delete,
+impl ActionKind {
+    pub const ALL: [ActionKind; 5] = [
+        ActionKind::Commands,
+        ActionKind::Network,
+        ActionKind::Browser,
+        ActionKind::Files,
+        ActionKind::Delete,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -321,7 +321,7 @@ impl Level {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum Scope {
-    Kind,
+    Whole,
     Folder(PathBuf),
     /// A host as a command names it (`devbox`, `10.0.1.20`).
     Host(String),
@@ -334,7 +334,7 @@ impl Scope {
     /// `site:` and its value.
     pub fn text(&self) -> String {
         match self {
-            Self::Kind => String::new(),
+            Self::Whole => String::new(),
             Self::Folder(f) => format!("folder:{}", f.display()),
             Self::Host(h) => format!("host:{h}"),
             Self::Site(s) => format!("site:{s}"),
@@ -343,7 +343,7 @@ impl Scope {
 
     pub fn parse(s: &str) -> Option<Self> {
         if s.is_empty() {
-            return Some(Self::Kind);
+            return Some(Self::Whole);
         }
         let (kind, value) = s.split_once(':')?;
         (!value.is_empty()).then_some(())?;
@@ -357,12 +357,12 @@ impl Scope {
 
     /// Whether it fits `kind`: a host for the network, a site for the
     /// browser, a folder for the rest.
-    pub fn fits(&self, kind: Kind) -> bool {
+    pub fn fits(&self, kind: ActionKind) -> bool {
         match self {
-            Self::Kind => true,
+            Self::Whole => true,
             Self::Folder(_) => kind.takes_folders(),
-            Self::Host(_) => kind == Kind::Network,
-            Self::Site(_) => kind == Kind::Browser,
+            Self::Host(_) => kind == ActionKind::Network,
+            Self::Site(_) => kind == ActionKind::Browser,
         }
     }
 }
@@ -376,7 +376,7 @@ pub enum Always {
     /// Writes to this connector.
     Connector(String),
     /// This kind of action, on its own, in this scope.
-    OnItsOwn { kind: Kind, scope: Scope },
+    OnItsOwn { kind: ActionKind, scope: Scope },
 }
 
 /// An answer a card may offer.
@@ -513,6 +513,8 @@ pub enum Why {
     System,
     /// It moves something to the Trash outside its folder.
     ToTrash,
+    /// It deletes or replaces what can't be told until it runs.
+    ForGood,
 }
 
 impl Why {
@@ -533,7 +535,32 @@ impl Why {
             Self::SignIn => "Waits while you sign in. Desk never sees your password",
             Self::System => "Changes this computer's own settings or security",
             Self::ToTrash => "Moves to the Trash",
+            Self::ForGood => "Can't tell what this deletes or replaces",
         }
+    }
+
+    /// Whether an ask stays the person's whatever the agent may do on its
+    /// own: a page that read as hostile, their own sign-in, what reaches
+    /// other people or a connected service, what a tool can't name, what a
+    /// command can't be read as, what it can't say it deletes, and the
+    /// computer's own settings and security.
+    pub fn held(self) -> bool {
+        matches!(
+            self,
+            Self::HostilePage
+                | Self::SignIn
+                | Self::SendsToPeople
+                | Self::ConnectorWrite
+                | Self::Unknown
+                | Self::Unclear
+                | Self::ForGood
+                | Self::System
+        )
+    }
+
+    /// Whether an ask is refused, not run, where nobody can be asked.
+    pub fn never_unattended(self) -> bool {
+        matches!(self, Self::Unclear | Self::ForGood | Self::System)
     }
 }
 
@@ -580,5 +607,71 @@ mod tests {
         let back = serde_json::to_value(&node).unwrap();
         assert_eq!(back["platform"], "windows");
         assert_eq!(serde_json::from_value::<DeskNode>(back).unwrap(), node);
+    }
+
+    #[test]
+    fn on_its_own_round_trips_as_stored_and_as_sent() {
+        for kind in ActionKind::ALL {
+            assert_eq!(ActionKind::parse(kind.as_str()), Some(kind));
+            let sent = serde_json::to_value(kind).unwrap();
+            assert_eq!(sent, serde_json::json!(kind.as_str()));
+            assert_eq!(serde_json::from_value::<ActionKind>(sent).unwrap(), kind);
+        }
+        for level in [Level::InFolders, Level::Anywhere] {
+            assert_eq!(Level::parse(level.as_str()), Some(level));
+            assert_eq!(
+                serde_json::from_value::<Level>(serde_json::to_value(level).unwrap()).unwrap(),
+                level
+            );
+        }
+        for (scope, sent) in [
+            (Scope::Whole, serde_json::json!({"kind": "whole"})),
+            (
+                Scope::Folder(PathBuf::from("/Users/sarah/dev")),
+                serde_json::json!({"kind": "folder", "value": "/Users/sarah/dev"}),
+            ),
+            (
+                Scope::Host("devbox".into()),
+                serde_json::json!({"kind": "host", "value": "devbox"}),
+            ),
+            (
+                Scope::Site("https://github.com".into()),
+                serde_json::json!({"kind": "site", "value": "https://github.com"}),
+            ),
+        ] {
+            assert_eq!(Scope::parse(&scope.text()), Some(scope.clone()));
+            assert_eq!(serde_json::to_value(&scope).unwrap(), sent);
+            assert_eq!(serde_json::from_value::<Scope>(sent).unwrap(), scope);
+        }
+        assert_eq!(Scope::Whole.text(), "");
+        for bad in ["host:", "planet:x", "devbox"] {
+            assert_eq!(Scope::parse(bad), None, "{bad}");
+        }
+        let always = Always::OnItsOwn {
+            kind: ActionKind::Network,
+            scope: Scope::Host("devbox".into()),
+        };
+        let sent = serde_json::to_value(&always).unwrap();
+        assert_eq!(serde_json::from_value::<Always>(sent).unwrap(), always);
+        assert_eq!(
+            serde_json::from_value::<By>(serde_json::to_value(By::OnItsOwn).unwrap()).unwrap(),
+            By::OnItsOwn
+        );
+    }
+
+    #[test]
+    fn held_asks_stay_the_persons_and_refuse_unattended() {
+        for why in [Why::Unclear, Why::ForGood, Why::System] {
+            assert!(why.held() && why.never_unattended(), "{why:?}");
+        }
+        for why in [
+            Why::CantBeUndone,
+            Why::OutsideFolder,
+            Why::OnAPage,
+            Why::NewSite,
+        ] {
+            assert!(!why.held() && !why.never_unattended(), "{why:?}");
+        }
+        assert!(Why::SendsToPeople.held() && !Why::SendsToPeople.never_unattended());
     }
 }

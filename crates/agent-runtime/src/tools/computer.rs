@@ -162,8 +162,19 @@ pub fn decide_unattended(
     }
     let asks = matches!(decision.verdict, Verdict::Ask { .. } | Verdict::Review);
     if asks && gate.is_some_and(|g| g.unattended_runs() && !g.asks_unattended(tool_name)) {
-        decision.verdict = Verdict::Run {
-            by: workforce_core::computer::By::Unattended,
+        decision.verdict = match &decision.verdict {
+            Verdict::Ask { why, .. } if why.never_unattended() => Verdict::Refuse {
+                refusal: workforce_core::computer::Refusal {
+                    rule: workforce_core::computer::Refused::OutsideLevel,
+                    sentence: format!(
+                        "{tool_name} wasn't run with nobody there to ask: {}. Ask for it in Desk.",
+                        why.sentence()
+                    ),
+                },
+            },
+            _ => Verdict::Run {
+                by: workforce_core::computer::By::Unattended,
+            },
         };
     }
     Some(decision)
@@ -562,6 +573,48 @@ mod tests {
             apply(denied, Some(&ask)).decision,
             PolicyDecision::Deny { reason } if reason == "policy"
         ));
+    }
+
+    /// A gate at Full access running what would ask in a job.
+    struct Asking(Why);
+
+    impl ComputerGate for Asking {
+        fn decides(&self, _tool: &str) -> bool {
+            true
+        }
+        fn verdict(&self, _tool: &str, _effect: &Effect) -> Verdict {
+            Verdict::Ask {
+                choices: vec![Choice::AllowOnce, Choice::Deny],
+                why: self.0,
+            }
+        }
+        fn record(&self, _record: Record) {}
+        fn unattended_runs(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn what_stays_the_persons_is_never_run_in_a_job() {
+        let tools = ToolRegistry::new();
+        let input = serde_json::json!({});
+        for why in [Why::Unclear, Why::ForGood, Why::System] {
+            let decided =
+                decide_unattended(Some(&Asking(why)), &tools, "exec.run", &input).unwrap();
+            assert!(
+                matches!(
+                    &decided.verdict,
+                    Verdict::Refuse { refusal } if refusal.rule == Refused::OutsideLevel
+                        && refusal.sentence.contains(why.sentence())
+                ),
+                "{why:?}: {:?}",
+                decided.verdict
+            );
+        }
+        let decided =
+            decide_unattended(Some(&Asking(Why::CantBeUndone)), &tools, "exec.run", &input)
+                .unwrap();
+        assert_eq!(decided.verdict, Verdict::Run { by: By::Unattended });
     }
 
     #[test]

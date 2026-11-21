@@ -793,7 +793,7 @@ fn glob_walk(
 /// can put them back: how an agent deletes on its own.
 pub struct TrashFiles {
     allowed_paths: Vec<PathBuf>,
-    trash: fn(&[PathBuf]) -> std::result::Result<(), String>,
+    trash: fn(&[PathBuf]) -> std::io::Result<()>,
 }
 
 impl TrashFiles {
@@ -832,7 +832,7 @@ impl TrashFiles {
 
 /// Moves `paths` to the OS's Trash. On macOS through the file manager, so
 /// Finder is never scripted and asks nothing.
-fn os_trash(paths: &[PathBuf]) -> std::result::Result<(), String> {
+fn os_trash(paths: &[PathBuf]) -> std::io::Result<()> {
     #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut context = trash::TrashContext::default();
     #[cfg(target_os = "macos")]
@@ -840,7 +840,7 @@ fn os_trash(paths: &[PathBuf]) -> std::result::Result<(), String> {
         use trash::macos::{DeleteMethod, TrashContextExtMacos};
         context.set_delete_method(DeleteMethod::NsFileManager);
     }
-    context.delete_all(paths).map_err(|e| e.to_string())
+    context.delete_all(paths).map_err(std::io::Error::other)
 }
 
 /// Why `real` (named `shown`) isn't moved to the Trash: it is outside the
@@ -945,31 +945,25 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn removes(paths: &[PathBuf]) -> std::result::Result<(), String> {
+    fn removes(paths: &[PathBuf]) -> std::io::Result<()> {
         paths.iter().try_for_each(|path| {
-            match fs::symlink_metadata(path)
-                .map_err(|e| e.to_string())?
-                .is_dir()
-            {
-                true => fs::remove_dir_all(path),
-                false => fs::remove_file(path),
+            if fs::symlink_metadata(path)?.is_dir() {
+                fs::remove_dir_all(path)
+            } else {
+                fs::remove_file(path)
             }
-            .map_err(|e| e.to_string())
         })
     }
 
-    fn never(_: &[PathBuf]) -> std::result::Result<(), String> {
+    fn never(_: &[PathBuf]) -> std::io::Result<()> {
         panic!("nothing should have been moved")
     }
 
-    fn fails(_: &[PathBuf]) -> std::result::Result<(), String> {
-        Err("the Trash is full".into())
+    fn fails(_: &[PathBuf]) -> std::io::Result<()> {
+        Err(std::io::Error::other("the Trash is full"))
     }
 
-    fn trasher(
-        root: &Path,
-        trash: fn(&[PathBuf]) -> std::result::Result<(), String>,
-    ) -> TrashFiles {
+    fn trasher(root: &Path, trash: fn(&[PathBuf]) -> std::io::Result<()>) -> TrashFiles {
         TrashFiles {
             allowed_paths: vec![root.to_path_buf()],
             trash,

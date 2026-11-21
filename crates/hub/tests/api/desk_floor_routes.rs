@@ -293,6 +293,7 @@ async fn a_routed_approval_needs_its_approver_alone_and_is_decided_once() {
                     approver_user_ids: vec![alice.id.to_string()],
                     ttl: Duration::from_secs(3600),
                     chat: false,
+                    origin: None,
                 },
                 None,
                 None,

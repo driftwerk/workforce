@@ -33,7 +33,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::store::{level_refusal, ActivityFilter, KeptGrant, OnItsOwnRow};
-use workforce_core::computer::{Kind, Level, Scope};
+use workforce_core::computer::{ActionKind, Level, Scope};
 
 use crate::api::Authorize;
 use crate::service::Desk;
@@ -322,7 +322,7 @@ fn bad(why: impl Into<String>) -> Response {
 /// A level or override as Settings lists it: a folder as the person reads it.
 #[derive(Serialize)]
 struct OnItsOwnView {
-    kind: Kind,
+    kind: ActionKind,
     scope: Scope,
     level: Level,
     created_at: chrono::DateTime<chrono::Utc>,
@@ -371,7 +371,7 @@ async fn get_on_its_own(State(s): S, h: HeaderMap, Query(q): Query<AgentQuery>) 
 #[derive(Deserialize)]
 struct OnItsOwnBody {
     agent: String,
-    kind: Kind,
+    kind: ActionKind,
     scope: Scope,
     level: Option<Level>,
 }
@@ -381,10 +381,11 @@ const MAX_HOST: usize = 253;
 
 /// `scope` as it is kept, or why it can't be: a host as a command names
 /// it, less any `user@`; a site's bare origin; a folder, `~` read as home,
-/// that an agent may work in.
+/// that an agent may work in, as the disk spells it with its links
+/// followed.
 fn kept_scope(scope: Scope, home: &Path) -> Result<Scope, String> {
     match scope {
-        Scope::Kind => Ok(Scope::Kind),
+        Scope::Whole => Ok(Scope::Whole),
         Scope::Host(host) => {
             let host = host.trim();
             let host = host.rsplit('@').next().unwrap_or(host).to_ascii_lowercase();
@@ -392,7 +393,7 @@ fn kept_scope(scope: Scope, home: &Path) -> Result<Scope, String> {
                 && host.len() <= MAX_HOST
                 && host
                     .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'));
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
             match plain {
                 true => Ok(Scope::Host(host)),
                 false => Err(format!("{host} isn't a host name or address.")),
@@ -431,10 +432,14 @@ fn kept_scope(scope: Scope, home: &Path) -> Result<Scope, String> {
             if !plain {
                 return Err(format!("{} isn't a full folder path.", folder.display()));
             }
-            match workforce_common::computer_access::works_in_refusal(&folder, home, &[]) {
-                Some(why) => Err(why),
-                None => Ok(Scope::Folder(folder)),
+            if let Some(why) =
+                workforce_common::computer_access::works_in_refusal(&folder, home, &[])
+            {
+                return Err(why);
             }
+            super::boss::resolve_real(&folder)
+                .map(Scope::Folder)
+                .ok_or_else(|| format!("{} leads nowhere.", folder.display()))
         }
     }
 }
@@ -464,7 +469,12 @@ async fn put_on_its_own(
         .set_on_its_own(LOCAL, &body.agent, body.kind, &scope, body.level)
         .await
     {
-        Ok(()) => {
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "It already asks each time there." })),
+        )
+            .into_response(),
+        Ok(true) => {
             tracing::info!(agent = %body.agent, kind = body.kind.as_str(), scope = %scope.text(), level = ?body.level, "what an agent does on its own set");
             StatusCode::NO_CONTENT.into_response()
         }
@@ -664,6 +674,152 @@ mod tests {
             let (status, probe) = call(&app, "GET", "/api/desk/computer/disk-access", None).await;
             assert_eq!(status, 200);
             assert!(["granted", "missing", "unknown"].contains(&probe["state"].as_str().unwrap()));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn what_an_agent_does_on_its_own_is_set_listed_and_forgotten_by_desk_alone() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let desk = crate::testing::desk_on(pool, dir.path()).await;
+            let closed = computer_router(desk.clone(), deny_all());
+            let devbox = json!({"agent": "kat", "kind": "network", "scope": {"kind": "host", "value": "dev@DevBox"}, "level": "anywhere"});
+            for (method, uri, body) in [
+                ("GET", "/api/desk/computer/on-its-own?agent=kat", None),
+                ("PUT", "/api/desk/computer/on-its-own", Some(devbox.clone())),
+                (
+                    "POST",
+                    "/api/desk/computer/on-its-own/ask-again",
+                    Some(json!({"agent": "kat"})),
+                ),
+                ("GET", "/api/desk/computer/activity?decided_by=on_its_own", None),
+            ] {
+                assert_eq!(call(&closed, method, uri, body).await.0, 401, "{uri}");
+            }
+            assert!(desk
+                .store()
+                .on_its_own_rows("local", "kat")
+                .await
+                .unwrap()
+                .is_empty());
+
+            let app = computer_router(desk.clone(), allow_all());
+            let put = |body: Value| {
+                let app = app.clone();
+                async move { call(&app, "PUT", "/api/desk/computer/on-its-own", Some(body)).await }
+            };
+            assert_eq!(put(devbox.clone()).await.0, 204);
+            assert_eq!(
+                put(json!({"agent": "kat", "kind": "files", "scope": {"kind": "folder", "value": "~/dev/acme-web"}, "level": "anywhere"}))
+                    .await
+                    .0,
+                204
+            );
+            assert_eq!(
+                put(json!({"agent": "kat", "kind": "commands", "scope": {"kind": "whole"}, "level": "in_folders"}))
+                    .await
+                    .0,
+                204
+            );
+            let (status, listed) =
+                call(&app, "GET", "/api/desk/computer/on-its-own?agent=kat", None).await;
+            assert_eq!(status, 200);
+            let rows: Vec<(&str, &Value, &str)> = listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| (r["kind"].as_str().unwrap(), &r["scope"], r["level"].as_str().unwrap()))
+                .collect();
+            assert_eq!(
+                rows,
+                vec![
+                    ("commands", &json!({"kind": "whole"}), "in_folders"),
+                    ("files", &json!({"kind": "folder", "value": "~/dev/acme-web"}), "anywhere"),
+                    ("network", &json!({"kind": "host", "value": "devbox"}), "anywhere"),
+                ]
+            );
+
+            for bad in [
+                json!({"agent": "kat", "kind": "network", "scope": {"kind": "host", "value": "devbox:22"}, "level": "anywhere"}),
+                json!({"agent": "kat", "kind": "network", "scope": {"kind": "host", "value": "dev box"}, "level": "anywhere"}),
+                json!({"agent": "kat", "kind": "network", "scope": {"kind": "whole"}, "level": "in_folders"}),
+                json!({"agent": "kat", "kind": "commands", "scope": {"kind": "host", "value": "devbox"}, "level": "anywhere"}),
+                json!({"agent": "kat", "kind": "files", "scope": {"kind": "folder", "value": "~/.ssh"}, "level": "anywhere"}),
+                json!({"agent": "kat", "kind": "browser", "scope": {"kind": "site", "value": "github.com"}, "level": "anywhere"}),
+            ] {
+                assert_eq!(put(bad.clone()).await.0, 400, "{bad}");
+            }
+            assert_eq!(
+                call(&app, "PUT", "/api/desk/computer/on-its-own", None).await.0,
+                400
+            );
+            assert_eq!(
+                call(&app, "POST", "/api/desk/computer/on-its-own/ask-again", None)
+                    .await
+                    .0,
+                400
+            );
+
+            let removed = json!({"agent": "kat", "kind": "network", "scope": {"kind": "host", "value": "devbox"}, "level": null});
+            assert_eq!(put(removed.clone()).await.0, 204);
+            let (status, missing) = put(removed).await;
+            assert_eq!(status, 404);
+            assert_eq!(missing["error"], "It already asks each time there.");
+
+            for decided_by in ["on_its_own", "person"] {
+                desk.store()
+                    .record_activity(&Activity {
+                        hub: "local".into(),
+                        agent: "kat".into(),
+                        person: Some("sarah".into()),
+                        session_id: None,
+                        request_id: None,
+                        kind: "exec".into(),
+                        doing: "git push --force".into(),
+                        folder: None,
+                        connector: None,
+                        tool: "exec.run".into(),
+                        vault_source: None,
+                        decided_by: decided_by.into(),
+                        outcome: json!({"outcome": "allowed"}),
+                        reason: None,
+                        exit_code: None,
+                        duration_ms: None,
+                        arguments: json!({}),
+                        device: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let (status, page) = call(
+                &app,
+                "GET",
+                "/api/desk/computer/activity?agent=kat&decided_by=on_its_own",
+                None,
+            )
+            .await;
+            assert_eq!(status, 200);
+            let rows = page["rows"].as_array().unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["decided_by"], "on_its_own");
+
+            assert_eq!(
+                call(
+                    &app,
+                    "POST",
+                    "/api/desk/computer/on-its-own/ask-again",
+                    Some(json!({"agent": "kat"}))
+                )
+                .await,
+                (200, json!({"cleared": 2}))
+            );
+            assert_eq!(
+                call(&app, "GET", "/api/desk/computer/on-its-own?agent=kat", None)
+                    .await
+                    .1,
+                json!([])
+            );
         })
         .await;
     }

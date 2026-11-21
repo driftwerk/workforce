@@ -3,59 +3,63 @@
 //! person chose, and overrides for one folder, host or site. [`lift`] turns
 //! the verdict's ask into a run where they cover the call, on the turns the
 //! person or the agent's own jobs started. It never touches a refusal, and
-//! never what stays the person's at every level ([`HELD`]): a level never
-//! adds an ask either.
+//! never what stays the person's at every level ([`Why::held`]): a level
+//! never adds an ask either.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use workforce_core::computer::{
-    Access, Always, Asking, By, Choice, Effect, Kind, Level, Refusal, Refused, Scope, Verdict, Why,
+    Access, ActionKind, Always, Asking, By, Choice, Effect, Level, Refusal, Refused, Scope,
+    Verdict, Why,
 };
 
-use super::asks::{always_asks, hosts, Asks, Host, Place};
+use super::asks::{always_asks, Asks, Host, Place};
 use super::policy::{browser_origin, is_browser_key, under, AgentPolicy, CallFacts};
 
 /// An agent's levels and overrides. No level for a kind is "ask each time".
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OnItsOwn {
-    pub levels: BTreeMap<Kind, Level>,
+    pub levels: BTreeMap<ActionKind, Level>,
     /// The kinds it does on its own in one folder, host or site.
-    pub scoped: Vec<(Kind, Scope)>,
+    pub scoped: Vec<(ActionKind, Scope)>,
 }
 
 impl OnItsOwn {
-    /// From stored `(kind, scope, level)` rows; one this hub can't read is
-    /// left out, and so asks.
+    /// One stored `(kind, scope, level)` row as this hub reads it: `None`
+    /// for one it can't, which then asks.
+    pub fn row(kind: &str, scope: &str, level: &str) -> Option<(ActionKind, Scope, Level)> {
+        match (
+            ActionKind::parse(kind),
+            Scope::parse(scope),
+            Level::parse(level),
+        ) {
+            (Some(kind), Some(Scope::Whole), Some(level)) => Some((kind, Scope::Whole, level)),
+            (Some(kind), Some(scope), Some(Level::Anywhere)) if scope.fits(kind) => {
+                Some((kind, scope, Level::Anywhere))
+            }
+            _ => {
+                tracing::warn!(kind, scope, level, "an on-its-own row was left out");
+                None
+            }
+        }
+    }
+
+    /// From stored `(kind, scope, level)` rows ([`Self::row`]).
     pub fn from_rows<'a>(rows: impl IntoIterator<Item = (&'a str, &'a str, &'a str)>) -> Self {
         rows.into_iter()
+            .filter_map(|(kind, scope, level)| Self::row(kind, scope, level))
             .fold(Self::default(), |mut out, (kind, scope, level)| {
-                match (Kind::parse(kind), Scope::parse(scope), Level::parse(level)) {
-                    (Some(kind), Some(Scope::Kind), Some(level)) => {
+                match scope {
+                    Scope::Whole => {
                         out.levels.insert(kind, level);
                     }
-                    (Some(kind), Some(scope), Some(Level::Anywhere)) if scope.fits(kind) => {
-                        out.scoped.push((kind, scope));
-                    }
-                    _ => tracing::warn!(kind, scope, level, "an on-its-own row was left out"),
+                    scope => out.scoped.push((kind, scope)),
                 }
                 out
             })
     }
 }
-
-/// Why an ask stays the person's whatever the levels say: a page that read
-/// as hostile, the person's own sign-in, what reaches other people or a
-/// connected service, what a tool can't name, and the computer's own
-/// settings and security.
-pub const HELD: [Why; 6] = [
-    Why::HostilePage,
-    Why::SignIn,
-    Why::SendsToPeople,
-    Why::ConnectorWrite,
-    Why::Unknown,
-    Why::System,
-];
 
 /// What a call reaches, as a level or an override would cover it.
 enum Targets {
@@ -65,7 +69,7 @@ enum Targets {
 }
 
 struct Reach {
-    kind: Kind,
+    kind: ActionKind,
     targets: Targets,
     /// A delete a command makes: on its own, the Trash does it instead.
     by_command: bool,
@@ -88,55 +92,57 @@ impl Targets {
     }
 }
 
-fn reach(kind: Kind, targets: Targets) -> Option<Reach> {
-    Some(Reach {
+fn reach(kind: ActionKind, targets: Targets) -> Vec<Reach> {
+    vec![Reach {
         kind,
         targets,
         by_command: false,
-    })
+    }]
 }
 
-/// The kind of action `call` is and what it reaches; `None` for what no
+/// What a command's always-asks class reaches, each part as its kind.
+fn reaches_of(asks: Asks) -> Vec<Reach> {
+    match asks {
+        Asks::Deletes(targets) => vec![Reach {
+            kind: ActionKind::Delete,
+            targets: Targets::Paths(targets),
+            by_command: true,
+        }],
+        Asks::Overwrites(targets) => reach(ActionKind::Files, Targets::Paths(targets)),
+        Asks::Irreversible { at } => {
+            reach(ActionKind::Commands, Targets::Paths(at.unwrap_or_default()))
+        }
+        Asks::Remote(hosts) => reach(ActionKind::Network, Targets::Hosts(hosts)),
+        Asks::Many(parts) => parts.into_iter().flat_map(reaches_of).collect(),
+        Asks::ForGood | Asks::Unclear | Asks::System => vec![],
+    }
+}
+
+/// The kinds of action `call` is and what each reaches; none for what no
 /// level covers.
-fn reach_of(p: &AgentPolicy, call: &CallFacts) -> Option<Reach> {
+fn reach_of(p: &AgentPolicy, call: &CallFacts) -> Vec<Reach> {
     match &call.effect {
         Effect::Exec { command, cwd } => {
             let place = Place::new(cwd.clone(), &p.own, &p.scratch, &p.home);
-            let remote = hosts(command);
-            // What it does here and can be read (a delete, a force push)
-            // is decided as that; only what can't be read is the other
-            // machine's when it reaches one.
-            match always_asks(command, &place) {
-                Some(Asks::System) => None,
-                Some(Asks::Deletes(targets)) => Some(Reach {
-                    kind: Kind::Delete,
-                    targets: Targets::Paths(targets),
-                    by_command: true,
-                }),
-                Some(Asks::Unclear) | None if !remote.is_empty() => {
-                    reach(Kind::Network, Targets::Hosts(remote))
-                }
-                _ => reach(
-                    Kind::Commands,
-                    Targets::Paths(cwd.iter().cloned().collect()),
-                ),
-            }
+            always_asks(command, &place)
+                .map(reaches_of)
+                .unwrap_or_default()
         }
         Effect::Session { cwd } => reach(
-            Kind::Commands,
+            ActionKind::Commands,
             Targets::Paths(cwd.iter().cloned().collect()),
         ),
-        Effect::Write { paths } => reach(Kind::Files, Targets::Paths(paths.clone())),
+        Effect::Write { paths } => reach(ActionKind::Files, Targets::Paths(paths.clone())),
         Effect::Move { from, to } => reach(
-            Kind::Files,
+            ActionKind::Files,
             Targets::Paths(from.iter().chain([to]).cloned().collect()),
         ),
-        Effect::Trash { paths } => reach(Kind::Delete, Targets::Paths(paths.clone())),
+        Effect::Trash { paths } => reach(ActionKind::Delete, Targets::Paths(paths.clone())),
         Effect::Connector { connector, .. } if is_browser_key(connector) => reach(
-            Kind::Browser,
+            ActionKind::Browser,
             Targets::Site(browser_origin(connector).map(str::to_string)),
         ),
-        _ => None,
+        _ => vec![],
     }
 }
 
@@ -186,21 +192,27 @@ fn offer(p: &AgentPolicy, call: &CallFacts, reach: &Reach) -> Option<Scope> {
             .filter(|folder| {
                 !paths.is_empty()
                     && paths.iter().all(|path| under(path, folder))
-                    && p.offerable(folder)
+                    && workforce_common::computer_access::works_in_refusal(
+                        folder,
+                        &p.home,
+                        &p.withheld,
+                    )
+                    .is_none()
             })
             .map(|folder| Scope::Folder(folder.clone())),
     }
 }
 
-fn to_trash(p: &AgentPolicy, reach: &Reach) -> Verdict {
-    let named = match &reach.targets {
-        Targets::Paths(paths) => paths
-            .iter()
-            .map(|path| p.shown(path))
-            .collect::<Vec<_>>()
-            .join(", "),
-        _ => String::new(),
-    };
+fn to_trash(p: &AgentPolicy, reaches: &[Reach]) -> Verdict {
+    let named = reaches
+        .iter()
+        .filter(|r| r.by_command)
+        .flat_map(|r| match &r.targets {
+            Targets::Paths(paths) => paths.iter().map(|path| p.shown(path)).collect(),
+            _ => Vec::new(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     Verdict::Refuse {
         refusal: Refusal {
             rule: Refused::UseTrash,
@@ -213,41 +225,41 @@ fn to_trash(p: &AgentPolicy, reach: &Reach) -> Verdict {
 }
 
 /// `verdict`, with what the agent does on its own laid over it: an ask it
-/// covers runs (a command's delete is sent to the Trash instead); one it
-/// doesn't may offer the override that would. Only at Full access asking
-/// before irreversible things, on the person's own work.
+/// covers runs (a command's delete is sent to the Trash instead, where the
+/// computer has one); one it doesn't may offer the override that would.
+/// Only at Full access asking before irreversible things, on the person's
+/// own work. Using the person's own Chrome is never offered.
 pub fn lift(p: &AgentPolicy, call: &CallFacts, verdict: Verdict) -> Verdict {
     let applies =
         call.own_work && p.access.access == Access::Full && p.access.asks == Asking::Irreversible;
     let (mut choices, why) = match verdict {
-        Verdict::Ask { choices, why } if applies && !HELD.contains(&why) => (choices, why),
+        Verdict::Ask { choices, why } if applies && !why.held() => (choices, why),
         other => return other,
     };
-    let Some(reach) = reach_of(p, call) else {
+    let reaches = reach_of(p, call);
+    let deletes = reaches.iter().any(|r| r.by_command);
+    if reaches.is_empty() || (deletes && !p.trash) {
         return Verdict::Ask { choices, why };
-    };
-    if covers(p, &reach) {
-        return match reach.by_command {
-            true => to_trash(p, &reach),
+    }
+    if reaches.iter().all(|r| covers(p, r)) {
+        return match deletes {
+            true => to_trash(p, &reaches),
             false => Verdict::Run { by: By::OnItsOwn },
         };
     }
     let lasting = choices.iter().any(|c| matches!(c, Choice::Always(_)));
-    if let Some(scope) = (!lasting && !reach.by_command)
-        .then(|| offer(p, call, &reach))
-        .flatten()
-    {
+    let offered = match reaches.as_slice() {
+        [one] if !lasting && !one.by_command && why != Why::TheirChrome => {
+            offer(p, call, one).map(|scope| (one.kind, scope))
+        }
+        _ => None,
+    };
+    if let Some((kind, scope)) = offered {
         let at = choices
             .iter()
             .position(|c| *c == Choice::Deny)
             .unwrap_or(choices.len());
-        choices.insert(
-            at,
-            Choice::Always(Always::OnItsOwn {
-                kind: reach.kind,
-                scope,
-            }),
-        );
+        choices.insert(at, Choice::Always(Always::OnItsOwn { kind, scope }));
     }
     Verdict::Ask { choices, why }
 }

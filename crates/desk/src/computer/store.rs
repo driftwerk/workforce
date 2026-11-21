@@ -14,7 +14,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio_postgres::Row;
 use uuid::Uuid;
-use workforce_core::computer::{Ability, Kind, Level, Scope};
+use workforce_core::computer::{Ability, ActionKind, Level, Scope};
 
 use super::on_its_own::OnItsOwn;
 use super::policy::{Grant, RunOf};
@@ -53,20 +53,20 @@ pub struct KeptGrant {
 /// One level or override, as Settings lists it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct OnItsOwnRow {
-    pub kind: Kind,
+    pub kind: ActionKind,
     pub scope: Scope,
     pub level: Level,
     pub created_at: DateTime<Utc>,
 }
 
 /// Why a level can't be kept as asked, in the person's words.
-pub fn level_refusal(kind: Kind, scope: &Scope, level: Option<Level>) -> Option<String> {
+pub fn level_refusal(kind: ActionKind, scope: &Scope, level: Option<Level>) -> Option<String> {
     match (scope, level) {
         _ if !scope.fits(kind) => Some(
             "A host goes with other machines, a site with the browser, and a folder with commands, files or the Trash."
                 .into(),
         ),
-        (Scope::Kind, Some(Level::InFolders)) if !kind.takes_folders() => Some(
+        (Scope::Whole, Some(Level::InFolders)) if !kind.takes_folders() => Some(
             "Other machines and the browser are allowed one by one, or everywhere.".into(),
         ),
         (Scope::Folder(_) | Scope::Host(_) | Scope::Site(_), Some(Level::InFolders)) => {
@@ -332,21 +332,16 @@ impl DeskStore {
             .map(|r| {
                 let (kind, scope, level): (String, String, String) =
                     (r.try_get(0)?, r.try_get(1)?, r.try_get(2)?);
-                Ok(
-                    match (
-                        Kind::parse(&kind),
-                        Scope::parse(&scope),
-                        Level::parse(&level),
-                    ) {
-                        (Some(kind), Some(scope), Some(level)) => Some(OnItsOwnRow {
+                OnItsOwn::row(&kind, &scope, &level)
+                    .map(|(kind, scope, level)| {
+                        Ok(OnItsOwnRow {
                             kind,
                             scope,
                             level,
                             created_at: r.try_get(3)?,
-                        }),
-                        _ => None,
-                    },
-                )
+                        })
+                    })
+                    .transpose()
             })
             .filter_map(Result::transpose)
             .collect()
@@ -354,20 +349,21 @@ impl DeskStore {
 
     /// Sets what `agent` does on its own for `kind` in `scope`: `None` asks
     /// each time again. Refused, in the person's words, where the level
-    /// doesn't fit ([`level_refusal`]).
+    /// doesn't fit ([`level_refusal`]). Whether there was a row to change:
+    /// `false` only for asking again where it already asked.
     pub async fn set_on_its_own(
         &self,
         hub: &str,
         agent: &str,
-        kind: Kind,
+        kind: ActionKind,
         scope: &Scope,
         level: Option<Level>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if let Some(why) = level_refusal(kind, scope, level) {
             eyre::bail!("{why}");
         }
         let client = self.pool().get().await?;
-        match level {
+        let changed = match level {
             None => {
                 client
                     .execute(
@@ -390,7 +386,7 @@ impl DeskStore {
             }
         };
         self.access_changed();
-        Ok(())
+        Ok(changed > 0)
     }
 
     /// "Ask me again": forgets everything `agent` on `hub` does on its own
@@ -886,8 +882,8 @@ mod tests {
                 .set_on_its_own(
                     "local",
                     "kat",
-                    Kind::Commands,
-                    &Scope::Kind,
+                    ActionKind::Commands,
+                    &Scope::Whole,
                     Some(Level::InFolders),
                 )
                 .await
@@ -897,7 +893,7 @@ mod tests {
                 .set_on_its_own(
                     "local",
                     "kat",
-                    Kind::Network,
+                    ActionKind::Network,
                     &devbox,
                     Some(Level::Anywhere),
                 )
@@ -907,8 +903,8 @@ mod tests {
                 .set_on_its_own(
                     "local",
                     "kat",
-                    Kind::Commands,
-                    &Scope::Kind,
+                    ActionKind::Commands,
+                    &Scope::Whole,
                     Some(Level::Anywhere),
                 )
                 .await
@@ -917,8 +913,8 @@ mod tests {
                 .set_on_its_own(
                     "local",
                     "ben",
-                    Kind::Browser,
-                    &Scope::Kind,
+                    ActionKind::Browser,
+                    &Scope::Whole,
                     Some(Level::Anywhere),
                 )
                 .await
@@ -926,9 +922,9 @@ mod tests {
             let kat = store.on_its_own("local", "kat").await.unwrap();
             assert_eq!(
                 kat.levels.into_iter().collect::<Vec<_>>(),
-                vec![(Kind::Commands, Level::Anywhere)]
+                vec![(ActionKind::Commands, Level::Anywhere)]
             );
-            assert_eq!(kat.scoped, vec![(Kind::Network, devbox.clone())]);
+            assert_eq!(kat.scoped, vec![(ActionKind::Network, devbox.clone())]);
             assert_eq!(
                 store
                     .on_its_own_rows("local", "kat")
@@ -938,8 +934,8 @@ mod tests {
                     .map(|r| (r.kind, r.scope, r.level))
                     .collect::<Vec<_>>(),
                 vec![
-                    (Kind::Commands, Scope::Kind, Level::Anywhere),
-                    (Kind::Network, devbox.clone(), Level::Anywhere),
+                    (ActionKind::Commands, Scope::Whole, Level::Anywhere),
+                    (ActionKind::Network, devbox.clone(), Level::Anywhere),
                 ]
             );
             assert_eq!(
@@ -949,14 +945,14 @@ mod tests {
 
             // What doesn't fit is refused and nothing is written.
             for (kind, scope, level) in [
-                (Kind::Network, Scope::Kind, Level::InFolders),
+                (ActionKind::Network, Scope::Whole, Level::InFolders),
                 (
-                    Kind::Commands,
+                    ActionKind::Commands,
                     Scope::Host("devbox".into()),
                     Level::Anywhere,
                 ),
                 (
-                    Kind::Files,
+                    ActionKind::Files,
                     Scope::Folder(PathBuf::from("/x")),
                     Level::InFolders,
                 ),
@@ -967,10 +963,17 @@ mod tests {
                     .is_err());
             }
 
-            store
-                .set_on_its_own("local", "kat", Kind::Network, &devbox, None)
+            assert!(store
+                .set_on_its_own("local", "kat", ActionKind::Network, &devbox, None)
                 .await
-                .unwrap();
+                .unwrap());
+            assert!(
+                !store
+                    .set_on_its_own("local", "kat", ActionKind::Network, &devbox, None)
+                    .await
+                    .unwrap(),
+                "a second removal finds nothing to remove"
+            );
             assert!(store
                 .on_its_own("local", "kat")
                 .await

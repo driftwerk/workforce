@@ -76,6 +76,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             expires_at: chrono::Utc::now(),
             chat: false,
+            origin: None,
         };
         assert_eq!(
             asking(&row, "  "),
