@@ -630,6 +630,19 @@ impl JobPayload {
         }
     }
 
+    /// What the payload says to the agent or the person, when it says
+    /// anything.
+    pub fn words(&self) -> Option<&str> {
+        match self {
+            Self::SystemEvent { text, .. } | Self::Reminder { text, .. } => Some(text),
+            Self::AgentTurn { message, .. } => Some(message),
+            Self::WorkflowStart { .. }
+            | Self::MonitorSweep
+            | Self::Consolidation { .. }
+            | Self::CrewSummary { .. } => None,
+        }
+    }
+
     /// Point the payload at `to` when it names anyone in `names`. Delivery
     /// maps an identity to its platform id, so `to` is always an identity.
     fn reassign_user(&mut self, names: &[String], to: &str) -> bool {

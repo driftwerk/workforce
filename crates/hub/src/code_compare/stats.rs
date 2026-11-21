@@ -1,9 +1,9 @@
 //! The arithmetic of a comparison of code search: the keys every random
 //! choice is made by, the sample's allocation, a text's first sentence, the
-//! bootstrap and its interval, recall, the same-top rule, a node's work, and
-//! the gates. Every function here is pure.
+//! bootstrap and its interval, recall, the same-top rule and overlap, a
+//! node's work, and the gates. Every function here is pure.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::Add;
 
 use rand::{Rng, SeedableRng};
@@ -17,6 +17,8 @@ const OVERALL_FLOOR: f64 = -0.02;
 const KIND_FLOOR: f64 = -0.05;
 const GATED_KIND: usize = 300;
 const RECALL_FLOOR: f64 = 0.97;
+pub(super) const TEXT_PASS: f64 = 0.95;
+pub(super) const TEXT_FLOOR: f64 = 0.90;
 pub(super) const SAME_DISTANCE: f32 = 1e-6;
 
 pub(super) fn key(seed: u64, purpose: &str, parts: &[&str]) -> [u8; 32] {
@@ -268,6 +270,21 @@ pub(super) fn same_top(reference: &[Answer], other: &[Answer], depth: usize, wit
             .all(|(hit, run)| run_of(&hit.object) == Some(*run))
 }
 
+pub(super) fn overlap(reference: &[Answer], other: &[Answer], depth: usize) -> f64 {
+    let top = |answers: &[Answer]| -> HashSet<Option<String>> {
+        answers
+            .iter()
+            .take(depth)
+            .map(|hit| hit.object.clone())
+            .collect()
+    };
+    let (reference, other) = (top(reference), top(other));
+    match reference.len().max(other.len()) {
+        0 => 1.0,
+        most => reference.intersection(&other).count() as f64 / most as f64,
+    }
+}
+
 pub(super) fn work_sums(text: &str, route: &str) -> Scored {
     let route = format!("route=\"{route}\"");
     let of = |series: &str, kinds: &[&str]| {
@@ -305,6 +322,22 @@ pub(super) enum Applying {
     Applied,
     NotApplied,
     ByStatement,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum Verdict {
+    Pass,
+    Warn,
+    Fail,
+}
+
+pub(super) fn same_verdict(all_same: bool, overlap: f64) -> Verdict {
+    match (all_same, overlap) {
+        (true, overlap) if overlap >= TEXT_PASS => Verdict::Pass,
+        (true, overlap) if overlap >= TEXT_FLOOR => Verdict::Warn,
+        _ => Verdict::Fail,
+    }
 }
 
 pub(super) fn gates(
@@ -672,6 +705,28 @@ mod tests {
         let mut stranger = reference.clone();
         stranger[2].object = Some("absent".to_string());
         assert!(!same_top(&reference, &stranger, 10, 1e-3));
+    }
+
+    #[test]
+    fn fewer_than_ten_results_are_compared_as_they_are() {
+        let short: Vec<Answer> = (0..7)
+            .map(|n| hit(&format!("o{n}"), n as f32 * 0.01))
+            .collect();
+        assert!(same_top(&short, &short, 10, 1e-3));
+        assert_eq!(overlap(&short, &short, 10), 1.0);
+        assert!(!same_top(&short, &short[..6], 10, 1e-3));
+        assert_eq!(overlap(&short, &short[..6], 10), 6.0 / 7.0);
+        assert_eq!(overlap(&[], &[], 10), 1.0);
+    }
+
+    #[test]
+    fn the_text_floors_are_the_plans() {
+        assert_eq!(same_verdict(true, 0.96), Verdict::Pass);
+        assert_eq!(same_verdict(true, 0.95), Verdict::Pass);
+        assert_eq!(same_verdict(true, 0.92), Verdict::Warn);
+        assert_eq!(same_verdict(true, 0.90), Verdict::Warn);
+        assert_eq!(same_verdict(true, 0.89), Verdict::Fail);
+        assert_eq!(same_verdict(false, 1.0), Verdict::Fail);
     }
 
     #[test]

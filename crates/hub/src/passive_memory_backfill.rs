@@ -27,7 +27,7 @@ use workforce_agent::runner::CURRENT_USER_ID;
 use workforce_core::types::AgentId;
 use workforce_memory::store::MemoryStore;
 
-use crate::passive_memory::extract_and_store;
+use crate::passive_memory::{extract_and_store, Assistant};
 use crate::session_scan::{
     enumerate_session_files, iter_turns, load_session_meta, read_jsonl_messages, resolve_agent_ids,
 };
@@ -82,8 +82,13 @@ pub async fn run(
             continue;
         }
         report.agents_scanned += 1;
+        let identity =
+            tokio::fs::read_to_string(agents_root.join(agent_id.as_str()).join("IDENTITY.md"))
+                .await
+                .ok();
+        let assistant = Assistant::named_in(agent_id, identity.as_deref());
         scan_agent(
-            &agent_id,
+            &assistant,
             &sessions_dir,
             &opts,
             &mut report,
@@ -96,7 +101,7 @@ pub async fn run(
 }
 
 async fn scan_agent(
-    agent_id: &AgentId,
+    assistant: &Assistant,
     sessions_dir: &Path,
     opts: &BackfillOptions,
     report: &mut BackfillReport,
@@ -105,7 +110,7 @@ async fn scan_agent(
 ) {
     for session_path in enumerate_session_files(sessions_dir) {
         match scan_session(
-            agent_id,
+            assistant,
             &session_path,
             opts,
             report,
@@ -118,7 +123,7 @@ async fn scan_agent(
             Err(e) => {
                 report.session_errors += 1;
                 warn!(
-                    agent = %agent_id,
+                    agent = %assistant.id,
                     session = %session_path.display(),
                     error = %e,
                     "Passive backfill failed for session"
@@ -129,7 +134,7 @@ async fn scan_agent(
 }
 
 async fn scan_session(
-    agent_id: &AgentId,
+    assistant: &Assistant,
     session_path: &Path,
     opts: &BackfillOptions,
     report: &mut BackfillReport,
@@ -156,7 +161,7 @@ async fn scan_session(
             .scope(meta.owner.clone(), {
                 let llm = Arc::clone(&llm_arc);
                 let store = Arc::clone(&store_arc);
-                let agent_id = agent_id.clone();
+                let assistant = assistant.clone();
                 let channel = meta.channel.clone();
                 let session_id = meta.id.clone();
                 let model = opts.model.clone();
@@ -168,7 +173,7 @@ async fn scan_session(
                     extract_and_store(
                         llm,
                         store,
-                        agent_id,
+                        assistant,
                         &channel,
                         Some(session_id),
                         message_ids,

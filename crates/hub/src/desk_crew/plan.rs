@@ -189,7 +189,7 @@ pub(crate) fn machine_line(
 const MACHINE_DOWN_SAID: u32 = 4;
 
 /// How long what happens to a plan is gathered into one turn.
-const GATHER: Duration = Duration::from_secs(3);
+pub(super) const GATHER: Duration = Duration::from_secs(3);
 
 pub const DESCRIPTION: &str = "Propose a plan for a goal the person gave you: tickets on your \
 group's board, each a piece of work a real session (Claude Code, Codex) does in a project folder, \

@@ -790,7 +790,7 @@ async fn scan_one_session(
         let result = crate::passive_memory::extract_and_store(
             Arc::clone(&service.llm),
             Arc::clone(&extraction.store),
-            service.agent_id.clone(),
+            crate::passive_memory::Assistant::of(service),
             &session.channel,
             Some(session.id.clone()),
             vec![pair.user_id.clone(), pair.assistant_id.clone()],

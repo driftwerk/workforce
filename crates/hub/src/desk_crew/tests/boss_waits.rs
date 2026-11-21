@@ -67,11 +67,13 @@ async fn what_a_session_and_its_boss_say_reaches_whom_it_answers_whole() {
 
         // 10:26:54, while a boss turn begun before it runs: the report.
         let (go, sent) = tokio::sync::oneshot::channel::<()>();
+        let (taken_tx, basis_taken) = tokio::sync::oneshot::channel::<()>();
         let early = {
             let crew = Arc::clone(&crew);
             let action = nudge(s.id, "Correction to my 10:25 message: production read-only.", None);
             tokio::spawn(async move {
                 crew.on_picture(async {
+                    let _ = taken_tx.send(());
                     let _ = sent.await;
                     let by = crew.by_overseer("Production stays read-only.").unwrap();
                     crew.perform(&action, by).await
@@ -79,7 +81,7 @@ async fn what_a_session_and_its_boss_say_reaches_whom_it_answers_whole() {
                 .await
             })
         };
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        basis_taken.await.unwrap();
         let long = report();
         let r = d
             .line_call(s.id, "tell", &json!({"to": "desk", "text": long}), None)

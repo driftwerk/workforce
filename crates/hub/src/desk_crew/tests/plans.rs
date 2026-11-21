@@ -1151,6 +1151,21 @@ async fn newly_said(llm: &wiremock::MockServer, marker: &str) -> usize {
         .count()
 }
 
+/// Waits until `marker` has been said `times` times, then for a plan turn's
+/// whole gather: it is said no more.
+async fn said_only(llm: &wiremock::MockServer, marker: &str, times: usize) {
+    eventually(marker, async || {
+        (newly_said(llm, marker).await >= times).then_some(())
+    })
+    .await;
+    tokio::time::sleep(super::super::plan::GATHER + Duration::from_secs(1)).await;
+    assert_eq!(
+        newly_said(llm, marker).await,
+        times,
+        "one turn a hold, however often it is counted"
+    );
+}
+
 /// `usd` spent by `session` now on a paid key, and the budgets counted again.
 async fn spent(d: &Desk, session: uuid::Uuid, usd: f64) {
     use workforce_desk::ledger::{Billing, Priced, Spend, Tokens};
@@ -1349,11 +1364,7 @@ async fn a_plan_at_its_warning_stops_starting_until_the_person_says_continue_and
         );
         assert_eq!(started(&d).len(), 1);
         // The boss was told of the hold once, in one plan turn.
-        tokio::time::sleep(Duration::from_millis(3500)).await;
-        assert_eq!(
-            newly_said(&llm, "Desk's breaker holds its new starts").await,
-            1
-        );
+        said_only(&llm, "Desk's breaker holds its new starts", 1).await;
 
         // The person says Continue: the next starts.
         d.breaker_continue(&subject, By::you()).unwrap();
@@ -1389,13 +1400,8 @@ async fn a_plan_at_its_warning_stops_starting_until_the_person_says_continue_and
         for _ in 0..4 {
             d.count_spend_now().await;
         }
-        tokio::time::sleep(Duration::from_millis(4000)).await;
+        said_only(&llm, "Desk's breaker holds its new starts", 2).await;
         assert_eq!(started(&d).len(), 2);
-        assert_eq!(
-            newly_said(&llm, "Desk's breaker holds its new starts").await,
-            2,
-            "one turn a hold, however often it is counted"
-        );
     })
     .await;
 }
@@ -2265,7 +2271,7 @@ async fn a_boss_runs_a_check_on_a_machine_and_what_no_boss_does_is_the_persons()
                 }
             })
         };
-        eventually("Desk polling", async || crew.relay_polled.lock().is_some().then_some(())).await;
+        eventually("Desk polling", async || crew.relay.polled_ever().then_some(())).await;
         // Read: run, judged there at Act.
         let r = run
             .execute(json!({ "machine": "devbox", "command": "git status", "reason": "Is it clean?" }))
