@@ -274,8 +274,12 @@ fn target<'a>(
 
 /// Whether `name`, a folder in a path, is one Desk never clones into: a
 /// hidden one, or the system's own.
-fn kept_out(name: &std::ffi::OsStr) -> bool {
-    name.to_string_lossy().starts_with('.') || name == "Library"
+/// Whether `inside`, a path below the home, goes through a folder Desk
+/// never clones into: a hidden one, or the system's own (a Mac's
+/// `~/Library`).
+fn kept_out(inside: &Path) -> bool {
+    let system = cfg!(target_os = "macos") && inside.starts_with("Library");
+    system || inside.iter().any(|c| c.to_string_lossy().starts_with('.'))
 }
 
 /// The checkout of `repo` at `t`, else one under `home` when no folder was
@@ -307,7 +311,7 @@ fn place(repo: &Repo, t: &Target, home: &Path) -> Result<Place, String> {
         .map_err(|e| format!("{} can't be made: {e}", shown()))?;
     let dest = names.iter().fold(base, |d, n| d.join(n));
     match dest.strip_prefix(home) {
-        Ok(inside) if inside.iter().any(kept_out) => Err(format!(
+        Ok(inside) if kept_out(inside) => Err(format!(
             "{} is inside a hidden or system folder, where Desk clones nothing",
             shown()
         )),
@@ -630,6 +634,15 @@ async fn clone_into(
         let _ = tokio::fs::remove_dir_all(&part).await;
         return Err(why);
     }
+    // Its folder, as the disk has it now, is still where it was made.
+    let parent = dest.parent().unwrap_or(home);
+    if tokio::fs::canonicalize(parent).await.ok().as_deref() != Some(parent) {
+        let _ = tokio::fs::remove_dir_all(&part).await;
+        return Err(format!(
+            "{} moved while {repo} was cloned; Desk left it as it is",
+            parent.display()
+        ));
+    }
     // Something put there meanwhile is never replaced.
     if tokio::fs::symlink_metadata(dest).await.is_ok() {
         let _ = tokio::fs::remove_dir_all(&part).await;
@@ -757,6 +770,43 @@ mod tests {
         assert_eq!(got, Got::Ready { path: wt_said });
     }
 
+    #[tokio::test]
+    async fn a_clone_whose_folder_moved_meanwhile_is_never_put_where_it_went() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let repo = repo_of("driftwerk/vellev").unwrap();
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        // git (and gh) clone into their last word; this one, while it does,
+        // swaps ~/work for a link to ~/.ssh when asked to.
+        let script = "#!/bin/sh\nfor a; do at=$a; done\n/bin/mkdir -p \"$at/.git\"\n\
+            if [ -e \"$HOME/swap\" ]; then /bin/mv \"$HOME/work\" \"$HOME/was\"; \
+            /bin/ln -s \"$HOME/.ssh\" \"$HOME/work\"; fi\n";
+        for prog in ["git", "gh"] {
+            std::fs::write(bin.join(prog), script).unwrap();
+            std::fs::set_permissions(bin.join(prog), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        let env = [("PATH".to_string(), bin.to_string_lossy().into_owned())];
+        std::fs::create_dir_all(home.join("work")).unwrap();
+        let dest = home.join("work/vellev");
+        assert_eq!(clone_into(&repo, &dest, &home, &env).await, Ok(()));
+        assert!(dest.join(".git").is_dir());
+        std::fs::remove_dir_all(&dest).unwrap();
+        std::fs::write(home.join("swap"), "").unwrap();
+        let got = clone_into(&repo, &dest, &home, &env).await;
+        assert_eq!(
+            got,
+            Err(format!(
+                "{} moved while {repo} was cloned; Desk left it as it is",
+                home.join("work").display()
+            ))
+        );
+        assert_eq!(std::fs::read_dir(home.join(".ssh")).unwrap().count(), 0);
+    }
+
     #[test]
     fn a_clone_failure_is_said_in_desks_words_never_the_servers() {
         for (said, means) in [
@@ -830,10 +880,25 @@ mod tests {
             ("work/vellev", "isn't a full path"),
             ("~/.ssh/vellev", hidden),
             ("~/keys/vellev", hidden),
-            ("~/Library/vellev", hidden),
         ] {
             assert_eq!(placed(folder), Err(format!("{folder} {why}")), "{folder}");
         }
+        // A Mac's own Library, or a link to it, but no folder of that name
+        // deeper down.
+        std::fs::create_dir_all(home.join("Library")).unwrap();
+        std::os::unix::fs::symlink(home.join("Library"), home.join("lib")).unwrap();
+        for folder in ["~/Library/vellev", "~/lib/vellev"] {
+            assert_eq!(
+                placed(folder).is_err(),
+                cfg!(target_os = "macos"),
+                "{folder}: {:?}",
+                placed(folder)
+            );
+        }
+        assert_eq!(
+            placed("~/work/Library/vellev"),
+            Ok(Place::Clone(home.join("work/Library/vellev")))
+        );
         // Where Desk clones it is looked at first, however deep.
         let deep = home.join("a/b/c/d/e/f/projects");
         checkout_at(

@@ -1439,6 +1439,31 @@ async fn a_plan_paused_for_a_ticket_that_keeps_failing_says_why_again_after_a_re
         again.pause_plan_failing(id, newer).await.unwrap();
         let read = desk(pool, dir.path()).await.plan(id).await.unwrap();
         assert_eq!(read.summary.paused_why.as_deref(), Some(newer));
+        // The person's pause after it: once that is kept, so is all before.
+        again
+            .pause_plan(id, Paused::Person, &By::you())
+            .await
+            .unwrap();
+        let pauses = |of: &'static str| {
+            let again = again.clone();
+            async move {
+                again
+                    .activity(crate::crew::Filter::All, None, 100)
+                    .await
+                    .unwrap()
+                    .events
+                    .into_iter()
+                    .filter(|e| e.kind == Kind::PlanPaused && e.detail.as_ref().is_some_and(|d| d["paused"] == of))
+                    .count()
+            }
+        };
+        let mut waited = 0;
+        while pauses("person").await == 0 {
+            waited += 1;
+            assert!(waited < 100, "the person's pause was never kept");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(pauses("start_failing").await, 1, "a newer reason is no second pause");
     })
     .await;
 }

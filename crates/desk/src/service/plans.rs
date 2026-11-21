@@ -1964,9 +1964,19 @@ impl Desk {
         }
         // A pause of the person's stays theirs: Desk's own reasons never
         // replace it.
-        let same = p.paused == Some(why) && p.paused_why == said;
-        if same || (p.paused == Some(Paused::Person) && why != Paused::Person) {
+        if p.paused == Some(Paused::Person) && why != Paused::Person {
             return self.plan_detail(p).await;
+        }
+        // Paused so already: only a newer reason is kept, said once.
+        if p.paused == Some(why) {
+            return match p.paused_why == said {
+                true => self.plan_detail(p).await,
+                false => {
+                    p.paused_why = said;
+                    p.updated_at = crew::now();
+                    self.plan_saved(&p).await
+                }
+            };
         }
         p.state = PlanState::Paused;
         p.paused = Some(why);
@@ -1992,6 +2002,7 @@ impl Desk {
         if p.state == PlanState::Running {
             p.state = PlanState::Paused;
             p.paused = Some(Paused::NoBoss);
+            p.paused_why = None;
         }
         p.updated_at = crew::now();
         self.plan_note(
@@ -2255,6 +2266,7 @@ impl Desk {
         }
         p.state = PlanState::Dropped;
         p.paused = None;
+        p.paused_why = None;
         p.updated_at = crew::now();
         self.plan_budget_ends(&p, by).await;
         self.plan_note(
@@ -2281,6 +2293,7 @@ impl Desk {
         }
         p.state = PlanState::Done;
         p.paused = None;
+        p.paused_why = None;
         p.updated_at = crew::now();
         self.plan_budget_ends(&p, by).await;
         self.plan_note(
