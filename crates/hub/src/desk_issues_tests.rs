@@ -242,7 +242,7 @@ async fn devbox_works_its_issue(
     let served = home_routes(Arc::clone(&local.sync.state), Arc::clone(&home));
 
     let there = machine_desk(devbox_pool, devbox_dir.path()).await;
-    let machine = MachineIssues::new();
+    let machine = MachineIssues::new(Arc::default());
     there.issues_with(Arc::clone(&machine) as _);
     let devbox_state = fixture(false).state;
     let relay = machine_routes(Arc::clone(&devbox_state), Arc::clone(&machine));
@@ -322,6 +322,19 @@ async fn devbox_works_its_issue(
     assert!(e.contains("which state"), "{e}");
     assert_eq!(carried.lock().unwrap().len(), before);
 
+    // A key of a team no board it reaches is linked to is refused, never
+    // sent through another team's link.
+    let e = call(json!({ "action": "get", "key": "OPS-3" }))
+        .await
+        .unwrap_err();
+    assert!(
+        e.contains("OPS isn't linked to a board this session reaches"),
+        "{e}"
+    );
+    assert!(told(&linear, "linear.issue_get")
+        .iter()
+        .all(|a| a["identifier"] != "OPS-3"));
+
     // Jira is linked to no board on the Mac: said, through the same path.
     let e = there
         .line_call(session.id, "jira", &json!({ "action": "list" }), STEP)
@@ -363,7 +376,7 @@ async fn devbox_works_its_issue(
     poller.abort();
 
     // With no Desk carrying, a session hears so at once.
-    let idle = MachineIssues::new();
+    let idle = MachineIssues::new(Arc::default());
     let started = Instant::now();
     let asker = Asker {
         session: session.id,
@@ -379,6 +392,15 @@ async fn devbox_works_its_issue(
         "{e}"
     );
     assert!(started.elapsed() < Duration::from_secs(2));
+    // Desk reaching the machine by its other routes, and never asking for
+    // these calls, is an older Desk.
+    let seen = Arc::new(crate::desk_crew::relay::NativeSeen::default());
+    seen.mark();
+    let e = MachineIssues::new(seen)
+        .issue(&asker, &asked)
+        .await
+        .unwrap_err();
+    assert!(e.contains("needs an update"), "{e}");
 }
 
 /// Only Desk's native side, with the hub's own token in its header, reaches
@@ -388,7 +410,7 @@ async fn devbox_works_its_issue(
 async fn only_desk_itself_carries_the_calls() {
     let state = fixture(false).state;
     let token = state.auth_token.clone();
-    let machine = MachineIssues::new();
+    let machine = MachineIssues::new(Arc::default());
     let relay = machine_routes(Arc::clone(&state), Arc::clone(&machine));
     for (bearer, uri) in [
         ("someone-else", "/api/desk/issues/relay"),

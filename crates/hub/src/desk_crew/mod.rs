@@ -325,6 +325,8 @@ pub struct CrewHub {
     /// ([`relay`]), and who waits for each answer: while Desk hasn't asked
     /// lately, nothing is queued and a machine is said not reached at once.
     relay: relay::Relays,
+    /// When Desk's native side last reached this hub.
+    pub(crate) native: Arc<relay::NativeSeen>,
     /// How long a relayed call waits for its machine's answer.
     relay_wait: Mutex<Duration>,
     /// Each boss's mind: its own deciding, one stretch at a time
@@ -786,7 +788,8 @@ impl CrewHub {
             machine_read: Mutex::default(),
             machine_down: Mutex::default(),
             reuse_claims: Mutex::default(),
-            relay: relay::Relays::new(relay::LIMITS),
+            relay: relay::relays(),
+            native: Arc::default(),
             relay_wait: Mutex::new(Duration::from_secs(30)),
             minds: mind::Minds::default(),
             notices: orchestrator::Notices::default(),

@@ -43,8 +43,11 @@ pub const LISTED: usize = 20;
 pub const MOST_LISTED: usize = 50;
 /// The longest comment a session posts.
 pub const MOST_COMMENT: usize = 20_000;
-/// The most of an answer a session reads, before it is fenced.
-pub const MOST_ANSWER: usize = 60_000;
+/// The most of an answer a session reads, in bytes as JSON: escaped as
+/// it is carried, so it always fits a machine's relay.
+pub const MOST_ANSWER: usize = 96 * 1024;
+/// What a clipped answer ends with.
+const CLIPPED: &str = "\n… (clipped: ask for fewer, or for one issue)";
 
 /// A session's call as it asked it, for `system`: what a machine hands on,
 /// and the computer holding the link checks again.
@@ -75,6 +78,21 @@ pub struct Asker {
 pub trait Issues: Send + std::marker::Sync {
     /// `asked` run for `asker`: what it answers, or its words for why not.
     async fn issue(&self, asker: &Asker, asked: &Asked) -> Result<Value, String>;
+
+    /// Whether `asker` is offered `system`'s tool: where the links can't
+    /// be seen from, always.
+    async fn offers(&self, _asker: &Asker, _system: System) -> bool {
+        true
+    }
+}
+
+/// The system a line tool named `tool` is the issue tool of.
+pub fn system_of_tool(tool: &str) -> Option<System> {
+    match tool {
+        "linear" => Some(System::Linear),
+        "jira" => Some(System::Jira),
+        _ => None,
+    }
 }
 
 /// A call checked: everything it may say, nothing else.
@@ -139,12 +157,7 @@ pub fn call_of(system: System, input: &Value) -> Result<IssueCall, String> {
         key,
         team,
         query: s("query"),
-        text: input
-            .get("text")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .map(str::to_string),
+        text: s("text"),
         state: s("state"),
         mine: input.get("mine").and_then(Value::as_bool).unwrap_or(false),
         limit: input
@@ -193,13 +206,52 @@ pub fn asked(system: System, input: &Value) -> Result<Asked, String> {
     })
 }
 
-/// Of `links`, the one `call` goes through: the one linked to its project
-/// or team, else the first of its system.
-pub fn pick<'a>(links: &'a [Sync], call: &IssueCall) -> Option<&'a Sync> {
-    let ours = || links.iter().filter(|s| s.system == call.system);
-    call.target()
-        .and_then(|t| ours().find(|s| s.target == t))
-        .or_else(|| ours().next())
+/// The link a call goes through, and the projects or teams it may read
+/// there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Picked<'a> {
+    pub link: &'a Sync,
+    pub targets: Vec<String>,
+}
+
+/// Of `links`, the ones a session reaches, the one `call` goes through:
+/// the one linked to the project or team it names, never another; naming
+/// none, the first, with every target linked through the same connection.
+pub fn pick<'a>(links: &'a [Sync], call: &IssueCall) -> Result<Picked<'a>, String> {
+    let title = call.system.title();
+    let ours: Vec<&Sync> = links.iter().filter(|s| s.system == call.system).collect();
+    let Some(first) = ours.first() else {
+        return Err(format!(
+            "No board this session reaches in Desk is linked to {title}. Link one (Board, then Link to {title}) and the sessions that reach it get {title} through it."
+        ));
+    };
+    match call.target() {
+        Some(t) => ours
+            .iter()
+            .find(|s| s.target == t)
+            .map(|link| Picked {
+                link,
+                targets: vec![link.target.clone()],
+            })
+            .ok_or_else(|| {
+                let reached: Vec<String> = ours.iter().map(|s| s.target.clone()).collect();
+                format!(
+                    "{t} isn't linked to a board this session reaches; in {title} it reaches {}.",
+                    sync::or_list(&reached)
+                )
+            }),
+        None => Ok(Picked {
+            link: first,
+            targets: ours
+                .iter()
+                .filter(|s| {
+                    (&s.via, &s.person, &s.agent, &s.workspace)
+                        == (&first.via, &first.person, &first.agent, &first.workspace)
+                })
+                .map(|s| s.target.clone())
+                .collect(),
+        }),
+    }
 }
 
 /// Who a write is made by: Desk, for the person, from a session.
@@ -214,7 +266,16 @@ pub struct By {
 impl By {
     /// What a write is signed with.
     pub fn mark(&self) -> String {
-        let one = |s: &str| crate::crew::one_line(s, 80);
+        let one = |s: &str| {
+            s.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(80)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
         let place = match &self.machine {
             Some(m) => format!(" on {}", one(m)),
             None => String::new(),
@@ -243,30 +304,61 @@ pub fn no_answer(asked: &Asked) -> String {
     }
 }
 
+/// The bytes `s` takes as a JSON string, its quotes included.
+pub fn json_len(s: &str) -> usize {
+    2 + s
+        .chars()
+        .map(|c| match c {
+            '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+            c if (c as u32) < 0x20 => 6,
+            c => c.len_utf8(),
+        })
+        .sum::<usize>()
+}
+
 /// `answer` as a session reads it: fenced as the issue's writers' words,
-/// clipped at [`MOST_ANSWER`].
-fn read(system: System, of: &str, answer: &Value) -> Value {
+/// clipped to take at most `budget` bytes as JSON; `None` when even its
+/// fence wouldn't fit.
+fn read(system: System, of: &str, answer: &Value, budget: usize) -> Option<Value> {
     let text = serde_json::to_string_pretty(answer).unwrap_or_default();
-    let text = match text.char_indices().nth(MOST_ANSWER) {
-        Some((at, _)) => format!(
-            "{}\n… (clipped: ask for fewer, or for one issue)",
-            &text[..at]
-        ),
-        None => text,
-    };
-    Value::String(sync::fence(system, of, &text, &sync::nonce()))
+    let nonce = sync::nonce();
+    let mut end = text.len();
+    let mut clip = "";
+    loop {
+        let out = sync::fence(system, of, &format!("{}{clip}", &text[..end]), &nonce);
+        let over = json_len(&out).saturating_sub(budget);
+        if over == 0 {
+            return Some(Value::String(out));
+        }
+        if end == 0 {
+            return None;
+        }
+        clip = CLIPPED;
+        // A character takes at most six bytes escaped: never cut more than
+        // the excess needs.
+        end = end.saturating_sub(over.div_ceil(6));
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+    }
 }
 
-/// What a list of `team`'s issues is fenced as.
-fn listed(team: &str) -> String {
-    format!("list ({team})")
+/// `answer` read whole within [`MOST_ANSWER`].
+fn read_all(system: System, of: &str, answer: &Value) -> Value {
+    read(system, of, answer, MOST_ANSWER).unwrap_or_default()
 }
 
-/// The Linear team `team`'s id: `link`'s own, else looked up by its key.
-async fn team_id(remote: &dyn Remote, link: &Sync, team: &str) -> Result<String, RemoteError> {
-    if let Some(id) = link.target_id.as_ref().filter(|_| link.target == team) {
+/// What a list of `targets`' issues is fenced as.
+fn listed(targets: &[String]) -> String {
+    format!("list ({})", targets.join(", "))
+}
+
+/// The Linear team `link` is linked to: its id, else looked up by its key.
+async fn team_id(remote: &dyn Remote, link: &Sync) -> Result<String, RemoteError> {
+    if let Some(id) = &link.target_id {
         return Ok(id.clone());
     }
+    let team = &link.target;
     let teams = sync::call(remote, System::Linear, "linear.teams_list", json!({})).await?;
     teams["teams"]
         .as_array()
@@ -278,39 +370,72 @@ async fn team_id(remote: &dyn Remote, link: &Sync, team: &str) -> Result<String,
         .ok_or_else(|| RemoteError::Failed(format!("Linear has no team {team} you can see.")))
 }
 
-/// The JQL for `call`'s list or search, newest change first.
-fn jql(link: &Sync, call: &IssueCall) -> String {
+/// The JQL for `call`'s list or search in `targets`, newest change first.
+fn jql(link: &Sync, call: &IssueCall, targets: &[String]) -> String {
     let quoted = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
-    let clauses: Vec<String> = match call.action {
-        Action::Search => call
-            .team
+    let projects = format!(
+        "project in ({})",
+        targets
             .iter()
-            .map(|t| format!("project = {}", quoted(t)))
+            .map(|t| quoted(t))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let clauses: Vec<String> = match call.action {
+        Action::Search => std::iter::once(projects)
             .chain(call.query.iter().map(|q| format!("text ~ {}", quoted(q))))
             .collect(),
-        _ => {
-            let project = call.team.as_deref().unwrap_or(&link.target);
-            [
-                Some(format!("project = {}", quoted(project))),
-                Some("statusCategory != Done".to_string()),
-                call.mine
-                    .then(|| sync::assigned_to_me(sync::shared_me(link))),
-            ]
-            .into_iter()
-            .flatten()
-            .collect()
-        }
+        _ => [
+            Some(projects),
+            Some("statusCategory != Done".to_string()),
+            call.mine
+                .then(|| sync::assigned_to_me(sync::shared_me(link))),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
     };
     format!("{} ORDER BY updated DESC", clauses.join(" AND "))
 }
 
-/// `call` run through `link` with `remote`, its writes signed by `by`.
+/// Of a Linear search's issues, those of `targets`' teams.
+fn only_of(mut answer: Value, targets: &[String]) -> Value {
+    if let Some(issues) = answer["issues"].as_array_mut() {
+        issues.retain(|i| {
+            i["identifier"]
+                .as_str()
+                .and_then(|k| k.rsplit_once('-'))
+                .is_some_and(|(t, _)| targets.iter().any(|x| x == t))
+        });
+        answer["count"] = json!(issues.len());
+    }
+    answer
+}
+
+/// `body` posted on `key` in `system`.
+async fn post_comment(
+    remote: &dyn Remote,
+    system: System,
+    key: &str,
+    body: String,
+) -> Result<Value, RemoteError> {
+    let (tool, field) = match system {
+        System::Jira => ("jira.add_comment", "issue_key"),
+        _ => ("linear.comment_add", "identifier"),
+    };
+    let mut args = json!({ "body": body });
+    args[field] = json!(key);
+    sync::call(remote, system, tool, args).await
+}
+
+/// `call` run through `picked` with `remote`, its writes signed by `by`.
 pub async fn run(
     remote: &dyn Remote,
-    link: &Sync,
+    picked: &Picked<'_>,
     call: &IssueCall,
     by: &By,
 ) -> Result<Value, RemoteError> {
+    let (link, targets) = (picked.link, picked.targets.as_slice());
     let system = call.system;
     let key = call.key.as_deref().unwrap_or_default();
     let jira = system == System::Jira;
@@ -323,17 +448,18 @@ pub async fn run(
         Action::List | Action::Search if jira => {
             let answer = get(
                 "jira.search",
-                json!({ "jql": jql(link, call), "max_results": call.limit }),
+                json!({ "jql": jql(link, call, targets), "max_results": call.limit }),
             )
             .await?;
-            Ok(
-                json!({ "issues": read(system, &listed(call.target().unwrap_or(&link.target)), &answer) }),
-            )
+            Ok(json!({ "issues": read_all(system, &listed(targets), &answer) }))
         }
+        Action::List if targets.len() > 1 => Err(RemoteError::Failed(format!(
+            "Say which team, in team: {}.",
+            sync::or_list(targets)
+        ))),
         Action::List => {
-            let team = call.team.as_deref().unwrap_or(&link.target);
             let mut args = json!({
-                "team_id": team_id(remote, link, team).await?,
+                "team_id": team_id(remote, link).await?,
                 "open_only": true,
                 "limit": call.limit,
             });
@@ -341,7 +467,7 @@ pub async fn run(
                 args["assignee_id"] = json!(link.me);
             }
             let answer = get("linear.issue_list", args).await?;
-            Ok(json!({ "issues": read(system, &listed(team), &answer) }))
+            Ok(json!({ "issues": read_all(system, &listed(targets), &answer) }))
         }
         Action::Search => {
             let query = call.query.as_deref().unwrap_or_default();
@@ -350,38 +476,41 @@ pub async fn run(
                 json!({ "query": query, "limit": call.limit }),
             )
             .await?;
-            Ok(json!({ "issues": read(system, "search results", &answer) }))
+            Ok(
+                json!({ "issues": read_all(system, &format!("search ({})", targets.join(", ")), &only_of(answer, targets)) }),
+            )
         }
         Action::Get => {
             let (issue, comments) = match jira {
-                true => (
-                    get("jira.get_issue", json!({ "issue_key": key })).await?,
-                    get("jira.list_comments", json!({ "issue_key": key })).await,
+                true => tokio::join!(
+                    get("jira.get_issue", json!({ "issue_key": key })),
+                    get("jira.list_comments", json!({ "issue_key": key })),
                 ),
-                false => (
-                    get("linear.issue_get", json!({ "identifier": key })).await?,
-                    get("linear.comment_list", json!({ "identifier": key })).await,
+                false => tokio::join!(
+                    get("linear.issue_get", json!({ "identifier": key })),
+                    get("linear.comment_list", json!({ "identifier": key })),
                 ),
             };
-            let mut out = json!({ "issue": read(system, key, &issue) });
-            match comments {
-                Ok(c) => out["comments"] = read(system, key, &c),
+            let issue = read_all(system, key, &issue?);
+            let left = MOST_ANSWER.saturating_sub(json_len(issue.as_str().unwrap_or_default()));
+            let mut out = json!({ "issue": issue });
+            match comments.map(|c| read(system, key, &c, left)) {
+                Ok(Some(c)) => out["comments"] = c,
+                Ok(None) => {
+                    out["comments_problem"] =
+                        json!("The issue alone fills the answer; its comments are left out.")
+                }
                 Err(e) => out["comments_problem"] = json!(e.to_string()),
             }
             Ok(out)
         }
         Action::Comment => {
-            let body = by.signed(call.text.as_deref().unwrap_or_default());
-            match jira {
-                true => get(
-                    "jira.add_comment",
-                    json!({ "issue_key": key, "body": body }),
-                ),
-                false => get(
-                    "linear.comment_add",
-                    json!({ "identifier": key, "body": body }),
-                ),
-            }
+            post_comment(
+                remote,
+                system,
+                key,
+                by.signed(call.text.as_deref().unwrap_or_default()),
+            )
             .await?;
             Ok(json!({ "done": format!("Commented on {key}, signed as {}.", by.mark()) }))
         }
@@ -389,20 +518,19 @@ pub async fn run(
             let answer = match jira {
                 true => get("jira.list_transitions", json!({ "issue_key": key })).await?,
                 false => {
-                    let team = call.target().unwrap_or(&link.target);
-                    let id = team_id(remote, link, team).await?;
+                    let id = team_id(remote, link).await?;
                     get("linear.states_list", json!({ "team_id": id })).await?
                 }
             };
             Ok(
-                json!({ "states": read(system, &format!("states ({})", call.target().unwrap_or(key)), &answer) }),
+                json!({ "states": read_all(system, &format!("states ({})", call.target().unwrap_or(key)), &answer) }),
             )
         }
         Action::Move => {
             let state = call.state.as_deref().unwrap_or_default();
             let team = match jira {
                 true => String::new(),
-                false => team_id(remote, link, call.target().unwrap_or(&link.target)).await?,
+                false => team_id(remote, link).await?,
             };
             let to = match sync::move_issue(remote, system, &team, key, state, || Ok(())).await? {
                 Moved::To(to) => to,
@@ -416,17 +544,12 @@ pub async fn run(
                     )))
                 }
             };
-            let note = by.signed(&format!("moved this to {to}."));
-            let noted = match jira {
-                true => get(
-                    "jira.add_comment",
-                    json!({ "issue_key": key, "body": note }),
-                ),
-                false => get(
-                    "linear.comment_add",
-                    json!({ "identifier": key, "body": note }),
-                ),
-            }
+            let noted = post_comment(
+                remote,
+                system,
+                key,
+                by.signed(&format!("moved this to {to}.")),
+            )
             .await;
             Ok(json!({ "done": match noted {
                 Ok(_) => format!("Moved {key} to {to}, with a note signed as {}.", by.mark()),

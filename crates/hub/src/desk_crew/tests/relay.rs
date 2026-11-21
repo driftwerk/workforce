@@ -300,12 +300,14 @@ async fn a_local_boss_reaches_its_groups_machine_sessions_through_desk() {
         assert_eq!(sent.level, workforce_common::oversight::Level::Act);
         assert!(sent.act.interrupt);
         assert_eq!(sent.input["session_id"], json!(remote.to_string()));
-        // It says when the Mac stops waiting for it, about its wait from now.
-        let left = sent.deadline - chrono::Utc::now();
-        let (low, high) = (chrono::Duration::seconds(20), chrono::Duration::seconds(30));
-        assert!(left > low && left <= high, "{left}");
+        // It says, as it is taken, how long the Mac still waits for it.
+        assert!(
+            (20_000..=30_000).contains(&sent.left_ms),
+            "{}",
+            sent.left_ms
+        );
         let wire = serde_json::to_value(&sent).unwrap();
-        assert!(wire["deadline"].is_string(), "{wire}");
+        assert_eq!(wire["leftMs"], json!(sent.left_ms), "{wire}");
 
         // Too large to carry: refused here, nothing queued.
         let before = seen.lock().len();

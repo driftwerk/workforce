@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 use workforce_agent::tools::registry::ToolRegistry;
 use workforce_agent::tools::{Tool, ToolResult};
-use workforce_desk::line::{LineTool, TOOLS};
+use workforce_desk::line::LineTool;
 use workforce_desk::{Desk, SessionMcp};
 
 use crate::mcp::{DirectExecutor, McpEndpoint, Surface};
@@ -65,9 +65,9 @@ impl LineMcp {
         Arc::new(Self { desk })
     }
 
-    fn endpoint(&self, caller: Uuid) -> McpEndpoint {
+    async fn endpoint(&self, caller: Uuid) -> McpEndpoint {
         let registry = ToolRegistry::new();
-        for def in &TOOLS {
+        for def in self.desk.line_tools(caller).await {
             registry.register(Arc::new(LineToolHandle {
                 caller,
                 def,
@@ -86,7 +86,7 @@ impl LineMcp {
 #[async_trait]
 impl SessionMcp for LineMcp {
     async fn answer(&self, caller: Uuid, body: &str) -> Option<String> {
-        self.endpoint(caller).handle(body).await
+        self.endpoint(caller).await.handle(body).await
     }
 }
 
@@ -95,8 +95,32 @@ mod tests {
     use serde_json::{json, Value};
     use workforce_postgres::test_support::with_test_pool;
 
+    use workforce_desk::line::TOOLS;
+
     use super::*;
     use crate::desk_crew::tests::{desk, hook_url, new_session};
+
+    /// Linear reached, Jira not.
+    struct OnlyLinear;
+
+    #[async_trait::async_trait]
+    impl workforce_desk::issues::Issues for OnlyLinear {
+        async fn issue(
+            &self,
+            _: &workforce_desk::issues::Asker,
+            _: &workforce_desk::issues::Asked,
+        ) -> Result<Value, String> {
+            Err("not here".into())
+        }
+
+        async fn offers(
+            &self,
+            _: &workforce_desk::issues::Asker,
+            system: workforce_desk::board::System,
+        ) -> bool {
+            system == workforce_desk::board::System::Linear
+        }
+    }
 
     async fn rpc(url: &str, body: Value) -> (reqwest::StatusCode, Value) {
         let response = reqwest::Client::new()
@@ -122,18 +146,34 @@ mod tests {
             assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
             d.serve_lines(LineMcp::new(d.clone()));
 
-            let (_, listed) = rpc(&url, json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).await;
-            let names: Vec<&str> = listed["result"]["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|t| t["name"].as_str().unwrap())
-                .collect();
-            let mut want: Vec<&str> = TOOLS.iter().map(|t| t.name).collect();
-            let mut got = names.clone();
-            want.sort();
-            got.sort();
-            assert_eq!(got, want);
+            let listed = async || {
+                let (_, listed) =
+                    rpc(&url, json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).await;
+                let mut names: Vec<String> = listed["result"]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|t| t["name"].as_str().unwrap().to_string())
+                    .collect();
+                names.sort();
+                names
+            };
+            let want = |offered: &[&str]| {
+                let mut want: Vec<String> = TOOLS
+                    .iter()
+                    .map(|t| t.name)
+                    .filter(|n| {
+                        workforce_desk::issues::system_of_tool(n).is_none() || offered.contains(n)
+                    })
+                    .map(str::to_string)
+                    .collect();
+                want.sort();
+                want
+            };
+            // An issue tool is offered only where its system is reached.
+            assert_eq!(listed().await, want(&[]));
+            d.issues_with(Arc::new(OnlyLinear));
+            assert_eq!(listed().await, want(&["linear"]));
 
             let (_, told) = rpc(
                 &url,
@@ -167,7 +207,7 @@ mod tests {
             let ok = bearer(token).await.unwrap();
             assert_eq!(ok.status(), reqwest::StatusCode::OK);
             let listed: Value = ok.json().await.unwrap();
-            assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), TOOLS.len());
+            assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), TOOLS.len() - 1);
             assert_eq!(bearer("nope").await.unwrap().status(), reqwest::StatusCode::NOT_FOUND);
 
             // A wrong token is answered nothing.

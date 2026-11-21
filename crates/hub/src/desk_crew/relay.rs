@@ -81,12 +81,12 @@ pub struct RelayCall {
     /// no more than these and its grant's.
     pub level: workforce_common::oversight::Level,
     pub act: workforce_common::oversight::Act,
-    /// When this hub stops waiting for its answer: Desk's native side sends
-    /// nothing it can't carry by then, so a call the boss was told may
-    /// not have been done is never done later. Desk leaves it out of what
-    /// it sends the machine, whose `served` route refuses a field it
-    /// doesn't know.
-    pub deadline: chrono::DateTime<chrono::Utc>,
+    /// How long, in milliseconds as it is taken, this hub still waits for
+    /// its answer: Desk's native side sends nothing it can't carry in that
+    /// time, so a call the boss was told may not have been done is never
+    /// done later. Desk leaves it out of what it sends the machine, whose
+    /// `served` route refuses a field it doesn't know.
+    pub left_ms: u64,
 }
 
 /// What a machine answered.
@@ -102,18 +102,44 @@ impl Ticketed for RelayCall {
     fn ticket(&self) -> Uuid {
         self.id
     }
+
+    fn left(&mut self, left: Duration) {
+        self.left_ms = u64::try_from(left.as_millis()).unwrap_or(u64::MAX);
+    }
 }
 
 /// The Mac's relay: what waits to be taken, and who waits for each answer.
 pub(crate) type Relays = Pickup<RelayCall, RelayAnswer>;
 
-/// How much the Mac's relay holds.
-pub(crate) const LIMITS: Limits = Limits {
-    most_queued: MOST_QUEUED,
-    most_waiting: MOST_WAITING,
-    most_taken: MOST_TAKEN,
-    poll_for: POLL_FOR,
-};
+/// An empty relay.
+pub(crate) fn relays() -> Relays {
+    Pickup::new(Limits {
+        most_queued: MOST_QUEUED,
+        most_waiting: MOST_WAITING,
+        most_taken: MOST_TAKEN,
+        poll_for: POLL_FOR,
+    })
+}
+
+/// When Desk's native side last reached this hub by any of its routes.
+#[derive(Default)]
+pub(crate) struct NativeSeen(parking_lot::Mutex<Option<std::time::Instant>>);
+
+impl NativeSeen {
+    pub(crate) fn mark(&self) {
+        *self.0.lock() = Some(std::time::Instant::now());
+    }
+
+    /// Whether it did within `within`.
+    pub(crate) fn within(&self, within: Duration) -> bool {
+        self.0.lock().is_some_and(|at| at.elapsed() < within)
+    }
+}
+
+/// What a native route's state notes of Desk's native side reaching it.
+pub(crate) trait Native {
+    fn reached(&self) {}
+}
 
 /// What only Desk's own plan runner asks a machine through the relay, never
 /// a boss's tool: its sessions, a new session started there, and a plan
@@ -201,8 +227,7 @@ impl CrewHub {
             link_id: RELAY_LINK,
             level: ceiling.level,
             act: ceiling.act,
-            deadline: chrono::Utc::now()
-                + chrono::Duration::from_std(wait).unwrap_or(chrono::Duration::seconds(30)),
+            left_ms: 0,
         };
         // Too large to carry: never queued, so nothing of it is done.
         if serde_json::to_vec(&call).map_or(usize::MAX, |b| b.len()) > MOST_CALL {
@@ -220,7 +245,7 @@ impl CrewHub {
             Err(Unsent::Taken) => Err(MachineRefused::Unknown(format!(
                 "Sent to {machine}, but its outcome isn't known yet: check {machine}'s session (crew.history) before you try it again."
             ))),
-            Err(Unsent::Unqueued | Unsent::NotTaken) => Err(unreached()),
+            Err(Unsent::NotPolling | Unsent::Full | Unsent::NotTaken) => Err(unreached()),
         }
     }
 
@@ -292,9 +317,10 @@ struct RelayApi {
 
 type S = State<Arc<RelayApi>>;
 
+/// A native route's query: a `token` in it is refused.
 #[derive(Deserialize)]
-struct TokenQuery {
-    token: Option<String>,
+pub(crate) struct TokenQuery {
+    pub(crate) token: Option<String>,
 }
 
 /// What Desk asks the machines' grants with: `plans=1` from one that
@@ -340,17 +366,27 @@ pub(crate) fn not_native(
     })
 }
 
+/// Returns the refusal when the request isn't Desk's native side's, and
+/// notes that it reached `$s` when it is.
 macro_rules! native {
-    ($s:expr, $h:expr, $q:expr) => {
-        if let Some(r) = not_native(&$s.state, &$h, $q.token.as_deref()) {
+    ($s:expr, $h:expr, $token:expr) => {
+        if let Some(r) = $crate::desk_crew::relay::not_native(&$s.state, &$h, $token) {
             return r;
         }
+        $crate::desk_crew::relay::Native::reached(&*$s);
     };
+}
+pub(crate) use native;
+
+impl Native for RelayApi {
+    fn reached(&self) {
+        self.crew.native.mark();
+    }
 }
 
 /// On the Mac: the calls queued for machines.
 async fn take(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>) -> Response {
-    native!(s, h, q);
+    native!(s, h, q.token.as_deref());
     Json(s.crew.relay_take(POLL_FOR).await).into_response()
 }
 
@@ -362,7 +398,7 @@ async fn answer(
     Path(id): Path<Uuid>,
     body: Bytes,
 ) -> Response {
-    native!(s, h, q);
+    native!(s, h, q.token.as_deref());
     if body.len() > MOST_ANSWER {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -407,7 +443,7 @@ struct Relayed {
 /// On the machine: a boss's call relayed from the home, decided under the
 /// machine's grant for its group.
 async fn served(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>, body: Bytes) -> Response {
-    native!(s, h, q);
+    native!(s, h, q.token.as_deref());
     let bad = |why: &str| (StatusCode::BAD_REQUEST, Json(json!({"error": why}))).into_response();
     let Ok(r) = serde_json::from_slice::<Relayed>(&body) else {
         return bad("that isn't a relayed call");
@@ -484,7 +520,7 @@ async fn served(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>, body: By
 /// this hub's own group bosses ([`super::machine_grants`]), for Desk's
 /// native side to carry to them.
 async fn machine_grants(State(s): S, h: HeaderMap, Query(q): Query<GrantsQuery>) -> Response {
-    native!(s, h, TokenQuery { token: q.token });
+    native!(s, h, q.token.as_deref());
     match s.crew.machine_grants(q.plans.as_deref() == Some("1")) {
         Some(w) => Json(w).into_response(),
         // Not known yet: Desk writes nothing, and deletes nothing, until it is.

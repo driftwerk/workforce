@@ -1175,7 +1175,7 @@ pub async fn mount(
     // on a machine, through Desk on the person's Mac.
     let issues_routes = match is_machine(&config.desk) {
         true => {
-            let issues = crate::desk_issues::MachineIssues::new();
+            let issues = crate::desk_issues::MachineIssues::new(Arc::clone(&crew.native));
             desk.issues_with(Arc::clone(&issues) as _);
             crate::desk_issues::machine_routes(Arc::clone(state), issues)
         }

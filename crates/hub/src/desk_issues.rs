@@ -28,7 +28,6 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -38,13 +37,17 @@ use workforce_desk::board_sync::RemoteError;
 use workforce_desk::issues::{self, Asked, Asker, By, Issues};
 
 use crate::desk_board_sync::{paused_words, refusal, BoardSync};
-use crate::desk_crew::relay::{machine_ok, not_native};
+use crate::desk_crew::relay::{machine_ok, native, Native, NativeSeen, TokenQuery};
 use crate::desk_pickup::{Limits, Pickup, Ticketed, Unsent};
 use crate::gateway::GatewayState;
 
-/// How long a served call's id is remembered, and how many at most.
+/// How long a served call's id is remembered, and how many at most: a
+/// machine's call waits [`issues::WAIT`], so ten minutes outlasts any.
 const SERVED_FOR: Duration = Duration::from_secs(10 * 60);
-const MOST_SERVED: usize = 1024;
+const MOST_SERVED: usize = 4096;
+/// How long since Desk's native side reached a machine by its other routes
+/// it may be said to be an older Desk, when it never asked for calls.
+const NATIVE_LATELY: Duration = Duration::from_secs(5 * 60);
 /// The largest call or answer carried.
 const MOST_BODY: usize = 256 * 1024;
 /// What a machine keeps back of a session's wait, for the answer to reach
@@ -102,8 +105,34 @@ impl HomeIssues {
     }
 
     /// `asked`, made from the session named `session` with id `id` (on
-    /// `machine`, when it runs on one).
+    /// `machine`, when it runs on one), in [`issues::RUN_FOR`] at most.
     pub(crate) async fn serve(
+        &self,
+        session: &str,
+        id: Uuid,
+        machine: Option<&str>,
+        asked: &Asked,
+    ) -> Result<Value, String> {
+        tokio::time::timeout(issues::RUN_FOR, self.run(session, id, machine, asked))
+            .await
+            .unwrap_or_else(|_| Err(issues::no_answer(asked)))
+    }
+
+    /// The links of `system` the session with id `id` (on `machine`) reaches.
+    async fn links(
+        &self,
+        system: System,
+        id: Uuid,
+        machine: Option<&str>,
+    ) -> Result<Vec<Sync>, String> {
+        let key = machine.map_or_else(|| id.to_string(), |m| format!("{m}/{id}"));
+        self.sync.desk.issue_links(system, &key).await.map_err(|e| {
+            tracing::warn!(error = %e, "the boards' links couldn't be read for a session");
+            "Desk couldn't read its boards just now; try again.".to_string()
+        })
+    }
+
+    async fn run(
         &self,
         session: &str,
         id: Uuid,
@@ -112,23 +141,9 @@ impl HomeIssues {
     ) -> Result<Value, String> {
         let call = issues::call_of(asked.system, &asked.input)?;
         let title = asked.system.title();
-        let links = self
-            .sync
-            .desk
-            .issue_links(
-                asked.system,
-                &machine.map_or_else(|| id.to_string(), |m| format!("{m}/{id}")),
-            )
-            .await
-            .map_err(|e| {
-                tracing::warn!(error = %e, "the boards' links couldn't be read for a session");
-                "Desk couldn't read its boards just now; try again.".to_string()
-            })?;
-        let Some(link) = issues::pick(&links, &call) else {
-            return Err(format!(
-                "No board this session reaches in Desk is linked to {title}. Link one (Board, then Link to {title}) and the sessions that reach it get {title} through it."
-            ));
-        };
+        let links = self.links(asked.system, id, machine).await?;
+        let picked = issues::pick(&links, &call)?;
+        let link = picked.link;
         let hub = self.sync.hub_name(&link.via).await;
         let remote = self
             .sync
@@ -152,38 +167,49 @@ impl HomeIssues {
             session: session.to_string(),
             machine: machine.map(str::to_string),
         };
-        match tokio::time::timeout(issues::RUN_FOR, issues::run(&*remote, link, &call, &by)).await
-        {
-            Ok(Ok(answer)) => Ok(answer),
-            Ok(Err(RemoteError::Waiting { .. })) => Err(format!(
+        match issues::run(&*remote, &picked, &call, &by).await {
+            Ok(answer) => Ok(answer),
+            Err(RemoteError::Waiting { .. }) => Err(format!(
                 "That waits for the person's approval on {hub}, which holds the {title} key; it goes through once they approve it there."
             )),
-            Ok(Err(e)) => Err(format!("{title} through {hub}: {e}")),
-            Err(_) => Err(issues::no_answer(asked)),
+            Err(e) => Err(format!("{title} through {hub}: {e}")),
         }
     }
 
-    /// Whether call `id` comes for the first time: each is served once.
-    fn first_time(&self, id: Uuid) -> bool {
+    /// Whether call `id` may be served: each once, and none while every
+    /// id kept is still within its window, so none is forgotten early.
+    fn first_time(&self, id: Uuid) -> Fresh {
         let mut served = self.served.lock();
         served.retain(|_, at| at.elapsed() < SERVED_FOR);
         if served.contains_key(&id) {
-            return false;
+            return Fresh::Served;
         }
         if served.len() >= MOST_SERVED {
-            if let Some(oldest) = served.iter().min_by_key(|(_, at)| **at).map(|(i, _)| *i) {
-                served.remove(&oldest);
-            }
+            return Fresh::Full;
         }
         served.insert(id, Instant::now());
-        true
+        Fresh::Yes
     }
+}
+
+/// Whether a call may be served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fresh {
+    Yes,
+    Served,
+    Full,
 }
 
 #[async_trait]
 impl Issues for HomeIssues {
     async fn issue(&self, asker: &Asker, asked: &Asked) -> Result<Value, String> {
         self.serve(&asker.name, asker.session, None, asked).await
+    }
+
+    async fn offers(&self, asker: &Asker, system: System) -> bool {
+        self.links(system, asker.session, None)
+            .await
+            .is_ok_and(|l| !l.is_empty())
     }
 }
 
@@ -200,25 +226,32 @@ pub(crate) struct RelayCall {
     /// That session's id on this machine.
     pub session_id: Uuid,
     pub input: Value,
-    /// When the machine stops waiting for its answer: nothing is carried
-    /// past it.
-    pub deadline: DateTime<Utc>,
+    /// How long, in milliseconds as it is taken, the machine still waits
+    /// for its answer: nothing is carried past it.
+    pub left_ms: u64,
 }
 
 impl Ticketed for RelayCall {
     fn ticket(&self) -> Uuid {
         self.id
     }
+
+    fn left(&mut self, left: Duration) {
+        self.left_ms = u64::try_from(left.as_millis()).unwrap_or(u64::MAX);
+    }
 }
 
 pub(crate) struct MachineIssues {
     pickup: Pickup<RelayCall, Answer>,
+    native: Arc<NativeSeen>,
 }
 
 impl MachineIssues {
-    pub(crate) fn new() -> Arc<Self> {
+    /// Its calls, for a Desk whose last visits by any route `native` notes.
+    pub(crate) fn new(native: Arc<NativeSeen>) -> Arc<Self> {
         Arc::new(Self {
             pickup: Pickup::new(LIMITS),
+            native,
         })
     }
 }
@@ -231,6 +264,14 @@ fn not_connected(system: System) -> String {
     )
 }
 
+/// What a session hears when Desk took its call and no answer came back.
+fn carried_no_answer(asked: &Asked) -> String {
+    match asked.action().is_some_and(issues::Action::writes) {
+        true => "Sent to Desk on your Mac, but no answer came back in time: it may have gone through. Read the issue (get) before you try again.".into(),
+        false => "Sent to Desk on your Mac, but no answer came back in time; try again.".into(),
+    }
+}
+
 #[async_trait]
 impl Issues for MachineIssues {
     async fn issue(&self, asker: &Asker, asked: &Asked) -> Result<Value, String> {
@@ -241,8 +282,7 @@ impl Issues for MachineIssues {
             session: asker.name.clone(),
             session_id: asker.session,
             input: asked.input.clone(),
-            deadline: Utc::now()
-                + chrono::Duration::from_std(wait).unwrap_or(chrono::Duration::zero()),
+            left_ms: 0,
         };
         if serde_json::to_vec(&call).map_or(usize::MAX, |b| b.len()) > MOST_BODY {
             return Err("That call is too large to carry; send less in it.".into());
@@ -250,31 +290,28 @@ impl Issues for MachineIssues {
         match self.pickup.send(call, wait).await {
             Ok(Answer::Ok(v)) => Ok(v),
             Ok(Answer::Error(e)) => Err(e),
-            Err(Unsent::Taken) => Err(issues::no_answer(asked)),
-            Err(Unsent::Unqueued | Unsent::NotTaken) => Err(not_connected(asked.system)),
+            Err(Unsent::Taken) => Err(carried_no_answer(asked)),
+            Err(Unsent::Full) => {
+                Err("Too many calls wait for Desk on your Mac; try again in a moment.".into())
+            }
+            Err(Unsent::NotPolling)
+                if !self.pickup.polled_ever() && self.native.within(NATIVE_LATELY) =>
+            {
+                Err("Desk on the Mac needs an update to give machines Linear and Jira.".into())
+            }
+            Err(Unsent::NotPolling | Unsent::NotTaken) => Err(not_connected(asked.system)),
         }
     }
 }
 
 // ── Routes ───────────────────────────────────────────────────────────────
 
-#[derive(Deserialize)]
-struct TokenQuery {
-    token: Option<String>,
-}
-
 struct Api<T> {
     state: Arc<GatewayState>,
     issues: Arc<T>,
 }
 
-macro_rules! native {
-    ($s:expr, $h:expr, $q:expr) => {
-        if let Some(r) = not_native(&$s.state, &$h, $q.token.as_deref()) {
-            return r;
-        }
-    };
-}
+impl<T> Native for Api<T> {}
 
 /// On a machine: its sessions' queued calls.
 async fn take(
@@ -282,7 +319,7 @@ async fn take(
     h: HeaderMap,
     Query(q): Query<TokenQuery>,
 ) -> Response {
-    native!(s, h, q);
+    native!(s, h, q.token.as_deref());
     Json(s.issues.pickup.take(LIMITS.poll_for).await).into_response()
 }
 
@@ -294,7 +331,7 @@ async fn answer(
     Path(id): Path<Uuid>,
     body: Bytes,
 ) -> Response {
-    native!(s, h, q);
+    native!(s, h, q.token.as_deref());
     if body.len() > MOST_BODY {
         return refusal(StatusCode::PAYLOAD_TOO_LARGE, "that answer is too large");
     }
@@ -328,7 +365,7 @@ async fn served(
     Query(q): Query<TokenQuery>,
     body: Bytes,
 ) -> Response {
-    native!(s, h, q);
+    native!(s, h, q.token.as_deref());
     if body.len() > MOST_BODY {
         return refusal(StatusCode::PAYLOAD_TOO_LARGE, "that call is too large");
     }
@@ -341,8 +378,15 @@ async fn served(
             "that call doesn't say its machine and session",
         );
     }
-    if !s.issues.first_time(c.id) {
-        return refusal(StatusCode::CONFLICT, "that call was served already");
+    match s.issues.first_time(c.id) {
+        Fresh::Yes => {}
+        Fresh::Served => return refusal(StatusCode::CONFLICT, "that call was served already"),
+        Fresh::Full => {
+            return refusal(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many machines' calls were served lately; try again in a moment",
+            )
+        }
     }
     let asked = Asked {
         system: c.system,
