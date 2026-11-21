@@ -99,12 +99,11 @@ fn claude_listing(dir: &Path, listed: Option<&[serde_json::Value]>) -> PathBuf {
         }
         None => "echo 'no agents' >&2; exit 1".into(),
     };
-    std::fs::write(
+    workforce_common::executable::write(
         &path,
         format!("#!/bin/sh\nif [ \"$1\" = agents ]; then {agents}; exit 0; fi\nexec sleep 60\n"),
     )
     .unwrap();
-    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     path
 }
 

@@ -17,6 +17,8 @@ pub mod delivery;
 pub mod emoji;
 pub mod engagement;
 pub mod errors;
+#[cfg(unix)]
+pub mod executable;
 pub mod heartbeat_check;
 pub mod identity;
 pub mod inherited_secrets;

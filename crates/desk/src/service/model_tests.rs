@@ -2,8 +2,6 @@
 //! on every resume of it, kept with it, and only ever a model's name on its
 //! CLI's command line.
 
-use std::os::unix::fs::PermissionsExt;
-
 use super::tests::options;
 use super::*;
 use crate::store::{build_pool, tests::record_fixture};
@@ -13,7 +11,7 @@ use workforce_postgres::test_support::with_test_pool;
 /// line each, and stays up until killed.
 fn logging_cli(dir: &Path) -> PathBuf {
     let path = dir.join("logging-claude");
-    std::fs::write(
+    workforce_common::executable::write(
         &path,
         format!(
             "#!/bin/sh\ncase \"$*\" in *session-id*|*--resume*) echo \"$@\" >> '{}/starts' ;; esac\nexec sleep 60\n",
@@ -21,7 +19,6 @@ fn logging_cli(dir: &Path) -> PathBuf {
         ),
     )
     .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
 }
 

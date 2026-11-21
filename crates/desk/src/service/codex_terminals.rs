@@ -386,8 +386,6 @@ mod tests {
         assert_eq!(codex_in(&table, 60).map(|p| p.pid), Some(62));
     }
 
-    use std::os::unix::fs::PermissionsExt;
-
     /// A session as the test reads it: id, engine, Codex's id, state, terminal.
     type Row = (Uuid, Engine, Option<String>, SessionState, Option<Uuid>);
     use tokio_util::sync::CancellationToken;
@@ -396,8 +394,8 @@ mod tests {
     /// A `codex` that is a process of that name running `resume <id>`.
     fn fake_codex(dir: &std::path::Path) -> PathBuf {
         let bin = dir.join("codex");
-        std::fs::write(&bin, "#!/bin/bash\nexec -a \"codex $*\" sleep 60\n").unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        workforce_common::executable::write(&bin, "#!/bin/bash\nexec -a \"codex $*\" sleep 60\n")
+            .unwrap();
         bin
     }
 
@@ -715,12 +713,11 @@ mod tests {
             let cwd = dir.path().to_string_lossy().into_owned();
             // A `claude` that runs `codex exec` as a tool would.
             let bin = dir.path().join("claude");
-            std::fs::write(
+            workforce_common::executable::write(
                 &bin,
                 "#!/bin/bash\nexec -a claude bash -c '(exec -a \"codex exec x\" sleep 60) & wait'\n",
             )
             .unwrap();
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
             let mut opts = crate::testing::options(dir.path());
             opts.env = std::collections::BTreeMap::from([
                 ("PATH".into(), "/usr/bin:/bin".into()),

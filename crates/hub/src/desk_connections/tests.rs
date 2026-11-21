@@ -2612,16 +2612,14 @@ mod setups {
 
     /// A stand-in `gh`, signed in as Sarah: it never reaches the real one.
     fn fake_gh(dir: &std::path::Path) -> super::gh::GhCli {
-        use std::os::unix::fs::PermissionsExt;
         let bin = dir.join("gh");
-        std::fs::write(
+        workforce_common::executable::write(
             &bin,
             format!(
                 "#!/bin/sh\ncase \"$1\" in\n  api) printf 'HTTP/2.0 200 OK\\nX-Oauth-Scopes: repo, read:org\\n\\n{{\"login\":\"sarah\"}}' ;;\n  auth) printf '%s\\n' '{GH_GOOD}' ;;\n  *) exit 1 ;;\nesac\n"
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         super::gh::GhCli::at(bin)
     }
 

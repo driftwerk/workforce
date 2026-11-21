@@ -37,7 +37,7 @@ const REFUSED: &str = "sk-ant-oat01-good-refused-5555555555abcdefghijklmnopqr";
 fn claude(dir: &Path) -> PathBuf {
     let path = dir.join("claude");
     let d = dir.display();
-    std::fs::write(
+    workforce_common::executable::write(
         &path,
         format!(
             "#!/bin/sh\ncase \"$1 $2\" in\n\
@@ -80,7 +80,6 @@ fn claude(dir: &Path) -> PathBuf {
         ),
     )
     .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
 }
 
@@ -483,7 +482,7 @@ async fn a_sign_in_from_another_computer_is_given_the_page_that_comes_back_by_it
 fn codex(dir: &Path) -> PathBuf {
     let path = dir.join("codex");
     let d = dir.display();
-    std::fs::write(
+    workforce_common::executable::write(
         &path,
         format!(
             "#!/bin/sh\ncase \"$1 $2\" in\n\
@@ -500,7 +499,6 @@ fn codex(dir: &Path) -> PathBuf {
         ),
     )
     .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
 }
 
@@ -634,7 +632,7 @@ fn devin(dir: &Path) -> PathBuf {
     }
     let path = dir.join("devin");
     let d = dir.display();
-    std::fs::write(
+    workforce_common::executable::write(
         &path,
         format!(
             "#!/bin/sh\n\
@@ -672,7 +670,6 @@ fn devin(dir: &Path) -> PathBuf {
         ),
     )
     .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
 }
 

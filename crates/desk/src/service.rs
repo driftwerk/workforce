@@ -8612,14 +8612,12 @@ mod tests {
     use crate::store::{build_pool, tests::record_fixture};
     use chrono::SubsecRound;
     use serde_json::json;
-    use std::os::unix::fs::PermissionsExt;
     use workforce_postgres::test_support::with_test_pool;
 
     /// A stand-in CLI that stays up until killed, ignoring its arguments.
     pub(super) fn fake_cli(dir: &Path) -> PathBuf {
         let path = dir.join("fake-cli");
-        std::fs::write(&path, "#!/bin/sh\nexec sleep 60\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        workforce_common::executable::write(&path, "#!/bin/sh\nexec sleep 60\n").unwrap();
         path
     }
 
@@ -9183,8 +9181,8 @@ mod tests {
             let (_hdir, socket, holder_cancel) = crate::holder::tests::holder().await;
             let dir = tempfile::tempdir().unwrap();
             let cli = dir.path().join("deaf-cli");
-            std::fs::write(&cli, "#!/bin/sh\ntrap '' HUP\nexec sleep 60\n").unwrap();
-            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+            workforce_common::executable::write(&cli, "#!/bin/sh\ntrap '' HUP\nexec sleep 60\n")
+                .unwrap();
             let mut opts = options(dir.path());
             opts.programs = crate::testing::programs(cli.clone(), cli);
             opts.holder = Some(HolderOptions {
@@ -9543,7 +9541,7 @@ mod tests {
             // Records its arguments and what it reads light or dark from.
             let cli = dir.path().join("recording-cli");
             let out = dir.path().join("launched");
-            std::fs::write(
+            workforce_common::executable::write(
                 &cli,
                 format!(
                     "#!/bin/sh\nprintf '%s\\n' \"$COLORFGBG\" \"$@\" > '{}'\nexec sleep 60\n",
@@ -9551,7 +9549,6 @@ mod tests {
                 ),
             )
             .unwrap();
-            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
             let mut opts = options(dir.path());
             opts.programs = crate::testing::programs(cli, fake_cli(dir.path()));
             opts.env
@@ -9793,7 +9790,7 @@ mod tests {
     /// otherwise keeps its environment where the test reads it.
     fn signed_in_cli(dir: &Path) -> PathBuf {
         let path = dir.join("signed-in-cli");
-        std::fs::write(
+        workforce_common::executable::write(
             &path,
             format!(
                 "#!/bin/sh\ncase \"$1 $2\" in\n\
@@ -9806,7 +9803,6 @@ mod tests {
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
 
@@ -10056,7 +10052,7 @@ mod tests {
     /// running, its pid where the test reads it once it runs as that shell.
     fn shell_cli(dir: &Path) -> PathBuf {
         let path = dir.join("shell-cli");
-        std::fs::write(
+        workforce_common::executable::write(
             &path,
             format!(
                 "#!/bin/sh\n/bin/sh -c 'echo $$ > \"$1\"; sleep 60; true' \
@@ -10065,7 +10061,6 @@ mod tests {
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
 
@@ -10410,7 +10405,7 @@ mod tests {
     /// `ok` is in `dir`; then it stays up until killed.
     fn failing_cli(dir: &Path) -> PathBuf {
         let path = dir.join("failing-cli");
-        std::fs::write(
+        workforce_common::executable::write(
             &path,
             format!(
                 "#!/bin/sh\n[ -e '{}/ok' ] && exec sleep 60\nprintf 'Starting\\n\\033[31merror: unknown model opus-9\\033[0m\\n'\nexit 3\n",
@@ -10418,7 +10413,6 @@ mod tests {
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
 
@@ -10807,7 +10801,7 @@ mod tests {
             // As a Claude Code that handles SIGHUP and SIGTERM and never
             // gets to act on them.
             let stubborn = dir.path().join("stubborn-cli");
-            std::fs::write(
+            workforce_common::executable::write(
                 &stubborn,
                 format!(
                     "#!/bin/sh\ntrap '' HUP TERM\nsleep 300 &\necho $! > {}\nwhile :; do sleep 1; done\n",
@@ -10815,7 +10809,6 @@ mod tests {
                 ),
             )
             .unwrap();
-            std::fs::set_permissions(&stubborn, std::fs::Permissions::from_mode(0o755)).unwrap();
             let mut opts = options(dir.path());
             opts.programs = crate::testing::programs(stubborn.clone(), stubborn);
             DeskStore::migrate(&pool).await.unwrap();
@@ -11985,12 +11978,11 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             // A CLI that prints, in hex, the first byte it is sent.
             let cli = dir.path().join("esc-cli");
-            std::fs::write(
+            workforce_common::executable::write(
                 &cli,
                 "#!/bin/sh\nstty raw -echo\nhead -c 1 | od -An -tx1\nexec sleep 60\n",
             )
             .unwrap();
-            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
             let (d, logged) = logged_desk(pool, dir.path(), cli).await;
             let s = new_session(&d, dir.path()).await;
             tokio::time::sleep(Duration::from_millis(300)).await;
@@ -12027,7 +12019,6 @@ mod tests {
 #[cfg(test)]
 mod codex_stop_tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     fn alive(pid: i32) -> bool {
         // SAFETY: signal 0 only checks that the process exists.
@@ -12048,7 +12039,7 @@ mod codex_stop_tests {
     /// file and both pids where the test reads them.
     fn busy_server(dir: &Path) -> PathBuf {
         let path = dir.join("busy-codex");
-        std::fs::write(
+        workforce_common::executable::write(
             &path,
             format!(
                 "#!/bin/sh\ntrap '' HUP TERM\n\
@@ -12061,7 +12052,6 @@ mod codex_stop_tests {
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
 
