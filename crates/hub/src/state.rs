@@ -897,25 +897,7 @@ mod tests {
     /// Weaviate's boot messages are as operators know them.
     #[tokio::test]
     async fn a_weaviate_that_does_not_come_up_is_reported_in_its_own_words() {
-        use std::sync::Mutex;
-        #[derive(Clone, Default)]
-        struct Captured(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Captured {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let captured = Captured::default();
-        let writer = captured.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .finish();
-        let logging = tracing::subscriber::set_default(subscriber);
+        let (captured, logging, _others) = crate::log_testing::Lines::capture();
         let store = workforce_memory::weaviate::WeaviateStore::new("http://127.0.0.1:1", None);
         let pace = ReadinessPace {
             first_check_floor: std::time::Duration::from_millis(200),
@@ -937,8 +919,8 @@ mod tests {
                 .contains("Weaviate unavailable after 1s"),
             "{refused}"
         );
-        let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
-        assert!(logged.contains("Weaviate not ready ("), "{logged}");
+        let warned = captured.at("WARN", "Weaviate not ready (");
+        assert!(!warned.is_empty(), "{}", captured.text());
     }
 
     /// A missing tenant is for an operator to create: boot fails at once

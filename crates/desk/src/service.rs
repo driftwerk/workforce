@@ -3374,6 +3374,14 @@ impl Desk {
             .collect()
     }
 
+    /// Every change from now, without a snapshot. A loop that listens
+    /// subscribes before it is spawned (its `fn` returns the future it
+    /// runs): nothing that happens once its owner has started is missed
+    /// while the loop starts.
+    pub fn events(&self) -> broadcast::Receiver<DeskEvent> {
+        self.0.events.subscribe()
+    }
+
     /// The current snapshot and every change after it.
     pub fn subscribe(&self) -> (DeskEvent, broadcast::Receiver<DeskEvent>) {
         let rx = self.0.events.subscribe();
@@ -4885,6 +4893,16 @@ impl Desk {
                 st.restarted.remove(&id);
             }
         }
+        // Said before the change below: whoever watches never sees its
+        // turn over without why.
+        if let Some(by) = by {
+            let view = self.view(id)?;
+            self.note(by.event(
+                Kind::Interrupted,
+                Some(Party::session(&view)),
+                format!("interrupted {}", view.label()),
+            ));
+        }
         // Claude Code runs no hook for an interrupted turn, nor for a
         // dialog Esc turned down: that wait is over, and what queues
         // behind it shows next (its own notice, for one its terminal asks).
@@ -4907,15 +4925,7 @@ impl Desk {
         // The turn is over: what waited for its next tool call goes in at
         // the idle.
         self.steers_released(id);
-        let view = self.view(id)?;
-        if let Some(by) = by {
-            self.note(by.event(
-                Kind::Interrupted,
-                Some(Party::session(&view)),
-                format!("interrupted {}", view.label()),
-            ));
-        }
-        Ok(view)
+        self.view(id)
     }
 
     /// Its Act fully boss clears the prompt `pending` only `id`'s terminal's

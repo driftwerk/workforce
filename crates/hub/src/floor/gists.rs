@@ -1430,6 +1430,7 @@ mod tests {
     use workforce_desk::gist::Said;
 
     use super::*;
+    use crate::log_testing::Lines;
 
     #[derive(Default)]
     struct Memory {
@@ -2421,48 +2422,6 @@ mod tests {
         settle().await;
         assert!(memory.written.lock().is_empty());
         assert!(model.asked.lock().is_empty());
-    }
-
-    /// What the log says while the guard is held, every level from debug.
-    #[derive(Clone, Default)]
-    struct Lines(Arc<Mutex<Vec<u8>>>);
-
-    impl std::io::Write for Lines {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl Lines {
-        fn capture() -> (Self, tracing::dispatcher::DefaultGuard, tracing::Dispatch) {
-            let lines = Self::default();
-            let writer = lines.clone();
-            let dispatch = tracing::Dispatch::new(
-                tracing_subscriber::fmt()
-                    .with_writer(move || writer.clone())
-                    .with_ansi(false)
-                    .with_max_level(tracing::Level::DEBUG)
-                    .finish(),
-            );
-            // A second dispatcher makes every callsite ask each one, so
-            // another test's thread can't leave one uninterested.
-            let others = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
-            let guard = tracing::dispatcher::set_default(&dispatch);
-            (lines, guard, others)
-        }
-
-        /// The lines at `level` that say `text`.
-        fn at(&self, level: &str, text: &str) -> Vec<String> {
-            String::from_utf8_lossy(&self.0.lock())
-                .lines()
-                .filter(|l| l.contains(&format!(" {level} ")) && l.contains(text))
-                .map(str::to_string)
-                .collect()
-        }
     }
 
     #[tokio::test(start_paused = true)]

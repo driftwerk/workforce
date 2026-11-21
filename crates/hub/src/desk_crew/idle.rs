@@ -184,58 +184,63 @@ struct Seen {
     ends: HashMap<Uuid, Event>,
 }
 
-pub(super) async fn idle_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
-    let (_, mut events) = crew.desk.subscribe();
-    let mut sweep = tokio::time::interval(SWEEP);
-    sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let seen: Arc<parking_lot::Mutex<Seen>> = Arc::default();
-    let mut slots: HashMap<String, Arc<tokio::sync::Semaphore>> = HashMap::new();
-    loop {
-        let sessions: Vec<Uuid> = tokio::select! {
-            () = cancel.cancelled() => return,
-            received = events.recv() => match received {
-                Ok(DeskEvent::Activity { event }) if event.kind == Kind::Finished => {
-                    let session: Option<Uuid> = super::watcher::finished_session(&event);
-                    if let Some(id) = session {
-                        seen.lock().ends.insert(id, *event);
+pub(super) fn idle_loop(
+    crew: Arc<CrewHub>,
+    cancel: CancellationToken,
+) -> impl std::future::Future<Output = ()> {
+    let mut events = crew.desk.events();
+    async move {
+        let mut sweep = tokio::time::interval(SWEEP);
+        sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let seen: Arc<parking_lot::Mutex<Seen>> = Arc::default();
+        let mut slots: HashMap<String, Arc<tokio::sync::Semaphore>> = HashMap::new();
+        loop {
+            let sessions: Vec<Uuid> = tokio::select! {
+                () = cancel.cancelled() => return,
+                received = events.recv() => match received {
+                    Ok(DeskEvent::Activity { event }) if event.kind == Kind::Finished => {
+                        let session: Option<Uuid> = super::watcher::finished_session(&event);
+                        if let Some(id) = session {
+                            seen.lock().ends.insert(id, *event);
+                        }
+                        session.into_iter().collect()
                     }
-                    session.into_iter().collect()
-                }
-                Ok(_) => continue,
-                Err(RecvError::Lagged(_)) => finished(&crew),
-                Err(RecvError::Closed) => return,
-            },
-            _ = sweep.tick() => match crew.desk.any_boss_unbound() {
-                true => finished(&crew),
-                false => Vec::new(),
-            },
-        };
-        crew.note_unbound(&seen);
-        for id in sessions {
-            crew.look_at_finished(id, &seen, &cancel, &mut slots);
-        }
-        for (boss, view, h, kind) in crew.refused_again() {
-            let crew = Arc::clone(&crew);
-            tokio::spawn(async move {
-                tracing::info!(session = %view.id, %boss, ?kind, "a boss's full turn couldn't send a refused next step either: the person is told");
-                crew.tell_person_refused(&boss, &view, &h.step, kind).await;
-            });
-        }
-        // Only what still waits is remembered.
-        let mut s = seen.lock();
-        if !s.judged.is_empty() {
-            let open: HashSet<Key> = crew
-                .desk
-                .list()
-                .iter()
-                .filter(|v| v.state == SessionState::Done)
-                .map(|v| (v.id, v.prompts))
-                .collect();
-            s.judged.retain(|k| open.contains(k));
-        }
-        crew.to_work.lock().retain(|k| s.judged.contains(k));
-        if s.ends.len() > 256 {
-            s.ends.clear();
+                    Ok(_) => continue,
+                    Err(RecvError::Lagged(_)) => finished(&crew),
+                    Err(RecvError::Closed) => return,
+                },
+                _ = sweep.tick() => match crew.desk.any_boss_unbound() {
+                    true => finished(&crew),
+                    false => Vec::new(),
+                },
+            };
+            crew.note_unbound(&seen);
+            for id in sessions {
+                crew.look_at_finished(id, &seen, &cancel, &mut slots);
+            }
+            for (boss, view, h, kind) in crew.refused_again() {
+                let crew = Arc::clone(&crew);
+                tokio::spawn(async move {
+                    tracing::info!(session = %view.id, %boss, ?kind, "a boss's full turn couldn't send a refused next step either: the person is told");
+                    crew.tell_person_refused(&boss, &view, &h.step, kind).await;
+                });
+            }
+            // Only what still waits is remembered.
+            let mut s = seen.lock();
+            if !s.judged.is_empty() {
+                let open: HashSet<Key> = crew
+                    .desk
+                    .list()
+                    .iter()
+                    .filter(|v| v.state == SessionState::Done)
+                    .map(|v| (v.id, v.prompts))
+                    .collect();
+                s.judged.retain(|k| open.contains(k));
+            }
+            crew.to_work.lock().retain(|k| s.judged.contains(k));
+            if s.ends.len() > 256 {
+                s.ends.clear();
+            }
         }
     }
 }

@@ -78,6 +78,13 @@ pub(crate) enum Stands {
     Busy,
 }
 
+/// The key that puts `ticket` back once each time its session went: its
+/// time in Doing says which time, and it is let go of once the ticket is on
+/// a session again.
+fn back_key(ticket: &workforce_desk::board::Ticket) -> String {
+    format!("back:{}:{}", ticket.id, ticket.state_at.timestamp_millis())
+}
+
 /// How the watchdog reads a ticket in Doing or Review whose session is
 /// `session`: `view` is what Desk has of it (none, gone), `ours` whether
 /// the boss runs it, `rested` whether it has been still for the grace.
@@ -251,8 +258,7 @@ impl CrewHub {
                 if ticket.state == TicketState::Doing && ticket.assignee.is_none() {
                     stuck.push(format!("{key} is in Doing with no session"));
                     if now - ticket.state_at >= grace {
-                        let once = format!("{}:none", ticket.state_at.timestamp_millis());
-                        self.put_back(service, o, t, &key, &once).await;
+                        self.put_back(service, o, t, &key).await;
                     }
                 }
                 continue;
@@ -262,6 +268,12 @@ impl CrewHub {
                 Err(DeskError::NotFound) => None,
                 Err(_) => continue,
             };
+            // On a session again (given another within Doing, whose time
+            // in Doing doesn't change): when that one goes, it goes back
+            // again.
+            if view.is_some() {
+                self.plan_watch.lock().done.remove(&back_key(ticket));
+            }
             let since = view
                 .as_ref()
                 .map_or(ticket.state_at, |v| v.updated_at.max(ticket.state_at));
@@ -287,7 +299,8 @@ impl CrewHub {
                 Stands::Fine => {}
                 Stands::Gone(s) => {
                     stuck.push(format!("{key} is in Doing, its session gone"));
-                    self.put_back(service, o, t, &key, &s.to_string()).await;
+                    tracing::debug!(%key, session = %s, "a ticket's session is gone");
+                    self.put_back(service, o, t, &key).await;
                 }
                 Stands::Down(_) => {
                     stuck.push(format!("{key} is in Doing, its session not running"));
@@ -316,21 +329,24 @@ impl CrewHub {
         self.say_stall(boss, o, p, busy, &stuck, now).await;
     }
 
-    /// Ticket `key` is in Doing with its session gone (`which`: it, or
-    /// when the ticket was let go): its boss puts it back in To do, so the
-    /// plan starts it again, as its own `crew.move_ticket` ([`CrewHub::gate`]:
-    /// a planned ticket that ran goes back in the queue by the person, so
-    /// below Act fully it is suggested to them). Once each.
+    /// Ticket `key` is in Doing with its session gone: its boss puts it
+    /// back in To do, so the plan starts it again, as its own
+    /// `crew.move_ticket` ([`CrewHub::gate`]: a planned ticket that ran goes
+    /// back in the queue by the person, so below Act fully it is suggested
+    /// to them). Once each time its session went, however a look sees it
+    /// gone: a session removed is gone from Desk before the ticket's let go
+    /// of it is written, so one look may see it still on the ticket and the
+    /// next the ticket with no one on it.
     async fn put_back(
         &self,
         service: &Arc<AgentService>,
         o: &Oversight,
         t: &PlanTicketView,
         key: &str,
-        which: &str,
     ) {
         let boss = service.agent_id.as_str();
-        let once = format!("back:{key}:{which}");
+        let ticket = &t.ticket.ticket;
+        let once = back_key(ticket);
         // Claimed before anything is awaited: two looks never both act.
         if !self.plan_watch.lock().done.insert(once.clone()) {
             return;
@@ -361,7 +377,7 @@ impl CrewHub {
                 let by = self.by_at_level(by, o);
                 self.perform(&action, by)
                     .await
-                    .map(|done| tracing::info!(%key, %which, %done, "a ticket whose session was gone went back to To do"))
+                    .map(|done| tracing::info!(%key, %done, "a ticket whose session was gone went back to To do"))
             }
             Gate::Suggest(_) => self
                 .suggest("crew.move_ticket", &input, &action, &by)

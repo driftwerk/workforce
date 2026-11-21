@@ -1844,32 +1844,7 @@ mod tests {
     /// says so, as its record does; it never says the call was allowed.
     #[tokio::test]
     async fn held_calls_are_audited_as_awaiting_approval() {
-        #[derive(Clone, Default)]
-        struct Lines(Arc<parking_lot::Mutex<Vec<u8>>>);
-
-        impl std::io::Write for Lines {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let lines = Lines::default();
-        let writer = lines.clone();
-        let audit = tracing::Dispatch::new(
-            tracing_subscriber::fmt()
-                .with_writer(move || writer.clone())
-                .with_ansi(false)
-                .finish(),
-        );
-        // With a single dispatcher registered, a callsite another test's
-        // thread meets first takes that thread's interest, which is none; a
-        // second one makes every callsite ask each registered dispatcher.
-        let _others = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
-        let _audited = tracing::dispatcher::set_default(&audit);
+        let (lines, _audited, _others) = crate::log_testing::Lines::capture();
         let (service, tool, _) = asking().await;
         let unattended = attended(&service).await.tools.unattended();
         service.set_approval_router(Arc::new(Routes::default()));
@@ -1883,12 +1858,8 @@ mod tests {
             call(tools.endpoint(), "catalogue_remove_entry", figma.clone()).await;
         }
 
-        let text = String::from_utf8(lines.0.lock().clone()).unwrap();
-        let audited: Vec<&str> = text
-            .lines()
-            .filter(|l| l.contains("round MCP tool call"))
-            .collect();
-        assert_eq!(audited.len(), 3, "{text}");
+        let audited = lines.at("INFO", "round MCP tool call");
+        assert_eq!(audited.len(), 3, "{}", lines.text());
         assert!(
             audited.iter().all(|l| l.contains("require_approval")),
             "{audited:?}"

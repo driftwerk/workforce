@@ -244,10 +244,20 @@ async fn a_work_turn_that_does_nothing_is_recorded_with_its_reason() {
             .contains("If you do nothing, say why in one sentence.")));
         let done = crew.undo(waited.id).await.unwrap();
         assert_eq!(done, "told acme-web to go ahead");
-        let inbox = d.store().line_inbox(&s.id.to_string()).await.unwrap();
-        assert!(inbox
-            .iter()
-            .any(|m| m.text == "Go ahead with your next step."));
+        // On its line, however far its delivery has gone.
+        eventually("the go-ahead on its line", async || {
+            d.line_thread(s.id, None, None)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|m| {
+                    m.to.kind == PartyKind::Session
+                        && m.to.id == s.id.to_string()
+                        && m.text == "Go ahead with your next step."
+                })
+                .map(drop)
+        })
+        .await;
     })
     .await;
 }

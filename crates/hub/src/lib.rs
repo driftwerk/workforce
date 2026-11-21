@@ -198,6 +198,8 @@ pub mod llm_tool;
 pub use hub_core::local_agent_registry;
 pub mod local_agent_tool;
 pub mod local_routing;
+#[cfg(test)]
+pub(crate) mod log_testing;
 pub mod logs_tool;
 pub mod mcp;
 pub mod mcp_gate;

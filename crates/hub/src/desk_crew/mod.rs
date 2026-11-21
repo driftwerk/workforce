@@ -194,6 +194,9 @@ pub struct CrewHub {
     /// keys paid for, never the person's plans. Act fully holds only under
     /// its budget, and not before this is read.
     spent_today: Mutex<HashMap<String, f64>>,
+    /// What a test says an overseer spent today, kept over each read.
+    #[cfg(test)]
+    spent_pinned: Mutex<HashMap<String, f64>>,
     /// What each machine last said each boss's sessions there spent today
     /// ([`shared_budget`]): one Act fully budget across them all.
     machine_spent: Mutex<shared_budget::Machines>,
@@ -542,30 +545,37 @@ pub(crate) fn boss_may_change(caller: &str, target: &str) -> Result<(), String> 
         .iter()
         .filter_map(Weak::upgrade)
         .find(|c| c.state.registry.get(caller).is_some());
-    let Some(crew) = crew else {
-        return Ok(());
-    };
-    let Some((_, o)) = crew.overseer_named(caller) else {
-        return Ok(());
-    };
-    if caller == target {
-        return Ok(());
+    match crew {
+        Some(crew) => crew.boss_may_change(caller, target),
+        None => Ok(()),
     }
-    let seen = crew.desk.seen_by(&o.scope);
-    let other_boss = crew.overseer_named(target).is_some()
-        || named_group(
-            &crew
-                .state
-                .registry
-                .get(target)
-                .map(|s| s.workspace.clone())
-                .unwrap_or_default(),
-        )
-        .is_some();
-    if other_boss || !crew.agent_in(target, &seen) {
-        return Err(crew.not_ours(&o.scope));
+}
+
+impl CrewHub {
+    /// [`boss_may_change`], on this crew's hub.
+    pub(crate) fn boss_may_change(&self, caller: &str, target: &str) -> Result<(), String> {
+        let Some((_, o)) = self.overseer_named(caller) else {
+            return Ok(());
+        };
+        if caller == target {
+            return Ok(());
+        }
+        let seen = self.desk.seen_by(&o.scope);
+        let other_boss = self.overseer_named(target).is_some()
+            || named_group(
+                &self
+                    .state
+                    .registry
+                    .get(target)
+                    .map(|s| s.workspace.clone())
+                    .unwrap_or_default(),
+            )
+            .is_some();
+        if other_boss || !self.agent_in(target, &seen) {
+            return Err(self.not_ours(&o.scope));
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// `service`'s settings as they are run: while any group has a boss of its
@@ -741,6 +751,8 @@ impl CrewHub {
             sent: Mutex::default(),
             read: Mutex::default(),
             spent_today: Mutex::default(),
+            #[cfg(test)]
+            spent_pinned: Mutex::default(),
             machine_spent: Mutex::default(),
             tooled: Mutex::default(),
             poke: tokio::sync::Notify::new(),
@@ -1146,6 +1158,14 @@ impl CrewHub {
                 .is_some_and(|id| self.fully(id, o).is_ok() && self.desk.acts_fully_in(session, id))
     }
 
+    /// Pins what `agent` spent today at `usd`, for tests: the tick's read
+    /// of the spend doesn't undo it.
+    #[cfg(test)]
+    pub(super) fn pin_spent_today(&self, agent: &str, usd: f64) {
+        self.spent_pinned.lock().insert(agent.to_string(), usd);
+        self.spent_today.lock().insert(agent.to_string(), usd);
+    }
+
     /// Reads the real money each overseer that chose Act fully has spent
     /// today, for [`Self::fully`], and tells Desk, which shows it: its
     /// scope's Desk sessions' calls a key paid for, and the model calls of
@@ -1222,6 +1242,8 @@ impl CrewHub {
             let mut today = self.spent_today.lock();
             today.retain(|agent, _| served.contains(agent));
             today.extend(spent);
+            #[cfg(test)]
+            today.extend(self.spent_pinned.lock().clone());
         }
         self.desk.set_full_budgets(shown);
         for boss in served {
