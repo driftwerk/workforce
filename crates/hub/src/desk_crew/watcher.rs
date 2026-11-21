@@ -1351,256 +1351,260 @@ struct Waking {
 /// Turns what happens into the overseers' check-ins: each event, and each
 /// threshold passed, goes to the overseer whose scope sees its group, and
 /// no other; each overseer's check-ins are gathered and spent apart.
-pub(super) async fn wake_loop(
+pub(super) fn wake_loop(
     crew: Arc<CrewHub>,
-    mut events: super::Events,
-    mut rework: super::Rework,
     cancel: CancellationToken,
-) {
-    let mut tick = tokio::time::interval(crew.timing.tick.min(crew.timing.coalesce));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut waking: HashMap<String, Waking> = HashMap::new();
-    // Kept on the boss's open items, so a restart doesn't raise them again.
-    let mut raised = crew.raised_marks().await;
-    // A check-in whose turn didn't run comes back here, to be tried again
-    // once: none is dropped without a word.
-    let (retry, mut retried) = tokio::sync::mpsc::unbounded_channel::<(String, Vec<Trigger>)>();
-    // What a boss's notices hand back when it no longer runs on them (Act
-    // fully ended, or isn't in force yet): checked in on here, the old way.
-    let (_unused, none_back) = tokio::sync::mpsc::unbounded_channel();
-    let mut handed_back = crew.wake_back.1.lock().take().unwrap_or(none_back);
-    // The ready tickets nobody has, so that one that becomes so wakes it.
-    let mut ready_seen = HashMap::new();
-    let mut ready_dirty = false;
-    crew.ready_unhanded(&mut ready_seen, |_| None).await;
-    loop {
-        // What was found, by the overseer it is for.
-        let mut found: Vec<(String, Trigger)> = Vec::new();
-        tokio::select! {
-            () = cancel.cancelled() => return,
-            received = events.recv() => match received {
-                Ok(DeskEvent::Activity { event }) => {
-                    if let Some((s, o)) = crew.overseer_of_group(event.group.as_deref()) {
-                        if let Some(mut t) = crew.trigger_for(&event, s.agent_id.as_str(), &o) {
-                            if !crew.its_plan_tells(&event).await {
-                                if let Some(session) = finished_session(&event) {
-                                    t.line = crew.with_doing(session, t.line).await;
+) -> impl std::future::Future<Output = ()> {
+    // Subscribed now, before the loop is spawned: nothing that happens
+    // once the crew has started is missed while it starts.
+    let mut events = crew.desk.events();
+    let mut rework = crew.rework.subscribe();
+    async move {
+        let mut tick = tokio::time::interval(crew.timing.tick.min(crew.timing.coalesce));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut waking: HashMap<String, Waking> = HashMap::new();
+        // Kept on the boss's open items, so a restart doesn't raise them again.
+        let mut raised = crew.raised_marks().await;
+        // A check-in whose turn didn't run comes back here, to be tried again
+        // once: none is dropped without a word.
+        let (retry, mut retried) = tokio::sync::mpsc::unbounded_channel::<(String, Vec<Trigger>)>();
+        // What a boss's notices hand back when it no longer runs on them (Act
+        // fully ended, or isn't in force yet): checked in on here, the old way.
+        let (_unused, none_back) = tokio::sync::mpsc::unbounded_channel();
+        let mut handed_back = crew.wake_back.1.lock().take().unwrap_or(none_back);
+        // The ready tickets nobody has, so that one that becomes so wakes it.
+        let mut ready_seen = HashMap::new();
+        let mut ready_dirty = false;
+        crew.ready_unhanded(&mut ready_seen, |_| None).await;
+        loop {
+            // What was found, by the overseer it is for.
+            let mut found: Vec<(String, Trigger)> = Vec::new();
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                received = events.recv() => match received {
+                    Ok(DeskEvent::Activity { event }) => {
+                        if let Some((s, o)) = crew.overseer_of_group(event.group.as_deref()) {
+                            if let Some(mut t) = crew.trigger_for(&event, s.agent_id.as_str(), &o) {
+                                if !crew.its_plan_tells(&event).await {
+                                    if let Some(session) = finished_session(&event) {
+                                        t.line = crew.with_doing(session, t.line).await;
+                                    }
+                                    found.push((s.agent_id.as_str().to_string(), t));
                                 }
-                                found.push((s.agent_id.as_str().to_string(), t));
                             }
                         }
                     }
-                }
-                // Looked at on the next tick, not here: reading the boards
-                // while events wait would let the channel lag and lose
-                // the wakes among them.
-                Ok(DeskEvent::Ticket { .. }) => ready_dirty = true,
-                // Events were lost: the boards may have changed in them.
-                Err(RecvError::Lagged(_)) => ready_dirty = true,
-                Ok(_) => {}
-                Err(RecvError::Closed) => return,
-            },
-            // A turn's end the boss's fast call handed to its full turn.
-            Ok(event) = rework.recv() => {
-                if let Some((s, o)) = crew.overseer_of_group(event.group.as_deref()) {
-                    if let Some(mut t) = crew.trigger_for(&event, s.agent_id.as_str(), &o) {
-                        if let Some(session) = finished_session(&event) {
-                            t.line = crew.with_doing(session, t.line).await;
-                            t.handed = Some(session);
-                        }
-                        found.push((s.agent_id.as_str().to_string(), t));
-                    }
-                }
-            }
-            Some((id, back)) = handed_back.recv() => {
-                let w = waking.entry(id).or_default();
-                w.window.get_or_insert_with(Instant::now);
-                hold(&mut w.pending, back);
-            }
-            Some((id, again)) = retried.recv() => {
-                tracing::warn!(agent = %id, held = again.len(), "the overseer's check-in didn't run; trying it again");
-                // Held again as it was: what it asks was raised already.
-                let w = waking.entry(id).or_default();
-                w.window.get_or_insert_with(Instant::now);
-                hold(&mut w.pending, again);
-            }
-            _ = tick.tick() => {
-                let overseers = crew.overseers();
-                // Kept up to date with no overseer too, so that one set up
-                // later isn't woken for what has long been ready.
-                if std::mem::take(&mut ready_dirty) {
-                    let of = |g: Option<&str>| crew.overseer_of_group(g);
-                    for t in crew.ready_unhanded(&mut ready_seen, |g| of(g).map(|(_, o)| o)).await {
-                        if let Some((s, _)) = of(t.group.as_deref()) {
+                    // Looked at on the next tick, not here: reading the boards
+                    // while events wait would let the channel lag and lose
+                    // the wakes among them.
+                    Ok(DeskEvent::Ticket { .. }) => ready_dirty = true,
+                    // Events were lost: the boards may have changed in them.
+                    Err(RecvError::Lagged(_)) => ready_dirty = true,
+                    Ok(_) => {}
+                    Err(RecvError::Closed) => return,
+                },
+                // A turn's end the boss's fast call handed to its full turn.
+                Ok(event) = rework.recv() => {
+                    if let Some((s, o)) = crew.overseer_of_group(event.group.as_deref()) {
+                        if let Some(mut t) = crew.trigger_for(&event, s.agent_id.as_str(), &o) {
+                            if let Some(session) = finished_session(&event) {
+                                t.line = crew.with_doing(session, t.line).await;
+                                t.handed = Some(session);
+                            }
                             found.push((s.agent_id.as_str().to_string(), t));
                         }
                     }
                 }
-                for (s, o) in &overseers {
-                    let id = s.agent_id.as_str().to_string();
-                    let w = waking.entry(id.clone()).or_default();
-                    let mut noted = std::mem::take(&mut w.noted);
-                    let at = crew.thresholds(&id, o, &mut noted).await;
-                    let w = waking.entry(id.clone()).or_default();
-                    w.noted = noted;
-                    found.extend(at.into_iter().map(|mut t| {
-                        t.routine = true;
-                        (id.clone(), t)
-                    }));
-                    // Unbound, it sweeps its scope every few minutes while
-                    // there is anything in it, whatever else woke it.
-                    let every = crew.timing.minute * UNBOUND_SWEEP_MINUTES;
-                    let due = w.swept.is_none_or(|at| at.elapsed() >= every);
-                    // Running on notices, it is swept only once they have
-                    // been quiet a while: the net under them.
-                    let noticed = crew.orchestrates(&id) && crew.noticed_lately(&id);
-                    if due && !noticed && crew.unbound(o) && crew.has_work(&id, o).await {
-                        if let Some(w) = waking.get_mut(&id) {
-                            w.swept = Some(Instant::now());
+                Some((id, back)) = handed_back.recv() => {
+                    let w = waking.entry(id).or_default();
+                    w.window.get_or_insert_with(Instant::now);
+                    hold(&mut w.pending, back);
+                }
+                Some((id, again)) = retried.recv() => {
+                    tracing::warn!(agent = %id, held = again.len(), "the overseer's check-in didn't run; trying it again");
+                    // Held again as it was: what it asks was raised already.
+                    let w = waking.entry(id).or_default();
+                    w.window.get_or_insert_with(Instant::now);
+                    hold(&mut w.pending, again);
+                }
+                _ = tick.tick() => {
+                    let overseers = crew.overseers();
+                    // Kept up to date with no overseer too, so that one set up
+                    // later isn't woken for what has long been ready.
+                    if std::mem::take(&mut ready_dirty) {
+                        let of = |g: Option<&str>| crew.overseer_of_group(g);
+                        for t in crew.ready_unhanded(&mut ready_seen, |g| of(g).map(|(_, o)| o)).await {
+                            if let Some((s, _)) = of(t.group.as_deref()) {
+                                found.push((s.agent_id.as_str().to_string(), t));
+                            }
                         }
-                        found.push((id.clone(), Trigger {
-                            line: SWEEP.into(),
-                            approvals: Vec::new(),
-                            hop: 0,
-                            about: None,
-                            group: None,
-                            handed: None,
-                            routine: true,
+                    }
+                    for (s, o) in &overseers {
+                        let id = s.agent_id.as_str().to_string();
+                        let w = waking.entry(id.clone()).or_default();
+                        let mut noted = std::mem::take(&mut w.noted);
+                        let at = crew.thresholds(&id, o, &mut noted).await;
+                        let w = waking.entry(id.clone()).or_default();
+                        w.noted = noted;
+                        found.extend(at.into_iter().map(|mut t| {
+                            t.routine = true;
+                            (id.clone(), t)
                         }));
+                        // Unbound, it sweeps its scope every few minutes while
+                        // there is anything in it, whatever else woke it.
+                        let every = crew.timing.minute * UNBOUND_SWEEP_MINUTES;
+                        let due = w.swept.is_none_or(|at| at.elapsed() >= every);
+                        // Running on notices, it is swept only once they have
+                        // been quiet a while: the net under them.
+                        let noticed = crew.orchestrates(&id) && crew.noticed_lately(&id);
+                        if due && !noticed && crew.unbound(o) && crew.has_work(&id, o).await {
+                            if let Some(w) = waking.get_mut(&id) {
+                                w.swept = Some(Instant::now());
+                            }
+                            found.push((id.clone(), Trigger {
+                                line: SWEEP.into(),
+                                approvals: Vec::new(),
+                                hop: 0,
+                                about: None,
+                                group: None,
+                                handed: None,
+                                routine: true,
+                            }));
+                        }
                     }
-                }
-                // An overseer gone has nothing waiting.
-                waking.retain(|id, _| overseers.iter().any(|(s, _)| s.agent_id.as_str() == id));
-            }
-        }
-        let now = Utc::now();
-        for (id, mut t) in found {
-            let Some((_, o)) = crew.overseer_named(&id) else {
-                continue;
-            };
-            let remind = (o.wake.remind_minutes > 0).then(|| {
-                chrono::Duration::from_std(crew.timing.minute * o.wake.remind_minutes)
-                    .unwrap_or(RAISED_FOR)
-            });
-            if fresh(&mut t, &raised, remind, now) {
-                let w = waking.entry(id).or_default();
-                w.window.get_or_insert_with(Instant::now);
-                hold(&mut w.pending, vec![t]);
-            }
-        }
-        let ids: Vec<String> = waking.keys().cloned().collect();
-        for id in ids {
-            let Some(w) = waking.get_mut(&id) else {
-                continue;
-            };
-            if w.firing.as_ref().is_some_and(|f| f.is_finished()) {
-                w.firing = None;
-            }
-            let due = w
-                .window
-                .is_some_and(|at| at.elapsed() >= crew.timing.coalesce);
-            if !due || w.firing.is_some() || w.pending.is_empty() {
-                continue;
-            }
-            // Its mind is busy, or the person's own turn runs in its DM:
-            // what it found keeps gathering for its next look, until it has
-            // waited long enough to queue for the mind in turn.
-            if w.window.is_some_and(|at| !crew.mind_may_start(&id, at)) {
-                continue;
-            }
-            if w.held_until.is_some_and(|until| Utc::now() < until) {
-                continue;
-            }
-            let Some((service, o)) = crew.overseer_named(&id) else {
-                w.window = None;
-                w.pending.clear();
-                continue;
-            };
-            // A check-in that speaks in the DM waits while the person types
-            // to the boss (at most the typing cap); a quiet one acts now.
-            let (level, _) = crew.level_now(&id, &o);
-            // Requests beside its message, and what needs the person.
-            let asks = w.pending.iter().any(|t| !t.approvals.is_empty());
-            let needs = asks || w.pending.iter().any(|t| t.about.is_some());
-            let speaks = !(level.acts() && o.updates.enabled) || asks;
-            if speaks && crew.typing_release(&id).is_some() {
-                continue;
-            }
-            // Away, a check-in that would only tell the person gathers for
-            // their return; one with what needs them still goes.
-            if speaks && !needs && crew.away_now(&id).await {
-                continue;
-            }
-            // Held by Desk's breaker, it takes no turns: what it would have
-            // checked in on is on the Floor for the person.
-            if crew.desk.agent_held(&id).is_some() {
-                w.window = None;
-                w.pending.clear();
-                continue;
-            }
-            // What it gathered of a group that has since become another's
-            // boundary is not its any more.
-            let seen = crew.desk.seen_by(&o.scope);
-            w.pending.retain(|t| seen.sees(t.group.as_deref()));
-            if w.pending.is_empty() {
-                w.window = None;
-                continue;
-            }
-            match crew.budget(&id, &o).await {
-                Ok(Budget::Open) => w.held_until = None,
-                Ok(Budget::Spent { until, daily }) => {
-                    w.held_until = Some(until);
-                    if w.told != Some(until) {
-                        w.told = Some(until);
-                        crew.paused(&service, until, daily);
-                    }
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %format!("{e:#}"), "counting the overseer's check-ins failed");
-                    w.held_until = chrono::Duration::from_std(crew.timing.coalesce)
-                        .ok()
-                        .map(|d| Utc::now() + d);
-                    continue;
+                    // An overseer gone has nothing waiting.
+                    waking.retain(|id, _| overseers.iter().any(|(s, _)| s.agent_id.as_str() == id));
                 }
             }
-            w.window = None;
-            let triggers = std::mem::take(&mut w.pending);
             let now = Utc::now();
-            raised.retain(|_, at| now - *at < RAISED_FOR);
-            for t in &triggers {
-                if let Some(key) = &t.about {
-                    raised.insert(key.clone(), now);
-                    crew.mark_raised(&id, key, &t.line, now).await;
+            for (id, mut t) in found {
+                let Some((_, o)) = crew.overseer_named(&id) else {
+                    continue;
+                };
+                let remind = (o.wake.remind_minutes > 0).then(|| {
+                    chrono::Duration::from_std(crew.timing.minute * o.wake.remind_minutes)
+                        .unwrap_or(RAISED_FOR)
+                });
+                if fresh(&mut t, &raised, remind, now) {
+                    let w = waking.entry(id).or_default();
+                    w.window.get_or_insert_with(Instant::now);
+                    hold(&mut w.pending, vec![t]);
                 }
             }
-            let crew = Arc::clone(&crew);
-            let retry = retry.clone();
-            let again: Vec<Trigger> = triggers
-                .iter()
-                .filter(|t| !t.line.starts_with(RETRIED))
-                .map(|t| Trigger {
-                    line: format!("{RETRIED}{}", t.line),
-                    routine: true,
-                    ..t.clone()
-                })
-                .collect();
-            let handed: Vec<uuid::Uuid> = triggers.iter().filter_map(|t| t.handed).collect();
-            w.firing = Some(tokio::spawn(async move {
-                // Its prompt is written once it holds its mind.
-                let woke = crew
-                    .with_mind(&id, "a check-in", crew.wake(service, o, triggers))
-                    .await;
-                if woke {
-                    // A refused next step handed to it was its to take
-                    // (`super::idle`).
-                    for s in handed {
-                        crew.full_turn_over(&id, s);
-                    }
-                } else if !again.is_empty() {
-                    let _ = retry.send((id, again));
+            let ids: Vec<String> = waking.keys().cloned().collect();
+            for id in ids {
+                let Some(w) = waking.get_mut(&id) else {
+                    continue;
+                };
+                if w.firing.as_ref().is_some_and(|f| f.is_finished()) {
+                    w.firing = None;
                 }
-            }));
+                let due = w
+                    .window
+                    .is_some_and(|at| at.elapsed() >= crew.timing.coalesce);
+                if !due || w.firing.is_some() || w.pending.is_empty() {
+                    continue;
+                }
+                // Its mind is busy, or the person's own turn runs in its DM:
+                // what it found keeps gathering for its next look, until it has
+                // waited long enough to queue for the mind in turn.
+                if w.window.is_some_and(|at| !crew.mind_may_start(&id, at)) {
+                    continue;
+                }
+                if w.held_until.is_some_and(|until| Utc::now() < until) {
+                    continue;
+                }
+                let Some((service, o)) = crew.overseer_named(&id) else {
+                    w.window = None;
+                    w.pending.clear();
+                    continue;
+                };
+                // A check-in that speaks in the DM waits while the person types
+                // to the boss (at most the typing cap); a quiet one acts now.
+                let (level, _) = crew.level_now(&id, &o);
+                // Requests beside its message, and what needs the person.
+                let asks = w.pending.iter().any(|t| !t.approvals.is_empty());
+                let needs = asks || w.pending.iter().any(|t| t.about.is_some());
+                let speaks = !(level.acts() && o.updates.enabled) || asks;
+                if speaks && crew.typing_release(&id).is_some() {
+                    continue;
+                }
+                // Away, a check-in that would only tell the person gathers for
+                // their return; one with what needs them still goes.
+                if speaks && !needs && crew.away_now(&id).await {
+                    continue;
+                }
+                // Held by Desk's breaker, it takes no turns: what it would have
+                // checked in on is on the Floor for the person.
+                if crew.desk.agent_held(&id).is_some() {
+                    w.window = None;
+                    w.pending.clear();
+                    continue;
+                }
+                // What it gathered of a group that has since become another's
+                // boundary is not its any more.
+                let seen = crew.desk.seen_by(&o.scope);
+                w.pending.retain(|t| seen.sees(t.group.as_deref()));
+                if w.pending.is_empty() {
+                    w.window = None;
+                    continue;
+                }
+                match crew.budget(&id, &o).await {
+                    Ok(Budget::Open) => w.held_until = None,
+                    Ok(Budget::Spent { until, daily }) => {
+                        w.held_until = Some(until);
+                        if w.told != Some(until) {
+                            w.told = Some(until);
+                            crew.paused(&service, until, daily);
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %format!("{e:#}"), "counting the overseer's check-ins failed");
+                        w.held_until = chrono::Duration::from_std(crew.timing.coalesce)
+                            .ok()
+                            .map(|d| Utc::now() + d);
+                        continue;
+                    }
+                }
+                w.window = None;
+                let triggers = std::mem::take(&mut w.pending);
+                let now = Utc::now();
+                raised.retain(|_, at| now - *at < RAISED_FOR);
+                for t in &triggers {
+                    if let Some(key) = &t.about {
+                        raised.insert(key.clone(), now);
+                        crew.mark_raised(&id, key, &t.line, now).await;
+                    }
+                }
+                let crew = Arc::clone(&crew);
+                let retry = retry.clone();
+                let again: Vec<Trigger> = triggers
+                    .iter()
+                    .filter(|t| !t.line.starts_with(RETRIED))
+                    .map(|t| Trigger {
+                        line: format!("{RETRIED}{}", t.line),
+                        routine: true,
+                        ..t.clone()
+                    })
+                    .collect();
+                let handed: Vec<uuid::Uuid> = triggers.iter().filter_map(|t| t.handed).collect();
+                w.firing = Some(tokio::spawn(async move {
+                    // Its prompt is written once it holds its mind.
+                    let woke = crew
+                        .with_mind(&id, "a check-in", crew.wake(service, o, triggers))
+                        .await;
+                    if woke {
+                        // A refused next step handed to it was its to take
+                        // (`super::idle`).
+                        for s in handed {
+                            crew.full_turn_over(&id, s);
+                        }
+                    } else if !again.is_empty() {
+                        let _ = retry.send((id, again));
+                    }
+                }));
+            }
         }
     }
 }

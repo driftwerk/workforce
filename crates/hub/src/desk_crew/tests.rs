@@ -6261,8 +6261,7 @@ async fn a_start_reuses_only_the_overseers_own_session_on_its_engine_once_and_as
     use super::actions::Action;
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        // Another boss, here and overseeing (of acme): a session of a boss
-        // no longer here is passed on to this one.
+        // Another boss, here, overseeing acme.
         let (sarah, _l2) = agent(dir.path(), "sarah", "ok").await;
         write_config(&sarah, "[oversight]\nenabled = true\ngroup = \"acme\"\n");
         let (overseer, crew, d, _llm) =
@@ -6668,8 +6667,7 @@ async fn a_wedged_mind_is_waited_for_only_so_long() {
         assert_eq!(crew.with_mind("desk", "an update", async { 5 }).await, 5);
         assert_eq!(said("m2").await, 2, "said again for a new stretch");
         // What it starts runs as part of it: a nested step never waits the
-        // whole bound again. A bound of a second keeps once and twice a
-        // second apart.
+        // whole bound again (a second here).
         crew.set_mind_wait_max(Duration::from_secs(1));
         let nested = std::time::Instant::now();
         let out = crew

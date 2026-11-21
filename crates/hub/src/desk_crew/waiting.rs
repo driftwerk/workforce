@@ -300,12 +300,24 @@ pub(super) fn waiting_in(thread: &[LineMessage], boss: &str, s: Uuid) -> Option<
             // "Understood, holding" waits on as the hold does.
             let waits = t.kind == LineKind::Tell
                 && (waits_on_answer(&t.text) || (held && !goes_on(&t.text)));
-            // Under the boss's hold, the wait began with the hold.
+            // Under the boss's hold, the wait began with the hold; a
+            // reply that only says it holds keeps what it waits on in its
+            // words that asked, so the wait reads the same whichever Desk
+            // saw first.
             let began = ours.filter(|_| held);
+            let said = match began {
+                Some(_) if !waits_on_answer(&t.text) => thread
+                    .iter()
+                    .rfind(|m| {
+                        to_boss(m, boss, s) && m.kind == LineKind::Tell && waits_on_answer(&m.text)
+                    })
+                    .unwrap_or(t),
+                _ => t,
+            };
             waits.then(|| Waiting {
                 since: began.map_or(t.at, reached),
                 message: began.map_or(t.id, |o| o.id),
-                said: Some(t.clone()),
+                said: Some(said.clone()),
                 persons,
             })
         }
@@ -773,11 +785,15 @@ impl CrewHub {
                 ),
             ));
         }
-        if matches!(view.state, SessionState::Working | SessionState::Blocked)
-            || thread
-                .iter()
-                .any(|m| to_boss(m, &i.boss, s) && m.at > i.opened_at && !waits_on_answer(&m.text))
-        {
+        // A word since that waits on no answer is its going on, unless by
+        // the rule that found it waiting it still waits on this item's
+        // message: a held session's "Understood, holding." is no going on.
+        let spoke = thread
+            .iter()
+            .any(|m| to_boss(m, &i.boss, s) && m.at > i.opened_at && !waits_on_answer(&m.text));
+        let still =
+            waiting_in(&thread, &i.boss, s).is_some_and(|w| key(s, w.message) == i.dedupe_key);
+        if matches!(view.state, SessionState::Working | SessionState::Blocked) || spoke && !still {
             return Some((
                 ClosedBy::Session,
                 format!("{name} went on without waiting; I've closed the question."),

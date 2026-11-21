@@ -109,8 +109,9 @@ async fn an_update_waits_for_a_pause_and_never_past_the_cap() {
             at >= chrono::Duration::milliseconds(2900),
             "held while typing: {at:?}"
         );
+        // At the cap, while the typing (five seconds) went on.
         assert!(
-            !typing.is_finished(),
+            at < chrono::Duration::milliseconds(5000),
             "out at the cap while still typing: {at:?}"
         );
         assert!(posted.content.contains("Opened PR #622"));
@@ -191,6 +192,7 @@ async fn a_needs_you_waits_only_for_typing_and_the_cap() {
         let (overseer, crew, _d, _llm) =
             overseeing_at(dir.path(), pool, "ok", ACT, &[], SECOND_MINUTES).await;
         let started = std::time::Instant::now();
+        let began = chrono::Utc::now();
         let typing = type_for(&crew, 5000);
         tokio::time::sleep(Duration::from_millis(30)).await;
         let r = ask(&crew, "Which key should staging use?").await;
@@ -201,14 +203,16 @@ async fn a_needs_you_waits_only_for_typing_and_the_cap() {
             started.elapsed()
         );
         assert!(needs_you(&overseer).is_empty(), "held while typing");
-        eventually("the needs-you", async || {
+        let posted = eventually("the needs-you", async || {
             needs_you(&overseer).into_iter().next()
         })
         .await;
-        let at = started.elapsed();
-        assert!(at >= Duration::from_millis(2900), "{at:?}");
+        // When it was posted, not when the test saw it: at the cap, while
+        // the typing (five seconds) went on.
+        let at = posted.timestamp - began;
+        assert!(at >= chrono::Duration::milliseconds(2900), "{at:?}");
         assert!(
-            !typing.is_finished(),
+            at < chrono::Duration::milliseconds(5000),
             "out at the cap while still typing: {at:?}"
         );
         typing.await.unwrap();

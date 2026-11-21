@@ -3365,6 +3365,11 @@ impl Desk {
             .collect()
     }
 
+    /// Every change from now, without a snapshot.
+    pub fn events(&self) -> broadcast::Receiver<DeskEvent> {
+        self.0.events.subscribe()
+    }
+
     /// The current snapshot and every change after it.
     pub fn subscribe(&self) -> (DeskEvent, broadcast::Receiver<DeskEvent>) {
         let rx = self.0.events.subscribe();

@@ -77,11 +77,14 @@ pub fn turns() -> Option<&'static Arc<dyn TurnLog>> {
 
 pub(super) async fn install(config: &WorkforceConfig) {
     static OPENED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    // A config without Postgres opens nothing and settles nothing: the
+    // floor stays the first one's with Postgres to open (in one process,
+    // a hub composed without it never keeps a later one from its store).
+    let Some(pg) = config.postgres.as_ref().filter(|p| p.enabled) else {
+        return;
+    };
     OPENED
         .get_or_init(|| async {
-            let Some(pg) = config.postgres.as_ref().filter(|p| p.enabled) else {
-                return;
-            };
             match PgFloorStore::new(pg).await {
                 Ok(store) => {
                     let installed = Installed::open(store);

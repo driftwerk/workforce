@@ -214,120 +214,123 @@ pub(crate) const ASK_AGAIN: &str = "Desk here, for the person: a permission prom
 /// and why. Each reason is said once a boss while it holds anything.
 type Told = HashMap<Uuid, (String, String)>;
 
-pub(super) async fn decide_loop(
+pub(super) fn decide_loop(
     crew: Arc<CrewHub>,
-    mut events: super::Events,
     cancel: CancellationToken,
-) {
-    let mut sweep = tokio::time::interval(SWEEP);
-    sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let (tx, mut said) = mpsc::unbounded_channel::<Said>();
-    let mut told = Told::new();
-    // The requests handed to the boss: each is decided once.
-    let mut asked: HashSet<Uuid> = HashSet::new();
-    // The boss's decisions Desk refused for now, by request.
-    let mut again: HashMap<Uuid, (Action, By)> = HashMap::new();
-    // How many decision calls each boss makes at once.
-    let mut slots: HashMap<String, Arc<tokio::sync::Semaphore>> = HashMap::new();
-    // When each session's terminal-only prompts were last cleared, by
-    // session: how often it is done.
-    let mut cleared: Cleared = HashMap::new();
-    // Requests whose decision call failed, when they are decided again,
-    // and how often each failed.
-    let mut again_at: HashMap<Uuid, tokio::time::Instant> = HashMap::new();
-    let mut failed: HashMap<Uuid, u32> = HashMap::new();
-    // However the loop ends (stopped, its events closed, a panic), Desk
-    // holds nothing more for a boss it no longer decides for.
-    let _holds_end = HoldsEnd(Arc::clone(&crew));
-    loop {
-        let mut swept = false;
-        let sessions: Vec<Uuid> = tokio::select! {
-            () = cancel.cancelled() => return,
-            Some(mut s) = said.recv() => {
-                // Handed to another boss: decided again, by that one.
-                if s.why.is_empty() {
-                    asked.remove(&s.approval);
-                    continue;
-                }
-                // Its decision call failed: decided again soon, the person
-                // told once; failing for minutes on end, it is theirs.
-                if s.retry {
-                    let n = failed.entry(s.approval).or_default();
-                    *n += 1;
-                    if *n > RETRIES {
-                        crew.desk.let_go(s.session, s.approval);
-                        s.retry = false;
-                        s.text = format!(
-                            "{} (it failed {RETRIES} times over, so it's yours to answer now)",
-                            s.text
-                        );
-                    } else {
-                        again_at.insert(s.approval, tokio::time::Instant::now() + crew.retry_after());
+) -> impl std::future::Future<Output = ()> {
+    // Subscribed now, before the loop is spawned: nothing that happens
+    // once the crew has started is missed while it starts.
+    let mut events = crew.desk.events();
+    async move {
+        let mut sweep = tokio::time::interval(SWEEP);
+        sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let (tx, mut said) = mpsc::unbounded_channel::<Said>();
+        let mut told = Told::new();
+        // The requests handed to the boss: each is decided once.
+        let mut asked: HashSet<Uuid> = HashSet::new();
+        // The boss's decisions Desk refused for now, by request.
+        let mut again: HashMap<Uuid, (Action, By)> = HashMap::new();
+        // How many decision calls each boss makes at once.
+        let mut slots: HashMap<String, Arc<tokio::sync::Semaphore>> = HashMap::new();
+        // When each session's terminal-only prompts were last cleared, by
+        // session: how often it is done.
+        let mut cleared: Cleared = HashMap::new();
+        // Requests whose decision call failed, when they are decided again,
+        // and how often each failed.
+        let mut again_at: HashMap<Uuid, tokio::time::Instant> = HashMap::new();
+        let mut failed: HashMap<Uuid, u32> = HashMap::new();
+        // However the loop ends (stopped, its events closed, a panic), Desk
+        // holds nothing more for a boss it no longer decides for.
+        let _holds_end = HoldsEnd(Arc::clone(&crew));
+        loop {
+            let mut swept = false;
+            let sessions: Vec<Uuid> = tokio::select! {
+                () = cancel.cancelled() => return,
+                Some(mut s) = said.recv() => {
+                    // Handed to another boss: decided again, by that one.
+                    if s.why.is_empty() {
+                        asked.remove(&s.approval);
+                        continue;
                     }
-                }
-                let refused = match s.again.take() {
-                    Some(a) => {
-                        // Held where its terminal asks it, it goes there, for
-                        // the person, and nothing more can answer it here;
-                        // otherwise Desk tries the decision again.
-                        if !crew.desk.let_go(s.session, s.approval) {
-                            again.insert(s.approval, a);
+                    // Its decision call failed: decided again soon, the person
+                    // told once; failing for minutes on end, it is theirs.
+                    if s.retry {
+                        let n = failed.entry(s.approval).or_default();
+                        *n += 1;
+                        if *n > RETRIES {
+                            crew.desk.let_go(s.session, s.approval);
+                            s.retry = false;
+                            s.text = format!(
+                                "{} (it failed {RETRIES} times over, so it's yours to answer now)",
+                                s.text
+                            );
+                        } else {
+                            again_at.insert(s.approval, tokio::time::Instant::now() + crew.retry_after());
                         }
-                        true
                     }
-                    None => false,
-                };
-                crew.say_waits(s, refused, &mut told).await;
-                continue;
-            }
-            received = events.recv() => match received {
-                Ok(DeskEvent::Session { session }) if session.pending.is_some() => vec![session.id],
-                Ok(DeskEvent::Activity { event }) if event.kind == Kind::NeedsYou => event
-                    .subject
-                    .as_ref()
-                    .and_then(|s| s.id.parse().ok())
-                    .into_iter()
-                    .collect(),
-                Ok(_) => continue,
-                Err(RecvError::Lagged(_)) => waiting(&crew),
-                Err(RecvError::Closed) => return,
-            },
-            // With no boss at Act fully in force, a sweep has nothing to
-            // decide; what is asked is still looked at as it comes.
-            _ = sweep.tick() => {
-                swept = true;
-                match crew.desk.any_boss_unbound() {
-                    true => {
-                        let (answered, seen) = crew.dialog_answerers();
-                        crew.desk.set_dialog_answerers_of(answered, seen);
-                        waiting(&crew)
-                    }
-                    false => {
-                        crew.desk.set_dialog_answerers(HashMap::new());
-                        Vec::new()
+                    let refused = match s.again.take() {
+                        Some(a) => {
+                            // Held where its terminal asks it, it goes there, for
+                            // the person, and nothing more can answer it here;
+                            // otherwise Desk tries the decision again.
+                            if !crew.desk.let_go(s.session, s.approval) {
+                                again.insert(s.approval, a);
+                            }
+                            true
+                        }
+                        None => false,
+                    };
+                    crew.say_waits(s, refused, &mut told).await;
+                    continue;
+                }
+                received = events.recv() => match received {
+                    Ok(DeskEvent::Session { session }) if session.pending.is_some() => vec![session.id],
+                    Ok(DeskEvent::Activity { event }) if event.kind == Kind::NeedsYou => event
+                        .subject
+                        .as_ref()
+                        .and_then(|s| s.id.parse().ok())
+                        .into_iter()
+                        .collect(),
+                    Ok(_) => continue,
+                    Err(RecvError::Lagged(_)) => waiting(&crew),
+                    Err(RecvError::Closed) => return,
+                },
+                // With no boss at Act fully in force, a sweep has nothing to
+                // decide; what is asked is still looked at as it comes.
+                _ = sweep.tick() => {
+                    swept = true;
+                    match crew.desk.any_boss_unbound() {
+                        true => {
+                            let (answered, seen) = crew.dialog_answerers();
+                            crew.desk.set_dialog_answerers_of(answered, seen);
+                            waiting(&crew)
+                        }
+                        false => {
+                            crew.desk.set_dialog_answerers(HashMap::new());
+                            Vec::new()
+                        }
                     }
                 }
-            }
-        };
-        // What Desk refused is done again each sweep, as its boss decided
-        // it, while that boss still decides it.
-        if swept && !again.is_empty() {
-            let views: HashMap<Uuid, SessionView> = crew
-                .desk
-                .list()
-                .into_iter()
-                .filter_map(|v| v.pending.as_ref().map(|p| p.id).map(|a| (a, v)))
-                .collect();
-            let mut taken = Vec::new();
-            for (approval, (action, by)) in &again {
-                let Some(view) = views.get(approval) else {
-                    taken.push(*approval);
-                    continue;
-                };
-                if !crew.still_decides(view, &by.party.id) {
-                    taken.push(*approval);
-                    crew.left_by_served(&by.party.id, view.id, *approval);
-                    crew.tell_dm(
+            };
+            // What Desk refused is done again each sweep, as its boss decided
+            // it, while that boss still decides it.
+            if swept && !again.is_empty() {
+                let views: HashMap<Uuid, SessionView> = crew
+                    .desk
+                    .list()
+                    .into_iter()
+                    .filter_map(|v| v.pending.as_ref().map(|p| p.id).map(|a| (a, v)))
+                    .collect();
+                let mut taken = Vec::new();
+                for (approval, (action, by)) in &again {
+                    let Some(view) = views.get(approval) else {
+                        taken.push(*approval);
+                        continue;
+                    };
+                    if !crew.still_decides(view, &by.party.id) {
+                        taken.push(*approval);
+                        crew.left_by_served(&by.party.id, view.id, *approval);
+                        crew.tell_dm(
                         &by.party.id,
                         &format!(
                             "{}'s request is yours again: Act fully isn't in force for it now, so I didn't do what I decided",
@@ -335,49 +338,50 @@ pub(super) async fn decide_loop(
                         ),
                     )
                     .await;
-                    continue;
+                        continue;
+                    }
+                    let deciding = crew.deciding(&by.party.id);
+                    let performed = crew.perform(action, by.clone()).await;
+                    drop(deciding);
+                    if performed.is_ok() {
+                        taken.push(*approval);
+                    }
                 }
-                let deciding = crew.deciding(&by.party.id);
-                let performed = crew.perform(action, by.clone()).await;
-                drop(deciding);
-                if performed.is_ok() {
-                    taken.push(*approval);
+                for a in taken {
+                    again.remove(&a);
                 }
             }
-            for a in taken {
-                again.remove(&a);
+            // A request whose decision call failed is decided again once its
+            // wait is up.
+            if swept {
+                let now = tokio::time::Instant::now();
+                again_at.retain(|a, at| {
+                    let due = *at <= now;
+                    if due {
+                        asked.remove(a);
+                    }
+                    !due
+                });
             }
-        }
-        // A request whose decision call failed is decided again once its
-        // wait is up.
-        if swept {
-            let now = tokio::time::Instant::now();
-            again_at.retain(|a, at| {
-                let due = *at <= now;
-                if due {
-                    asked.remove(a);
-                }
-                !due
-            });
-        }
-        for id in sessions {
-            crew.look_at(id, &mut asked, &tx, &cancel, &mut slots, &mut cleared);
-        }
-        // Only what still waits is remembered: a dialog's question behind
-        // another ask too, so it isn't said again when it shows again.
-        if !told.is_empty() || !asked.is_empty() || !again.is_empty() {
-            let open: HashSet<Uuid> = crew
-                .desk
-                .list()
-                .into_iter()
-                .filter_map(|v| v.pending.map(|p| p.id))
-                .chain(crew.desk.questions_behind())
-                .collect();
-            told.retain(|a, _| open.contains(a));
-            asked.retain(|a| open.contains(a));
-            again.retain(|a, _| open.contains(a));
-            again_at.retain(|a, _| open.contains(a));
-            failed.retain(|a, _| open.contains(a));
+            for id in sessions {
+                crew.look_at(id, &mut asked, &tx, &cancel, &mut slots, &mut cleared);
+            }
+            // Only what still waits is remembered: a dialog's question behind
+            // another ask too, so it isn't said again when it shows again.
+            if !told.is_empty() || !asked.is_empty() || !again.is_empty() {
+                let open: HashSet<Uuid> = crew
+                    .desk
+                    .list()
+                    .into_iter()
+                    .filter_map(|v| v.pending.map(|p| p.id))
+                    .chain(crew.desk.questions_behind())
+                    .collect();
+                told.retain(|a, _| open.contains(a));
+                asked.retain(|a| open.contains(a));
+                again.retain(|a, _| open.contains(a));
+                again_at.retain(|a, _| open.contains(a));
+                failed.retain(|a, _| open.contains(a));
+            }
         }
     }
 }

@@ -1972,40 +1972,44 @@ impl CrewHub {
 /// Keeps the open items: each session question that stops waiting on the
 /// person closes its item as it happens; every minute what is past closes
 /// and what is due is said again; and the nightly sweep runs.
-pub(super) async fn items_loop(
+pub(super) fn items_loop(
     crew: Arc<CrewHub>,
-    mut events: super::Events,
     cancel: CancellationToken,
-) {
-    let mut every = tokio::time::interval(crew.timing.minute);
-    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let sweep_after = chrono::Duration::from_std(crew.timing.minute)
-        .map(|m| m * SWEEP_AFTER.num_minutes() as i32)
-        .unwrap_or(SWEEP_AFTER);
-    loop {
-        tokio::select! {
-            () = cancel.cancelled() => return,
-            received = events.recv() => match received {
-                Ok(DeskEvent::Line { message, removed: false })
-                    if message.kind != LineKind::Ask && message.from_session().is_some() =>
-                {
-                    crew.replied(&message).await;
-                }
-                Ok(DeskEvent::Line { message, .. }) if message.kind == LineKind::Ask => {
-                    let name = message.from.name.clone();
-                    if let Some((by, why)) = line_closed(message.asked, &name) {
-                        if let Err(e) = crew.desk.store().item_close_of_line(message.id, by, &why).await {
-                            tracing::warn!(error = %e, "closing a question's open item failed");
+) -> impl std::future::Future<Output = ()> {
+    // Subscribed now, before the loop is spawned: nothing that happens
+    // once the crew has started is missed while it starts.
+    let mut events = crew.desk.events();
+    async move {
+        let mut every = tokio::time::interval(crew.timing.minute);
+        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let sweep_after = chrono::Duration::from_std(crew.timing.minute)
+            .map(|m| m * SWEEP_AFTER.num_minutes() as i32)
+            .unwrap_or(SWEEP_AFTER);
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                received = events.recv() => match received {
+                    Ok(DeskEvent::Line { message, removed: false })
+                        if message.kind != LineKind::Ask && message.from_session().is_some() =>
+                    {
+                        crew.replied(&message).await;
+                    }
+                    Ok(DeskEvent::Line { message, .. }) if message.kind == LineKind::Ask => {
+                        let name = message.from.name.clone();
+                        if let Some((by, why)) = line_closed(message.asked, &name) {
+                            if let Err(e) = crew.desk.store().item_close_of_line(message.id, by, &why).await {
+                                tracing::warn!(error = %e, "closing a question's open item failed");
+                            }
                         }
                     }
-                }
-                Ok(_) | Err(RecvError::Lagged(_)) => {}
-                Err(RecvError::Closed) => return,
-            },
-            _ = every.tick() => {
-                crew.look_at_items().await;
-                if crew.sweep_due().await {
-                    crew.sweep_items(sweep_after).await;
+                    Ok(_) | Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => return,
+                },
+                _ = every.tick() => {
+                    crew.look_at_items().await;
+                    if crew.sweep_due().await {
+                        crew.sweep_items(sweep_after).await;
+                    }
                 }
             }
         }

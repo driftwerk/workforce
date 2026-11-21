@@ -237,6 +237,65 @@ async fn a_wait_settled_in_its_session_is_closed_and_said_in_one_line() {
     .await;
 }
 
+/// A held session given to the person before it says it holds: its
+/// "Understood, holding." still waits, so the question stays theirs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_sessions_holding_reply_after_its_wait_is_the_persons_leaves_it_open() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let config = format!("{ACT}wake = {{ waiting_after_minutes = 60 }}\n");
+        let (_overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", &config, &[]).await;
+        let (s, _) = stopped(&d, dir.path(), "Cufflink Migration").await;
+        d.line_call(s.id, "tell", &json!({"to": "desk", "text": REPORT}), None)
+            .await
+            .unwrap();
+        crew.perform(
+            &Action::Nudge {
+                to: Target::Session(s.id),
+                message:
+                    "Don't change staging any further until I answer: this is the person's call."
+                        .into(),
+                reply_to: None,
+            },
+            crew.by_overseer("It needs a decision.").unwrap(),
+        )
+        .await
+        .unwrap();
+        let hold = d
+            .line_thread(s.id, None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .rfind(|m| m.text.contains("until I answer"))
+            .unwrap();
+        let _ = d.store().line_take(hold.id, Delivery::Delivered).await;
+        // Desk looks before the session replies: the person has it.
+        crew.look_for_silent_waits().await;
+        let wait = the_wait(&d, s.id).await;
+        assert!(
+            wait.dedupe_key.ends_with(&hold.id.to_string()),
+            "{}",
+            wait.dedupe_key
+        );
+        d.line_call(
+            s.id,
+            "tell",
+            &json!({"to": "desk", "text": "Understood, holding."}),
+            None,
+        )
+        .await
+        .unwrap();
+        for _ in 0..3 {
+            crew.look_at_items().await;
+            crew.look_for_silent_waits().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let now = d.store().open_item(wait.id).await.unwrap().unwrap();
+        assert_eq!(now.state, OpenState::Open, "still the person's: {now:?}");
+    })
+    .await;
+}
+
 /// The boss holds the session saying it is the person's: the person has it
 /// at once; the boss's own decision reaching the session closes it, said in
 /// a line.
@@ -248,9 +307,11 @@ async fn a_bosss_hold_is_the_persons_at_once_and_its_decision_closes_it() {
         let config = format!("{ACT}wake = {{ waiting_after_minutes = 60 }}\n");
         let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", &config, &[]).await;
         let (s, _) = stopped(&d, dir.path(), "Cufflink Migration").await;
-        d.line_call(s.id, "tell", &json!({"to": "desk", "text": REPORT}), None)
+        let r = d
+            .line_call(s.id, "tell", &json!({"to": "desk", "text": REPORT}), None)
             .await
             .unwrap();
+        let report: uuid::Uuid = serde_json::from_value(r["id"].clone()).unwrap();
         let by = || crew.by_overseer("It needs a decision.").unwrap();
         let nudge = |text: &str| Action::Nudge {
             to: Target::Session(s.id),
@@ -290,18 +351,21 @@ async fn a_bosss_hold_is_the_persons_at_once_and_its_decision_closes_it() {
             "{}",
             wait.dedupe_key
         );
-        // In its own words: those of its reply when it came before Desk
-        // looked, else its report before the hold (given at once, the hold
-        // can be looked at before the reply is).
+        // In its words that asked, whether Desk saw its reply first or the
+        // hold: its report, its options and its recommendation.
         assert!(
-            wait.text.contains("holding") || wait.text.contains("Both need your decision"),
+            wait.text.contains("Both need your decision"),
             "its own words: {}",
             wait.text
         );
+        assert_eq!(wait.line_message, Some(report));
+        assert_eq!(wait.options.len(), 3, "{:?}", wait.options);
         assert!(
-            !wait.text.contains("until I answer"),
-            "not the boss's: {}",
-            wait.text
+            wait.recommendation
+                .as_deref()
+                .unwrap_or_default()
+                .contains("I recommend (a)"),
+            "{wait:?}"
         );
 
         // The boss decides within its directives: it reaches the session.

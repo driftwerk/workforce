@@ -639,15 +639,12 @@ async fn reports_waiting_when_the_hub_stopped_are_taken_by_a_turn_when_it_starts
         let dir = tempfile::tempdir().unwrap();
         let (overseer, crew, d, s) = paced_session(5, "Noted.", pool, dir.path()).await;
         let report = kept_report(&d, s, "Step 14 done: the old DNS records are gone.").await;
-        // Kept straight in the store, no event: the hub starting again, its
-        // line loop reads what waits.
+        // Kept straight in the store, no event: the hub starting again, a
+        // line loop of its own reads what waits (the crew's has read
+        // already), stopped however the test ends.
         let cancel = tokio_util::sync::CancellationToken::new();
-        tokio::spawn(super::super::line::line_loop(
-            Arc::clone(&crew),
-            crew.desk.subscribe().1,
-            crew.rework.subscribe(),
-            cancel.clone(),
-        ));
+        let _stop = cancel.clone().drop_guard();
+        tokio::spawn(super::super::line::line_loop(Arc::clone(&crew), cancel));
         let turn = eventually("the waiting report's turn", async || {
             overseer
                 .sessions
@@ -670,7 +667,6 @@ async fn reports_waiting_when_the_hub_stopped_are_taken_by_a_turn_when_it_starts
         assert!(taken.delivered_at.is_some());
         tokio::time::sleep(super::super::line::GATHER * 2).await;
         assert_eq!(line_turns(&overseer, s), 1, "one turn took it");
-        cancel.cancel();
     })
     .await;
 }

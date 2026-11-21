@@ -992,259 +992,264 @@ impl Gathered {
 /// its mind is held, or the person's own turn runs in its DM, what its
 /// sessions say keeps gathering, and the session that has waited longest
 /// goes first. It takes sessions on as they appear, when it is set to.
-pub(super) async fn line_loop(
+pub(super) fn line_loop(
     crew: Arc<CrewHub>,
-    mut events: super::Events,
-    mut rework: super::Rework,
     cancel: CancellationToken,
-) {
-    let mut gathering: HashMap<Uuid, Gathered> = HashMap::new();
-    for (session, kept) in crew.line_kept().await {
-        gathering
-            .entry(session)
-            .or_insert_with(Gathered::new)
-            .take(kept);
-    }
-    // The waiting reports of a turn that didn't run, given back.
-    let (give_back, mut given_back) =
-        tokio::sync::mpsc::unbounded_channel::<(Uuid, Vec<LineMessage>)>();
-    // Each line turn running, by session, with the boss it is for.
-    let mut running: HashMap<Uuid, (tokio::task::JoinHandle<()>, Option<String>)> = HashMap::new();
-    let mut tick = tokio::time::interval(Duration::from_millis(500));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut taking_on: Option<tokio::task::JoinHandle<()>> = None;
-    let mut looked: Option<Instant> = None;
-    // The requests already given to a boss, by id and boss, while open.
-    let mut offered: HashSet<(Uuid, String)> = HashSet::new();
-    let mut asked_at: Option<Instant> = None;
-    loop {
-        let mut look = false;
-        let mut lagged = false;
-        tokio::select! {
-            () = cancel.cancelled() => return,
-            received = events.recv() => match received {
-                Ok(DeskEvent::Line { message, removed: false }) => {
-                    let fresh = message.to.kind == PartyKind::Manager
-                        && matches!(message.kind, LineKind::Ask | LineKind::Tell)
-                        && message.at == message.updated_at
-                        && message.asked.is_none_or(|a| a == Asked::Open);
-                    if let (true, Some(session)) = (fresh, message.from_session()) {
-                        gathering
-                            .entry(session)
-                            .or_insert_with(Gathered::new)
-                            .messages
-                            .push(*message);
-                    }
-                }
-                Ok(DeskEvent::Activity { event }) => {
-                    // What the breaker did to a session the overseer runs
-                    // outside a plan (a plan's go to its own turn).
-                    if let Some((session, line, None)) = crew.breaker_note(&event).await {
-                        gathering
-                            .entry(session)
-                            .or_insert_with(Gathered::new)
-                            .ended
-                            .push(line);
-                    }
-                    if let Some((session, mut line)) = crew.work_line(&event) {
-                        if super::watcher::finished_session(&event).is_some() {
-                            line = crew.with_doing(session, line).await;
+) -> impl std::future::Future<Output = ()> {
+    // Subscribed now, before the loop is spawned: nothing that happens
+    // once the crew has started is missed while it starts.
+    let mut events = crew.desk.events();
+    let mut rework = crew.rework.subscribe();
+    async move {
+        let mut gathering: HashMap<Uuid, Gathered> = HashMap::new();
+        for (session, kept) in crew.line_kept().await {
+            gathering
+                .entry(session)
+                .or_insert_with(Gathered::new)
+                .take(kept);
+        }
+        // The waiting reports of a turn that didn't run, given back.
+        let (give_back, mut given_back) =
+            tokio::sync::mpsc::unbounded_channel::<(Uuid, Vec<LineMessage>)>();
+        // Each line turn running, by session, with the boss it is for.
+        let mut running: HashMap<Uuid, (tokio::task::JoinHandle<()>, Option<String>)> =
+            HashMap::new();
+        let mut tick = tokio::time::interval(Duration::from_millis(500));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut taking_on: Option<tokio::task::JoinHandle<()>> = None;
+        let mut looked: Option<Instant> = None;
+        // The requests already given to a boss, by id and boss, while open.
+        let mut offered: HashSet<(Uuid, String)> = HashSet::new();
+        let mut asked_at: Option<Instant> = None;
+        loop {
+            let mut look = false;
+            let mut lagged = false;
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                received = events.recv() => match received {
+                    Ok(DeskEvent::Line { message, removed: false }) => {
+                        let fresh = message.to.kind == PartyKind::Manager
+                            && matches!(message.kind, LineKind::Ask | LineKind::Tell)
+                            && message.at == message.updated_at
+                            && message.asked.is_none_or(|a| a == Asked::Open);
+                        if let (true, Some(session)) = (fresh, message.from_session()) {
+                            gathering
+                                .entry(session)
+                                .or_insert_with(Gathered::new)
+                                .take(vec![*message]);
                         }
-                        gathering
-                            .entry(session)
-                            .or_insert_with(Gathered::new)
-                            .ended
-                            .push(line);
                     }
-                }
-                Ok(DeskEvent::Session { .. }) => {
-                    look = looked.is_none_or(|at| at.elapsed() >= Duration::from_secs(1));
-                }
-                Err(RecvError::Lagged(missed)) => {
-                    // Its questions are read again from the store: none
-                    // missed is left unanswered.
-                    tracing::warn!(missed, "the line loop fell behind Desk's events");
-                    lagged = true;
-                }
-                Ok(_) => {}
-                Err(RecvError::Closed) => return,
-            },
-            // A turn's end the boss's fast call handed to its full turn.
-            Ok(event) = rework.recv() => {
-                if let Some((session, line)) = crew.work_line(&event) {
-                    let line = crew.with_doing(session, line).await;
-                    let g = gathering.entry(session).or_insert_with(Gathered::new);
-                    g.ended.push(line);
-                    g.handed = true;
-                }
-            }
-            Some((session, reports)) = given_back.recv() => {
-                let g = gathering.entry(session).or_insert_with(Gathered::new);
-                g.retry = Some(Instant::now() + NOT_RUN_AGAIN);
-                g.take(reports);
-            }
-            _ = tick.tick() => {}
-        }
-        // A session's turn running now has what it was given: only the
-        // others' are taken up again.
-        if lagged {
-            for (session, kept) in crew
-                .line_kept()
-                .await
-                .into_iter()
-                .filter(|(s, _)| !running.contains_key(s))
-            {
-                gathering
-                    .entry(session)
-                    .or_insert_with(Gathered::new)
-                    .take(kept);
-            }
-        }
-        // What the sessions a boss runs ask Desk to allow, at most twice a
-        // second: each open request it can answer and hasn't been given.
-        if asked_at.is_none_or(|at| at.elapsed() >= ASKS_EVERY) {
-            asked_at = Some(Instant::now());
-            for (session, approval, line) in crew.owed_asks(&mut offered) {
-                tracing::info!(%session, %approval, "a request goes to the boss that runs its session");
-                gathering
-                    .entry(session)
-                    .or_insert_with(Gathered::new)
-                    .asks
-                    .push((approval, line));
-            }
-        }
-        // New sessions as they appear, and all of them now and then.
-        look |= looked.is_none_or(|at| at.elapsed() >= crew.timing.tick);
-        if look && taking_on.as_ref().is_none_or(|h| h.is_finished()) {
-            looked = Some(Instant::now());
-            let crew = Arc::clone(&crew);
-            taking_on = Some(tokio::spawn(async move { crew.take_on_all().await }));
-        }
-        running.retain(|_, (h, _)| !h.is_finished());
-        let mut due: Vec<(Uuid, Instant)> = gathering
-            .iter()
-            .filter(|(s, g)| {
-                g.since.elapsed() >= GATHER
-                    && (g.retry.is_none_or(|at| at <= Instant::now())
-                        || g.messages.iter().any(|m| m.kind == LineKind::Ask))
-                    && !running.contains_key(s)
-            })
-            .map(|(s, g)| (*s, g.since))
-            .collect();
-        // The longest waiting first: each boss starts one at a time.
-        due.sort_by_key(|(_, since)| *since);
-        let mut busy: HashSet<String> = running.values().filter_map(|(_, b)| b.clone()).collect();
-        for (session, since) in due {
-            let boss = crew.line_boss(session);
-            if let Some(b) = &boss {
-                // One line turn per boss at a time; while its mind is busy
-                // what its sessions say gathers, until it has waited long
-                // enough to queue for the mind in turn.
-                if busy.contains(b) || !crew.mind_may_start(b, since) {
-                    continue;
-                }
-            }
-            let Some(Gathered {
-                mut messages,
-                mut ended,
-                mut asks,
-                mut handed,
-                ..
-            }) = gathering.remove(&session)
-            else {
-                continue;
-            };
-            // Answered while it was gathered (by the person, say): no turn
-            // for it.
-            let open = crew
-                .desk
-                .view(session)
-                .ok()
-                .and_then(|v| v.pending)
-                .map(|p| p.id);
-            asks.retain(|(approval, _)| Some(*approval) == open);
-            let work = !ended.is_empty() || !asks.is_empty();
-            // Let go, or taken over, while it waited: no work turn, and its
-            // requests are the boss's to be given again once it drives.
-            if work && !crew.still_works(session) {
-                ended.clear();
-                handed = false;
-                let boss = crew.boss_of(session);
-                for (approval, _) in asks.drain(..) {
-                    offered.retain(|(a, b)| *a != approval || Some(b) != boss.as_ref());
-                }
-                if messages.is_empty() {
-                    continue;
-                }
-            }
-            // Out of its boss's turns for the hour: its turn's end, what it
-            // asks Desk to allow and its reports wait, gathered, for the
-            // next, in their place in line; its questions go on now.
-            let work = !ended.is_empty() || !asks.is_empty();
-            let reports = crew.reports_paced(session, &messages);
-            if (work || reports) && !crew.spend_work_turn(session) {
-                let mut waiting = if reports {
-                    std::mem::take(&mut messages)
-                } else {
-                    Vec::new()
-                };
-                crew.wait_for_next_turn(&mut waiting).await;
-                gathering.insert(
-                    session,
-                    Gathered {
-                        since,
-                        // Looked at again soon, not only when the hour
-                        // frees one: the person may raise the cap or
-                        // turn on Act fully meanwhile.
-                        retry: Some(Instant::now() + GATHER),
-                        messages: waiting,
-                        ended: std::mem::take(&mut ended),
-                        asks: std::mem::take(&mut asks),
-                        handed: std::mem::take(&mut handed),
-                    },
-                );
-                if messages.is_empty() {
-                    continue;
-                }
-            }
-            ended.extend(asks.iter().map(|(_, line)| line.clone()));
-            if let Some(b) = &boss {
-                busy.insert(b.clone());
-            }
-            let crew = Arc::clone(&crew);
-            let give_back = give_back.clone();
-            let turn_boss = boss.clone().filter(|_| handed);
-            running.insert(
-                session,
-                (
-                    tokio::spawn(async move {
-                        let waited: Vec<LineMessage> = messages
-                            .iter()
-                            .filter(|m| m.delivery == Delivery::Queued)
-                            .cloned()
-                            .collect();
-                        let turn = crew.answer_line(session, messages, ended).await;
-                        // Taken once its turn has read them; a turn that
-                        // didn't run leaves them waiting, for another.
-                        match turn {
-                            LineTurn::NotRun if !waited.is_empty() => {
-                                let _ = give_back.send((session, waited));
+                    Ok(DeskEvent::Activity { event }) => {
+                        // What the breaker did to a session the overseer runs
+                        // outside a plan (a plan's go to its own turn).
+                        if let Some((session, line, None)) = crew.breaker_note(&event).await {
+                            gathering
+                                .entry(session)
+                                .or_insert_with(Gathered::new)
+                                .ended
+                                .push(line);
+                        }
+                        if let Some((session, mut line)) = crew.work_line(&event) {
+                            if super::watcher::finished_session(&event).is_some() {
+                                line = crew.with_doing(session, line).await;
                             }
-                            _ => crew.reports_taken(&waited).await,
+                            gathering
+                                .entry(session)
+                                .or_insert_with(Gathered::new)
+                                .ended
+                                .push(line);
                         }
-                        let ran = turn == LineTurn::Ran;
-                        // A refused next step handed to it was its to take
-                        // (`super::idle`), once its turn ran.
-                        if let Some(b) = turn_boss.as_ref().filter(|_| ran) {
-                            crew.full_turn_over(b, session);
-                        }
-                        // What its turn was given and left open is the
-                        // person's: never given to it again by itself.
-                        crew.left_open(session, &asks).await;
-                    }),
-                    boss,
-                ),
-            );
+                    }
+                    Ok(DeskEvent::Session { .. }) => {
+                        look = looked.is_none_or(|at| at.elapsed() >= Duration::from_secs(1));
+                    }
+                    Err(RecvError::Lagged(missed)) => {
+                        // Its questions are read again from the store: none
+                        // missed is left unanswered.
+                        tracing::warn!(missed, "the line loop fell behind Desk's events");
+                        lagged = true;
+                    }
+                    Ok(_) => {}
+                    Err(RecvError::Closed) => return,
+                },
+                // A turn's end the boss's fast call handed to its full turn.
+                Ok(event) = rework.recv() => {
+                    if let Some((session, line)) = crew.work_line(&event) {
+                        let line = crew.with_doing(session, line).await;
+                        let g = gathering.entry(session).or_insert_with(Gathered::new);
+                        g.ended.push(line);
+                        g.handed = true;
+                    }
+                }
+                Some((session, reports)) = given_back.recv() => {
+                    let g = gathering.entry(session).or_insert_with(Gathered::new);
+                    g.retry = Some(Instant::now() + NOT_RUN_AGAIN);
+                    g.take(reports);
+                }
+                _ = tick.tick() => {}
+            }
+            // A session's turn running now has what it was given: only the
+            // others' are taken up again.
+            if lagged {
+                for (session, kept) in crew
+                    .line_kept()
+                    .await
+                    .into_iter()
+                    .filter(|(s, _)| !running.contains_key(s))
+                {
+                    gathering
+                        .entry(session)
+                        .or_insert_with(Gathered::new)
+                        .take(kept);
+                }
+            }
+            // What the sessions a boss runs ask Desk to allow, at most twice a
+            // second: each open request it can answer and hasn't been given.
+            if asked_at.is_none_or(|at| at.elapsed() >= ASKS_EVERY) {
+                asked_at = Some(Instant::now());
+                for (session, approval, line) in crew.owed_asks(&mut offered) {
+                    tracing::info!(%session, %approval, "a request goes to the boss that runs its session");
+                    gathering
+                        .entry(session)
+                        .or_insert_with(Gathered::new)
+                        .asks
+                        .push((approval, line));
+                }
+            }
+            // New sessions as they appear, and all of them now and then.
+            look |= looked.is_none_or(|at| at.elapsed() >= crew.timing.tick);
+            if look && taking_on.as_ref().is_none_or(|h| h.is_finished()) {
+                looked = Some(Instant::now());
+                let crew = Arc::clone(&crew);
+                taking_on = Some(tokio::spawn(async move { crew.take_on_all().await }));
+            }
+            running.retain(|_, (h, _)| !h.is_finished());
+            let mut due: Vec<(Uuid, Instant)> = gathering
+                .iter()
+                .filter(|(s, g)| {
+                    g.since.elapsed() >= GATHER
+                        && (g.retry.is_none_or(|at| at <= Instant::now())
+                            || g.messages.iter().any(|m| m.kind == LineKind::Ask))
+                        && !running.contains_key(s)
+                })
+                .map(|(s, g)| (*s, g.since))
+                .collect();
+            // The longest waiting first: each boss starts one at a time.
+            due.sort_by_key(|(_, since)| *since);
+            let mut busy: HashSet<String> =
+                running.values().filter_map(|(_, b)| b.clone()).collect();
+            for (session, since) in due {
+                let boss = crew.line_boss(session);
+                if let Some(b) = &boss {
+                    // One line turn per boss at a time; while its mind is busy
+                    // what its sessions say gathers, until it has waited long
+                    // enough to queue for the mind in turn.
+                    if busy.contains(b) || !crew.mind_may_start(b, since) {
+                        continue;
+                    }
+                }
+                let Some(Gathered {
+                    mut messages,
+                    mut ended,
+                    mut asks,
+                    mut handed,
+                    ..
+                }) = gathering.remove(&session)
+                else {
+                    continue;
+                };
+                // Answered while it was gathered (by the person, say): no turn
+                // for it.
+                let open = crew
+                    .desk
+                    .view(session)
+                    .ok()
+                    .and_then(|v| v.pending)
+                    .map(|p| p.id);
+                asks.retain(|(approval, _)| Some(*approval) == open);
+                let work = !ended.is_empty() || !asks.is_empty();
+                // Let go, or taken over, while it waited: no work turn, and its
+                // requests are the boss's to be given again once it drives.
+                if work && !crew.still_works(session) {
+                    ended.clear();
+                    handed = false;
+                    let boss = crew.boss_of(session);
+                    for (approval, _) in asks.drain(..) {
+                        offered.retain(|(a, b)| *a != approval || Some(b) != boss.as_ref());
+                    }
+                    if messages.is_empty() {
+                        continue;
+                    }
+                }
+                // Out of its boss's turns for the hour: its turn's end, what it
+                // asks Desk to allow and its reports wait, gathered, for the
+                // next, in their place in line; its questions go on now.
+                let work = !ended.is_empty() || !asks.is_empty();
+                let reports = crew.reports_paced(session, &messages);
+                if (work || reports) && !crew.spend_work_turn(session) {
+                    let mut waiting = if reports {
+                        std::mem::take(&mut messages)
+                    } else {
+                        Vec::new()
+                    };
+                    crew.wait_for_next_turn(&mut waiting).await;
+                    gathering.insert(
+                        session,
+                        Gathered {
+                            since,
+                            // Looked at again soon, not only when the hour
+                            // frees one: the person may raise the cap or
+                            // turn on Act fully meanwhile.
+                            retry: Some(Instant::now() + GATHER),
+                            messages: waiting,
+                            ended: std::mem::take(&mut ended),
+                            asks: std::mem::take(&mut asks),
+                            handed: std::mem::take(&mut handed),
+                        },
+                    );
+                    if messages.is_empty() {
+                        continue;
+                    }
+                }
+                ended.extend(asks.iter().map(|(_, line)| line.clone()));
+                if let Some(b) = &boss {
+                    busy.insert(b.clone());
+                }
+                let crew = Arc::clone(&crew);
+                let give_back = give_back.clone();
+                let turn_boss = boss.clone().filter(|_| handed);
+                running.insert(
+                    session,
+                    (
+                        tokio::spawn(async move {
+                            let waited: Vec<LineMessage> = messages
+                                .iter()
+                                .filter(|m| m.delivery == Delivery::Queued)
+                                .cloned()
+                                .collect();
+                            let turn = crew.answer_line(session, messages, ended).await;
+                            // Taken once its turn has read them; a turn that
+                            // didn't run leaves them waiting, for another.
+                            match turn {
+                                LineTurn::NotRun if !waited.is_empty() => {
+                                    let _ = give_back.send((session, waited));
+                                }
+                                _ => crew.reports_taken(&waited).await,
+                            }
+                            let ran = turn == LineTurn::Ran;
+                            // A refused next step handed to it was its to take
+                            // (`super::idle`), once its turn ran.
+                            if let Some(b) = turn_boss.as_ref().filter(|_| ran) {
+                                crew.full_turn_over(b, session);
+                            }
+                            // What its turn was given and left open is the
+                            // person's: never given to it again by itself.
+                            crew.left_open(session, &asks).await;
+                        }),
+                        boss,
+                    ),
+                );
+            }
         }
     }
 }
