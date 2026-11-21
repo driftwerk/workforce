@@ -16,6 +16,7 @@ use std::time::Instant;
 use chrono::{DateTime, Utc};
 use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
+use workforce_agent::tools::Tool as _;
 use workforce_common::channels::DESK_CHANNEL;
 use workforce_common::oversight::{Level, Oversight, Scope, WorkStyle};
 use workforce_desk::crew::Crew as _;
@@ -352,9 +353,8 @@ impl CrewHub {
             .collect();
         let had = self.tooled.lock().clone();
         if want != had {
-            // Each overseer's tools for its level, by agent: registered
-            // over the ones it had, so a turn running meanwhile never finds
-            // them gone; only what it may no longer use is taken away.
+            // Registered over the old ones, so a running turn never finds
+            // them gone.
             let mut tools: HashMap<String, Vec<CrewTool>> = current
                 .iter()
                 .map(|(s, o)| {
@@ -365,12 +365,7 @@ impl CrewHub {
                 .collect();
             for s in self.services() {
                 let kept = tools.get(s.agent_id.as_str());
-                let keeps = |name: &str| {
-                    kept.is_some_and(|t| {
-                        t.iter()
-                            .any(|t| workforce_agent::tools::Tool::name(t) == name)
-                    })
-                };
+                let keeps = |name: &str| kept.is_some_and(|t| t.iter().any(|t| t.name() == name));
                 for name in READ.iter().chain(ACT.iter()).filter(|n| !keeps(n)) {
                     s.tools.unregister(name);
                 }

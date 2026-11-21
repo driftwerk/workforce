@@ -49,51 +49,77 @@ fn approve(s: uuid::Uuid, a: uuid::Uuid) -> Value {
 
 /// Moving between Act and Act fully gives the overseer its tools for the
 /// new level over the old ones: a turn running meanwhile never finds them
-/// gone.
+/// gone. Down to Watch it keeps only what it reads and its own settings'
+/// card; overseeing nothing, it has no crew tools at all.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_level_change_never_leaves_the_overseer_without_its_tools() {
+    use super::super::tools::{ACT, READ};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use workforce_common::oversight::Level;
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
         let (overseer, crew, _d, _llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
-        eventually("the overseer's tools", async || {
-            overseer.tools.has("crew.interrupt").then_some(())
-        })
-        .await;
-        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let at = |level: Level| {
+            UNBOUND.replace(
+                "level = \"full\"",
+                &format!("level = \"{}\"", level.as_str()),
+            )
+        };
+        let settle = async |config: &str, level: Option<Level>| {
+            write_config(&overseer, config);
+            super::super::config_saved(&overseer);
+            crew.sync().await;
+            eventually("the level in force", async || {
+                (crew.overseer_service().map(|(_, o)| o.level) == level).then_some(())
+            })
+            .await;
+        };
+        let has = |names: &[&str]| names.iter().filter(|n| overseer.tools.has(n)).count();
+        settle(UNBOUND, Some(Level::Full)).await;
+        // Each time the tools change, every one of them is there.
+        let done = Arc::new(AtomicBool::new(false));
         let watching = {
             let (overseer, done) = (Arc::clone(&overseer), Arc::clone(&done));
             std::thread::spawn(move || {
-                let mut gone = 0;
-                while !done.load(std::sync::atomic::Ordering::Relaxed) {
-                    gone += usize::from(!overseer.tools.has("crew.interrupt"));
+                let (mut seen, mut gone) = (overseer.tools.generation(), 0);
+                while !done.load(Ordering::Relaxed) {
+                    let now = overseer.tools.generation();
+                    if now != seen {
+                        seen = now;
+                        gone += READ
+                            .iter()
+                            .chain(ACT.iter())
+                            .filter(|n| !overseer.tools.has(n))
+                            .count();
+                    }
+                    std::thread::yield_now();
                 }
                 gone
             })
         };
-        let act = UNBOUND.replace("level = \"full\"", "level = \"act\"");
-        for config in [&act, UNBOUND].into_iter().cycle().take(20) {
-            write_config(&overseer, config);
-            super::super::config_saved(&overseer);
-            let level = if config.contains("\"act\"") {
-                workforce_common::oversight::Level::Act
-            } else {
-                workforce_common::oversight::Level::Full
-            };
-            crew.sync().await;
-            eventually("the level in force", async || {
-                crew.overseer_service()
-                    .filter(|(_, o)| o.level == level)
-                    .map(|_| ())
-            })
-            .await;
+        for level in [Level::Act, Level::Full].into_iter().cycle().take(20) {
+            settle(&at(level), Some(level)).await;
         }
-        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        done.store(true, Ordering::Relaxed);
         assert_eq!(
             watching.join().unwrap(),
             0,
             "the overseer's tools went missing"
         );
+        // Watching, it keeps what it reads and the card to ask for more.
+        settle(&at(Level::Watch), Some(Level::Watch)).await;
+        assert_eq!(has(&READ), READ.len());
+        assert_eq!(
+            ACT.iter()
+                .copied()
+                .filter(|n| overseer.tools.has(n))
+                .collect::<Vec<_>>(),
+            vec![super::super::own_settings::NAME]
+        );
+        // Overseeing nothing, it has none.
+        settle(&UNBOUND.replace("enabled = true", "enabled = false"), None).await;
+        assert_eq!(has(&READ) + has(&ACT), 0);
     })
     .await;
 }
@@ -828,7 +854,7 @@ async fn a_running_session_goes_back_to_its_own_mode_when_unbound_ends() {
             })
             .await;
             match (ends, held) {
-                (_, None) => {}
+                (_, None) => assert!(desks(), "{ends:?}: never held, yet not passed on"),
                 (Ends::Released, Some(why)) => assert!(why.contains("leave it alone"), "{why}"),
                 (_, Some(why)) => assert!(
                     why.contains("put back in its own mode") || why.contains("puts it back"),
