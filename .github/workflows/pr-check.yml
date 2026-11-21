@@ -174,9 +174,10 @@ jobs:
     needs: [changes]
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    # A warm cache builds in about 30 minutes; a cold one (the cache is saved
-    # only from main, so after a red main or a lockfile change) takes over 60.
-    timeout-minutes: 100
+    # At two build jobs a warm cache builds in 20 to 35 minutes; a cold one
+    # (the cache is saved only from main, so after a red main or a lockfile
+    # change) can take 80.
+    timeout-minutes: 120
     permissions:
       contents: read
     env:
@@ -640,6 +641,7 @@ jobs:
     needs: [changes]
     if: needs.changes.outputs.docs == 'true' && needs.changes.outputs.code != 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     permissions:
       contents: read
     env:
@@ -652,6 +654,8 @@ jobs:
         with:
           shared-key: test
           save-if: false
+      - name: Give the build room to swap
+        uses: ./.github/actions/swap
       - run: cargo test -p workforce-hub --lib -- remote_mcp::help
 
   # The one check branch protection requires: path- and lane-skipped jobs
