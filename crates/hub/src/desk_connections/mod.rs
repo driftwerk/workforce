@@ -1413,13 +1413,14 @@ impl Connections {
         person: &str,
     ) -> Option<DateTime<Utc>> {
         let at = Self::consented_path(c, &conn.key)?;
+        let lasts = chrono::Duration::days(c.consent_days?);
         let given = self
             .vault_at(tier, &conn.level)
             .ok()?
             .get(&key_at(tier, person, &at))?;
         DateTime::parse_from_rfc3339(given.trim())
             .ok()
-            .map(|t| t.with_timezone(&Utc) + chrono::Duration::days(c.consent_days?))
+            .map(|t| t.with_timezone(&Utc) + lasts)
     }
 
     /// The person renewed `conn`'s approval at the service (Desk's
