@@ -1,5 +1,5 @@
 name: Give the build room to swap
-description: Adds 16 GB of swap on /mnt when it has room, so a build's memory peak slows the runner instead of killing it.
+description: Adds 16 GB of swap on /mnt when it has room.
 
 # The hub's library and its tests are each a rustc of about 9 GB: with the
 # rest of a build, or the services a job runs beside it, that can pass the
@@ -14,7 +14,8 @@ runs:
         free -h
         # Only a mitigation: without room on the scratch disk, build as
         # before.
-        if [ ! -d /mnt ] || [ "$(df --output=avail -BG /mnt | tail -1 | tr -dc 0-9)" -lt 24 ]; then
+        avail=$(df --output=avail -BG /mnt 2>/dev/null | tail -1 | tr -dc 0-9)
+        if [ "${avail:-0}" -lt 24 ]; then
           echo "No room on /mnt for swap: building with the runner's own."
           exit 0
         fi

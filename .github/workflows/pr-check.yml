@@ -429,17 +429,17 @@ jobs:
           path: ~/vellev-models
           key: vellev-models-bge-base-bge-small-en-v1.5
           restore-keys: vellev-models-
-      - name: Give the build room to swap
-        uses: ./.github/actions/swap
       # See test-build: the hub's build script makes ui/dist, and the
       # directory is newer than its last run, so without this every cargo
       # command rebuilds the hub.
       - run: mkdir -p ui/dist
+      - name: Give the build room to swap
+        uses: ./.github/actions/swap
       # Built before the node and Weaviate start, so its memory peak is not
       # theirs too; the tests then run this binary as it is.
       - name: Build the hub's tests
         if: matrix.leg == 'hub'
-        run: cargo test --all-features -p workforce-hub --lib --no-run
+        run: crates/hub/vellev-node-tests.sh --no-run --all-features
       - name: Start a vellev node
         timeout-minutes: 30
         run: |
