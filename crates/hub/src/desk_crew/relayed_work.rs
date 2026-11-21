@@ -32,7 +32,7 @@ use uuid::Uuid;
 use workforce_common::channels::DESK_CHANNEL;
 use workforce_common::oversight::Oversight;
 use workforce_desk::charge::Wheel;
-use workforce_desk::crew::{By, Event, Kind};
+use workforce_desk::crew::{self, By, Event, Kind};
 use workforce_desk::grant::{BossRef, Grant};
 use workforce_desk::line::{Asked, Delivery, LineKind, LineMessage};
 use workforce_desk::ChargeView;
@@ -72,6 +72,15 @@ pub(crate) struct Run {
     pub goal: String,
     pub folder: String,
     pub last_reply: Option<String>,
+    /// Whether its boss's question answerer has what it asks, there
+    /// ([`super::answer`]): it isn't raised to the boss's turns.
+    #[serde(default)]
+    pub answered: bool,
+    /// It as the overview there shows it, while what it waits on is raised
+    /// to its boss here ([`CrewHub::raised_elsewhere`]): what the boss's
+    /// check-in watches, as for a session here.
+    #[serde(default)]
+    pub item: Option<crew::Item>,
 }
 
 impl Run {
@@ -370,6 +379,16 @@ impl CrewHub {
             .filter(|m| m.asked == Some(Asked::Open) && ours(m))
             .map(Line::from)
             .collect();
+        let views: Vec<_> = runs
+            .iter()
+            .filter_map(|c| self.desk.view(c.session).ok())
+            .collect();
+        let answered: HashSet<Uuid> = views
+            .iter()
+            .filter(|v| self.answers_question_itself(v))
+            .map(|v| v.id)
+            .collect();
+        let items = self.desk.session_items(self, &views);
         let ids: Vec<String> = runs.iter().map(|c| c.session.to_string()).collect();
         let events = match ids.is_empty() {
             true => Vec::new(),
@@ -384,6 +403,10 @@ impl CrewHub {
             .iter()
             .filter_map(|e| {
                 let run = run_of(e.subject.as_ref()?.id.parse().ok()?)?;
+                let asked = matches!(e.kind, Kind::Finished | Kind::Question);
+                if asked && answered.contains(&run.session) {
+                    return None;
+                }
                 work_frame(self.grant_event(g, e), e, run)
             })
             .collect();
@@ -392,7 +415,12 @@ impl CrewHub {
         let (sessions, requests): (Vec<Run>, Vec<Option<Frame>>) = runs
             .iter()
             .filter_map(|c| {
-                let v = self.desk.view(c.session).ok()?;
+                let v = views.iter().find(|v| v.id == c.session)?;
+                let item = items
+                    .iter()
+                    .find(|i| i.id == c.session.to_string())
+                    .filter(|i| !self.raised_elsewhere(i, party))
+                    .cloned();
                 let request = v
                     .pending
                     .as_ref()
@@ -400,7 +428,7 @@ impl CrewHub {
                         p.answerable && p.request.is_some() && c.wheel == Wheel::Boss && !unbound
                     })
                     .and_then(|p| {
-                        let f = super::served::request_frame(g, &v, p);
+                        let f = super::served::request_frame(g, v, p);
                         Some(Frame {
                             id: p.id.to_string(),
                             subject: c.session,
@@ -421,6 +449,8 @@ impl CrewHub {
                         .as_deref()
                         .filter(|_| replies)
                         .map(|r| workforce_desk::crew::clip(r, 1500)),
+                    answered: answered.contains(&c.session),
+                    item,
                 };
                 Some((run, request))
             })
@@ -657,6 +687,37 @@ impl CrewHub {
                 },
             );
         }
+    }
+
+    /// The sessions `boss` runs on machines, as the overview there shows
+    /// them, each by `<machine>/<id>`: what its check-in watches with its
+    /// sessions here ([`CrewHub::thresholds`]).
+    pub(crate) fn machine_items(&self, boss: &str) -> Vec<crew::Item> {
+        self.work_away
+            .lock()
+            .runs
+            .iter()
+            .filter(|(_, (_, b, _))| b == boss)
+            .filter_map(|(named, ((_, group), _, run))| {
+                let mut item = run.item.clone()?;
+                item.id.clone_from(named);
+                item.group_id = (group != workforce_desk::UNGROUPED
+                    && workforce_desk::grant::plan_of(group).is_none())
+                .then(|| group.clone());
+                item.group = None;
+                Some(item)
+            })
+            .collect()
+    }
+
+    /// Whether the boss's question answerer on its machine has what the
+    /// session `<machine>/<id>` asks.
+    pub(crate) fn answered_on_machine(&self, named: &str) -> bool {
+        self.work_away
+            .lock()
+            .runs
+            .get(named)
+            .is_some_and(|(_, _, run)| run.answered)
     }
 
     fn away_forget(&self, keep: impl Fn(&(String, String)) -> bool) {
@@ -1019,6 +1080,8 @@ mod tests {
             goal: String::new(),
             folder: "/src".into(),
             last_reply: None,
+            answered: false,
+            item: None,
         }
     }
 

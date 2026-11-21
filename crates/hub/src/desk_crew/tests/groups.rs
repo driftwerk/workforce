@@ -291,6 +291,38 @@ fn pointed_at(name: &str, other: &Client, dir: &Path) -> Vec<(Value, bool)> {
                 false,
             ),
         ],
+        // A ticket of another scope's, named, is as none.
+        super::super::tickets::READ => vec![(json!({ "ticket": other.ticket }), true)],
+        super::super::tickets::EDIT => vec![(
+            json!({ "ticket": other.ticket, "title": "Retitled", "reason": r }),
+            true,
+        )],
+        super::super::tickets::COMMENT => vec![(
+            json!({ "ticket": other.ticket, "comment": "Seen", "reason": r }),
+            true,
+        )],
+        super::super::tickets::LINK => vec![(
+            json!({ "ticket": other.ticket, "needs": other.ticket, "reason": r }),
+            true,
+        )],
+        super::super::tickets::DELETE => {
+            vec![(json!({ "ticket": other.ticket, "reason": r }), true)]
+        }
+        super::super::tickets::CREATE => vec![(
+            json!({
+                "board": other.ticket.split('-').next().unwrap_or_default(),
+                "title": "Elsewhere",
+                "reason": r
+            }),
+            true,
+        )],
+        // A boss's own waits: below Act fully none starts, and another
+        // scope's session is never said back.
+        super::super::watches::WATCH => vec![(
+            json!({ "minutes": 5, "note": "Look again.", "session_id": s }),
+            false,
+        )],
+        super::super::watches::WATCHES => vec![(json!({}), false)],
         // The person's GitHub, read as them: no scope of Desk's in it.
         "crew.github_pr" => vec![(json!({ "repo": "acme/web", "number": 1 }), false)],
         "crew.github_branch" => vec![(json!({ "repo": "acme/web", "branch": "main" }), false)],
@@ -530,7 +562,19 @@ async fn kept_out(boss: &AgentService, other: &Client, secret: &str, refusal: &s
                 // one, and a group that isn't which to name, after the same
                 // words.
                 let said = r.error.as_deref().unwrap_or_default();
-                if input.get("board").is_some() {
+                // A ticket made on another scope's board: it has none so
+                // called.
+                if *name == super::super::tickets::CREATE {
+                    assert_eq!(
+                        said,
+                        format!(
+                            "You have no board called {:?}.",
+                            input["board"].as_str().unwrap_or_default()
+                        ),
+                        "{} {name} {input}",
+                        boss.agent_id
+                    );
+                } else if input.get("board").is_some() {
                     assert!(
                         said.starts_with(&words) && said.contains("new_board"),
                         "{} {name} {input}: {said}",

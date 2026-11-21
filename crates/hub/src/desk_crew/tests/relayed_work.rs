@@ -323,3 +323,116 @@ async fn a_take_is_refused_to_any_boss_but_the_grants_own_from_its_home() {
     })
     .await;
 }
+
+/// On the Mac: a session the boss runs on devbox that has gone quiet is
+/// said in its check-in as one here is, once, in the same words and after
+/// the same wait; one whose wait devbox raises elsewhere is not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_machine_session_gone_quiet_is_said_in_the_check_in_as_one_here_is() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_main, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            &[],
+        )
+        .await;
+        let id = uuid::Uuid::new_v4();
+        d.change_layout(|l| {
+            let mut l = l.clone();
+            l.ungrouped.items.push(format!("session:devbox/{id}"));
+            Ok(l)
+        })
+        .await
+        .unwrap();
+        let (_, o) = eventually("the main overseer", async || crew.overseer_named("desk")).await;
+        eventually("the grants", async || crew.machine_grants(true, true).map(drop)).await;
+        let quiet_since = chrono::Utc::now() - chrono::Duration::hours(1);
+        let item: workforce_desk::crew::Item = serde_json::from_value(json!({
+            "kind": "session", "id": id.to_string(), "name": "VEL-9", "engine": "claude",
+            "origin": "desk", "state": "working", "task": "Ship the fix", "detail": "● Bash",
+            "since": quiet_since, "lastActivity": quiet_since, "approval": null, "question": null,
+        }))
+        .unwrap();
+        // devbox, standing in: its take says how VEL-9 is.
+        let shown = Arc::new(parking_lot::Mutex::new(Some(item)));
+        let poller = {
+            let (crew, shown) = (Arc::clone(&crew), Arc::clone(&shown));
+            tokio::spawn(async move {
+                loop {
+                    for c in crew.relay_take(Duration::from_millis(200)).await {
+                        let body = match c.tool.as_str() {
+                            WORK_TAKE => json!(Taken {
+                                now: chrono::Utc::now().timestamp_millis(),
+                                sessions: vec![super::super::relayed_work::Run {
+                                    id,
+                                    name: "VEL-9".into(),
+                                    engine: "Claude Code".into(),
+                                    state: "working".into(),
+                                    wheel: workforce_desk::charge::Wheel::Boss,
+                                    goal: "Ship the fix".into(),
+                                    folder: "/src".into(),
+                                    last_reply: None,
+                                    answered: false,
+                                    item: shown.lock().clone(),
+                                }],
+                                ..Taken::default()
+                            }),
+                            _ => json!({}),
+                        };
+                        crew.relay_answer(
+                            c.id,
+                            super::super::relay::RelayAnswer {
+                                status: ServedStatus::Ok,
+                                body,
+                            },
+                        );
+                    }
+                }
+            })
+        };
+        // What the check-in says of VEL-9, and what it noted.
+        let quiet = |mut noted: std::collections::HashSet<String>| {
+            let (crew, o) = (Arc::clone(&crew), o.clone());
+            async move {
+                let said: Vec<String> = crew
+                    .thresholds("desk", &o, &mut noted)
+                    .await
+                    .into_iter()
+                    .map(|t| t.line)
+                    .filter(|l| l.contains("VEL-9"))
+                    .collect();
+                (said, noted)
+            }
+        };
+
+        let (said, noted) = eventually("VEL-9 said quiet", async || {
+            let (said, noted) = quiet(std::collections::HashSet::new()).await;
+            (!said.is_empty()).then_some((said, noted))
+        })
+        .await;
+        assert_eq!(
+            said,
+            [format!(
+                "VEL-9 (Claude Code session devbox/{id}) has been quiet for 60 min while working on \
+                 Ship the fix (last: ● Bash)"
+            )]
+        );
+        let (said, _) = quiet(noted).await;
+        assert!(said.is_empty(), "said once: {said:?}");
+        assert!(crew.machine_items("sarah").is_empty(), "the boss's own");
+
+        // devbox raises what it waits on elsewhere: nothing said here.
+        *shown.lock() = None;
+        eventually("devbox's word heard", async || {
+            crew.machine_items("desk").is_empty().then_some(())
+        })
+        .await;
+        let (said, _) = quiet(std::collections::HashSet::new()).await;
+        assert!(said.is_empty(), "{said:?}");
+        poller.abort();
+    })
+    .await;
+}
