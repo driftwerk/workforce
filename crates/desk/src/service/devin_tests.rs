@@ -38,8 +38,7 @@ exec sleep 60
 "#,
         dir = dir.display()
     );
-    std::fs::write(&path, script).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    workforce_common::executable::write(&path, script).unwrap();
     path
 }
 

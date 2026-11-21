@@ -2400,9 +2400,8 @@ fn broken_cli(dir: &Path) -> PathBuf {
 /// A Claude Code whose sessions run on, except while `broken` holds: then
 /// they say why they can't start and end at once.
 fn cli_broken_while(dir: &Path, broken: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join("broken-claude");
-    std::fs::write(
+    workforce_common::executable::write(
         &path,
         format!(
             "#!/bin/sh\ncase \"$1\" in --version) echo '2.1.300 (Claude Code)'; exit 0;; auth) exit 1;; esac\n\
@@ -2410,7 +2409,6 @@ fn cli_broken_while(dir: &Path, broken: &str) -> PathBuf {
         ),
     )
     .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
 }
 
