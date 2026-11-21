@@ -580,8 +580,7 @@ impl Desk {
     /// boss still sees it. One its boss (or Desk, for a boss gone or a
     /// group with a boss of its own) let go is the usual rules', as before.
     pub fn taken_back(&self, id: Uuid) -> bool {
-        self.charge_of(id)
-            .is_some_and(|c| !c.live() && c.released_by == Some(charge::ReleasedBy::Person))
+        self.charge_of(id).is_some_and(|c| c.taken_back())
     }
 
     /// What Desk shows of the charges: every live one, and every one let

@@ -783,9 +783,9 @@ impl CrewHub {
         self.gate_as(action, o, boss.as_deref(), false)
     }
 
-    /// Closing a session `boss` neither started nor was handed: only the
-    /// person closes it (Desk refuses anyone else), so it is theirs to
-    /// approve, never run.
+    /// Closing a session `boss` neither started nor was handed, or the
+    /// person took back from it: only the person closes it (Desk refuses
+    /// anyone else), so it is theirs to approve, never run.
     fn close_not_its(&self, action: &Action, o: &Oversight, boss: Option<&str>) -> Option<Gate> {
         let Action::Close { session } = action else {
             return None;
@@ -797,7 +797,7 @@ impl CrewHub {
         Some(match o.level {
             Level::Watch => Gate::Refuse,
             _ => Gate::Suggest(
-                "only the person closes a session you didn't start and weren't handed: they close it with one click"
+                "only the person closes a session you didn't start, weren't handed or they took back from you: they close it with one click"
                     .into(),
             ),
         })
@@ -2223,7 +2223,7 @@ impl CrewHub {
                 if by.party.kind == crew::PartyKind::Manager {
                     if !d.may_end(*session, Some(&by)) {
                         return Err(
-                            "Only the person closes a session you didn't start and weren't handed."
+                            "Only the person closes a session you didn't start, weren't handed or they took back from you."
                                 .into(),
                         );
                     }

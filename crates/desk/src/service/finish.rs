@@ -24,8 +24,9 @@ pub(crate) enum Finish {
 }
 
 /// Whether `by` may end a session whose boss's charge is `charge`: the
-/// person always; a boss only one it owns, one it started or the person
-/// handed it, never one it took on by itself; no one else.
+/// person always; a boss only one it started or the person handed it,
+/// whether it still runs it or let it go, never one it took on by itself
+/// or the person took back; no one else.
 pub(crate) fn may_end(by: Option<&By>, charge: Option<&Charge>) -> bool {
     let Some(by) = by else {
         return false;
@@ -33,7 +34,7 @@ pub(crate) fn may_end(by: Option<&By>, charge: Option<&Charge>) -> bool {
     match by.party.kind {
         PartyKind::You => true,
         PartyKind::Manager => charge.is_some_and(|c| {
-            c.live() && c.boss == by.party.id && matches!(c.how, How::Started | How::Handed)
+            c.boss == by.party.id && matches!(c.how, How::Started | How::Handed) && !c.taken_back()
         }),
         PartyKind::Agent | PartyKind::Session | PartyKind::Desk => false,
     }
@@ -126,7 +127,7 @@ mod tests {
     #[test]
     fn only_the_person_or_the_boss_that_owns_a_session_ends_it() {
         use super::may_end;
-        use crate::charge::{Charge, How};
+        use crate::charge::{Charge, How, ReleasedBy};
         use crate::crew::{By, Party};
         let id = uuid::Uuid::new_v4();
         let boss = By::manager("sarah", "Sarah", "done");
@@ -141,9 +142,29 @@ mod tests {
         assert!(!may_end(Some(&boss), None), "never its");
         let other = Charge::new(id, "max", How::Started, None);
         assert!(!may_end(Some(&boss), Some(&other)), "another boss's");
-        let mut released = charged(How::Started);
-        released.released_at = Some(chrono::Utc::now());
-        assert!(!may_end(Some(&boss), Some(&released)), "given back");
+        let released = |how, by| {
+            let mut c = charged(how);
+            c.released_at = Some(chrono::Utc::now());
+            c.released_by = by;
+            c
+        };
+        for how in [How::Started, How::Handed] {
+            assert!(
+                may_end(Some(&boss), Some(&released(how, Some(ReleasedBy::Boss)))),
+                "let go by its boss: still its to close"
+            );
+            assert!(
+                !may_end(Some(&boss), Some(&released(how, Some(ReleasedBy::Person)))),
+                "taken back by the person"
+            );
+        }
+        assert!(
+            !may_end(
+                Some(&boss),
+                Some(&released(How::Taken, Some(ReleasedBy::Boss)))
+            ),
+            "never took it on itself"
+        );
         let agent = By {
             party: Party::agent("scout", "Scout"),
             ..By::you()

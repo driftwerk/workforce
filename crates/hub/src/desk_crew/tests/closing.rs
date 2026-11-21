@@ -407,3 +407,47 @@ async fn asked_to_close_what_is_finished_a_boss_closes_and_removes_its_own_and_n
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_boss_still_closes_what_it_started_after_it_let_it_go_and_never_what_the_person_took_back(
+) {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (overseer, crew, d, _llm) = overseeing(&base, pool, "ok", FULL, &[]).await;
+        d.boss_bounds_with(workforce_desk::charge::Bounds {
+            home: base.clone(),
+            ..Default::default()
+        });
+        let boss = Party::manager("desk", &super::super::name_of(&overseer));
+        let clean = base.join("acme-web");
+        repo(&clean, "git@github.com:acme/acme-web.git");
+        let let_go = finished(&d, &crew, &base, &clean, "let-go", &boss, How::Started).await;
+        let taken_back = finished(&d, &crew, &base, &clean, "theirs", &boss, How::Started).await;
+        *crew.close_settle.lock() = chrono::Duration::zero();
+        let by_boss = By::manager("desk", &boss.name, "Its work is done.");
+        d.release(let_go.id, &by_boss).await.unwrap();
+        d.release(taken_back.id, &By::you()).await.unwrap();
+        assert!(d.charges().iter().all(|c| c.boss != "desk"), "none live");
+
+        let close = overseer.tools.get(super::super::closing::TOOL).unwrap();
+        let ask = |s: &SessionView| {
+            json!({ "session_id": s.id.to_string(), "reason": "The person asked to close the finished sessions." })
+        };
+        let r = close.execute(ask(&taken_back)).await.unwrap();
+        assert!(!r.success, "{r:?}");
+        assert!(
+            r.error.as_deref().is_some_and(|e| e.contains("took theirs back")),
+            "{r:?}"
+        );
+        assert_ne!(state(&d, taken_back.id), SessionState::Closed);
+
+        let r = close.execute(ask(&let_go)).await.unwrap();
+        assert!(r.success, "{r:?}");
+        eventually("it is closed and removed", async || {
+            d.view(let_go.id).is_err().then_some(())
+        })
+        .await;
+    })
+    .await;
+}
