@@ -35,7 +35,9 @@ fn named_channel(job: &ScheduledJob) -> Option<&str> {
 
 /// The Desk conversation `job` was made in, which its output goes to unless
 /// it names a Slack channel of its own.
-fn desk_target(job: &ScheduledJob) -> Option<&workforce_common::channels::desk::DeskTarget> {
+pub(crate) fn desk_target(
+    job: &ScheduledJob,
+) -> Option<&workforce_common::channels::desk::DeskTarget> {
     job.deliver_to
         .as_ref()
         .and_then(DeliveryTarget::desk_target)
@@ -623,6 +625,68 @@ impl Scheduler {
         drop(jobs);
         self.add_job_reporting(name, description, schedule, payload, None)
             .await
+    }
+
+    /// Keep the hub's own job `name` for `person` while `job` is given: added
+    /// once, theirs and uncapped, and left as it is while it stands; removed
+    /// once `job` isn't given. Whether anything changed.
+    pub async fn keep_for(
+        &self,
+        person: &str,
+        name: &str,
+        job: Option<crate::hub_core::schedules::HubJob>,
+    ) -> bool {
+        let mut jobs = self.jobs.write().await;
+        let held: Vec<String> = jobs
+            .iter()
+            .filter(|j| j.name == name && j.owner() == Some(person))
+            .map(|j| j.id.clone())
+            .collect();
+        match (held.is_empty(), job) {
+            (false, Some(_)) | (true, None) => false,
+            (false, None) => {
+                jobs.retain(|j| !held.contains(&j.id));
+                self.persist_change(&jobs, crate::scheduler_store::JobChange::Removed(&held))
+                    .await;
+                info!(name, "Hub job removed");
+                true
+            }
+            (true, Some(job)) => {
+                let now = Utc::now();
+                let kept = ScheduledJob {
+                    id: Uuid::new_v4().to_string(),
+                    name: name.to_string(),
+                    description: Some(job.description),
+                    next_run: next_run_time(&job.schedule, &now, self.default_tz),
+                    schedule: job.schedule,
+                    payload: job.payload,
+                    enabled: true,
+                    created_at: now,
+                    last_run: None,
+                    run_count: 0,
+                    is_reminder: false,
+                    delivery_failures: 0,
+                    creator_identity_id: Some(person.to_string()),
+                    run_as_identity_id: None,
+                    bill_to_identity_id: None,
+                    visibility: Some(crate::hub_core::schedules::VISIBILITY_PRIVATE.to_string()),
+                    max_runs: None,
+                    budget_usd: None,
+                    expires_at: None,
+                    deliver_to: Some(job.deliver_to),
+                    edited_by: None,
+                    paused_by_suspension: false,
+                    paused_by_plan: false,
+                    plan_resumed_at: None,
+                    plan_hourly_limit: None,
+                };
+                info!(job_id = %kept.id, name, "Hub job added");
+                jobs.push(kept.clone());
+                self.persist_change(&jobs, crate::scheduler_store::JobChange::Upserted(&kept))
+                    .await;
+                true
+            }
+        }
     }
 
     /// Remove every persisted WorkflowStart job from this scheduler.
@@ -2340,7 +2404,9 @@ impl Scheduler {
                         info!(job_id = %job.id, name = %job.name, "Agent job executed");
                         // A stopped run's reason is the scheduler's to deliver
                         // whoever owns delivery: the agent posted no result.
-                        let agent_owns_delivery = *agent_owns_delivery && answered;
+                        // An answer of nothing to say is no one's to deliver.
+                        let agent_owns_delivery = (*agent_owns_delivery && answered)
+                            || (answered && crate::hub_core::schedules::says_nothing(&response));
                         // A job asked from a voice bridge answers on it, and one
                         // made in Desk in its conversation; the Slack DM below
                         // stays the voice fallback. Self-delivering jobs already
@@ -2908,6 +2974,15 @@ impl crate::hosts::SchedulerHost for Scheduler {
         Scheduler::upsert_job(self, name, description, schedule, payload).await
     }
 
+    async fn keep_for(
+        &self,
+        person: &str,
+        name: &str,
+        job: Option<crate::hub_core::schedules::HubJob>,
+    ) -> bool {
+        Scheduler::keep_for(self, person, name, job).await
+    }
+
     async fn update_job_run_as(&self, job_id: &str, identity_id: Option<String>) -> bool {
         Scheduler::update_job_run_as(self, job_id, identity_id).await
     }
@@ -3128,6 +3203,50 @@ mod tests {
 
     async fn test_scheduler() -> Arc<Scheduler> {
         Arc::new(Scheduler::new(test_service().await))
+    }
+
+    /// The hub's own job for a person is added once, theirs, uncapped and
+    /// answering in their Desk, and removed once it isn't wanted; another
+    /// person's is a job of its own.
+    #[tokio::test]
+    async fn a_hub_job_is_kept_once_for_its_person_uncapped_and_removed_when_unwanted() {
+        let sched = test_scheduler().await;
+        let job = crate::desk_connections::approvals::job;
+        assert!(sched.keep_for("ann", "Watch", Some(job())).await);
+        assert!(
+            !sched.keep_for("ann", "Watch", Some(job())).await,
+            "kept once"
+        );
+        assert!(sched.keep_for("bob", "Watch", Some(job())).await);
+        let jobs = sched.list_jobs().await;
+        let ann = jobs.iter().find(|j| j.owner() == Some("ann")).unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(
+            (ann.max_runs, ann.budget_usd, ann.expires_at),
+            (None, None, None)
+        );
+        assert!(desk_target(ann).is_some() && ann.next_run.is_some());
+        assert!(sched.keep_for("ann", "Watch", None).await);
+        assert!(!sched.keep_for("ann", "Watch", None).await);
+        let left = sched.list_jobs().await;
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].owner(), Some("bob"));
+    }
+
+    #[test]
+    fn an_answer_of_nothing_to_say_is_delivered_nowhere() {
+        use crate::hub_core::schedules::says_nothing;
+        for quiet in [
+            "NOTHING_TO_SAY",
+            " `NOTHING_TO_SAY`\n",
+            "**NOTHING_TO_SAY.**",
+        ] {
+            assert!(says_nothing(quiet), "{quiet}");
+        }
+        assert!(!says_nothing(
+            "NatWest's approval lapses about 3 Feb. NOTHING_TO_SAY"
+        ));
+        assert!(!says_nothing(""));
     }
 
     /// The creator a reminder added inside a turn run as `principal`, and

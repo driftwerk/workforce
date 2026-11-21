@@ -118,14 +118,38 @@ pub struct Connector {
     /// the form): where a single connection kept each, and where an
     /// instance does, under `<prefix><key>/`.
     pub extras: &'static [(&'static str, &'static str)],
-    /// How many days the person's approval at the service lasts, for one
-    /// whose approval lapses (a bank's): kept as [`CONSENTED_AT`] each time
-    /// it is connected or renewed.
-    pub consent_days: Option<i64>,
+    /// How the person renews their approval at the service, for one whose
+    /// approval lapses (a bank's): when it was given is kept as
+    /// [`CONSENTED_AT`] when it is first connected, and again only when
+    /// they say they renewed it.
+    pub renewal: Option<Renewal>,
+    /// It only ever reads: there is nothing to allow writes to.
+    pub reads_only: bool,
+}
+
+/// How a service's approval, which lapses, is renewed: by the person, at
+/// the service. The service doesn't say when it lapses, so Desk estimates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Renewal {
+    /// What the approval is called: "Bank approval".
+    pub label: &'static str,
+    /// Where it is renewed.
+    pub page: &'static str,
+    /// The button that opens it.
+    pub open: &'static str,
+    /// What renewing takes, and that Desk takes the person's word for it.
+    pub about: &'static str,
+    /// The button the person presses once they have.
+    pub done: &'static str,
 }
 
 /// Where a connection whose approval lapses keeps when it was last given.
 pub const CONSENTED_AT: &str = "consented_at";
+
+/// BankSync's web app: where a bank's keys are made and its approval
+/// renewed.
+pub const BANKSYNC_APP: &str = "https://app.banksync.io";
 
 /// Where an instance keeps the name the person gave it.
 pub const LABEL: &str = "label";
@@ -295,7 +319,8 @@ pub const CATALOG: &[Connector] = &[
             ("skills/github/app_id", "app_id"),
             ("skills/github/app_private_key", "app_private_key"),
         ],
-        consent_days: None,
+        renewal: None,
+        reads_only: false,
     },
     Connector {
         id: "google",
@@ -318,7 +343,8 @@ pub const CATALOG: &[Connector] = &[
         site: None,
         name_hint: "Work, Personal",
         extras: &[],
-        consent_days: None,
+        renewal: None,
+        reads_only: false,
     },
     Connector {
         id: "email",
@@ -348,7 +374,8 @@ pub const CATALOG: &[Connector] = &[
                 "command_timeout_secs",
             ),
         ],
-        consent_days: None,
+        renewal: None,
+        reads_only: false,
     },
     Connector {
         id: "jira",
@@ -365,7 +392,8 @@ pub const CATALOG: &[Connector] = &[
         site: Some("site"),
         name_hint: "Acme",
         extras: &[("skills/jira/default_project", "default_project")],
-        consent_days: None,
+        renewal: None,
+        reads_only: false,
     },
     Connector {
         id: "linear",
@@ -382,7 +410,8 @@ pub const CATALOG: &[Connector] = &[
         site: None,
         name_hint: "Acme",
         extras: &[("skills/linear/default_team_id", "default_team_id")],
-        consent_days: None,
+        renewal: None,
+        reads_only: false,
     },
     Connector {
         id: "slack",
@@ -399,7 +428,8 @@ pub const CATALOG: &[Connector] = &[
         site: None,
         name_hint: "",
         extras: &[],
-        consent_days: None,
+        renewal: None,
+        reads_only: false,
     },
     Connector {
         id: "datadog",
@@ -416,7 +446,8 @@ pub const CATALOG: &[Connector] = &[
         site: Some("site"),
         name_hint: "Production",
         extras: &[("skills/datadog/base_url", "base_url")],
-        consent_days: None,
+        renewal: None,
+        reads_only: false,
     },
     Connector {
         id: "metabase",
@@ -440,7 +471,8 @@ pub const CATALOG: &[Connector] = &[
                 "access_client_secret",
             ),
         ],
-        consent_days: None,
+        renewal: None,
+        reads_only: false,
     },
     Connector {
         id: "bank",
@@ -457,7 +489,14 @@ pub const CATALOG: &[Connector] = &[
         site: Some("bank"),
         name_hint: "NatWest",
         extras: &[("skills/bank/consented_at", CONSENTED_AT)],
-        consent_days: Some(90),
+        renewal: Some(Renewal {
+            label: "Bank approval",
+            page: BANKSYNC_APP,
+            open: "Open BankSync",
+            about: "Renew the approval in BankSync: it takes you to your bank to approve it again. BankSync doesn't tell Desk when an approval lapses, so Desk takes your word that you renewed it and counts about 90 days from then.",
+            done: "I’ve renewed it, check it",
+        }),
+        reads_only: true,
     },
 ];
 

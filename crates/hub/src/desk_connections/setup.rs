@@ -90,9 +90,6 @@ pub const NAMES: [&str; 7] = [
     "connections.use",
 ];
 
-/// BankSync's web app, where its keys are made.
-const BANKSYNC_APP: &str = "https://app.banksync.io";
-
 /// Datadog's regions, as a setup keeps its site.
 const DATADOG_SITES: &[&str] = &["us1", "us3", "us5", "eu1", "ap1", "us1-fed"];
 
@@ -420,8 +417,8 @@ fn recipe(service: &str) -> Option<Recipe> {
             key_label: "Make a token and save it to the vault",
         },
         "bank" => Recipe {
-            page: |_| Some(BANKSYNC_APP.into()),
-            origins: |_| vec![BANKSYNC_APP.into()],
+            page: |_| Some(catalog::BANKSYNC_APP.into()),
+            origins: |_| vec![catalog::BANKSYNC_APP.into()],
             // BankSync's settings sit under the workspace's own segment:
             // `/<workspace>/settings/developers/api-keys`.
             paths: &["/settings/developers"],

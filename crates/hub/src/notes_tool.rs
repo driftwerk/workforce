@@ -141,6 +141,9 @@ pub struct DailyNotesMemoryWriter {
     /// take it, and what the store refuses is dropped, never written to the
     /// daily notes or files any other conversation reads.
     contained: bool,
+    /// What it flushes read a person's private connector (their bank):
+    /// nothing of it is kept anywhere.
+    forgets: bool,
 }
 
 impl DailyNotesMemoryWriter {
@@ -150,6 +153,7 @@ impl DailyNotesMemoryWriter {
             store: None,
             agent_id: AgentId::new("default"),
             contained: false,
+            forgets: false,
         }
     }
 
@@ -159,6 +163,7 @@ impl DailyNotesMemoryWriter {
             store: Some(store),
             agent_id,
             contained: false,
+            forgets: false,
         }
     }
 
@@ -166,6 +171,13 @@ impl DailyNotesMemoryWriter {
     /// ([`Session::kept_apart`](workforce_common::session::Session::kept_apart)).
     pub fn containing(mut self, yes: bool) -> Self {
         self.contained = yes;
+        self
+    }
+
+    /// Flushing a session that read a person's private connector when `yes`
+    /// ([`Session::read_personal`](workforce_common::session::Session::read_personal)).
+    pub fn forgetting(mut self, yes: bool) -> Self {
+        self.forgets = yes;
         self
     }
 
@@ -203,6 +215,9 @@ fn append_technical_log(workspace: &std::path::Path, content: &str, heading: &st
 #[async_trait]
 impl workforce_agent::compaction::MemoryWriter for DailyNotesMemoryWriter {
     async fn write_flush(&self, content: &str, label: &str) -> Result<()> {
+        if self.forgets {
+            return Ok(());
+        }
         if let Some(ref store) = self.store {
             if let Some(uid) = crate::user_config::current_identity_id() {
                 let tags = vec![
@@ -232,6 +247,9 @@ impl workforce_agent::compaction::MemoryWriter for DailyNotesMemoryWriter {
     }
 
     async fn write_technical_log(&self, content: &str, label: &str) -> Result<()> {
+        if self.forgets {
+            return Ok(());
+        }
         if let Some(ref store) = self.store {
             if let Some(uid) = crate::user_config::current_identity_id() {
                 let tags = vec![
@@ -998,6 +1016,7 @@ pub fn memory_writer_of(
         None => DailyNotesMemoryWriter::new(workspace),
     }
     .containing(session.kept_apart())
+    .forgetting(session.read_personal())
 }
 
 #[cfg(test)]
@@ -1078,6 +1097,45 @@ mod tests {
                 assert!(files(&workspace) > 0);
             })
             .await;
+    }
+
+    /// A conversation that read the person's bank keeps nothing of a flush:
+    /// not in the memory store, not in files.
+    #[tokio::test]
+    async fn a_flush_of_a_conversation_that_read_the_bank_keeps_nothing() {
+        use workforce_agent::compaction::MemoryWriter as _;
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().to_path_buf();
+        let store = Arc::new(workforce_memory::in_memory::InMemoryStore::new());
+        let mut banked = workforce_common::session::Session::new("desk", "sam", "a");
+        banked.mark_read_personal();
+        workforce_agent::runner::CURRENT_USER_ID
+            .scope("sam".to_string(), async {
+                for writer in [
+                    memory_writer_of(
+                        workspace.clone(),
+                        Some(Arc::clone(&store) as Arc<dyn MemoryStore>),
+                        AgentId::new("a"),
+                        &banked,
+                    ),
+                    memory_writer_of(workspace.clone(), None, AgentId::new("a"), &banked),
+                ] {
+                    writer
+                        .write_flush("balance 1,204.50", "flush")
+                        .await
+                        .unwrap();
+                    writer
+                        .write_technical_log("balance log", "log")
+                        .await
+                        .unwrap();
+                }
+            })
+            .await;
+        assert_eq!(walk(&workspace).len(), 0);
+        assert_eq!(
+            store.count(MemoryFilter::system_unscoped()).await.unwrap(),
+            0
+        );
     }
 
     fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {

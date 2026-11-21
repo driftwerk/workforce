@@ -375,6 +375,7 @@ impl HubSkillToolInvoker {
             .connectors
             .as_ref()
             .and_then(|c| c.snapshot().block_reason(tool).map(str::to_string))
+            .or_else(|| crate::personal_access::refusal(tool).map(str::to_string))
         {
             return envelope(false, Value::Null, Some(reason));
         }
@@ -692,6 +693,58 @@ mod tests {
         let refused = on_desk.unwrap_err();
         assert!(refused.contains("which a skill cannot"), "{refused}");
         assert!(elsewhere.is_ok(), "{elsewhere:?}");
+    }
+
+    /// A skill never reads the person's bank: not from Slack, not from a job
+    /// that names the bank and answers in Desk, not from a workflow step; and
+    /// were its manifest gate passed, the call itself is refused off Desk.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_skill_never_reaches_the_person_s_bank() {
+        use workforce_agent::runner::{
+            ToolWhitelist, CURRENT_AUTOMATED_ORIGIN, CURRENT_DESK, TOOL_WHITELIST,
+        };
+        use workforce_common::channels::desk::{DeskPlace, DeskScope, DeskTarget};
+        let registry = Arc::new(ToolRegistry::new());
+        registry.register(Arc::new(Named("bank.transactions")));
+        let invoker = Arc::new(invoker_with(registry));
+        let job_desk = DeskScope {
+            target: DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, "desk", None, false),
+            attended: false,
+            relayed: false,
+            owner: "person-1".into(),
+        };
+        let refused = {
+            let invoker = Arc::clone(&invoker);
+            tokio::task::spawn_blocking(move || {
+                let permission = permission("bank.transactions", &[]);
+                let args = serde_json::json!({});
+                let slack = invoker.invoke(&ctx(), &permission, &args);
+                let job = CURRENT_DESK.sync_scope(Some(job_desk), || {
+                    TOOL_WHITELIST.sync_scope(
+                        ToolWhitelist::for_own_session(&["bank".to_string()]),
+                        || invoker.invoke(&ctx(), &permission, &args),
+                    )
+                });
+                let step = CURRENT_AUTOMATED_ORIGIN.sync_scope("workflow".into(), || {
+                    invoker.invoke(&ctx(), &permission, &args)
+                });
+                [slack, job, step]
+            })
+            .await
+            .unwrap()
+        };
+        for outcome in refused {
+            assert!(outcome.unwrap_err().contains("never be granted"));
+        }
+        for origin in [None, Some("workflow")] {
+            let run = invoker.run(&ctx(), "bank.transactions", serde_json::json!({}));
+            let out = match origin {
+                Some(o) => CURRENT_AUTOMATED_ORIGIN.scope(o.into(), run).await,
+                None => run.await,
+            };
+            assert_eq!(out["success"], false, "{out}");
+            assert!(out["output"].is_null(), "{out}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

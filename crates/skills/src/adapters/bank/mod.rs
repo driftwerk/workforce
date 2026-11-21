@@ -41,10 +41,10 @@ pub struct BankSkill {
 
 impl BankSkill {
     /// The caller's connections in `store`, read on every call, against
-    /// BankSync at `base`. All of them share one limiter: a person's banks
-    /// are in one BankSync workspace, and so under one limit.
+    /// BankSync at `base`. Every agent's share the process's one limiter, as
+    /// a person's banks in one BankSync workspace share its limit.
     pub fn with_store(store: Arc<dyn SecretStore>, selector: Option<String>, base: &str) -> Self {
-        let limiter = Arc::new(Limiter::default());
+        let limiter = Limiter::shared();
         let base = base.to_string();
         let reads = Arc::clone(&store);
         let clients = LiveInstances::live(store, Self::instance_paths(), selector, move |name| {

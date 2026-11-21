@@ -87,6 +87,8 @@ impl Statuses for Kept {
 struct Crew {
     agents: Mutex<Vec<Agent>>,
     reloads: Mutex<Vec<(String, String)>>,
+    /// Whether each agent watches the person's bank approvals, as last set.
+    watches: Mutex<BTreeMap<String, bool>>,
     /// Each agent's `config.toml`, as the hub's write keeps it.
     configs: Mutex<HashMap<String, String>>,
 }
@@ -102,6 +104,10 @@ impl Agents for Crew {
             .lock()
             .unwrap()
             .push((agent.to_string(), connector.to_string()));
+    }
+    async fn watch_approvals(&self, agent: &str, person: &str, on: bool) {
+        assert_eq!(person, SARAH);
+        self.watches.lock().unwrap().insert(agent.to_string(), on);
     }
     async fn choose(
         &self,
@@ -3236,7 +3242,6 @@ async fn a_bank_connects_only_on_a_key_that_reads_and_says_when_its_approval_lap
         .await;
     assert!(lapsed.is_err(), "a bank whose approval lapsed is refused");
 
-    let before = Utc::now();
     let natwest =
         h.c.connect(
             SARAH,
@@ -3249,16 +3254,106 @@ async fn a_bank_connects_only_on_a_key_that_reads_and_says_when_its_approval_lap
         .await
         .unwrap();
     assert_eq!(natwest.account.as_deref(), Some("NatWest"));
-    let until = natwest.approved_until.expect("an approval date");
-    assert!(until >= before + chrono::Duration::days(90));
-    assert!(until <= Utc::now() + chrono::Duration::days(90));
+    let approval = natwest.approval.expect("an approval date");
+    assert!(approval.estimated && !approval.due);
+    assert_eq!(approval.days_left, 90);
+    assert_eq!(
+        approval.until,
+        (Utc::now() + chrono::Duration::days(90)).date_naive()
+    );
+
+    let path = key_at(
+        VaultSource::AgentPerUser,
+        SARAH,
+        &format!(
+            "skills/bank/workspaces/{}/consented_at",
+            natwest.id.rsplit('~').next().unwrap()
+        ),
+    );
+    let stamp = || h.allan.get(&path).expect("a stamp");
+    let long_ago = (Utc::now() - chrono::Duration::days(100)).to_rfc3339();
+    h.allan
+        .apply(
+            &[VaultOp::Set {
+                path: &path,
+                value: &long_ago,
+            }],
+            VaultActor::User(SARAH),
+        )
+        .unwrap();
 
     let tested = h.c.test(SARAH, "bank", &natwest.id).await.unwrap();
+    assert_eq!(stamp(), long_ago, "a Test moves nothing");
+    let lapsed = tested.approval.unwrap();
+    assert!(lapsed.due && lapsed.days_left < 0);
+    h.c.reconnect(SARAH, "bank", &natwest.id, bank(BS_GOOD, "natwest"))
+        .await
+        .unwrap();
+    assert_eq!(stamp(), long_ago, "nor does a new key");
+    let key = natwest.id.rsplit('~').next().unwrap().to_string();
+    h.c.keep(
+        catalog::find("bank").unwrap(),
+        &Level::Agent("allan".into()),
+        &key,
+        SARAH,
+        &bank(BS_GOOD, "natwest"),
+        Some("NatWest"),
+    )
+    .unwrap();
     assert_eq!(
-        tested.approved_until,
-        Some(until),
-        "a Test alone moves nothing"
+        stamp(),
+        long_ago,
+        "nor a setup run again, which keeps it the same way"
     );
+
     let renewed = h.c.renew(SARAH, "bank", &natwest.id).await.unwrap();
-    assert!(renewed.approved_until.unwrap() > until, "a renewal does");
+    assert_ne!(stamp(), long_ago, "the person's renewal does");
+    assert_eq!(renewed.approval.unwrap().days_left, 90);
+
+    h.c.disconnect(SARAH, "bank", &natwest.id).await.unwrap();
+    assert!(h.allan.get(&path).is_none(), "its stamp goes with it");
+}
+
+#[tokio::test]
+async fn one_agent_watches_the_person_s_bank_approvals_while_a_bank_is_kept() {
+    let h = hub().await;
+    let watching = || {
+        h.crew
+            .watches
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, on)| **on)
+            .map(|(a, _)| a.clone())
+            .collect::<Vec<_>>()
+    };
+    let own =
+        h.c.connect(
+            SARAH,
+            "bank",
+            Some("NatWest"),
+            "agent",
+            Some("ben"),
+            bank(BS_GOOD, "natwest"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(watching(), ["ben"], "the agent whose own it is");
+    let all =
+        h.c.connect(
+            SARAH,
+            "bank",
+            Some("Revolut"),
+            "all",
+            None,
+            bank(BS_GOOD, "natwest"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(watching(), ["ben"], "ben reaches the shared one too");
+    h.c.disconnect(SARAH, "bank", &own.id).await.unwrap();
+    assert_eq!(watching(), ["allan"], "the first by name it reaches");
+    h.c.disconnect(SARAH, "bank", &all.id).await.unwrap();
+    assert!(watching().is_empty(), "gone with the last bank");
+    assert_eq!(h.crew.watches.lock().unwrap().len(), 2);
 }

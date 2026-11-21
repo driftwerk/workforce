@@ -135,17 +135,8 @@ async fn account_of<P: BankProvider>(
             "This bank connection has no accounts.".into(),
         )),
         many => Err(BankError::Invalid(format!(
-            "This bank has {} accounts: pass `account`, one of {}.",
-            many.len(),
-            many.iter()
-                .map(|a| format!(
-                    "{} ({} {})",
-                    a.id,
-                    a.name.as_deref().unwrap_or(&a.kind),
-                    a.number
-                ))
-                .collect::<Vec<_>>()
-                .join(", ")
+            "This bank has {} accounts: pass `account`, an `id` bank.accounts lists.",
+            many.len()
         ))),
     }
 }
@@ -200,7 +191,7 @@ impl<P: BankProvider + 'static> Tool for BankAccountsTool<P> {
     }
 
     fn description(&self) -> &str {
-        "A bank connection's bank (whether its approval stands), its accounts with their balances, and when the person's approval of the bank lapses (`approval.until`; `approval.remind` is true on the days to remind them to renew it in BankSync). Read only: nothing can move money."
+        "A bank connection's bank (whether its approval stands), its accounts with their balances, and about when the person's approval of the bank lapses (`approval.until`, an estimate: BankSync doesn't say, so it is 90 days from when they last approved it; `approval.remind` is true on the days to remind them to renew it in BankSync). Say the date is about, never exact. Read only: nothing can move money."
     }
 
     fn input_schema(&self) -> Value {

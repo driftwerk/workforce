@@ -2300,3 +2300,73 @@ fn a_turn_that_read_the_person_s_bank_is_never_remembered() {
     )]));
     assert!(!super::extraction::read_personal(&[]));
 }
+
+#[test]
+fn a_session_stays_marked_once_a_turn_read_the_bank_even_after_compaction() {
+    use std::sync::Arc;
+    use workforce_agent::runner::ToolInvocation;
+    use workforce_common::session::{InMemorySessionStore, SessionStore};
+    let call = |tool: &str, success: bool, output: serde_json::Value| ToolInvocation {
+        tool_name: tool.into(),
+        input: serde_json::json!({}),
+        output,
+        success,
+        policy_decision: "allow".into(),
+        duration_ms: 1,
+        denial_reason: None,
+        error: None,
+    };
+    let store: Arc<dyn SessionStore> = Arc::new(InMemorySessionStore::new());
+    let mut session = Session::new("desk", "ann", "kat");
+    store.save(&session).unwrap();
+
+    super::extraction::note_personal_read(
+        &store,
+        &mut session,
+        &[
+            call("linear.issue_get", true, serde_json::json!({})),
+            call("bank.accounts", false, serde_json::Value::Null),
+        ],
+    );
+    assert!(!session.read_personal(), "a refused bank call read nothing");
+    assert!(super::learns_from(&session));
+
+    super::extraction::note_personal_read(
+        &store,
+        &mut session,
+        &[call(
+            "bank.balances",
+            true,
+            serde_json::json!({"data": "£1"}),
+        )],
+    );
+    assert!(session.read_personal());
+    let mut compacted = store.get(&session.id).unwrap().unwrap();
+    assert!(compacted.read_personal(), "kept by its own patch");
+    compacted.messages.clear();
+    super::extraction::note_personal_read(&store, &mut compacted, &[]);
+    assert!(compacted.read_personal());
+    assert!(!super::extraction::digest_turn_admits(
+        &compacted, "ann", None
+    ));
+    assert!(
+        !super::learns_from(&compacted),
+        "know-how and turn extraction learn nothing of it"
+    );
+
+    let mut other = Session::new("desk", "ann", "kat");
+    store.save(&other).unwrap();
+    super::extraction::note_personal_read(
+        &store,
+        &mut other,
+        &[call(
+            "sessions",
+            true,
+            serde_json::json!({ workforce_common::session::PERSONAL_READ_KEY: true }),
+        )],
+    );
+    assert!(
+        other.read_personal(),
+        "reading a banked conversation back marks this one"
+    );
+}

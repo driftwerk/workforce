@@ -1,16 +1,25 @@
 //! Where a person's private connectors (their bank:
 //! [`PERSONAL`](workforce_common::connector_binding::PERSONAL)) may be read:
-//! in a Desk conversation only, the person's own, and on work nobody is
-//! there to watch (a job, a workflow it set up, a heartbeat) only where that
-//! work names their tools in its `tools`. Everywhere else (Slack, a monitor,
-//! a channel) their tools are hidden, and a call to one is refused.
+//! in the person's own Desk conversation only (their DM with the agent, or a
+//! call), never a room, and on work nobody is there to watch (a job, a
+//! workflow it set up, a heartbeat, the overseer's relayed turns) only where
+//! that work names their tools in its `tools`. Everywhere else (Slack, a
+//! monitor, a channel) their tools are hidden, and a call to one is refused.
 
 use workforce_agent::tools::access::{ToolAccess, ToolAccessSnapshot};
+use workforce_common::channels::desk::DeskPlace;
 use workforce_common::connector_binding::PERSONAL;
 
 const OFF_DESK: &str =
     "The person's bank is read only in a Desk conversation with them. Ask them there.";
+const IN_ROOM: &str = "The person's bank is read only in their own Desk conversation with you, never in a room others share.";
 const UNNAMED: &str = "Work nobody is watching reads the person's bank only when it names the bank tools in its `tools` and answers in Desk.";
+
+/// Whether `place` is the person's alone: their DM with the agent (or a
+/// thread on it), or a call.
+pub fn is_private(place: &DeskPlace) -> bool {
+    matches!(place, DeskPlace::Dm { .. } | DeskPlace::Call)
+}
 
 /// Why `tool`, a personal connector's, can't be called now; `None` when it
 /// can, or isn't one.
@@ -21,7 +30,11 @@ pub fn refusal(tool: &str) -> Option<&'static str> {
     let Some(desk) = workforce_agent::runner::current_desk() else {
         return Some(OFF_DESK);
     };
-    let watched = desk.attended && crate::hub_core::origins::automated_origin().is_none();
+    if !is_private(&desk.target.place) {
+        return Some(IN_ROOM);
+    }
+    let watched =
+        desk.attended && !desk.relayed && crate::hub_core::origins::automated_origin().is_none();
     let named = workforce_agent::runner::tool_whitelist().is_some_and(|w| {
         w.tools
             .iter()
@@ -49,15 +62,26 @@ impl ToolAccess for PersonalDataAccess {
 mod tests {
     use super::*;
     use workforce_agent::runner::{with_desk, with_tool_whitelist, ToolWhitelist};
-    use workforce_common::channels::desk::{DeskPlace, DeskScope, DeskTarget};
+    use workforce_common::channels::desk::{DeskScope, DeskTarget};
 
-    fn desk(attended: bool) -> Option<DeskScope> {
+    fn desk_at(place: DeskPlace, attended: bool, relayed: bool) -> Option<DeskScope> {
         Some(DeskScope {
-            target: DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, "desk", None, false),
+            target: DeskTarget::of_turn(&place, "desk", None, false),
             owner: "ann".into(),
             attended,
-            relayed: false,
+            relayed,
         })
+    }
+
+    fn desk(attended: bool) -> Option<DeskScope> {
+        desk_at(DeskPlace::Dm { thread: None }, attended, false)
+    }
+
+    fn naming_bank<F: std::future::Future>(f: F) -> impl std::future::Future<Output = F::Output> {
+        with_tool_whitelist(
+            Some(ToolWhitelist::for_own_session(&["bank".to_string()])),
+            f,
+        )
     }
 
     fn blocked() -> Vec<String> {
@@ -112,5 +136,64 @@ mod tests {
             with_desk(desk(false), async { refusal("bank.accounts") }).await,
             Some(UNNAMED)
         );
+    }
+
+    #[tokio::test]
+    async fn the_overseer_s_relayed_turn_never_reads_it_unless_it_names_the_bank() {
+        let relayed = desk_at(DeskPlace::Dm { thread: None }, true, true);
+        assert_eq!(
+            with_desk(relayed.clone(), async { refusal("bank.balances") }).await,
+            Some(UNNAMED)
+        );
+        assert_eq!(
+            with_desk(relayed, naming_bank(async { refusal("bank.balances") })).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn work_descending_from_automation_needs_the_bank_named() {
+        let automated = crate::hub_core::origins::descending_from(
+            Some("heartbeat".into()),
+            with_desk(desk(true), async { refusal("bank.accounts") }),
+        )
+        .await;
+        assert_eq!(automated, Some(UNNAMED));
+    }
+
+    #[tokio::test]
+    async fn a_room_never_reads_it_even_named_and_a_dm_thread_or_call_does() {
+        let room = desk_at(
+            DeskPlace::Room {
+                room: uuid::Uuid::nil(),
+                name: "family".into(),
+                thread: None,
+            },
+            true,
+            false,
+        );
+        assert_eq!(
+            with_desk(room, naming_bank(async { refusal("bank.accounts") })).await,
+            Some(IN_ROOM)
+        );
+        let legacy = desk_at(DeskPlace::LegacyRoom { slug: "old".into() }, true, false);
+        assert_eq!(
+            with_desk(legacy, async { refusal("bank.accounts") }).await,
+            Some(IN_ROOM)
+        );
+        for place in [
+            DeskPlace::Dm {
+                thread: Some("m1".into()),
+            },
+            DeskPlace::Call,
+        ] {
+            assert_eq!(
+                with_desk(desk_at(place, true, false), async {
+                    refusal("bank.accounts")
+                })
+                .await,
+                None
+            );
+        }
     }
 }

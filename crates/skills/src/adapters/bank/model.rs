@@ -117,13 +117,17 @@ impl Window {
     }
 }
 
-/// When a connection's approval lapses, and whether to remind the person
-/// about it today.
+/// When a connection's approval lapses, by the UTC calendar, and whether to
+/// remind the person about it today. The provider doesn't say when, so it is
+/// `estimated`: [`CONSENT_DAYS`] from when it was last approved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Approval {
     pub until: NaiveDate,
     pub days_left: i64,
     pub remind: bool,
+    /// It lapses within the week, or has.
+    pub due: bool,
+    pub estimated: bool,
 }
 
 impl Approval {
@@ -134,6 +138,8 @@ impl Approval {
             until,
             days_left,
             remind: REMIND_AT.contains(&days_left),
+            due: days_left <= REMIND_AT[0],
+            estimated: true,
         }
     }
 }
@@ -243,6 +249,14 @@ mod tests {
             .collect();
         assert_eq!(Approval::of(consented, until).until, until);
         assert_eq!(reminded, vec![0, 1, 7]);
+        let due: Vec<i64> = (-2..=10)
+            .map(|n| Approval::of(consented, until - Duration::days(n)))
+            .filter(|a| a.due && a.estimated)
+            .map(|a| a.days_left)
+            .collect();
+        assert_eq!(due, (-2..=7).collect::<Vec<_>>());
+        let late_utc: DateTime<Utc> = "2026-09-01T23:30:00Z".parse().unwrap();
+        assert_eq!(Approval::of(late_utc, day("2026-09-01")).days_left, 90);
     }
 
     #[test]

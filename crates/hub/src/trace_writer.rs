@@ -302,10 +302,14 @@ struct TraceEnvelope<'a, T: Serialize> {
     data: &'a T,
 }
 
-/// Writes trace data as JSONL files to the local filesystem.
+/// Writes trace data as JSONL files to the local filesystem. A run that
+/// read a person's private connector (their bank) leaves no trace: its
+/// file goes, and nothing more of it is written.
 pub struct JsonlTraceWriter {
     /// The opened file handle, protected by a mutex for thread safety.
     file: Mutex<std::io::BufWriter<fs::File>>,
+    path: PathBuf,
+    personal: std::sync::atomic::AtomicBool,
 }
 
 impl JsonlTraceWriter {
@@ -338,7 +342,26 @@ impl JsonlTraceWriter {
 
         Ok(Self {
             file: Mutex::new(writer),
+            path: file_path,
+            personal: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Whether the run read a personal connector, by `round` or before it:
+    /// once it has, its file is removed.
+    fn forgets(&self, round: Option<&TraceRound>) -> bool {
+        use std::sync::atomic::Ordering;
+        let read = round.is_some_and(|r| {
+            r.tool_results
+                .iter()
+                .any(|t| workforce_common::connector_binding::is_personal(&t.tool_name))
+        });
+        if read && !self.personal.swap(true, Ordering::SeqCst) {
+            if let Err(e) = fs::remove_file(&self.path) {
+                tracing::warn!(error = %e, "a trace that read the person's bank wasn't removed");
+            }
+        }
+        self.personal.load(Ordering::SeqCst)
     }
 
     /// Write a single JSON line with a type discriminator.
@@ -364,11 +387,17 @@ impl TraceWriter for JsonlTraceWriter {
     }
 
     fn write_round(&self, round: &TraceRound) -> Result<()> {
-        self.write_line("round", round)
+        match self.forgets(Some(round)) {
+            true => Ok(()),
+            false => self.write_line("round", round),
+        }
     }
 
     fn write_footer(&self, footer: &TraceFooter) -> Result<()> {
-        self.write_line("footer", footer)
+        match self.forgets(None) {
+            true => Ok(()),
+            false => self.write_line("footer", footer),
+        }
     }
 }
 
@@ -425,6 +454,49 @@ mod tests {
             .unwrap();
         let trace = fs::read_dir(day.path()).unwrap().next().unwrap().unwrap();
         assert_eq!(other_bits(&trace.path()), 0);
+    }
+
+    #[test]
+    fn a_run_that_reads_the_person_s_bank_leaves_no_trace() {
+        use workforce_agent::trace::ToolResultTrace;
+        let base = tempfile::tempdir().unwrap();
+        let writer = JsonlTraceWriter::new(base.path(), "kat").unwrap();
+        let round = |tool: &str| {
+            let mut r: TraceRound = serde_json::from_value(serde_json::json!({
+                "round": 1, "input": [], "response": [], "tool_results": [],
+                "model": "m", "stop_reason": "tool_use", "input_tokens": 0,
+                "output_tokens": 0, "cache_read_tokens": 0, "cache_creation_tokens": 0
+            }))
+            .unwrap();
+            r.tool_results.push(ToolResultTrace {
+                tool_use_id: "t".into(),
+                tool_name: tool.into(),
+                input: serde_json::json!({}),
+                output: serde_json::json!("£12.30 at Tesco"),
+                success: true,
+                duration_ms: 1,
+            });
+            r
+        };
+        writer.write_round(&round("linear.issue_get")).unwrap();
+        assert!(writer.path.exists());
+        writer.write_round(&round("bank.transactions")).unwrap();
+        writer.write_round(&round("linear.issue_get")).unwrap();
+        assert!(!writer.path.exists());
+        let left: Vec<_> = walk(base.path());
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
+        fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .flat_map(|e| match e.path().is_dir() {
+                true => walk(&e.path()),
+                false => vec![e.path()],
+            })
+            .collect()
     }
 
     fn day_name(n: i64) -> String {

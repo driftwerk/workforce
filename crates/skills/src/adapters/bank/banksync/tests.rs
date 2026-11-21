@@ -176,11 +176,16 @@ async fn a_bank_is_named_by_its_id_or_its_name_alone() {
         Err(BankError::Invalid(_))
     ));
     let twins = json!({"data": [bank("a", "NatWest", true), bank("b", "NatWest Business", true)]});
+    assert_eq!(
+        bank_named(&twins, "natwest").unwrap(),
+        "a",
+        "its own name first"
+    );
+    assert_eq!(bank_named(&twins, "natwest business").unwrap(), "b");
     assert!(matches!(
-        bank_named(&twins, "natwest"),
+        bank_named(&twins, "west"),
         Err(BankError::Invalid(_))
     ));
-    assert_eq!(bank_named(&twins, "natwest business").unwrap(), "b");
 }
 
 #[tokio::test]
@@ -275,6 +280,95 @@ async fn a_stored_connection_reads_its_key_bank_and_approval_as_the_caller() {
     let empty = BankSync::with_store(InMem::from(&[]), "revolut", &server.uri(), Arc::default());
     assert_eq!(empty.accounts().await, Err(BankError::NotConfigured("key")));
     assert_eq!(empty.consented_at(), None);
+}
+
+/// A new key may be of another BankSync workspace: it is checked again, and
+/// the bank found under the old one is looked up again.
+#[tokio::test]
+async fn a_new_key_is_checked_again_and_its_bank_looked_up_again() {
+    const OTHER: &str = "bsk_other000000000000000000000000000";
+    let server = serve(&["banks:read"]).await;
+    Mock::given(method("GET"))
+        .and(path("/whoami"))
+        .and(header("X-API-Key", OTHER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(whoami(&["banks:read"])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/banks"))
+        .and(header("X-API-Key", OTHER))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                json!({"success": true, "data": [bank("bnk_rev2", "Revolut", true)]}),
+            ),
+        )
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    for id in ["bnk_rev", "bnk_rev2"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/banks/{id}/accounts")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(accounts()))
+            .mount(&server)
+            .await;
+    }
+    let store = InMem::from(&[
+        ("skills/bank/workspaces/revolut/api_key", KEY),
+        ("skills/bank/workspaces/revolut/bank", "Revolut"),
+    ]);
+    let bs = BankSync::with_store(store.clone(), "revolut", &server.uri(), Arc::default());
+    bs.accounts().await.unwrap();
+    store
+        .set("skills/bank/workspaces/revolut/api_key", OTHER)
+        .unwrap();
+    bs.accounts().await.unwrap();
+    let asked: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect();
+    assert_eq!(
+        asked,
+        [
+            "/whoami",
+            "/banks",
+            "/banks/bnk_rev/accounts",
+            "/whoami",
+            "/banks",
+            "/banks/bnk_rev2/accounts"
+        ]
+    );
+}
+
+/// Every connection and agent of a person's on one BankSync workspace
+/// counts against its one limit.
+#[tokio::test]
+async fn a_person_s_connections_on_one_workspace_share_its_limit() {
+    let server = serve(&["banks:read"]).await;
+    for id in ["bnk_nw", "bnk_rev"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/banks/{id}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"success": true, "data": bank(id, "Bank", true)})),
+            )
+            .mount(&server)
+            .await;
+    }
+    let limiter = Arc::new(Limiter::default());
+    let natwest = BankSync::fixed(KEY, "natwest", &server.uri(), Arc::clone(&limiter));
+    let revolut = BankSync::fixed(KEY, "revolut", &server.uri(), Arc::clone(&limiter));
+    workforce_agent::runner::CURRENT_USER_ID
+        .scope("ann".into(), async {
+            natwest.connection().await.unwrap();
+            revolut.connection().await.unwrap();
+        })
+        .await;
+    let counts = limiter.0.lock().unwrap();
+    assert_eq!(counts["ann\u{0}ws_1"].len(), 4, "two banks, two reads each");
+    assert!(Arc::ptr_eq(&Limiter::shared(), &Limiter::shared()));
 }
 
 #[tokio::test]

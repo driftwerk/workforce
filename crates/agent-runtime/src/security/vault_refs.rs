@@ -201,6 +201,29 @@ mod tests {
         }
     }
 
+    /// A marker never reads the person's bank key, under any prefix it
+    /// could be reached by, even where the key is stored.
+    #[test]
+    fn a_marker_never_reads_a_bank_key() {
+        let store = StubStore::with(&[
+            ("skills/bank/api_key", "bsk_x"),
+            ("skills/bank/workspaces/natwest/api_key", "bsk_y"),
+            ("skills/linear/api_key", "lin_z"),
+        ]);
+        for (marker, prefix) in [
+            ("[[vault:api_key]]", "skills/bank/"),
+            ("[[vault:workspaces/natwest/api_key]]", "skills/bank/"),
+            ("[[vault:bank/api_key]]", "skills/"),
+        ] {
+            let err = resolve_vault_refs(marker, &store, prefix).unwrap_err();
+            assert_eq!(err.to_string(), GENERIC_RESOLUTION_ERROR, "{marker}");
+        }
+        assert_eq!(
+            resolve_vault_refs("[[vault:linear/api_key]]", &store, "skills/").unwrap(),
+            "lin_z"
+        );
+    }
+
     #[test]
     fn passthrough_when_no_marker() {
         let store = StubStore::with(&[]);

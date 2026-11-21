@@ -217,7 +217,12 @@ async fn the_account_is_implied_only_when_there_is_one() {
     ));
     let out = tool.execute(json!({})).await.unwrap();
     assert!(!out.success);
-    assert!(out.error.unwrap().contains("acc1"));
+    let said = out.error.unwrap();
+    assert!(said.contains("2 accounts"), "{said}");
+    assert!(
+        !["acc1", "Current", "1234"].iter().any(|x| said.contains(x)),
+        "nothing of the bank's outside the fence: {said}"
+    );
 }
 
 #[tokio::test]
@@ -269,6 +274,8 @@ async fn accounts_say_when_the_approval_lapses_and_to_remind_a_week_before() {
     let approval = &data(&out.output)["approval"];
     assert_eq!(approval["days_left"], 7);
     assert_eq!(approval["remind"], true);
+    assert_eq!(approval["due"], true);
+    assert_eq!(approval["estimated"], true);
 }
 
 #[tokio::test]
@@ -282,15 +289,26 @@ async fn balances_of_every_account_stop_at_the_rate_limit_with_what_they_have() 
     assert_eq!(got["partial"], true);
 }
 
+/// Every read of what a bank says comes fenced, so a turn that reads it is
+/// armed against it as against any outside content.
 #[tokio::test]
 async fn what_a_bank_says_reaches_the_model_fenced() {
-    let tool = BankTransactionsTool(ctx(
-        vec![("natwest", Fake::new(&["acc"], &[&["a"]]))],
-        "natwest",
-    ));
-    let out = tool.execute(json!({})).await.unwrap();
-    assert!(out.output["data"]
-        .as_str()
-        .unwrap()
-        .contains("EXTERNAL_UNTRUSTED_CONTENT"));
+    let ctx = || ctx(vec![("natwest", Fake::new(&["acc"], &[&["a"]]))], "natwest");
+    let reads: [Box<dyn Tool>; 3] = [
+        Box::new(BankAccountsTool(ctx())),
+        Box::new(BankBalancesTool(ctx())),
+        Box::new(BankTransactionsTool(ctx())),
+    ];
+    for tool in reads {
+        let out = tool.execute(json!({})).await.unwrap();
+        assert!(out.success, "{}: {:?}", tool.name(), out.error);
+        assert!(
+            out.output["data"]
+                .as_str()
+                .unwrap()
+                .contains("EXTERNAL_UNTRUSTED_CONTENT"),
+            "{}",
+            tool.name()
+        );
+    }
 }
