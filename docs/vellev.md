@@ -723,4 +723,37 @@ workforce code compare run --config workforce.toml \
   graph's and each store's entity counts by repo in the manifest.
 - **Check 4.** `vectors.jsonl` and `answers.jsonl` hold the query vectors
   and the node's answers to them, summed with the rest, so that the
-  serving node can be asked the same vectors before a switch.
+  serving node can be asked the same vectors before a switch (below).
+
+`workforce code compare same` is check 4, run on the serving node once it
+has adopted the code backup and before `vector_backend` is switched:
+
+```
+workforce code compare same --config workforce.toml \
+    --run runs/compare-1 --out runs/compare-1-same.json
+```
+
+- **Before any request.** Every file of the run must match its
+  `SHA256SUMS`, and the run must list same queries, each in
+  `queries.jsonl`, `vectors.jsonl` and `answers.jsonl`. The model,
+  dimensions, query prefix and distance in the run's manifest must be
+  `[vellev.code]`'s, since the vectors were made by that model. Then both
+  code collections must exist in that shape; nothing is made, and a node
+  that does not serve the tenant fails at that first request.
+- **(a) The gate.** Each same query's saved vector is asked of the node
+  (one repo, 20 results), and its first 10 must be the run's answer to
+  that vector, their order differing only between scores within 1e-3 of
+  each other. This compares the adopted index and data, free of
+  differences between the two machines' embeddings.
+- **(b) Advisory.** Each same query's text is asked too, and the mean
+  share of the run's top 10 its answer holds is taken: at 0.95 or more it
+  passes, from 0.90 it passes with a warning, and below 0.90, which would
+  mean another model or prefix, it fails.
+- **What it writes.** Nothing to any store: it only searches. The result,
+  naming the run by the sha256 of its `SHA256SUMS` and the code
+  collections by their identity, with each query's outcome, the mean and
+  the verdict, goes to `--out` by
+  way of `<out>.partial`; an existing one of either is refused and never
+  written over. The sha256 of `--out` is printed, and a failure, still
+  written, exits non-zero naming the queries that differ, the text
+  overlap below its floor, or both.

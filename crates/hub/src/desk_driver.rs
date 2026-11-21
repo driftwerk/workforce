@@ -1186,6 +1186,21 @@ pub async fn mount(
     let (board_sync, board_sync_routes) = crate::desk_board_sync::install(state, desk.clone());
     board_sync.start(cancel_sync.clone());
     let app = app.merge(crate::gateway::hardened(board_sync_routes));
+    // Sessions' Linear and Jira: through this computer's board links, or,
+    // on a machine, through Desk on the person's Mac.
+    let issues_routes = match is_machine(&config.desk) {
+        true => {
+            let issues = crate::desk_issues::MachineIssues::new(Arc::clone(&crew.native));
+            desk.issues_with(Arc::clone(&issues) as _);
+            crate::desk_issues::machine_routes(Arc::clone(state), issues)
+        }
+        false => {
+            let issues = crate::desk_issues::HomeIssues::new(Arc::clone(&board_sync));
+            desk.issues_with(Arc::clone(&issues) as _);
+            crate::desk_issues::home_routes(Arc::clone(state), issues)
+        }
+    };
+    let app = app.merge(crate::gateway::hardened(issues_routes));
     let app = app.merge(crate::desk_ticket_files::install(Arc::clone(&board_sync)));
     let app = app.merge(crate::desk_ticket_comments::install(Arc::clone(
         &board_sync,
@@ -1198,7 +1213,8 @@ pub async fn mount(
         });
     knows_sync.start(cancel_sync);
     let app = app.merge(crate::gateway::hardened(knows_routes));
-    Ok(app.merge(workforce_desk::router(
+    let native = Arc::clone(&crew.native);
+    let app = app.merge(workforce_desk::router(
         desk,
         Arc::new(SystemAdmins(Arc::clone(state))),
         Arc::new(voice),
@@ -1225,7 +1241,14 @@ pub async fn mount(
                 }),
         }),
         crew,
-    )))
+    ));
+    // On a machine, Desk's native side reaching it by any route is seen,
+    // so a Desk that never asks for its sessions' issue calls is known to
+    // be older.
+    Ok(match is_machine(&config.desk) {
+        true => crate::desk_crew::relay::noting_native(app, state.auth_token.clone(), native),
+        false => app,
+    })
 }
 
 #[cfg(test)]

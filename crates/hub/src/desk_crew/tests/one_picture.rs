@@ -134,6 +134,7 @@ async fn a_relayed_pause_is_never_contradicted_and_one_step_is_told_once() {
 
         // 21:11:19 the person's pause, relayed to the session by a turn.
         let (go, decided) = tokio::sync::oneshot::channel::<()>();
+        let (taken_tx, basis_taken) = tokio::sync::oneshot::channel::<()>();
         let early = {
             let crew = Arc::clone(&crew);
             let action = nudge(
@@ -143,6 +144,7 @@ async fn a_relayed_pause_is_never_contradicted_and_one_step_is_told_once() {
             tokio::spawn(async move {
                 // A focused call begun before the pause, answering after it.
                 crew.on_picture(async {
+                    let _ = taken_tx.send(());
                     let _ = decided.await;
                     let by = || crew.by_overseer("Its work isn't done.").unwrap();
                     let refused = crew.perform(&action, by()).await;
@@ -153,7 +155,7 @@ async fn a_relayed_pause_is_never_contradicted_and_one_step_is_told_once() {
                 .await
             })
         };
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        basis_taken.await.unwrap();
         crew.picture_person_told(
             "desk",
             "All work on the migration needs to pause, except what is in progress and almost finished.",

@@ -2033,6 +2033,8 @@ mod relay;
 mod relayed_decide;
 mod shared_budget;
 
+mod renamed;
+
 /// A boss still among the hub's agents whose config fails to read for a
 /// moment keeps the sessions it runs; one that stays no overseer lets them
 /// go once that has lasted.

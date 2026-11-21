@@ -3000,6 +3000,7 @@ pub(crate) fn spawn_turn_extraction(
         None
     };
     let pm_agent_id = service.agent_id.clone();
+    let pm_assistant = crate::passive_memory::Assistant::of(service);
     let pm_channel = session.channel.clone();
     let pm_session_id = session.id.clone();
     let pm_user_msg = effective_message.to_string();
@@ -3015,7 +3016,7 @@ pub(crate) fn spawn_turn_extraction(
             if let Err(e) = crate::passive_memory::extract_and_store(
                 pm_llm,
                 store,
-                pm_agent_id.clone(),
+                pm_assistant,
                 &pm_channel,
                 Some(pm_session_id.clone()),
                 turn_message_ids,

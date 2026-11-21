@@ -273,7 +273,7 @@ async fn a_local_boss_reaches_its_groups_machine_sessions_through_desk() {
             })
         };
         eventually("Desk polling", async || {
-            crew.relay_polled.lock().is_some().then_some(())
+            crew.relay.polled_ever().then_some(())
         })
         .await;
 
@@ -300,12 +300,14 @@ async fn a_local_boss_reaches_its_groups_machine_sessions_through_desk() {
         assert_eq!(sent.level, workforce_common::oversight::Level::Act);
         assert!(sent.act.interrupt);
         assert_eq!(sent.input["session_id"], json!(remote.to_string()));
-        // It says when the Mac stops waiting for it, about its wait from now.
-        let left = sent.deadline - chrono::Utc::now();
-        let (low, high) = (chrono::Duration::seconds(20), chrono::Duration::seconds(30));
-        assert!(left > low && left <= high, "{left}");
+        // It says, as it is taken, how long the Mac still waits for it.
+        assert!(
+            (20_000..=30_000).contains(&sent.left_ms),
+            "{}",
+            sent.left_ms
+        );
         let wire = serde_json::to_value(&sent).unwrap();
-        assert!(wire["deadline"].is_string(), "{wire}");
+        assert_eq!(wire["leftMs"], json!(sent.left_ms), "{wire}");
 
         // Too large to carry: refused here, nothing queued.
         let before = seen.lock().len();
@@ -695,7 +697,7 @@ async fn a_job_held_here_or_on_a_machine_is_one_job_and_an_approval_there_carrie
             })
         };
         eventually("Desk polling", async || {
-            crew.relay_polled.lock().is_some().then_some(())
+            crew.relay.polled_ever().then_some(())
         })
         .await;
         let release = |key: &str| json!({ "kind": "release", "target": "acme/api", "key": key });
@@ -1390,7 +1392,7 @@ async fn holds_its_own(pool: workforce_postgres::PostgresPool) {
     );
 
     eventually("Desk polling", async || {
-        crew.relay_polled.lock().is_some().then_some(())
+        crew.relay.polled_ever().then_some(())
     })
     .await;
     // Each reaches its own: the main overseer under its plan's grant, Sarah
@@ -1474,7 +1476,7 @@ async fn a_boss_check_runs_at_the_machines_own_route_and_is_never_a_groups_call(
             })
         };
         eventually("Desk polling", async || {
-            crew.relay_polled.lock().is_some().then_some(())
+            crew.relay.polled_ever().then_some(())
         })
         .await;
         eventually("the run tool", async || boss.tools.get("crew.machine_run")).await;
