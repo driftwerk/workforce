@@ -891,6 +891,7 @@ impl Desk {
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::eventually;
     use super::*;
     use crate::floor::{Outcome, TurnOp};
     use crate::store::build_pool;
@@ -1127,6 +1128,9 @@ mod tests {
                 ("SHELL".into(), "/bin/sh".into()),
                 ("HOME".into(), dir.path().to_string_lossy().into_owned()),
             ]);
+            // A Claude Code recent enough for its line, whatever is installed.
+            let cli = super::super::tests::versioned_cli(dir.path());
+            opts.programs = crate::testing::programs(cli.clone(), cli);
             crate::store::DeskStore::migrate(&pool).await.unwrap();
             let bosses = |d: &Desk| {
                 d.set_bosses(vec![super::super::Boss {
@@ -1158,6 +1162,7 @@ mod tests {
             )
             .await
             .unwrap();
+            d.engines_read_now(None).await;
             let by = bosses(&d);
             let terminal = Uuid::new_v4();
             d.create_terminal(NewTerminal {
@@ -1199,9 +1204,32 @@ mod tests {
 
             // The hub restarts; the holder kept its terminal, and the
             // session in it is linked again, still asking.
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            let store = crate::store::DeskStore::from_pool(pool.clone());
+            eventually("kept as asking", async || {
+                let r = store.get(s).await.ok()??;
+                (r.state == SessionState::Asking).then_some(())
+            })
+            .await;
+            let holder = d.holder().await.expect("a holder");
+            eventually("its terminal in the holder", async || {
+                let held = holder.list().await.ok()?;
+                held.iter()
+                    .any(|h| {
+                        !h.exited
+                            && h.meta["kind"].as_str() == Some("terminal")
+                            && h.meta["terminal"].as_str() == Some(terminal.to_string().as_str())
+                    })
+                    .then_some(())
+            })
+            .await;
+            let port = d.0.hook_port;
             cancel.cancel();
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            eventually("the last hub gone", async || {
+                std::net::TcpListener::bind(("127.0.0.1", port))
+                    .ok()
+                    .map(drop)
+            })
+            .await;
             let d = Desk::start(
                 crate::store::DeskStore::from_pool(pool.clone()),
                 opts,
@@ -1211,23 +1239,34 @@ mod tests {
             .await
             .unwrap();
             let by = bosses(&d);
-            wait_until(|| d.view(s).is_ok_and(|v| v.live)).await;
+            eventually("linked again, still asking", async || {
+                let v = d.view(s).ok()?;
+                (v.live && v.state == SessionState::Asking).then_some(())
+            })
+            .await;
             assert_eq!(
                 d.0.state.lock().live.get(&s).and_then(|l| l.terminal),
                 Some(terminal),
                 "linked again in its terminal"
             );
-            assert_eq!(d.view(s).unwrap().state, SessionState::Asking);
-            wait_until(|| d.charge_of(s).is_some_and(|c| c.live())).await;
+            eventually("its boss runs it", async || {
+                d.charge_of(s).filter(|c| c.live()).map(drop)
+            })
+            .await;
             let row = |id| {
                 let d = d.clone();
                 async move { d.0.store.line_message(id).await.unwrap().unwrap() }
             };
-            assert_eq!(
-                d.line_waits(&row(earlier.id).await),
-                Some(crate::line::Wait::Asking),
-                "what it said before is never the answer"
-            );
+            // What it said before is never the answer: back in its queue
+            // once it runs, it waits on the question.
+            eventually("queued again, waiting on the question", async || {
+                let m = row(earlier.id).await;
+                (m.delivery == crate::line::Delivery::Queued
+                    && d.line_waits(&m) == Some(crate::line::Wait::Asking))
+                .then_some(())
+            })
+            .await;
+            assert_eq!(d.line_next(s, Duration::from_millis(300)).await, None);
             let after = d
                 .line_send(
                     super::super::Sender::Overseer(by),

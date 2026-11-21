@@ -8622,6 +8622,29 @@ mod tests {
     use serde_json::json;
     use workforce_postgres::test_support::with_test_pool;
 
+    /// What `check` finds, once it finds something: up to ten seconds.
+    pub(super) async fn eventually<T>(what: &str, mut check: impl AsyncFnMut() -> Option<T>) -> T {
+        for _ in 0..400 {
+            if let Some(found) = check().await {
+                return found;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("{what} never happened");
+    }
+
+    /// A stand-in Claude Code 2.1.300, recent enough for its line, that
+    /// otherwise stays up until killed.
+    pub(super) fn versioned_cli(dir: &Path) -> PathBuf {
+        let path = dir.join("versioned-cli");
+        workforce_common::executable::write(
+            &path,
+            "#!/bin/sh\ncase \"$1\" in\n--version) echo '2.1.300 (Claude Code)' ;;\n*) exec sleep 60 ;;\nesac\n",
+        )
+        .unwrap();
+        path
+    }
+
     /// A stand-in CLI that stays up until killed, ignoring its arguments.
     pub(super) fn fake_cli(dir: &Path) -> PathBuf {
         let path = dir.join("fake-cli");
@@ -8970,9 +8993,26 @@ mod tests {
             )
             .await;
             assert_eq!(first.view(s.id).unwrap().state, SessionState::Asking);
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            // Kept as asking, its process in the holder: then the hub goes,
+            // and its hook port with it.
+            let store = DeskStore::from_pool(pool.clone());
+            eventually("kept as asking", async || {
+                let r = store.get(s.id).await.ok()??;
+                (r.state == SessionState::Asking).then_some(())
+            })
+            .await;
+            let holder = first.holder().await.expect("a holder");
+            eventually("in the holder", async || {
+                let held = Desk::held_running(&holder, s.id).await.ok()?;
+                (!held.is_empty()).then_some(())
+            })
+            .await;
+            let port = first.0.hook_port;
             first_cancel.cancel();
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            eventually("the last hub gone", async || {
+                std::net::TcpListener::bind(("127.0.0.1", port)).ok().map(drop)
+            })
+            .await;
 
             let second = Desk::start(
                 DeskStore::from_pool(pool.clone()),
@@ -8983,25 +9023,29 @@ mod tests {
             .await
             .unwrap();
             let by = bosses(&second);
-            let v = second.view(s.id).unwrap();
-            assert!(v.live, "taken back");
-            assert_eq!(v.state, SessionState::Asking, "still asking");
-            for _ in 0..200 {
-                if second.charge_of(s.id).is_some_and(|c| c.live()) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            assert!(second.charge_of(s.id).is_some_and(|c| c.live()), "its boss runs it");
+            eventually("taken back, still asking", async || {
+                let v = second.view(s.id).ok()?;
+                (v.live && v.state == SessionState::Asking).then_some(())
+            })
+            .await;
+            eventually("its boss runs it", async || {
+                second.charge_of(s.id).filter(|c| c.live()).map(drop)
+            })
+            .await;
             let row = |id| {
                 let d = second.clone();
                 async move { d.0.store.line_message(id).await.unwrap().unwrap() }
             };
-            // What its boss said before is never the answer to it.
-            assert_eq!(
-                second.line_waits(&row(earlier.id).await),
-                Some(crate::line::Wait::Asking)
-            );
+            // What its boss said before is never the answer to it: back in
+            // its queue once it runs, it waits on the question.
+            eventually("queued again, waiting on the question", async || {
+                let m = row(earlier.id).await;
+                (m.delivery == crate::line::Delivery::Queued
+                    && second.line_waits(&m) == Some(crate::line::Wait::Asking))
+                .then_some(())
+            })
+            .await;
+            assert_eq!(second.line_next(s.id, Duration::from_millis(300)).await, None);
             // What it says now, having read it, is.
             let after = second
                 .line_send(Sender::Overseer(by), tell(s.id, "Yes, switch them."))
