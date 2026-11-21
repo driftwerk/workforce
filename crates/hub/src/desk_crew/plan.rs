@@ -168,9 +168,14 @@ pub(crate) fn machine_line(
             reply()
         ));
     }
-    if matches!(now.state.as_str(), "asking" | "blocked")
-        && !matches!(was.state.as_str(), "asking" | "blocked")
-    {
+    if now.state == "asking" {
+        return Some(format!(
+            "{key}'s session on {machine} finished a turn on a question for you.{} Answer it with \
+             crew.nudge as the person would, so it goes on; tell the person only what only they can answer.",
+            reply()
+        ));
+    }
+    if now.state == "blocked" && was.state != "blocked" {
         return Some(format!(
             "{key}'s session on {machine} is waiting on a request there: the person answers it in Desk."
         ));
@@ -2900,11 +2905,41 @@ mod tests {
             quick.contains("finished a turn") && quick.contains("“b”"),
             "{quick}"
         );
-        // It asks the person there, once.
-        let asks = machine_line("devbox", &seen("working", None), &now("asking", None)).unwrap();
-        assert!(asks.contains("waiting on a request there"), "{asks}");
+        // A turn that ends on a question is the boss's to answer, once a
+        // question.
+        let asks = machine_line(
+            "devbox",
+            &seen("working", None),
+            &now("asking", Some("Which branch?")),
+        )
+        .unwrap();
+        assert!(
+            asks.starts_with("VEL-3's session on devbox finished a turn on a question for you.")
+                && asks.contains("“Which branch?”")
+                && asks.contains("crew.nudge"),
+            "{asks}"
+        );
         assert_eq!(
-            machine_line("devbox", &seen("asking", None), &now("blocked", None)),
+            machine_line(
+                "devbox",
+                &seen("asking", Some("Which branch?")),
+                &now("asking", Some("Which branch?"))
+            ),
+            None
+        );
+        let again = machine_line(
+            "devbox",
+            &seen("asking", Some("Which branch?")),
+            &now("asking", Some("Main or dev?")),
+        )
+        .unwrap();
+        assert!(again.contains("“Main or dev?”"), "{again}");
+        // A request waits there, once.
+        let request =
+            machine_line("devbox", &seen("working", None), &now("blocked", None)).unwrap();
+        assert!(request.contains("waiting on a request there"), "{request}");
+        assert_eq!(
+            machine_line("devbox", &seen("blocked", None), &now("blocked", None)),
             None
         );
         // It ends, once.
