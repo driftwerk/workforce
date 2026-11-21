@@ -305,18 +305,18 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn a_token_in_a_processs_arguments_alone_isnt_in_its_environment() {
-        let token = "DESK_DEPS_RUN=tok";
+        let entry = "DESK_DEPS_RUN=run-1";
         let mut argued = tokio::process::Command::new("sh")
-            .args(["-c", "sleep 60; :", token])
+            .args(["-c", "sleep 60; :", entry])
             .spawn()
             .unwrap();
         let mut carried = tokio::process::Command::new("sh")
             .args(["-c", "sleep 60; :"])
-            .env("DESK_DEPS_RUN", "tok")
+            .env("DESK_DEPS_RUN", "run-1")
             .spawn()
             .unwrap();
-        assert!(!carries(argued.id().unwrap(), token).await);
-        assert!(carries(carried.id().unwrap(), token).await);
+        assert!(!carries(argued.id().unwrap(), entry).await);
+        assert!(carries(carried.id().unwrap(), entry).await);
         argued.kill().await.unwrap();
         carried.kill().await.unwrap();
     }
