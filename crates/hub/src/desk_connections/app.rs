@@ -90,7 +90,7 @@ pub const APPS: [App; 2] = [
         pkce: false,
         auth: ClientAuth::Basic,
         extra: &[],
-        identity: "company_url",
+        identity: "company_id",
         id_shape: r"^[A-Za-z0-9_-]{16,64}$",
         secret_shape: r"^[A-Za-z0-9_-]{16,64}$",
     },
@@ -292,13 +292,15 @@ impl App {
             }
             Kind::FreeAgent => {
                 let company = &v["company"];
-                let (Some(name), Some(url)) = (text(&company["name"]), text(&company["url"]))
-                else {
+                // Its `url` is the same for every business: its `id` isn't.
+                let id =
+                    text(&company["id"]).or_else(|| company["id"].as_u64().map(|n| n.to_string()));
+                let (Some(name), Some(id)) = (text(&company["name"]), id) else {
                     return Err("FreeAgent didn't say which business this is".into());
                 };
                 Ok(Account {
-                    identity: url.to_lowercase(),
-                    subs: vec![("company", name.clone()), ("company_url", url)],
+                    identity: id.clone(),
+                    subs: vec![("company", name.clone()), ("company_id", id)],
                     name,
                 })
             }
@@ -329,13 +331,14 @@ impl App {
         })
     }
 
-    fn same_again(&self, identity: &str, name: &str) -> String {
+    /// The words for approving connection `name` again as another account.
+    fn not_this(&self, account: &str, name: &str) -> String {
         match self.kind {
             Kind::Google => format!(
-                "That's {identity} again: it's already connected as '{name}'. Sign in with the other Google account, then allow."
+                "That's {account}, but this connection is '{name}'. Sign in with that Google account, then allow."
             ),
             Kind::FreeAgent => format!(
-                "That's the same business again: it's already connected as '{name}'. On FreeAgent's page, sign out and sign in as the other business, then approve."
+                "That's {account}, but this connection is '{name}'. On FreeAgent's page, sign in as {name}, then approve."
             ),
         }
     }
@@ -544,35 +547,54 @@ impl Connections {
         (p.until > Instant::now()).then_some(p)
     }
 
-    /// The name of the person's connection of `c` that is `identity`'s,
-    /// other than `except`.
+    /// The person's connection of `c` that is `identity`'s: where it is
+    /// and its name.
     fn same_account(
         &self,
         c: &Connector,
         app: &App,
         person: &str,
         identity: &str,
-        except: Option<(&Level, &str)>,
-    ) -> Option<String> {
+    ) -> Option<(Conn, String)> {
         self.levels().into_iter().find_map(|level| {
             self.instances(c, &level, person)
                 .into_iter()
-                .filter(|(key, _)| except != Some((&level, key.as_str())))
                 .find_map(|(key, tier)| {
-                    let vault = self.vault_at(tier, &level).ok()?;
-                    vault
-                        .get(&key_at(tier, person, &c.at(&key, app.identity)))
+                    self.identity_at(c, app, &level, &key, tier, person)
                         .filter(|kept| kept.eq_ignore_ascii_case(identity))?;
                     let (name, _) = self.named_at(c, &level, &key, tier, person);
-                    Some(name.unwrap_or(key))
+                    Some((
+                        Conn {
+                            level: level.clone(),
+                            key: key.clone(),
+                        },
+                        name.unwrap_or(key),
+                    ))
                 })
         })
     }
 
+    /// The account connection `key` at `level` was signed in as.
+    fn identity_at(
+        &self,
+        c: &Connector,
+        app: &App,
+        level: &Level,
+        key: &str,
+        tier: VaultSource,
+        person: &str,
+    ) -> Option<String> {
+        self.vault_at(tier, level)
+            .ok()?
+            .get(&key_at(tier, person, &c.at(key, app.identity)))
+    }
+
     /// Completes sign-in `p` with the service's `code`: the exchange on the
     /// app and redirect it started on, then its tokens and account kept as
-    /// its instance at its level's tier. Nothing is kept once it was
-    /// cancelled, or when the account is one already connected.
+    /// its instance at its level's tier. An account connected already is
+    /// signed in again where it is kept, under its name; approving a
+    /// connection again takes only the account it is. Nothing is kept once
+    /// it was cancelled.
     pub async fn complete(&self, p: Pending, code: &str) -> Result<String, String> {
         let c = catalog::find(p.connector).expect("a sign-in's service is in the catalog");
         let app = of(c.id).expect("a sign-in's service signs in on an app");
@@ -608,22 +630,59 @@ impl Connections {
         if self.waiting_flow(&p.flow).is_none() {
             return Err(gone());
         }
-        let except = f.key.as_deref().filter(|_| f.again).map(|k| (&f.level, k));
-        if let Some(name) = self.same_account(c, app, &f.person, &account.identity, except) {
-            return fail(app.same_again(&account.name, &name));
-        }
-        let key = match f.key {
-            Some(key) => key,
-            None if self.keys_in_use(c, &f.person).is_empty() => DEFAULT_INSTANCE.to_string(),
-            None => self.new_key(c, &f.person, &account.name),
+        let (conn, again) = match (f.again, f.key.clone()) {
+            (true, Some(key)) => {
+                let held = self.held_at(c, &f.level, &key, &f.person);
+                let kept =
+                    held.and_then(|tier| self.identity_at(c, app, &f.level, &key, tier, &f.person));
+                if kept.is_some_and(|kept| !kept.eq_ignore_ascii_case(&account.identity)) {
+                    let name = held
+                        .and_then(|tier| self.named_at(c, &f.level, &key, tier, &f.person).0)
+                        .unwrap_or_else(|| key.clone());
+                    return fail(app.not_this(&account.name, &name));
+                }
+                (
+                    Conn {
+                        level: f.level.clone(),
+                        key,
+                    },
+                    true,
+                )
+            }
+            (_, key) => match self.same_account(c, app, &f.person, &account.identity) {
+                Some((conn, _)) => (conn, true),
+                None => {
+                    let key = match key {
+                        Some(key) => key,
+                        None if self.keys_in_use(c, &f.person).is_empty() => {
+                            DEFAULT_INSTANCE.to_string()
+                        }
+                        None => self.new_key(c, &f.person, &account.name),
+                    };
+                    (
+                        Conn {
+                            level: f.level.clone(),
+                            key,
+                        },
+                        false,
+                    )
+                }
+            },
         };
-        let tier = Self::tiers(c, &f.level)[0];
-        let Ok(vault) = self.vault_at(tier, &f.level) else {
+        let refreshed = again && !f.again;
+        let key = conn.key.clone();
+        let tier = match again {
+            true => self
+                .held_at(c, &conn.level, &key, &f.person)
+                .unwrap_or_else(|| Self::tiers(c, &conn.level)[0]),
+            false => Self::tiers(c, &conn.level)[0],
+        };
+        let Ok(vault) = self.vault_at(tier, &conn.level) else {
             return fail("Desk couldn't keep the sign-in.".into());
         };
         let at = |sub: &str| key_at(tier, &f.person, &c.at(&key, sub));
         let expires_at = tokens.expires_at.to_string();
-        let label = (!f.again).then(|| f.name.clone().unwrap_or_else(|| account.name.clone()));
+        let label = (!again).then(|| f.name.clone().unwrap_or_else(|| account.name.clone()));
         let values: Vec<(String, &str)> = [
             ("refresh_token", tokens.refresh_token.as_str()),
             ("access_token", tokens.access_token.as_str()),
@@ -644,10 +703,6 @@ impl Connections {
             error!(connector = c.id, error = %format!("{e:#}"), "keeping a sign-in failed");
             return fail("Desk couldn't keep the sign-in.".into());
         }
-        let conn = Conn {
-            level: f.level,
-            key,
-        };
         let note = app.lacking(&account.name, &tokens.scopes);
         let found = Found::Works {
             account: account.name.clone(),
@@ -655,13 +710,27 @@ impl Connections {
         self.record_noted(c, &conn, &f.person, &found, true, note.clone())
             .await;
         self.reload(c, &conn.level, &f.person).await;
-        self.settle(
+        let said = match refreshed {
+            true => {
+                let tier = self.held_at(c, &conn.level, &key, &f.person);
+                let name = tier
+                    .and_then(|tier| self.named_at(c, &conn.level, &key, tier, &f.person).0)
+                    .unwrap_or_else(|| key.clone());
+                format!(
+                    "{} was connected already as '{name}': it's signed in again as {}.",
+                    c.name, account.name
+                )
+            }
+            false => format!("{} is connected as {}.", c.name, account.name),
+        };
+        self.settle_at(
             &p.flow,
+            conn,
             FlowState::Connected {
                 account: account.name.clone(),
             },
         );
-        Ok(note.unwrap_or_else(|| format!("{} is connected as {}.", c.name, account.name)))
+        Ok(note.unwrap_or(said))
     }
 
     /// Checks connection `conn` of `c` through the adapter's own token

@@ -204,7 +204,9 @@ async fn google_userinfo(h: HeaderMap) -> Response {
     }
 }
 
-/// FreeAgent's company: `harbor2` is Harbor again, signed in once more.
+/// FreeAgent's company, as its API answers: the same `url` for every
+/// business, told apart by `id`. `harbor2` is Harbor again, signed in once
+/// more.
 async fn freeagent_company(h: HeaderMap) -> Response {
     match bearer(&h) {
         Some(who) => {
@@ -212,8 +214,10 @@ async fn freeagent_company(h: HeaderMap) -> Response {
             let mut name = at.to_string();
             name[..1].make_ascii_uppercase();
             Json(json!({ "company": {
+                "url": "https://api.freeagent.com/v2/company",
+                "id": format!("{}", at.len() * 1000 + at.as_bytes()[0] as usize),
                 "name": name,
-                "url": format!("https://api.freeagent.com/v2/company/{at}"),
+                "subdomain": at,
             }}))
             .into_response()
         }
@@ -3515,10 +3519,7 @@ mod apps {
                 .get(&mine(&format!("skills/freeagent/workspaces/default/{sub}")))
         };
         assert_eq!(at("company").as_deref(), Some("Harbor"));
-        assert_eq!(
-            at("company_url").as_deref(),
-            Some("https://api.freeagent.com/v2/company/harbor")
-        );
+        assert_eq!(at("company_id").as_deref(), Some("6104"));
         assert_eq!(at("label").as_deref(), Some("Harbor"));
         freeagent(&h, None, "lumen").await.unwrap();
         let list = h.c.list(SARAH).await;
@@ -3531,28 +3532,90 @@ mod apps {
         assert!(accounts.contains(&Some("Harbor")) && accounts.contains(&Some("Lumen")));
     }
 
+    /// The same business again is its own connection signed in again, by
+    /// its name: never a second one over the same books.
     #[tokio::test]
-    async fn the_same_business_twice_is_refused_and_nothing_kept() {
+    async fn the_same_business_again_signs_its_connection_in_again() {
         let h = hub().await;
         h.c.keep_app(SARAH, "freeagent", FA_ID, FA_SECRET)
             .await
             .unwrap();
         freeagent(&h, None, "harbor").await.unwrap();
-        let before = keys(&h.global);
         let started =
             h.c.start(SARAH, "freeagent", Some("Other"), "all", None)
                 .await
                 .unwrap();
-        let said = signs_in(&h, &started, "harbor2").await.unwrap_err();
-        assert!(
-            said.contains("same business") && said.contains("Nothing was saved"),
-            "{said}"
+        let said = signs_in(&h, &started, "harbor2").await.unwrap();
+        assert!(said.contains("connected already as 'Harbor'"), "{said}");
+        let list = h.c.list(SARAH).await;
+        let fa = connector(&list, "freeagent");
+        assert_eq!(fa.connections.len(), 1);
+        assert_eq!(fa.connections[0].name, "Harbor");
+        assert_eq!(
+            h.global
+                .get(&mine("skills/freeagent/workspaces/default/refresh_token"))
+                .as_deref(),
+            Some("rt-harbor2")
         );
-        assert_eq!(keys(&h.global), before);
-        assert!(matches!(
-            h.c.flow(SARAH, &started.flow),
-            Some(FlowState::Failed { .. })
-        ));
+    }
+
+    /// Approving Harbor again signed in as Lumen keeps nothing: Lumen's
+    /// books never go under Harbor's name.
+    #[tokio::test]
+    async fn approving_again_as_another_business_keeps_nothing() {
+        let h = hub().await;
+        h.c.keep_app(SARAH, "freeagent", FA_ID, FA_SECRET)
+            .await
+            .unwrap();
+        freeagent(&h, Some("Books"), "harbor").await.unwrap();
+        let id = connector(&h.c.list(SARAH).await, "freeagent").connections[0]
+            .id
+            .clone();
+        let again = h.c.approve_again(SARAH, "freeagent", &id).await.unwrap();
+        let said = signs_in(&h, &again, "lumen").await.unwrap_err();
+        assert!(said.contains("this connection is 'Books'"), "{said}");
+        let path = |sub: &str| mine(&format!("skills/freeagent/workspaces/default/{sub}"));
+        assert_eq!(
+            h.global.get(&path("refresh_token")).as_deref(),
+            Some("rt-harbor")
+        );
+        assert_eq!(h.global.get(&path("company")).as_deref(), Some("Harbor"));
+    }
+
+    /// A lapsed Google connection set up again is signed in again where it
+    /// is, so asking the agent to set it up never dead-ends.
+    #[tokio::test]
+    async fn a_lapsed_connection_set_up_again_is_signed_in_again() {
+        let h = hub().await;
+        h.c.keep_app(SARAH, "google", &GOOGLE_ID, &GOOGLE_SECRET)
+            .await
+            .unwrap();
+        let started =
+            h.c.start(SARAH, "google", Some("Work"), "all", None)
+                .await
+                .unwrap();
+        signs_in(&h, &started, "work").await.unwrap();
+        let path = |sub: &str| mine(&format!("skills/google/workspaces/default/{sub}"));
+        h.global.set(&path("refresh_token"), "rt-revoked").unwrap();
+        h.global.set(&path("expires_at"), "1").unwrap();
+        let id = connector(&h.c.list(SARAH).await, "google").connections[0]
+            .id
+            .clone();
+        assert_eq!(
+            h.c.test(SARAH, "google", &id).await.unwrap().status,
+            Status::NeedsReconnect
+        );
+        let started = h.c.start(SARAH, "google", None, "all", None).await.unwrap();
+        signs_in(&h, &started, "work").await.unwrap();
+        let checked = h.c.test(SARAH, "google", &id).await.unwrap();
+        assert_eq!(checked.status, Status::Connected);
+        assert_eq!(checked.name, "Work");
+        assert_eq!(
+            connector(&h.c.list(SARAH).await, "google")
+                .connections
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

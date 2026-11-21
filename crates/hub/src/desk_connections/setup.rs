@@ -2590,12 +2590,14 @@ impl Setups {
         let person = caller.person.clone();
         let (account, conn) = match flow {
             Some(flow) => match self.connections.flow(&person, &flow) {
+                // Where the sign-in ended: an account connected already is
+                // its own connection, signed in again.
                 Some(super::FlowState::Connected { account }) => (
                     account,
-                    Conn {
+                    self.connections.flow_conn(&flow).unwrap_or(Conn {
                         level: level.clone(),
                         key: key.clone(),
-                    },
+                    }),
                 ),
                 Some(super::FlowState::Waiting) => {
                     return Err(format!(

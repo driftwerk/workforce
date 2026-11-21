@@ -1618,6 +1618,32 @@ impl Connections {
         id
     }
 
+    /// [`Self::settle`], with the connection it ended on: an account
+    /// connected already is signed in again where it is kept.
+    fn settle_at(&self, flow: &str, conn: Conn, state: FlowState) {
+        if let Some(f) = self
+            .flows
+            .lock()
+            .expect("connection flows poisoned")
+            .get_mut(flow)
+            .filter(|f| f.state == FlowState::Waiting)
+        {
+            f.level = conn.level;
+            f.key = Some(conn.key);
+        }
+        self.settle(flow, state);
+    }
+
+    /// The connection sign-in `flow` keeps, as far as it knows it.
+    fn flow_conn(&self, flow: &str) -> Option<Conn> {
+        let flows = self.flows.lock().expect("connection flows poisoned");
+        let f = flows.get(flow)?;
+        Some(Conn {
+            level: f.level.clone(),
+            key: f.key.clone()?,
+        })
+    }
+
     fn settle(&self, flow: &str, state: FlowState) {
         if let Some(f) = self
             .flows
