@@ -687,7 +687,6 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn claude_round_cost_prices_tokens_not_cumulative_total() {
-        use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let mut cfg = workforce_common::settings::WorkforceConfig::default();
         cfg.hub.data_dir = tmp.path().to_string_lossy().to_string();
@@ -723,12 +722,11 @@ pub(super) mod tests {
             },
             "total_cost_usd": 9.5,
         });
-        std::fs::write(
+        workforce_common::executable::write(
             &resumed,
             format!("#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' '{result_event}'\n"),
         )
         .unwrap();
-        std::fs::set_permissions(&resumed, std::fs::Permissions::from_mode(0o755)).unwrap();
         let ctx = RoundContext {
             service: &service,
             identity: None,

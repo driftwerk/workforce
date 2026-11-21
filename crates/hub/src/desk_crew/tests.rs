@@ -228,9 +228,8 @@ fn hub(agents: &[Arc<AgentService>]) -> Arc<GatewayState> {
 /// A stand-in for Claude Code: it writes its arguments (the hook settings
 /// among them) where the test reads them, and stays up.
 fn fake_cli(dir: &Path) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join("fake-claude");
-    std::fs::write(
+    workforce_common::executable::write(
         &path,
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}/args-$$\"\nexec sleep 60\n",
@@ -238,7 +237,6 @@ fn fake_cli(dir: &Path) -> PathBuf {
         ),
     )
     .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
 }
 
@@ -4543,9 +4541,8 @@ async fn a_session_its_boss_has_calls_for_no_attention_but_the_bosss() {
 
 /// [`fake_cli`] that says its version, as an installed Claude Code does.
 fn installed_cli(dir: &Path) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join("installed-claude");
-    std::fs::write(
+    workforce_common::executable::write(
         &path,
         format!(
             "#!/bin/sh\ncase \"$1\" in --version) echo '2.1.300 (Claude Code)'; exit 0;; auth) exit 1;; esac\nprintf '%s\\n' \"$@\" > \"{}/args-$$\"\nexec sleep 60\n",
@@ -4553,16 +4550,13 @@ fn installed_cli(dir: &Path) -> PathBuf {
         ),
     )
     .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
 }
 
 /// A program that isn't the engine it is named for: it says no version.
 fn not_installed(dir: &Path) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join("not-codex");
-    std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    workforce_common::executable::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
     path
 }
 

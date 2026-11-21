@@ -22,9 +22,8 @@ use crate::store::{build_pool, DeskStore};
 /// A stand-in `codex`: as `app-server --listen unix://…` it says where it
 /// was told to listen, for the test to listen there; as the TUI it waits.
 fn fake_codex(dir: &Path) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join("fake-codex");
-    std::fs::write(
+    workforce_common::executable::write(
         &path,
         format!(
             "#!/bin/sh\n[ \"$1\" = app-server ] && echo \"${{3#unix://}}\" > '{d}/listen'\n\
@@ -33,7 +32,6 @@ fn fake_codex(dir: &Path) -> PathBuf {
         ),
     )
     .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
 }
 

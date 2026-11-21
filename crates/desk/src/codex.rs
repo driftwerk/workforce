@@ -1806,14 +1806,12 @@ pub(crate) mod tests {
     /// A script standing in for `codex app-server`: `body` runs once it has
     /// opened the socket path it was told to listen on.
     fn stand_in(dir: &Path, body: &str) -> (PathBuf, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
         let program = dir.join("fake-codex");
-        std::fs::write(
+        workforce_common::executable::write(
             &program,
             format!("#!/bin/sh\n: > \"${{3#unix://}}\"\n{body}\n"),
         )
         .unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         (program, dir.join("s.sock"))
     }
 
