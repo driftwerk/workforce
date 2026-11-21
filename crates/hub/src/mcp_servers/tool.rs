@@ -69,6 +69,12 @@ impl Tool for McpTool {
         self.input_schema.clone()
     }
 
+    /// What a server returns is its own, or someone else's: never the
+    /// agent's.
+    fn reads_outside_content(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, input: Value) -> Result<ToolResult> {
         // Call-time gate for MCP workspaces: a dormant member (a gated env not
         // active for this session) is not callable, even if a stale tool name

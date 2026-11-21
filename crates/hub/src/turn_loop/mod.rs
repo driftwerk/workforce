@@ -5586,7 +5586,9 @@ pub(crate) async fn stream_admitted(
     let in_flight_for_task = crate::memory_fence::TurnInFlight::begin(&service.workspace);
     // Whether a person's message started it, for what its runner asks.
     let chat_for_task = workforce_agent::runner::chat_origin();
-    let handle = tokio::spawn(workforce_agent::runner::CURRENT_CHAT_ORIGIN.scope(chat_for_task, workforce_agent::runner::CURRENT_MEMORY_FENCE.scope(memory_fence_for_task, workforce_agent::runner::with_desk(desk_scope_for_task, CURRENT_BILLING_IDENTITY.scope(
+    // The caller's guard (a workflow step's, a monitor's) crosses the spawn.
+    let guard_for_task = workforce_agent::runner::caller_content_guard();
+    let handle = tokio::spawn(workforce_agent::runner::with_caller_guard(guard_for_task, workforce_agent::runner::CURRENT_CHAT_ORIGIN.scope(chat_for_task, workforce_agent::runner::CURRENT_MEMORY_FENCE.scope(memory_fence_for_task, workforce_agent::runner::with_desk(desk_scope_for_task, CURRENT_BILLING_IDENTITY.scope(
         billing_identity_for_task.unwrap_or_default(),
         CURRENT_VOICE_CHANNEL.scope(
         voice_channel_for_task,
@@ -6106,7 +6108,7 @@ pub(crate) async fn stream_admitted(
     ),
     ),
     ),
-    )))));
+    ))))));
 
     // Everything downstream reads the reply without voice directions; they
     // travel beside it.

@@ -132,15 +132,15 @@ mod tests {
             .collect();
         assert_eq!(
             outside,
-            HashSet::from([
-                "google.gmail.search",
-                "google.gmail.get",
-                "google.gmail.attachment",
-                "google.gmail.thread_get",
-                "google.chat.messages_list",
-                "google.chat.threads_list",
-            ])
+            HashSet::from_iter(
+                crate::adapters::google::tool_helpers::OUTSIDE_READS
+                    .iter()
+                    .copied()
+            ),
+            "every listed read is a real tool"
         );
+        assert!(outside.contains("google.calendar.event_get"));
+        assert!(!outside.contains("google.calendar.create"));
     }
 
     /// Regression: the `tool_names()` enumeration on the parent

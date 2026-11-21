@@ -14,7 +14,7 @@ use crate::artifacts::{
     global_store, normalize_columns, stage_table, zip_table, DEFAULT_INLINE_THRESHOLD,
 };
 use crate::runner::{CURRENT_AGENT_ID, CURRENT_USER_ID};
-use crate::security::external_content::wrap_external_content;
+use crate::security::external_content::wrap_own_content;
 use crate::tools::{Tool, ToolResult};
 
 use super::backend::{classify_read_only, Backend, Introspect, QueryResult};
@@ -147,7 +147,7 @@ fn deliver(source: &'static str, qr: QueryResult) -> Result<Value> {
                 "kind": "rows",
                 "columns": columns,
                 "row_count": row_count,
-                "rows_wrapped": wrap_external_content(&rendered, source).wrapped_content,
+                "rows_wrapped": wrap_own_content(&rendered, source).wrapped_content,
             })
         }
     };

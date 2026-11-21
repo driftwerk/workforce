@@ -1,17 +1,12 @@
-//! What a monitor's `agent_task` turn may do. The event that starts it is
-//! outside content, so the turn runs as a scheduled job with `tools` does: on
-//! a frozen set of read tools, its own delivery when it posts its result
-//! itself, and whatever the monitor names. Its guard is armed from the start
-//! and refuses rather than asks, since no one is there to ask; what it refused
-//! is told to the monitor's owner.
+//! What a monitor's `agent_task` turn may do ([`MonitorTurn`]).
 
 use std::sync::Arc;
 
 use workforce_agent::runner::{with_content_guard, with_tool_whitelist, ToolWhitelist};
-use workforce_agent::security::monitor::{AnomalySignal, ContentGuard, ContentScope};
+use workforce_agent::security::monitor::{AnomalySignal, ContentGuard, ContentScope, Place};
 use workforce_orchestrator::monitor::MonitorMeta;
 
-use crate::serve::{AgentService, CURATION_TOOL_PATTERNS, WORKER_EXCLUDED_READS};
+use crate::serve::AgentService;
 
 /// The tool a turn posts its own result with.
 const DELIVERY_TOOL: &str = "messaging.send";
@@ -27,13 +22,20 @@ const MESSAGING_READS: &[&str] = &[
     "messaging.emoji_list",
 ];
 
-/// A fetch can carry what the turn read out in its URL.
-const OUTBOUND_READS: &str = "web.";
+/// Reads a monitor's turn is not given unless it names them: a fetch can
+/// carry what the turn read out in its URL, and the agent's own files and
+/// data are not what the event is about.
+const UNOFFERED_READS: &[&str] = &["web.", "filesystem.", "data."];
 
 /// How a monitor's turn delivers its result.
 pub(crate) enum Delivery<'a> {
-    /// It posts it itself, to the destination resolved for `deliver_to`.
-    Posts { dest: &'a str, deliver_to: &'a str },
+    /// It posts it itself on `surface`, to the destination resolved for
+    /// `deliver_to`.
+    Posts {
+        surface: &'a str,
+        dest: &'a str,
+        deliver_to: &'a str,
+    },
     /// Its answer is told for it.
     Told,
 }
@@ -42,28 +44,26 @@ pub(crate) enum Delivery<'a> {
 /// it posts, and `named`.
 pub(crate) fn turn_tools(delivery: &Delivery<'_>, named: &[String]) -> Vec<String> {
     let posts = matches!(delivery, Delivery::Posts { .. }).then_some(DELIVERY_TOOL);
-    CURATION_TOOL_PATTERNS
-        .iter()
-        .copied()
-        .filter(|tool| !tool.starts_with(OUTBOUND_READS))
-        .chain(
-            workforce_skills::adapters::read_only_adapter_tools()
-                .into_iter()
-                .filter(|tool| !WORKER_EXCLUDED_READS.contains(tool)),
-        )
+    crate::turn_loop::worker::curation_tool_patterns()
+        .into_iter()
+        .filter(|tool| !UNOFFERED_READS.iter().any(|read| tool.starts_with(read)))
         .chain(
             workforce_skills::adapters::email::READ_TOOLS
                 .iter()
-                .copied(),
+                .chain(workforce_skills::adapters::google::tool_helpers::OUTSIDE_READS)
+                .chain(MESSAGING_READS)
+                .chain(posts.as_ref())
+                .map(|tool| tool.to_string()),
         )
-        .chain(MESSAGING_READS.iter().copied())
-        .chain(posts)
-        .map(str::to_string)
         .chain(named.iter().cloned())
         .collect()
 }
 
-/// One monitor's `agent_task` turn, scoped to what its job needs.
+/// One monitor's `agent_task` turn, scoped to what its job needs. The event
+/// that starts it is outside content, so it runs on a frozen set of read
+/// tools, its own delivery and what the monitor names, under a guard armed
+/// from the start that refuses rather than asks; its owner is told what was
+/// refused.
 pub(crate) struct MonitorTurn {
     guard: Arc<ContentGuard>,
     tools: Vec<String>,
@@ -72,7 +72,11 @@ pub(crate) struct MonitorTurn {
 impl MonitorTurn {
     pub(crate) fn new(monitor: &MonitorMeta, delivery: &Delivery<'_>, named: &[String]) -> Self {
         let expected = match delivery {
-            Delivery::Posts { dest, deliver_to } => vec![dest.to_string(), deliver_to.to_string()],
+            Delivery::Posts {
+                surface,
+                dest,
+                deliver_to,
+            } => vec![Place::on(surface, dest), Place::on(surface, deliver_to)],
             Delivery::Told => Vec::new(),
         };
         Self {
@@ -124,6 +128,27 @@ impl MonitorTurn {
     pub(crate) fn notice(&self, monitor: &MonitorMeta) -> Option<String> {
         stopped_notice(monitor, &self.guard.stops())
     }
+}
+
+/// Keep the guard a run that owns `session` set on it, so a turn resumed
+/// there later (after a restart) is guarded as this one is.
+pub(crate) fn keep(session: &mut workforce_common::session::Session) {
+    if let Some(scope) = workforce_agent::runner::caller_content_guard()
+        .and_then(|guard| serde_json::to_value(guard.kept_scope()).ok())
+    {
+        session.set_content_scope(scope);
+    }
+}
+
+/// The guard kept on `session` for a turn its caller set none for.
+pub(crate) fn kept_guard(
+    session: &workforce_common::session::Session,
+) -> Option<Arc<ContentGuard>> {
+    if workforce_agent::runner::caller_content_guard().is_some() {
+        return None;
+    }
+    let scope: ContentScope = serde_json::from_value(session.content_scope()?.clone()).ok()?;
+    Some(Arc::new(ContentGuard::new(scope)))
 }
 
 fn stopped_notice(monitor: &MonitorMeta, stops: &[AnomalySignal]) -> Option<String> {
@@ -181,6 +206,7 @@ mod tests {
 
     fn posts() -> Delivery<'static> {
         Delivery::Posts {
+            surface: "slack",
             dest: "C1",
             deliver_to: "#ops",
         }
@@ -195,11 +221,18 @@ mod tests {
         for tool in [
             "email.read",
             "email.search",
+            "google.gmail.get",
             "messaging.read",
             "messaging.send",
-            "filesystem.read",
+            "knowledge.ask",
         ] {
             assert!(tools.iter().any(|t| t == tool), "{tool} is missing");
+        }
+        for tool in ["filesystem.read", "data.query", "web.fetch"] {
+            assert!(
+                !tools.iter().any(|t| t == tool),
+                "{tool} is offered unnamed"
+            );
         }
     }
 
@@ -230,6 +263,18 @@ mod tests {
             .check("messaging.send", &serde_json::json!({}), Some(&to("C666")))
             .unwrap();
         assert!(held.refused);
+        assert!(turn.notice(&meta()).is_none(), "nothing refused yet");
+        turn.guard.refused(&held.signal);
+        let on_teams = workforce_agent::tools::SurfaceEffect::Writes {
+            platform: "teams".into(),
+            destination: "C1".into(),
+        };
+        assert!(
+            turn.guard
+                .check("messaging.send", &serde_json::json!({}), Some(&on_teams))
+                .is_some(),
+            "its channel on another platform is somewhere new"
+        );
         let notice = turn.notice(&meta()).unwrap();
         assert!(notice.contains("Inbox watch"), "{notice}");
         assert!(notice.contains("`messaging.send`"), "{notice}");

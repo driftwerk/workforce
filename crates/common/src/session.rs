@@ -1204,6 +1204,17 @@ impl Session {
             .insert("tool_whitelist".into(), serde_json::json!(tools));
     }
 
+    /// The guard scope a run that owns this session ran under, kept so a
+    /// turn resumed here later runs under it again.
+    pub fn content_scope(&self) -> Option<&serde_json::Value> {
+        self.metadata.get("content_scope")
+    }
+
+    pub fn set_content_scope(&mut self, scope: serde_json::Value) {
+        self.metadata_object_mut()
+            .insert("content_scope".into(), scope);
+    }
+
     /// True between a rollover's sync seal+mint and its async carry-over
     /// seeding — guards against rolling a successor again before it is seeded.
     pub fn rollover_pending(&self) -> bool {

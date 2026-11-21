@@ -82,6 +82,7 @@ workflow = "my-workflow"
 # agent = "lynx"                 # optional; defaults to the default agent
 # prompt = "Summarise the message and tell the user what changed."
 # deliver_to = "@U0XXXXXXX"      # #channel id or @user DM
+# tools = ["email.move"]          # optional: anything beyond reading and posting to deliver_to
 # --- or make an agent converse in the channel (standing persona binding) ---
 # type = "persona"
 # agent = "lynx"                 # must be bound to the channel/workspace

@@ -355,7 +355,7 @@ pub fn build_prior_messages_reading<'m>(
                 if text.trim().is_empty() {
                     continue;
                 }
-                LlmMessage::assistant(&*text)
+                LlmMessage::assistant(&*told_as_data(msg, text))
             }
             MessageRole::Tool => {
                 if shared.is_some_and(|s| msg.actor.as_deref() != Some(s.viewer.as_str())) {
@@ -374,6 +374,27 @@ pub fn build_prior_messages_reading<'m>(
     }
 
     result
+}
+
+/// What a monitor told in Desk carries what it saw, from outside: read back
+/// as data, never as the agent's own words.
+fn told_as_data<'m>(
+    msg: &SessionMessage,
+    text: std::borrow::Cow<'m, str>,
+) -> std::borrow::Cow<'m, str> {
+    let by_monitor = msg.desk.as_ref().and_then(|mark| mark.delivery)
+        == Some(workforce_common::channels::desk::DeliveryKind::Monitor);
+    if by_monitor {
+        std::borrow::Cow::Owned(
+            workforce_agent::security::external_content::wrap_external_content(
+                &text,
+                "what a monitor saw",
+            )
+            .wrapped_content,
+        )
+    } else {
+        text
+    }
 }
 
 /// Append `msg` to `result`, merging into the last entry when both are same-role text.

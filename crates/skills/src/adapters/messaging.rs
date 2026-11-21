@@ -963,6 +963,10 @@ impl Tool for MessagingListPinsTool {
         "messaging.list_pins"
     }
 
+    fn reads_outside_content(&self) -> bool {
+        true
+    }
+
     fn surface_effect(&self, _input: &serde_json::Value) -> Option<SurfaceEffect> {
         Some(SurfaceEffect::Reads)
     }
@@ -1057,6 +1061,10 @@ impl MessagingMemberInfoTool {
 impl Tool for MessagingMemberInfoTool {
     fn name(&self) -> &str {
         "messaging.member_info"
+    }
+
+    fn reads_outside_content(&self) -> bool {
+        true
     }
 
     fn surface_effect(&self, _input: &serde_json::Value) -> Option<SurfaceEffect> {
@@ -1616,6 +1624,10 @@ impl MessagingChannelInfoTool {
 impl Tool for MessagingChannelInfoTool {
     fn name(&self) -> &str {
         "messaging.channel_info"
+    }
+
+    fn reads_outside_content(&self) -> bool {
+        true
     }
 
     fn surface_effect(&self, _input: &serde_json::Value) -> Option<SurfaceEffect> {

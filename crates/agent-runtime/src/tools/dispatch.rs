@@ -19,7 +19,7 @@ use crate::runner::{
     combine_with_cascade, execute_with_deadline, tool_not_found_message, CapabilityGate,
     PermissionGate, RunnerConfig, CURRENT_SESSION_KEY, CURRENT_USER_ID,
 };
-use crate::security::monitor::{ContentGuard, Held};
+use crate::security::monitor::ContentGuard;
 use crate::security::secret_sinks::substitute_secret_markers;
 use crate::tools::access::ToolAccessSnapshot;
 use crate::tools::arguments::{
@@ -53,8 +53,6 @@ pub struct ToolGates {
     /// with `[desk]` ([`crate::tools::computer`]).
     pub computer_gate: Option<Arc<dyn ComputerGate>>,
     pub arguments: ArgumentValidation,
-    /// The turn's guard against outside content steering it; none outside a
-    /// turn.
     pub content_guard: Option<Arc<ContentGuard>>,
 }
 
@@ -208,35 +206,42 @@ fn gate_with(
     ) {
         return blocked;
     }
-    let held = gates
-        .content_guard
-        .as_deref()
-        .and_then(|guard| guard.check(tool_name, input, effect.as_ref()));
-    let response = match held {
-        None => response,
-        Some(Held {
-            refused: true,
-            reason,
-            ..
-        }) => {
+    let guarded = gates.content_guard.as_deref().and_then(|guard| {
+        guard
+            .check(tool_name, input, effect.as_ref())
+            .map(|held| (guard, held))
+    });
+    let missing = || {
+        tools
+            .get(tool_name)
+            .and_then(|tool| missing_required_fields(&tool.input_schema(), input))
+    };
+    // The guard's hold offers no "always": surface allows are not what it
+    // reads.
+    let (response, holds) = match guarded {
+        None => (response, holds),
+        Some((guard, held)) if held.refused => {
+            if let Some(missing) = missing() {
+                return incomplete_call(tool_name, &missing);
+            }
+            guard.refused(&held.signal);
             return GateOutcome::Blocked {
                 message: format!(
-                    "BLOCKED: {reason}. It did not run. Finish the task without it;                      the person has been told."
+                    "BLOCKED: {}. It did not run. Finish the task without it; \
+                     the person has been told.",
+                    held.reason
                 ),
-                reason,
+                reason: held.reason,
                 consumed: Vec::new(),
-            }
+            };
         }
-        Some(Held { reason, .. }) => held_for_approval(response, reason),
+        Some((_, held)) => (held_for_approval(response, held.reason), None),
     };
     match response.decision {
         PolicyDecision::RequireApproval {
             reason,
             allow_save_allow,
-        } => match tools
-            .get(tool_name)
-            .and_then(|tool| missing_required_fields(&tool.input_schema(), input))
-        {
+        } => match missing() {
             None => GateOutcome::RequireApproval {
                 reason: with_notice(tools, tool_name, reason),
                 allow_save_allow,
@@ -2527,7 +2532,7 @@ mod tests {
         fn guarded(expected: &str, refuses: bool) -> ToolGates {
             ToolGates {
                 content_guard: Some(Arc::new(ContentGuard::new(ContentScope {
-                    expected: vec![expected.into()],
+                    expected: vec![crate::security::monitor::Place::any(expected)],
                     armed: Some("email from x@evil.example".into()),
                     refuses,
                     ..ContentScope::default()
@@ -2547,11 +2552,12 @@ mod tests {
                 GateOutcome::RequireApproval {
                     reason,
                     allow_save_allow,
-                    ..
+                    holds,
                 } => {
                     assert!(reason.contains("slack c1"), "{reason}");
                     assert!(reason.contains("outside content"), "{reason}");
                     assert!(!allow_save_allow);
+                    assert!(holds.is_none(), "no \"always allow\" for a guard's hold");
                 }
                 other => panic!("expected an approval, got {other:?}"),
             }
@@ -2567,6 +2573,33 @@ mod tests {
                 post(&guarded("C1", true), &permissive_policy()),
                 GateOutcome::Execute { .. }
             ));
+        }
+
+        #[test]
+        fn a_refusal_reads_cleanly_and_an_incomplete_call_is_not_one() {
+            let gates = guarded("C2", true);
+            let GateOutcome::Blocked { message, .. } = post(&gates, &permissive_policy()) else {
+                panic!("a refusing guard blocks");
+            };
+            assert!(!message.contains("  "), "{message}");
+            let guard = gates.content_guard.as_deref().unwrap();
+            assert_eq!(guard.stops().len(), 1);
+            let incomplete = serde_json::json!({ "channel": "C9" });
+            let outcome = as_user(|| {
+                gate_tool_call(
+                    &gates,
+                    &permissive_policy(),
+                    &surfaced_tools(),
+                    "messaging.send",
+                    &incomplete,
+                )
+            });
+            assert!(!matches!(outcome, GateOutcome::Execute { .. }));
+            assert_eq!(
+                guard.stops().len(),
+                1,
+                "a call missing its text was never refused"
+            );
         }
 
         #[test]

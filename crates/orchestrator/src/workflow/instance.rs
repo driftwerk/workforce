@@ -387,19 +387,25 @@ pub enum TriggerSource {
     Workflow {
         instance_id: String,
         step_id: String,
+        /// What started that run, when it was outside content: a run it
+        /// starts carries it on.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outside: Option<String>,
     },
 }
 
 impl TriggerSource {
     /// What started a run whose payload is outside content — a webhook, an
-    /// HTTP call or a monitor's event — named for the fence around it; `None`
-    /// for a run a person, a hand-off or another run started.
+    /// HTTP call, a monitor's event, or a run one of those started — named
+    /// for the fence around it; `None` for a run a person or a hand-off
+    /// started.
     pub fn outside(&self) -> Option<String> {
         match self {
             Self::Webhook { source, .. } => Some(format!("a webhook from {source}")),
             Self::Http { id } => Some(format!("an HTTP call to {id}")),
             Self::Monitor { monitor_id } => Some(format!("monitor {monitor_id}")),
-            Self::Cli | Self::Handoff { .. } | Self::Api | Self::Workflow { .. } => None,
+            Self::Workflow { outside, .. } => outside.clone(),
+            Self::Cli | Self::Handoff { .. } | Self::Api => None,
         }
     }
 }

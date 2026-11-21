@@ -649,6 +649,18 @@ fn validate_input(id: &str, what: &str, input: &Value) -> Result<()> {
 }
 
 /// A JSON pointer is empty (the whole document) or starts at its root.
+/// Whether `entry` reads as a tool's or a namespace's name: dotted
+/// segments of letters, digits, `_` and `-`.
+fn names_a_tool(entry: &str) -> bool {
+    !entry.is_empty()
+        && entry.split('.').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        })
+}
+
 pub fn validate_pointer(id: &str, field: &str, pointer: Option<&str>) -> Result<()> {
     match pointer {
         Some(p) if !p.is_empty() && !p.starts_with('/') => Err(eyre::eyre!(
@@ -875,9 +887,10 @@ impl MonitorDefinition {
                 if prompt.trim().is_empty() {
                     return Err(needs("a prompt"));
                 }
-                if tools.iter().any(|tool| tool.trim().is_empty()) {
+                if let Some(bad) = tools.iter().find(|tool| !names_a_tool(tool)) {
                     return Err(eyre::eyre!(
-                        "Monitor '{id}' agent_task tools has an empty entry: name each tool or namespace"
+                        "Monitor '{id}' agent_task tools has '{bad}': name each tool or namespace \
+                         exactly (`email.move`, `email`), without wildcards"
                     ));
                 }
                 if surface.as_deref() == Some(SURFACE_DESK) {
@@ -1563,6 +1576,27 @@ input = { id = "{{id}}" }
             Some(("@U1", Some("teams")))
         );
         assert!(MonitorDefinition::from_toml(&format!("{ok}surface = \"discord\"\n")).is_err());
+        for tools in [
+            r#"["email.move", "email"]"#,
+            r#"["google.gmail.label_create"]"#,
+        ] {
+            assert!(
+                MonitorDefinition::from_toml(&format!("{ok}tools = {tools}\n")).is_ok(),
+                "{tools}"
+            );
+        }
+        for tools in [
+            r#"["*"]"#,
+            r#"["email.*"]"#,
+            r#"[""]"#,
+            r#"["email move"]"#,
+            r#"["email."]"#,
+        ] {
+            assert!(
+                MonitorDefinition::from_toml(&format!("{ok}tools = {tools}\n")).is_err(),
+                "{tools}"
+            );
+        }
     }
 
     #[test]

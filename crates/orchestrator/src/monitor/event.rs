@@ -163,9 +163,10 @@ impl MonitorEvent {
         placeholder()
             .replace_all(template, |captures: &regex::Captures<'_>| {
                 let value = self.placeholder_value(&captures[1], &payload);
-                match self.is_outside(&captures[1]) {
-                    true => fence(&value),
-                    false => value,
+                if self.is_outside(&captures[1]) {
+                    fence(&value)
+                } else {
+                    value
                 }
             })
             .into_owned()

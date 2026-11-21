@@ -29,8 +29,28 @@ pub struct GoogleTool {
     ctx: Arc<GoogleApiContext>,
     handler: HandlerFn,
     effect: Option<EffectFn>,
-    outside: bool,
 }
+
+/// The Google tools that return what someone else wrote (a message, an
+/// event's description, a shared document): a turn that reads one is
+/// guarded from then on.
+pub const OUTSIDE_READS: &[&str] = &[
+    "google.gmail.search",
+    "google.gmail.get",
+    "google.gmail.attachment",
+    "google.gmail.thread_get",
+    "google.gmail.history",
+    "google.chat.messages_list",
+    "google.chat.threads_list",
+    "google.calendar.events",
+    "google.calendar.event_get",
+    "google.calendar.search",
+    "google.docs.cat",
+    "google.drive.download",
+    "google.drive.comments_list",
+    "google.sheets.get",
+    "google.slides.read_slide",
+];
 
 impl GoogleTool {
     pub fn new(
@@ -47,7 +67,6 @@ impl GoogleTool {
             ctx,
             handler,
             effect: None,
-            outside: false,
         }
     }
 
@@ -75,7 +94,7 @@ impl Tool for GoogleTool {
     }
 
     fn reads_outside_content(&self) -> bool {
-        self.outside
+        OUTSIDE_READS.contains(&self.name.as_str())
     }
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
@@ -148,22 +167,6 @@ pub fn sending_tool(
 ) -> Arc<dyn Tool> {
     GoogleTool {
         effect: Some(effect),
-        ..GoogleTool::new(name, desc, schema, ctx.clone(), h)
-    }
-    .arc()
-}
-
-/// Shorthand for a tool that returns what someone else wrote (a message, a
-/// thread, an attachment): a turn that reads it is guarded from then on.
-pub fn outside_tool(
-    name: &str,
-    desc: &str,
-    schema: serde_json::Value,
-    ctx: &Arc<GoogleApiContext>,
-    h: HandlerFn,
-) -> Arc<dyn Tool> {
-    GoogleTool {
-        outside: true,
         ..GoogleTool::new(name, desc, schema, ctx.clone(), h)
     }
     .arc()

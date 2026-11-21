@@ -117,6 +117,7 @@ pub(crate) fn stamp_tool_whitelist(session: &mut Session) {
         workforce_agent::runner::tool_whitelist().filter(|whitelist| whitelist.owns_session)
     {
         session.set_tool_whitelist(&whitelist.tools);
+        crate::monitor::scope::keep(session);
     }
 }
 
@@ -454,6 +455,7 @@ pub(crate) mod tests {
             "web.fetch",
         ]);
         let delivery = crate::monitor::scope::Delivery::Posts {
+            surface: "slack",
             dest: "C1",
             deliver_to: "#ops",
         };

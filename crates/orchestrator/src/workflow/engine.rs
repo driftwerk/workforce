@@ -266,6 +266,12 @@ impl WorkflowExecutor {
 
         let agent_id = step.agent.clone().or_else(|| def.workflow.agent.clone());
 
+        let outside = Outside::of(&instance.trigger);
+        // What earlier steps made of outside content is outside content too.
+        let handed = |text: String| match &outside {
+            Some(outside) => outside.fence(&text),
+            None => text,
+        };
         let completed = || instance.step_history.iter().filter(|r| !r.failed);
         let history_context = match &step.receives {
             Some(producers) => {
@@ -277,7 +283,7 @@ impl WorkflowExecutor {
                             .and_then(|record| record.outputs.as_ref())
                             .map_or_else(
                                 || "(this step handed over no package in this run)".to_string(),
-                                package::render,
+                                |outputs| handed(package::render(outputs)),
                             );
                         format!("\n### {producer}\n{package}\n")
                     })
@@ -291,7 +297,10 @@ impl WorkflowExecutor {
                             "\n### {} (outcome: {})\n{}\n",
                             record.step_id,
                             given_outcome(record).unwrap_or("continued"),
-                            package::shown(record.outputs.as_ref(), &record.agent_response),
+                            handed(package::shown(
+                                record.outputs.as_ref(),
+                                &record.agent_response
+                            )),
                         )
                     })
                     .collect();
@@ -338,7 +347,6 @@ impl WorkflowExecutor {
         // Step outputs are shown once, as packages, not again inside the
         // variables; who may steer the run, and the decision people are
         // asked, are no step's business.
-        let outside = Outside::of(&instance.trigger);
         let inputs = match &instance.variables {
             serde_json::Value::Object(vars) => serde_json::Value::Object(
                 vars.iter()
@@ -350,16 +358,7 @@ impl WorkflowExecutor {
             ),
             other => other.clone(),
         };
-        let variables_context =
-            if inputs.is_null() || inputs.as_object().is_some_and(|o| o.is_empty()) {
-                String::new()
-            } else {
-                let json = serde_json::to_string_pretty(&inputs).unwrap_or_default();
-                match &outside {
-                    Some(outside) => format!("\n## Context\n{}\n", outside.fence(&json)),
-                    None => format!("\n## Context\n```json\n{json}\n```\n"),
-                }
-            };
+        let variables_context = context_section(&inputs, outside.as_ref());
 
         // A context field declared `required = false` is optional at resolution
         // time too — otherwise `required` means one thing to the start-time check
@@ -439,7 +438,7 @@ impl WorkflowExecutor {
             let rendered = if spec.state.trim_start().starts_with('{') {
                 resolve_json_template(&spec.state, &instance.variables, &optional_context)
             } else {
-                resolve_template_vars(&spec.state, &instance.variables, &optional_context)
+                resolve_prompt("decide state", &spec.state).map_err(|_| Vec::new())
             };
             FirstAsk {
                 spec: spec.clone(),
@@ -1147,6 +1146,7 @@ impl Outside {
                 .flat_map(|payload| payload.keys())
                 .filter(|key| !key.starts_with('_'))
                 .cloned()
+                .chain(std::iter::once("steps".to_string()))
                 .collect(),
             source,
         })
@@ -1158,6 +1158,30 @@ impl Outside {
     }
 }
 
+/// The run's inputs for a step's prompt: the author's own as JSON, and what
+/// an outside trigger put in fenced as outside content.
+fn context_section(inputs: &serde_json::Value, outside: Option<&Outside>) -> String {
+    let Some(vars) = inputs.as_object().filter(|vars| !vars.is_empty()) else {
+        return String::new();
+    };
+    let (theirs, ours): (serde_json::Map<_, _>, serde_json::Map<_, _>) = vars
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .partition(|(key, _)| outside.is_some_and(|outside| outside.keys.contains(key)));
+    let pretty = |vars: serde_json::Map<String, serde_json::Value>| {
+        serde_json::to_string_pretty(&serde_json::Value::Object(vars)).unwrap_or_default()
+    };
+    let ours = (!ours.is_empty()).then(|| format!("```json\n{}\n```\n", pretty(ours)));
+    let theirs = outside
+        .filter(|_| !theirs.is_empty())
+        .map(|outside| format!("{}\n", outside.fence(&pretty(theirs))));
+    format!(
+        "\n## Context\n{}{}",
+        ours.unwrap_or_default(),
+        theirs.unwrap_or_default()
+    )
+}
+
 /// Prose, with each reference to what an outside trigger put in fenced as
 /// outside content.
 struct Fenced<'a>(&'a Outside);
@@ -1165,9 +1189,11 @@ struct Fenced<'a>(&'a Outside);
 impl RenderRef for Fenced<'_> {
     fn value(&mut self, key: &str, value: &serde_json::Value) -> String {
         let root = key.split('.').next().unwrap_or(key).trim();
-        match self.0.keys.contains(root) {
-            true => self.0.fence(&render_template_value(value)),
-            false => render_template_value(value),
+        let rendered = render_template_value(value);
+        if self.0.keys.contains(root) {
+            self.0.fence(&rendered)
+        } else {
+            rendered
         }
     }
 }
@@ -3375,9 +3401,13 @@ task = '{"title": "{{body}}"}'
             "the context block too: {}",
             exec.task_prompt
         );
+        let (_, context) = exec.task_prompt.split_once("## Context").unwrap();
+        let (ours, _) = context
+            .split_once("<<<EXTERNAL_UNTRUSTED_CONTENT_")
+            .unwrap();
         assert!(
-            !exec.task_prompt.contains("```json"),
-            "{}",
+            ours.contains("```json") && ours.contains("\"ops\"") && !ours.contains("mallory"),
+            "the author's own inputs stay plain, the payload's are fenced: {}",
             exec.task_prompt
         );
     }

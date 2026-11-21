@@ -130,6 +130,11 @@ pub trait ToolInvoke: Send + Sync {
     /// again as soon as it registers.
     fn has(&self, tool: &str) -> bool;
 
+    /// The tools loaded on the agent now; none where the invoker can't say.
+    fn loaded(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     async fn invoke(&self, call: ToolCall<'_>) -> Result<Value, InvokeError>;
 }
 
@@ -400,6 +405,10 @@ impl ToolInvoke for GovernedInvoker {
 
     fn has(&self, tool: &str) -> bool {
         self.tools.get(tool).is_some()
+    }
+
+    fn loaded(&self) -> Vec<String> {
+        self.tools.names()
     }
 
     async fn invoke(&self, call: ToolCall<'_>) -> Result<Value, InvokeError> {

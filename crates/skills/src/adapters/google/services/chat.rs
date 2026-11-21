@@ -11,7 +11,7 @@ use workforce_agent::tools::{SurfaceEffect, Tool};
 use crate::adapters::google::api::{GoogleApi, GoogleApiContext};
 
 use crate::adapters::google::tool_helpers::{
-    handler, object_schema, optional_str, optional_u64, outside_tool, props, required_str, sending_tool, tool,
+    handler, object_schema, optional_str, optional_u64, props, required_str, sending_tool, tool,
     urlencode,
 };
 
@@ -84,7 +84,7 @@ pub fn tools(ctx: Arc<GoogleApiContext>) -> Vec<Arc<dyn Tool>> {
         ]),
         &["space"],
     );
-    out.push(outside_tool(
+    out.push(tool(
         "google.chat.messages_list",
         "List messages in a Chat space",
         msg_list_schema,
@@ -200,7 +200,7 @@ pub fn tools(ctx: Arc<GoogleApiContext>) -> Vec<Arc<dyn Tool>> {
         ]),
         &["space"],
     );
-    out.push(outside_tool(
+    out.push(tool(
         "google.chat.threads_list",
         "List threads in a Chat space",
         threads_schema,

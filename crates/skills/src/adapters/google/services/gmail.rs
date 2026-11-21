@@ -33,7 +33,7 @@ use crate::adapters::utils::{
 };
 
 use crate::adapters::google::tool_helpers::{
-    handler, object_schema, optional_str, optional_u64, outside_tool, props, required_str, sending_tool, tool,
+    handler, object_schema, optional_str, optional_u64, props, required_str, sending_tool, tool,
     urlencode,
 };
 
@@ -67,7 +67,7 @@ pub fn tools(ctx: Arc<GoogleApiContext>) -> Vec<Arc<dyn Tool>> {
         ]),
         &["q"],
     );
-    out.push(outside_tool(
+    out.push(tool(
         "google.gmail.search",
         "Search Gmail messages",
         search_schema,
@@ -86,7 +86,7 @@ pub fn tools(ctx: Arc<GoogleApiContext>) -> Vec<Arc<dyn Tool>> {
         ]),
         &["message_id"],
     );
-    out.push(outside_tool(
+    out.push(tool(
         "google.gmail.get",
         "Get a Gmail message by ID. A message with a payload also carries a top-level \
          `attachments` list of `{part_id, filename, mime_type, size}`; open one with \
@@ -217,7 +217,7 @@ pub fn tools(ctx: Arc<GoogleApiContext>) -> Vec<Arc<dyn Tool>> {
         ]),
         &["message_id", "part_id"],
     );
-    out.push(outside_tool(
+    out.push(tool(
         "google.gmail.attachment",
         "Download a Gmail attachment and render it into your view so you can read it — \
          documents, PDFs, spreadsheets, images, audio or video. Pass the `part_id` from a \
@@ -239,7 +239,7 @@ pub fn tools(ctx: Arc<GoogleApiContext>) -> Vec<Arc<dyn Tool>> {
         ]),
         &["thread_id"],
     );
-    out.push(outside_tool(
+    out.push(tool(
         "google.gmail.thread_get",
         "Get a Gmail thread by ID",
         thread_get_schema,

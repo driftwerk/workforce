@@ -642,6 +642,7 @@ impl TurnChain {
             let resolved = service.resolved.snapshot();
             (resolved.effort_level(), resolved.fast)
         };
+        let kept = crate::monitor::scope::kept_guard(turn.session);
         let routes = Box::pin(self.run_routes(service, turn));
         // A person's own route alone: what the turn finds missing or tells
         // them to connect is their own login, never a shared one.
@@ -650,6 +651,12 @@ impl TurnChain {
         > = match self.personal_only() {
             true => Box::pin(crate::subscription::personal_logins_only(routes)),
             false => routes,
+        };
+        let routes: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ChainOutcome>> + Send + '_>,
+        > = match kept {
+            Some(guard) => Box::pin(workforce_agent::runner::with_content_guard(guard, routes)),
+            None => routes,
         };
         workforce_agent::llm::provider::with_effort_override(
             effort,
