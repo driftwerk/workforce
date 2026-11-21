@@ -27,7 +27,7 @@ use workforce_agent::runner::CURRENT_USER_ID;
 use workforce_core::types::AgentId;
 use workforce_memory::store::MemoryStore;
 
-use crate::passive_memory::extract_and_store;
+use crate::passive_memory::{extract_and_store, Assistant};
 use crate::session_scan::{
     enumerate_session_files, iter_turns, load_session_meta, read_jsonl_messages, resolve_agent_ids,
 };
@@ -168,7 +168,7 @@ async fn scan_session(
                     extract_and_store(
                         llm,
                         store,
-                        agent_id,
+                        Assistant::by_id(agent_id),
                         &channel,
                         Some(session_id),
                         message_ids,

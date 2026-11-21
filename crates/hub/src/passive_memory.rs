@@ -237,11 +237,39 @@ fn parse_events(raw: &str) -> Option<Vec<ExtractedEvent>> {
 /// the latest source-message timestamp; for session-scanner backfill it's the
 /// archived turn's timestamp. Pass `None` to fall back to "now", which is
 /// only correct for turns that just happened.
+/// Whom a memory is extracted for: the agent that owns it, by its id, and
+/// the name the exchange calls it by.
+#[derive(Debug, Clone)]
+pub struct Assistant {
+    pub id: AgentId,
+    pub name: String,
+}
+
+impl Assistant {
+    /// An agent known only by its id, which it goes by.
+    pub fn by_id(id: AgentId) -> Self {
+        Self {
+            name: id.as_str().to_string(),
+            id,
+        }
+    }
+
+    /// `service`, by its name now.
+    pub fn of(service: &crate::serve::AgentService) -> Self {
+        Self {
+            id: service.agent_id.clone(),
+            name: service
+                .display_name()
+                .unwrap_or_else(|| service.agent_id.as_str().to_string()),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn extract_and_store(
     llm: Arc<dyn LlmProvider>,
     store: Arc<dyn MemoryStore>,
-    agent_id: AgentId,
+    agent: Assistant,
     channel: &str,
     session_id: Option<String>,
     message_ids: Vec<String>,
@@ -285,12 +313,9 @@ pub async fn extract_and_store(
     // archived turn's timestamp. The payload carries this date so the extractor
     // resolves relative phrasing ("last night") to absolute dates at write time.
     let resolved_event_time = event_time.unwrap_or_else(chrono::Utc::now);
-    let user_msg = extraction_user_payload(
-        resolved_event_time,
-        agent_id.as_str(),
-        user_message,
-        agent_response,
-    );
+    let Assistant { id: agent_id, name } = agent;
+    let user_msg =
+        extraction_user_payload(resolved_event_time, &name, user_message, agent_response);
 
     // Suppress extended reasoning: this is a single-shot JSON extraction, and
     // reasoning models otherwise burn the whole token budget on hidden
@@ -737,7 +762,7 @@ mod tests {
         let stored = extract_and_store(
             Arc::new(PanicLlm),
             Arc::new(InMemoryStore::new()),
-            AgentId::new("allan"),
+            Assistant::by_id(AgentId::new("allan")),
             "ios",
             None,
             Vec::new(),
@@ -762,7 +787,7 @@ mod tests {
                 extract_and_store(
                     Arc::new(ProseLlm),
                     store.clone(),
-                    AgentId::new("allan"),
+                    Assistant::by_id(AgentId::new("allan")),
                     "ios",
                     None,
                     Vec::new(),

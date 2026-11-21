@@ -562,15 +562,25 @@ pub enum Target {
 
 /// What a boss says when it holds a session for its own answer: "change
 /// nothing until I answer", "wait for my decision". Each is followed by
-/// what it waits on ([`HOLD_ON`]).
-const HOLDS: [&str; 6] = [
+/// what it waits on ([`HOLD_ON`]). Those naming the boss are
+/// [`boss_words`]'s.
+const HOLDS: [&str; 4] = [
     "until i ",
-    "until desk ",
     "until your boss ",
     "wait for my ",
-    "wait for desk",
     "wait for your boss",
 ];
+
+/// The words a session or boss names boss `boss` by, lowercased: the
+/// line's address, `desk`, and its name.
+pub fn boss_words(boss: &str) -> Vec<String> {
+    let mut words = vec!["desk".to_string()];
+    let name = boss.trim().to_lowercase().replace('\u{2019}', "'");
+    if !name.is_empty() && !words.contains(&name) {
+        words.push(name);
+    }
+    words
+}
 
 /// What a hold waits on: the boss's own word, as a verb after "until I"
 /// or a noun after "wait for my" ("answer", "replies", "decided",
@@ -624,23 +634,26 @@ const UNDONE: [&str; 11] = [
 /// Whether `text`, a boss's words to a session (or a session's of itself),
 /// holds the session for the boss's answer: it waits on the boss, not on
 /// its work. Only words that wait on an answer: "until I've checked CI"
-/// or "until I say stop" isn't one.
-pub fn holds(text: &str) -> bool {
+/// or "until I say stop" isn't one. `boss` is the boss's name as the
+/// writer knew it.
+pub fn holds(text: &str, boss: &str) -> bool {
     let lower = text
         .to_lowercase()
         .replace(['\u{2019}', '\''], "'")
         .replace("i've", "i have");
-    HOLDS.iter().any(|h| {
-        lower.match_indices(h).any(|(at, _)| {
+    let named = boss_words(boss)
+        .into_iter()
+        .flat_map(|n| [format!("until {n} "), format!("wait for {n}")]);
+    HOLDS.iter().map(|h| h.to_string()).chain(named).any(|h| {
+        lower.match_indices(h.as_str()).any(|(at, _)| {
             let waits_for = h.starts_with("wait for");
             if waits_for && UNDONE.iter().any(|u| lower[..at].ends_with(u)) {
                 return false;
             }
             let after = &lower[at + h.len()..];
+            let waits_for_boss = waits_for && !h.ends_with("my ");
             // "wait for desk" is Desk, never "desktop".
-            if (h.ends_with("desk") || h.ends_with("boss"))
-                && after.chars().next().is_some_and(char::is_alphanumeric)
-            {
+            if waits_for_boss && after.chars().next().is_some_and(char::is_alphanumeric) {
                 return false;
             }
             let rest = after.strip_prefix("'s").unwrap_or(after).trim_start();
@@ -649,7 +662,7 @@ pub fn holds(text: &str) -> bool {
             let rest = rest.strip_prefix("my ").unwrap_or(rest);
             waits_on(rest)
                 // "Wait for Desk." alone waits on Desk.
-                || (waits_for && !h.ends_with("my ") && !rest.starts_with(char::is_alphanumeric))
+                || (waits_for_boss && !rest.starts_with(char::is_alphanumeric))
         })
     })
 }
@@ -2312,7 +2325,7 @@ mod tests {
             "Hold until I sign off.",
             "Wait for my ok.",
         ] {
-            assert!(holds(held), "{held}");
+            assert!(holds(held, "Desk"), "{held}");
         }
         for not in [
             "Keep going until I say stop.",
@@ -2327,8 +2340,31 @@ mod tests {
             "Keep the watcher going until CI finishes.",
             "Wait for the CI run to finish.",
         ] {
-            assert!(!holds(not), "{not}");
+            assert!(!holds(not, "Desk"), "{not}");
         }
+    }
+
+    #[test]
+    fn a_hold_names_the_boss_by_its_name_or_as_desk() {
+        for held in [
+            "I'm changing nothing until Kat answers.",
+            "Wait for Kat\u{2019}s go-ahead.",
+            "Wait for Kat.",
+            "Change nothing until Desk answers.",
+        ] {
+            assert!(holds(held, "Kat"), "{held}");
+        }
+        assert!(
+            !holds("Wait for Katalog to finish indexing.", "Kat"),
+            "another word"
+        );
+        assert!(
+            !holds("Change nothing until Kat answers.", "Mia"),
+            "another's name"
+        );
+        assert!(!holds("Change nothing until Kat answers.", "  "), "no name");
+        assert_eq!(boss_words("Desk"), ["desk"]);
+        assert_eq!(boss_words(" Big Al "), ["desk", "big al"]);
     }
 
     #[test]

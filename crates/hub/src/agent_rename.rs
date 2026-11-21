@@ -16,7 +16,8 @@
 //! Identity files are re-read on every turn (by mtime), so the default agent,
 //! which the overlay watcher never rebuilds, answers to its new name on its
 //! next turn as well. Sentences a person wrote in their own words are theirs
-//! and are left alone.
+//! and are left alone; [`mentions`] lists where they, or the hub's other
+//! agents and jobs, still say the old name.
 
 use std::path::{Path, PathBuf};
 
@@ -363,6 +364,103 @@ impl Renamer<'_> {
     }
 }
 
+/// A line that still calls an agent by a name it no longer has. A rename
+/// rewrites only the sentences Desk wrote; the rest are the person's words,
+/// to change or keep.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Mention {
+    /// The agent whose text it is, by id.
+    pub agent: String,
+    /// Where in it: a file ("SOUL.md"), "its instructions", or a job.
+    pub place: String,
+    pub line: String,
+}
+
+/// The most mentions listed.
+pub const MENTIONS_MAX: usize = 50;
+
+/// The longest line a mention shows.
+const MENTION_LINE_CHARS: usize = 160;
+
+/// Whether `line` says `name` as a word, its case aside: "Desk's helper"
+/// does, "desktop" doesn't.
+fn says_name(line: &str, name: &str) -> bool {
+    let (line, name) = (line.to_lowercase(), name.trim().to_lowercase());
+    !name.is_empty()
+        && line.match_indices(&name).any(|(at, _)| {
+            !line[..at]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric)
+                && !line[at + name.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_alphanumeric)
+        })
+}
+
+/// The lines of `text` that say `name`, at `place` in `agent`'s texts.
+fn naming(agent: &str, place: &str, text: &str, name: &str) -> Vec<Mention> {
+    text.lines()
+        .filter(|l| says_name(l, name))
+        .map(|l| Mention {
+            agent: agent.to_string(),
+            place: place.to_string(),
+            line: l.trim().chars().take(MENTION_LINE_CHARS).collect(),
+        })
+        .collect()
+}
+
+/// Where the hub's serving agents still call one of them `old`: their
+/// identity files, instructions and jobs, agent `own`'s first; at most
+/// [`MENTIONS_MAX`].
+pub async fn mentions(
+    registry: &dyn RegistryView,
+    config_path: &Path,
+    own: &str,
+    old: &str,
+) -> Vec<Mention> {
+    let config = workforce_common::settings::WorkforceConfig::load(config_path).ok();
+    let mut services = registry.all_services();
+    services.sort_by_key(|s| (s.agent_id.as_str() != own, s.agent_id.as_str().to_string()));
+    let mut found = Vec::new();
+    for s in &services {
+        let id = s.agent_id.as_str();
+        found.extend(
+            workforce_common::config_files::IDENTITY_FILES
+                .iter()
+                .filter_map(|f| {
+                    workforce_common::config_files::read(&s.workspace.join(f))
+                        .ok()
+                        .flatten()
+                        .map(|text| naming(id, f, &text, old))
+                })
+                .flatten(),
+        );
+        found.extend(
+            config
+                .as_ref()
+                .and_then(|c| c.agent_by_id(id))
+                .and_then(|a| a.system_prompt.as_deref())
+                .map(|p| naming(id, "its instructions", p, old))
+                .unwrap_or_default(),
+        );
+        if let Some(scheduler) = &s.scheduler {
+            found.extend(scheduler.list_jobs().await.iter().flat_map(|job| {
+                job.payload
+                    .words()
+                    .map(|w| naming(id, &format!("job “{}”", job.name), w, old))
+                    .unwrap_or_default()
+            }));
+        }
+        if found.len() >= MENTIONS_MAX {
+            break;
+        }
+    }
+    found.truncate(MENTIONS_MAX);
+    found
+}
+
 /// Puts back the files written, as far as it can.
 async fn undo(written: &[Written]) {
     for w in written {
@@ -446,6 +544,34 @@ mod tests {
                 "Lookout"
             ),
             "You are Scoutmaster. Your human set you up"
+        );
+    }
+
+    #[test]
+    fn a_name_is_said_as_a_word_its_case_aside() {
+        assert!(says_name("Ask Desk's helper first.", "Desk"));
+        assert!(says_name("ask desk.", "Desk"));
+        assert!(says_name("You report to Big Al.", "big al"));
+        assert!(!says_name("Open the desktop app.", "Desk"));
+        assert!(!says_name("Anything at all.", "  "));
+        let found = naming(
+            "scout",
+            "SOUL.md",
+            "# Soul\nDesk runs you.\n\nNothing here.",
+            "Desk",
+        );
+        assert_eq!(
+            found,
+            [Mention {
+                agent: "scout".into(),
+                place: "SOUL.md".into(),
+                line: "Desk runs you.".into()
+            }]
+        );
+        let long = format!("Desk {}", "x".repeat(400));
+        assert_eq!(
+            naming("a", "p", &long, "Desk")[0].line.chars().count(),
+            MENTION_LINE_CHARS
         );
     }
 

@@ -418,10 +418,52 @@ async fn an_agent_renames_itself_once_approved_and_agent_update_renames_the_same
         taken.error
     );
 
+    std::fs::write(
+        workspace.join("TOOLS.md"),
+        "# Tools\nScout's checks run on the CI box.\n",
+    )
+    .unwrap();
     let done = rename.execute(json!({ "name": "Lookout" })).await.unwrap();
     assert!(done.success, "{}", done.output);
+    assert_eq!(
+        done.output["still_says_old_name"],
+        json!([
+            {"agent": "scout", "place": "TOOLS.md", "line": "Scout's checks run on the CI box."},
+            {"agent": "scout", "place": "its instructions", "line": "You are Scout."}
+        ]),
+        "the person's words, not Desk's sentences"
+    );
     assert_eq!(listed_name(&state, "scout").await, "Lookout");
     says(&workspace, "Lookout");
+    let named = |listed: &Value, id: &str| {
+        listed["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == id)
+            .unwrap()["name"]
+            .clone()
+    };
+    let list = workforce_hub::agent_tool::AgentListTool::new(tools_of(
+        &state,
+        &config_path,
+        &data,
+        "scout",
+    ));
+    let listed = list.execute(json!({})).await.unwrap();
+    assert_eq!(
+        named(&listed.output, "scout"),
+        "Lookout",
+        "the running agent's name now"
+    );
+    let show = workforce_hub::agent_tool::AgentShowTool::new(tools_of(
+        &state,
+        &config_path,
+        &data,
+        "scout",
+    ));
+    let shown = show.execute(json!({ "agent_id": "scout" })).await.unwrap();
+    assert_eq!(shown.output["name"], "Lookout");
     assert_eq!(
         WorkforceConfig::load(&config_path)
             .unwrap()
@@ -451,4 +493,63 @@ async fn an_agent_renames_itself_once_approved_and_agent_update_renames_the_same
     assert!(done.success, "{}", done.output);
     says(&workspace, "Spyglass");
     assert_eq!(listed_name(&state, "scout").await, "Spyglass");
+}
+
+/// After a rename, the lines that still say the old name in the person's
+/// own words, the agent's or another's, are listed for them to change;
+/// the sentences Desk wrote already say the new one.
+#[tokio::test]
+async fn the_old_names_mentions_are_listed_after_a_rename() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let config_path = dir.path().join("workforce.toml");
+    std::fs::write(&config_path, base(&data)).unwrap();
+    let state = boot(&config_path).await;
+    let desk = desk_files(&state, "desk", "Desk");
+    let soul = std::fs::read_to_string(desk.join("SOUL.md")).unwrap();
+    std::fs::write(
+        desk.join("SOUL.md"),
+        format!("{soul}\nSign every update as Desk.\n"),
+    )
+    .unwrap();
+    let scout = desk_files(&state, "scout", "Scout");
+    std::fs::write(
+        scout.join("TOOLS.md"),
+        "# Tools\nAsk Desk before you deploy.\nThe desktop build is separate.\n",
+    )
+    .unwrap();
+
+    let (status, body) = call(
+        &state,
+        "PATCH",
+        "/api/agents/desk",
+        Some(json!({ "name": "Kat" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = call(&state, "GET", "/api/agents/desk/mentions?name=Desk", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["mentions"],
+        json!([
+            {"agent": "desk", "place": "SOUL.md", "line": "Sign every update as Desk."},
+            {"agent": "scout", "place": "TOOLS.md", "line": "Ask Desk before you deploy."}
+        ])
+    );
+    let (status, body) = call(&state, "GET", "/api/agents/desk/mentions?name=Kat", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body["mentions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["agent"] == "desk" && m["place"] == "IDENTITY.md"),
+        "{body}"
+    );
+
+    let (status, _) = call(&state, "GET", "/api/agents/ghost/mentions?name=Desk", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = call(&state, "GET", "/api/agents/desk/mentions?name=%20", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }

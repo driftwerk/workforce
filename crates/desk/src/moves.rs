@@ -192,8 +192,9 @@ pub enum Effect {
     LeftWithNoBoss { charges: usize, plans: usize },
     /// A boss keeps what it learned, but won't recall it in the new scope.
     MemoryStays,
-    /// A handover note from one boss to the other.
-    Handover { from: String, to: String },
+    /// A handover note to boss `to`: from the boss `from`, or from Desk,
+    /// out of the facts, when no boss oversaw it.
+    Handover { from: Option<String>, to: String },
     /// It is told on its line what changed.
     Tell,
     /// The move can't be made.
@@ -381,7 +382,7 @@ fn boss_effects(ctx: &MoveContext, choices: &Choices, to: Option<&str>) -> Vec<E
             }
             if plans > 0 {
                 out.push(Effect::Handover {
-                    from: me.agent.clone(),
+                    from: Some(me.agent.clone()),
                     to: main.agent.clone(),
                 });
             }
@@ -399,7 +400,7 @@ fn boss_effects(ctx: &MoveContext, choices: &Choices, to: Option<&str>) -> Vec<E
 fn handover(from: Option<&BossRef>, to: Option<&BossRef>) -> Option<Effect> {
     let to = to?;
     Some(Effect::Handover {
-        from: from.map_or_else(|| "desk".to_string(), |b| b.agent.clone()),
+        from: from.map(|b| b.agent.clone()),
         to: to.agent.clone(),
     })
 }
@@ -498,10 +499,7 @@ pub fn effect_text(
         Effect::Handover { from: f, to: t } => format!(
             "{} receives only the note below from {}.",
             n.boss(t),
-            match f.as_str() {
-                "desk" => "Desk".to_string(),
-                f => n.boss(f),
-            }
+            f.as_deref().map_or_else(|| "Desk".to_string(), |f| n.boss(f))
         ),
         Effect::Tell => format!("{item} is told on its line that it moved."),
         Effect::Refused { why } => why.clone(),

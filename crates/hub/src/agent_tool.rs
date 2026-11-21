@@ -73,7 +73,7 @@ impl ListedAgent {
 impl AgentToolContext {
     /// Every configured agent, sorted by id: the running ones, each read
     /// from its own service, which holds the entry it was (re)spawned with,
-    /// and the ones starting or failed to load. Before the registry is
+    /// by its name now, and the ones starting or failed to load. Before the registry is
     /// attached, the config this tool was built with.
     fn agents(&self) -> Vec<ListedAgent> {
         let Some(registry) = self.registry.get().and_then(Weak::upgrade) else {
@@ -95,7 +95,10 @@ impl AgentToolContext {
                 .chain(&self.config.agents)
                 .find(|a| a.id == id)
                 .map(|config| ListedAgent {
-                    config: config.clone(),
+                    config: AgentConfig {
+                        name: svc.display_name(),
+                        ..config.clone()
+                    },
                     status: AgentStatus::Running,
                 })
         });
@@ -111,9 +114,6 @@ impl AgentToolContext {
 }
 
 impl AgentToolContext {
-    /// Renames agent `id` the one way every rename goes (see
-    /// [`crate::agent_rename`]), beside the hub's config (see
-    /// [`Self::overlay_path`]).
     /// The base config the overlay sits beside: this agent's, else the
     /// hub's (an agent built at runtime, Desk's for one, has none of its
     /// own), else the default agent's.
@@ -126,12 +126,16 @@ impl AgentToolContext {
         })
     }
 
+    /// Renames agent `id` the one way every rename goes (see
+    /// [`crate::agent_rename`]), beside the hub's config (see
+    /// [`Self::overlay_path`]): the name as kept, and where the hub's agents
+    /// still say its old one.
     async fn rename(
         &self,
         id: &str,
         name: &str,
         instructions: Option<String>,
-    ) -> Result<String, String> {
+    ) -> Result<(String, Vec<crate::agent_rename::Mention>), String> {
         let Some(registry) = self.registry.get().and_then(Weak::upgrade) else {
             return Err("The hub's agents can't be read yet; try again in a moment".to_string());
         };
@@ -144,7 +148,8 @@ impl AgentToolContext {
             |d| Arc::clone(&d.lock_manager),
         );
         let user = current_turn_user();
-        crate::agent_rename::Renamer {
+        let was = registry.get(id).and_then(|s| s.display_name());
+        let kept = crate::agent_rename::Renamer {
             registry: &*registry,
             config_path: &config_path,
             data_dir: std::path::Path::new(&self.data_dir),
@@ -155,7 +160,14 @@ impl AgentToolContext {
         }
         .rename(id, name, instructions)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+        let still = match was
+            .filter(|w| crate::agent_rename::as_read(w) != crate::agent_rename::as_read(&kept))
+        {
+            Some(was) => crate::agent_rename::mentions(&*registry, &config_path, id, &was).await,
+            None => Vec::new(),
+        };
+        Ok((kept, still))
     }
 }
 
@@ -608,15 +620,22 @@ impl Tool for AgentUpdateTool {
                 .rename(&agent_id, &name, system_prompt.take())
                 .await
             {
-                Ok(name) => renamed = Some(name),
+                Ok(done) => renamed = Some(done),
                 Err(why) => return Ok(ToolResult::failure(why, duration())),
             }
-            if model.is_none() && default.is_none() {
-                return Ok(ToolResult::success(
-                    serde_json::json!({ "updated": true, "id": agent_id, "name": renamed }),
-                    duration(),
-                ));
-            }
+        }
+        let (renamed, still) = renamed.unzip();
+        let still = still.unwrap_or_default();
+        if renamed.is_some() && model.is_none() && default.is_none() {
+            return Ok(ToolResult::success(
+                serde_json::json!({
+                    "updated": true,
+                    "id": agent_id,
+                    "name": renamed,
+                    "still_says_old_name": still,
+                }),
+                duration(),
+            ));
         }
 
         let Some(config_path) = self.ctx.overlay_path() else {
@@ -667,6 +686,7 @@ impl Tool for AgentUpdateTool {
                 "updated": true,
                 "id": agent_id,
                 "name": renamed,
+                "still_says_old_name": still,
                 "live_within_seconds": true,
             }),
             duration(),
@@ -741,12 +761,13 @@ impl Tool for AgentRenameTool {
             .rename(&self.ctx.agent_id, &params.name, None)
             .await
         {
-            Ok(name) => Ok(ToolResult::success(
+            Ok((name, still)) => Ok(ToolResult::success(
                 serde_json::json!({
                     "renamed": true,
                     "id": self.ctx.agent_id,
                     "name": name,
                     "note": "You answer to the new name from your next message.",
+                    "still_says_old_name": still,
                 }),
                 duration(),
             )),

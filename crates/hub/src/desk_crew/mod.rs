@@ -1305,6 +1305,16 @@ impl CrewHub {
             .find(|(_, o)| o.scope == *scope)
     }
 
+    /// What the person calls boss `boss`: its name now, whether or not it
+    /// still oversees; a boss gone from the hub is
+    /// [`workforce_desk::crew::UNNAMED_BOSS`].
+    pub(super) fn boss_name_of(&self, boss: &str) -> String {
+        self.state.registry.get(boss).map_or_else(
+            || workforce_desk::crew::shown_name(boss, None, true),
+            |s| name_of(&s),
+        )
+    }
+
     /// The overseer `agent` and its settings, while it oversees.
     pub(crate) fn overseer_named(&self, agent: &str) -> Option<(Arc<AgentService>, Oversight)> {
         self.overseers()
