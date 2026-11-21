@@ -39,7 +39,8 @@ text_enum!(How {
 text_enum!(ReleasedBy {
     // The person took it back.
     Person => "person",
-    // Its boss let it go (or Desk did, for a boss gone).
+    // Its boss let it go, or Desk did for a boss gone: no longer the boss's
+    // to close.
     Boss => "boss",
     // Its boss let it go because its work was done.
     Done => "done",

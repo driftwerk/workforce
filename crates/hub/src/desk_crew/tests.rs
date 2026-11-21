@@ -3590,7 +3590,10 @@ async fn taking_on_is_offered_unless_every_session_is_and_letting_go_always_runs
         let s = new_session(&d, dir.path(), "acme-web").await;
         let (_, mut o) = crew.overseer_service().unwrap();
         let take = Action::TakeOn { session: s.id };
-        let release = Action::Release { session: s.id };
+        let release = Action::Release {
+            session: s.id,
+            done: false,
+        };
         assert!(
             matches!(crew.gate(&take, &o), Gate::Suggest(_)),
             "handed only"

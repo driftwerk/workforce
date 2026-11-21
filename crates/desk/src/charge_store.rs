@@ -24,8 +24,20 @@ fn charge(row: &Row) -> Result<Charge> {
         updated_at: row.try_get("updated_at")?,
         released_by: row
             .try_get::<_, Option<&str>>("released_by")?
-            .map(ReleasedBy::parse)
-            .transpose()?,
+            .map(released_by),
+    })
+}
+
+/// Who let a charge go, as stored; a reason this Desk doesn't know (written
+/// by a newer one) is read as the boss's own, which keeps the session the
+/// person's to close.
+pub(crate) fn released_by(text: &str) -> ReleasedBy {
+    ReleasedBy::parse(text).unwrap_or_else(|_| {
+        tracing::warn!(
+            released_by = text,
+            "a charge was released for a reason this Desk doesn't know; read as the boss's"
+        );
+        ReleasedBy::Boss
     })
 }
 
@@ -63,12 +75,22 @@ impl DeskStore {
     /// Every charge, released ones too.
     pub async fn charges(&self) -> Result<Vec<Charge>> {
         let client = self.pool().get().await?;
-        client
+        let rows = client
             .query(&format!("SELECT {COLUMNS} FROM charges"), &[])
-            .await?
+            .await?;
+        Ok(rows
             .iter()
-            .map(charge)
-            .collect()
+            .filter_map(|row| {
+                charge(row)
+                    .inspect_err(|e| {
+                        tracing::warn!(
+                            error = format!("{e:#}"),
+                            "a charge couldn't be read and is skipped"
+                        )
+                    })
+                    .ok()
+            })
+            .collect())
     }
 
     pub async fn charge(&self, session: Uuid) -> Result<Option<Charge>> {

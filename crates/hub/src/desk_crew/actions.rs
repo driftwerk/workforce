@@ -150,9 +150,11 @@ pub(crate) enum Action {
     TakeOn {
         session: Uuid,
     },
-    /// Let a session it runs go: the person runs it on their own.
+    /// Let a session it runs go: the person runs it on their own. `done`:
+    /// its work is finished, so the boss may still close it.
     Release {
         session: Uuid,
+        done: bool,
     },
     /// Continue a session's work in a session of another engine, with a
     /// brief of it: only ever suggested, as the brief goes to that
@@ -237,6 +239,8 @@ struct Input {
     reply_to: Option<String>,
     message_id: Option<String>,
     reason: Option<String>,
+    /// `crew.release`: the session's work is finished.
+    done: Option<bool>,
     #[serde(default)]
     options: Vec<String>,
     draft: Option<String>,
@@ -472,6 +476,7 @@ impl Action {
             },
             "crew.release" => Self::Release {
                 session: session()?,
+                done: i.done.unwrap_or(false),
             },
             "crew.handoff" => Self::Handoff {
                 session: session()?,
@@ -656,9 +661,12 @@ fn charge_plain(e: workforce_desk::DeskError) -> String {
     }
 }
 
+/// What a boss may not close, as the refusal says it.
+const NOT_ITS: &str =
+    "a session you didn't start or weren't handed, or that is no longer yours to run";
+
 /// How long a boss's resume or restart is waited for: its turn goes on
 /// past it, never held for the whole of a tool call's time.
-const NOT_ITS: &str = "a session you didn't start and weren't handed, or that the person took back";
 const STARTS_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
 /// How long a close waits, past Desk's own wait, for a session still
 /// stopping to have closed, so it is removed as it closes.
@@ -798,7 +806,7 @@ impl CrewHub {
         Some(match o.level {
             Level::Watch => Gate::Refuse,
             _ => Gate::Suggest(
-format!("only the person closes {NOT_ITS}: they close it with one click").into(),
+                format!("only the person closes {NOT_ITS}: they close it with one click").into(),
             ),
         })
     }
@@ -1427,7 +1435,7 @@ format!("only the person closes {NOT_ITS}: they close it with one click").into()
             | Action::Resume { session: s, .. }
             | Action::Restart { session: s, .. }
             | Action::TakeOn { session: s }
-            | Action::Release { session: s }
+            | Action::Release { session: s, .. }
             | Action::Handoff { session: s, .. }
             | Action::SetMode { session: s, .. }
             | Action::SwitchLogin { session: s, .. } => {
@@ -1543,7 +1551,7 @@ format!("only the person closes {NOT_ITS}: they close it with one click").into()
             Action::TakeOn { session } => {
                 format!("Run {} for you", self.session_name(*session))
             }
-            Action::Release { session } => {
+            Action::Release { session, .. } => {
                 format!("Let {} go: you run it", self.session_name(*session))
             }
             Action::Handoff {
@@ -2352,8 +2360,13 @@ format!("only the person closes {NOT_ITS}: they close it with one click").into()
                     .map_err(charge_plain)?;
                 Ok(format!("took on {}", self.session_name(c.session)))
             }
-            Action::Release { session } => {
-                let c = d.release_done(*session, &by).await.map_err(charge_plain)?;
+            Action::Release { session, done } => {
+                let c = if *done {
+                    d.release_done(*session, &by).await
+                } else {
+                    d.release(*session, &by).await
+                }
+                .map_err(charge_plain)?;
                 Ok(format!("let {} go", self.session_name(c.session)))
             }
             Action::Handoff {

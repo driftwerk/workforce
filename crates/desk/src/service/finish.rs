@@ -24,19 +24,15 @@ pub(crate) enum Finish {
 }
 
 /// Whether `by` may end a session whose boss's charge is `charge`: the
-/// person always; a boss only one it started or the person handed it,
-/// while it runs it or after it let it go as done, never one it took on by
-/// itself, was let go of for any other reason, or the person took back; no
-/// one else.
+/// person always; a boss only one it started or was handed that it runs or
+/// let go as done.
 pub(crate) fn may_end(by: Option<&By>, charge: Option<&Charge>) -> bool {
     let Some(by) = by else {
         return false;
     };
     match by.party.kind {
         PartyKind::You => true,
-        PartyKind::Manager => charge.is_some_and(|c| {
-            c.boss == by.party.id && c.closable_by_boss()
-        }),
+        PartyKind::Manager => charge.is_some_and(|c| c.boss == by.party.id && c.closable_by_boss()),
         PartyKind::Agent | PartyKind::Session | PartyKind::Desk => false,
     }
 }

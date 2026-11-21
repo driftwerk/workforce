@@ -423,14 +423,23 @@ async fn asked_to_close_a_boss_ends_what_it_let_go_as_done_and_never_what_it_no_
         let clean = base.join("acme-web");
         repo(&clean, "git@github.com:acme/acme-web.git");
         let by_boss = By::manager("desk", &boss.name, "Its work is done.");
+        let release = overseer.tools.get("crew.release").unwrap();
         let mut done = Vec::new();
         for (name, how) in [("started", How::Started), ("handed", How::Handed)] {
             let s = finished(&d, &crew, &base, &clean, name, &boss, how).await;
-            d.release_done(s.id, &by_boss).await.unwrap();
+            let r = release
+                .execute(json!({ "session_id": s.id.to_string(), "reason": "Finished.", "done": true }))
+                .await
+                .unwrap();
+            assert!(r.success, "{r:?}");
             done.push(s);
         }
         let by_desk = finished(&d, &crew, &base, &clean, "desk", &boss, How::Started).await;
-        d.release(by_desk.id, &by_boss).await.unwrap();
+        let r = release
+            .execute(json!({ "session_id": by_desk.id.to_string(), "reason": "Yours now." }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
         let theirs = finished(&d, &crew, &base, &clean, "theirs", &boss, How::Started).await;
         d.release(theirs.id, &By::you()).await.unwrap();
         let typing = finished(&d, &crew, &base, &clean, "typing", &boss, How::Started).await;
@@ -459,9 +468,15 @@ async fn asked_to_close_a_boss_ends_what_it_let_go_as_done_and_never_what_it_no_
         let ask = |s: &SessionView| {
             json!({ "session_id": s.id.to_string(), "reason": "The person asked to close the finished sessions." })
         };
+        let r = close.execute(ask(&by_desk)).await.unwrap();
+        assert!(r.success && r.output["suggested"].is_string(), "{r:?}");
+        let r = close.execute(ask(&theirs)).await.unwrap();
+        assert!(!r.success, "{r:?}");
+        assert!(
+            r.error.as_deref().is_some_and(|e| e.contains("took theirs back")),
+            "{r:?}"
+        );
         for s in [&by_desk, &theirs] {
-            let r = close.execute(ask(s)).await.unwrap();
-            assert!(!r.success || r.output["suggested"].is_string(), "{r:?}");
             assert_ne!(state(&d, s.id), SessionState::Closed);
         }
         let r = close.execute(ask(&typing)).await.unwrap();
@@ -493,11 +508,17 @@ async fn the_sweep_never_closes_a_session_its_boss_let_go() {
         let plain = base.join("notes");
         std::fs::create_dir_all(&plain).unwrap();
         let let_go = finished(&d, &crew, &base, &plain, "let-go", &boss, How::Started).await;
+        let running = finished(&d, &crew, &base, &plain, "running", &boss, How::Started).await;
         d.release_done(let_go.id, &By::manager("desk", &boss.name, "Done."))
             .await
             .unwrap();
         *crew.close_settle.lock() = chrono::Duration::zero();
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        crew.look_at_finished_sessions().await;
+        eventually("the one it still runs closed", async || {
+            crew.look_at_finished_sessions().await;
+            (state(&d, running.id) == SessionState::Closed).then_some(())
+        })
+        .await;
         assert_eq!(state(&d, let_go.id), SessionState::Done);
     })
     .await;
