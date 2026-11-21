@@ -1321,3 +1321,48 @@ fn a_command_is_read_for_settings_where_it_runs() {
         home
     ));
 }
+
+#[tokio::test]
+async fn a_boss_that_let_a_session_go_still_ends_what_it_started_until_the_person_takes_it_back() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let boss = By::manager("sarah", "Sarah", "its work is done");
+        let charged = |how| {
+            let d = d.clone();
+            let dir = dir.path().to_path_buf();
+            async move {
+                let s = new_session(&d, &dir).await;
+                d.take_on(s.id, &sarah(), how, &Default::default(), &By::you())
+                    .await
+                    .unwrap();
+                s.id
+            }
+        };
+        let started = charged(How::Started).await;
+        let handed = charged(How::Handed).await;
+        let taken = charged(How::Taken).await;
+        let theirs = charged(How::Started).await;
+        for (id, by) in [
+            (started, &boss),
+            (handed, &boss),
+            (taken, &boss),
+            (theirs, &By::you()),
+        ] {
+            d.release(id, by).await.unwrap();
+        }
+        assert!(d.charges().iter().all(|c| c.boss != "sarah"), "none live");
+        assert!(d.charge_load().await, "read again, as after a restart");
+        assert!(d.may_end(started, Some(&boss)));
+        assert!(d.may_end(handed, Some(&boss)));
+        assert!(!d.may_end(taken, Some(&boss)), "took it on itself");
+        assert!(!d.may_end(theirs, Some(&boss)), "the person took it back");
+        d.end(started, Some(boss.clone())).await.unwrap();
+        assert_eq!(d.view(started).unwrap().state, SessionState::Closed);
+        assert!(matches!(
+            d.end(theirs, Some(boss)).await,
+            Err(DeskError::Conflict(_))
+        ));
+    })
+    .await;
+}

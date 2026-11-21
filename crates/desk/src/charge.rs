@@ -131,6 +131,11 @@ impl Charge {
     pub fn live(&self) -> bool {
         self.released_at.is_none()
     }
+
+    /// Whether the person took it back from its boss.
+    pub fn taken_back(&self) -> bool {
+        !self.live() && self.released_by == Some(ReleasedBy::Person)
+    }
 }
 
 /// Why no boss acts on `name` once the person took it back from its boss:
