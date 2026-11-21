@@ -176,7 +176,7 @@ jobs:
     runs-on: ubuntu-latest
     # At two build jobs a warm cache builds in 20 to 35 minutes; a cold one
     # (the cache is saved only from main, so after a red main or a lockfile
-    # change) can take 80.
+    # change) takes much longer, and the limit allows for it.
     timeout-minutes: 120
     permissions:
       contents: read

@@ -1,11 +1,11 @@
 name: Give the build room to swap
-description: Adds 16 GB of swap on /mnt when it has room.
+description: Adds 16 GiB of swap on /mnt when it has room.
 
 # The hub's library is a rustc of about 10 GB, and its tests one of about
-# 17 GB. That one alone, or the library beside the rest of a build or a job's
-# services, passes the runner's 16 GB of memory, and the runner thrashes until
-# it is lost ("lost communication"). Swap lets such a moment pass, a little
-# slower, instead of losing the job.
+# 17 GB. The tests' rustc alone, or the library beside the rest of a build or
+# a job's services, passes the runner's 16 GB of memory, and the runner
+# thrashes until it is lost ("lost communication"). Swap lets such a moment
+# pass, a little slower, instead of losing the job.
 runs:
   using: composite
   steps:
