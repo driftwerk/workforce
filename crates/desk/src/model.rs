@@ -270,6 +270,11 @@ pub struct SessionView {
     /// with it, and what it gives the person comes as its own card.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub boss_has: Option<String>,
+    /// Whether its Act fully boss answers what it asks itself, here: said
+    /// only in Desk's list of the sessions ([`crate::Desk::listed`]), for
+    /// the hub of a boss that runs it from another computer.
+    #[serde(default)]
+    pub boss_answers: bool,
     /// How its process last ended on its own, until it starts again.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exited: Option<Exited>,
@@ -432,6 +437,7 @@ impl SessionView {
             mode: None,
             waits_on_you: None,
             boss_has: None,
+            boss_answers: false,
             failure: None,
             exited: None,
             created_at: r.created_at,

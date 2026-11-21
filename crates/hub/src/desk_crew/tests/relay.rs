@@ -927,6 +927,11 @@ fn carrying(
                     "desk.sessions" => {
                         native(&there, "GET", "/api/desk/sessions", Value::Null).await
                     }
+                    // Desk's own machines, as it answers them itself.
+                    "desk.machines" => (
+                        StatusCode::OK,
+                        json!({"machines": [{"name": "devbox", "label": "devbox", "reached": true}]}),
+                    ),
                     "desk.session_start" => {
                         let mut start: serde_json::Map<String, Value> = START_FIELDS
                             .iter()
@@ -1609,10 +1614,15 @@ async fn works_a_machine_session(
     let vel9 = started(&there, devbox_dir.path(), "VEL-9").await;
     let vel15 = started(&there, devbox_dir.path(), "VEL-15").await;
     let machine_id = format!("devbox/{}", vel9.id);
+    // VEL-9 was never placed in the sidebar: it is in no group, as the
+    // sidebar shows it. VEL-15 is in a group with no boss of its own.
     d.change_layout(|l| {
-        let mut l = l.clone();
-        l.ungrouped.items.push(format!("session:{machine_id}"));
-        Ok(l)
+        l.create(
+            "acme",
+            "Acme",
+            &[format!("session:devbox/{}", vel15.id)],
+            None,
+        )
     })
     .await
     .unwrap();
@@ -1620,33 +1630,6 @@ async fn works_a_machine_session(
         crew.overseer_named("desk").map(drop)
     })
     .await;
-
-    // Said only to a Desk that carries it, and once plans' grants are.
-    eventually("the grants", async || {
-        crew.machine_grants(true, false).map(drop)
-    })
-    .await;
-    let none = |w: super::super::machine_grants::MachineGrants| {
-        w.machines.values().all(|m| m.grants.is_empty())
-    };
-    assert!(none(crew.machine_grants(true, false).unwrap()));
-    assert!(none(crew.machine_grants(false, true).unwrap()));
-    let w = crew.machine_grants(true, true).unwrap();
-    let grants = &w.machines["devbox"].grants;
-    assert_eq!(grants.len(), 1, "{grants:?}");
-    assert_eq!(grants[0].group, workforce_desk::UNGROUPED);
-    let mut put = grants[0].grant.clone();
-    assert_eq!(put["boss"], "local:desk");
-    assert_eq!(
-        put["members"],
-        json!([vel9.id]),
-        "devbox's sessions in no group here alone"
-    );
-    assert_eq!(put["act"]["take_on_all"], json!(true));
-    put["revision"] = json!(1);
-    let (code, out) = super::served::native(&there, "PUT", "/api/desk/grants/ungrouped", put).await;
-    assert_eq!(code, StatusCode::OK, "{out}");
-
     let served =
         super::super::relay::routes(Arc::clone(&there_crew.state), Arc::clone(&there_crew));
     let carried: Arc<parking_lot::Mutex<Vec<RelayCall>>> = Arc::default();
@@ -1658,6 +1641,39 @@ async fn works_a_machine_session(
         &carried,
     );
     eventually("Desk relaying", async || crew.relaying().then_some(())).await;
+
+    // Said only to a Desk that carries it, and once plans' grants are.
+    eventually("the grants", async || {
+        crew.machine_grants(true, false).map(drop)
+    })
+    .await;
+    let none = |w: super::super::machine_grants::MachineGrants| {
+        w.machines.values().all(|m| m.grants.is_empty())
+    };
+    assert!(none(crew.machine_grants(true, false).unwrap()));
+    assert!(none(crew.machine_grants(false, true).unwrap()));
+    let w = eventually("devbox's sessions read", async || {
+        crew.machine_grants(true, true).filter(|w| {
+            w.machines
+                .get("devbox")
+                .is_some_and(|m| !m.grants.is_empty())
+        })
+    })
+    .await;
+    let grants = &w.machines["devbox"].grants;
+    assert_eq!(grants.len(), 1, "{grants:?}");
+    assert_eq!(grants[0].group, workforce_desk::UNGROUPED);
+    let mut put = grants[0].grant.clone();
+    assert_eq!(put["boss"], "local:desk");
+    assert_eq!(
+        put["members"],
+        json!([vel9.id]),
+        "devbox's sessions in no group here alone, one never placed included"
+    );
+    assert_eq!(put["act"]["take_on_all"], json!(true));
+    put["revision"] = json!(1);
+    let (code, out) = super::served::native(&there, "PUT", "/api/desk/grants/ungrouped", put).await;
+    assert_eq!(code, StatusCode::OK, "{out}");
 
     let r = run(
         &main,

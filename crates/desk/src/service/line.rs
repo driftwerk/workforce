@@ -799,7 +799,7 @@ impl Desk {
                         // anything is said of it.
                         if let Sender::Overseer(by) = &from {
                             let group = them.group.as_ref().map(|g| g.id.as_str());
-                            if !self.boss_reaches(&by.party.id, group) {
+                            if !self.boss_reaches(&by.party.id, group, Some(id)) {
                                 return Err(Refusal::NoSuchSession(id.to_string()).into());
                             }
                             // Taken back by the person: no boss writes to
@@ -1125,7 +1125,11 @@ impl Desk {
             Sender::Overseer(b)
                 if question.to.kind == PartyKind::Manager
                     && question.to.id == b.party.id
-                    && self.boss_reaches(&b.party.id, question.group.as_deref()) =>
+                    && self.boss_reaches(
+                        &b.party.id,
+                        question.group.as_deref(),
+                        question.from_session(),
+                    ) =>
             {
                 if let Some(asker) = question.from_session() {
                     self.boss_holds(asker, Some(b))?;

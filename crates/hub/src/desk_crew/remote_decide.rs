@@ -314,42 +314,40 @@ impl CrewHub {
     /// One decision call by `d` on `prompt`: its model's text, or why there
     /// is none.
     pub(crate) async fn decide_by(&self, d: &Decider, prompt: &str) -> Result<String, Failed> {
-        match &d.how {
-            How::Here(service) => self
-                .decision_call(service, super::decide::SYSTEM, prompt)
-                .await
-                .map_err(Failed::from),
-            How::Remote { boss, group } => self.remote_decision_call(boss, group, prompt).await,
-            How::Relayed { boss, group } => {
-                self.relayed_decision_call(boss, group, prompt, Call::Request)
-                    .await
-            }
-        }
+        self.answer_by(d, Call::Request, prompt).await
     }
 
-    /// Whether `d` answers the questions of the sessions it is over itself,
-    /// now: this hub's own boss, and the home's own boss of a machine's
-    /// sessions while its home says Act fully is in force for it. A boss
-    /// on another hub answers them in its own turns there.
-    pub(crate) fn answers(&self, d: &Decider) -> bool {
+    /// Whether `d` makes `call` itself, now: this hub's own boss, and the
+    /// home's own boss of a machine's sessions while its home says Act
+    /// fully is in force for it and that it takes it. A boss on another
+    /// hub decides requests alone: it answers questions and plans in its
+    /// own turns there.
+    pub(crate) fn answers(&self, d: &Decider, call: Call) -> bool {
         match &d.how {
             How::Here(_) => true,
-            How::Relayed { boss, group } => self.home_holds_full(boss, group),
-            How::Remote { .. } => false,
+            How::Relayed { boss, group } => self.home_takes(boss, group, call),
+            How::Remote { .. } => call == Call::Request,
         }
     }
 
-    /// One answer call by `d` on a session's question `prompt`
-    /// ([`super::answer`]): its model's text, or why there is none.
-    pub(crate) async fn answer_by(&self, d: &Decider, prompt: &str) -> Result<String, Failed> {
+    /// One decision call by `d` on `prompt` for `call`, with its own
+    /// instructions: its model's text, or why there is none.
+    pub(crate) async fn answer_by(
+        &self,
+        d: &Decider,
+        call: Call,
+        prompt: &str,
+    ) -> Result<String, Failed> {
         match &d.how {
             How::Here(service) => self
-                .decision_call(service, super::answer::SYSTEM, prompt)
+                .decision_call(service, call.system(), prompt)
                 .await
                 .map_err(Failed::from),
             How::Relayed { boss, group } => {
-                self.relayed_decision_call(boss, group, prompt, Call::Question)
-                    .await
+                self.relayed_decision_call(boss, group, prompt, call).await
+            }
+            How::Remote { boss, group } if call == Call::Request => {
+                self.remote_decision_call(boss, group, prompt).await
             }
             How::Remote { .. } => Err(Failed::from(
                 "its boss answers questions in its own turns, on its hub".to_string(),

@@ -141,7 +141,10 @@ impl Ceiling {
 
     /// Its switches as a relayed call carries them.
     pub fn relayed_act(&self) -> Value {
-        let mut act = serde_json::to_value(self.act).unwrap_or_else(|_| json!({}));
+        let mut act = serde_json::to_value(self.act).unwrap_or_else(|e| {
+            tracing::error!(error = %e, "a ceiling's switches couldn't be said: none go with it");
+            json!({})
+        });
         act[TAKE_ON_ALL] = json!(self.take_on == TakeOn::All);
         act
     }
@@ -207,8 +210,30 @@ pub struct Served {
     pub audit: Option<Uuid>,
 }
 
+/// Why a call this engine doesn't serve is refused: what tells the home
+/// its Desk here is older ([`super::relay::older`]).
+pub(crate) fn not_served(tool: &str) -> String {
+    format!("{tool} isn't served to a boss here.")
+}
+
 fn refused(why: impl Into<String>) -> (ServedStatus, Value) {
     (ServedStatus::Refused, json!({ "error": why.into() }))
+}
+
+/// How long the person's last input keeps a session theirs from its boss,
+/// as a grant's `act` says it ([`Oversight::wake`]).
+pub const HOLD_MINUTES: &str = "hold_minutes";
+/// How long the person's last input keeps a session's questions theirs.
+pub const ANSWER_AFTER_MINUTES: &str = "answer_after_minutes";
+
+/// The minutes `act` says for `k`, within what a boss's own settings
+/// allow; `default` when it says none it may.
+fn minutes_of(act: &Value, k: &str, default: u32) -> u32 {
+    let most = workforce_common::oversight::MAX_HOLD_MINUTES.unsigned_abs();
+    act.get(k)
+        .and_then(Value::as_u64)
+        .filter(|m| (1..=most).contains(m))
+        .map_or(default, |m| m as u32)
 }
 
 /// The daily budget `act` gives (`budget_usd_per_day`), in cents: an
@@ -280,7 +305,29 @@ pub fn served_oversight(g: &Grant) -> Oversight {
     };
     o.work.parallel = parallel;
     o.work.engine = Engine::Claude.as_str().to_string();
+    o.wake.hold_minutes = minutes_of(&g.act, HOLD_MINUTES, o.wake.hold_minutes);
+    o.wake.answer_after_minutes =
+        minutes_of(&g.act, ANSWER_AFTER_MINUTES, o.wake.answer_after_minutes);
     o
+}
+
+/// `i` as a boss served from `g` sees it: what it waits on, and what it
+/// did last, said only as far as the grant shows a session's questions.
+pub(super) fn seen_item(
+    g: &Grant,
+    mut i: workforce_desk::crew::Item,
+) -> workforce_desk::crew::Item {
+    if !sees::shows(g.sees, Part::Question) {
+        i.detail = None;
+        if let Some(a) = &mut i.approval {
+            a.summary.clear();
+        }
+        if let Some(q) = &mut i.question {
+            q.text.clear();
+            q.options = None;
+        }
+    }
+    i
 }
 
 /// Whether `folder`, said plainly, is inside one of `allowed` on this
@@ -297,13 +344,13 @@ pub fn folder_inside(folder: &str, allowed: &[String]) -> Option<std::path::Path
         .then_some(real)
 }
 
-/// The `event` frame that tells a served boss of `g` that session `view`
-/// waits on request `p`: its words only where Sees shows its question.
-pub(super) fn request_frame(
+/// What tells a served boss of `g` that session `view` waits on request
+/// `p`: its words only where Sees shows its question.
+pub(super) fn request_line(
     g: &Grant,
     view: &workforce_desk::model::SessionView,
     p: &workforce_desk::model::PendingApproval,
-) -> Value {
+) -> String {
     let what = match (sees::shows(g.sees, Part::Question), p.detail.trim()) {
         (false, _) => String::new(),
         (true, "") => format!(": {}", p.tool),
@@ -315,10 +362,19 @@ pub(super) fn request_frame(
         view.id,
         p.id
     );
+    sees::capped(&line, 2_000)
+}
+
+/// The `event` frame that says [`request_line`].
+pub(super) fn request_frame(
+    g: &Grant,
+    view: &workforce_desk::model::SessionView,
+    p: &workforce_desk::model::PendingApproval,
+) -> Value {
     json!({
         "kind": "needs_you",
         "subject": view.id,
-        "line": sees::capped(&line, 2_000),
+        "line": request_line(g, view, p),
         "at": chrono::Utc::now(),
         "hop": 0,
     })
@@ -426,7 +482,7 @@ impl CrewHub {
             }
         };
         let (status, mut body) = match tool {
-            None => refused(format!("{} isn't served to a boss here.", call.tool)),
+            None => refused(not_served(&call.tool)),
             Some(tool) => self.decide_served(tool, &call, group).await,
         };
         let changed = cleaned(&mut body);
@@ -865,6 +921,19 @@ impl CrewHub {
         };
     }
 
+    /// The live grant of session `id`'s group here, at any level, when
+    /// `boss` is its boss and it holds `id`.
+    pub(super) fn live_grant_of(&self, boss: &str, id: Uuid) -> Option<Grant> {
+        let view = self.desk.view(id).ok()?;
+        let group = view
+            .group
+            .as_ref()
+            .map_or(workforce_desk::UNGROUPED, |g| g.id.as_str());
+        self.desk.grant_live(group).ok().filter(|g| {
+            g.boss.as_ref().is_some_and(|b| b.party_id() == boss) && self.in_grant(g, id)
+        })
+    }
+
     /// Whether `id` is one of this engine's sessions in `g`.
     pub(super) fn in_grant(&self, g: &Grant, id: Uuid) -> bool {
         (g.members.contains(&id) || g.born.contains(&id)) && self.desk.view(id).is_ok()
@@ -897,24 +966,26 @@ impl CrewHub {
                     .map_err(internal)?;
                 let rows: Vec<Value> = o
                     .items
-                    .iter()
+                    .into_iter()
                     .filter(|i| i.kind == ItemKind::Session)
                     .filter(|i| i.id.parse().is_ok_and(|id| self.in_grant(g, id)))
                     .map(|i| {
+                        let i = seen_item(g, i);
                         let runs = i.id.parse().is_ok_and(|id| self.runs(id, boss));
-                        let mut r = json!({
+                        let mut row = json!({
                             "id": i.id, "name": i.name, "cwd": i.cwd,
                             "engine": i.engine.map(|e| e.as_str()),
                             "state": i.state, "task": i.task, "since": i.since,
                             "you_run_it": runs,
                             "asks": i.approval.is_some() || i.question.is_some(),
                         });
-                        if shows(Part::Question) {
-                            r["detail"] = json!(i.detail);
-                            r["approval"] = json!(i.approval.as_ref().map(|a| (&a.id, &a.summary)));
-                            r["question"] = json!(i.question.as_ref().map(|q| &q.text));
+                        if sees::shows(g.sees, Part::Question) {
+                            row["detail"] = json!(i.detail);
+                            row["approval"] =
+                                json!(i.approval.as_ref().map(|a| (&a.id, &a.summary)));
+                            row["question"] = json!(i.question.as_ref().map(|q| &q.text));
                         }
-                        r
+                        row
                     })
                     .collect();
                 Ok(json!({
@@ -1154,21 +1225,6 @@ impl CrewHub {
                             Box::pin(self.assign_after(r, &who, None, id, started.is_ok())).await;
                         }
                         started?.0
-                    }
-                    Action::TakeOn { session } => {
-                        let party = Party::manager(boss, &boss_name(g));
-                        let c = self
-                            .desk
-                            .take_on(
-                                *session,
-                                &party,
-                                workforce_desk::charge::How::Taken,
-                                &o.scope,
-                                &by,
-                            )
-                            .await
-                            .map_err(super::actions::charge_plain)?;
-                        format!("took on {}", self.session_name(c.session))
                     }
                     _ => Box::pin(self.perform_with(&action, by, &order)).await?,
                 };

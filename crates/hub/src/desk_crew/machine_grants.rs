@@ -51,9 +51,11 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 use workforce_common::oversight::{Level, Oversight, Scope, TakeOn};
+use workforce_desk::crew::{Crew, MachineSession};
 use workforce_desk::grant::{plan_key, plan_of, BossRef, MAX_MEMBERS};
 use workforce_desk::UNGROUPED;
 
+use super::machines::ANY_MACHINE;
 use super::relay::machine_session;
 use super::{plan, CrewHub};
 use crate::serve::AgentService;
@@ -116,6 +118,8 @@ fn act_of(o: &Oversight) -> Value {
         "parallel": o.work.parallel,
     });
     act[super::served::TAKE_ON_ALL] = json!(o.work.take_on == TakeOn::All);
+    act[super::served::HOLD_MINUTES] = json!(o.wake.hold_minutes);
+    act[super::served::ANSWER_AFTER_MINUTES] = json!(o.wake.answer_after_minutes);
     act
 }
 
@@ -182,6 +186,13 @@ impl Granted {
             }),
         }
     }
+}
+
+/// The machine and session a sidebar item names, when it is a machine's.
+fn machine_item(item: &str) -> Option<(String, Uuid)> {
+    item.strip_prefix("session:")
+        .and_then(machine_session)
+        .map(|(m, id)| (m.to_string(), id))
 }
 
 /// Sessions by the machine they are on.
@@ -280,7 +291,9 @@ impl CrewHub {
     /// Each machine's sessions the sidebar has in Ungrouped that the main
     /// overseer `agent` reaches by its machine's Ungrouped grant: none for
     /// a group's boss, and none of its plans' (a machine holds a session in
-    /// one grant only).
+    /// one grant only). As the sidebar resolves it: each machine's open
+    /// sessions, as last read there, in no group; the ones it lists in
+    /// Ungrouped for a machine not read yet.
     pub(crate) fn ungrouped_sessions(&self, agent: &str, o: &Oversight) -> MachineSessions {
         if o.scope != Scope::Ungrouped {
             return MachineSessions::new();
@@ -290,18 +303,123 @@ impl CrewHub {
             .into_iter()
             .flat_map(|((m, _), (_, ids))| ids.into_iter().map(move |id| (m.clone(), id)))
             .collect();
-        self.desk
-            .layout()
+        let layout = self.desk.layout();
+        let grouped: BTreeSet<(String, Uuid)> = layout
+            .groups
+            .iter()
+            .flat_map(|g| g.items.iter())
+            .filter_map(|i| machine_item(i))
+            .collect();
+        let known = self.machine_known.lock();
+        let present = known
+            .iter()
+            .flat_map(|(m, (_, ids))| ids.iter().map(move |id| (m.clone(), *id)));
+        let unread = layout
             .ungrouped
             .items
             .iter()
-            .filter_map(|i| i.strip_prefix("session:").and_then(machine_session))
-            .map(|(m, id)| (m.to_string(), id))
-            .filter(|k| !planned.contains(k))
+            .filter_map(|i| machine_item(i))
+            .filter(|(m, _)| !known.contains_key(m));
+        present
+            .chain(unread)
+            .filter(|k| !grouped.contains(k) && !planned.contains(k))
             .fold(MachineSessions::new(), |mut out, (m, id)| {
                 out.entry(m).or_default().insert(id);
                 out
             })
+    }
+
+    /// How far apart one machine's sessions are read.
+    pub(super) fn machine_gap(&self) -> std::time::Duration {
+        self.timing.tick.min(std::time::Duration::from_secs(15))
+    }
+
+    /// Keeps `listed`, `machine`'s sessions as Desk there just listed them,
+    /// but those closed.
+    pub(super) fn machine_listed(&self, machine: &str, listed: &[MachineSession]) {
+        let open = listed
+            .iter()
+            .filter(|s| s.state != "closed")
+            .map(|s| s.id)
+            .collect();
+        self.machine_known
+            .lock()
+            .insert(machine.to_string(), (std::time::Instant::now(), open));
+    }
+
+    /// Reads the sessions of each of the person's machines Desk reaches, at
+    /// most [`Self::machine_gap`] apart, while Desk carries machines'
+    /// Ungrouped grants: what [`Self::ungrouped_sessions`] are made of. A
+    /// machine Desk no longer has is forgotten; one that can't be read
+    /// keeps what was last read of it.
+    pub(super) async fn watch_ungrouped(&self) {
+        let main = self
+            .overseers()
+            .into_iter()
+            .find(|(_, o)| o.scope == Scope::Ungrouped)
+            .map(|(s, _)| s.agent_id.as_str().to_string());
+        let Some(boss) = main.filter(|_| self.ungrouped_carried()) else {
+            self.machine_known.lock().clear();
+            return;
+        };
+        let gap = self.machine_gap();
+        {
+            let mut read = self.machine_read.lock();
+            if read.get(ANY_MACHINE).is_some_and(|at| at.elapsed() < gap) {
+                return;
+            }
+            read.insert(ANY_MACHINE.to_string(), std::time::Instant::now());
+        }
+        let machines = match self
+            .machine_ask(ANY_MACHINE, &boss, "desk.machines", json!({}))
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(error = %e, "the person's machines weren't read");
+                return;
+            }
+        };
+        let had: BTreeSet<String> = machines["machines"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|m| m["name"].as_str())
+            .filter(|m| super::relay::machine_ok(m))
+            .map(str::to_string)
+            .collect();
+        self.machine_known.lock().retain(|m, _| had.contains(m));
+        let reached = machines["machines"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|m| m["reached"].as_bool() == Some(true))
+            .filter_map(|m| m["name"].as_str())
+            .filter(|m| had.contains(*m));
+        for machine in reached {
+            let fresh = self
+                .machine_known
+                .lock()
+                .get(machine)
+                .is_some_and(|(at, _)| at.elapsed() < gap);
+            if fresh {
+                continue;
+            }
+            match self
+                .machine_call(machine, None, &boss, "desk.sessions", json!({}))
+                .await
+            {
+                Ok(v) => match serde_json::from_value::<Vec<MachineSession>>(v) {
+                    Ok(listed) => self.machine_listed(machine, &listed),
+                    Err(e) => {
+                        tracing::debug!(%machine, error = %e, "a machine's sessions couldn't be read");
+                    }
+                },
+                Err(e) => {
+                    tracing::debug!(%machine, error = %e, "a machine's sessions weren't read")
+                }
+            }
+        }
     }
 
     /// Whether Desk on this computer carries machines' Ungrouped grants:

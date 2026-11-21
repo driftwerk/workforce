@@ -331,7 +331,7 @@ async fn a_take_is_refused_to_any_boss_but_the_grants_own_from_its_home() {
 async fn a_machine_session_gone_quiet_is_said_in_the_check_in_as_one_here_is() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let (_main, crew, d, _llm) = overseeing(
+        let (_main, crew, _d, _llm) = overseeing(
             dir.path(),
             pool,
             "ok",
@@ -339,14 +339,9 @@ async fn a_machine_session_gone_quiet_is_said_in_the_check_in_as_one_here_is() {
             &[],
         )
         .await;
+        // VEL-9, on devbox, was never placed in the sidebar: it is in no
+        // group, the main overseer's.
         let id = uuid::Uuid::new_v4();
-        d.change_layout(|l| {
-            let mut l = l.clone();
-            l.ungrouped.items.push(format!("session:devbox/{id}"));
-            Ok(l)
-        })
-        .await
-        .unwrap();
         let (_, o) = eventually("the main overseer", async || crew.overseer_named("desk")).await;
         eventually("the grants", async || crew.machine_grants(true, true).map(drop)).await;
         let quiet_since = chrono::Utc::now() - chrono::Duration::hours(1);
@@ -380,6 +375,10 @@ async fn a_machine_session_gone_quiet_is_said_in_the_check_in_as_one_here_is() {
                                 }],
                                 ..Taken::default()
                             }),
+                            "desk.machines" => {
+                                json!({"machines": [{"name": "devbox", "reached": true}]})
+                            }
+                            "desk.sessions" => json!([{"id": id, "state": "working"}]),
                             _ => json!({}),
                         };
                         crew.relay_answer(

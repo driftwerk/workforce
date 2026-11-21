@@ -2332,11 +2332,20 @@ impl CrewHub {
                 self.change_ticket_boxed(action, by).await
             }
             Action::TakeOn { session } => {
-                let (service, o) = self
-                    .boss_for(&by)
-                    .await
-                    .ok_or("No one oversees the crew to run it.")?;
-                let boss = Party::manager(service.agent_id.as_str(), &super::name_of(&service));
+                // A boss served from a grant here takes it on under its
+                // grant's scope; this hub's own, under its own.
+                let taker = match workforce_desk::grant::is_served(&by.party.id) {
+                    true => self
+                        .live_grant_of(&by.party.id, *session)
+                        .map(|g| (by.party.clone(), super::served::served_oversight(&g).scope)),
+                    false => self.boss_for(&by).await.map(|(service, o)| {
+                        (
+                            Party::manager(service.agent_id.as_str(), &super::name_of(&service)),
+                            o.scope,
+                        )
+                    }),
+                };
+                let (boss, scope) = taker.ok_or("No one oversees the crew to run it.")?;
                 // The overseer taking it on by itself, or the person saying
                 // yes to its offer.
                 let how = match by.party.kind {
@@ -2350,7 +2359,7 @@ impl CrewHub {
                     _ => How::Taken,
                 };
                 let c = d
-                    .take_on(*session, &boss, how, &o.scope, &by)
+                    .take_on(*session, &boss, how, &scope, &by)
                     .await
                     .map_err(charge_plain)?;
                 Ok(format!("took on {}", self.session_name(c.session)))

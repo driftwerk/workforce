@@ -46,6 +46,7 @@ mod handover;
 mod held;
 mod idle;
 mod items;
+mod left;
 mod line;
 mod logins;
 pub(crate) mod machine_grants;
@@ -325,6 +326,11 @@ pub struct CrewHub {
     plans_watched: std::sync::atomic::AtomicBool,
     /// When Desk last asked for machines' Ungrouped grants: it carries them.
     ungrouped_asked: Mutex<Option<std::time::Instant>>,
+    /// Each of the person's machines' open sessions, as Desk there last
+    /// listed them, and when: what the sidebar shows of it
+    /// ([`machine_grants`]).
+    machine_known:
+        Mutex<HashMap<String, (std::time::Instant, std::collections::BTreeSet<uuid::Uuid>)>>,
     machine_read: Mutex<HashMap<String, std::time::Instant>>,
     /// Each machine's plan reads that failed in a row.
     machine_down: Mutex<HashMap<String, u32>>,
@@ -809,6 +815,7 @@ impl CrewHub {
             machine_plans: Mutex::default(),
             plans_watched: std::sync::atomic::AtomicBool::new(false),
             ungrouped_asked: Mutex::default(),
+            machine_known: Mutex::default(),
             machine_read: Mutex::default(),
             machine_down: Mutex::default(),
             reuse_claims: Mutex::default(),
@@ -1742,6 +1749,10 @@ impl Crew for CrewHub {
 
     fn answers_for(&self, boss: &str) -> bool {
         self.home_reads(boss)
+    }
+
+    fn answers_itself(&self, view: &workforce_desk::model::SessionView) -> bool {
+        self.answers_question_itself(view)
     }
 
     async fn assign(&self, agent: &str, task: &str) -> Result<String, String> {

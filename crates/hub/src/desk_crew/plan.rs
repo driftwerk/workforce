@@ -1574,6 +1574,7 @@ impl CrewHub {
             return;
         }
         self.watch_machines().await;
+        self.watch_ungrouped().await;
         self.retry_machine_starts().await;
         match self.desk.plans(Some(PlanState::Paused), None).await {
             Ok(paused) => {
@@ -1612,7 +1613,7 @@ impl CrewHub {
     /// A session here in Doing that ended as it started is held back too:
     /// one that ended before its ticket was its was missed as it ended.
     async fn watch_machines(&self) {
-        let gap = self.timing.tick.min(Duration::from_secs(15));
+        let gap = self.machine_gap();
         // The plans themselves are read once a gap apart, too.
         {
             let mut read = self.machine_read.lock();
@@ -1735,7 +1736,11 @@ impl CrewHub {
             let listed: Vec<MachineSession> = match listed {
                 Ok(v) => {
                     self.machine_down.lock().remove(&machine);
-                    serde_json::from_value(v).unwrap_or_default()
+                    let listed = serde_json::from_value::<Vec<MachineSession>>(v).ok();
+                    if let Some(l) = &listed {
+                        self.machine_listed(&machine, l);
+                    }
+                    listed.unwrap_or_default()
                 }
                 Err(e) => {
                     tracing::debug!(%machine, error = %e, "a machine's plan sessions weren't read");
@@ -1788,7 +1793,10 @@ impl CrewHub {
                 let line = match (now, &was) {
                     // In Review, its turns are the person's to read.
                     (Some(now), Some(was)) => {
-                        machine_line(&machine, was, now, self.answered_on_machine(&item))
+                        let answered = now
+                            .boss_answers
+                            .unwrap_or_else(|| self.answered_on_machine(&item));
+                        machine_line(&machine, was, now, answered)
                             .filter(|l| !(review && l.contains("finished a turn")))
                     }
                     (None, Some(was)) if was.state == "starting" && was.misses >= 1 => {
@@ -2877,6 +2885,7 @@ mod tests {
             last_reply: reply.map(str::to_string),
             created_at: None,
             boss_has: None,
+            boss_answers: None,
             exited: None,
         };
         // Nothing new: nothing said.

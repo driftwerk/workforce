@@ -31,6 +31,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -38,6 +39,7 @@ use uuid::Uuid;
 use workforce_common::oversight::{Level, Oversight};
 use workforce_desk::grant::BossRef;
 
+use super::left::Left;
 use super::remote_decide::Failed;
 use super::served::{Ceiling, ServedStatus};
 use super::CrewHub;
@@ -109,6 +111,8 @@ struct Home {
     /// What the home counted of each of the boss's other grants here, by
     /// group: in `elsewhere`, and perhaps behind what they said since.
     others: HashMap<String, f64>,
+    /// What it takes beyond requests.
+    takes: HashSet<Call>,
 }
 
 /// The most any of a boss's fresh words, by grant, counts as spent: its
@@ -128,37 +132,44 @@ fn most_spent(fresh: &[(&str, &Home)]) -> Option<f64> {
         .reduce(f64::max)
 }
 
-/// What a relayed boss's decision call is for: a session's request, or a
-/// question it asks ([`super::answer`]). The home answers each with its
-/// own instructions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What a relayed boss's decision call is for: a session's request, a
+/// question it asks, or the plan it presents ([`super::answer`]). The home
+/// answers each with its own instructions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Call {
     Request,
     Question,
+    Plan,
 }
 
 impl Call {
+    /// What a home takes beyond requests, which every home takes: what its
+    /// take says it does, so a machine hands an older home none of the
+    /// others.
+    pub(crate) const BEYOND: [Self; 2] = [Self::Question, Self::Plan];
+
     /// How a take names it: a request's is said as none, as an older
     /// machine's is.
     fn said(self) -> Option<&'static str> {
         match self {
             Self::Request => None,
             Self::Question => Some("question"),
+            Self::Plan => Some("plan"),
         }
     }
 
     fn of(kind: Option<&str>) -> Option<Self> {
         match kind {
             None => Some(Self::Request),
-            Some("question") => Some(Self::Question),
-            Some(_) => None,
+            Some(k) => Self::BEYOND.into_iter().find(|c| c.said() == Some(k)),
         }
     }
 
-    fn system(self) -> &'static str {
+    pub(crate) fn system(self) -> &'static str {
         match self {
             Self::Request => super::decide::SYSTEM,
             Self::Question => super::answer::SYSTEM,
+            Self::Plan => super::answer::PLAN_SYSTEM,
         }
     }
 }
@@ -166,8 +177,28 @@ impl Call {
 /// The most notices for the person a machine keeps for one boss until its
 /// home takes them.
 const MOST_NOTES: usize = 16;
-/// How long a notice for the person may be.
+/// How long each word of a notice for the person may be.
 const MAX_NOTE: usize = 1_000;
+/// The most notices the Mac says in one boss's DM a minute: the rest wait
+/// on the machine for later takes.
+const NOTES_PER_MINUTE: usize = 6;
+/// How long the Mac remembers a notice it said, so one a later take hands
+/// back again is said once.
+const NOTE_KEPT: Duration = Duration::from_secs(600);
+
+/// What a boss relayed from its home leaves to the person, as its machine
+/// keeps it for the home's takes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Note {
+    pub id: Uuid,
+    #[serde(flatten)]
+    pub left: Left,
+}
+
+/// It with each word capped, its secrets hidden.
+fn tidied(left: Left) -> Left {
+    left.with_text(|t| workforce_desk::sees::capped(&crate::redact::hide_secrets(&t), MAX_NOTE))
+}
 
 /// What a machine holds of its relayed bosses' decisions.
 #[derive(Default)]
@@ -177,9 +208,9 @@ pub(crate) struct Outbox {
     homes: HashMap<Key, Home>,
     /// What waits to be taken, oldest first.
     queued: HashMap<Key, VecDeque<(Uuid, String, Call)>>,
-    /// What each boss (`home/<agent>`) says to the person, oldest first:
-    /// its home's take carries it to the boss's DM there.
-    notes: HashMap<String, VecDeque<String>>,
+    /// What each boss (`home/<agent>`) leaves to the person, oldest first:
+    /// each of its home's takes hands it until one says it was taken.
+    notes: HashMap<String, VecDeque<Note>>,
     /// Who waits for each answer, and whose it is.
     waiting: HashMap<Uuid, (Key, oneshot::Sender<Result<String, Failed>>)>,
     /// What a take handed out: only these are answered.
@@ -266,13 +297,21 @@ impl CrewHub {
     }
 
     /// Whether the home said, lately, that Act fully is in force for
-    /// `party` (`home/<agent>`) in `group`.
-    pub(crate) fn home_holds_full(&self, party: &str, group: &str) -> bool {
+    /// `party` (`home/<agent>`) in `group`, and that it takes `call`.
+    pub(crate) fn home_takes(&self, party: &str, group: &str, call: Call) -> bool {
         self.relayed
             .lock()
             .homes
             .get(&(party.to_string(), group.to_string()))
-            .is_some_and(|h| h.at.elapsed() < FRESH)
+            .is_some_and(|h| {
+                h.at.elapsed() < FRESH && (call == Call::Request || h.takes.contains(&call))
+            })
+    }
+
+    /// Whether the home said, lately, that Act fully is in force for
+    /// `party` (`home/<agent>`) in `group`.
+    pub(crate) fn home_holds_full(&self, party: &str, group: &str) -> bool {
+        self.home_takes(party, group, Call::Request)
     }
 
     /// What Act fully's one budget counts as spent today for `party`
@@ -340,19 +379,19 @@ impl CrewHub {
         }
     }
 
-    /// Keeps `text` for the person, from the boss `party` relayed from the
-    /// home, for its home's next take to say in the boss's DM there; the
+    /// Keeps what the boss `party`, relayed from the home, leaves to the
+    /// person, for its home's takes to say in the boss's DM there; the
     /// oldest goes first once [`MOST_NOTES`] wait.
-    pub(crate) fn relayed_note(&self, party: &str, text: &str) {
+    pub(crate) fn relayed_note(&self, party: &str, left: Left) {
         let mut out = self.relayed.lock();
         let notes = out.notes.entry(party.to_string()).or_default();
         if notes.len() >= MOST_NOTES {
             notes.pop_front();
         }
-        notes.push_back(workforce_desk::sees::capped(
-            &crate::redact::hide_secrets(text),
-            MAX_NOTE,
-        ));
+        notes.push_back(Note {
+            id: Uuid::new_v4(),
+            left: tidied(left),
+        });
     }
 
     /// One decision call by `boss` (`home/<agent>`), relayed from the home,
@@ -462,6 +501,12 @@ impl CrewHub {
             && age.is_some()
             && here.is_some()
             && elsewhere.is_some();
+        let takes: HashSet<Call> = input["takes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|k| Call::of(Some(k.as_str()?)))
+            .collect();
         let most = input["most"]
             .as_u64()
             .map_or(MOST_TAKEN, |m| (m as usize).min(MOST_TAKEN));
@@ -496,6 +541,7 @@ impl CrewHub {
                             here,
                             elsewhere,
                             others,
+                            takes,
                         },
                     );
                 }
@@ -522,13 +568,26 @@ impl CrewHub {
         if !ours {
             return refused(&workforce_desk::scope::not_ours(None));
         }
-        let notes: Vec<String> = self
-            .relayed
-            .lock()
-            .notes
-            .remove(&key.0)
-            .map(Vec::from)
-            .unwrap_or_default();
+        let said: HashSet<Uuid> = input["notesTaken"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str()?.parse().ok())
+            .collect();
+        let notes: Vec<Note> = {
+            let mut out = self.relayed.lock();
+            match out.notes.get_mut(&key.0) {
+                Some(n) => {
+                    n.retain(|note| !said.contains(&note.id));
+                    let left = Vec::from(n.clone());
+                    if n.is_empty() {
+                        out.notes.remove(&key.0);
+                    }
+                    left
+                }
+                None => Vec::new(),
+            }
+        };
         let full = in_force && self.served_full(&key.0).is_some();
         let mut body = json!({ "full": full, "decisions": decisions, "notes": notes });
         if let (Some(f), Some(usd)) = (from, here) {
@@ -642,6 +701,47 @@ struct Pump {
     /// The decision calls made lately, and the room for them at once.
     calls: VecDeque<Instant>,
     at_once: Arc<tokio::sync::Semaphore>,
+    /// The notices for the person the last takes handed that were said,
+    /// for the next take to say were taken.
+    notes_taken: Vec<Uuid>,
+}
+
+/// The notices for the person the Mac said lately, from every machine.
+#[derive(Default)]
+struct Told {
+    /// Each by its id, when it was said.
+    said: HashMap<Uuid, Instant>,
+    /// When each boss's DM was last said one in.
+    at: HashMap<String, VecDeque<Instant>>,
+}
+
+impl Told {
+    /// Whether `note` is to be said in `agent`'s DM now: not said already,
+    /// and within [`NOTES_PER_MINUTE`]. One that is, is counted said.
+    fn says(&mut self, agent: &str, note: Uuid, now: Instant) -> bool {
+        self.said
+            .retain(|_, at| now.duration_since(*at) < NOTE_KEPT);
+        if self.said.contains_key(&note) {
+            return false;
+        }
+        let at = self.at.entry(agent.to_string()).or_default();
+        while at
+            .front()
+            .is_some_and(|t| now.duration_since(*t) >= Duration::from_secs(60))
+        {
+            at.pop_front();
+        }
+        if at.len() >= NOTES_PER_MINUTE {
+            return false;
+        }
+        at.push_back(now);
+        self.said.insert(note, now);
+        true
+    }
+
+    fn said(&self, note: Uuid) -> bool {
+        self.said.contains_key(&note)
+    }
 }
 
 impl Pump {
@@ -670,6 +770,7 @@ impl Default for Pump {
             counts: None,
             calls: VecDeque::new(),
             at_once: Arc::new(tokio::sync::Semaphore::new(AT_ONCE)),
+            notes_taken: Vec::new(),
         }
     }
 }
@@ -709,6 +810,7 @@ impl CrewHub {
 /// and says so when Act fully ends.
 pub(crate) async fn pump_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     let pumps: Pumps = Arc::default();
+    let told: Arc<Mutex<Told>> = Arc::default();
     let mut tick = tokio::time::interval(TAKE_EVERY / 4);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -745,6 +847,7 @@ pub(crate) async fn pump_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                     k,
                     in_force,
                     Arc::clone(&pumps),
+                    Arc::clone(&told),
                 ));
             }
         }
@@ -763,6 +866,7 @@ async fn take(
     k: (String, String),
     in_force: bool,
     pumps: Pumps,
+    told: Arc<Mutex<Told>>,
 ) {
     let (machine, group) = &k;
     let agent = service.agent_id.as_str().to_string();
@@ -777,19 +881,21 @@ async fn take(
     // As many as there is room to decide now: none is refused for pace.
     // In force there only once the machine said it counts this budget, so
     // an engine that counts only its own spend never acts fully.
-    let (most, counts) = {
+    let (most, counts, notes_taken) = {
         let mut p = pumps.lock();
         let p = p.entry(k.clone()).or_default();
         let counts = p
             .counts
             .is_some_and(|(f, at)| Some(f) == from && started.duration_since(at) < CONFIRMED_FOR);
-        (p.room(started), counts)
+        (p.room(started), counts, p.notes_taken.clone())
     };
     let says = in_force && counts && elsewhere.is_some();
     let mut input = json!({
         "inForce": says,
         "sentAt": chrono::Utc::now().timestamp_millis(),
         "most": most,
+        "takes": Call::BEYOND.map(Call::said),
+        "notesTaken": notes_taken,
     });
     if let Some(f) = from {
         input["countFrom"] = json!(f.timestamp_millis());
@@ -842,14 +948,39 @@ async fn take(
                 _ => IDLE_EVERY,
             };
     }
-    let notes = match &got {
-        Ok(a) if a.status == ServedStatus::Ok => a.body["notes"].as_array().cloned(),
-        _ => None,
+    let notes: Vec<Note> = match &got {
+        Ok(a) if a.status == ServedStatus::Ok => a.body["notes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .take(MOST_NOTES)
+            .filter_map(|n| serde_json::from_value(n.clone()).ok())
+            .collect(),
+        _ => Vec::new(),
     };
-    for note in notes.into_iter().flatten().take(MOST_NOTES) {
-        if let Some(text) = note.as_str() {
-            crew.tell_dm(&agent, &workforce_desk::sees::capped(text, MAX_NOTE))
+    if got.as_ref().is_ok_and(|a| a.status == ServedStatus::Ok) {
+        let mut p = pumps.lock();
+        let p = p.entry(k.clone()).or_default();
+        p.notes_taken.retain(|id| !notes_taken.contains(id));
+    }
+    for note in notes {
+        let (say, said) = {
+            let mut t = told.lock();
+            let say = t.says(&agent, note.id, Instant::now());
+            (say, say || t.said(note.id))
+        };
+        if say {
+            let words = tidied(note.left).words();
+            crew.tell_dm(&agent, &format!("On {machine}: {words}"))
                 .await;
+        }
+        if said {
+            pumps
+                .lock()
+                .entry(k.clone())
+                .or_default()
+                .notes_taken
+                .push(note.id);
         }
     }
     for d in decisions {
@@ -884,21 +1015,19 @@ async fn decide_one(
     let (machine, group) = &k;
     let agent = service.agent_id.as_str().to_string();
     let refuse = |code: Code, why: &str| Err::<String, _>((code, why.to_string()));
-    let checked = if !prompt.starts_with(super::decide::MARK) || call.is_none() {
-        Some(refuse(Code::NotADecision, "not a decision its home takes"))
-    } else if prompt.chars().count() > MAX_PROMPT {
-        Some(refuse(
+    let checked = match call.filter(|_| prompt.starts_with(super::decide::MARK)) {
+        None => Err((Code::NotADecision, "not a decision its home takes")),
+        Some(_) if prompt.chars().count() > MAX_PROMPT => Err((
             Code::TooLong,
             "the request is too long for its home to decide",
-        ))
-    } else {
-        None
+        )),
+        Some(c) => Ok(c),
     };
     // Room for it: a take hands out no more than there is, so this waits
     // only on calls just begun; a call counts once it is to be made.
     let slot = match checked {
-        Some(_) => None,
-        None => {
+        Err(_) => None,
+        Ok(_) => {
             let at_once = {
                 let mut p = pumps.lock();
                 let p = p.entry(k.clone()).or_default();
@@ -920,16 +1049,15 @@ async fn decide_one(
             }
         }
     };
-    let decided = if let Some(refused) = checked {
-        refused
-    } else if slot.is_none() {
-        refuse(Code::Paced, "its home decides no more for it just now")
-    } else if !crew.relay_in_force(&agent, &o) {
-        refuse(Code::NotInForce, "Act fully isn't in force for it at home")
-    } else {
-        match tokio::time::timeout(
+    let decided = match checked {
+        Err((code, why)) => refuse(code, why),
+        Ok(_) if slot.is_none() => refuse(Code::Paced, "its home decides no more for it just now"),
+        Ok(_) if !crew.relay_in_force(&agent, &o) => {
+            refuse(Code::NotInForce, "Act fully isn't in force for it at home")
+        }
+        Ok(call) => match tokio::time::timeout(
             HERE_WITHIN,
-            crew.decision_call(&service, call.unwrap_or(Call::Request).system(), &prompt),
+            crew.decision_call(&service, call.system(), &prompt),
         )
         .await
         {
@@ -945,7 +1073,7 @@ async fn decide_one(
                     HERE_WITHIN.as_secs()
                 ),
             ),
-        }
+        },
     };
     drop(slot);
     // Stopped, held or spent at home while its model answered: what it
@@ -988,6 +1116,7 @@ mod tests {
             here,
             elsewhere,
             others: others.iter().map(|(g, u)| (g.to_string(), *u)).collect(),
+            takes: HashSet::new(),
         }
     }
 

@@ -293,7 +293,7 @@ impl CrewHub {
 /// there doesn't serve: that Desk there needs updating.
 pub(crate) fn older(machine: &str, tool: &str, answer: &RelayAnswer) -> Option<String> {
     (answer.status == ServedStatus::Refused
-        && answer.body["error"].as_str() == Some(&format!("{tool} isn't served to a boss here.")))
+        && answer.body["error"].as_str() == Some(&super::served::not_served(tool)))
     .then(|| {
         format!("Desk on {machine} is older and can't do {tool} yet: tell the person to update Desk there.")
     })

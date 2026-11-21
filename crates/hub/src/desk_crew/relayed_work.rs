@@ -53,8 +53,6 @@ pub(crate) const WORK_FRESH: Duration = Duration::from_secs(45);
 const MOST_EVENTS: i64 = 100;
 /// How long a line message a turn was shown stays known for its tools.
 const LINES_KEPT: Duration = Duration::from_secs(3_600);
-/// When reports a turn didn't take are given to the next.
-const NOT_RUN_AGAIN: Duration = Duration::from_secs(60);
 /// How often the machine looks for questions whose home stopped reading.
 const SWEEP_EVERY: Duration = Duration::from_secs(5);
 
@@ -129,6 +127,8 @@ pub(crate) struct Frame {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Taken {
+    /// Where the next take reads from: when it was made, or its last
+    /// event's time when it hands back as many as a take does.
     pub now: i64,
     pub sessions: Vec<Run>,
     pub events: Vec<Frame>,
@@ -184,10 +184,28 @@ struct Known {
 /// What the Mac keeps of its bosses' work on machines.
 #[derive(Default)]
 pub(crate) struct Away {
-    /// Each machine session a boss runs, by `<machine>/<id>`: its grant's
-    /// key, its boss and how it is.
-    runs: HashMap<String, ((String, String), String, Run)>,
+    /// Each machine session a boss runs, by `<machine>/<id>`, as the
+    /// latest take said.
+    runs: HashMap<String, AwayRun>,
     lines: HashMap<Uuid, Known>,
+}
+
+/// A machine session a boss runs, as a take said it.
+struct AwayRun {
+    /// Its grant's key.
+    grant: (String, String),
+    boss: String,
+    run: Run,
+    /// When the take was made.
+    at: Instant,
+}
+
+impl AwayRun {
+    /// It as `boss`'s, said lately: a take older than [`WORK_FRESH`] says
+    /// nothing of now.
+    fn of(&self, boss: &str) -> Option<&Run> {
+        (self.boss == boss && self.at.elapsed() < WORK_FRESH).then_some(&self.run)
+    }
 }
 
 /// Whether event `e` of session `run` is the boss's to hear: what
@@ -251,6 +269,14 @@ impl CrewHub {
     /// Gives the person each open question to a boss relayed from the home
     /// whose home no longer reads its line, at most every [`SWEEP_EVERY`].
     pub(super) async fn sweep_unread_homes(&self) {
+        let relayed = self
+            .desk
+            .charges()
+            .iter()
+            .any(|c| super::relayed_decide::relayed_party(&c.boss));
+        if !relayed {
+            return;
+        }
         {
             let mut h = self.work_homes.lock();
             if h.swept.is_some_and(|at| at.elapsed() < SWEEP_EVERY) {
@@ -271,7 +297,7 @@ impl CrewHub {
                 && !self.home_reads(&a.to.id)
         }) {
             if let Err(e) = self
-                .escalate(ask.id, &By::you(), UNREAD, Vec::new(), None)
+                .escalate(ask.id, &By::desk(UNREAD), UNREAD, Vec::new(), None)
                 .await
             {
                 tracing::info!(error = %e, "a question wasn't given to the person");
@@ -308,20 +334,20 @@ impl CrewHub {
             h.took.insert(key.clone(), Instant::now());
             match peek {
                 true => now,
-                false => {
-                    let since = input["since"]
-                        .as_i64()
-                        .and_then(DateTime::from_timestamp_millis)
-                        .filter(|s| *s <= now)
-                        .or_else(|| h.cursor.get(&key).copied())
-                        .unwrap_or(now);
-                    h.cursor.insert(key.clone(), now);
-                    since
-                }
+                false => input["since"]
+                    .as_i64()
+                    .and_then(DateTime::from_timestamp_millis)
+                    .filter(|s| *s <= now)
+                    .or_else(|| h.cursor.get(&key).copied())
+                    .unwrap_or(now),
             }
         };
         match self.relayed_work_of(&g, &key.0, since, now, input).await {
             Ok(taken) => {
+                if let Some(read_to) = DateTime::from_timestamp_millis(taken.now).filter(|_| !peek)
+                {
+                    self.work_homes.lock().cursor.insert(key, read_to);
+                }
                 let mut body = json!(taken);
                 super::served::cleaned(&mut body);
                 (ServedStatus::Ok, body)
@@ -395,9 +421,14 @@ impl CrewHub {
             false => {
                 self.desk
                     .store()
-                    .events_since(since, &ids, MOST_EVENTS, None)
+                    .events_from(since, &ids, MOST_EVENTS)
                     .await?
             }
+        };
+        // As many as one take hands back: the next reads on from the last.
+        let read_to = match events.len() as i64 {
+            n if n >= MOST_EVENTS => events.last().map_or(now, |e| e.at),
+            _ => now,
         };
         let events = events
             .iter()
@@ -420,21 +451,18 @@ impl CrewHub {
                     .iter()
                     .find(|i| i.id == c.session.to_string())
                     .filter(|i| !self.raised_elsewhere(i, party))
-                    .cloned();
+                    .map(|i| super::served::seen_item(g, i.clone()));
                 let request = v
                     .pending
                     .as_ref()
                     .filter(|p| {
                         p.answerable && p.request.is_some() && c.wheel == Wheel::Boss && !unbound
                     })
-                    .and_then(|p| {
-                        let f = super::served::request_frame(g, v, p);
-                        Some(Frame {
-                            id: p.id.to_string(),
-                            subject: c.session,
-                            line: f["line"].as_str()?.to_string(),
-                            hop: 0,
-                        })
+                    .map(|p| Frame {
+                        id: p.id.to_string(),
+                        subject: c.session,
+                        line: super::served::request_line(g, v, p),
+                        hop: 0,
                     });
                 let run = Run {
                     id: c.session,
@@ -456,7 +484,7 @@ impl CrewHub {
             })
             .unzip();
         Ok(Taken {
-            now: now.timestamp_millis(),
+            now: read_to.timestamp_millis(),
             sessions,
             events,
             asks,
@@ -481,6 +509,23 @@ impl CrewHub {
 }
 
 // ── The Mac's side ──────────────────────────────────────────────────────
+
+/// How a turn on a machine session went: whether it ran, and the
+/// questions it couldn't settle there, for a turn again.
+#[derive(Debug, Default)]
+struct Turned {
+    ran: bool,
+    unsettled: Vec<Uuid>,
+}
+
+impl Turned {
+    fn ran(ran: bool) -> Self {
+        Self {
+            ran,
+            unsettled: Vec::new(),
+        }
+    }
+}
 
 /// What came for one machine session, waiting for its boss's turn.
 #[derive(Debug, Default)]
@@ -605,18 +650,18 @@ impl Pump {
             .collect()
     }
 
-    /// A turn on `session` ended: its reports were taken if it `ran`, else
-    /// given to a turn again after [`NOT_RUN_AGAIN`].
-    fn turned(&mut self, session: Uuid, reports: &[Uuid], ran: bool) {
+    /// A turn on `session` ended: its reports were taken if it ran, else
+    /// given to a turn again `after` (a crew minute), as are the questions
+    /// it couldn't settle on its machine.
+    fn turned(&mut self, session: Uuid, reports: &[Uuid], t: &Turned, after: Duration) {
         self.turning.remove(&session);
-        match ran {
-            true => self.acked.extend_from_slice(reports),
-            false => {
-                let again = Instant::now() + NOT_RUN_AGAIN;
-                for id in reports {
-                    self.offered.insert(id.to_string(), Some(again));
-                }
-            }
+        let again = Instant::now() + after;
+        let unread = reports.iter().filter(|_| !t.ran);
+        if t.ran {
+            self.acked.extend_from_slice(reports);
+        }
+        for id in unread.chain(&t.unsettled) {
+            self.offered.insert(id.to_string(), Some(again));
         }
     }
 }
@@ -653,20 +698,25 @@ impl CrewHub {
             .lock()
             .runs
             .iter()
-            .filter(|(k, (_, b, run))| b == boss && run.busy() && !planned(k))
+            .filter(|(k, r)| r.of(boss).is_some_and(Run::busy) && !planned(k))
             .count()
     }
 
-    /// What `t` says of `k`'s machine sessions run by `agent`, kept for the
-    /// slots and the tools.
-    fn away_heard(&self, k: &(String, String), agent: &str, t: &Taken) {
+    /// What `t`, a take made `at`, says of `k`'s machine sessions run by
+    /// `agent`, kept for the slots and the tools.
+    fn away_heard(&self, k: &(String, String), agent: &str, t: &Taken, at: Instant) {
         let (machine, group) = k;
         let mut away = self.work_away.lock();
-        away.runs.retain(|_, (grant, _, _)| grant != k);
+        away.runs.retain(|_, r| r.grant != *k);
         for s in &t.sessions {
             away.runs.insert(
                 format!("{machine}/{}", s.id),
-                (k.clone(), agent.to_string(), s.clone()),
+                AwayRun {
+                    grant: k.clone(),
+                    boss: agent.to_string(),
+                    run: s.clone(),
+                    at,
+                },
             );
         }
         let open: HashSet<Uuid> = t.asks.iter().chain(&t.reports).map(|l| l.said.id).collect();
@@ -697,9 +747,9 @@ impl CrewHub {
             .lock()
             .runs
             .iter()
-            .filter(|(_, (_, b, _))| b == boss)
-            .filter_map(|(named, ((_, group), _, run))| {
-                let mut item = run.item.clone()?;
+            .filter_map(|(named, r)| {
+                let group = &r.grant.1;
+                let mut item = r.of(boss)?.item.clone()?;
                 item.id.clone_from(named);
                 item.group_id = (group != workforce_desk::UNGROUPED
                     && workforce_desk::grant::plan_of(group).is_none())
@@ -717,12 +767,13 @@ impl CrewHub {
             .lock()
             .runs
             .get(named)
-            .is_some_and(|(_, _, run)| run.answered)
+            .and_then(|r| r.of(&r.boss))
+            .is_some_and(|run| run.answered)
     }
 
     fn away_forget(&self, keep: impl Fn(&(String, String)) -> bool) {
         let mut away = self.work_away.lock();
-        away.runs.retain(|_, (k, _, _)| keep(k));
+        away.runs.retain(|_, r| keep(&r.grant));
         away.lines
             .retain(|_, l| keep(&(l.machine.clone(), l.group.clone())));
     }
@@ -852,14 +903,15 @@ async fn take(
     let Some(t) = taken else {
         return;
     };
-    crew.away_heard(&k, &agent, &t);
+    crew.away_heard(&k, &agent, &t, started);
     for (session, work) in due {
         let Some(run) = t.sessions.iter().find(|s| s.id == session).cloned() else {
-            pumps
-                .lock()
-                .entry(k.clone())
-                .or_default()
-                .turned(session, &[], true);
+            pumps.lock().entry(k.clone()).or_default().turned(
+                session,
+                &[],
+                &Turned::ran(true),
+                crew.timing.minute,
+            );
             continue;
         };
         tokio::spawn(work_turn(
@@ -892,7 +944,7 @@ async fn work_turn(
         .filter(|l| l.said.kind != LineKind::Ask)
         .map(|l| l.said.id)
         .collect();
-    let ran = crew
+    let turned = crew
         .with_mind(
             &agent,
             "a machine session's line",
@@ -903,12 +955,13 @@ async fn work_turn(
         .lock()
         .entry(k)
         .or_default()
-        .turned(run.id, &reports, ran);
+        .turned(run.id, &reports, &turned, crew.timing.minute);
 }
 
 impl CrewHub {
-    /// Relays `tool` with `input` under `k`'s grant for `agent`: what went
-    /// wrong is only logged, as for a line turn's own settling here.
+    /// Relays `tool` with `input` under `k`'s grant for `agent`: whether
+    /// it reached the machine. A refusal is only logged, as for a line
+    /// turn's own settling here.
     async fn relay_settle(
         &self,
         agent: &str,
@@ -916,21 +969,24 @@ impl CrewHub {
         k: &(String, String),
         tool: &str,
         input: Value,
-    ) {
+    ) -> bool {
         let ceiling = self.ceiling_now(agent, o);
         match self.relay(&k.0, &k.1, tool, input, agent, &ceiling).await {
-            Ok(a) if a.status == ServedStatus::Refused => {
-                tracing::info!(machine = %k.0, %tool, answer = %a.body, "a machine refused a boss's settling");
+            Ok(a) => {
+                if a.status == ServedStatus::Refused {
+                    tracing::info!(machine = %k.0, %tool, answer = %a.body, "a machine refused a boss's settling");
+                }
+                true
             }
-            Ok(_) => {}
             Err(why) => {
-                tracing::info!(machine = %k.0, %tool, %why, "a boss's settling didn't reach its machine")
+                tracing::info!(machine = %k.0, %tool, %why, "a boss's settling didn't reach its machine");
+                false
             }
         }
     }
 
     /// Gives each question in `asks` to the person on its machine, saying
-    /// `why`.
+    /// `why`: those that didn't reach it.
     async fn machine_to_person(
         &self,
         agent: &str,
@@ -938,14 +994,19 @@ impl CrewHub {
         k: &(String, String),
         asks: &[&Line],
         why: &str,
-    ) {
+    ) -> Vec<Uuid> {
+        let mut unsettled = Vec::new();
         for a in asks {
             let input = json!({"message_id": a.said.id.to_string(), "reason": why});
-            self.relay_settle(agent, o, k, "crew.escalate", input).await;
+            if !self.relay_settle(agent, o, k, "crew.escalate", input).await {
+                unsettled.push(a.said.id);
+            }
         }
+        unsettled
     }
 
-    /// [`work_turn`]'s own: whether its turn ran.
+    /// [`work_turn`]'s own: whether its turn ran, and what of its
+    /// questions it couldn't settle on the machine.
     async fn work_turn_now(
         &self,
         service: &Arc<AgentService>,
@@ -953,7 +1014,7 @@ impl CrewHub {
         k: &(String, String),
         run: &Run,
         work: &mut Work,
-    ) -> bool {
+    ) -> Turned {
         let agent = service.agent_id.as_str();
         let asks: Vec<Line> = work
             .said
@@ -964,27 +1025,36 @@ impl CrewHub {
         let asked: Vec<&Line> = asks.iter().collect();
         if let Some(held) = self.desk.agent_held_why(agent) {
             let why = format!("{} is {held}, so this came to you.", name_of(service));
-            self.machine_to_person(agent, o, k, &asked, &why).await;
-            return false;
+            return Turned {
+                ran: false,
+                unsettled: self.machine_to_person(agent, o, k, &asked, &why).await,
+            };
         }
         let hop = work.said.iter().map(|l| l.hop).max().unwrap_or(0);
+        let mut unsettled = Vec::new();
         if let Some(why) = straight_to_person(o, hop, self.unbound(o)) {
-            self.machine_to_person(agent, o, k, &asked, why).await;
+            unsettled = self.machine_to_person(agent, o, k, &asked, why).await;
             work.said.retain(|l| l.said.kind != LineKind::Ask);
             if work.is_empty() {
-                return true;
+                return Turned {
+                    ran: true,
+                    unsettled,
+                };
             }
         }
         let Some(owner) = self.person(Some(service)) else {
-            self.machine_to_person(
-                agent,
-                o,
-                k,
-                &asked,
-                "Desk has no conversation with you to work from yet.",
-            )
-            .await;
-            return true;
+            return Turned {
+                ran: true,
+                unsettled: self
+                    .machine_to_person(
+                        agent,
+                        o,
+                        k,
+                        &asked,
+                        "Desk has no conversation with you to work from yet.",
+                    )
+                    .await,
+            };
         };
         let asks: Vec<Uuid> = work
             .said
@@ -1001,10 +1071,13 @@ impl CrewHub {
             tracing::warn!(machine = %k.0, session = %run.id, error = %format!("{e:#}"), "the overseer's turn on a machine session failed");
         }
         if asks.is_empty() {
-            return ran.is_ok();
+            return Turned {
+                ran: ran.is_ok(),
+                unsettled,
+            };
         }
         let ceiling = self.ceiling_now(agent, o);
-        let open: Vec<Uuid> = match self
+        let peeked = self
             .relay(
                 &k.0,
                 &k.1,
@@ -1013,8 +1086,8 @@ impl CrewHub {
                 agent,
                 &ceiling,
             )
-            .await
-        {
+            .await;
+        let open: Vec<Uuid> = match peeked {
             Ok(a) if a.status == ServedStatus::Ok => serde_json::from_value::<Taken>(a.body)
                 .map(|t| {
                     t.asks
@@ -1024,7 +1097,14 @@ impl CrewHub {
                         .collect()
                 })
                 .unwrap_or_default(),
-            _ => Vec::new(),
+            // Not read: what is still open is given to a turn again.
+            _ => {
+                unsettled.extend(asks);
+                return Turned {
+                    ran: ran.is_ok(),
+                    unsettled,
+                };
+            }
         };
         let reply = ran.as_ref().map(|r| r.answer.as_str()).map_err(|_| ());
         for (ask, settled) in open.iter().zip(settle(reply, open.len())) {
@@ -1047,15 +1127,22 @@ impl CrewHub {
                     json!({"message_id": ask.to_string(), "reason": why}),
                 ),
             };
-            self.relay_settle(agent, o, k, tool, input).await;
+            if !self.relay_settle(agent, o, k, tool, input).await {
+                unsettled.push(*ask);
+            }
         }
-        ran.is_ok()
+        Turned {
+            ran: ran.is_ok(),
+            unsettled,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MINUTE: Duration = Duration::from_secs(60);
 
     fn line(session: Uuid, kind: LineKind) -> Line {
         Line {
@@ -1118,7 +1205,7 @@ mod tests {
         assert_eq!(work.said, vec![ask.clone(), report.clone()]);
         assert!(p.due().is_empty(), "its turn runs: nothing more is due");
         // The same take again (the cursor's event comes back): nothing new.
-        p.turned(s, &[report.said.id], true);
+        p.turned(s, &[report.said.id], &Turned::ran(true), MINUTE);
         p.heard(&t);
         assert!(p.due().is_empty());
         assert_eq!(
@@ -1141,10 +1228,10 @@ mod tests {
         let mut p = Pump::default();
         p.heard(&t);
         assert_eq!(p.due().len(), 1);
-        p.turned(s, &[report.said.id], false);
+        p.turned(s, &[report.said.id], &Turned::ran(false), MINUTE);
         assert!(p.acked.is_empty());
         p.heard(&t);
-        assert!(p.due().is_empty(), "not before NOT_RUN_AGAIN");
+        assert!(p.due().is_empty(), "not before a minute");
         p.offered
             .insert(report.said.id.to_string(), Some(Instant::now()));
         p.heard(&t);
@@ -1154,6 +1241,33 @@ mod tests {
             ..Taken::default()
         });
         assert!(p.offered.is_empty(), "what is no longer open is forgotten");
+    }
+
+    #[test]
+    fn a_question_a_turn_couldnt_settle_on_its_machine_comes_again_later() {
+        let s = Uuid::new_v4();
+        let (settled, lost) = (line(s, LineKind::Ask), line(s, LineKind::Ask));
+        let t = Taken {
+            now: 1,
+            sessions: vec![run(s)],
+            asks: vec![settled.clone(), lost.clone()],
+            ..Taken::default()
+        };
+        let mut p = Pump::default();
+        p.heard(&t);
+        assert_eq!(p.due().len(), 1);
+        let turned = Turned {
+            ran: true,
+            unsettled: vec![lost.said.id],
+        };
+        p.turned(s, &[], &turned, Duration::ZERO);
+        p.heard(&t);
+        let due = p.due();
+        assert_eq!(due.len(), 1, "given again once due");
+        assert_eq!(due[0].1.said, vec![lost], "only the one it couldn't settle");
+        p.turned(s, &[], &Turned::ran(true), MINUTE);
+        p.heard(&t);
+        assert!(p.due().is_empty(), "settled: never again while it is open");
     }
 
     #[test]
@@ -1173,13 +1287,29 @@ mod tests {
     }
 
     #[test]
+    fn a_run_is_its_bosss_only_while_its_take_is_fresh() {
+        let away = |at: Instant| AwayRun {
+            grant: ("devbox".into(), "acme".into()),
+            boss: "home/desk".into(),
+            run: run(Uuid::new_v4()),
+            at,
+        };
+        assert!(away(Instant::now()).of("home/desk").is_some());
+        assert!(away(Instant::now()).of("home/sarah").is_none());
+        assert!(
+            away(Instant::now() - WORK_FRESH).of("home/desk").is_none(),
+            "a take that old says nothing of now"
+        );
+    }
+
+    #[test]
     fn a_machine_that_doesnt_serve_a_call_is_said_to_need_updating() {
         let refused = |error: &str| super::super::relay::RelayAnswer {
             status: ServedStatus::Refused,
             body: json!({ "error": error }),
         };
         assert_eq!(
-            super::super::relay::older("devbox", WORK_TAKE, &refused("crew.work_take isn't served to a boss here.")),
+            super::super::relay::older("devbox", WORK_TAKE, &refused(&super::super::served::not_served(WORK_TAKE))),
             Some("Desk on devbox is older and can't do crew.work_take yet: tell the person to update Desk there.".into())
         );
         assert_eq!(

@@ -188,7 +188,7 @@ type Q = Query<TokenQuery>;
 
 async fn list(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
     guarded!(s, h, q);
-    Json(s.desk.list()).into_response()
+    Json(s.desk.listed()).into_response()
 }
 
 /// Which spend a route asks for: a period (`day`, `week`, `month`,

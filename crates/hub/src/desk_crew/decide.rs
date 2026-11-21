@@ -33,6 +33,7 @@ use workforce_desk::decision::{BossDecision, How, Need};
 use workforce_desk::model::{DeskEvent, PendingApproval, SessionView};
 
 use super::actions::Action;
+use super::left::Left;
 use super::watcher::tracked;
 use super::{CrewHub, FULL_SPEND_UNREAD};
 
@@ -158,7 +159,8 @@ struct Said {
     approval: Uuid,
     boss: String,
     why: String,
-    text: String,
+    /// What is said of it; none for one handed to another boss.
+    left: Option<Left>,
     again: Option<(Action, By)>,
     /// Whether Desk can answer it (not asked in its own terminal).
     answerable: bool,
@@ -192,7 +194,7 @@ impl CrewHub {
 
 /// How many times a request's decision call fails (one every
 /// [`CrewHub::retry_after`]) before it is the person's.
-const RETRIES: u32 = 15;
+pub(super) const RETRIES: u32 = 15;
 
 /// Clears what Desk holds for bosses when the decide loop ends.
 struct HoldsEnd(Arc<CrewHub>);
@@ -258,10 +260,9 @@ pub(super) fn decide_loop(
                         if *n > RETRIES {
                             crew.desk.let_go(s.session, s.approval);
                             s.retry = false;
-                            s.text = format!(
-                                "{} (it failed {RETRIES} times over, so it's yours to answer now)",
-                                s.text
-                            );
+                            if let Some(Left::Slow { given_up, .. }) = &mut s.left {
+                                *given_up = true;
+                            }
                         } else {
                             again_at.insert(s.approval, tokio::time::Instant::now() + crew.retry_after());
                         }
@@ -328,14 +329,13 @@ pub(super) fn decide_loop(
                     if !crew.still_decides(view, &by.party.id) {
                         taken.push(*approval);
                         crew.left_by_served(&by.party.id, view.id, *approval);
-                        crew.tell_dm(
-                        &by.party.id,
-                        &format!(
-                            "{}'s request is yours again: Act fully isn't in force for it now, so I didn't do what I decided",
-                            view.label()
-                        ),
-                    )
-                    .await;
+                        crew.leave(
+                            &by.party.id,
+                            Left::YoursAgain {
+                                session: view.label().to_string(),
+                            },
+                        )
+                        .await;
                         continue;
                     }
                     let deciding = crew.deciding(&by.party.id);
@@ -522,11 +522,11 @@ impl CrewHub {
                 approval: p.id,
                 boss: boss.clone(),
                 why: why.clone(),
-                text: format!(
-                    "{} is waiting on you to allow {}: {why}",
-                    view.label(),
-                    quoted(&shown(&p))
-                ),
+                left: Some(Left::Waits {
+                    session: view.label().to_string(),
+                    ask: quoted(&shown(&p)),
+                    why: why.clone(),
+                }),
                 again: None,
                 answerable: p.answerable,
                 retry: false,
@@ -639,7 +639,7 @@ impl CrewHub {
                         approval: p.id,
                         boss,
                         why: String::new(),
-                        text: String::new(),
+                        left: None,
                         again: None,
                         answerable: p.answerable,
                         retry: false,
@@ -648,20 +648,26 @@ impl CrewHub {
                 }
                 _ => return,
             };
-            let text = match retry {
+            let (session, ask) = (view.label().to_string(), quoted(&shown(&p)));
+            let left = match retry {
                 // Still the boss's: the person only hears why it is slow.
-                true => format!("{} asks for {}: {why}", view.label(), quoted(&shown(&p))),
-                false => format!(
-                    "{} is waiting on you to allow {}: {why}",
-                    view.label(),
-                    quoted(&shown(&p))
-                ),
+                true => Left::Slow {
+                    session,
+                    ask,
+                    why: why.clone(),
+                    given_up: false,
+                },
+                false => Left::Waits {
+                    session,
+                    ask,
+                    why: why.clone(),
+                },
             };
             let _ = tx.send(Said {
                 session: view.id,
                 approval: p.id,
                 boss,
-                text,
+                left: Some(left),
                 why,
                 again,
                 answerable: p.answerable,
@@ -685,8 +691,8 @@ impl CrewHub {
         }
         let said = told.values().any(|(b, w)| *b == s.boss && *w == s.why);
         told.insert(s.approval, (s.boss.clone(), s.why.clone()));
-        if !said {
-            self.tell_dm(&s.boss, &s.text).await;
+        if let Some(left) = s.left.filter(|_| !said) {
+            self.leave(&s.boss, left).await;
         }
     }
 
@@ -1114,15 +1120,24 @@ impl CrewHub {
         self.record(&mut d).await;
     }
 
+    /// Says what `boss` leaves to the person in its DM: here, or at home
+    /// for the home's own boss of a machine's sessions, whose home's next
+    /// take says it in its DM there ([`super::relayed_decide`]).
+    pub(super) async fn leave(&self, boss: &str, left: Left) {
+        match super::relayed_decide::relayed_party(boss) {
+            true => self.relayed_note(boss, left),
+            false => self.tell_dm(boss, &left.words()).await,
+        }
+    }
+
     /// Says `text` in `boss`'s DM, as a notice; in the person's conversation
     /// with `boss` off Desk instead, when a turn of theirs there is what
-    /// says it ([`crate::desk_surface::notice`]); at home for the home's own
-    /// boss of a machine's sessions.
+    /// says it ([`crate::desk_surface::notice`]). A boss relayed from its
+    /// home hears only what it leaves ([`Self::leave`]).
     pub(super) async fn tell_dm(&self, boss: &str, text: &str) {
-        // The home's own boss of a machine's sessions: its home's next take
-        // says it in its DM there ([`super::relayed_decide`]).
         if super::relayed_decide::relayed_party(boss) {
-            return self.relayed_note(boss, text);
+            tracing::info!(%boss, "only what a boss relayed from its home leaves to the person is said there");
+            return;
         }
         // A boss on another hub: its conversation is there, where what it
         // leaves to the person goes up as an ask ([`Self::left_by_served`]).

@@ -3349,6 +3349,20 @@ impl Desk {
             .ok_or(DeskError::NotFound)
     }
 
+    /// [`Self::list`], each saying whether its boss answers what it asks
+    /// itself ([`SessionView::boss_answers`]): what Desk's list of the
+    /// sessions shows.
+    pub fn listed(&self) -> Vec<SessionView> {
+        let crew = self.crew();
+        self.list()
+            .into_iter()
+            .map(|mut v| {
+                v.boss_answers = crew.as_ref().is_some_and(|c| c.answers_itself(&v));
+                v
+            })
+            .collect()
+    }
+
     pub fn list(&self) -> Vec<SessionView> {
         let st = self.0.state.lock();
         let mut all: Vec<_> = st
