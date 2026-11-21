@@ -1415,6 +1415,42 @@ async fn the_person_turns_down_a_change_or_must_before_editing_and_the_plan_stay
 }
 
 #[tokio::test]
+async fn a_plan_paused_for_a_ticket_that_keeps_failing_says_why_again_after_a_restart() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool.clone(), dir.path()).await;
+        let p = d
+            .propose_plan(new_plan(dir.path(), &[("a", &[])]), &sarah(), &by_sarah())
+            .await
+            .unwrap();
+        let id = p.summary.plan.id;
+        d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let why = "DES-1 couldn't start 5 times: /gone is not a folder";
+        d.pause_plan_failing(id, why).await.unwrap();
+        for _ in 0..100 {
+            if d.0
+                .store
+                .paused_reason(id, "start_failing")
+                .await
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let again = desk(pool, dir.path()).await;
+        let read = again.plan(id).await.unwrap();
+        assert_eq!(read.summary.plan.paused, Some(Paused::StartFailing));
+        assert_eq!(read.summary.paused_why.as_deref(), Some(why));
+        let needs = again.plan_needs();
+        assert_eq!(needs.len(), 1, "its Floor need is read back");
+        assert!(needs[0].ask.contains(why), "{}", needs[0].ask);
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn a_plan_paused_for_a_ticket_that_keeps_failing_says_why_and_the_floor_continues_it() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();

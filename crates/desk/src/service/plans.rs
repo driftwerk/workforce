@@ -570,15 +570,41 @@ impl Desk {
         needs
     }
 
-    /// Reads the plans waiting on the person.
+    /// Reads the plans waiting on the person: to approve, or to go on
+    /// after their tickets kept failing to start, saying why again.
     pub(super) async fn plans_load(&self) {
         match self.0.store.plans(None).await {
             Ok(all) => {
-                for p in all.into_iter().filter(Plan::awaiting) {
-                    self.plan_awaits(&p).await;
+                for p in all {
+                    let failing = p.paused == Some(Paused::StartFailing);
+                    if failing {
+                        self.failing_read(p.id).await;
+                    }
+                    if failing || p.awaiting() {
+                        self.plan_awaits(&p).await;
+                    }
                 }
             }
             Err(e) => tracing::warn!(error = format!("{e:#}"), "couldn't read plans"),
+        }
+    }
+
+    /// Why plan `id` paused for a ticket failing to start, read back from
+    /// its pause.
+    async fn failing_read(&self, id: Uuid) {
+        match self
+            .0
+            .store
+            .paused_reason(id, Paused::StartFailing.as_str())
+            .await
+        {
+            Ok(Some(why)) => {
+                self.0.boss_plans.lock().failing.insert(id, why);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(plan = %id, error = format!("{e:#}"), "why a plan paused wasn't read");
+            }
         }
     }
 
