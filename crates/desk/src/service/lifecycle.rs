@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use super::{Desk, DeskError, Persist, State};
 use crate::adopt;
+use crate::board::TicketState;
 use crate::codex;
 use crate::crew::{By, Kind, Party};
 use crate::memory_store::Memory;
@@ -31,6 +32,19 @@ pub struct Hidden {
     pub name: String,
     pub cwd: String,
     pub hidden_at: DateTime<Utc>,
+}
+
+/// What closing a session would leave, as the person reads it before they
+/// close it: its turn under way or what it asks, its folder's uncommitted
+/// or unpushed work, its open pull requests and tickets, and its folder.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Closing {
+    pub folder: String,
+    pub work: Option<String>,
+    pub changes: Option<String>,
+    pub pulls: Vec<u64>,
+    pub tickets: Vec<String>,
 }
 
 /// How a session is removed.
@@ -726,6 +740,41 @@ impl Desk {
     /// person, or the boss that started it or was handed it.
     pub fn may_end(&self, id: Uuid, by: Option<&By>) -> bool {
         super::finish::may_end(by, self.charge_of(id).as_ref())
+    }
+
+    /// What closing session `id` would leave ([`Closing`]): what Desk knows
+    /// of it here, and what the hub's crew reads of its folder and pull
+    /// requests, as its boss's own close reads them.
+    pub async fn closing(&self, id: Uuid) -> Result<Closing, DeskError> {
+        let v = self.view(id)?;
+        let work = match v.state {
+            _ if v.pending.is_some() || v.asked.is_some() => Some("it's waiting on you"),
+            SessionState::Asking | SessionState::Blocked => Some("it's waiting on you"),
+            SessionState::Starting | SessionState::Working => Some("it's working"),
+            _ => None,
+        };
+        let mut tickets = Vec::new();
+        for t in self
+            .0
+            .store
+            .session_tickets(id)
+            .await
+            .map_err(|e| DeskError::Internal(e.wrap_err("reading a session's tickets")))?
+            .into_iter()
+            .filter(|t| !matches!(t.state, TicketState::Done | TicketState::Dropped))
+        {
+            tickets.push(self.key_of(&t).await?);
+        }
+        let known = Closing {
+            folder: v.cwd.clone(),
+            work: work.map(str::to_string),
+            tickets,
+            ..Closing::default()
+        };
+        Ok(match self.crew() {
+            Some(crew) => crew.closing(&v, known).await,
+            None => known,
+        })
     }
 
     /// Ends a session: stops it if it runs here and closes it, so it leaves

@@ -1144,6 +1144,10 @@ pub struct PlanTicket {
     /// A session or an agent has it.
     #[serde(default)]
     pub assigned: bool,
+    /// The session that has it, by its assignee's id (`machine/id` for one
+    /// on a machine).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
     /// The runner is starting a session for it.
     #[serde(default)]
     pub starting: bool,
@@ -1202,17 +1206,43 @@ pub struct Start {
     pub repo: Option<String>,
 }
 
+/// How many sessions `plan` holds: each one its tickets in Doing or Review
+/// are on until `closed` says it was, and each start of one under
+/// way or whose outcome isn't known yet, every session once.
+pub fn held(tickets: &[PlanTicket], closed: impl Fn(&str) -> bool) -> usize {
+    tickets
+        .iter()
+        .filter_map(|t| {
+            let on = t.session.as_deref().filter(|s| {
+                t.starting
+                    || (matches!(t.state, TicketState::Doing | TicketState::Review) && !closed(s))
+            });
+            match on {
+                Some(s) => Some(s.to_string()),
+                None => t.starting.then(|| t.id.to_string()),
+            }
+        })
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+/// How many more sessions `plan` may start now: fewer than its own limit
+/// counts what it `held`, and fewer than its boss's `limit` counts the
+/// boss's sessions starting or working (`busy`).
+pub fn room(plan: &Plan, held: usize, busy: usize, limit: usize) -> usize {
+    plan.limit(limit)
+        .saturating_sub(held)
+        .min(limit.saturating_sub(busy))
+}
+
 /// What the runner starts now for `plan`: its ready tickets in rank order,
-/// while the boss's sessions starting or working (`busy`, counting the
-/// starts under way) are fewer than the plan's limit (the boss's own being
-/// `limit`). None while the plan doesn't run (not approved, paused, done or
-/// dropped), or while `standing`, its group's spend, is at its warning or
-/// over.
+/// at most `room` of them ([`room`]). None while the plan doesn't run (not
+/// approved, paused, done or dropped), or while `standing`, its group's
+/// spend, is at its warning or over.
 pub fn next_starts(
     plan: &Plan,
     tickets: &[PlanTicket],
-    busy: usize,
-    limit: usize,
+    room: usize,
     standing: Option<Status>,
 ) -> Vec<Start> {
     if !plan.runs() {
@@ -1222,7 +1252,6 @@ pub fn next_starts(
         Some(Status::Warn | Status::Over) => return Vec::new(),
         Some(Status::Under) | None => {}
     }
-    let cap = plan.limit(limit);
     let states: HashMap<Uuid, TicketState> = tickets.iter().map(|t| (t.id, t.state)).collect();
     let mut ready: Vec<&PlanTicket> = tickets.iter().filter(|t| startable(t, &states)).collect();
     ready.sort_by(|a, b| a.rank.total_cmp(&b.rank));
@@ -1245,10 +1274,9 @@ pub fn next_starts(
         .filter(|t| t.state == TicketState::Doing || t.starting)
         .flat_map(|t| places(t).into_iter().map(|f| (t.machine.as_deref(), f)))
         .collect();
-    let mut busy = busy;
     let mut out = Vec::new();
     for t in ready {
-        if busy >= cap {
+        if out.len() >= room {
             break;
         }
         let at = places(t);
@@ -1267,7 +1295,6 @@ pub fn next_starts(
             worktree: shared,
             repo: t.repo.clone(),
         });
-        busy += 1;
     }
     out
 }

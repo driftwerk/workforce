@@ -837,6 +837,12 @@ pub trait Crew: Send + Sync {
     ) -> Result<String, String> {
         Err("no boss here interrupts sessions".into())
     }
+    /// What closing `v` would leave, `known` with what only the hub reads:
+    /// its folder's uncommitted or unpushed work and its open pull
+    /// requests, as its boss's own close reads them.
+    async fn closing(&self, _v: &SessionView, known: crate::Closing) -> crate::Closing {
+        known
+    }
     /// The agent overseeing the crew, if one does.
     fn overseer(&self) -> Option<Overseer>;
     /// The hub's agents, with the turn each is running.

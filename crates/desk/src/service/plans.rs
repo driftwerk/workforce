@@ -3148,6 +3148,12 @@ fn plan_ticket(
         model: r.model,
         repo: r.repo,
         assigned: v.ticket.assignee.is_some(),
+        session: v
+            .ticket
+            .assignee
+            .as_ref()
+            .filter(|a| a.kind == PartyKind::Session)
+            .map(|a| a.id.clone()),
         starting,
         held_back: r.held_back,
     }
@@ -3198,6 +3204,7 @@ fn plan_why(s: &Snapshot, parallel: Option<i16>) -> String {
             model: t.model.clone(),
             repo: t.repo.clone(),
             assigned: false,
+            session: None,
             starting: false,
             held_back: None,
         })

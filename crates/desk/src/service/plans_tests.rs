@@ -1204,8 +1204,7 @@ async fn a_pause_that_comes_while_a_pass_runs_starts_nothing_and_a_pause_of_the_
         let start = plan::next_starts(
             &read.summary.plan,
             &d.plan_tickets(id).await.unwrap(),
-            0,
-            4,
+            plan::room(&read.summary.plan, 0, 0, 4),
             None,
         )
         .remove(0);
@@ -1246,8 +1245,7 @@ async fn a_drop_racing_a_start_leaves_no_session_working_on_the_dropped_ticket()
         let start = plan::next_starts(
             &read.summary.plan,
             &d.plan_tickets(id).await.unwrap(),
-            0,
-            4,
+            plan::room(&read.summary.plan, 0, 0, 4),
             None,
         )
         .remove(0);
@@ -1587,8 +1585,7 @@ async fn the_breaker_holding_the_plans_group_holds_its_starts() {
         let start = plan::next_starts(
             &read.summary.plan,
             &d.plan_tickets(id).await.unwrap(),
-            0,
-            4,
+            plan::room(&read.summary.plan, 0, 0, 4),
             None,
         )
         .remove(0);
@@ -1621,8 +1618,7 @@ async fn a_start_that_cant_happen_now_is_skipped_and_one_whose_session_cant_star
         let start = plan::next_starts(
             &read.summary.plan,
             &d.plan_tickets(id).await.unwrap(),
-            0,
-            4,
+            plan::room(&read.summary.plan, 0, 0, 4),
             None,
         )
         .remove(0);
@@ -1674,8 +1670,7 @@ async fn a_plans_session_is_written_down_before_its_process_starts() {
         let start = plan::next_starts(
             &read.summary.plan,
             &d.plan_tickets(id).await.unwrap(),
-            0,
-            4,
+            plan::room(&read.summary.plan, 0, 0, 4),
             None,
         )
         .remove(0);
@@ -1868,7 +1863,12 @@ async fn capped_plan(d: &Desk, dir: &Path, titles: &[(&str, &[usize])], usd: f64
 async fn next(d: &Desk, id: Uuid) -> Vec<Start> {
     let p = d.plan(id).await.unwrap().summary.plan;
     let held = d.plan_starts_held(p.group.as_deref(), id).map(|(s, _)| s);
-    plan::next_starts(&p, &d.plan_tickets(id).await.unwrap(), 0, 4, held)
+    plan::next_starts(
+        &p,
+        &d.plan_tickets(id).await.unwrap(),
+        plan::room(&p, 0, 0, 4),
+        held,
+    )
 }
 
 #[tokio::test]
@@ -2015,8 +2015,13 @@ async fn a_plan_at_its_warning_stops_starting_until_continue_and_stops_again_whe
              Sarah has stopped starting sessions."
         );
         assert!(next(&d, id).await.is_empty());
-        let second =
-            plan::next_starts(&plan, &d.plan_tickets(id).await.unwrap(), 1, 4, None).remove(0);
+        let second = plan::next_starts(
+            &plan,
+            &d.plan_tickets(id).await.unwrap(),
+            plan::room(&plan, 1, 0, 4),
+            None,
+        )
+        .remove(0);
         let refused = d
             .plan_start(&plan, &second, &sarah(), &by_sarah())
             .await

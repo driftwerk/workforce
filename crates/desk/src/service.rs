@@ -80,7 +80,7 @@ pub use knows_sync::Gather as KnowsGather;
 mod lifecycle;
 mod line;
 mod picture;
-pub use lifecycle::{Clearing, Hidden, KeptSession, Removal, Removed};
+pub use lifecycle::{Clearing, Closing, Hidden, KeptSession, Removal, Removed};
 #[cfg(test)]
 mod accounts_tests;
 #[cfg(test)]

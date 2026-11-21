@@ -1598,6 +1598,26 @@ impl CrewHub {
             .count()
     }
 
+    /// Whether the session `assignee` (`machine/id` for one on a machine)
+    /// was closed, here or as its machine was last read: only that lets its
+    /// plan's slot go. One that ended on its own, was let go, is gone from
+    /// its machine or not read yet still holds it, until its ticket is
+    /// moved on or returned to the plan.
+    pub(super) fn closed(&self, assignee: &str) -> bool {
+        if super::relay::machine_session(assignee).is_some() {
+            return self
+                .machine_seen
+                .lock()
+                .get(assignee)
+                .is_some_and(|s| s.state == "closed");
+        }
+        assignee
+            .parse::<Uuid>()
+            .ok()
+            .and_then(|id| self.desk.view(id).ok())
+            .is_some_and(|v| v.state == SessionState::Closed)
+    }
+
     /// Reads each machine that open plans' tickets work on, at most once a
     /// gap apart, through Desk on this computer: what changed of their
     /// sessions goes to the plan's boss as a line of its next plan turn.
@@ -1945,7 +1965,9 @@ impl CrewHub {
                 let busy = self.desk.charges_busy(&boss.id)
                     + self.desk.starts_under_way(&boss.id).await
                     + self.machine_busy(&boss.id);
-                for s in plan::next_starts(&p, &rows, busy, limit, standing) {
+                let held = plan::held(&tickets, |s| self.closed(s));
+                let room = plan::room(&p, held, busy, limit);
+                for s in plan::next_starts(&p, &rows, room, standing) {
                     match self.desk.plan_start(&p, &s, &boss, &by).await {
                         Ok(started) => {
                             self.plan_failed.lock().remove(&s.ticket);
@@ -2215,11 +2237,13 @@ impl CrewHub {
             .await
             .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX));
         let busy = self.desk.charges_busy(boss) + opened;
+        let held = plan::held(&rows, |s| self.closed(s));
+        let room = plan::room(p, held, busy, o.work.parallel as usize);
         let by = self.by_boss(
             service,
             "The person approved the plan; you decide each start.",
         );
-        for s in plan::next_starts(p, &rows, busy, o.work.parallel as usize, standing) {
+        for s in plan::next_starts(p, &rows, room, standing) {
             let Some(t) = tickets.iter().find(|t| t.id == s.ticket) else {
                 continue;
             };
@@ -2819,6 +2843,7 @@ mod tests {
             machine: None,
             model: None,
             assigned: false,
+            session: None,
             starting: false,
             held_back: None,
         };
