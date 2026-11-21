@@ -8,6 +8,7 @@
 use std::borrow::Cow;
 
 use super::types::{strip_foreign_reasoning, ContentBlock, LlmMessage};
+use crate::attachments::photo::MODEL_IMAGE_TYPES;
 
 /// Image and document blocks an Anthropic-shaped request carries at most.
 /// The Messages API counts up to 100 or 600, but past 20 every image must be
@@ -40,10 +41,41 @@ fn is_frame_label(text: &str) -> bool {
     text.starts_with("Frame ") && text.contains(" of `") && text.contains("` at ")
 }
 
+/// `messages` with every image of a type no model reads replaced where it
+/// stood by a note saying so: a provider told to read one fails the whole
+/// request, not just that image. Borrows when nothing changes.
+pub fn readable_images(messages: Cow<'_, [LlmMessage]>) -> Cow<'_, [LlmMessage]> {
+    let unreadable = |b: &ContentBlock| {
+        matches!(b, ContentBlock::Image { source }
+            if !MODEL_IMAGE_TYPES.iter().any(|t| source.media_type.eq_ignore_ascii_case(t)))
+    };
+    if !messages.iter().flat_map(|m| &m.content).any(unreadable) {
+        return messages;
+    }
+    let mut owned = messages.into_owned();
+    owned
+        .iter_mut()
+        .flat_map(|m| m.content.iter_mut())
+        .filter(|b| unreadable(b))
+        .for_each(|b| {
+            if let ContentBlock::Image { source } = b {
+                *b = ContentBlock::Text {
+                    text: format!(
+                        "[image removed: {} is not an image format models read]",
+                        source.media_type
+                    ),
+                };
+            }
+        });
+    Cow::Owned(owned)
+}
+
 /// `messages` carrying at most `max` image and document blocks, images
 /// dropped to get there: frames before other images, oldest first.
-/// Documents count but stay.
+/// Documents count but stay. Images of a type no model reads go first (see
+/// [`readable_images`]).
 pub fn cap_images(messages: Cow<'_, [LlmMessage]>, max: usize) -> Cow<'_, [LlmMessage]> {
+    let messages = readable_images(messages);
     let documents = messages
         .iter()
         .flat_map(|m| &m.content)
@@ -157,6 +189,22 @@ mod tests {
             .flat_map(|m| &m.content)
             .filter(|b| matches!(b, ContentBlock::Text { text } if text.contains("removed: this request")))
             .count()
+    }
+
+    #[test]
+    fn an_image_no_model_reads_becomes_a_note_where_it_stood() {
+        let heic = ContentBlock::image_base64("image/heic", "AAAA".into());
+        let messages = vec![user(vec![text("look"), heic, image("photo")])];
+        let capped = cap_images(Cow::Borrowed(&messages), 4);
+        assert_eq!(kept(&capped), ["photo"]);
+        assert!(matches!(
+            &capped[0].content[1],
+            ContentBlock::Text { text } if text.contains("image/heic is not an image format")
+        ));
+        assert!(matches!(
+            readable_images(Cow::Borrowed(&capped)),
+            Cow::Borrowed(_)
+        ));
     }
 
     #[test]

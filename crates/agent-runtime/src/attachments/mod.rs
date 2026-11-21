@@ -38,6 +38,7 @@ pub mod frames;
 pub use frames::FrameSelection;
 pub mod pdf;
 pub mod pdf_render;
+pub mod photo;
 pub mod video;
 
 /// An agent's `[llm.vision]` describer, as its startup left it.
@@ -344,6 +345,7 @@ fn infer_mime_from_extension(filename: &str, mime_type: &str) -> Option<&'static
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
         "webp" => "image/webp",
+        "heic" | "heif" => "image/heic",
         "csv" => "text/csv",
         "txt" => "text/plain",
         "md" => "text/markdown",
@@ -377,7 +379,7 @@ fn retype_attachment(att: &SessionAttachment, mime: &str) -> Option<SessionAttac
                     .ok()
             })
             .flatten()?;
-        let actual = crate::llm::image::detect_image_media_type(&head)
+        let actual = photo::sniff(&head)
             .or_else(|| head.starts_with(b"%PDF-").then_some("application/pdf"))?;
         return (actual.starts_with("image/") == mime.starts_with("image/"))
             .then(|| relabel(actual));
@@ -612,6 +614,19 @@ pub async fn process_image_attachment(
     att: &SessionAttachment,
     strategy: &VisionStrategy<'_>,
 ) -> ContentBlock {
+    let ready = match photo::model_ready(att).await {
+        Ok(ready) => ready,
+        Err(e) => {
+            tracing::warn!(file = %att.filename, error = %e, "Image not readable by a model");
+            return ContentBlock::Text {
+                text: format!(
+                    "Image `{}` was attached but cannot be shown to the model: {e}",
+                    att.filename
+                ),
+            };
+        }
+    };
+    let att = ready.as_ref();
     match strategy {
         VisionStrategy::Native | VisionStrategy::NativeImages => ContentBlock::Image {
             source: base64_source(&att.mime_type, &att.data),

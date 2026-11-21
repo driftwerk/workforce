@@ -2826,6 +2826,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_refused_input_fails_over_without_retrying_the_model() {
+        let inner = Arc::new(MockFailThenSucceed::new(
+            1,
+            "ChatGPT API error (400): invalid_image_format: could not be decoded",
+        ));
+        let config = FailoverConfig {
+            failover: vec!["backup-model".to_string()],
+            retry: RetryConfig {
+                max_retries: 4,
+                initial_backoff_ms: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let provider = FailoverProvider::new(inner.clone(), config);
+
+        provider
+            .create_message(None, &[], &[], Some("primary"), None, true)
+            .await
+            .unwrap();
+
+        assert_eq!(inner.fail_count.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.last_used_model().as_deref(), Some("backup-model"));
+    }
+
+    #[tokio::test]
     async fn retry_overloaded_retries_same_model() {
         let inner = Arc::new(MockFailThenSucceed::new(1, "529 overloaded"));
         let config = FailoverConfig {

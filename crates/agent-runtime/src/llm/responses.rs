@@ -370,6 +370,8 @@ pub enum ResponsesError {
     InvalidReasoning(String),
     #[error("ChatGPT API error (400): response stopped by the content filter ({0})")]
     ContentFiltered(String),
+    #[error("ChatGPT API error (400): {code}: {message}")]
+    InvalidInput { code: String, message: String },
     #[error("ChatGPT API error (529): {0}")]
     Overloaded(String),
     #[error("ChatGPT API error ({status}): {body}")]
@@ -907,8 +909,7 @@ impl ResponseState {
                     }
                 }
             }
-            "response.failed" => return Err(failed_error(&event["response"]["error"])),
-            "error" => return Err(failed_error(event)),
+            "response.failed" | "error" => return Err(event_error(event)),
             "codex.rate_limits" => return Ok(vec![Emit::Limits(LimitSnapshot::from_event(event))]),
             "response.created"
             | "response.in_progress"
@@ -1060,10 +1061,62 @@ fn usage(usage: &Value) -> TokenUsage {
 
 // ─── Errors ─────────────────────────────────────────────────────────────────
 
-/// The error a `response.failed` / `error` event's error object names.
+/// Longest a provider's message is kept in an error: it can quote the input.
+const MAX_ERROR_MESSAGE_CHARS: usize = 500;
+
+/// The error a `response.failed` / `error` event names. The backend puts the
+/// error object under `response.error`, under `response.status_details`, under
+/// `error`, or flat on the event, so the first of those that says why wins.
+fn event_error(event: &Value) -> ResponsesError {
+    let says_why =
+        |error: &&Value| text_of(error, "message").is_some() || error_code(error).is_some();
+    let error = [
+        &event["response"]["error"],
+        &event["response"]["status_details"]["error"],
+        &event["error"],
+        event,
+    ]
+    .into_iter()
+    .find(says_why)
+    .unwrap_or(&event["response"]["error"]);
+    failed_error(error)
+}
+
+fn text_of<'a>(error: &'a Value, key: &str) -> Option<&'a str> {
+    error[key].as_str().filter(|s| !s.is_empty())
+}
+
+/// The error's own code, never the event's `type` (`error`, `response.failed`).
+fn error_code(error: &Value) -> Option<&str> {
+    text_of(error, "code")
+        .or_else(|| text_of(error, "type").filter(|t| *t != "error" && !t.starts_with("response.")))
+}
+
+/// `message` as a log-safe line: cut before any inlined base64 payload and
+/// bounded in length.
+fn shown(message: &str) -> String {
+    let text = message
+        .split_once("base64,")
+        .map_or(message.to_string(), |(head, _)| format!("{head}base64,…"));
+    text.chars().take(MAX_ERROR_MESSAGE_CHARS).collect()
+}
+
+/// Whether `code` says the request's input was refused, which no retry fixes.
+fn is_invalid_input(code: &str) -> bool {
+    code.starts_with("invalid_")
+        || code.starts_with("unsupported_")
+        || code.contains("image")
+        || code == "bad_request"
+}
+
+/// The error an error object names.
 fn failed_error(error: &Value) -> ResponsesError {
-    let message = error["message"].as_str().unwrap_or_default().to_string();
-    match error["code"].as_str().or_else(|| error["type"].as_str()) {
+    let reason = text_of(error, "message").unwrap_or("the provider gave no reason");
+    let message = shown(&match text_of(error, "param") {
+        Some(param) => format!("{reason} (param: {param})"),
+        None => reason.to_string(),
+    });
+    match error_code(error) {
         Some("context_length_exceeded") => ResponsesError::ContextOverflow(message),
         Some("server_is_overloaded" | "slow_down") => ResponsesError::Overloaded(message),
         Some("invalid_encrypted_content") => ResponsesError::InvalidReasoning(message),
@@ -1071,6 +1124,10 @@ fn failed_error(error: &Value) -> ResponsesError {
         Some("usage_limit_reached") => usage_limit(error),
         Some("rate_limit_exceeded") => ResponsesError::Throttled {
             retry_after: retry_after_in(&message),
+        },
+        Some(code) if is_invalid_input(code) => ResponsesError::InvalidInput {
+            code: code.to_string(),
+            message,
         },
         code => ResponsesError::Stream(format!(
             "response failed ({}): {message}",
@@ -2146,6 +2203,65 @@ mod tests {
             "code": "server_is_overloaded", "message": "busy"}}});
         let err = emits(&format!("data: {overloaded}\n\n")).expect_err("failed response");
         assert_eq!(classify_error(&err.to_string()), ErrorKind::Overloaded);
+    }
+
+    #[test]
+    fn a_failed_response_says_why_wherever_the_backend_put_it() {
+        let reason = |event: Value| {
+            emits(&format!("data: {event}\n\n"))
+                .expect_err("failed response")
+                .to_string()
+        };
+        let nested = reason(json!({"type": "response.failed", "response": {"error": {
+            "code": "invalid_image_format",
+            "message": "The image data you provided could not be decoded.",
+            "param": "input[3].content[1]"}}}));
+        assert_eq!(
+            nested,
+            "ChatGPT API error (400): invalid_image_format: The image data you provided could not \
+             be decoded. (param: input[3].content[1])"
+        );
+        let status_details = reason(json!({"type": "response.failed", "response": {
+            "error": {"type": "error"},
+            "status_details": {"error": {"code": "invalid_prompt", "message": "Rejected."}}}}));
+        assert!(
+            status_details.contains("invalid_prompt: Rejected."),
+            "{status_details}"
+        );
+        let wrapped = reason(json!({"type": "error",
+            "error": {"type": "invalid_request_error", "message": "Bad input."}}));
+        assert!(
+            wrapped.contains("invalid_request_error: Bad input."),
+            "{wrapped}"
+        );
+        let flat = reason(json!({"type": "error", "code": "unsupported_image_type",
+            "message": "HEIC is not supported."}));
+        assert!(
+            flat.contains("unsupported_image_type: HEIC is not supported."),
+            "{flat}"
+        );
+        let unexplained = reason(json!({"type": "response.failed", "response": {
+            "instructions": "secret system prompt", "error": {"type": "error"}}}));
+        assert_eq!(
+            unexplained,
+            "ChatGPT API error: response failed (unknown): the provider gave no reason"
+        );
+    }
+
+    #[test]
+    fn a_refused_input_is_not_retried_and_never_quotes_an_image() {
+        let blob = "A".repeat(4000);
+        let err = emits(&format!(
+            "data: {}\n\n",
+            json!({"type": "response.failed", "response": {"error": {
+                "code": "invalid_image_url",
+                "message": format!("Invalid image data:image/heic;base64,{blob}")}}})
+        ))
+        .expect_err("failed response");
+        let text = err.to_string();
+        assert!(text.ends_with("data:image/heic;base64,…"), "{text}");
+        assert_eq!(classify_error(&text), ErrorKind::ClientError);
+        assert!(!ErrorKind::ClientError.is_retryable());
     }
 
     // ── Client ──────────────────────────────────────────────────────────
