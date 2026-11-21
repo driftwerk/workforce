@@ -352,12 +352,30 @@ impl CrewHub {
             .collect();
         let had = self.tooled.lock().clone();
         if want != had {
+            // Each overseer's tools for its level, by agent: registered
+            // over the ones it had, so a turn running meanwhile never finds
+            // them gone; only what it may no longer use is taken away.
+            let mut tools: HashMap<String, Vec<CrewTool>> = current
+                .iter()
+                .map(|(s, o)| {
+                    let id = s.agent_id.as_str();
+                    let at = CrewTool::for_level(&self.me(), id, &o.scope, o.level == Level::Watch);
+                    (id.to_string(), at)
+                })
+                .collect();
             for s in self.services() {
-                for name in READ.iter().chain(ACT.iter()) {
+                let kept = tools.get(s.agent_id.as_str());
+                let keeps = |name: &str| {
+                    kept.is_some_and(|t| {
+                        t.iter()
+                            .any(|t| workforce_agent::tools::Tool::name(t) == name)
+                    })
+                };
+                for name in READ.iter().chain(ACT.iter()).filter(|n| !keeps(n)) {
                     s.tools.unregister(name);
                 }
                 // `desk.*` only on agents that oversee nothing.
-                match want.contains_key(s.agent_id.as_str()) {
+                match kept.is_some() {
                     true => crate::connector_pins::pin(&s),
                     false => crate::desk_driver::register_tools(&s),
                 }
@@ -367,7 +385,7 @@ impl CrewHub {
                     s.tools.unregister(name);
                 }
                 let id = s.agent_id.as_str();
-                for tool in CrewTool::for_level(&self.me(), id, &o.scope, o.level == Level::Watch) {
+                for tool in tools.remove(id).unwrap_or_default() {
                     s.tools.register(Arc::new(tool));
                 }
                 // An overseer has Desk's browser.
