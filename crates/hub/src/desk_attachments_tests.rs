@@ -1167,23 +1167,7 @@ fn a_session_s_owner_is_read_once_in_a_call() {
 /// and why.
 #[test]
 fn a_file_whose_lookup_failed_is_logged_when_its_mark_leaves_it_out() {
-    #[derive(Clone, Default)]
-    struct Logged(Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for Logged {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let logged = Logged::default();
-    let writer = logged.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::WARN)
-        .with_writer(move || writer.clone())
-        .finish();
+    let (logged, _logging, _others) = crate::log_testing::Lines::capture();
     let sessions = in_memory();
     let id = ArtifactId::fresh();
     let store = NoFilesStore {
@@ -1195,11 +1179,9 @@ fn a_file_whose_lookup_failed_is_logged_when_its_mark_leaves_it_out() {
         "image/png",
         id.as_str(),
     )];
-    let files = tracing::subscriber::with_default(subscriber, || {
-        carried_files(&store, sessions.as_ref(), "scout", "alice", &named)
-    });
+    let files = carried_files(&store, sessions.as_ref(), "scout", "alice", &named);
     assert!(files.is_empty());
-    let logged = String::from_utf8(logged.0.lock().unwrap().clone()).unwrap();
+    let logged = logged.text();
     assert!(logged.contains(id.as_str()), "{logged}");
     assert!(logged.contains("the bucket is having a moment"), "{logged}");
 }

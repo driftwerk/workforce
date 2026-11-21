@@ -34,7 +34,7 @@ pub enum RepoUpdateResult {
     Err { error: String },
 }
 
-/// Most of a failed repo's error a log line carries; git's stderr is unbounded.
+/// Bound on a failed repo's error in the refresh warning; git's stderr is unbounded.
 const LOGGED_ERROR_MAX_BYTES: usize = 2048;
 
 impl RepoUpdateReport {
@@ -52,7 +52,7 @@ impl RepoUpdateReport {
 }
 
 /// Warn once for each repo of `project` that failed to update, with why.
-pub fn warn_failures(project: &str, reports: &[RepoUpdateReport]) {
+pub(crate) fn warn_failures(project: &str, reports: &[RepoUpdateReport]) {
     reports
         .iter()
         .filter_map(|r| r.logged_error().map(|error| (r, error)))
@@ -63,7 +63,7 @@ pub fn warn_failures(project: &str, reports: &[RepoUpdateReport]) {
                 alias = %r.alias,
                 branch = %r.branch,
                 error = %error,
-                "cc project refresh: some repos failed; continuing with their stale state"
+                "cc project refresh: repo failed; continuing with its stale state"
             )
         });
 }
@@ -118,7 +118,7 @@ impl ProjectUpdater {
                     let result = match fetcher.pull_repo(&repo.source, &dest, &branch).await {
                         Ok(outcome) => RepoUpdateResult::Ok(outcome),
                         Err(e) => RepoUpdateResult::Err {
-                            error: format!("{e:#}"),
+                            error: e.to_string(),
                         },
                     };
                     RepoUpdateReport {
@@ -141,6 +141,7 @@ impl ProjectUpdater {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log_testing::Lines;
     use workforce_projects::{ProjectRepo, RepoSource};
 
     #[test]
@@ -185,29 +186,9 @@ mod tests {
     }
 
     fn logged_by(run: impl FnOnce()) -> String {
-        #[derive(Clone, Default)]
-        struct Lines(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Lines {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let lines = Lines::default();
-        let writer = lines.clone();
-        let logs = tracing::Dispatch::new(
-            tracing_subscriber::fmt()
-                .with_writer(move || writer.clone())
-                .with_ansi(false)
-                .finish(),
-        );
-        let _others = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
-        tracing::dispatcher::with_default(&logs, run);
-        let logged = lines.0.lock().unwrap().clone();
-        String::from_utf8(logged).unwrap()
+        let (lines, _logging, _others) = Lines::capture();
+        run();
+        lines.text()
     }
 
     #[test]

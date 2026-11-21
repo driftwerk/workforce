@@ -505,31 +505,14 @@ mod tests {
             .fallback(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR });
         let url = workforce_vellev::testing::serve(app).await;
 
-        #[derive(Clone, Default)]
-        struct Captured(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Captured {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let captured = Captured::default();
-        let writer = captured.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .finish();
-        let logging = tracing::subscriber::set_default(subscriber);
+        let (captured, logging, _others) = crate::log_testing::Lines::capture();
         let refused = WeaviateArtifacts::new(&url, None)
             .upsert("spec-1", "text", "hash")
             .await
             .expect_err("the store is told, to index the artifact later");
         assert!(refused.to_string().contains("500"), "{refused}");
         drop(logging);
-        let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let logged = captured.text();
         assert!(
             logged.contains("artifact vector upsert non-2xx")
                 && logged.contains("status=500")

@@ -12,7 +12,7 @@ use std::process::Output;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use eyre::{eyre, Result, WrapErr};
+use eyre::{eyre, Result};
 
 use crate::git_hardening::hardened_git;
 
@@ -53,7 +53,7 @@ pub(super) async fn run_git(
     let output = tokio::time::timeout(timeout, cmd.output())
         .await
         .map_err(|_| eyre!("git {} timed out after {}s", args[0], timeout.as_secs()))?
-        .wrap_err_with(|| format!("git {} could not run", args[0]))?;
+        .map_err(|e| eyre!("git {} could not run: {e}", args[0]))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         let sanitised = match token {
