@@ -101,11 +101,12 @@ impl HomeIssues {
             .unwrap_or_else(|| "the person".to_string())
     }
 
-    /// `asked`, made from the session `session` (on `machine`, when it runs
-    /// on one).
+    /// `asked`, made from the session named `session` with id `id` (on
+    /// `machine`, when it runs on one).
     pub(crate) async fn serve(
         &self,
         session: &str,
+        id: Uuid,
         machine: Option<&str>,
         asked: &Asked,
     ) -> Result<Value, String> {
@@ -114,7 +115,10 @@ impl HomeIssues {
         let links = self
             .sync
             .desk
-            .issue_links(asked.system)
+            .issue_links(
+                asked.system,
+                &machine.map_or_else(|| id.to_string(), |m| format!("{m}/{id}")),
+            )
             .await
             .map_err(|e| {
                 tracing::warn!(error = %e, "the boards' links couldn't be read for a session");
@@ -122,7 +126,7 @@ impl HomeIssues {
             })?;
         let Some(link) = issues::pick(&links, &call) else {
             return Err(format!(
-                "No board in Desk is linked to {title}. Link one (Board, then Link to {title}) and every session gets {title} through it."
+                "No board this session reaches in Desk is linked to {title}. Link one (Board, then Link to {title}) and the sessions that reach it get {title} through it."
             ));
         };
         let hub = self.sync.hub_name(&link.via).await;
@@ -179,7 +183,7 @@ impl HomeIssues {
 #[async_trait]
 impl Issues for HomeIssues {
     async fn issue(&self, asker: &Asker, asked: &Asked) -> Result<Value, String> {
-        self.serve(&asker.name, None, asked).await
+        self.serve(&asker.name, asker.session, None, asked).await
     }
 }
 
@@ -193,6 +197,8 @@ pub(crate) struct RelayCall {
     pub system: System,
     /// The session it was made from, by its name.
     pub session: String,
+    /// That session's id on this machine.
+    pub session_id: Uuid,
     pub input: Value,
     /// When the machine stops waiting for its answer: nothing is carried
     /// past it.
@@ -233,6 +239,7 @@ impl Issues for MachineIssues {
             id: Uuid::new_v4(),
             system: asked.system,
             session: asker.name.clone(),
+            session_id: asker.session,
             input: asked.input.clone(),
             deadline: Utc::now()
                 + chrono::Duration::from_std(wait).unwrap_or(chrono::Duration::zero()),
@@ -309,6 +316,7 @@ struct Served {
     machine: String,
     system: System,
     session: String,
+    session_id: Uuid,
     #[serde(default)]
     input: Value,
 }
@@ -340,7 +348,10 @@ async fn served(
         system: c.system,
         input: c.input,
     };
-    let out = s.issues.serve(&c.session, Some(&c.machine), &asked).await;
+    let out = s
+        .issues
+        .serve(&c.session, c.session_id, Some(&c.machine), &asked)
+        .await;
     tracing::info!(
         id = %c.id,
         machine = %c.machine,

@@ -19,13 +19,25 @@ impl Desk {
         }
     }
 
-    /// The links of `system` sessions' calls may go through: every synced
-    /// board's, in the boards' order.
-    pub async fn issue_links(&self, system: System) -> Result<Vec<Sync>, DeskError> {
+    /// The links of `system` the session keyed `session` (its id, or
+    /// `<machine>/<id>` for one on a machine) may go through: those of the
+    /// synced boards it reaches, as the ticket tool reaches them, in the
+    /// boards' order.
+    pub async fn issue_links(&self, system: System, session: &str) -> Result<Vec<Sync>, DeskError> {
+        let group = self.group_of_member(&format!("session:{session}"));
+        let bossed = self.bossed();
         Ok(self
             .boards()
             .await?
             .into_iter()
+            .filter(|b| {
+                crate::board::board_reachable(
+                    self.line_reach(),
+                    group.as_deref(),
+                    b.group.as_deref(),
+                    &bossed,
+                )
+            })
             .filter_map(|b| b.sync)
             .filter(|s| s.system == system)
             .collect())

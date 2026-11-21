@@ -185,7 +185,7 @@ fn courier(
             for c in calls.as_array().cloned().unwrap_or_default() {
                 let body = json!({
                     "id": c["id"], "machine": "devbox", "system": c["system"],
-                    "session": c["session"], "input": c["input"],
+                    "session": c["session"], "sessionId": c["sessionId"], "input": c["input"],
                 });
                 carried.lock().unwrap().push(body.clone());
                 let (_, answer) =
@@ -327,7 +327,23 @@ async fn devbox_works_its_issue(
         .line_call(session.id, "jira", &json!({ "action": "list" }), STEP)
         .await
         .unwrap_err();
-    assert!(e.contains("No board in Desk is linked to Jira"), "{e}");
+    assert!(
+        e.contains("No board this session reaches in Desk is linked to Jira"),
+        "{e}"
+    );
+
+    // Put in a group on the Mac, the session reaches only that group's
+    // boards, as the ticket tool does: Vellev's link isn't its.
+    let item = format!("session:devbox/{}", session.id);
+    home_desk
+        .change_layout(|l| l.create("g-acme", "Acme", &[item], None))
+        .await
+        .unwrap();
+    let e = call(json!({ "action": "list" })).await.unwrap_err();
+    assert!(
+        e.contains("No board this session reaches in Desk is linked to Linear"),
+        "{e}"
+    );
 
     // The same call handed over again is never served twice.
     let first = carried.lock().unwrap()[0].clone();
