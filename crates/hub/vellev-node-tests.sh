@@ -8,7 +8,7 @@ set -euo pipefail
 hub=(cargo test -p workforce-hub --lib)
 if [ "${1:-}" = --no-run ]; then
   shift
-  exec "${hub[@]}" "$@" --no-run
+  exec "${hub[@]}" --no-run "$@"
 fi
 hub+=("$@")
 here="$(cd "$(dirname "$0")" && pwd)"

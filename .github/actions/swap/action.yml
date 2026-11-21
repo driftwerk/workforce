@@ -14,7 +14,7 @@ runs:
         free -h
         # Only a mitigation: without room on the scratch disk, build as
         # before.
-        avail=$(df --output=avail -BG /mnt 2>/dev/null | tail -1 | tr -dc 0-9)
+        avail=$(df --output=avail -BG /mnt 2>/dev/null | tail -1 | tr -dc 0-9) || true
         if [ "${avail:-0}" -lt 24 ]; then
           echo "No room on /mnt for swap: building with the runner's own."
           exit 0
