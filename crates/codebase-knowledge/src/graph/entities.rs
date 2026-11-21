@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::indexer::summary_generator::SummaryGranularity;
+
 /// Unique identifier for a code entity.
 /// Deterministic: hash(repo_id + file_path + kind + name).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -78,14 +80,11 @@ impl CodeEntity {
     /// on every trigger forever. The `count_matches_is_summarisable_predicate`
     /// test guards the coupling.
     pub fn is_summarisable(&self) -> bool {
-        if !self.language.has_parser() {
-            return false;
-        }
-        match self.kind {
-            EntityKind::Function | EntityKind::Method => !self.is_trivial_private_helper(),
-            EntityKind::File | EntityKind::Module => true,
-            _ => false,
-        }
+        self.language.has_parser()
+            && match SummaryGranularity::of(&self.kind) {
+                Some(SummaryGranularity::Function) => !self.is_trivial_private_helper(),
+                granularity => granularity.is_some(),
+            }
     }
 
     /// A private, undocumented, very short function/method. The doc check is

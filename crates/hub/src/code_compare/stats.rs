@@ -102,8 +102,6 @@ pub(super) fn stratum_weight(population: usize, sampled: usize) -> f64 {
     population as f64 / sampled.max(1) as f64
 }
 
-/// Weighted sums over queries: of the weights, of each difference, and of
-/// each store's hits.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(super) struct Sum {
     pub(super) weight: f64,
@@ -144,7 +142,6 @@ impl std::iter::Sum for Sum {
     }
 }
 
-/// A sampled entity: its kind, its queries, and their sums.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct Unit {
     pub(super) stratum: String,
@@ -168,9 +165,6 @@ pub(super) struct Replicates {
     pub(super) strata: BTreeMap<String, Vec<Sum>>,
 }
 
-/// `resamples` replicates, each drawing as many units of each kind as it
-/// has, with replacement: replicate by replicate, kind by kind in name
-/// order, draw by draw.
 pub(super) fn bootstrap(units: &[Unit], resamples: usize, seed: u64) -> Replicates {
     let strata = strata(units);
     let mut rng = ChaCha8Rng::from_seed(key(seed, "bootstrap", &[]));
@@ -197,7 +191,6 @@ pub(super) fn bootstrap(units: &[Unit], resamples: usize, seed: u64) -> Replicat
     })
 }
 
-/// The 95 % percentile interval: the `⌊0.025·B⌋`th and `(⌈0.975·B⌉ − 1)`th.
 pub(super) fn interval(replicates: &mut [f64]) -> (f64, f64) {
     replicates.sort_by(f64::total_cmp);
     let count = replicates.len();
@@ -231,8 +224,6 @@ fn distance(answer: &Answer) -> f32 {
     answer.distance.unwrap_or_default()
 }
 
-/// The share of the exact `k` nearest the index found among its first `k`,
-/// a tie at the boundary, give or take [`SAME_DISTANCE`], counting as found.
 pub(super) fn recall(index: &[Answer], exact: &[Answer], k: usize) -> f64 {
     let k = k.min(exact.len());
     let Some(boundary) = k.checked_sub(1).map(|last| distance(&exact[last])) else {
@@ -246,16 +237,12 @@ pub(super) fn recall(index: &[Answer], exact: &[Answer], k: usize) -> f64 {
     found as f64 / k as f64
 }
 
-/// Whether the scan has the index's first hit at the node's distance.
 pub(super) fn first_agrees(first: Option<&Answer>, scanned: Option<f32>) -> bool {
     first.is_none_or(|first| {
         scanned.is_some_and(|scanned| (scanned - distance(first)).abs() <= SAME_DISTANCE)
     })
 }
 
-/// Whether `other`'s first `depth` are `reference`'s but for order among
-/// results within `within` of the next: each is among `reference`'s, in the
-/// same run of near-equal distances as `reference`'s at its place.
 pub(super) fn same_top(reference: &[Answer], other: &[Answer], depth: usize, within: f32) -> bool {
     let runs: Vec<usize> = reference
         .iter()
@@ -281,8 +268,6 @@ pub(super) fn same_top(reference: &[Answer], other: &[Answer], depth: usize, wit
             .all(|(hit, run)| run_of(&hit.object) == Some(*run))
 }
 
-/// What `vellev_search_work` in Prometheus' text says the searches on
-/// `route` did: their count, the rows scored exactly, and those estimated.
 pub(super) fn work_sums(text: &str, route: &str) -> Scored {
     let route = format!("route=\"{route}\"");
     let of = |series: &str, kinds: &[&str]| {
@@ -307,8 +292,6 @@ pub(super) fn work_sums(text: &str, route: &str) -> Scored {
     }
 }
 
-/// Whether the one search between `before` and `after` shortlisted a repo
-/// of `held` rows; `None` unless exactly one search was made.
 pub(super) fn shortlisted(before: Scored, after: Scored, held: usize) -> Option<bool> {
     (after.searches == before.searches + 1).then(|| {
         after.estimated > before.estimated

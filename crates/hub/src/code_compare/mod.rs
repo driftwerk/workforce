@@ -193,19 +193,16 @@ async fn eligible(
     Ok(excluded.is_none())
 }
 
-/// Each kind's share, in integers, of the entities with an embeddable record
-/// text and question, those of the lowest keys: one pass a page at a time.
 async fn sampled(graph: &CodeGraph, seed: u64, entities: usize) -> Result<Sample> {
     let mut population = Population::default();
     let mut lowest: BTreeMap<String, Smallest<([u8; 32], String, String), CodeEntity>> =
         BTreeMap::new();
-    let mut repos: Vec<String> = graph
+    let repos: Vec<String> = graph
         .list_repositories()
         .await?
         .into_iter()
         .map(|repo| repo.id)
         .collect();
-    repos.sort();
     for repo in &repos {
         let mut after = String::new();
         loop {
@@ -334,7 +331,6 @@ struct Vectors {
     plain: Option<Vec<f32>>,
 }
 
-/// One question as it was asked, with every store's answer judged.
 struct Asked {
     query: Query,
     vectors: Vectors,
@@ -382,35 +378,30 @@ struct Held {
     text: String,
 }
 
-/// Results resolved to the graph's entities as the product resolves them,
-/// each looked up once.
 struct Judge<'a> {
     graph: &'a CodeGraph,
-    held: HashMap<String, Option<Held>>,
+    held: HashMap<(String, String), Option<Held>>,
 }
 
 impl Judge<'_> {
-    async fn held(&mut self, entity_id: &str) -> Result<Option<Held>> {
-        if let Some(held) = self.held.get(entity_id) {
+    async fn held(&mut self, found: &VectorSearchResult) -> Result<Option<Held>> {
+        let key = (found.repo_id.clone(), found.entity_id.clone());
+        if let Some(held) = self.held.get(&key) {
             return Ok(held.clone());
         }
         let entity = self
             .graph
-            .get_entity(&EntityId(entity_id.to_string()))
+            .get_entity(&EntityId(found.entity_id.clone()))
             .await?;
         let held = entity.map(|entity| Held {
             qualified_name: entity.qualified_name.clone(),
             start_line: entity.start_line as u32,
             text: record_text(&entity),
         });
-        self.held.insert(entity_id.to_string(), held.clone());
+        self.held.insert(key, held.clone());
         Ok(held)
     }
 
-    /// `hit`: among the first [`DEPTH`] distinct entities the graph holds of
-    /// `results`, the target's text; `moved`, those of them at another line.
-    /// `hit_raw`: among the first [`DEPTH`] as they came, held under their
-    /// own qualified name, the target's text.
     async fn side(
         &mut self,
         target: &Target,
@@ -419,15 +410,16 @@ impl Judge<'_> {
     ) -> Result<Side> {
         let (mut seen, mut hit, mut hit_raw, mut moved) = (HashSet::new(), false, false, 0);
         for (at, result) in results.iter().enumerate() {
-            let Some(held) = self.held(&result.found.entity_id).await? else {
+            let Some(held) = self.held(&result.found).await? else {
                 continue;
             };
             let is_target = held.text == target.text;
+            let own_name = held.qualified_name == result.found.qualified_name;
             if seen.len() < DEPTH && seen.insert(result.found.entity_id.clone()) {
                 hit |= is_target;
-                moved += usize::from(result.found.start_line != held.start_line);
+                moved += usize::from(own_name && result.found.start_line != held.start_line);
             }
-            if at < DEPTH && held.qualified_name == result.found.qualified_name {
+            if at < DEPTH && own_name {
                 hit_raw |= is_target;
             }
         }
@@ -441,8 +433,6 @@ impl Judge<'_> {
     }
 }
 
-/// The places, from one, of `results` of `target`'s id under another
-/// qualified name: siblings the graph dropped.
 fn siblings(target: &CodeEntity, results: &[Answer]) -> Vec<usize> {
     results
         .iter()
@@ -670,8 +660,6 @@ async fn measured(
     })
 }
 
-/// Check 2: each question asked of the node's index alone, its work read
-/// before and after, then each repo scanned once for all of its questions.
 async fn recalled(
     asked: &[(&Query, &Vectors)],
     vellev: &dyn SearchedByVector,
@@ -780,8 +768,6 @@ struct Check2 {
     self_checked: bool,
 }
 
-/// The share of sampled targets whose Weaviate answers hold a sibling the
-/// graph dropped; and by repo, the targets, those holding one, and siblings.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 struct Siblings {
     share: f64,
@@ -831,7 +817,6 @@ struct Tally {
     applied: bool,
 }
 
-/// The statistics and gates of a run, in one fold over its targets.
 fn found(
     asked: &[Asked],
     recall: &[Recalled],
@@ -1026,7 +1011,6 @@ impl Run {
     }
 }
 
-/// What a run found, as an operator reads it.
 impl std::fmt::Display for Run {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let found = &self.report.findings;
@@ -1108,7 +1092,6 @@ fn refused_if_there(out: &Path) -> Result<()> {
     }
 }
 
-/// Write a file through `write`, make it durable, and hash it as it lies on disk.
 fn wrote(path: &Path, write: impl FnOnce(&mut BufWriter<File>) -> Result<()>) -> Result<String> {
     let mut writer = BufWriter::new(File::create(path)?);
     write(&mut writer)?;
@@ -1155,12 +1138,12 @@ fn lines<T: Serialize>(
 
 /// Make `out`'s `.partial`, measure into it, write the files and then their
 /// sums, and move them to `out`, made empty for them so that nothing else
-/// there is written over. A failure leaves `.partial` with no sums.
+/// there is written over. A failure before the sums leaves `.partial` with
+/// none; one in moving them says that `.partial` holds the finished run.
 async fn recorded(
     out: &Path,
     measure: impl std::future::Future<Output = Result<(Measured, Manifest)>>,
 ) -> Result<Run> {
-    refused_if_there(out)?;
     let (out, partial) = placed(out)?;
     let parent = out.parent().unwrap_or(Path::new(""));
     std::fs::create_dir_all(parent)?;
@@ -1187,18 +1170,28 @@ async fn recorded(
         .map(|(name, sum)| format!("{sum}  {name}\n"))
         .collect();
     wrote(&at(SUMS), |writer| Ok(writer.write_all(listed.as_bytes())?))?;
-    synced(&partial)?;
-    std::fs::create_dir(&out).wrap_err_with(|| {
-        format!(
-            "making {}, which a run moves its files into and never writes over",
-            out.display()
-        )
-    })?;
-    std::fs::rename(&partial, &out)
-        .inspect_err(|_| {
-            let _ = std::fs::remove_dir(&out);
+    synced(&partial)
+        .and_then(|()| {
+            std::fs::create_dir(&out).wrap_err_with(|| {
+                format!(
+                    "making {}, which a run moves its files into and never writes over",
+                    out.display()
+                )
+            })
         })
-        .wrap_err_with(|| format!("moving {} to {}", partial.display(), out.display()))?;
+        .and_then(|()| {
+            std::fs::rename(&partial, &out)
+                .inspect_err(|_| {
+                    let _ = std::fs::remove_dir(&out);
+                })
+                .wrap_err_with(|| format!("moving {} to {}", partial.display(), out.display()))
+        })
+        .wrap_err_with(|| {
+            format!(
+                "{} holds the finished run, summed in {SUMS}",
+                partial.display()
+            )
+        })?;
     synced(parent)?;
     Ok(Run { dir: out, report })
 }
@@ -1208,9 +1201,6 @@ struct Opened {
     about: GraphAbout,
 }
 
-/// The SQLite code graph `config` names (in `data_dir`, if given), opened as
-/// the hub opens it, once it is hashed: refused while its write-ahead log holds
-/// pages the hash would not cover, and on any other backend.
 fn opened_graph(config: &WorkforceConfig, data_dir: Option<&Path>) -> Result<Opened> {
     let backend = config.codegraph.backend.clone();
     if backend == "postgres" {
@@ -1223,7 +1213,9 @@ fn opened_graph(config: &WorkforceConfig, data_dir: Option<&Path>) -> Result<Ope
         Path::to_path_buf,
     );
     let path = crate::knowledge::code_graph_path(&data_dir);
-    let wal = PathBuf::from(format!("{}-wal", path.display()));
+    let mut wal = path.clone().into_os_string();
+    wal.push("-wal");
+    let wal = PathBuf::from(wal);
     if std::fs::metadata(&wal).is_ok_and(|wal| wal.len() > 0) {
         return Err(eyre!(
             "{} holds pages not yet in the code graph, which its hash would not cover: open the graph once with sqlite3 and close it (or copy it with `.backup`), then run again",

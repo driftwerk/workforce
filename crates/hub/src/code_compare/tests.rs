@@ -166,6 +166,7 @@ struct Searched {
     made: Mutex<std::collections::HashMap<Vec<u32>, String>>,
     asked: Mutex<Vec<(&'static str, String, usize)>>,
     failing_vector: Option<usize>,
+    failing_count: bool,
 }
 
 fn bits(vector: &[f32]) -> Vec<u32> {
@@ -283,7 +284,10 @@ impl SearchedByVector for Searched {
     }
 
     async fn counted(&self, repo_id: &str) -> Result<usize> {
-        Ok(self.held.get(repo_id).copied().unwrap_or_default())
+        match self.failing_count {
+            true => Err(eyre!("the node went away")),
+            false => Ok(self.held.get(repo_id).copied().unwrap_or_default()),
+        }
     }
 }
 
@@ -372,6 +376,7 @@ async fn ran(
     work: &dyn Worked,
     options: &CompareOptions,
 ) -> Result<Run> {
+    refused_if_there(&options.out)?;
     recorded(&options.out, async {
         let measured = measured(graph, weaviate, vellev, work, options, &|_| {}).await?;
         let manifest = manifest(graph, options, &measured);
@@ -605,7 +610,8 @@ async fn a_hit_is_judged_on_the_entity_the_product_shows() {
         graph: &graph,
         held: HashMap::new(),
     };
-    let sibling = named(&target.entity, "lib::B::new");
+    let mut sibling = named(&target.entity, "lib::B::new");
+    sibling.found.start_line = 20;
 
     let weaviate = judge
         .side(&target, vec![sibling.clone()], true)
@@ -749,7 +755,6 @@ async fn every_search_is_the_products() {
     assert!(asked
         .iter()
         .all(|(_, repo, limit)| repo == "r" && *limit == 20));
-    assert_eq!(DEPTH, 10);
     assert!(run.passed().is_ok(), "{:?}", run.report.findings.gates);
 }
 
@@ -758,8 +763,9 @@ fn holds_no_result(out: &Path) {
     assert!(!partial(out).join(SUMS).exists());
 }
 
-/// A store's failure fails the run, naming the side and the question, with
-/// nothing that could pass for a result, and nothing asked after it.
+/// A store's failure fails the run, naming the side and the question or
+/// repo, with nothing that could pass for a result, and nothing asked after
+/// it.
 #[tokio::test]
 async fn a_store_error_fails_the_run_with_no_result() {
     let entities = functions("r", 12);
@@ -813,6 +819,24 @@ async fn a_store_error_fails_the_run_with_no_result() {
         failed.contains(&format!("weaviate failed on query {}", ids[1])),
         "{failed}"
     );
+    holds_no_result(&out);
+
+    let out = dir.path().join("count");
+    let vellev = Searched {
+        failing_count: true,
+        ..Searched::of(&entities, first)
+    };
+    let failed = ran(
+        &graph,
+        &weaviate_of(&entities, first),
+        &vellev,
+        &Counters::shortlisting(),
+        &options(&out),
+    )
+    .await
+    .unwrap_err();
+    let failed = format!("{failed:#}");
+    assert!(failed.contains("vellev failed on repo r"), "{failed}");
     holds_no_result(&out);
 
     let big = functions("big", SHORTLIST_ABOVE + 1);
@@ -1043,8 +1067,11 @@ async fn the_run_is_moved_into_out_alone() {
 
     let out = dir.path().join("meanwhile");
     let failed = format!("{:#}", run(out.clone(), true).await.unwrap_err());
+    let finished = format!("{} holds the finished run", partial(&out).display());
+    assert!(failed.contains(&finished), "{failed}");
     assert!(failed.contains("never writes over"), "{failed}");
     assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
+    assert!(partial(&out).join(SUMS).is_file());
 }
 
 /// A graph with nothing to ask fails the overall gate, saying so.

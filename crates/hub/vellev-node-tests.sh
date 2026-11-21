@@ -44,7 +44,9 @@ ran() {
   fi
 }
 args=("$@")
-ran "${#together[@]}" "${together[@]}"
+if [ "${#together[@]}" -gt 0 ]; then
+  ran "${#together[@]}" "${together[@]}"
+fi
 for path in ${apart[@]+"${apart[@]}"}; do
   ran 1 "$path"
 done
