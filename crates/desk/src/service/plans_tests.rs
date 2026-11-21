@@ -511,7 +511,6 @@ async fn a_start_cut_off_before_its_session_starts_that_session_and_no_other() {
                 },
                 &sarah(),
                 by_sarah(),
-                true,
             )
             .await;
         assert!(matches!(again, Err(DeskError::Conflict(_))));
@@ -555,7 +554,7 @@ async fn a_start_cut_off_after_its_session_started_only_links_it() {
             env: Default::default(),
             group: None,
         };
-        d.create_for_as(session, new, &sarah(), by_sarah(), true)
+        d.create_for_as(session, new, &sarah(), by_sarah())
             .await
             .unwrap();
         let before = d.list().len();

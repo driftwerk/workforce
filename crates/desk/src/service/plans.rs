@@ -3092,8 +3092,7 @@ impl Desk {
             env: BTreeMap::new(),
             group,
         };
-        self.create_for_as(session, new, boss, by.clone(), true)
-            .await
+        self.create_for_as(session, new, boss, by.clone()).await
     }
 
     /// Gives `t` to the session started for it, as it is now: the person's

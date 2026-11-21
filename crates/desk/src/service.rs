@@ -797,10 +797,12 @@ struct State {
     exited: HashMap<Uuid, Exited>,
     /// Each session's folder's dependencies, as Desk installs them
     /// ([`SessionView::deps`]).
-    deps: HashMap<Uuid, crate::deps::Deps>,
-    /// The install running into each folder, and the sessions told when it
-    /// ends.
+    deps: HashMap<Uuid, deps::Kept>,
+    /// The install running into each folder, by its canonical path, and the
+    /// sessions told when it ends.
     installing: HashMap<PathBuf, Vec<Uuid>>,
+    /// Keeps [`Self::installing`]'s writes in turn.
+    deps_writes: Arc<tokio::sync::Mutex<()>>,
     /// Which Anthropic account each of the person's accounts is, when known
     /// ([`crate::identity`]).
     links: HashMap<Uuid, crate::identity::Link>,
@@ -2050,6 +2052,7 @@ impl Desk {
             ),
         }
         desk.handoffs_recover().await;
+        desk.deps_recover().await;
         desk.carry_asks(kept_asks, open_waits);
         // Steered again into the turns still running, once each is heard.
         desk.rush_load().await;
@@ -2472,7 +2475,7 @@ impl Desk {
         view.prompts = live.map_or(0, |l| l.prompts);
         view.failure = state.turn_failures.get(&r.id).cloned();
         view.exited = state.exited.get(&r.id).cloned();
-        view.deps = state.deps.get(&r.id).cloned();
+        view.deps = state.deps.get(&r.id).map(|k| k.deps.clone());
         view.mode = live.and(state.modes_started.get(&r.id).copied());
         view.waits_on_you = Self::waits_on_you(state, &view);
         view.boss_has = Self::boss_has(state, &view);
@@ -2533,6 +2536,7 @@ impl Desk {
                     | Transition::Interrupted
             )
         });
+        let read = Self::deps_read(st, id, &transitions, turn_over);
         // A session running here whose turn an API error ended: how it
         // ended is turn_ended's and its transcript's to say.
         let reported = st.live.contains_key(&id) && view.failure.is_some();
@@ -2615,6 +2619,10 @@ impl Desk {
         if noticed {
             let _ = self.0.persist.send(Persist::Attention(id, view.updated_at));
         }
+        let view = match read {
+            true => SessionView { deps: None, ..view },
+            false => view,
+        };
         let _ = self.0.events.send(DeskEvent::Session {
             session: Box::new(view),
         });
@@ -3527,14 +3535,14 @@ impl Desk {
         new: NewSession,
         boss: &Party,
         by: By,
-        deps: bool,
     ) -> Result<SessionView, DeskError> {
-        self.start_session(new, Some(id), Some(boss), Some(by), false, deps)
+        self.start_session(new, Some(id), Some(boss), Some(by), false, true)
             .await
     }
 
     /// Starts `new`; `deps`: its folder's dependencies are installed as it
-    /// starts ([`crate::deps`]).
+    /// starts ([`crate::deps`]), where a boss's plan or the person's choice
+    /// of folder vouches for it.
     async fn start_session(
         &self,
         new: NewSession,
@@ -3653,13 +3661,22 @@ impl Desk {
             ),
             None => (cwd, None),
         };
-        let now = Utc::now();
-        let found = deps.then(|| crate::deps::found(&cwd)).flatten();
-        let begun = found.as_ref().map(|f| crate::deps::Deps::begun(f, now));
-        let prompt = match (new.prompt, &begun) {
-            (Some(p), Some(d)) => Some(format!("{p}\n\n{}", d.brief())),
+        let ready = match deps {
+            true => {
+                let at = deps::canonical(&cwd).await;
+                deps::found(at.clone(), folder_chosen || boss.is_some())
+                    .await
+                    .map(|f| (at, f))
+            }
+            false => None,
+        };
+        let prompt = match (new.prompt, &ready) {
+            (Some(p), Some((_, f))) => {
+                Some(format!("{p}\n\n{}", crate::deps::Deps::begun(f).brief()))
+            }
             (p, _) => p,
         };
+        let now = Utc::now();
         let caps = engine::caps(new.engine, view);
         let record = SessionRecord {
             id,
@@ -3720,8 +3737,8 @@ impl Desk {
                 .await;
             return Err(e);
         }
-        if let (Some(found), Some(begun)) = (found, begun) {
-            self.deps_begin(id, &cwd, found, begun);
+        if let Some((at, found)) = &ready {
+            self.deps_begin(id, at, found);
         }
         // Persist what hooks may already have changed since launch.
         self.change(id, |_, _| {});

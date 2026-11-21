@@ -117,13 +117,26 @@ async fn until(mut ok: impl FnMut() -> bool) {
     panic!("not in time");
 }
 
-async fn told(d: &Desk, id: Uuid) -> Vec<String> {
-    d.line_thread(id, None, None)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|m| m.text)
-        .collect()
+/// Waits until `id` is told on its line what `says`.
+async fn told(d: &Desk, id: Uuid, says: impl Fn(&str) -> bool) {
+    for _ in 0..500 {
+        let said: Vec<String> = d
+            .line_thread(id, None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.text)
+            .collect();
+        if said.iter().any(|t| says(t)) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("never told");
+}
+
+fn installed(t: &str) -> bool {
+    t.starts_with("Desk installed this folder's dependencies")
 }
 
 fn installing(v: &SessionView) -> bool {
@@ -154,11 +167,7 @@ async fn a_tickets_folder_is_installed_once_and_every_session_in_it_is_told() {
         .await;
         assert_eq!(h.runs(), 1, "installed once");
         for id in [a.id, b.id] {
-            let said = told(&d, id).await;
-            assert!(
-                said.iter().any(|t| t.starts_with("Desk installed this folder's dependencies")),
-                "{said:?}"
-            );
+            told(&d, id, installed).await;
         }
         // Current now: a third start is told so, and nothing runs.
         let c = d.create_chosen(start("MAN-3", &work), true).await.unwrap();
@@ -203,14 +212,22 @@ async fn a_failed_install_says_why_and_how_to_try_again_and_the_session_runs_on(
                 why: why.clone()
             })
         );
-        let said = told(&d, a.id).await;
-        assert!(
-            said.iter()
-                .any(|t| t.contains(&why) && t.contains(&format!("Run `{COMMAND}`"))),
-            "{said:?}"
+        told(&d, a.id, |t| {
+            t.contains(&why) && t.contains(&format!("Run `{COMMAND}`"))
+        })
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(work.join("node_modules/.desk-deps")).unwrap(),
+            "failed",
+            "pnpm's own state isn't trusted after it"
         );
-        assert!(!work.join("node_modules/.desk-deps").exists());
         assert!(d.view(a.id).unwrap().live, "it runs on");
+        // Started again in the folder, it is installed again.
+        std::fs::write(h.home.join("exit"), "0").unwrap();
+        let b = d.create_chosen(start("MAN-2", &work), true).await.unwrap();
+        assert!(installing(&b), "{:?}", b.deps);
+        until(|| matches!(deps_of(&d, b.id), Some(Deps::Installed { .. }))).await;
+        assert_eq!(h.runs(), 2);
     })
     .await;
 }
@@ -237,6 +254,151 @@ async fn a_folder_desk_wont_install_says_why_in_its_brief() {
         assert_eq!(b.last_prompt.as_deref(), Some("Work on MAN-2."));
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(h.runs(), 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_session_forgotten_while_its_folder_installs_is_never_told() {
+    with_test_pool(build_pool, |pool| async move {
+        let h = Home::new();
+        let d = h.desk(pool).await;
+        let work = h.project("mantis");
+        let a = d.create_chosen(start("MAN-1", &work), true).await.unwrap();
+        // Another path to the same folder joins the same install.
+        let link = h.home.join("link");
+        std::os::unix::fs::symlink(&work, &link).unwrap();
+        let b = d.create_chosen(start("MAN-2", &link), true).await.unwrap();
+        until(|| h.runs() == 1).await;
+        d.forget(a.id).await.unwrap();
+        h.go();
+        until(|| matches!(deps_of(&d, b.id), Some(Deps::Installed { .. }))).await;
+        assert_eq!(h.runs(), 1, "one install for both paths");
+        assert_eq!(deps_of(&d, a.id), None);
+        assert!(d.view(a.id).is_err());
+        told(&d, b.id, installed).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_start_that_doesnt_vouch_for_its_folder_installs_nothing_there() {
+    with_test_pool(build_pool, |pool| async move {
+        let h = Home::new();
+        let d = h.desk(pool).await;
+        let work = h.project("mantis");
+        let a = d
+            .start_session(
+                start("MAN-1", &work),
+                None,
+                None,
+                Some(By::you()),
+                false,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            a.deps,
+            Some(Deps::Left {
+                why: crate::deps::UNVOUCHED.into()
+            })
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(h.runs(), 0);
+    })
+    .await;
+}
+
+#[test]
+fn what_a_session_was_told_of_its_folder_leaves_its_card_once_a_later_turn_ends() {
+    let command = "npm ci".to_string();
+    let mut st = State::default();
+    let id = Uuid::new_v4();
+    let (said, prompt) = ("done", "go on");
+    st.deps.insert(
+        id,
+        Kept::new(Deps::Failed {
+            command,
+            why: "x".into(),
+        }),
+    );
+    // The turn that ran as it was said ends: it stays.
+    assert!(!Desk::deps_read(
+        &mut st,
+        id,
+        &[Transition::Finished { reply: said }],
+        true
+    ));
+    assert!(st.deps.contains_key(&id));
+    // A turn after it begins, then ends: it goes.
+    assert!(!Desk::deps_read(
+        &mut st,
+        id,
+        &[Transition::Prompted { prompt }],
+        false
+    ));
+    assert!(Desk::deps_read(
+        &mut st,
+        id,
+        &[Transition::Finished { reply: said }],
+        true
+    ));
+    assert!(!st.deps.contains_key(&id));
+    // One installing stays whatever its turns.
+    st.deps.insert(
+        id,
+        Kept::new(Deps::Installing {
+            command: COMMAND.into(),
+        }),
+    );
+    for _ in 0..2 {
+        assert!(!Desk::deps_read(
+            &mut st,
+            id,
+            &[Transition::Prompted { prompt }],
+            true
+        ));
+    }
+    assert!(st.deps.contains_key(&id));
+}
+
+#[tokio::test]
+async fn a_desk_started_again_looks_again_at_the_folders_it_was_installing() {
+    with_test_pool(build_pool, |pool| async move {
+        let h = Home::new();
+        let d = h.desk(pool.clone()).await;
+        let work = h.project("mantis");
+        let a = d.create_chosen(start("MAN-1", &work), true).await.unwrap();
+        until(|| h.runs() == 1).await;
+        let id = a.id.to_string();
+        let kept = |d: Desk| {
+            let id = id.clone();
+            async move {
+                d.0.store
+                    .state(INSTALLING)
+                    .await
+                    .unwrap()
+                    .is_some_and(|e| e.value.to_string().contains(&id))
+            }
+        };
+        for _ in 0..500 {
+            if kept(d.clone()).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(kept(d.clone()).await, "the folder installing is kept");
+        let again = h.desk(pool).await;
+        until(|| h.runs() == 2).await;
+        assert!(
+            matches!(deps_of(&again, a.id), Some(Deps::Installing { .. })),
+            "{:?}",
+            deps_of(&again, a.id)
+        );
+        h.go();
+        until(|| matches!(deps_of(&again, a.id), Some(Deps::Installed { .. }))).await;
+        told(&again, a.id, installed).await;
     })
     .await;
 }

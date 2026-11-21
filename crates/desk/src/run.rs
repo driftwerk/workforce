@@ -238,22 +238,26 @@ pub async fn run(command: &str, cwd: &Path, secs: u64, env: &[(String, String)])
         cwd,
         Duration::from_secs(secs),
         env,
+        |_| {},
     )
     .await
 }
 
 /// Runs `program` with `args` in `cwd` as [`run`] runs a check, for at
-/// most `wait`, its environment `env` alone.
-pub async fn exec<P, A>(
+/// most `wait`, its environment `env` alone. `began` is given its process
+/// (and group) id once it starts.
+pub async fn exec<P, A, F>(
     program: P,
     args: &[A],
     cwd: &Path,
     wait: Duration,
     env: &[(String, String)],
+    began: F,
 ) -> Ran
 where
     P: AsRef<std::ffi::OsStr>,
     A: AsRef<std::ffi::OsStr>,
+    F: FnOnce(u32) + Send,
 {
     use std::os::unix::process::ExitStatusExt;
     let mut cmd = tokio::process::Command::new(program);
@@ -283,6 +287,9 @@ where
             }
         }
     };
+    if let Some(pid) = child.id() {
+        began(pid);
+    }
     let mut group = Group(child.id().and_then(|p| i32::try_from(p).ok()));
     let (out, err) = (Arc::default(), Arc::default());
     let reading = [
