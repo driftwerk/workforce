@@ -276,6 +276,10 @@ pub struct SessionView {
     /// Its folder's dependencies, when Desk installs them as it starts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deps: Option<crate::deps::Deps>,
+    /// What Desk sees it wait on, once the wait has lasted a while
+    /// ([`crate::sight`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waits: Option<WaitsView>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -295,6 +299,14 @@ impl SessionView {
     pub fn ended_as_started(&self) -> Option<&Exited> {
         Exited::as_started(self.exited.as_ref(), self.state)
     }
+}
+
+/// A wait Desk sees a session in: in its words, and since when.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WaitsView {
+    pub words: String,
+    pub since: DateTime<Utc>,
 }
 
 /// How a session's process ended on its own (not stopped, closed or ended
@@ -438,6 +450,7 @@ impl SessionView {
             failure: None,
             exited: None,
             deps: None,
+            waits: None,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }

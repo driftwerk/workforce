@@ -65,6 +65,10 @@ fn session_item(
             SessionState::Starting | SessionState::Working | SessionState::Blocked
         )
     });
+    let waits = v
+        .waits
+        .as_ref()
+        .map(|w| format!("{}, {}", w.words, crate::sight::lasted(now - w.since)));
     let detail = match (v.state, v.background) {
         _ if restarted.is_some() => restarted.map(|r| {
             let w = r.words(tz);
@@ -73,14 +77,25 @@ fn session_item(
                 .map(|f| f.to_uppercase().chain(c).collect())
                 .unwrap_or(w)
         }),
-        (SessionState::Done, Some(b)) if waiting => Some(match b.count {
-            1 => "Waiting on 1 background task".to_string(),
-            n => format!("Waiting on {n} background tasks"),
-        }),
+        (SessionState::Done, Some(b)) if waiting => {
+            let tasks = match b.count {
+                1 => "Waiting on 1 background task".to_string(),
+                n => format!("Waiting on {n} background tasks"),
+            };
+            Some(match waits {
+                Some(w) => format!("{tasks} · {w}"),
+                None => tasks,
+            })
+        }
         (SessionState::Done | SessionState::Idle | SessionState::Asking, _) => {
             v.last_reply.as_deref().map(|r| crew::one_line(r, 140))
         }
-        _ => v.current_tool.as_ref().map(|t| format!("● {t}")),
+        _ => match (v.current_tool.as_ref(), waits) {
+            (Some(t), Some(w)) => Some(format!("● {t} · {w}")),
+            (Some(t), None) => Some(format!("● {t}")),
+            (None, Some(w)) => Some(format!("● {w}")),
+            (None, None) => None,
+        },
     };
     let question = v
         .asked

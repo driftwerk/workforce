@@ -894,6 +894,7 @@ fn options(config: &WorkforceConfig) -> Options {
             machine: is_machine(desk),
             grant_hours: desk.bosses.grant_hours,
         },
+        sight: Default::default(),
     }
 }
 

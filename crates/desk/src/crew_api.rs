@@ -1392,6 +1392,7 @@ mod tests {
                 line_reach: crate::line::Reach::Group,
                 memory: Default::default(),
                 bosses: Default::default(),
+                sight: Default::default(),
             },
             Default::default(),
             CancellationToken::new(),

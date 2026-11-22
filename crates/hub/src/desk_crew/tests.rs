@@ -301,6 +301,7 @@ async fn desk_as(
             line_reach: workforce_desk::line::Reach::Group,
             memory: Default::default(),
             bosses,
+            sight: Default::default(),
         },
         floor,
         CancellationToken::new(),
