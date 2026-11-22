@@ -967,9 +967,11 @@ fn carrying(
                         }
                         native(&there, "POST", "/api/desk/sessions", Value::Object(start)).await
                     }
-                    // The Mac's own takes of their work, every few seconds,
-                    // aren't the calls a test counts.
-                    t if t == super::super::relayed_work::WORK_TAKE => {
+                    // The Mac's own takes of their work and decisions aren't
+                    // the calls a test counts.
+                    t if t == super::super::relayed_work::WORK_TAKE
+                        || t == super::super::relayed_decide::TAKE =>
+                    {
                         let body = as_desk_posts(&c);
                         let (_, out) = post(&served, "/api/desk/crew/served", &token, body).await;
                         crew.relay_answer(c.id, serde_json::from_value(out).unwrap());
@@ -1126,8 +1128,9 @@ async fn directs_from_launch(
     assert_eq!(now["members"], json!([id]));
     assert!(there.charge_of(id).is_some_and(|c| c.live()));
 
-    // Nothing else is reached. A session there of no plan is never sent;
-    // on devbox, the plan's grant serves its boss alone, for its session
+    // Nothing else is reached. A session there of no plan is never sent
+    // (this Desk carries no Ungrouped grant, and the boss is told so); on
+    // devbox, the plan's grant serves its boss alone, for its session
     // alone: not another boss, not a peer's session (in Sarah's Acme
     // there), not one of no plan; and its boss starts nothing there itself.
     let loose = new_session(&there, devbox_dir.path(), "loose").await;
@@ -1141,10 +1144,11 @@ async fn directs_from_launch(
             json!({"session_id": format!("devbox/{s}")}),
         )
         .await;
-        assert!(r
-            .error
-            .unwrap()
-            .contains("only your own plans' ticket sessions"));
+        let e = r.error.unwrap_or_default();
+        assert!(
+            e.contains("can't let you reach devbox's ungrouped sessions"),
+            "{e}"
+        );
     }
     assert_eq!(carried.lock().len(), before);
     let history = |s: uuid::Uuid| json!({"session_id": s});
@@ -1357,6 +1361,8 @@ async fn holds_its_own(pool: workforce_postgres::PostgresPool) {
                             listed.lock().push(s.clone());
                             s
                         }
+                        // The pump's take, which isn't a call this counts.
+                        super::super::relayed_decide::TAKE => json!({}),
                         _ => {
                             carried.lock().push(c.clone());
                             json!({"done": "read"})

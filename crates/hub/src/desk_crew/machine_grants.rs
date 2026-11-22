@@ -307,9 +307,10 @@ impl CrewHub {
     /// a group's boss, and none of its plans' (a machine holds a session in
     /// one grant only). As the sidebar resolves it: each machine's open
     /// sessions, as last read there, in no group; none of a machine not
-    /// read yet, or whose listing doesn't say which grant holds each.
+    /// read yet, or whose listing doesn't say which grant holds each, and
+    /// none while Desk doesn't carry machines' Ungrouped grants.
     pub(crate) fn ungrouped_sessions(&self, o: &Oversight) -> MachineSessions {
-        if o.scope != Scope::Ungrouped {
+        if o.scope != Scope::Ungrouped || !self.ungrouped_carried() {
             return MachineSessions::new();
         }
         // Every plan's session there, whatever its engine or state: a plan's
@@ -321,13 +322,7 @@ impl CrewHub {
             .filter_map(|item| machine_session(item))
             .map(|(m, id)| (m.to_string(), id))
             .collect();
-        let layout = self.desk.layout();
-        let grouped: BTreeSet<(String, Uuid)> = layout
-            .groups
-            .iter()
-            .flat_map(|g| g.items.iter())
-            .filter_map(|i| machine_item(i))
-            .collect();
+        let grouped = self.machine_grouped();
         self.machine_known
             .lock()
             .iter()
@@ -338,6 +333,17 @@ impl CrewHub {
                 out.entry(m).or_default().insert(id);
                 out
             })
+    }
+
+    /// Each machine session the sidebar has in a group.
+    fn machine_grouped(&self) -> BTreeSet<(String, Uuid)> {
+        self.desk
+            .layout()
+            .groups
+            .iter()
+            .flat_map(|g| g.items.iter())
+            .filter_map(|i| machine_item(i))
+            .collect()
     }
 
     /// How far apart one machine's sessions are read.
@@ -482,12 +488,17 @@ impl CrewHub {
             .ungrouped_sessions(o)
             .get(machine)
             .is_some_and(|ids| ids.contains(&id));
-        match (ours, self.ungrouped_carried()) {
-            (true, true) => Ok(UNGROUPED.to_string()),
-            (true, false) => Err(format!(
+        // A Desk that doesn't carry them: one the sidebar has in no group
+        // can't be reached, as Desk there isn't read for it.
+        let older = !self.ungrouped_carried()
+            && o.scope == Scope::Ungrouped
+            && !self.machine_grouped().contains(&(machine.to_string(), id));
+        match (ours, older) {
+            (true, _) => Ok(UNGROUPED.to_string()),
+            (false, true) => Err(format!(
                 "Desk on this computer is older and can't let you reach {machine}'s ungrouped sessions: tell the person to update Desk."
             )),
-            (false, _) => Err(format!(
+            (false, false) => Err(format!(
                 "On {machine} you run only your own plans' ticket sessions and the sessions in no group, and this isn't one of them."
             )),
         }
