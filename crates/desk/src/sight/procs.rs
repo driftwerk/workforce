@@ -379,7 +379,7 @@ fn remote(args: &[&str]) -> Option<(String, String)> {
     let host = loop {
         let w = words.next()?;
         match w.strip_prefix('-') {
-            Some(flags) if flags == "-" => break words.next()?,
+            Some("-") => break words.next()?,
             Some(flags) => {
                 let valued = flags.chars().last().is_some_and(|f| SSH_VALUED.contains(f));
                 if valued && flags.len() == 1 {
