@@ -519,17 +519,54 @@ async fn a_question_is_the_persons_once_its_home_takes_only_under_another_grant(
     .await;
 }
 
-/// On devbox: its Ungrouped grant Desk just wrote, its home not yet taking
-/// under it and the hub long started: what its first session asks its boss
+/// On devbox: its Ungrouped grant Desk just wrote again, its home not yet
+/// taking under it and the hub long started: what its first session asks its boss
 /// waits for the home's take, and isn't the person's.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_question_under_a_grant_just_written_waits_for_its_homes_first_take() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let (crew, d, [vel9, _, _, _]) = devbox(dir.path(), pool).await;
+        let (crew, d, [vel9, vel15, vel20, _]) = devbox(dir.path(), pool).await;
         let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
         let token = crew.state.auth_token.clone();
         crew.homes_gone();
+        put_ungrouped(&d, 2, &[vel9.id, vel15.id, vel20.id], true).await;
+        let out = post(&app, &token, take_on(vel9.id, true)).await;
+        assert_eq!(out["status"], "ok", "{out}");
+        let asked = d
+            .line_call(
+                vel9.id,
+                "ask",
+                &json!({"to": "desk", "text": "Ship VEL-9 now?", "wait_seconds": 60}),
+                Some(Duration::from_millis(10)),
+            )
+            .await
+            .unwrap();
+        let ask: uuid::Uuid = serde_json::from_value(asked["id"].clone()).unwrap();
+        // Past a sweep or more.
+        tokio::time::sleep(Duration::from_secs(7)).await;
+        let q = d.store().line_message(ask).await.unwrap().unwrap();
+        assert_eq!(q.to.id, HOME_DESK, "{q:?}");
+        assert_eq!(q.asked, Some(Asked::Open), "{q:?}");
+    })
+    .await;
+}
+
+/// On devbox: its Ungrouped grant, taken under once, is deleted and written
+/// again: the take under the one gone counts for nothing, and what VEL-9
+/// asks under the new one waits for the home's first take.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_grant_written_again_is_new_whatever_was_taken_under_the_one_gone() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (crew, d, [vel9, vel15, vel20, _]) = devbox(dir.path(), pool).await;
+        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let token = crew.state.auth_token.clone();
+        take(&app, &token, json!({})).await;
+        crew.homes_gone();
+        let (code, out) = native(&d, "DELETE", "/api/desk/grants/ungrouped", json!({})).await;
+        assert!(code.is_success(), "{out}");
+        put_ungrouped(&d, 2, &[vel9.id, vel15.id, vel20.id], true).await;
         let out = post(&app, &token, take_on(vel9.id, true)).await;
         assert_eq!(out["status"], "ok", "{out}");
         let asked = d

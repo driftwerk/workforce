@@ -195,6 +195,10 @@ pub(crate) struct Homes {
     /// restarted here is taken for again within [`WORK_FRESH`].
     grace: Instant,
     swept: Option<Instant>,
+    /// The grants issued by then count as issued [`WORK_FRESH`] earlier
+    /// ([`CrewHub::homes_gone`]).
+    #[cfg(test)]
+    aged_to: Option<DateTime<Utc>>,
 }
 
 impl Default for Homes {
@@ -205,30 +209,53 @@ impl Default for Homes {
             handed: HashMap::new(),
             grace: Instant::now() + WORK_FRESH,
             swept: None,
+            #[cfg(test)]
+            aged_to: None,
         }
     }
 }
 
 impl Homes {
     /// Whether `party`'s home took lately: under `grant`'s (its group, and
-    /// when it was issued), else under any. One it never took under here
-    /// may be taken under yet: at first, and while the grant is new.
+    /// when it was issued), else under any. One it never took under here,
+    /// or not since it was issued, may be taken under yet: at first, and
+    /// while the grant is new.
     fn reads(&self, party: &str, grant: Option<(&str, DateTime<Utc>)>) -> bool {
-        let mut took = self
-            .took
-            .iter()
-            .filter(|((p, g), _)| p == party && grant.is_none_or(|(w, _)| g == w))
-            .peekable();
-        let new = |issued: DateTime<Utc>| {
-            (Utc::now() - issued)
-                .to_std()
-                .ok()
-                .is_none_or(|age| age < WORK_FRESH)
+        let fresh = |at: &Instant| at.elapsed() < WORK_FRESH;
+        let Some((group, issued)) = grant else {
+            let mut took = self.took.iter().filter(|((p, _), _)| p == party).peekable();
+            return match took.peek() {
+                None => Instant::now() < self.grace,
+                Some(_) => took.any(|(_, at)| fresh(at)),
+            };
         };
-        match took.peek() {
-            None => Instant::now() < self.grace || grant.is_some_and(|(_, at)| new(at)),
-            Some(_) => took.any(|(_, at)| at.elapsed() < WORK_FRESH),
+        let taken_at = |at: &Instant| {
+            chrono::TimeDelta::from_std(at.elapsed())
+                .map_or(DateTime::<Utc>::MIN_UTC, |d| Utc::now() - d)
+        };
+        #[cfg(test)]
+        let issued = match self.aged_to {
+            Some(to) if issued <= to => issued - chrono::TimeDelta::from_std(WORK_FRESH).unwrap(),
+            _ => issued,
+        };
+        let new = (Utc::now() - issued)
+            .to_std()
+            .ok()
+            .is_none_or(|age| age < WORK_FRESH);
+        match self
+            .took
+            .get(&(party.to_string(), group.to_string()))
+            .filter(|at| taken_at(at) >= issued)
+        {
+            Some(at) => fresh(at),
+            None => Instant::now() < self.grace || new,
         }
+    }
+
+    /// Forgets the takes under grants no longer here: one made again is
+    /// new.
+    fn forget_gone(&mut self, groups: &HashSet<String>) {
+        self.took.retain(|(_, g), _| groups.contains(g));
     }
 }
 
@@ -358,6 +385,13 @@ impl CrewHub {
             }
             h.swept = Some(Instant::now());
         }
+        let groups: HashSet<String> = self
+            .desk
+            .grants_bossed()
+            .into_iter()
+            .map(|(g, _)| g.group)
+            .collect();
+        self.work_homes.lock().forget_gone(&groups);
         let home = format!("{}/", workforce_desk::grant::HOME_HUB);
         let asks = match self.desk.store().line_open_asks_to(&home).await {
             Ok(asks) => asks,
@@ -615,7 +649,8 @@ impl CrewHub {
 
 #[cfg(test)]
 impl CrewHub {
-    /// Every home here as if it stopped taking [`WORK_FRESH`] ago.
+    /// Every home here as if it stopped taking [`WORK_FRESH`] ago, and every
+    /// grant here as if issued as long ago.
     pub(crate) fn homes_gone(&self) {
         let mut h = self.work_homes.lock();
         let long_ago = Instant::now()
@@ -624,6 +659,7 @@ impl CrewHub {
         h.grace = long_ago;
         h.swept = None;
         h.took.values_mut().for_each(|at| *at = long_ago);
+        h.aged_to = Some(Utc::now());
     }
 }
 
@@ -1457,10 +1493,12 @@ mod tests {
             Instant::now() - WORK_FRESH,
         );
         assert!(!h.reads("home/desk", None), "its home stopped taking");
-        assert!(
-            !h.reads("home/desk", Some(("g", Utc::now()))),
-            "a grant taken under once is new no more"
-        );
+        assert!(!h.reads("home/desk", Some(("g", long_ago))));
+        // Issued again since that take (written anew, or renewed): new.
+        assert!(h.reads("home/desk", Some(("g", Utc::now()))));
+        // Gone, then: its takes are forgotten.
+        h.forget_gone(&HashSet::from(["ungrouped".to_string()]));
+        assert!(h.took.is_empty());
     }
 
     #[test]
