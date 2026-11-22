@@ -14,7 +14,7 @@ use workforce_agent::artifacts::{global_store, resolve_bytes_input, ArtifactStor
 use workforce_agent::runner::CURRENT_AGENT_ID;
 use workforce_agent::tools::Tool;
 
-use crate::adapters::google::api::{GoogleApi, GoogleApiContext};
+use crate::adapters::google::api::{GoogleApi, GoogleApis};
 
 use crate::adapters::google::tool_helpers::{
     handler, object_schema, optional_str, optional_u64, required_str, urlencode, GoogleTool,
@@ -95,7 +95,7 @@ fn upload_metadata(name: &str, parent: Option<&str>, convert_to: Option<&str>) -
     metadata
 }
 
-pub fn tools(ctx: Arc<GoogleApiContext>) -> Vec<Arc<dyn Tool>> {
+pub fn tools(ctx: Arc<GoogleApis>) -> Vec<Arc<dyn Tool>> {
     let mut out: Vec<Arc<dyn Tool>> = Vec::new();
 
     // ─── list/search ─────────────────────────────────────────────────────────

@@ -46,6 +46,7 @@ fn ticket(n: u128, state: TicketState, needs: &[u128]) -> PlanTicket {
         machine: None,
         model: None,
         assigned: false,
+        session: None,
         starting: false,
         held_back: None,
     }
@@ -171,7 +172,7 @@ fn progress_reads_and_writes_the_shape_desk_reads() {
     let p = progress(&[ticket(1, TicketState::Todo, &[])]);
     let v = serde_json::to_value(&p).unwrap();
     for field in [
-        "done", "doing", "review", "ready", "blocked", "waiting", "total", "next",
+        "done", "doing", "review", "ready", "blocked", "waiting", "total", "next", "holding",
     ] {
         assert!(v.get(field).is_some(), "{field} in {v}");
     }
@@ -611,18 +612,24 @@ fn an_approved_plan_starts_its_ready_tickets_up_to_the_limit_in_rank_order() {
     let p = plan(PlanState::Running);
     let mut tickets: Vec<PlanTicket> = (1..=5).map(|n| ticket(n, TicketState::Todo, &[])).collect();
     tickets[0].rank = 9_999.0;
-    let starts = next_starts(&p, &tickets, 0, 4, None);
+    let starts = next_starts(&p, &tickets, room(&p, 0, 0, 4), None);
     let order: Vec<Uuid> = starts.iter().map(|s| s.ticket).collect();
     assert_eq!(order, vec![u(2), u(3), u(4), u(5)]);
     // One busy already: three.
-    assert_eq!(next_starts(&p, &tickets, 1, 4, None).len(), 3);
+    assert_eq!(next_starts(&p, &tickets, room(&p, 1, 0, 4), None).len(), 3);
     // The plan's own limit is lower.
     let mut low = p.clone();
     low.parallel = Some(2);
-    assert_eq!(next_starts(&low, &tickets, 0, 4, None).len(), 2);
+    assert_eq!(
+        next_starts(&low, &tickets, room(&low, 0, 0, 4), None).len(),
+        2
+    );
     // Never above the boss's.
     low.parallel = Some(9);
-    assert_eq!(next_starts(&low, &tickets, 0, 4, None).len(), 4);
+    assert_eq!(
+        next_starts(&low, &tickets, room(&low, 0, 0, 4), None).len(),
+        4
+    );
 }
 
 #[test]
@@ -631,7 +638,7 @@ fn a_ticket_held_back_never_starts_by_itself_and_waits_on_someone() {
     let mut held = ticket(1, TicketState::Todo, &[]);
     held.held_back = Some("its session ended as it started (exit 1)".into());
     let tickets = vec![held, ticket(2, TicketState::Todo, &[])];
-    let order: Vec<Uuid> = next_starts(&p, &tickets, 0, 4, None)
+    let order: Vec<Uuid> = next_starts(&p, &tickets, room(&p, 0, 0, 4), None)
         .iter()
         .map(|s| s.ticket)
         .collect();
@@ -654,11 +661,16 @@ fn a_ticket_sharing_a_folder_with_work_under_way_gets_a_worktree() {
         elsewhere,
         ticket(4, TicketState::Todo, &[]),
     ];
-    let starts = next_starts(&p, &tickets, 1, 4, None);
+    let starts = next_starts(&p, &tickets, room(&p, 1, 0, 4), None);
     let wt: Vec<(Uuid, bool)> = starts.iter().map(|s| (s.ticket, s.worktree)).collect();
     assert_eq!(wt, vec![(u(2), true), (u(3), false), (u(4), true)]);
     // Alone in its folder, the first doesn't.
-    let alone = next_starts(&p, &[ticket(5, TicketState::Todo, &[])], 0, 4, None);
+    let alone = next_starts(
+        &p,
+        &[ticket(5, TicketState::Todo, &[])],
+        room(&p, 0, 0, 4),
+        None,
+    );
     assert!(!alone[0].worktree);
 }
 
@@ -701,15 +713,17 @@ fn next_starts_never_exceeds_the_limit_never_starts_an_unready_ticket_and_starts
                 t
             })
             .collect();
-        let busy = rng.below(6) as usize;
+        let held = rng.below(6) as usize;
+        let busy = rng.below(8) as usize;
         let limit = 1 + rng.below(12) as usize;
         let mut p = plan(PlanState::Running);
         p.parallel = (rng.below(3) == 0).then(|| rng.below(6) as i16);
         let cap = p.limit(limit);
-        let starts = next_starts(&p, &tickets, busy, limit, None);
+        let free = room(&p, held, busy, limit);
+        let starts = next_starts(&p, &tickets, free, None);
         assert!(
-            starts.len() <= cap.saturating_sub(busy),
-            "case {case}: {} starts with {busy} busy of {cap}",
+            held + starts.len() <= cap.max(held) && busy + starts.len() <= limit.max(busy),
+            "case {case}: {} starts with {held} held of {cap} and {busy} busy of {limit}",
             starts.len()
         );
         let by_id: HashMap<Uuid, &PlanTicket> = tickets.iter().map(|t| (t.id, t)).collect();
@@ -731,7 +745,7 @@ fn next_starts_never_exceeds_the_limit_never_starts_an_unready_ticket_and_starts
         // for ones ranked after those started.
         let ready: Vec<&PlanTicket> = tickets.iter().filter(|t| startable(t, &st)).collect();
         if starts.len() < ready.len() {
-            assert_eq!(busy + starts.len(), cap.max(busy), "case {case}");
+            assert_eq!(starts.len(), free, "case {case}");
         }
         if let Some(last) = starts.last().map(|s| by_id[&s.ticket].rank) {
             for t in &ready {
@@ -755,15 +769,15 @@ fn next_starts_never_exceeds_the_limit_never_starts_an_unready_ticket_and_starts
             let mut held = p.clone();
             held.state = PlanState::Paused;
             held.paused = Some(reason);
-            assert!(next_starts(&held, &tickets, 0, limit, None).is_empty());
+            assert!(next_starts(&held, &tickets, room(&held, 0, 0, limit), None).is_empty());
         }
         for standing in [Status::Warn, Status::Over] {
-            assert!(next_starts(&p, &tickets, 0, limit, Some(standing)).is_empty());
+            assert!(next_starts(&p, &tickets, room(&p, 0, 0, limit), Some(standing)).is_empty());
         }
         for state in [PlanState::Proposed, PlanState::Done, PlanState::Dropped] {
             let mut other = p.clone();
             other.state = state;
-            assert!(next_starts(&other, &tickets, 0, limit, None).is_empty());
+            assert!(next_starts(&other, &tickets, room(&other, 0, 0, limit), None).is_empty());
         }
     }
 }
@@ -1086,13 +1100,108 @@ fn over_the_limit_nothing_starts_until_it_drains() {
             machine: None,
             model: None,
             assigned: false,
+            session: None,
             starting: false,
             held_back: None,
         });
     }
-    assert!(next_starts(&p, &tickets, 5, 4, None).is_empty());
-    assert!(next_starts(&p, &tickets, 4, 4, None).is_empty());
-    assert_eq!(next_starts(&p, &tickets, 3, 4, None).len(), 1);
+    assert!(next_starts(&p, &tickets, room(&p, 5, 0, 4), None).is_empty());
+    assert!(next_starts(&p, &tickets, room(&p, 4, 0, 4), None).is_empty());
+    assert_eq!(next_starts(&p, &tickets, room(&p, 3, 0, 4), None).len(), 1);
+}
+
+/// The Mantis plan of 21 Nov: four at once, every ticket on devbox. Each
+/// session it holds keeps its slot whatever it is doing, or whatever was
+/// last seen of it, until it is closed or removed.
+fn on_devbox(n: u128, state: TicketState) -> PlanTicket {
+    let mut t = ticket(n, state, &[]);
+    t.machine = Some("devbox".into());
+    t.folder = Some(format!("/home/dev/mantis-{n}"));
+    t
+}
+
+fn mantis() -> (Plan, Vec<PlanTicket>) {
+    let mut p = plan(PlanState::Running);
+    p.parallel = Some(4);
+    let mut tickets: Vec<PlanTicket> = (1..=18)
+        .map(|n| {
+            let mut t = on_devbox(n, TicketState::Doing);
+            t.assigned = true;
+            t.session = Some(format!("devbox/{}", u(100 + n)));
+            t
+        })
+        .collect();
+    tickets.extend((19..=22).map(|n| on_devbox(n, TicketState::Todo)));
+    (p, tickets)
+}
+
+#[test]
+fn eighteen_sessions_on_a_machine_hold_eighteen_slots_whatever_was_seen_of_them() {
+    let (p, mut tickets) = mantis();
+    // Nothing seen of them yet (a restart, devbox not answering), or each
+    // seen working, idle or asking, or killed and so interrupted or
+    // stopped: none is closed, and their tickets are still in Doing.
+    assert_eq!(held(&tickets), 18);
+    assert!(next_starts(&p, &tickets, room(&p, 18, 0, 12), None).is_empty());
+    let line = full(&progress(&tickets), 4).unwrap();
+    assert!(
+        line.starts_with("holds 18 of 4 sessions: ACM-1, ACM-2,"),
+        "{line}"
+    );
+    // Fifteen closed: one slot of four is free.
+    for t in &mut tickets[..15] {
+        t.session = None;
+    }
+    assert_eq!(held(&tickets), 3);
+    let starts = next_starts(&p, &tickets, room(&p, 3, 0, 12), None);
+    assert_eq!(starts.iter().map(|s| s.ticket).collect::<Vec<_>>(), [u(19)]);
+    assert_eq!(full(&progress(&tickets), 4), None);
+    // All eighteen closed: it starts four again.
+    for t in &mut tickets {
+        t.session = None;
+    }
+    assert_eq!(held(&tickets), 0);
+    assert_eq!(next_starts(&p, &tickets, room(&p, 0, 0, 12), None).len(), 4);
+}
+
+#[test]
+fn a_plan_holds_its_review_sessions_and_unknown_starts_once_each_and_not_its_done_ones() {
+    let (_, mut tickets) = mantis();
+    tickets.truncate(2);
+    let mut review = on_devbox(30, TicketState::Review);
+    review.session = Some("devbox/review".into());
+    // A start whose outcome isn't known: no session yet.
+    let mut unsure = on_devbox(31, TicketState::Doing);
+    unsure.starting = true;
+    // Started and linked, its link not ended yet: one session.
+    let mut linked = on_devbox(32, TicketState::Doing);
+    linked.starting = true;
+    linked.session = Some("devbox/linked".into());
+    // Two tickets on one session.
+    let mut twice = on_devbox(33, TicketState::Doing);
+    twice.session = tickets[0].session.clone();
+    let mut done = on_devbox(34, TicketState::Done);
+    done.session = Some("devbox/done".into());
+    tickets.extend([review, unsure, linked, twice, done]);
+    let names: Vec<String> = holding(&tickets).iter().map(|t| t.name()).collect();
+    assert_eq!(names, ["ACM-1", "ACM-2", "ACM-30", "ACM-31", "ACM-32"]);
+    // A closed session's ticket holds nothing; a linked start still does.
+    tickets[2].session = None;
+    tickets[4].session = None;
+    assert_eq!(held(&tickets), 4);
+}
+
+#[test]
+fn room_is_what_the_plan_and_its_boss_each_have_left() {
+    let mut p = plan(PlanState::Running);
+    p.parallel = Some(4);
+    assert_eq!(room(&p, 0, 0, 12), 4);
+    assert_eq!(room(&p, 3, 0, 12), 1);
+    assert_eq!(room(&p, 18, 0, 12), 0);
+    assert_eq!(room(&p, 1, 11, 12), 1);
+    assert_eq!(room(&p, 0, 12, 12), 0);
+    p.parallel = None;
+    assert_eq!(room(&p, 5, 2, 12), 7);
 }
 
 #[test]
@@ -1104,7 +1213,7 @@ fn the_same_folder_on_another_computer_needs_no_copy_of_its_own() {
     let mut there_too = ticket(3, TicketState::Todo, &[]);
     there_too.machine = Some("devbox".into());
     let p = plan(PlanState::Running);
-    let starts = next_starts(&p, &[here, there, there_too], 0, 4, None);
+    let starts = next_starts(&p, &[here, there, there_too], room(&p, 0, 0, 4), None);
     let copies: Vec<bool> = starts.iter().map(|s| s.worktree).collect();
     assert_eq!(copies, [false, false, true], "only the second on devbox");
 }
@@ -1327,7 +1436,7 @@ fn a_ticket_of_a_repository_starts_with_its_checkout_found_there() {
     b.repo = Some("github.com/driftwerk/vellev".into());
     b.machine = Some("devbox".into());
     let p = plan(PlanState::Running);
-    let starts = next_starts(&p, &[a, b], 0, 4, None);
+    let starts = next_starts(&p, &[a, b], room(&p, 0, 0, 4), None);
     assert_eq!(starts.len(), 2);
     assert_eq!(
         starts[0].repo.as_deref(),
@@ -1348,7 +1457,7 @@ fn a_ticket_of_a_repository_starts_with_its_checkout_found_there() {
     c.folder = Some("/home/dev/projects/driftwerk/vellev".into());
     c.repo = Some("github.com/driftwerk/vellev".into());
     c.machine = Some("devbox".into());
-    let starts = next_starts(&p, &[doing, c], 1, 4, None);
+    let starts = next_starts(&p, &[doing, c], room(&p, 1, 0, 4), None);
     assert_eq!(starts.len(), 1);
     assert!(starts[0].worktree, "its folder is in use");
 }

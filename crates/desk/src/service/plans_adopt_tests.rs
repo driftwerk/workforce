@@ -203,7 +203,12 @@ async fn a_plan_takes_on_synced_issues_beside_new_tickets() {
         let p = d.approve_plan(plan.id, 1, &By::you()).await.unwrap();
         assert_eq!(states(&p), vec![TicketState::Todo; 3]);
         let plan = p.summary.plan.clone();
-        let ready = plan::next_starts(&plan, &d.plan_tickets(plan.id).await.unwrap(), 0, 4, None);
+        let ready = plan::next_starts(
+            &plan,
+            &d.plan_tickets(plan.id).await.unwrap(),
+            plan::room(&plan, 0, 0, 4),
+            None,
+        );
         assert_eq!(
             ready.iter().map(|s| s.ticket).collect::<Vec<_>>(),
             vec![one.id]
@@ -538,7 +543,12 @@ async fn dropping_lets_taken_tickets_go_where_they_are() {
 
         let p = d.approve_plan(id, 2, &By::you()).await.unwrap();
         let plan = p.summary.plan.clone();
-        let ready = plan::next_starts(&plan, &d.plan_tickets(id).await.unwrap(), 0, 4, None);
+        let ready = plan::next_starts(
+            &plan,
+            &d.plan_tickets(id).await.unwrap(),
+            plan::room(&plan, 0, 0, 4),
+            None,
+        );
         d.plan_start(&plan, &ready[0], &sarah(), &by_sarah())
             .await
             .unwrap();

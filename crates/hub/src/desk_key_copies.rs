@@ -206,7 +206,7 @@ pub fn copyable(id: &str) -> Option<&'static Connector> {
     CATALOG
         .iter()
         .find(|c| c.id == id)
-        .filter(|c| !c.shared && c.sign_in != SignIn::Google && !c.fields.is_empty())
+        .filter(|c| !c.shared && c.sign_in != SignIn::App && !c.fields.is_empty())
 }
 
 /// How the tokens GitHub issues to an app on a sign-in begin: an OAuth
@@ -543,7 +543,7 @@ pub fn connections_of(sources: &[Source], person: &Uuid) -> Vec<Listed> {
 /// Whether the person holds a Google sign-in in any of `sources`: said, as
 /// it isn't copied, so Desk can say to sign in there instead.
 fn signed_in_to_google(sources: &[Source], person: &Uuid) -> bool {
-    let Some(google) = CATALOG.iter().find(|c| c.sign_in == SignIn::Google) else {
+    let Some(google) = CATALOG.iter().find(|c| c.id == "google") else {
         return false;
     };
     sources.iter().any(|src| {

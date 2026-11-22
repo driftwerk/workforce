@@ -6,8 +6,7 @@
 //! through FreeAgent's per-minute rate window by honouring `Retry-After` on
 //! a `429`. The shared `reqwest::Client` carries the mandatory `User-Agent`.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use eyre::{eyre, Result, WrapErr};
@@ -19,6 +18,7 @@ use workforce_common::settings::SecretStore;
 use workforce_oauth_client::{OAuthClientCreds, TokenStore as GenericTokenStore};
 
 use super::token_store::build_token_store;
+use crate::adapters::utils::{unknown_instance, LiveInstances};
 
 /// FreeAgent's default page size and its hard upper bound.
 pub const DEFAULT_PER_PAGE: u64 = 25;
@@ -273,55 +273,81 @@ fn backoff_for(attempt: u32) -> Duration {
     (BACKOFF_BASE * (1u32 << shift)).min(BACKOFF_MAX)
 }
 
-/// Holds one `FreeAgentClient` per workspace, built lazily and shared so a
-/// workspace's token-refresh single-flight lock is reused across calls.
+/// The answer to a call while no FreeAgent app is kept.
+pub const NOT_SET_UP: &str = "FreeAgent isn't set up: run connections.setup service=freeagent";
+
+/// Every FreeAgent business the caller can use, each a client built the
+/// first time anyone uses it, from the app kept then.
 pub struct FreeAgentContext {
     store: Arc<dyn SecretStore>,
-    http: reqwest::Client,
-    creds: OAuthClientCreds,
-    api_base: String,
-    sandbox: bool,
-    clients: Mutex<HashMap<String, Arc<FreeAgentClient>>>,
+    clients: Arc<LiveInstances<FreeAgentClient>>,
 }
 
 impl FreeAgentContext {
     pub fn new(
         store: Arc<dyn SecretStore>,
         http: reqwest::Client,
-        creds: OAuthClientCreds,
-        sandbox: bool,
+        selector: Option<String>,
     ) -> Self {
-        let api_base = super::provider::FreeAgentProvider::new(sandbox)
-            .api_base()
-            .to_string();
+        Self::build(store, http, selector, None)
+    }
+
+    fn build(
+        store: Arc<dyn SecretStore>,
+        http: reqwest::Client,
+        selector: Option<String>,
+        api_base: Option<String>,
+    ) -> Self {
+        let kept = Arc::clone(&store);
+        let clients = LiveInstances::live(
+            Arc::clone(&store),
+            super::FreeAgentSkill::instance_paths(),
+            selector,
+            move |name| {
+                let creds = super::read_client_creds(kept.as_ref())?;
+                let sandbox = super::read_sandbox(kept.as_ref());
+                let base = api_base.clone().unwrap_or_else(|| {
+                    super::provider::FreeAgentProvider::new(sandbox)
+                        .api_base()
+                        .to_string()
+                });
+                Ok(FreeAgentClient::new(
+                    Arc::clone(&kept),
+                    name,
+                    creds,
+                    http.clone(),
+                    base,
+                    sandbox,
+                ))
+            },
+        );
         Self {
             store,
-            http,
-            creds,
-            api_base,
-            sandbox,
-            clients: Mutex::new(HashMap::new()),
+            clients: Arc::new(clients),
         }
     }
 
-    /// Resolve (get-or-create) the client for a workspace. Per-user token
-    /// resolution happens inside the client on each call, so one client per
-    /// workspace name serves every user correctly.
-    pub fn client(&self, workspace: &str) -> Arc<FreeAgentClient> {
-        let mut map = self
-            .clients
-            .lock()
-            .expect("freeagent client cache poisoned");
-        Arc::clone(map.entry(workspace.to_string()).or_insert_with(|| {
-            Arc::new(FreeAgentClient::new(
-                Arc::clone(&self.store),
-                workspace,
-                self.creds.clone(),
-                self.http.clone(),
-                self.api_base.clone(),
-                self.sandbox,
-            ))
-        }))
+    /// The business a call names, else the caller's default; never one the
+    /// caller has none of.
+    pub fn client(&self, requested: Option<&str>) -> Result<Arc<FreeAgentClient>> {
+        super::read_client_creds(self.store.as_ref()).map_err(|_| eyre!(NOT_SET_UP))?;
+        let (clients, default) = self.clients.for_caller();
+        let name = workforce_agent::llm::environment::resolve_instance(
+            "freeagent",
+            requested,
+            &default,
+            &clients,
+        )
+        .map_err(|d| eyre!("{}", d.message))?;
+        clients
+            .get(&name)
+            .cloned()
+            .ok_or_else(|| unknown_instance("FreeAgent business", &name, &clients))
+    }
+
+    /// The businesses, read as whoever asks.
+    pub fn clients(&self) -> Arc<LiveInstances<FreeAgentClient>> {
+        Arc::clone(&self.clients)
     }
 
     /// Test constructor pointing every client's data calls at `api_base`.
@@ -329,17 +355,9 @@ impl FreeAgentContext {
     pub(crate) fn with_base_for_test(
         store: Arc<dyn SecretStore>,
         http: reqwest::Client,
-        creds: OAuthClientCreds,
         api_base: String,
     ) -> Self {
-        Self {
-            store,
-            http,
-            creds,
-            api_base,
-            sandbox: false,
-            clients: Mutex::new(HashMap::new()),
-        }
+        Self::build(store, http, None, Some(api_base))
     }
 }
 

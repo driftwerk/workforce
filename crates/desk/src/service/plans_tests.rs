@@ -1247,8 +1247,7 @@ async fn a_pause_that_comes_while_a_pass_runs_starts_nothing_and_a_pause_of_the_
         let start = plan::next_starts(
             &read.summary.plan,
             &d.plan_tickets(id).await.unwrap(),
-            0,
-            4,
+            plan::room(&read.summary.plan, 0, 0, 4),
             None,
         )
         .remove(0);
@@ -1289,8 +1288,7 @@ async fn a_drop_racing_a_start_leaves_no_session_working_on_the_dropped_ticket()
         let start = plan::next_starts(
             &read.summary.plan,
             &d.plan_tickets(id).await.unwrap(),
-            0,
-            4,
+            plan::room(&read.summary.plan, 0, 0, 4),
             None,
         )
         .remove(0);
@@ -1630,8 +1628,7 @@ async fn the_breaker_holding_the_plans_group_holds_its_starts() {
         let start = plan::next_starts(
             &read.summary.plan,
             &d.plan_tickets(id).await.unwrap(),
-            0,
-            4,
+            plan::room(&read.summary.plan, 0, 0, 4),
             None,
         )
         .remove(0);
@@ -1664,8 +1661,7 @@ async fn a_start_that_cant_happen_now_is_skipped_and_one_whose_session_cant_star
         let start = plan::next_starts(
             &read.summary.plan,
             &d.plan_tickets(id).await.unwrap(),
-            0,
-            4,
+            plan::room(&read.summary.plan, 0, 0, 4),
             None,
         )
         .remove(0);
@@ -1717,8 +1713,7 @@ async fn a_plans_session_is_written_down_before_its_process_starts() {
         let start = plan::next_starts(
             &read.summary.plan,
             &d.plan_tickets(id).await.unwrap(),
-            0,
-            4,
+            plan::room(&read.summary.plan, 0, 0, 4),
             None,
         )
         .remove(0);
@@ -1911,7 +1906,12 @@ async fn capped_plan(d: &Desk, dir: &Path, titles: &[(&str, &[usize])], usd: f64
 async fn next(d: &Desk, id: Uuid) -> Vec<Start> {
     let p = d.plan(id).await.unwrap().summary.plan;
     let held = d.plan_starts_held(p.group.as_deref(), id).map(|(s, _)| s);
-    plan::next_starts(&p, &d.plan_tickets(id).await.unwrap(), 0, 4, held)
+    plan::next_starts(
+        &p,
+        &d.plan_tickets(id).await.unwrap(),
+        plan::room(&p, 0, 0, 4),
+        held,
+    )
 }
 
 #[tokio::test]
@@ -2058,8 +2058,13 @@ async fn a_plan_at_its_warning_stops_starting_until_continue_and_stops_again_whe
              Sarah has stopped starting sessions."
         );
         assert!(next(&d, id).await.is_empty());
-        let second =
-            plan::next_starts(&plan, &d.plan_tickets(id).await.unwrap(), 1, 4, None).remove(0);
+        let second = plan::next_starts(
+            &plan,
+            &d.plan_tickets(id).await.unwrap(),
+            plan::room(&plan, 1, 0, 4),
+            None,
+        )
+        .remove(0);
         let refused = d
             .plan_start(&plan, &second, &sarah(), &by_sarah())
             .await
@@ -2570,6 +2575,73 @@ async fn a_ticket_of_a_repository_here_may_name_a_folder_desk_clones_into_but_ne
                 .contains("is inside a hidden or system folder, where Desk clones nothing"),
             "{refused}"
         );
+    })
+    .await;
+}
+
+/// A plan's ticket holds its slot until its session is closed or removed,
+/// and its close is kept on the ticket: a restart, which doesn't load
+/// closed sessions, frees it no less; one reopened holds it again.
+#[tokio::test]
+async fn a_closed_or_removed_session_frees_its_plans_slot_and_a_restart_keeps_it_free() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool.clone(), dir.path()).await;
+        let p = d
+            .propose_plan(
+                new_plan(dir.path(), &[("a", &[]), ("b", &[])]),
+                &sarah(),
+                &by_sarah(),
+            )
+            .await
+            .unwrap();
+        let id = p.summary.plan.id;
+        let p = d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let plan = p.summary.plan.clone();
+        let mut sessions = Vec::new();
+        for t in &p.tickets {
+            let start = Start {
+                repo: None,
+                ticket: t.ticket.ticket.id,
+                engine: Engine::Claude,
+                folder: dir.path().to_string_lossy().into_owned(),
+                view: None,
+                worktree: false,
+            };
+            sessions.push(
+                d.plan_start(&plan, &start, &sarah(), &by_sarah())
+                    .await
+                    .unwrap()
+                    .id,
+            );
+        }
+        let held = async |d: &crate::Desk| crate::plan::held(&d.plan_tickets(id).await.unwrap());
+        assert_eq!(held(&d).await, 2);
+        d.end(sessions[0], Some(By::you())).await.unwrap();
+        d.persisted().await;
+        assert_eq!(held(&d).await, 1, "closed");
+        let again = desk(pool.clone(), dir.path()).await;
+        assert_eq!(held(&again).await, 1, "still closed after a restart");
+        // Reopened: its ticket holds its slot again.
+        let r = again.0.store.get(sessions[0]).await.unwrap().unwrap();
+        again.save(crate::model::SessionRecord {
+            state: SessionState::Stopped,
+            ..r
+        });
+        again.persisted().await;
+        assert_eq!(held(&again).await, 2, "running again");
+        // Closed and removed: its ticket is no one's.
+        again.end(sessions[1], Some(By::you())).await.unwrap();
+        again.remove_closed(sessions[1]).await.unwrap();
+        again.persisted().await;
+        assert_eq!(held(&again).await, 1, "removed");
+        let gone = sessions[1].to_string();
+        assert!(again
+            .plan_tickets(id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|t| t.session.as_deref() != Some(gone.as_str())));
     })
     .await;
 }

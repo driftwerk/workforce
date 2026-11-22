@@ -16,6 +16,7 @@ use std::time::Instant;
 use chrono::{DateTime, Utc};
 use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
+use workforce_agent::tools::Tool as _;
 use workforce_common::channels::DESK_CHANNEL;
 use workforce_common::oversight::{Level, Oversight, Scope, WorkStyle};
 use workforce_desk::crew::Crew as _;
@@ -352,12 +353,24 @@ impl CrewHub {
             .collect();
         let had = self.tooled.lock().clone();
         if want != had {
+            // Registered over the old ones, so a running turn never finds
+            // them gone.
+            let mut tools: HashMap<String, Vec<CrewTool>> = current
+                .iter()
+                .map(|(s, o)| {
+                    let id = s.agent_id.as_str();
+                    let at = CrewTool::for_level(&self.me(), id, &o.scope, o.level == Level::Watch);
+                    (id.to_string(), at)
+                })
+                .collect();
             for s in self.services() {
-                for name in READ.iter().chain(ACT.iter()) {
+                let kept = tools.get(s.agent_id.as_str());
+                let keeps = |name: &str| kept.is_some_and(|t| t.iter().any(|t| t.name() == name));
+                for name in READ.iter().chain(ACT.iter()).filter(|n| !keeps(n)) {
                     s.tools.unregister(name);
                 }
                 // `desk.*` only on agents that oversee nothing.
-                match want.contains_key(s.agent_id.as_str()) {
+                match kept.is_some() {
                     true => crate::connector_pins::pin(&s),
                     false => crate::desk_driver::register_tools(&s),
                 }
@@ -367,7 +380,7 @@ impl CrewHub {
                     s.tools.unregister(name);
                 }
                 let id = s.agent_id.as_str();
-                for tool in CrewTool::for_level(&self.me(), id, &o.scope, o.level == Level::Watch) {
+                for tool in tools.remove(id).unwrap_or_default() {
                     s.tools.register(Arc::new(tool));
                 }
                 // An overseer has Desk's browser.

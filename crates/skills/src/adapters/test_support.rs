@@ -222,3 +222,40 @@ pub(crate) fn canned_response(
     }
     reqwest::Response::from(builder.body(body).unwrap())
 }
+
+/// What the code under test logs, at every level, while its guard is held.
+#[derive(Clone, Default)]
+pub struct Logs(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Logs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+    type Writer = Logs;
+    fn make_writer(&'a self) -> Logs {
+        self.clone()
+    }
+}
+
+impl Logs {
+    pub fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+        let logs = Self::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        (logs, tracing::subscriber::set_default(subscriber))
+    }
+
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
