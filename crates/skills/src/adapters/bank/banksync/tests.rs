@@ -67,7 +67,7 @@ async fn serve(scopes: &[&str]) -> MockServer {
 }
 
 fn natwest(server: &MockServer) -> BankSync {
-    BankSync::fixed(KEY, "natwest", &server.uri(), Arc::default(), None)
+    BankSync::fixed(KEY, "natwest", &server.uri(), Arc::default(), "ann")
 }
 
 fn window() -> Window {
@@ -256,90 +256,97 @@ async fn the_limiter_keeps_each_person_to_ten_a_minute() {
 
 #[tokio::test]
 async fn a_stored_connection_reads_its_key_bank_and_approval_as_the_caller() {
-    let server = serve(&["banks:read"]).await;
-    Mock::given(method("GET"))
-        .and(path("/banks/bnk_rev/accounts"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(accounts()))
-        .mount(&server)
-        .await;
-    let store = InMem::from(&[
-        ("skills/bank/workspaces/revolut/api_key", KEY),
-        ("skills/bank/workspaces/revolut/bank", "Revolut"),
-        (
-            "skills/bank/workspaces/revolut/consented_at",
-            "2026-09-01T10:00:00Z",
-        ),
-    ]);
-    let bs = BankSync::with_store(store, "revolut", &server.uri(), Arc::default());
-    assert_eq!(bs.accounts().await.unwrap().len(), 1);
-    assert_eq!(
-        bs.consented_at(),
-        Some("2026-09-01T10:00:00Z".parse().unwrap())
-    );
+    workforce_agent::runner::CURRENT_USER_ID
+        .scope("ann".into(), async {
+            let server = serve(&["banks:read"]).await;
+            Mock::given(method("GET"))
+                .and(path("/banks/bnk_rev/accounts"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(accounts()))
+                .mount(&server)
+                .await;
+            let store = InMem::from(&[
+                ("skills/bank/workspaces/revolut/api_key", KEY),
+                ("skills/bank/workspaces/revolut/bank", "Revolut"),
+                (
+                    "skills/bank/workspaces/revolut/consented_at",
+                    "2026-09-01T10:00:00Z",
+                ),
+            ]);
+            let bs = BankSync::with_store(store, "revolut", &server.uri(), Arc::default());
+            assert_eq!(bs.accounts().await.unwrap().len(), 1);
+            assert_eq!(
+                bs.consented_at(),
+                Some("2026-09-01T10:00:00Z".parse().unwrap())
+            );
 
-    let empty = BankSync::with_store(InMem::from(&[]), "revolut", &server.uri(), Arc::default());
-    assert_eq!(empty.accounts().await, Err(BankError::NotConfigured("key")));
-    assert_eq!(empty.consented_at(), None);
+            let empty =
+                BankSync::with_store(InMem::from(&[]), "revolut", &server.uri(), Arc::default());
+            assert_eq!(empty.accounts().await, Err(BankError::NotConfigured("key")));
+            assert_eq!(empty.consented_at(), None);
+        })
+        .await;
 }
 
 /// A new key may be of another BankSync workspace: it is checked again, and
 /// the bank found under the old one is looked up again.
 #[tokio::test]
 async fn a_new_key_is_checked_again_and_its_bank_looked_up_again() {
-    const OTHER: &str = "bsk_other000000000000000000000000000";
-    let server = serve(&["banks:read"]).await;
-    Mock::given(method("GET"))
-        .and(path("/whoami"))
-        .and(header("X-API-Key", OTHER))
-        .respond_with(ResponseTemplate::new(200).set_body_json(whoami(&["banks:read"])))
-        .mount(&server)
+    workforce_agent::runner::CURRENT_USER_ID
+        .scope("ann".into(), async {
+            const OTHER: &str = "bsk_other000000000000000000000000000";
+            let server = serve(&["banks:read"]).await;
+            Mock::given(method("GET"))
+                .and(path("/whoami"))
+                .and(header("X-API-Key", OTHER))
+                .respond_with(ResponseTemplate::new(200).set_body_json(whoami(&["banks:read"])))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/banks"))
+                .and(header("X-API-Key", OTHER))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    json!({"success": true, "data": [bank("bnk_rev2", "Revolut", true)]}),
+                ))
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            for id in ["bnk_rev", "bnk_rev2"] {
+                Mock::given(method("GET"))
+                    .and(path(format!("/banks/{id}/accounts")))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(accounts()))
+                    .mount(&server)
+                    .await;
+            }
+            let store = InMem::from(&[
+                ("skills/bank/workspaces/revolut/api_key", KEY),
+                ("skills/bank/workspaces/revolut/bank", "Revolut"),
+            ]);
+            let bs = BankSync::with_store(store.clone(), "revolut", &server.uri(), Arc::default());
+            bs.accounts().await.unwrap();
+            store
+                .set("skills/bank/workspaces/revolut/api_key", OTHER)
+                .unwrap();
+            bs.accounts().await.unwrap();
+            let asked: Vec<String> = server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.url.path().to_string())
+                .collect();
+            assert_eq!(
+                asked,
+                [
+                    "/whoami",
+                    "/banks",
+                    "/banks/bnk_rev/accounts",
+                    "/whoami",
+                    "/banks",
+                    "/banks/bnk_rev2/accounts"
+                ]
+            );
+        })
         .await;
-    Mock::given(method("GET"))
-        .and(path("/banks"))
-        .and(header("X-API-Key", OTHER))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(
-                json!({"success": true, "data": [bank("bnk_rev2", "Revolut", true)]}),
-            ),
-        )
-        .with_priority(1)
-        .mount(&server)
-        .await;
-    for id in ["bnk_rev", "bnk_rev2"] {
-        Mock::given(method("GET"))
-            .and(path(format!("/banks/{id}/accounts")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(accounts()))
-            .mount(&server)
-            .await;
-    }
-    let store = InMem::from(&[
-        ("skills/bank/workspaces/revolut/api_key", KEY),
-        ("skills/bank/workspaces/revolut/bank", "Revolut"),
-    ]);
-    let bs = BankSync::with_store(store.clone(), "revolut", &server.uri(), Arc::default());
-    bs.accounts().await.unwrap();
-    store
-        .set("skills/bank/workspaces/revolut/api_key", OTHER)
-        .unwrap();
-    bs.accounts().await.unwrap();
-    let asked: Vec<String> = server
-        .received_requests()
-        .await
-        .unwrap()
-        .iter()
-        .map(|r| r.url.path().to_string())
-        .collect();
-    assert_eq!(
-        asked,
-        [
-            "/whoami",
-            "/banks",
-            "/banks/bnk_rev/accounts",
-            "/whoami",
-            "/banks",
-            "/banks/bnk_rev2/accounts"
-        ]
-    );
 }
 
 /// Every connection and agent of a person's on one BankSync workspace
@@ -358,20 +365,8 @@ async fn a_person_s_connections_on_one_workspace_share_its_limit() {
             .await;
     }
     let limiter = Arc::new(Limiter::default());
-    let natwest = BankSync::fixed(
-        KEY,
-        "natwest",
-        &server.uri(),
-        Arc::clone(&limiter),
-        Some("ann"),
-    );
-    let revolut = BankSync::fixed(
-        KEY,
-        "revolut",
-        &server.uri(),
-        Arc::clone(&limiter),
-        Some("ann"),
-    );
+    let natwest = BankSync::fixed(KEY, "natwest", &server.uri(), Arc::clone(&limiter), "ann");
+    let revolut = BankSync::fixed(KEY, "revolut", &server.uri(), Arc::clone(&limiter), "ann");
     natwest.connection().await.unwrap();
     revolut.connection().await.unwrap();
     let counts = limiter.0.lock().unwrap();
@@ -394,4 +389,18 @@ fn a_page_reads_its_cursor_and_drops_rows_without_an_amount() {
     assert_eq!(page.transactions.len(), 1);
     assert_eq!(page.cursor.as_deref(), Some("c2"));
     assert!(page.has_more);
+}
+
+/// A stored connection read with no person is refused, never counted in a
+/// bucket others share.
+#[tokio::test]
+async fn a_stored_call_with_no_person_is_refused_not_pooled() {
+    let server = serve(&["banks:read"]).await;
+    let store = InMem::from(&[
+        ("skills/bank/workspaces/revolut/api_key", KEY),
+        ("skills/bank/workspaces/revolut/bank", "Revolut"),
+    ]);
+    let bs = BankSync::with_store(store, "revolut", &server.uri(), Arc::default());
+    assert!(matches!(bs.accounts().await, Err(BankError::Invalid(_))));
+    assert!(server.received_requests().await.unwrap().is_empty());
 }

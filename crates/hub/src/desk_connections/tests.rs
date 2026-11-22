@@ -269,6 +269,7 @@ async fn services(github: Arc<Github>) -> Services {
         slack_api: base.clone(),
         datadog_api: Some(base.clone()),
         bank_api: format!("{base}/banksync"),
+        bank_limiter: Default::default(),
         google_token: format!("{base}/token"),
         google_userinfo: format!("{base}/userinfo"),
         poll_floor: Duration::from_millis(10),

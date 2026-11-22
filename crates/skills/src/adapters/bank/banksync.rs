@@ -87,8 +87,8 @@ enum Keys {
     Fixed {
         api_key: Secret<String>,
         bank: String,
-        /// Whose limit it spends, where no call is made as them.
-        owner: Option<String>,
+        /// Whose limit it spends: the person it is of.
+        owner: String,
     },
     Store {
         store: Arc<dyn SecretStore>,
@@ -111,19 +111,19 @@ pub struct BankSync {
 impl BankSync {
     /// A connection on `api_key` reading `bank`, at `base` (BankSync's
     /// [`API`] outside tests). `owner` is the person it is of, whose limit it
-    /// spends; none is the caller of the running call.
+    /// spends.
     pub fn fixed(
         api_key: &str,
         bank: &str,
         base: &str,
         limiter: Arc<Limiter>,
-        owner: Option<&str>,
+        owner: &str,
     ) -> Self {
         Self::new(
             Keys::Fixed {
                 api_key: Secret::new(api_key.to_string()),
                 bank: bank.to_string(),
-                owner: owner.map(str::to_string),
+                owner: owner.to_string(),
             },
             base,
             limiter,
@@ -179,6 +179,24 @@ impl BankSync {
         }
     }
 
+    /// The person whose limit a call spends: a checked connection's owner,
+    /// else the person the call runs as. A call with none is refused, never
+    /// counted in a bucket others share.
+    fn person(&self) -> Result<String, BankError> {
+        let who = match &self.keys {
+            Keys::Fixed { owner, .. } => owner.clone(),
+            Keys::Store { .. } => workforce_agent::runner::CURRENT_USER_ID
+                .try_with(String::clone)
+                .unwrap_or_default(),
+        };
+        match who.trim().is_empty() {
+            true => Err(BankError::Invalid(
+                "The bank is read only as a person, and this call has none.".into(),
+            )),
+            false => Ok(who),
+        }
+    }
+
     fn api_key(&self) -> Result<Secret<String>, BankError> {
         self.field("api_key")
             .filter(|k| !k.trim().is_empty())
@@ -195,14 +213,7 @@ impl BankSync {
         path: &str,
         query: &[(&str, String)],
     ) -> Result<Value, BankError> {
-        let who = match &self.keys {
-            Keys::Fixed {
-                owner: Some(owner), ..
-            } => owner.clone(),
-            _ => workforce_agent::runner::CURRENT_USER_ID
-                .try_with(String::clone)
-                .unwrap_or_default(),
-        };
+        let who = self.person()?;
         let bucket = format!("{who}\u{0}{workspace}");
         let mut waited = false;
         loop {
@@ -515,14 +526,16 @@ impl BankProvider for BankSync {
 
 /// What a key and bank test as, for Connections: the bank's name when the
 /// key only reads and the bank's approval stands. It spends `owner`'s limit,
-/// the person whose connection it is.
+/// the person whose connection it is, in `limiter` (the process's
+/// [`Limiter::shared`] outside tests).
 pub async fn check(
     api_key: &str,
     bank: &str,
     base: &str,
     owner: &str,
+    limiter: Arc<Limiter>,
 ) -> Result<Connection, BankError> {
-    BankSync::fixed(api_key, bank, base, Limiter::shared(), Some(owner))
+    BankSync::fixed(api_key, bank, base, limiter, owner)
         .connection()
         .await
 }

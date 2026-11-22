@@ -30,6 +30,9 @@ pub struct Services {
     /// `None`: `https://api.{site}`.
     pub datadog_api: Option<String>,
     pub bank_api: String,
+    /// BankSync's per-person limit, which a check spends: the process's one
+    /// outside tests.
+    pub bank_limiter: std::sync::Arc<workforce_skills::adapters::bank::banksync::Limiter>,
     pub google_token: String,
     pub google_userinfo: String,
     /// The shortest wait between two polls of a device sign-in.
@@ -55,6 +58,7 @@ impl Services {
             slack_api: "https://slack.com/api".into(),
             datadog_api: None,
             bank_api: workforce_skills::adapters::bank::banksync::API.into(),
+            bank_limiter: workforce_skills::adapters::bank::banksync::Limiter::shared(),
             google_token: workforce_skills::adapters::google::oauth::TOKEN_URL.into(),
             google_userinfo: workforce_skills::adapters::google::oauth::USERINFO_URL.into(),
             poll_floor: Duration::from_secs(5),
@@ -313,6 +317,7 @@ impl Services {
             field(f, "bank"),
             &self.bank_api,
             person,
+            std::sync::Arc::clone(&self.bank_limiter),
         )
         .await
         {
