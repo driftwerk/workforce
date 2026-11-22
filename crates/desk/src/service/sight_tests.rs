@@ -100,15 +100,15 @@ async fn a_working_sessions_tree_is_sampled_and_no_session_working_lists_nothing
         })
         .await;
         assert!(d.sight_reads() >= 1);
-        assert_eq!(seen.root, d.process_root(s.id));
+        assert_eq!(Some(seen.root), d.process_root(s.id));
         assert_eq!(seen.reading.kind, Kind::Works);
         assert_eq!(seen.reading.words, "running sleep");
         assert!(seen.output.is_empty(), "nothing is read without a redactor");
-        assert_eq!(seen.tree[0].proc.pid, seen.root.unwrap(), "root first");
+        assert_eq!(seen.tree[0].proc.pid, seen.root, "root first");
         let super::Processes::Tree(tree) = d.process_tree(s.id).await else {
             panic!("its tree is listed");
         };
-        assert_eq!(tree.rows[0].pid, seen.root.unwrap());
+        assert_eq!(tree.rows[0].pid, seen.root);
         assert!(tree.rows.iter().all(|r| r.args.is_none()));
         assert_eq!(d.view(s.id).unwrap().waits, None);
         kill_work(&seen);
