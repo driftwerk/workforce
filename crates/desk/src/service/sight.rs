@@ -9,7 +9,6 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
@@ -116,7 +115,7 @@ pub struct Sample {
     /// Whether this computer's processes could be listed.
     pub listed: bool,
     /// The process its work runs under.
-    pub root: Option<u32>,
+    pub root: u32,
     /// Its work's processes, root first.
     pub tree: Vec<Stat>,
     runs: HashMap<u32, (u64, u64)>,
@@ -258,10 +257,8 @@ fn newest_tasks(folder: &Path) -> Vec<(PathBuf, SystemTime)> {
         .filter(|e| e.path().extension().is_some_and(|x| x == "output"))
         .filter_map(|e| {
             let meta = std::fs::symlink_metadata(e.path()).ok()?;
-            meta.file_type()
-                .is_file()
-                .then(|| Some((e.path(), meta.modified().ok()?)))
-                .flatten()
+            meta.file_type().is_file().then_some(())?;
+            Some((e.path(), meta.modified().ok()?))
         })
         .collect();
     found.sort_by(|a, b| b.1.cmp(&a.1));
@@ -427,7 +424,7 @@ impl Desk {
 
     /// The process a session's work runs under on this computer: its own
     /// process, an adopted one's, or the shell of the Desk terminal it was
-    /// typed in. None when nothing of it runs here.
+    /// typed in. None when Desk knows of none.
     pub fn process_root(&self, id: Uuid) -> Option<u32> {
         let st = self.0.state.lock();
         let r = st.records.get(&id)?;
@@ -437,10 +434,7 @@ impl Desk {
     fn root_in(st: &super::State, r: &SessionRecord) -> Option<u32> {
         match st.live.get(&r.id) {
             Some(l) => Self::root_of(l, r.engine).or_else(|| l.terminal.and(l.pty.pid())),
-            None => r
-                .external_pid
-                .filter(|p| crate::adopt::alive(*p))
-                .and_then(|p| u32::try_from(p).ok()),
+            None => r.external_pid.and_then(|p| u32::try_from(p).ok()),
         }
     }
 
@@ -552,7 +546,7 @@ impl Desk {
             .await
             .ok()
         };
-        let files = files.unwrap_or(Files {
+        let files = files.unwrap_or_else(|| Files {
             records: prev.map(|p| p.records.clone()).unwrap_or_default(),
             open_call: None,
             tasks: prev.map(|p| p.tasks.clone()).unwrap_or_default(),
@@ -598,7 +592,10 @@ impl Desk {
             poll: chrono::Duration::from_std(self.0.opts.sight.poll).unwrap_or_default(),
         });
         let reading = match prev {
-            Some(p) if p.reading.kind == reading.kind && p.reading.words == reading.words => {
+            Some(p)
+                if (&p.reading.kind, &p.reading.words, p.reading.pid)
+                    == (&reading.kind, &reading.words, reading.pid) =>
+            {
                 Reading {
                     since: p.reading.since.min(reading.since),
                     ..reading
@@ -610,7 +607,7 @@ impl Desk {
             at: now,
             first_at: prev.map_or(now, |p| p.first_at),
             listed: table.is_some(),
-            root: Some(d.root),
+            root: d.root,
             waits: waits_of(&reading, now, self.0.opts.sight.shown_after),
             runs: sight_procs::runs(&refs),
             cpu_growing: growing,
@@ -641,8 +638,11 @@ impl Desk {
         let Some(s) = self.sample_fresh(id).await else {
             return Processes::NotRunning;
         };
-        let Some(root) = s.root.filter(|_| s.listed) else {
+        if !s.listed {
             return Processes::Unlisted;
+        }
+        let Some(root) = s.tree.first().map(|p| p.proc.pid) else {
+            return Processes::NotRunning;
         };
         let redactor = self.0.ledger.redactor.clone();
         let (rows, more) = rows_of(&s, redactor.as_deref());
@@ -946,7 +946,7 @@ impl Desk {
 }
 
 #[cfg(test)]
-pub(super) fn redactor_for_tests() -> Arc<dyn Redactor> {
+pub(super) fn redactor_for_tests() -> std::sync::Arc<dyn Redactor> {
     struct Hides;
     impl Redactor for Hides {
         fn stored<'a>(&self, text: &'a str) -> crate::memory::Redacted<'a> {
@@ -970,7 +970,7 @@ pub(super) fn redactor_for_tests() -> Arc<dyn Redactor> {
             }
         }
     }
-    Arc::new(Hides)
+    std::sync::Arc::new(Hides)
 }
 
 #[cfg(test)]
@@ -1071,7 +1071,7 @@ mod tests {
             at: now,
             first_at: now,
             listed: true,
-            root: Some(1),
+            root: 1,
             runs: HashMap::new(),
             cpu_growing: HashSet::from([3]),
             active_at: now,
