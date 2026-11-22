@@ -171,6 +171,10 @@ fn is_owned(creator: Option<&str>) -> bool {
     creator.is_some_and(|c| !c.starts_with("system:"))
 }
 
+/// The origin a run of a job that isn't its person's own ([`is_own`])
+/// carries.
+pub(crate) const ON_BEHALF_ORIGIN: &str = "scheduler-on-behalf";
+
 /// Whether a job is its run-as person's own: they created it to run as
 /// themselves and nobody else has changed it since
 /// ([`ScheduledJob::edited_by`]). Who may read its history is theirs to
@@ -2320,6 +2324,8 @@ impl Scheduler {
                 // then posted marked so.
                 let armed = workforce_agent::security::monitor::Armed::new();
                 let turn = workforce_agent::runner::with_guard_keeper(Some(armed.keeper()), turn);
+                let turn =
+                    descending_from((!is_own(job)).then(|| ON_BEHALF_ORIGIN.to_string()), turn);
                 let process_result = match run_capped(turn, run_minutes).await {
                     Some(result) => result,
                     // Cut off, as a skip: a long run is not a failing job.

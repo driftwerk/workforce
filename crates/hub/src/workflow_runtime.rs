@@ -594,6 +594,27 @@ fn artifact_scope(instance_id: &str) -> String {
 /// Name prefix for the scheduler jobs that back `TriggerDefinition::Schedule`.
 const SCHEDULE_JOB_PREFIX: &str = "workflow-schedule:";
 
+/// How many runs deep [`WorkflowRuntime::run_origin`] follows a run's
+/// starts back.
+const MAX_RUN_DEPTH: usize = 32;
+
+/// The origin of a run started from outside in a way not otherwise named:
+/// none of the agent's own jobs.
+const OUTSIDE_ORIGIN: &str = "workflow-outside";
+
+/// The automated origin a run's turns carry, by what started it: the
+/// engine's own for a start the person made, else the monitor, webhook or
+/// hand-off it came in by.
+fn trigger_origin(source: &TriggerSource) -> &'static str {
+    match source {
+        TriggerSource::Cli | TriggerSource::Api => WORKFLOW_ENGINE,
+        TriggerSource::Monitor { .. } => workforce_common::subscription::MONITOR,
+        TriggerSource::Webhook { .. } | TriggerSource::Http { .. } => "webhook",
+        TriggerSource::Handoff { .. } => "handoff",
+        TriggerSource::Workflow { .. } => OUTSIDE_ORIGIN,
+    }
+}
+
 /// One scheduler job derived from a schedule trigger.
 struct ScheduleRegistration {
     name: String,
@@ -4390,12 +4411,15 @@ impl WorkflowRuntime {
                     desk,
                     workforce_agent::runner::CURRENT_ARTIFACT_SCOPE.scope(
                         artifact_scope(instance_id),
-                        Box::pin(self.execute_loop_inner(
-                            instance_id,
-                            channel_id,
-                            thread_id,
-                            originating_agent_id,
-                        )),
+                        workforce_agent::runner::CURRENT_AUTOMATED_ORIGIN.scope(
+                            self.run_origin(instance_id).to_string(),
+                            Box::pin(self.execute_loop_inner(
+                                instance_id,
+                                channel_id,
+                                thread_id,
+                                originating_agent_id,
+                            )),
+                        ),
                     ),
                 ),
             )
@@ -6284,6 +6308,24 @@ impl WorkflowRuntime {
             }
         }
         Err(eyre!("workflow {id} kept changing; nothing was changed").into())
+    }
+
+    /// What a run's turns descend from: the engine, for a run the person
+    /// started (by hand, on a schedule, through the API) or one such a run
+    /// started; else what started it from outside, as [`trigger_origin`]
+    /// names it. A run whose start can't be traced is from outside.
+    fn run_origin(&self, instance_id: &str) -> &'static str {
+        let mut id = instance_id.to_string();
+        for _ in 0..MAX_RUN_DEPTH {
+            let Ok(instance) = self.load_instance(&id) else {
+                return OUTSIDE_ORIGIN;
+            };
+            match instance.trigger.source {
+                TriggerSource::Workflow { instance_id, .. } => id = instance_id,
+                source => return trigger_origin(&source),
+            }
+        }
+        OUTSIDE_ORIGIN
     }
 
     fn load_instance(
@@ -10708,6 +10750,50 @@ mod tests {
         let occupant = WorkflowExecutor::start(&def, webhook_trigger(), None).unwrap();
         runtime.save_instance(&occupant).unwrap();
         (runtime, occupant.id)
+    }
+
+    /// A run's turns carry what started it: a webhook's run, and a run
+    /// one of its steps started, are none of the agent's own jobs; one the
+    /// person started is the engine's.
+    #[tokio::test]
+    async fn a_runs_origin_is_what_started_it_traced_back() {
+        let runtime = test_runtime().await;
+        let def = queueable_def(4);
+        let run = |trigger: TriggerInfo| {
+            let instance = WorkflowExecutor::start(&def, trigger, None).unwrap();
+            runtime.save_instance(&instance).unwrap();
+            instance.id
+        };
+        let api = |source| TriggerInfo {
+            source,
+            payload: serde_json::Value::Null,
+        };
+        let hooked = run(api(TriggerSource::Webhook {
+            source: "github".into(),
+            event_type: "push".into(),
+        }));
+        let started = run(api(TriggerSource::Api));
+        let child = |parent: &str| {
+            run(api(TriggerSource::Workflow {
+                instance_id: parent.to_string(),
+                step_id: "s".into(),
+                outside: None,
+            }))
+        };
+        assert_eq!(runtime.run_origin(&hooked), "webhook");
+        assert_eq!(runtime.run_origin(&started), WORKFLOW_ENGINE);
+        assert_eq!(runtime.run_origin(&child(&hooked)), "webhook");
+        assert_eq!(
+            runtime.run_origin(&child(&child(&started))),
+            WORKFLOW_ENGINE
+        );
+        assert_eq!(runtime.run_origin(&child("gone")), OUTSIDE_ORIGIN);
+        assert_eq!(
+            runtime.run_origin(&run(api(TriggerSource::Monitor {
+                monitor_id: "m".into()
+            }))),
+            "monitor"
+        );
     }
 
     async fn trigger_start(runtime: &Arc<WorkflowRuntime>) -> String {
