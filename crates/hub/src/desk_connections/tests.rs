@@ -4173,5 +4173,17 @@ async fn the_documents_folder_is_said_only_to_the_hubs_person_and_never_made() {
     )
     .unwrap();
     assert_eq!(body["exists"], false);
+    assert_eq!(body["state"], "missing");
     assert!(!service.workspace.join("documents").exists());
+    // A file where the folder should be is said as such, never as missing.
+    std::fs::write(service.workspace.join("documents"), "x").unwrap();
+    let said = app.clone().oneshot(ask("scout", &sarah)).await.unwrap();
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(said.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["state"], "not_a_folder");
+    assert_eq!(body["exists"], false);
 }

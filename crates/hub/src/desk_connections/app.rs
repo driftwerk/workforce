@@ -285,7 +285,6 @@ impl App {
             .is_match(v)
     }
 
-    /// Whether `id` and `secret` look like this app's.
     /// What the page is searched for to find `field` alone: its shape,
     /// unanchored. `None` where the id and secret look alike (FreeAgent's),
     /// so only a selector tells them apart.
@@ -299,6 +298,7 @@ impl App {
             .then(|| shape.trim_start_matches('^').trim_end_matches('$'))
     }
 
+    /// Whether `id` and `secret` look like this app's.
     pub fn shaped(&self, id: &str, secret: &str) -> bool {
         // FreeAgent's id and secret are shaped alike: one read twice is
         // neither.

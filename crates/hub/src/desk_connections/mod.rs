@@ -2551,8 +2551,8 @@ async fn start(
         .into_response()
 }
 
-/// Agent `agent`'s documents folder, `{path, exists}`: made when the agent
-/// is equipped, never here.
+/// Agent `agent`'s documents folder, `{path, exists, state}`: made when
+/// the agent is equipped, never here.
 async fn documents(
     State(r): S,
     h: HeaderMap,
@@ -2573,8 +2573,14 @@ async fn documents(
         Err(refused) => return refused.into_response(),
     };
     let path = service.workspace.join("documents");
-    let exists = crate::desk_driver::documents_kept(&service.workspace).is_some();
-    Json(json!({ "path": path, "exists": exists })).into_response()
+    // `made`, `missing` (made when the agent is next equipped), or
+    // `not_a_folder`: a link or a file, which Desk never uses.
+    let state = match std::fs::symlink_metadata(&path) {
+        Ok(m) if m.file_type().is_dir() => "made",
+        Ok(_) => "not_a_folder",
+        Err(_) => "missing",
+    };
+    Json(json!({ "path": path, "exists": state == "made", "state": state })).into_response()
 }
 
 async fn flow(
