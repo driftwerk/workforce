@@ -222,6 +222,13 @@ impl CallSite {
     /// its result for the MCP client from `tools`, the surface it ran on.
     fn report(&self, tools: &ToolRegistry, name: &str, held: Held) -> ToolResult {
         let Held { exec, decision } = held;
+        // A bank call, or a read-back of a conversation that made one,
+        // marks the turn it was made in (as the call itself did, as it
+        // ran): nothing later in the turn keeps anything of it.
+        if exec.success {
+            workforce_agent::personal::calling(name);
+            workforce_agent::personal::answered(&exec.output);
+        }
         self.audit
             .record(name, decision, exec.deny_reason.as_deref());
         self.shape(tools, name, exec)

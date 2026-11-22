@@ -809,6 +809,63 @@ After adding or changing credentials, call system.enable_skill('datadog') to rel
             default_config_template: "",
         },
         BuiltinSkillMeta {
+            name: "bank",
+            description: "Read the person's own bank accounts (balances and transactions) through BankSync, read only",
+            required_credentials: &[
+                CredentialMeta {
+                    vault_path: "skills/bank/api_key",
+                    description: "BankSync API key holding banks:read and institutions:read only",
+                    required: true,
+                },
+                CredentialMeta {
+                    vault_path: "skills/bank/bank",
+                    description: "The bank, by its name in BankSync (NatWest) or its id",
+                    required: true,
+                },
+                CredentialMeta {
+                    vault_path: "skills/bank/consented_at",
+                    description: "When the person last approved the bank (Desk keeps it)",
+                    required: false,
+                },
+            ],
+            tool_prefix: "bank",
+            default_scope: CredScope::PerUser,
+            managed_by: CredManaged::Manual,
+            setup_hint: "\
+Each connection is one bank the person linked in BankSync, kept as their own. \
+Set one up with connections.setup {service: 'bank', name: '<Bank>'}: keep `bank` \
+(its name as BankSync shows it) with connections.keep, then in the person's \
+signed-in BankSync tab open Settings > Developers > API keys, make a key named \
+'Desk – <Bank>' with only banks:read and institutions:read, and read it with \
+browser.capture_key, so it never passes through you. Desk tests it and keeps it.\n\
+Never vault.set a bank key yourself, and never make a key with any other scope: \
+a key that can do more than read is refused.\n\
+Set skills/bank/default_workspace only when the person names a default.",
+            workspace_vault_prefix: "skills/bank/workspaces/",
+            workspace_credentials: &[
+                WorkspaceCredentialMeta {
+                    key: "api_key",
+                    description: "BankSync API key (banks:read, institutions:read)",
+                    required: true,
+                    addable: true,
+                },
+                WorkspaceCredentialMeta {
+                    key: "bank",
+                    description: "The bank's name in BankSync, or its id",
+                    required: true,
+                    addable: true,
+                },
+                WorkspaceCredentialMeta {
+                    key: "consented_at",
+                    description: "When the person last approved the bank (Desk keeps it)",
+                    required: false,
+                    addable: false,
+                },
+            ],
+            supports_config: false,
+            default_config_template: "",
+        },
+        BuiltinSkillMeta {
             name: "metabase",
             description: "Query Metabase cards/dashboards, run native SQL, manage collections across multiple Metabase instances",
             required_credentials: &[
@@ -1768,6 +1825,11 @@ const DEFAULT_SELECTORS: &[(&str, &str, &str)] = &[
         "skills/metabase/default_instance",
         "Default instance name",
     ),
+    (
+        "bank",
+        "skills/bank/default_workspace",
+        "Default workspace name",
+    ),
     ("xero", "skills/xero/default_entity", "Default entity name"),
     (
         "freeagent",
@@ -2308,6 +2370,7 @@ pub fn static_skill_tool_names(skill_name: &str) -> Vec<&'static str> {
         "linear" => adapters::linear::LinearSkill::tool_names(),
         "jira" => adapters::jira::JiraSkill::tool_names(),
         "datadog" => adapters::datadog::DatadogSkill::tool_names(),
+        "bank" => adapters::bank::BankSkill::tool_names(),
         "metabase" => adapters::metabase::MetabaseSkill::tool_names(),
         "xero" => adapters::xero::XeroSkill::tool_names(),
         "freeagent" => adapters::freeagent::FreeAgentSkill::tool_names(),
@@ -2367,6 +2430,7 @@ pub fn load_skill_from_vault(
         "linear" => load_linear_from_vault(vault, global_vault, config, registry),
         "jira" => load_jira_from_vault(vault, global_vault, config, registry),
         "datadog" => load_datadog_from_vault(vault, global_vault, config, registry),
+        "bank" => load_bank_from_vault(vault, global_vault, registry),
         "metabase" => load_metabase_from_vault(vault, global_vault, registry),
         "xero" => load_xero_from_vault(vault, global_vault, config, registry),
         "freeagent" => load_freeagent_from_vault(vault, global_vault, config, registry),
@@ -3221,6 +3285,44 @@ fn load_datadog_from_vault(
     Ok(SkillLoadResult {
         tool_names: names,
         context_hint,
+    })
+}
+
+/// The person's bank connections, read as whoever calls: nothing to load
+/// when the caller has none and none is shared.
+fn load_bank_from_vault(
+    vault: Arc<Vault>,
+    global_vault: Option<Arc<Vault>>,
+    registry: &ToolRegistry,
+) -> eyre::Result<SkillLoadResult> {
+    use workforce_skills::adapters::bank::{banksync, BankSkill};
+    let store = layered_user_store(vault, global_vault);
+    let paths = BankSkill::instance_paths();
+    if paths.names(store.as_ref()).is_empty() {
+        eyre::bail!("No bank connections. Set one up with connections.setup {{service: 'bank'}}.");
+    }
+    let selector = selector(store.as_ref(), "bank", "skills/bank/default_workspace");
+    let skill = BankSkill::with_store(store, selector, banksync::API);
+    registry.set_instance_source("bank", skill.instance_source());
+    let names: Vec<String> = skill
+        .tools()
+        .into_iter()
+        .map(|tool| {
+            let name = tool.name().to_string();
+            registry.register(tool);
+            name
+        })
+        .collect();
+    info!(
+        skill = "bank",
+        count = names.len(),
+        "Loaded skill from vault"
+    );
+    Ok(SkillLoadResult {
+        tool_names: names,
+        context_hint: Some(
+            "Bank: the person's own accounts, read only. Name the connection you read (`workspace`).".into(),
+        ),
     })
 }
 
@@ -4982,6 +5084,7 @@ mod tests {
             ("linear", "workspaces"),
             ("github", "workspaces"),
             ("datadog", "accounts"),
+            ("bank", "workspaces"),
             ("metabase", "instances"),
             ("postmark", "workspaces"),
             ("sendgrid", "workspaces"),
@@ -5612,6 +5715,7 @@ mod tests {
             ("linear", "linear."),
             ("jira", "jira."),
             ("datadog", "datadog."),
+            ("bank", "bank."),
             ("metabase", "metabase."),
             ("xero", "xero."),
             ("github", "github."),

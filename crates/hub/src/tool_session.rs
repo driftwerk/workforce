@@ -8,9 +8,9 @@
 //!   group's boss conversation's channel is refused outright
 //!   ([`crate::boss_links::conversation::refused_channel`]).
 //! - **Named by neither**: the current turn's session.
-//! - **Kept apart** (a boss conversation, or one a boss left behind): only
-//!   from inside itself, so no other conversation's turn reads or compacts
-//!   what it holds into its own memory.
+//! - **Kept apart** (a boss conversation, or one a boss left behind), or
+//!   having read the person's bank: only from inside itself, so no other
+//!   conversation's turn reads or compacts what it holds into its own memory.
 //!
 //! A call with no identity in scope reaches nothing.
 
@@ -58,8 +58,9 @@ pub fn resolve(
     let session = found.ok_or_else(|| NOT_FOUND.to_string())?;
     let own_turn = current.as_deref() == Some(session.id.as_str());
     let owned = identity.as_deref() == Some(session.owner.as_str());
-    // Its own turn's session, or another of the person's that isn't kept apart.
-    let reachable = own_turn || (owned && !session.kept_apart());
+    // Its own turn's session, or another of the person's that isn't kept
+    // apart and never read their bank.
+    let reachable = own_turn || (owned && !session.kept_apart() && !session.read_personal());
     if !reachable {
         return Err(NOT_FOUND.into());
     }
@@ -92,6 +93,9 @@ mod tests {
         let mut left = store.get_or_create("web", SAM, "allan").unwrap();
         left.metadata = serde_json::json!({ "desk_scope_left": "desk-group:acme" });
         store.save(&left).unwrap();
+        let mut banked = store.get_or_create("ios", SAM, "allan").unwrap();
+        banked.mark_read_personal();
+        store.save(&banked).unwrap();
 
         // From Sam's DM: his DM, by id, by channel or by default.
         as_sam(&sams.id, async {
@@ -106,6 +110,12 @@ mod tests {
             assert!(resolve(&store, None, Some("desk:boss:k")).is_err());
             assert!(resolve(&store, None, Some("DESK:BOSS:k")).is_err());
             assert!(resolve(&store, Some(&left.id), None).is_err());
+            assert!(resolve(&store, Some(&banked.id), None).is_err());
+            assert!(resolve(&store, None, Some("ios")).is_err());
+        })
+        .await;
+        as_sam(&banked.id, async {
+            assert_eq!(resolve(&store, None, None).unwrap().id, banked.id);
         })
         .await;
         // Naming a channel makes nothing.
