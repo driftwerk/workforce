@@ -723,12 +723,13 @@ impl CrewHub {
         self.machine_sight.lock().moved.retain(|k, _| kept(k));
     }
 
-    /// Notes that the plan session `item` on a machine was seen to move.
+    /// Notes that the plan session `item` on a machine was seen to move:
+    /// what was seen inside it before (its glance there, as it worked, or
+    /// as it finished) no longer says what it does.
     pub(super) fn machine_moved(&self, item: &str) {
-        self.machine_sight
-            .lock()
-            .moved
-            .insert(item.to_string(), Instant::now());
+        let mut seen = self.machine_sight.lock();
+        seen.moved.insert(item.to_string(), Instant::now());
+        seen.glances.remove(item);
     }
 
     /// Whether the plan session `item` on a machine hasn't moved for

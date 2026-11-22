@@ -1545,7 +1545,8 @@ async fn every_machine_call_is_refused_at_the_served_route() {
     .await;
 }
 
-/// A glance as a machine gives it: waiting on a build slot since `since`.
+/// A glance as a machine gives it: waiting on a build slot since `since`,
+/// in its call `toolu_1`.
 fn machine_glance(id: uuid::Uuid, since: chrono::DateTime<chrono::Utc>) -> Value {
     use workforce_desk::sight::{Glance, Kind, Reading, Wait};
     let g = Glance {
@@ -1555,7 +1556,8 @@ fn machine_glance(id: uuid::Uuid, since: chrono::DateTime<chrono::Utc>) -> Value
             since,
             by: Some("ssh".into()),
             on: None,
-            pid: None,
+            pid: Some(4242),
+            call: Some("toolu_1".into()),
         },
         open_call: None,
         transcript: None,

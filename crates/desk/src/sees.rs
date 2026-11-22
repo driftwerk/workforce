@@ -95,6 +95,7 @@ pub fn glance(g: Glance, sees: Sees) -> Glance {
                 failed: Vec::new(),
                 ..p
             }),
+            note: w.note.filter(|_| replies),
             ..w
         }),
         stall: None,
@@ -175,6 +176,7 @@ mod tests {
                 by: Some("ssh".into()),
                 on: Some("devbox".into()),
                 pid: None,
+                call: None,
             },
             open_call: Some(OpenCall {
                 id: "t1".into(),
@@ -206,7 +208,7 @@ mod tests {
                     failed: vec!["test".into()],
                     head_matches_local: Some(true),
                 }),
-                note: None,
+                note: Some("Its PR on acme/web is read as the person.".into()),
             }),
             stall: None,
         }
@@ -226,7 +228,26 @@ mod tests {
             (pr.number, pr.checks.as_str(), pr.failed.len()),
             (0, "failure", 0)
         );
+        assert_eq!(w.note, None, "nothing naming its repository");
         assert_eq!(g.transcript, seen().transcript);
+    }
+
+    #[test]
+    fn a_pr_at_status_is_said_without_a_number_or_checks_it_doesnt_show() {
+        let now = chrono::Utc::now();
+        let g = glance(seen(), Sees::Status);
+        let line = g.render(chrono_tz::UTC, now);
+        assert!(line.contains("PR: CI failure"), "{line}");
+        assert!(
+            !line.contains("PR #") && !line.contains("check named"),
+            "{line}"
+        );
+        let t = crate::sight::Thresholds {
+            quiet: chrono::Duration::zero(),
+            stall: chrono::Duration::zero(),
+        };
+        let s = crate::sight::verdict(&g, crate::model::SessionState::Done, now, t).unwrap();
+        assert_eq!(s.words, "its PR's CI failed");
     }
 
     #[test]
