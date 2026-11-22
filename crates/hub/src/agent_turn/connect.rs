@@ -53,6 +53,7 @@ impl Connect {
         self,
         progress: Option<&mpsc::Sender<ProgressEvent>>,
     ) -> ChainOutcome {
+        let resumes = self.prompt.resumes;
         if let Some(progress) = progress {
             for event in [
                 ProgressEvent::ConnectRequired {
@@ -66,7 +67,11 @@ impl Connect {
                 let _ = progress.send(event).await;
             }
         }
-        ChainOutcome::Notice { text: self.text }
+        ChainOutcome::Notice {
+            text: self.text,
+            resumes,
+            guard: None,
+        }
     }
 }
 

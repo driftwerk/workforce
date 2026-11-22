@@ -160,8 +160,12 @@ async fn in_the_quiet_hours_what_a_monitor_saw_waits_for_the_roundup_after_them(
             "{}",
             said.content
         );
-        let left = d.store().monitor_held_for("scout").await.unwrap();
-        assert_eq!(left.len(), 1, "the one still due later waits");
+        // The told one leaves the hold once its telling is recorded.
+        let left = eventually("only the one still due later", async || {
+            let left = d.store().monitor_held_for("scout").await.unwrap();
+            (left.len() == 1).then_some(left)
+        })
+        .await;
         assert_eq!(left[0].text, "Invoice from Acme: #42");
     })
     .await;

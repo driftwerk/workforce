@@ -456,6 +456,11 @@ const KEPT_WRITES: &[&str] = &[
     "decision.record",
 ];
 
+/// The tools whose `action` names what it acts on in full (`artifact`
+/// doing `artifact.share`), with the names it dispatches. A dotted action
+/// is taken at its word for these alone.
+const DOTTED_ACTIONS: &[(&str, &[&str])] = &[("artifact", &["artifact", "decision"])];
+
 /// The fields of an `http.request` beyond its URL and method: anything in
 /// them could carry what the turn read out.
 const HTTP_EXTRAS: &[&str] = &["query", "headers", "body", "body_text", "endpoint", "path"];
@@ -895,13 +900,27 @@ pub fn assess(
     let (namespace, leaf) = tool.rsplit_once('.').unwrap_or((tool, tool));
     let root = tool.split('.').next().unwrap_or(tool);
     let exfiltration = |to: String| AnomalySignal::Exfiltration { tool: owned(), to };
-    // What the call does, by tool and action: `artifact` doing
-    // `artifact.share` (an action that names its tool) or `share`, or the
-    // tool alone.
-    let does = match action.as_str() {
-        "" => tool.to_string(),
-        named if named.contains('.') => named.to_string(),
-        bare => format!("{tool}.{bare}"),
+    // What the call does, by tool and action: `{tool}.{action}`, or the
+    // tool alone. Only a tool whose actions name what they act on
+    // ([`DOTTED_ACTIONS`]) is taken at a dotted action's word, and only for
+    // the names it dispatches: any other tool's dotted action is its own.
+    let dotted = DOTTED_ACTIONS
+        .iter()
+        .find(|(name, _)| *name == tool)
+        .and_then(|(_, prefixes)| {
+            prefixes
+                .iter()
+                .any(|prefix| {
+                    action
+                        .strip_prefix(prefix)
+                        .is_some_and(|rest| rest.starts_with('.'))
+                })
+                .then(|| action.clone())
+        });
+    let does = match (dotted, action.as_str()) {
+        (Some(named), _) => named,
+        (None, "") => tool.to_string(),
+        (None, bare) => format!("{tool}.{bare}"),
     };
     let listed = |list: &[&str]| list.contains(&tool) || list.contains(&does.as_str());
     if CREDENTIAL_NAMESPACES.contains(&root) || names_a_secret(input) {
@@ -1176,7 +1195,12 @@ mod tests {
         );
         assert!(!held.refused);
         assert!(held.reason.contains("email from x@evil.example"));
-        for own in ["C1", "#c1", "C1 › thread 1.5", "C1 in T1", ""] {
+        // A post that names nowhere is not a confirmed post to the turn's
+        // own place: it is weighed as any call, and a send is a way out.
+        assert!(guard
+            .check("messaging.send", &json!({}), Some(&writes("slack", "")))
+            .is_some());
+        for own in ["C1", "#c1", "C1 › thread 1.5", "C1 in T1"] {
             assert_eq!(
                 guard.check("messaging.send", &json!({}), Some(&writes("slack", own))),
                 None,
@@ -1773,6 +1797,26 @@ mod tests {
             assert_eq!(guard.check(tool, &json!({}), None), None, "{tool}");
         }
         assert_eq!(guard.check("mcp", &json!({ "action": "list" }), None), None);
+    }
+
+    #[test]
+    fn a_dotted_action_is_taken_at_its_word_only_from_a_tool_that_dispatches_it() {
+        let guard = armed(delivering("C1"));
+        for (tool, action) in [
+            ("role.create", "role.list"),
+            ("skill.grant", "skill.grants"),
+            ("jira.create_issue", "artifact.read"),
+            ("artifact", "knowledge.search"),
+            ("artifact", "artifactx.read"),
+        ] {
+            let input = json!({ "action": action });
+            assert!(
+                guard.check(tool, &input, None).is_some(),
+                "{tool} doing {action}"
+            );
+        }
+        let read = json!({ "action": "decision.list" });
+        assert_eq!(guard.check("artifact", &read, None), None);
     }
 
     #[test]

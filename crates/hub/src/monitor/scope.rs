@@ -191,17 +191,28 @@ pub(crate) fn keep_turn(
     session: &mut workforce_common::session::Session,
     result: &workforce_agent::runner::RunResult,
 ) {
-    let waiting = result
-        .tool_invocations
-        .iter()
-        .any(|call| call.policy_decision == "require_approval");
-    session.set_turn_content_scope(
-        result
-            .guard
-            .as_ref()
-            .filter(|_| waiting)
-            .and_then(|scope| serde_json::to_value(scope).ok()),
-    );
+    keep_paused(session, result.guard.as_deref().filter(|_| paused(result)));
+}
+
+/// Whether the turn that gave `result` paused rather than finished: it
+/// waits on an approval, or stopped on its round budget for the person to
+/// say carry on. The turn that picks it up carries on from it.
+fn paused(result: &workforce_agent::runner::RunResult) -> bool {
+    result.budget_capped
+        || result.hit_round_cap
+        || result
+            .tool_invocations
+            .iter()
+            .any(|call| call.policy_decision == "require_approval")
+}
+
+/// Keep `scope` on `session` as the guard of the turn that picks up where
+/// this one paused; `None` when it finished and nothing is kept.
+pub(crate) fn keep_paused(
+    session: &mut workforce_common::session::Session,
+    scope: Option<&ContentScope>,
+) {
+    session.set_turn_content_scope(scope.and_then(|scope| serde_json::to_value(scope).ok()));
 }
 
 /// What keeps the guard of a turn on `session_id` as it arms and refuses,
@@ -209,6 +220,7 @@ pub(crate) fn keep_turn(
 /// off the runtime's threads, in the order the guard changed; once the
 /// turn is [`finish`](Self::finish)ed none lands, so the turn's own
 /// end ([`keep_turn`]) is the last word.
+#[derive(Clone)]
 pub(crate) struct TurnKeeper {
     sessions: Arc<dyn workforce_common::session::SessionStore>,
     session_id: String,
@@ -285,6 +297,45 @@ impl TurnKeeper {
         })
     }
 
+    /// What ends the turn's keeping if the turn is dropped before it
+    /// [`finish`](Self::finish)es: a stop, a timeout or a client gone clears
+    /// what it kept, as a turn that ended; a shutdown (`shutting_down`)
+    /// leaves it, for the turn a restart resumes.
+    pub(crate) fn on_drop(&self, shutting_down: fn() -> bool) -> DroppedTurn {
+        DroppedTurn {
+            keeper: Some(self.clone()),
+            shutting_down,
+        }
+    }
+
+    /// End the keeping now: nothing more is written, and unless `keep`
+    /// what was kept is cleared, under the same lock as every write.
+    fn end(&self, keep: bool) {
+        let (sessions, session_id, state) = (
+            Arc::clone(&self.sessions),
+            self.session_id.clone(),
+            Arc::clone(&self.state),
+        );
+        let end = move || {
+            let mut written = state.written.lock().unwrap_or_else(|e| e.into_inner());
+            written.finished = true;
+            if keep {
+                return;
+            }
+            if let Err(e) = sessions.merge_metadata(
+                &session_id,
+                serde_json::Map::new(),
+                &[workforce_common::session::TURN_CONTENT_SCOPE],
+            ) {
+                tracing::warn!(session = %session_id, error = %e, "A stopped turn's guard could not be cleared");
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => drop(runtime.spawn_blocking(end)),
+            Err(_) => end(),
+        }
+    }
+
     /// The turn ended: once this returns, no write of its keeper lands,
     /// one under way having finished first.
     pub(crate) async fn finish(&self) {
@@ -298,6 +349,28 @@ impl TurnKeeper {
         };
         if tokio::task::spawn_blocking(finish).await.is_err() {
             tracing::warn!(session = %self.session_id, "The turn's guard keeper could not be finished");
+        }
+    }
+}
+
+/// The end of a turn's keeping should the turn be dropped unfinished
+/// ([`TurnKeeper::on_drop`]); [`disarm`](Self::disarm)ed once it finishes.
+pub(crate) struct DroppedTurn {
+    keeper: Option<TurnKeeper>,
+    shutting_down: fn() -> bool,
+}
+
+impl DroppedTurn {
+    /// The turn finished: its own end is what it keeps.
+    pub(crate) fn disarm(mut self) {
+        self.keeper = None;
+    }
+}
+
+impl Drop for DroppedTurn {
+    fn drop(&mut self) {
+        if let Some(keeper) = self.keeper.take() {
+            keeper.end((self.shutting_down)());
         }
     }
 }
@@ -323,6 +396,45 @@ fn stopped_notice(monitor: &MonitorMeta, stops: &[AnomalySignal]) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A turn dropped unfinished: stopped, its kept guard is cleared; cut
+    /// off by a shutdown, it stays for the turn a restart resumes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_turn_clears_its_guard_unless_the_hub_is_shutting_down() {
+        use workforce_common::session::SessionStore;
+        for (shutting_down, kept_after) in [(false, false), (true, true)] {
+            let sessions: Arc<dyn SessionStore> =
+                Arc::new(workforce_common::session::InMemorySessionStore::new());
+            let id = sessions.get_or_create("web", "alice", "scout").unwrap().id;
+            let kept = || {
+                sessions
+                    .get(&id)
+                    .unwrap()
+                    .unwrap()
+                    .turn_content_scope()
+                    .is_some()
+            };
+            let turn = TurnKeeper::new(Arc::clone(&sessions), id.clone());
+            let dropped = turn.on_drop(match shutting_down {
+                true => || true,
+                false => || false,
+            });
+            turn.keeper()(&ContentScope {
+                armed: Some("email.read".into()),
+                ..ContentScope::default()
+            });
+            for _ in 0..200 {
+                if kept() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert!(kept());
+            drop(dropped);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert_eq!(kept(), kept_after, "shutting down: {shutting_down}");
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_keepers_write_after_the_turn_ends_never_brings_its_guard_back() {

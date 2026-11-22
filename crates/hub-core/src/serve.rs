@@ -3826,6 +3826,7 @@ pub mod tests {
         assert_eq!(
             remove,
             vec![
+                "turn_content_scope",
                 "round_cap_continuation",
                 "agent_engine:claude-code",
                 "agent_engine:codex"

@@ -394,8 +394,14 @@ pub enum ChainOutcome {
         route: RouteTag,
     },
     /// No route could serve, and the person the turn is for is told how to
-    /// make one: saved as the turn's answer, with nothing to bill.
-    Notice { text: String },
+    /// make one: saved as the turn's answer, with nothing to bill. When
+    /// the turn `resumes` once they do, it keeps the `guard` it paused
+    /// under.
+    Notice {
+        text: String,
+        resumes: bool,
+        guard: Option<Box<workforce_agent::security::monitor::ContentScope>>,
+    },
 }
 
 /// The route that served a turn.
@@ -611,7 +617,11 @@ async fn notice(text: String, progress: Option<&mpsc::Sender<ProgressEvent>>) ->
             let _ = progress.send(event).await;
         }
     }
-    ChainOutcome::Notice { text }
+    ChainOutcome::Notice {
+        text,
+        resumes: false,
+        guard: None,
+    }
 }
 
 /// No route of a turn could serve it; each says why.
@@ -647,9 +657,15 @@ impl TurnChain {
             Arc::clone(&service.sessions),
             turn.session.id.clone(),
         );
+        // Dropped unfinished (stopped, timed out, its client gone), the
+        // turn's kept guard is cleared; cut off by a shutdown it is left for
+        // the turn a restart resumes.
+        let dropped = keeper.on_drop(crate::shutdown::in_progress);
+        let keeps = keeper.keeper();
         // Every route runs under the turn's guard, made and armed from what
         // started the turn as a runner's turn is: a CLI engine's round is
-        // guarded as the runner's loop is.
+        // guarded as the runner's loop is. A guard kept for the session (a
+        // turn resumed) or the caller's is the one it arms.
         let started = turn
             .prior
             .iter()
@@ -659,16 +675,19 @@ impl TurnChain {
                 content: turn.task.clone(),
             }))
             .collect::<Vec<_>>();
+        let guard = workforce_agent::runner::with_content_guard(
+            kept,
+            workforce_agent::runner::with_guard_keeper(Some(Arc::clone(&keeps)), async {
+                workforce_agent::runner::guard_for_turn(&started, &service.tools)
+            }),
+        )
+        .await;
         let routes = Box::pin(workforce_agent::runner::with_guard_keeper(
-            Some(keeper.keeper()),
-            async move {
-                let guard = workforce_agent::runner::guard_for_turn(&started, &service.tools);
-                workforce_agent::runner::with_content_guard(
-                    Some(guard),
-                    self.run_routes(service, turn),
-                )
-                .await
-            },
+            Some(keeps),
+            workforce_agent::runner::with_content_guard(
+                Some(Arc::clone(&guard)),
+                self.run_routes(service, turn),
+            ),
         ));
         // A person's own route alone: what the turn finds missing or tells
         // them to connect is their own login, never a shared one.
@@ -678,15 +697,6 @@ impl TurnChain {
             true => Box::pin(crate::subscription::personal_logins_only(routes)),
             false => routes,
         };
-        let routes: std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<ChainOutcome>> + Send + '_>,
-        > = match kept {
-            Some(guard) => Box::pin(workforce_agent::runner::with_content_guard(
-                Some(guard),
-                routes,
-            )),
-            None => routes,
-        };
         let outcome = workforce_agent::llm::provider::with_effort_override(
             effort,
             workforce_agent::llm::provider::with_fast_mode(fast, routes),
@@ -695,7 +705,21 @@ impl TurnChain {
         // The turn's end is what it keeps: no write of its keeper lands
         // after it.
         keeper.finish().await;
-        outcome
+        dropped.disarm();
+        // A notice the turn resumes from once the person connects keeps
+        // the guard it paused under.
+        outcome.map(|outcome| match outcome {
+            ChainOutcome::Notice {
+                text,
+                resumes: true,
+                ..
+            } => ChainOutcome::Notice {
+                text,
+                resumes: true,
+                guard: guard.armed_scope(),
+            },
+            outcome => outcome,
+        })
     }
 
     async fn run_routes(&self, service: &AgentService, turn: TurnRun<'_>) -> Result<ChainOutcome> {
