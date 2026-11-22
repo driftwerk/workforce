@@ -325,15 +325,13 @@ pub struct CrewHub {
     /// [`actions::REUSE_CLAIM`] has passed.
     reuse_claims: Mutex<HashMap<uuid::Uuid, std::time::Instant>>,
     /// Calls for the person's machines, waiting for Desk's native side
-    /// ([`relay`]), and who waits for each answer.
-    relays: Mutex<relay::Relays>,
-    /// Told when a call is queued for a machine.
-    relay_queued: tokio::sync::Notify,
+    /// ([`relay`]), and who waits for each answer: while Desk hasn't asked
+    /// lately, nothing is queued and a machine is said not reached at once.
+    relay: relay::Relays,
+    /// When Desk's native side last reached this hub.
+    pub(crate) native: Arc<relay::NativeSeen>,
     /// How long a relayed call waits for its machine's answer.
     relay_wait: Mutex<Duration>,
-    /// When Desk's native side last asked for calls: while it hasn't
-    /// lately, nothing is queued and a machine is said not reached at once.
-    relay_polled: Mutex<Option<std::time::Instant>>,
     /// Each boss's mind: its own deciding, one stretch at a time
     /// ([`mind`]).
     minds: mind::Minds,
@@ -802,10 +800,9 @@ impl CrewHub {
             machine_read: Mutex::default(),
             machine_down: Mutex::default(),
             reuse_claims: Mutex::default(),
-            relays: Mutex::default(),
-            relay_queued: tokio::sync::Notify::new(),
+            relay: relay::relays(),
+            native: Arc::default(),
             relay_wait: Mutex::new(Duration::from_secs(30)),
-            relay_polled: Mutex::new(None),
             minds: mind::Minds::default(),
             notices: orchestrator::Notices::default(),
             watches_in_flight: Mutex::default(),
@@ -1303,6 +1300,16 @@ impl CrewHub {
         self.overseers()
             .into_iter()
             .find(|(_, o)| o.scope == *scope)
+    }
+
+    /// What the person calls boss `boss`: its name now, whether or not it
+    /// still oversees; a boss gone from the hub is
+    /// [`workforce_desk::crew::UNNAMED_BOSS`].
+    pub(super) fn boss_name_of(&self, boss: &str) -> String {
+        self.state.registry.get(boss).map_or_else(
+            || workforce_desk::crew::shown_name(boss, None, true),
+            |s| name_of(&s),
+        )
     }
 
     /// The overseer `agent` and its settings, while it oversees.

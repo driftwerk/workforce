@@ -45,6 +45,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
@@ -52,6 +53,7 @@ use uuid::Uuid;
 use workforce_common::settings::VaultActor;
 use workforce_desk::board::{Filter, Paused, System, Via};
 use workforce_desk::board_sync::{self as sync, Remote, RemoteError, RemoteState};
+use workforce_desk::github_sync as gh;
 use workforce_desk::{Desk, DeskError, LinkBoard};
 use workforce_mcp_client::{McpClient, McpError, McpLimits, StaticBearer};
 
@@ -368,44 +370,85 @@ pub struct Reached {
     pub agent: Option<String>,
 }
 
+/// What a link asks of a person's connections there, for
+/// [`BoardSync::github_connection`].
+struct Wanted<'a> {
+    system: System,
+    names: &'a [String],
+    default: Option<&'a str>,
+    asked: Option<&'a str>,
+    target: Option<&'a str>,
+    owner: Option<&'a str>,
+}
+
+/// Why a link can't go through a GitHub connection yet: the ones to pick
+/// from, and why, as the dialog says it.
+struct PickConnection {
+    names: Vec<String>,
+    why: String,
+}
+
 // ── This hub's own tools ─────────────────────────────────────────────────
 
-/// This hub's own `jira.*` / `linear.*` tools, with the person's keys from
-/// its vault, run through the gate chain remote MCP runs, as the person.
+/// One of this hub's agents' own `jira.*` / `linear.*` / `github.*` tools
+/// (`agent`, else the default's), with the person's keys from its vault,
+/// run through the gate chain remote MCP runs, as the person. An agent that
+/// is gone or doesn't let the person in offers them nothing, as a linked
+/// hub's does.
 pub struct LocalRemote {
     state: Arc<GatewayState>,
     person: String,
     system: System,
+    agent: Option<String>,
+    adapters: Arc<crate::remote_mcp::server::AdapterChecks>,
 }
 
 impl LocalRemote {
-    pub fn new(state: Arc<GatewayState>, person: &str, system: System) -> Self {
+    pub(crate) fn new(
+        state: Arc<GatewayState>,
+        person: &str,
+        system: System,
+        agent: Option<&str>,
+        adapters: Arc<crate::remote_mcp::server::AdapterChecks>,
+    ) -> Self {
         Self {
             state,
             person: person.to_string(),
             system,
+            agent: agent.map(str::to_string),
+            adapters,
         }
     }
 
-    fn service(&self) -> Result<Arc<crate::serve::AgentService>, RemoteError> {
-        self.state
-            .registry
-            .default_agent()
-            .ok_or_else(|| RemoteError::Refused("this hub runs no agent".into()))
+    fn service(&self) -> Option<Arc<crate::serve::AgentService>> {
+        crate::remote_mcp::access::reachable(&self.state, &self.person, self.agent.as_deref()).ok()
     }
 
     /// The registry's tools the sync may call for this system, its adapter
     /// loaded first with the person's keys, as a turn of theirs loads it: a
     /// key they keep for themselves otherwise reaches the registry only once
-    /// some turn of theirs has used it.
+    /// some turn of theirs has used it. An adapter that isn't loaded is
+    /// looked at once in [`crate::remote_mcp::server::ADAPTERS_RECHECK`] per
+    /// agent, person and system, as remote MCP looks at a person's.
     fn surface(
         &self,
         service: &crate::serve::AgentService,
     ) -> workforce_agent::tools::registry::ToolRegistry {
         let skill = self.system.as_str();
-        workforce_agent::runner::CURRENT_USER_ID.sync_scope(self.person.clone(), || {
-            crate::skill_loader::ensure_adapters_loaded(service, |s| s == skill)
-        });
+        let due = || {
+            self.adapters.due(
+                (
+                    service.agent_id.to_string(),
+                    format!("{}/{skill}", self.person),
+                ),
+                (),
+            )
+        };
+        if !crate::skill_loader::skill_tools_registered(skill, &service.tools) && due() {
+            workforce_agent::runner::CURRENT_USER_ID.sync_scope(self.person.clone(), || {
+                crate::skill_loader::ensure_adapters_loaded(service, |s| s == skill)
+            });
+        }
         let patterns: Vec<String> = sync::callable(self.system)
             .iter()
             .map(|t| t.to_string())
@@ -417,8 +460,10 @@ impl LocalRemote {
 #[async_trait]
 impl Remote for LocalRemote {
     async fn tools(&self) -> Result<Vec<String>, RemoteError> {
-        let service = self.service()?;
-        Ok(self.surface(&service).names())
+        Ok(self
+            .service()
+            .map(|service| self.surface(&service).names())
+            .unwrap_or_default())
     }
 
     async fn call(&self, tool: &str, args: Value) -> Result<Value, RemoteError> {
@@ -436,7 +481,9 @@ impl LocalRemote {
     async fn run(&self, tool: &str, args: Value, quiet: bool) -> Result<Value, RemoteError> {
         use crate::mcp::ToolCallExecutor as _;
         use crate::mcp_gate::{ApprovalMode, CallAudit, CallOrigin, CallSite, GatedExecutor};
-        let service = self.service()?;
+        let service = self
+            .service()
+            .ok_or_else(|| RemoteError::Missing(tool.to_string()))?;
         let surface = Arc::new(self.surface(&service));
         let Some(t) = surface.get(tool) else {
             return Err(RemoteError::Missing(tool.to_string()));
@@ -493,7 +540,17 @@ pub struct BoardSync {
     /// loop for them.
     kicked: std::sync::Mutex<std::collections::HashSet<Uuid>>,
     wake: tokio::sync::Notify,
+    /// When this computer's adapters were last looked at ([`LocalRemote`]).
+    adapters: Arc<crate::remote_mcp::server::AdapterChecks>,
+    /// Whether a GitHub connection reaches what a link names, as last
+    /// asked ([`Self::reaches`]).
+    reached: crate::recent::Recent<String, bool>,
 }
+
+/// The most agents, or GitHub connections, asked at once.
+const PROBES_AT_ONCE: usize = 4;
+/// How long whether a connection reaches a link's target is kept.
+const REACH_RECHECK: Duration = Duration::from_secs(60);
 
 impl BoardSync {
     pub fn new(state: Arc<GatewayState>, desk: Desk) -> Self {
@@ -509,6 +566,8 @@ impl BoardSync {
             http: Arc::new(http),
             kicked: Default::default(),
             wake: tokio::sync::Notify::new(),
+            adapters: Arc::new(crate::remote_mcp::server::adapter_checks()),
+            reached: crate::recent::Recent::new(REACH_RECHECK),
         }
     }
 
@@ -680,6 +739,8 @@ impl BoardSync {
                 Arc::clone(&self.state),
                 person,
                 system,
+                agent,
+                Arc::clone(&self.adapters),
             ))),
             Via::Hub { hub } => {
                 let h = self
@@ -701,12 +762,10 @@ impl BoardSync {
     }
 
     /// What reaches every tool `system`'s sync needs, and the agent that
-    /// offers them: on a hub, `prefer` (the board's agent) first, then the
-    /// agents the person may reach there (`GET /mcp/agents`), its default
-    /// first, since a hub offers each agent's own tools. The plain `/mcp`
-    /// (the default agent, whoever it admits) only on an older hub without
-    /// that list. None of them: `Missing`; no agent that lets the person
-    /// in: `Refused`.
+    /// offers them: `prefer` (the board's agent) first, then the agents the
+    /// person may reach there ([`Self::candidates`]), its default first,
+    /// since each agent offers its own tools. None of them: `Missing`; no
+    /// agent that lets the person in: `Refused`.
     pub async fn offered(
         &self,
         system: System,
@@ -730,9 +789,6 @@ impl BoardSync {
                 missing => Err(Paused::Missing { tools: missing }),
             }
         };
-        let Via::Hub { hub } = via else {
-            return probe(None).await;
-        };
         // A token refused or a hub away: no agent there will do.
         let fatal = |p: &Paused| {
             matches!(
@@ -752,46 +808,20 @@ impl BoardSync {
                 Err(p) => other = Some(p),
             }
         }
-        // Then every agent the person may reach there, asked at once and
-        // taken in the hub's order, its default first.
-        let h = self
-            .desk
-            .sync_hub(hub)
-            .await
-            .ok()
-            .flatten()
-            .ok_or(Paused::HubUnpaired)?;
-        let vault = self.state.vault.as_ref().ok_or(Paused::NoToken)?;
-        let token = read_token(vault, person, hub).ok_or(Paused::NoToken)?;
-        let rest: Vec<Option<String>> = match hub_agents(&h.url, &token, &self.http)
-            .await
-            .map_err(|e| paused_by(&e))?
-        {
-            // An older hub, without the list: its default agent only.
-            None => vec![None],
-            Some(agents) if agents.is_empty() => {
-                return Err(Paused::Refused {
-                    reason: NO_AGENT_LETS_YOU_IN.into(),
-                })
-            }
-            Some(agents) => agents
-                .into_iter()
-                .filter(|a| Some(a.as_str()) != prefer)
-                .map(Some)
-                .collect(),
-        };
+        let rest: Vec<Option<String>> = self
+            .candidates(via, person)
+            .await?
+            .into_iter()
+            .filter(|a| a.is_none() || a.as_deref() != prefer)
+            .collect();
         // The first (the default, where it lets the person in) alone, as
-        // it most often has them; then the others at once.
+        // it most often has them; then the others a few at once, in order,
+        // until one has them.
         let mut rest = rest.into_iter();
-        let mut found: Vec<Result<Reached, Paused>> = vec![];
-        if let Some(first) = rest.next() {
-            match probe(first).await {
-                Ok(r) => return Ok(r),
-                Err(p) => found.push(Err(p)),
-            }
-        }
-        found.extend(futures::future::join_all(rest.map(probe)).await);
-        for found in found {
+        let first = futures::stream::iter(rest.next()).then(probe);
+        let others = futures::stream::iter(rest.map(probe)).buffered(PROBES_AT_ONCE);
+        let mut found = std::pin::pin!(first.chain(others));
+        while let Some(found) = found.next().await {
             match found {
                 Ok(r) => return Ok(r),
                 Err(p @ Paused::Missing { .. }) => missing = missing.or(Some(p)),
@@ -804,6 +834,153 @@ impl BoardSync {
                 .map(|t| t.to_string())
                 .collect(),
         }))
+    }
+
+    /// The agents `person` may reach `via` a hub, in the order they are
+    /// asked, its default first: this hub's roster as remote MCP serves it,
+    /// or a linked hub's `GET /mcp/agents`. `[None]` (its default agent
+    /// only) for an older hub without that list; none at all: `Refused`.
+    async fn candidates(&self, via: &Via, person: &str) -> Result<Vec<Option<String>>, Paused> {
+        let agents = match via {
+            Via::ThisHub => {
+                let default = self.state.registry.default_id().to_string();
+                let mut ids = crate::remote_mcp::access::reachable_ids(&self.state, person);
+                ids.sort_by_key(|id| *id != default);
+                Some(ids)
+            }
+            Via::Hub { hub } => {
+                let h = self
+                    .desk
+                    .sync_hub(hub)
+                    .await
+                    .ok()
+                    .flatten()
+                    .ok_or(Paused::HubUnpaired)?;
+                let vault = self.state.vault.as_ref().ok_or(Paused::NoToken)?;
+                let token = read_token(vault, person, hub).ok_or(Paused::NoToken)?;
+                hub_agents(&h.url, &token, &self.http)
+                    .await
+                    .map_err(|e| paused_by(&e))?
+            }
+        };
+        match agents {
+            None => Ok(vec![None]),
+            Some(agents) if agents.is_empty() => Err(Paused::Refused {
+                reason: NO_AGENT_LETS_YOU_IN.into(),
+            }),
+            Some(agents) => Ok(agents.into_iter().map(Some).collect()),
+        }
+    }
+
+    /// Which of the person's several GitHub connections there a link goes
+    /// through: the one they picked, unless GitHub says it can't reach what
+    /// the link names; else the default, unless GitHub says the same of it;
+    /// else the only other that does, the others asked a few at once.
+    /// `None`: nothing to choose (Jira or Linear, one connection, nothing
+    /// named, a pick that isn't theirs, or none reaching it), so the link
+    /// goes on as asked.
+    async fn github_connection(
+        &self,
+        via: &Via,
+        person: &str,
+        reached: &Reached,
+        wanted: Wanted<'_>,
+    ) -> Result<Option<String>, PickConnection> {
+        let Wanted {
+            system,
+            names,
+            default,
+            asked,
+            target,
+            owner,
+        } = wanted;
+        if system != System::Github || names.len() < 2 {
+            return Ok(None);
+        }
+        let Some((tool, args)) = gh::reach_probe(target, owner) else {
+            return Ok(None);
+        };
+        let named = target.or(owner).unwrap_or_default();
+        let key = format!("{person}|{via:?}|{:?}|{tool}|{args}", reached.agent);
+        let (key, args, remote) = (&key, &args, &reached.remote);
+        if let Some(asked) = asked.filter(|a| names.iter().any(|n| n == a)) {
+            return match self.reaches(remote, key, asked, tool, args).await {
+                gh::Reach::No => Err(PickConnection {
+                    names: names.to_vec(),
+                    why: format!(
+                        "Your GitHub connection {asked} can't reach {named}: pick another."
+                    ),
+                }),
+                gh::Reach::Yes | gh::Reach::Unknown => Ok(Some(asked.to_string())),
+            };
+        }
+        if asked.is_some() {
+            return Ok(None);
+        }
+        let default = default.filter(|d| names.iter().any(|n| n == d));
+        if let Some(d) = default {
+            match self.reaches(remote, key, d, tool, args).await {
+                gh::Reach::Yes | gh::Reach::Unknown => return Ok(Some(d.to_string())),
+                gh::Reach::No => {}
+            }
+        }
+        let others: Vec<_> = names
+            .iter()
+            .filter(|n| Some(n.as_str()) != default)
+            .map(|name| self.reaching(remote, key, name, tool, args))
+            .collect();
+        let reaching: Vec<String> = futures::stream::iter(others)
+            .buffered(PROBES_AT_ONCE)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+        match gh::among(reaching) {
+            Some(gh::Connection::Use(one)) => Ok(Some(one)),
+            Some(gh::Connection::Ask(several)) => Err(PickConnection {
+                why: sync::workspace_words(&workspace_kind(system), None, &several),
+                names: several,
+            }),
+            None => Ok(None),
+        }
+    }
+
+    /// `name`, if it reaches what `tool` reads ([`Self::reaches`]).
+    async fn reaching(
+        &self,
+        remote: &Arc<dyn Remote>,
+        key: &str,
+        name: &str,
+        tool: &'static str,
+        args: &Value,
+    ) -> Option<String> {
+        (self.reaches(remote, key, name, tool, args).await == gh::Reach::Yes)
+            .then(|| name.to_string())
+    }
+
+    /// Whether GitHub connection `name` reaches what `tool` reads, as last
+    /// asked under `key` within [`REACH_RECHECK`]; asked now otherwise. An
+    /// answer GitHub couldn't give isn't kept.
+    async fn reaches(
+        &self,
+        remote: &Arc<dyn Remote>,
+        key: &str,
+        name: &str,
+        tool: &'static str,
+        args: &Value,
+    ) -> gh::Reach {
+        let key = format!("{key}|{name}");
+        if let Some(yes) = self.reached.get(&key) {
+            return if yes { gh::Reach::Yes } else { gh::Reach::No };
+        }
+        let through = sync::in_workspace(Arc::clone(remote), System::Github, Some(name));
+        let answer = sync::call_quiet(&*through, System::Github, tool, args.clone()).await;
+        let reach = gh::reach_of(tool, &answer);
+        if reach != gh::Reach::Unknown {
+            self.reached.put(key, reach == gh::Reach::Yes);
+        }
+        reach
     }
 
     /// The linked hub that offers `system`'s tools to `person`, if any: a
@@ -830,7 +1007,7 @@ impl BoardSync {
     /// The name a board's hub goes by, for what the board says.
     pub async fn hub_name(&self, via: &Via) -> String {
         match via {
-            Via::ThisHub => "This computer".to_string(),
+            Via::ThisHub => workforce_desk::board::THIS_COMPUTER.to_string(),
             Via::Hub { hub } => self
                 .desk
                 .sync_hub(hub)
@@ -866,7 +1043,8 @@ pub fn paused_by(e: &RemoteError) -> Paused {
 /// words.
 fn missing_words(hub: &str, system: System, _tools: &[String]) -> String {
     format!(
-        "No agent on {hub} you can reach has {} switched on.",
+        "No agent on {} you can reach has {} switched on.",
+        workforce_desk::board::in_sentence(hub),
         system.title()
     )
 }
@@ -1460,13 +1638,7 @@ async fn check_link(
     let hub = r.sync.hub_name(&body.via).await;
     let reached = match r
         .sync
-        .offered(
-            body.system,
-            &body.via,
-            &person,
-            None,
-            body.workspace.as_deref(),
-        )
+        .offered(body.system, &body.via, &person, None, None)
         .await
     {
         Ok(reached) => reached,
@@ -1478,7 +1650,6 @@ async fn check_link(
                 .into_response()
         }
     };
-    let remote = reached.remote;
     // Which agent there offers the tools: "Jira through Lattice".
     let mut out = json!({
         "offered": true,
@@ -1486,8 +1657,32 @@ async fn check_link(
     });
     // The person's workspaces there, where they have several: one is
     // picked before any team or project is listed, and every call after
-    // names it.
-    let listed = sync::workspaces(&*remote, body.system).await;
+    // names it. Of several GitHub connections, the one that reaches the
+    // owner or target named.
+    let listed = sync::workspaces(&*reached.remote, body.system).await;
+    if let Some((names, default)) = &listed {
+        let wanted = Wanted {
+            system: body.system,
+            names,
+            default: default.as_deref(),
+            asked: body.workspace.as_deref(),
+            target: body.target.as_deref(),
+            owner: body.owner.as_deref(),
+        };
+        match r
+            .sync
+            .github_connection(&body.via, &person, &reached, wanted)
+            .await
+        {
+            Ok(chosen) => body.workspace = chosen.or(body.workspace),
+            Err(pick) => {
+                out["workspaces"] = json!(pick.names);
+                out["workspaceWhy"] = json!(pick.why);
+                return Json(out).into_response();
+            }
+        }
+    }
+    let remote = sync::in_workspace(reached.remote, body.system, body.workspace.as_deref());
     if let Some((names, default)) = &listed {
         if names.len() > 1 {
             out["workspaces"] = json!(names);
@@ -1880,21 +2075,12 @@ async fn link_board(
         }
     }
     let hub = r.sync.hub_name(&link.via).await;
-    let remote = match r
+    let reached = match r
         .sync
-        .offered(
-            link.system,
-            &link.via,
-            &person,
-            None,
-            link.workspace.as_deref(),
-        )
+        .offered(link.system, &link.via, &person, None, None)
         .await
     {
-        Ok(reached) => {
-            link.agent = reached.agent;
-            reached.remote
-        }
+        Ok(reached) => reached,
         Err(p) => {
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -1906,8 +2092,25 @@ async fn link_board(
     // The workspace it syncs, kept on the link and named on every call:
     // the one picked, which must be the person's there; else the one a call
     // naming none goes to, so a workspace they add later changes nothing.
-    // With several and none of them the default, one must be picked.
-    if let Some((names, default)) = sync::workspaces(&*remote, link.system).await {
+    // With several and none of them the default, one must be picked. Of
+    // several GitHub connections, the one that reaches the target.
+    if let Some((names, default)) = sync::workspaces(&*reached.remote, link.system).await {
+        let wanted = Wanted {
+            system: link.system,
+            names: &names,
+            default: default.as_deref(),
+            asked: link.workspace.as_deref(),
+            target: Some(&link.target),
+            owner: None,
+        };
+        match r
+            .sync
+            .github_connection(&link.via, &person, &reached, wanted)
+            .await
+        {
+            Ok(chosen) => link.workspace = chosen.or(link.workspace.take()),
+            Err(pick) => return refusal(StatusCode::BAD_REQUEST, &pick.why),
+        }
         match link.workspace.as_ref() {
             Some(w) if !names.contains(w) => {
                 return refusal(
@@ -1929,12 +2132,15 @@ async fn link_board(
             None => {}
         }
     }
+    link.agent = reached.agent;
+    let remote = sync::in_workspace(reached.remote, link.system, link.workspace.as_deref());
     // Who the person is there, kept on the link for "assigned to me",
     // Mine and Take it; an id they typed is theirs to keep.
     match &link.me {
         _ if link.not_me && link.me.is_none() => {
             link.me_note = Some(format!(
-                "You said {hub}'s answer of who you are on {} isn't you: check again once it's right.",
+                "You said {}'s answer of who you are on {} isn't you: check again once it's right.",
+                workforce_desk::board::in_sentence(&hub),
                 link.system.title()
             ));
         }
@@ -2232,7 +2438,7 @@ async fn github_states(
     target: &str,
     target_id: Option<&str>,
 ) -> Result<Vec<RemoteState>, RemoteError> {
-    use workforce_desk::github_sync::{self as gh, Target};
+    use workforce_desk::github_sync::Target;
     match gh::target_of(target) {
         Some(Target::Project { owner, number }) => {
             let p = sync::call(
@@ -2276,7 +2482,7 @@ async fn github_project_id(
     remote: &dyn Remote,
     target: &str,
 ) -> Result<Option<String>, RemoteError> {
-    use workforce_desk::github_sync::{self as gh, Target};
+    use workforce_desk::github_sync::Target;
     let Some(Target::Project { owner, number }) = gh::target_of(target) else {
         return Ok(None);
     };
@@ -2305,7 +2511,7 @@ async fn github_matches(
     me: Option<&str>,
     page: Option<&str>,
 ) -> Result<(usize, Option<String>), RemoteError> {
-    use workforce_desk::github_sync::{self as gh, Target};
+    use workforce_desk::github_sync::Target;
     match gh::target_of(target) {
         Some(Target::Project { .. }) => {
             let mut args = json!({ "project_id": target_id.unwrap_or_default() });

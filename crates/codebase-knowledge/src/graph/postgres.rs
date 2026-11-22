@@ -1595,13 +1595,24 @@ mod tests {
             PostgresCodeGraphBackend::ensure_fill_index(&pool)
                 .await
                 .unwrap();
-            let begun = std::time::Instant::now();
-            while valid().await != Some(true) {
-                assert!(begun.elapsed() < std::time::Duration::from_secs(20));
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-            // As an interrupted build leaves it.
+            let rebuilt = || async {
+                let begun = std::time::Instant::now();
+                while valid().await != Some(true) {
+                    assert!(begun.elapsed() < std::time::Duration::from_secs(20));
+                    PostgresCodeGraphBackend::ensure_fill_index(&pool)
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            };
+            rebuilt().await;
+            // As an interrupted build leaves it, with the build's lock held
+            // so the hub's own keeper can't rebuild it meanwhile.
             let conn = pool.get().await.unwrap();
+            let lock = PostgresCodeGraphBackend::FILL_INDEX_BUILDING;
+            conn.execute("SELECT pg_advisory_lock($1)", &[&lock])
+                .await
+                .unwrap();
             conn.execute(
                 "UPDATE pg_index SET indisvalid = false WHERE indexrelid = \
                  (SELECT oid FROM pg_class WHERE relname = 'idx_entities_repo_id')",
@@ -1610,10 +1621,10 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(valid().await, Some(false));
-            PostgresCodeGraphBackend::ensure_fill_index(&pool)
+            conn.execute("SELECT pg_advisory_unlock($1)", &[&lock])
                 .await
                 .unwrap();
-            assert_eq!(valid().await, Some(true));
+            rebuilt().await;
         })
         .await;
     }

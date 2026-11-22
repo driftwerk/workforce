@@ -923,6 +923,49 @@ async fn a_tickets_session_runs_the_tickets_model() {
     .await;
 }
 
+/// A ticket's session starts with its folder's dependencies made ready,
+/// or told why they weren't.
+#[tokio::test]
+async fn a_tickets_session_is_told_of_its_folders_dependencies() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"x"}"#).unwrap();
+        let d = desk(pool, dir.path()).await;
+        let p = d
+            .propose_plan(new_plan(dir.path(), &[("a", &[])]), &sarah(), &by_sarah())
+            .await
+            .unwrap();
+        let p = d
+            .approve_plan(p.summary.plan.id, 1, &By::you())
+            .await
+            .unwrap();
+        let start = Start {
+            repo: None,
+            ticket: p.tickets[0].ticket.ticket.id,
+            engine: Engine::Claude,
+            folder: dir.path().to_string_lossy().into_owned(),
+            view: None,
+            worktree: false,
+        };
+        let a = d
+            .plan_start(&p.summary.plan, &start, &sarah(), &by_sarah())
+            .await
+            .unwrap();
+        let v = d.view(a.id).unwrap();
+        assert_eq!(
+            v.deps,
+            Some(crate::deps::Deps::Left {
+                why: "it has no lockfile".into()
+            })
+        );
+        assert!(v
+            .last_prompt
+            .unwrap()
+            .contains("Desk didn't install this folder's dependencies: it has no lockfile."));
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn a_paused_plan_starts_nothing_until_the_person_resumes_it() {
     with_test_pool(build_pool, |pool| async move {

@@ -2034,6 +2034,7 @@ async fn a_plans_ticket_on_a_machine_starts_there_once_and_its_turns_wake_the_bo
         assert_eq!(sent[0]["name"], json!(key));
         assert_eq!(sent[0]["cwd"], "/home/dev/vellev");
         assert_eq!(sent[0]["model"], "claude-opus-4-8");
+        assert_eq!(sent[0]["deps"], true, "its folder is made ready there");
         assert!(
             sent[0]["prompt"]
                 .as_str()
@@ -2484,7 +2485,7 @@ async fn a_boss_runs_a_check_on_a_machine_and_what_no_boss_does_is_the_persons()
                 }
             })
         };
-        eventually("Desk polling", async || crew.relay_polled.lock().is_some().then_some(())).await;
+        eventually("Desk polling", async || crew.relay.polled_ever().then_some(())).await;
         // Read: run, judged there at Act.
         let r = run
             .execute(json!({ "machine": "devbox", "command": "git status", "reason": "Is it clean?" }))
