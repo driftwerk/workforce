@@ -342,7 +342,7 @@ impl CrewHub {
                 .filter(|(.., at)| at.elapsed() < MACHINE_GLANCE_FOR)
                 .map(|(g, state, _)| (g.clone(), *state))?,
         };
-        let stall = sight::verdict(&g, state, chrono::Utc::now(), self.thresholds(o));
+        let stall = sight::verdict(&g, state, chrono::Utc::now(), self.stall_thresholds(o));
         Some((g, stall))
     }
 
