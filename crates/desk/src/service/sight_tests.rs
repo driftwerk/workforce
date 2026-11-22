@@ -244,6 +244,63 @@ async fn only_a_new_line_of_the_open_calls_own_output_says_a_wait_and_it_shows_o
 }
 
 #[tokio::test]
+async fn a_background_shells_own_new_line_says_its_wait_once_the_turn_has_ended() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = working_cli(dir.path(), "Started the tests in the background");
+        let opts = options_with(dir.path(), cli, sight_in(dir.path()));
+        let d = desk_with(pool, opts, redacting()).await;
+        let s = new_session(&d, dir.path()).await;
+        let tasks = working_on_a_bash_call(&d, dir.path(), s.id).await;
+        let transcript = dir
+            .path()
+            .join("projects")
+            .join("-p")
+            .join(format!("{}.jsonl", s.id));
+        let at = chrono::Utc::now().to_rfc3339();
+        let result = json!({"type": "user", "timestamp": at, "uuid": "u2",
+            "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_1",
+            "content": "Command running in background with ID: b9"}]}});
+        let ended = json!({"type": "assistant", "timestamp": at, "uuid": "u3",
+            "message": {"stop_reason": "end_turn", "content": [{"type": "text", "text": "Started."}]}});
+        append(&transcript, &format!("{result}\n{ended}\n"));
+        let shell = tasks.join("b9.output");
+        append(&shell, "rbuild: all 3 build slots are busy; waiting for one\n");
+        post(
+            &d,
+            s.id,
+            json!({"hook_event_name": "Stop", "background_tasks": [
+                {"id": "b9", "type": "shell", "status": "running", "command": "rbuild w -- cargo test"}]}),
+        )
+        .await;
+        assert_eq!(d.view(s.id).unwrap().state, SessionState::Done);
+
+        let first = sampled_until(&d, s.id, has_shell).await;
+        assert_eq!(first.open_call, None, "its turn ended");
+        let next = sampled_until(&d, s.id, |s| s.at > first.at).await;
+        assert_ne!(
+            next.reading.kind,
+            Kind::Waits(Wait::Queue),
+            "a line there before Desk looked is no wait"
+        );
+
+        let before = chrono::Utc::now();
+        append(&shell, "   Compiling x\nrbuild: all 3 build slots are busy; waiting for one\n");
+        let seen = sampled_until(&d, s.id, |s| s.waits.is_some()).await;
+        assert_eq!(seen.reading.kind, Kind::Waits(Wait::Queue));
+        assert_eq!(seen.reading.words, "waiting for a build slot");
+        assert_eq!(seen.reading.call.as_deref(), Some("b9"));
+        assert!(seen.reading.since >= before, "since the line appeared");
+
+        append(&shell, "test a ... ok\n");
+        let after = sampled_until(&d, s.id, |s| s.waits.is_none()).await;
+        assert_ne!(after.reading.kind, Kind::Waits(Wait::Queue));
+        kill_work(&after);
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn a_root_ticking_its_screen_is_neither_work_nor_output() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();

@@ -106,10 +106,11 @@ pub fn said_wait(line: &str) -> Option<(Wait, String)> {
     })
 }
 
-/// What an open call's own output last said it waits on, and since when.
+/// What an open call's or a background shell's own output last said it
+/// waits on, and since when.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Said {
-    /// The call's id.
+    /// The call's or the shell's id.
     pub call: String,
     pub wait: Wait,
     pub words: String,
@@ -263,8 +264,9 @@ pub struct Evidence<'a> {
     /// The session's work, root first ([`work`]).
     pub tree: &'a [&'a Stat],
     pub open_call: Option<&'a OpenCall>,
-    /// What the open call's own output says it waits on.
-    pub said: Option<&'a Said>,
+    /// What the open call's and its background shells' own output says
+    /// each waits on.
+    pub said: &'a [Said],
     /// When its processes last used the CPU.
     pub active_at: DateTime<Utc>,
     pub now: DateTime<Utc>,
@@ -325,17 +327,22 @@ pub fn classify(e: &Evidence<'_>) -> Reading {
         .unwrap_or_else(|| otherwise(e, &below))
 }
 
+/// The open call's own wait, else its background shells' longest.
 fn said_rule(e: &Evidence<'_>, below: &[&Stat]) -> Option<Reading> {
-    let call = e.open_call?;
-    let said = e.said.filter(|s| s.call == call.id)?;
+    let own = e
+        .open_call
+        .and_then(|c| Some((e.said.iter().find(|s| s.call == c.id)?, Some(c))));
+    let (said, call) = own.or_else(|| Some((e.said.iter().min_by_key(|s| s.since)?, None)))?;
     Some(Reading {
         kind: Kind::Waits(said.wait),
         words: said.words.clone(),
         since: said.since,
-        by: Some(call.tool.clone()),
+        by: call.map(|c| c.tool.clone()),
         on: None,
-        pid: call_shell(below, call, e.now).map(|s| s.proc.pid),
-        call: Some(call.id.clone()),
+        pid: call
+            .and_then(|c| call_shell(below, c, e.now))
+            .map(|s| s.proc.pid),
+        call: Some(said.call.clone()),
     })
 }
 
@@ -560,7 +567,7 @@ mod tests {
         classify(&Evidence {
             tree: &tree,
             open_call: said.as_ref().map(|_| &call),
-            said: said.as_ref(),
+            said: said.as_slice(),
             active_at: now() - Duration::minutes(active_ago),
             now: now(),
             poll: Duration::minutes(10),
@@ -695,7 +702,7 @@ mod tests {
         let r = classify(&Evidence {
             tree: &tree,
             open_call: Some(&call),
-            said: said.as_ref(),
+            said: said.as_slice(),
             active_at: now(),
             now: now(),
             poll: Duration::minutes(10),
@@ -731,29 +738,46 @@ mod tests {
     }
 
     #[test]
-    fn a_wait_said_with_no_open_call_or_by_another_call_is_no_wait() {
+    fn the_open_calls_wait_comes_first_then_a_background_shells_longest() {
         let all = idle();
         let tree = work(&all, 100, Engine::Claude, None);
         let call = bash_call(11);
-        let said = appeared(&call, BUSY, 10);
-        let other = OpenCall {
-            id: "toolu_2".into(),
-            ..call.clone()
+        let shell = |id: &str, line: &str, ago| {
+            let at = now() - Duration::minutes(ago);
+            said_after(None, id, &[line.to_string()], at, false).unwrap()
         };
-        let evidence = |open_call| Evidence {
-            tree: &tree,
-            open_call,
-            said: said.as_ref(),
-            active_at: now(),
-            now: now(),
-            poll: Duration::minutes(10),
+        let shells = [shell("b1", "retrying in 30 s", 3), shell("b2", BUSY, 8)];
+        let own = [
+            shells.to_vec(),
+            appeared(&call, "job is queued", 1).into_iter().collect(),
+        ]
+        .concat();
+        let read = |open_call, said: &[Said]| {
+            classify(&Evidence {
+                tree: &tree,
+                open_call,
+                said,
+                active_at: now(),
+                now: now(),
+                poll: Duration::minutes(10),
+            })
         };
-        assert_eq!(classify(&evidence(None)).kind, Kind::Quiet);
-        assert_eq!(classify(&evidence(Some(&other))).kind, Kind::Works);
+        let r = read(Some(&call), &own);
         assert_eq!(
-            classify(&evidence(Some(&call))).kind,
-            Kind::Waits(Wait::Queue)
+            (r.words.as_str(), r.call.as_deref(), r.by.as_deref()),
+            ("queued", Some("toolu_1"), Some("Bash"))
         );
+        for open_call in [None, Some(&call)] {
+            let r = read(open_call, &shells);
+            assert_eq!(r.kind, Kind::Waits(Wait::Queue));
+            assert_eq!(r.call.as_deref(), Some("b2"), "the longest-waiting shell");
+            assert_eq!(
+                (r.since, r.pid, r.by),
+                (now() - Duration::minutes(8), None, None)
+            );
+        }
+        assert_eq!(read(None, &[]).kind, Kind::Quiet);
+        assert_eq!(read(Some(&call), &[]).kind, Kind::Works);
     }
 
     #[test]
@@ -910,7 +934,7 @@ mod tests {
         let r = classify(&Evidence {
             tree: &tree,
             open_call: Some(&call),
-            said: None,
+            said: &[],
             active_at: now(),
             now: now(),
             poll: Duration::minutes(10),

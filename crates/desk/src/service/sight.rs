@@ -110,10 +110,11 @@ pub struct Sample {
     /// session out of Desk.
     pub open_call: Option<OpenCall>,
     folder: Option<Arc<TaskFolder>>,
-    /// The open call's own task output, by the call's id.
-    call_output: Option<(String, Tracked)>,
-    shells: Vec<Tracked>,
-    said: Option<Said>,
+    call_output: Option<Output>,
+    shells: Vec<Output>,
+    /// What its open call's and background shells' own output says each
+    /// waits on.
+    said: Vec<Said>,
     /// Its newest lines on screen, then from its open call's and its
     /// background shells' output, redacted, oldest first; none where the
     /// person keeps the session out of Desk.
@@ -183,6 +184,10 @@ struct Due {
     prev: Option<Sample>,
 }
 
+/// A task output file, by the id of the call or background shell that
+/// writes it.
+type Output = (String, Tracked);
+
 /// A task output file as last read.
 #[derive(Debug, Clone, PartialEq)]
 struct Tracked {
@@ -206,12 +211,13 @@ impl Tracked {
     }
 }
 
-/// A session's task output folder as last listed: its last write, every
-/// name in it, and the newest output files made since it was first listed
-/// (all of them that first time), with when each was made.
+/// A session's task output folder as last listed: when it was first
+/// listed, its last write, every name in it, and the newest output files in
+/// it, with when each was made.
 #[derive(Debug)]
 struct TaskFolder {
     path: PathBuf,
+    first: SystemTime,
     changed: SystemTime,
     names: HashSet<OsString>,
     born: Vec<(PathBuf, SystemTime)>,
@@ -222,10 +228,10 @@ struct Files {
     records: Vec<RecordSeen>,
     open_call: Option<OpenCall>,
     folder: Option<Arc<TaskFolder>>,
-    call_output: Option<(String, Tracked)>,
-    /// The lines that appeared in the open call's own output this pass.
-    call_new: Vec<String>,
-    shells: Vec<Tracked>,
+    call_output: Option<Output>,
+    shells: Vec<Output>,
+    /// The lines that appeared in each output this pass, by its id.
+    new: Vec<(String, Vec<String>)>,
 }
 
 impl Files {
@@ -236,18 +242,17 @@ impl Files {
             open_call: prev.and_then(|p| p.open_call.clone()),
             folder: prev.and_then(|p| p.folder.clone()),
             call_output: prev.and_then(|p| p.call_output.clone()),
-            call_new: Vec::new(),
             shells: prev.map(|p| p.shells.clone()).unwrap_or_default(),
+            new: Vec::new(),
         }
     }
 }
 
 /// Each task output file read and its length.
-fn lengths<'a>(call: Option<&'a (String, Tracked)>, shells: &'a [Tracked]) -> Vec<(&'a Path, u64)> {
-    call.map(|(_, t)| t)
-        .into_iter()
+fn lengths<'a>(call: Option<&'a Output>, shells: &'a [Output]) -> Vec<(&'a Path, u64)> {
+    call.into_iter()
         .chain(shells)
-        .map(|t| (t.path.as_path(), t.len))
+        .map(|(_, t)| (t.path.as_path(), t.len))
         .collect()
 }
 
@@ -294,18 +299,18 @@ fn plain(path: &Path) -> Option<std::fs::Metadata> {
         .filter(|m| m.file_type().is_file())
 }
 
-/// `folder` listed again only when it changed since `prev`: it as listed,
-/// and the output files new to it since `prev` (none the first time, when
-/// everything in it was there before Desk looked). Only the names it did
-/// not hold before are looked at.
-fn listed(
-    folder: &Path,
-    prev: Option<&Arc<TaskFolder>>,
-) -> Option<(Arc<TaskFolder>, Vec<PathBuf>)> {
+/// When the file `meta` describes was made, where its system says.
+fn made(meta: &std::fs::Metadata) -> Option<SystemTime> {
+    meta.created().or_else(|_| meta.modified()).ok()
+}
+
+/// `folder` listed again only when it changed since `prev`; only the names
+/// it did not hold before are looked at.
+fn listed(folder: &Path, prev: Option<&Arc<TaskFolder>>) -> Option<Arc<TaskFolder>> {
     let changed = std::fs::metadata(folder).ok()?.modified().ok()?;
     let prev = prev.filter(|f| f.path == folder);
     if let Some(same) = prev.filter(|f| f.changed == changed) {
-        return Some((same.clone(), Vec::new()));
+        return Some(same.clone());
     }
     let names: HashSet<OsString> = std::fs::read_dir(folder)
         .ok()?
@@ -318,15 +323,10 @@ fn listed(
         .map(|n| folder.join(n))
         .filter(|p| p.extension().is_some_and(|x| x == "output"))
         .filter_map(|p| {
-            let meta = plain(&p)?;
-            let made = meta.created().or_else(|_| meta.modified()).ok()?;
+            let made = made(&plain(&p)?)?;
             Some((p, made))
         })
         .collect();
-    let fresh = match prev {
-        Some(_) => new.iter().map(|(p, _)| p.clone()).collect(),
-        None => Vec::new(),
-    };
     let mut born: Vec<(PathBuf, SystemTime)> = prev
         .map(|f| f.born.clone())
         .unwrap_or_default()
@@ -337,11 +337,12 @@ fn listed(
     born.drain(..born.len().saturating_sub(BORN_KEPT));
     let folder = TaskFolder {
         path: folder.to_path_buf(),
+        first: prev.map_or_else(SystemTime::now, |f| f.first),
         changed,
         names,
         born,
     };
-    Some((Arc::new(folder), fresh))
+    Some(Arc::new(folder))
 }
 
 /// `t` read on to the end of its whole lines: it as read, and its lines
@@ -416,25 +417,26 @@ fn open_call_in(path: &Path, engine: Engine) -> Option<OpenCall> {
     sight::open_call(lines)
 }
 
+/// `path` in `folder` as first read: from its start when it was made since
+/// the folder was first listed, from its end when it was there before.
+fn first_read(folder: &TaskFolder, path: &Path) -> Option<Tracked> {
+    let meta = plain(path)?;
+    let from = match made(&meta)? >= folder.first {
+        true => 0,
+        false => meta.len(),
+    };
+    Some(Tracked::from(path.to_path_buf(), from))
+}
+
 /// The output file `call` writes to in `folder`: the first made since it
-/// started, not a background shell's, read from its start when it is new
-/// since the last pass (`fresh`) and from its end otherwise.
-fn call_file(
-    call: &OpenCall,
-    folder: &TaskFolder,
-    fresh: &[PathBuf],
-    shells: &[PathBuf],
-) -> Option<Tracked> {
+/// started that is no background shell's.
+fn call_file(call: &OpenCall, folder: &TaskFolder, shells: &[PathBuf]) -> Option<Tracked> {
     let (path, _) = folder
         .born
         .iter()
         .filter(|(p, made)| to_utc(*made) >= call.since - sight_procs::SKEW && !shells.contains(p))
         .min_by_key(|(_, made)| *made)?;
-    let from = match fresh.contains(path) {
-        true => 0,
-        false => plain(path)?.len(),
-    };
-    Some(Tracked::from(path.clone(), from))
+    first_read(folder, path)
 }
 
 /// What a session's files say since `prev`: each record's length and last
@@ -473,51 +475,52 @@ fn read_files(
                 ..c
             }),
     };
-    let Some((folder, fresh)) =
-        tasks.and_then(|t| listed(&t, prev.and_then(|p| p.folder.as_ref())))
-    else {
+    let Some(folder) = tasks.and_then(|t| listed(&t, prev.and_then(|p| p.folder.as_ref()))) else {
         return Files {
             records: seen,
             open_call,
             ..Files::kept(None)
         };
     };
-    let shell_paths: Vec<PathBuf> = shells
+    let shells: Vec<(&String, PathBuf)> = shells
         .iter()
         .filter(|id| plain_name(id))
-        .map(|id| folder.path.join(format!("{id}.output")))
+        .map(|id| (id, folder.path.join(format!("{id}.output"))))
         .collect();
-    let held = prev.and_then(|p| p.call_output.as_ref());
-    let (call_output, call_new) = open_call
+    let shell_paths: Vec<PathBuf> = shells.iter().map(|(_, p)| p.clone()).collect();
+    let held = |id: &str| {
+        prev.into_iter()
+            .flat_map(|p| p.call_output.iter().chain(&p.shells))
+            .find(|(held, _)| held == id)
+            .map(|(_, t)| t.clone())
+    };
+    let call_output = open_call
         .as_ref()
         .filter(|c| c.tool == SHELL_TOOL)
         .and_then(|c| {
-            let tracked = match held {
-                Some((id, t)) if *id == c.id => t.clone(),
-                _ => call_file(c, &folder, &fresh, &shell_paths)?,
-            };
-            let (tracked, new) = read_on(tracked, redactor);
-            Some(((c.id.clone(), tracked), new))
-        })
-        .unzip();
-    let shells = shell_paths
+            let t = held(&c.id).or_else(|| call_file(c, &folder, &shell_paths))?;
+            Some((c.id.clone(), t))
+        });
+    let shells: Vec<Output> = shells
         .into_iter()
-        .filter(|p| plain(p).is_some())
-        .map(|path| {
-            let t = prev
-                .and_then(|p| p.shells.iter().find(|t| t.path == path))
-                .cloned()
-                .unwrap_or_else(|| Tracked::from(path, 0));
-            read_on(t, redactor).0
+        .filter_map(|(id, path)| {
+            let t = held(id).or_else(|| first_read(&folder, &path))?;
+            Some((id.clone(), t))
         })
         .collect();
+    let read = |(id, t): Output| {
+        let (t, new) = read_on(t, redactor);
+        ((id.clone(), t), (id, new))
+    };
+    let (call_output, call_new) = call_output.map(read).unzip();
+    let (shells, shells_new): (Vec<Output>, Vec<_>) = shells.into_iter().map(read).unzip();
     Files {
         records: seen,
         open_call,
         folder: Some(folder),
         call_output,
-        call_new: call_new.unwrap_or_default(),
         shells,
+        new: call_new.into_iter().chain(shells_new).collect(),
     }
 }
 
@@ -774,24 +777,26 @@ impl Desk {
             Some(_) => now,
             None => last_write.unwrap_or(now),
         };
-        let said = files
-            .open_call
-            .as_ref()
-            .zip(files.call_output.as_ref())
-            .filter(|(c, (id, _))| c.id == *id)
-            .and_then(|(c, _)| {
-                let busy = prev.is_some_and(|p| {
-                    sight_procs::call_shell(&refs, c, now).is_some_and(|shell| {
-                        sight_procs::active(&p.runs, &sight_procs::subtree(&refs, shell))
-                    })
-                });
-                let held = prev.and_then(|p| p.said.clone());
-                sight_procs::said_after(held, &c.id, &files.call_new, now, busy)
-            });
+        let busy = |id: &str| {
+            let call = files.open_call.as_ref().filter(|c| c.id == id);
+            call.zip(prev).is_some_and(|(c, p)| {
+                sight_procs::call_shell(&refs, c, now).is_some_and(|shell| {
+                    sight_procs::active(&p.runs, &sight_procs::subtree(&refs, shell))
+                })
+            })
+        };
+        let said: Vec<Said> = files
+            .new
+            .iter()
+            .filter_map(|(id, new)| {
+                let held = prev.and_then(|p| p.said.iter().find(|s| s.call == *id));
+                sight_procs::said_after(held.cloned(), id, new, now, busy(id))
+            })
+            .collect();
         let reading = sight_procs::classify(&Evidence {
             tree: &refs,
             open_call: files.open_call.as_ref(),
-            said: said.as_ref(),
+            said: &said,
             active_at,
             now,
             poll: chrono::Duration::from_std(self.0.opts.sight.poll).unwrap_or_default(),
@@ -814,7 +819,7 @@ impl Desk {
                     .map(|t| redacted_lines(&t, redactor.as_deref()))
                     .unwrap_or_default();
                 let call = files.call_output.iter().flat_map(|(_, t)| &t.lines);
-                let shells = files.shells.iter().flat_map(|t| &t.lines);
+                let shells = files.shells.iter().flat_map(|(_, t)| &t.lines);
                 screen
                     .into_iter()
                     .chain(call.chain(shells).cloned())
@@ -969,15 +974,6 @@ mod tests {
         assert_eq!(tasks_folder(&root, linked, "cli-1"), None);
     }
 
-    fn made(path: &Path, secs: u64) {
-        std::fs::File::options()
-            .write(true)
-            .open(path)
-            .unwrap()
-            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
-            .unwrap();
-    }
-
     #[test]
     fn a_task_folder_is_listed_again_only_when_it_changed_and_never_follows_links() {
         let dir = tempfile::tempdir().unwrap();
@@ -988,21 +984,26 @@ mod tests {
         std::fs::write(&transcript, "waiting for a review\n").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&transcript, dir.path().join("a-agent.output")).unwrap();
-        let (first, fresh) = listed(dir.path(), None).unwrap();
-        assert!(fresh.is_empty(), "what was there before Desk looked is old");
+        let first = listed(dir.path(), None).unwrap();
         let born: Vec<&PathBuf> = first.born.iter().map(|(p, _)| p).collect();
         assert_eq!(
             born,
             [&old],
             "a sub-agent's linked transcript is never read"
         );
-        let (again, fresh) = listed(dir.path(), Some(&first)).unwrap();
-        assert!(Arc::ptr_eq(&first, &again) && fresh.is_empty());
+        let again = listed(dir.path(), Some(&first)).unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+        assert_eq!(
+            first_read(&first, &old).unwrap().read_to,
+            27,
+            "what was there before Desk looked is read from its end"
+        );
         std::thread::sleep(Duration::from_millis(20));
         let new = dir.path().join("b-new.output");
-        std::fs::write(&new, "").unwrap();
-        let (next, fresh) = listed(dir.path(), Some(&first)).unwrap();
-        assert_eq!(fresh, std::slice::from_ref(&new));
+        std::fs::write(&new, "all 3 build slots are busy\n").unwrap();
+        let next = listed(dir.path(), Some(&first)).unwrap();
+        assert_eq!(next.first, first.first);
+        assert_eq!(first_read(&next, &new).unwrap().read_to, 0, "made since");
         assert_eq!(next.born.len(), 2);
         assert!(next.names.len() == 5 && next.born.iter().any(|(p, _)| *p == new));
     }
@@ -1045,12 +1046,12 @@ mod tests {
         let file = |name: &str| {
             let p = dir.path().join(name);
             std::fs::write(&p, "printed before\n").unwrap();
-            made(&p, 1);
             p
         };
         let (before, shell, own, later) = (file("b0"), file("b1"), file("b2"), file("b3"));
         let folder = TaskFolder {
             path: dir.path().to_path_buf(),
+            first: at(0),
             changed: at(0),
             names: HashSet::new(),
             born: vec![
@@ -1066,21 +1067,22 @@ mod tests {
             input: String::new(),
             since: to_utc(at(1000)),
         };
-        let fresh = call_file(
-            &call,
-            &folder,
-            std::slice::from_ref(&own),
-            std::slice::from_ref(&shell),
-        )
-        .unwrap();
-        assert_eq!((fresh.path.as_path(), fresh.read_to), (own.as_path(), 0));
-        let old = call_file(&call, &folder, &[], &[shell]).unwrap();
+        let made_since = call_file(&call, &folder, std::slice::from_ref(&shell)).unwrap();
+        assert_eq!(
+            (made_since.path.as_path(), made_since.read_to),
+            (own.as_path(), 0)
+        );
+        let listed_later = TaskFolder {
+            first: SystemTime::now() + Duration::from_secs(3600),
+            ..folder
+        };
+        let old = call_file(&call, &listed_later, &[shell]).unwrap();
         assert_eq!(old.read_to, 15, "a file there before is read from its end");
         let late = OpenCall {
             since: to_utc(at(1100)),
             ..call
         };
-        assert!(call_file(&late, &folder, &[], &[]).is_none());
+        assert!(call_file(&late, &listed_later, &[]).is_none());
     }
 
     #[test]
@@ -1119,7 +1121,7 @@ mod tests {
             folder: None,
             call_output: None,
             shells: vec![],
-            said: None,
+            said: vec![],
             output: vec![],
             output_at: now,
             reading: Reading {
