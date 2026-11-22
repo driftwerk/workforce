@@ -145,6 +145,21 @@ fn clipped(label: &str) -> String {
 /// running, before it is taken to have died without saying so.
 pub const AGENT_QUIET: Duration = Duration::minutes(10);
 
+/// How many looks in a row must find fewer shells running than the CLI
+/// reported before those not found are taken to have ended: one look can
+/// come before a shell's process starts.
+pub const MISSED_LOOKS: u32 = 3;
+
+/// Looks in a row that found fewer shells running than the CLI reported:
+/// how many, since when, and whether they have gone on long enough for
+/// those not found to have ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Missed {
+    looks: u32,
+    first: DateTime<Utc>,
+    gone: bool,
+}
+
 /// What a session has running in the background.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Background {
@@ -155,6 +170,9 @@ pub struct Background {
     reported: bool,
     /// Shells seen running under the session at the last look.
     shells: Option<usize>,
+    /// The looks since the CLI's report that found fewer of its shells
+    /// running than it reported.
+    missed: Option<Missed>,
     /// Since when the session has had some.
     since: Option<DateTime<Utc>>,
     /// Run again after a restart: what its last process had running,
@@ -173,8 +191,8 @@ impl Background {
             .count();
         let reported = self.tasks.len() - agents;
         let shells = match (self.reported, self.shells) {
-            (true, Some(seen)) => reported.min(seen),
-            (true, None) => reported,
+            (true, Some(seen)) if self.missed.is_some_and(|m| m.gone) => reported.min(seen),
+            (true, _) => reported,
             (false, seen) => seen.unwrap_or(0),
         };
         agents + shells
@@ -239,6 +257,7 @@ impl Background {
     /// a resumed CLI can report what it no longer runs.
     pub fn reported(mut self, tasks: Option<Vec<Reported>>, now: DateTime<Utc>) -> Self {
         self.shells = None;
+        self.missed = None;
         match tasks {
             Some(tasks) => {
                 let heard = std::mem::take(&mut self.tasks);
@@ -304,20 +323,34 @@ impl Background {
     }
 
     /// A look at the session's processes found `shells` running: a
-    /// sub-agent unheard past [`AGENT_QUIET`] with none running died.
-    pub fn looked(mut self, shells: usize, now: DateTime<Utc>) -> Self {
+    /// sub-agent unheard past [`AGENT_QUIET`] with none running died, and
+    /// the reported shells it didn't find ended once [`MISSED_LOOKS`] looks
+    /// in a row over at least `unseen` missed them.
+    pub fn looked(mut self, shells: usize, now: DateTime<Utc>, unseen: Duration) -> Self {
+        let short = self.reported && shells < self.shells().count();
+        self.missed = short.then(|| {
+            let (looks, first) = self.missed.map_or((1, now), |m| (m.looks + 1, m.first));
+            Missed {
+                looks,
+                first,
+                gone: looks >= MISSED_LOOKS && now - first >= unseen,
+            }
+        });
         self.shells = Some(shells);
         if shells == 0 {
-            self.tasks
-                .retain(|_, t| t.kind != TaskKind::Agent || now - t.heard < AGENT_QUIET);
+            let gone = self.missed.is_some_and(|m| m.gone);
+            self.tasks.retain(|_, t| match t.kind {
+                TaskKind::Agent => now - t.heard < AGENT_QUIET,
+                TaskKind::Shell => !gone,
+            });
         }
         self.dated(now)
     }
 
     /// [`Self::looked`], when there was a look.
-    pub fn looked_if(self, shells: Option<usize>, now: DateTime<Utc>) -> Self {
+    pub fn looked_if(self, shells: Option<usize>, now: DateTime<Utc>, unseen: Duration) -> Self {
         match shells {
-            Some(shells) => self.looked(shells, now),
+            Some(shells) => self.looked(shells, now, unseen),
             None => self,
         }
     }
@@ -338,6 +371,8 @@ mod tests {
             .to_utc()
             + Duration::minutes(minutes)
     }
+
+    const UNSEEN: Duration = Duration::minutes(2);
 
     fn tasks(list: &[(&str, TaskKind)]) -> Option<Vec<Reported>> {
         Some(list.iter().map(|(id, k)| Reported::new(id, *k)).collect())
@@ -429,22 +464,60 @@ mod tests {
     #[test]
     fn a_shell_counts_while_its_process_runs() {
         let b = Background::default().reported(tasks(&[("s1", TaskKind::Shell)]), at(0));
-        assert_eq!(b.clone().looked(1, at(1)).count(), 1);
-        assert_eq!(
-            b.clone().looked(0, at(1)).count(),
-            0,
-            "it ended without a word"
-        );
+        assert_eq!(b.clone().looked(1, at(1), UNSEEN).count(), 1);
         let unreported = Background::default().reported(None, at(0));
         assert!(
             unreported.worth_a_look(),
             "a CLI that reports nothing is looked at"
         );
         assert_eq!(
-            unreported.looked(2, at(1)).count(),
+            unreported.looked(2, at(1), UNSEEN).count(),
             2,
             "its shells are counted by process"
         );
+    }
+
+    #[test]
+    fn a_reported_shell_is_kept_until_looks_in_a_row_miss_it_past_the_grace() {
+        let b = Background::default().reported(tasks(&[("s1", TaskKind::Shell)]), at(0));
+        let missed = b.clone().looked(0, at(0), UNSEEN);
+        assert_eq!(missed.count(), 1, "one look can come before it starts");
+        assert!(missed.worth_a_look() && missed.view().is_some());
+        assert_eq!(missed.shells().collect::<Vec<_>>(), ["s1"]);
+        let missed = missed.looked(0, at(1), UNSEEN).looked(0, at(1), UNSEEN);
+        assert_eq!(
+            missed.count(),
+            1,
+            "missed three times, but within the grace"
+        );
+        let found = missed.clone().looked(1, at(1), UNSEEN);
+        assert_eq!(found.count(), 1);
+        let after = found.looked(0, at(2), UNSEEN).looked(0, at(3), UNSEEN);
+        assert_eq!(
+            after.clone().looked(0, at(3), UNSEEN).count(),
+            1,
+            "found again, its misses count anew"
+        );
+        let gone = after.looked(0, at(4), UNSEEN);
+        assert_eq!(
+            (gone.count(), gone.view()),
+            (0, None),
+            "missed long enough: it ended"
+        );
+        assert_eq!(gone.shells().count(), 0);
+        assert!(!gone.worth_a_look());
+        let quick = b.clone().looked(0, at(0), UNSEEN).looked(0, at(3), UNSEEN);
+        assert_eq!(quick.count(), 1, "two looks are never enough");
+        let reported_again = missed
+            .reported(tasks(&[("s1", TaskKind::Shell)]), at(1))
+            .looked(0, at(5), UNSEEN);
+        assert_eq!(
+            reported_again.count(),
+            1,
+            "the CLI says it runs: looked at anew"
+        );
+        let ended = b.reported(tasks(&[]), at(1));
+        assert_eq!(ended.count(), 0, "the CLI's own report ends it at once");
     }
 
     #[test]
@@ -461,7 +534,7 @@ mod tests {
     fn a_turns_report_is_newer_than_the_last_look() {
         let b = Background::default()
             .reported(tasks(&[("s1", TaskKind::Shell)]), at(0))
-            .looked(0, at(1))
+            .looked(0, at(1), UNSEEN)
             .reported(tasks(&[("s2", TaskKind::Shell)]), at(2));
         assert_eq!(
             b.count(),
@@ -474,22 +547,26 @@ mod tests {
     fn a_sub_agent_unheard_with_nothing_running_has_died() {
         let b = Background::default().reported(tasks(&[("a1", TaskKind::Agent)]), at(0));
         assert_eq!(
-            b.clone().looked(0, at(9)).count(),
+            b.clone().looked(0, at(9), UNSEEN).count(),
             1,
             "still within its quiet"
         );
         assert_eq!(
-            b.clone().looked(1, at(30)).count(),
+            b.clone().looked(1, at(30), UNSEEN).count(),
             1,
             "a shell of its still runs"
         );
         let heard = b.clone().heard("a1", at(8));
         assert_eq!(
-            heard.clone().looked(0, at(15)).count(),
+            heard.clone().looked(0, at(15), UNSEEN).count(),
             1,
             "heard from lately"
         );
-        assert_eq!(heard.looked(0, at(19)).count(), 0, "it died without a stop");
+        assert_eq!(
+            heard.looked(0, at(19), UNSEEN).count(),
+            0,
+            "it died without a stop"
+        );
     }
 
     #[test]
@@ -501,7 +578,7 @@ mod tests {
         assert_eq!(
             b.clone()
                 .started("t2", TaskKind::Agent, at(9))
-                .looked(0, at(15))
+                .looked(0, at(15), UNSEEN)
                 .count(),
             1,
             "heard working lately"

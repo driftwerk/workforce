@@ -23,17 +23,18 @@ use crate::store::DeskStore;
 
 const TOOL_SHELL: &str = "/bin/sh -c 'sleep 600; : /h/.claude/shell-snapshots/snapshot-sh-1.sh' &";
 
-/// A stand-in CLI that prints `said`, runs a tool shell with a long `sleep`
-/// under it, as Claude Code's Bash tool does, then runs `then`.
-fn cli_running(dir: &Path, said: &str, then: &str) -> PathBuf {
+/// A stand-in CLI that runs `first`, then a tool shell with a long `sleep`
+/// under it, as Claude Code's Bash tool does, then `then`.
+fn cli_running(dir: &Path, first: &str, then: &str) -> PathBuf {
     let path = dir.join("working-cli");
-    let script = format!("#!/bin/sh\necho '{said}'\n{TOOL_SHELL}\n{then}\n");
+    let script = format!("#!/bin/sh\n{first}\n{TOOL_SHELL}\n{then}\n");
     workforce_common::executable::write(&path, &script).unwrap();
     path
 }
 
+/// [`cli_running`] once it has printed `said`.
 fn working_cli(dir: &Path, said: &str) -> PathBuf {
-    cli_running(dir, said, "exec sleep 60")
+    cli_running(dir, &format!("echo '{said}'"), "exec sleep 60")
 }
 
 fn options_with(dir: &Path, cli: PathBuf, sight: SightOptions) -> Options {
@@ -244,10 +245,10 @@ async fn only_a_new_line_of_the_open_calls_own_output_says_a_wait_and_it_shows_o
 }
 
 #[tokio::test]
-async fn a_background_shells_own_new_line_says_its_wait_once_the_turn_has_ended() {
+async fn a_background_shell_missed_as_its_turn_ends_still_says_its_wait_until_it_ends() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let cli = working_cli(dir.path(), "Started the tests in the background");
+        let cli = cli_running(dir.path(), "sleep 5", "exec sleep 60");
         let opts = options_with(dir.path(), cli, sight_in(dir.path()));
         let d = desk_with(pool, opts, redacting()).await;
         let s = new_session(&d, dir.path()).await;
@@ -266,8 +267,14 @@ async fn a_background_shells_own_new_line_says_its_wait_once_the_turn_has_ended(
         append(&transcript, &format!("{result}\n{ended}\n"));
         let shell = tasks.join("b9.output");
         append(&shell, "rbuild: all 3 build slots are busy; waiting for one\n");
-        let first = sampled_until(&d, s.id, has_shell).await;
-        assert_eq!(first.open_call, None, "its call returned");
+        let root = d.process_root(s.id).unwrap();
+        let table = crate::procs::table().await.unwrap();
+        assert!(
+            !crate::procs::under(&table, root)
+                .into_iter()
+                .any(is_tool_shell),
+            "the turn ends before its shell's process starts"
+        );
         post(
             &d,
             s.id,
@@ -277,8 +284,14 @@ async fn a_background_shells_own_new_line_says_its_wait_once_the_turn_has_ended(
         .await;
         let v = d.view(s.id).unwrap();
         assert_eq!(v.state, SessionState::Done);
-        assert_eq!(v.background.map(|b| b.count), Some(1), "its shell runs");
+        assert_eq!(
+            v.background.map(|b| b.count),
+            Some(1),
+            "one look that misses it is no end"
+        );
 
+        let first = sampled_until(&d, s.id, has_shell).await;
+        assert_eq!(first.open_call, None, "its call returned");
         let next = sampled_until(&d, s.id, |s| s.at > first.at).await;
         assert_ne!(
             next.reading.kind,
@@ -297,6 +310,20 @@ async fn a_background_shells_own_new_line_says_its_wait_once_the_turn_has_ended(
         append(&shell, "test a ... ok\n");
         let after = sampled_until(&d, s.id, |s| s.waits.is_none()).await;
         assert_ne!(after.reading.kind, Kind::Waits(Wait::Queue));
+
+        append(&shell, "\n[exited with code 0]\n");
+        for _ in 0..100 {
+            d.sight_pass().await;
+            if d.view(s.id).unwrap().background.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            d.view(s.id).unwrap().background,
+            None,
+            "its output says it ended"
+        );
         kill_work(&after);
     })
     .await;
@@ -308,7 +335,7 @@ async fn a_root_ticking_its_screen_is_neither_work_nor_output() {
         let dir = tempfile::tempdir().unwrap();
         let ticking =
             "i=0; while :; do i=$((i+1)); [ $((i % 5000)) -eq 0 ] && echo \"Running… ($i)\"; done";
-        let cli = cli_running(dir.path(), "starting", ticking);
+        let cli = cli_running(dir.path(), "echo starting", ticking);
         let opts = options_with(dir.path(), cli, sight_in(dir.path()));
         let d = desk_with(pool, opts, redacting()).await;
         let s = new_session(&d, dir.path()).await;
