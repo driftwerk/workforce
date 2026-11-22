@@ -1099,7 +1099,8 @@ pub const BOARD_SYNC_GITHUB_PICK_TOOLS: &[&str] = &[
 /// link keeps and passes on every call. Called when the hub offers them
 /// and never needed: a hub without them names the workspaces in the error
 /// a call without one gets ([`crate::instances`]).
-pub const BOARD_SYNC_WORKSPACE_TOOLS: &[&str] = &["jira.workspaces", "linear.workspaces"];
+pub const BOARD_SYNC_WORKSPACE_TOOLS: &[&str] =
+    &["jira.workspaces", "linear.workspaces", "github.workspaces"];
 
 /// Who the person is on Jira (`jira.myself`) and on Linear
 /// (`linear.viewer`): what "assigned to me", Mine and Take it go by. Where

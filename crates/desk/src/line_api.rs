@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::api::Authorize;
-use crate::line::{When, TOOLS};
+use crate::line::When;
 use crate::service::{Desk, LineError, Sender};
 
 /// How long one plugin request may wait: a mod's fetch is cut off around
@@ -65,8 +65,9 @@ macro_rules! caller {
 type P = Path<HashMap<String, String>>;
 
 async fn tools(State(desk): State<Desk>, Path(p): P) -> Response {
-    caller!(desk, p);
-    Json(json!({ "tools": TOOLS.iter().map(|t| t.definition()).collect::<Vec<_>>() }))
+    let caller = caller!(desk, p);
+    let tools = desk.line_tools(caller).await;
+    Json(json!({ "tools": tools.iter().map(|t| t.definition()).collect::<Vec<_>>() }))
         .into_response()
 }
 

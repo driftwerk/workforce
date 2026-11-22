@@ -91,7 +91,7 @@ fn a_session_across_bosses_leaves_its_ticket_ledger_and_questions_and_its_charge
                 budget: Uuid::from_u128(300)
             },
             Effect::Handover {
-                from: "sarah".into(),
+                from: Some("sarah".into()),
                 to: "mia".into()
             },
             Effect::Tell,
@@ -152,7 +152,7 @@ fn a_session_into_and_out_of_the_main_bosses_scope() {
         boss: "desk".into()
     }));
     assert!(out.contains(&Effect::Handover {
-        from: "sarah".into(),
+        from: Some("sarah".into()),
         to: "desk".into()
     }));
     // Into Acme from ungrouped.
@@ -166,7 +166,7 @@ fn a_session_into_and_out_of_the_main_bosses_scope() {
         boss: "sarah".into()
     }));
     assert!(into.contains(&Effect::Handover {
-        from: "desk".into(),
+        from: Some("desk".into()),
         to: "sarah".into()
     }));
     // A session nobody runs, with nothing on it: told, and Desk writes the
@@ -177,7 +177,7 @@ fn a_session_into_and_out_of_the_main_bosses_scope() {
         move_effects(&S, Some("acme"), &quiet, &Choices::default()),
         [
             Effect::Handover {
-                from: "desk".into(),
+                from: None,
                 to: "sarah".into()
             },
             Effect::Tell
@@ -205,7 +205,7 @@ fn a_ticket_moves_to_another_board_unless_synced_or_there_is_none() {
             },
             Effect::LedgerStays { rows: 2, usd: 1.0 },
             Effect::Handover {
-                from: "sarah".into(),
+                from: Some("sarah".into()),
                 to: "mia".into()
             },
         ]
@@ -291,7 +291,7 @@ fn a_boss_moved_into_a_bossed_group_asks_and_never_replaces_silently() {
                 plans: 1
             },
             Effect::Handover {
-                from: "sarah".into(),
+                from: Some("sarah".into()),
                 to: "desk".into()
             },
             Effect::MemoryStays,
@@ -362,6 +362,7 @@ impl Names for N {
         match agent {
             "mia" => "Mia".into(),
             "sarah" => "Sarah".into(),
+            "desk" => "Kat".into(),
             other => other.into(),
         }
     }
@@ -402,11 +403,33 @@ fn each_effect_reads_in_plain_words() {
     );
     assert_eq!(
         text(&Effect::Handover {
-            from: "sarah".into(),
+            from: Some("sarah".into()),
             to: "mia".into()
         }),
         "Mia receives only the note below from Sarah."
     );
+    assert_eq!(
+        text(&Effect::Handover {
+            from: None,
+            to: "mia".into()
+        }),
+        "Mia receives only the note below from Desk."
+    );
+    assert_eq!(
+        text(&Effect::Handover {
+            from: Some("desk".into()),
+            to: "mia".into()
+        }),
+        "Mia receives only the note below from Kat.",
+        "the main boss, renamed, is a boss like any"
+    );
+    let facts = Effect::Handover {
+        from: None,
+        to: "mia".into(),
+    };
+    let stored = serde_json::to_value(&facts).unwrap();
+    assert_eq!(stored, serde_json::json!({"kind": "handover", "to": "mia"}));
+    assert_eq!(serde_json::from_value::<Effect>(stored).unwrap(), facts);
     // Every effect says something.
     for e in [
         Effect::ChargeTo { boss: "mia".into() },

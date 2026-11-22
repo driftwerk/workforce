@@ -4092,7 +4092,7 @@ async fn codex_resumed_turn_never_repeats_the_prompt_in_the_thread() {
 }
 
 #[tokio::test]
-async fn codex_turn_names_an_image_it_cannot_show() {
+async fn codex_turn_names_an_image_it_cannot_show_as_a_saved_file() {
     let hub = codex_hub(codex_first).await;
     hub.chatgpt_login(ALICE).await;
     let svg = b"<svg xmlns='http://www.w3.org/2000/svg'/>";
@@ -4124,7 +4124,7 @@ async fn codex_turn_names_an_image_it_cannot_show() {
     );
     let stdin = hub.codex.recorded(1, "stdin");
     assert!(
-        stdin.contains("image/svg+xml image can't be shown here"),
+        stdin.contains("Binary file `logo.svg` (image/svg+xml) saved to"),
         "{stdin}"
     );
 }

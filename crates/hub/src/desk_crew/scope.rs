@@ -118,7 +118,7 @@ impl CrewHub {
             | Action::Resume { session, .. }
             | Action::Restart { session, .. }
             | Action::TakeOn { session }
-            | Action::Release { session }
+            | Action::Release { session, .. }
             | Action::Handoff { session, .. }
             | Action::SetMode { session, .. }
             | Action::SwitchLogin { session, .. } => self.session_seen(*session, seen),

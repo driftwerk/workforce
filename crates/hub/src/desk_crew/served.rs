@@ -1036,7 +1036,7 @@ impl CrewHub {
                 return Err(self.not_in_grant(g));
             }
         }
-        if let Action::Release { session } = &action {
+        if let Action::Release { session, .. } = &action {
             if !self.in_grant(g, *session) || !self.runs(*session, boss) {
                 return Err("You don't run that session.".into());
             }
