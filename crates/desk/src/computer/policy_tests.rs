@@ -2456,6 +2456,31 @@ fn the_second_reviews_bypasses_ask_whatever_runs_on_its_own() {
         "sed -f /dev/stdin f <<'EOF'\n1e rm -rf ~\nEOF",
         "make -f - <<'EOF'\nx:\n\trm -rf ~\nEOF",
         "awk '{print > $1}' list",
+        // The final review: only commands known to set no names keep
+        // integers known, and a bare-name `cd` where it is.
+        "i=0; trap \"i='a[\\$(rm -rf ~)]'\" DEBUG; echo $((i))",
+        "i=0; i[0]='a[$(rm -rf ~)]'; echo $((i))",
+        "i=0; i[0]='a[$(rm -rf ~)]'; [[ $i -eq 0 ]]",
+        "i=0; command read i <<< 'a[$(rm -rf ~)]'; echo $((i))",
+        "i=0; builtin printf -v i %s 'a[$(rm -rf ~)]'; echo $((i))",
+        "i=0; command declare i='a[$(rm -rf ~)]'; echo $((i))",
+        "i=0; builtin export i='a[$(rm -rf ~)]'; [[ $i -eq 0 ]]",
+        "command export CDPATH=/Users/sarah/dev; cd src && rm -rf build",
+        "read CDPATH <<< /Users/sarah/dev; cd src && rm -rf build",
+        "printf -v CDPATH /Users/sarah/dev; cd src && rm -rf build",
+        ": ${CDPATH:=/Users/sarah/dev}; cd src && rm -rf build",
+        "mapfile -t CDPATH <<< /Users/sarah/dev; cd src && rm -rf build",
+        "getopts a: CDPATH; cd src && rm -rf build",
+        "source ./env.sh; cd src && rm -rf build",
+        ". ./env.sh; cd src && rm -rf build",
+        "fd . /Users/sarah/dev/acme-web -e o -x rm -rf",
+        "rg --pre ./x foo",
+        "taskset 1 rm -rf ~",
+        "open -a Terminal x.sh",
+        "open x.command",
+        "git -c submodule.x.update='!rm -rf ~' submodule update",
+        "git -c sendemail.smtpserver=/tmp/x send-email a.patch",
+        "git -c web.browser=x help -w log",
     ] {
         for pol in [&full(), &anywhere] {
             let c = own(in_folder(exec(command, ACME), ACME));

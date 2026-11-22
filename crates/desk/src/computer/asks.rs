@@ -641,7 +641,9 @@ pub fn always_asks(command: &str, place: &Place<'_>) -> Option<Asks> {
                 // A bare name is found through `CDPATH` when the line sets
                 // it, even when it is right here too; else it is here.
                 (_, Some(w)) if !w.text.starts_with(['/', '.', '~']) => {
-                    let cdpath = here.set.iter().any(|n| n == "CDPATH")
+                    // Or when anything before it may have set it.
+                    let cdpath = !simple.clean
+                        || here.set.iter().any(|n| n == "CDPATH")
                         || words[..at.unwrap_or(0)]
                             .iter()
                             .any(|w| w.text.starts_with("CDPATH="));
@@ -1318,58 +1320,116 @@ fn default_branch(name: &str) -> bool {
 pub fn publishes_on(command: &str, branch: Option<&str>) -> bool {
     // A line that can't be read is handed over when it could publish.
     let Ok(commands) = split(command) else {
-        return [
-            "push", "publish", "deploy", "release", "apply", "merge", "--prod",
-        ]
-        .iter()
-        .any(|k| command.contains(k));
+        return names_publishing(command);
     };
     let on_default = branch.is_some_and(default_branch);
+    let place = Place::new(Some(PathBuf::from("/")), &[], &[], Path::new("/"));
     commands.iter().any(|c| {
-        let words: Vec<&str> = c
-            .words
-            .iter()
-            .filter(|w| !is_assignment(w))
-            .map(|w| w.text.as_str())
-            .collect();
-        publishes_words(&words, on_default, branch)
+        let words: Vec<&Word> = c.words.iter().collect();
+        publishes_words(&words, c, &place, (on_default, branch), false)
     })
 }
 
-fn publishes_words(words: &[&str], on_default: bool, branch: Option<&str>) -> bool {
-    let Some(first) = words.first() else {
+/// The words a line that can't be read is told to publish by.
+fn names_publishing(text: &str) -> bool {
+    [
+        "push", "publish", "deploy", "release", "apply", "merge", "--prod",
+    ]
+    .iter()
+    .any(|k| text.contains(k))
+}
+
+/// One command, read as [`always_asks`] reads it: past a wrapper, into
+/// what a shell, `eval` or `xargs` runs. One it reads as
+/// [`Asks::Unclear`] publishes when its words say so; one whose program
+/// isn't written out at all (`$CMD`, `sh -c "$CMD"`) may.
+fn publishes_words(
+    words: &[&Word],
+    simple: &Simple,
+    place: &Place<'_>,
+    on: (bool, Option<&str>),
+    unknown: bool,
+) -> bool {
+    let (on_default, branch) = on;
+    let Some(i) = words
+        .iter()
+        .position(|w| !is_assignment(w) && (w.dynamic || !KEYWORDS.contains(&w.text.as_str())))
+    else {
         return false;
     };
-    let name = first.rsplit('/').next().unwrap_or(first);
-    let args = &words[1..];
-    let has = |w: &str| args.contains(&w);
+    let first = words[i];
+    if first.dynamic {
+        return true;
+    }
+    let name = first.text.rsplit('/').next().unwrap_or(&first.text);
+    let args = &words[i + 1..];
+    let told = || {
+        let text: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
+        names_publishing(&text.join(" "))
+    };
+    let has = |w: &str| args.iter().any(|a| a.text == w);
     match name {
-        "exec" | "command" | "builtin" | "nohup" | "time" | "caffeinate" | "env" | "nice" => {
-            let skip = args
-                .iter()
-                .take_while(|w| w.starts_with('-') || w.contains('='))
-                .count();
-            publishes_words(&args[skip..], on_default, branch)
+        "env" if split_string(args).is_some() => match split_string(args) {
+            Some(Some(script)) => publishes_on(&script, branch),
+            _ => true,
+        },
+        _ if wrapped(name, args).is_some() => match wrapped(name, args) {
+            Some(Ok(at)) => publishes_words(&args[at..], simple, place, on, unknown),
+            _ => told(),
+        },
+        "xargs" => {
+            let short = Short {
+                flags: "0oprtxeil",
+                valued: "EILnPsad",
+            };
+            let long = |n: &str| match n {
+                "null" | "verbose" | "no-run-if-empty" | "interactive" | "exit" | "show-limits"
+                | "open-tty" => Some(false),
+                "arg-file" | "delimiter" | "max-args" | "max-procs" | "max-chars" | "max-lines"
+                | "process-slot-var" => Some(true),
+                _ => None,
+            };
+            match getopt(args, &short, long, 0) {
+                Ok((_, ops)) => {
+                    publishes_words(&args[args.len() - ops.len()..], simple, place, on, true)
+                }
+                Err(()) => told(),
+            }
         }
-        _ if SHELLS.contains(&name) => {
-            let at = args
-                .iter()
-                .position(|w| !w.starts_with("--") && w.starts_with('-') && w.contains('c'));
-            at.and_then(|at| args.get(at + 1))
-                .is_some_and(|script| publishes_on(script, branch))
+        "eval" => {
+            if args.iter().any(|w| w.dynamic) {
+                return true;
+            }
+            let text: Vec<&str> = args.iter().map(|w| w.text.as_str()).collect();
+            publishes_on(&text.join(" "), branch)
         }
+        _ if SHELLS.contains(&name) || other_shell(name) => match shell_options(args) {
+            Ok((true, _, at)) => match args.get(at) {
+                Some(script) if !script.dynamic => publishes_on(&script.text, branch),
+                Some(_) => true,
+                None => told(),
+            },
+            // An option made as it runs may be `-c` and its script.
+            _ => told() || args.iter().any(|w| w.dynamic),
+        },
         "git" => {
-            let Some(push) = args.iter().position(|w| *w == "push") else {
-                return false;
+            let Some(push) = args.iter().position(|w| w.text == "push") else {
+                return classify_words(words, simple, place, unknown) == Some(Asks::Unclear)
+                    && told();
             };
             let rest = &args[push + 1..];
-            if rest.iter().any(|w| matches!(*w, "--all" | "--mirror")) {
+            // What `xargs` adds, or a word made as it runs, may be any.
+            if unknown
+                || rest
+                    .iter()
+                    .any(|w| w.dynamic || matches!(w.text.as_str(), "--all" | "--mirror"))
+            {
                 return true;
             }
             let operands: Vec<&str> = rest
                 .iter()
-                .filter(|w| !w.starts_with('-'))
-                .copied()
+                .filter(|w| !w.text.starts_with('-'))
+                .map(|w| w.text.as_str())
                 .collect();
             // `git push [remote] [refspec…]`: no refspec pushes the branch
             // it is on.
@@ -1395,7 +1455,7 @@ fn publishes_words(words: &[&str], on_default: bool, branch: Option<&str>) -> bo
         "kubectl" => has("apply") || has("rollout"),
         "terraform" | "tofu" => has("apply"),
         "helm" => has("upgrade") || has("install"),
-        _ => false,
+        _ => classify_words(words, simple, place, unknown) == Some(Asks::Unclear) && told(),
     }
 }
 
@@ -1434,6 +1494,9 @@ struct Simple {
     nested: bool,
     /// The names the line had set to integers when it runs.
     ints: Vec<String>,
+    /// Every command before it on the line is one known to set no names
+    /// ([`leaves_names`]): a bare-name `cd` is found where it is.
+    clean: bool,
 }
 
 struct Splitter {
@@ -1471,9 +1534,36 @@ struct Splitter {
     /// A compound command (`if`, `while`, `for`, `case`) has begun, at this
     /// command: what is set after may not happen.
     compound: Option<usize>,
+    /// Every command read so far is known to set no names.
+    clean: bool,
+    /// The line is read as though anything could have set any name: no
+    /// integers known, no bare-name `cd` found (see [`split`]).
+    void: bool,
+    /// A loop has begun: what a command in it sets, the commands before
+    /// it in the loop see the next time round.
+    looping: bool,
+    /// The line has to be read [`Self::void`]: a `trap` or `function` in
+    /// it, or a loop holding a command that may set names.
+    voids: bool,
+    /// The command being read assigns a name what isn't an integer
+    /// (`x=a`), or what can't be told (`x=$y`), or sets one by expansion
+    /// (`${X:=v}`).
+    assigns: (bool, bool, bool),
 }
 
+/// The line's simple commands. A `trap` (whose action may run before any
+/// command after, or every time round a loop), a `function` (whose body
+/// runs where it is called), or a loop holding a command that may set
+/// names, makes the whole line read as though any name could be anything.
 fn split(command: &str) -> Result<Vec<Simple>, ()> {
+    let (out, voids) = split_as(command, false)?;
+    match voids {
+        false => Ok(out),
+        true => Ok(split_as(command, true)?.0),
+    }
+}
+
+fn split_as(command: &str, void: bool) -> Result<(Vec<Simple>, bool), ()> {
     let mut s = Splitter {
         chars: command.chars().collect(),
         at: 0,
@@ -1493,9 +1583,14 @@ fn split(command: &str) -> Result<Vec<Simple>, ()> {
         cond: false,
         depth: 0,
         compound: None,
+        clean: true,
+        void,
+        looping: false,
+        voids: false,
+        assigns: (false, false, false),
     };
     s.run()?;
-    Ok(s.out)
+    Ok((s.out, s.voids))
 }
 
 impl Splitter {
@@ -1559,6 +1654,8 @@ impl Splitter {
                     false => {
                         self.ints.remove(name);
                         self.pending.retain(|n| n != name);
+                        self.assigns.0 = true;
+                        self.assigns.1 |= word.dynamic;
                     }
                 }
             } else if self.current.words.is_empty()
@@ -1589,43 +1686,42 @@ impl Splitter {
         let mut done = std::mem::take(&mut self.current);
         let pending = std::mem::take(&mut self.pending);
         let counted = std::mem::take(&mut self.counted);
+        let (text, unknown, expands) = std::mem::take(&mut self.assigns);
         done.ints = self.ints.iter().cloned().collect();
-        let name = done
-            .words
-            .iter()
-            .find(|w| !is_assignment(w) && !KEYWORDS.contains(&w.text.as_str()));
-        // What sets names in this shell to what can't be told.
-        let sets_any = name.is_some_and(|w| {
-            w.dynamic
-                || matches!(
-                    w.text.as_str(),
-                    "source"
-                        | "."
-                        | "read"
-                        | "mapfile"
-                        | "readarray"
-                        | "getopts"
-                        | "printf"
-                        | "declare"
-                        | "typeset"
-                        | "local"
-                        | "export"
-                        | "readonly"
-                        | "unset"
-                        | "eval"
-                        | "exec"
-                        | "wait"
-                        | "set"
-                        | "select"
-                        | "shopt"
-                )
-                || (w.text == "for" && done.words.len() > 1)
-        });
-        if sets_any {
-            self.ints.clear();
+        done.clean = self.clean && !self.void;
+        for w in &done.words {
+            if !w.dynamic && matches!(w.text.as_str(), "while" | "until" | "for" | "select") {
+                self.looping = true;
+            }
+            if w.dynamic || !KEYWORDS.contains(&w.text.as_str()) {
+                break;
+            }
         }
-        let surely =
-            !self.cond && self.depth == 0 && !alone && !done.piped_in && self.compound.is_none();
+        let name = run_name(&done.words);
+        let leaves = !unknown && !expands && leaves_names(name, &done);
+        if name.is_some_and(|(w, _)| !w.dynamic && matches!(w.text.as_str(), "trap" | "function")) {
+            self.voids = true;
+        }
+        // Round a loop, what a later command sets the earlier see: one
+        // that may set names, or sets one to what isn't an integer, voids
+        // the line. A program of its own can't set the shell's names.
+        if self.looping
+            && (text
+                || !leaves
+                    && name.is_none_or(|(w, _)| w.dynamic || BUILTINS.contains(&w.text.as_str())))
+        {
+            self.voids = true;
+        }
+        if !leaves {
+            self.ints.clear();
+            self.clean = false;
+        }
+        let surely = !self.void
+            && !self.cond
+            && self.depth == 0
+            && !alone
+            && !done.piped_in
+            && self.compound.is_none();
         if surely {
             if name.is_none() {
                 self.ints.extend(pending);
@@ -1835,6 +1931,7 @@ impl Splitter {
                                     self.ints.clear();
                                     self.pending.clear();
                                     self.counted.clear();
+                                    self.assigns.2 = true;
                                 }
                                 let length = inner.len() > 1
                                     && inner.starts_with('#')
@@ -2016,7 +2113,11 @@ impl Splitter {
                             .out
                             .last()
                             .is_some_and(|c| c.words.len() == 1 && c.words[0].text == "for");
-                    if !self.cond && self.depth == 0 && (self.compound.is_none() || for_start) {
+                    if !self.void
+                        && !self.cond
+                        && self.depth == 0
+                        && (self.compound.is_none() || for_start)
+                    {
                         self.ints.extend(set);
                     }
                 }
@@ -2363,6 +2464,150 @@ const KEYWORDS: &[&str] = &[
     "!", "{", "}", "then", "do", "else", "elif", "if", "while", "until", "fi", "done",
 ];
 
+/// The shells' own commands, and their compound words: any may set a name
+/// in the shell that runs it, as a program of its own can't.
+const BUILTINS: &[&str] = &[
+    ".",
+    ":",
+    "[",
+    "[[",
+    "alias",
+    "autoload",
+    "bg",
+    "bind",
+    "bindkey",
+    "break",
+    "builtin",
+    "caller",
+    "case",
+    "cd",
+    "chdir",
+    "command",
+    "compgen",
+    "complete",
+    "compopt",
+    "continue",
+    "coproc",
+    "declare",
+    "dirs",
+    "disown",
+    "echo",
+    "emulate",
+    "enable",
+    "eval",
+    "exec",
+    "exit",
+    "export",
+    "false",
+    "fc",
+    "fg",
+    "float",
+    "for",
+    "function",
+    "functions",
+    "getopts",
+    "hash",
+    "help",
+    "history",
+    "integer",
+    "jobs",
+    "kill",
+    "let",
+    "local",
+    "logout",
+    "mapfile",
+    "noglob",
+    "popd",
+    "print",
+    "printf",
+    "pushd",
+    "pwd",
+    "read",
+    "readarray",
+    "readonly",
+    "return",
+    "select",
+    "set",
+    "setopt",
+    "shift",
+    "shopt",
+    "source",
+    "suspend",
+    "test",
+    "time",
+    "times",
+    "trap",
+    "true",
+    "type",
+    "typeset",
+    "ulimit",
+    "umask",
+    "unalias",
+    "unset",
+    "unsetopt",
+    "vared",
+    "wait",
+    "whence",
+    "zle",
+    "zmodload",
+    "zparseopts",
+    "zstyle",
+];
+
+/// What a simple command runs, past assignments, keywords, and `command`,
+/// `builtin` and `exec` with their options; and the words after it.
+fn run_name(words: &[Word]) -> Option<(&Word, &[Word])> {
+    let mut at = words
+        .iter()
+        .position(|w| !is_assignment(w) && (w.dynamic || !KEYWORDS.contains(&w.text.as_str())))?;
+    while !words[at].dynamic && matches!(words[at].text.as_str(), "command" | "builtin" | "exec") {
+        let exec = words[at].text == "exec";
+        at += 1;
+        while let Some(w) = words.get(at) {
+            if w.dynamic || !is_option(w) {
+                break;
+            }
+            at += 1;
+            if w.text == "--" {
+                break;
+            }
+            // `exec -a NAME`: the name it is run as.
+            if exec && !w.text.starts_with("--") && w.text.contains('a') {
+                at += 1;
+            }
+        }
+        if at >= words.len() {
+            return None;
+        }
+    }
+    Some((&words[at], &words[at + 1..]))
+}
+
+/// Whether a command is one known to set no name in its shell: none (an
+/// assignment alone), `echo`, `printf` without `-v`, `true`, `false`,
+/// `:`, a `cd`, a test comparing as numbers only integers, the `for` of a
+/// `for ((…))`. What it expands is judged apart (`${X:=v}`).
+fn leaves_names(name: Option<(&Word, &[Word])>, simple: &Simple) -> bool {
+    let Some((name, args)) = name else {
+        return true;
+    };
+    if name.dynamic {
+        return false;
+    }
+    match name.text.as_str() {
+        "echo" | "true" | "false" | ":" | "cd" | "pushd" | "popd" | "chdir" => true,
+        "printf" => args
+            .first()
+            .is_none_or(|w| !w.dynamic && !w.text.starts_with("-v")),
+        "[" | "test" | "[[" => {
+            let args: Vec<&Word> = args.iter().collect();
+            !compares_names(&args, simple)
+        }
+        "for" => args.is_empty(),
+        _ => false,
+    }
+}
+
 fn is_assignment(word: &Word) -> bool {
     word.text.split_once('=').is_some_and(|(name, _)| {
         !name.is_empty()
@@ -2505,6 +2750,16 @@ fn classify_words(
         "sed" if sed_runs(args) => Some(Asks::Unclear),
         "sqlite3" if sqlite_runs(args, simple) => Some(Asks::Unclear),
         "m4" => Some(Asks::Unclear),
+        // A program it runs on each file it searches.
+        "rg" if args.iter().any(|w| {
+            (w.dynamic && w.text.starts_with('-'))
+                || w.text == "--pre"
+                || w.text.starts_with("--pre=")
+        }) =>
+        {
+            Some(Asks::Unclear)
+        }
+        "open" if opens_to_run(args) => Some(Asks::Unclear),
         "make"
             if args.iter().enumerate().any(|(k, w)| {
                 w.text.starts_with("--eval")
@@ -2982,6 +3237,7 @@ fn classify_words(
                 .then_some(Asks::Unclear)
         }
         "find" => find(args, simple, place),
+        "fd" | "fdfind" => fd(args, simple, place),
         _ => None,
     }
 }
@@ -3070,6 +3326,11 @@ const RUNS_ITS_ARGS: &[&str] = &[
     "batch",
     "emacs",
     "emacsclient",
+    "taskset",
+    "chrt",
+    "numactl",
+    "prlimit",
+    "cpulimit",
 ];
 
 /// What in a shell's environment it runs or sources as it starts or
@@ -3587,6 +3848,24 @@ fn target_dir(args: &[&Word]) -> Option<Word> {
 /// written out, one run for what `xargs` or `find` feeds, a shell reading
 /// its commands from a pipe, and an option it doesn't know can't be read.
 fn shell(args: &[&Word], simple: &Simple, place: &Place<'_>, unknown: bool) -> Option<Asks> {
+    let Ok((command, stdin, i)) = shell_options(args) else {
+        return Some(Asks::Unclear);
+    };
+    let script = args.get(i);
+    match (command, script) {
+        _ if unknown => Some(Asks::Unclear),
+        (true, Some(s)) if !s.dynamic => always_asks(&s.text, place),
+        (true, _) => Some(Asks::Unclear),
+        (false, Some(s)) if from_stdin(s) => Some(Asks::Unclear),
+        (false, Some(_)) if !stdin && !simple.piped_in && !simple.fed => None,
+        (false, _) => Some(Asks::Unclear),
+    }
+}
+
+/// A shell's options: whether it runs a script given with `-c`, whether
+/// it reads its commands from stdin (`-s`), and where its first operand
+/// is. `Err` for an option it doesn't know or one made as it runs.
+fn shell_options(args: &[&Word]) -> Result<(bool, bool, usize), ()> {
     const FLAGS: &str = "abcefhiklmnprstuvxBCEHPT";
     const LONG: &[&str] = &[
         "norc",
@@ -3605,7 +3884,7 @@ fn shell(args: &[&Word], simple: &Simple, place: &Place<'_>, unknown: bool) -> O
     while let Some(w) = args.get(i) {
         let t = w.text.as_str();
         if w.dynamic {
-            return Some(Asks::Unclear);
+            return Err(());
         }
         if t == "--" || t == "-" {
             i += 1;
@@ -3621,7 +3900,7 @@ fn shell(args: &[&Word], simple: &Simple, place: &Place<'_>, unknown: bool) -> O
         i += 1;
         if let Some(long) = letters.strip_prefix('-') {
             if !LONG.contains(&long) {
-                return Some(Asks::Unclear);
+                return Err(());
             }
             continue;
         }
@@ -3634,19 +3913,11 @@ fn shell(args: &[&Word], simple: &Simple, place: &Place<'_>, unknown: bool) -> O
                 'c' => command = true,
                 's' => stdin = true,
                 _ if FLAGS.contains(c) => {}
-                _ => return Some(Asks::Unclear),
+                _ => return Err(()),
             }
         }
     }
-    let script = args.get(i);
-    match (command, script) {
-        _ if unknown => Some(Asks::Unclear),
-        (true, Some(s)) if !s.dynamic => always_asks(&s.text, place),
-        (true, _) => Some(Asks::Unclear),
-        (false, Some(s)) if from_stdin(s) => Some(Asks::Unclear),
-        (false, Some(_)) if !stdin && !simple.piped_in && !simple.fed => None,
-        (false, _) => Some(Asks::Unclear),
-    }
+    Ok((command, stdin, i))
 }
 
 /// `tar`: unpacking ([`Place::extracts`]) where its `-C` says, or the cwd.
@@ -3810,6 +4081,122 @@ fn find(args: &[&Word], simple: &Simple, place: &Place<'_>) -> Option<Asks> {
         k += 1;
     }
     found
+}
+
+/// `fd`: what it runs for each file it finds (`-x`, `--exec`) or for all
+/// of them (`-X`, `--exec-batch`), read as `find -exec`'s is, on files it
+/// can't name. A search from elsewhere (`--base-directory`), a command
+/// given in one word, and a word made as it runs that may be an option
+/// can't be read.
+fn fd(args: &[&Word], simple: &Simple, place: &Place<'_>) -> Option<Asks> {
+    let mut found: Option<Asks> = None;
+    let mut k = 0;
+    while let Some(w) = args.get(k) {
+        let t = w.text.as_str();
+        if (w.dynamic && (t.is_empty() || t.starts_with('-')))
+            || t == "--base-directory"
+            || t.starts_with("--base-directory=")
+            || t.starts_with("--exec=")
+            || t.starts_with("--exec-batch=")
+        {
+            return Some(Asks::Unclear);
+        }
+        let exec = matches!(t, "--exec" | "--exec-batch")
+            || (t.starts_with('-') && !t.starts_with("--") && t.contains(['x', 'X']));
+        k += 1;
+        if !exec {
+            continue;
+        }
+        let end = args[k..]
+            .iter()
+            .position(|w| w.text == ";")
+            .map_or(args.len(), |p| k + p);
+        // `{}`, `{.}`, `{/}`, `{//}`, `{/.}`: the file found.
+        let inner: Vec<&Word> = args[k..end]
+            .iter()
+            .copied()
+            .filter(|w| !(w.text.starts_with('{') && w.text.ends_with('}')))
+            .collect();
+        let asks = match inner.is_empty() {
+            true => Some(Asks::Unclear),
+            false => classify_words(&inner, simple, place, true),
+        };
+        if let Some(a) = asks {
+            found = Some(match found.take() {
+                Some(was) => was.worst(a),
+                None => a,
+            });
+        }
+        k = end + 1;
+    }
+    found
+}
+
+/// `open` given what runs as it opens: a script (`x.command`, `x.sh`), a
+/// file it can't name until it runs, or any file handed to a terminal or a
+/// script runner (`-a Terminal`).
+fn opens_to_run(args: &[&Word]) -> bool {
+    const RUNNERS: &[&str] = &[
+        "terminal",
+        "iterm",
+        "iterm2",
+        "warp",
+        "alacritty",
+        "kitty",
+        "wezterm",
+        "ghostty",
+        "hyper",
+        "tabby",
+        "script editor",
+        "automator",
+        "com.apple.terminal",
+        "com.googlecode.iterm2",
+        "com.apple.scripteditor2",
+    ];
+    const RUN: &[&str] = &[
+        ".command",
+        ".tool",
+        ".sh",
+        ".bash",
+        ".zsh",
+        ".csh",
+        ".terminal",
+        ".scpt",
+        ".scptd",
+        ".applescript",
+        ".workflow",
+    ];
+    let mut by_runner = false;
+    let mut files = false;
+    let mut k = 0;
+    while let Some(w) = args.get(k) {
+        k += 1;
+        let t = w.text.as_str();
+        match t {
+            "-a" | "-b" => {
+                let app = args.get(k);
+                k += 1;
+                by_runner |= app.is_none_or(|a| {
+                    let name = a.text.trim_end_matches('/').to_lowercase();
+                    let name = name.rsplit('/').next().unwrap_or(&name);
+                    let name = name.strip_suffix(".app").unwrap_or(name);
+                    a.dynamic || RUNNERS.contains(&name)
+                });
+            }
+            "--args" => break,
+            // A file made as it runs may be a script; an address isn't.
+            _ if w.dynamic && !t.starts_with("http") => return true,
+            _ if t.starts_with('-') => {}
+            _ => {
+                let lower = t.trim_end_matches('/').to_lowercase();
+                if RUN.iter().any(|e| lower.ends_with(e)) {
+                    return true;
+                }
+                files = true;
+            }
+        }
+    }
+    by_runner && files
 }
 
 /// Interpreters that run a program given to them as text.
@@ -4944,6 +5331,159 @@ mod tests {
     /// The second re-review: a heredoc's body the shell expands, a write
     /// by `<>` or by redirections alone, and a delete reached past
     /// `find`'s own options or a `cd` Desk can't follow.
+    /// The final review: integers stay known, and a bare-name `cd` is
+    /// found where it is, only across commands known to set no names.
+    #[test]
+    fn names_stay_known_only_across_commands_known_to_set_none() {
+        for command in [
+            // A trap's action runs before each command after it.
+            "i=0; trap \"i='a[\\$(rm -rf ~)]'\" DEBUG; echo $((i))",
+            "i=0; echo $((i)); trap 'i=x' DEBUG",
+            // An element of `i` is `i`.
+            "i=0; i[0]='a[$(rm -rf ~)]'; echo $((i))",
+            "i=0; i[0]='a[$(rm -rf ~)]'; [[ $i -eq 0 ]]",
+            "i=0; i[0]+=x; echo $((i))",
+            // Behind `command`, `builtin` and `exec`, and their options.
+            "i=0; command read i <<< 'a[$(rm -rf ~)]'; echo $((i))",
+            "i=0; builtin printf -v i %s 'a[$(rm -rf ~)]'; echo $((i))",
+            "i=0; command declare i='a[$(rm -rf ~)]'; echo $((i))",
+            "i=0; builtin export i='a[$(rm -rf ~)]'; [[ $i -eq 0 ]]",
+            "i=0; command -p read i; echo $((i))",
+            "i=0; command -- read i; echo $((i))",
+            // Any command not known to set no names.
+            "i=0; ls; echo $((i))",
+            "i=0; let i=x; echo $((i))",
+            "i=0; f; echo $((i))",
+            "i=0; $X; echo $((i))",
+            "i=0; printf -vi x; echo $((i))",
+            "i=0; printf $F x; echo $((i))",
+            "i=0; x=$y; echo $((i))",
+            "i=0; echo ${i:=x}; echo $((i))",
+            // Round a loop, what is set later is seen earlier.
+            "i=0; while [[ $i -lt 3 ]]; do read i; done",
+            "i=0; while true; do echo $((i)); i='a[$(rm -rf ~)]'; done",
+            "i=0; until false; do echo $((i)); eval x; done",
+            "i=0; while :; do echo $((i)); $X; done",
+            "i=0; function f { :; }; echo $((i))",
+        ] {
+            assert_eq!(asks(command), Some(U), "{command:?}");
+        }
+        let mut wrong = Vec::new();
+        for command in [
+            "command export CDPATH=/Users/sarah/dev; cd src && rm -rf build",
+            "read CDPATH <<< /Users/sarah/dev; cd src && rm -rf build",
+            "printf -v CDPATH /Users/sarah/dev; cd src && rm -rf build",
+            ": ${CDPATH:=/Users/sarah/dev}; cd src && rm -rf build",
+            "mapfile -t CDPATH <<< /Users/sarah/dev; cd src && rm -rf build",
+            "getopts a: CDPATH; cd src && rm -rf build",
+            "source ./env.sh; cd src && rm -rf build",
+            ". ./env.sh; cd src && rm -rf build",
+            "eval x; cd src && rm -rf build",
+            "ls; cd src && rm -rf build",
+            "trap 'CDPATH=/x' DEBUG; cd src && rm -rf build",
+            "cd src && rm -rf build; trap x DEBUG",
+        ] {
+            if asks(command).is_none() {
+                wrong.push(command);
+            }
+        }
+        assert!(wrong.is_empty(), "these didn't ask: {wrong:#?}");
+        for command in [
+            "i=0; i=$((i+1)); [ $i -lt 3 ]",
+            "i=0\nwhile [ $i -lt 3 ]; do i=$((i + 1)); done",
+            "for ((i=0;i<3;i++)); do echo $((i * 2)); done",
+            "n=3; for ((i = 0; i < n; i++)); do ls; done",
+            "[ $? -ne 0 ]",
+            "cd src && rm -rf build",
+            "i=0; echo $i; printf '%d' $i; true; : x; [ $i -lt 3 ]; echo $((i))",
+            "i=0; command echo x; builtin true; echo $((i))",
+            "x=a; cd src && rm -rf build",
+            "echo x; [ -d src ] && cd src && rm -rf build",
+        ] {
+            assert_eq!(asks(command), None, "{command:?}");
+        }
+    }
+
+    /// What a publish-or-deploy can't read, it tells by its words; what it
+    /// runs behind a wrapper, a shell, `eval` or `xargs` is read.
+    #[test]
+    fn what_publishes_behind_what_cant_be_read_is_handed_over() {
+        for command in [
+            "eval 'git push origin main'",
+            "timeout 60 git push",
+            "bash -c -- 'npm publish'",
+            "xargs git push",
+            "sh -c \"$CMD\"",
+            "$CMD",
+            "nice -n 5 npm publish",
+            "git -c alias.x='!git push' x",
+        ] {
+            assert!(publishes_on(command, Some("main")), "{command:?}");
+        }
+        for command in [
+            "eval 'git push origin main'",
+            "bash -c -- 'npm publish'",
+            "xargs git push",
+        ] {
+            assert!(publishes(command), "{command:?}");
+        }
+        for command in [
+            "timeout 60 git status",
+            "eval 'ls'",
+            "bash -c -- 'npm test'",
+        ] {
+            assert!(!publishes_on(command, Some("main")), "{command:?}");
+        }
+    }
+
+    /// The last of the final review: `fd`'s commands, `rg --pre`, more
+    /// runners, `open` running a script, and git settings that run.
+    #[test]
+    fn fd_rg_runners_and_open_are_read() {
+        assert_eq!(
+            asks("fd . /Users/sarah/dev/acme-web -e o -x rm -rf"),
+            Some(G)
+        );
+        assert_eq!(asks("fd -e o --exec rm -rf {}"), Some(G));
+        assert_eq!(asks("fd -HIX rm -rf"), Some(G));
+        for command in [
+            "fd --exec-batch=rm",
+            "fd --base-directory /x -x rm",
+            "fd $X",
+            "fd -x",
+            "rg --pre ./x foo",
+            "rg --pre=./x foo",
+            "taskset 1 rm -rf ~",
+            "chrt -f 1 rm -rf ~",
+            "numactl -N 0 rm -rf ~",
+            "prlimit --nofile=1 rm -rf ~",
+            "cpulimit -l 5 rm -rf ~",
+            "open -a Terminal x.sh",
+            "open -a Terminal x",
+            "open -a /Applications/iTerm.app x",
+            "open x.command",
+            "open -n ./x.tool",
+            "open \"$F\"",
+            "sed 's/a/b/e' f",
+            "git -c submodule.x.update='!rm -rf ~' submodule update",
+            "git -c sendemail.smtpserver=/tmp/x send-email a.patch",
+            "git -c web.browser=x help -w log",
+        ] {
+            assert_eq!(asks(command), Some(U), "{command:?}");
+        }
+        for command in [
+            "fd -e rs src",
+            "fd -x echo",
+            "rg --pre-glob '*.gz' foo",
+            "rg foo",
+            "open https://x.example",
+            "open README.md",
+            "open -a Preview a.pdf",
+        ] {
+            assert_eq!(asks(command), None, "{command:?}");
+        }
+    }
+
     #[test]
     fn what_a_shell_expands_or_opens_on_its_own_is_read() {
         for command in [
