@@ -837,6 +837,12 @@ pub trait Crew: Send + Sync {
     ) -> Result<String, String> {
         Err("no boss here interrupts sessions".into())
     }
+    /// What closing `v` would leave, `known` with what only the hub reads:
+    /// its folder's uncommitted or unpushed work and its open pull
+    /// requests, as its boss's own close reads them.
+    async fn closing(&self, _v: &SessionView, known: crate::Closing) -> crate::Closing {
+        known
+    }
     /// The agent overseeing the crew, if one does.
     fn overseer(&self) -> Option<Overseer>;
     /// The hub's agents, with the turn each is running.
@@ -854,6 +860,11 @@ pub trait Crew: Send + Sync {
     /// The engine the boss `agent` starts sessions on when nothing says
     /// another (`[oversight.work] engine`), while it oversees.
     fn default_engine(&self, _agent: &str) -> Option<String> {
+        None
+    }
+    /// How many sessions `plan`'s boss runs at once
+    /// (`[oversight.work] parallel`), while it oversees the plan's scope.
+    fn boss_limit(&self, _plan: &crate::plan::Plan) -> Option<usize> {
         None
     }
     /// The start of today, in the person's time.

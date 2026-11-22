@@ -232,7 +232,7 @@ fn fake_cli(dir: &Path) -> PathBuf {
     workforce_common::executable::write(
         &path,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}/args-$$\"\nexec sleep 60\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}/args-$$\"\nexec sleep 600\n",
             dir.display()
         ),
     )
@@ -4557,7 +4557,7 @@ fn installed_cli(dir: &Path) -> PathBuf {
     workforce_common::executable::write(
         &path,
         format!(
-            "#!/bin/sh\ncase \"$1\" in --version) echo '2.1.300 (Claude Code)'; exit 0;; auth) exit 1;; esac\nprintf '%s\\n' \"$@\" > \"{}/args-$$\"\nexec sleep 60\n",
+            "#!/bin/sh\ncase \"$1\" in --version) echo '2.1.300 (Claude Code)'; exit 0;; auth) exit 1;; esac\nprintf '%s\\n' \"$@\" > \"{}/args-$$\"\nexec sleep 600\n",
             dir.display()
         ),
     )
