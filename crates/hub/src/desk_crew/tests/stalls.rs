@@ -932,7 +932,7 @@ pub(super) fn building_cli(dir: &Path, says: Says) -> PathBuf {
         }
     };
     workforce_common::executable::write(
-        bin.join("ssh"),
+        &bin.join("ssh"),
         format!("#!/bin/sh\necho $$ >> '{}'\n{runs}\n", pids.display()),
     )
     .unwrap();
